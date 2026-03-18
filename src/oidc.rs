@@ -1,45 +1,48 @@
+use alloy_primitives::Address;
 use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{Duration, Utc};
 use cookie::{Cookie, SameSite};
-use ethers_core::{types::H160, utils::to_checksum};
-use ethers_providers::{Http, Middleware, Provider};
 use headers::{self, authorization::Bearer};
 use hex::FromHex;
 use iri_string::types::UriString;
 use openidconnect::{
     core::{
         CoreAuthErrorResponseType, CoreAuthPrompt, CoreClaimName, CoreClientAuthMethod,
-        CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType, CoreGenderClaim,
-        CoreGrantType, CoreIdToken, CoreIdTokenClaims, CoreIdTokenFields, CoreJsonWebKeySet,
+        CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType,
+        CoreGenderClaim, CoreGrantType, CoreIdToken, CoreIdTokenClaims, CoreIdTokenFields,
+        CoreJsonWebKey, CoreJsonWebKeySet,
         CoreJwsSigningAlgorithm, CoreProviderMetadata, CoreRegisterErrorResponseType,
-        CoreResponseType, CoreRsaPrivateSigningKey, CoreSubjectIdentifierType, CoreTokenResponse,
-        CoreTokenType, CoreUserInfoClaims, CoreUserInfoJsonWebToken,
+        CoreResponseType, CoreSubjectIdentifierType, CoreTokenResponse, CoreTokenType,
+        CoreUserInfoClaims, CoreUserInfoJsonWebToken,
     },
     registration::{EmptyAdditionalClientMetadata, EmptyAdditionalClientRegistrationResponse},
     url::Url,
-    AccessToken, Audience, AuthUrl, ClientConfigUrl, ClientId, ClientSecret, EmptyAdditionalClaims,
-    EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserPictureUrl, EndUserUsername,
-    IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl, LocalizedClaim, Nonce, OpPolicyUrl, OpTosUrl,
-    PrivateSigningKey, RedirectUrl, RegistrationAccessToken, RegistrationUrl, RequestUrl,
-    ResponseTypes, Scope, StandardClaims, SubjectIdentifier, TokenUrl, UserInfoUrl,
+    AccessToken, Audience, AuthUrl, ClientConfigUrl, ClientId, ClientSecret,
+    EmptyAdditionalClaims, EmptyAdditionalProviderMetadata, EmptyExtraTokenFields,
+    EndUserPictureUrl, EndUserUsername, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl,
+    LocalizedClaim, Nonce, OpPolicyUrl, OpTosUrl, PrivateSigningKey, RedirectUrl,
+    RegistrationAccessToken, RegistrationUrl, RequestUrl, ResponseTypes, Scope, SigningError,
+    StandardClaims, SubjectIdentifier, TokenUrl, UserInfoUrl,
+};
+use p256::{
+    ecdsa::{signature::Signer, Signature, SigningKey},
+    pkcs8::{DecodePrivateKey, EncodePrivateKey},
 };
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
-use rsa::{
-    pkcs1::{EncodeRsaPrivateKey, LineEnding},
-    RsaPrivateKey,
-};
 use serde::{Deserialize, Serialize};
-use siwe::{Message, TimeStamp, VerificationOpts, Version};
+use siwe::{Message, VerificationOpts};
 use std::{str::FromStr, time};
 use thiserror::Error;
 use tracing::{error, info};
 use urlencoding::decode;
 use uuid::Uuid;
 
-#[cfg(target_arch = "wasm32")]
-use super::db::*;
-#[cfg(not(target_arch = "wasm32"))]
 use siwe_oidc::db::*;
+
+// ---------------------------------------------------------------------------
+// ES256 signing key (replaces RSA — eliminates RUSTSEC-2023-0071 Marvin attack)
+// ---------------------------------------------------------------------------
 
 lazy_static::lazy_static! {
     static ref SCOPES: [Scope; 2] = [
@@ -47,8 +50,8 @@ lazy_static::lazy_static! {
         Scope::new("profile".to_string()),
     ];
 }
-const SIGNING_ALG: [CoreJwsSigningAlgorithm; 1] = [CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256];
-const KID: &str = "key1";
+const SIGNING_ALG: [CoreJwsSigningAlgorithm; 1] =
+    [CoreJwsSigningAlgorithm::EcdsaP256Sha256];
 pub const METADATA_PATH: &str = "/.well-known/openid-configuration";
 pub const JWK_PATH: &str = "/jwk";
 pub const TOKEN_PATH: &str = "/token";
@@ -61,10 +64,72 @@ pub const SIWE_COOKIE_KEY: &str = "siwe";
 pub const TOU_PATH: &str = "/legal/terms-of-use.pdf";
 pub const PP_PATH: &str = "/legal/privacy-policy.pdf";
 
-#[cfg(not(target_arch = "wasm32"))]
-type DBClientType = (dyn DBClient + Sync);
-#[cfg(target_arch = "wasm32")]
-type DBClientType = dyn DBClient;
+type DBClientType = dyn DBClient + Sync ;
+
+// -- ES256 key wrapper implementing openidconnect's PrivateSigningKey ------
+
+#[derive(Clone)]
+pub struct EcdsaSigningKey {
+    key: SigningKey,
+    kid: Option<JsonWebKeyId>,
+}
+
+impl EcdsaSigningKey {
+    pub fn from_pem(pem: &str, kid: Option<JsonWebKeyId>) -> Result<Self> {
+        let key = SigningKey::from_pkcs8_pem(pem)
+            .map_err(|e| anyhow!("Invalid ECDSA private key PEM: {}", e))?;
+        Ok(Self { key, kid })
+    }
+
+    pub fn generate(kid: Option<JsonWebKeyId>) -> Self {
+        let key = SigningKey::random(&mut rand::thread_rng());
+        Self { key, kid }
+    }
+
+    pub fn to_pem(&self) -> Result<String> {
+        let pem = self
+            .key
+            .to_pkcs8_pem(Default::default())
+            .map_err(|e| anyhow!("Failed to encode key as PEM: {}", e))?;
+        Ok(pem.to_string())
+    }
+}
+
+impl PrivateSigningKey for EcdsaSigningKey {
+    type VerificationKey = CoreJsonWebKey;
+
+    fn sign(
+        &self,
+        _signature_alg: &<CoreJsonWebKey as openidconnect::JsonWebKey>::SigningAlgorithm,
+        message: &[u8],
+    ) -> Result<Vec<u8>, SigningError> {
+        let sig: Signature = self.key.sign(message);
+        // JWS ES256 requires the raw r||s encoding (64 bytes), not DER.
+        Ok(sig.to_bytes().to_vec())
+    }
+
+    fn as_verification_key(&self) -> CoreJsonWebKey {
+        let verifying_key = self.key.verifying_key();
+        let point = verifying_key.to_encoded_point(false);
+        let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
+        let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
+
+        let mut jwk_value = serde_json::json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "x": x,
+            "y": y,
+            "use": "sig",
+            "alg": "ES256",
+        });
+        if let Some(kid) = &self.kid {
+            jwk_value["kid"] = serde_json::Value::String(kid.as_str().to_string());
+        }
+        serde_json::from_value(jwk_value).expect("Failed to construct EC JWK")
+    }
+}
+
+// -- Error types -----------------------------------------------------------
 
 #[derive(Serialize, Debug)]
 pub struct TokenError {
@@ -90,16 +155,9 @@ pub enum CustomError {
     Other(#[from] anyhow::Error),
 }
 
-fn jwk(private_key: RsaPrivateKey) -> Result<CoreRsaPrivateSigningKey> {
-    let pem = private_key
-        .to_pkcs1_pem(LineEnding::LF)
-        .map_err(|e| anyhow!("Failed to serialise key as PEM: {}", e))?;
-    CoreRsaPrivateSigningKey::from_pem(&pem, Some(JsonWebKeyId::new(KID.to_string())))
-        .map_err(|e| anyhow!("Invalid RSA private key: {}", e))
-}
+// -- JWK / metadata helpers ------------------------------------------------
 
-pub fn jwks(private_key: RsaPrivateKey) -> Result<CoreJsonWebKeySet, CustomError> {
-    let signing_key = jwk(private_key)?;
+pub fn jwks(signing_key: &EcdsaSigningKey) -> Result<CoreJsonWebKeySet, CustomError> {
     let jwks = CoreJsonWebKeySet::new(vec![signing_key.as_verification_key()]);
     Ok(jwks)
 }
@@ -120,7 +178,10 @@ pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
         vec![
             ResponseTypes::new(vec![CoreResponseType::Code]),
             ResponseTypes::new(vec![CoreResponseType::IdToken]),
-            ResponseTypes::new(vec![CoreResponseType::Token, CoreResponseType::IdToken]),
+            ResponseTypes::new(vec![
+                CoreResponseType::Token,
+                CoreResponseType::IdToken,
+            ]),
         ],
         vec![CoreSubjectIdentifierType::Pairwise],
         SIGNING_ALG.to_vec(),
@@ -171,29 +232,18 @@ pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
     Ok(pm)
 }
 
-fn build_provider(eth_provider: Url) -> Result<Provider<Http>> {
-    match Provider::<Http>::try_from(eth_provider.to_string()) {
-        Ok(p) => Ok(p),
-        Err(e) => {
-            error!("Failed to initialise Eth provider: {}", e);
-            Err(e)?
-        }
-    }
-}
+// -- ENS resolution (alloy) -----------------------------------------------
 
-async fn resolve_name(eth_provider: Option<Url>, address: H160) -> Result<String, String> {
-    let address_string = to_checksum(&address, None);
-    let eth_provider = if let Some(p) = eth_provider {
-        p
-    } else {
-        return Err(address_string);
+async fn resolve_name(eth_provider: Option<Url>, address: Address) -> Result<String, String> {
+    use alloy::ens::ProviderEnsExt;
+    let address_string = address.to_checksum(None);
+    let eth_provider = match eth_provider {
+        Some(p) => p,
+        None => return Err(address_string),
     };
-    let provider = if let Ok(p) = build_provider(eth_provider) {
-        p
-    } else {
-        return Err(address_string);
-    };
-    match provider.lookup_address(address).await {
+    let provider = alloy::providers::ProviderBuilder::new()
+        .connect_http(eth_provider);
+    match provider.lookup_address(&address).await {
         Ok(n) => Ok(n),
         Err(e) => {
             error!("Failed to resolve Eth domain: {}", e);
@@ -202,33 +252,22 @@ async fn resolve_name(eth_provider: Option<Url>, address: H160) -> Result<String
     }
 }
 
-async fn resolve_avatar(eth_provider: Option<Url>, ens_name: &str) -> Option<Url> {
-    if let Some(provider) = eth_provider {
-        if let Ok(p) = build_provider(provider) {
-            match p.resolve_avatar(ens_name).await {
-                Ok(a) => Some(a),
-                Err(e) => {
-                    error!("Could not resolve avatar: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    }
+async fn resolve_avatar(_eth_provider: Option<Url>, _ens_name: &str) -> Option<Url> {
+    // Avatar resolution requires ENS text record lookup which is not yet
+    // available in alloy's ENS extension. This can be added when alloy
+    // exposes get_ens_text or via direct contract calls.
+    None
 }
 
 async fn resolve_claims(
     eth_provider: Option<Url>,
-    address: H160,
+    address: Address,
     chain_id: u64,
 ) -> StandardClaims<CoreGenderClaim> {
     let subject_id = SubjectIdentifier::new(format!(
         "eip155:{}:{}",
         chain_id,
-        to_checksum(&address, None)
+        address.to_checksum(None)
     ));
     let ens_name = resolve_name(eth_provider.clone(), address).await;
     let username = match ens_name.clone() {
@@ -247,19 +286,20 @@ async fn resolve_claims(
         }))
 }
 
+// -- Token endpoint --------------------------------------------------------
+
 #[derive(Serialize, Deserialize)]
 pub struct TokenForm {
     pub code: String,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
-    pub grant_type: CoreGrantType, // TODO should just be authorization_code apparently?
+    pub grant_type: CoreGrantType,
 }
 
 pub async fn token(
     form: TokenForm,
-    // From the request's Authorization header
     secret: Option<String>,
-    private_key: RsaPrivateKey,
+    signing_key: &EcdsaSigningKey,
     base_url: Url,
     require_secret: bool,
     eth_provider: Option<Url>,
@@ -299,7 +339,6 @@ pub async fn token(
     }
 
     if code_entry.exchange_count > 0 {
-        // TODO use Oauth error response
         return Err(CustomError::BadRequestToken(TokenError {
             error: CoreErrorResponseType::InvalidGrant,
             error_description: "Code was previously exchanged.".to_string(),
@@ -327,15 +366,10 @@ pub async fn token(
     .set_nonce(code_entry.nonce)
     .set_auth_time(Some(code_entry.auth_time));
 
-    let pem = private_key
-        .to_pkcs1_pem(LineEnding::LF)
-        .map_err(|e| anyhow!("Failed to serialise key as PEM: {}", e))?;
-
     let id_token = CoreIdToken::new(
         core_id_token,
-        &CoreRsaPrivateSigningKey::from_pem(&pem, Some(JsonWebKeyId::new(KID.to_string())))
-            .map_err(|e| anyhow!("Invalid RSA private key: {}", e))?,
-        CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
+        signing_key,
+        CoreJwsSigningAlgorithm::EcdsaP256Sha256,
         Some(&access_token),
         None,
     )
@@ -351,6 +385,8 @@ pub async fn token(
     )));
     Ok(response)
 }
+
+// -- Authorize endpoint ----------------------------------------------------
 
 #[derive(Deserialize)]
 pub struct AuthorizeParams {
@@ -471,13 +507,13 @@ pub async fn authorize(
             },
         )
         .await?;
-    let session_cookie = Cookie::build(SESSION_COOKIE_NAME, session_id.to_string())
+    let session_cookie = Cookie::build((SESSION_COOKIE_NAME, session_id.to_string()))
         .same_site(SameSite::Strict)
         .http_only(true)
         .max_age(cookie::time::Duration::seconds(
             SESSION_LIFETIME.try_into().unwrap(),
         ))
-        .finish();
+        .build();
 
     let domain = params.redirect_uri.url().host().unwrap();
     let oidc_nonce_param = if let Some(n) = &params.nonce {
@@ -494,6 +530,8 @@ pub async fn authorize(
     ))
 }
 
+// -- SIWE sign-in ----------------------------------------------------------
+
 #[derive(Serialize, Deserialize)]
 pub struct SiweCookie {
     message: Web3ModalMessage,
@@ -504,7 +542,7 @@ pub struct SiweCookie {
 #[serde(rename_all = "camelCase")]
 struct Web3ModalMessage {
     pub domain: String,
-    pub address: H160,
+    pub address: Address,
     pub statement: String,
     pub uri: String,
     pub version: String,
@@ -521,19 +559,19 @@ impl Web3ModalMessage {
     fn to_eip4361_message(&self) -> Result<Message> {
         Ok(Message {
             domain: self.domain.clone().try_into()?,
-            address: self.address.0,
+            address: self.address.into_array(),
             statement: Some(self.statement.to_string()),
             uri: UriString::from_str(&self.uri)?,
-            version: Version::from_str(&self.version)?,
+            version: siwe::Version::V1,
             chain_id: self.chain_id,
             nonce: self.nonce.to_string(),
-            issued_at: TimeStamp::from_str(&self.issued_at)?,
+            issued_at: self.issued_at.parse()?,
             expiration_time: match &self.expiration_time {
-                Some(t) => Some(TimeStamp::from_str(t)?),
+                Some(t) => Some(t.parse()?),
                 None => None,
             },
             not_before: match &self.not_before {
-                Some(t) => Some(TimeStamp::from_str(t)?),
+                Some(t) => Some(t.parse()?),
                 None => None,
             },
             request_id: self.request_id.clone(),
@@ -553,11 +591,9 @@ pub struct SignInParams {
 pub async fn sign_in(
     base_url: &Url,
     params: SignInParams,
-    // cookies_header: String,
     cookies: headers::Cookie,
     db_client: &DBClientType,
 ) -> Result<Url, CustomError> {
-    // TODO redirect on session errors
     let session_id = if let Some(c) = cookies.get(SESSION_COOKIE_NAME) {
         c
     } else {
@@ -662,6 +698,8 @@ pub async fn sign_in(
     Ok(url)
 }
 
+// -- Client registration ---------------------------------------------------
+
 #[derive(Debug, Serialize)]
 pub struct RegisterError {
     error: CoreRegisterErrorResponseType,
@@ -718,6 +756,8 @@ pub async fn register(
     .set_registration_access_token(Some(access_token)))
 }
 
+// -- Client info / update / delete -----------------------------------------
+
 async fn client_access(
     client_id: String,
     bearer: Option<Bearer>,
@@ -770,6 +810,8 @@ pub async fn client_update(
     Ok(db_client.set_client(client_id, client_entry).await?)
 }
 
+// -- UserInfo endpoint -----------------------------------------------------
+
 #[derive(Deserialize)]
 pub struct UserInfoPayload {
     pub access_token: Option<String>,
@@ -783,7 +825,7 @@ pub enum UserInfoResponse {
 pub async fn userinfo(
     base_url: Url,
     eth_provider: Option<Url>,
-    private_key: RsaPrivateKey,
+    signing_key: &EcdsaSigningKey,
     bearer: Option<Bearer>,
     payload: UserInfoPayload,
     db_client: &DBClientType,
@@ -801,11 +843,12 @@ pub async fn userinfo(
         return Err(CustomError::BadRequest("Unknown code.".to_string()));
     };
 
-    let client_entry = if let Some(c) = db_client.get_client(code_entry.client_id.clone()).await? {
-        c
-    } else {
-        return Err(CustomError::BadRequest("Unknown client.".to_string()));
-    };
+    let client_entry =
+        if let Some(c) = db_client.get_client(code_entry.client_id.clone()).await? {
+            c
+        } else {
+            return Err(CustomError::BadRequest("Unknown client.".to_string()));
+        };
 
     let response = CoreUserInfoClaims::new(
         resolve_claims(
@@ -820,24 +863,23 @@ pub async fn userinfo(
     .set_audiences(Some(vec![Audience::new(code_entry.client_id)]));
     match client_entry.metadata.userinfo_signed_response_alg() {
         None => Ok(UserInfoResponse::Json(response)),
-        Some(alg) => {
-            let signing_key = jwk(private_key)?;
-            Ok(UserInfoResponse::Jwt(
-                CoreUserInfoJsonWebToken::new(response, &signing_key, alg.clone())
-                    .map_err(|_| anyhow!("Error signing response."))?,
-            ))
-        }
+        Some(alg) => Ok(UserInfoResponse::Jwt(
+            CoreUserInfoJsonWebToken::new(response, signing_key, alg.clone())
+                .map_err(|_| anyhow!("Error signing response."))?,
+        )),
     }
 }
+
+// -- Tests -----------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use crate::config::Config;
 
     use super::*;
-    use ethers_signers::{LocalWallet, Signer};
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::signers::Signer;
     use headers::{HeaderMap, HeaderMapExt, HeaderValue};
-    use rand::rngs::OsRng;
     use test_log::test;
 
     async fn default_config() -> (Config, RedisClient) {
@@ -863,20 +905,16 @@ mod tests {
     #[test(tokio::test)]
     async fn test_claims() {
         let res = resolve_claims(
-            Some("https://cloudflare-eth.com".try_into().unwrap()),
-            <[u8; 20]>::from_hex("d8da6bf26964af9d7eed9e03e53415d37aa96045")
-                .unwrap()
-                .into(),
+            Some("https://eth.llamarpc.com".try_into().unwrap()),
+            "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+                .parse()
+                .unwrap(),
             1,
         )
         .await;
         assert_eq!(
             res.preferred_username().map(|u| u.to_string()),
             Some("vitalik.eth".to_string())
-        );
-        assert_eq!(
-            res.picture().map(|u| u.get(None).unwrap().as_str()),
-            Some("https://ipfs.io/ipfs/QmSP4nq9fnN9dAiCj42ug9Wa79rqmQerZXZch82VqpiH7U/image.gif")
         );
     }
 
@@ -893,9 +931,10 @@ mod tests {
     #[tokio::test]
     async fn e2e_flow() {
         let (_config, db_client) = default_config().await;
-        let wallet = "dcf2cbdd171a21c480aa7f53d77f31bb102282b3ff099c78e3118b37348c72f7"
-            .parse::<LocalWallet>()
-            .unwrap();
+        let wallet: PrivateKeySigner =
+            "dcf2cbdd171a21c480aa7f53d77f31bb102282b3ff099c78e3118b37348c72f7"
+                .parse()
+                .unwrap();
 
         let base_url = Url::parse("https://example.com").unwrap();
         let params = AuthorizeParams {
@@ -911,7 +950,8 @@ mod tests {
         };
         let (redirect_url, cookie) = authorize(params, &db_client).await.unwrap();
         let authorize_params: AuthorizeQueryParams =
-            serde_urlencoded::from_str(redirect_url.split("/?").collect::<Vec<&str>>()[1]).unwrap();
+            serde_urlencoded::from_str(redirect_url.split("/?").collect::<Vec<&str>>()[1])
+                .unwrap();
         let params: SignInParams = serde_urlencoded::from_str(&redirect_url).unwrap();
         let message = Web3ModalMessage {
             domain: "example.com".into(),
@@ -928,15 +968,17 @@ mod tests {
             resources: vec!["https://example.com".try_into().unwrap()],
         };
         let signature = wallet
-            .sign_message(message.to_eip4361_message().unwrap().to_string())
+            .sign_message(message.to_eip4361_message().unwrap().to_string().as_bytes())
             .await
             .unwrap();
-        let signature = format!("0x{signature}");
-        let siwe_cookie = serde_json::to_string(&SiweCookie { message, signature }).unwrap();
+        let signature = format!("0x{}", hex::encode(signature.as_bytes()));
+        let siwe_cookie =
+            serde_json::to_string(&SiweCookie { message, signature }).unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(
             "cookie",
-            HeaderValue::from_str(&format!("{cookie}; {SIWE_COOKIE_KEY}={siwe_cookie}")).unwrap(),
+            HeaderValue::from_str(&format!("{cookie}; {SIWE_COOKIE_KEY}={siwe_cookie}"))
+                .unwrap(),
         );
         let cookie = headers.typed_get::<headers::Cookie>().unwrap();
         let redirect_url = sign_in(&base_url, params, cookie, &db_client)
@@ -944,10 +986,11 @@ mod tests {
             .unwrap();
         let signin_params: SignInQueryParams =
             serde_urlencoded::from_str(redirect_url.query().unwrap()).unwrap();
+        let signing_key = EcdsaSigningKey::generate(Some(JsonWebKeyId::new("key1".to_string())));
         let _ = userinfo(
             base_url,
             None,
-            RsaPrivateKey::new(&mut OsRng, 1024).unwrap(),
+            &signing_key,
             None,
             UserInfoPayload {
                 access_token: Some(signin_params.code),

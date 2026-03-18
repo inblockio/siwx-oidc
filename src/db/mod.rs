@@ -1,18 +1,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{offset::Utc, DateTime};
-use ethers_core::types::H160;
+use alloy_primitives::Address;
 use openidconnect::{core::CoreClientMetadata, Nonce, RegistrationAccessToken};
 use serde::{Deserialize, Serialize};
 
-#[cfg(not(target_arch = "wasm32"))]
 mod redis;
-#[cfg(not(target_arch = "wasm32"))]
-pub use redis::RedisClient;
-#[cfg(target_arch = "wasm32")]
-mod cf;
-#[cfg(target_arch = "wasm32")]
-pub use cf::CFClient;
+pub use self::redis::RedisClient;
 
 const KV_CLIENT_PREFIX: &str = "clients";
 const KV_SESSION_PREFIX: &str = "sessions";
@@ -23,11 +17,11 @@ pub const SESSION_COOKIE_NAME: &str = "session";
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CodeEntry {
     pub exchange_count: usize,
-    pub address: H160,
+    pub address: Address,
     pub nonce: Option<Nonce>,
     pub client_id: String,
     pub auth_time: DateTime<Utc>,
-    pub chain_id: Option<u64>, // TODO temporary, for transition purposes
+    pub chain_id: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -45,9 +39,7 @@ pub struct SessionEntry {
     pub signin_count: u64,
 }
 
-// Using a trait to easily pass async functions with async_trait
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[async_trait]
 pub trait DBClient {
     async fn set_client(&self, client_id: String, client_entry: ClientEntry) -> Result<()>;
     async fn get_client(&self, client_id: String) -> Result<Option<ClientEntry>>;

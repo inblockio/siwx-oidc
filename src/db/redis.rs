@@ -16,18 +16,17 @@ pub struct RedisClient {
 
 impl RedisClient {
     pub async fn new(url: &Url) -> Result<Self> {
-        let manager = RedisConnectionManager::new(url.clone())
+        let manager = RedisConnectionManager::new(url.as_str())
             .context("Could not build Redis connection manager")?;
         let pool = bb8::Pool::builder()
             .build(manager.clone())
             .await
-            .context("Coud not build Redis pool")?;
+            .context("Could not build Redis pool")?;
         Ok(Self { pool })
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[async_trait]
 impl DBClient for RedisClient {
     async fn set_client(&self, client_id: String, client_entry: ClientEntry) -> Result<()> {
         let mut conn = self
@@ -36,7 +35,7 @@ impl DBClient for RedisClient {
             .await
             .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
 
-        conn.set(
+        conn.set::<_, _, ()>(
             format!("{}/{}", KV_CLIENT_PREFIX, client_id),
             serde_json::to_string(&client_entry)
                 .map_err(|e| anyhow!("Failed to serialize client entry: {}", e))?,
@@ -70,9 +69,9 @@ impl DBClient for RedisClient {
             .get()
             .await
             .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
-        conn.del(format!("{}/{}", KV_CLIENT_PREFIX, client_id))
+        conn.del::<_, ()>(format!("{}/{}", KV_CLIENT_PREFIX, client_id))
             .await
-            .map_err(|e| anyhow!("Failed to get kv: {}", e))?;
+            .map_err(|e| anyhow!("Failed to delete kv: {}", e))?;
         Ok(())
     }
 
@@ -82,13 +81,11 @@ impl DBClient for RedisClient {
             .get()
             .await
             .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
-        conn.set_ex(
+        conn.set_ex::<_, _, ()>(
             code.to_string(),
-            hex::encode(
-                bincode::serialize(&code_entry)
-                    .map_err(|e| anyhow!("Failed to serialise code: {}", e))?,
-            ),
-            ENTRY_LIFETIME,
+            serde_json::to_string(&code_entry)
+                .map_err(|e| anyhow!("Failed to serialize code entry: {}", e))?,
+            ENTRY_LIFETIME as u64,
         )
         .await
         .map_err(|e| anyhow!("Failed to set kv: {}", e))?;
@@ -101,19 +98,16 @@ impl DBClient for RedisClient {
             .get()
             .await
             .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
-        let serialized_entry: Option<Vec<u8>> = conn
+        let entry: Option<String> = conn
             .get(code)
             .await
             .map_err(|e| anyhow!("Failed to get kv: {}", e))?;
-        if serialized_entry.is_none() {
-            return Ok(None);
+        if let Some(e) = entry {
+            Ok(serde_json::from_str(&e)
+                .map_err(|e| anyhow!("Failed to deserialize code entry: {}", e))?)
+        } else {
+            Ok(None)
         }
-        let code_entry: CodeEntry = bincode::deserialize(
-            &hex::decode(serialized_entry.unwrap())
-                .map_err(|e| anyhow!("Failed to decode code entry: {}", e))?,
-        )
-        .map_err(|e| anyhow!("Failed to deserialize code: {}", e))?;
-        Ok(Some(code_entry))
     }
 
     async fn set_session(&self, id: String, entry: SessionEntry) -> Result<()> {
@@ -123,11 +117,11 @@ impl DBClient for RedisClient {
             .await
             .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
 
-        conn.set_ex(
+        conn.set_ex::<_, _, ()>(
             format!("{}/{}", KV_SESSION_PREFIX, id),
             serde_json::to_string(&entry)
                 .map_err(|e| anyhow!("Failed to serialize session entry: {}", e))?,
-            SESSION_LIFETIME.try_into().unwrap(),
+            SESSION_LIFETIME,
         )
         .await
         .map_err(|e| anyhow!("Failed to set kv: {}", e))?;

@@ -13,12 +13,12 @@ FROM chef as dep_cacher
 COPY --from=dep_planner /siwe-oidc/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
-FROM node:16-alpine as node_builder
+FROM node:22-alpine as node_builder
 ENV PROJECT_ID=""
 ADD --chown=node:node ./static /siwe-oidc/static
 ADD --chown=node:node ./js/ui /siwe-oidc/js/ui
 WORKDIR /siwe-oidc/js/ui
-RUN npm install
+RUN npm install --legacy-peer-deps
 RUN npm run build
 
 FROM chef as builder
