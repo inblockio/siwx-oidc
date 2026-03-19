@@ -17,6 +17,12 @@ pub struct Config {
     pub default_clients: HashMap<String, String>,
     pub require_secret: bool,
     pub eth_provider: Option<Url>,
+    /// DID method names accepted at sign-in (e.g. ["pkh"]).
+    /// Must be a subset of the methods registered in siwx-core.
+    pub supported_did_methods: Vec<String>,
+    /// did:pkh namespaces accepted at sign-in (e.g. ["eip155", "ed25519", "p256"]).
+    /// Must be a subset of the cipher suites registered in siwx-core.
+    pub supported_pkh_namespaces: Vec<String>,
 }
 
 impl Default for Config {
@@ -30,6 +36,12 @@ impl Default for Config {
             default_clients: HashMap::default(),
             require_secret: false,
             eth_provider: None,
+            supported_did_methods: vec!["pkh".to_string()],
+            supported_pkh_namespaces: vec![
+                "eip155".to_string(),
+                "ed25519".to_string(),
+                "p256".to_string(),
+            ],
         }
     }
 }

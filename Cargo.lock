@@ -1701,6 +1701,7 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.6.4",
  "serde",
  "sha2",
  "subtle",
@@ -2589,6 +2590,7 @@ dependencies = [
  "once_cell",
  "serdect",
  "sha2",
+ "signature",
 ]
 
 [[package]]
@@ -4044,23 +4046,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "siwe"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95bdefc0eedf06440b27092fbfe33f2cb493ad6a3423aa12cfe7f2aac44bd618"
+name = "siwx-core"
+version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "hex",
- "http",
- "iri-string",
  "k256",
+ "p256",
  "rand 0.8.5",
+ "serde",
  "sha3",
- "thiserror 1.0.38",
- "time",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
-name = "siwe-oidc"
+name = "siwx-oidc"
 version = "0.2.0"
 dependencies = [
  "alloy",
@@ -4077,7 +4077,7 @@ dependencies = [
  "figment",
  "headers",
  "hex",
- "iri-string",
+ "k256",
  "lazy_static",
  "openidconnect",
  "p256",
@@ -4086,7 +4086,8 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "sha2",
- "siwe",
+ "sha3",
+ "siwx-core",
  "test-log",
  "thiserror 2.0.18",
  "tokio",

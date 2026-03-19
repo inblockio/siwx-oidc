@@ -79,12 +79,13 @@
 					message: preparedMessage,
 				});
 
+				const did = `did:pkh:eip155:${account.chainId}:${account.address}`;
 				const session = {
-					message: new SiweMessage(preparedMessage),
-					raw: msgToSign,
+					did,
+					message: preparedMessage,
 					signature,
 				};
-				Cookies.set('siwe', JSON.stringify(session), {
+				Cookies.set('siwx', JSON.stringify(session), {
 					expires: expirationTime,
 				});
 

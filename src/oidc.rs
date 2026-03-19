@@ -585,6 +585,8 @@ pub struct SignInParams {
 
 pub async fn sign_in(
     _base_url: &Url,
+    allowed_did_methods: &[String],
+    allowed_pkh_namespaces: &[String],
     params: SignInParams,
     cookies: headers::Cookie,
     db_client: &DBClientType,
@@ -629,6 +631,26 @@ pub async fn sign_in(
     let did_method = find_did_method(&siwx_cookie.did).ok_or_else(|| {
         CustomError::BadRequest(format!("Unsupported DID: {}", &siwx_cookie.did))
     })?;
+
+    // Enforce configured allow-lists.
+    if !allowed_did_methods.iter().any(|m| m == did_method.method_name()) {
+        return Err(CustomError::BadRequest(format!(
+            "DID method '{}' is not enabled on this server",
+            did_method.method_name()
+        )));
+    }
+    if did_method.method_name() == "pkh" {
+        let namespace = siwx_cookie.did
+            .strip_prefix("did:pkh:")
+            .and_then(|s| s.split(':').next())
+            .unwrap_or("");
+        if !allowed_pkh_namespaces.iter().any(|n| n == namespace) {
+            return Err(CustomError::BadRequest(format!(
+                "did:pkh namespace '{namespace}' is not enabled on this server"
+            )));
+        }
+    }
+
     info!("sign_in: did={}", siwx_cookie.did);
     let valid = did_method
         .verify(&siwx_cookie.did, &siwx_cookie.message, &sig_bytes)
@@ -975,9 +997,22 @@ mod tests {
                 .unwrap(),
         );
         let cookie = headers.typed_get::<headers::Cookie>().unwrap();
-        let redirect_url = sign_in(&base_url, params, cookie, &db_client)
-            .await
-            .unwrap();
+        let default_methods = vec!["pkh".to_string()];
+        let default_namespaces = vec![
+            "eip155".to_string(),
+            "ed25519".to_string(),
+            "p256".to_string(),
+        ];
+        let redirect_url = sign_in(
+            &base_url,
+            &default_methods,
+            &default_namespaces,
+            params,
+            cookie,
+            &db_client,
+        )
+        .await
+        .unwrap();
         let signin_params: SignInQueryParams =
             serde_urlencoded::from_str(redirect_url.query().unwrap()).unwrap();
         let oidc_signing_key =

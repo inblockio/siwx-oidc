@@ -31,6 +31,7 @@ use tracing::info;
 
 use super::config;
 use super::oidc::{self, CustomError, EcdsaSigningKey};
+use siwx_core::{all_cipher_suites, all_did_methods};
 use siwx_oidc::db::*;
 use openidconnect::JsonWebKeyId;
 
@@ -126,8 +127,15 @@ async fn sign_in(
     Query(params): Query<oidc::SignInParams>,
     TypedHeader(cookies): TypedHeader<headers::Cookie>,
 ) -> Result<Redirect, CustomError> {
-    let url =
-        oidc::sign_in(&state.config.base_url, params, cookies, &state.redis_client).await?;
+    let url = oidc::sign_in(
+        &state.config.base_url,
+        &state.config.supported_did_methods,
+        &state.config.supported_pkh_namespaces,
+        params,
+        cookies,
+        &state.redis_client,
+    )
+    .await?;
     Ok(Redirect::to(url.as_str()))
 }
 
@@ -256,6 +264,34 @@ pub async fn main() {
     let config = config.extract::<config::Config>().unwrap();
 
     tracing_subscriber::fmt::init();
+
+    // Validate configured DID methods against the siwx-core registry.
+    {
+        let registered: Vec<String> = all_did_methods()
+            .iter()
+            .map(|m| m.method_name().to_string())
+            .collect();
+        for method in &config.supported_did_methods {
+            if !registered.contains(method) {
+                panic!(
+                    "Configured DID method '{}' is not registered in siwx-core (registered: {:?})",
+                    method, registered
+                );
+            }
+        }
+        let registered_ns: Vec<String> = all_cipher_suites()
+            .iter()
+            .map(|cs| cs.namespace().to_string())
+            .collect();
+        for ns in &config.supported_pkh_namespaces {
+            if !registered_ns.contains(ns) {
+                panic!(
+                    "Configured pkh namespace '{}' is not registered in siwx-core (registered: {:?})",
+                    ns, registered_ns
+                );
+            }
+        }
+    }
 
     let redis_client = RedisClient::new(&config.redis_url)
         .await
