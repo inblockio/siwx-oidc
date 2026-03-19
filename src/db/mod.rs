@@ -11,6 +11,7 @@ const KV_CLIENT_PREFIX: &str = "clients";
 const KV_SESSION_PREFIX: &str = "sessions";
 pub const ENTRY_LIFETIME: usize = 30;
 pub const SESSION_LIFETIME: u64 = 300; // 5min
+pub const CLIENT_LIFETIME: u64 = 30 * 24 * 3600; // 30 days
 pub const SESSION_COOKIE_NAME: &str = "session";
 
 #[derive(Clone, Serialize, Deserialize)]

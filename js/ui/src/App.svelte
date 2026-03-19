@@ -87,6 +87,8 @@
 				};
 				Cookies.set('siwx', JSON.stringify(session), {
 					expires: expirationTime,
+					sameSite: 'Strict',
+					secure: window.location.protocol === 'https:',
 				});
 
 				window.location.replace(

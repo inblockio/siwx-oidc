@@ -35,10 +35,11 @@ impl DBClient for RedisClient {
             .await
             .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
 
-        conn.set::<_, _, ()>(
+        conn.set_ex::<_, _, ()>(
             format!("{}/{}", KV_CLIENT_PREFIX, client_id),
             serde_json::to_string(&client_entry)
                 .map_err(|e| anyhow!("Failed to serialize client entry: {}", e))?,
+            CLIENT_LIFETIME,
         )
         .await
         .map_err(|e| anyhow!("Failed to set kv: {}", e))?;
