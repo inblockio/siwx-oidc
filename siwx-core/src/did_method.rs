@@ -54,7 +54,8 @@ pub trait DIDMethod: Send + Sync {
 ///
 /// Add one line here when a new `DIDMethod` implementation is ready.
 pub fn all_did_methods() -> Vec<Box<dyn DIDMethod>> {
-    vec![]
+    use crate::pkh::PkhMethod;
+    vec![Box::new(PkhMethod)]
 }
 
 /// Find the handler for `did`, or `None` if no registered method matches.
@@ -72,9 +73,14 @@ mod tests {
     }
 
     #[test]
-    fn all_did_methods_compiles() {
+    fn all_did_methods_has_pkh() {
         let methods = all_did_methods();
-        // empty until Phase 1.4 adds PkhMethod
-        assert_eq!(methods.len(), 0);
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].method_name(), "pkh");
+    }
+
+    #[test]
+    fn find_pkh_did_returns_some() {
+        assert!(find_did_method("did:pkh:eip155:1:0xAbc").is_some());
     }
 }
