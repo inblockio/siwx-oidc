@@ -5,6 +5,7 @@ RUN cargo install cargo-chef
 FROM chef as dep_planner
 COPY ./src/ ./src/
 COPY ./siwx-core/ ./siwx-core/
+COPY ./siwx-oidc-auth/ ./siwx-oidc-auth/
 COPY ./Cargo.lock ./
 COPY ./Cargo.toml ./
 COPY ./siwe-oidc.toml ./
