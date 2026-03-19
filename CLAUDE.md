@@ -25,7 +25,7 @@ Key decisions:
 - **Manual registries**: `all_did_methods()` / `all_cipher_suites()` — no
   `inventory` crate (WASM-unsafe)
 - **In-repo workspace**: `siwx-core` (lib, no async) + `siwx-oidc` (binary,
-  axum server) as Cargo workspace members
+  axum server) + `siwx-oidc-auth` (headless client CLI) as Cargo workspace members
 - **Cipher suites copied from aqua-rs-auth** — not a crate dependency; all
   transitive deps pulled in directly
 
@@ -40,10 +40,13 @@ Key decisions:
 
 | DID Method | Cipher suites | Status |
 |-----------|--------------|--------|
-| `did:pkh` | eip155, ed25519, p256 | Phase 1 — port from aqua-rs-auth |
-| `did:key` | Ed25519, P-256 | Phase 2 — prove modularity |
-| `did:peer` | variant 0/2 | Phase 2 |
+| `did:pkh` | eip155, ed25519, p256 | ✅ Implemented — `siwx-core/src/pkh/` |
+| `did:key` | Ed25519 (`z6Mk…`), P-256 (`zDn…`) | ✅ Implemented — `siwx-core/src/key/` |
+| `did:peer` | variant 0, variant 2 V-key | ✅ Implemented — `siwx-core/src/peer/` |
 | `did:web`, `did:webvh`, `did:keri` | — | Architecture only; async resolver needed |
+
+`did:key` and `did:peer` are opt-in — add them to `supported_did_methods` in config.
+Default config only enables `did:pkh` with all three namespaces.
 
 ## Breaking changes vs siwe-oidc
 
@@ -64,6 +67,23 @@ Phase 1.7 changes are small:
 - `siwe` npm package and Web3Modal stay for Phase 1
 
 Phase 2+ (Ed25519/P-256) needs a different wallet connector — scoped separately.
+
+## Headless client (siwx-oidc-auth)
+
+`siwx-oidc-auth/` is a standalone workspace member providing a library + CLI
+for authenticating to siwx-oidc without a browser, using a local `did:key` key.
+
+```bash
+siwx-oidc-auth \
+  --server http://localhost:8000 \
+  --client-id <id> \
+  --redirect-uri https://app.example.com/callback \
+  [--key-type ed25519|p256] \
+  [--key-hex <32-byte-hex>]  # omit to generate a random key
+```
+
+Useful for CI, service accounts, and integration tests. The server must have
+`did:key` in `supported_did_methods` for this to work.
 
 ## Config env vars (native binary)
 
