@@ -38,7 +38,7 @@ use tracing::{error, info};
 use urlencoding::decode;
 use uuid::Uuid;
 
-use siwe_oidc::db::*;
+use siwx_oidc::db::*;
 
 // ---------------------------------------------------------------------------
 // ES256 signing key (replaces RSA — eliminates RUSTSEC-2023-0071 Marvin attack)

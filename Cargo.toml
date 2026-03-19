@@ -1,13 +1,17 @@
+[workspace]
+members = ["siwx-core"]
+resolver = "2"
+
 [package]
-name = "siwe-oidc"
+name = "siwx-oidc"
 version = "0.2.0"
 edition = "2021"
-authors = ["Spruce Systems, Inc."]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/spruceid/siwe-oidc/"
-description = "OpenID Connect Identity Provider for Sign-In with Ethereum."
+repository = "https://github.com/inblockio/siwx-oidc/"
+description = "CAIP-122 to OpenID Connect bridge — Sign-In With X for any DID method."
 
 [dependencies]
+siwx-core = { path = "siwx-core" }
 alloy-primitives = { version = "1", features = ["serde"] }
 alloy = { version = "1", features = ["providers", "transport-http", "ens"] }
 anyhow = "1"

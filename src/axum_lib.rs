@@ -31,7 +31,7 @@ use tracing::info;
 
 use super::config;
 use super::oidc::{self, CustomError, EcdsaSigningKey};
-use ::siwe_oidc::db::*;
+use siwx_oidc::db::*;
 use openidconnect::JsonWebKeyId;
 
 // -- Shared application state ----------------------------------------------
