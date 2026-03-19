@@ -54,8 +54,10 @@ pub trait DIDMethod: Send + Sync {
 ///
 /// Add one line here when a new `DIDMethod` implementation is ready.
 pub fn all_did_methods() -> Vec<Box<dyn DIDMethod>> {
+    use crate::key::KeyMethod;
+    use crate::peer::PeerMethod;
     use crate::pkh::PkhMethod;
-    vec![Box::new(PkhMethod)]
+    vec![Box::new(PkhMethod), Box::new(KeyMethod), Box::new(PeerMethod)]
 }
 
 /// Find the handler for `did`, or `None` if no registered method matches.
@@ -73,14 +75,32 @@ mod tests {
     }
 
     #[test]
-    fn all_did_methods_has_pkh() {
+    fn all_did_methods_has_pkh_key_peer() {
         let methods = all_did_methods();
-        assert_eq!(methods.len(), 1);
-        assert_eq!(methods[0].method_name(), "pkh");
+        let names: Vec<&str> = methods.iter().map(|m| m.method_name()).collect();
+        assert!(names.contains(&"pkh"));
+        assert!(names.contains(&"key"));
+        assert!(names.contains(&"peer"));
     }
 
     #[test]
     fn find_pkh_did_returns_some() {
         assert!(find_did_method("did:pkh:eip155:1:0xAbc").is_some());
+    }
+
+    #[test]
+    fn find_key_did_returns_some() {
+        assert!(find_did_method("did:key:z6MkiTBz1y").is_some());
+    }
+
+    #[test]
+    fn find_peer_v0_returns_some() {
+        assert!(find_did_method("did:peer:0z6Mkfoo").is_some());
+    }
+
+    #[test]
+    fn find_peer_v1_returns_none() {
+        // variant 1 is not supported
+        assert!(find_did_method("did:peer:1zQm").is_none());
     }
 }

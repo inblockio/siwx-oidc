@@ -5,6 +5,8 @@ pub mod cipher_suite;
 pub mod did;
 pub mod did_method;
 pub mod error;
+pub mod key;
+pub mod peer;
 pub mod pkh;
 
 pub use cipher_suite::{all_cipher_suites, find_cipher_suite, CipherSuite};
