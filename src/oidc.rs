@@ -35,8 +35,14 @@ use tracing::{error, info};
 use urlencoding::decode;
 use uuid::Uuid;
 
+use subtle::ConstantTimeEq;
 use siwx_core::find_did_method;
 use siwx_oidc::db::*;
+
+/// Constant-time string comparison to prevent timing attacks on secrets.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
 
 // ---------------------------------------------------------------------------
 // ES256 signing key (replaces RSA — eliminates RUSTSEC-2023-0071 Marvin attack)
@@ -214,7 +220,6 @@ pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
     .set_token_endpoint_auth_methods_supported(Some(vec![
         CoreClientAuthMethod::ClientSecretBasic,
         CoreClientAuthMethod::ClientSecretPost,
-        CoreClientAuthMethod::PrivateKeyJwt,
     ]))
     .set_op_policy_uri(Some(OpPolicyUrl::from_url(
         base_url
@@ -308,6 +313,8 @@ pub struct TokenForm {
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub grant_type: CoreGrantType,
+    /// PKCE code verifier (required if code_challenge was sent in /authorize).
+    pub code_verifier: Option<String>,
 }
 
 pub async fn token(
@@ -316,17 +323,28 @@ pub async fn token(
     signing_key: &EcdsaSigningKey,
     base_url: Url,
     require_secret: bool,
+    id_token_ttl_secs: u64,
     eth_provider: Option<Url>,
     db_client: &DBClientType,
 ) -> Result<CoreTokenResponse, CustomError> {
-    let code_entry = if let Some(c) = db_client.get_code(form.code.to_string()).await? {
-        c
-    } else {
+    // Validate grant_type.
+    if form.grant_type != CoreGrantType::AuthorizationCode {
         return Err(CustomError::BadRequestToken(TokenError {
-            error: CoreErrorResponseType::InvalidGrant,
-            error_description: "Unknown code.".to_string(),
+            error: CoreErrorResponseType::UnsupportedGrantType,
+            error_description: "Only authorization_code is supported.".to_string(),
         }));
-    };
+    }
+
+    // Atomically consume the code (prevents race-condition replay).
+    let code_entry = db_client
+        .try_consume_code(form.code.to_string())
+        .await?
+        .ok_or_else(|| {
+            CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::InvalidGrant,
+                error_description: "Unknown or already-exchanged code.".to_string(),
+            })
+        })?;
 
     let client_id = if let Some(c) = form.client_id.clone() {
         c
@@ -339,35 +357,62 @@ pub async fn token(
     } else {
         form.client_secret.clone()
     } {
-        let client_entry = db_client.get_client(client_id.clone()).await?;
-        if client_entry.is_none() {
-            return Err(CustomError::Unauthorized(
-                "Unrecognised client id.".to_string(),
-            ));
-        }
-        if secret != client_entry.unwrap().secret {
+        let client_entry = db_client
+            .get_client(client_id.clone())
+            .await?
+            .ok_or_else(|| {
+                CustomError::Unauthorized("Unrecognised client id.".to_string())
+            })?;
+        if !constant_time_eq(&secret, &client_entry.secret) {
             return Err(CustomError::Unauthorized("Bad secret.".to_string()));
         }
     } else if require_secret {
         return Err(CustomError::Unauthorized("Secret required.".to_string()));
     }
 
-    if code_entry.exchange_count > 0 {
-        return Err(CustomError::BadRequestToken(TokenError {
-            error: CoreErrorResponseType::InvalidGrant,
-            error_description: "Code was previously exchanged.".to_string(),
-        }));
+    // PKCE: validate code_verifier if a code_challenge was issued.
+    if let Some(ref challenge) = code_entry.code_challenge {
+        let verifier = form.code_verifier.as_ref().ok_or_else(|| {
+            CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::InvalidGrant,
+                error_description: "code_verifier required (PKCE).".to_string(),
+            })
+        })?;
+        let method = code_entry
+            .code_challenge_method
+            .as_deref()
+            .unwrap_or("S256");
+        let computed = match method {
+            "S256" => {
+                use sha2::{Digest, Sha256};
+                let hash = Sha256::digest(verifier.as_bytes());
+                URL_SAFE_NO_PAD.encode(hash)
+            }
+            "plain" => verifier.clone(),
+            _ => {
+                return Err(CustomError::BadRequest(
+                    "Unsupported code_challenge_method.".to_string(),
+                ))
+            }
+        };
+        if !constant_time_eq(&computed, challenge) {
+            return Err(CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::InvalidGrant,
+                error_description: "code_verifier mismatch.".to_string(),
+            }));
+        }
     }
-    let mut code_entry2 = code_entry.clone();
-    code_entry2.exchange_count += 1;
+
+    // Generate a distinct access token (not the code itself).
+    let access_token_id = Uuid::new_v4().to_string();
     db_client
-        .set_code(form.code.to_string(), code_entry2)
+        .set_code(access_token_id.clone(), code_entry.clone())
         .await?;
-    let access_token = AccessToken::new(form.code);
+    let access_token = AccessToken::new(access_token_id);
     let core_id_token = CoreIdTokenClaims::new(
         IssuerUrl::from_url(base_url),
         vec![Audience::new(client_id.clone())],
-        Utc::now() + Duration::seconds(60),
+        Utc::now() + Duration::seconds(id_token_ttl_secs as i64),
         Utc::now(),
         resolve_claims(eth_provider, &code_entry.did).await,
         EmptyAdditionalClaims {},
@@ -408,6 +453,10 @@ pub struct AuthorizeParams {
     pub prompt: Option<CoreAuthPrompt>,
     pub request_uri: Option<RequestUrl>,
     pub request: Option<String>,
+    /// PKCE code_challenge.
+    pub code_challenge: Option<String>,
+    /// PKCE code_challenge_method ("S256" or "plain").
+    pub code_challenge_method: Option<String>,
 }
 
 pub async fn authorize(
@@ -516,24 +565,36 @@ pub async fn authorize(
             },
         )
         .await?;
+    let is_https = params.redirect_uri.url().scheme() == "https";
     let session_cookie = Cookie::build((SESSION_COOKIE_NAME, session_id.to_string()))
         .same_site(SameSite::Strict)
         .http_only(true)
+        .secure(is_https)
         .max_age(cookie::time::Duration::seconds(
             SESSION_LIFETIME.try_into().unwrap(),
         ))
         .build();
 
-    let domain = params.redirect_uri.url().host().unwrap();
+    let domain = params
+        .redirect_uri
+        .url()
+        .host()
+        .ok_or_else(|| CustomError::BadRequest("redirect_uri has no host".to_string()))?;
     let oidc_nonce_param = if let Some(n) = &params.nonce {
         format!("&oidc_nonce={}", n.secret())
     } else {
         "".to_string()
     };
+    let pkce_params = match (&params.code_challenge, &params.code_challenge_method) {
+        (Some(cc), Some(ccm)) => format!("&code_challenge={cc}&code_challenge_method={ccm}"),
+        (Some(cc), None) => format!("&code_challenge={cc}&code_challenge_method=S256"),
+        _ => "".to_string(),
+    };
     Ok((
         format!(
-            "/?nonce={}&domain={}&redirect_uri={}&state={}&client_id={}{}",
-            nonce, domain, *params.redirect_uri, state, params.client_id, oidc_nonce_param
+            "/?nonce={}&domain={}&redirect_uri={}&state={}&client_id={}{}{}",
+            nonce, domain, *params.redirect_uri, state, params.client_id, oidc_nonce_param,
+            pkce_params
         ),
         Box::new(session_cookie),
     ))
@@ -581,6 +642,10 @@ pub struct SignInParams {
     pub state: String,
     pub oidc_nonce: Option<Nonce>,
     pub client_id: String,
+    /// PKCE code_challenge (passed through from /authorize).
+    pub code_challenge: Option<String>,
+    /// PKCE code_challenge_method ("S256" or "plain").
+    pub code_challenge_method: Option<String>,
 }
 
 pub async fn sign_in(
@@ -603,7 +668,12 @@ pub async fn sign_in(
     } else {
         return Err(CustomError::BadRequest("Session not found".to_string()));
     };
-    if session_entry.signin_count > 0 {
+
+    // Atomically mark session as signed-in (prevents race-condition double sign-in).
+    if !db_client
+        .try_mark_session_signed_in(session_id.to_string())
+        .await?
+    {
         return Err(CustomError::BadRequest(
             "Session has already logged in".to_string(),
         ));
@@ -683,13 +753,9 @@ pub async fn sign_in(
         exchange_count: 0,
         client_id: params.client_id.clone(),
         auth_time: Utc::now(),
+        code_challenge: params.code_challenge.clone(),
+        code_challenge_method: params.code_challenge_method.clone(),
     };
-
-    let mut new_session_entry = session_entry.clone();
-    new_session_entry.signin_count += 1;
-    db_client
-        .set_session(session_id.to_string(), new_session_entry)
-        .await?;
 
     let code = Uuid::new_v4();
     db_client.set_code(code.to_string(), code_entry).await?;
@@ -775,7 +841,10 @@ async fn client_access(
         .await?
         .ok_or(CustomError::NotFound)?;
     let stored_access_token = client_entry.access_token.clone();
-    if stored_access_token.is_none() || *stored_access_token.unwrap().secret() != access_token {
+    let stored = stored_access_token
+        .as_ref()
+        .ok_or_else(|| CustomError::Unauthorized("Bad access token.".to_string()))?;
+    if !constant_time_eq(stored.secret(), &access_token) {
         return Err(CustomError::Unauthorized("Bad access token.".to_string()));
     }
     Ok(client_entry)
@@ -961,6 +1030,8 @@ mod tests {
             prompt: None,
             request_uri: None,
             request: None,
+            code_challenge: None,
+            code_challenge_method: None,
         };
         let (redirect_url, cookie) = authorize(params, &db_client).await.unwrap();
         let authorize_params: AuthorizeQueryParams =

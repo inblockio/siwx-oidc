@@ -18,7 +18,7 @@ use figment::{
 };
 use headers::Header;
 use openidconnect::core::{
-    CoreClientMetadata, CoreClientRegistrationResponse, CoreJsonWebKeySet, CoreProviderMetadata,
+    CoreClientMetadata, CoreClientRegistrationResponse, CoreJsonWebKeySet,
     CoreTokenResponse, CoreUserInfoClaims, CoreUserInfoJsonWebToken,
 };
 use std::{net::SocketAddr, sync::Arc};
@@ -81,8 +81,12 @@ async fn jwk_set(
 
 async fn provider_metadata(
     State(state): State<AppState>,
-) -> Result<Json<CoreProviderMetadata>, CustomError> {
-    Ok(oidc::metadata(state.config.base_url)?.into())
+) -> Result<Json<serde_json::Value>, CustomError> {
+    let pm = oidc::metadata(state.config.base_url)?;
+    let mut value = serde_json::to_value(pm)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize metadata: {}", e))?;
+    value["code_challenge_methods_supported"] = serde_json::json!(["S256"]);
+    Ok(value.into())
 }
 
 async fn token(
@@ -102,6 +106,7 @@ async fn token(
         &state.signing_key,
         state.config.base_url,
         state.config.require_secret,
+        state.config.id_token_ttl_secs,
         state.config.eth_provider,
         &state.redis_client,
     )
@@ -272,24 +277,22 @@ pub async fn main() {
             .map(|m| m.method_name().to_string())
             .collect();
         for method in &config.supported_did_methods {
-            if !registered.contains(method) {
-                panic!(
-                    "Configured DID method '{}' is not registered in siwx-core (registered: {:?})",
-                    method, registered
-                );
-            }
+            assert!(
+                registered.contains(method),
+                "FATAL: configured DID method '{}' is not registered in siwx-core (registered: {:?})",
+                method, registered
+            );
         }
         let registered_ns: Vec<String> = all_cipher_suites()
             .iter()
             .map(|cs| cs.namespace().to_string())
             .collect();
         for ns in &config.supported_pkh_namespaces {
-            if !registered_ns.contains(ns) {
-                panic!(
-                    "Configured pkh namespace '{}' is not registered in siwx-core (registered: {:?})",
-                    ns, registered_ns
-                );
-            }
+            assert!(
+                registered_ns.contains(ns),
+                "FATAL: configured pkh namespace '{}' is not registered in siwx-core (registered: {:?})",
+                ns, registered_ns
+            );
         }
     }
 

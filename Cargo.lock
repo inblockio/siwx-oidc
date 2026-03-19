@@ -4162,6 +4162,7 @@ dependencies = [
  "sha2",
  "sha3",
  "siwx-core",
+ "subtle",
  "test-log",
  "thiserror 2.0.18",
  "tokio",
@@ -4178,6 +4179,7 @@ name = "siwx-oidc-auth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bs58",
  "chrono",
  "clap",
@@ -4189,6 +4191,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "sha2",
  "siwx-core",
  "tokio",
  "url",

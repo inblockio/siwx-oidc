@@ -16,6 +16,8 @@ pub struct Config {
     pub redis_url: Url,
     pub default_clients: HashMap<String, String>,
     pub require_secret: bool,
+    /// ID token lifetime in seconds. Default: 300 (5 minutes).
+    pub id_token_ttl_secs: u64,
     pub eth_provider: Option<Url>,
     /// DID method names accepted at sign-in (e.g. ["pkh"]).
     /// Must be a subset of the methods registered in siwx-core.
@@ -34,7 +36,8 @@ impl Default for Config {
             signing_key_pem: None,
             redis_url: Url::parse("redis://localhost").unwrap(),
             default_clients: HashMap::default(),
-            require_secret: false,
+            require_secret: true,
+            id_token_ttl_secs: 300,
             eth_provider: None,
             supported_did_methods: vec!["pkh".to_string()],
             supported_pkh_namespaces: vec![

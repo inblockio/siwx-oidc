@@ -23,6 +23,7 @@
 //! ```
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
 use ed25519_dalek::{pkcs8::DecodePrivateKey, Signer, SigningKey as Ed25519SigningKey};
 use p256::ecdsa::SigningKey as P256SigningKey;
@@ -258,6 +259,22 @@ pub async fn authenticate(
         .context("failed to build HTTP client")?;
 
     // -----------------------------------------------------------------------
+    // PKCE: generate code_verifier and code_challenge (S256)
+    // -----------------------------------------------------------------------
+    use rand::distributions::Alphanumeric;
+    use rand::Rng;
+    let code_verifier: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(128)
+        .map(char::from)
+        .collect();
+    let code_challenge = {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(code_verifier.as_bytes());
+        URL_SAFE_NO_PAD.encode(hash)
+    };
+
+    // -----------------------------------------------------------------------
     // Step 1: GET /authorize — get nonce + session cookie
     // -----------------------------------------------------------------------
     let authorize_url = base.join("/authorize")?;
@@ -269,6 +286,8 @@ pub async fn authenticate(
             ("scope", "openid profile"),
             ("response_type", "code"),
             ("state", "headless"),
+            ("code_challenge", code_challenge.as_str()),
+            ("code_challenge_method", "S256"),
         ])
         .send()
         .await
@@ -369,6 +388,7 @@ pub async fn authenticate(
             ("code", code.as_str()),
             ("client_id", client_id),
             ("grant_type", "authorization_code"),
+            ("code_verifier", code_verifier.as_str()),
         ])
         .send()
         .await

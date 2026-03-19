@@ -145,4 +145,62 @@ impl DBClient for RedisClient {
             Ok(None)
         }
     }
+
+    async fn try_consume_code(&self, code: String) -> Result<Option<CodeEntry>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+
+        // Atomic: SETNX on a consumed flag — only one caller wins.
+        let consumed_key = format!("{}/consumed", code);
+        let was_set: bool = conn
+            .set_nx(&consumed_key, "1")
+            .await
+            .map_err(|e| anyhow!("Failed to SETNX consumed flag: {}", e))?;
+        if was_set {
+            let _: () = conn
+                .expire(&consumed_key, ENTRY_LIFETIME as i64)
+                .await
+                .unwrap_or(());
+        } else {
+            return Ok(None); // Already consumed by another request
+        }
+
+        // Read the code entry (safe: only the winner reaches here).
+        let entry: Option<String> = conn
+            .get(&code)
+            .await
+            .map_err(|e| anyhow!("Failed to get code entry: {}", e))?;
+        match entry {
+            Some(e) => Ok(Some(
+                serde_json::from_str(&e)
+                    .map_err(|e| anyhow!("Failed to deserialize code entry: {}", e))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    async fn try_mark_session_signed_in(&self, id: String) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+
+        // Atomic: SETNX on a signed-in flag — only one sign_in wins.
+        let flag_key = format!("{}/{}/signed_in", KV_SESSION_PREFIX, id);
+        let was_set: bool = conn
+            .set_nx(&flag_key, "1")
+            .await
+            .map_err(|e| anyhow!("Failed to SETNX signed_in flag: {}", e))?;
+        if was_set {
+            let _: () = conn
+                .expire(&flag_key, SESSION_LIFETIME as i64)
+                .await
+                .unwrap_or(());
+        }
+        Ok(was_set)
+    }
 }

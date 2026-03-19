@@ -17,11 +17,16 @@ pub const SESSION_COOKIE_NAME: &str = "session";
 pub struct CodeEntry {
     pub exchange_count: usize,
     /// The authenticated DID (e.g. `did:pkh:eip155:1:0x…`).
-    /// Replaces the old `address: Address` + `chain_id` fields.
     pub did: String,
     pub nonce: Option<Nonce>,
     pub client_id: String,
     pub auth_time: DateTime<Utc>,
+    /// PKCE code_challenge (S256-hashed verifier, base64url-encoded).
+    #[serde(default)]
+    pub code_challenge: Option<String>,
+    /// PKCE code_challenge_method ("S256" or "plain").
+    #[serde(default)]
+    pub code_challenge_method: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -48,4 +53,10 @@ pub trait DBClient {
     async fn get_code(&self, code: String) -> Result<Option<CodeEntry>>;
     async fn set_session(&self, id: String, entry: SessionEntry) -> Result<()>;
     async fn get_session(&self, id: String) -> Result<Option<SessionEntry>>;
+    /// Atomically consume an authorization code. Returns the entry if this is
+    /// the first call for this code, or None if already consumed / not found.
+    async fn try_consume_code(&self, code: String) -> Result<Option<CodeEntry>>;
+    /// Atomically mark a session as signed-in. Returns true on first call,
+    /// false if the session was already signed-in.
+    async fn try_mark_session_signed_in(&self, id: String) -> Result<bool>;
 }
