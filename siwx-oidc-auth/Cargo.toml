@@ -20,8 +20,8 @@ siwx-core = { path = "../siwx-core" }
 anyhow = "1"
 bs58 = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+clap = { version = "4", features = ["derive", "env"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "pem"] }
 hex = "0.4"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 rand = "0.8"

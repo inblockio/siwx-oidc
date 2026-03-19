@@ -1,8 +1,8 @@
 //! Headless OIDC client for siwx-oidc.
 //!
 //! Performs the full authorization code flow using a local Ed25519 or P-256
-//! private key, without any browser or user interaction. Useful for CI,
-//! service accounts, and automated testing.
+//! private key, without any browser or user interaction. The key is identified
+//! as a `did:key` DID; the server must have `"key"` in `supported_did_methods`.
 //!
 //! # Example
 //!
@@ -11,9 +11,9 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let key = SiwxKey::generate_ed25519();
+//!     let key = SiwxKey::from_pem_file("identity.pem".as_ref()).unwrap();
 //!     let tokens = authenticate(
-//!         "http://localhost:8000",
+//!         "https://siwx.example.com",
 //!         "my-client-id",
 //!         "https://app.example.com/callback",
 //!         &key,
@@ -23,13 +23,13 @@
 //! ```
 
 use anyhow::{anyhow, bail, Context, Result};
-use bs58;
 use chrono::Utc;
-use ed25519_dalek::{Signer, SigningKey as Ed25519SigningKey};
+use ed25519_dalek::{pkcs8::DecodePrivateKey, Signer, SigningKey as Ed25519SigningKey};
 use p256::ecdsa::SigningKey as P256SigningKey;
 use rand::rngs::OsRng;
 use reqwest::{header, redirect::Policy, StatusCode};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use url::Url;
 use urlencoding::encode;
 
@@ -48,15 +48,51 @@ pub enum SiwxKey {
 }
 
 impl SiwxKey {
-    /// Generate a random Ed25519 key.
-    pub fn generate_ed25519() -> Self {
-        SiwxKey::Ed25519(Ed25519SigningKey::generate(&mut OsRng))
+    // -- PEM (primary) -----------------------------------------------------
+
+    /// Load a private key from a PKCS#8 PEM string.
+    ///
+    /// Auto-detects Ed25519 vs P-256 from the PKCS#8 algorithm OID.
+    pub fn from_pem(pem: &str) -> Result<Self> {
+        if let Ok(key) = Ed25519SigningKey::from_pkcs8_pem(pem) {
+            return Ok(SiwxKey::Ed25519(key));
+        }
+        if let Ok(key) = <P256SigningKey as DecodePrivateKey>::from_pkcs8_pem(pem) {
+            return Ok(SiwxKey::P256(key));
+        }
+        bail!("PEM does not contain a recognized Ed25519 or P-256 PKCS#8 private key")
     }
 
-    /// Generate a random P-256 key.
-    pub fn generate_p256() -> Self {
-        SiwxKey::P256(P256SigningKey::random(&mut OsRng))
+    /// Load a private key from a PKCS#8 PEM file.
+    ///
+    /// Auto-detects Ed25519 vs P-256 from the PKCS#8 algorithm OID.
+    pub fn from_pem_file(path: &Path) -> Result<Self> {
+        let pem = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read key file: {}", path.display()))?;
+        Self::from_pem(&pem)
     }
+
+    /// Export the private key as a PKCS#8 PEM string.
+    pub fn to_pem(&self) -> Result<String> {
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+        use p256::pkcs8::LineEnding;
+        match self {
+            SiwxKey::Ed25519(key) => {
+                let pem = key
+                    .to_pkcs8_pem(LineEnding::LF)
+                    .map_err(|e| anyhow!("failed to encode Ed25519 key as PEM: {e}"))?;
+                Ok(pem.to_string())
+            }
+            SiwxKey::P256(key) => {
+                let pem = key
+                    .to_pkcs8_pem(LineEnding::LF)
+                    .map_err(|e| anyhow!("failed to encode P-256 key as PEM: {e}"))?;
+                Ok(pem.to_string())
+            }
+        }
+    }
+
+    // -- Hex (dev / testing) -----------------------------------------------
 
     /// Load an Ed25519 key from a 32-byte hex-encoded seed.
     pub fn ed25519_from_hex(hex_seed: &str) -> Result<Self> {
@@ -73,6 +109,20 @@ impl SiwxKey {
         let key = P256SigningKey::from_slice(&bytes).context("invalid P-256 scalar")?;
         Ok(SiwxKey::P256(key))
     }
+
+    // -- Generation --------------------------------------------------------
+
+    /// Generate a random Ed25519 key.
+    pub fn generate_ed25519() -> Self {
+        SiwxKey::Ed25519(Ed25519SigningKey::generate(&mut OsRng))
+    }
+
+    /// Generate a random P-256 key.
+    pub fn generate_p256() -> Self {
+        SiwxKey::P256(P256SigningKey::random(&mut OsRng))
+    }
+
+    // -- DID derivation ----------------------------------------------------
 
     /// The `did:key:z…` DID derived from this key.
     pub fn did(&self) -> String {
@@ -91,15 +141,15 @@ impl SiwxKey {
         }
     }
 
-    /// The key type label for display in CAIP-122 messages.
-    fn type_label(&self) -> &'static str {
+    /// The key type label for display.
+    pub fn type_label(&self) -> &'static str {
         match self {
             SiwxKey::Ed25519(_) => "Ed25519",
             SiwxKey::P256(_) => "P-256",
         }
     }
 
-    /// Sign `message` bytes and return the hex-encoded signature.
+    /// Sign `message` and return the hex-encoded signature.
     fn sign(&self, message: &str) -> String {
         match self {
             SiwxKey::Ed25519(key) => {
@@ -118,14 +168,7 @@ impl SiwxKey {
 // CAIP-122 message building
 // ---------------------------------------------------------------------------
 
-/// Build a minimal CAIP-122 message that satisfies siwx-oidc's nonce and
-/// resource checks. The message is unsigned; call `SiwxKey::sign` on the result.
-fn build_message(
-    domain: &str,
-    key: &SiwxKey,
-    redirect_uri: &str,
-    nonce: &str,
-) -> String {
+fn build_message(domain: &str, key: &SiwxKey, redirect_uri: &str, nonce: &str) -> String {
     let did = key.did();
     let z_encoded = did.strip_prefix("did:key:").unwrap_or(&did);
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
@@ -153,12 +196,14 @@ pub struct AuthTokens {
     pub access_token: String,
     pub token_type: String,
     pub id_token: Option<String>,
+    /// Token lifetime in seconds (from the server's `expires_in` field).
+    pub expires_in: Option<u64>,
     /// The `did:key:z…` DID that authenticated.
     pub did: String,
 }
 
 // ---------------------------------------------------------------------------
-// Internal wire types (serde mirrors of server JSON)
+// Internal wire types
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -181,6 +226,7 @@ struct TokenResponseRaw {
     access_token: String,
     token_type: String,
     id_token: Option<String>,
+    expires_in: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -189,11 +235,16 @@ struct TokenResponseRaw {
 
 /// Perform the full siwx-oidc authorization code flow with a local signing key.
 ///
-/// - `server_url`: Base URL of the siwx-oidc server (e.g. `"http://localhost:8000"`).
+/// - `server_url`: Base URL of the siwx-oidc server (e.g. `"https://siwx.example.com"`).
 /// - `client_id`: OIDC client ID registered with the server.
 /// - `redirect_uri`: Registered redirect URI. The server validates the CAIP-122
 ///   message contains this URI in its `Resources:` section.
 /// - `key`: Local signing key used to derive the DID and sign the challenge.
+///
+/// The server must have `"key"` in `supported_did_methods` for `did:key` to work.
+///
+/// To re-authenticate when tokens expire, call this function again — the flow
+/// is stateless and the key is deterministic.
 pub async fn authenticate(
     server_url: &str,
     client_id: &str,
@@ -224,13 +275,9 @@ pub async fn authenticate(
         .context("GET /authorize failed")?;
 
     if resp.status() != StatusCode::SEE_OTHER {
-        bail!(
-            "/authorize returned {} instead of 303",
-            resp.status()
-        );
+        bail!("/authorize returned {} instead of 303", resp.status());
     }
 
-    // Extract session cookie from Set-Cookie header.
     let session_cookie = resp
         .headers()
         .get_all(header::SET_COOKIE)
@@ -238,7 +285,6 @@ pub async fn authenticate(
         .find_map(|v| {
             let s = v.to_str().ok()?;
             if s.starts_with("session=") {
-                // take just "session={value}" (strip attributes)
                 Some(s.split(';').next()?.to_string())
             } else {
                 None
@@ -246,17 +292,16 @@ pub async fn authenticate(
         })
         .ok_or_else(|| anyhow!("/authorize response missing session cookie"))?;
 
-    // Extract redirect URL (relative, e.g. "/?nonce=...&state=...&...").
     let location = resp
         .headers()
         .get(header::LOCATION)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| anyhow!("/authorize response missing Location header"))?;
 
-    // Resolve the relative Location against the server base URL to parse params.
     let redirect_url = base.join(location).context("invalid Location header")?;
-    let params: AuthorizeRedirectParams = serde_urlencoded::from_str(redirect_url.query().unwrap_or(""))
-        .context("failed to parse authorize redirect query params")?;
+    let params: AuthorizeRedirectParams =
+        serde_urlencoded::from_str(redirect_url.query().unwrap_or(""))
+            .context("failed to parse authorize redirect query params")?;
 
     // -----------------------------------------------------------------------
     // Step 2: Build CAIP-122 message and sign
@@ -298,7 +343,6 @@ pub async fn authenticate(
         bail!("/sign_in returned {status}: {body}");
     }
 
-    // Extract the auth code from the redirect Location.
     let code_location = resp
         .headers()
         .get(header::LOCATION)
@@ -341,6 +385,7 @@ pub async fn authenticate(
         access_token: raw.access_token,
         token_type: raw.token_type,
         id_token: raw.id_token,
+        expires_in: raw.expires_in,
         did,
     })
 }

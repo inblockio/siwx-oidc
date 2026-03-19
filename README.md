@@ -1,136 +1,165 @@
-# OpenID Connect Identity Provider for Sign-In with Ethereum
+# siwx-oidc
 
-## Getting Started
+CAIP-122 to OpenID Connect bridge — Sign-In With X for any DID method.
 
-Two versions are available, a stand-alone binary (using Axum and Redis) and a
-Cloudflare Worker. They use the same code base and are selected at compile time
-(compiling for `wasm32` will make the Worker version).
+siwx-oidc lets any OIDC relying party authenticate users via DID-based
+cryptographic identity. Users sign a CAIP-122 challenge with their wallet (or a
+local key); siwx-oidc issues standard OIDC tokens (ID token, access token) in
+return.
 
-> The front-end depends on WalletConnect, meaning you will need to create a
-> project with them and have the environment variable `PROJECT_ID` set when you
-> build the front-end.
+It is the modular, multi-DID successor to
+[siwe-oidc](https://github.com/inblockio/siwe-oidc) (Ethereum-only).
 
-### Cloudflare Worker
+## Supported DID methods
 
-You will need [`wrangler`](https://github.com/cloudflare/wrangler).
+| DID Method | Key types | Notes |
+|-----------|-----------|-------|
+| `did:pkh` | eip155 (Ethereum), ed25519, p256 | Default. Cipher suites ported from [aqua-rs-auth](https://github.com/inblockio/aqua-rs-auth). |
+| `did:key` | Ed25519 (`z6Mk…`), P-256 (`zDn…`) | Opt-in via config. Used by the headless client. |
+| `did:peer` | Variant 0, Variant 2 (V-key) | Opt-in via config. |
 
-First, copy the configuration file template:
-```bash
-cp wrangler_example.toml wrangler.toml
-```
+## Workspace
 
-Then replace the following fields:
-- `account_id`: your Cloudflare account ID;
-- `zone_id`: (Optional) DNS zone ID;
-- `kv_namespaces`: a KV namespace ID (created with `wrangler kv:namespace create SIWE_OIDC`); and
-- the environment variables under `vars`.
+| Crate | Description |
+|-------|-------------|
+| **siwx-oidc** (root) | Axum server — OIDC provider with Redis backend |
+| **siwx-core** | Traits (`DIDMethod`, `CipherSuite`), crypto verification, no async |
+| **siwx-oidc-auth** | Headless OIDC client — authenticate from CLI/CI with a local key |
 
-You will also need to add a secret RSA key in PEM format:
-```
-wrangler secret put RSA_PEM
-```
+## Quick start (server)
 
-At this point, you should be able to create/publish the worker:
-```
-wrangler publish
-```
+### Dependencies
 
-The IdP currently only supports having the **frontend under the same subdomain as
-the API**. Here is the configuration for Cloudflare Pages:
-- `Build command`: `cd js/ui && npm install && npm run build`;
-- `Build output directory`: `/static`; and
-- `Root directory`: `/`.
-And you will need to add some rules to do the routing between the Page and the
-Worker. Here are the rules for the Worker (the Page being used as the fallback
-on the subdomain):
-```
-siweoidc.example.com/s*
-siweoidc.example.com/u*
-siweoidc.example.com/r*
-siweoidc.example.com/a*
-siweoidc.example.com/t*
-siweoidc.example.com/j*
-siweoidc.example.com/c*
-siweoidc.example.com/.w*
-```
+- Redis (or a Redis-compatible database)
+- Rust 1.75+
 
-### Stand-Alone Binary
-
-> **WARNING - ** Due to the reliance on WalletConnect, and the project ID being
-> loaded at compile-time, the current version of the Docker image won't have a
-> working web app.
-
-#### Dependencies
-
-Redis, or a Redis compatible database (e.g. MemoryDB in AWS), is required.
-
-#### Starting the IdP
-
-The Docker image is available at `ghcr.io/spruceid/siwe_oidc:0.1.0`. Here is an
-example usage:
-```bash
-docker run -p 8000:8000 -e SIWEOIDC_REDIS_URL="redis://redis" ghcr.io/spruceid/siwe_oidc:latest
-```
-
-It can be configured either with the `siwe-oidc.toml` configuration file, or
-through environment variables:
-* `SIWEOIDC_ADDRESS` is the IP address to bind to.
-* `SIWEOIDC_REDIS_URL` is the URL to the Redis instance.
-* `SIWEOIDC_BASE_URL` is the URL you want to advertise in the OIDC configuration
-  (e.g. `https://oidc.example.com`).
-* `SIWEOIDC_RSA_PEM` is the signing key, in PEM format. One will be generated if
-  none is provided.
-
-### OIDC Functionalities
-
-The current flow is very basic -- after the user is authenticated you will
-receive:
-- an Ethereum address as the subject (`sub` field); and
-- an ENS domain as the `preferred_username` (with a fallback to the address).
-
-For the core OIDC information, it is available under
-`/.well-known/openid-configuration`.
-
-OIDC Conformance Suite:
-- 🟨 (25/29, and 10 skipped) [basic](https://www.certification.openid.net/plan-detail.html?plan=gXe7Ju1O1afZa&public=true) (`email` scope skipped,  `profile` scope partially supported, ACR, `prompt=none` and request URIs yet to be supported);
-- 🟩 [config](https://www.certification.openid.net/plan-detail.html?plan=SAmBjvtyfTDVn&public=true);
-- 🟧 [dynamic code](https://www.certification.openid.net/plan-detail.html?plan=7rexGcCd4SWJa&public=true).
-
-### TODO Items
-
-* Additional information, from native projects (e.g. ENS domains profile
-  pictures), to more traditional ones (e.g. email).
-
-## Development
-
-### Cloudflare Worker
+### Running
 
 ```bash
-wrangler dev
+# Start Redis
+redis-server &
+
+# Run the server (generates an ES256 signing key on first start)
+cargo run
 ```
-You can now use http://127.0.0.1:8787/.well-known/openid-configuration.
 
-> At the moment it's not possible to use it end-to-end with the frontend as they
-> need to share the same host (i.e. port), unless using a local load-balancer.
+The OIDC discovery endpoint is at `http://127.0.0.1:8000/.well-known/openid-configuration`.
 
-### Stand Alone Binary
+### Configuration
 
-A Docker Compose is available to test the IdP locally with Keycloak.
+Configure via `siwe-oidc.toml` or environment variables (prefix `SIWEOIDC_`):
 
-1. You will first need to run:
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SIWEOIDC_ADDRESS` | IP address to bind | `127.0.0.1` |
+| `SIWEOIDC_PORT` | Port | `8000` |
+| `SIWEOIDC_BASE_URL` | Advertised OIDC issuer URL | `http://127.0.0.1:8000` |
+| `SIWEOIDC_REDIS_URL` | Redis connection URL | `redis://localhost` |
+| `SIWEOIDC_SIGNING_KEY_PEM` | PKCS#8 PEM for ES256 signing key (generated if absent) | — |
+| `SIWEOIDC_REQUIRE_SECRET` | Require client secret for token exchange | `false` |
+| `SIWEOIDC_SUPPORTED_DID_METHODS` | DID methods accepted at sign-in | `["pkh"]` |
+| `SIWEOIDC_SUPPORTED_PKH_NAMESPACES` | did:pkh namespaces accepted | `["eip155","ed25519","p256"]` |
+
+To enable `did:key` (required for the headless client):
+```toml
+# siwe-oidc.toml
+[supported_did_methods]
+0 = "pkh"
+1 = "key"
+```
+
+## Quick start (headless client)
+
+The headless client authenticates to a siwx-oidc server without a browser,
+using a local `did:key` private key. Useful for services, CI, and automated
+testing.
+
+### Generate a persistent identity
+
 ```bash
-docker-compose -f test/docker-compose.yml up -d
+# Generate an Ed25519 key (default)
+openssl genpkey -algorithm Ed25519 -out identity.pem
+
+# See the DID derived from this key
+cargo run -p siwx-oidc-auth -- --print-did --key-file identity.pem
 ```
 
-2. And then edit your `/etc/hosts` to have `siwe-oidc` point to `127.0.0.1`.
-   This is so both your browser, and Keycloak, can access the IdP.
+### Authenticate
 
-3. In Keycloak, you will need to create a new IdP. You can use
-   `http://siwe-oidc:8000/.well-known/openid-configuration` to fill the settings
-   automatically. As for the client ID/secret, you can use `sdf`/`sdf`.
+```bash
+cargo run -p siwx-oidc-auth -- \
+  --server https://siwx.example.com \
+  --client-id my-service \
+  --redirect-uri https://myapp.example.com/callback \
+  --key-file identity.pem
+```
 
-## Disclaimer
+Output: JSON with `access_token`, `id_token`, `token_type`, `expires_in`, and
+`did`.
 
-Our identity provider for Sign-In with Ethereum has not yet undergone a formal
-security audit. We welcome continued feedback on the usability, architecture,
-and security of this implementation.
+### Key input priority
+
+1. `--key-file <path>` — PKCS#8 PEM file (auto-detects Ed25519 vs P-256)
+2. `SIWX_KEY_FILE` env var — same as `--key-file`, for container orchestration
+3. `--key-hex <hex>` — 32-byte hex seed (requires `--key-type`), for dev/testing
+4. (none) — generates an ephemeral key and prints the PEM to stderr
+
+### Token refresh
+
+Tokens expire (default: 30 seconds). To refresh, call `authenticate()` again —
+the flow is stateless and the key is deterministic. For long-running services,
+re-authenticate before `expires_in` elapses.
+
+### Library usage
+
+```rust
+use siwx_oidc_auth::{SiwxKey, authenticate};
+
+let key = SiwxKey::from_pem_file("identity.pem".as_ref())?;
+let tokens = authenticate(
+    "https://siwx.example.com",
+    "my-client-id",
+    "https://app.example.com/callback",
+    &key,
+).await?;
+```
+
+## Frontend
+
+The Svelte frontend (`js/ui/`) handles browser-based sign-in for `did:pkh:eip155`
+(Ethereum) using Web3Modal + Wagmi.
+
+```bash
+cd js/ui && npm install && npm run build
+```
+
+The build output goes to `static/` which the server serves automatically.
+
+> The frontend uses WalletConnect — set the `PROJECT_ID` environment variable
+> when building.
+
+## Architecture
+
+The extensibility model uses two traits:
+
+- **`DIDMethod`** — primary, server-visible dispatch. One implementation per DID
+  method (`PkhMethod`, `KeyMethod`, `PeerMethod`).
+- **`CipherSuite`** — secondary, internal to `did:pkh`. One implementation per
+  cipher suite (`Eip155Suite`, `Ed25519Suite`, `P256Suite`).
+
+Adding a new DID method requires one file and one line in `all_did_methods()`.
+Adding a new cipher suite (for did:pkh) requires one file and one line in
+`all_cipher_suites()`.
+
+Registries are manual static functions — no `inventory` crate (WASM-unsafe).
+
+## Breaking changes vs siwe-oidc
+
+1. **`sub` claim**: `eip155:1:0xAddr` → `did:pkh:eip155:1:0xAddr`
+2. **Sign-in cookie**: `siwe` → `siwx`; payload `{ did, message, signature }`
+3. **CodeEntry**: `address: Address` → `did: String` — flush Redis on upgrade
+4. **Config**: adds `supported_did_methods` + `supported_pkh_namespaces`
+
+## License
+
+MIT OR Apache-2.0
