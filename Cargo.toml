@@ -25,7 +25,6 @@ cookie = "0.18"
 figment = { version = "0.10", features = ["toml", "env"] }
 headers = "0.4"
 hex = "0.4"
-iri-string = { version = "0.7", features = ["serde"] }
 lazy_static = "1.4"
 openidconnect = "4.0"
 p256 = { version = "0.13", features = ["ecdsa", "pem", "jwk"] }
@@ -34,7 +33,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_urlencoded = "0.7"
 sha2 = "0.10"
-siwe = "0.6"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
@@ -45,8 +43,9 @@ urlencoding = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
-alloy = { version = "1", features = ["signers", "signer-local", "providers", "transport-http"] }
 env_logger = "0.11"
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"
 test-log = "0.2"
 tokio = { version = "1", features = ["macros", "rt"] }
 

@@ -4,8 +4,6 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{Duration, Utc};
 use cookie::{Cookie, SameSite};
 use headers::{self, authorization::Bearer};
-use hex::FromHex;
-use iri_string::types::UriString;
 use openidconnect::{
     core::{
         CoreAuthErrorResponseType, CoreAuthPrompt, CoreClaimName, CoreClientAuthMethod,
@@ -31,13 +29,13 @@ use p256::{
 };
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
-use siwe::{Message, VerificationOpts};
-use std::{str::FromStr, time};
+use std::time;
 use thiserror::Error;
 use tracing::{error, info};
 use urlencoding::decode;
 use uuid::Uuid;
 
+use siwx_core::find_did_method;
 use siwx_oidc::db::*;
 
 // ---------------------------------------------------------------------------
@@ -60,7 +58,7 @@ pub const REGISTER_PATH: &str = "/register";
 pub const CLIENT_PATH: &str = "/client";
 pub const USERINFO_PATH: &str = "/userinfo";
 pub const SIGNIN_PATH: &str = "/sign_in";
-pub const SIWE_COOKIE_KEY: &str = "siwe";
+pub const SIWX_COOKIE_KEY: &str = "siwx";
 pub const TOU_PATH: &str = "/legal/terms-of-use.pdf";
 pub const PP_PATH: &str = "/legal/privacy-policy.pdf";
 
@@ -261,28 +259,44 @@ async fn resolve_avatar(_eth_provider: Option<Url>, _ens_name: &str) -> Option<U
 
 async fn resolve_claims(
     eth_provider: Option<Url>,
-    address: Address,
-    chain_id: u64,
+    did: &str,
 ) -> StandardClaims<CoreGenderClaim> {
-    let subject_id = SubjectIdentifier::new(format!(
-        "eip155:{}:{}",
-        chain_id,
-        address.to_checksum(None)
-    ));
-    let ens_name = resolve_name(eth_provider.clone(), address).await;
-    let username = match ens_name.clone() {
-        Ok(n) | Err(n) => n,
+    // canonical_subject is the OIDC sub claim — full DID string for did:pkh.
+    let subject = find_did_method(did)
+        .and_then(|m| m.canonical_subject(did).ok())
+        .unwrap_or_else(|| did.to_string());
+
+    // address_for_message is used as preferred_username fallback.
+    let address_str = find_did_method(did)
+        .and_then(|m| m.address_for_message(did).ok())
+        .unwrap_or_else(|| did.to_string());
+
+    // ENS resolution only for eip155 DIDs.
+    let (username, ens_result) = if did.starts_with("did:pkh:eip155:") {
+        if let Ok(addr) = address_str.parse::<Address>() {
+            let result = resolve_name(eth_provider.clone(), addr).await;
+            let name = match result.clone() {
+                Ok(n) | Err(n) => n,
+            };
+            (name, Some(result))
+        } else {
+            (address_str.clone(), None)
+        }
+    } else {
+        (address_str.clone(), None)
     };
-    let avatar = match ens_name {
-        Ok(n) => resolve_avatar(eth_provider.clone(), &n).await,
-        Err(_) => None,
+
+    let avatar = match ens_result {
+        Some(Ok(ref n)) => resolve_avatar(eth_provider, n).await,
+        _ => None,
     };
-    StandardClaims::new(subject_id)
+
+    StandardClaims::new(SubjectIdentifier::new(subject))
         .set_preferred_username(Some(EndUserUsername::new(username)))
         .set_picture(avatar.map(|a| {
-            let mut avatar_localized = LocalizedClaim::new();
-            avatar_localized.insert(None, EndUserPictureUrl::new(a.to_string()));
-            avatar_localized
+            let mut m = LocalizedClaim::new();
+            m.insert(None, EndUserPictureUrl::new(a.to_string()));
+            m
         }))
 }
 
@@ -355,12 +369,7 @@ pub async fn token(
         vec![Audience::new(client_id.clone())],
         Utc::now() + Duration::seconds(60),
         Utc::now(),
-        resolve_claims(
-            eth_provider,
-            code_entry.address,
-            code_entry.chain_id.unwrap_or(1),
-        )
-        .await,
+        resolve_claims(eth_provider, &code_entry.did).await,
         EmptyAdditionalClaims {},
     )
     .set_nonce(code_entry.nonce)
@@ -530,54 +539,40 @@ pub async fn authorize(
     ))
 }
 
-// -- SIWE sign-in ----------------------------------------------------------
+// -- SiwX sign-in ----------------------------------------------------------
 
+/// Cookie set by the frontend after the user signs the CAIP-122 challenge.
 #[derive(Serialize, Deserialize)]
-pub struct SiweCookie {
-    message: Web3ModalMessage,
-    signature: String,
+pub struct SiwxCookie {
+    pub did: String,
+    /// The canonical CAIP-122 message string that was signed.
+    pub message: String,
+    /// Hex-encoded signature bytes, optionally prefixed with "0x".
+    pub signature: String,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Web3ModalMessage {
-    pub domain: String,
-    pub address: Address,
-    pub statement: String,
-    pub uri: String,
-    pub version: String,
-    pub chain_id: u64,
-    pub nonce: String,
-    pub issued_at: String,
-    pub expiration_time: Option<String>,
-    pub not_before: Option<String>,
-    pub request_id: Option<String>,
-    pub resources: Vec<UriString>,
+/// Extract the `Nonce: {value}` line from a CAIP-122 message.
+fn extract_nonce(message: &str) -> Option<&str> {
+    message
+        .lines()
+        .find(|l| l.starts_with("Nonce: "))
+        .map(|l| l.trim_start_matches("Nonce: ").trim())
 }
 
-impl Web3ModalMessage {
-    fn to_eip4361_message(&self) -> Result<Message> {
-        Ok(Message {
-            domain: self.domain.clone().try_into()?,
-            address: self.address.into_array(),
-            statement: Some(self.statement.to_string()),
-            uri: UriString::from_str(&self.uri)?,
-            version: siwe::Version::V1,
-            chain_id: self.chain_id,
-            nonce: self.nonce.to_string(),
-            issued_at: self.issued_at.parse()?,
-            expiration_time: match &self.expiration_time {
-                Some(t) => Some(t.parse()?),
-                None => None,
-            },
-            not_before: match &self.not_before {
-                Some(t) => Some(t.parse()?),
-                None => None,
-            },
-            request_id: self.request_id.clone(),
-            resources: self.resources.clone(),
-        })
+/// Extract resource URIs from the `Resources:` section of a CAIP-122 message.
+fn extract_resources(message: &str) -> Vec<&str> {
+    let mut in_resources = false;
+    let mut out = vec![];
+    for line in message.lines() {
+        if line == "Resources:" {
+            in_resources = true;
+        } else if in_resources && line.starts_with("- ") {
+            out.push(line[2..].trim());
+        } else if in_resources {
+            break;
+        }
     }
+    out
 }
 
 #[derive(Deserialize)]
@@ -589,7 +584,7 @@ pub struct SignInParams {
 }
 
 pub async fn sign_in(
-    base_url: &Url,
+    _base_url: &Url,
     params: SignInParams,
     cookies: headers::Cookie,
     db_client: &DBClientType,
@@ -612,75 +607,60 @@ pub async fn sign_in(
         ));
     }
 
-    let siwe_cookie: SiweCookie = match cookies.get(SIWE_COOKIE_KEY) {
+    let siwx_cookie: SiwxCookie = match cookies.get(SIWX_COOKIE_KEY) {
         Some(c) => serde_json::from_str(
-            &decode(c).map_err(|e| anyhow!("Could not decode siwe cookie: {}", e))?,
+            &decode(c).map_err(|e| anyhow!("Could not decode siwx cookie: {}", e))?,
         )
-        .map_err(|e| anyhow!("Could not deserialize siwe cookie: {}", e))?,
+        .map_err(|e| anyhow!("Could not deserialize siwx cookie: {}", e))?,
         None => {
-            return Err(anyhow!("No `siwe` cookie").into());
+            return Err(anyhow!("No `siwx` cookie").into());
         }
     };
 
-    let signature = match <[u8; 65]>::from_hex(
-        siwe_cookie
-            .signature
-            .chars()
-            .skip(2)
-            .take(130)
-            .collect::<String>(),
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(CustomError::BadRequest(format!("Bad signature: {}", e)));
-        }
-    };
+    // Hex-decode signature ("0x…" or raw hex).
+    let sig_hex = siwx_cookie
+        .signature
+        .strip_prefix("0x")
+        .unwrap_or(&siwx_cookie.signature);
+    let sig_bytes = hex::decode(sig_hex)
+        .map_err(|e| CustomError::BadRequest(format!("Bad signature: {}", e)))?;
 
-    let message = siwe_cookie
-        .message
-        .to_eip4361_message()
-        .map_err(|e| anyhow!("Failed to serialise message: {}", e))?;
-    info!("{}", message);
+    // Dispatch to the appropriate DID method and verify.
+    let did_method = find_did_method(&siwx_cookie.did).ok_or_else(|| {
+        CustomError::BadRequest(format!("Unsupported DID: {}", &siwx_cookie.did))
+    })?;
+    info!("sign_in: did={}", siwx_cookie.did);
+    let valid = did_method
+        .verify(&siwx_cookie.did, &siwx_cookie.message, &sig_bytes)
+        .map_err(|e| anyhow!("Verification error: {}", e))?;
+    if !valid {
+        return Err(CustomError::Unauthorized(
+            "Signature verification failed".to_string(),
+        ));
+    }
 
-    let domain = if let Some(d) = base_url.domain() {
-        match d.try_into() {
-            Ok(dd) => Some(dd),
-            Err(e) => {
-                error!("Failed to translate domain into authority: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-    message
-        .verify(
-            &signature,
-            &VerificationOpts {
-                domain,
-                nonce: Some(session_entry.siwe_nonce.clone()),
-                timestamp: None,
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("Failed message verification: {}", e))?;
+    // Nonce must match the session.
+    let msg_nonce = extract_nonce(&siwx_cookie.message)
+        .ok_or_else(|| anyhow!("Nonce not found in CAIP-122 message"))?;
+    if msg_nonce != session_entry.siwe_nonce {
+        return Err(CustomError::BadRequest("Nonce mismatch".to_string()));
+    }
 
-    let domain = params.redirect_uri.url();
-    if let Some(r) = siwe_cookie.message.resources.first() {
-        if *domain != Url::from_str(r.as_ref()).unwrap() {
-            return Err(anyhow!("Conflicting domains in message and redirect").into());
-        }
-    } else {
-        return Err(anyhow!("Missing resource in SIWE message").into());
+    // At least one resource must match the redirect_uri.
+    let redirect_url = params.redirect_uri.url();
+    if !extract_resources(&siwx_cookie.message)
+        .iter()
+        .any(|r| Url::parse(r).ok().as_ref() == Some(redirect_url))
+    {
+        return Err(anyhow!("Missing or mismatched resource in CAIP-122 message").into());
     }
 
     let code_entry = CodeEntry {
-        address: siwe_cookie.message.address,
+        did: siwx_cookie.did,
         nonce: params.oidc_nonce.clone(),
         exchange_count: 0,
         client_id: params.client_id.clone(),
         auth_time: Utc::now(),
-        chain_id: Some(siwe_cookie.message.chain_id),
     };
 
     let mut new_session_entry = session_entry.clone();
@@ -851,12 +831,7 @@ pub async fn userinfo(
         };
 
     let response = CoreUserInfoClaims::new(
-        resolve_claims(
-            eth_provider,
-            code_entry.address,
-            code_entry.chain_id.unwrap_or(1),
-        )
-        .await,
+        resolve_claims(eth_provider, &code_entry.did).await,
         EmptyAdditionalClaims::default(),
     )
     .set_issuer(Some(IssuerUrl::from_url(base_url.clone())))
@@ -877,9 +852,9 @@ mod tests {
     use crate::config::Config;
 
     use super::*;
-    use alloy::signers::local::PrivateKeySigner;
-    use alloy::signers::Signer;
     use headers::{HeaderMap, HeaderMapExt, HeaderValue};
+    use sha3::{Digest, Keccak256};
+    use siwx_core::did::{address_from_verifying_key, eip55_checksum};
     use test_log::test;
 
     async fn default_config() -> (Config, RedisClient) {
@@ -904,12 +879,10 @@ mod tests {
 
     #[test(tokio::test)]
     async fn test_claims() {
+        // Vitalik's DID — known ENS name
         let res = resolve_claims(
             Some("https://eth.llamarpc.com".try_into().unwrap()),
-            "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-                .parse()
-                .unwrap(),
-            1,
+            "did:pkh:eip155:1:0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
         )
         .await;
         assert_eq!(
@@ -928,13 +901,32 @@ mod tests {
         code: String,
     }
 
+    /// EIP-191 sign helper — mirrors Eip155Suite::verify's prehash logic.
+    fn eth_sign(key: &k256::ecdsa::SigningKey, msg: &str) -> String {
+        let prefix = format!("\x19Ethereum Signed Message:\n{}", msg.len());
+        let prehash: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(prefix.as_bytes());
+            h.update(msg.as_bytes());
+            h.finalize().into()
+        };
+        let (sig, rec_id) = key.sign_prehash_recoverable(&prehash).unwrap();
+        let mut bytes = [0u8; 65];
+        bytes[..64].copy_from_slice(&sig.to_bytes());
+        bytes[64] = u8::from(rec_id) + 27;
+        format!("0x{}", hex::encode(bytes))
+    }
+
     #[tokio::test]
     async fn e2e_flow() {
         let (_config, db_client) = default_config().await;
-        let wallet: PrivateKeySigner =
-            "dcf2cbdd171a21c480aa7f53d77f31bb102282b3ff099c78e3118b37348c72f7"
-                .parse()
-                .unwrap();
+
+        // Generate an eip155 keypair (same approach as Eip155Suite tests).
+        let secret = k256::SecretKey::random(&mut rand::thread_rng());
+        let signing_key = k256::ecdsa::SigningKey::from(&secret);
+        let addr = address_from_verifying_key(signing_key.verifying_key());
+        let address_str = format!("0x{}", eip55_checksum(&addr));
+        let did = format!("did:pkh:eip155:1:{address_str}");
 
         let base_url = Url::parse("https://example.com").unwrap();
         let params = AuthorizeParams {
@@ -953,31 +945,33 @@ mod tests {
             serde_urlencoded::from_str(redirect_url.split("/?").collect::<Vec<&str>>()[1])
                 .unwrap();
         let params: SignInParams = serde_urlencoded::from_str(&redirect_url).unwrap();
-        let message = Web3ModalMessage {
-            domain: "example.com".into(),
-            address: wallet.address(),
-            statement: "statement".to_string(),
-            uri: base_url.to_string(),
-            version: "1".into(),
-            chain_id: 1,
-            nonce: authorize_params.nonce,
-            issued_at: "2023-04-17T11:01:24.862Z".into(),
-            expiration_time: None,
-            not_before: None,
-            request_id: None,
-            resources: vec!["https://example.com".try_into().unwrap()],
-        };
-        let signature = wallet
-            .sign_message(message.to_eip4361_message().unwrap().to_string().as_bytes())
-            .await
-            .unwrap();
-        let signature = format!("0x{}", hex::encode(signature.as_bytes()));
-        let siwe_cookie =
-            serde_json::to_string(&SiweCookie { message, signature }).unwrap();
+
+        // Build the CAIP-122 message (EIP-4361 format for eip155).
+        let message = format!(
+            "example.com wants you to sign in with your Ethereum account:\n\
+             {address_str}\n\n\
+             You are signing-in to example.com.\n\n\
+             URI: https://example.com\n\
+             Version: 1\n\
+             Chain ID: 1\n\
+             Nonce: {}\n\
+             Issued At: 2023-04-17T11:01:24.862Z\n\
+             Resources:\n\
+             - https://example.com",
+            authorize_params.nonce,
+        );
+        let signature = eth_sign(&signing_key, &message);
+        let siwx_cookie = serde_json::to_string(&SiwxCookie {
+            did,
+            message,
+            signature,
+        })
+        .unwrap();
+
         let mut headers = HeaderMap::new();
         headers.insert(
             "cookie",
-            HeaderValue::from_str(&format!("{cookie}; {SIWE_COOKIE_KEY}={siwe_cookie}"))
+            HeaderValue::from_str(&format!("{cookie}; {SIWX_COOKIE_KEY}={siwx_cookie}"))
                 .unwrap(),
         );
         let cookie = headers.typed_get::<headers::Cookie>().unwrap();
@@ -986,11 +980,12 @@ mod tests {
             .unwrap();
         let signin_params: SignInQueryParams =
             serde_urlencoded::from_str(redirect_url.query().unwrap()).unwrap();
-        let signing_key = EcdsaSigningKey::generate(Some(JsonWebKeyId::new("key1".to_string())));
+        let oidc_signing_key =
+            EcdsaSigningKey::generate(Some(JsonWebKeyId::new("key1".to_string())));
         let _ = userinfo(
             base_url,
             None,
-            &signing_key,
+            &oidc_signing_key,
             None,
             UserInfoPayload {
                 access_token: Some(signin_params.code),

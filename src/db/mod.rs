@@ -1,7 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{offset::Utc, DateTime};
-use alloy_primitives::Address;
 use openidconnect::{core::CoreClientMetadata, Nonce, RegistrationAccessToken};
 use serde::{Deserialize, Serialize};
 
@@ -17,11 +16,12 @@ pub const SESSION_COOKIE_NAME: &str = "session";
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CodeEntry {
     pub exchange_count: usize,
-    pub address: Address,
+    /// The authenticated DID (e.g. `did:pkh:eip155:1:0x…`).
+    /// Replaces the old `address: Address` + `chain_id` fields.
+    pub did: String,
     pub nonce: Option<Nonce>,
     pub client_id: String,
     pub auth_time: DateTime<Utc>,
-    pub chain_id: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
