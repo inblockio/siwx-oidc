@@ -142,5 +142,36 @@ Prefix: `SIWEOIDC_` (via Figment: `siwe-oidc.toml` or env vars)
 
 ## Frontend (js/ui/src/App.svelte)
 
-Ethereum-only (Web3Modal + Wagmi + `siwe` npm). Cookie name `'siwx'`, payload
-`{ did, message, signature }`. Ed25519/P-256 wallet connectors scoped for later.
+Ethereum-only. Uses `@wagmi/core` + `@wagmi/connectors` `injected()` for direct
+browser wallet detection (MetaMask, Brave, Coinbase extension) via EIP-1193.
+SIWE message built with `viem/siwe` (`createSiweMessage`). No cloud dependency
+(no WalletConnect/Reown, no PROJECT_ID needed).
+
+Cookie name `'siwx'`, payload `{ did, message, signature }`.
+
+Mobile wallet support (QR codes) was removed in favor of sovereignty — no
+third-party relay servers. Mobile users can authenticate via the headless
+`siwx-oidc-auth` CLI with `did:key`.
+
+## Deployment (Docker)
+
+```bash
+# Build locally
+docker build -t ghcr.io/inblockio/siwx-oidc:latest .
+
+# Image is ~18MB (Alpine + static musl binary + frontend assets)
+# CI publishes to GHCR on push to main (see .github/workflows/docker.yml)
+```
+
+Matrix Synapse deployment: see `../siwx-oidc-matrix-server` (branch `siwx`).
+Run `/deploy-check` for the full pre-deployment checklist.
+
+## Claude Code skills
+
+| Skill | Purpose |
+|-------|---------|
+| `/add-did-method` | Add a new DID method to siwx-core |
+| `/add-cipher-suite` | Add a new cipher suite to did:pkh |
+| `/docker-build` | Build, test, push Docker image |
+| `/deploy-check` | Pre-deployment checklist for Matrix |
+| `/debug-oidc` | Debug OIDC authentication flow issues |

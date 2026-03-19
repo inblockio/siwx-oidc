@@ -45,6 +45,13 @@ Adding a cipher suite: create `siwx-core/src/pkh/{namespace}.rs`, implement
 - `siwx-core/src/did_method.rs` — DIDMethod trait and registry
 - `siwx-oidc-auth/src/lib.rs` — Headless client (SiwxKey, authenticate())
 
+## Frontend
+
+`js/ui/src/App.svelte` — Svelte 4, built with webpack 5.
+Wallet connection via `@wagmi/core` + `@wagmi/connectors` `injected()` (EIP-1193).
+SIWE messages via `viem/siwe` (`createSiweMessage`).
+No cloud dependencies (no WalletConnect/Reown, no PROJECT_ID).
+
 ## Style notes
 
 - siwx-core has no async — all verification is pure crypto
