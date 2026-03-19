@@ -1,0 +1,48 @@
+You are working on siwx-oidc, a CAIP-122 to OpenID Connect bridge server.
+
+## Workspace
+
+Three Rust crates in one workspace:
+- siwx-core (siwx-core/) — Pure crypto traits and implementations. No async.
+- siwx-oidc (src/) — Axum OIDC server with Redis.
+- siwx-oidc-auth (siwx-oidc-auth/) — Headless client, library + CLI.
+
+## Architecture
+
+Two-trait model:
+- DIDMethod (siwx-core/src/did_method.rs) — primary, server-visible. Implementations: PkhMethod, KeyMethod, PeerMethod.
+- CipherSuite (siwx-core/src/cipher_suite.rs) — internal to did:pkh. Implementations: Eip155Suite, Ed25519Suite, P256Suite.
+
+Registries: all_did_methods() and all_cipher_suites() are static vec constructors, not inventory/linkme.
+
+Extension: one file + one line in the registry function.
+
+## Key files
+
+Server logic: src/oidc.rs (sign_in, token, userinfo, ES256 key wrapper)
+Config: src/config.rs (supported_did_methods, supported_pkh_namespaces)
+Routes: src/axum_lib.rs (startup validation, Axum routes)
+DID dispatch: siwx-core/src/did_method.rs (DIDMethod trait, find_did_method())
+Client: siwx-oidc-auth/src/lib.rs (SiwxKey, authenticate(), AuthTokens)
+
+## Sign-in flow
+
+GET /authorize → 303 redirect + session cookie → client signs CAIP-122 message
+GET /sign_in with siwx cookie → find_did_method().verify() → 303 redirect with code
+POST /token → ES256-signed ID token + access token
+
+## Conventions
+
+- sub claim = full DID string (e.g., did:pkh:eip155:1:0x...)
+- Cookie name: siwx (not siwe), payload: { did, message, signature }
+- Config prefix: SIWEOIDC_ (Figment, supports TOML + env vars)
+- siwx-core is sync-only — no network, no async
+- Crypto ported from aqua-rs-auth (../aqua-rs-auth) — not a dependency
+- New DID methods are opt-in via supported_did_methods config
+- PKCS#8 PEM is the canonical key format (auto-detects Ed25519 vs P-256)
+
+## Testing
+
+cargo test -p siwx-core  — all crypto tests, no Redis needed (57 tests)
+cargo test --bin siwx-oidc  — server tests, needs Redis on localhost
+cargo build --workspace  — full workspace build
