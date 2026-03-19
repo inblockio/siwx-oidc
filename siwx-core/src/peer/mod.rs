@@ -29,9 +29,9 @@ fn extract_z_body(did: &str) -> Result<String, SiwxError> {
                     "did:peer variant 0 body must start with 'z': {did}"
                 ))
             })
-    } else if body.starts_with('2') {
+    } else if let Some(rest) = body.strip_prefix('2') {
         // Variant 2: did:peer:2.{elements} — find first V (verification) element.
-        for component in body[1..].split('.') {
+        for component in rest.split('.') {
             if component.starts_with('V') {
                 if let Some(pos) = component.find('z') {
                     return Ok(component[pos + 1..].to_string());

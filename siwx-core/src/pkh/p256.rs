@@ -24,7 +24,7 @@ impl CipherSuite for P256Suite {
 
     fn verify(&self, did: &str, message: &str, signature: &[u8]) -> Result<bool, SiwxError> {
         let pubkey_bytes = pubkey_from_p256_did(did)?;
-        let point = EncodedPoint::from_bytes(&pubkey_bytes)
+        let point = EncodedPoint::from_bytes(pubkey_bytes)
             .map_err(|e| SiwxError::InvalidSignature(format!("invalid p256 encoded point: {e}")))?;
         let verifying_key = VerifyingKey::from_encoded_point(&point)
             .map_err(|e| SiwxError::InvalidSignature(format!("invalid p256 pubkey: {e}")))?;
