@@ -1,5 +1,5 @@
 [workspace]
-members = ["siwx-core"]
+members = ["siwx-core", "siwx-oidc-auth"]
 resolver = "2"
 
 [package]
