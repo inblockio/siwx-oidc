@@ -11,9 +11,7 @@ module.exports = {
 		'bundle': ['./src/main.ts']
 	},
 	resolve: {
-		alias: {
-			svelte: path.dirname(require.resolve('svelte/package.json'))
-		},
+		conditionNames: ['svelte', 'browser', 'import', 'require', 'default'],
 		extensions: ['.mjs', '.js', '.ts', '.svelte'],
 		mainFields: ['svelte', 'browser', 'module', 'main'],
 		fallback: {
@@ -86,8 +84,10 @@ module.exports = {
 				]
 			},
 			{
-				// required to prevent errors from Svelte on Webpack 5+
-				test: /node_modules\/svelte\/.*\.mjs$/,
+				// Disable strict ESM fully-specified path resolution for node_modules
+				// (fixes process/browser, @reown, @walletconnect, svelte ESM imports)
+				test: /\.m?js$/,
+				include: /node_modules/,
 				resolve: {
 					fullySpecified: false
 				}
@@ -103,7 +103,6 @@ module.exports = {
 		new MiniCssExtractPlugin({
 			filename: '[name].css'
 		}),
-		new webpack.EnvironmentPlugin(prod ? ['PROJECT_ID'] : []),
 	],
 	devtool: prod ? false : 'source-map',
 	devServer: {

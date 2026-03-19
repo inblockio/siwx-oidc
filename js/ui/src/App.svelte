@@ -1,109 +1,118 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	
-	
-	import { createAppKit } from '@reown/appkit'
-	import { WagmiAdapter } from '@reown/appkit-adapter-wagmi'
-	import { arbitrum, mainnet, polygon } from '@reown/appkit/networks'
-	import { getAccount, signMessage, reconnect } from '@wagmi/core';
-	import { SiweMessage } from 'siwe';
+	import { createConfig, connect, disconnect, getAccount, signMessage, reconnect, http, watchAccount } from '@wagmi/core';
+	import { injected } from '@wagmi/connectors';
+	import { mainnet, arbitrum, polygon } from 'viem/chains';
+	import { createSiweMessage } from 'viem/siwe';
 	import Cookies from 'js-cookie';
 
-	// TODO: REMOVE DEFAULTS:
-	// main.ts will parse the params from the server
 	export let domain: string;
 	export let nonce: string;
 	export let redirect: string;
 	export let state: string;
 	export let oidc_nonce: string;
 	export let client_id: string;
-	const projectId: string = process.env.PROJECT_ID;
 
-	$: status = 'Not Logged In';
+	let status = 'Not Logged In';
+	let error: string | null = null;
+	let connecting = false;
+	let client_metadata: any = {};
 
-	const networks = [mainnet, arbitrum, polygon];
-
-	const wagmiAdapter = new WagmiAdapter({
-		networks,
-		projectId,
-	});
-
-	const modal = createAppKit({
-		adapters: [wagmiAdapter],
-		networks,
-		defaultNetwork: mainnet,
-		projectId,
-		themeMode: 'dark',
-	});
-
-	reconnect(wagmiAdapter.wagmiConfig)
-
-	let client_metadata = {};
-	onMount(async () => {
-		try {
-			client_metadata = fetch(`${window.location.origin}/client/${client_id}`).then((response) => response.json());
-		} catch (e) {
-			console.error(e);
-		}
-	});
-
-	modal.subscribeState(async (newState) => {
-
-		const account = getAccount(wagmiAdapter.wagmiConfig);
-
-		if (account.isConnected) {
-			try {
-				const expirationTime = new Date(
-					new Date().getTime() + 2 * 24 * 60 * 60 * 1000, // 48h
-				);
-
-				const msgToSign = new SiweMessage({
-					domain: window.location.host,
-					address: account.address,
-					chainId: account.chainId,
-					expirationTime: expirationTime.toISOString(),
-					uri: window.location.origin,
-					version: '1',
-					statement: `You are signing-in to ${window.location.host}.`,
-					nonce,
-					resources: [redirect],
-				});
-
-				const preparedMessage = msgToSign.prepareMessage();
-				
-				await new Promise((resolve) => setTimeout(resolve, 1000));
-				
-				const signature = await signMessage(wagmiAdapter.wagmiConfig, {
-					message: preparedMessage,
-				});
-
-				const did = `did:pkh:eip155:${account.chainId}:${account.address}`;
-				const session = {
-					did,
-					message: preparedMessage,
-					signature,
-				};
-				Cookies.set('siwx', JSON.stringify(session), {
-					expires: expirationTime,
-					sameSite: 'Strict',
-					secure: window.location.protocol === 'https:',
-				});
-
-				window.location.replace(
-					`/sign_in?redirect_uri=${encodeURI(redirect)}&state=${encodeURI(state)}&client_id=${encodeURI(
-						client_id,
-					)}${encodeURI(oidc_nonce_param)}`,
-				);
-				return;
-			} catch (e) {
-				console.error(e);
-			}
-		}
+	const config = createConfig({
+		chains: [mainnet, arbitrum, polygon],
+		connectors: [injected()],
+		transports: {
+			[mainnet.id]: http(),
+			[arbitrum.id]: http(),
+			[polygon.id]: http(),
+		},
 	});
 
 	let oidc_nonce_param = '';
 	if (oidc_nonce != null && oidc_nonce != '') {
 		oidc_nonce_param = `&oidc_nonce=${oidc_nonce}`;
+	}
+
+	onMount(async () => {
+		try {
+			const resp = await fetch(`${window.location.origin}/client/${client_id}`);
+			client_metadata = await resp.json();
+		} catch (e) {
+			console.error(e);
+		}
+
+		// Auto-reconnect if previously connected
+		await reconnect(config);
+	});
+
+	async function handleConnect() {
+		if (connecting) return;
+		connecting = true;
+		error = null;
+		status = 'Connecting...';
+
+		try {
+			const result = await connect(config, { connector: injected() });
+
+			if (result.accounts.length > 0) {
+				await performSignIn(result.accounts[0], result.chainId);
+			}
+		} catch (e: any) {
+			if (e.name === 'ConnectorNotFoundError' || e.message?.includes('No injected')) {
+				error = 'No wallet detected. Please install MetaMask or another Ethereum wallet extension.';
+			} else if (e.name === 'UserRejectedRequestError') {
+				error = 'Connection rejected.';
+			} else {
+				error = e.shortMessage || e.message || 'Failed to connect wallet';
+			}
+			status = 'Not Logged In';
+			console.error(e);
+		} finally {
+			connecting = false;
+		}
+	}
+
+	async function performSignIn(address: string, chainId: number) {
+		status = 'Signing message...';
+
+		const expirationTime = new Date(
+			new Date().getTime() + 2 * 24 * 60 * 60 * 1000, // 48h
+		);
+
+		const preparedMessage = createSiweMessage({
+			domain: window.location.host,
+			address: address as `0x${string}`,
+			chainId,
+			expirationTime,
+			uri: window.location.origin,
+			version: '1',
+			statement: `You are signing-in to ${window.location.host}.`,
+			nonce,
+			resources: [redirect],
+		});
+
+		const signature = await signMessage(config, {
+			message: preparedMessage,
+		});
+
+		const did = `did:pkh:eip155:${chainId}:${address}`;
+		const session = {
+			did,
+			message: preparedMessage,
+			signature,
+		};
+		Cookies.set('siwx', JSON.stringify(session), {
+			expires: expirationTime,
+			sameSite: 'Strict',
+			secure: window.location.protocol === 'https:',
+		});
+
+		status = 'Redirecting...';
+		window.location.replace(
+			`/sign_in?redirect_uri=${encodeURI(redirect)}&state=${encodeURI(state)}&client_id=${encodeURI(
+				client_id,
+			)}${encodeURI(oidc_nonce_param)}`,
+		);
 	}
 </script>
 
@@ -127,9 +136,8 @@
 
 		<button
 			class="h-12 border hover:scale-105 justify-evenly shadow-xl border-white mt-4 duration-100 ease-in-out transition-all transform flex items-center"
-			on:click={() => {
-				modal.open();
-			}}
+			disabled={connecting}
+			on:click={handleConnect}
 		>
 			<svg
 				xmlns="http://www.w3.org/2000/svg"
@@ -155,8 +163,15 @@
 					/>
 				</g>
 			</svg>
-			<p class="font-bold">Sign-In with Ethereum</p>
+			<p class="font-bold">
+				{#if connecting}Connecting...{:else}Sign-In with Ethereum{/if}
+			</p>
 		</button>
+
+		{#if error}
+			<span class="text-xs text-red-500 mt-2">{error}</span>
+		{/if}
+
 		<div class="self-center mt-auto text-center font-semibold text-xs">
 			By using this service you agree to the <a href="/legal/terms-of-use.pdf">Terms of Use</a> and
 			<a href="/legal/privacy-policy.pdf">Privacy Policy</a>.
@@ -262,35 +277,6 @@
 		white-space: -pre-wrap; /* Opera 4-6 */
 		white-space: -o-pre-wrap; /* Opera 7 */
 		word-wrap: break-word; /* Internet Explorer 5.5+ */
-	}
-
-	.web3modal-modal-lightbox {
-		z-index: 30 !important;
-	}
-
-	.walletconnect-modal__base {
-		background-color: #273137 !important;
-	}
-
-	.walletconnect-qrcode__text {
-		color: white !important;
-	}
-
-	.walletconnect-modal__mobile__toggle {
-		background: rgba(255, 255, 255, 0.1) !important;
-	}
-
-	.walletconnect-qrcode__image {
-		border: 24px solid white !important;
-		border-radius: 8px !important;
-	}
-
-	.walletconnect-modal__base__row:hover {
-		background: rgba(255, 255, 255, 0.1) !important;
-	}
-
-	.walletconnect-modal__mobile__toggle_selector {
-		background: rgba(255, 255, 255, 0.2) !important;
 	}
 
 	/**
