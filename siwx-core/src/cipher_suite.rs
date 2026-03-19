@@ -39,7 +39,12 @@ pub trait CipherSuite: Send + Sync {
 ///
 /// Add one line here when a new `CipherSuite` implementation is ready.
 pub fn all_cipher_suites() -> Vec<Box<dyn CipherSuite>> {
-    vec![]
+    use crate::pkh::{Ed25519Suite, Eip155Suite, P256Suite};
+    vec![
+        Box::new(Eip155Suite),
+        Box::new(Ed25519Suite),
+        Box::new(P256Suite),
+    ]
 }
 
 /// Find the cipher suite for the given namespace name.
@@ -59,9 +64,14 @@ mod tests {
     }
 
     #[test]
-    fn all_cipher_suites_compiles() {
-        let suites = all_cipher_suites();
-        // empty until Phase 1.3 adds the three cipher suites
-        assert_eq!(suites.len(), 0);
+    fn all_cipher_suites_has_three_entries() {
+        assert_eq!(all_cipher_suites().len(), 3);
+    }
+
+    #[test]
+    fn find_known_namespaces() {
+        for ns in ["eip155", "ed25519", "p256"] {
+            assert!(find_cipher_suite(ns).is_some(), "missing suite for {ns}");
+        }
     }
 }
