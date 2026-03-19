@@ -61,6 +61,9 @@ module.exports = {
 						preprocess: sveltePreprocess({
 							sourceMap: !prod,
 							postcss: true,
+							typescript: {
+								tsconfigFile: './tsconfig.json',
+							},
 						}),
 					}
 				}
