@@ -2,10 +2,10 @@
 	import { onMount } from 'svelte';
 	
 	
-	import { createWeb3Modal, defaultWagmiConfig } from '@web3modal/wagmi'
-
-	import { arbitrum, mainnet, polygon } from '@wagmi/core/chains';
-	import { getAccount, signMessage, reconnect, getConnections} from '@wagmi/core';
+	import { createAppKit } from '@reown/appkit'
+	import { WagmiAdapter } from '@reown/appkit-adapter-wagmi'
+	import { arbitrum, mainnet, polygon } from '@reown/appkit/networks'
+	import { getAccount, signMessage, reconnect } from '@wagmi/core';
 	import { SiweMessage } from 'siwe';
 	import Cookies from 'js-cookie';
 
@@ -21,24 +21,22 @@
 
 	$: status = 'Not Logged In';
 
-	const chains = [mainnet, arbitrum, polygon];
+	const networks = [mainnet, arbitrum, polygon];
 
-	const config = defaultWagmiConfig({
-		chains,
+	const wagmiAdapter = new WagmiAdapter({
+		networks,
 		projectId,
-		enableCoinbase: false,
-		enableInjected: false,
-	})
-
-	const web3modal = createWeb3Modal({
-		defaultChain: mainnet,
-		wagmiConfig: config,
-  		projectId,
-		themeMode: 'dark',
-		featuredWalletIds: [],
 	});
 
-	reconnect(config)
+	const modal = createAppKit({
+		adapters: [wagmiAdapter],
+		networks,
+		defaultNetwork: mainnet,
+		projectId,
+		themeMode: 'dark',
+	});
+
+	reconnect(wagmiAdapter.wagmiConfig)
 
 	let client_metadata = {};
 	onMount(async () => {
@@ -49,9 +47,9 @@
 		}
 	});
 
-	web3modal.subscribeState(async (newState) => {
+	modal.subscribeState(async (newState) => {
 
-		const account = getAccount(config);
+		const account = getAccount(wagmiAdapter.wagmiConfig);
 
 		if (account.isConnected) {
 			try {
@@ -75,7 +73,7 @@
 				
 				await new Promise((resolve) => setTimeout(resolve, 1000));
 				
-				const signature = await signMessage(config,{
+				const signature = await signMessage(wagmiAdapter.wagmiConfig, {
 					message: preparedMessage,
 				});
 
@@ -130,7 +128,7 @@
 		<button
 			class="h-12 border hover:scale-105 justify-evenly shadow-xl border-white mt-4 duration-100 ease-in-out transition-all transform flex items-center"
 			on:click={() => {
-				web3modal.open();
+				modal.open();
 			}}
 		>
 			<svg

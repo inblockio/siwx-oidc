@@ -40,10 +40,12 @@
 		"validate": "svelte-check"
 	},
 	"dependencies": {
-		"@wagmi/core": "^2.16.0",
-		"@web3modal/wagmi": "^5.1.0",
+		"@reown/appkit": "^1.8.19",
+		"@reown/appkit-adapter-wagmi": "^1.8.19",
+		"@wagmi/core": "^2.21.2",
 		"js-cookie": "^3.0.5",
 		"siwe": "^2.3.0",
-		"viem": "^2.23.0"
+		"viem": "^2.47.0",
+		"wagmi": "^2.19.5"
 	}
 }
