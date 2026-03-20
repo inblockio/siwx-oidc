@@ -29,6 +29,10 @@ pub struct Config {
     /// did:pkh namespaces accepted at sign-in (e.g. ["eip155", "ed25519", "p256"]).
     /// Must be a subset of the cipher suites registered in siwx-core.
     pub supported_pkh_namespaces: Vec<String>,
+    /// WebAuthn Relying Party ID (domain). Defaults to the hostname of `base_url`.
+    pub rp_id: Option<String>,
+    /// WebAuthn expected origin. Defaults to `base_url` (scheme + host + port).
+    pub rp_origin: Option<String>,
 }
 
 impl Default for Config {
@@ -50,6 +54,8 @@ impl Default for Config {
                 "ed25519".to_string(),
                 "p256".to_string(),
             ],
+            rp_id: None,
+            rp_origin: None,
         }
     }
 }

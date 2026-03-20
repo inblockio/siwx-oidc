@@ -44,6 +44,10 @@ pub struct SessionEntry {
     pub oidc_nonce: Option<Nonce>,
     pub secret: String,
     pub signin_count: u64,
+    /// Set by a server-verified ceremony (e.g. WebAuthn) before redirecting to /sign_in.
+    /// When present, sign_in trusts this DID without re-verifying a CAIP-122 cookie.
+    #[serde(default)]
+    pub verified_did: Option<String>,
 }
 
 #[async_trait]

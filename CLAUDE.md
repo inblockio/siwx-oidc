@@ -29,11 +29,12 @@ siwx-core/src/                     ← Pure crypto library (no async, no network
   peer/mod.rs                       did:peer — variant 0 + variant 2 V-key
 
 src/                                ← Axum OIDC server (binary)
-  config.rs                          Config struct (supported_did_methods, signing key, etc.)
-  axum_lib.rs                        Routes, startup validation, state
+  config.rs                          Config struct (supported_did_methods, RP ID, signing key, etc.)
+  axum_lib.rs                        Routes, startup validation, state (incl. Webauthn)
   oidc.rs                            OIDC logic: authorize, sign_in, token, userinfo, ES256 key
+  webauthn.rs                        WebAuthn ceremony: register + discoverable authenticate
   db/mod.rs                          DBClient trait, CodeEntry, SessionEntry, ClientEntry
-  db/redis.rs                        Redis implementation
+  db/redis.rs                        Redis implementation + generic helpers (set_raw, get_raw, etc.)
 
 siwx-oidc-auth/src/                ← Headless OIDC client (library + CLI)
   lib.rs                             SiwxKey (PEM/hex/generate), authenticate(), AuthTokens
@@ -44,7 +45,31 @@ js/ui/src/App.svelte               ← Svelte frontend (Ethereum-only via Web3Mo
 
 ## Architecture
 
-**Two-trait extensibility model:**
+**Three-layer model:**
+
+```
+Layer 1: siwx-core        — Pure crypto library (no async, no network, WASM-safe)
+  ├── DIDMethod trait       — DID parsing + CAIP-122 verification dispatch
+  ├── CipherSuite trait     — Internal to did:pkh, never imported by server
+  └── Registries            — Manual static functions (no inventory crate)
+
+Layer 2: src/{ceremony}.rs — Auth ceremony verification (server-side)
+  ├── CAIP-122              — Wallet signing (verified in sign_in via DIDMethod::verify)
+  ├── [planned] WebAuthn    — Passkey ceremony (webauthn-rs safe API → verified DID in session)
+  └── [planned] RFC 8628    — Device Authorization Grant (device page → approved device code)
+
+Layer 3: src/oidc.rs       — OIDC token issuance (single code issuance point: sign_in)
+```
+
+**Key boundary:** siwx-core handles CAIP-122 proof verification only. New authentication
+ceremonies (WebAuthn, SSH, PGP) are server-layer modules that produce a verified DID.
+The `DIDMethod` trait is NOT extended for non-CAIP-122 proofs. See `/add-auth-ceremony`.
+
+**Why:** NIST SP 800-63B, W3C WebAuthn §7.2, and webauthn-rs all mandate that ceremony
+verification (challenge binding, origin checking, RP ID, flags, sign count) lives in the
+server layer where session state is available. Crypto alone is necessary but not sufficient.
+
+**Two-trait extensibility model (Layer 1):**
 - `DIDMethod` — primary, server-visible dispatch. The server only sees this trait.
 - `CipherSuite` — secondary, internal to `did:pkh`. Never imported by the server.
 
@@ -53,11 +78,18 @@ No `inventory` crate (WASM-unsafe).
 
 **Adding a new DID method** = one file + one line in registry. See `/add-did-method`.
 **Adding a new cipher suite** = one file + one line in registry. See `/add-cipher-suite`.
+**Adding a new auth ceremony** = one server module + sign_in generalization. See `/add-auth-ceremony`.
 
-**Sign-in flow:**
+**Sign-in flow (CAIP-122 — existing):**
 1. `GET /authorize` → session cookie + nonce
 2. Frontend/client builds CAIP-122 message with nonce, signs it
 3. `GET /sign_in` with `siwx` cookie → `find_did_method(did).verify()` → auth code
+4. `POST /token` → ID token + access token (ES256 signed)
+
+**Sign-in flow (server-verified ceremony — planned):**
+1. `GET /authorize` → session cookie + nonce
+2. Ceremony endpoint verifies proof (e.g. WebAuthn assertion) → stores verified DID in Redis session
+3. Redirect to `GET /sign_in` → reads `session.verified_did` (trusted) → auth code
 4. `POST /token` → ID token + access token (ES256 signed)
 
 ## DID method scope
@@ -125,6 +157,11 @@ Prefix: `SIWEOIDC_` (via Figment: `siwe-oidc.toml` or env vars)
 | `SIWEOIDC_SIGNING_KEY_PEM` | PKCS#8 PEM for ES256 signing key | generated |
 | `SIWEOIDC_SUPPORTED_DID_METHODS` | DID methods accepted at sign-in | `["pkh"]` |
 | `SIWEOIDC_SUPPORTED_PKH_NAMESPACES` | did:pkh namespaces accepted | `["eip155","ed25519","p256"]` |
+| `SIWEOIDC_RP_ID` | WebAuthn Relying Party ID (domain) | hostname of `BASE_URL` |
+| `SIWEOIDC_RP_ORIGIN` | WebAuthn expected origin URL | `BASE_URL` |
+
+**For passkey login:** add `"key"` to `SIWEOIDC_SUPPORTED_DID_METHODS` so the `did:key:zDn…`
+DIDs derived from passkeys are accepted by `sign_in`.
 
 ## Breaking changes vs siwe-oidc
 
@@ -142,16 +179,16 @@ Prefix: `SIWEOIDC_` (via Figment: `siwe-oidc.toml` or env vars)
 
 ## Frontend (js/ui/src/App.svelte)
 
-Ethereum-only. Uses `@wagmi/core` + `@wagmi/connectors` `injected()` for direct
-browser wallet detection (MetaMask, Brave, Coinbase extension) via EIP-1193.
-SIWE message built with `viem/siwe` (`createSiweMessage`). No cloud dependency
-(no WalletConnect/Reown, no PROJECT_ID needed).
+Two authentication methods on the login page:
 
-Cookie name `'siwx'`, payload `{ did, message, signature }`.
+1. **Sign-In with Ethereum** — `@wagmi/core` + `injected()` for direct browser wallet
+   detection (MetaMask, Brave, Coinbase extension) via EIP-1193. SIWE message built
+   with `viem/siwe` (`createSiweMessage`). Cookie name `'siwx'`, payload `{ did, message, signature }`.
 
-Mobile wallet support (QR codes) was removed in favor of sovereignty — no
-third-party relay servers. Mobile users can authenticate via the headless
-`siwx-oidc-auth` CLI with `did:key`.
+2. **Sign-In with Passkey** — Browser WebAuthn API (`navigator.credentials.get()`).
+   Calls `/webauthn/authenticate/start` → browser passkey prompt → `/webauthn/authenticate/finish`.
+   No cookie involved — verified DID stored server-side in Redis session.
+   "Register a new passkey" link for first-time users.
 
 ## Deployment (Docker)
 
@@ -166,12 +203,86 @@ docker build -t ghcr.io/inblockio/siwx-oidc:latest .
 Matrix Synapse deployment: see `../siwx-oidc-matrix-server` (branch `siwx`).
 Run `/deploy-check` for the full pre-deployment checklist.
 
+## WebAuthn/Passkey architecture
+
+**Ceremony module:** `src/webauthn.rs` — uses `webauthn-rs` 0.6.0-dev safe API.
+**DID derivation:** Passkey P-256 pubkey → compressed SEC1 → `did:key:zDn…` (same
+encoding as `siwx-core/src/key/mod.rs`).
+
+**Redis keys:**
+```
+webauthn:challenge/{session_id}    TTL 120s  — ceremony state (register or auth)
+webauthn:credential/{cred_id_b64}  no TTL    — stored Passkey (JSON-serialized)
+```
+
+**Endpoints:**
+```
+POST /webauthn/register/start       — returns CreationChallengeResponse
+POST /webauthn/register/finish      — verifies attestation, stores credential
+POST /webauthn/authenticate/start   — returns RequestChallengeResponse (discoverable)
+POST /webauthn/authenticate/finish  — verifies assertion, stores verified_did in session
+```
+
+## Troubleshooting
+
+### WebAuthn passkey login fails
+
+1. **"DID method 'key' is not enabled on this server"** → add `"key"` to
+   `SIWEOIDC_SUPPORTED_DID_METHODS` (passkeys derive `did:key:zDn…`).
+
+2. **"No registration challenge found (expired or already used)"** → challenge has
+   120s TTL. User took too long or page was refreshed. Retry from the start.
+
+3. **"WebAuthn registration/auth start failed"** → check `SIWEOIDC_BASE_URL` has a
+   valid hostname (used as RP ID). If behind a reverse proxy, set `SIWEOIDC_RP_ID`
+   and `SIWEOIDC_RP_ORIGIN` explicitly.
+
+4. **Browser shows no passkeys / "NotAllowedError"** → RP ID mismatch. The browser
+   will only offer passkeys registered for the exact RP ID domain. Check that the
+   domain users see in the browser matches `SIWEOIDC_RP_ID`.
+
+5. **"Credential not found" after selecting a passkey** → credential was stored on a
+   different Redis instance, or Redis was flushed. Credential keys have no TTL but
+   are lost on `--reset`. Check `redis-cli KEYS 'webauthn:credential/*'`.
+
+6. **"Session not found"** → session expired (300s TTL) between authenticate_finish
+   and sign_in redirect. Check for network/proxy delays.
+
+### CAIP-122 wallet login fails
+
+Run `/debug-oidc` for the full OIDC flow debugging checklist.
+
+Common issues:
+- **"Nonce mismatch"** → session cookie expired between authorize and sign_in.
+- **"Signature verification failed"** → DID in cookie doesn't match the signing key.
+- **"Missing or mismatched resource"** → redirect_uri not in CAIP-122 resources array.
+
+### Redis inspection
+
+```bash
+# List all WebAuthn credentials
+redis-cli KEYS 'webauthn:credential/*'
+
+# Inspect a specific credential
+redis-cli GET 'webauthn:credential/{cred_id_b64}'
+
+# List active challenges
+redis-cli KEYS 'webauthn:challenge/*'
+
+# List active sessions
+redis-cli KEYS 'sessions/*'
+
+# Check if a session has a verified_did
+redis-cli GET 'sessions/{session_id}' | python3 -m json.tool
+```
+
 ## Claude Code skills
 
 | Skill | Purpose |
 |-------|---------|
-| `/add-did-method` | Add a new DID method to siwx-core |
-| `/add-cipher-suite` | Add a new cipher suite to did:pkh |
+| `/add-did-method` | Add a new DID method to siwx-core (Layer 1) |
+| `/add-cipher-suite` | Add a new cipher suite to did:pkh (Layer 1) |
+| `/add-auth-ceremony` | Add a new auth ceremony to the server (Layer 2) |
 | `/docker-build` | Build, test, push Docker image |
 | `/deploy-check` | Pre-deployment checklist for Matrix |
 | `/debug-oidc` | Debug OIDC authentication flow issues |

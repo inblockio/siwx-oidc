@@ -23,6 +23,7 @@ use openidconnect::core::{
 };
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
+use webauthn_rs::prelude::*;
 use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
@@ -31,6 +32,7 @@ use tracing::info;
 
 use super::config;
 use super::oidc::{self, CustomError, EcdsaSigningKey};
+use super::webauthn as wa;
 use openidconnect::JsonWebKeyId;
 use siwx_core::{all_cipher_suites, all_did_methods};
 use siwx_oidc::db::*;
@@ -42,6 +44,7 @@ struct AppState {
     signing_key: Arc<EcdsaSigningKey>,
     config: config::Config,
     redis_client: RedisClient,
+    webauthn: Arc<Webauthn>,
 }
 
 // -- Error → Response conversion -------------------------------------------
@@ -263,6 +266,74 @@ async fn client_delete(
 
 async fn healthcheck() {}
 
+// -- WebAuthn route handlers -----------------------------------------------
+
+async fn webauthn_register_start(
+    State(state): State<AppState>,
+    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    Json(payload): Json<wa::RegisterStartRequest>,
+) -> Result<Json<CreationChallengeResponse>, CustomError> {
+    let session_id = cookies
+        .get(SESSION_COOKIE_NAME)
+        .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
+    let ccr = wa::register_start(
+        &state.webauthn,
+        &state.redis_client,
+        session_id,
+        payload.display_name,
+    )
+    .await?;
+    Ok(Json(ccr))
+}
+
+async fn webauthn_register_finish(
+    State(state): State<AppState>,
+    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    Json(reg_response): Json<RegisterPublicKeyCredential>,
+) -> Result<Json<wa::RegisterFinishResponse>, CustomError> {
+    let session_id = cookies
+        .get(SESSION_COOKIE_NAME)
+        .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
+    let resp = wa::register_finish(
+        &state.webauthn,
+        &state.redis_client,
+        session_id,
+        reg_response,
+    )
+    .await?;
+    Ok(Json(resp))
+}
+
+async fn webauthn_authenticate_start(
+    State(state): State<AppState>,
+    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+) -> Result<Json<RequestChallengeResponse>, CustomError> {
+    let session_id = cookies
+        .get(SESSION_COOKIE_NAME)
+        .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
+    let rcr =
+        wa::authenticate_start(&state.webauthn, &state.redis_client, session_id).await?;
+    Ok(Json(rcr))
+}
+
+async fn webauthn_authenticate_finish(
+    State(state): State<AppState>,
+    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    Json(auth_response): Json<PublicKeyCredential>,
+) -> Result<Json<wa::AuthenticateFinishResponse>, CustomError> {
+    let session_id = cookies
+        .get(SESSION_COOKIE_NAME)
+        .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
+    let resp = wa::authenticate_finish(
+        &state.webauthn,
+        &state.redis_client,
+        session_id,
+        auth_response,
+    )
+    .await?;
+    Ok(Json(resp))
+}
+
 // -- Application entry point -----------------------------------------------
 
 pub async fn main() {
@@ -322,10 +393,18 @@ pub async fn main() {
         key
     };
 
+    let webauthn = wa::build_webauthn(
+        &config.base_url,
+        config.rp_id.as_deref(),
+        config.rp_origin.as_deref(),
+    )
+    .expect("Failed to initialize WebAuthn — check SIWEOIDC_BASE_URL, SIWEOIDC_RP_ID, SIWEOIDC_RP_ORIGIN");
+
     let state = AppState {
         signing_key: Arc::new(signing_key),
         config: config.clone(),
         redis_client,
+        webauthn: Arc::new(webauthn),
     };
 
     let app = Router::new()
@@ -346,6 +425,16 @@ pub async fn main() {
             get(clientinfo).delete(client_delete).post(client_update),
         )
         .route(oidc::SIGNIN_PATH, get(sign_in))
+        .route("/webauthn/register/start", post(webauthn_register_start))
+        .route("/webauthn/register/finish", post(webauthn_register_finish))
+        .route(
+            "/webauthn/authenticate/start",
+            post(webauthn_authenticate_start),
+        )
+        .route(
+            "/webauthn/authenticate/finish",
+            post(webauthn_authenticate_finish),
+        )
         .route("/health", get(healthcheck))
         .with_state(state)
         .layer(TraceLayer::new_for_http());

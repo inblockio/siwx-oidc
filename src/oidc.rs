@@ -608,6 +608,7 @@ pub async fn authorize(
                 oidc_nonce: params.nonce.clone(),
                 secret: session_secret.clone(),
                 signin_count: 0,
+                verified_did: None,
             },
         )
         .await?;
@@ -730,79 +731,113 @@ pub async fn sign_in(
         ));
     }
 
-    let siwx_cookie: SiwxCookie = match cookies.get(SIWX_COOKIE_KEY) {
-        Some(c) => serde_json::from_str(
-            &decode(c).map_err(|e| anyhow!("Could not decode siwx cookie: {}", e))?,
-        )
-        .map_err(|e| anyhow!("Could not deserialize siwx cookie: {}", e))?,
-        None => {
-            return Err(anyhow!("No `siwx` cookie").into());
-        }
-    };
-
-    // Hex-decode signature ("0x…" or raw hex).
-    let sig_hex = siwx_cookie
-        .signature
-        .strip_prefix("0x")
-        .unwrap_or(&siwx_cookie.signature);
-    let sig_bytes = hex::decode(sig_hex)
-        .map_err(|e| CustomError::BadRequest(format!("Bad signature: {}", e)))?;
-
-    // Dispatch to the appropriate DID method and verify.
-    let did_method = find_did_method(&siwx_cookie.did)
-        .ok_or_else(|| CustomError::BadRequest(format!("Unsupported DID: {}", &siwx_cookie.did)))?;
-
-    // Enforce configured allow-lists.
-    if !allowed_did_methods
-        .iter()
-        .any(|m| m == did_method.method_name())
-    {
-        return Err(CustomError::BadRequest(format!(
-            "DID method '{}' is not enabled on this server",
-            did_method.method_name()
-        )));
-    }
-    if did_method.method_name() == "pkh" {
-        let namespace = siwx_cookie
-            .did
-            .strip_prefix("did:pkh:")
-            .and_then(|s| s.split(':').next())
-            .unwrap_or("");
-        if !allowed_pkh_namespaces.iter().any(|n| n == namespace) {
+    // -- Determine the authenticated DID --
+    // Path A: Server-verified ceremony (WebAuthn). The DID was already verified
+    //         by the ceremony endpoint and stored in the Redis session — trusted.
+    // Path B: Client-set CAIP-122 cookie (existing wallet flow — untrusted, must verify).
+    let did = if let Some(ref verified_did) = session_entry.verified_did {
+        info!("sign_in: server-verified did={}", verified_did);
+        let did_method = find_did_method(verified_did).ok_or_else(|| {
+            CustomError::BadRequest(format!("Unsupported DID: {}", verified_did))
+        })?;
+        if !allowed_did_methods
+            .iter()
+            .any(|m| m == did_method.method_name())
+        {
             return Err(CustomError::BadRequest(format!(
-                "did:pkh namespace '{namespace}' is not enabled on this server"
+                "DID method '{}' is not enabled on this server",
+                did_method.method_name()
             )));
         }
-    }
+        // Enforce pkh namespace allowlist (same check as CAIP-122 path).
+        if did_method.method_name() == "pkh" {
+            let namespace = verified_did
+                .strip_prefix("did:pkh:")
+                .and_then(|s| s.split(':').next())
+                .unwrap_or("");
+            if !allowed_pkh_namespaces.iter().any(|n| n == namespace) {
+                return Err(CustomError::BadRequest(format!(
+                    "did:pkh namespace '{namespace}' is not enabled on this server"
+                )));
+            }
+        }
+        verified_did.clone()
+    } else {
+        // Path B: CAIP-122 cookie verification (unchanged from original)
+        let siwx_cookie: SiwxCookie = match cookies.get(SIWX_COOKIE_KEY) {
+            Some(c) => serde_json::from_str(
+                &decode(c).map_err(|e| anyhow!("Could not decode siwx cookie: {}", e))?,
+            )
+            .map_err(|e| anyhow!("Could not deserialize siwx cookie: {}", e))?,
+            None => {
+                return Err(anyhow!("No `siwx` cookie").into());
+            }
+        };
 
-    info!("sign_in: did={}", siwx_cookie.did);
-    let valid = did_method
-        .verify(&siwx_cookie.did, &siwx_cookie.message, &sig_bytes)
-        .map_err(|e| anyhow!("Verification error: {}", e))?;
-    if !valid {
-        return Err(CustomError::Unauthorized(
-            "Signature verification failed".to_string(),
-        ));
-    }
+        let sig_hex = siwx_cookie
+            .signature
+            .strip_prefix("0x")
+            .unwrap_or(&siwx_cookie.signature);
+        let sig_bytes = hex::decode(sig_hex)
+            .map_err(|e| CustomError::BadRequest(format!("Bad signature: {}", e)))?;
 
-    // Nonce must match the session.
-    let msg_nonce = extract_nonce(&siwx_cookie.message)
-        .ok_or_else(|| anyhow!("Nonce not found in CAIP-122 message"))?;
-    if msg_nonce != session_entry.siwe_nonce {
-        return Err(CustomError::BadRequest("Nonce mismatch".to_string()));
-    }
+        let did_method = find_did_method(&siwx_cookie.did).ok_or_else(|| {
+            CustomError::BadRequest(format!("Unsupported DID: {}", &siwx_cookie.did))
+        })?;
 
-    // At least one resource must match the redirect_uri.
-    let redirect_url = params.redirect_uri.url();
-    if !extract_resources(&siwx_cookie.message)
-        .iter()
-        .any(|r| Url::parse(r).ok().as_ref() == Some(redirect_url))
-    {
-        return Err(anyhow!("Missing or mismatched resource in CAIP-122 message").into());
-    }
+        if !allowed_did_methods
+            .iter()
+            .any(|m| m == did_method.method_name())
+        {
+            return Err(CustomError::BadRequest(format!(
+                "DID method '{}' is not enabled on this server",
+                did_method.method_name()
+            )));
+        }
+        if did_method.method_name() == "pkh" {
+            let namespace = siwx_cookie
+                .did
+                .strip_prefix("did:pkh:")
+                .and_then(|s| s.split(':').next())
+                .unwrap_or("");
+            if !allowed_pkh_namespaces.iter().any(|n| n == namespace) {
+                return Err(CustomError::BadRequest(format!(
+                    "did:pkh namespace '{namespace}' is not enabled on this server"
+                )));
+            }
+        }
+
+        info!("sign_in: did={}", siwx_cookie.did);
+        let valid = did_method
+            .verify(&siwx_cookie.did, &siwx_cookie.message, &sig_bytes)
+            .map_err(|e| anyhow!("Verification error: {}", e))?;
+        if !valid {
+            return Err(CustomError::Unauthorized(
+                "Signature verification failed".to_string(),
+            ));
+        }
+
+        let msg_nonce = extract_nonce(&siwx_cookie.message)
+            .ok_or_else(|| anyhow!("Nonce not found in CAIP-122 message"))?;
+        if msg_nonce != session_entry.siwe_nonce {
+            return Err(CustomError::BadRequest("Nonce mismatch".to_string()));
+        }
+
+        let redirect_url = params.redirect_uri.url();
+        if !extract_resources(&siwx_cookie.message)
+            .iter()
+            .any(|r| Url::parse(r).ok().as_ref() == Some(redirect_url))
+        {
+            return Err(
+                anyhow!("Missing or mismatched resource in CAIP-122 message").into(),
+            );
+        }
+
+        siwx_cookie.did
+    };
 
     let code_entry = CodeEntry {
-        did: siwx_cookie.did,
+        did,
         nonce: params.oidc_nonce.clone(),
         exchange_count: 0,
         client_id: params.client_id.clone(),
