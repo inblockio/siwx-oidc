@@ -275,7 +275,7 @@ async fn resolve_name(eth_provider: Option<Url>, address: Address) -> Result<Str
     let provider = alloy::providers::ProviderBuilder::new().connect_http(eth_provider);
     let resolver = IUniversalResolver::new(UNIVERSAL_RESOLVER, &provider);
     let reverse_name = dns_encode_reverse(&address);
-    let reverse_bytes: alloy_primitives::Bytes = reverse_name.into();
+    let reverse_bytes = alloy_primitives::Bytes::copy_from_slice(&reverse_name);
     debug!(
         "ENS reverse lookup: address={}, encoded_len={}",
         address_string,
