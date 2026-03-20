@@ -285,10 +285,10 @@ async fn resolve_claims(
             };
             (name, Some(result))
         } else {
-            (address_str.clone(), None)
+            (did.to_string(), None)
         }
     } else {
-        (address_str.clone(), None)
+        (did.to_string(), None)
     };
 
     let avatar = match ens_result {
