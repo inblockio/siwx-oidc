@@ -966,16 +966,26 @@ mod tests {
     }
 
     #[test(tokio::test)]
-    async fn test_claims() {
-        // Vitalik's DID — known ENS name
-        let res = resolve_claims(
-            Some("https://eth.llamarpc.com".try_into().unwrap()),
-            "did:pkh:eip155:1:0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
-        )
-        .await;
+    async fn test_claims_without_ens() {
+        // Without eth_provider, preferred_username is always the full DID.
+        let did = "did:pkh:eip155:1:0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+        let res = resolve_claims(None, did).await;
         assert_eq!(
             res.preferred_username().map(|u| u.to_string()),
-            Some("vitalik.eth".to_string())
+            Some(did.to_string())
+        );
+        // No ENS resolution → name claim should be absent.
+        assert!(res.name().is_none());
+    }
+
+    #[test(tokio::test)]
+    async fn test_claims_non_eip155() {
+        // Non-eip155 DID — preferred_username is the full DID, no ENS attempt.
+        let did = "did:pkh:ed25519:0xabcdef1234567890";
+        let res = resolve_claims(None, did).await;
+        assert_eq!(
+            res.preferred_username().map(|u| u.to_string()),
+            Some(did.to_string())
         );
     }
 
