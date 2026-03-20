@@ -29,7 +29,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 use std::time;
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use urlencoding::decode;
 use uuid::Uuid;
 
@@ -244,11 +244,16 @@ alloy::sol! {
     }
 }
 
-/// DNS-encode `<hex_addr>.addr.reverse` for the Universal Resolver.
+/// DNS-encode `<hex_addr>.addr.reverse` for the Universal Resolver (RFC 1035 wire format).
+///
+/// For address 0x4B23da…, produces:
+/// `\x28` + 40-char lowercase hex (no 0x) + `\x04addr\x07reverse\x00`
 fn dns_encode_reverse(address: &Address) -> Vec<u8> {
-    let hex_addr = format!("{:x}", address); // lowercase, no 0x prefix
+    // Use hex::encode on raw bytes — guaranteed lowercase, no prefix, exactly 40 chars.
+    let hex_addr = hex::encode(address.as_slice());
+    debug_assert_eq!(hex_addr.len(), 40);
     let labels: [&[u8]; 3] = [hex_addr.as_bytes(), b"addr", b"reverse"];
-    let mut buf = Vec::with_capacity(hex_addr.len() + 16);
+    let mut buf = Vec::with_capacity(55); // 1+40 + 1+4 + 1+7 + 1 = 55
     for label in &labels {
         buf.push(label.len() as u8);
         buf.extend_from_slice(label);
@@ -270,11 +275,26 @@ async fn resolve_name(eth_provider: Option<Url>, address: Address) -> Result<Str
     let provider = alloy::providers::ProviderBuilder::new().connect_http(eth_provider);
     let resolver = IUniversalResolver::new(UNIVERSAL_RESOLVER, &provider);
     let reverse_name = dns_encode_reverse(&address);
-    match resolver.reverse(reverse_name.into()).call().await {
-        Ok(result) if !result.name.is_empty() => Ok(result.name),
-        Ok(_) => Err(address_string),
+    let reverse_bytes: alloy_primitives::Bytes = reverse_name.into();
+    debug!(
+        "ENS reverse lookup: address={}, encoded_len={}",
+        address_string,
+        reverse_bytes.len()
+    );
+    match resolver.reverse(reverse_bytes).call().await {
+        Ok(result) if !result.name.is_empty() => {
+            info!("ENS resolved: {} -> {}", address_string, result.name);
+            Ok(result.name)
+        }
+        Ok(_) => {
+            debug!("ENS reverse returned empty name for {}", address_string);
+            Err(address_string)
+        }
         Err(e) => {
-            error!("Failed to resolve ENS name via Universal Resolver: {}", e);
+            error!(
+                "ENS Universal Resolver revert for {}: {:?}",
+                address_string, e
+            );
             Err(address_string)
         }
     }
@@ -975,6 +995,23 @@ mod tests {
     use sha3::{Digest, Keccak256};
     use siwx_core::did::{address_from_verifying_key, eip55_checksum};
     use test_log::test;
+
+    #[test]
+    fn test_dns_encode_reverse() {
+        let addr: Address = "0x4B23da593596D94035c57Adf6C2454216449B1B2"
+            .parse()
+            .unwrap();
+        let encoded = dns_encode_reverse(&addr);
+        // \x28 + 40-char hex + \x04 + "addr" + \x07 + "reverse" + \x00
+        assert_eq!(encoded.len(), 55);
+        assert_eq!(encoded[0], 0x28); // label length = 40
+        assert_eq!(&encoded[1..41], b"4b23da593596d94035c57adf6c2454216449b1b2");
+        assert_eq!(encoded[41], 0x04);
+        assert_eq!(&encoded[42..46], b"addr");
+        assert_eq!(encoded[46], 0x07);
+        assert_eq!(&encoded[47..54], b"reverse");
+        assert_eq!(encoded[54], 0x00);
+    }
 
     async fn default_config() -> (Config, RedisClient) {
         let config = Config::default();
