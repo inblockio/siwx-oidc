@@ -148,9 +148,14 @@ mod tests {
     fn ed25519_roundtrip() {
         let key = Ed25519SigningKey::generate(&mut OsRng);
         let did = ed25519_did(&key);
-        assert!(did.starts_with("did:key:z6Mk"), "expected z6Mk prefix, got {did}");
+        assert!(
+            did.starts_with("did:key:z6Mk"),
+            "expected z6Mk prefix, got {did}"
+        );
         let sig = key.sign(b"hello did:key");
-        assert!(KeyMethod.verify(&did, "hello did:key", &sig.to_bytes()).unwrap());
+        assert!(KeyMethod
+            .verify(&did, "hello did:key", &sig.to_bytes())
+            .unwrap());
     }
 
     #[test]
@@ -167,7 +172,9 @@ mod tests {
         let key = P256SigningKey::random(&mut OsRng);
         let did = p256_did(&key);
         let sig: P256Signature = key.sign(b"hello p256 key");
-        assert!(KeyMethod.verify(&did, "hello p256 key", &sig.to_bytes()).unwrap());
+        assert!(KeyMethod
+            .verify(&did, "hello p256 key", &sig.to_bytes())
+            .unwrap());
     }
 
     #[test]
@@ -175,7 +182,9 @@ mod tests {
         let key = P256SigningKey::random(&mut OsRng);
         let did = p256_did(&key);
         let sig: P256Signature = key.sign(b"hello p256 key");
-        assert!(KeyMethod.verify(&did, "hello p256 key", sig.to_der().as_bytes()).unwrap());
+        assert!(KeyMethod
+            .verify(&did, "hello p256 key", sig.to_der().as_bytes())
+            .unwrap());
     }
 
     #[test]

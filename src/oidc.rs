@@ -7,21 +7,19 @@ use headers::{self, authorization::Bearer};
 use openidconnect::{
     core::{
         CoreAuthErrorResponseType, CoreAuthPrompt, CoreClaimName, CoreClientAuthMethod,
-        CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType,
-        CoreGenderClaim, CoreGrantType, CoreIdToken, CoreIdTokenClaims, CoreIdTokenFields,
-        CoreJsonWebKey, CoreJsonWebKeySet,
-        CoreJwsSigningAlgorithm, CoreProviderMetadata, CoreRegisterErrorResponseType,
-        CoreResponseType, CoreSubjectIdentifierType, CoreTokenResponse, CoreTokenType,
-        CoreUserInfoClaims, CoreUserInfoJsonWebToken,
+        CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType, CoreGenderClaim,
+        CoreGrantType, CoreIdToken, CoreIdTokenClaims, CoreIdTokenFields, CoreJsonWebKey,
+        CoreJsonWebKeySet, CoreJwsSigningAlgorithm, CoreProviderMetadata,
+        CoreRegisterErrorResponseType, CoreResponseType, CoreSubjectIdentifierType,
+        CoreTokenResponse, CoreTokenType, CoreUserInfoClaims, CoreUserInfoJsonWebToken,
     },
     registration::{EmptyAdditionalClientMetadata, EmptyAdditionalClientRegistrationResponse},
     url::Url,
-    AccessToken, Audience, AuthUrl, ClientConfigUrl, ClientId, ClientSecret,
-    EmptyAdditionalClaims, EmptyAdditionalProviderMetadata, EmptyExtraTokenFields,
-    EndUserName, EndUserPictureUrl, EndUserUsername, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl,
-    LocalizedClaim, Nonce, OpPolicyUrl, OpTosUrl, PrivateSigningKey, RedirectUrl,
-    RegistrationAccessToken, RegistrationUrl, RequestUrl, ResponseTypes, Scope, SigningError,
-    StandardClaims, SubjectIdentifier, TokenUrl, UserInfoUrl,
+    AccessToken, Audience, AuthUrl, ClientConfigUrl, ClientId, ClientSecret, EmptyAdditionalClaims,
+    EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserName, EndUserPictureUrl,
+    EndUserUsername, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl, LocalizedClaim, Nonce, OpPolicyUrl,
+    OpTosUrl, PrivateSigningKey, RedirectUrl, RegistrationAccessToken, RegistrationUrl, RequestUrl,
+    ResponseTypes, Scope, SigningError, StandardClaims, SubjectIdentifier, TokenUrl, UserInfoUrl,
 };
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
@@ -35,9 +33,9 @@ use tracing::{error, info};
 use urlencoding::decode;
 use uuid::Uuid;
 
-use subtle::ConstantTimeEq;
 use siwx_core::find_did_method;
 use siwx_oidc::db::*;
+use subtle::ConstantTimeEq;
 
 /// Constant-time string comparison to prevent timing attacks on secrets.
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -54,8 +52,7 @@ lazy_static::lazy_static! {
         Scope::new("profile".to_string()),
     ];
 }
-const SIGNING_ALG: [CoreJwsSigningAlgorithm; 1] =
-    [CoreJwsSigningAlgorithm::EcdsaP256Sha256];
+const SIGNING_ALG: [CoreJwsSigningAlgorithm; 1] = [CoreJwsSigningAlgorithm::EcdsaP256Sha256];
 pub const METADATA_PATH: &str = "/.well-known/openid-configuration";
 pub const JWK_PATH: &str = "/jwk";
 pub const TOKEN_PATH: &str = "/token";
@@ -68,7 +65,7 @@ pub const SIWX_COOKIE_KEY: &str = "siwx";
 pub const TOU_PATH: &str = "/legal/terms-of-use.pdf";
 pub const PP_PATH: &str = "/legal/privacy-policy.pdf";
 
-type DBClientType = dyn DBClient + Sync ;
+type DBClientType = dyn DBClient + Sync;
 
 // -- ES256 key wrapper implementing openidconnect's PrivateSigningKey ------
 
@@ -182,10 +179,7 @@ pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
         vec![
             ResponseTypes::new(vec![CoreResponseType::Code]),
             ResponseTypes::new(vec![CoreResponseType::IdToken]),
-            ResponseTypes::new(vec![
-                CoreResponseType::Token,
-                CoreResponseType::IdToken,
-            ]),
+            ResponseTypes::new(vec![CoreResponseType::Token, CoreResponseType::IdToken]),
         ],
         vec![CoreSubjectIdentifierType::Pairwise],
         SIGNING_ALG.to_vec(),
@@ -245,8 +239,7 @@ async fn resolve_name(eth_provider: Option<Url>, address: Address) -> Result<Str
         Some(p) => p,
         None => return Err(address_string),
     };
-    let provider = alloy::providers::ProviderBuilder::new()
-        .connect_http(eth_provider);
+    let provider = alloy::providers::ProviderBuilder::new().connect_http(eth_provider);
     match provider.lookup_address(&address).await {
         Ok(n) => Ok(n),
         Err(e) => {
@@ -263,10 +256,7 @@ async fn resolve_avatar(_eth_provider: Option<Url>, _ens_name: &str) -> Option<U
     None
 }
 
-async fn resolve_claims(
-    eth_provider: Option<Url>,
-    did: &str,
-) -> StandardClaims<CoreGenderClaim> {
+async fn resolve_claims(eth_provider: Option<Url>, did: &str) -> StandardClaims<CoreGenderClaim> {
     // canonical_subject is the OIDC sub claim — full DID string for did:pkh.
     let subject = find_did_method(did)
         .and_then(|m| m.canonical_subject(did).ok())
@@ -362,9 +352,7 @@ pub async fn token(
         let client_entry = db_client
             .get_client(client_id.clone())
             .await?
-            .ok_or_else(|| {
-                CustomError::Unauthorized("Unrecognised client id.".to_string())
-            })?;
+            .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
         if !constant_time_eq(&secret, &client_entry.secret) {
             return Err(CustomError::Unauthorized("Bad secret.".to_string()));
         }
@@ -595,7 +583,12 @@ pub async fn authorize(
     Ok((
         format!(
             "/?nonce={}&domain={}&redirect_uri={}&state={}&client_id={}{}{}",
-            nonce, domain, *params.redirect_uri, state, params.client_id, oidc_nonce_param,
+            nonce,
+            domain,
+            *params.redirect_uri,
+            state,
+            params.client_id,
+            oidc_nonce_param,
             pkce_params
         ),
         Box::new(session_cookie),
@@ -700,19 +693,22 @@ pub async fn sign_in(
         .map_err(|e| CustomError::BadRequest(format!("Bad signature: {}", e)))?;
 
     // Dispatch to the appropriate DID method and verify.
-    let did_method = find_did_method(&siwx_cookie.did).ok_or_else(|| {
-        CustomError::BadRequest(format!("Unsupported DID: {}", &siwx_cookie.did))
-    })?;
+    let did_method = find_did_method(&siwx_cookie.did)
+        .ok_or_else(|| CustomError::BadRequest(format!("Unsupported DID: {}", &siwx_cookie.did)))?;
 
     // Enforce configured allow-lists.
-    if !allowed_did_methods.iter().any(|m| m == did_method.method_name()) {
+    if !allowed_did_methods
+        .iter()
+        .any(|m| m == did_method.method_name())
+    {
         return Err(CustomError::BadRequest(format!(
             "DID method '{}' is not enabled on this server",
             did_method.method_name()
         )));
     }
     if did_method.method_name() == "pkh" {
-        let namespace = siwx_cookie.did
+        let namespace = siwx_cookie
+            .did
             .strip_prefix("did:pkh:")
             .and_then(|s| s.split(':').next())
             .unwrap_or("");
@@ -916,12 +912,11 @@ pub async fn userinfo(
         return Err(CustomError::BadRequest("Unknown code.".to_string()));
     };
 
-    let client_entry =
-        if let Some(c) = db_client.get_client(code_entry.client_id.clone()).await? {
-            c
-        } else {
-            return Err(CustomError::BadRequest("Unknown client.".to_string()));
-        };
+    let client_entry = if let Some(c) = db_client.get_client(code_entry.client_id.clone()).await? {
+        c
+    } else {
+        return Err(CustomError::BadRequest("Unknown client.".to_string()));
+    };
 
     let response = CoreUserInfoClaims::new(
         resolve_claims(eth_provider, &code_entry.did).await,
@@ -1037,8 +1032,7 @@ mod tests {
         };
         let (redirect_url, cookie) = authorize(params, &db_client).await.unwrap();
         let authorize_params: AuthorizeQueryParams =
-            serde_urlencoded::from_str(redirect_url.split("/?").collect::<Vec<&str>>()[1])
-                .unwrap();
+            serde_urlencoded::from_str(redirect_url.split("/?").collect::<Vec<&str>>()[1]).unwrap();
         let params: SignInParams = serde_urlencoded::from_str(&redirect_url).unwrap();
 
         // Build the CAIP-122 message (EIP-4361 format for eip155).
@@ -1066,8 +1060,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "cookie",
-            HeaderValue::from_str(&format!("{cookie}; {SIWX_COOKIE_KEY}={siwx_cookie}"))
-                .unwrap(),
+            HeaderValue::from_str(&format!("{cookie}; {SIWX_COOKIE_KEY}={siwx_cookie}")).unwrap(),
         );
         let cookie = headers.typed_get::<headers::Cookie>().unwrap();
         let default_methods = vec!["pkh".to_string()];

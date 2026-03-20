@@ -113,7 +113,9 @@ mod tests {
         let key = Ed25519SigningKey::generate(&mut OsRng);
         let did = format!("did:peer:0z{}", z_encode_ed25519(&key));
         let sig = key.sign(b"hello peer v0");
-        assert!(PeerMethod.verify(&did, "hello peer v0", &sig.to_bytes()).unwrap());
+        assert!(PeerMethod
+            .verify(&did, "hello peer v0", &sig.to_bytes())
+            .unwrap());
     }
 
     #[test]
@@ -121,7 +123,9 @@ mod tests {
         let key = P256SigningKey::random(&mut OsRng);
         let did = format!("did:peer:0z{}", z_encode_p256(&key));
         let sig: P256Sig = key.sign(b"p256 peer v0");
-        assert!(PeerMethod.verify(&did, "p256 peer v0", &sig.to_bytes()).unwrap());
+        assert!(PeerMethod
+            .verify(&did, "p256 peer v0", &sig.to_bytes())
+            .unwrap());
     }
 
     #[test]
@@ -135,7 +139,9 @@ mod tests {
         );
         // must verify with the V (verification) key
         let sig = ver_key.sign(b"hello peer v2");
-        assert!(PeerMethod.verify(&did, "hello peer v2", &sig.to_bytes()).unwrap());
+        assert!(PeerMethod
+            .verify(&did, "hello peer v2", &sig.to_bytes())
+            .unwrap());
     }
 
     #[test]
@@ -149,7 +155,9 @@ mod tests {
         );
         // signing with the E (encryption) key should fail
         let sig = enc_key.sign(b"hello peer v2");
-        assert!(!PeerMethod.verify(&did, "hello peer v2", &sig.to_bytes()).unwrap());
+        assert!(!PeerMethod
+            .verify(&did, "hello peer v2", &sig.to_bytes())
+            .unwrap());
     }
 
     #[test]
@@ -163,7 +171,9 @@ mod tests {
             z_encode_ed25519(&enc_key)
         );
         let sig = ver_key.sign(b"v before e");
-        assert!(PeerMethod.verify(&did, "v before e", &sig.to_bytes()).unwrap());
+        assert!(PeerMethod
+            .verify(&did, "v before e", &sig.to_bytes())
+            .unwrap());
     }
 
     #[test]

@@ -34,8 +34,8 @@ impl DIDMethod for PkhMethod {
 
     fn address_for_message(&self, did: &str) -> Result<String, SiwxError> {
         let (ns, remainder) = split_namespace(did)?;
-        let suite = find_cipher_suite(ns)
-            .ok_or_else(|| SiwxError::UnsupportedMethod(ns.to_string()))?;
+        let suite =
+            find_cipher_suite(ns).ok_or_else(|| SiwxError::UnsupportedMethod(ns.to_string()))?;
         let (address, _) = suite.parse_did_parts(remainder)?;
         // For eip155 always return EIP-55 checksummed form.
         if ns == "eip155" {
@@ -54,8 +54,8 @@ impl DIDMethod for PkhMethod {
 
     fn chain_id(&self, did: &str) -> Result<Option<String>, SiwxError> {
         let (ns, remainder) = split_namespace(did)?;
-        let suite = find_cipher_suite(ns)
-            .ok_or_else(|| SiwxError::UnsupportedMethod(ns.to_string()))?;
+        let suite =
+            find_cipher_suite(ns).ok_or_else(|| SiwxError::UnsupportedMethod(ns.to_string()))?;
         let (_, chain_id) = suite.parse_did_parts(remainder)?;
         Ok(chain_id)
     }
@@ -65,15 +65,10 @@ impl DIDMethod for PkhMethod {
         Ok(did.to_string())
     }
 
-    fn verify(
-        &self,
-        did: &str,
-        canonical_msg: &str,
-        signature: &[u8],
-    ) -> Result<bool, SiwxError> {
+    fn verify(&self, did: &str, canonical_msg: &str, signature: &[u8]) -> Result<bool, SiwxError> {
         let (ns, _) = split_namespace(did)?;
-        let suite = find_cipher_suite(ns)
-            .ok_or_else(|| SiwxError::UnsupportedMethod(ns.to_string()))?;
+        let suite =
+            find_cipher_suite(ns).ok_or_else(|| SiwxError::UnsupportedMethod(ns.to_string()))?;
         suite.verify(did, canonical_msg, signature)
     }
 }

@@ -42,12 +42,7 @@ pub trait DIDMethod: Send + Sync {
     /// - `did` — the signer's full DID string
     /// - `canonical_msg` — the canonical CAIP-122 message that was signed
     /// - `signature` — raw signature bytes (caller hex-decodes from cookie)
-    fn verify(
-        &self,
-        did: &str,
-        canonical_msg: &str,
-        signature: &[u8],
-    ) -> Result<bool, SiwxError>;
+    fn verify(&self, did: &str, canonical_msg: &str, signature: &[u8]) -> Result<bool, SiwxError>;
 }
 
 /// All registered DID method handlers, in priority order.
@@ -57,7 +52,11 @@ pub fn all_did_methods() -> Vec<Box<dyn DIDMethod>> {
     use crate::key::KeyMethod;
     use crate::peer::PeerMethod;
     use crate::pkh::PkhMethod;
-    vec![Box::new(PkhMethod), Box::new(KeyMethod), Box::new(PeerMethod)]
+    vec![
+        Box::new(PkhMethod),
+        Box::new(KeyMethod),
+        Box::new(PeerMethod),
+    ]
 }
 
 /// Find the handler for `did`, or `None` if no registered method matches.

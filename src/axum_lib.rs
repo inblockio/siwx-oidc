@@ -18,8 +18,8 @@ use figment::{
 };
 use headers::Header;
 use openidconnect::core::{
-    CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType,
-    CoreJsonWebKeySet, CoreTokenResponse, CoreUserInfoClaims, CoreUserInfoJsonWebToken,
+    CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType, CoreJsonWebKeySet,
+    CoreTokenResponse, CoreUserInfoClaims, CoreUserInfoJsonWebToken,
 };
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
@@ -31,9 +31,9 @@ use tracing::info;
 
 use super::config;
 use super::oidc::{self, CustomError, EcdsaSigningKey};
+use openidconnect::JsonWebKeyId;
 use siwx_core::{all_cipher_suites, all_did_methods};
 use siwx_oidc::db::*;
-use openidconnect::JsonWebKeyId;
 
 // -- Shared application state ----------------------------------------------
 
@@ -55,9 +55,7 @@ impl IntoResponse for CustomError {
             CustomError::BadRequestRegister(e) => {
                 (StatusCode::BAD_REQUEST, Json(e)).into_response()
             }
-            CustomError::BadRequestToken(e) => {
-                (StatusCode::BAD_REQUEST, Json(e)).into_response()
-            }
+            CustomError::BadRequestToken(e) => (StatusCode::BAD_REQUEST, Json(e)).into_response(),
             CustomError::Unauthorized(_) => {
                 (StatusCode::UNAUTHORIZED, self.to_string()).into_response()
             }
@@ -72,9 +70,7 @@ impl IntoResponse for CustomError {
 
 // -- Route handlers --------------------------------------------------------
 
-async fn jwk_set(
-    State(state): State<AppState>,
-) -> Result<Json<CoreJsonWebKeySet>, CustomError> {
+async fn jwk_set(State(state): State<AppState>) -> Result<Json<CoreJsonWebKeySet>, CustomError> {
     let jwks = oidc::jwks(&state.signing_key)?;
     Ok(jwks.into())
 }
@@ -113,12 +109,10 @@ async fn token(
         // Wrap non-Token errors so they always produce a JSON body.
         match e {
             CustomError::BadRequestToken(_) => e,
-            CustomError::Unauthorized(msg) => {
-                CustomError::BadRequestToken(oidc::TokenError {
-                    error: CoreErrorResponseType::InvalidClient,
-                    error_description: msg,
-                })
-            }
+            CustomError::Unauthorized(msg) => CustomError::BadRequestToken(oidc::TokenError {
+                error: CoreErrorResponseType::InvalidClient,
+                error_description: msg,
+            }),
             other => CustomError::BadRequestToken(oidc::TokenError {
                 error: CoreErrorResponseType::InvalidRequest,
                 error_description: other.to_string(),
@@ -162,8 +156,7 @@ async fn register(
     State(state): State<AppState>,
     Json(payload): Json<CoreClientMetadata>,
 ) -> Result<(StatusCode, Json<CoreClientRegistrationResponse>), CustomError> {
-    let registration =
-        oidc::register(payload, state.config.base_url, &state.redis_client).await?;
+    let registration = oidc::register(payload, state.config.base_url, &state.redis_client).await?;
     Ok((StatusCode::CREATED, registration.into()))
 }
 
@@ -175,9 +168,7 @@ impl IntoResponse for UserInfoResponseJWT {
             .status(StatusCode::OK)
             .header(ContentType::name(), "application/jwt")
             .body(axum::body::Body::from(
-                serde_json::to_string(&self.0 .0)
-                    .unwrap()
-                    .replace('"', ""),
+                serde_json::to_string(&self.0 .0).unwrap().replace('"', ""),
             ))
             .unwrap()
     }
@@ -354,9 +345,7 @@ pub async fn main() {
         .route(oidc::USERINFO_PATH, get(userinfo).post(userinfo_post))
         .route(
             &format!("{}/{{id}}", oidc::CLIENT_PATH),
-            get(clientinfo)
-                .delete(client_delete)
-                .post(client_update),
+            get(clientinfo).delete(client_delete).post(client_update),
         )
         .route(oidc::SIGNIN_PATH, get(sign_in))
         .route("/health", get(healthcheck))

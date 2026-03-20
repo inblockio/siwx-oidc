@@ -49,9 +49,8 @@ impl CipherSuite for Eip155Suite {
         let sig = k256::ecdsa::Signature::from_slice(&signature[..64])
             .map_err(|e| SiwxError::InvalidSignature(e.to_string()))?;
 
-        let recovered =
-            k256::ecdsa::VerifyingKey::recover_from_prehash(&prehash, &sig, rec_id)
-                .map_err(|e| SiwxError::InvalidSignature(format!("ecrecover failed: {e}")))?;
+        let recovered = k256::ecdsa::VerifyingKey::recover_from_prehash(&prehash, &sig, rec_id)
+            .map_err(|e| SiwxError::InvalidSignature(format!("ecrecover failed: {e}")))?;
 
         Ok(address_from_verifying_key(&recovered) == expected_addr)
     }
@@ -60,7 +59,9 @@ impl CipherSuite for Eip155Suite {
     fn parse_did_parts(&self, did_remainder: &str) -> Result<(String, Option<String>), SiwxError> {
         let mut parts = did_remainder.splitn(2, ':');
         let chain_num = parts.next().ok_or_else(|| {
-            SiwxError::InvalidDid(format!("missing chain_id in eip155 remainder: {did_remainder}"))
+            SiwxError::InvalidDid(format!(
+                "missing chain_id in eip155 remainder: {did_remainder}"
+            ))
         })?;
         let address = parts.next().ok_or_else(|| {
             SiwxError::InvalidDid(format!(

@@ -31,8 +31,7 @@ pub trait CipherSuite: Send + Sync {
     ///
     /// For eip155 `"1:0xAbCd…"` → `("0xAbCd…", Some("eip155:1"))`.
     /// For ed25519 `"0x{pubkey}"` → `("0x{pubkey}", None)`.
-    fn parse_did_parts(&self, did_remainder: &str)
-        -> Result<(String, Option<String>), SiwxError>;
+    fn parse_did_parts(&self, did_remainder: &str) -> Result<(String, Option<String>), SiwxError>;
 }
 
 /// All registered cipher suite handlers, in priority order.

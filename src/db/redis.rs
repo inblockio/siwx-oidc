@@ -181,10 +181,9 @@ impl DBClient for RedisClient {
         match entry {
             Some(e) => {
                 debug!("try_consume_code: found key={}", key);
-                Ok(Some(
-                    serde_json::from_str(&e)
-                        .map_err(|e| anyhow!("Failed to deserialize code entry: {}", e))?,
-                ))
+                Ok(Some(serde_json::from_str(&e).map_err(|e| {
+                    anyhow!("Failed to deserialize code entry: {}", e)
+                })?))
             }
             None => {
                 debug!("try_consume_code: NOT FOUND key={}", key);

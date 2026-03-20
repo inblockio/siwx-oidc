@@ -81,7 +81,9 @@ mod tests {
     fn tampered_message_rejects() {
         let (key, did) = make_keypair();
         let sig = key.sign(b"original");
-        assert!(!Ed25519Suite.verify(&did, "tampered", &sig.to_bytes()).unwrap());
+        assert!(!Ed25519Suite
+            .verify(&did, "tampered", &sig.to_bytes())
+            .unwrap());
     }
 
     #[test]

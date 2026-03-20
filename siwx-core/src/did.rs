@@ -114,14 +114,16 @@ mod tests {
         let raw = hex::decode("5aaeb6053f3e94c9b9a09f33669435e7ef1beaed").unwrap();
         let mut addr = [0u8; 20];
         addr.copy_from_slice(&raw);
-        assert_eq!(eip55_checksum(&addr), "5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed");
+        assert_eq!(
+            eip55_checksum(&addr),
+            "5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
+        );
     }
 
     #[test]
     fn parse_eip155_namespace() {
-        let ns =
-            parse_did_namespace("did:pkh:eip155:1:0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B")
-                .unwrap();
+        let ns = parse_did_namespace("did:pkh:eip155:1:0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B")
+            .unwrap();
         assert_eq!(ns, "eip155");
     }
 

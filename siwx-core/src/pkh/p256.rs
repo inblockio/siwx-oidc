@@ -72,7 +72,9 @@ mod tests {
         let (key, did) = make_keypair();
         let msg = "hello siwx";
         let sig: Signature = key.sign(msg.as_bytes());
-        assert!(P256Suite.verify(&did, msg, sig.to_der().as_bytes()).unwrap());
+        assert!(P256Suite
+            .verify(&did, msg, sig.to_der().as_bytes())
+            .unwrap());
     }
 
     #[test]

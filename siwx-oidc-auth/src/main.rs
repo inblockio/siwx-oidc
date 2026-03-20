@@ -30,7 +30,6 @@ struct Cli {
     redirect_uri: Option<String>,
 
     // -- Key input (priority: --key-file > SIWX_KEY_FILE > --key-hex > generate) --
-
     /// Path to a PKCS#8 PEM private key file. Auto-detects Ed25519 vs P-256.
     /// Can also be set via SIWX_KEY_FILE environment variable.
     #[arg(long, env = "SIWX_KEY_FILE")]
