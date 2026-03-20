@@ -29,7 +29,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 use std::time;
 use thiserror::Error;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 use urlencoding::decode;
 use uuid::Uuid;
 
@@ -267,20 +267,19 @@ const UNIVERSAL_RESOLVER: Address =
     alloy_primitives::address!("0xeeeeeeee14d718c2b47d9923deab1335e144eeee");
 
 async fn resolve_name(eth_provider: Option<Url>, address: Address) -> Result<String, String> {
+    use alloy::ens::ProviderEnsExt;
+
     let address_string = address.to_checksum(None);
     let eth_provider = match eth_provider {
         Some(p) => p,
         None => return Err(address_string),
     };
     let provider = alloy::providers::ProviderBuilder::new().connect_http(eth_provider);
+
+    // Try Universal Resolver first (supports NameWrapper / modern ENS primary names).
     let resolver = IUniversalResolver::new(UNIVERSAL_RESOLVER, &provider);
     let reverse_name = dns_encode_reverse(&address);
     let reverse_bytes = alloy_primitives::Bytes::copy_from_slice(&reverse_name);
-    debug!(
-        "ENS reverse lookup: address={}, encoded_len={}",
-        address_string,
-        reverse_bytes.len()
-    );
     // coinType 60 = Ethereum (SLIP-44), empty gateways array
     match resolver
         .reverseWithGateways(reverse_bytes, alloy_primitives::U256::from(60), vec![])
@@ -289,20 +288,36 @@ async fn resolve_name(eth_provider: Option<Url>, address: Address) -> Result<Str
     {
         Ok(result) if !result.resolvedName.is_empty() => {
             info!(
-                "ENS resolved: {} -> {}",
+                "ENS resolved (Universal Resolver): {} -> {}",
                 address_string, result.resolvedName
             );
-            Ok(result.resolvedName)
+            return Ok(result.resolvedName);
         }
         Ok(_) => {
-            debug!("ENS reverse returned empty name for {}", address_string);
-            Err(address_string)
+            debug!(
+                "Universal Resolver returned empty name for {}, trying legacy",
+                address_string
+            );
         }
         Err(e) => {
-            error!(
-                "ENS Universal Resolver revert for {}: {:?}",
+            // Universal Resolver may revert for offchain resolvers (CCIP Read / EIP-3668)
+            // which alloy doesn't support yet. Fall back to legacy ENS registry.
+            debug!(
+                "Universal Resolver revert for {} (likely CCIP Read), trying legacy: {:?}",
                 address_string, e
             );
+        }
+    }
+
+    // Fallback: legacy ENS registry (doesn't support NameWrapper but handles
+    // standard reverse records and doesn't require CCIP Read).
+    match provider.lookup_address(&address).await {
+        Ok(n) => {
+            info!("ENS resolved (legacy): {} -> {}", address_string, n);
+            Ok(n)
+        }
+        Err(e) => {
+            debug!("ENS legacy lookup failed for {}: {}", address_string, e);
             Err(address_string)
         }
     }
