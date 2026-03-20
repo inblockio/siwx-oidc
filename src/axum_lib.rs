@@ -104,10 +104,7 @@ async fn token(
         form,
         secret,
         &state.signing_key,
-        state.config.base_url,
-        state.config.require_secret,
-        state.config.id_token_ttl_secs,
-        state.config.eth_provider,
+        &state.config,
         &state.redis_client,
     )
     .await

@@ -326,10 +326,7 @@ pub async fn token(
     form: TokenForm,
     secret: Option<String>,
     signing_key: &EcdsaSigningKey,
-    base_url: Url,
-    require_secret: bool,
-    id_token_ttl_secs: u64,
-    eth_provider: Option<Url>,
+    config: &crate::config::Config,
     db_client: &DBClientType,
 ) -> Result<CoreTokenResponse, CustomError> {
     // Validate grant_type.
@@ -371,7 +368,7 @@ pub async fn token(
         if !constant_time_eq(&secret, &client_entry.secret) {
             return Err(CustomError::Unauthorized("Bad secret.".to_string()));
         }
-    } else if require_secret {
+    } else if config.require_secret {
         return Err(CustomError::Unauthorized("Secret required.".to_string()));
     }
 
@@ -415,11 +412,11 @@ pub async fn token(
         .await?;
     let access_token = AccessToken::new(access_token_id);
     let core_id_token = CoreIdTokenClaims::new(
-        IssuerUrl::from_url(base_url),
+        IssuerUrl::from_url(config.base_url.clone()),
         vec![Audience::new(client_id.clone())],
-        Utc::now() + Duration::seconds(id_token_ttl_secs as i64),
+        Utc::now() + Duration::seconds(config.id_token_ttl_secs as i64),
         Utc::now(),
-        resolve_claims(eth_provider, &code_entry.did).await,
+        resolve_claims(config.eth_provider.clone(), &code_entry.did).await,
         EmptyAdditionalClaims {},
     )
     .set_nonce(code_entry.nonce)
