@@ -19,6 +19,10 @@ pub struct Config {
     /// ID token lifetime in seconds. Default: 300 (5 minutes).
     pub id_token_ttl_secs: u64,
     pub eth_provider: Option<Url>,
+    /// ENS reverse-lookup API URL. Appended with `/{address}` and must return
+    /// JSON with an `ens_primary` field. Default: `https://api.ensdata.net`.
+    /// Set to empty string to disable ENS resolution entirely.
+    pub ens_api_url: Option<Url>,
     /// DID method names accepted at sign-in (e.g. ["pkh"]).
     /// Must be a subset of the methods registered in siwx-core.
     pub supported_did_methods: Vec<String>,
@@ -39,6 +43,7 @@ impl Default for Config {
             require_secret: true,
             id_token_ttl_secs: 300,
             eth_provider: None,
+            ens_api_url: Some(Url::parse("https://api.ensdata.net").unwrap()),
             supported_did_methods: vec!["pkh".to_string()],
             supported_pkh_namespaces: vec![
                 "eip155".to_string(),

@@ -16,9 +16,9 @@ use openidconnect::{
     registration::{EmptyAdditionalClientMetadata, EmptyAdditionalClientRegistrationResponse},
     url::Url,
     AccessToken, Audience, AuthUrl, ClientConfigUrl, ClientId, ClientSecret, EmptyAdditionalClaims,
-    EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserName, EndUserPictureUrl,
-    EndUserUsername, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl, LocalizedClaim, Nonce, OpPolicyUrl,
-    OpTosUrl, PrivateSigningKey, RedirectUrl, RegistrationAccessToken, RegistrationUrl, RequestUrl,
+    EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserName, EndUserUsername,
+    IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl, LocalizedClaim, Nonce, OpPolicyUrl, OpTosUrl,
+    PrivateSigningKey, RedirectUrl, RegistrationAccessToken, RegistrationUrl, RequestUrl,
     ResponseTypes, Scope, SigningError, StandardClaims, SubjectIdentifier, TokenUrl, UserInfoUrl,
 };
 use p256::{
@@ -230,107 +230,94 @@ pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
     Ok(pm)
 }
 
-// -- ENS resolution via Universal Resolver --------------------------------
+// -- ENS resolution -------------------------------------------------------
 //
-// alloy's built-in lookup_address() uses the legacy ENS registry which
-// doesn't support NameWrapper-based reverse records. Primary names set
-// through the modern ENS app require the Universal Resolver.
+// Primary strategy: HTTP API (handles CCIP Read / NameWrapper / offchain
+// names server-side). Default: api.ensdata.net. Override via ens_api_url.
+//
+// Fallback: on-chain via alloy's legacy ENS registry (eth_provider).
+// Does not support NameWrapper but handles classic reverse records.
 
-alloy::sol! {
-    #[sol(rpc)]
-    interface IUniversalResolver {
-        function reverseWithGateways(bytes calldata reverseName, uint256 coinType, string[] calldata gateways) external view
-            returns (string resolvedName, address resolver, address reverseResolver);
-    }
-}
-
-/// DNS-encode `<hex_addr>.addr.reverse` for the Universal Resolver (RFC 1035 wire format).
-///
-/// For address 0x4B23da…, produces:
-/// `\x28` + 40-char lowercase hex (no 0x) + `\x04addr\x07reverse\x00`
-fn dns_encode_reverse(address: &Address) -> Vec<u8> {
-    // Use hex::encode on raw bytes — guaranteed lowercase, no prefix, exactly 40 chars.
-    let hex_addr = hex::encode(address.as_slice());
-    debug_assert_eq!(hex_addr.len(), 40);
-    let labels: [&[u8]; 3] = [hex_addr.as_bytes(), b"addr", b"reverse"];
-    let mut buf = Vec::with_capacity(55); // 1+40 + 1+4 + 1+7 + 1 = 55
-    for label in &labels {
-        buf.push(label.len() as u8);
-        buf.extend_from_slice(label);
-    }
-    buf.push(0); // root terminator
-    buf
-}
-
-/// ENS Universal Resolver on mainnet.
-const UNIVERSAL_RESOLVER: Address =
-    alloy_primitives::address!("0xeeeeeeee14d718c2b47d9923deab1335e144eeee");
-
-async fn resolve_name(eth_provider: Option<Url>, address: Address) -> Result<String, String> {
-    use alloy::ens::ProviderEnsExt;
-
-    let address_string = address.to_checksum(None);
-    let eth_provider = match eth_provider {
-        Some(p) => p,
-        None => return Err(address_string),
-    };
-    let provider = alloy::providers::ProviderBuilder::new().connect_http(eth_provider);
-
-    // Try Universal Resolver first (supports NameWrapper / modern ENS primary names).
-    let resolver = IUniversalResolver::new(UNIVERSAL_RESOLVER, &provider);
-    let reverse_name = dns_encode_reverse(&address);
-    let reverse_bytes = alloy_primitives::Bytes::copy_from_slice(&reverse_name);
-    // coinType 60 = Ethereum (SLIP-44), empty gateways array
-    match resolver
-        .reverseWithGateways(reverse_bytes, alloy_primitives::U256::from(60), vec![])
-        .call()
-        .await
-    {
-        Ok(result) if !result.resolvedName.is_empty() => {
-            info!(
-                "ENS resolved (Universal Resolver): {} -> {}",
-                address_string, result.resolvedName
-            );
-            return Ok(result.resolvedName);
+/// Resolve ENS primary name via HTTP API.
+/// API must accept GET /{address} and return JSON with `ens_primary` field.
+async fn resolve_name_http(api_url: &Url, address_string: &str) -> Option<String> {
+    let url = format!(
+        "{}/{}",
+        api_url.as_str().trim_end_matches('/'),
+        address_string
+    );
+    let client = reqwest::Client::new();
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(name) = json.get("ens_primary").and_then(|v| v.as_str()) {
+                    if !name.is_empty() {
+                        info!("ENS resolved (HTTP API): {} -> {}", address_string, name);
+                        return Some(name.to_string());
+                    }
+                }
+            }
+            None
         }
-        Ok(_) => {
+        Ok(resp) => {
             debug!(
-                "Universal Resolver returned empty name for {}, trying legacy",
+                "ENS API returned status {} for {}",
+                resp.status(),
                 address_string
             );
+            None
         }
         Err(e) => {
-            // Universal Resolver may revert for offchain resolvers (CCIP Read / EIP-3668)
-            // which alloy doesn't support yet. Fall back to legacy ENS registry.
-            debug!(
-                "Universal Resolver revert for {} (likely CCIP Read), trying legacy: {:?}",
-                address_string, e
-            );
-        }
-    }
-
-    // Fallback: legacy ENS registry (doesn't support NameWrapper but handles
-    // standard reverse records and doesn't require CCIP Read).
-    match provider.lookup_address(&address).await {
-        Ok(n) => {
-            info!("ENS resolved (legacy): {} -> {}", address_string, n);
-            Ok(n)
-        }
-        Err(e) => {
-            debug!("ENS legacy lookup failed for {}: {}", address_string, e);
-            Err(address_string)
+            debug!("ENS API request failed for {}: {}", address_string, e);
+            None
         }
     }
 }
 
-async fn resolve_avatar(_eth_provider: Option<Url>, _ens_name: &str) -> Option<Url> {
-    // Avatar resolution requires ENS text record lookup which is not yet
-    // available in alloy's ENS extension. This can be added when alloy
-    // exposes get_ens_text or via direct contract calls.
+/// Resolve ENS primary name via on-chain legacy ENS registry.
+async fn resolve_name_onchain(eth_provider: &Url, address: &Address) -> Option<String> {
+    use alloy::ens::ProviderEnsExt;
+    let provider = alloy::providers::ProviderBuilder::new().connect_http(eth_provider.clone());
+    match provider.lookup_address(address).await {
+        Ok(n) => {
+            info!("ENS resolved (on-chain): {} -> {}", address, n);
+            Some(n)
+        }
+        Err(e) => {
+            debug!("ENS on-chain lookup failed for {}: {}", address, e);
+            None
+        }
+    }
+}
+
+async fn resolve_name(
+    ens_api_url: Option<&Url>,
+    eth_provider: Option<&Url>,
+    address: &Address,
+) -> Option<String> {
+    let address_string = address.to_checksum(None);
+
+    // Try HTTP API first (handles CCIP Read / NameWrapper / offchain names).
+    if let Some(api_url) = ens_api_url {
+        if let Some(name) = resolve_name_http(api_url, &address_string).await {
+            return Some(name);
+        }
+    }
+
+    // Fallback: on-chain legacy ENS registry.
+    if let Some(provider) = eth_provider {
+        if let Some(name) = resolve_name_onchain(provider, address).await {
+            return Some(name);
+        }
+    }
+
     None
 }
 
-async fn resolve_claims(eth_provider: Option<Url>, did: &str) -> StandardClaims<CoreGenderClaim> {
+async fn resolve_claims(
+    config: &crate::config::Config,
+    did: &str,
+) -> StandardClaims<CoreGenderClaim> {
     // canonical_subject is the OIDC sub claim — full DID string for did:pkh.
     let subject = find_did_method(did)
         .and_then(|m| m.canonical_subject(did).ok())
@@ -342,9 +329,14 @@ async fn resolve_claims(eth_provider: Option<Url>, did: &str) -> StandardClaims<
         .unwrap_or_else(|| did.to_string());
 
     // ENS resolution only for eip155 DIDs.
-    let ens_result = if did.starts_with("did:pkh:eip155:") {
+    let ens_name = if did.starts_with("did:pkh:eip155:") {
         if let Ok(addr) = address_str.parse::<Address>() {
-            Some(resolve_name(eth_provider.clone(), addr).await)
+            resolve_name(
+                config.ens_api_url.as_ref(),
+                config.eth_provider.as_ref(),
+                &addr,
+            )
+            .await
         } else {
             None
         }
@@ -352,23 +344,13 @@ async fn resolve_claims(eth_provider: Option<Url>, did: &str) -> StandardClaims<
         None
     };
 
-    let avatar = match ens_result {
-        Some(Ok(ref n)) => resolve_avatar(eth_provider, n).await,
-        _ => None,
-    };
-
     // preferred_username is ALWAYS the full DID (used as Matrix username).
     // name is the ENS name when available (used as Matrix display name).
     let mut claims = StandardClaims::new(SubjectIdentifier::new(subject))
-        .set_preferred_username(Some(EndUserUsername::new(did.to_string())))
-        .set_picture(avatar.map(|a| {
-            let mut m = LocalizedClaim::new();
-            m.insert(None, EndUserPictureUrl::new(a.to_string()));
-            m
-        }));
-    if let Some(Ok(ens_name)) = ens_result {
+        .set_preferred_username(Some(EndUserUsername::new(did.to_string())));
+    if let Some(name) = ens_name {
         let mut m = LocalizedClaim::new();
-        m.insert(None, EndUserName::new(ens_name));
+        m.insert(None, EndUserName::new(name));
         claims = claims.set_name(Some(m));
     }
     claims
@@ -478,7 +460,7 @@ pub async fn token(
         vec![Audience::new(client_id.clone())],
         Utc::now() + Duration::seconds(config.id_token_ttl_secs as i64),
         Utc::now(),
-        resolve_claims(config.eth_provider.clone(), &code_entry.did).await,
+        resolve_claims(config, &code_entry.did).await,
         EmptyAdditionalClaims {},
     )
     .set_nonce(code_entry.nonce)
@@ -966,8 +948,7 @@ pub enum UserInfoResponse {
 }
 
 pub async fn userinfo(
-    base_url: Url,
-    eth_provider: Option<Url>,
+    config: &crate::config::Config,
     signing_key: &EcdsaSigningKey,
     bearer: Option<Bearer>,
     payload: UserInfoPayload,
@@ -993,10 +974,10 @@ pub async fn userinfo(
     };
 
     let response = CoreUserInfoClaims::new(
-        resolve_claims(eth_provider, &code_entry.did).await,
+        resolve_claims(config, &code_entry.did).await,
         EmptyAdditionalClaims::default(),
     )
-    .set_issuer(Some(IssuerUrl::from_url(base_url.clone())))
+    .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
     .set_audiences(Some(vec![Audience::new(code_entry.client_id)]));
     match client_entry.metadata.userinfo_signed_response_alg() {
         None => Ok(UserInfoResponse::Json(response)),
@@ -1019,23 +1000,6 @@ mod tests {
     use siwx_core::did::{address_from_verifying_key, eip55_checksum};
     use test_log::test;
 
-    #[test]
-    fn test_dns_encode_reverse() {
-        let addr: Address = "0x4B23da593596D94035c57Adf6C2454216449B1B2"
-            .parse()
-            .unwrap();
-        let encoded = dns_encode_reverse(&addr);
-        // \x28 + 40-char hex + \x04 + "addr" + \x07 + "reverse" + \x00
-        assert_eq!(encoded.len(), 55);
-        assert_eq!(encoded[0], 0x28); // label length = 40
-        assert_eq!(&encoded[1..41], b"4b23da593596d94035c57adf6c2454216449b1b2");
-        assert_eq!(encoded[41], 0x04);
-        assert_eq!(&encoded[42..46], b"addr");
-        assert_eq!(encoded[46], 0x07);
-        assert_eq!(&encoded[47..54], b"reverse");
-        assert_eq!(encoded[54], 0x00);
-    }
-
     async fn default_config() -> (Config, RedisClient) {
         let config = Config::default();
         let db_client = RedisClient::new(&config.redis_url).await.unwrap();
@@ -1056,11 +1020,20 @@ mod tests {
         (config, db_client)
     }
 
+    fn config_no_ens() -> Config {
+        Config {
+            ens_api_url: None,
+            eth_provider: None,
+            ..Config::default()
+        }
+    }
+
     #[test(tokio::test)]
     async fn test_claims_without_ens() {
-        // Without eth_provider, preferred_username is always the full DID.
+        // Without ENS config, preferred_username is always the full DID.
         let did = "did:pkh:eip155:1:0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
-        let res = resolve_claims(None, did).await;
+        let config = config_no_ens();
+        let res = resolve_claims(&config, did).await;
         assert_eq!(
             res.preferred_username().map(|u| u.to_string()),
             Some(did.to_string())
@@ -1073,7 +1046,8 @@ mod tests {
     async fn test_claims_non_eip155() {
         // Non-eip155 DID — preferred_username is the full DID, no ENS attempt.
         let did = "did:pkh:ed25519:0xabcdef1234567890";
-        let res = resolve_claims(None, did).await;
+        let config = config_no_ens();
+        let res = resolve_claims(&config, did).await;
         assert_eq!(
             res.preferred_username().map(|u| u.to_string()),
             Some(did.to_string())
@@ -1108,7 +1082,7 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_flow() {
-        let (_config, db_client) = default_config().await;
+        let (config, db_client) = default_config().await;
 
         // Generate an eip155 keypair (same approach as Eip155Suite tests).
         let secret = k256::SecretKey::random(&mut rand::thread_rng());
@@ -1185,8 +1159,7 @@ mod tests {
         let oidc_signing_key =
             EcdsaSigningKey::generate(Some(JsonWebKeyId::new("key1".to_string())));
         let _ = userinfo(
-            base_url,
-            None,
+            &config,
             &oidc_signing_key,
             None,
             UserInfoPayload {

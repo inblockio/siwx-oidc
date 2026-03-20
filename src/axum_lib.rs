@@ -194,8 +194,7 @@ async fn userinfo(
 ) -> Result<UserInfoResponse, CustomError> {
     let payload = oidc::UserInfoPayload { access_token: None };
     let claims = oidc::userinfo(
-        state.config.base_url,
-        state.config.eth_provider,
+        &state.config,
         &state.signing_key,
         bearer.map(|b| b.0 .0),
         payload,
@@ -214,8 +213,7 @@ async fn userinfo_post(
     Form(payload): Form<oidc::UserInfoPayload>,
 ) -> Result<UserInfoResponse, CustomError> {
     let claims = oidc::userinfo(
-        state.config.base_url,
-        state.config.eth_provider,
+        &state.config,
         &state.signing_key,
         bearer.map(|b| b.0 .0),
         payload,

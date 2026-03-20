@@ -29,6 +29,7 @@ lazy_static = "1.4"
 openidconnect = "4.0"
 p256 = { version = "0.13", features = ["ecdsa", "pem", "jwk"] }
 rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_urlencoded = "0.7"
