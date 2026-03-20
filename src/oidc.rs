@@ -239,8 +239,8 @@ pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
 alloy::sol! {
     #[sol(rpc)]
     interface IUniversalResolver {
-        function reverse(bytes calldata reverseName) external view
-            returns (string name, address resolvedAddress, address reverseResolverAddress, address resolverAddress);
+        function reverseWithGateways(bytes calldata reverseName, uint256 coinType, string[] calldata gateways) external view
+            returns (string resolvedName, address resolver, address reverseResolver);
     }
 }
 
@@ -281,10 +281,11 @@ async fn resolve_name(eth_provider: Option<Url>, address: Address) -> Result<Str
         address_string,
         reverse_bytes.len()
     );
-    match resolver.reverse(reverse_bytes).call().await {
-        Ok(result) if !result.name.is_empty() => {
-            info!("ENS resolved: {} -> {}", address_string, result.name);
-            Ok(result.name)
+    // coinType 60 = Ethereum (SLIP-44), empty gateways array
+    match resolver.reverseWithGateways(reverse_bytes, alloy_primitives::U256::from(60), vec![]).call().await {
+        Ok(result) if !result.resolvedName.is_empty() => {
+            info!("ENS resolved: {} -> {}", address_string, result.resolvedName);
+            Ok(result.resolvedName)
         }
         Ok(_) => {
             debug!("ENS reverse returned empty name for {}", address_string);
