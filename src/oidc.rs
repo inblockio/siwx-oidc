@@ -18,7 +18,7 @@ use openidconnect::{
     url::Url,
     AccessToken, Audience, AuthUrl, ClientConfigUrl, ClientId, ClientSecret,
     EmptyAdditionalClaims, EmptyAdditionalProviderMetadata, EmptyExtraTokenFields,
-    EndUserPictureUrl, EndUserUsername, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl,
+    EndUserName, EndUserPictureUrl, EndUserUsername, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl,
     LocalizedClaim, Nonce, OpPolicyUrl, OpTosUrl, PrivateSigningKey, RedirectUrl,
     RegistrationAccessToken, RegistrationUrl, RequestUrl, ResponseTypes, Scope, SigningError,
     StandardClaims, SubjectIdentifier, TokenUrl, UserInfoUrl,
@@ -210,6 +210,7 @@ pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
         CoreClaimName::new("iat".to_string()),
         CoreClaimName::new("iss".to_string()),
         CoreClaimName::new("preferred_username".to_string()),
+        CoreClaimName::new("name".to_string()),
         CoreClaimName::new("picture".to_string()),
     ]))
     .set_registration_endpoint(Some(RegistrationUrl::from_url(
@@ -271,24 +272,20 @@ async fn resolve_claims(
         .and_then(|m| m.canonical_subject(did).ok())
         .unwrap_or_else(|| did.to_string());
 
-    // address_for_message is used as preferred_username fallback.
+    // address_for_message is used for ENS resolution input.
     let address_str = find_did_method(did)
         .and_then(|m| m.address_for_message(did).ok())
         .unwrap_or_else(|| did.to_string());
 
     // ENS resolution only for eip155 DIDs.
-    let (username, ens_result) = if did.starts_with("did:pkh:eip155:") {
+    let ens_result = if did.starts_with("did:pkh:eip155:") {
         if let Ok(addr) = address_str.parse::<Address>() {
-            let result = resolve_name(eth_provider.clone(), addr).await;
-            let name = match result.clone() {
-                Ok(n) | Err(n) => n,
-            };
-            (name, Some(result))
+            Some(resolve_name(eth_provider.clone(), addr).await)
         } else {
-            (did.to_string(), None)
+            None
         }
     } else {
-        (did.to_string(), None)
+        None
     };
 
     let avatar = match ens_result {
@@ -296,13 +293,21 @@ async fn resolve_claims(
         _ => None,
     };
 
-    StandardClaims::new(SubjectIdentifier::new(subject))
-        .set_preferred_username(Some(EndUserUsername::new(username)))
+    // preferred_username is ALWAYS the full DID (used as Matrix username).
+    // name is the ENS name when available (used as Matrix display name).
+    let mut claims = StandardClaims::new(SubjectIdentifier::new(subject))
+        .set_preferred_username(Some(EndUserUsername::new(did.to_string())))
         .set_picture(avatar.map(|a| {
             let mut m = LocalizedClaim::new();
             m.insert(None, EndUserPictureUrl::new(a.to_string()));
             m
-        }))
+        }));
+    if let Some(Ok(ens_name)) = ens_result {
+        let mut m = LocalizedClaim::new();
+        m.insert(None, EndUserName::new(ens_name));
+        claims = claims.set_name(Some(m));
+    }
+    claims
 }
 
 // -- Token endpoint --------------------------------------------------------
