@@ -230,20 +230,51 @@ pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
     Ok(pm)
 }
 
-// -- ENS resolution (alloy) -----------------------------------------------
+// -- ENS resolution via Universal Resolver --------------------------------
+//
+// alloy's built-in lookup_address() uses the legacy ENS registry which
+// doesn't support NameWrapper-based reverse records. Primary names set
+// through the modern ENS app require the Universal Resolver.
+
+alloy::sol! {
+    #[sol(rpc)]
+    interface IUniversalResolver {
+        function reverse(bytes calldata reverseName) external view
+            returns (string name, address resolvedAddress, address reverseResolverAddress, address resolverAddress);
+    }
+}
+
+/// DNS-encode `<hex_addr>.addr.reverse` for the Universal Resolver.
+fn dns_encode_reverse(address: &Address) -> Vec<u8> {
+    let hex_addr = format!("{:x}", address); // lowercase, no 0x prefix
+    let labels: [&[u8]; 3] = [hex_addr.as_bytes(), b"addr", b"reverse"];
+    let mut buf = Vec::with_capacity(hex_addr.len() + 16);
+    for label in &labels {
+        buf.push(label.len() as u8);
+        buf.extend_from_slice(label);
+    }
+    buf.push(0); // root terminator
+    buf
+}
+
+/// ENS Universal Resolver on mainnet.
+const UNIVERSAL_RESOLVER: Address =
+    alloy_primitives::address!("0xeeeeeeee14d718c2b47d9923deab1335e144eeee");
 
 async fn resolve_name(eth_provider: Option<Url>, address: Address) -> Result<String, String> {
-    use alloy::ens::ProviderEnsExt;
     let address_string = address.to_checksum(None);
     let eth_provider = match eth_provider {
         Some(p) => p,
         None => return Err(address_string),
     };
     let provider = alloy::providers::ProviderBuilder::new().connect_http(eth_provider);
-    match provider.lookup_address(&address).await {
-        Ok(n) => Ok(n),
+    let resolver = IUniversalResolver::new(UNIVERSAL_RESOLVER, &provider);
+    let reverse_name = dns_encode_reverse(&address);
+    match resolver.reverse(reverse_name.into()).call().await {
+        Ok(result) if !result.name.is_empty() => Ok(result.name),
+        Ok(_) => Err(address_string),
         Err(e) => {
-            error!("Failed to resolve Eth domain: {}", e);
+            error!("Failed to resolve ENS name via Universal Resolver: {}", e);
             Err(address_string)
         }
     }

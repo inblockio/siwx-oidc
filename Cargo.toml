@@ -13,7 +13,7 @@ description = "CAIP-122 to OpenID Connect bridge — Sign-In With X for any DID 
 [dependencies]
 siwx-core = { path = "siwx-core" }
 alloy-primitives = { version = "1", features = ["serde"] }
-alloy = { version = "1", features = ["providers", "transport-http", "ens"] }
+alloy = { version = "1", features = ["providers", "transport-http", "contract", "sol-types"] }
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
