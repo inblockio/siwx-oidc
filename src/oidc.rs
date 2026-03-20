@@ -282,9 +282,16 @@ async fn resolve_name(eth_provider: Option<Url>, address: Address) -> Result<Str
         reverse_bytes.len()
     );
     // coinType 60 = Ethereum (SLIP-44), empty gateways array
-    match resolver.reverseWithGateways(reverse_bytes, alloy_primitives::U256::from(60), vec![]).call().await {
+    match resolver
+        .reverseWithGateways(reverse_bytes, alloy_primitives::U256::from(60), vec![])
+        .call()
+        .await
+    {
         Ok(result) if !result.resolvedName.is_empty() => {
-            info!("ENS resolved: {} -> {}", address_string, result.resolvedName);
+            info!(
+                "ENS resolved: {} -> {}",
+                address_string, result.resolvedName
+            );
             Ok(result.resolvedName)
         }
         Ok(_) => {
