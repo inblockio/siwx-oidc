@@ -18,8 +18,8 @@ use figment::{
 };
 use headers::Header;
 use openidconnect::core::{
-    CoreClientMetadata, CoreClientRegistrationResponse, CoreJsonWebKeySet,
-    CoreTokenResponse, CoreUserInfoClaims, CoreUserInfoJsonWebToken,
+    CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType,
+    CoreJsonWebKeySet, CoreTokenResponse, CoreUserInfoClaims, CoreUserInfoJsonWebToken,
 };
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
@@ -110,7 +110,24 @@ async fn token(
         state.config.eth_provider,
         &state.redis_client,
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        // OAuth2 RFC 6749 §5.2: token endpoint errors MUST be JSON.
+        // Wrap non-Token errors so they always produce a JSON body.
+        match e {
+            CustomError::BadRequestToken(_) => e,
+            CustomError::Unauthorized(msg) => {
+                CustomError::BadRequestToken(oidc::TokenError {
+                    error: CoreErrorResponseType::InvalidClient,
+                    error_description: msg,
+                })
+            }
+            other => CustomError::BadRequestToken(oidc::TokenError {
+                error: CoreErrorResponseType::InvalidRequest,
+                error_description: other.to_string(),
+            }),
+        }
+    })?;
     Ok(token_response.into())
 }
 

@@ -5,6 +5,7 @@ use bb8_redis::{
     redis::AsyncCommands,
     RedisConnectionManager,
 };
+use tracing::debug;
 use url::Url;
 
 use super::*;
@@ -82,14 +83,13 @@ impl DBClient for RedisClient {
             .get()
             .await
             .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
-        conn.set_ex::<_, _, ()>(
-            code.to_string(),
-            serde_json::to_string(&code_entry)
-                .map_err(|e| anyhow!("Failed to serialize code entry: {}", e))?,
-            ENTRY_LIFETIME as u64,
-        )
-        .await
-        .map_err(|e| anyhow!("Failed to set kv: {}", e))?;
+        let key = format!("{}/{}", KV_CODE_PREFIX, code);
+        let value = serde_json::to_string(&code_entry)
+            .map_err(|e| anyhow!("Failed to serialize code entry: {}", e))?;
+        conn.set_ex::<_, _, ()>(&key, &value, ENTRY_LIFETIME as u64)
+            .await
+            .map_err(|e| anyhow!("Failed to set code in Redis: {}", e))?;
+        debug!("set_code: stored key={} ttl={}s", key, ENTRY_LIFETIME);
         Ok(())
     }
 
@@ -99,8 +99,9 @@ impl DBClient for RedisClient {
             .get()
             .await
             .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+        let key = format!("{}/{}", KV_CODE_PREFIX, code);
         let entry: Option<String> = conn
-            .get(code)
+            .get(&key)
             .await
             .map_err(|e| anyhow!("Failed to get kv: {}", e))?;
         if let Some(e) = entry {
@@ -154,8 +155,10 @@ impl DBClient for RedisClient {
             .await
             .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
 
+        let key = format!("{}/{}", KV_CODE_PREFIX, code);
+
         // Atomic: SETNX on a consumed flag — only one caller wins.
-        let consumed_key = format!("{}/consumed", code);
+        let consumed_key = format!("{}/consumed", key);
         let was_set: bool = conn
             .set_nx(&consumed_key, "1")
             .await
@@ -166,20 +169,27 @@ impl DBClient for RedisClient {
                 .await
                 .unwrap_or(());
         } else {
+            debug!("try_consume_code: already consumed key={}", key);
             return Ok(None); // Already consumed by another request
         }
 
         // Read the code entry (safe: only the winner reaches here).
         let entry: Option<String> = conn
-            .get(&code)
+            .get(&key)
             .await
             .map_err(|e| anyhow!("Failed to get code entry: {}", e))?;
         match entry {
-            Some(e) => Ok(Some(
-                serde_json::from_str(&e)
-                    .map_err(|e| anyhow!("Failed to deserialize code entry: {}", e))?,
-            )),
-            None => Ok(None),
+            Some(e) => {
+                debug!("try_consume_code: found key={}", key);
+                Ok(Some(
+                    serde_json::from_str(&e)
+                        .map_err(|e| anyhow!("Failed to deserialize code entry: {}", e))?,
+                ))
+            }
+            None => {
+                debug!("try_consume_code: NOT FOUND key={}", key);
+                Ok(None)
+            }
         }
     }
 
