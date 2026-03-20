@@ -297,16 +297,16 @@ async fn resolve_name(
 ) -> Option<String> {
     let address_string = address.to_checksum(None);
 
-    // Try HTTP API first (handles CCIP Read / NameWrapper / offchain names).
-    if let Some(api_url) = ens_api_url {
-        if let Some(name) = resolve_name_http(api_url, &address_string).await {
+    // eth_provider overrides: use on-chain ENS registry directly.
+    if let Some(provider) = eth_provider {
+        if let Some(name) = resolve_name_onchain(provider, address).await {
             return Some(name);
         }
     }
 
-    // Fallback: on-chain legacy ENS registry.
-    if let Some(provider) = eth_provider {
-        if let Some(name) = resolve_name_onchain(provider, address).await {
+    // Default: HTTP API (handles CCIP Read / NameWrapper / offchain names).
+    if let Some(api_url) = ens_api_url {
+        if let Some(name) = resolve_name_http(api_url, &address_string).await {
             return Some(name);
         }
     }
