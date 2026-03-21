@@ -12,7 +12,9 @@ const app = new App({
 		redirect: params.get('redirect_uri'),
 		state: params.get('state'),
 		oidc_nonce: params.get('oidc_nonce'),
-		client_id: params.get('client_id')
+		client_id: params.get('client_id'),
+		code_challenge: params.get('code_challenge'),
+		code_challenge_method: params.get('code_challenge_method'),
 	}
 });
 

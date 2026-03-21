@@ -12,10 +12,16 @@
 	export let state: string;
 	export let oidc_nonce: string;
 	export let client_id: string;
+	export let code_challenge: string;
+	export let code_challenge_method: string;
 
 	let status = 'Not Logged In';
 	let error: string | null = null;
 	let connecting = false;
+	let passkeyLoading = false;
+	let linkingPasskey = false;
+	let showLinkOption = false;
+	let linkSuccess = false;
 	let client_metadata: any = {};
 
 	const config = createConfig({
@@ -31,6 +37,20 @@
 	let oidc_nonce_param = '';
 	if (oidc_nonce != null && oidc_nonce != '') {
 		oidc_nonce_param = `&oidc_nonce=${oidc_nonce}`;
+	}
+
+	let pkce_params = '';
+	if (code_challenge != null && code_challenge != '') {
+		pkce_params = `&code_challenge=${code_challenge}`;
+		if (code_challenge_method != null && code_challenge_method != '') {
+			pkce_params += `&code_challenge_method=${code_challenge_method}`;
+		} else {
+			pkce_params += '&code_challenge_method=S256';
+		}
+	}
+
+	function buildSignInUrl(): string {
+		return `/sign_in?redirect_uri=${encodeURI(redirect)}&state=${encodeURI(state)}&client_id=${encodeURI(client_id)}${encodeURI(oidc_nonce_param)}${encodeURI(pkce_params)}`;
 	}
 
 	onMount(async () => {
@@ -107,12 +127,230 @@
 			secure: window.location.protocol === 'https:',
 		});
 
+		// Show option to link a passkey before redirecting.
+		showLinkOption = true;
+		status = 'Signed — link a passkey or continue';
+	}
+
+	function proceedToSignIn() {
 		status = 'Redirecting...';
-		window.location.replace(
-			`/sign_in?redirect_uri=${encodeURI(redirect)}&state=${encodeURI(state)}&client_id=${encodeURI(
-				client_id,
-			)}${encodeURI(oidc_nonce_param)}`,
-		);
+		window.location.replace(buildSignInUrl());
+	}
+
+	async function handleLinkPasskey() {
+		if (linkingPasskey) return;
+		linkingPasskey = true;
+		error = null;
+		status = 'Linking passkey to wallet...';
+
+		try {
+			// Step 1: Start link ceremony (server verifies siwx cookie for DID ownership).
+			const startResp = await fetch('/link/webauthn/start', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: '{}',
+			});
+			if (!startResp.ok) {
+				throw new Error(await startResp.text());
+			}
+			const options = await startResp.json();
+
+			// Step 2: Browser WebAuthn API — user creates passkey.
+			options.publicKey.challenge = base64urlToBuffer(options.publicKey.challenge);
+			options.publicKey.user.id = base64urlToBuffer(options.publicKey.user.id);
+			if (options.publicKey.excludeCredentials) {
+				for (const c of options.publicKey.excludeCredentials) {
+					c.id = base64urlToBuffer(c.id);
+				}
+			}
+
+			const credential = await navigator.credentials.create({ publicKey: options.publicKey });
+			if (!credential) throw new Error('No credential created');
+
+			// Step 3: Send attestation to server.
+			const attestationResponse = (credential as PublicKeyCredential).response as AuthenticatorAttestationResponse;
+			const finishResp = await fetch('/link/webauthn/finish', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					id: credential.id,
+					rawId: bufferToBase64url(new Uint8Array((credential as PublicKeyCredential).rawId)),
+					type: credential.type,
+					response: {
+						attestationObject: bufferToBase64url(new Uint8Array(attestationResponse.attestationObject)),
+						clientDataJSON: bufferToBase64url(new Uint8Array(attestationResponse.clientDataJSON)),
+					},
+				}),
+			});
+			if (!finishResp.ok) {
+				throw new Error(await finishResp.text());
+			}
+
+			const result = await finishResp.json();
+			linkSuccess = true;
+			status = `Passkey linked to ${result.primary_did.substring(0, 30)}…`;
+		} catch (e: any) {
+			if (e.name === 'NotAllowedError') {
+				error = 'Passkey linking was cancelled.';
+			} else {
+				error = e.message || 'Passkey linking failed';
+			}
+			status = 'Link failed — you can still continue';
+		} finally {
+			linkingPasskey = false;
+		}
+	}
+
+	async function handlePasskeySignIn() {
+		if (passkeyLoading) return;
+		passkeyLoading = true;
+		error = null;
+		status = 'Authenticating with passkey...';
+
+		try {
+			// Step 1: Start authentication ceremony (server creates challenge)
+			const startResp = await fetch('/webauthn/authenticate/start', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: '{}',
+			});
+			if (!startResp.ok) {
+				throw new Error(await startResp.text());
+			}
+			const options = await startResp.json();
+
+			// Step 2: Browser WebAuthn API — user selects passkey
+			// Convert base64url challenge to ArrayBuffer
+			options.publicKey.challenge = base64urlToBuffer(options.publicKey.challenge);
+			if (options.publicKey.allowCredentials) {
+				for (const c of options.publicKey.allowCredentials) {
+					c.id = base64urlToBuffer(c.id);
+				}
+			}
+
+			const assertion = await navigator.credentials.get({ publicKey: options.publicKey });
+			if (!assertion) throw new Error('No credential returned');
+
+			// Step 3: Send assertion to server for verification
+			const authResponse = (assertion as PublicKeyCredential).response as AuthenticatorAssertionResponse;
+			const finishResp = await fetch('/webauthn/authenticate/finish', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					id: assertion.id,
+					rawId: bufferToBase64url(new Uint8Array((assertion as PublicKeyCredential).rawId)),
+					type: assertion.type,
+					response: {
+						authenticatorData: bufferToBase64url(new Uint8Array(authResponse.authenticatorData)),
+						clientDataJSON: bufferToBase64url(new Uint8Array(authResponse.clientDataJSON)),
+						signature: bufferToBase64url(new Uint8Array(authResponse.signature)),
+						userHandle: authResponse.userHandle
+							? bufferToBase64url(new Uint8Array(authResponse.userHandle))
+							: null,
+					},
+				}),
+			});
+			if (!finishResp.ok) {
+				throw new Error(await finishResp.text());
+			}
+
+			// Step 4: Redirect to /sign_in — session.verified_did is now set
+			status = 'Redirecting...';
+			window.location.replace(buildSignInUrl());
+		} catch (e: any) {
+			if (e.name === 'NotAllowedError') {
+				error = 'Passkey authentication was cancelled.';
+			} else {
+				error = e.message || 'Passkey authentication failed';
+			}
+			status = 'Not Logged In';
+			console.error(e);
+		} finally {
+			passkeyLoading = false;
+		}
+	}
+
+	async function handlePasskeyRegister() {
+		if (passkeyLoading) return;
+		passkeyLoading = true;
+		error = null;
+		status = 'Registering passkey...';
+
+		try {
+			const startResp = await fetch('/webauthn/register/start', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ display_name: null }),
+			});
+			if (!startResp.ok) {
+				throw new Error(await startResp.text());
+			}
+			const options = await startResp.json();
+
+			// Convert base64url fields to ArrayBuffer
+			options.publicKey.challenge = base64urlToBuffer(options.publicKey.challenge);
+			options.publicKey.user.id = base64urlToBuffer(options.publicKey.user.id);
+			if (options.publicKey.excludeCredentials) {
+				for (const c of options.publicKey.excludeCredentials) {
+					c.id = base64urlToBuffer(c.id);
+				}
+			}
+
+			const credential = await navigator.credentials.create({ publicKey: options.publicKey });
+			if (!credential) throw new Error('No credential created');
+
+			const attestationResponse = (credential as PublicKeyCredential).response as AuthenticatorAttestationResponse;
+			const finishResp = await fetch('/webauthn/register/finish', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					id: credential.id,
+					rawId: bufferToBase64url(new Uint8Array((credential as PublicKeyCredential).rawId)),
+					type: credential.type,
+					response: {
+						attestationObject: bufferToBase64url(new Uint8Array(attestationResponse.attestationObject)),
+						clientDataJSON: bufferToBase64url(new Uint8Array(attestationResponse.clientDataJSON)),
+					},
+				}),
+			});
+			if (!finishResp.ok) {
+				throw new Error(await finishResp.text());
+			}
+
+			const result = await finishResp.json();
+			status = `Passkey registered! DID: ${result.did.substring(0, 24)}…`;
+			error = null;
+
+			// After registration, authenticate immediately
+			await handlePasskeySignIn();
+		} catch (e: any) {
+			if (e.name === 'NotAllowedError') {
+				error = 'Passkey registration was cancelled.';
+			} else {
+				error = e.message || 'Passkey registration failed';
+			}
+			status = 'Not Logged In';
+			console.error(e);
+		} finally {
+			passkeyLoading = false;
+		}
+	}
+
+	// -- Base64url <-> ArrayBuffer helpers --
+
+	function base64urlToBuffer(b64: string): ArrayBuffer {
+		const padding = '='.repeat((4 - (b64.length % 4)) % 4);
+		const base64 = (b64 + padding).replace(/-/g, '+').replace(/_/g, '/');
+		const raw = atob(base64);
+		const arr = new Uint8Array(raw.length);
+		for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+		return arr.buffer;
+	}
+
+	function bufferToBase64url(buf: Uint8Array): string {
+		let binary = '';
+		for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i]);
+		return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
 	}
 </script>
 
@@ -167,6 +405,65 @@
 				{#if connecting}Connecting...{:else}Sign-In with Ethereum{/if}
 			</p>
 		</button>
+
+		<div class="flex items-center my-3">
+			<div class="flex-grow border-t border-gray-300"></div>
+			<span class="mx-3 text-xs text-gray-400">or</span>
+			<div class="flex-grow border-t border-gray-300"></div>
+		</div>
+
+		<button
+			class="h-12 border hover:scale-105 justify-evenly shadow-xl border-white duration-100 ease-in-out transition-all transform flex items-center"
+			disabled={passkeyLoading}
+			on:click={handlePasskeySignIn}
+		>
+			<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5">
+				<path fill-rule="evenodd" d="M15.75 1.5a6.75 6.75 0 0 0-6.651 7.906c.067.39-.032.717-.221.906l-6.5 6.499a3 3 0 0 0-.878 2.121v2.818c0 .414.336.75.75.75H6a.75.75 0 0 0 .75-.75v-1.5h1.5A.75.75 0 0 0 9 19.5V18h1.5a.75.75 0 0 0 .53-.22l2.658-2.658c.19-.189.517-.288.906-.22A6.75 6.75 0 1 0 15.75 1.5Zm0 3a.75.75 0 0 0 0 1.5A2.25 2.25 0 0 1 18 8.25a.75.75 0 0 0 1.5 0 3.75 3.75 0 0 0-3.75-3.75Z" clip-rule="evenodd" />
+			</svg>
+			<p class="font-bold">
+				{#if passkeyLoading}Authenticating...{:else}Sign-In with Passkey{/if}
+			</p>
+		</button>
+
+		<button
+			class="text-xs text-gray-400 hover:text-gray-600 mt-1 underline cursor-pointer"
+			disabled={passkeyLoading}
+			on:click={handlePasskeyRegister}
+		>
+			Register a new passkey
+		</button>
+
+		{#if showLinkOption}
+			<div class="mt-3 p-3 border border-gray-200 rounded text-xs">
+				{#if linkSuccess}
+					<p class="text-green-600 font-semibold mb-2">Passkey linked successfully!</p>
+					<button
+						class="h-10 w-full border hover:scale-105 shadow-xl border-white duration-100 ease-in-out transition-all transform flex items-center justify-center font-bold"
+						on:click={proceedToSignIn}
+					>
+						Continue
+					</button>
+				{:else}
+					<p class="mb-2">Link a passkey so you can sign in without a wallet next time?</p>
+					<div class="flex gap-2">
+						<button
+							class="flex-1 h-10 border hover:scale-105 shadow-xl border-white duration-100 ease-in-out transition-all transform flex items-center justify-center font-bold"
+							disabled={linkingPasskey}
+							on:click={handleLinkPasskey}
+						>
+							{#if linkingPasskey}Linking...{:else}Yes, link passkey{/if}
+						</button>
+						<button
+							class="flex-1 h-10 border hover:scale-105 shadow-xl border-white duration-100 ease-in-out transition-all transform flex items-center justify-center font-bold text-gray-400"
+							disabled={linkingPasskey}
+							on:click={proceedToSignIn}
+						>
+							Skip
+						</button>
+					</div>
+				{/if}
+			</div>
+		{/if}
 
 		{#if error}
 			<span class="text-xs text-red-500 mt-2">{error}</span>

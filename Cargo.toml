@@ -43,6 +43,10 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 url = { version = "2", features = ["serde"] }
 urlencoding = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
+# WebAuthn/passkey ceremony (safe API only — see PLAN_webauthn.md)
+webauthn-rs = { version = "0.6.0-dev", features = ["danger-allow-state-serialisation", "conditional-ui"] }
+bs58 = "0.5"
+webauthn-rs-proto = "0.6.0-dev"
 
 [dev-dependencies]
 env_logger = "0.11"

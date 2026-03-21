@@ -27,6 +27,62 @@ impl RedisClient {
     }
 }
 
+/// Generic Redis helpers for non-DBClient storage (WebAuthn credentials, challenges, etc.).
+impl RedisClient {
+    /// Store a key-value pair with a TTL in seconds.
+    pub async fn set_ex_raw(&self, key: &str, value: &str, ttl_secs: u64) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+        conn.set_ex::<_, _, ()>(key, value, ttl_secs)
+            .await
+            .map_err(|e| anyhow!("Redis SET EX: {}", e))?;
+        Ok(())
+    }
+
+    /// Store a key-value pair with no TTL (persistent).
+    pub async fn set_raw(&self, key: &str, value: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+        conn.set::<_, _, ()>(key, value)
+            .await
+            .map_err(|e| anyhow!("Redis SET: {}", e))?;
+        Ok(())
+    }
+
+    /// Get a value by key.
+    pub async fn get_raw(&self, key: &str) -> Result<Option<String>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+        let val: Option<String> = conn
+            .get(key)
+            .await
+            .map_err(|e| anyhow!("Redis GET: {}", e))?;
+        Ok(val)
+    }
+
+    /// Delete a key.
+    pub async fn del_raw(&self, key: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+        conn.del::<_, ()>(key)
+            .await
+            .map_err(|e| anyhow!("Redis DEL: {}", e))?;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl DBClient for RedisClient {
     async fn set_client(&self, client_id: String, client_entry: ClientEntry) -> Result<()> {
