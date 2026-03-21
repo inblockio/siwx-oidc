@@ -47,7 +47,7 @@ fn did_from_passkey(passkey: &Passkey) -> Result<String> {
             }
             // Build compressed SEC1 point: 0x02 (even y) or 0x03 (odd y) + x
             let y_bytes: &[u8] = ec2.y.as_ref();
-            let y_is_odd = y_bytes.last().map_or(false, |b| b & 1 == 1);
+            let y_is_odd = y_bytes.last().is_some_and(|b| b & 1 == 1);
             let prefix = if y_is_odd { 0x03 } else { 0x02 };
             let mut compressed = vec![prefix];
             compressed.extend_from_slice(ec2.x.as_ref());
