@@ -163,20 +163,20 @@ If found, substitute `primary_did` as the OIDC `sub` instead of the passkey's `d
 ## Implementation Order
 
 ```
-Phase 1 — Foundation (this branch)
-  1a. Add webauthn-rs dependency
-  1b. Add verified_did to SessionEntry
-  1c. Create src/webauthn.rs (register + authenticate endpoints)
-  1d. Register routes in axum_lib.rs
-  1e. Add RP config to config.rs
-  1f. Generalize sign_in for server-verified path
-  1g. Add passkey UI to App.svelte
+Phase 1 — Foundation (this branch)                              ✅ DONE
+  1a. Add webauthn-rs dependency                                   ✅
+  1b. Add verified_did to SessionEntry                             ✅
+  1c. Create src/webauthn.rs (register + authenticate endpoints)   ✅
+  1d. Register routes in axum_lib.rs                               ✅
+  1e. Add RP config to config.rs                                   ✅
+  1f. Generalize sign_in for server-verified path                  ✅
+  1g. Add passkey UI to App.svelte                                 ✅
   1h. Test: new user registers passkey → logs in → gets Matrix account
 
-Phase 2 — Account Linking
-  2a. Add /link endpoints
-  2b. Add webauthn:link Redis schema
-  2c. Modify authenticate_finish to check link mappings
+Phase 2 — Account Linking                                        ✅ DONE
+  2a. Add /link endpoints                                          ✅
+  2b. Add webauthn:link Redis schema                               ✅
+  2c. Modify authenticate_finish to check link mappings            ✅
   2d. Test: existing MetaMask user links passkey → logs in via passkey → same account
 
 Phase 3 — RFC 8628 Device Authorization Grant (separate branch)

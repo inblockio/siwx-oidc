@@ -688,6 +688,77 @@ fn extract_resources(message: &str) -> Vec<&str> {
     out
 }
 
+/// Verify the `siwx` cookie's CAIP-122 signature and nonce against the session.
+/// Returns the verified DID on success. Does NOT consume the session.
+pub fn verify_siwx_cookie(
+    cookies: &headers::Cookie,
+    session: &SessionEntry,
+    allowed_did_methods: &[String],
+    allowed_pkh_namespaces: &[String],
+) -> Result<String, CustomError> {
+    let siwx_cookie: SiwxCookie = match cookies.get(SIWX_COOKIE_KEY) {
+        Some(c) => serde_json::from_str(
+            &decode(c).map_err(|e| anyhow!("Could not decode siwx cookie: {}", e))?,
+        )
+        .map_err(|e| anyhow!("Could not deserialize siwx cookie: {}", e))?,
+        None => {
+            return Err(CustomError::BadRequest(
+                "No `siwx` cookie — sign in with a wallet first".to_string(),
+            ));
+        }
+    };
+
+    let sig_hex = siwx_cookie
+        .signature
+        .strip_prefix("0x")
+        .unwrap_or(&siwx_cookie.signature);
+    let sig_bytes = hex::decode(sig_hex)
+        .map_err(|e| CustomError::BadRequest(format!("Bad signature: {}", e)))?;
+
+    let did_method = find_did_method(&siwx_cookie.did).ok_or_else(|| {
+        CustomError::BadRequest(format!("Unsupported DID: {}", &siwx_cookie.did))
+    })?;
+
+    if !allowed_did_methods
+        .iter()
+        .any(|m| m == did_method.method_name())
+    {
+        return Err(CustomError::BadRequest(format!(
+            "DID method '{}' is not enabled on this server",
+            did_method.method_name()
+        )));
+    }
+    if did_method.method_name() == "pkh" {
+        let namespace = siwx_cookie
+            .did
+            .strip_prefix("did:pkh:")
+            .and_then(|s| s.split(':').next())
+            .unwrap_or("");
+        if !allowed_pkh_namespaces.iter().any(|n| n == namespace) {
+            return Err(CustomError::BadRequest(format!(
+                "did:pkh namespace '{namespace}' is not enabled on this server"
+            )));
+        }
+    }
+
+    let valid = did_method
+        .verify(&siwx_cookie.did, &siwx_cookie.message, &sig_bytes)
+        .map_err(|e| anyhow!("Verification error: {}", e))?;
+    if !valid {
+        return Err(CustomError::Unauthorized(
+            "Signature verification failed".to_string(),
+        ));
+    }
+
+    let msg_nonce = extract_nonce(&siwx_cookie.message)
+        .ok_or_else(|| anyhow!("Nonce not found in CAIP-122 message"))?;
+    if msg_nonce != session.siwe_nonce {
+        return Err(CustomError::BadRequest("Nonce mismatch".to_string()));
+    }
+
+    Ok(siwx_cookie.did)
+}
+
 #[derive(Deserialize)]
 pub struct SignInParams {
     pub redirect_uri: RedirectUrl,

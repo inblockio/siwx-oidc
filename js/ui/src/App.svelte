@@ -19,6 +19,9 @@
 	let error: string | null = null;
 	let connecting = false;
 	let passkeyLoading = false;
+	let linkingPasskey = false;
+	let showLinkOption = false;
+	let linkSuccess = false;
 	let client_metadata: any = {};
 
 	const config = createConfig({
@@ -124,8 +127,78 @@
 			secure: window.location.protocol === 'https:',
 		});
 
+		// Show option to link a passkey before redirecting.
+		showLinkOption = true;
+		status = 'Signed — link a passkey or continue';
+	}
+
+	function proceedToSignIn() {
 		status = 'Redirecting...';
 		window.location.replace(buildSignInUrl());
+	}
+
+	async function handleLinkPasskey() {
+		if (linkingPasskey) return;
+		linkingPasskey = true;
+		error = null;
+		status = 'Linking passkey to wallet...';
+
+		try {
+			// Step 1: Start link ceremony (server verifies siwx cookie for DID ownership).
+			const startResp = await fetch('/link/webauthn/start', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: '{}',
+			});
+			if (!startResp.ok) {
+				throw new Error(await startResp.text());
+			}
+			const options = await startResp.json();
+
+			// Step 2: Browser WebAuthn API — user creates passkey.
+			options.publicKey.challenge = base64urlToBuffer(options.publicKey.challenge);
+			options.publicKey.user.id = base64urlToBuffer(options.publicKey.user.id);
+			if (options.publicKey.excludeCredentials) {
+				for (const c of options.publicKey.excludeCredentials) {
+					c.id = base64urlToBuffer(c.id);
+				}
+			}
+
+			const credential = await navigator.credentials.create({ publicKey: options.publicKey });
+			if (!credential) throw new Error('No credential created');
+
+			// Step 3: Send attestation to server.
+			const attestationResponse = (credential as PublicKeyCredential).response as AuthenticatorAttestationResponse;
+			const finishResp = await fetch('/link/webauthn/finish', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					id: credential.id,
+					rawId: bufferToBase64url(new Uint8Array((credential as PublicKeyCredential).rawId)),
+					type: credential.type,
+					response: {
+						attestationObject: bufferToBase64url(new Uint8Array(attestationResponse.attestationObject)),
+						clientDataJSON: bufferToBase64url(new Uint8Array(attestationResponse.clientDataJSON)),
+					},
+				}),
+			});
+			if (!finishResp.ok) {
+				throw new Error(await finishResp.text());
+			}
+
+			const result = await finishResp.json();
+			linkSuccess = true;
+			status = `Passkey linked to ${result.primary_did.substring(0, 30)}…`;
+		} catch (e: any) {
+			if (e.name === 'NotAllowedError') {
+				error = 'Passkey linking was cancelled.';
+			} else {
+				error = e.message || 'Passkey linking failed';
+			}
+			status = 'Link failed — you can still continue';
+		} finally {
+			linkingPasskey = false;
+		}
 	}
 
 	async function handlePasskeySignIn() {
@@ -359,6 +432,38 @@
 		>
 			Register a new passkey
 		</button>
+
+		{#if showLinkOption}
+			<div class="mt-3 p-3 border border-gray-200 rounded text-xs">
+				{#if linkSuccess}
+					<p class="text-green-600 font-semibold mb-2">Passkey linked successfully!</p>
+					<button
+						class="h-10 w-full border hover:scale-105 shadow-xl border-white duration-100 ease-in-out transition-all transform flex items-center justify-center font-bold"
+						on:click={proceedToSignIn}
+					>
+						Continue
+					</button>
+				{:else}
+					<p class="mb-2">Link a passkey so you can sign in without a wallet next time?</p>
+					<div class="flex gap-2">
+						<button
+							class="flex-1 h-10 border hover:scale-105 shadow-xl border-white duration-100 ease-in-out transition-all transform flex items-center justify-center font-bold"
+							disabled={linkingPasskey}
+							on:click={handleLinkPasskey}
+						>
+							{#if linkingPasskey}Linking...{:else}Yes, link passkey{/if}
+						</button>
+						<button
+							class="flex-1 h-10 border hover:scale-105 shadow-xl border-white duration-100 ease-in-out transition-all transform flex items-center justify-center font-bold text-gray-400"
+							disabled={linkingPasskey}
+							on:click={proceedToSignIn}
+						>
+							Skip
+						</button>
+					</div>
+				{/if}
+			</div>
+		{/if}
 
 		{#if error}
 			<span class="text-xs text-red-500 mt-2">{error}</span>

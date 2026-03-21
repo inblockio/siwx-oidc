@@ -334,6 +334,58 @@ async fn webauthn_authenticate_finish(
     Ok(Json(resp))
 }
 
+// -- Account linking route handlers (Phase 2) ------------------------------
+
+async fn webauthn_link_start(
+    State(state): State<AppState>,
+    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+) -> Result<Json<CreationChallengeResponse>, CustomError> {
+    let session_id = cookies
+        .get(SESSION_COOKIE_NAME)
+        .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
+    let session = state
+        .redis_client
+        .get_session(session_id.to_string())
+        .await?
+        .ok_or_else(|| CustomError::BadRequest("Session not found".to_string()))?;
+
+    // Verify the siwx cookie to prove DID ownership.
+    let primary_did = oidc::verify_siwx_cookie(
+        &cookies,
+        &session,
+        &state.config.supported_did_methods,
+        &state.config.supported_pkh_namespaces,
+    )?;
+
+    let ccr = wa::link_start(
+        &state.webauthn,
+        &state.redis_client,
+        session_id,
+        &primary_did,
+        None,
+    )
+    .await?;
+    Ok(Json(ccr))
+}
+
+async fn webauthn_link_finish(
+    State(state): State<AppState>,
+    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    Json(reg_response): Json<RegisterPublicKeyCredential>,
+) -> Result<Json<wa::LinkFinishResponse>, CustomError> {
+    let session_id = cookies
+        .get(SESSION_COOKIE_NAME)
+        .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
+    let resp = wa::link_finish(
+        &state.webauthn,
+        &state.redis_client,
+        session_id,
+        reg_response,
+    )
+    .await?;
+    Ok(Json(resp))
+}
+
 // -- Application entry point -----------------------------------------------
 
 pub async fn main() {
@@ -435,6 +487,8 @@ pub async fn main() {
             "/webauthn/authenticate/finish",
             post(webauthn_authenticate_finish),
         )
+        .route("/link/webauthn/start", post(webauthn_link_start))
+        .route("/link/webauthn/finish", post(webauthn_link_finish))
         .route("/health", get(healthcheck))
         .with_state(state)
         .layer(TraceLayer::new_for_http());

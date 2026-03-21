@@ -190,6 +190,10 @@ Two authentication methods on the login page:
    No cookie involved — verified DID stored server-side in Redis session.
    "Register a new passkey" link for first-time users.
 
+3. **Link Passkey to Wallet** — After wallet sign-in, user is offered "Link a passkey
+   for future logins?" before redirecting. Calls `/link/webauthn/start` → browser
+   creates passkey → `/link/webauthn/finish`. Future passkey logins produce the wallet DID.
+
 ## Deployment (Docker)
 
 ```bash
@@ -211,8 +215,10 @@ encoding as `siwx-core/src/key/mod.rs`).
 
 **Redis keys:**
 ```
-webauthn:challenge/{session_id}    TTL 120s  — ceremony state (register or auth)
-webauthn:credential/{cred_id_b64}  no TTL    — stored Passkey (JSON-serialized)
+webauthn:challenge/{session_id}        TTL 120s  — ceremony state (register or auth)
+webauthn:credential/{cred_id_b64}      no TTL    — stored Passkey (JSON-serialized)
+webauthn:link/{cred_id_b64}            no TTL    — { primary_did, label } (account linking)
+webauthn:link_challenge/{session_id}   TTL 120s  — link ceremony state (reg_state + primary_did)
 ```
 
 **Endpoints:**
@@ -221,7 +227,15 @@ POST /webauthn/register/start       — returns CreationChallengeResponse
 POST /webauthn/register/finish      — verifies attestation, stores credential
 POST /webauthn/authenticate/start   — returns RequestChallengeResponse (discoverable)
 POST /webauthn/authenticate/finish  — verifies assertion, stores verified_did in session
+POST /link/webauthn/start           — begin passkey registration (verifies siwx cookie for DID ownership)
+POST /link/webauthn/finish          — verifies attestation, stores credential + link mapping
 ```
+
+**Account linking (Phase 2):** Wallet users can link a passkey to their existing DID.
+After linking, authenticating with that passkey produces the wallet's DID (not a new `did:key`).
+The `/link/webauthn/start` endpoint verifies the `siwx` cookie's CAIP-122 signature to prove
+DID ownership before creating the link. `authenticate_finish` checks `webauthn:link/{cred_id}`
+and substitutes `primary_did` if a mapping exists.
 
 ## Troubleshooting
 
