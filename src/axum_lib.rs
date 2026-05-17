@@ -30,9 +30,11 @@ use tower_http::{
 };
 use tracing::info;
 
+use super::compat;
 use super::config;
 use super::introspect;
 use super::oidc::{self, CustomError, EcdsaSigningKey};
+use super::synapse_client::SynapseClient;
 use super::webauthn as wa;
 use openidconnect::JsonWebKeyId;
 use siwx_core::{all_cipher_suites, all_did_methods};
@@ -46,6 +48,7 @@ struct AppState {
     config: config::Config,
     redis_client: RedisClient,
     webauthn: Arc<Webauthn>,
+    synapse_client: Option<Arc<SynapseClient>>,
 }
 
 /// State subset exposed to the introspection endpoint.
@@ -98,10 +101,16 @@ async fn jwk_set(State(state): State<AppState>) -> Result<Json<CoreJsonWebKeySet
 async fn provider_metadata(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, CustomError> {
-    let pm = oidc::metadata(state.config.base_url)?;
+    let pm = oidc::metadata(state.config.base_url.clone())?;
     let mut value = serde_json::to_value(pm)
         .map_err(|e| anyhow::anyhow!("Failed to serialize metadata: {}", e))?;
+    let base_url = state.config.base_url.as_str().trim_end_matches('/');
     value["code_challenge_methods_supported"] = serde_json::json!(["S256"]);
+    value["introspection_endpoint"] = serde_json::json!(format!("{}/oauth2/introspect", base_url));
+    value["introspection_endpoint_auth_methods_supported"] = serde_json::json!(["bearer"]);
+    value["grant_types_supported"] = serde_json::json!(["authorization_code", "refresh_token"]);
+    value["revocation_endpoint"] = serde_json::json!(format!("{}/oauth2/revoke", base_url));
+    value["token_endpoint_auth_methods_supported"] = serde_json::json!(["client_secret_post", "none"]);
     Ok(value.into())
 }
 
@@ -167,6 +176,7 @@ async fn sign_in(
         params,
         cookies,
         &state.redis_client,
+        state.synapse_client.as_deref(),
     )
     .await?;
     Ok(Redirect::to(url.as_str()))
@@ -469,14 +479,28 @@ pub async fn main() {
     )
     .expect("Failed to initialize WebAuthn — check SIWEOIDC_BASE_URL, SIWEOIDC_RP_ID, SIWEOIDC_RP_ORIGIN");
 
+    // Initialize Synapse client for MSC3861 device lifecycle (optional).
+    let synapse_client = match (&config.synapse_endpoint, &config.mas_shared_secret) {
+        (Some(endpoint), Some(secret)) => {
+            info!("Synapse client enabled: {}", endpoint);
+            Some(Arc::new(SynapseClient::new(endpoint.as_str(), secret)))
+        }
+        _ => None,
+    };
+
     let state = AppState {
         signing_key: Arc::new(signing_key),
         config: config.clone(),
         redis_client,
         webauthn: Arc::new(webauthn),
+        synapse_client,
     };
 
     let introspect_state = IntrospectState::from(&state);
+    let compat_state = compat::CompatState {
+        redis_client: state.redis_client.clone(),
+        synapse_client: state.synapse_client.clone(),
+    };
 
     let app = Router::new()
         .nest_service("/build", ServeDir::new("./static/build"))
@@ -514,6 +538,23 @@ pub async fn main() {
         .route(
             "/oauth2/introspect",
             post(introspect::introspect).with_state(introspect_state),
+        )
+        // MSC3861 compat endpoints — revocation + Matrix legacy login/logout/refresh
+        .route(
+            "/oauth2/revoke",
+            post(compat::revoke).with_state(compat_state.clone()),
+        )
+        .route(
+            "/_matrix/client/v3/login",
+            get(compat::login_flows),
+        )
+        .route(
+            "/_matrix/client/v3/logout",
+            post(compat::logout).with_state(compat_state.clone()),
+        )
+        .route(
+            "/_matrix/client/v3/refresh",
+            post(compat::refresh).with_state(compat_state),
         )
         .layer(TraceLayer::new_for_http());
 

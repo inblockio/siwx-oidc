@@ -29,13 +29,15 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 use std::time;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use urlencoding::decode;
 use uuid::Uuid;
 
 use siwx_core::find_did_method;
 use siwx_oidc::db::*;
 use subtle::ConstantTimeEq;
+
+use crate::synapse_client::SynapseClient;
 
 use crate::introspect::generate_opaque_token;
 
@@ -459,7 +461,10 @@ pub async fn token(
         // MSC3861: issue a `mat_`-prefixed opaque token stored in Redis.
         let opaque = generate_opaque_token("mat_");
         let username = code_entry.did.replace(':', "-");
-        let device_id = format!("SIWX_{}", &opaque[4..12]);
+        let device_id = code_entry
+            .device_id
+            .clone()
+            .unwrap_or_else(|| format!("SIWX_{}", &opaque[4..12]));
         let iat = now.timestamp();
         let exp = iat + ACCESS_TOKEN_TTL as i64;
         let metadata = TokenMetadata {
@@ -803,6 +808,12 @@ pub struct SignInParams {
     pub code_challenge_method: Option<String>,
 }
 
+/// Derive a Matrix-compatible localpart from a DID by replacing colons with
+/// dashes and lowercasing.
+fn did_to_localpart(did: &str) -> String {
+    did.replace(':', "-").to_lowercase()
+}
+
 pub async fn sign_in(
     _base_url: &Url,
     allowed_did_methods: &[String],
@@ -810,6 +821,7 @@ pub async fn sign_in(
     params: SignInParams,
     cookies: headers::Cookie,
     db_client: &DBClientType,
+    synapse_client: Option<&SynapseClient>,
 ) -> Result<Url, CustomError> {
     let session_id = if let Some(c) = cookies.get(SESSION_COOKIE_NAME) {
         c
@@ -939,6 +951,40 @@ pub async fn sign_in(
         siwx_cookie.did
     };
 
+    // -- Synapse device lifecycle (best-effort, never fails the auth flow) --
+    let device_id = if let Some(synapse) = synapse_client {
+        let localpart = did_to_localpart(&did);
+        let dev_id = format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]);
+
+        // Provision user if new
+        match synapse.is_localpart_available(&localpart).await {
+            Ok(true) => {
+                if let Err(e) = synapse.provision_user(&localpart, &did).await {
+                    warn!("provision_user failed: {}", e);
+                }
+            }
+            Ok(false) => {} // existing user
+            Err(e) => warn!("is_localpart_available check failed: {}", e),
+        }
+
+        // Upsert device
+        if let Err(e) = synapse
+            .upsert_device(&localpart, &dev_id, Some("Element Web"))
+            .await
+        {
+            warn!("upsert_device failed: {}", e);
+        }
+
+        // Allow cross-signing reset
+        if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
+            warn!("allow_cross_signing_reset failed: {}", e);
+        }
+
+        Some(dev_id)
+    } else {
+        None
+    };
+
     let code_entry = CodeEntry {
         did,
         nonce: params.oidc_nonce.clone(),
@@ -947,6 +993,7 @@ pub async fn sign_in(
         auth_time: Utc::now(),
         code_challenge: params.code_challenge.clone(),
         code_challenge_method: params.code_challenge_method.clone(),
+        device_id,
     };
 
     let code = Uuid::new_v4();
@@ -1323,6 +1370,7 @@ mod tests {
             params,
             cookie,
             &db_client,
+            None, // no synapse_client in tests
         )
         .await
         .unwrap();

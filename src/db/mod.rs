@@ -35,6 +35,9 @@ pub struct CodeEntry {
     /// PKCE code_challenge_method ("S256" or "plain").
     #[serde(default)]
     pub code_challenge_method: Option<String>,
+    /// Device ID generated during Synapse provisioning (MSC3861).
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
