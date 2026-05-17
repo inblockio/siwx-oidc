@@ -37,6 +37,8 @@ use siwx_core::find_did_method;
 use siwx_oidc::db::*;
 use subtle::ConstantTimeEq;
 
+use crate::introspect::generate_opaque_token;
+
 /// Constant-time string comparison to prevent timing attacks on secrets.
 fn constant_time_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
@@ -449,17 +451,43 @@ pub async fn token(
         }
     }
 
-    // Generate a distinct access token (not the code itself).
-    let access_token_id = Uuid::new_v4().to_string();
-    db_client
-        .set_code(access_token_id.clone(), code_entry.clone())
-        .await?;
-    let access_token = AccessToken::new(access_token_id);
+    // Determine whether to issue opaque tokens (MSC3861 mode) or JWT-backed tokens.
+    let msc3861_mode = config.mas_shared_secret.is_some();
+
+    let now = Utc::now();
+    let access_token = if msc3861_mode {
+        // MSC3861: issue a `mat_`-prefixed opaque token stored in Redis.
+        let opaque = generate_opaque_token("mat_");
+        let username = code_entry.did.replace(':', "-");
+        let device_id = format!("SIWX_{}", &opaque[4..12]);
+        let iat = now.timestamp();
+        let exp = iat + ACCESS_TOKEN_TTL as i64;
+        let metadata = TokenMetadata {
+            username,
+            device_id,
+            scope: "openid".to_string(),
+            client_id: client_id.clone(),
+            iat,
+            exp,
+        };
+        db_client
+            .set_token(&opaque, &metadata, ACCESS_TOKEN_TTL)
+            .await?;
+        AccessToken::new(opaque)
+    } else {
+        // Legacy: UUID-based access token backed by code entry in Redis.
+        let access_token_id = Uuid::new_v4().to_string();
+        db_client
+            .set_code(access_token_id.clone(), code_entry.clone())
+            .await?;
+        AccessToken::new(access_token_id)
+    };
+
     let core_id_token = CoreIdTokenClaims::new(
         IssuerUrl::from_url(config.base_url.clone()),
         vec![Audience::new(client_id.clone())],
-        Utc::now() + Duration::seconds(config.id_token_ttl_secs as i64),
-        Utc::now(),
+        now + Duration::seconds(config.id_token_ttl_secs as i64),
+        now,
         resolve_claims(config, &code_entry.did).await,
         EmptyAdditionalClaims {},
     )
@@ -475,14 +503,18 @@ pub async fn token(
     )
     .map_err(|e| anyhow!("{}", e))?;
 
+    let expires_in_secs = if msc3861_mode {
+        ACCESS_TOKEN_TTL
+    } else {
+        ENTRY_LIFETIME as u64
+    };
+
     let mut response = CoreTokenResponse::new(
         access_token,
         CoreTokenType::Bearer,
         CoreIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
     );
-    response.set_expires_in(Some(&time::Duration::from_secs(
-        ENTRY_LIFETIME.try_into().unwrap(),
-    )));
+    response.set_expires_in(Some(&time::Duration::from_secs(expires_in_secs)));
     Ok(response)
 }
 
@@ -1060,14 +1092,48 @@ pub async fn userinfo(
     payload: UserInfoPayload,
     db_client: &DBClientType,
 ) -> Result<UserInfoResponse, CustomError> {
-    let code = if let Some(b) = bearer {
+    let token_str = if let Some(b) = bearer {
         b.token().to_string()
     } else if let Some(c) = payload.access_token {
         c
     } else {
         return Err(CustomError::BadRequest("Missing access token.".to_string()));
     };
-    let code_entry = if let Some(c) = db_client.get_code(code).await? {
+
+    // MSC3861 opaque tokens: if the token starts with `mat_`, look it up in the
+    // token store and synthesize the claims from TokenMetadata.
+    if token_str.starts_with("mat_") {
+        let metadata = db_client
+            .get_token(&token_str)
+            .await?
+            .ok_or_else(|| CustomError::BadRequest("Unknown or expired token.".to_string()))?;
+        if metadata.exp <= Utc::now().timestamp() {
+            return Err(CustomError::BadRequest("Token expired.".to_string()));
+        }
+        // Reconstruct the DID from the stored username (reverse the colon->dash mapping).
+        // The username is stored as e.g. "did-pkh-eip155-1-0xABC..." so we reverse dashes to colons.
+        let did = metadata.username.replace('-', ":");
+        let client_entry = db_client
+            .get_client(metadata.client_id.clone())
+            .await?
+            .ok_or_else(|| CustomError::BadRequest("Unknown client.".to_string()))?;
+        let response = CoreUserInfoClaims::new(
+            resolve_claims(config, &did).await,
+            EmptyAdditionalClaims::default(),
+        )
+        .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
+        .set_audiences(Some(vec![Audience::new(metadata.client_id)]));
+        return match client_entry.metadata.userinfo_signed_response_alg() {
+            None => Ok(UserInfoResponse::Json(response)),
+            Some(alg) => Ok(UserInfoResponse::Jwt(
+                CoreUserInfoJsonWebToken::new(response, signing_key, alg.clone())
+                    .map_err(|_| anyhow!("Error signing response."))?,
+            )),
+        };
+    }
+
+    // Legacy path: UUID-based access token backed by code entry.
+    let code_entry = if let Some(c) = db_client.get_code(token_str).await? {
         c
     } else {
         return Err(CustomError::BadRequest("Unknown code.".to_string()));

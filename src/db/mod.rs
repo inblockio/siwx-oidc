@@ -10,10 +10,16 @@ pub use self::redis::RedisClient;
 const KV_CLIENT_PREFIX: &str = "clients";
 const KV_SESSION_PREFIX: &str = "sessions";
 const KV_CODE_PREFIX: &str = "codes";
+const KV_TOKEN_PREFIX: &str = "token";
 pub const ENTRY_LIFETIME: usize = 300; // 5min — auth codes must outlive redirect chains
 pub const SESSION_LIFETIME: u64 = 300; // 5min
 pub const CLIENT_LIFETIME: u64 = 30 * 24 * 3600; // 30 days
 pub const SESSION_COOKIE_NAME: &str = "session";
+
+/// TTL for opaque access tokens (MSC3861 mode).
+pub const ACCESS_TOKEN_TTL: u64 = 300; // 5 minutes
+/// TTL for opaque refresh tokens (MSC3861 mode).
+pub const REFRESH_TOKEN_TTL: u64 = 86400; // 24 hours
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CodeEntry {
@@ -50,6 +56,23 @@ pub struct SessionEntry {
     pub verified_did: Option<String>,
 }
 
+/// Metadata stored alongside an opaque token in Redis (MSC3861 introspection).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenMetadata {
+    /// The Matrix-compatible username (DID with colons replaced by dashes).
+    pub username: String,
+    /// Device ID assigned by this provider (deterministic from token).
+    pub device_id: String,
+    /// Space-separated OAuth2 scopes granted.
+    pub scope: String,
+    /// The client_id that requested the token.
+    pub client_id: String,
+    /// Token issued-at (Unix timestamp).
+    pub iat: i64,
+    /// Token expiry (Unix timestamp).
+    pub exp: i64,
+}
+
 #[async_trait]
 pub trait DBClient {
     async fn set_client(&self, client_id: String, client_entry: ClientEntry) -> Result<()>;
@@ -65,4 +88,13 @@ pub trait DBClient {
     /// Atomically mark a session as signed-in. Returns true on first call,
     /// false if the session was already signed-in.
     async fn try_mark_session_signed_in(&self, id: String) -> Result<bool>;
+
+    // -- Opaque token storage (MSC3861) ----------------------------------------
+
+    /// Store an opaque token with metadata and a TTL in seconds.
+    async fn set_token(&self, token: &str, metadata: &TokenMetadata, ttl: u64) -> Result<()>;
+    /// Retrieve metadata for an opaque token (returns None if expired/missing).
+    async fn get_token(&self, token: &str) -> Result<Option<TokenMetadata>>;
+    /// Delete an opaque token (e.g. on revocation).
+    async fn delete_token(&self, token: &str) -> Result<()>;
 }

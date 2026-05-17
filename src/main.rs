@@ -1,5 +1,6 @@
 mod axum_lib;
 mod config;
+mod introspect;
 mod oidc;
 mod webauthn;
 

@@ -269,4 +269,54 @@ impl DBClient for RedisClient {
         }
         Ok(was_set)
     }
+
+    // -- Opaque token storage (MSC3861) ----------------------------------------
+
+    async fn set_token(&self, token: &str, metadata: &TokenMetadata, ttl: u64) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+        let key = format!("{}/{}", KV_TOKEN_PREFIX, token);
+        let value = serde_json::to_string(metadata)
+            .map_err(|e| anyhow!("Failed to serialize token metadata: {}", e))?;
+        conn.set_ex::<_, _, ()>(&key, &value, ttl)
+            .await
+            .map_err(|e| anyhow!("Failed to SET EX token: {}", e))?;
+        debug!("set_token: stored key={} ttl={}s", key, ttl);
+        Ok(())
+    }
+
+    async fn get_token(&self, token: &str) -> Result<Option<TokenMetadata>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+        let key = format!("{}/{}", KV_TOKEN_PREFIX, token);
+        let entry: Option<String> = conn
+            .get(&key)
+            .await
+            .map_err(|e| anyhow!("Failed to GET token: {}", e))?;
+        match entry {
+            Some(e) => Ok(Some(serde_json::from_str(&e).map_err(|e| {
+                anyhow!("Failed to deserialize token metadata: {}", e)
+            })?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn delete_token(&self, token: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+        let key = format!("{}/{}", KV_TOKEN_PREFIX, token);
+        conn.del::<_, ()>(&key)
+            .await
+            .map_err(|e| anyhow!("Failed to DEL token: {}", e))?;
+        Ok(())
+    }
 }

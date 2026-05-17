@@ -33,6 +33,15 @@ pub struct Config {
     pub rp_id: Option<String>,
     /// WebAuthn expected origin. Defaults to `base_url` (scheme + host + port).
     pub rp_origin: Option<String>,
+    /// Shared secret for MSC3861 token introspection (Synapse delegates auth).
+    /// When set, the token endpoint issues opaque tokens stored in Redis instead
+    /// of JWTs, and the `/oauth2/introspect` endpoint becomes active.
+    /// Env: `SIWEOIDC_MAS_SHARED_SECRET`
+    pub mas_shared_secret: Option<String>,
+    /// Synapse homeserver endpoint for provisioning calls (MSC3861 Agent C).
+    /// Example: `http://matrix_synapse:8080`
+    /// Env: `SIWEOIDC_SYNAPSE_ENDPOINT`
+    pub synapse_endpoint: Option<Url>,
 }
 
 impl Default for Config {
@@ -56,6 +65,8 @@ impl Default for Config {
             ],
             rp_id: None,
             rp_origin: None,
+            mas_shared_secret: None,
+            synapse_endpoint: None,
         }
     }
 }

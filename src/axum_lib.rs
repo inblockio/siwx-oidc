@@ -31,6 +31,7 @@ use tower_http::{
 use tracing::info;
 
 use super::config;
+use super::introspect;
 use super::oidc::{self, CustomError, EcdsaSigningKey};
 use super::webauthn as wa;
 use openidconnect::JsonWebKeyId;
@@ -45,6 +46,22 @@ struct AppState {
     config: config::Config,
     redis_client: RedisClient,
     webauthn: Arc<Webauthn>,
+}
+
+/// State subset exposed to the introspection endpoint.
+#[derive(Clone)]
+pub struct IntrospectState {
+    pub mas_shared_secret: Option<String>,
+    pub redis_client: RedisClient,
+}
+
+impl From<&AppState> for IntrospectState {
+    fn from(state: &AppState) -> Self {
+        Self {
+            mas_shared_secret: state.config.mas_shared_secret.clone(),
+            redis_client: state.redis_client.clone(),
+        }
+    }
 }
 
 // -- Error → Response conversion -------------------------------------------
@@ -459,6 +476,8 @@ pub async fn main() {
         webauthn: Arc::new(webauthn),
     };
 
+    let introspect_state = IntrospectState::from(&state);
+
     let app = Router::new()
         .nest_service("/build", ServeDir::new("./static/build"))
         .nest_service("/legal", ServeDir::new("./static/legal"))
@@ -491,6 +510,11 @@ pub async fn main() {
         .route("/link/webauthn/finish", post(webauthn_link_finish))
         .route("/health", get(healthcheck))
         .with_state(state)
+        // MSC3861 introspection — separate state (only needs secret + Redis)
+        .route(
+            "/oauth2/introspect",
+            post(introspect::introspect).with_state(introspect_state),
+        )
         .layer(TraceLayer::new_for_http());
 
     let addr = SocketAddr::from((config.address, config.port));
