@@ -319,4 +319,14 @@ impl DBClient for RedisClient {
             .map_err(|e| anyhow!("Failed to DEL token: {}", e))?;
         Ok(())
     }
+
+    async fn get_device_id(&self, did: &str) -> Result<Option<String>> {
+        let key = format!("{}/{}", KV_DEVICE_PREFIX, did);
+        self.get_raw(&key).await
+    }
+
+    async fn set_device_id(&self, did: &str, device_id: &str) -> Result<()> {
+        let key = format!("{}/{}", KV_DEVICE_PREFIX, did);
+        self.set_raw(&key, device_id).await
+    }
 }

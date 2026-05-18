@@ -958,7 +958,22 @@ pub async fn sign_in(
     // -- Synapse device lifecycle (best-effort, never fails the auth flow) --
     let device_id = if let Some(synapse) = synapse_client {
         let localpart = did_to_localpart(&did);
-        let dev_id = format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]);
+
+        // Reuse existing device ID for this DID, or generate a new one.
+        let (dev_id, is_new_device) = match db_client.get_device_id(&did).await {
+            Ok(Some(existing)) => {
+                debug!("reusing device_id={} for did={}", existing, did);
+                (existing, false)
+            }
+            _ => {
+                let new_id = format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]);
+                debug!("new device_id={} for did={}", new_id, did);
+                if let Err(e) = db_client.set_device_id(&did, &new_id).await {
+                    warn!("failed to persist device_id: {}", e);
+                }
+                (new_id, true)
+            }
+        };
 
         // Provision user if new
         match synapse.is_localpart_available(&localpart).await {
@@ -979,9 +994,11 @@ pub async fn sign_in(
             warn!("upsert_device failed: {}", e);
         }
 
-        // Allow cross-signing reset
-        if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
-            warn!("allow_cross_signing_reset failed: {}", e);
+        // Only reset cross-signing for first-time devices
+        if is_new_device {
+            if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
+                warn!("allow_cross_signing_reset failed: {}", e);
+            }
         }
 
         Some(dev_id)
