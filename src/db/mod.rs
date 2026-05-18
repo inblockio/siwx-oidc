@@ -18,7 +18,7 @@ pub const CLIENT_LIFETIME: u64 = 30 * 24 * 3600; // 30 days
 pub const SESSION_COOKIE_NAME: &str = "session";
 
 /// TTL for opaque access tokens (MSC3861 mode).
-pub const ACCESS_TOKEN_TTL: u64 = 300; // 5 minutes
+pub const ACCESS_TOKEN_TTL: u64 = 3000; // 50 minutes
 /// TTL for opaque refresh tokens (MSC3861 mode).
 pub const REFRESH_TOKEN_TTL: u64 = 86400; // 24 hours
 
