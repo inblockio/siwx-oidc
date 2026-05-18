@@ -925,10 +925,71 @@ pub struct SignInParams {
     pub code_challenge_method: Option<String>,
 }
 
-/// Derive a Matrix-compatible localpart from a DID by replacing colons with
-/// dashes and lowercasing.
+/// Derive a Matrix-compatible localpart from a DID.
+///
+/// For `did:pkh` (hex-based, case-insensitive): colons to dashes + lowercase.
+/// For `did:key` and `did:peer` variant 0 (base58btc, case-sensitive): the
+/// base58 body is decoded to bytes and re-encoded as lowercase hex so the
+/// mapping is fully reversible.  Use [`localpart_to_did`] to reverse.
 fn did_to_localpart(did: &str) -> String {
+    // did:key:z{base58} -> did-key-{hex}
+    if let Some(z_body) = did.strip_prefix("did:key:z") {
+        if let Ok(bytes) = bs58::decode(z_body).into_vec() {
+            return format!("did-key-{}", hex::encode(&bytes));
+        }
+    }
+
+    // did:peer:0z{base58} -> did-peer-0-{hex}
+    if let Some(rest) = did.strip_prefix("did:peer:0z") {
+        if let Ok(bytes) = bs58::decode(rest).into_vec() {
+            return format!("did-peer-0-{}", hex::encode(&bytes));
+        }
+    }
+
+    // Fallback (did:pkh and anything else): colons to dashes, lowercase.
     did.replace(':', "-").to_lowercase()
+}
+
+/// Reverse a Matrix localpart back to the original DID.
+///
+/// Inverse of [`did_to_localpart`].  For hex-encoded `did:key` / `did:peer`
+/// localparts the bytes are decoded and re-encoded as base58btc.
+/// For `did:pkh:eip155` the address is restored to EIP-55 checksum form.
+fn localpart_to_did(localpart: &str) -> String {
+    // did-key-{hex} -> did:key:z{base58}
+    if let Some(hex_str) = localpart.strip_prefix("did-key-") {
+        if let Ok(bytes) = hex::decode(hex_str) {
+            return format!("did:key:z{}", bs58::encode(&bytes).into_string());
+        }
+    }
+
+    // did-peer-0-{hex} -> did:peer:0z{base58}
+    if let Some(hex_str) = localpart.strip_prefix("did-peer-0-") {
+        if let Ok(bytes) = hex::decode(hex_str) {
+            return format!("did:peer:0z{}", bs58::encode(&bytes).into_string());
+        }
+    }
+
+    // Simple dash-to-colon reversal first.
+    let did = localpart.replace('-', ":");
+
+    // For eip155: restore EIP-55 checksummed address so the DID is canonical.
+    if let Some(rest) = did.strip_prefix("did:pkh:eip155:") {
+        if let Some((chain, addr_lower)) = rest.rsplit_once(':') {
+            if let Some(hex_str) = addr_lower.strip_prefix("0x") {
+                if hex_str.len() == 40 {
+                    if let Ok(bytes) = hex::decode(hex_str) {
+                        if let Ok(addr) = <[u8; 20]>::try_from(bytes.as_slice()) {
+                            let checksummed = siwx_core::did::eip55_checksum(&addr);
+                            return format!("did:pkh:eip155:{chain}:0x{checksummed}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    did
 }
 
 pub async fn sign_in(
@@ -1294,9 +1355,10 @@ pub async fn userinfo(
         if metadata.exp <= Utc::now().timestamp() {
             return Err(CustomError::BadRequest("Token expired.".to_string()));
         }
-        // Reconstruct the DID from the stored username (reverse the colon->dash mapping).
-        // The username is stored as e.g. "did-pkh-eip155-1-0xABC..." so we reverse dashes to colons.
-        let did = metadata.username.replace('-', ":");
+        // Reconstruct the DID from the stored localpart (reverses the hex encoding
+        // applied by did_to_localpart for did:key/did:peer, or the simple dash mapping
+        // for did:pkh).
+        let did = localpart_to_did(&metadata.username);
         let client_entry = db_client
             .get_client(metadata.client_id.clone())
             .await?
@@ -1526,5 +1588,78 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    // -- did_to_localpart / localpart_to_did roundtrip tests --
+
+    /// Helper: assert the localpart is Matrix-compatible (lowercase, restricted charset).
+    fn assert_valid_localpart(localpart: &str) {
+        for ch in localpart.chars() {
+            assert!(
+                ch.is_ascii_lowercase()
+                    || ch.is_ascii_digit()
+                    || matches!(ch, '.' | '_' | '=' | '-' | '/'),
+                "invalid localpart char '{}' in '{}'",
+                ch,
+                localpart
+            );
+        }
+    }
+
+    #[test]
+    fn localpart_roundtrip_did_pkh() {
+        let did = "did:pkh:eip155:1:0x4b23da593596d94035c57adf6c2454216449b1b2";
+        let lp = did_to_localpart(did);
+        assert_valid_localpart(&lp);
+        assert_eq!(lp, "did-pkh-eip155-1-0x4b23da593596d94035c57adf6c2454216449b1b2");
+        // Reverse restores canonical EIP-55 checksum form.
+        let reversed = localpart_to_did(&lp);
+        assert_eq!(reversed, "did:pkh:eip155:1:0x4B23da593596D94035c57Adf6C2454216449B1B2");
+        // Re-encoding the checksummed DID produces the same localpart.
+        assert_eq!(did_to_localpart(&reversed), lp);
+    }
+
+    #[test]
+    fn localpart_roundtrip_did_key_ed25519() {
+        let did = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+        let lp = did_to_localpart(did);
+        assert_valid_localpart(&lp);
+        // Must NOT contain uppercase (hex is inherently lowercase).
+        assert_eq!(lp, lp.to_lowercase(), "localpart must be lowercase");
+        // Roundtrip must recover the exact original DID (case-sensitive base58).
+        assert_eq!(localpart_to_did(&lp), did);
+    }
+
+    #[test]
+    fn localpart_roundtrip_did_key_p256() {
+        let did = "did:key:zDnaeUKTWUXc1HDpGfKbEK31nKLN1BHQFGfBNPaMphFkMBosR";
+        let lp = did_to_localpart(did);
+        assert_valid_localpart(&lp);
+        assert_eq!(lp, lp.to_lowercase(), "localpart must be lowercase");
+        assert_eq!(localpart_to_did(&lp), did);
+    }
+
+    #[test]
+    fn localpart_roundtrip_did_peer_variant0() {
+        let did = "did:peer:0z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+        let lp = did_to_localpart(did);
+        assert_valid_localpart(&lp);
+        assert_eq!(lp, lp.to_lowercase(), "localpart must be lowercase");
+        assert_eq!(localpart_to_did(&lp), did);
+    }
+
+    #[test]
+    fn localpart_did_pkh_restores_eip55_checksum() {
+        // did:pkh with mixed-case EIP-55 address -- localpart is lowercased,
+        // but reverse restores the canonical EIP-55 checksum form.
+        let did = "did:pkh:eip155:1:0xABCDEF1234567890abcdef1234567890ABCDEF12";
+        let lp = did_to_localpart(did);
+        assert_eq!(lp, "did-pkh-eip155-1-0xabcdef1234567890abcdef1234567890abcdef12");
+        let reversed = localpart_to_did(&lp);
+        // EIP-55 checksum is deterministic: same bytes always produce the same mixed-case.
+        assert!(reversed.starts_with("did:pkh:eip155:1:0x"));
+        // Roundtrip through did_to_localpart must produce the same localpart
+        // (checksum is cosmetic, the localpart is the stable identity).
+        assert_eq!(did_to_localpart(&reversed), lp);
     }
 }

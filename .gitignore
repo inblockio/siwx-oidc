@@ -5,3 +5,11 @@
 **/dist
 *.png
 *:Zone.Identifier
+
+# Override global ~/.gitignore that ignores .claude/ entirely.
+# Track skills (commands/) but ignore instance-specific files.
+!.claude/
+.claude/*
+!.claude/commands/
+.claude/settings.local.json
+.claude/worktrees/
