@@ -550,8 +550,8 @@
 		height: 600px;
 		background: radial-gradient(
 			ellipse at center,
-			rgba(4, 210, 202, 0.06) 0%,
-			rgba(4, 210, 202, 0.02) 40%,
+			rgba(232, 97, 26, 0.06) 0%,
+			rgba(232, 97, 26, 0.02) 40%,
 			transparent 70%
 		);
 		pointer-events: none;
@@ -678,26 +678,26 @@
 	}
 
 	.btn-primary {
-		background: linear-gradient(135deg, #04D2CA 0%, #06A8A2 100%);
-		color: #041a19;
+		background: linear-gradient(135deg, #EF5402 0%, #D4570F 100%);
+		color: #fff;
 		box-shadow:
 			0 1px 2px rgba(0, 0, 0, 0.1),
-			0 0 0 1px rgba(4, 210, 202, 0.12) inset;
+			0 0 0 1px rgba(232, 97, 26, 0.12) inset;
 	}
 
 	.btn-primary:not(:disabled):hover {
-		background: linear-gradient(135deg, #0ce8df 0%, #04D2CA 100%);
+		background: linear-gradient(135deg, #ff6a1a 0%, #EF5402 100%);
 		box-shadow:
-			0 4px 16px rgba(4, 210, 202, 0.2),
-			0 0 0 1px rgba(4, 210, 202, 0.15) inset;
+			0 4px 16px rgba(232, 97, 26, 0.25),
+			0 0 0 1px rgba(232, 97, 26, 0.15) inset;
 		transform: translateY(-1px);
 	}
 
 	.btn-primary:not(:disabled):active {
 		transform: translateY(0);
 		box-shadow:
-			0 1px 4px rgba(4, 210, 202, 0.12),
-			0 0 0 1px rgba(4, 210, 202, 0.1) inset;
+			0 1px 4px rgba(232, 97, 26, 0.12),
+			0 0 0 1px rgba(232, 97, 26, 0.1) inset;
 	}
 
 	.btn-secondary {
@@ -784,7 +784,7 @@
 		border: none;
 		padding: 0;
 		margin: 0;
-		color: #069e98;
+		color: #E8611A;
 		font-size: 13px;
 		font-weight: 500;
 		cursor: pointer;
@@ -794,7 +794,7 @@
 	}
 
 	.link-btn:hover {
-		color: #04D2CA;
+		color: #EF5402;
 	}
 
 	.link-btn:disabled {
@@ -820,7 +820,7 @@
 	.success-icon {
 		width: 40px;
 		height: 40px;
-		color: #069e98;
+		color: #E8611A;
 	}
 
 	.link-actions {
