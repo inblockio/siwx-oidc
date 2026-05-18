@@ -986,7 +986,14 @@ pub async fn sign_in(
             Err(e) => warn!("is_localpart_available check failed: {}", e),
         }
 
-        // Upsert device
+        // Delete existing device to clear stale one-time keys, then recreate.
+        // Element's crypto state (IndexedDB) does not survive logout, so the
+        // new session always generates fresh Olm keys. Without deletion, the
+        // old one-time key IDs collide and Element enters an infinite retry loop.
+        if !is_new_device {
+            let _ = synapse.delete_device(&localpart, &dev_id).await;
+        }
+
         if let Err(e) = synapse
             .upsert_device(&localpart, &dev_id, Some("Element Web"))
             .await
@@ -994,11 +1001,8 @@ pub async fn sign_in(
             warn!("upsert_device failed: {}", e);
         }
 
-        // Only reset cross-signing for first-time devices
-        if is_new_device {
-            if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
-                warn!("allow_cross_signing_reset failed: {}", e);
-            }
+        if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
+            warn!("allow_cross_signing_reset failed: {}", e);
         }
 
         Some(dev_id)
