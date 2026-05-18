@@ -1130,19 +1130,18 @@ pub async fn sign_in(
     };
 
     // -- Synapse device lifecycle (best-effort, never fails the auth flow) --
+    //
+    // Matches MAS behavior: devices are created/updated on login, deleted on
+    // logout. This preserves crypto state (identity keys, Olm sessions, pending
+    // to-device messages) for clients with persistent storage. Stale one-time
+    // keys are flushed when the device is deleted at logout, not at login.
     let device_id = if let Some(synapse) = synapse_client {
         let localpart = did_to_localpart(&did);
 
-        // Reuse existing device ID for this DID, or generate a new one.
-        // When reusing, delete the old device first to flush stale one-time
-        // keys from Synapse (the client will upload fresh keys on connect).
         let (dev_id, is_new_device) = match db_client.get_device_id(&did).await {
             Ok(Some(existing)) => {
-                debug!("recycling device_id={} for did={}", existing, did);
-                if let Err(e) = synapse.delete_device(&localpart, &existing).await {
-                    warn!("delete_device (pre-recreate) failed: {}", e);
-                }
-                (existing, true)
+                debug!("reusing device_id={} for did={}", existing, did);
+                (existing, false)
             }
             _ => {
                 let new_id = format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]);

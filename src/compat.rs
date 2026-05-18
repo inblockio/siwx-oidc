@@ -54,9 +54,8 @@ pub async fn revoke(
     State(state): State<CompatState>,
     axum::extract::Form(form): axum::extract::Form<RevokeForm>,
 ) -> StatusCode {
-    // Delete token from Redis (idempotent). Device is NOT deleted here;
-    // it is recycled (delete + recreate) at next login to flush stale
-    // one-time keys while preserving the same device ID.
+    // Delete token from Redis (idempotent). Device is deleted at logout,
+    // not here; revoke only affects the token.
     let _ = state.redis_client.delete_token(&form.token).await;
     StatusCode::OK
 }
@@ -82,11 +81,23 @@ pub async fn logout(
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
 ) -> impl IntoResponse {
     if let Some(TypedHeader(auth)) = bearer {
-        // Delete the token from Redis (session invalidation). Device is
-        // recycled (delete + recreate) at next login, not here.
+        // Look up token metadata before deletion to get device info
+        if let Ok(Some(metadata)) = state.redis_client.get_token(auth.token()).await {
+            // Delete the device from Synapse (flushes crypto keys and pending
+            // to-device messages). Matches MAS behavior: device cleanup happens
+            // at logout, not at login, so persistent clients keep their crypto
+            // state across sessions.
+            if let Some(ref synapse) = state.synapse_client {
+                if let Err(e) = synapse
+                    .delete_device(&metadata.username, &metadata.device_id)
+                    .await
+                {
+                    warn!("logout: delete_device failed: {}", e);
+                }
+            }
+        }
         let _ = state.redis_client.delete_token(auth.token()).await;
     }
-    // Always return 200 with empty JSON object (idempotent).
     (StatusCode::OK, Json(serde_json::json!({})))
 }
 
