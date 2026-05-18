@@ -931,7 +931,7 @@ pub struct SignInParams {
 /// For `did:key` and `did:peer` variant 0 (base58btc, case-sensitive): the
 /// base58 body is decoded to bytes and re-encoded as lowercase hex so the
 /// mapping is fully reversible.  Use [`localpart_to_did`] to reverse.
-fn did_to_localpart(did: &str) -> String {
+pub fn did_to_localpart(did: &str) -> String {
     // did:key:z{base58} -> did-key-{hex}
     if let Some(z_body) = did.strip_prefix("did:key:z") {
         if let Ok(bytes) = bs58::decode(z_body).into_vec() {
@@ -955,7 +955,7 @@ fn did_to_localpart(did: &str) -> String {
 /// Inverse of [`did_to_localpart`].  For hex-encoded `did:key` / `did:peer`
 /// localparts the bytes are decoded and re-encoded as base58btc.
 /// For `did:pkh:eip155` the address is restored to EIP-55 checksum form.
-fn localpart_to_did(localpart: &str) -> String {
+pub fn localpart_to_did(localpart: &str) -> String {
     // did-key-{hex} -> did:key:z{base58}
     if let Some(hex_str) = localpart.strip_prefix("did-key-") {
         if let Ok(bytes) = hex::decode(hex_str) {

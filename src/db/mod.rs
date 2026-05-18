@@ -108,4 +108,7 @@ pub trait DBClient {
     async fn get_device_id(&self, did: &str) -> Result<Option<String>>;
     /// Store a persistent device ID for a DID (no TTL).
     async fn set_device_id(&self, did: &str, device_id: &str) -> Result<()>;
+    /// Remove the persistent device ID for a DID (called at logout so the next
+    /// login creates a fresh device for clients that clear their crypto store).
+    async fn delete_device_id(&self, did: &str) -> Result<()>;
 }

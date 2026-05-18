@@ -22,6 +22,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::introspect::generate_opaque_token;
+use crate::oidc::localpart_to_did;
 use crate::synapse_client::SynapseClient;
 use siwx_oidc::db::{DBClient, RedisClient, TokenMetadata, ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL};
 
@@ -81,12 +82,9 @@ pub async fn logout(
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
 ) -> impl IntoResponse {
     if let Some(TypedHeader(auth)) = bearer {
-        // Look up token metadata before deletion to get device info
         if let Ok(Some(metadata)) = state.redis_client.get_token(auth.token()).await {
             // Delete the device from Synapse (flushes crypto keys and pending
-            // to-device messages). Matches MAS behavior: device cleanup happens
-            // at logout, not at login, so persistent clients keep their crypto
-            // state across sessions.
+            // to-device messages).
             if let Some(ref synapse) = state.synapse_client {
                 if let Err(e) = synapse
                     .delete_device(&metadata.username, &metadata.device_id)
@@ -94,6 +92,15 @@ pub async fn logout(
                 {
                     warn!("logout: delete_device failed: {}", e);
                 }
+            }
+
+            // Clear the persistent device-ID mapping so the next login creates
+            // a fresh device. Without this, Element Web (which clears IndexedDB
+            // on logout) would reuse the old device ID with new identity keys,
+            // causing SigningKeyChanged rejections from other clients.
+            let did = localpart_to_did(&metadata.username);
+            if let Err(e) = state.redis_client.delete_device_id(&did).await {
+                warn!("logout: delete_device_id failed: {}", e);
             }
         }
         let _ = state.redis_client.delete_token(auth.token()).await;
