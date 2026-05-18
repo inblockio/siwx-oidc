@@ -18,8 +18,9 @@ use openidconnect::{
     AccessToken, Audience, AuthUrl, ClientConfigUrl, ClientId, ClientSecret, EmptyAdditionalClaims,
     EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserName, EndUserUsername,
     IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl, LocalizedClaim, Nonce, OpPolicyUrl, OpTosUrl,
-    PrivateSigningKey, RedirectUrl, RegistrationAccessToken, RegistrationUrl, RequestUrl,
-    ResponseTypes, Scope, SigningError, StandardClaims, SubjectIdentifier, TokenUrl, UserInfoUrl,
+    PrivateSigningKey, RedirectUrl, RefreshToken, RegistrationAccessToken, RegistrationUrl,
+    RequestUrl, ResponseTypes, Scope, SigningError, StandardClaims, SubjectIdentifier, TokenUrl,
+    UserInfoUrl,
 };
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
@@ -364,12 +365,14 @@ async fn resolve_claims(
 
 #[derive(Serialize, Deserialize)]
 pub struct TokenForm {
-    pub code: String,
+    pub code: Option<String>,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub grant_type: CoreGrantType,
     /// PKCE code verifier (required if code_challenge was sent in /authorize).
     pub code_verifier: Option<String>,
+    /// Refresh token (required when grant_type=refresh_token).
+    pub refresh_token: Option<String>,
 }
 
 pub async fn token(
@@ -379,17 +382,113 @@ pub async fn token(
     config: &crate::config::Config,
     db_client: &DBClientType,
 ) -> Result<CoreTokenResponse, CustomError> {
-    // Validate grant_type.
-    if form.grant_type != CoreGrantType::AuthorizationCode {
+    match form.grant_type {
+        CoreGrantType::AuthorizationCode => {
+            token_authorization_code(form, secret, signing_key, config, db_client).await
+        }
+        CoreGrantType::RefreshToken => {
+            token_refresh(form, config, db_client).await
+        }
+        _ => Err(CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::UnsupportedGrantType,
+            error_description: "Supported grant_types: authorization_code, refresh_token."
+                .to_string(),
+        })),
+    }
+}
+
+async fn token_refresh(
+    form: TokenForm,
+    config: &crate::config::Config,
+    db_client: &DBClientType,
+) -> Result<CoreTokenResponse, CustomError> {
+    if config.mas_shared_secret.is_none() {
         return Err(CustomError::BadRequestToken(TokenError {
             error: CoreErrorResponseType::UnsupportedGrantType,
-            error_description: "Only authorization_code is supported.".to_string(),
+            error_description: "refresh_token grant requires MSC3861 mode.".to_string(),
         }));
     }
 
-    // Atomically consume the code (prevents race-condition replay).
+    let rt = form.refresh_token.ok_or_else(|| {
+        CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidRequest,
+            error_description: "refresh_token parameter is required.".to_string(),
+        })
+    })?;
+
+    let metadata = db_client
+        .get_token(&rt)
+        .await?
+        .ok_or_else(|| {
+            CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::InvalidGrant,
+                error_description: "Unknown or expired refresh token.".to_string(),
+            })
+        })?;
+
+    if metadata.exp <= Utc::now().timestamp() {
+        return Err(CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "Refresh token has expired.".to_string(),
+        }));
+    }
+
+    let now = Utc::now().timestamp();
+
+    let new_access = generate_opaque_token("mat_");
+    let access_meta = TokenMetadata {
+        username: metadata.username.clone(),
+        device_id: metadata.device_id.clone(),
+        scope: metadata.scope.clone(),
+        client_id: metadata.client_id.clone(),
+        iat: now,
+        exp: now + ACCESS_TOKEN_TTL as i64,
+    };
+    db_client
+        .set_token(&new_access, &access_meta, ACCESS_TOKEN_TTL)
+        .await?;
+
+    let new_refresh = generate_opaque_token("mcr_");
+    let refresh_meta = TokenMetadata {
+        username: metadata.username.clone(),
+        device_id: metadata.device_id.clone(),
+        scope: metadata.scope.clone(),
+        client_id: metadata.client_id.clone(),
+        iat: now,
+        exp: now + REFRESH_TOKEN_TTL as i64,
+    };
+    db_client
+        .set_token(&new_refresh, &refresh_meta, REFRESH_TOKEN_TTL)
+        .await?;
+
+    let _ = db_client.delete_token(&rt).await;
+
+    let mut response = CoreTokenResponse::new(
+        AccessToken::new(new_access),
+        CoreTokenType::Bearer,
+        CoreIdTokenFields::new(None, EmptyExtraTokenFields {}),
+    );
+    response.set_expires_in(Some(&time::Duration::from_secs(ACCESS_TOKEN_TTL)));
+    response.set_refresh_token(Some(RefreshToken::new(new_refresh)));
+    Ok(response)
+}
+
+async fn token_authorization_code(
+    form: TokenForm,
+    secret: Option<String>,
+    signing_key: &EcdsaSigningKey,
+    config: &crate::config::Config,
+    db_client: &DBClientType,
+) -> Result<CoreTokenResponse, CustomError> {
+    let code = form.code.ok_or_else(|| {
+        CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidRequest,
+            error_description: "code parameter is required.".to_string(),
+        })
+    })?;
+
     let code_entry = db_client
-        .try_consume_code(form.code.to_string())
+        .try_consume_code(code)
         .await?
         .ok_or_else(|| {
             CustomError::BadRequestToken(TokenError {
@@ -453,12 +552,10 @@ pub async fn token(
         }
     }
 
-    // Determine whether to issue opaque tokens (MSC3861 mode) or JWT-backed tokens.
     let msc3861_mode = config.mas_shared_secret.is_some();
 
     let now = Utc::now();
-    let access_token = if msc3861_mode {
-        // MSC3861: issue a `mat_`-prefixed opaque token stored in Redis.
+    let (access_token, refresh_token) = if msc3861_mode {
         let opaque = generate_opaque_token("mat_");
         let username = did_to_localpart(&code_entry.did);
         let device_id = code_entry
@@ -466,30 +563,45 @@ pub async fn token(
             .clone()
             .unwrap_or_else(|| format!("SIWX_{}", &opaque[4..12]));
         let iat = now.timestamp();
-        let exp = iat + ACCESS_TOKEN_TTL as i64;
         let scope = format!(
             "openid urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:{}",
             device_id
         );
-        let metadata = TokenMetadata {
+        let access_metadata = TokenMetadata {
+            username: username.clone(),
+            device_id: device_id.clone(),
+            scope: scope.clone(),
+            client_id: client_id.clone(),
+            iat,
+            exp: iat + ACCESS_TOKEN_TTL as i64,
+        };
+        db_client
+            .set_token(&opaque, &access_metadata, ACCESS_TOKEN_TTL)
+            .await?;
+
+        let refresh_opaque = generate_opaque_token("mcr_");
+        let refresh_metadata = TokenMetadata {
             username,
             device_id,
             scope,
             client_id: client_id.clone(),
             iat,
-            exp,
+            exp: iat + REFRESH_TOKEN_TTL as i64,
         };
         db_client
-            .set_token(&opaque, &metadata, ACCESS_TOKEN_TTL)
+            .set_token(&refresh_opaque, &refresh_metadata, REFRESH_TOKEN_TTL)
             .await?;
-        AccessToken::new(opaque)
+
+        (
+            AccessToken::new(opaque),
+            Some(RefreshToken::new(refresh_opaque)),
+        )
     } else {
-        // Legacy: UUID-based access token backed by code entry in Redis.
         let access_token_id = Uuid::new_v4().to_string();
         db_client
             .set_code(access_token_id.clone(), code_entry.clone())
             .await?;
-        AccessToken::new(access_token_id)
+        (AccessToken::new(access_token_id), None)
     };
 
     let core_id_token = CoreIdTokenClaims::new(
@@ -524,6 +636,7 @@ pub async fn token(
         CoreIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
     );
     response.set_expires_in(Some(&time::Duration::from_secs(expires_in_secs)));
+    response.set_refresh_token(refresh_token);
     Ok(response)
 }
 
@@ -960,10 +1073,15 @@ pub async fn sign_in(
         let localpart = did_to_localpart(&did);
 
         // Reuse existing device ID for this DID, or generate a new one.
+        // When reusing, delete the old device first to flush stale one-time
+        // keys from Synapse (the client will upload fresh keys on connect).
         let (dev_id, is_new_device) = match db_client.get_device_id(&did).await {
             Ok(Some(existing)) => {
-                debug!("reusing device_id={} for did={}", existing, did);
-                (existing, false)
+                debug!("recycling device_id={} for did={}", existing, did);
+                if let Err(e) = synapse.delete_device(&localpart, &existing).await {
+                    warn!("delete_device (pre-recreate) failed: {}", e);
+                }
+                (existing, true)
             }
             _ => {
                 let new_id = format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]);
@@ -986,14 +1104,6 @@ pub async fn sign_in(
             Err(e) => warn!("is_localpart_available check failed: {}", e),
         }
 
-        // Delete existing device to clear stale one-time keys, then recreate.
-        // Element's crypto state (IndexedDB) does not survive logout, so the
-        // new session always generates fresh Olm keys. Without deletion, the
-        // old one-time key IDs collide and Element enters an infinite retry loop.
-        if !is_new_device {
-            let _ = synapse.delete_device(&localpart, &dev_id).await;
-        }
-
         if let Err(e) = synapse
             .upsert_device(&localpart, &dev_id, Some("Element Web"))
             .await
@@ -1001,8 +1111,10 @@ pub async fn sign_in(
             warn!("upsert_device failed: {}", e);
         }
 
-        if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
-            warn!("allow_cross_signing_reset failed: {}", e);
+        if is_new_device {
+            if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
+                warn!("allow_cross_signing_reset failed: {}", e);
+            }
         }
 
         Some(dev_id)
