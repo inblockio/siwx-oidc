@@ -19,7 +19,7 @@ use figment::{
 use headers::Header;
 use openidconnect::core::{
     CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType, CoreJsonWebKeySet,
-    CoreTokenResponse, CoreUserInfoClaims, CoreUserInfoJsonWebToken,
+    CoreUserInfoClaims, CoreUserInfoJsonWebToken,
 };
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
@@ -119,7 +119,7 @@ async fn token(
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
     basic: Option<TypedHeader<Authorization<Basic>>>,
     Form(form): Form<oidc::TokenForm>,
-) -> Result<Json<CoreTokenResponse>, CustomError> {
+) -> Result<Json<serde_json::Value>, CustomError> {
     let secret = if let Some(b) = bearer {
         Some(b.0 .0.token().to_string())
     } else {
@@ -148,7 +148,15 @@ async fn token(
             }),
         }
     })?;
-    Ok(token_response.into())
+    // Strip null fields (e.g. "id_token": null on refresh responses) because
+    // oidc-client-ts treats a present-but-null id_token as a validation target
+    // and fails when it cannot decode it as a JWT.
+    let mut value = serde_json::to_value(token_response)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize token response: {}", e))?;
+    if let serde_json::Value::Object(ref mut map) = value {
+        map.retain(|_, v| !v.is_null());
+    }
+    Ok(value.into())
 }
 
 async fn authorize(
