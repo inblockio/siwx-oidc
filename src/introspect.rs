@@ -46,11 +46,21 @@ pub struct IntrospectForm {
     #[serde(default)]
     #[allow(dead_code)]
     pub token_type_hint: Option<String>,
+    /// client_secret_post auth: client_id in form body (accepted but not validated).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub client_id: Option<String>,
+    /// client_secret_post auth: client_secret in form body (alternative to Bearer).
+    #[serde(default)]
+    pub client_secret: Option<String>,
 }
 
 /// RFC 7662 introspection endpoint.
 ///
-/// Authentication: `Authorization: Bearer {shared_secret}`
+/// Authentication (either method accepted):
+/// - `Authorization: Bearer {shared_secret}` (Bearer token)
+/// - `client_id=X&client_secret={shared_secret}` in form body (client_secret_post)
+///
 /// Body: `token=X&token_type_hint=access_token` (form-urlencoded)
 ///
 /// Returns active token metadata or `{"active": false}`.
@@ -59,15 +69,20 @@ pub async fn introspect(
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
     Form(form): Form<IntrospectForm>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Require Bearer authentication.
-    let bearer = bearer.ok_or(StatusCode::UNAUTHORIZED)?;
-
-    // Verify shared secret using constant-time comparison.
     let secret = state
         .mas_shared_secret
         .as_ref()
         .ok_or(StatusCode::NOT_FOUND)?;
-    let provided = bearer.token().as_bytes();
+
+    // Accept either Bearer token OR client_secret in form body (client_secret_post).
+    let provided = if let Some(ref b) = bearer {
+        b.token().as_bytes()
+    } else if let Some(ref cs) = form.client_secret {
+        cs.as_bytes()
+    } else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+
     let expected = secret.as_bytes();
     if provided.len() != expected.len() || !bool::from(provided.ct_eq(expected)) {
         return Err(StatusCode::UNAUTHORIZED);
