@@ -54,20 +54,11 @@ pub async fn revoke(
     State(state): State<CompatState>,
     axum::extract::Form(form): axum::extract::Form<RevokeForm>,
 ) -> StatusCode {
-    // Look up token metadata BEFORE deleting (need device_id for cleanup).
-    if let Ok(Some(meta)) = state.redis_client.get_token(&form.token).await {
-        // Delete from Redis.
-        let _ = state.redis_client.delete_token(&form.token).await;
-        // Best-effort device cleanup via Synapse.
-        if let Some(ref client) = state.synapse_client {
-            if let Err(e) = client.delete_device(&meta.username, &meta.device_id).await {
-                warn!("revoke: device cleanup failed: {}", e);
-            }
-        }
-    } else {
-        // Token not found or Redis error; still attempt delete (idempotent).
-        let _ = state.redis_client.delete_token(&form.token).await;
-    }
+    // Delete token from Redis (idempotent). Device is NOT deleted because
+    // device IDs are persistent across sessions (stored in Redis as
+    // `device_ids/{did}`); destroying the device would wipe cross-signing
+    // state and force re-verification on next login.
+    let _ = state.redis_client.delete_token(&form.token).await;
     StatusCode::OK
 }
 
@@ -92,18 +83,10 @@ pub async fn logout(
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
 ) -> impl IntoResponse {
     if let Some(TypedHeader(auth)) = bearer {
-        let token = auth.token();
-        // Look up metadata for device cleanup before deletion.
-        if let Ok(Some(meta)) = state.redis_client.get_token(token).await {
-            let _ = state.redis_client.delete_token(token).await;
-            if let Some(ref client) = state.synapse_client {
-                if let Err(e) = client.delete_device(&meta.username, &meta.device_id).await {
-                    warn!("logout: device cleanup failed: {}", e);
-                }
-            }
-        } else {
-            let _ = state.redis_client.delete_token(token).await;
-        }
+        // Delete the token from Redis (session invalidation). Device is NOT
+        // deleted because device IDs are persistent across sessions; destroying
+        // the device would wipe cross-signing state.
+        let _ = state.redis_client.delete_token(auth.token()).await;
     }
     // Always return 200 with empty JSON object (idempotent).
     (StatusCode::OK, Json(serde_json::json!({})))
