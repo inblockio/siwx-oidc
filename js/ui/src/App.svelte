@@ -23,6 +23,7 @@
 	let showLinkOption = false;
 	let linkSuccess = false;
 	let client_metadata: any = {};
+	let mounted = false;
 
 	const config = createConfig({
 		chains: [mainnet, arbitrum, polygon],
@@ -61,8 +62,8 @@
 			console.error(e);
 		}
 
-		// Auto-reconnect if previously connected
 		await reconnect(config);
+		mounted = true;
 	});
 
 	async function handleConnect() {
@@ -127,7 +128,6 @@
 			secure: window.location.protocol === 'https:',
 		});
 
-		// Show option to link a passkey before redirecting.
 		showLinkOption = true;
 		status = 'Signed — link a passkey or continue';
 	}
@@ -144,7 +144,6 @@
 		status = 'Linking passkey to wallet...';
 
 		try {
-			// Step 1: Start link ceremony (server verifies siwx cookie for DID ownership).
 			const startResp = await fetch('/link/webauthn/start', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
@@ -155,7 +154,6 @@
 			}
 			const options = await startResp.json();
 
-			// Step 2: Browser WebAuthn API — user creates passkey.
 			options.publicKey.challenge = base64urlToBuffer(options.publicKey.challenge);
 			options.publicKey.user.id = base64urlToBuffer(options.publicKey.user.id);
 			if (options.publicKey.excludeCredentials) {
@@ -167,7 +165,6 @@
 			const credential = await navigator.credentials.create({ publicKey: options.publicKey });
 			if (!credential) throw new Error('No credential created');
 
-			// Step 3: Send attestation to server.
 			const attestationResponse = (credential as PublicKeyCredential).response as AuthenticatorAttestationResponse;
 			const finishResp = await fetch('/link/webauthn/finish', {
 				method: 'POST',
@@ -188,7 +185,7 @@
 
 			const result = await finishResp.json();
 			linkSuccess = true;
-			status = `Passkey linked to ${result.primary_did.substring(0, 30)}…`;
+			status = `Passkey linked to ${result.primary_did.substring(0, 30)}...`;
 		} catch (e: any) {
 			if (e.name === 'NotAllowedError') {
 				error = 'Passkey linking was cancelled.';
@@ -208,7 +205,6 @@
 		status = 'Authenticating with passkey...';
 
 		try {
-			// Step 1: Start authentication ceremony (server creates challenge)
 			const startResp = await fetch('/webauthn/authenticate/start', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
@@ -219,8 +215,6 @@
 			}
 			const options = await startResp.json();
 
-			// Step 2: Browser WebAuthn API — user selects passkey
-			// Convert base64url challenge to ArrayBuffer
 			options.publicKey.challenge = base64urlToBuffer(options.publicKey.challenge);
 			if (options.publicKey.allowCredentials) {
 				for (const c of options.publicKey.allowCredentials) {
@@ -231,7 +225,6 @@
 			const assertion = await navigator.credentials.get({ publicKey: options.publicKey });
 			if (!assertion) throw new Error('No credential returned');
 
-			// Step 3: Send assertion to server for verification
 			const authResponse = (assertion as PublicKeyCredential).response as AuthenticatorAssertionResponse;
 			const finishResp = await fetch('/webauthn/authenticate/finish', {
 				method: 'POST',
@@ -254,7 +247,6 @@
 				throw new Error(await finishResp.text());
 			}
 
-			// Step 4: Redirect to /sign_in — session.verified_did is now set
 			status = 'Redirecting...';
 			window.location.replace(buildSignInUrl());
 		} catch (e: any) {
@@ -287,7 +279,6 @@
 			}
 			const options = await startResp.json();
 
-			// Convert base64url fields to ArrayBuffer
 			options.publicKey.challenge = base64urlToBuffer(options.publicKey.challenge);
 			options.publicKey.user.id = base64urlToBuffer(options.publicKey.user.id);
 			if (options.publicKey.excludeCredentials) {
@@ -318,10 +309,9 @@
 			}
 
 			const result = await finishResp.json();
-			status = `Passkey registered! DID: ${result.did.substring(0, 24)}…`;
+			status = `Passkey registered! DID: ${result.did.substring(0, 24)}...`;
 			error = null;
 
-			// After registration, authenticate immediately
 			await handlePasskeySignIn();
 		} catch (e: any) {
 			if (e.name === 'NotAllowedError') {
@@ -335,8 +325,6 @@
 			passkeyLoading = false;
 		}
 	}
-
-	// -- Base64url <-> ArrayBuffer helpers --
 
 	function base64urlToBuffer(b64: string): ArrayBuffer {
 		const padding = '='.repeat((4 - (b64.length % 4)) % 4);
@@ -354,248 +342,587 @@
 	}
 </script>
 
-<div
-	class="font-satoshi flex-grow w-full h-screen items-center flex justify-center flex-wrap flex-col"
-	style="background: radial-gradient(ellipse at 60% 40%, #2a1004 0%, #0d0d0d 65%);"
->
-	<div class="w-96 text-center bg-white rounded-20 text-grey flex h-100 flex-col p-12 shadow-lg shadow-white">
-		{#if client_metadata.logo_uri}
-			<div class="flex justify-evenly items-stretch">
-				<img height="72" width="72" class="self-center mb-8" src="img/inblockio-logo.png" alt="inblockio logo" />
-				<img height="72" width="72" class="self-center mb-8" src={client_metadata.logo_uri} alt="Client logo" />
-			</div>
-		{:else}
-			<img height="72" width="72" class="self-center mb-8" src="img/inblockio-logo.png" alt="inblockio logo" />
-		{/if}
-		<h5>Welcome</h5>
-		<span class="text-xs">
-			Sign-In with Ethereum to continue to {client_metadata.client_name ? client_metadata.client_name : domain}
-		</span>
+<div class="login-page" class:mounted>
+	<div class="ambient-glow"></div>
 
-		<button
-			class="h-12 border hover:scale-105 justify-evenly shadow-xl border-white mt-4 duration-100 ease-in-out transition-all transform flex items-center"
-			disabled={connecting}
-			on:click={handleConnect}
-		>
-			<svg
-				xmlns="http://www.w3.org/2000/svg"
-				clip-rule="evenodd"
-				fill-rule="evenodd"
-				stroke-linejoin="round"
-				stroke-miterlimit="1.41421"
-				viewBox="170 30 220 350"
-				class="w-6 h-8"
-			>
-				<g fill-rule="nonzero" transform="matrix(.781253 0 0 .781253 180 37.1453)">
-					<path d="m127.961 0-2.795 9.5v275.668l2.795 2.79 127.962-75.638z" fill="#343434" /><path
-						d="m127.962 0-127.962 212.32 127.962 75.639v-133.801z"
-						fill="#8c8c8c"
-					/>
-					<path d="m127.961 312.187-1.575 1.92v98.199l1.575 4.601 128.038-180.32z" fill="#3c3c3b" /><path
-						d="m127.962 416.905v-104.72l-127.962-75.6z"
-						fill="#8c8c8c"
-					/>
-					<path d="m127.961 287.958 127.96-75.637-127.96-58.162z" fill="#141414" /><path
-						d="m.001 212.321 127.96 75.637v-133.799z"
-						fill="#393939"
-					/>
-				</g>
-			</svg>
-			<p class="font-bold">
-				{#if connecting}Connecting...{:else}Sign-In with Ethereum{/if}
-			</p>
-		</button>
-
-		<div class="flex items-center my-3">
-			<div class="flex-grow border-t border-gray-300"></div>
-			<span class="mx-3 text-xs text-gray-400">or</span>
-			<div class="flex-grow border-t border-gray-300"></div>
-		</div>
-
-		<button
-			class="h-12 border hover:scale-105 justify-evenly shadow-xl border-white duration-100 ease-in-out transition-all transform flex items-center"
-			disabled={passkeyLoading}
-			on:click={handlePasskeySignIn}
-		>
-			<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5">
-				<path fill-rule="evenodd" d="M15.75 1.5a6.75 6.75 0 0 0-6.651 7.906c.067.39-.032.717-.221.906l-6.5 6.499a3 3 0 0 0-.878 2.121v2.818c0 .414.336.75.75.75H6a.75.75 0 0 0 .75-.75v-1.5h1.5A.75.75 0 0 0 9 19.5V18h1.5a.75.75 0 0 0 .53-.22l2.658-2.658c.19-.189.517-.288.906-.22A6.75 6.75 0 1 0 15.75 1.5Zm0 3a.75.75 0 0 0 0 1.5A2.25 2.25 0 0 1 18 8.25a.75.75 0 0 0 1.5 0 3.75 3.75 0 0 0-3.75-3.75Z" clip-rule="evenodd" />
-			</svg>
-			<p class="font-bold">
-				{#if passkeyLoading}Authenticating...{:else}Sign-In with Passkey{/if}
-			</p>
-		</button>
-
-		<button
-			class="text-xs text-gray-400 hover:text-gray-600 mt-1 underline cursor-pointer"
-			disabled={passkeyLoading}
-			on:click={handlePasskeyRegister}
-		>
-			Register a new passkey
-		</button>
-
-		{#if showLinkOption}
-			<div class="mt-3 p-3 border border-gray-200 rounded text-xs">
-				{#if linkSuccess}
-					<p class="text-green-600 font-semibold mb-2">Passkey linked successfully!</p>
-					<button
-						class="h-10 w-full border hover:scale-105 shadow-xl border-white duration-100 ease-in-out transition-all transform flex items-center justify-center font-bold"
-						on:click={proceedToSignIn}
-					>
-						Continue
-					</button>
-				{:else}
-					<p class="mb-2">Link a passkey so you can sign in without a wallet next time?</p>
-					<div class="flex gap-2">
-						<button
-							class="flex-1 h-10 border hover:scale-105 shadow-xl border-white duration-100 ease-in-out transition-all transform flex items-center justify-center font-bold"
-							disabled={linkingPasskey}
-							on:click={handleLinkPasskey}
-						>
-							{#if linkingPasskey}Linking...{:else}Yes, link passkey{/if}
-						</button>
-						<button
-							class="flex-1 h-10 border hover:scale-105 shadow-xl border-white duration-100 ease-in-out transition-all transform flex items-center justify-center font-bold text-gray-400"
-							disabled={linkingPasskey}
-							on:click={proceedToSignIn}
-						>
-							Skip
-						</button>
+	<div class="login-card">
+		<div class="card-inner">
+			<!-- Logo area -->
+			<div class="logo-area">
+				{#if client_metadata.logo_uri}
+					<div class="logo-pair">
+						<img src="img/inblockio-logo.png" alt="inblock.io" class="logo" />
+						<span class="logo-connector"></span>
+						<img src={client_metadata.logo_uri} alt="Client" class="logo" />
 					</div>
+				{:else}
+					<img src="img/inblockio-logo.png" alt="inblock.io" class="logo logo-single" />
 				{/if}
 			</div>
-		{/if}
 
-		{#if error}
-			<span class="text-xs text-red-500 mt-2">{error}</span>
-		{/if}
+			{#if !showLinkOption}
+				<!-- === Default state: choose auth method === -->
+				<div class="auth-section">
+					<h1 class="title">Sign in</h1>
+					<p class="subtitle">
+						Continue to {client_metadata.client_name || domain}
+					</p>
 
-		<div class="self-center mt-auto text-center font-semibold text-xs">
-			By using this service you agree to the <a href="/legal/terms-of-use.pdf">Terms of Use</a> and
-			<a href="/legal/privacy-policy.pdf">Privacy Policy</a>.
+					<!-- Primary: Ethereum -->
+					<button
+						class="btn btn-primary"
+						disabled={connecting}
+						on:click={handleConnect}
+					>
+						<svg
+							xmlns="http://www.w3.org/2000/svg"
+							clip-rule="evenodd"
+							fill-rule="evenodd"
+							stroke-linejoin="round"
+							stroke-miterlimit="1.41421"
+							viewBox="170 30 220 350"
+							class="btn-icon eth-icon"
+						>
+							<g fill-rule="nonzero" transform="matrix(.781253 0 0 .781253 180 37.1453)">
+								<path d="m127.961 0-2.795 9.5v275.668l2.795 2.79 127.962-75.638z" fill="#343434" />
+								<path d="m127.962 0-127.962 212.32 127.962 75.639v-133.801z" fill="#8c8c8c" />
+								<path d="m127.961 312.187-1.575 1.92v98.199l1.575 4.601 128.038-180.32z" fill="#3c3c3b" />
+								<path d="m127.962 416.905v-104.72l-127.962-75.6z" fill="#8c8c8c" />
+								<path d="m127.961 287.958 127.96-75.637-127.96-58.162z" fill="#141414" />
+								<path d="m.001 212.321 127.96 75.637v-133.799z" fill="#393939" />
+							</g>
+						</svg>
+						<span>{#if connecting}Connecting wallet...{:else}Sign in with Ethereum{/if}</span>
+					</button>
+
+					<!-- Divider -->
+					<div class="divider">
+						<div class="divider-line"></div>
+						<span class="divider-text">or</span>
+						<div class="divider-line"></div>
+					</div>
+
+					<!-- Secondary: Passkey sign-in -->
+					<button
+						class="btn btn-secondary"
+						disabled={passkeyLoading}
+						on:click={handlePasskeySignIn}
+					>
+						<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="btn-icon">
+							<path fill-rule="evenodd" d="M15.75 1.5a6.75 6.75 0 0 0-6.651 7.906c.067.39-.032.717-.221.906l-6.5 6.499a3 3 0 0 0-.878 2.121v2.818c0 .414.336.75.75.75H6a.75.75 0 0 0 .75-.75v-1.5h1.5A.75.75 0 0 0 9 19.5V18h1.5a.75.75 0 0 0 .53-.22l2.658-2.658c.19-.189.517-.288.906-.22A6.75 6.75 0 1 0 15.75 1.5Zm0 3a.75.75 0 0 0 0 1.5A2.25 2.25 0 0 1 18 8.25a.75.75 0 0 0 1.5 0 3.75 3.75 0 0 0-3.75-3.75Z" clip-rule="evenodd" />
+						</svg>
+						<span>{#if passkeyLoading}Authenticating...{:else}Sign in with Passkey{/if}</span>
+					</button>
+
+					<p class="register-hint">
+						No passkey yet?
+						<button
+							class="link-btn"
+							disabled={passkeyLoading}
+							on:click={handlePasskeyRegister}
+						>
+							Create one
+						</button>
+					</p>
+				</div>
+
+			{:else}
+				<!-- === Post-Ethereum: passkey linking === -->
+				<div class="auth-section link-section">
+					{#if linkSuccess}
+						<div class="success-badge">
+							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="success-icon">
+								<path fill-rule="evenodd" d="M2.25 12c0-5.385 4.365-9.75 9.75-9.75s9.75 4.365 9.75 9.75-4.365 9.75-9.75 9.75S2.25 17.385 2.25 12Zm13.36-1.814a.75.75 0 1 0-1.22-.872l-3.236 4.53L9.53 12.22a.75.75 0 0 0-1.06 1.06l2.25 2.25a.75.75 0 0 0 1.14-.094l3.75-5.25Z" clip-rule="evenodd" />
+							</svg>
+						</div>
+						<h1 class="title">Passkey linked</h1>
+						<p class="subtitle">You can use it to sign in next time without a wallet.</p>
+						<button class="btn btn-primary" on:click={proceedToSignIn}>
+							<span>Continue to {client_metadata.client_name || domain}</span>
+							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="btn-icon btn-icon-right">
+								<path fill-rule="evenodd" d="M3 10a.75.75 0 0 1 .75-.75h10.638L10.23 5.29a.75.75 0 1 1 1.04-1.08l5.5 5.25a.75.75 0 0 1 0 1.08l-5.5 5.25a.75.75 0 1 1-1.04-1.08l4.158-3.96H3.75A.75.75 0 0 1 3 10Z" clip-rule="evenodd" />
+							</svg>
+						</button>
+					{:else}
+						<div class="success-badge">
+							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="success-icon">
+								<path fill-rule="evenodd" d="M2.25 12c0-5.385 4.365-9.75 9.75-9.75s9.75 4.365 9.75 9.75-4.365 9.75-9.75 9.75S2.25 17.385 2.25 12Zm13.36-1.814a.75.75 0 1 0-1.22-.872l-3.236 4.53L9.53 12.22a.75.75 0 0 0-1.06 1.06l2.25 2.25a.75.75 0 0 0 1.14-.094l3.75-5.25Z" clip-rule="evenodd" />
+							</svg>
+						</div>
+						<h1 class="title">Wallet verified</h1>
+						<p class="subtitle">
+							Link a passkey so you can sign in without a wallet next time.
+						</p>
+
+						<div class="link-actions">
+							<button
+								class="btn btn-primary"
+								disabled={linkingPasskey}
+								on:click={handleLinkPasskey}
+							>
+								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="btn-icon">
+									<path fill-rule="evenodd" d="M15.75 1.5a6.75 6.75 0 0 0-6.651 7.906c.067.39-.032.717-.221.906l-6.5 6.499a3 3 0 0 0-.878 2.121v2.818c0 .414.336.75.75.75H6a.75.75 0 0 0 .75-.75v-1.5h1.5A.75.75 0 0 0 9 19.5V18h1.5a.75.75 0 0 0 .53-.22l2.658-2.658c.19-.189.517-.288.906-.22A6.75 6.75 0 1 0 15.75 1.5Zm0 3a.75.75 0 0 0 0 1.5A2.25 2.25 0 0 1 18 8.25a.75.75 0 0 0 1.5 0 3.75 3.75 0 0 0-3.75-3.75Z" clip-rule="evenodd" />
+								</svg>
+								<span>{#if linkingPasskey}Linking...{:else}Link a passkey{/if}</span>
+							</button>
+
+							<button
+								class="btn btn-ghost"
+								disabled={linkingPasskey}
+								on:click={proceedToSignIn}
+							>
+								<span>Skip for now</span>
+								<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="btn-icon btn-icon-right">
+									<path fill-rule="evenodd" d="M3 10a.75.75 0 0 1 .75-.75h10.638L10.23 5.29a.75.75 0 1 1 1.04-1.08l5.5 5.25a.75.75 0 0 1 0 1.08l-5.5 5.25a.75.75 0 1 1-1.04-1.08l4.158-3.96H3.75A.75.75 0 0 1 3 10Z" clip-rule="evenodd" />
+								</svg>
+							</button>
+						</div>
+					{/if}
+				</div>
+			{/if}
+
+			<!-- Error display -->
+			{#if error}
+				<div class="error-msg">
+					<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="error-icon">
+						<path fill-rule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-8-5a.75.75 0 0 1 .75.75v4.5a.75.75 0 0 1-1.5 0v-4.5A.75.75 0 0 1 10 5Zm0 10a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" clip-rule="evenodd" />
+					</svg>
+					<span>{error}</span>
+				</div>
+			{/if}
+
+			<!-- Footer -->
+			<div class="footer">
+				<p>
+					By continuing you agree to the
+					<a href="/legal/terms-of-use.pdf">Terms of Use</a> and
+					<a href="/legal/privacy-policy.pdf">Privacy Policy</a>.
+				</p>
+				{#if client_metadata.client_uri}
+					<p class="client-uri">Requested by {client_metadata.client_uri}</p>
+				{/if}
+			</div>
 		</div>
-
-		{#if client_metadata.client_uri}
-			<span class="text-xs mt-4">Request linked to {client_metadata.client_uri}</span>
-		{/if}
 	</div>
 </div>
 
-<style global lang="postcss">
+<style lang="postcss">
 	@tailwind base;
 	@tailwind components;
 	@tailwind utilities;
 
-	.tooltip {
+	/* ---- Page ---- */
+
+	:global(html), :global(body) {
+		margin: 0;
+		padding: 0;
+		width: 100%;
+		height: 100%;
+		background: #080808;
+		overflow-x: hidden;
+		font-family: 'Satoshi', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+		-webkit-font-smoothing: antialiased;
+		-moz-osx-font-smoothing: grayscale;
+	}
+
+	.login-page {
+		position: relative;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		min-height: 100vh;
+		padding: 24px;
+		background: #080808;
+		opacity: 0;
+		transition: opacity 0.6s ease;
+	}
+
+	.login-page.mounted {
+		opacity: 1;
+	}
+
+	.ambient-glow {
+		position: fixed;
+		top: -30%;
+		left: 50%;
+		transform: translateX(-50%);
+		width: 800px;
+		height: 600px;
+		background: radial-gradient(
+			ellipse at center,
+			rgba(4, 210, 202, 0.07) 0%,
+			rgba(4, 210, 202, 0.02) 40%,
+			transparent 70%
+		);
+		pointer-events: none;
+		z-index: 0;
+	}
+
+	/* ---- Card ---- */
+
+	.login-card {
+		position: relative;
+		z-index: 1;
+		width: 100%;
+		max-width: 400px;
+		border-radius: 20px;
+		background: rgba(255, 255, 255, 0.03);
+		border: 1px solid rgba(255, 255, 255, 0.06);
+		backdrop-filter: blur(40px);
+		box-shadow:
+			0 0 0 1px rgba(255, 255, 255, 0.03) inset,
+			0 20px 60px -12px rgba(0, 0, 0, 0.5);
+	}
+
+	.card-inner {
+		padding: 40px 36px 32px;
+		display: flex;
+		flex-direction: column;
+		gap: 0;
+	}
+
+	/* ---- Logo ---- */
+
+	.logo-area {
+		display: flex;
+		justify-content: center;
+		margin-bottom: 32px;
+	}
+
+	.logo {
+		width: 52px;
+		height: 52px;
+		object-fit: contain;
+		border-radius: 12px;
+	}
+
+	.logo-single {
+		width: 56px;
+		height: 56px;
+	}
+
+	.logo-pair {
+		display: flex;
+		align-items: center;
+		gap: 16px;
+	}
+
+	.logo-connector {
+		display: block;
+		width: 24px;
+		height: 1px;
+		background: rgba(255, 255, 255, 0.12);
+		position: relative;
+	}
+
+	.logo-connector::after {
+		content: '';
+		position: absolute;
+		right: -2px;
+		top: -2px;
+		width: 5px;
+		height: 5px;
+		border-radius: 50%;
+		background: rgba(255, 255, 255, 0.12);
+	}
+
+	/* ---- Auth section ---- */
+
+	.auth-section {
+		display: flex;
+		flex-direction: column;
+	}
+
+	.title {
+		font-family: 'Satoshi', sans-serif;
+		font-weight: 700;
+		font-size: 22px;
+		line-height: 1.3;
+		color: rgba(255, 255, 255, 0.93);
+		margin: 0 0 6px;
+		letter-spacing: -0.3px;
+	}
+
+	.subtitle {
+		font-size: 14px;
+		line-height: 1.5;
+		color: rgba(255, 255, 255, 0.4);
+		margin: 0 0 28px;
+	}
+
+	/* ---- Buttons ---- */
+
+	.btn {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 10px;
+		height: 48px;
+		padding: 0 20px;
+		border-radius: 12px;
+		font-family: 'Satoshi', sans-serif;
+		font-weight: 600;
+		font-size: 14px;
+		letter-spacing: 0.1px;
+		cursor: pointer;
+		transition: all 0.15s ease;
+		border: none;
+		outline: none;
+		width: 100%;
+	}
+
+	.btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.btn-primary {
+		background: linear-gradient(135deg, #04D2CA 0%, #06A8A2 100%);
+		color: #041a19;
+		box-shadow:
+			0 1px 2px rgba(0, 0, 0, 0.2),
+			0 0 0 1px rgba(4, 210, 202, 0.15) inset;
+	}
+
+	.btn-primary:not(:disabled):hover {
+		background: linear-gradient(135deg, #0ce8df 0%, #04D2CA 100%);
+		box-shadow:
+			0 4px 16px rgba(4, 210, 202, 0.25),
+			0 0 0 1px rgba(4, 210, 202, 0.2) inset;
+		transform: translateY(-1px);
+	}
+
+	.btn-primary:not(:disabled):active {
+		transform: translateY(0);
+		box-shadow:
+			0 1px 4px rgba(4, 210, 202, 0.15),
+			0 0 0 1px rgba(4, 210, 202, 0.15) inset;
+	}
+
+	.btn-secondary {
+		background: rgba(255, 255, 255, 0.06);
+		color: rgba(255, 255, 255, 0.85);
+		border: 1px solid rgba(255, 255, 255, 0.08);
+	}
+
+	.btn-secondary:not(:disabled):hover {
+		background: rgba(255, 255, 255, 0.1);
+		border-color: rgba(255, 255, 255, 0.14);
+		transform: translateY(-1px);
+	}
+
+	.btn-secondary:not(:disabled):active {
+		transform: translateY(0);
+		background: rgba(255, 255, 255, 0.08);
+	}
+
+	.btn-ghost {
+		background: transparent;
+		color: rgba(255, 255, 255, 0.45);
+		border: 1px solid rgba(255, 255, 255, 0.06);
+	}
+
+	.btn-ghost:not(:disabled):hover {
+		color: rgba(255, 255, 255, 0.7);
+		background: rgba(255, 255, 255, 0.04);
+		border-color: rgba(255, 255, 255, 0.1);
+	}
+
+	.btn-icon {
+		width: 18px;
+		height: 18px;
+		flex-shrink: 0;
+	}
+
+	.btn-icon-right {
+		width: 16px;
+		height: 16px;
+		margin-left: -2px;
+	}
+
+	.eth-icon {
+		width: 14px;
+		height: 22px;
+	}
+
+	.eth-icon path[fill="#343434"] { fill: #0a3d3b; }
+	.eth-icon path[fill="#8c8c8c"] { fill: #0d5451; }
+	.eth-icon path[fill="#3c3c3b"] { fill: #0a3d3b; }
+	.eth-icon path[fill="#141414"] { fill: #062c2b; }
+	.eth-icon path[fill="#393939"] { fill: #0d5451; }
+
+	/* ---- Divider ---- */
+
+	.divider {
+		display: flex;
+		align-items: center;
+		gap: 14px;
+		margin: 16px 0;
+	}
+
+	.divider-line {
+		flex: 1;
+		height: 1px;
+		background: rgba(255, 255, 255, 0.06);
+	}
+
+	.divider-text {
+		font-size: 12px;
+		color: rgba(255, 255, 255, 0.2);
+		text-transform: uppercase;
+		letter-spacing: 1px;
+		font-weight: 500;
+	}
+
+	/* ---- Register hint ---- */
+
+	.register-hint {
+		text-align: center;
+		font-size: 13px;
+		color: rgba(255, 255, 255, 0.3);
+		margin: 12px 0 0;
+	}
+
+	.link-btn {
+		background: none;
+		border: none;
+		padding: 0;
+		margin: 0;
+		color: #04D2CA;
+		font-size: 13px;
+		font-weight: 500;
+		cursor: pointer;
+		font-family: inherit;
+		text-decoration: none;
+		transition: color 0.15s ease;
+	}
+
+	.link-btn:hover {
+		color: #0ce8df;
+	}
+
+	.link-btn:disabled {
+		opacity: 0.4;
+		cursor: not-allowed;
+	}
+
+	/* ---- Link section (post-Ethereum) ---- */
+
+	.link-section {
+		align-items: center;
+		text-align: center;
+	}
+
+	.link-section .subtitle {
+		max-width: 280px;
+	}
+
+	.success-badge {
+		margin-bottom: 16px;
+	}
+
+	.success-icon {
+		width: 40px;
+		height: 40px;
+		color: #04D2CA;
+	}
+
+	.link-actions {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+		width: 100%;
+	}
+
+	/* ---- Error ---- */
+
+	.error-msg {
+		display: flex;
+		align-items: flex-start;
+		gap: 8px;
+		margin-top: 16px;
+		padding: 10px 14px;
+		border-radius: 10px;
+		background: rgba(239, 68, 68, 0.08);
+		border: 1px solid rgba(239, 68, 68, 0.12);
+	}
+
+	.error-msg span {
+		font-size: 13px;
+		line-height: 1.4;
+		color: #f87171;
+	}
+
+	.error-icon {
+		width: 16px;
+		height: 16px;
+		color: #f87171;
+		flex-shrink: 0;
+		margin-top: 1px;
+	}
+
+	/* ---- Footer ---- */
+
+	.footer {
+		margin-top: 28px;
+		padding-top: 20px;
+		border-top: 1px solid rgba(255, 255, 255, 0.04);
+		text-align: center;
+	}
+
+	.footer p {
+		font-size: 11px;
+		line-height: 1.5;
+		color: rgba(255, 255, 255, 0.2);
+		margin: 0;
+	}
+
+	.footer a {
+		color: rgba(255, 255, 255, 0.35);
+		text-decoration: none;
+		transition: color 0.15s ease;
+	}
+
+	.footer a:hover {
+		color: rgba(255, 255, 255, 0.6);
+	}
+
+	.client-uri {
+		margin-top: 6px !important;
+		font-size: 10px !important;
+		color: rgba(255, 255, 255, 0.12) !important;
+	}
+
+	/* ---- Tooltip (kept for compat) ---- */
+
+	:global(.tooltip) {
 		@apply invisible absolute;
 	}
 
-	.has-tooltip:hover .tooltip {
+	:global(.has-tooltip:hover .tooltip) {
 		@apply visible z-50;
 	}
-	html,
-	body {
-		position: relative;
-		width: 100vw;
-		height: 100vh;
-		margin: 0px;
-		padding: 0px;
-		font-size: 18px;
-		background: #0d0d0d;
-		display: flex;
-		flex-direction: column;
-		overflow-x: hidden;
-		@apply font-satoshi;
-	}
 
-	h1,
-	h2,
-	h3,
-	h4,
-	h5,
-	h6 {
-		@apply font-extrabold;
-		@apply font-satoshi;
-	}
-
-	h1 {
-		font-size: 76px;
-		line-height: 129px;
-		letter-spacing: -4.5%;
-	}
-
-	h2 {
-		font-size: 66px;
-		line-height: 101px;
-		letter-spacing: -3%;
-	}
-
-	h3 {
-		font-size: 52px;
-		line-height: 80px;
-		letter-spacing: -1.5%;
-	}
-
-	h4 {
-		font-size: 48px;
-		line-height: 63px;
-		letter-spacing: -1%;
-	}
-
-	h5 {
-		font-size: 32px;
-		line-height: 49px;
-		letter-spacing: -0.5%;
-	}
-
-	h6 {
-		font-size: 24px;
-		line-height: 37px;
-		letter-spacing: -0.5%;
-	}
-
-	body {
-		color: #222222;
-	}
-
-	a {
-		text-decoration: none;
-		color: #04d2ca;
-	}
-
-	td,
-	th {
-		font-family: 'Satoshi';
-		font-weight: 400;
-	}
-
-	pre {
-		white-space: pre-wrap; /* Since CSS 2.1 */
-		white-space: -moz-pre-wrap; /* Mozilla, since 1999 */
-		white-space: -pre-wrap; /* Opera 4-6 */
-		white-space: -o-pre-wrap; /* Opera 7 */
-		word-wrap: break-word; /* Internet Explorer 5.5+ */
-	}
-
-	/**
-	Custom scrollbar settings
-	*/
-	::-webkit-scrollbar-track {
-		border-radius: 8px;
-		background-color: #ccc;
-	}
-
-	::-webkit-scrollbar-thumb {
-		border-radius: 8px;
-		background-color: #888;
-	}
-	::-webkit-scrollbar {
-		height: 6px;
-		border-radius: 8px;
-		width: 6px;
-		background-color: #ccc;
-	}
-
-	.grecaptcha-badge {
+	:global(.grecaptcha-badge) {
 		visibility: hidden;
+	}
+
+	/* ---- Scrollbar ---- */
+
+	:global(::-webkit-scrollbar-track) {
+		border-radius: 8px;
+		background-color: #1a1a1a;
+	}
+
+	:global(::-webkit-scrollbar-thumb) {
+		border-radius: 8px;
+		background-color: #333;
+	}
+
+	:global(::-webkit-scrollbar) {
+		height: 6px;
+		width: 6px;
+		border-radius: 8px;
+		background-color: #1a1a1a;
 	}
 </style>
