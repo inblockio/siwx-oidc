@@ -460,7 +460,7 @@ pub async fn token(
     let access_token = if msc3861_mode {
         // MSC3861: issue a `mat_`-prefixed opaque token stored in Redis.
         let opaque = generate_opaque_token("mat_");
-        let username = code_entry.did.replace(':', "-");
+        let username = did_to_localpart(&code_entry.did);
         let device_id = code_entry
             .device_id
             .clone()
