@@ -467,10 +467,14 @@ pub async fn token(
             .unwrap_or_else(|| format!("SIWX_{}", &opaque[4..12]));
         let iat = now.timestamp();
         let exp = iat + ACCESS_TOKEN_TTL as i64;
+        let scope = format!(
+            "openid urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:{}",
+            device_id
+        );
         let metadata = TokenMetadata {
             username,
             device_id,
-            scope: "openid".to_string(),
+            scope,
             client_id: client_id.clone(),
             iat,
             exp,
