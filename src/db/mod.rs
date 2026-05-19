@@ -100,4 +100,9 @@ pub trait DBClient {
     async fn get_token(&self, token: &str) -> Result<Option<TokenMetadata>>;
     /// Delete an opaque token (e.g. on revocation).
     async fn delete_token(&self, token: &str) -> Result<()>;
+
+    /// Generic key-value get (used for identity profile data).
+    async fn get_kv(&self, _key: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
