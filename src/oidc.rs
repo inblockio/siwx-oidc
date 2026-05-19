@@ -1085,26 +1085,22 @@ pub async fn sign_in(
     let device_id = if let Some(synapse) = synapse_client {
         let localpart = did_to_localpart(&did);
 
-        // Reuse existing device ID for this DID, or generate a new one.
-        // When reusing, delete the old device first to flush stale one-time
-        // keys from Synapse (the client will upload fresh keys on connect).
-        let (dev_id, is_new_device) = match db_client.get_device_id(&did).await {
-            Ok(Some(existing)) => {
-                debug!("recycling device_id={} for did={}", existing, did);
-                if let Err(e) = synapse.delete_device(&localpart, &existing).await {
-                    warn!("delete_device (pre-recreate) failed: {}", e);
-                }
-                (existing, true)
+        // Always generate a fresh device_id. If an old device exists, delete
+        // it first so Synapse drops stale e2e keys. We never recycle device_ids
+        // because Synapse keeps cross-signing signatures after delete_device,
+        // and its signature-upload handler skips new signatures when a stale
+        // one already exists for the same device_id.
+        if let Ok(Some(old_id)) = db_client.get_device_id(&did).await {
+            debug!("cleaning up old device_id={} for did={}", old_id, did);
+            if let Err(e) = synapse.delete_device(&localpart, &old_id).await {
+                warn!("delete_device (cleanup) failed: {}", e);
             }
-            _ => {
-                let new_id = format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]);
-                debug!("new device_id={} for did={}", new_id, did);
-                if let Err(e) = db_client.set_device_id(&did, &new_id).await {
-                    warn!("failed to persist device_id: {}", e);
-                }
-                (new_id, true)
-            }
-        };
+        }
+        let dev_id = format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]);
+        debug!("new device_id={} for did={}", dev_id, did);
+        if let Err(e) = db_client.set_device_id(&did, &dev_id).await {
+            warn!("failed to persist device_id: {}", e);
+        }
 
         // Provision user if new
         match synapse.is_localpart_available(&localpart).await {
@@ -1125,11 +1121,8 @@ pub async fn sign_in(
             warn!("upsert_device failed: {}", e);
         }
 
-        // Only reset cross-signing for first-time devices
-        if is_new_device {
-            if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
-                warn!("allow_cross_signing_reset failed: {}", e);
-            }
+        if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
+            warn!("allow_cross_signing_reset failed: {}", e);
         }
 
         Some(dev_id)

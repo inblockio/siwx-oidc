@@ -329,4 +329,9 @@ impl DBClient for RedisClient {
         let key = format!("{}/{}", KV_DEVICE_PREFIX, did);
         self.set_raw(&key, device_id).await
     }
+
+    async fn delete_device_id(&self, did: &str) -> Result<()> {
+        let key = format!("{}/{}", KV_DEVICE_PREFIX, did);
+        self.del_raw(&key).await
+    }
 }
