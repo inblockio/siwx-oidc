@@ -508,7 +508,6 @@ pub async fn main() {
     let introspect_state = IntrospectState::from(&state);
     let compat_state = compat::CompatState {
         redis_client: state.redis_client.clone(),
-        synapse_client: state.synapse_client.clone(),
     };
 
     let app = Router::new()
