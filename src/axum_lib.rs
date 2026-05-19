@@ -129,7 +129,7 @@ async fn provider_metadata(
     let base_url = state.config.base_url.as_str().trim_end_matches('/');
     value["code_challenge_methods_supported"] = serde_json::json!(["S256"]);
     value["introspection_endpoint"] = serde_json::json!(format!("{}/oauth2/introspect", base_url));
-    value["introspection_endpoint_auth_methods_supported"] = serde_json::json!(["bearer"]);
+    value["introspection_endpoint_auth_methods_supported"] = serde_json::json!(["client_secret_post", "bearer"]);
     value["grant_types_supported"] = serde_json::json!(["authorization_code", "refresh_token"]);
     value["revocation_endpoint"] = serde_json::json!(format!("{}/oauth2/revoke", base_url));
     value["token_endpoint_auth_methods_supported"] = serde_json::json!(["client_secret_post", "none"]);

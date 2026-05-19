@@ -172,32 +172,6 @@ impl SynapseClient {
         warn!(%status, %body, "is_localpart_available: unexpected response");
         anyhow::bail!("is_localpart_available: HTTP {status}");
     }
-
-    /// Synchronise the full set of devices for a user.
-    ///
-    /// Synapse will create missing devices and remove any that are not in the list.
-    pub async fn sync_devices(&self, localpart: &str, devices: &[String]) -> Result<()> {
-        let url = format!("{}/_synapse/mas/sync_devices", self.endpoint);
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.shared_secret)
-            .json(&json!({
-                "localpart": localpart,
-                "devices": devices,
-            }))
-            .send()
-            .await
-            .context("sync_devices: request failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            warn!(%status, %body, "sync_devices failed");
-            anyhow::bail!("sync_devices: HTTP {status}");
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
