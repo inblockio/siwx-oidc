@@ -1194,6 +1194,18 @@ pub async fn sign_in(
                 if let Err(e) = synapse.provision_user(&localpart, &did).await {
                     warn!("provision_user failed: {}", e);
                 }
+                // First-ever login for this user: grant a window in which Element
+                // (or any client) can upload its initial cross-signing keys
+                // without UIA. Subsequent logins must NOT re-grant this — doing
+                // so lets a client silently replace the user's cross-signing
+                // public keys, which makes secret-storage recovery impossible
+                // (the imported private key no longer derives the server's
+                // public key). That mismatch is the root cause of the Element
+                // "Verify this device" loop reproducible end-to-end via
+                // aqua-matrix-agent --enable-recovery / --recover.
+                if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
+                    warn!("allow_cross_signing_reset failed: {}", e);
+                }
             }
             Ok(false) => {}
             Err(e) => warn!("is_localpart_available check failed: {}", e),
@@ -1208,10 +1220,6 @@ pub async fn sign_in(
             .await
         {
             warn!("upsert_device failed: {}", e);
-        }
-
-        if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
-            warn!("allow_cross_signing_reset failed: {}", e);
         }
 
         Some(dev_id)
