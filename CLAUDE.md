@@ -159,6 +159,7 @@ Prefix: `SIWEOIDC_` (via Figment: `siwe-oidc.toml` or env vars)
 | `SIWEOIDC_SUPPORTED_PKH_NAMESPACES` | did:pkh namespaces accepted | `["eip155","ed25519","p256"]` |
 | `SIWEOIDC_RP_ID` | WebAuthn Relying Party ID (domain) | hostname of `BASE_URL` |
 | `SIWEOIDC_RP_ORIGIN` | WebAuthn expected origin URL | `BASE_URL` |
+| `SIWEOIDC_LOG_FORMAT` | Log output format | `pretty` (or `json`) |
 
 **For passkey login:** add `"key"` to `SIWEOIDC_SUPPORTED_DID_METHODS` so the `did:key:zDn…`
 DIDs derived from passkeys are accepted by `sign_in`.
@@ -206,6 +207,17 @@ docker build -t ghcr.io/inblockio/siwx-oidc:latest .
 
 Matrix Synapse deployment: see `../siwx-oidc-matrix-server` (branch `siwx`).
 Run `/deploy-check` for the full pre-deployment checklist.
+
+### MSC3861 device lifecycle
+
+Device IDs are never recycled. Each login generates a fresh `SIWX_{uuid}`. The old
+device (if any) is deleted from Synapse first. Both `revoke` and `logout` handlers
+call `delete_device` for cleanup. `allow_cross_signing_reset` fires unconditionally.
+
+**Why no recycling:** Synapse's `delete_device` (MAS API) does not remove cross-signing
+signatures, and its signature-upload handler skips new uploads when a stale one exists.
+Recycling a device_id with new keys creates unrecoverable verification failures.
+See `../siwx-oidc-matrix-server/docs/2026-05-19-device-verification-analysis.md`.
 
 ## WebAuthn/Passkey architecture
 
@@ -290,6 +302,44 @@ redis-cli KEYS 'sessions/*'
 redis-cli GET 'sessions/{session_id}' | python3 -m json.tool
 ```
 
+## Logging conventions
+
+**Subscriber:** Initialized in `axum_lib.rs::main()` with `EnvFilter`. Default filter:
+`siwx_oidc=info,tower_http=info,warn`. Override with `RUST_LOG` env var.
+
+**Format:** Set `SIWEOIDC_LOG_FORMAT=json` for structured JSON output (container log
+aggregation). Default: human-readable (`pretty`).
+
+**Level guidelines for new modules:**
+
+| Level | Use for | Examples |
+|-------|---------|---------|
+| `error!` | Unrecoverable failures that halt a request or corrupt state | Signing key load failure, Redis pool exhausted |
+| `warn!` | Recoverable errors, unexpected but handled conditions | Synapse API failure (best-effort), invalid client input, auth failures |
+| `info!` | Significant state changes, request lifecycle events | Sign-in success, ceremony start/finish, server startup |
+| `debug!` | Internal details useful during development | Redis key operations, token metadata, ENS resolution attempts |
+
+**Rules:**
+- siwx-core: NO logging (pure library, no tracing dependency)
+- Never log secrets, tokens, cookies, or signing key material
+- Use structured fields (`info!(did = %did, "sign_in success")`) not string interpolation
+- Error paths: prefer logging at the boundary (`CustomError::into_response`) over scattering
+  `warn!` calls through business logic
+- Modules that bypass `CustomError` (introspect, compat) must log their own errors
+
+## TODO: MSC3861 compliance gaps
+
+Audit document: `docs/audit/msc3861-compliance-audit.md` (2026-05-19)
+
+**HIGH priority (blocks native Element OIDC):**
+1. `/authorize` rejects Matrix-specific scopes (`oidc.rs:758-760`). Accept or ignore `urn:matrix:...` scopes.
+2. Discovery advertises `introspection_endpoint_auth_methods_supported: ["bearer"]` but Synapse uses `client_secret_post` (`axum_lib.rs:110`). Fix to `["client_secret_post", "bearer"]`.
+
+**MEDIUM priority:**
+3. `sub` inconsistency: ID token uses full DID, introspection uses localpart. Align them.
+4. Add `name` field to introspection response for display name updates.
+5. Migrate to stable Matrix scopes (`urn:matrix:client:...` instead of `urn:matrix:org.matrix.msc2967.client:...`).
+6. Remove or wire up dead `sync_devices` code.
 ## Claude Code skills
 
 | Skill | Purpose |

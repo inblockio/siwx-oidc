@@ -20,8 +20,23 @@ The OIDC flow has 4 stages. Ask the user where it fails, or check logs:
 docker compose logs siwx-oidc --tail 50
 
 # If running locally with debug logging
-RUST_LOG=siwx_oidc=debug,tower_http=trace cargo run
+RUST_LOG=siwx_oidc=debug,tower_http=debug cargo run
+
+# For full trace-level output (very verbose)
+RUST_LOG=siwx_oidc=trace,tower_http=trace cargo run
+
+# For JSON output (useful for piping to jq)
+SIWEOIDC_LOG_FORMAT=json RUST_LOG=siwx_oidc=debug cargo run 2>&1 | jq .
 ```
+
+Key log targets:
+- `siwx_oidc::oidc` -- sign-in, token, authorize, ENS resolution
+- `siwx_oidc::webauthn` -- passkey ceremonies
+- `siwx_oidc::axum_lib` -- startup, request/response lifecycle, error responses
+- `siwx_oidc::introspect` -- token introspection (MSC3861)
+- `siwx_oidc::compat` -- Matrix compat endpoints (revoke, refresh, logout)
+- `siwx_oidc::synapse_client` -- Synapse provisioning API calls
+- `tower_http` -- HTTP request/response traces
 
 ## 3. Check OIDC discovery
 

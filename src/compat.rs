@@ -19,7 +19,7 @@ use axum_extra::{
 use chrono::Utc;
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::introspect::generate_opaque_token;
 use crate::synapse_client::SynapseClient;
@@ -54,10 +54,17 @@ pub async fn revoke(
     State(state): State<CompatState>,
     axum::extract::Form(form): axum::extract::Form<RevokeForm>,
 ) -> StatusCode {
-    // Delete token from Redis (idempotent). Device is NOT deleted here;
-    // it is recycled (delete + recreate) at next login to flush stale
-    // one-time keys while preserving the same device ID.
-    let _ = state.redis_client.delete_token(&form.token).await;
+    // Look up token metadata so we can clean up the Synapse device.
+    if let Ok(Some(meta)) = state.redis_client.get_token(&form.token).await {
+        if let Some(ref synapse) = state.synapse_client {
+            if let Err(e) = synapse.delete_device(&meta.username, &meta.device_id).await {
+                warn!("revoke: delete_device failed: {}", e);
+            }
+        }
+    }
+    if let Err(e) = state.redis_client.delete_token(&form.token).await {
+        warn!(error = %e, "revoke: failed to delete token from Redis");
+    }
     StatusCode::OK
 }
 
@@ -82,11 +89,17 @@ pub async fn logout(
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
 ) -> impl IntoResponse {
     if let Some(TypedHeader(auth)) = bearer {
-        // Delete the token from Redis (session invalidation). Device is
-        // recycled (delete + recreate) at next login, not here.
-        let _ = state.redis_client.delete_token(auth.token()).await;
+        if let Ok(Some(meta)) = state.redis_client.get_token(auth.token()).await {
+            if let Some(ref synapse) = state.synapse_client {
+                if let Err(e) = synapse.delete_device(&meta.username, &meta.device_id).await {
+                    warn!("logout: delete_device failed: {}", e);
+                }
+            }
+        }
+        if let Err(e) = state.redis_client.delete_token(auth.token()).await {
+            warn!(error = %e, "logout: failed to delete token from Redis");
+        }
     }
-    // Always return 200 with empty JSON object (idempotent).
     (StatusCode::OK, Json(serde_json::json!({})))
 }
 
@@ -176,6 +189,11 @@ pub async fn refresh(
 
     // Delete the old refresh token.
     let _ = state.redis_client.delete_token(&body.refresh_token).await;
+
+    debug!(
+        username = %metadata.username,
+        "refresh: tokens rotated successfully"
+    );
 
     (
         StatusCode::OK,
