@@ -1174,10 +1174,10 @@ pub async fn sign_in(
     let device_id = if let Some(synapse) = synapse_client {
         let localpart = did_to_localpart(&did);
 
-        let (dev_id, is_new_device) = match db_client.get_device_id(&did).await {
+        let dev_id = match db_client.get_device_id(&did).await {
             Ok(Some(existing)) => {
                 debug!("reusing device_id={} for did={}", existing, did);
-                (existing, false)
+                existing
             }
             _ => {
                 let new_id = format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]);
@@ -1185,7 +1185,7 @@ pub async fn sign_in(
                 if let Err(e) = db_client.set_device_id(&did, &new_id).await {
                     warn!("failed to persist device_id: {}", e);
                 }
-                (new_id, true)
+                new_id
             }
         };
 
@@ -1211,10 +1211,23 @@ pub async fn sign_in(
             Err(e) => warn!("is_localpart_available check failed: {}", e),
         }
 
-        if !is_new_device {
-            let _ = synapse.delete_device(&localpart, &dev_id).await;
-        }
-
+        // Do NOT delete + recreate the device on relogin. Rotating the
+        // device's ed25519/curve25519 keys mid-lifecycle invalidates any
+        // cross-signing signatures previously made by that device key id,
+        // most notably `master.signatures.{user}.ed25519:SIWX_<id>`. Even
+        // when the new device gets re-signed by the user's self-signing
+        // key (which Element does after recovery), Element-Web's UI keeps
+        // treating the device as unverified because the stale
+        // device-attests-master signature on the master key no longer
+        // verifies. End-to-end repro: aqua-matrix-agent --enable-recovery
+        // then --recover succeeded post-fix in the SDK, but Element's
+        // DeviceListener still showed "Verify this device".
+        //
+        // Stale one-time keys (the original motivation for delete+recreate
+        // in d736346) are flushed naturally: `/keys/upload` replaces the
+        // device's signed-curve25519 one-time keys on every login, and
+        // Element handles `M_USER_IN_USE` on /keys/claim by upgrading to
+        // a fallback key.
         if let Err(e) = synapse
             .upsert_device(&localpart, &dev_id, Some("Element Web"))
             .await
