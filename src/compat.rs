@@ -19,7 +19,7 @@ use axum_extra::{
 use chrono::Utc;
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::introspect::generate_opaque_token;
 use crate::oidc::localpart_to_did;
@@ -131,10 +131,14 @@ pub async fn refresh(
     State(state): State<CompatState>,
     Json(body): Json<RefreshRequest>,
 ) -> impl IntoResponse {
+    let rt_prefix = &body.refresh_token[..body.refresh_token.len().min(8)];
+    info!("compat::refresh: received refresh request (token={}...)", rt_prefix);
+
     // Look up the refresh token.
     let metadata = match state.redis_client.get_token(&body.refresh_token).await {
         Ok(Some(m)) => m,
         _ => {
+            warn!("compat::refresh: token {}... not found in Redis", rt_prefix);
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
@@ -147,6 +151,7 @@ pub async fn refresh(
 
     // Verify the refresh token has not expired.
     if metadata.exp <= Utc::now().timestamp() {
+        warn!("compat::refresh: token {}... expired (exp={})", rt_prefix, metadata.exp);
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -211,6 +216,14 @@ pub async fn refresh(
 
     // Delete the old refresh token.
     let _ = state.redis_client.delete_token(&body.refresh_token).await;
+
+    info!(
+        "compat::refresh: success for user={} device={} (new_at={}... new_rt={}...)",
+        metadata.username,
+        metadata.device_id,
+        &new_access_token[..new_access_token.len().min(8)],
+        &new_refresh_token[..new_refresh_token.len().min(8)],
+    );
 
     (
         StatusCode::OK,

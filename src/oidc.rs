@@ -428,7 +428,10 @@ async fn token_refresh(
     config: &crate::config::Config,
     db_client: &DBClientType,
 ) -> Result<CoreTokenResponse, CustomError> {
+    info!("token_refresh: grant_type=refresh_token received");
+
     if config.mas_shared_secret.is_none() {
+        warn!("token_refresh: rejected - MSC3861 mode not enabled");
         return Err(CustomError::BadRequestToken(TokenError {
             error: CoreErrorResponseType::UnsupportedGrantType,
             error_description: "refresh_token grant requires MSC3861 mode.".to_string(),
@@ -436,16 +439,19 @@ async fn token_refresh(
     }
 
     let rt = form.refresh_token.ok_or_else(|| {
+        warn!("token_refresh: rejected - missing refresh_token parameter");
         CustomError::BadRequestToken(TokenError {
             error: CoreErrorResponseType::InvalidRequest,
             error_description: "refresh_token parameter is required.".to_string(),
         })
     })?;
 
+    let rt_prefix = &rt[..rt.len().min(8)];
     let metadata = db_client
         .get_token(&rt)
         .await?
         .ok_or_else(|| {
+            warn!("token_refresh: rejected - token {}... not found in Redis", rt_prefix);
             CustomError::BadRequestToken(TokenError {
                 error: CoreErrorResponseType::InvalidGrant,
                 error_description: "Unknown or expired refresh token.".to_string(),
@@ -453,6 +459,7 @@ async fn token_refresh(
         })?;
 
     if metadata.exp <= Utc::now().timestamp() {
+        warn!("token_refresh: rejected - token {}... expired (exp={})", rt_prefix, metadata.exp);
         return Err(CustomError::BadRequestToken(TokenError {
             error: CoreErrorResponseType::InvalidGrant,
             error_description: "Refresh token has expired.".to_string(),
@@ -488,6 +495,15 @@ async fn token_refresh(
         .await?;
 
     let _ = db_client.delete_token(&rt).await;
+
+    info!(
+        "token_refresh: success for user={} device={} (old={}... new_at={}... new_rt={}...)",
+        metadata.username,
+        metadata.device_id,
+        rt_prefix,
+        &new_access[..new_access.len().min(8)],
+        &new_refresh[..new_refresh.len().min(8)],
+    );
 
     let mut response = CoreTokenResponse::new(
         AccessToken::new(new_access),

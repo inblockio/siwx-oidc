@@ -25,6 +25,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 use webauthn_rs::prelude::*;
 use tower_http::{
+    cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
@@ -32,6 +33,8 @@ use tracing::info;
 
 use super::compat;
 use super::config;
+#[cfg(feature = "identity")]
+use super::identity;
 use super::introspect;
 use super::oidc::{self, CustomError, EcdsaSigningKey};
 use super::synapse_client::SynapseClient;
@@ -510,6 +513,22 @@ pub async fn main() {
         synapse_client: state.synapse_client.clone(),
     };
 
+    #[cfg(feature = "identity")]
+    let identity_state = {
+        use aqua_identity_resolver::InMemoryClaimStore;
+        let store = Arc::new(InMemoryClaimStore::new());
+        let resolver = Arc::new(
+            aqua_identity_resolver::AquaIdentityResolver::with_store(store),
+        );
+        info!("Identity claim ingestion enabled");
+        identity::IdentityState {
+            resolver,
+            redis_client: state.redis_client.clone(),
+            synapse_client: state.synapse_client.clone(),
+            mas_shared_secret: state.config.mas_shared_secret.clone(),
+        }
+    };
+
     let app = Router::new()
         .nest_service("/build", ServeDir::new("./static/build"))
         .nest_service("/legal", ServeDir::new("./static/legal"))
@@ -541,8 +560,16 @@ pub async fn main() {
         .route("/link/webauthn/start", post(webauthn_link_start))
         .route("/link/webauthn/finish", post(webauthn_link_finish))
         .route("/health", get(healthcheck))
-        .with_state(state)
-        // MSC3861 introspection — separate state (only needs secret + Redis)
+        .with_state(state);
+
+    #[cfg(feature = "identity")]
+    let app = app.route(
+        "/identity/claims",
+        post(identity::ingest_claims).with_state(identity_state),
+    );
+
+    let app = app
+        // MSC3861 introspection -- separate state (only needs secret + Redis)
         .route(
             "/oauth2/introspect",
             post(introspect::introspect).with_state(introspect_state),
@@ -563,6 +590,20 @@ pub async fn main() {
         .route(
             "/_matrix/client/v3/refresh",
             post(compat::refresh).with_state(compat_state),
+        )
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::OPTIONS,
+                ])
+                .allow_headers([
+                    axum::http::header::AUTHORIZATION,
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::header::ACCEPT,
+                ]),
         )
         .layer(TraceLayer::new_for_http());
 
