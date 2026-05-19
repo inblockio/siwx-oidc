@@ -144,6 +144,8 @@ pub async fn refresh(
         client_id: metadata.client_id.clone(),
         iat: now,
         exp: now + ACCESS_TOKEN_TTL as i64,
+        did: metadata.did.clone(),
+        name: metadata.name.clone(),
     };
 
     if let Err(e) = state
@@ -170,6 +172,8 @@ pub async fn refresh(
         client_id: metadata.client_id.clone(),
         iat: now,
         exp: now + REFRESH_TOKEN_TTL as i64,
+        did: metadata.did.clone(),
+        name: metadata.name.clone(),
     };
 
     if let Err(e) = state

@@ -75,6 +75,10 @@ pub struct TokenMetadata {
     pub iat: i64,
     /// Token expiry (Unix timestamp).
     pub exp: i64,
+    /// The original DID (used as OIDC `sub` claim for consistency with ID token).
+    pub did: String,
+    /// Display name (ENS name or DID) for Synapse display name updates.
+    pub name: String,
 }
 
 #[async_trait]

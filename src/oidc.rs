@@ -443,6 +443,8 @@ async fn token_refresh(
         client_id: metadata.client_id.clone(),
         iat: now,
         exp: now + ACCESS_TOKEN_TTL as i64,
+        did: metadata.did.clone(),
+        name: metadata.name.clone(),
     };
     db_client
         .set_token(&new_access, &access_meta, ACCESS_TOKEN_TTL)
@@ -456,6 +458,8 @@ async fn token_refresh(
         client_id: metadata.client_id.clone(),
         iat: now,
         exp: now + REFRESH_TOKEN_TTL as i64,
+        did: metadata.did.clone(),
+        name: metadata.name.clone(),
     };
     db_client
         .set_token(&new_refresh, &refresh_meta, REFRESH_TOKEN_TTL)
@@ -577,9 +581,15 @@ async fn token_authorization_code(
             .unwrap_or_else(|| format!("SIWX_{}", &opaque[4..12]));
         let iat = now.timestamp();
         let scope = format!(
-            "openid urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:{}",
+            "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
             device_id
         );
+        let display_name = resolve_claims(config, &code_entry.did)
+            .await
+            .name()
+            .and_then(|n| n.get(None))
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| code_entry.did.clone());
         let access_metadata = TokenMetadata {
             username: username.clone(),
             device_id: device_id.clone(),
@@ -587,6 +597,8 @@ async fn token_authorization_code(
             client_id: client_id.clone(),
             iat,
             exp: iat + ACCESS_TOKEN_TTL as i64,
+            did: code_entry.did.clone(),
+            name: display_name.clone(),
         };
         db_client
             .set_token(&opaque, &access_metadata, ACCESS_TOKEN_TTL)
@@ -600,6 +612,8 @@ async fn token_authorization_code(
             client_id: client_id.clone(),
             iat,
             exp: iat + REFRESH_TOKEN_TTL as i64,
+            did: code_entry.did.clone(),
+            name: display_name,
         };
         db_client
             .set_token(&refresh_opaque, &refresh_metadata, REFRESH_TOKEN_TTL)
@@ -755,10 +769,14 @@ pub async fn authorize(
     }
     let _response_type = params.response_type.as_ref().unwrap();
 
-    for scope in params.scope.as_str().trim().split(' ') {
-        if !SCOPES.contains(&Scope::new(scope.to_string())) {
-            return Err(anyhow!("Scope not supported: {}", scope).into());
-        }
+    let has_openid = params
+        .scope
+        .as_str()
+        .trim()
+        .split(' ')
+        .any(|s| s == "openid");
+    if !has_openid {
+        return Err(anyhow!("The 'openid' scope is required.").into());
     }
 
     let session_id = Uuid::new_v4();
@@ -1534,5 +1552,29 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn authorize_accepts_matrix_scopes() {
+        let (_config, db_client) = default_config().await;
+        let params = AuthorizeParams {
+            client_id: "client".into(),
+            redirect_uri: RedirectUrl::from_url(
+                Url::parse("https://example.com").unwrap(),
+            ),
+            scope: Scope::new(
+                "openid urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:ABCDEF".to_string(),
+            ),
+            response_type: Some(CoreResponseType::Code),
+            state: Some("state".into()),
+            nonce: None,
+            prompt: None,
+            request_uri: None,
+            request: None,
+            code_challenge: None,
+            code_challenge_method: None,
+        };
+        let result = authorize(params, &db_client).await;
+        assert!(result.is_ok(), "authorize must accept Matrix scopes: {:?}", result.err());
     }
 }
