@@ -1,0 +1,64 @@
+{
+  "revisions": {
+    "0x8d447e2394b28937952c695a1925688dc017affecfd9dc307bc2ac288367db40": {
+      "previous_revision": "0x921b9e4153c024affe8f4118e841396c09c6af70cabcb91ec096aecd812fc6d8",
+      "revision_type": "0x7e94f4356c86f01ca9847a6835525231f37d7f43a9d44f186f6e4e07647ef7f6",
+      "nonce": "0xa5cb3695e88e7ca87c6a9eebc0309b5a",
+      "local_timestamp": 1779196394,
+      "version": "https://aqua-protocol.org/docs/v4/schema",
+      "method": "tree",
+      "hash_type": "FIPS_202-SHA3-256",
+      "payloads": {
+        "signer_did": "did:key:z6MkmwP9dLN3tEMA7LJfQjtFKppERcfy4Rvn4fWGjBHWrruk",
+        "given_name": "Alpha",
+        "family_name": "Agent",
+        "preferred_username": "AlphaAgent"
+      },
+      "leaves": [
+        "0x3eea1694b786111e25d8f932e3af19faf704c7ef437c314988cbb4aa6ffc5e24",
+        "0x43a07ce3b463787ba681d7eaaa3f7dce50395b52390e629e3489671f9206ab10",
+        "0xa917cab16e95c3e31a876cd6aa5f613eff6203c39956d70c1567af97a8c80810",
+        "0x8c84f9030a951d195199f13d4dc64717b3f718b9cbc6c17791e1dc532c40add3",
+        "0xe2f5054623c39770a8e5a379c1c68ca0485a163b603cee8c048f5a669972fbc2",
+        "0x9cb9f35f150c576c19082b93814a10787428385e561bd4e49c17808dd64a96df",
+        "0x6371c1cb875f20fdde780055ad662c3e077dcda5a3269c1071cb7f99c34d734a",
+        "0x3248277e651c8a4588e13ac9c978cd60d075e2fcae6bd724255e5b9d87724968",
+        "0x1945e39217eb22ebf1d7564c72c682dd6e5101428b33cd867d76d2aa1a9d8a03",
+        "0x127fcd533f6723c7152b598d85e8bef4f0ae74fec0d4dcc7a0ab866e9dc003dd",
+        "0x2471d2ede0d6896c0437e6f8e05b1f1bbc9fbf70d6be2ee4a8ae25ab095b87ac",
+        "0x81e6819cf8840afe4b32fa752a6034da6e6ca37008ae7224e860f07c30680b00",
+        "0xa4e46ad947cfa8deb2ea7f7a36b804a9b459bc0f31955e5a6eb5b8eff34ebd84"
+      ]
+    },
+    "0x921b9e4153c024affe8f4118e841396c09c6af70cabcb91ec096aecd812fc6d8": {
+      "revision_type": "anchor",
+      "nonce": "0x0d28b0c5af222bcab1fe3675b547c9b0",
+      "local_timestamp": 1779196393,
+      "version": "https://aqua-protocol.org/docs/v4/schema",
+      "method": "scalar",
+      "hash_type": "FIPS_202-SHA3-256",
+      "structural_links": [
+        "0x7e94f4356c86f01ca9847a6835525231f37d7f43a9d44f186f6e4e07647ef7f6"
+      ]
+    },
+    "0xe30164c3873a59ba0b11135bcdf9b8e44501f3ec50e97ad585ed7b224cc910ec": {
+      "previous_revision": "0x8d447e2394b28937952c695a1925688dc017affecfd9dc307bc2ac288367db40",
+      "revision_type": "0x553a84104c54b5fd715638d9179546558644ed2732f988ee4b9b2425580155ba",
+      "nonce": "0xdc31e5e918ec0cfc4a20d261ec2e1af2",
+      "local_timestamp": 1779196394,
+      "version": "https://aqua-protocol.org/docs/v4/schema",
+      "method": "scalar",
+      "hash_type": "FIPS_202-SHA3-256",
+      "signer": "did:key:z6MkmwP9dLN3tEMA7LJfQjtFKppERcfy4Rvn4fWGjBHWrruk",
+      "signature": {
+        "signature_type": "ed25519",
+        "signature": "0x7d9dfc29fad4727acee0a3d2deb49efcba42fdb4250bc7721d93ee5673b122643a5fe3bb1841d6aa0e68ffdeaeff2bcbf54bf54b063d4f8b78226efc07f70106",
+        "signature_public_identifier": "0x6f361a8e60ba469eb5c2d04d6f73750a54c31694e80bb8edd09451ff911f5ecf"
+      }
+    }
+  },
+  "file_index": {
+    "0x8d447e2394b28937952c695a1925688dc017affecfd9dc307bc2ac288367db40": "object_0x8d447e",
+    "0x921b9e4153c024affe8f4118e841396c09c6af70cabcb91ec096aecd812fc6d8": "anchor_0x921b9e"
+  }
+}

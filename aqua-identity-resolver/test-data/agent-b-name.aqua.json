@@ -1,0 +1,62 @@
+{
+  "revisions": {
+    "0x650746409ecde63029c14db1ca5f798a0b0c3e8bd6a2c3d32b30a75f7a23c7b0": {
+      "revision_type": "anchor",
+      "nonce": "0x35c3b4188657c3e701cb9a68bdbb2d91",
+      "local_timestamp": 1779156039,
+      "version": "https://aqua-protocol.org/docs/v4/schema",
+      "method": "scalar",
+      "hash_type": "FIPS_202-SHA3-256",
+      "structural_links": [
+        "0x7e94f4356c86f01ca9847a6835525231f37d7f43a9d44f186f6e4e07647ef7f6"
+      ]
+    },
+    "0xe0ea9f944df75300ffd1806fcf236d52ce8bf89a7c70ee82188ca2f1faf875bf": {
+      "previous_revision": "0x650746409ecde63029c14db1ca5f798a0b0c3e8bd6a2c3d32b30a75f7a23c7b0",
+      "revision_type": "0x7e94f4356c86f01ca9847a6835525231f37d7f43a9d44f186f6e4e07647ef7f6",
+      "nonce": "0x1121101d04dd1bd45736a16cfa2acd28",
+      "local_timestamp": 1779156040,
+      "version": "https://aqua-protocol.org/docs/v4/schema",
+      "method": "tree",
+      "hash_type": "FIPS_202-SHA3-256",
+      "payloads": {
+        "signer_did": "did:key:z6Mkw7Tw2WB8oSVQ1zGprTPLMi2wtXbcQkZQaoaQWfqsq2cv",
+        "given_name": "Aqua",
+        "family_name": "Beta"
+      },
+      "leaves": [
+        "0xeef7c3876779d674ba7f8cab233c7a6cc11e65c89af5a214bbd9a4cb26db53bd",
+        "0xb0704f83503767f5f3e28e77edc36ebcdb3e9355952bba7e0643835df3826832",
+        "0x1fe50ea3de33f332cc0ee977e7fa8f4d8a50974371a21c93452d50071c1d38fa",
+        "0x60f31d211e29f90ee239182f95edebdcaeac0926e6a54d9b6ae2c24f2360331c",
+        "0xe1829ab18044d232598c2c6cbdd6a2d520c33ea619b578b0d010055e3a195218",
+        "0xe0f8bb4d15ef8ca2040c3fc8587db016f66e0c31d5e5fda88fb6e4c22d374170",
+        "0x0baf3a493c75dd4e8d623493d5e936b8ba22f410cf1d450ad4ba9e8779be9f2c",
+        "0xdaf394d623f312854fdbd9994884bac036c5d7af8748dfa81da81766a0442a20",
+        "0xeeb907de6c7155a8267f16657ab3ab2cc454a237306a8caf4efb97f05e96b119",
+        "0x1b43134551a02c093865801d89597d62a73079fe4a60d47f49acbf88117a39e2",
+        "0x87e1924d41e525a925b20fbe4e9e1a17badc1f19999a3d2667414190e44f5d23",
+        "0x5a0aad9187563274598ff1d7572dfb108cc5bc76833a3ede367d4702b0cf3f76"
+      ]
+    },
+    "0xfdb8200ba0a253da5ad0280f36959bd7f89fdac17a4f80afa34a099192c8489e": {
+      "previous_revision": "0xe0ea9f944df75300ffd1806fcf236d52ce8bf89a7c70ee82188ca2f1faf875bf",
+      "revision_type": "0x553a84104c54b5fd715638d9179546558644ed2732f988ee4b9b2425580155ba",
+      "nonce": "0xfa9e8d5bec0dcc350f72e6a85643d676",
+      "local_timestamp": 1779156112,
+      "version": "https://aqua-protocol.org/docs/v4/schema",
+      "method": "scalar",
+      "hash_type": "FIPS_202-SHA3-256",
+      "signer": "did:key:z6Mkw7Tw2WB8oSVQ1zGprTPLMi2wtXbcQkZQaoaQWfqsq2cv",
+      "signature": {
+        "signature_type": "ed25519",
+        "signature": "0xa1bd56449e89749fec8b6d0131f6f93349fc915c134b7e35fc864831dd9f700ce096882f277591c5914272ad1dfbecb55950c2cbe6e97214e967883a8326800e",
+        "signature_public_identifier": "0xf78480855d63de927a35b9de70317b38703312a93d236fca793e099d25a756e7"
+      }
+    }
+  },
+  "file_index": {
+    "0x650746409ecde63029c14db1ca5f798a0b0c3e8bd6a2c3d32b30a75f7a23c7b0": "anchor_0x650746",
+    "0xe0ea9f944df75300ffd1806fcf236d52ce8bf89a7c70ee82188ca2f1faf875bf": "object_0xe0ea9f"
+  }
+}

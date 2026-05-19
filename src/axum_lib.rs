@@ -33,6 +33,8 @@ use tracing::info;
 
 use super::compat;
 use super::config;
+#[cfg(feature = "identity")]
+use super::identity;
 use super::introspect;
 use super::oidc::{self, CustomError, EcdsaSigningKey};
 use super::synapse_client::SynapseClient;
@@ -510,6 +512,22 @@ pub async fn main() {
         redis_client: state.redis_client.clone(),
     };
 
+    #[cfg(feature = "identity")]
+    let identity_state = {
+        use aqua_identity_resolver::InMemoryClaimStore;
+        let store = Arc::new(InMemoryClaimStore::new());
+        let resolver = Arc::new(
+            aqua_identity_resolver::AquaIdentityResolver::with_store(store),
+        );
+        info!("Identity claim ingestion enabled");
+        identity::IdentityState {
+            resolver,
+            redis_client: state.redis_client.clone(),
+            synapse_client: state.synapse_client.clone(),
+            mas_shared_secret: state.config.mas_shared_secret.clone(),
+        }
+    };
+
     let app = Router::new()
         .nest_service("/build", ServeDir::new("./static/build"))
         .nest_service("/legal", ServeDir::new("./static/legal"))
@@ -542,6 +560,12 @@ pub async fn main() {
         .route("/link/webauthn/finish", post(webauthn_link_finish))
         .route("/health", get(healthcheck))
         .with_state(state);
+
+    #[cfg(feature = "identity")]
+    let app = app.route(
+        "/identity/claims",
+        post(identity::ingest_claims).with_state(identity_state),
+    );
 
     let app = app
         // MSC3861 introspection -- separate state (only needs secret + Redis)
