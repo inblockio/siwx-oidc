@@ -323,19 +323,36 @@ async fn resolve_name(
 async fn resolve_claims(
     config: &crate::config::Config,
     did: &str,
+    db_client: Option<&DBClientType>,
 ) -> StandardClaims<CoreGenderClaim> {
-    // canonical_subject is the OIDC sub claim — full DID string for did:pkh.
+    // canonical_subject is the OIDC sub claim -- full DID string for did:pkh.
     let subject = find_did_method(did)
         .and_then(|m| m.canonical_subject(did).ok())
         .unwrap_or_else(|| did.to_string());
+
+    let (identity_name, identity_email) = if let Some(db) = db_client {
+        let name = db
+            .get_kv(&format!("identity:display_name:{}", did))
+            .await
+            .ok()
+            .flatten();
+        let email = db
+            .get_kv(&format!("identity:email:{}", did))
+            .await
+            .ok()
+            .flatten();
+        (name, email)
+    } else {
+        (None, None)
+    };
 
     // address_for_message is used for ENS resolution input.
     let address_str = find_did_method(did)
         .and_then(|m| m.address_for_message(did).ok())
         .unwrap_or_else(|| did.to_string());
 
-    // ENS resolution only for eip155 DIDs.
-    let ens_name = if did.starts_with("did:pkh:eip155:") {
+    // ENS resolution only for eip155 DIDs (skipped if identity name already set).
+    let ens_name = if identity_name.is_none() && did.starts_with("did:pkh:eip155:") {
         if let Ok(addr) = address_str.parse::<Address>() {
             resolve_name(
                 config.ens_api_url.as_ref(),
@@ -350,14 +367,22 @@ async fn resolve_claims(
         None
     };
 
+    // Priority: identity claim > ENS > none
+    let display_name = identity_name.or(ens_name);
+
     // preferred_username is ALWAYS the full DID (used as Matrix username).
-    // name is the ENS name when available (used as Matrix display name).
+    // name is the display name when available (used as Matrix display name).
     let mut claims = StandardClaims::new(SubjectIdentifier::new(subject))
         .set_preferred_username(Some(EndUserUsername::new(did.to_string())));
-    if let Some(name) = ens_name {
+    if let Some(name) = display_name {
         let mut m = LocalizedClaim::new();
         m.insert(None, EndUserName::new(name));
         claims = claims.set_name(Some(m));
+    }
+    if let Some(email) = identity_email {
+        claims = claims
+            .set_email(Some(openidconnect::EndUserEmail::new(email)))
+            .set_email_verified(Some(true));
     }
     claims
 }
@@ -610,7 +635,7 @@ async fn token_authorization_code(
         vec![Audience::new(client_id.clone())],
         now + Duration::seconds(config.id_token_ttl_secs as i64),
         now,
-        resolve_claims(config, &code_entry.did).await,
+        resolve_claims(config, &code_entry.did, Some(db_client)).await,
         EmptyAdditionalClaims {},
     )
     .set_nonce(code_entry.nonce)
@@ -1152,12 +1177,17 @@ pub async fn sign_in(
                 if let Err(e) = synapse.provision_user(&localpart, &did).await {
                     warn!("provision_user failed: {}", e);
                 }
-                if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
-                    warn!("allow_cross_signing_reset failed: {}", e);
-                }
             }
             Ok(false) => {}
             Err(e) => warn!("is_localpart_available check failed: {}", e),
+        }
+
+        // Allow cross-signing reset on every login so Element can set up or
+        // rotate keys for the current device. Without this, returning users
+        // whose device changed (e.g. after the deterministic-ID migration)
+        // are stuck with an unverified session forever.
+        if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
+            warn!("allow_cross_signing_reset failed: {}", e);
         }
 
         if let Err(e) = synapse
@@ -1353,7 +1383,7 @@ pub async fn userinfo(
             .await?
             .ok_or_else(|| CustomError::BadRequest("Unknown client.".to_string()))?;
         let response = CoreUserInfoClaims::new(
-            resolve_claims(config, &did).await,
+            resolve_claims(config, &did, Some(db_client)).await,
             EmptyAdditionalClaims::default(),
         )
         .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
@@ -1381,7 +1411,7 @@ pub async fn userinfo(
     };
 
     let response = CoreUserInfoClaims::new(
-        resolve_claims(config, &code_entry.did).await,
+        resolve_claims(config, &code_entry.did, Some(db_client)).await,
         EmptyAdditionalClaims::default(),
     )
     .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
@@ -1437,24 +1467,21 @@ mod tests {
 
     #[test(tokio::test)]
     async fn test_claims_without_ens() {
-        // Without ENS config, preferred_username is always the full DID.
         let did = "did:pkh:eip155:1:0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
         let config = config_no_ens();
-        let res = resolve_claims(&config, did).await;
+        let res = resolve_claims(&config, did, None).await;
         assert_eq!(
             res.preferred_username().map(|u| u.to_string()),
             Some(did.to_string())
         );
-        // No ENS resolution → name claim should be absent.
         assert!(res.name().is_none());
     }
 
     #[test(tokio::test)]
     async fn test_claims_non_eip155() {
-        // Non-eip155 DID — preferred_username is the full DID, no ENS attempt.
         let did = "did:pkh:ed25519:0xabcdef1234567890";
         let config = config_no_ens();
-        let res = resolve_claims(&config, did).await;
+        let res = resolve_claims(&config, did, None).await;
         assert_eq!(
             res.preferred_username().map(|u| u.to_string()),
             Some(did.to_string())
