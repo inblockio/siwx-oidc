@@ -18,12 +18,9 @@ use axum_extra::{
 };
 use chrono::Utc;
 use serde::Deserialize;
-use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::introspect::generate_opaque_token;
-use crate::oidc::localpart_to_did;
-use crate::synapse_client::SynapseClient;
 use siwx_oidc::db::{DBClient, RedisClient, TokenMetadata, ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL};
 
 // -- Shared state for compat endpoints ----------------------------------------
@@ -31,7 +28,6 @@ use siwx_oidc::db::{DBClient, RedisClient, TokenMetadata, ACCESS_TOKEN_TTL, REFR
 #[derive(Clone)]
 pub struct CompatState {
     pub redis_client: RedisClient,
-    pub synapse_client: Option<Arc<SynapseClient>>,
 }
 
 // -- Request/response types ---------------------------------------------------
@@ -55,25 +51,6 @@ pub async fn revoke(
     State(state): State<CompatState>,
     axum::extract::Form(form): axum::extract::Form<RevokeForm>,
 ) -> StatusCode {
-    // Look up token metadata BEFORE deleting so we can clean up the device.
-    // Element's OIDC logout calls revoke (not /_matrix/client/v3/logout),
-    // so this is the primary path where device cleanup must happen.
-    if let Ok(Some(metadata)) = state.redis_client.get_token(&form.token).await {
-        if let Some(ref synapse) = state.synapse_client {
-            if let Err(e) = synapse
-                .delete_device(&metadata.username, &metadata.device_id)
-                .await
-            {
-                warn!("revoke: delete_device failed: {}", e);
-            }
-        }
-
-        let did = localpart_to_did(&metadata.username);
-        if let Err(e) = state.redis_client.delete_device_id(&did).await {
-            warn!("revoke: delete_device_id failed: {}", e);
-        }
-    }
-
     let _ = state.redis_client.delete_token(&form.token).await;
     StatusCode::OK
 }
@@ -99,27 +76,6 @@ pub async fn logout(
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
 ) -> impl IntoResponse {
     if let Some(TypedHeader(auth)) = bearer {
-        if let Ok(Some(metadata)) = state.redis_client.get_token(auth.token()).await {
-            // Delete the device from Synapse (flushes crypto keys and pending
-            // to-device messages).
-            if let Some(ref synapse) = state.synapse_client {
-                if let Err(e) = synapse
-                    .delete_device(&metadata.username, &metadata.device_id)
-                    .await
-                {
-                    warn!("logout: delete_device failed: {}", e);
-                }
-            }
-
-            // Clear the persistent device-ID mapping so the next login
-            // creates a fresh device. Element Web clears IndexedDB on logout,
-            // so reusing the old device_id with new identity keys would cause
-            // SigningKeyChanged rejections from other clients.
-            let did = localpart_to_did(&metadata.username);
-            if let Err(e) = state.redis_client.delete_device_id(&did).await {
-                warn!("logout: delete_device_id failed: {}", e);
-            }
-        }
         let _ = state.redis_client.delete_token(auth.token()).await;
     }
     (StatusCode::OK, Json(serde_json::json!({})))
@@ -131,10 +87,14 @@ pub async fn refresh(
     State(state): State<CompatState>,
     Json(body): Json<RefreshRequest>,
 ) -> impl IntoResponse {
+    let rt_prefix = &body.refresh_token[..body.refresh_token.len().min(8)];
+    info!("compat::refresh: received refresh request (token={}...)", rt_prefix);
+
     // Look up the refresh token.
     let metadata = match state.redis_client.get_token(&body.refresh_token).await {
         Ok(Some(m)) => m,
         _ => {
+            warn!("compat::refresh: token {}... not found in Redis", rt_prefix);
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
@@ -147,6 +107,7 @@ pub async fn refresh(
 
     // Verify the refresh token has not expired.
     if metadata.exp <= Utc::now().timestamp() {
+        warn!("compat::refresh: token {}... expired (exp={})", rt_prefix, metadata.exp);
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -211,6 +172,14 @@ pub async fn refresh(
 
     // Delete the old refresh token.
     let _ = state.redis_client.delete_token(&body.refresh_token).await;
+
+    info!(
+        "compat::refresh: success for user={} device={} (new_at={}... new_rt={}...)",
+        metadata.username,
+        metadata.device_id,
+        &new_access_token[..new_access_token.len().min(8)],
+        &new_refresh_token[..new_refresh_token.len().min(8)],
+    );
 
     (
         StatusCode::OK,

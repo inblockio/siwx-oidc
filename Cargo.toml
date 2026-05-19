@@ -47,7 +47,6 @@ uuid = { version = "1", features = ["serde", "v4"] }
 webauthn-rs = { version = "0.6.0-dev", features = ["danger-allow-state-serialisation", "conditional-ui"] }
 bs58 = "0.5"
 webauthn-rs-proto = "0.6.0-dev"
-
 [dev-dependencies]
 base64 = "0.22"
 chrono = "0.4"
