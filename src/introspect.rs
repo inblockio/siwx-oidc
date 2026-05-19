@@ -17,7 +17,7 @@ use chrono::Utc;
 use rand::{thread_rng, Rng};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use siwx_oidc::db::DBClient;
 
@@ -72,7 +72,10 @@ pub async fn introspect(
     let secret = state
         .mas_shared_secret
         .as_ref()
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or_else(|| {
+            warn!("introspect: endpoint called but mas_shared_secret not configured");
+            StatusCode::NOT_FOUND
+        })?;
 
     // Accept either Bearer token OR client_secret in form body (client_secret_post).
     let provided = if let Some(ref b) = bearer {
@@ -80,11 +83,13 @@ pub async fn introspect(
     } else if let Some(ref cs) = form.client_secret {
         cs.as_bytes()
     } else {
+        warn!("introspect: no Bearer token or client_secret provided");
         return Err(StatusCode::UNAUTHORIZED);
     };
 
     let expected = secret.as_bytes();
     if provided.len() != expected.len() || !bool::from(provided.ct_eq(expected)) {
+        warn!("introspect: invalid shared secret");
         return Err(StatusCode::UNAUTHORIZED);
     }
 

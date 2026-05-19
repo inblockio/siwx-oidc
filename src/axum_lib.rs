@@ -25,10 +25,13 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 use webauthn_rs::prelude::*;
 use tower_http::{
+    classify::ServerErrorsFailureClass,
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
-use tracing::info;
+use std::time::Duration;
+use tracing::{info, warn};
+use tracing_subscriber::{fmt, EnvFilter};
 
 use super::compat;
 use super::config;
@@ -71,6 +74,25 @@ impl From<&AppState> for IntrospectState {
 
 impl IntoResponse for CustomError {
     fn into_response(self) -> Response {
+        match &self {
+            CustomError::BadRequest(msg) => {
+                warn!(error = %msg, "bad_request");
+            }
+            CustomError::BadRequestRegister(e) => {
+                warn!(error = ?e, "bad_request_register");
+            }
+            CustomError::BadRequestToken(e) => {
+                warn!(error = ?e, "bad_request_token");
+            }
+            CustomError::Unauthorized(msg) => {
+                warn!(error = %msg, "unauthorized");
+            }
+            CustomError::Other(e) => {
+                warn!(error = %e, "internal_error");
+            }
+            CustomError::NotFound | CustomError::Redirect(_) => {}
+        }
+
         match self {
             CustomError::BadRequest(_) => {
                 (StatusCode::BAD_REQUEST, self.to_string()).into_response()
@@ -429,7 +451,24 @@ pub async fn main() {
         .merge(Env::prefixed("SIWEOIDC_").split("__").global());
     let config = config.extract::<config::Config>().unwrap();
 
-    tracing_subscriber::fmt::init();
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("siwx_oidc=info,tower_http=info,warn"));
+
+    match config.log_format.as_str() {
+        "json" => {
+            fmt()
+                .json()
+                .with_env_filter(env_filter)
+                .with_target(true)
+                .init();
+        }
+        _ => {
+            fmt()
+                .with_env_filter(env_filter)
+                .with_target(true)
+                .init();
+        }
+    }
 
     // Validate configured DID methods against the siwx-core registry.
     {
@@ -564,7 +603,38 @@ pub async fn main() {
             "/_matrix/client/v3/refresh",
             post(compat::refresh).with_state(compat_state),
         )
-        .layer(TraceLayer::new_for_http());
+        .layer(
+            TraceLayer::new_for_http()
+                .on_request(|req: &axum::http::Request<_>, _span: &tracing::Span| {
+                    info!(
+                        method = %req.method(),
+                        path = %req.uri().path(),
+                        "request"
+                    );
+                })
+                .on_response(
+                    |res: &axum::http::Response<_>,
+                     latency: Duration,
+                     _span: &tracing::Span| {
+                        info!(
+                            status = res.status().as_u16(),
+                            latency_ms = latency.as_millis() as u64,
+                            "response"
+                        );
+                    },
+                )
+                .on_failure(
+                    |error: ServerErrorsFailureClass,
+                     latency: Duration,
+                     _span: &tracing::Span| {
+                        warn!(
+                            error = %error,
+                            latency_ms = latency.as_millis() as u64,
+                            "request failed"
+                        );
+                    },
+                ),
+        );
 
     let addr = SocketAddr::from((config.address, config.port));
     info!("Listening on {}", addr);

@@ -42,6 +42,9 @@ pub struct Config {
     /// Example: `http://matrix_synapse:8080`
     /// Env: `SIWEOIDC_SYNAPSE_ENDPOINT`
     pub synapse_endpoint: Option<Url>,
+    /// Log output format: "pretty" (default, human-readable) or "json" (structured).
+    /// Env: `SIWEOIDC_LOG_FORMAT`
+    pub log_format: String,
 }
 
 impl Default for Config {
@@ -67,6 +70,7 @@ impl Default for Config {
             rp_origin: None,
             mas_shared_secret: None,
             synapse_endpoint: None,
+            log_format: "pretty".to_string(),
         }
     }
 }
