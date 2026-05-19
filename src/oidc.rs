@@ -572,7 +572,7 @@ async fn token_authorization_code(
     let msc3861_mode = config.mas_shared_secret.is_some();
 
     let now = Utc::now();
-    let (access_token, refresh_token) = if msc3861_mode {
+    let (access_token, refresh_token, cached_claims) = if msc3861_mode {
         let opaque = generate_opaque_token("mat_");
         let username = did_to_localpart(&code_entry.did);
         let device_id = code_entry
@@ -584,8 +584,8 @@ async fn token_authorization_code(
             "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
             device_id
         );
-        let display_name = resolve_claims(config, &code_entry.did)
-            .await
+        let claims = resolve_claims(config, &code_entry.did).await;
+        let display_name = claims
             .name()
             .and_then(|n| n.get(None))
             .map(|n| n.to_string())
@@ -622,13 +622,19 @@ async fn token_authorization_code(
         (
             AccessToken::new(opaque),
             Some(RefreshToken::new(refresh_opaque)),
+            Some(claims),
         )
     } else {
         let access_token_id = Uuid::new_v4().to_string();
         db_client
             .set_code(access_token_id.clone(), code_entry.clone())
             .await?;
-        (AccessToken::new(access_token_id), None)
+        (AccessToken::new(access_token_id), None, None)
+    };
+
+    let resolved = match cached_claims {
+        Some(c) => c,
+        None => resolve_claims(config, &code_entry.did).await,
     };
 
     let core_id_token = CoreIdTokenClaims::new(
@@ -636,7 +642,7 @@ async fn token_authorization_code(
         vec![Audience::new(client_id.clone())],
         now + Duration::seconds(config.id_token_ttl_secs as i64),
         now,
-        resolve_claims(config, &code_entry.did).await,
+        resolved,
         EmptyAdditionalClaims {},
     )
     .set_nonce(code_entry.nonce)
