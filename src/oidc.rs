@@ -515,8 +515,21 @@ async fn token_authorization_code(
         if !constant_time_eq(&secret, &client_entry.secret) {
             return Err(CustomError::Unauthorized("Bad secret.".to_string()));
         }
-    } else if config.require_secret {
-        return Err(CustomError::Unauthorized("Secret required.".to_string()));
+    } else {
+        let client_entry = db_client
+            .get_client(client_id.clone())
+            .await?
+            .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
+        match client_entry.metadata.token_endpoint_auth_method() {
+            Some(CoreClientAuthMethod::None) => {}
+            Some(_) => {
+                return Err(CustomError::Unauthorized("Secret required.".to_string()));
+            }
+            None if config.require_secret => {
+                return Err(CustomError::Unauthorized("Secret required.".to_string()));
+            }
+            None => {}
+        }
     }
 
     // PKCE: validate code_verifier if a code_challenge was issued.
