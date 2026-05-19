@@ -22,6 +22,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::introspect::generate_opaque_token;
+use crate::oidc::localpart_to_did;
 use crate::synapse_client::SynapseClient;
 use siwx_oidc::db::{DBClient, RedisClient, TokenMetadata, ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL};
 
@@ -54,8 +55,25 @@ pub async fn revoke(
     State(state): State<CompatState>,
     axum::extract::Form(form): axum::extract::Form<RevokeForm>,
 ) -> StatusCode {
-    // Delete token from Redis (idempotent). Device is deleted at logout,
-    // not here; revoke only affects the token.
+    // Look up token metadata BEFORE deleting so we can clean up the device.
+    // Element's OIDC logout calls revoke (not /_matrix/client/v3/logout),
+    // so this is the primary path where device cleanup must happen.
+    if let Ok(Some(metadata)) = state.redis_client.get_token(&form.token).await {
+        if let Some(ref synapse) = state.synapse_client {
+            if let Err(e) = synapse
+                .delete_device(&metadata.username, &metadata.device_id)
+                .await
+            {
+                warn!("revoke: delete_device failed: {}", e);
+            }
+        }
+
+        let did = localpart_to_did(&metadata.username);
+        if let Err(e) = state.redis_client.delete_device_id(&did).await {
+            warn!("revoke: delete_device_id failed: {}", e);
+        }
+    }
+
     let _ = state.redis_client.delete_token(&form.token).await;
     StatusCode::OK
 }
@@ -93,6 +111,14 @@ pub async fn logout(
                 }
             }
 
+            // Clear the persistent device-ID mapping so the next login
+            // creates a fresh device. Element Web clears IndexedDB on logout,
+            // so reusing the old device_id with new identity keys would cause
+            // SigningKeyChanged rejections from other clients.
+            let did = localpart_to_did(&metadata.username);
+            if let Err(e) = state.redis_client.delete_device_id(&did).await {
+                warn!("logout: delete_device_id failed: {}", e);
+            }
         }
         let _ = state.redis_client.delete_token(auth.token()).await;
     }

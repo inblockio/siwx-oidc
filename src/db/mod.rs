@@ -11,6 +11,7 @@ const KV_CLIENT_PREFIX: &str = "clients";
 const KV_SESSION_PREFIX: &str = "sessions";
 const KV_CODE_PREFIX: &str = "codes";
 const KV_TOKEN_PREFIX: &str = "token";
+const KV_DEVICE_PREFIX: &str = "device_ids";
 pub const ENTRY_LIFETIME: usize = 300; // 5min — auth codes must outlive redirect chains
 pub const SESSION_LIFETIME: u64 = 300; // 5min
 pub const CLIENT_LIFETIME: u64 = 30 * 24 * 3600; // 30 days
@@ -100,6 +101,16 @@ pub trait DBClient {
     async fn get_token(&self, token: &str) -> Result<Option<TokenMetadata>>;
     /// Delete an opaque token (e.g. on revocation).
     async fn delete_token(&self, token: &str) -> Result<()>;
+
+    // -- Device ID persistence (migration shim) --------------------------------
+
+    /// Look up the persistent device ID for a DID.
+    async fn get_device_id(&self, did: &str) -> Result<Option<String>>;
+    /// Store a persistent device ID for a DID (no TTL).
+    async fn set_device_id(&self, did: &str, device_id: &str) -> Result<()>;
+    /// Remove the persistent device ID for a DID (called at logout so the next
+    /// login creates a fresh device for clients that clear their crypto store).
+    async fn delete_device_id(&self, did: &str) -> Result<()>;
 
     /// Generic key-value get (used for identity profile data).
     async fn get_kv(&self, _key: &str) -> Result<Option<String>> {
