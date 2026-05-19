@@ -328,19 +328,13 @@ aggregation). Default: human-readable (`pretty`).
   `warn!` calls through business logic
 - Modules that bypass `CustomError` (introspect, compat) must log their own errors
 
-## TODO: MSC3861 compliance gaps
+## MSC3861 compliance (resolved 2026-05-19)
 
 Audit document: `docs/audit/msc3861-compliance-audit.md` (2026-05-19)
+Implementation plan: `docs/superpowers/plans/2026-05-19-msc3861-compliance.md`
 
-**HIGH priority (blocks native Element OIDC):**
-1. `/authorize` rejects Matrix-specific scopes (`oidc.rs:758-760`). Accept or ignore `urn:matrix:...` scopes.
-2. Discovery advertises `introspection_endpoint_auth_methods_supported: ["bearer"]` but Synapse uses `client_secret_post` (`axum_lib.rs:110`). Fix to `["client_secret_post", "bearer"]`.
-
-**MEDIUM priority:**
-3. `sub` inconsistency: ID token uses full DID, introspection uses localpart. Align them.
-4. Add `name` field to introspection response for display name updates.
-5. Migrate to stable Matrix scopes (`urn:matrix:client:...` instead of `urn:matrix:org.matrix.msc2967.client:...`).
-6. Remove or wire up dead `sync_devices` code.
+All 6 items fixed in branch `msc3861-compliance`. Deploy note: **Redis flush required**
+(TokenMetadata schema changed, `did` and `name` fields are now required).
 
 ## Claude Code skills
 
