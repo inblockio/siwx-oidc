@@ -30,6 +30,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 use std::time;
 use thiserror::Error;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 use urlencoding::decode;
 use uuid::Uuid;
@@ -1138,29 +1139,24 @@ pub async fn sign_in(
     let device_id = if let Some(synapse) = synapse_client {
         let localpart = did_to_localpart(&did);
 
-        let (dev_id, is_new_device) = match db_client.get_device_id(&did).await {
-            Ok(Some(existing)) => {
-                debug!("reusing device_id={} for did={}", existing, did);
-                (existing, false)
-            }
-            _ => {
-                let new_id = format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]);
-                debug!("new device_id={} for did={}", new_id, did);
-                if let Err(e) = db_client.set_device_id(&did, &new_id).await {
-                    warn!("failed to persist device_id: {}", e);
-                }
-                (new_id, true)
-            }
+        let dev_id = {
+            let mut hasher = Sha256::new();
+            hasher.update(did.as_bytes());
+            let hash = hasher.finalize();
+            format!("SIWX_{}", hex::encode(&hash[..4]))
         };
+        debug!("deterministic device_id={} for did={}", dev_id, did);
 
-        // Provision user if new
         match synapse.is_localpart_available(&localpart).await {
             Ok(true) => {
                 if let Err(e) = synapse.provision_user(&localpart, &did).await {
                     warn!("provision_user failed: {}", e);
                 }
+                if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
+                    warn!("allow_cross_signing_reset failed: {}", e);
+                }
             }
-            Ok(false) => {} // existing user
+            Ok(false) => {}
             Err(e) => warn!("is_localpart_available check failed: {}", e),
         }
 
@@ -1169,12 +1165,6 @@ pub async fn sign_in(
             .await
         {
             warn!("upsert_device failed: {}", e);
-        }
-
-        if is_new_device {
-            if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
-                warn!("allow_cross_signing_reset failed: {}", e);
-            }
         }
 
         Some(dev_id)

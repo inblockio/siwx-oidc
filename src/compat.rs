@@ -22,7 +22,6 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::introspect::generate_opaque_token;
-use crate::oidc::localpart_to_did;
 use crate::synapse_client::SynapseClient;
 use siwx_oidc::db::{DBClient, RedisClient, TokenMetadata, ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL};
 
@@ -94,14 +93,6 @@ pub async fn logout(
                 }
             }
 
-            // Clear the persistent device-ID mapping so the next login creates
-            // a fresh device. Without this, Element Web (which clears IndexedDB
-            // on logout) would reuse the old device ID with new identity keys,
-            // causing SigningKeyChanged rejections from other clients.
-            let did = localpart_to_did(&metadata.username);
-            if let Err(e) = state.redis_client.delete_device_id(&did).await {
-                warn!("logout: delete_device_id failed: {}", e);
-            }
         }
         let _ = state.redis_client.delete_token(auth.token()).await;
     }
