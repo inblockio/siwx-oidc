@@ -54,10 +54,9 @@ pub async fn revoke(
     State(state): State<CompatState>,
     axum::extract::Form(form): axum::extract::Form<RevokeForm>,
 ) -> StatusCode {
-    // Delete token from Redis (idempotent). Device is NOT deleted because
-    // device IDs are persistent across sessions (stored in Redis as
-    // `device_ids/{did}`); destroying the device would wipe cross-signing
-    // state and force re-verification on next login.
+    // Delete token from Redis (idempotent). Device is NOT deleted here;
+    // it is recycled (delete + recreate) at next login to flush stale
+    // one-time keys while preserving the same device ID.
     let _ = state.redis_client.delete_token(&form.token).await;
     StatusCode::OK
 }
@@ -83,9 +82,8 @@ pub async fn logout(
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
 ) -> impl IntoResponse {
     if let Some(TypedHeader(auth)) = bearer {
-        // Delete the token from Redis (session invalidation). Device is NOT
-        // deleted because device IDs are persistent across sessions; destroying
-        // the device would wipe cross-signing state.
+        // Delete the token from Redis (session invalidation). Device is
+        // recycled (delete + recreate) at next login, not here.
         let _ = state.redis_client.delete_token(auth.token()).await;
     }
     // Always return 200 with empty JSON object (idempotent).
