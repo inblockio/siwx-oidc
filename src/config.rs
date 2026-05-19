@@ -57,7 +57,7 @@ impl Default for Config {
             id_token_ttl_secs: 300,
             eth_provider: None,
             ens_api_url: Some(Url::parse("https://api.ensdata.net").unwrap()),
-            supported_did_methods: vec!["pkh".to_string()],
+            supported_did_methods: vec!["pkh".to_string(), "key".to_string()],
             supported_pkh_namespaces: vec![
                 "eip155".to_string(),
                 "ed25519".to_string(),
