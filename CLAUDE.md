@@ -6,8 +6,9 @@
 
 Users sign a CAIP-122 challenge with their wallet (or a local key); siwx-oidc
 issues standard OIDC tokens (ID token, access token) in return. Any OIDC relying
-party can use it. The primary deployment target is
-[Matrix Authentication Service (MAS)](https://github.com/element-hq/matrix-authentication-service).
+party can use it. The primary deployment target is Matrix Synapse, where siwx-oidc
+**replaces MAS entirely** via MSC3861 (delegated auth with shared secret, token
+introspection, user/device provisioning).
 
 Multi-DID successor to [siwe-oidc](https://github.com/inblockio/siwe-oidc) (Ethereum-only).
 
@@ -289,6 +290,20 @@ redis-cli KEYS 'sessions/*'
 # Check if a session has a verified_did
 redis-cli GET 'sessions/{session_id}' | python3 -m json.tool
 ```
+
+## TODO: MSC3861 compliance gaps
+
+Audit document: `docs/audit/msc3861-compliance-audit.md` (2026-05-19)
+
+**HIGH priority (blocks native Element OIDC):**
+1. `/authorize` rejects Matrix-specific scopes (`oidc.rs:758-760`). Accept or ignore `urn:matrix:...` scopes.
+2. Discovery advertises `introspection_endpoint_auth_methods_supported: ["bearer"]` but Synapse uses `client_secret_post` (`axum_lib.rs:110`). Fix to `["client_secret_post", "bearer"]`.
+
+**MEDIUM priority:**
+3. `sub` inconsistency: ID token uses full DID, introspection uses localpart. Align them.
+4. Add `name` field to introspection response for display name updates.
+5. Migrate to stable Matrix scopes (`urn:matrix:client:...` instead of `urn:matrix:org.matrix.msc2967.client:...`).
+6. Remove or wire up dead `sync_devices` code.
 
 ## Claude Code skills
 
