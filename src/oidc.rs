@@ -30,7 +30,6 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 use std::time;
 use thiserror::Error;
-use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 use urlencoding::decode;
 use uuid::Uuid;
@@ -1172,43 +1171,23 @@ pub async fn sign_in(
     };
 
     // -- Synapse device lifecycle (best-effort, never fails the auth flow) --
-    //
-    // Matches MAS behavior: devices are created/updated on login, deleted on
-    // logout. This preserves crypto state (identity keys, Olm sessions, pending
-    // to-device messages) for clients with persistent storage. Stale one-time
-    // keys are flushed when the device is deleted at logout, not at login.
-    //
-    // Device ID resolution order:
-    //   1. Existing Redis entry (preserves crypto stores from before the
-    //      deterministic migration)
-    //   2. Deterministic SHA-256 derivation (new users, or after logout clears
-    //      the Redis entry)
-    // On every login the resolved device_id is persisted to Redis so it remains
-    // stable across re-authentications.
     let device_id = if let Some(synapse) = synapse_client {
         let localpart = did_to_localpart(&did);
 
-        let deterministic_id = {
-            let mut hasher = Sha256::new();
-            hasher.update(did.as_bytes());
-            let hash = hasher.finalize();
-            format!("SIWX_{}", hex::encode(&hash[..4]))
-        };
-
-        let dev_id = match db_client.get_device_id(&did).await {
+        let (dev_id, is_new_device) = match db_client.get_device_id(&did).await {
             Ok(Some(existing)) => {
                 debug!("reusing device_id={} for did={}", existing, did);
-                existing
+                (existing, false)
             }
             _ => {
-                debug!("deterministic device_id={} for did={}", deterministic_id, did);
-                deterministic_id
+                let new_id = format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]);
+                debug!("new device_id={} for did={}", new_id, did);
+                if let Err(e) = db_client.set_device_id(&did, &new_id).await {
+                    warn!("failed to persist device_id: {}", e);
+                }
+                (new_id, true)
             }
         };
-
-        if let Err(e) = db_client.set_device_id(&did, &dev_id).await {
-            warn!("failed to persist device_id: {}", e);
-        }
 
         match synapse.is_localpart_available(&localpart).await {
             Ok(true) => {
@@ -1220,21 +1199,19 @@ pub async fn sign_in(
             Err(e) => warn!("is_localpart_available check failed: {}", e),
         }
 
-        if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
-            warn!("allow_cross_signing_reset failed: {}", e);
+        if !is_new_device {
+            let _ = synapse.delete_device(&localpart, &dev_id).await;
         }
-
-        // Delete the device first to purge any stale crypto keys from Synapse.
-        // If the previous logout failed or never fired (browser crash, network
-        // error), the old one-time keys would still be associated with this
-        // device ID and conflict with the new keys Element uploads.
-        let _ = synapse.delete_device(&localpart, &dev_id).await;
 
         if let Err(e) = synapse
             .upsert_device(&localpart, &dev_id, Some("Element Web"))
             .await
         {
             warn!("upsert_device failed: {}", e);
+        }
+
+        if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
+            warn!("allow_cross_signing_reset failed: {}", e);
         }
 
         Some(dev_id)
@@ -1702,29 +1679,6 @@ mod tests {
         assert_valid_localpart(&lp);
         assert_eq!(lp, lp.to_lowercase(), "localpart must be lowercase");
         assert_eq!(localpart_to_did(&lp), did);
-    }
-
-    #[test]
-    fn deterministic_device_id_is_stable() {
-        let did = "did:key:z6MkmwP9dLN3tEMA7LJfQjtFKppERcfy4Rvn4fWGjBHWrruk";
-        let make_id = || {
-            let mut hasher = Sha256::new();
-            hasher.update(did.as_bytes());
-            let hash = hasher.finalize();
-            format!("SIWX_{}", hex::encode(&hash[..4]))
-        };
-        let id1 = make_id();
-        let id2 = make_id();
-        assert_eq!(id1, id2, "same DID must always produce the same device_id");
-        assert!(id1.starts_with("SIWX_"), "device_id must have SIWX_ prefix");
-        assert_eq!(id1.len(), 13, "SIWX_ + 8 hex chars");
-
-        let other_did = "did:pkh:eip155:1:0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
-        let mut hasher = Sha256::new();
-        hasher.update(other_did.as_bytes());
-        let hash = hasher.finalize();
-        let other_id = format!("SIWX_{}", hex::encode(&hash[..4]));
-        assert_ne!(id1, other_id, "different DIDs must produce different device_ids");
     }
 
     #[test]

@@ -750,7 +750,7 @@ async fn returning_user_new_device() {
     assert_eq!(revoke_resp.status(), StatusCode::OK);
     eprintln!("[e2e] first session revoked");
 
-    // Second login (same user, new session).
+    // Second login (same user, new session -- no logout in between).
     let (token2, device2) = login_with_key(&signing_key, &address, &did).await;
     eprintln!("[e2e] second login: token={}, device={:?}", &token2[..12], device2);
 
@@ -783,19 +783,30 @@ async fn returning_user_new_device() {
             "second login should yield same user"
         );
 
-        // Device IDs should be different (new device per login).
+        // E2EE INVARIANT: same DID must get the same device_id across
+        // re-authentications (no logout in between). A different device_id
+        // means the client's crypto store (Megolm sessions, Olm identity
+        // keys) becomes orphaned and all E2EE breaks.
         if let (Some(d1), Some(d2)) = (&device1, &device2) {
-            assert_ne!(d1, d2, "each login should generate a unique device_id");
-            eprintln!("[e2e] confirmed different device_ids: {} vs {}", d1, d2);
+            assert_eq!(
+                d1, d2,
+                "E2EE BROKEN: device_id changed between logins ({} -> {}). \
+                 Clients with persistent crypto stores will fail to restore \
+                 sessions and all Megolm sessions become undecryptable.",
+                d1, d2
+            );
+            eprintln!("[e2e] E2EE OK: device_id stable across logins: {}", d1);
         }
     } else {
         eprintln!("[e2e] Matrix introspection unavailable - skipping whoami validation");
         eprintln!("[e2e] Both logins succeeded at the siwx-oidc level");
-        // We can still verify device_id uniqueness from the token metadata
-        // if both devices were returned.
         if let (Some(d1), Some(d2)) = (&device1, &device2) {
-            assert_ne!(d1, d2, "each login should generate a unique device_id");
-            eprintln!("[e2e] confirmed different device_ids: {} vs {}", d1, d2);
+            assert_eq!(
+                d1, d2,
+                "E2EE BROKEN: device_id changed between logins ({} -> {})",
+                d1, d2
+            );
+            eprintln!("[e2e] E2EE OK: device_id stable across logins: {}", d1);
         }
     }
 
@@ -803,6 +814,232 @@ async fn returning_user_new_device() {
     let _ = http
         .post(format!("{}/oauth2/revoke", oidc))
         .form(&[("token", token2.as_str())])
+        .send()
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// Test: E2EE device stability after logout cycle
+// ---------------------------------------------------------------------------
+
+/// After a full logout (which clears the device_id mapping), the next login
+/// must still produce a stable, deterministic device_id. Two consecutive
+/// post-logout logins must yield the same device_id.
+#[tokio::test]
+async fn e2ee_device_stable_after_logout() {
+    let oidc = siweoidc_host();
+    let http = Client::new();
+
+    let secret_key = k256::SecretKey::random(&mut thread_rng());
+    let signing_key = SigningKey::from(&secret_key);
+    let addr_bytes = address_from_key(signing_key.verifying_key());
+    let address = eip55_checksum(&addr_bytes);
+    let did = format!("did:pkh:eip155:1:{}", address);
+
+    async fn login_with_key(
+        signing_key: &SigningKey,
+        address: &str,
+        did: &str,
+    ) -> (String, Option<String>) {
+        let base = siweoidc_host();
+        let http_inner = Client::new();
+
+        let redirect_uri = format!("{}/callback", base);
+        let reg_body = serde_json::json!({
+            "redirect_uris": [&redirect_uri],
+            "token_endpoint_auth_method": "client_secret_post",
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+        });
+        let reg_resp = http_inner
+            .post(format!("{}/register", base))
+            .json(&reg_body)
+            .send()
+            .await
+            .unwrap();
+        let reg_json: Value = reg_resp.json().await.unwrap();
+        let client_id = reg_json["client_id"].as_str().unwrap().to_string();
+        let client_secret = reg_json["client_secret"].as_str().unwrap().to_string();
+
+        let (code_verifier, code_challenge) = pkce_pair();
+        let state = "e2ee_stable_state";
+        let client = no_redirect_client();
+
+        let authorize_url = format!(
+            "{}/authorize?client_id={}&redirect_uri={}&scope=openid&response_type=code&state={}&code_challenge={}&code_challenge_method=S256",
+            base,
+            urlencoding::encode(&client_id),
+            urlencoding::encode(&redirect_uri),
+            state,
+            urlencoding::encode(&code_challenge),
+        );
+        let auth_resp = client.get(&authorize_url).send().await.unwrap();
+        assert_eq!(auth_resp.status(), StatusCode::SEE_OTHER);
+
+        let set_cookie = auth_resp
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let session_cookie = set_cookie.split(';').next().unwrap().to_string();
+
+        let location = auth_resp
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let query = parse_query(&location);
+        let nonce = query.get("nonce").unwrap();
+        let domain = query.get("domain").unwrap();
+
+        let issued_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let message = format!(
+            "{domain} wants you to sign in with your Ethereum account:\n\
+             {address}\n\n\
+             You are signing-in to {domain}.\n\n\
+             URI: {base}\n\
+             Version: 1\n\
+             Chain ID: 1\n\
+             Nonce: {nonce}\n\
+             Issued At: {issued_at}\n\
+             Resources:\n\
+             - {redirect_uri}",
+            domain = domain,
+            address = address,
+            base = base,
+            nonce = nonce,
+            issued_at = issued_at,
+            redirect_uri = redirect_uri,
+        );
+
+        let signature = eip191_sign(signing_key, &message);
+        let siwx_payload = serde_json::json!({
+            "did": did,
+            "message": message,
+            "signature": signature,
+        });
+        let siwx_cookie_value = serde_json::to_string(&siwx_payload).unwrap();
+
+        let sign_in_url = format!(
+            "{}/sign_in?redirect_uri={}&state={}&client_id={}&code_challenge={}&code_challenge_method=S256",
+            base,
+            urlencoding::encode(&redirect_uri),
+            state,
+            urlencoding::encode(&client_id),
+            urlencoding::encode(&code_challenge),
+        );
+
+        let sign_in_resp = client
+            .get(&sign_in_url)
+            .header(
+                "cookie",
+                format!(
+                    "{}; siwx={}",
+                    session_cookie,
+                    urlencoding::encode(&siwx_cookie_value)
+                ),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sign_in_resp.status(), StatusCode::SEE_OTHER);
+
+        let sign_in_location = sign_in_resp
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let callback_query = parse_query(&sign_in_location);
+        let code = callback_query.get("code").unwrap().clone();
+
+        let token_resp = http_inner
+            .post(format!("{}/token", base))
+            .form(&[
+                ("code", code.as_str()),
+                ("client_id", client_id.as_str()),
+                ("client_secret", client_secret.as_str()),
+                ("grant_type", "authorization_code"),
+                ("code_verifier", code_verifier.as_str()),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(token_resp.status(), StatusCode::OK);
+        let token_json: Value = token_resp.json().await.unwrap();
+        let access_token = token_json["access_token"].as_str().unwrap().to_string();
+
+        let matrix = matrix_host();
+        let whoami_resp = http_inner
+            .get(format!("{}/_matrix/client/v3/account/whoami", matrix))
+            .bearer_auth(&access_token)
+            .send()
+            .await
+            .unwrap();
+        let device_id = if whoami_resp.status() == StatusCode::OK {
+            let wj: Value = whoami_resp.json().await.unwrap();
+            wj["device_id"].as_str().map(|s| s.to_string())
+        } else {
+            None
+        };
+
+        (access_token, device_id)
+    }
+
+    // Login 1.
+    let (token1, device1) = login_with_key(&signing_key, &address, &did).await;
+    eprintln!("[e2e:logout] login 1: device={:?}", device1);
+
+    // Full logout (deletes device + clears Redis device_id mapping).
+    let logout_resp = http
+        .post(format!("{}/_matrix/client/v3/logout", oidc))
+        .bearer_auth(&token1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout_resp.status(), StatusCode::OK);
+    eprintln!("[e2e:logout] logged out");
+
+    // Login 2 (after logout, device_id comes from deterministic derivation).
+    let (token2, device2) = login_with_key(&signing_key, &address, &did).await;
+    eprintln!("[e2e:logout] login 2: device={:?}", device2);
+
+    // Login 3 (no logout, device_id must match login 2).
+    let (token3, device3) = login_with_key(&signing_key, &address, &did).await;
+    eprintln!("[e2e:logout] login 3: device={:?}", device3);
+
+    // The critical E2EE invariant: logins 2 and 3 must produce the same
+    // device_id. If they differ, any client that connected during login 2 will
+    // have a crypto store bound to that device_id and login 3 will fail with
+    // "account in store doesn't match."
+    if let (Some(d2), Some(d3)) = (&device2, &device3) {
+        assert_eq!(
+            d2, d3,
+            "E2EE BROKEN: device_id changed after logout cycle ({} -> {}). \
+             Persistent clients (agents with SQLite stores) will fail to \
+             restore sessions after re-authentication.",
+            d2, d3
+        );
+        eprintln!(
+            "[e2e:logout] E2EE OK: device_id stable after logout cycle: {}",
+            d2
+        );
+    }
+
+    // Clean up.
+    let _ = http
+        .post(format!("{}/oauth2/revoke", oidc))
+        .form(&[("token", token2.as_str())])
+        .send()
+        .await;
+    let _ = http
+        .post(format!("{}/oauth2/revoke", oidc))
+        .form(&[("token", token3.as_str())])
         .send()
         .await;
 }
