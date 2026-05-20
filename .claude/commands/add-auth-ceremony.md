@@ -1,0 +1,1 @@
+../../skills/add-auth-ceremony.md

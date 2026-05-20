@@ -336,13 +336,17 @@ Implementation plan: `docs/superpowers/plans/2026-05-19-msc3861-compliance.md`
 All 6 items fixed in branch `msc3861-compliance`. Deploy note: **Redis flush required**
 (TokenMetadata schema changed, `did` and `name` fields are now required).
 
-## Claude Code skills
+## Skills (`skills/`)
+
+Skill files live at the repo root in `skills/` (visible to all users).
+Claude Code discovers them via symlinks in `.claude/commands/` (invoke with `/skill-name`).
 
 | Skill | Purpose |
 |-------|---------|
 | `/add-did-method` | Add a new DID method to siwx-core (Layer 1) |
 | `/add-cipher-suite` | Add a new cipher suite to did:pkh (Layer 1) |
 | `/add-auth-ceremony` | Add a new auth ceremony to the server (Layer 2) |
-| `/docker-build` | Build, test, push Docker image |
-| `/deploy-check` | Pre-deployment checklist for Matrix |
+| `/authenticate-siwe-matrix` | End-to-end auth flow: Element Web to siwx-oidc to Synapse |
 | `/debug-oidc` | Debug OIDC authentication flow issues |
+| `/deploy-check` | Pre-deployment checklist for Matrix |
+| `/docker-build` | Build, test, push Docker image |
