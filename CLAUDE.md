@@ -15,20 +15,6 @@ Multi-DID successor to [siwe-oidc](https://github.com/inblockio/siwe-oidc) (Ethe
 ## File map
 
 ```
-siwx-core/src/                     ← Pure crypto library (no async, no network)
-  lib.rs                            Crate root — re-exports traits
-  did_method.rs                     DIDMethod trait + all_did_methods() registry
-  cipher_suite.rs                   CipherSuite trait + all_cipher_suites() registry
-  did.rs                            DID parsing utilities (address extraction, EIP-55)
-  error.rs                          SiwxError enum
-  pkh/                              did:pkh — dispatches to cipher suites
-    method.rs                         PkhMethod (DIDMethod impl)
-    eip155.rs                         EIP-191 ecrecover (Ethereum)
-    ed25519.rs                        Ed25519 raw signature verify
-    p256.rs                           P-256 ECDSA verify (DER + fixed)
-  key/mod.rs                        did:key — multibase/multicodec key decoding
-  peer/mod.rs                       did:peer — variant 0 + variant 2 V-key
-
 src/                                ← Axum OIDC server (binary)
   config.rs                          Config struct (supported_did_methods, RP ID, signing key, etc.)
   axum_lib.rs                        Routes, startup validation, state (incl. Webauthn)
@@ -49,7 +35,7 @@ js/ui/src/App.svelte               ← Svelte frontend (Ethereum-only via Web3Mo
 **Three-layer model:**
 
 ```
-Layer 1: siwx-core        — Pure crypto library (no async, no network, WASM-safe)
+Layer 1: aqua-auth         — Crypto library (external crate, pure core + optional HTTP layer)
   ├── DIDMethod trait       — DID parsing + CAIP-122 verification dispatch
   ├── CipherSuite trait     — Internal to did:pkh, never imported by server
   └── Registries            — Manual static functions (no inventory crate)
@@ -62,7 +48,7 @@ Layer 2: src/{ceremony}.rs — Auth ceremony verification (server-side)
 Layer 3: src/oidc.rs       — OIDC token issuance (single code issuance point: sign_in)
 ```
 
-**Key boundary:** siwx-core handles CAIP-122 proof verification only. New authentication
+**Key boundary:** aqua-auth handles CAIP-122 proof verification only. New authentication
 ceremonies (WebAuthn, SSH, PGP) are server-layer modules that produce a verified DID.
 The `DIDMethod` trait is NOT extended for non-CAIP-122 proofs. See `/add-auth-ceremony`.
 
@@ -97,9 +83,9 @@ No `inventory` crate (WASM-unsafe).
 
 | DID Method | Key types | Location | Default |
 |-----------|-----------|----------|---------|
-| `did:pkh` | eip155, ed25519, p256 | `siwx-core/src/pkh/` | Yes |
-| `did:key` | Ed25519 (`z6Mk…`), P-256 (`zDn…`) | `siwx-core/src/key/` | No (opt-in) |
-| `did:peer` | variant 0, variant 2 | `siwx-core/src/peer/` | No (opt-in) |
+| `did:pkh` | eip155, ed25519, p256 | `aqua-auth` (pkh module) | Yes |
+| `did:key` | Ed25519 (`z6Mk…`), P-256 (`zDn…`) | `aqua-auth` (key module) | No (opt-in) |
+| `did:peer` | variant 0, variant 2 | `aqua-auth` (peer module) | No (opt-in) |
 | `did:web` | — | Not implemented | Needs async resolver |
 
 ## Building and testing
@@ -108,8 +94,8 @@ No `inventory` crate (WASM-unsafe).
 # Build the full workspace
 cargo build --workspace
 
-# Run siwx-core unit tests (57 tests, no Redis needed)
-cargo test -p siwx-core
+# Run aqua-auth crypto tests (71 tests, no Redis needed)
+cargo test -p aqua-auth
 
 # Run server tests (needs Redis on localhost:6379)
 cargo test --bin siwx-oidc
@@ -121,7 +107,7 @@ cargo run
 cargo run -p siwx-oidc-auth -- --help
 ```
 
-The siwx-core tests are self-contained (pure crypto). The server e2e test
+The aqua-auth tests are self-contained (pure crypto). The server e2e test
 (`oidc::tests::e2e_flow`) requires a running Redis instance.
 
 ## Headless client (siwx-oidc-auth)
@@ -177,7 +163,7 @@ DIDs derived from passkeys are accepted by `sign_in`.
 | Repo | Purpose |
 |------|---------|
 | `../siwe-oidc` | Upstream Ethereum-only predecessor (abandoned) |
-| `../aqua-rs-auth` | Reference cipher suites — port files, do not add as dependency |
+| `../aqua-auth` | Crypto layer (aqua-auth 0.2.0) providing DIDMethod/CipherSuite traits. Workspace dependency. |
 
 ## Frontend (js/ui/src/App.svelte)
 
@@ -224,7 +210,7 @@ See `../siwx-oidc-matrix-server/docs/2026-05-19-device-verification-analysis.md`
 
 **Ceremony module:** `src/webauthn.rs` — uses `webauthn-rs` 0.6.0-dev safe API.
 **DID derivation:** Passkey P-256 pubkey → compressed SEC1 → `did:key:zDn…` (same
-encoding as `siwx-core/src/key/mod.rs`).
+encoding as aqua-auth's key module).
 
 **Redis keys:**
 ```
@@ -321,7 +307,7 @@ aggregation). Default: human-readable (`pretty`).
 | `debug!` | Internal details useful during development | Redis key operations, token metadata, ENS resolution attempts |
 
 **Rules:**
-- siwx-core: NO logging (pure library, no tracing dependency)
+- aqua-auth: NO logging (pure library, no tracing dependency)
 - Never log secrets, tokens, cookies, or signing key material
 - Use structured fields (`info!(did = %did, "sign_in success")`) not string interpolation
 - Error paths: prefer logging at the boundary (`CustomError::into_response`) over scattering
@@ -336,13 +322,17 @@ Implementation plan: `docs/superpowers/plans/2026-05-19-msc3861-compliance.md`
 All 6 items fixed in branch `msc3861-compliance`. Deploy note: **Redis flush required**
 (TokenMetadata schema changed, `did` and `name` fields are now required).
 
-## Claude Code skills
+## Skills (`skills/`)
+
+Skill files live at the repo root in `skills/` (visible to all users).
+Claude Code discovers them via symlinks in `.claude/commands/` (invoke with `/skill-name`).
 
 | Skill | Purpose |
 |-------|---------|
-| `/add-did-method` | Add a new DID method to siwx-core (Layer 1) |
-| `/add-cipher-suite` | Add a new cipher suite to did:pkh (Layer 1) |
+| `/add-did-method` | Add a new DID method to aqua-auth (Layer 1) |
+| `/add-cipher-suite` | Add a new cipher suite to did:pkh in aqua-auth (Layer 1) |
 | `/add-auth-ceremony` | Add a new auth ceremony to the server (Layer 2) |
-| `/docker-build` | Build, test, push Docker image |
-| `/deploy-check` | Pre-deployment checklist for Matrix |
+| `/authenticate-siwe-matrix` | End-to-end auth flow: Element Web to siwx-oidc to Synapse |
 | `/debug-oidc` | Debug OIDC authentication flow issues |
+| `/deploy-check` | Pre-deployment checklist for Matrix |
+| `/docker-build` | Build, test, push Docker image |

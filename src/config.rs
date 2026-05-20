@@ -24,10 +24,10 @@ pub struct Config {
     /// Set to empty string to disable ENS resolution entirely.
     pub ens_api_url: Option<Url>,
     /// DID method names accepted at sign-in (e.g. ["pkh"]).
-    /// Must be a subset of the methods registered in siwx-core.
+    /// Must be a subset of the methods registered in aqua-auth.
     pub supported_did_methods: Vec<String>,
     /// did:pkh namespaces accepted at sign-in (e.g. ["eip155", "ed25519", "p256"]).
-    /// Must be a subset of the cipher suites registered in siwx-core.
+    /// Must be a subset of the cipher suites registered in aqua-auth.
     pub supported_pkh_namespaces: Vec<String>,
     /// WebAuthn Relying Party ID (domain). Defaults to the hostname of `base_url`.
     pub rp_id: Option<String>,

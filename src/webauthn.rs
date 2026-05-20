@@ -25,7 +25,7 @@ const CHALLENGE_TTL: u64 = 120; // 2 min
 
 // -- DID derivation from P-256 public key --
 
-/// Multicodec varint for P-256 (0x1200), same as siwx-core/src/key/mod.rs.
+/// Multicodec varint for P-256 (0x1200), same as aqua-auth key module.
 const P256_MULTICODEC: &[u8] = &[0x80, 0x24];
 
 /// Derive a `did:key:zDn…` from a P-256 compressed SEC1 public key (33 bytes).
