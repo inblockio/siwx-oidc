@@ -34,7 +34,7 @@ use std::path::Path;
 use url::Url;
 use urlencoding::encode;
 
-// Multicodec varint prefixes (same as siwx-core/src/key/mod.rs)
+// Multicodec varint prefixes (same as aqua-auth key module)
 const ED25519_PREFIX: &[u8] = &[0xED, 0x01];
 const P256_PREFIX: &[u8] = &[0x80, 0x24];
 

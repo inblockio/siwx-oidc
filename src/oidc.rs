@@ -34,7 +34,7 @@ use tracing::{debug, info, warn};
 use urlencoding::decode;
 use uuid::Uuid;
 
-use siwx_core::find_did_method;
+use aqua_auth::find_did_method;
 use siwx_oidc::db::*;
 use subtle::ConstantTimeEq;
 
@@ -1385,7 +1385,7 @@ mod tests {
     use super::*;
     use headers::{HeaderMap, HeaderMapExt, HeaderValue};
     use sha3::{Digest, Keccak256};
-    use siwx_core::did::{address_from_verifying_key, eip55_checksum};
+    use aqua_auth::{address_from_verifying_key, eip55_checksum};
     use test_log::test;
 
     async fn default_config() -> (Config, RedisClient) {

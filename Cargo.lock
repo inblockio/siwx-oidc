@@ -793,6 +793,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "aqua-auth"
+version = "0.2.0"
+dependencies = [
+ "bs58",
+ "ed25519-dalek",
+ "hex",
+ "k256",
+ "p256",
+ "serde",
+ "sha3",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "arcstr"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4607,27 +4621,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "siwx-core"
-version = "0.1.0"
-dependencies = [
- "bs58",
- "ed25519-dalek",
- "hex",
- "k256",
- "p256",
- "rand 0.8.5",
- "serde",
- "sha3",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "siwx-oidc"
 version = "0.2.0"
 dependencies = [
  "alloy",
  "alloy-primitives",
  "anyhow",
+ "aqua-auth",
  "async-trait",
  "axum",
  "axum-extra",
@@ -4651,7 +4651,6 @@ dependencies = [
  "serde_urlencoded",
  "sha2 0.10.6",
  "sha3",
- "siwx-core",
  "subtle",
  "test-log",
  "thiserror 2.0.18",
@@ -4671,6 +4670,7 @@ name = "siwx-oidc-auth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aqua-auth",
  "base64 0.22.1",
  "bs58",
  "chrono",
@@ -4684,7 +4684,6 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "sha2 0.10.6",
- "siwx-core",
  "tokio",
  "url",
  "urlencoding",

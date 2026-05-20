@@ -24,6 +24,7 @@ use openidconnect::core::{
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 use webauthn_rs::prelude::*;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::{
     classify::ServerErrorsFailureClass,
     services::{ServeDir, ServeFile},
@@ -40,7 +41,7 @@ use super::oidc::{self, CustomError, EcdsaSigningKey};
 use super::synapse_client::SynapseClient;
 use super::webauthn as wa;
 use openidconnect::JsonWebKeyId;
-use siwx_core::{all_cipher_suites, all_did_methods};
+use aqua_auth::{all_cipher_suites, all_did_methods};
 use siwx_oidc::db::*;
 
 // -- Shared application state ----------------------------------------------
@@ -470,7 +471,7 @@ pub async fn main() {
         }
     }
 
-    // Validate configured DID methods against the siwx-core registry.
+    // Validate configured DID methods against the aqua-auth registry.
     {
         let registered: Vec<String> = all_did_methods()
             .iter()
@@ -479,7 +480,7 @@ pub async fn main() {
         for method in &config.supported_did_methods {
             assert!(
                 registered.contains(method),
-                "FATAL: configured DID method '{}' is not registered in siwx-core (registered: {:?})",
+                "FATAL: configured DID method '{}' is not registered in aqua-auth (registered: {:?})",
                 method, registered
             );
         }
@@ -490,7 +491,7 @@ pub async fn main() {
         for ns in &config.supported_pkh_namespaces {
             assert!(
                 registered_ns.contains(ns),
-                "FATAL: configured pkh namespace '{}' is not registered in siwx-core (registered: {:?})",
+                "FATAL: configured pkh namespace '{}' is not registered in aqua-auth (registered: {:?})",
                 ns, registered_ns
             );
         }
@@ -634,6 +635,16 @@ pub async fn main() {
                         );
                     },
                 ),
+        )
+        .layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::any())
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::OPTIONS,
+                ])
+                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
         );
 
     let addr = SocketAddr::from((config.address, config.port));
