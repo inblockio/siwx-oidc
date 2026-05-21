@@ -796,12 +796,15 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "aqua-auth"
 version = "0.2.0"
 dependencies = [
+ "base64 0.21.7",
  "bs58",
  "ed25519-dalek",
  "hex",
  "k256",
  "p256",
  "serde",
+ "serde_json",
+ "sha2 0.10.6",
  "sha3",
  "thiserror 2.0.18",
 ]

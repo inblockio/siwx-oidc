@@ -2,7 +2,7 @@ name: Publish Docker
 
 on:
   push:
-    branches: [main]
+    branches: [main, fork-stable]
   release:
     types: [published]
   workflow_dispatch:
@@ -19,6 +19,12 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout aqua-auth
+        uses: actions/checkout@v4
+        with:
+          repository: inblockio/aqua-rs-auth
+          path: aqua-auth
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -43,6 +49,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          build-contexts: |
+            aqua-auth=./aqua-auth
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
