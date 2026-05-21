@@ -385,9 +385,10 @@ async fn webauthn_authenticate_finish(
         .get(SESSION_COOKIE_NAME)
         .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
     let resp = wa::authenticate_finish(
-        &state.webauthn,
         &state.redis_client,
         session_id,
+        &state.rp_id,
+        &state.rp_origin,
         auth_response,
     )
     .await?;

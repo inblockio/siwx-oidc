@@ -7,7 +7,9 @@
 //! `sign_in` reads it from there (server-side, trusted).
 
 use anyhow::{anyhow, Result};
+use aqua_auth::{verify_webauthn_assertion, WebAuthnAssertionParams};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use p256::ecdsa::Signature;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use url::Url;
@@ -35,8 +37,7 @@ fn did_from_p256_compressed(compressed: &[u8]) -> String {
     format!("did:key:z{}", bs58::encode(&bytes).into_string())
 }
 
-/// Extract the P-256 public key from a Passkey credential and derive a did:key.
-fn did_from_passkey(passkey: &Passkey) -> Result<String> {
+fn compressed_pubkey_from_passkey(passkey: &Passkey) -> Result<Vec<u8>> {
     let cose_key = passkey.get_public_key();
     match &cose_key.key {
         COSEKeyType::EC_EC2(ec2) => {
@@ -45,18 +46,22 @@ fn did_from_passkey(passkey: &Passkey) -> Result<String> {
                     "WebAuthn credential uses unsupported curve (expected P-256)"
                 ));
             }
-            // Build compressed SEC1 point: 0x02 (even y) or 0x03 (odd y) + x
             let y_bytes: &[u8] = ec2.y.as_ref();
             let y_is_odd = y_bytes.last().is_some_and(|b| b & 1 == 1);
             let prefix = if y_is_odd { 0x03 } else { 0x02 };
             let mut compressed = vec![prefix];
             compressed.extend_from_slice(ec2.x.as_ref());
-            Ok(did_from_p256_compressed(&compressed))
+            Ok(compressed)
         }
         _ => Err(anyhow!(
             "WebAuthn credential is not EC2/P-256 — cannot derive did:key"
         )),
     }
+}
+
+fn did_from_passkey(passkey: &Passkey) -> Result<String> {
+    let compressed = compressed_pubkey_from_passkey(passkey)?;
+    Ok(did_from_p256_compressed(&compressed))
 }
 
 // -- Request/response types for the HTTP API --
@@ -199,29 +204,24 @@ pub async fn authenticate_start(
 }
 
 pub async fn authenticate_finish(
-    webauthn: &Webauthn,
     redis: &RedisClient,
     session_id: &str,
+    rp_id: &str,
+    rp_origin: &str,
     auth_response: PublicKeyCredential,
 ) -> Result<AuthenticateFinishResponse> {
-    // Retrieve and consume the authentication state.
     let challenge_key = format!("{}/{}", CHALLENGE_PREFIX, session_id);
-    let state_json = redis
+    let challenge_b64 = redis
         .get_raw(&challenge_key)
         .await?
         .ok_or_else(|| anyhow!("No auth challenge found (expired or already used)"))?;
     redis.del_raw(&challenge_key).await?;
 
-    let auth_state: DiscoverableAuthentication = serde_json::from_str(&state_json)
-        .map_err(|e| anyhow!("Failed to deserialize auth state: {}", e))?;
+    let challenge_bytes = URL_SAFE_NO_PAD
+        .decode(&challenge_b64)
+        .map_err(|e| anyhow!("Failed to decode stored challenge: {}", e))?;
 
-    // Step 1: Identify which credential the user selected (get cred_id from assertion).
-    let (_user_unique_id, cred_id) = webauthn
-        .identify_discoverable_authentication(&auth_response)
-        .map_err(|e| anyhow!("Failed to identify credential: {:?}", e))?;
-
-    // Step 2: Look up the stored credential from Redis.
-    let cred_id_b64 = URL_SAFE_NO_PAD.encode(cred_id);
+    let cred_id_b64 = URL_SAFE_NO_PAD.encode(&*auth_response.raw_id);
     if cred_id_b64.is_empty() {
         return Err(anyhow!("Empty credential ID in WebAuthn assertion"));
     }
@@ -230,18 +230,34 @@ pub async fn authenticate_finish(
         .get_raw(&cred_key)
         .await?
         .ok_or_else(|| anyhow!("Credential not found: {}", cred_id_b64))?;
-    let mut passkey: Passkey = serde_json::from_str(&cred_json)
+    let passkey: Passkey = serde_json::from_str(&cred_json)
         .map_err(|e| anyhow!("Failed to deserialize credential: {}", e))?;
 
-    // Step 3: Convert to DiscoverableKey and finish the ceremony.
-    let dk: DiscoverableKey = (&passkey).into();
-    let auth_result = webauthn
-        .finish_discoverable_authentication(&auth_response, auth_state, &[dk])
-        .map_err(|e| anyhow!("WebAuthn authentication failed: {:?}", e))?;
+    let compressed_pubkey = compressed_pubkey_from_passkey(&passkey)?;
+
+    let der_sig = &*auth_response.response.signature;
+    let sig = Signature::from_der(der_sig)
+        .map_err(|e| anyhow!("Failed to DER-decode ECDSA signature: {}", e))?;
+    let sig_bytes = sig.to_bytes();
+
+    let params = WebAuthnAssertionParams {
+        credential_public_key: &compressed_pubkey,
+        authenticator_data: &*auth_response.response.authenticator_data,
+        client_data_json: &*auth_response.response.client_data_json,
+        signature: &sig_bytes,
+        expected_challenge: &challenge_bytes,
+        expected_origin: rp_origin,
+        expected_rp_id: rp_id,
+    };
+
+    match verify_webauthn_assertion(&params) {
+        Ok(true) => {}
+        Ok(false) => return Err(anyhow!("WebAuthn assertion signature verification failed")),
+        Err(e) => return Err(anyhow!("WebAuthn assertion verification error: {}", e)),
+    }
 
     let passkey_did = did_from_passkey(&passkey)?;
 
-    // Phase 2: Check if this credential is linked to a primary DID.
     let did = match redis
         .get_raw(&format!("{}/{}", LINK_PREFIX, cred_id_b64))
         .await?
@@ -250,7 +266,7 @@ pub async fn authenticate_finish(
             let link_entry: LinkEntry = serde_json::from_str(&link_json)
                 .map_err(|e| anyhow!("Failed to deserialize link entry: {}", e))?;
             info!(
-                "webauthn authenticate_finish: linked cred={} → primary_did={}",
+                "webauthn authenticate_finish: linked cred={} primary_did={}",
                 cred_id_b64, link_entry.primary_did
             );
             link_entry.primary_did
@@ -258,13 +274,19 @@ pub async fn authenticate_finish(
         None => passkey_did,
     };
 
-    // Update sign count in stored credential.
-    passkey.update_credential(&auth_result);
-    let updated_json = serde_json::to_string(&passkey)
-        .map_err(|e| anyhow!("Failed to serialize updated credential: {}", e))?;
-    redis.set_raw(&cred_key, &updated_json).await?;
+    let auth_data = &*auth_response.response.authenticator_data;
+    if auth_data.len() >= 37 {
+        let new_counter =
+            u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
+        let mut passkey_value: serde_json::Value = serde_json::from_str(&cred_json)?;
+        if let Some(cred) = passkey_value.get_mut("cred") {
+            cred["counter"] = serde_json::json!(new_counter);
+        }
+        redis
+            .set_raw(&cred_key, &serde_json::to_string(&passkey_value)?)
+            .await?;
+    }
 
-    // Store verified DID in the session (this is what sign_in reads).
     let session_key = format!("sessions/{}", session_id);
     let session_json = redis
         .get_raw(&session_key)
