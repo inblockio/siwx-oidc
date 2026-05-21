@@ -256,6 +256,11 @@ pub async fn authenticate_finish(
         Err(e) => return Err(anyhow!("WebAuthn assertion verification error: {}", e)),
     }
 
+    let flags = auth_response.response.authenticator_data[32];
+    if flags & 0x04 == 0 {
+        return Err(anyhow!("User Verification flag not set"));
+    }
+
     let passkey_did = did_from_passkey(&passkey)?;
 
     let did = match redis
@@ -280,6 +285,16 @@ pub async fn authenticate_finish(
             u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
         let mut passkey_value: serde_json::Value = serde_json::from_str(&cred_json)?;
         if let Some(cred) = passkey_value.get_mut("cred") {
+            let stored_counter = cred.get("counter").and_then(|c| c.as_u64()).unwrap_or(0) as u32;
+            if new_counter > 0 || stored_counter > 0 {
+                if new_counter < stored_counter {
+                    return Err(anyhow!(
+                        "Sign count regression (stored={}, got={}), possible cloned authenticator",
+                        stored_counter,
+                        new_counter
+                    ));
+                }
+            }
             cred["counter"] = serde_json::json!(new_counter);
         }
         redis
@@ -430,7 +445,7 @@ pub fn build_webauthn(
     let resolved_rp_id = rp_id.unwrap_or(&default_rp_id).to_string();
 
     let default_origin = base_url.as_str().trim_end_matches('/').to_string();
-    let resolved_rp_origin = rp_origin.unwrap_or(&default_origin).to_string();
+    let resolved_rp_origin = rp_origin.unwrap_or(&default_origin).trim_end_matches('/').to_string();
     let rp_origin_url = Url::parse(&resolved_rp_origin)
         .map_err(|e| anyhow!("Invalid SIWEOIDC_RP_ORIGIN: {}", e))?;
 
