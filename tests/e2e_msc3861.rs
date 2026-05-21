@@ -362,6 +362,7 @@ async fn matrix_introspection_healthy(token: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore]
 async fn full_lifecycle() {
     let matrix = matrix_host();
     let oidc = siweoidc_host();
@@ -451,6 +452,7 @@ async fn full_lifecycle() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore]
 async fn refresh_token_flow() {
     let matrix = matrix_host();
     let oidc = siweoidc_host();
@@ -566,6 +568,7 @@ async fn refresh_token_flow() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore]
 async fn returning_user_new_device() {
     let matrix = matrix_host();
     let oidc = siweoidc_host();

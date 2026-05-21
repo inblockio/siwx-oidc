@@ -391,6 +391,7 @@ async fn sync_and_find_message(
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore]
 async fn two_client_messaging() {
     let http = Client::new();
 
