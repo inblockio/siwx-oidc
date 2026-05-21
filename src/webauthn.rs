@@ -181,17 +181,15 @@ pub async fn authenticate_start(
     redis: &RedisClient,
     session_id: &str,
 ) -> Result<RequestChallengeResponse> {
-    // Discoverable credentials: empty allow list — browser shows all passkeys for this RP.
-    let (rcr, auth_state) = webauthn
+    let (rcr, _auth_state) = webauthn
         .start_discoverable_authentication()
         .map_err(|e| anyhow!("WebAuthn auth start failed: {:?}", e))?;
 
-    let state_json = serde_json::to_string(&auth_state)
-        .map_err(|e| anyhow!("Failed to serialize auth state: {}", e))?;
+    let challenge_b64 = URL_SAFE_NO_PAD.encode(&*rcr.public_key.challenge);
     redis
         .set_ex_raw(
             &format!("{}/{}", CHALLENGE_PREFIX, session_id),
-            &state_json,
+            &challenge_b64,
             CHALLENGE_TTL,
         )
         .await?;
