@@ -391,24 +391,37 @@ pub async fn link_finish(
     })
 }
 
+pub struct WebauthnConfig {
+    pub webauthn: Webauthn,
+    pub rp_id: String,
+    pub rp_origin: String,
+}
+
 /// Build the Webauthn instance from config.
 pub fn build_webauthn(
     base_url: &Url,
     rp_id: Option<&str>,
     rp_origin: Option<&str>,
-) -> Result<Webauthn> {
+) -> Result<WebauthnConfig> {
     let default_rp_id = base_url
         .host_str()
         .ok_or_else(|| anyhow!("SIWEOIDC_BASE_URL has no host — cannot derive WebAuthn RP ID"))?
         .to_string();
-    let rp_id = rp_id.unwrap_or(&default_rp_id);
+    let resolved_rp_id = rp_id.unwrap_or(&default_rp_id).to_string();
 
     let default_origin = base_url.as_str().trim_end_matches('/').to_string();
-    let rp_origin = Url::parse(rp_origin.unwrap_or(&default_origin))
+    let resolved_rp_origin = rp_origin.unwrap_or(&default_origin).to_string();
+    let rp_origin_url = Url::parse(&resolved_rp_origin)
         .map_err(|e| anyhow!("Invalid SIWEOIDC_RP_ORIGIN: {}", e))?;
 
-    WebauthnBuilder::new(rp_id, &rp_origin)
-        .map_err(|e| anyhow!("WebauthnBuilder::new failed (rp_id={}, origin={}): {:?}", rp_id, rp_origin, e))?
+    let webauthn = WebauthnBuilder::new(&resolved_rp_id, &rp_origin_url)
+        .map_err(|e| anyhow!("WebauthnBuilder::new failed (rp_id={}, origin={}): {:?}", resolved_rp_id, rp_origin_url, e))?
         .build()
-        .map_err(|e| anyhow!("Webauthn::build failed: {:?}", e))
+        .map_err(|e| anyhow!("Webauthn::build failed: {:?}", e))?;
+
+    Ok(WebauthnConfig {
+        webauthn,
+        rp_id: resolved_rp_id,
+        rp_origin: resolved_rp_origin,
+    })
 }

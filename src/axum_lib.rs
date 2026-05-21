@@ -52,6 +52,8 @@ struct AppState {
     config: config::Config,
     redis_client: RedisClient,
     webauthn: Arc<Webauthn>,
+    rp_id: String,
+    rp_origin: String,
     synapse_client: Option<Arc<SynapseClient>>,
 }
 
@@ -520,7 +522,7 @@ pub async fn main() {
         key
     };
 
-    let webauthn = wa::build_webauthn(
+    let wa_config = wa::build_webauthn(
         &config.base_url,
         config.rp_id.as_deref(),
         config.rp_origin.as_deref(),
@@ -540,7 +542,9 @@ pub async fn main() {
         signing_key: Arc::new(signing_key),
         config: config.clone(),
         redis_client,
-        webauthn: Arc::new(webauthn),
+        webauthn: Arc::new(wa_config.webauthn),
+        rp_id: wa_config.rp_id,
+        rp_origin: wa_config.rp_origin,
         synapse_client,
     };
 
