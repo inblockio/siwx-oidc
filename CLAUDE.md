@@ -94,8 +94,8 @@ No `inventory` crate (WASM-unsafe).
 # Build the full workspace
 cargo build --workspace
 
-# Run aqua-auth crypto tests (71 tests, no Redis needed)
-cargo test -p aqua-auth
+# Run aqua-auth crypto tests (83 tests incl. webauthn, no Redis needed)
+cd ../aqua-auth && cargo test --features webauthn && cd -
 
 # Run server tests (needs Redis on localhost:6379)
 cargo test --bin siwx-oidc
@@ -208,7 +208,8 @@ See `../siwx-oidc-matrix-server/docs/2026-05-19-device-verification-analysis.md`
 
 ## WebAuthn/Passkey architecture
 
-**Ceremony module:** `src/webauthn.rs` — uses `webauthn-rs` 0.6.0-dev safe API.
+**Ceremony module:** `src/webauthn.rs` — registration uses `webauthn-rs` 0.6.0-dev safe API;
+assertion verification uses `aqua-auth`'s `verify_webauthn_assertion` (P-256, behind `webauthn` feature).
 **DID derivation:** Passkey P-256 pubkey → compressed SEC1 → `did:key:zDn…` (same
 encoding as aqua-auth's key module).
 
