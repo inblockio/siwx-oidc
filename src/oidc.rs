@@ -565,23 +565,33 @@ async fn token_device_code(
                 .clone();
 
             let proposed_device_id = extract_device_id_from_scope(&entry.scope);
+            debug!(
+                scope = %entry.scope,
+                extracted_device_id = ?proposed_device_id,
+                "device_code grant: scope extraction"
+            );
 
             let dev_id = if let Some(ref proposed) = proposed_device_id {
-                debug!(proposed_device_id = %proposed, "using client-proposed device_id from scope");
-                provision_synapse_device_additive(
-                    &did,
-                    synapse_client,
-                    db_client,
-                    proposed,
-                    "Element X",
-                )
-                .await;
+                info!(proposed_device_id = %proposed, "using client-proposed device_id from scope");
                 proposed.clone()
             } else {
-                let device_id =
-                    provision_synapse_device(&did, synapse_client, db_client, "Element X").await;
-                device_id.unwrap_or_else(|| format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]))
+                let generated = format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]);
+                warn!(
+                    scope = %entry.scope,
+                    generated_device_id = %generated,
+                    "no device_id found in scope, generating one"
+                );
+                generated
             };
+
+            provision_synapse_device_additive(
+                &did,
+                synapse_client,
+                db_client,
+                &dev_id,
+                "Element X",
+            )
+            .await;
 
             let now = Utc::now();
             let iat = now.timestamp();
@@ -616,8 +626,8 @@ async fn token_device_code(
             let refresh_token = generate_opaque_token("mcr_");
             let refresh_meta = TokenMetadata {
                 username,
-                device_id: dev_id,
-                scope,
+                device_id: dev_id.clone(),
+                scope: scope.clone(),
                 client_id: client_id.clone(),
                 iat,
                 exp: iat + REFRESH_TOKEN_TTL as i64,
@@ -650,7 +660,7 @@ async fn token_device_code(
             let _ = db_client.delete_device_code(&dc).await;
             let _ = db_client.delete_user_code_mapping(&entry.user_code).await;
 
-            info!(did = %did, "device_code grant: tokens issued");
+            info!(did = %did, device_id = %dev_id, "device_code grant: tokens issued");
 
             let mut response = CoreTokenResponse::new(
                 AccessToken::new(access_token),
@@ -659,6 +669,12 @@ async fn token_device_code(
             );
             response.set_expires_in(Some(&time::Duration::from_secs(ACCESS_TOKEN_TTL)));
             response.set_refresh_token(Some(RefreshToken::new(refresh_token)));
+            response.set_scopes(Some(
+                scope
+                    .split_whitespace()
+                    .map(|s| Scope::new(s.to_string()))
+                    .collect(),
+            ));
             Ok(response)
         }
     }
@@ -1820,6 +1836,13 @@ mod tests {
                 "urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:CW2fdkGgZZW8StwGioe2CVKBb3685OjKt8wRUR0iZyc"
             ),
             Some("CW2fdkGgZZW8StwGioe2CVKBb3685OjKt8wRUR0iZyc".to_string())
+        );
+        // Device ID with slash (base64url-encoded, as sent by Element X)
+        assert_eq!(
+            extract_device_id_from_scope(
+                "urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:r8LXBERpNLfhbR3a/Wy1m9xE6ennsd2RJltz0xLrt3A"
+            ),
+            Some("r8LXBERpNLfhbR3a/Wy1m9xE6ennsd2RJltz0xLrt3A".to_string())
         );
         assert_eq!(extract_device_id_from_scope("openid"), None);
         assert_eq!(

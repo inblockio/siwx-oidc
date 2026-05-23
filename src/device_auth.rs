@@ -1,7 +1,7 @@
 use axum::response::Html;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::config::Config;
 use crate::introspect::generate_opaque_token;
@@ -56,6 +56,7 @@ pub async fn device_authorization(
     // 2. Generate codes
     let device_code = generate_opaque_token("dvc_");
     let user_code = generate_user_code();
+    debug!(raw_scope = ?form.scope, "device_authorization: scope from client");
     let scope = form.scope.unwrap_or_else(|| "openid".to_string());
 
     // 3. Build entry
