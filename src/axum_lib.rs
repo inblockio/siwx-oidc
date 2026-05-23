@@ -573,10 +573,7 @@ async fn account_passkey_start_handler(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, CustomError> {
-    let action = payload
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
     if action.is_empty() {
         return Err(CustomError::BadRequest("Missing action".to_string()));
     }

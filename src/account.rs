@@ -734,7 +734,10 @@ mod tests {
             sanitize_action("org.matrix.cross_signing_reset"),
             "org.matrix.cross_signing_reset"
         );
-        assert_eq!(sanitize_action("<script>alert(1)</script>"), "scriptalert1script");
+        assert_eq!(
+            sanitize_action("<script>alert(1)</script>"),
+            "scriptalert1script"
+        );
         assert_eq!(sanitize_action("'; DROP TABLE--"), "DROPTABLE");
         assert_eq!(sanitize_action(&"A".repeat(100)).len(), 64);
     }
