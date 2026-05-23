@@ -11,14 +11,25 @@ use siwx_oidc::db::*;
 /// Consonant alphabet for user codes (base-20, no vowels to avoid profanity).
 const USER_CODE_ALPHABET: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ";
 
-/// Generate an 8-character user code from consonants, formatted as XXXX-XXXX.
+/// Length of the user code in characters (excluding the separator).
+const USER_CODE_LEN: usize = 6;
+
+/// Generate a 6-character user code from consonants, formatted as XXX-XXX.
+///
+/// 6 consonants from a 20-character alphabet give log2(20^6) ≈ 25.9 bits of
+/// entropy, which is comfortably above the ~20-bit minimum recommended by
+/// RFC 8628 §6.1 for the lifetime of a device code (600s).
+///
+/// The shorter format ensures the code fits in narrow client display widgets
+/// (notably the Element X mobile verification screen).
 pub fn generate_user_code() -> String {
     let mut rng = rand::thread_rng();
-    let chars: Vec<u8> = (0..8)
+    let chars: Vec<u8> = (0..USER_CODE_LEN)
         .map(|_| USER_CODE_ALPHABET[rng.gen_range(0..USER_CODE_ALPHABET.len())])
         .collect();
-    let left = std::str::from_utf8(&chars[..4]).unwrap();
-    let right = std::str::from_utf8(&chars[4..]).unwrap();
+    let mid = USER_CODE_LEN / 2;
+    let left = std::str::from_utf8(&chars[..mid]).unwrap();
+    let right = std::str::from_utf8(&chars[mid..]).unwrap();
     format!("{}-{}", left, right)
 }
 
@@ -146,7 +157,7 @@ pub fn device_page(query: DevicePageQuery, base_url: &str) -> Html<String> {
 <div class="card">
   <p>A new device wants to sign in to your account. Verify the code below matches what's shown on the device, then approve with your wallet or passkey.</p>
   <div id="code-section">
-    <input type="text" id="user_code" placeholder="XXXX-XXXX" value="{user_code_value}" maxlength="9"
+    <input type="text" id="user_code" placeholder="XXX-XXX" value="{user_code_value}" maxlength="9"
            style="{}" >
     <button class="btn btn-approve" onclick="lookupCode()" style="margin-top: 12px;">Verify Code</button>
   </div>
@@ -169,7 +180,7 @@ if (currentUserCode) {{
 
 async function lookupCode() {{
   const code = document.getElementById('user_code').value.trim().toUpperCase();
-  if (!code || code.length < 8) {{ showStatus('Enter a valid code (XXXX-XXXX)', true); return; }}
+  if (!code || code.length < 6) {{ showStatus('Enter a valid code (XXX-XXX)', true); return; }}
   currentUserCode = code;
   try {{
     const r = await fetch(BASE + '/device/verify?user_code=' + encodeURIComponent(code));
@@ -416,4 +427,31 @@ pub async fn device_approve_passkey(
     info!(user_code = %user_code, did = %verified_did, "device approved via passkey");
 
     Ok(Html("<html><body style='background:#0d1117;color:#3fb950;text-align:center;padding:60px;font-family:sans-serif'><h2>Device approved!</h2><p>You can close this page.</p></body></html>".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_code_format() {
+        for _ in 0..1000 {
+            let code = generate_user_code();
+            assert_eq!(code.len(), 7, "expected 7 chars (XXX-XXX), got {code:?}");
+            assert_eq!(
+                code.as_bytes()[3],
+                b'-',
+                "separator must be at index 3: {code:?}"
+            );
+            let body = code.replace('-', "");
+            assert_eq!(body.len(), USER_CODE_LEN);
+            for b in body.as_bytes() {
+                assert!(
+                    USER_CODE_ALPHABET.contains(b),
+                    "char {:?} not in consonant alphabet (code {code:?})",
+                    *b as char
+                );
+            }
+        }
+    }
 }
