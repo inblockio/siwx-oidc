@@ -49,6 +49,10 @@ pub struct Config {
     /// Used for cross-signing pre-flight checks during device approval.
     /// Env: `SIWEOIDC_MATRIX_SERVER_NAME`
     pub matrix_server_name: Option<String>,
+    /// MSC4191: Account management URI advertised in OIDC discovery.
+    /// When absent, defaults to `{base_url}/account`.
+    /// Env: `SIWEOIDC_ACCOUNT_MANAGEMENT_URI`
+    pub account_management_uri: Option<Url>,
 }
 
 impl Default for Config {
@@ -76,6 +80,7 @@ impl Default for Config {
             synapse_endpoint: None,
             log_format: "pretty".to_string(),
             matrix_server_name: None,
+            account_management_uri: None,
         }
     }
 }
