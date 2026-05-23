@@ -52,9 +52,15 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 lazy_static::lazy_static! {
-    static ref SCOPES: [Scope; 2] = [
+    static ref SCOPES: Vec<Scope> = vec![
         Scope::new("openid".to_string()),
         Scope::new("profile".to_string()),
+        // Stable Matrix scopes (MSC2967 graduated)
+        Scope::new("urn:matrix:client:api:*".to_string()),
+        Scope::new("urn:matrix:client:device:*".to_string()),
+        // MSC2967 unstable prefixes (still used by Element X)
+        Scope::new("urn:matrix:org.matrix.msc2967.client:api:*".to_string()),
+        Scope::new("urn:matrix:org.matrix.msc2967.client:device:*".to_string()),
     ];
 }
 const SIGNING_ALG: [CoreJwsSigningAlgorithm; 1] = [CoreJwsSigningAlgorithm::EcdsaP256Sha256];
@@ -201,7 +207,7 @@ pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
             .map_err(|e| anyhow!("Unable to join URL: {}", e))?,
     )))
     .set_userinfo_signing_alg_values_supported(Some(SIGNING_ALG.to_vec()))
-    .set_scopes_supported(Some(SCOPES.to_vec()))
+    .set_scopes_supported(Some(SCOPES.clone()))
     .set_claims_supported(Some(vec![
         CoreClaimName::new("sub".to_string()),
         CoreClaimName::new("aud".to_string()),
@@ -1812,6 +1818,41 @@ mod tests {
             result.is_ok(),
             "authorize must accept Matrix scopes: {:?}",
             result.err()
+        );
+    }
+
+    #[test]
+    fn discovery_metadata_contains_matrix_scopes() {
+        let base = Url::parse("https://siwx-oidc.example.com").unwrap();
+        let pm = metadata(base).unwrap();
+        let json = serde_json::to_value(&pm).unwrap();
+        let scopes = json["scopes_supported"]
+            .as_array()
+            .expect("scopes_supported must be an array");
+        let scope_strings: Vec<&str> = scopes.iter().map(|s| s.as_str().unwrap()).collect();
+
+        // Core OIDC scopes
+        assert!(scope_strings.contains(&"openid"), "missing openid");
+        assert!(scope_strings.contains(&"profile"), "missing profile");
+
+        // Stable Matrix scopes
+        assert!(
+            scope_strings.contains(&"urn:matrix:client:api:*"),
+            "missing stable urn:matrix:client:api:*"
+        );
+        assert!(
+            scope_strings.contains(&"urn:matrix:client:device:*"),
+            "missing stable urn:matrix:client:device:*"
+        );
+
+        // MSC2967 unstable Matrix scopes (used by Element X)
+        assert!(
+            scope_strings.contains(&"urn:matrix:org.matrix.msc2967.client:api:*"),
+            "missing unstable urn:matrix:org.matrix.msc2967.client:api:*"
+        );
+        assert!(
+            scope_strings.contains(&"urn:matrix:org.matrix.msc2967.client:device:*"),
+            "missing unstable urn:matrix:org.matrix.msc2967.client:device:*"
         );
     }
 
