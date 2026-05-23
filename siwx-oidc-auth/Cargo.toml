@@ -15,7 +15,7 @@ name = "siwx-oidc-auth"
 path = "src/main.rs"
 
 [dependencies]
-aqua-auth = { path = "../../aqua-auth" }
+aqua-auth = { git = "https://github.com/inblockio/aqua-rs-auth" }
 
 anyhow = "1"
 bs58 = "0.5"

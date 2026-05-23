@@ -373,6 +373,8 @@ pub struct TokenForm {
     pub code_verifier: Option<String>,
     /// Refresh token (required when grant_type=refresh_token).
     pub refresh_token: Option<String>,
+    /// Device code (required when grant_type=device_code).
+    pub device_code: Option<String>,
 }
 
 pub async fn token(
@@ -381,6 +383,7 @@ pub async fn token(
     signing_key: &EcdsaSigningKey,
     config: &crate::config::Config,
     db_client: &DBClientType,
+    synapse_client: Option<&SynapseClient>,
 ) -> Result<CoreTokenResponse, CustomError> {
     match form.grant_type {
         CoreGrantType::AuthorizationCode => {
@@ -389,9 +392,12 @@ pub async fn token(
         CoreGrantType::RefreshToken => {
             token_refresh(form, config, db_client).await
         }
+        CoreGrantType::DeviceCode => {
+            token_device_code(form, signing_key, config, db_client, synapse_client).await
+        }
         _ => Err(CustomError::BadRequestToken(TokenError {
             error: CoreErrorResponseType::UnsupportedGrantType,
-            error_description: "Supported grant_types: authorization_code, refresh_token."
+            error_description: "Supported grant_types: authorization_code, refresh_token, urn:ietf:params:oauth:grant-type:device_code."
                 .to_string(),
         })),
     }
@@ -474,6 +480,159 @@ async fn token_refresh(
     response.set_expires_in(Some(&time::Duration::from_secs(ACCESS_TOKEN_TTL)));
     response.set_refresh_token(Some(RefreshToken::new(new_refresh)));
     Ok(response)
+}
+
+fn device_code_error(error: &str, description: &str) -> CustomError {
+    CustomError::BadRequestToken(TokenError {
+        error: CoreErrorResponseType::Extension(error.to_string()),
+        error_description: description.to_string(),
+    })
+}
+
+async fn token_device_code(
+    form: TokenForm,
+    signing_key: &EcdsaSigningKey,
+    config: &crate::config::Config,
+    db_client: &DBClientType,
+    synapse_client: Option<&SynapseClient>,
+) -> Result<CoreTokenResponse, CustomError> {
+    if config.mas_shared_secret.is_none() {
+        return Err(CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::UnsupportedGrantType,
+            error_description: "device_code grant requires MSC3861 mode.".to_string(),
+        }));
+    }
+
+    let dc = form.device_code.ok_or_else(|| {
+        CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidRequest,
+            error_description: "device_code parameter is required.".to_string(),
+        })
+    })?;
+    let client_id = form.client_id.ok_or_else(|| {
+        CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidRequest,
+            error_description: "client_id parameter is required.".to_string(),
+        })
+    })?;
+
+    let mut entry = db_client
+        .get_device_code(&dc)
+        .await?
+        .ok_or_else(|| device_code_error("expired_token", "Device code expired or not found."))?;
+
+    if entry.client_id != client_id {
+        return Err(CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "client_id mismatch.".to_string(),
+        }));
+    }
+
+    // Rate limiting: reject if polling faster than the interval.
+    let now_ts = Utc::now().timestamp();
+    if let Some(last) = entry.last_poll {
+        if now_ts - last < DEVICE_CODE_INTERVAL as i64 {
+            entry.last_poll = Some(now_ts);
+            let _ = db_client.update_device_code(&dc, &entry, DEVICE_CODE_LIFETIME).await;
+            return Err(device_code_error("slow_down", "Polling too fast. Increase interval."));
+        }
+    }
+    entry.last_poll = Some(now_ts);
+    let _ = db_client.update_device_code(&dc, &entry, DEVICE_CODE_LIFETIME).await;
+
+    match entry.status {
+        DeviceCodeStatus::Pending => {
+            Err(device_code_error("authorization_pending", "User has not yet approved."))
+        }
+        DeviceCodeStatus::Denied => {
+            let _ = db_client.delete_device_code(&dc).await;
+            let _ = db_client.delete_user_code_mapping(&entry.user_code).await;
+            Err(device_code_error("access_denied", "User denied the request."))
+        }
+        DeviceCodeStatus::Approved => {
+            let did = entry.did.as_ref()
+                .ok_or_else(|| device_code_error("server_error", "Approved but no DID."))?
+                .clone();
+
+            let device_id = provision_synapse_device(
+                &did, synapse_client, db_client, "Element X",
+            ).await;
+
+            let now = Utc::now();
+            let iat = now.timestamp();
+            let username = did_to_localpart(&did);
+            let dev_id = device_id.unwrap_or_else(|| format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]));
+            let scope = format!(
+                "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
+                dev_id
+            );
+
+            let claims = resolve_claims(config, &did).await;
+            let display_name = claims
+                .name()
+                .and_then(|n| n.get(None))
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| did.clone());
+
+            let access_token = generate_opaque_token("mat_");
+            let access_meta = TokenMetadata {
+                username: username.clone(),
+                device_id: dev_id.clone(),
+                scope: scope.clone(),
+                client_id: client_id.clone(),
+                iat,
+                exp: iat + ACCESS_TOKEN_TTL as i64,
+                did: did.clone(),
+                name: display_name.clone(),
+            };
+            db_client.set_token(&access_token, &access_meta, ACCESS_TOKEN_TTL).await?;
+
+            let refresh_token = generate_opaque_token("mcr_");
+            let refresh_meta = TokenMetadata {
+                username,
+                device_id: dev_id,
+                scope,
+                client_id: client_id.clone(),
+                iat,
+                exp: iat + REFRESH_TOKEN_TTL as i64,
+                did: did.clone(),
+                name: display_name,
+            };
+            db_client.set_token(&refresh_token, &refresh_meta, REFRESH_TOKEN_TTL).await?;
+
+            let core_id_token = CoreIdTokenClaims::new(
+                IssuerUrl::from_url(config.base_url.clone()),
+                vec![Audience::new(client_id)],
+                now + Duration::seconds(config.id_token_ttl_secs as i64),
+                now,
+                claims,
+                EmptyAdditionalClaims {},
+            );
+
+            let id_token = CoreIdToken::new(
+                core_id_token,
+                signing_key,
+                CoreJwsSigningAlgorithm::EcdsaP256Sha256,
+                Some(&AccessToken::new(access_token.clone())),
+                None,
+            ).map_err(|e| anyhow!("{}", e))?;
+
+            // Cleanup
+            let _ = db_client.delete_device_code(&dc).await;
+            let _ = db_client.delete_user_code_mapping(&entry.user_code).await;
+
+            info!(did = %did, "device_code grant: tokens issued");
+
+            let mut response = CoreTokenResponse::new(
+                AccessToken::new(access_token),
+                CoreTokenType::Bearer,
+                CoreIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
+            );
+            response.set_expires_in(Some(&time::Duration::from_secs(ACCESS_TOKEN_TTL)));
+            response.set_refresh_token(Some(RefreshToken::new(refresh_token)));
+            Ok(response)
+        }
+    }
 }
 
 async fn token_authorization_code(
@@ -959,6 +1118,53 @@ fn did_to_localpart(did: &str) -> String {
     did.replace(':', "-").to_lowercase()
 }
 
+/// Provision a Synapse device for a DID. Best-effort: failures are logged
+/// but never fail the auth flow. Returns the new device_id if Synapse is configured.
+pub async fn provision_synapse_device(
+    did: &str,
+    synapse_client: Option<&SynapseClient>,
+    db_client: &DBClientType,
+    display_name: &str,
+) -> Option<String> {
+    let synapse = synapse_client?;
+    let localpart = did_to_localpart(did);
+
+    if let Ok(Some(old_id)) = db_client.get_device_id(did).await {
+        debug!("cleaning up old device_id={} for did={}", old_id, did);
+        if let Err(e) = synapse.delete_device(&localpart, &old_id).await {
+            warn!("delete_device (cleanup) failed: {}", e);
+        }
+    }
+    let dev_id = format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]);
+    debug!("new device_id={} for did={}", dev_id, did);
+    if let Err(e) = db_client.set_device_id(did, &dev_id).await {
+        warn!("failed to persist device_id: {}", e);
+    }
+
+    match synapse.is_localpart_available(&localpart).await {
+        Ok(true) => {
+            if let Err(e) = synapse.provision_user(&localpart, did).await {
+                warn!("provision_user failed: {}", e);
+            }
+        }
+        Ok(false) => {}
+        Err(e) => warn!("is_localpart_available check failed: {}", e),
+    }
+
+    if let Err(e) = synapse
+        .upsert_device(&localpart, &dev_id, Some(display_name))
+        .await
+    {
+        warn!("upsert_device failed: {}", e);
+    }
+
+    if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
+        warn!("allow_cross_signing_reset failed: {}", e);
+    }
+
+    Some(dev_id)
+}
+
 pub async fn sign_in(
     _base_url: &Url,
     allowed_did_methods: &[String],
@@ -1096,54 +1302,7 @@ pub async fn sign_in(
         siwx_cookie.did
     };
 
-    // -- Synapse device lifecycle (best-effort, never fails the auth flow) --
-    let device_id = if let Some(synapse) = synapse_client {
-        let localpart = did_to_localpart(&did);
-
-        // Always generate a fresh device_id. If an old device exists, delete
-        // it first so Synapse drops stale e2e keys. We never recycle device_ids
-        // because Synapse keeps cross-signing signatures after delete_device,
-        // and its signature-upload handler skips new signatures when a stale
-        // one already exists for the same device_id.
-        if let Ok(Some(old_id)) = db_client.get_device_id(&did).await {
-            debug!("cleaning up old device_id={} for did={}", old_id, did);
-            if let Err(e) = synapse.delete_device(&localpart, &old_id).await {
-                warn!("delete_device (cleanup) failed: {}", e);
-            }
-        }
-        let dev_id = format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]);
-        debug!("new device_id={} for did={}", dev_id, did);
-        if let Err(e) = db_client.set_device_id(&did, &dev_id).await {
-            warn!("failed to persist device_id: {}", e);
-        }
-
-        // Provision user if new
-        match synapse.is_localpart_available(&localpart).await {
-            Ok(true) => {
-                if let Err(e) = synapse.provision_user(&localpart, &did).await {
-                    warn!("provision_user failed: {}", e);
-                }
-            }
-            Ok(false) => {} // existing user
-            Err(e) => warn!("is_localpart_available check failed: {}", e),
-        }
-
-        // Upsert device
-        if let Err(e) = synapse
-            .upsert_device(&localpart, &dev_id, Some("Element Web"))
-            .await
-        {
-            warn!("upsert_device failed: {}", e);
-        }
-
-        if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
-            warn!("allow_cross_signing_reset failed: {}", e);
-        }
-
-        Some(dev_id)
-    } else {
-        None
-    };
+    let device_id = provision_synapse_device(&did, synapse_client, db_client, "Element Web").await;
 
     let code_entry = CodeEntry {
         did,

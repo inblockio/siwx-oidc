@@ -22,6 +22,11 @@ pub const ACCESS_TOKEN_TTL: u64 = 300; // 5 minutes
 /// TTL for opaque refresh tokens (MSC3861 mode).
 pub const REFRESH_TOKEN_TTL: u64 = 86400; // 24 hours
 
+/// Default device code lifetime (RFC 8628 `expires_in`).
+pub const DEVICE_CODE_LIFETIME: u64 = 1800; // 30 minutes
+/// Minimum polling interval for device code grant (seconds).
+pub const DEVICE_CODE_INTERVAL: u64 = 5;
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CodeEntry {
     pub exchange_count: usize,
@@ -58,6 +63,27 @@ pub struct SessionEntry {
     /// When present, sign_in trusts this DID without re-verifying a CAIP-122 cookie.
     #[serde(default)]
     pub verified_did: Option<String>,
+}
+
+/// Status of an RFC 8628 device authorization code.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum DeviceCodeStatus {
+    Pending,
+    Approved,
+    Denied,
+}
+
+/// An RFC 8628 device authorization code stored in Redis.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeviceCodeEntry {
+    pub user_code: String,
+    pub client_id: String,
+    pub scope: String,
+    pub status: DeviceCodeStatus,
+    pub did: Option<String>,
+    pub device_id: Option<String>,
+    pub last_poll: Option<i64>,
+    pub created_at: i64,
 }
 
 /// Metadata stored alongside an opaque token in Redis (MSC3861 introspection).
@@ -114,4 +140,21 @@ pub trait DBClient {
     async fn set_device_id(&self, did: &str, device_id: &str) -> Result<()>;
     /// Remove the persistent device ID for a DID.
     async fn delete_device_id(&self, did: &str) -> Result<()>;
+
+    // -- RFC 8628 device code storage -----------------------------------------
+
+    /// Store a device code entry with a TTL in seconds.
+    async fn set_device_code(&self, device_code: &str, entry: &DeviceCodeEntry, ttl: u64) -> Result<()>;
+    /// Retrieve a device code entry.
+    async fn get_device_code(&self, device_code: &str) -> Result<Option<DeviceCodeEntry>>;
+    /// Update a device code entry (preserving original TTL is caller's responsibility).
+    async fn update_device_code(&self, device_code: &str, entry: &DeviceCodeEntry, ttl: u64) -> Result<()>;
+    /// Delete a device code entry.
+    async fn delete_device_code(&self, device_code: &str) -> Result<()>;
+    /// Look up a device code by its user-facing code.
+    async fn get_device_code_by_user_code(&self, user_code: &str) -> Result<Option<(String, DeviceCodeEntry)>>;
+    /// Store the user_code -> device_code reverse mapping with a TTL.
+    async fn set_user_code_mapping(&self, user_code: &str, device_code: &str, ttl: u64) -> Result<()>;
+    /// Delete the user_code -> device_code mapping.
+    async fn delete_user_code_mapping(&self, user_code: &str) -> Result<()>;
 }

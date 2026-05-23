@@ -200,6 +200,7 @@ pub struct AuthTokens {
     /// Token lifetime in seconds (from the server's `expires_in` field).
     pub expires_in: Option<u64>,
     /// Refresh token for obtaining new access tokens without re-authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
     /// The `did:key:z…` DID that authenticated.
     pub did: String,
@@ -233,8 +234,25 @@ struct TokenResponseRaw {
     refresh_token: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct DeviceAuthResponseRaw {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    verification_uri_complete: String,
+    expires_in: u64,
+    interval: u64,
+}
+
+#[derive(Deserialize)]
+struct TokenErrorResponse {
+    error: String,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
-// Main entry point
+// Authorization code flow
 // ---------------------------------------------------------------------------
 
 /// Perform the full siwx-oidc authorization code flow with a local signing key.
@@ -414,6 +432,10 @@ pub async fn authenticate(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Refresh token exchange
+// ---------------------------------------------------------------------------
+
 /// Exchange a refresh token for a new set of tokens.
 ///
 /// The server rotates the refresh token on each use: the returned `AuthTokens`
@@ -462,4 +484,130 @@ pub async fn refresh(
         refresh_token: raw.refresh_token,
         did: did.to_string(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// DID extraction from JWT
+// ---------------------------------------------------------------------------
+
+fn extract_did_from_id_token(id_token: &str) -> Option<String> {
+    let payload = id_token.splitn(3, '.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// RFC 8628 Device Authorization Grant
+// ---------------------------------------------------------------------------
+
+/// Perform the RFC 8628 device authorization grant flow.
+///
+/// No local signing key is needed; the user approves on another device
+/// (browser with wallet or passkey). Intended for headless servers and CI.
+///
+/// - `server_url`: Base URL of the siwx-oidc server.
+/// - `client_id`: OIDC client ID registered with the server.
+///
+/// Prints the user code and verification URI to stderr, then polls until
+/// approved, denied, or expired.
+pub async fn authenticate_device_flow(
+    server_url: &str,
+    client_id: &str,
+) -> Result<AuthTokens> {
+    let base = Url::parse(server_url).context("invalid server_url")?;
+    let client = reqwest::Client::new();
+
+    // Step 1: POST /device_authorization
+    let device_auth_url = base.join("/device_authorization")?;
+    let resp = client
+        .post(device_auth_url)
+        .form(&[("client_id", client_id), ("scope", "openid")])
+        .send()
+        .await
+        .context("POST /device_authorization failed")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("/device_authorization returned {status}: {body}");
+    }
+
+    let device_auth: DeviceAuthResponseRaw = resp.json().await
+        .context("/device_authorization JSON parse failed")?;
+
+    // Step 2: Display instructions
+    eprintln!();
+    eprintln!("To approve this device, open:");
+    eprintln!("  {}", device_auth.verification_uri_complete);
+    eprintln!();
+    eprintln!("Or go to {} and enter code: {}", device_auth.verification_uri, device_auth.user_code);
+    eprintln!();
+    eprintln!("Waiting for approval (expires in {}s)...", device_auth.expires_in);
+
+    // Step 3: Poll POST /token until approved
+    let token_url = base.join("/token")?;
+    let mut interval = device_auth.interval;
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(device_auth.expires_in);
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+
+        if std::time::Instant::now() > deadline {
+            bail!("Device code expired (no approval within {}s)", device_auth.expires_in);
+        }
+
+        let resp = client
+            .post(token_url.clone())
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("device_code", device_auth.device_code.as_str()),
+                ("client_id", client_id),
+            ])
+            .send()
+            .await
+            .context("POST /token (device poll) failed")?;
+
+        if resp.status().is_success() {
+            let raw: TokenResponseRaw = resp.json().await
+                .context("/token JSON parse failed")?;
+            let did = raw.id_token.as_ref()
+                .and_then(|t| extract_did_from_id_token(t))
+                .unwrap_or_default();
+            eprintln!("Approved!");
+            return Ok(AuthTokens {
+                access_token: raw.access_token,
+                token_type: raw.token_type,
+                id_token: raw.id_token,
+                expires_in: raw.expires_in,
+                refresh_token: raw.refresh_token,
+                did,
+            });
+        }
+
+        let body = resp.text().await.unwrap_or_default();
+        let err: TokenErrorResponse = serde_json::from_str(&body)
+            .unwrap_or_else(|_| TokenErrorResponse {
+                error: "unknown".to_string(),
+                error_description: Some(body),
+            });
+
+        match err.error.as_str() {
+            "authorization_pending" => {}
+            "slow_down" => {
+                interval += 5;
+            }
+            "access_denied" => {
+                bail!("Device login was denied by the user");
+            }
+            "expired_token" => {
+                bail!("Device code expired");
+            }
+            other => {
+                let desc = err.error_description.unwrap_or_default();
+                bail!("/token error: {other}: {desc}");
+            }
+        }
+    }
 }

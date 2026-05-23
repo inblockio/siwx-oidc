@@ -40,6 +40,7 @@ use super::introspect;
 use super::oidc::{self, CustomError, EcdsaSigningKey};
 use super::synapse_client::SynapseClient;
 use super::webauthn as wa;
+use super::device_auth;
 use openidconnect::JsonWebKeyId;
 use aqua_auth::{all_cipher_suites, all_did_methods};
 use siwx_oidc::db::*;
@@ -133,7 +134,8 @@ async fn provider_metadata(
     value["code_challenge_methods_supported"] = serde_json::json!(["S256"]);
     value["introspection_endpoint"] = serde_json::json!(format!("{}/oauth2/introspect", base_url));
     value["introspection_endpoint_auth_methods_supported"] = serde_json::json!(["client_secret_post", "bearer"]);
-    value["grant_types_supported"] = serde_json::json!(["authorization_code", "refresh_token"]);
+    value["grant_types_supported"] = serde_json::json!(["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"]);
+    value["device_authorization_endpoint"] = serde_json::json!(format!("{}/device_authorization", base_url));
     value["revocation_endpoint"] = serde_json::json!(format!("{}/oauth2/revoke", base_url));
     value["token_endpoint_auth_methods_supported"] = serde_json::json!(["client_secret_post", "none"]);
     Ok(value.into())
@@ -156,6 +158,7 @@ async fn token(
         &state.signing_key,
         &state.config,
         &state.redis_client,
+        state.synapse_client.as_deref(),
     )
     .await
     .map_err(|e| {
@@ -325,6 +328,73 @@ async fn client_delete(
 }
 
 async fn healthcheck() {}
+
+// -- RFC 8628 device authorization handlers ---------------------------------
+
+async fn device_authorization_handler(
+    State(state): State<AppState>,
+    Form(form): Form<device_auth::DeviceAuthRequest>,
+) -> Result<Json<device_auth::DeviceAuthResponse>, CustomError> {
+    let resp = device_auth::device_authorization(&state.config, &state.redis_client, form).await?;
+    Ok(Json(resp))
+}
+
+async fn device_page_handler(
+    State(state): State<AppState>,
+    Query(query): Query<device_auth::DevicePageQuery>,
+) -> axum::response::Html<String> {
+    device_auth::device_page(query, state.config.base_url.as_str())
+}
+
+async fn device_verify_handler(
+    State(state): State<AppState>,
+    Query(query): Query<device_auth::DevicePageQuery>,
+) -> Result<StatusCode, CustomError> {
+    let code = query.user_code.as_deref().unwrap_or("");
+    device_auth::device_verify(&state.redis_client, code).await?;
+    Ok(StatusCode::OK)
+}
+
+async fn device_approve_handler(
+    State(state): State<AppState>,
+    Json(req): Json<device_auth::DeviceApproveRequest>,
+) -> Result<axum::response::Html<String>, CustomError> {
+    device_auth::device_approve(&state.config, &state.redis_client, req).await
+}
+
+async fn device_passkey_start_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<RequestChallengeResponse>, CustomError> {
+    let user_code = payload.get("user_code")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CustomError::BadRequest("Missing user_code".to_string()))?;
+    device_auth::device_verify(&state.redis_client, user_code).await?;
+    let session_id = format!("device_passkey_{}", user_code);
+    let rcr = wa::authenticate_start(&state.webauthn, &state.redis_client, &session_id).await?;
+    Ok(Json(rcr))
+}
+
+async fn device_passkey_finish_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<axum::response::Html<String>, CustomError> {
+    let user_code = payload.get("user_code")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CustomError::BadRequest("Missing user_code".to_string()))?
+        .to_string();
+    let auth_response: PublicKeyCredential = serde_json::from_value(payload.clone())
+        .map_err(|e| CustomError::BadRequest(format!("Invalid credential: {}", e)))?;
+    let session_id = format!("device_passkey_{}", user_code);
+    let resp = wa::authenticate_finish(
+        &state.redis_client,
+        &session_id,
+        &state.rp_id,
+        &state.rp_origin,
+        auth_response,
+    ).await?;
+    device_auth::device_approve_passkey(&state.redis_client, &user_code, &resp.did).await
+}
 
 // -- WebAuthn route handlers -----------------------------------------------
 
@@ -586,6 +656,11 @@ pub async fn main() {
         .route("/link/webauthn/start", post(webauthn_link_start))
         .route("/link/webauthn/finish", post(webauthn_link_finish))
         .route("/health", get(healthcheck))
+        .route("/device_authorization", post(device_authorization_handler))
+        .route("/device", get(device_page_handler).post(device_approve_handler))
+        .route("/device/verify", get(device_verify_handler))
+        .route("/device/passkey/start", post(device_passkey_start_handler))
+        .route("/device/passkey/finish", post(device_passkey_finish_handler))
         .with_state(state)
         // MSC3861 introspection — separate state (only needs secret + Redis)
         .route(

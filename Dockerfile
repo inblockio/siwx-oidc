@@ -5,7 +5,6 @@ RUN cargo install cargo-chef
 
 FROM chef AS dep_planner
 COPY ./src/ ./src/
-COPY --from=aqua-auth / /aqua-auth/
 COPY ./siwx-oidc-auth/ ./siwx-oidc-auth/
 COPY ./Cargo.lock ./
 COPY ./Cargo.toml ./
@@ -14,7 +13,6 @@ RUN cargo chef prepare  --recipe-path recipe.json
 
 FROM chef AS dep_cacher
 COPY --from=dep_planner /siwx-oidc/recipe.json recipe.json
-COPY --from=dep_planner /aqua-auth/ /aqua-auth/
 RUN cargo chef cook --release --recipe-path recipe.json
 
 FROM node:22-alpine AS node_builder
@@ -28,7 +26,6 @@ FROM chef AS builder
 COPY --from=dep_cacher /siwx-oidc/target/ ./target/
 COPY --from=dep_cacher $CARGO_HOME $CARGO_HOME
 COPY --from=dep_planner /siwx-oidc/ ./
-COPY --from=dep_planner /aqua-auth/ /aqua-auth/
 RUN cargo build --release
 
 FROM alpine

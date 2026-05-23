@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::{Parser, ValueEnum};
-use siwx_oidc_auth::{authenticate, refresh, SiwxKey};
+use siwx_oidc_auth::{authenticate, authenticate_device_flow, refresh, SiwxKey};
 
 /// Headless OIDC client for siwx-oidc.
 ///
@@ -17,7 +17,12 @@ struct Cli {
     #[arg(long)]
     print_did: bool,
 
-    /// Base URL of the siwx-oidc server.
+    /// Use RFC 8628 Device Authorization Grant. The user approves on another
+    /// device (browser with wallet or passkey). No local signing key needed.
+    #[arg(long)]
+    device_flow: bool,
+
+    /// Base URL of the siwx-oidc server (required unless --print-did).
     #[arg(long, required_unless_present = "print_did")]
     server: Option<String>,
 
@@ -25,7 +30,7 @@ struct Cli {
     #[arg(long, required_unless_present = "print_did")]
     client_id: Option<String>,
 
-    /// Registered redirect URI (required for initial auth, not for refresh).
+    /// Registered redirect URI (required for initial auth code flow).
     #[arg(long)]
     redirect_uri: Option<String>,
 
@@ -56,14 +61,12 @@ enum KeyTypeArg {
 }
 
 fn load_key(cli: &Cli) -> Result<SiwxKey> {
-    // Priority 1: PEM file (--key-file or SIWX_KEY_FILE env)
     if let Some(path) = &cli.key_file {
         let key = SiwxKey::from_pem_file(path)?;
         eprintln!("Loaded {} key from {}", key.type_label(), path.display());
         return Ok(key);
     }
 
-    // Priority 2: hex seed (--key-hex, needs --key-type)
     if let Some(hex) = &cli.key_hex {
         return match cli.key_type {
             KeyTypeArg::Ed25519 => SiwxKey::ed25519_from_hex(hex),
@@ -71,13 +74,12 @@ fn load_key(cli: &Cli) -> Result<SiwxKey> {
         };
     }
 
-    // Priority 3: generate ephemeral key, print PEM to stderr for saving
     let key = match cli.key_type {
         KeyTypeArg::Ed25519 => SiwxKey::generate_ed25519(),
         KeyTypeArg::P256 => SiwxKey::generate_p256(),
     };
     eprintln!(
-        "No key provided — generated ephemeral {} key.\n\
+        "No key provided -- generated ephemeral {} key.\n\
          Save this PEM to reuse the same DID:\n\n{}",
         key.type_label(),
         key.to_pem()?,
@@ -88,9 +90,9 @@ fn load_key(cli: &Cli) -> Result<SiwxKey> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let key = load_key(&cli)?;
 
     if cli.print_did {
+        let key = load_key(&cli)?;
         println!("{}", key.did());
         return Ok(());
     }
@@ -102,6 +104,13 @@ async fn main() -> Result<()> {
         bail!("--server and --client-id are required");
     }
 
+    if cli.device_flow {
+        let tokens = authenticate_device_flow(server, client_id).await?;
+        println!("{}", serde_json::to_string_pretty(&tokens)?);
+        return Ok(());
+    }
+
+    let key = load_key(&cli)?;
     eprintln!("DID: {}", key.did());
 
     let tokens = if let Some(rt) = &cli.refresh_token {

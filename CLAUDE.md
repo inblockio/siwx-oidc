@@ -19,8 +19,9 @@ src/                                ← Axum OIDC server (binary)
   config.rs                          Config struct (supported_did_methods, RP ID, signing key, etc.)
   axum_lib.rs                        Routes, startup validation, state (incl. Webauthn)
   oidc.rs                            OIDC logic: authorize, sign_in, token, userinfo, ES256 key
+  device_auth.rs                     RFC 8628 Device Authorization Grant (device_code, approval page)
   webauthn.rs                        WebAuthn ceremony: register + discoverable authenticate
-  db/mod.rs                          DBClient trait, CodeEntry, SessionEntry, ClientEntry
+  db/mod.rs                          DBClient trait, CodeEntry, SessionEntry, ClientEntry, DeviceCodeEntry
   db/redis.rs                        Redis implementation + generic helpers (set_raw, get_raw, etc.)
 
 siwx-oidc-auth/src/                ← Headless OIDC client (library + CLI)
@@ -42,10 +43,10 @@ Layer 1: aqua-auth         — Crypto library (external crate, pure core + optio
 
 Layer 2: src/{ceremony}.rs — Auth ceremony verification (server-side)
   ├── CAIP-122              — Wallet signing (verified in sign_in via DIDMethod::verify)
-  ├── [planned] WebAuthn    — Passkey ceremony (webauthn-rs safe API → verified DID in session)
-  └── [planned] RFC 8628    — Device Authorization Grant (device page → approved device code)
+  ├── WebAuthn              — Passkey ceremony (webauthn-rs safe API, verified DID in session)
+  └── RFC 8628              — Device Authorization Grant (device_auth.rs, approval page + polling)
 
-Layer 3: src/oidc.rs       — OIDC token issuance (single code issuance point: sign_in)
+Layer 3: src/oidc.rs       — OIDC token issuance (sign_in + device_code grant)
 ```
 
 **Key boundary:** aqua-auth handles CAIP-122 proof verification only. New authentication
@@ -73,11 +74,17 @@ No `inventory` crate (WASM-unsafe).
 3. `GET /sign_in` with `siwx` cookie → `find_did_method(did).verify()` → auth code
 4. `POST /token` → ID token + access token (ES256 signed)
 
-**Sign-in flow (server-verified ceremony — planned):**
+**Sign-in flow (server-verified ceremony, e.g. WebAuthn passkey):**
 1. `GET /authorize` → session cookie + nonce
-2. Ceremony endpoint verifies proof (e.g. WebAuthn assertion) → stores verified DID in Redis session
+2. Ceremony endpoint verifies proof (WebAuthn assertion) → stores verified DID in Redis session
 3. Redirect to `GET /sign_in` → reads `session.verified_did` (trusted) → auth code
 4. `POST /token` → ID token + access token (ES256 signed)
+
+**Device code flow (RFC 8628, for Element X QR code login):**
+1. `POST /device_authorization` → device_code + user_code + verification_uri
+2. Device polls `POST /token` with `grant_type=urn:ietf:params:oauth:grant-type:device_code`
+3. User opens `/device?user_code=XXXX-XXXX`, authenticates with wallet/passkey
+4. Approval updates device code status → next poll returns tokens + provisions Synapse device
 
 ## Token model
 
@@ -100,14 +107,17 @@ scope format.
    `TokenMetadata` entries in Redis. The authorization code (`CodeEntry`) is consumed.
 2. `POST /token` (grant_type=refresh_token) rotates both tokens: new access + new
    refresh, old refresh deleted. `device_id` is preserved across rotations.
-3. `userinfo` resolves tokens via `get_token` first (covers both modes), then falls
+3. `POST /token` (grant_type=device_code) provisions Synapse device, issues tokens,
+   cleans up device code and user code entries.
+4. `userinfo` resolves tokens via `get_token` first (covers both modes), then falls
    back to `get_code` for backward compatibility with pre-refresh-token deployments.
 
 **Client library (`siwx-oidc-auth`):**
 - `authenticate()` returns `AuthTokens` with `refresh_token: Option<String>` populated
 - `refresh()` exchanges a refresh token for new tokens via `POST /token`
+- `authenticate_device_flow()` polls device code grant until approved
 - CLI: `--refresh-token <value>` calls `refresh()` instead of `authenticate()`
-  (`--redirect-uri` is not required for refresh)
+- CLI: `--device-flow` uses RFC 8628 (no local key needed)
 
 **Deploy note:** Redis flush recommended when upgrading from pre-refresh-token
 deployments (standalone mode token storage changed from `CodeEntry` to `TokenMetadata`).
@@ -146,8 +156,9 @@ The aqua-auth tests are self-contained (pure crypto). The server e2e test
 
 ## Headless client (siwx-oidc-auth)
 
-Authenticates to a remote siwx-oidc server with a local `did:key` private key.
-Server must have `"key"` in `supported_did_methods`.
+Two authentication modes:
+
+**Authorization code flow** (local signing key, server needs `"key"` in `supported_did_methods`):
 
 ```bash
 # Generate a persistent Ed25519 identity
@@ -174,6 +185,48 @@ PEM format is canonical (PKCS#8, auto-detects Ed25519 vs P-256).
 The `refresh()` library function and `--refresh-token` CLI flag exchange a refresh
 token for new access + refresh tokens without repeating the full CAIP-122 sign-in.
 The server rotates the refresh token on each use (old token is deleted).
+
+**Device flow** (RFC 8628, no local key needed; user approves on another device):
+
+```bash
+# For headless servers, CI, or machines without a browser/wallet
+siwx-oidc-auth --device-flow \
+  --server https://siwx.example.com \
+  --client-id my-service
+```
+
+Prints a user code and verification URL to stderr, polls until approved.
+The resulting tokens are associated with whatever DID the approving user
+authenticates with (wallet or passkey).
+
+**Identity ownership:** The two modes produce different identity models:
+
+| Mode | Identity owner | DID type | Use case |
+|------|---------------|----------|----------|
+| Auth code (`--key-file`) | The machine itself | `did:key:z6Mk...` (Ed25519) or `did:key:zDn...` (P-256) | Service accounts, bots, autonomous agents |
+| Device flow (`--device-flow`) | The human who approves | `did:pkh:eip155:1:0x...` (wallet) or `did:key:zDn...` (passkey) | CI, headless SSH, shared servers |
+
+The device flow does NOT give the machine its own DID. The approving user's
+DID is embedded in the tokens. If they approve with MetaMask, the session runs
+under their `did:pkh:eip155:...`; if they approve with a passkey, it runs under
+their `did:key:zDn...` (or linked wallet DID).
+
+**Device flow examples:**
+
+```bash
+# CI pipeline: prints approval URL in CI log, engineer approves on phone
+siwx-oidc-auth --device-flow \
+  --server https://siwx.example.com --client-id ci-bot
+
+# Remote SSH session: no browser available
+siwx-oidc-auth --device-flow \
+  --server https://siwx.example.com --client-id my-app
+
+# Pipe access token directly to a file
+siwx-oidc-auth --device-flow \
+  --server https://siwx.example.com --client-id agent \
+  | jq -r .access_token > /tmp/matrix-token
+```
 
 ## Config env vars
 
@@ -263,6 +316,8 @@ webauthn:challenge/{session_id}        TTL 120s  — ceremony state (register or
 webauthn:credential/{cred_id_b64}      no TTL    — stored Passkey (JSON-serialized)
 webauthn:link/{cred_id_b64}            no TTL    — { primary_did, label } (account linking)
 webauthn:link_challenge/{session_id}   TTL 120s  — link ceremony state (reg_state + primary_did)
+device_codes/{device_code}             TTL 1800s — DeviceCodeEntry (RFC 8628)
+user_codes/{user_code}                 TTL 1800s — reverse lookup to device_code
 ```
 
 **Endpoints:**
@@ -273,6 +328,12 @@ POST /webauthn/authenticate/start   — returns RequestChallengeResponse (discov
 POST /webauthn/authenticate/finish  — verifies assertion, stores verified_did in session
 POST /link/webauthn/start           — begin passkey registration (verifies siwx cookie for DID ownership)
 POST /link/webauthn/finish          — verifies attestation, stores credential + link mapping
+POST /device_authorization          — RFC 8628: returns device_code + user_code + verification_uri
+GET  /device                        — approval page (user authenticates and approves device login)
+POST /device                        — process approval (wallet CAIP-122 signature)
+GET  /device/verify                 — check if user_code is valid and pending
+POST /device/passkey/start          — start passkey auth for device approval
+POST /device/passkey/finish         — finish passkey auth and approve device
 ```
 
 **Account linking (Phase 2):** Wallet users can link a passkey to their existing DID.
@@ -332,6 +393,15 @@ redis-cli KEYS 'sessions/*'
 
 # Check if a session has a verified_did
 redis-cli GET 'sessions/{session_id}' | python3 -m json.tool
+
+# List active device codes (RFC 8628)
+redis-cli KEYS 'device_codes/*'
+
+# Inspect a device code status
+redis-cli GET 'device_codes/{device_code}' | python3 -m json.tool
+
+# List active user codes
+redis-cli KEYS 'user_codes/*'
 ```
 
 ## Logging conventions
