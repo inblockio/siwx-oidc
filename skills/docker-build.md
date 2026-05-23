@@ -1,11 +1,14 @@
 Build, test, and optionally push the siwx-oidc Docker image.
 
+Docker images are built by GitHub Actions CI on push to main. Manual local
+builds should only be used for testing, never for production deployment.
+
 ## Steps
 
-1. Run the siwx-core tests first (fast, catches Rust issues early):
+1. Run tests first (catches Rust issues early):
 ```bash
-cargo test -p siwx-core
-cargo clippy -p siwx-core -- -D warnings
+cd ../aqua-auth && cargo test --features webauthn && cd -
+cargo clippy --workspace -- -D warnings
 ```
 
 2. Run the frontend build locally to catch webpack errors before Docker:
@@ -30,17 +33,18 @@ docker run --rm ghcr.io/inblockio/siwx-oidc:latest --help 2>&1 || true
 docker run --rm --entrypoint which ghcr.io/inblockio/siwx-oidc:latest wget
 ```
 
-5. If the user wants to push, confirm first, then:
+5. Push to GitHub and let CI publish to GHCR:
 ```bash
-docker push ghcr.io/inblockio/siwx-oidc:latest
+git push origin main
+gh run list -R inblockio/siwx-oidc --limit 1  # watch CI
 ```
 
-Note: Pushing to GHCR normally happens via CI (GitHub Actions on push to main).
-Manual push requires `docker login ghcr.io` with a PAT that has `write:packages` scope.
+Watchtower on the production server auto-pulls new images every 5 minutes.
+No manual deployment steps needed.
 
 ## Common issues
 
 - **webpack `fullySpecified` errors**: ESM modules in node_modules need `fullySpecified: false` rule in webpack.config.js
 - **clippy failures on CI but not locally**: CI uses latest stable Rust, check with `rustup update && cargo clippy`
-- **Docker build fails at npm step**: The node_builder stage is independent — check `npm run build` locally first
+- **Docker build fails at npm step**: The node_builder stage is independent; check `npm run build` locally first
 - **Image too large**: Should be ~18MB. If much larger, check that the multi-stage build is working (final stage is `FROM alpine`, not the build stage)

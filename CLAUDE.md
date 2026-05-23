@@ -281,15 +281,24 @@ Two authentication methods on the login page:
 
 ## Deployment (Docker)
 
-```bash
-# Build locally
-docker build -t ghcr.io/inblockio/siwx-oidc:latest .
+**Deploy model:** Code on dev machine, push to GitHub, CI builds Docker images to GHCR,
+server pulls and runs them. No repos or builds on the server.
 
-# Image is ~18MB (Alpine + static musl binary + frontend assets)
+```bash
 # CI publishes to GHCR on push to main (see .github/workflows/docker.yml)
+# Image is ~18MB (Alpine + static musl binary + frontend assets)
 ```
 
-Matrix Synapse deployment: see `../siwx-oidc-matrix-server` (branch `siwx`).
+**Production server:** `deploy@142.93.168.4` (`agentic.inblock.io`)
+- Stack directory: `/home/deploy/matrix/stack/` (docker-compose.yml + .env only)
+- Watchtower auto-pulls new GHCR images every 5 minutes
+- Caddy reverse proxy in portal stack (`portal-caddy-1`, config at `/home/portal/portal/Caddyfile`)
+
+**CORS rule:** Caddy must strip siwx-oidc's upstream CORS headers (`header_down
+-Access-Control-Allow-Origin` in `reverse_proxy` blocks). Without this, dual ACAO
+headers cause silent OIDC failures. See `Caddyfile.local` `(strip_upstream_cors)` snippet.
+
+Matrix Synapse deployment: see `../siwx-oidc-matrix-server`.
 Run `/deploy-check` for the full pre-deployment checklist.
 
 ### MSC3861 device lifecycle
