@@ -367,7 +367,8 @@ async fn device_approve_handler(
     Json(req): Json<device_auth::DeviceApproveRequest>,
 ) -> Result<Json<device_auth::DeviceApproveResponse>, CustomError> {
     let synapse = state.synapse_client.as_deref();
-    let resp = device_auth::device_approve(&state.config, &state.redis_client, req, synapse).await?;
+    let resp =
+        device_auth::device_approve(&state.config, &state.redis_client, req, synapse).await?;
     Ok(Json(resp))
 }
 

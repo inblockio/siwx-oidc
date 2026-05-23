@@ -191,9 +191,7 @@ pub async fn authenticate_start(
         .start_discoverable_authentication()
         .map_err(|e| anyhow!("WebAuthn auth start failed: {:?}", e))?;
 
-    let credential_keys = redis
-        .keys_raw(&format!("{}/*", CREDENTIAL_PREFIX))
-        .await?;
+    let credential_keys = redis.keys_raw(&format!("{}/*", CREDENTIAL_PREFIX)).await?;
     let prefix_len = CREDENTIAL_PREFIX.len() + 1; // "webauthn:credential/"
     let allow_list: Vec<AllowCredentials> = credential_keys
         .iter()

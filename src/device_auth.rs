@@ -780,8 +780,7 @@ pub struct DeviceApproveResponse {
     pub warning: Option<String>,
 }
 
-const CROSS_SIGNING_WARNING: &str =
-    "Your account has no Secure Backup set up. \
+const CROSS_SIGNING_WARNING: &str = "Your account has no Secure Backup set up. \
      The QR code login will fail because encryption keys cannot be transferred. \
      Please set up Secure Backup in Element Web first, then retry the QR code flow.";
 
@@ -901,12 +900,8 @@ pub async fn device_approve(
         ));
     }
 
-    let warning = check_cross_signing(
-        did,
-        synapse_client,
-        config.matrix_server_name.as_deref(),
-    )
-    .await;
+    let warning =
+        check_cross_signing(did, synapse_client, config.matrix_server_name.as_deref()).await;
 
     entry.status = DeviceCodeStatus::Approved;
     entry.did = Some(did.clone());
@@ -939,8 +934,7 @@ pub async fn device_approve_passkey(
         return Err(CustomError::BadRequest("Code already used".to_string()));
     }
 
-    let warning =
-        check_cross_signing(verified_did, synapse_client, matrix_server_name).await;
+    let warning = check_cross_signing(verified_did, synapse_client, matrix_server_name).await;
 
     entry.status = DeviceCodeStatus::Approved;
     entry.did = Some(verified_did.to_string());

@@ -143,11 +143,7 @@ impl SynapseClient {
     /// Queries Synapse's `/_matrix/client/v3/keys/query` using the admin token.
     /// Returns `false` on any error (graceful degradation: the caller shows no
     /// warning rather than blocking the flow).
-    pub async fn has_cross_signing_keys(
-        &self,
-        localpart: &str,
-        server_name: &str,
-    ) -> Result<bool> {
+    pub async fn has_cross_signing_keys(&self, localpart: &str, server_name: &str) -> Result<bool> {
         let user_id = format!("@{}:{}", localpart, server_name);
         let url = format!("{}/_matrix/client/v3/keys/query", self.endpoint);
         let resp = self
