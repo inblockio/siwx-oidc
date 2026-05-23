@@ -69,13 +69,10 @@ pub async fn introspect(
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
     Form(form): Form<IntrospectForm>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let secret = state
-        .mas_shared_secret
-        .as_ref()
-        .ok_or_else(|| {
-            warn!("introspect: endpoint called but mas_shared_secret not configured");
-            StatusCode::NOT_FOUND
-        })?;
+    let secret = state.mas_shared_secret.as_ref().ok_or_else(|| {
+        warn!("introspect: endpoint called but mas_shared_secret not configured");
+        StatusCode::NOT_FOUND
+    })?;
 
     // Accept either Bearer token OR client_secret in form body (client_secret_post).
     let provided = if let Some(ref b) = bearer {

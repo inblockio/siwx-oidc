@@ -21,28 +21,28 @@ use openidconnect::core::{
     CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType, CoreJsonWebKeySet,
     CoreUserInfoClaims, CoreUserInfoJsonWebToken,
 };
+use std::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
-use webauthn_rs::prelude::*;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::{
     classify::ServerErrorsFailureClass,
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
-use std::time::Duration;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
+use webauthn_rs::prelude::*;
 
 use super::compat;
 use super::config;
+use super::device_auth;
 use super::introspect;
 use super::oidc::{self, CustomError, EcdsaSigningKey};
 use super::synapse_client::SynapseClient;
 use super::webauthn as wa;
-use super::device_auth;
-use openidconnect::JsonWebKeyId;
 use aqua_auth::{all_cipher_suites, all_did_methods};
+use openidconnect::JsonWebKeyId;
 use siwx_oidc::db::*;
 
 // -- Shared application state ----------------------------------------------
@@ -133,11 +133,18 @@ async fn provider_metadata(
     let base_url = state.config.base_url.as_str().trim_end_matches('/');
     value["code_challenge_methods_supported"] = serde_json::json!(["S256"]);
     value["introspection_endpoint"] = serde_json::json!(format!("{}/oauth2/introspect", base_url));
-    value["introspection_endpoint_auth_methods_supported"] = serde_json::json!(["client_secret_post", "bearer"]);
-    value["grant_types_supported"] = serde_json::json!(["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"]);
-    value["device_authorization_endpoint"] = serde_json::json!(format!("{}/device_authorization", base_url));
+    value["introspection_endpoint_auth_methods_supported"] =
+        serde_json::json!(["client_secret_post", "bearer"]);
+    value["grant_types_supported"] = serde_json::json!([
+        "authorization_code",
+        "refresh_token",
+        "urn:ietf:params:oauth:grant-type:device_code"
+    ]);
+    value["device_authorization_endpoint"] =
+        serde_json::json!(format!("{}/device_authorization", base_url));
     value["revocation_endpoint"] = serde_json::json!(format!("{}/oauth2/revoke", base_url));
-    value["token_endpoint_auth_methods_supported"] = serde_json::json!(["client_secret_post", "none"]);
+    value["token_endpoint_auth_methods_supported"] =
+        serde_json::json!(["client_secret_post", "none"]);
     Ok(value.into())
 }
 
@@ -366,7 +373,8 @@ async fn device_passkey_start_handler(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<RequestChallengeResponse>, CustomError> {
-    let user_code = payload.get("user_code")
+    let user_code = payload
+        .get("user_code")
         .and_then(|v| v.as_str())
         .ok_or_else(|| CustomError::BadRequest("Missing user_code".to_string()))?;
     device_auth::device_verify(&state.redis_client, user_code).await?;
@@ -379,7 +387,8 @@ async fn device_passkey_finish_handler(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<axum::response::Html<String>, CustomError> {
-    let user_code = payload.get("user_code")
+    let user_code = payload
+        .get("user_code")
         .and_then(|v| v.as_str())
         .ok_or_else(|| CustomError::BadRequest("Missing user_code".to_string()))?
         .to_string();
@@ -392,7 +401,8 @@ async fn device_passkey_finish_handler(
         &state.rp_id,
         &state.rp_origin,
         auth_response,
-    ).await?;
+    )
+    .await?;
     device_auth::device_approve_passkey(&state.redis_client, &user_code, &resp.did).await
 }
 
@@ -441,8 +451,7 @@ async fn webauthn_authenticate_start(
     let session_id = cookies
         .get(SESSION_COOKIE_NAME)
         .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
-    let rcr =
-        wa::authenticate_start(&state.webauthn, &state.redis_client, session_id).await?;
+    let rcr = wa::authenticate_start(&state.webauthn, &state.redis_client, session_id).await?;
     Ok(Json(rcr))
 }
 
@@ -537,10 +546,7 @@ pub async fn main() {
                 .init();
         }
         _ => {
-            fmt()
-                .with_env_filter(env_filter)
-                .with_target(true)
-                .init();
+            fmt().with_env_filter(env_filter).with_target(true).init();
         }
     }
 
@@ -657,10 +663,16 @@ pub async fn main() {
         .route("/link/webauthn/finish", post(webauthn_link_finish))
         .route("/health", get(healthcheck))
         .route("/device_authorization", post(device_authorization_handler))
-        .route("/device", get(device_page_handler).post(device_approve_handler))
+        .route(
+            "/device",
+            get(device_page_handler).post(device_approve_handler),
+        )
         .route("/device/verify", get(device_verify_handler))
         .route("/device/passkey/start", post(device_passkey_start_handler))
-        .route("/device/passkey/finish", post(device_passkey_finish_handler))
+        .route(
+            "/device/passkey/finish",
+            post(device_passkey_finish_handler),
+        )
         .with_state(state)
         // MSC3861 introspection — separate state (only needs secret + Redis)
         .route(
@@ -672,10 +684,7 @@ pub async fn main() {
             "/oauth2/revoke",
             post(compat::revoke).with_state(compat_state.clone()),
         )
-        .route(
-            "/_matrix/client/v3/login",
-            get(compat::login_flows),
-        )
+        .route("/_matrix/client/v3/login", get(compat::login_flows))
         .route(
             "/_matrix/client/v3/logout",
             post(compat::logout).with_state(compat_state.clone()),
@@ -694,9 +703,7 @@ pub async fn main() {
                     );
                 })
                 .on_response(
-                    |res: &axum::http::Response<_>,
-                     latency: Duration,
-                     _span: &tracing::Span| {
+                    |res: &axum::http::Response<_>, latency: Duration, _span: &tracing::Span| {
                         info!(
                             status = res.status().as_u16(),
                             latency_ms = latency.as_millis() as u64,
@@ -705,9 +712,7 @@ pub async fn main() {
                     },
                 )
                 .on_failure(
-                    |error: ServerErrorsFailureClass,
-                     latency: Duration,
-                     _span: &tracing::Span| {
+                    |error: ServerErrorsFailureClass, latency: Duration, _span: &tracing::Span| {
                         warn!(
                             error = %error,
                             latency_ms = latency.as_millis() as u64,

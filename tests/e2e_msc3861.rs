@@ -96,10 +96,7 @@ fn pkce_pair() -> (String, String) {
 
 /// Build a reqwest client that does NOT follow redirects (so we can inspect 302s).
 fn no_redirect_client() -> Client {
-    Client::builder()
-        .redirect(Policy::none())
-        .build()
-        .unwrap()
+    Client::builder().redirect(Policy::none()).build().unwrap()
 }
 
 /// Extract query parameters from a URL string (absolute or relative).
@@ -203,7 +200,10 @@ async fn perform_auth_flow() -> AuthResult {
         .to_str()
         .unwrap()
         .to_string();
-    eprintln!("[e2e] authorize redirect: {}", &location[..80.min(location.len())]);
+    eprintln!(
+        "[e2e] authorize redirect: {}",
+        &location[..80.min(location.len())]
+    );
 
     // Parse the nonce from the redirect query.
     let query = parse_query(&location);
@@ -741,7 +741,11 @@ async fn returning_user_new_device() {
 
     // First login.
     let (token1, device1) = login_with_key(&signing_key, &address, &did).await;
-    eprintln!("[e2e] first login: token={}, device={:?}", &token1[..12], device1);
+    eprintln!(
+        "[e2e] first login: token={}, device={:?}",
+        &token1[..12],
+        device1
+    );
 
     // Revoke (simulate logout).
     let revoke_resp = http
@@ -755,11 +759,21 @@ async fn returning_user_new_device() {
 
     // Second login (same user, new session).
     let (token2, device2) = login_with_key(&signing_key, &address, &did).await;
-    eprintln!("[e2e] second login: token={}, device={:?}", &token2[..12], device2);
+    eprintln!(
+        "[e2e] second login: token={}, device={:?}",
+        &token2[..12],
+        device2
+    );
 
     // Both tokens should be valid mat_ tokens.
-    assert!(token1.starts_with("mat_"), "first token must have mat_ prefix");
-    assert!(token2.starts_with("mat_"), "second token must have mat_ prefix");
+    assert!(
+        token1.starts_with("mat_"),
+        "first token must have mat_ prefix"
+    );
+    assert!(
+        token2.starts_with("mat_"),
+        "second token must have mat_ prefix"
+    );
     assert_ne!(token1, token2, "each login must produce a unique token");
 
     // Verify the second token works against Matrix (if introspection is healthy).

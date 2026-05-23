@@ -6,12 +6,7 @@
 //! - `POST /_matrix/client/v3/logout` (session logout)
 //! - `POST /_matrix/client/v3/refresh` (token refresh)
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use axum_extra::{
     headers::{authorization::Bearer, Authorization},
     TypedHeader,

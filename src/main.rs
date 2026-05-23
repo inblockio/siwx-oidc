@@ -1,11 +1,11 @@
 mod axum_lib;
 mod compat;
 mod config;
+mod device_auth;
 mod introspect;
 mod oidc;
 mod synapse_client;
 mod webauthn;
-mod device_auth;
 
 #[tokio::main]
 async fn main() {

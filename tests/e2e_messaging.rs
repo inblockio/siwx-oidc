@@ -86,10 +86,7 @@ fn pkce_pair() -> (String, String) {
 }
 
 fn no_redirect_client() -> Client {
-    Client::builder()
-        .redirect(Policy::none())
-        .build()
-        .unwrap()
+    Client::builder().redirect(Policy::none()).build().unwrap()
 }
 
 fn parse_query(url: &str) -> HashMap<String, String> {
@@ -277,10 +274,7 @@ async fn matrix_whoami(http: &Client, token: &str) -> Option<Value> {
 
 async fn create_room(http: &Client, token: &str, name: &str) -> String {
     let resp = http
-        .post(format!(
-            "{}/_matrix/client/v3/createRoom",
-            matrix_host()
-        ))
+        .post(format!("{}/_matrix/client/v3/createRoom", matrix_host()))
         .bearer_auth(token)
         .json(&json!({
             "name": name,
@@ -347,7 +341,12 @@ async fn send_message(http: &Client, token: &str, room_id: &str, body: &str) -> 
         .unwrap();
     let status = resp.status();
     let resp_body: Value = resp.json().await.unwrap();
-    assert_eq!(status, StatusCode::OK, "send_message failed: {:?}", resp_body);
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "send_message failed: {:?}",
+        resp_body
+    );
     resp_body["event_id"].as_str().unwrap().to_string()
 }
 
@@ -411,10 +410,7 @@ async fn two_client_messaging() {
         .as_str()
         .unwrap()
         .to_string();
-    let bob_user_id = bob_whoami.unwrap()["user_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let bob_user_id = bob_whoami.unwrap()["user_id"].as_str().unwrap().to_string();
     eprintln!("[e2e] alice={}, bob={}", alice_user_id, bob_user_id);
 
     let room_id = create_room(&http, &alice.access_token, "e2e-test-room").await;
@@ -439,8 +435,7 @@ async fn two_client_messaging() {
     eprintln!("[e2e] bob received alice's message");
 
     let reply_message = format!("Hello back from bob! timestamp={}", Utc::now().timestamp());
-    let reply_event_id =
-        send_message(&http, &bob.access_token, &room_id, &reply_message).await;
+    let reply_event_id = send_message(&http, &bob.access_token, &room_id, &reply_message).await;
     eprintln!("[e2e] bob sent reply, event_id={}", reply_event_id);
 
     let found_reply =

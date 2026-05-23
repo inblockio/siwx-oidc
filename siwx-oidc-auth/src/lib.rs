@@ -475,7 +475,10 @@ pub async fn refresh(
         bail!("/token refresh returned {status}: {body}");
     }
 
-    let raw: TokenResponseRaw = resp.json().await.context("/token refresh JSON parse failed")?;
+    let raw: TokenResponseRaw = resp
+        .json()
+        .await
+        .context("/token refresh JSON parse failed")?;
     Ok(AuthTokens {
         access_token: raw.access_token,
         token_type: raw.token_type,
@@ -494,7 +497,10 @@ fn extract_did_from_id_token(id_token: &str) -> Option<String> {
     let payload = id_token.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    claims.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string())
+    claims
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -511,10 +517,7 @@ fn extract_did_from_id_token(id_token: &str) -> Option<String> {
 ///
 /// Prints the user code and verification URI to stderr, then polls until
 /// approved, denied, or expired.
-pub async fn authenticate_device_flow(
-    server_url: &str,
-    client_id: &str,
-) -> Result<AuthTokens> {
+pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Result<AuthTokens> {
     let base = Url::parse(server_url).context("invalid server_url")?;
     let client = reqwest::Client::new();
 
@@ -533,7 +536,9 @@ pub async fn authenticate_device_flow(
         bail!("/device_authorization returned {status}: {body}");
     }
 
-    let device_auth: DeviceAuthResponseRaw = resp.json().await
+    let device_auth: DeviceAuthResponseRaw = resp
+        .json()
+        .await
         .context("/device_authorization JSON parse failed")?;
 
     // Step 2: Display instructions
@@ -541,21 +546,30 @@ pub async fn authenticate_device_flow(
     eprintln!("To approve this device, open:");
     eprintln!("  {}", device_auth.verification_uri_complete);
     eprintln!();
-    eprintln!("Or go to {} and enter code: {}", device_auth.verification_uri, device_auth.user_code);
+    eprintln!(
+        "Or go to {} and enter code: {}",
+        device_auth.verification_uri, device_auth.user_code
+    );
     eprintln!();
-    eprintln!("Waiting for approval (expires in {}s)...", device_auth.expires_in);
+    eprintln!(
+        "Waiting for approval (expires in {}s)...",
+        device_auth.expires_in
+    );
 
     // Step 3: Poll POST /token until approved
     let token_url = base.join("/token")?;
     let mut interval = device_auth.interval;
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(device_auth.expires_in);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(device_auth.expires_in);
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
 
         if std::time::Instant::now() > deadline {
-            bail!("Device code expired (no approval within {}s)", device_auth.expires_in);
+            bail!(
+                "Device code expired (no approval within {}s)",
+                device_auth.expires_in
+            );
         }
 
         let resp = client
@@ -570,9 +584,10 @@ pub async fn authenticate_device_flow(
             .context("POST /token (device poll) failed")?;
 
         if resp.status().is_success() {
-            let raw: TokenResponseRaw = resp.json().await
-                .context("/token JSON parse failed")?;
-            let did = raw.id_token.as_ref()
+            let raw: TokenResponseRaw = resp.json().await.context("/token JSON parse failed")?;
+            let did = raw
+                .id_token
+                .as_ref()
                 .and_then(|t| extract_did_from_id_token(t))
                 .unwrap_or_default();
             eprintln!("Approved!");
@@ -587,8 +602,8 @@ pub async fn authenticate_device_flow(
         }
 
         let body = resp.text().await.unwrap_or_default();
-        let err: TokenErrorResponse = serde_json::from_str(&body)
-            .unwrap_or_else(|_| TokenErrorResponse {
+        let err: TokenErrorResponse =
+            serde_json::from_str(&body).unwrap_or_else(|_| TokenErrorResponse {
                 error: "unknown".to_string(),
                 error_description: Some(body),
             });

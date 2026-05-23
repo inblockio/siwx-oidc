@@ -284,7 +284,11 @@ function bufferToBase64(buf) {{
 </script>
 </body>
 </html>"#,
-        if user_code_value.is_empty() { "" } else { "display:none;" }
+        if user_code_value.is_empty() {
+            ""
+        } else {
+            "display:none;"
+        }
     ))
 }
 
@@ -329,17 +333,25 @@ pub async fn device_approve(
 
     if req.action == "deny" {
         entry.status = DeviceCodeStatus::Denied;
-        let _ = db_client.update_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME).await;
+        let _ = db_client
+            .update_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
+            .await;
         info!(user_code = %req.user_code, "device denied");
         return Ok(Html("<html><body style='background:#0d1117;color:#f85149;text-align:center;padding:60px;font-family:sans-serif'><h2>Device denied</h2></body></html>".to_string()));
     }
 
     // Approve: verify the wallet signature
-    let did = req.did.as_ref()
+    let did = req
+        .did
+        .as_ref()
         .ok_or_else(|| CustomError::BadRequest("Missing DID".to_string()))?;
-    let message = req.message.as_ref()
+    let message = req
+        .message
+        .as_ref()
         .ok_or_else(|| CustomError::BadRequest("Missing message".to_string()))?;
-    let signature = req.signature.as_ref()
+    let signature = req
+        .signature
+        .as_ref()
         .ok_or_else(|| CustomError::BadRequest("Missing signature".to_string()))?;
 
     let sig_hex = signature.strip_prefix("0x").unwrap_or(signature);
@@ -349,22 +361,31 @@ pub async fn device_approve(
     let did_method = aqua_auth::find_did_method(did)
         .ok_or_else(|| CustomError::BadRequest(format!("Unsupported DID: {}", did)))?;
 
-    if !config.supported_did_methods.iter().any(|m| m == did_method.method_name()) {
+    if !config
+        .supported_did_methods
+        .iter()
+        .any(|m| m == did_method.method_name())
+    {
         return Err(CustomError::BadRequest(format!(
             "DID method '{}' is not enabled on this server",
             did_method.method_name()
         )));
     }
 
-    let valid = did_method.verify(did, message, &sig_bytes)
+    let valid = did_method
+        .verify(did, message, &sig_bytes)
         .map_err(|e| CustomError::BadRequest(format!("Verification error: {}", e)))?;
     if !valid {
-        return Err(CustomError::Unauthorized("Signature verification failed".to_string()));
+        return Err(CustomError::Unauthorized(
+            "Signature verification failed".to_string(),
+        ));
     }
 
     entry.status = DeviceCodeStatus::Approved;
     entry.did = Some(did.clone());
-    let _ = db_client.update_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME).await;
+    let _ = db_client
+        .update_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
+        .await;
     info!(user_code = %req.user_code, did = %did, "device approved");
 
     Ok(Html("<html><body style='background:#0d1117;color:#3fb950;text-align:center;padding:60px;font-family:sans-serif'><h2>Device approved!</h2><p>You can close this page.</p></body></html>".to_string()))
@@ -388,7 +409,9 @@ pub async fn device_approve_passkey(
 
     entry.status = DeviceCodeStatus::Approved;
     entry.did = Some(verified_did.to_string());
-    let _ = db_client.update_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME).await;
+    let _ = db_client
+        .update_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
+        .await;
     info!(user_code = %user_code, did = %verified_did, "device approved via passkey");
 
     Ok(Html("<html><body style='background:#0d1117;color:#3fb950;text-align:center;padding:60px;font-family:sans-serif'><h2>Device approved!</h2><p>You can close this page.</p></body></html>".to_string()))

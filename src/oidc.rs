@@ -415,15 +415,12 @@ async fn token_refresh(
         })
     })?;
 
-    let metadata = db_client
-        .get_token(&rt)
-        .await?
-        .ok_or_else(|| {
-            CustomError::BadRequestToken(TokenError {
-                error: CoreErrorResponseType::InvalidGrant,
-                error_description: "Unknown or expired refresh token.".to_string(),
-            })
-        })?;
+    let metadata = db_client.get_token(&rt).await?.ok_or_else(|| {
+        CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "Unknown or expired refresh token.".to_string(),
+        })
+    })?;
 
     if metadata.exp <= Utc::now().timestamp() {
         return Err(CustomError::BadRequestToken(TokenError {
@@ -533,24 +530,37 @@ async fn token_device_code(
     if let Some(last) = entry.last_poll {
         if now_ts - last < DEVICE_CODE_INTERVAL as i64 {
             entry.last_poll = Some(now_ts);
-            let _ = db_client.update_device_code(&dc, &entry, DEVICE_CODE_LIFETIME).await;
-            return Err(device_code_error("slow_down", "Polling too fast. Increase interval."));
+            let _ = db_client
+                .update_device_code(&dc, &entry, DEVICE_CODE_LIFETIME)
+                .await;
+            return Err(device_code_error(
+                "slow_down",
+                "Polling too fast. Increase interval.",
+            ));
         }
     }
     entry.last_poll = Some(now_ts);
-    let _ = db_client.update_device_code(&dc, &entry, DEVICE_CODE_LIFETIME).await;
+    let _ = db_client
+        .update_device_code(&dc, &entry, DEVICE_CODE_LIFETIME)
+        .await;
 
     match entry.status {
-        DeviceCodeStatus::Pending => {
-            Err(device_code_error("authorization_pending", "User has not yet approved."))
-        }
+        DeviceCodeStatus::Pending => Err(device_code_error(
+            "authorization_pending",
+            "User has not yet approved.",
+        )),
         DeviceCodeStatus::Denied => {
             let _ = db_client.delete_device_code(&dc).await;
             let _ = db_client.delete_user_code_mapping(&entry.user_code).await;
-            Err(device_code_error("access_denied", "User denied the request."))
+            Err(device_code_error(
+                "access_denied",
+                "User denied the request.",
+            ))
         }
         DeviceCodeStatus::Approved => {
-            let did = entry.did.as_ref()
+            let did = entry
+                .did
+                .as_ref()
                 .ok_or_else(|| device_code_error("server_error", "Approved but no DID."))?
                 .clone();
 
@@ -559,13 +569,17 @@ async fn token_device_code(
             let dev_id = if let Some(ref proposed) = proposed_device_id {
                 debug!(proposed_device_id = %proposed, "using client-proposed device_id from scope");
                 provision_synapse_device_additive(
-                    &did, synapse_client, db_client, proposed, "Element X",
-                ).await;
+                    &did,
+                    synapse_client,
+                    db_client,
+                    proposed,
+                    "Element X",
+                )
+                .await;
                 proposed.clone()
             } else {
-                let device_id = provision_synapse_device(
-                    &did, synapse_client, db_client, "Element X",
-                ).await;
+                let device_id =
+                    provision_synapse_device(&did, synapse_client, db_client, "Element X").await;
                 device_id.unwrap_or_else(|| format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]))
             };
 
@@ -595,7 +609,9 @@ async fn token_device_code(
                 did: did.clone(),
                 name: display_name.clone(),
             };
-            db_client.set_token(&access_token, &access_meta, ACCESS_TOKEN_TTL).await?;
+            db_client
+                .set_token(&access_token, &access_meta, ACCESS_TOKEN_TTL)
+                .await?;
 
             let refresh_token = generate_opaque_token("mcr_");
             let refresh_meta = TokenMetadata {
@@ -608,7 +624,9 @@ async fn token_device_code(
                 did: did.clone(),
                 name: display_name,
             };
-            db_client.set_token(&refresh_token, &refresh_meta, REFRESH_TOKEN_TTL).await?;
+            db_client
+                .set_token(&refresh_token, &refresh_meta, REFRESH_TOKEN_TTL)
+                .await?;
 
             let core_id_token = CoreIdTokenClaims::new(
                 IssuerUrl::from_url(config.base_url.clone()),
@@ -625,7 +643,8 @@ async fn token_device_code(
                 CoreJwsSigningAlgorithm::EcdsaP256Sha256,
                 Some(&AccessToken::new(access_token.clone())),
                 None,
-            ).map_err(|e| anyhow!("{}", e))?;
+            )
+            .map_err(|e| anyhow!("{}", e))?;
 
             // Cleanup
             let _ = db_client.delete_device_code(&dc).await;
@@ -659,15 +678,12 @@ async fn token_authorization_code(
         })
     })?;
 
-    let code_entry = db_client
-        .try_consume_code(code)
-        .await?
-        .ok_or_else(|| {
-            CustomError::BadRequestToken(TokenError {
-                error: CoreErrorResponseType::InvalidGrant,
-                error_description: "Unknown or already-exchanged code.".to_string(),
-            })
-        })?;
+    let code_entry = db_client.try_consume_code(code).await?.ok_or_else(|| {
+        CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "Unknown or already-exchanged code.".to_string(),
+        })
+    })?;
 
     let client_id = if let Some(c) = form.client_id.clone() {
         c
@@ -750,10 +766,7 @@ async fn token_authorization_code(
         .unwrap_or_else(|| code_entry.did.clone());
 
     let (access_prefix, refresh_prefix, scope) = if msc3861_mode {
-        let device_id = code_entry
-            .device_id
-            .clone()
-            .unwrap_or_default();
+        let device_id = code_entry.device_id.clone().unwrap_or_default();
         (
             "mat_",
             "mcr_",
@@ -1066,9 +1079,8 @@ pub fn verify_siwx_cookie(
     let sig_bytes = hex::decode(sig_hex)
         .map_err(|e| CustomError::BadRequest(format!("Bad signature: {}", e)))?;
 
-    let did_method = find_did_method(&siwx_cookie.did).ok_or_else(|| {
-        CustomError::BadRequest(format!("Unsupported DID: {}", &siwx_cookie.did))
-    })?;
+    let did_method = find_did_method(&siwx_cookie.did)
+        .ok_or_else(|| CustomError::BadRequest(format!("Unsupported DID: {}", &siwx_cookie.did)))?;
 
     if !allowed_did_methods
         .iter()
@@ -1131,7 +1143,8 @@ fn did_to_localpart(did: &str) -> String {
 /// Extract a device_id from a scope string containing `urn:matrix:client:device:XXX`.
 fn extract_device_id_from_scope(scope: &str) -> Option<String> {
     const PREFIX: &str = "urn:matrix:client:device:";
-    scope.split_whitespace()
+    scope
+        .split_whitespace()
         .find(|s| s.starts_with(PREFIX))
         .map(|s| s[PREFIX.len()..].to_string())
         .filter(|id| !id.is_empty())
@@ -1258,9 +1271,8 @@ pub async fn sign_in(
     // Path B: Client-set CAIP-122 cookie (existing wallet flow — untrusted, must verify).
     let did = if let Some(ref verified_did) = session_entry.verified_did {
         info!("sign_in: server-verified did={}", verified_did);
-        let did_method = find_did_method(verified_did).ok_or_else(|| {
-            CustomError::BadRequest(format!("Unsupported DID: {}", verified_did))
-        })?;
+        let did_method = find_did_method(verified_did)
+            .ok_or_else(|| CustomError::BadRequest(format!("Unsupported DID: {}", verified_did)))?;
         if !allowed_did_methods
             .iter()
             .any(|m| m == did_method.method_name())
@@ -1349,9 +1361,7 @@ pub async fn sign_in(
             .iter()
             .any(|r| Url::parse(r).ok().as_ref() == Some(redirect_url))
         {
-            return Err(
-                anyhow!("Missing or mismatched resource in CAIP-122 message").into(),
-            );
+            return Err(anyhow!("Missing or mismatched resource in CAIP-122 message").into());
         }
 
         siwx_cookie.did
@@ -1580,9 +1590,9 @@ mod tests {
     use crate::config::Config;
 
     use super::*;
+    use aqua_auth::{address_from_verifying_key, eip55_checksum};
     use headers::{HeaderMap, HeaderMapExt, HeaderValue};
     use sha3::{Digest, Keccak256};
-    use aqua_auth::{address_from_verifying_key, eip55_checksum};
     use test_log::test;
 
     async fn default_config() -> (Config, RedisClient) {
@@ -1778,7 +1788,11 @@ mod tests {
             code_challenge_method: None,
         };
         let result = authorize(params, &db_client).await;
-        assert!(result.is_ok(), "authorize must accept Matrix scopes: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "authorize must accept Matrix scopes: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1796,7 +1810,13 @@ mod tests {
             Some("SIWX_43efbac7".to_string())
         );
         assert_eq!(extract_device_id_from_scope("openid"), None);
-        assert_eq!(extract_device_id_from_scope("openid urn:matrix:client:api:*"), None);
-        assert_eq!(extract_device_id_from_scope("openid urn:matrix:client:device:"), None);
+        assert_eq!(
+            extract_device_id_from_scope("openid urn:matrix:client:api:*"),
+            None
+        );
+        assert_eq!(
+            extract_device_id_from_scope("openid urn:matrix:client:device:"),
+            None
+        );
     }
 }
