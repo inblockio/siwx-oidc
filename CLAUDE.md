@@ -24,8 +24,8 @@ src/                                ← Axum OIDC server (binary)
   db/redis.rs                        Redis implementation + generic helpers (set_raw, get_raw, etc.)
 
 siwx-oidc-auth/src/                ← Headless OIDC client (library + CLI)
-  lib.rs                             SiwxKey (PEM/hex/generate), authenticate(), AuthTokens
-  main.rs                            CLI: --key-file, --print-did, --server
+  lib.rs                             SiwxKey (PEM/hex/generate), authenticate(), refresh(), AuthTokens
+  main.rs                            CLI: --key-file, --print-did, --server, --refresh-token
 
 js/ui/src/App.svelte               ← Svelte frontend (Ethereum-only via Web3Modal)
 ```
@@ -79,6 +79,40 @@ No `inventory` crate (WASM-unsafe).
 3. Redirect to `GET /sign_in` → reads `session.verified_did` (trusted) → auth code
 4. `POST /token` → ID token + access token (ES256 signed)
 
+## Token model
+
+Both standalone and MSC3861 modes use the same token storage model (`TokenMetadata`
+in Redis via `set_token`/`get_token`). The only differences are token prefixes and
+scope format.
+
+| Aspect | MSC3861 mode | Standalone mode |
+|--------|-------------|-----------------|
+| Access token prefix | `mat_` | (none) |
+| Refresh token prefix | `mcr_` | (none) |
+| Scope format | `openid urn:matrix:client:api:* urn:matrix:client:device:{id}` | `openid profile` |
+| Access token TTL | 300s | 300s |
+| Refresh token TTL | 86400s (24h) | 86400s (24h) |
+| Introspection | Active (`/oauth2/introspect`) | Not available |
+| Device ID | Synapse-managed `SIWX_{uuid}` | Empty string (no Synapse) |
+
+**Token lifecycle:**
+1. `POST /token` (grant_type=authorization_code) creates both access and refresh
+   `TokenMetadata` entries in Redis. The authorization code (`CodeEntry`) is consumed.
+2. `POST /token` (grant_type=refresh_token) rotates both tokens: new access + new
+   refresh, old refresh deleted. `device_id` is preserved across rotations.
+3. `userinfo` resolves tokens via `get_token` first (covers both modes), then falls
+   back to `get_code` for backward compatibility with pre-refresh-token deployments.
+
+**Client library (`siwx-oidc-auth`):**
+- `authenticate()` returns `AuthTokens` with `refresh_token: Option<String>` populated
+- `refresh()` exchanges a refresh token for new tokens via `POST /token`
+- CLI: `--refresh-token <value>` calls `refresh()` instead of `authenticate()`
+  (`--redirect-uri` is not required for refresh)
+
+**Deploy note:** Redis flush recommended when upgrading from pre-refresh-token
+deployments (standalone mode token storage changed from `CodeEntry` to `TokenMetadata`).
+Existing sessions via the legacy `get_code` path still work as a fallback.
+
 ## DID method scope
 
 | DID Method | Key types | Location | Default |
@@ -122,14 +156,24 @@ openssl genpkey -algorithm Ed25519 -out identity.pem
 # Print the DID for registration
 siwx-oidc-auth --print-did --key-file identity.pem
 
-# Authenticate and get OIDC tokens
+# Authenticate and get OIDC tokens (includes refresh_token)
 siwx-oidc-auth --server https://siwx.example.com \
   --client-id my-service --redirect-uri https://app/callback \
+  --key-file identity.pem
+
+# Refresh tokens without re-authenticating (no --redirect-uri needed)
+siwx-oidc-auth --server https://siwx.example.com \
+  --client-id my-service --refresh-token "<refresh_token_value>" \
   --key-file identity.pem
 ```
 
 Key input priority: `--key-file` > `SIWX_KEY_FILE` env > `--key-hex` > generate ephemeral.
 PEM format is canonical (PKCS#8, auto-detects Ed25519 vs P-256).
+
+**Refresh tokens:** Both standalone and MSC3861 modes issue refresh tokens (24h TTL).
+The `refresh()` library function and `--refresh-token` CLI flag exchange a refresh
+token for new access + refresh tokens without repeating the full CAIP-122 sign-in.
+The server rotates the refresh token on each use (old token is deleted).
 
 ## Config env vars
 
@@ -336,4 +380,5 @@ Claude Code discovers them via symlinks in `.claude/commands/` (invoke with `/sk
 | `/authenticate-siwe-matrix` | End-to-end auth flow: Element Web to siwx-oidc to Synapse |
 | `/debug-oidc` | Debug OIDC authentication flow issues |
 | `/deploy-check` | Pre-deployment checklist for Matrix |
+| `/element-x-qr-code-specialist` | Element X QR code login setup, implementation, and troubleshooting |
 | `/docker-build` | Build, test, push Docker image |

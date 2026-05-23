@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::{Parser, ValueEnum};
-use siwx_oidc_auth::{authenticate, SiwxKey};
+use siwx_oidc_auth::{authenticate, refresh, SiwxKey};
 
 /// Headless OIDC client for siwx-oidc.
 ///
@@ -17,16 +17,16 @@ struct Cli {
     #[arg(long)]
     print_did: bool,
 
-    /// Base URL of the siwx-oidc server (required unless --print-did).
+    /// Base URL of the siwx-oidc server.
     #[arg(long, required_unless_present = "print_did")]
     server: Option<String>,
 
-    /// OIDC client ID registered with the server (required unless --print-did).
+    /// OIDC client ID registered with the server.
     #[arg(long, required_unless_present = "print_did")]
     client_id: Option<String>,
 
-    /// Registered redirect URI (required unless --print-did).
-    #[arg(long, required_unless_present = "print_did")]
+    /// Registered redirect URI (required for initial auth, not for refresh).
+    #[arg(long)]
     redirect_uri: Option<String>,
 
     // -- Key input (priority: --key-file > SIWX_KEY_FILE > --key-hex > generate) --
@@ -42,6 +42,11 @@ struct Cli {
     /// Hex-encoded 32-byte private key seed. For dev/testing only.
     #[arg(long)]
     key_hex: Option<String>,
+
+    /// Refresh token from a previous authentication. When provided, exchanges
+    /// it for new tokens instead of performing a full auth flow.
+    #[arg(long)]
+    refresh_token: Option<String>,
 }
 
 #[derive(ValueEnum, Clone)]
@@ -90,17 +95,26 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // These are required_unless_present = "print_did", so safe to unwrap.
     let server = cli.server.as_deref().unwrap();
     let client_id = cli.client_id.as_deref().unwrap();
-    let redirect_uri = cli.redirect_uri.as_deref().unwrap();
 
-    if server.is_empty() || client_id.is_empty() || redirect_uri.is_empty() {
-        bail!("--server, --client-id, and --redirect-uri are all required");
+    if server.is_empty() || client_id.is_empty() {
+        bail!("--server and --client-id are required");
     }
 
     eprintln!("DID: {}", key.did());
-    let tokens = authenticate(server, client_id, redirect_uri, &key).await?;
+
+    let tokens = if let Some(rt) = &cli.refresh_token {
+        refresh(server, client_id, rt, &key.did()).await?
+    } else {
+        let redirect_uri = cli.redirect_uri.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--redirect-uri is required for initial authentication")
+        })?;
+        if redirect_uri.is_empty() {
+            bail!("--redirect-uri must not be empty");
+        }
+        authenticate(server, client_id, redirect_uri, &key).await?
+    };
     println!("{}", serde_json::to_string_pretty(&tokens)?);
     Ok(())
 }

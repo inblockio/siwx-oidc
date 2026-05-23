@@ -199,6 +199,8 @@ pub struct AuthTokens {
     pub id_token: Option<String>,
     /// Token lifetime in seconds (from the server's `expires_in` field).
     pub expires_in: Option<u64>,
+    /// Refresh token for obtaining new access tokens without re-authentication.
+    pub refresh_token: Option<String>,
     /// The `did:key:z…` DID that authenticated.
     pub did: String,
 }
@@ -228,6 +230,7 @@ struct TokenResponseRaw {
     token_type: String,
     id_token: Option<String>,
     expires_in: Option<u64>,
+    refresh_token: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +409,57 @@ pub async fn authenticate(
         token_type: raw.token_type,
         id_token: raw.id_token,
         expires_in: raw.expires_in,
+        refresh_token: raw.refresh_token,
         did,
+    })
+}
+
+/// Exchange a refresh token for a new set of tokens.
+///
+/// The server rotates the refresh token on each use: the returned `AuthTokens`
+/// contains a new `refresh_token` that replaces the one passed in.
+///
+/// - `server_url`: Base URL of the siwx-oidc server.
+/// - `client_id`: OIDC client ID.
+/// - `refresh_token`: The refresh token from a previous `authenticate()` or `refresh()` call.
+/// - `did`: The DID associated with this session (carried forward for the caller).
+pub async fn refresh(
+    server_url: &str,
+    client_id: &str,
+    refresh_token: &str,
+    did: &str,
+) -> Result<AuthTokens> {
+    let base = Url::parse(server_url).context("invalid server_url")?;
+    let client = reqwest::Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let token_url = base.join("/token")?;
+    let resp = client
+        .post(token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id),
+            ("refresh_token", refresh_token),
+        ])
+        .send()
+        .await
+        .context("POST /token (refresh) failed")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("/token refresh returned {status}: {body}");
+    }
+
+    let raw: TokenResponseRaw = resp.json().await.context("/token refresh JSON parse failed")?;
+    Ok(AuthTokens {
+        access_token: raw.access_token,
+        token_type: raw.token_type,
+        id_token: raw.id_token,
+        expires_in: raw.expires_in,
+        refresh_token: raw.refresh_token,
+        did: did.to_string(),
     })
 }
