@@ -207,9 +207,7 @@ pub async fn authenticate_start(
             })
         })
         .collect();
-    if !allow_list.is_empty() {
-        rcr.public_key.allow_credentials = allow_list;
-    }
+    rcr.public_key.allow_credentials = allow_list;
 
     let challenge_b64 = URL_SAFE_NO_PAD.encode(&*rcr.public_key.challenge);
     redis

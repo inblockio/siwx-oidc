@@ -595,6 +595,10 @@ async function approvePasskey() {
     const options = await startR.json();
     options.publicKey.challenge = base64ToBuffer(options.publicKey.challenge);
     if (options.publicKey.allowCredentials) {
+      if (options.publicKey.allowCredentials.length === 0) {
+        showStatus('No passkeys registered on this server. Register a passkey first.', true);
+        return;
+      }
       options.publicKey.allowCredentials = options.publicKey.allowCredentials.map((c) => ({ ...c, id: base64ToBuffer(c.id) }));
     }
     const credential = await navigator.credentials.get({ publicKey: options.publicKey });

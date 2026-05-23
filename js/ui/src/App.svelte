@@ -217,6 +217,9 @@
 
 			options.publicKey.challenge = base64urlToBuffer(options.publicKey.challenge);
 			if (options.publicKey.allowCredentials) {
+				if (options.publicKey.allowCredentials.length === 0) {
+					throw new Error('No passkeys registered on this server. Register a passkey first.');
+				}
 				for (const c of options.publicKey.allowCredentials) {
 					c.id = base64urlToBuffer(c.id);
 				}
