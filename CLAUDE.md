@@ -119,8 +119,9 @@ The aqua-auth tests are self-contained (pure crypto). The server e2e test
 
 ## Headless client (siwx-oidc-auth)
 
-Authenticates to a remote siwx-oidc server with a local `did:key` private key.
-Server must have `"key"` in `supported_did_methods`.
+Two authentication modes:
+
+**Authorization code flow** (local signing key, server needs `"key"` in `supported_did_methods`):
 
 ```bash
 # Generate a persistent Ed25519 identity
@@ -137,6 +138,48 @@ siwx-oidc-auth --server https://siwx.example.com \
 
 Key input priority: `--key-file` > `SIWX_KEY_FILE` env > `--key-hex` > generate ephemeral.
 PEM format is canonical (PKCS#8, auto-detects Ed25519 vs P-256).
+
+**Device flow** (RFC 8628, no local key needed; user approves on another device):
+
+```bash
+# For headless servers, CI, or machines without a browser/wallet
+siwx-oidc-auth --device-flow \
+  --server https://siwx.example.com \
+  --client-id my-service
+```
+
+Prints a user code and verification URL to stderr, polls until approved.
+The resulting tokens are associated with whatever DID the approving user
+authenticates with (wallet or passkey).
+
+**Identity ownership:** The two modes produce different identity models:
+
+| Mode | Identity owner | DID type | Use case |
+|------|---------------|----------|----------|
+| Auth code (`--key-file`) | The machine itself | `did:key:z6Mk...` (Ed25519) or `did:key:zDn...` (P-256) | Service accounts, bots, autonomous agents |
+| Device flow (`--device-flow`) | The human who approves | `did:pkh:eip155:1:0x...` (wallet) or `did:key:zDn...` (passkey) | CI, headless SSH, shared servers |
+
+The device flow does NOT give the machine its own DID. The approving user's
+DID is embedded in the tokens. If they approve with MetaMask, the session runs
+under their `did:pkh:eip155:...`; if they approve with a passkey, it runs under
+their `did:key:zDn...` (or linked wallet DID).
+
+**Device flow examples:**
+
+```bash
+# CI pipeline: prints approval URL in CI log, engineer approves on phone
+siwx-oidc-auth --device-flow \
+  --server https://siwx.example.com --client-id ci-bot
+
+# Remote SSH session: no browser available
+siwx-oidc-auth --device-flow \
+  --server https://siwx.example.com --client-id my-app
+
+# Pipe access token directly to a file
+siwx-oidc-auth --device-flow \
+  --server https://siwx.example.com --client-id agent \
+  | jq -r .access_token > /tmp/matrix-token
+```
 
 ## Config env vars
 

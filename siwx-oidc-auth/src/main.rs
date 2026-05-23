@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::{Parser, ValueEnum};
-use siwx_oidc_auth::{authenticate, SiwxKey};
+use siwx_oidc_auth::{authenticate, authenticate_device_flow, SiwxKey};
 
 /// Headless OIDC client for siwx-oidc.
 ///
@@ -17,6 +17,11 @@ struct Cli {
     #[arg(long)]
     print_did: bool,
 
+    /// Use RFC 8628 Device Authorization Grant. The user approves on another
+    /// device (browser with wallet or passkey). No local signing key needed.
+    #[arg(long)]
+    device_flow: bool,
+
     /// Base URL of the siwx-oidc server (required unless --print-did).
     #[arg(long, required_unless_present = "print_did")]
     server: Option<String>,
@@ -25,8 +30,8 @@ struct Cli {
     #[arg(long, required_unless_present = "print_did")]
     client_id: Option<String>,
 
-    /// Registered redirect URI (required unless --print-did).
-    #[arg(long, required_unless_present = "print_did")]
+    /// Registered redirect URI (required unless --print-did or --device-flow).
+    #[arg(long, required_unless_present_any = ["print_did", "device_flow"])]
     redirect_uri: Option<String>,
 
     // -- Key input (priority: --key-file > SIWX_KEY_FILE > --key-hex > generate) --
@@ -83,16 +88,26 @@ fn load_key(cli: &Cli) -> Result<SiwxKey> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let key = load_key(&cli)?;
 
     if cli.print_did {
+        let key = load_key(&cli)?;
         println!("{}", key.did());
         return Ok(());
     }
 
-    // These are required_unless_present = "print_did", so safe to unwrap.
     let server = cli.server.as_deref().unwrap();
     let client_id = cli.client_id.as_deref().unwrap();
+
+    if cli.device_flow {
+        if server.is_empty() || client_id.is_empty() {
+            bail!("--server and --client-id are required for --device-flow");
+        }
+        let tokens = authenticate_device_flow(server, client_id).await?;
+        println!("{}", serde_json::to_string_pretty(&tokens)?);
+        return Ok(());
+    }
+
+    let key = load_key(&cli)?;
     let redirect_uri = cli.redirect_uri.as_deref().unwrap();
 
     if server.is_empty() || client_id.is_empty() || redirect_uri.is_empty() {
