@@ -20,6 +20,7 @@ src/                                ← Axum OIDC server (binary)
   axum_lib.rs                        Routes, startup validation, state (incl. Webauthn)
   oidc.rs                            OIDC logic: authorize, sign_in, token, userinfo, ES256 key
   device_auth.rs                     RFC 8628 Device Authorization Grant (device_code, approval page)
+  account.rs                         MSC4191/MSC4312: account management page + cross-signing reset
   webauthn.rs                        WebAuthn ceremony: register + discoverable authenticate
   db/mod.rs                          DBClient trait, CodeEntry, SessionEntry, ClientEntry, DeviceCodeEntry
   db/redis.rs                        Redis implementation + generic helpers (set_raw, get_raw, etc.)
@@ -245,6 +246,7 @@ Prefix: `SIWEOIDC_` (via Figment: `siwe-oidc.toml` or env vars)
 | `SIWEOIDC_RP_ORIGIN` | WebAuthn expected origin URL | `BASE_URL` |
 | `SIWEOIDC_LOG_FORMAT` | Log output format | `pretty` (or `json`) |
 | `SIWEOIDC_MATRIX_SERVER_NAME` | Matrix server_name for cross-signing checks | (none) |
+| `SIWEOIDC_ACCOUNT_MANAGEMENT_URI` | MSC4191 account management URL (override) | `{base_url}/account` |
 
 **For passkey login:** add `"key"` to `SIWEOIDC_SUPPORTED_DID_METHODS` so the `did:key:zDn…`
 DIDs derived from passkeys are accepted by `sign_in`.
@@ -358,6 +360,10 @@ POST /device                        — process approval (wallet CAIP-122 signat
 GET  /device/verify                 — check if user_code is valid and pending
 POST /device/passkey/start          — start passkey auth for device approval
 POST /device/passkey/finish         — finish passkey auth and approve device
+GET  /account                       — MSC4191 account management page
+POST /account/wallet                — wallet re-auth for account action (MSC4312)
+POST /account/passkey/start         — start passkey auth for account action
+POST /account/passkey/finish        — finish passkey auth for account action
 ```
 
 **Account linking (Phase 2):** Wallet users can link a passkey to their existing DID.
@@ -411,20 +417,43 @@ nothing to transfer, the rendezvous session expires, and Element X aborts.
 device approval page checks for cross-signing keys and warns the user if they
 are missing. Set this env var to the Matrix server_name (e.g. `matrix.inblock.io`).
 
-**Why cross-signing can't auto-bootstrap:** Cross-signing key generation requires
-the same security flow the user signed in with (wallet signature or passkey
-ceremony). The OIDC provider can't generate these keys on behalf of the user
-because they are E2EE secrets that only the client should hold. This is by design
-(W3C WebAuthn, NIST SP 800-63B): credential material never leaves the client.
-With MAS (Matrix Authentication Service), the Element Web client bootstraps
-cross-signing automatically after login because MAS has a tightly integrated UIA
-(User-Interactive Authentication) flow. With siwx-oidc as an external OIDC
-provider, Element Web falls back to manual Secure Backup setup because the UIA
-bridge is not present.
+**Cross-signing auto-bootstrap (investigated 2026-05-23):** MAS contains zero
+cross-signing code. First-time cross-signing key upload is handled by Synapse
+via MSC3967 (stable since spec v1.11, Synapse >= 1.110.0), which skips UIA
+entirely when the user has no existing cross-signing keys. This works
+identically for any OIDC provider, including siwx-oidc.
+
+Element Web had a `freshLogin` detection bug (PR #30141, merged June 2025)
+where OIDC delegate logins were treated as session restorations
+(`freshLogin=false`), causing it to skip `bootstrapCrossSigning()` entirely.
+With the fix and correct `.well-known` `m.authentication` configuration
+(MSC2965), auto-bootstrap should work without manual Secure Backup setup.
+
+**Prerequisites for auto-bootstrap:**
+1. Synapse >= 1.110.0 (MSC3967 stable)
+2. `.well-known/matrix/client` includes `m.authentication` pointing to siwx-oidc
+3. Element Web version includes freshLogin fix (PR #30141, June 2025)
+
+**For cross-signing key RESET** (not first-time): siwx-oidc calls
+`allow_cross_signing_reset` on every login (both provisioning modes), and
+also provides a spec-compliant account management page at `/account`
+(MSC4191 + MSC4312). When Element Web encounters a cross-signing reset
+needing user confirmation, it reads `account_management_uri` from OIDC
+discovery and opens `/account?action=org.matrix.cross_signing_reset`.
+The user re-authenticates (wallet or passkey), siwx-oidc calls
+`allow_cross_signing_reset`, and Element Web retries the upload.
+
+**For QR code login specifically:** even with auto-bootstrap working, the
+approving device must have cross-signing private keys in Secure Backup so
+it can transfer them via the MSC4108 rendezvous channel. If no Secure Backup
+exists, the QR login will fail after approval.
+
+Run `/cross-signing-bootstrap-and-debug` for the full diagnostic flowchart.
 
 **Diagnostic:** Check Synapse logs for `has no master cross-signing key` warnings
 during device provisioning. Check siwx-oidc logs for `device approval: user has
-no cross-signing keys` warnings.
+no cross-signing keys` warnings. Check browser console for `bootstrapCrossSigning`
+calls and `keys/device_signing/upload` requests during login.
 
 ### CAIP-122 wallet login fails
 
@@ -510,4 +539,5 @@ Claude Code discovers them via symlinks in `.claude/commands/` (invoke with `/sk
 | `/debug-oidc` | Debug OIDC authentication flow issues |
 | `/deploy-check` | Pre-deployment checklist for Matrix |
 | `/element-x-qr-code-specialist` | Element X QR code login setup, implementation, and troubleshooting |
+| `/cross-signing-bootstrap-and-debug` | Cross-signing bootstrap, debug, and MSC3967/4312/4191 reference |
 | `/docker-build` | Build, test, push Docker image |

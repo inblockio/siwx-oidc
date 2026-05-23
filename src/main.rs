@@ -1,3 +1,4 @@
+mod account;
 mod axum_lib;
 mod compat;
 mod config;

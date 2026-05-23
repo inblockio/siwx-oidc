@@ -34,6 +34,7 @@ use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 use webauthn_rs::prelude::*;
 
+use super::account;
 use super::compat;
 use super::config;
 use super::device_auth;
@@ -145,6 +146,16 @@ async fn provider_metadata(
     value["revocation_endpoint"] = serde_json::json!(format!("{}/oauth2/revoke", base_url));
     value["token_endpoint_auth_methods_supported"] =
         serde_json::json!(["client_secret_post", "none"]);
+    // MSC4191: account management discovery (stable v1.18)
+    let account_uri = state
+        .config
+        .account_management_uri
+        .as_ref()
+        .map(|u| u.as_str().to_string())
+        .unwrap_or_else(|| format!("{}/account", base_url));
+    value["account_management_uri"] = serde_json::json!(account_uri);
+    value["account_management_actions_supported"] =
+        serde_json::json!(["org.matrix.cross_signing_reset"]);
     Ok(value.into())
 }
 
@@ -540,6 +551,75 @@ async fn webauthn_link_finish(
     Ok(Json(resp))
 }
 
+// -- Account management route handlers (MSC4191/MSC4312) --------------------
+
+async fn account_page_handler(
+    State(state): State<AppState>,
+    Query(query): Query<account::AccountPageQuery>,
+) -> axum::response::Html<String> {
+    account::account_page(query, state.config.base_url.as_str())
+}
+
+async fn account_wallet_handler(
+    State(state): State<AppState>,
+    Json(req): Json<account::AccountWalletRequest>,
+) -> Result<Json<account::AccountActionResponse>, CustomError> {
+    let synapse = state.synapse_client.as_deref();
+    let resp = account::account_wallet(&state.config, req, synapse).await?;
+    Ok(Json(resp))
+}
+
+async fn account_passkey_start_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, CustomError> {
+    let action = payload
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if action.is_empty() {
+        return Err(CustomError::BadRequest("Missing action".to_string()));
+    }
+    let session_id = format!("account_passkey_{}", uuid::Uuid::new_v4());
+    let rcr = wa::authenticate_start(&state.webauthn, &state.redis_client, &session_id).await?;
+    let mut value = serde_json::to_value(&rcr)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize challenge: {}", e))?;
+    value["session_id"] = serde_json::json!(session_id);
+    Ok(Json(value))
+}
+
+async fn account_passkey_finish_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<account::AccountActionResponse>, CustomError> {
+    let action = payload
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CustomError::BadRequest("Missing action".to_string()))?
+        .to_string();
+
+    let session_id = payload
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CustomError::BadRequest("Missing session_id".to_string()))?;
+
+    let synapse = state.synapse_client.as_deref();
+    let req = account::AccountPasskeyFinishRequest {
+        action,
+        credential: payload.clone(),
+    };
+    let resp = account::account_passkey_finish(
+        &state.redis_client,
+        session_id,
+        &state.rp_id,
+        &state.rp_origin,
+        req,
+        synapse,
+    )
+    .await?;
+    Ok(Json(resp))
+}
+
 // -- Application entry point -----------------------------------------------
 
 pub async fn main() {
@@ -686,6 +766,17 @@ pub async fn main() {
         .route(
             "/device/passkey/finish",
             post(device_passkey_finish_handler),
+        )
+        // MSC4191/MSC4312: account management + cross-signing reset
+        .route("/account", get(account_page_handler))
+        .route("/account/wallet", post(account_wallet_handler))
+        .route(
+            "/account/passkey/start",
+            post(account_passkey_start_handler),
+        )
+        .route(
+            "/account/passkey/finish",
+            post(account_passkey_finish_handler),
         )
         .with_state(state)
         // MSC3861 introspection — separate state (only needs secret + Redis)
