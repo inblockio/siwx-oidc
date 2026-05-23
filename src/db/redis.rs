@@ -69,6 +69,20 @@ impl RedisClient {
         Ok(val)
     }
 
+    /// List keys matching a glob pattern.
+    pub async fn keys_raw(&self, pattern: &str) -> Result<Vec<String>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+        let keys: Vec<String> = conn
+            .keys(pattern)
+            .await
+            .map_err(|e| anyhow!("Redis KEYS: {}", e))?;
+        Ok(keys)
+    }
+
     /// Delete a key.
     pub async fn del_raw(&self, key: &str) -> Result<()> {
         let mut conn = self

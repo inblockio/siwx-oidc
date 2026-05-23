@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use url::Url;
 use webauthn_rs::prelude::*;
+use webauthn_rs_proto::AllowCredentials;
 
 use siwx_oidc::db::RedisClient;
 
@@ -186,9 +187,29 @@ pub async fn authenticate_start(
     redis: &RedisClient,
     session_id: &str,
 ) -> Result<RequestChallengeResponse> {
-    let (rcr, _auth_state) = webauthn
+    let (mut rcr, _auth_state) = webauthn
         .start_discoverable_authentication()
         .map_err(|e| anyhow!("WebAuthn auth start failed: {:?}", e))?;
+
+    let credential_keys = redis
+        .keys_raw(&format!("{}/*", CREDENTIAL_PREFIX))
+        .await?;
+    let prefix_len = CREDENTIAL_PREFIX.len() + 1; // "webauthn:credential/"
+    let allow_list: Vec<AllowCredentials> = credential_keys
+        .iter()
+        .filter_map(|key| {
+            let cred_id_b64 = &key[prefix_len..];
+            let bytes = URL_SAFE_NO_PAD.decode(cred_id_b64).ok()?;
+            Some(AllowCredentials {
+                type_: "public-key".to_string(),
+                id: Base64UrlSafeData::from(bytes),
+                transports: None,
+            })
+        })
+        .collect();
+    if !allow_list.is_empty() {
+        rcr.public_key.allow_credentials = allow_list;
+    }
 
     let challenge_b64 = URL_SAFE_NO_PAD.encode(&*rcr.public_key.challenge);
     redis
