@@ -45,6 +45,10 @@ pub struct Config {
     /// Log output format: "pretty" (default, human-readable) or "json" (structured).
     /// Env: `SIWEOIDC_LOG_FORMAT`
     pub log_format: String,
+    /// Matrix homeserver server_name (e.g. `matrix.inblock.io`).
+    /// Used for cross-signing pre-flight checks during device approval.
+    /// Env: `SIWEOIDC_MATRIX_SERVER_NAME`
+    pub matrix_server_name: Option<String>,
 }
 
 impl Default for Config {
@@ -71,6 +75,7 @@ impl Default for Config {
             mas_shared_secret: None,
             synapse_endpoint: None,
             log_format: "pretty".to_string(),
+            matrix_server_name: None,
         }
     }
 }

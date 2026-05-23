@@ -244,6 +244,7 @@ Prefix: `SIWEOIDC_` (via Figment: `siwe-oidc.toml` or env vars)
 | `SIWEOIDC_RP_ID` | WebAuthn Relying Party ID (domain) | hostname of `BASE_URL` |
 | `SIWEOIDC_RP_ORIGIN` | WebAuthn expected origin URL | `BASE_URL` |
 | `SIWEOIDC_LOG_FORMAT` | Log output format | `pretty` (or `json`) |
+| `SIWEOIDC_MATRIX_SERVER_NAME` | Matrix server_name for cross-signing checks | (none) |
 
 **For passkey login:** add `"key"` to `SIWEOIDC_SUPPORTED_DID_METHODS` so the `did:key:zDn…`
 DIDs derived from passkeys are accepted by `sign_in`.
@@ -389,6 +390,41 @@ and substitutes `primary_did` if a mapping exists.
 
 6. **"Session not found"** → session expired (300s TTL) between authenticate_finish
    and sign_in redirect. Check for network/proxy delays.
+
+### QR code login (Element X) succeeds but then fails
+
+**Symptom:** The device approval page shows "Device approved", siwx-oidc logs
+confirm tokens were issued, but Element X shows a login failure after ~30-60s.
+
+**Root cause:** The user's Element Web session has no Secure Backup (cross-signing
+keys). MSC4108 Phase 4 requires Element Web to transfer cross-signing private keys
+to Element X via the rendezvous channel. Without cross-signing, Element Web has
+nothing to transfer, the rendezvous session expires, and Element X aborts.
+
+**Fix:** Set up Secure Backup in Element Web **before** using QR code login:
+1. Log in to Element Web with wallet or passkey
+2. Go to Settings > Security & Privacy > Set up Secure Backup
+3. Complete the key backup setup
+4. Then use "Link new device" to add Element X
+
+**Pre-flight warning:** When `SIWEOIDC_MATRIX_SERVER_NAME` is configured, the
+device approval page checks for cross-signing keys and warns the user if they
+are missing. Set this env var to the Matrix server_name (e.g. `matrix.inblock.io`).
+
+**Why cross-signing can't auto-bootstrap:** Cross-signing key generation requires
+the same security flow the user signed in with (wallet signature or passkey
+ceremony). The OIDC provider can't generate these keys on behalf of the user
+because they are E2EE secrets that only the client should hold. This is by design
+(W3C WebAuthn, NIST SP 800-63B): credential material never leaves the client.
+With MAS (Matrix Authentication Service), the Element Web client bootstraps
+cross-signing automatically after login because MAS has a tightly integrated UIA
+(User-Interactive Authentication) flow. With siwx-oidc as an external OIDC
+provider, Element Web falls back to manual Secure Backup setup because the UIA
+bridge is not present.
+
+**Diagnostic:** Check Synapse logs for `has no master cross-signing key` warnings
+during device provisioning. Check siwx-oidc logs for `device approval: user has
+no cross-signing keys` warnings.
 
 ### CAIP-122 wallet login fails
 

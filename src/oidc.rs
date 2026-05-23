@@ -1152,7 +1152,7 @@ pub struct SignInParams {
 
 /// Derive a Matrix-compatible localpart from a DID by replacing colons with
 /// dashes and lowercasing.
-fn did_to_localpart(did: &str) -> String {
+pub(crate) fn did_to_localpart(did: &str) -> String {
     did.replace(':', "-").to_lowercase()
 }
 

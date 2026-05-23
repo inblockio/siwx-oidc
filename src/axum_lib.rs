@@ -365,8 +365,10 @@ async fn device_verify_handler(
 async fn device_approve_handler(
     State(state): State<AppState>,
     Json(req): Json<device_auth::DeviceApproveRequest>,
-) -> Result<axum::response::Html<String>, CustomError> {
-    device_auth::device_approve(&state.config, &state.redis_client, req).await
+) -> Result<Json<device_auth::DeviceApproveResponse>, CustomError> {
+    let synapse = state.synapse_client.as_deref();
+    let resp = device_auth::device_approve(&state.config, &state.redis_client, req, synapse).await?;
+    Ok(Json(resp))
 }
 
 async fn device_passkey_start_handler(
@@ -386,7 +388,7 @@ async fn device_passkey_start_handler(
 async fn device_passkey_finish_handler(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
-) -> Result<axum::response::Html<String>, CustomError> {
+) -> Result<Json<device_auth::DeviceApproveResponse>, CustomError> {
     let user_code = payload
         .get("user_code")
         .and_then(|v| v.as_str())
@@ -404,7 +406,17 @@ async fn device_passkey_finish_handler(
     )
     .await
     .map_err(|e| CustomError::BadRequest(e.to_string()))?;
-    device_auth::device_approve_passkey(&state.redis_client, &user_code, &resp.did).await
+    let synapse = state.synapse_client.as_deref();
+    let server_name = state.config.matrix_server_name.as_deref();
+    let result = device_auth::device_approve_passkey(
+        &state.redis_client,
+        &user_code,
+        &resp.did,
+        synapse,
+        server_name,
+    )
+    .await?;
+    Ok(Json(result))
 }
 
 // -- WebAuthn route handlers -----------------------------------------------

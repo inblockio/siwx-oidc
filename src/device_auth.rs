@@ -1,11 +1,12 @@
 use axum::response::Html;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::introspect::generate_opaque_token;
-use crate::oidc::CustomError;
+use crate::oidc::{did_to_localpart, CustomError};
+use crate::synapse_client::SynapseClient;
 use siwx_oidc::db::*;
 
 /// Consonant alphabet for user codes (base-20, no vowels to avoid profanity).
@@ -573,8 +574,10 @@ async function approveWallet() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ user_code: currentUserCode, action: 'approve', did, message, signature })
     });
-    if (r.ok) { showTerminal('approved'); }
-    else { const t = await r.text(); showStatus(t || 'Approval failed.', true); }
+    if (r.ok) {
+      const data = await r.json().catch(() => ({}));
+      showTerminal(data.status || 'approved', data.warning);
+    } else { const t = await r.text(); showStatus(t || 'Approval failed.', true); }
   } catch (e) {
     showStatus('Wallet error: ' + (e.message || e), true);
   } finally {
@@ -618,8 +621,10 @@ async function approvePasskey() {
         }
       })
     });
-    if (finishR.ok) { showTerminal('approved'); }
-    else { const t = await finishR.text(); showStatus(t || 'Passkey authentication failed.', true); }
+    if (finishR.ok) {
+      const data = await finishR.json().catch(() => ({}));
+      showTerminal(data.status || 'approved', data.warning);
+    } else { const t = await finishR.text(); showStatus(t || 'Passkey authentication failed.', true); }
   } catch (e) {
     showStatus('Passkey error: ' + (e.message || e), true);
   } finally {
@@ -645,19 +650,26 @@ async function denyDevice() {
 const CHECK_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="success-icon"><path fill-rule="evenodd" d="M2.25 12c0-5.385 4.365-9.75 9.75-9.75s9.75 4.365 9.75 9.75-4.365 9.75-9.75 9.75S2.25 17.385 2.25 12Zm13.36-1.814a.75.75 0 1 0-1.22-.872l-3.236 4.53L9.53 12.22a.75.75 0 0 0-1.06 1.06l2.25 2.25a.75.75 0 0 0 1.14-.094l3.75-5.25Z" clip-rule="evenodd"/></svg>';
 const X_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="denied-icon"><path fill-rule="evenodd" d="M12 2.25c-5.385 0-9.75 4.365-9.75 9.75s4.365 9.75 9.75 9.75 9.75-4.365 9.75-9.75S17.385 2.25 12 2.25Zm-1.72 6.97a.75.75 0 1 0-1.06 1.06L10.94 12l-1.72 1.72a.75.75 0 1 0 1.06 1.06L12 13.06l1.72 1.72a.75.75 0 1 0 1.06-1.06L13.06 12l1.72-1.72a.75.75 0 1 0-1.06-1.06L12 10.94l-1.72-1.72Z" clip-rule="evenodd"/></svg>';
 
-function showTerminal(kind) {
+function showTerminal(kind, warning) {
   $('code-section').classList.add('hidden');
   $('auth-section').classList.add('hidden');
   hideStatus();
   const section = $('terminal-section');
   const badge = $('terminal-badge');
   const title = $('terminal-title');
+  const subtitle = $('terminal-subtitle');
   if (kind === 'approved') {
     badge.innerHTML = CHECK_SVG;
     title.textContent = 'Device approved';
   } else {
     badge.innerHTML = X_SVG;
     title.textContent = 'Device denied';
+  }
+  if (warning) {
+    subtitle.textContent = warning;
+    subtitle.style.color = 'var(--accent-deep)';
+  } else {
+    subtitle.textContent = 'You can close this page.';
   }
   section.classList.remove('hidden');
 }
@@ -707,10 +719,7 @@ function bufferToBase64(buf) {
 }
 "#;
 
-/// Render a terminal-state page (approved / denied) using the same visual
-/// language as `device_page`. Used as the response body for direct (non-AJAX)
-/// device approval submissions and as a graceful fallback if the client-side
-/// JavaScript fails to take over the UI.
+#[cfg(test)]
 fn terminal_page(kind: TerminalKind) -> Html<String> {
     let (title, icon_svg) = match kind {
         TerminalKind::Approved => (
@@ -758,9 +767,45 @@ fn terminal_page(kind: TerminalKind) -> Html<String> {
 }
 
 #[derive(Copy, Clone)]
+#[cfg(test)]
 enum TerminalKind {
     Approved,
     Denied,
+}
+
+#[derive(Serialize)]
+pub struct DeviceApproveResponse {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+const CROSS_SIGNING_WARNING: &str =
+    "Your account has no Secure Backup set up. \
+     The QR code login will fail because encryption keys cannot be transferred. \
+     Please set up Secure Backup in Element Web first, then retry the QR code flow.";
+
+async fn check_cross_signing(
+    did: &str,
+    synapse_client: Option<&SynapseClient>,
+    server_name: Option<&str>,
+) -> Option<String> {
+    let (synapse, sn) = match (synapse_client, server_name) {
+        (Some(s), Some(n)) => (s, n),
+        _ => return None,
+    };
+    let localpart = did_to_localpart(did);
+    match synapse.has_cross_signing_keys(&localpart, sn).await {
+        Ok(true) => None,
+        Ok(false) => {
+            warn!(did = %did, "device approval: user has no cross-signing keys");
+            Some(CROSS_SIGNING_WARNING.to_string())
+        }
+        Err(e) => {
+            debug!("cross-signing check failed (skipping warning): {}", e);
+            None
+        }
+    }
 }
 
 /// Verify that a user code exists and is pending.
@@ -792,7 +837,8 @@ pub async fn device_approve(
     config: &Config,
     db_client: &(dyn DBClient + Sync),
     req: DeviceApproveRequest,
-) -> Result<Html<String>, CustomError> {
+    synapse_client: Option<&SynapseClient>,
+) -> Result<DeviceApproveResponse, CustomError> {
     let (device_code, mut entry) = db_client
         .get_device_code_by_user_code(&req.user_code)
         .await?
@@ -808,7 +854,10 @@ pub async fn device_approve(
             .update_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
             .await;
         info!(user_code = %req.user_code, "device denied");
-        return Ok(terminal_page(TerminalKind::Denied));
+        return Ok(DeviceApproveResponse {
+            status: "denied".to_string(),
+            warning: None,
+        });
     }
 
     // Approve: verify the wallet signature
@@ -852,6 +901,13 @@ pub async fn device_approve(
         ));
     }
 
+    let warning = check_cross_signing(
+        did,
+        synapse_client,
+        config.matrix_server_name.as_deref(),
+    )
+    .await;
+
     entry.status = DeviceCodeStatus::Approved;
     entry.did = Some(did.clone());
     let _ = db_client
@@ -859,7 +915,10 @@ pub async fn device_approve(
         .await;
     info!(user_code = %req.user_code, did = %did, "device approved");
 
-    Ok(terminal_page(TerminalKind::Approved))
+    Ok(DeviceApproveResponse {
+        status: "approved".to_string(),
+        warning,
+    })
 }
 
 /// Process a device approval via passkey (WebAuthn).
@@ -868,7 +927,9 @@ pub async fn device_approve_passkey(
     db_client: &(dyn DBClient + Sync),
     user_code: &str,
     verified_did: &str,
-) -> Result<Html<String>, CustomError> {
+    synapse_client: Option<&SynapseClient>,
+    matrix_server_name: Option<&str>,
+) -> Result<DeviceApproveResponse, CustomError> {
     let (device_code, mut entry) = db_client
         .get_device_code_by_user_code(user_code)
         .await?
@@ -878,6 +939,9 @@ pub async fn device_approve_passkey(
         return Err(CustomError::BadRequest("Code already used".to_string()));
     }
 
+    let warning =
+        check_cross_signing(verified_did, synapse_client, matrix_server_name).await;
+
     entry.status = DeviceCodeStatus::Approved;
     entry.did = Some(verified_did.to_string());
     let _ = db_client
@@ -885,7 +949,10 @@ pub async fn device_approve_passkey(
         .await;
     info!(user_code = %user_code, did = %verified_did, "device approved via passkey");
 
-    Ok(terminal_page(TerminalKind::Approved))
+    Ok(DeviceApproveResponse {
+        status: "approved".to_string(),
+        warning,
+    })
 }
 
 #[cfg(test)]
