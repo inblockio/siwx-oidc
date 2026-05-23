@@ -303,9 +303,23 @@ Run `/deploy-check` for the full pre-deployment checklist.
 
 ### MSC3861 device lifecycle
 
-Device IDs are never recycled. Each login generates a fresh `SIWX_{uuid}`. The old
+**Two provisioning modes:**
+
+| Mode | Function | Behavior | Used by |
+|------|----------|----------|---------|
+| Replacement | `provision_synapse_device` | Deletes old device, creates `SIWX_{uuid}` | Regular sign_in (Element Web) |
+| Additive | `provision_synapse_device_additive` | Upserts without deleting existing devices | Device code grant (QR login) |
+
+**Replacement mode (sign_in):** Each login generates a fresh `SIWX_{uuid}`. The old
 device (if any) is deleted from Synapse first. Both `revoke` and `logout` handlers
 call `delete_device` for cleanup. `allow_cross_signing_reset` fires unconditionally.
+
+**Additive mode (device_code grant):** The device_code flow honors the client-proposed
+device_id from the scope (`urn:matrix:client:device:XXX`). Element X sends its own
+device_id in the scope of `POST /device_authorization`; the token endpoint extracts it
+via `extract_device_id_from_scope()` and provisions that exact device_id on Synapse
+without deleting existing devices. Falls back to replacement mode if no device_id is
+in the scope.
 
 **Why no recycling:** Synapse's `delete_device` (MAS API) does not remove cross-signing
 signatures, and its signature-upload handler skips new uploads when a stale one exists.
