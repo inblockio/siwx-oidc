@@ -188,7 +188,7 @@ Settings > Sessions).
 |-----|-------------|---------|
 | `SIWEOIDC_DEVICE_CODE_EXPIRY` | Device code lifetime in seconds | `1800` (30 min) |
 | `SIWEOIDC_DEVICE_CODE_INTERVAL` | Minimum polling interval in seconds | `5` |
-| `SIWEOIDC_USER_CODE_LENGTH` | User code length (characters) | `8` |
+| `SIWEOIDC_USER_CODE_LENGTH` | User code length (characters) | `6` |
 | `SIWEOIDC_USER_CODE_CHARSET` | Character set for user codes | `BCDFGHJKLMNPQRSTVWXZ` (base-20, no vowels) |
 
 ### Synapse homeserver.yaml
@@ -243,7 +243,7 @@ Parameters:
 Logic:
 1. Validate client_id exists in Redis
 2. Generate high-entropy `device_code` (32+ bytes, base62)
-3. Generate human-readable `user_code` (8 chars, base-20: `BCDFGHJKLMNPQRSTVWXZ`, hyphenated: `WDJB-MJHT`)
+3. Generate human-readable `user_code` (6 chars, base-20: `BCDFGHJKLMNPQRSTVWXZ`, hyphenated: `WDJ-BMJ`)
 4. Store `device_code:{code}` in Redis with TTL = `expires_in`
 5. Store `user_code:{code}` in Redis with TTL = `expires_in` (reverse lookup)
 6. Return JSON response
@@ -252,9 +252,9 @@ Response:
 ```json
 {
   "device_code": "...",
-  "user_code": "WDJB-MJHT",
+  "user_code": "WDJ-BMJ",
   "verification_uri": "{base_url}/device",
-  "verification_uri_complete": "{base_url}/device?user_code=WDJB-MJHT",
+  "verification_uri_complete": "{base_url}/device?user_code=WDJ-BMJ",
   "expires_in": 1800,
   "interval": 5
 }

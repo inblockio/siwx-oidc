@@ -83,7 +83,7 @@ No `inventory` crate (WASM-unsafe).
 **Device code flow (RFC 8628, for Element X QR code login):**
 1. `POST /device_authorization` → device_code + user_code + verification_uri
 2. Device polls `POST /token` with `grant_type=urn:ietf:params:oauth:grant-type:device_code`
-3. User opens `/device?user_code=XXXX-XXXX`, authenticates with wallet/passkey
+3. User opens `/device?user_code=XXX-XXX`, authenticates with wallet/passkey
 4. Approval updates device code status → next poll returns tokens + provisions Synapse device
 
 ## Token model
@@ -314,12 +314,12 @@ Run `/deploy-check` for the full pre-deployment checklist.
 device (if any) is deleted from Synapse first. Both `revoke` and `logout` handlers
 call `delete_device` for cleanup. `allow_cross_signing_reset` fires unconditionally.
 
-**Additive mode (device_code grant):** The device_code flow honors the client-proposed
-device_id from the scope (`urn:matrix:client:device:XXX`). Element X sends its own
-device_id in the scope of `POST /device_authorization`; the token endpoint extracts it
-via `extract_device_id_from_scope()` and provisions that exact device_id on Synapse
-without deleting existing devices. Falls back to replacement mode if no device_id is
-in the scope.
+**Additive mode (device_code grant):** The device_code flow ALWAYS uses additive
+provisioning, never replacement. If the client includes a device_id in the scope
+(`urn:matrix:client:device:XXX` or `urn:matrix:org.matrix.msc2967.client:device:XXX`),
+that exact device_id is provisioned. If no device_id is in the scope, a `SIWX_{uuid}`
+is generated. In both cases, existing devices are preserved. The token response
+includes the scope so clients can discover the actual provisioned device_id.
 
 **Why no recycling:** Synapse's `delete_device` (MAS API) does not remove cross-signing
 signatures, and its signature-upload handler skips new uploads when a stale one exists.
