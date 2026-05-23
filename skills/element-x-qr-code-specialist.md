@@ -50,7 +50,7 @@ Element X (mobile)                    Element Web (desktop, logged in)
 | Layer | Protocol | Purpose | Status |
 |-------|----------|---------|--------|
 | Transport | MSC4108 rendezvous (2024 version) | Encrypted device-to-device relay via Synapse | Built into Synapse >= 1.106.0 |
-| Auth | RFC 8628 / MSC4341 | Device Authorization Grant | Must be implemented in siwx-oidc |
+| Auth | RFC 8628 / MSC4341 | Device Authorization Grant | Implemented in siwx-oidc |
 | Tokens | MSC3861 | OIDC delegated auth, token introspection | Already implemented |
 | E2EE | MSC4108 Phase 4 | Cross-signing key transfer via rendezvous | Handled by Element clients |
 
@@ -76,12 +76,12 @@ so only the 2024 version works.
 | Component | Status | Blocker? |
 |-----------|--------|----------|
 | Synapse rendezvous server | Available (>= 1.106.0, current is 1.153.0+) | No |
-| Synapse `msc4108_enabled` config | Not yet added to entrypoint | Config only |
-| Reverse proxy (Caddy) | Works, may need ETag-safe config | Minor |
-| siwx-oidc: `POST /device_authorization` | **NOT IMPLEMENTED** | **PRIMARY BLOCKER** |
-| siwx-oidc: `POST /token` device_code grant | **NOT IMPLEMENTED** | **PRIMARY BLOCKER** |
-| siwx-oidc: `GET /device` approval page | **NOT IMPLEMENTED** | **PRIMARY BLOCKER** |
-| siwx-oidc: OIDC discovery update | **NOT IMPLEMENTED** | **BLOCKER** |
+| Synapse `msc4108_enabled` config | Deployed | No |
+| Reverse proxy (Caddy) | Works | No |
+| siwx-oidc: `POST /device_authorization` | Implemented | No |
+| siwx-oidc: `POST /token` device_code grant | Implemented (honors client device_id from scope) | No |
+| siwx-oidc: `GET /device` approval page | Implemented (wallet + passkey) | No |
+| siwx-oidc: OIDC discovery update | Implemented | No |
 | Element Web: "Link new device" UI | Available in production Element Web | No |
 | Element X: QR code scanning | Available in production Element X | No |
 
