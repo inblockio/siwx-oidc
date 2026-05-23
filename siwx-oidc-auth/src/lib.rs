@@ -491,7 +491,7 @@ pub async fn refresh(
 // ---------------------------------------------------------------------------
 
 fn extract_did_from_id_token(id_token: &str) -> Option<String> {
-    let payload = id_token.splitn(3, '.').nth(1)?;
+    let payload = id_token.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     claims.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string())

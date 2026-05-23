@@ -242,8 +242,8 @@ pub async fn authenticate_finish(
 
     let params = WebAuthnAssertionParams {
         credential_public_key: &compressed_pubkey,
-        authenticator_data: &*auth_response.response.authenticator_data,
-        client_data_json: &*auth_response.response.client_data_json,
+        authenticator_data: &auth_response.response.authenticator_data,
+        client_data_json: &auth_response.response.client_data_json,
         signature: &sig_bytes,
         expected_challenge: &challenge_bytes,
         expected_origin: rp_origin,
@@ -286,14 +286,12 @@ pub async fn authenticate_finish(
         let mut passkey_value: serde_json::Value = serde_json::from_str(&cred_json)?;
         if let Some(cred) = passkey_value.get_mut("cred") {
             let stored_counter = cred.get("counter").and_then(|c| c.as_u64()).unwrap_or(0) as u32;
-            if new_counter > 0 || stored_counter > 0 {
-                if new_counter < stored_counter {
-                    return Err(anyhow!(
-                        "Sign count regression (stored={}, got={}), possible cloned authenticator",
-                        stored_counter,
-                        new_counter
-                    ));
-                }
+            if (new_counter > 0 || stored_counter > 0) && new_counter < stored_counter {
+                return Err(anyhow!(
+                    "Sign count regression (stored={}, got={}), possible cloned authenticator",
+                    stored_counter,
+                    new_counter
+                ));
             }
             cred["counter"] = serde_json::json!(new_counter);
         }
