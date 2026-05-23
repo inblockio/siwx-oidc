@@ -122,14 +122,24 @@ openssl genpkey -algorithm Ed25519 -out identity.pem
 # Print the DID for registration
 siwx-oidc-auth --print-did --key-file identity.pem
 
-# Authenticate and get OIDC tokens
+# Authenticate and get OIDC tokens (includes refresh_token)
 siwx-oidc-auth --server https://siwx.example.com \
   --client-id my-service --redirect-uri https://app/callback \
+  --key-file identity.pem
+
+# Refresh tokens without re-authenticating (no --redirect-uri needed)
+siwx-oidc-auth --server https://siwx.example.com \
+  --client-id my-service --refresh-token "<refresh_token_value>" \
   --key-file identity.pem
 ```
 
 Key input priority: `--key-file` > `SIWX_KEY_FILE` env > `--key-hex` > generate ephemeral.
 PEM format is canonical (PKCS#8, auto-detects Ed25519 vs P-256).
+
+**Refresh tokens:** Both standalone and MSC3861 modes issue refresh tokens (24h TTL).
+The `refresh()` library function and `--refresh-token` CLI flag exchange a refresh
+token for new access + refresh tokens without repeating the full CAIP-122 sign-in.
+The server rotates the refresh token on each use (old token is deleted).
 
 ## Config env vars
 

@@ -402,13 +402,6 @@ async fn token_refresh(
     config: &crate::config::Config,
     db_client: &DBClientType,
 ) -> Result<CoreTokenResponse, CustomError> {
-    if config.mas_shared_secret.is_none() {
-        return Err(CustomError::BadRequestToken(TokenError {
-            error: CoreErrorResponseType::UnsupportedGrantType,
-            error_description: "refresh_token grant requires MSC3861 mode.".to_string(),
-        }));
-    }
-
     let rt = form.refresh_token.ok_or_else(|| {
         CustomError::BadRequestToken(TokenError {
             error: CoreErrorResponseType::InvalidRequest,
@@ -433,9 +426,15 @@ async fn token_refresh(
         }));
     }
 
+    let (access_prefix, refresh_prefix) = if config.mas_shared_secret.is_some() {
+        ("mat_", "mcr_")
+    } else {
+        ("", "")
+    };
+
     let now = Utc::now().timestamp();
 
-    let new_access = generate_opaque_token("mat_");
+    let new_access = generate_opaque_token(access_prefix);
     let access_meta = TokenMetadata {
         username: metadata.username.clone(),
         device_id: metadata.device_id.clone(),
@@ -450,7 +449,7 @@ async fn token_refresh(
         .set_token(&new_access, &access_meta, ACCESS_TOKEN_TTL)
         .await?;
 
-    let new_refresh = generate_opaque_token("mcr_");
+    let new_refresh = generate_opaque_token(refresh_prefix);
     let refresh_meta = TokenMetadata {
         username: metadata.username.clone(),
         device_id: metadata.device_id.clone(),
@@ -572,77 +571,73 @@ async fn token_authorization_code(
     let msc3861_mode = config.mas_shared_secret.is_some();
 
     let now = Utc::now();
-    let (access_token, refresh_token, cached_claims) = if msc3861_mode {
-        let opaque = generate_opaque_token("mat_");
-        let username = did_to_localpart(&code_entry.did);
+    let iat = now.timestamp();
+    let username = did_to_localpart(&code_entry.did);
+    let claims = resolve_claims(config, &code_entry.did).await;
+    let display_name = claims
+        .name()
+        .and_then(|n| n.get(None))
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| code_entry.did.clone());
+
+    let (access_prefix, refresh_prefix, scope) = if msc3861_mode {
         let device_id = code_entry
             .device_id
             .clone()
-            .unwrap_or_else(|| format!("SIWX_{}", &opaque[4..12]));
-        let iat = now.timestamp();
-        let scope = format!(
-            "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
-            device_id
-        );
-        let claims = resolve_claims(config, &code_entry.did).await;
-        let display_name = claims
-            .name()
-            .and_then(|n| n.get(None))
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| code_entry.did.clone());
-        let access_metadata = TokenMetadata {
-            username: username.clone(),
-            device_id: device_id.clone(),
-            scope: scope.clone(),
-            client_id: client_id.clone(),
-            iat,
-            exp: iat + ACCESS_TOKEN_TTL as i64,
-            did: code_entry.did.clone(),
-            name: display_name.clone(),
-        };
-        db_client
-            .set_token(&opaque, &access_metadata, ACCESS_TOKEN_TTL)
-            .await?;
-
-        let refresh_opaque = generate_opaque_token("mcr_");
-        let refresh_metadata = TokenMetadata {
-            username,
-            device_id,
-            scope,
-            client_id: client_id.clone(),
-            iat,
-            exp: iat + REFRESH_TOKEN_TTL as i64,
-            did: code_entry.did.clone(),
-            name: display_name,
-        };
-        db_client
-            .set_token(&refresh_opaque, &refresh_metadata, REFRESH_TOKEN_TTL)
-            .await?;
-
+            .unwrap_or_default();
         (
-            AccessToken::new(opaque),
-            Some(RefreshToken::new(refresh_opaque)),
-            Some(claims),
+            "mat_",
+            "mcr_",
+            format!(
+                "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
+                device_id
+            ),
         )
     } else {
-        let access_token_id = Uuid::new_v4().to_string();
-        db_client
-            .set_code(access_token_id.clone(), code_entry.clone())
-            .await?;
-        (AccessToken::new(access_token_id), None, None)
+        ("", "", "openid profile".to_string())
     };
 
-    let resolved = match cached_claims {
-        Some(c) => c,
-        None => resolve_claims(config, &code_entry.did).await,
+    let device_id = code_entry.device_id.clone().unwrap_or_default();
+
+    let opaque = generate_opaque_token(access_prefix);
+    let access_metadata = TokenMetadata {
+        username: username.clone(),
+        device_id: device_id.clone(),
+        scope: scope.clone(),
+        client_id: client_id.clone(),
+        iat,
+        exp: iat + ACCESS_TOKEN_TTL as i64,
+        did: code_entry.did.clone(),
+        name: display_name.clone(),
     };
+    db_client
+        .set_token(&opaque, &access_metadata, ACCESS_TOKEN_TTL)
+        .await?;
+
+    let refresh_opaque = generate_opaque_token(refresh_prefix);
+    let refresh_metadata = TokenMetadata {
+        username,
+        device_id,
+        scope,
+        client_id: client_id.clone(),
+        iat,
+        exp: iat + REFRESH_TOKEN_TTL as i64,
+        did: code_entry.did.clone(),
+        name: display_name,
+    };
+    db_client
+        .set_token(&refresh_opaque, &refresh_metadata, REFRESH_TOKEN_TTL)
+        .await?;
+
+    let access_token = AccessToken::new(opaque);
+    let refresh_token = Some(RefreshToken::new(refresh_opaque));
 
     let core_id_token = CoreIdTokenClaims::new(
         IssuerUrl::from_url(config.base_url.clone()),
         vec![Audience::new(client_id.clone())],
         now + Duration::seconds(config.id_token_ttl_secs as i64),
         now,
-        resolved,
+        claims,
         EmptyAdditionalClaims {},
     )
     .set_nonce(code_entry.nonce)
@@ -657,11 +652,7 @@ async fn token_authorization_code(
     )
     .map_err(|e| anyhow!("{}", e))?;
 
-    let expires_in_secs = if msc3861_mode {
-        ACCESS_TOKEN_TTL
-    } else {
-        ENTRY_LIFETIME as u64
-    };
+    let expires_in_secs = ACCESS_TOKEN_TTL;
 
     let mut response = CoreTokenResponse::new(
         access_token,
@@ -1316,25 +1307,17 @@ pub async fn userinfo(
         return Err(CustomError::BadRequest("Missing access token.".to_string()));
     };
 
-    // MSC3861 opaque tokens: if the token starts with `mat_`, look it up in the
-    // token store and synthesize the claims from TokenMetadata.
-    if token_str.starts_with("mat_") {
-        let metadata = db_client
-            .get_token(&token_str)
-            .await?
-            .ok_or_else(|| CustomError::BadRequest("Unknown or expired token.".to_string()))?;
+    // Try TokenMetadata first (covers both MSC3861 mat_ tokens and standalone tokens).
+    if let Some(metadata) = db_client.get_token(&token_str).await? {
         if metadata.exp <= Utc::now().timestamp() {
             return Err(CustomError::BadRequest("Token expired.".to_string()));
         }
-        // Reconstruct the DID from the stored username (reverse the colon->dash mapping).
-        // The username is stored as e.g. "did-pkh-eip155-1-0xABC..." so we reverse dashes to colons.
-        let did = metadata.username.replace('-', ":");
         let client_entry = db_client
             .get_client(metadata.client_id.clone())
             .await?
             .ok_or_else(|| CustomError::BadRequest("Unknown client.".to_string()))?;
         let response = CoreUserInfoClaims::new(
-            resolve_claims(config, &did).await,
+            resolve_claims(config, &metadata.did).await,
             EmptyAdditionalClaims::default(),
         )
         .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
@@ -1348,11 +1331,11 @@ pub async fn userinfo(
         };
     }
 
-    // Legacy path: UUID-based access token backed by code entry.
+    // Legacy fallback: UUID-based access token backed by code entry (pre-refresh-token deployments).
     let code_entry = if let Some(c) = db_client.get_code(token_str).await? {
         c
     } else {
-        return Err(CustomError::BadRequest("Unknown code.".to_string()));
+        return Err(CustomError::BadRequest("Unknown token.".to_string()));
     };
 
     let client_entry = if let Some(c) = db_client.get_client(code_entry.client_id.clone()).await? {
