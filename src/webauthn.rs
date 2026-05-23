@@ -203,12 +203,15 @@ pub async fn authenticate_start(
     Ok(rcr)
 }
 
-pub async fn authenticate_finish(
+/// Core WebAuthn assertion verification: challenge retrieval, credential lookup,
+/// cryptographic verification, counter update, and DID resolution. Shared by
+/// both the OIDC login flow and the device approval flow.
+pub async fn verify_credential(
     redis: &RedisClient,
     session_id: &str,
     rp_id: &str,
     rp_origin: &str,
-    auth_response: PublicKeyCredential,
+    auth_response: &PublicKeyCredential,
 ) -> Result<AuthenticateFinishResponse> {
     let challenge_key = format!("{}/{}", CHALLENGE_PREFIX, session_id);
     let challenge_b64 = redis
@@ -271,7 +274,7 @@ pub async fn authenticate_finish(
             let link_entry: LinkEntry = serde_json::from_str(&link_json)
                 .map_err(|e| anyhow!("Failed to deserialize link entry: {}", e))?;
             info!(
-                "webauthn authenticate_finish: linked cred={} primary_did={}",
+                "webauthn verify_credential: linked cred={} primary_did={}",
                 cred_id_b64, link_entry.primary_did
             );
             link_entry.primary_did
@@ -300,6 +303,24 @@ pub async fn authenticate_finish(
             .await?;
     }
 
+    info!(
+        "webauthn verify_credential: did={} cred={}",
+        did, cred_id_b64
+    );
+    Ok(AuthenticateFinishResponse { ok: true, did })
+}
+
+/// Full authenticate-finish for the OIDC login flow: verifies the credential
+/// AND stores the verified DID in the Redis session (needed by `sign_in`).
+pub async fn authenticate_finish(
+    redis: &RedisClient,
+    session_id: &str,
+    rp_id: &str,
+    rp_origin: &str,
+    auth_response: PublicKeyCredential,
+) -> Result<AuthenticateFinishResponse> {
+    let resp = verify_credential(redis, session_id, rp_id, rp_origin, &auth_response).await?;
+
     let session_key = format!("sessions/{}", session_id);
     let session_json = redis
         .get_raw(&session_key)
@@ -307,7 +328,7 @@ pub async fn authenticate_finish(
         .ok_or_else(|| anyhow!("Session not found"))?;
     let mut session: siwx_oidc::db::SessionEntry = serde_json::from_str(&session_json)
         .map_err(|e| anyhow!("Failed to deserialize session: {}", e))?;
-    session.verified_did = Some(did.clone());
+    session.verified_did = Some(resp.did.clone());
     let updated_session = serde_json::to_string(&session)
         .map_err(|e| anyhow!("Failed to serialize session: {}", e))?;
     redis
@@ -318,11 +339,7 @@ pub async fn authenticate_finish(
         )
         .await?;
 
-    info!(
-        "webauthn authenticate_finish: did={} cred={}",
-        did, cred_id_b64
-    );
-    Ok(AuthenticateFinishResponse { ok: true, did })
+    Ok(resp)
 }
 
 // -- Account linking ceremony (Phase 2) ------------------------------------

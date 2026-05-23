@@ -395,12 +395,12 @@ async fn device_passkey_finish_handler(
     let auth_response: PublicKeyCredential = serde_json::from_value(payload.clone())
         .map_err(|e| CustomError::BadRequest(format!("Invalid credential: {}", e)))?;
     let session_id = format!("device_passkey_{}", user_code);
-    let resp = wa::authenticate_finish(
+    let resp = wa::verify_credential(
         &state.redis_client,
         &session_id,
         &state.rp_id,
         &state.rp_origin,
-        auth_response,
+        &auth_response,
     )
     .await?;
     device_auth::device_approve_passkey(&state.redis_client, &user_code, &resp.did).await

@@ -597,7 +597,7 @@ async function approvePasskey() {
     if (options.publicKey.allowCredentials) {
       options.publicKey.allowCredentials = options.publicKey.allowCredentials.map((c) => ({ ...c, id: base64ToBuffer(c.id) }));
     }
-    const credential = await navigator.credentials.get(options);
+    const credential = await navigator.credentials.get({ publicKey: options.publicKey });
     const finishR = await fetch(BASE + '/device/passkey/finish', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -688,7 +688,8 @@ function setBusy(id, busy, label) {
 }
 
 function base64ToBuffer(b64) {
-  const s = b64.replace(/-/g, '+').replace(/_/g, '/');
+  const padding = '='.repeat((4 - (b64.length % 4)) % 4);
+  const s = (b64 + padding).replace(/-/g, '+').replace(/_/g, '/');
   const raw = atob(s);
   const buf = new Uint8Array(raw.length);
   for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
