@@ -554,14 +554,24 @@ async fn token_device_code(
                 .ok_or_else(|| device_code_error("server_error", "Approved but no DID."))?
                 .clone();
 
-            let device_id = provision_synapse_device(
-                &did, synapse_client, db_client, "Element X",
-            ).await;
+            let proposed_device_id = extract_device_id_from_scope(&entry.scope);
+
+            let dev_id = if let Some(ref proposed) = proposed_device_id {
+                debug!(proposed_device_id = %proposed, "using client-proposed device_id from scope");
+                provision_synapse_device_additive(
+                    &did, synapse_client, db_client, proposed, "Element X",
+                ).await;
+                proposed.clone()
+            } else {
+                let device_id = provision_synapse_device(
+                    &did, synapse_client, db_client, "Element X",
+                ).await;
+                device_id.unwrap_or_else(|| format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]))
+            };
 
             let now = Utc::now();
             let iat = now.timestamp();
             let username = did_to_localpart(&did);
-            let dev_id = device_id.unwrap_or_else(|| format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]));
             let scope = format!(
                 "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
                 dev_id
@@ -1118,6 +1128,15 @@ fn did_to_localpart(did: &str) -> String {
     did.replace(':', "-").to_lowercase()
 }
 
+/// Extract a device_id from a scope string containing `urn:matrix:client:device:XXX`.
+fn extract_device_id_from_scope(scope: &str) -> Option<String> {
+    const PREFIX: &str = "urn:matrix:client:device:";
+    scope.split_whitespace()
+        .find(|s| s.starts_with(PREFIX))
+        .map(|s| s[PREFIX.len()..].to_string())
+        .filter(|id| !id.is_empty())
+}
+
 /// Provision a Synapse device for a DID. Best-effort: failures are logged
 /// but never fail the auth flow. Returns the new device_id if Synapse is configured.
 pub async fn provision_synapse_device(
@@ -1163,6 +1182,42 @@ pub async fn provision_synapse_device(
     }
 
     Some(dev_id)
+}
+
+/// Provision a Synapse device without deleting existing devices.
+/// Used by device_code grant (QR login) where we ADD a second device.
+async fn provision_synapse_device_additive(
+    did: &str,
+    synapse_client: Option<&SynapseClient>,
+    _db_client: &DBClientType,
+    device_id: &str,
+    display_name: &str,
+) -> Option<String> {
+    let synapse = synapse_client?;
+    let localpart = did_to_localpart(did);
+
+    match synapse.is_localpart_available(&localpart).await {
+        Ok(true) => {
+            if let Err(e) = synapse.provision_user(&localpart, did).await {
+                warn!("provision_user failed: {}", e);
+            }
+        }
+        Ok(false) => {}
+        Err(e) => warn!("is_localpart_available check failed: {}", e),
+    }
+
+    if let Err(e) = synapse
+        .upsert_device(&localpart, device_id, Some(display_name))
+        .await
+    {
+        warn!("upsert_device failed: {}", e);
+    }
+
+    if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
+        warn!("allow_cross_signing_reset failed: {}", e);
+    }
+
+    Some(device_id.to_string())
 }
 
 pub async fn sign_in(
@@ -1724,5 +1779,24 @@ mod tests {
         };
         let result = authorize(params, &db_client).await;
         assert!(result.is_ok(), "authorize must accept Matrix scopes: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_extract_device_id_from_scope() {
+        assert_eq!(
+            extract_device_id_from_scope(
+                "openid urn:matrix:client:api:* urn:matrix:client:device:W6ujlqyJoG5+BxH9eLdYgizkylgTS9z6ZzWqRM0FIBQ"
+            ),
+            Some("W6ujlqyJoG5+BxH9eLdYgizkylgTS9z6ZzWqRM0FIBQ".to_string())
+        );
+        assert_eq!(
+            extract_device_id_from_scope(
+                "openid urn:matrix:client:api:* urn:matrix:client:device:SIWX_43efbac7"
+            ),
+            Some("SIWX_43efbac7".to_string())
+        );
+        assert_eq!(extract_device_id_from_scope("openid"), None);
+        assert_eq!(extract_device_id_from_scope("openid urn:matrix:client:api:*"), None);
+        assert_eq!(extract_device_id_from_scope("openid urn:matrix:client:device:"), None);
     }
 }

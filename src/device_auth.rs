@@ -62,7 +62,7 @@ pub async fn device_authorization(
     let entry = DeviceCodeEntry {
         user_code: user_code.clone(),
         client_id: form.client_id,
-        scope,
+        scope: scope.clone(),
         status: DeviceCodeStatus::Pending,
         did: None,
         device_id: None,
@@ -86,6 +86,7 @@ pub async fn device_authorization(
     info!(
         device_code_prefix = &device_code[..8],
         user_code = %user_code,
+        scope = %scope,
         "device_authorization issued"
     );
 
