@@ -1142,11 +1142,19 @@ fn did_to_localpart(did: &str) -> String {
 
 /// Extract a device_id from a scope string containing `urn:matrix:client:device:XXX`.
 fn extract_device_id_from_scope(scope: &str) -> Option<String> {
-    const PREFIX: &str = "urn:matrix:client:device:";
+    const STABLE_PREFIX: &str = "urn:matrix:client:device:";
+    const MSC2967_PREFIX: &str = "urn:matrix:org.matrix.msc2967.client:device:";
     scope
         .split_whitespace()
-        .find(|s| s.starts_with(PREFIX))
-        .map(|s| s[PREFIX.len()..].to_string())
+        .find_map(|s| {
+            if s.starts_with(STABLE_PREFIX) {
+                Some(s[STABLE_PREFIX.len()..].to_string())
+            } else if s.starts_with(MSC2967_PREFIX) {
+                Some(s[MSC2967_PREFIX.len()..].to_string())
+            } else {
+                None
+            }
+        })
         .filter(|id| !id.is_empty())
 }
 
@@ -1797,6 +1805,7 @@ mod tests {
 
     #[test]
     fn test_extract_device_id_from_scope() {
+        // Stable prefix
         assert_eq!(
             extract_device_id_from_scope(
                 "openid urn:matrix:client:api:* urn:matrix:client:device:W6ujlqyJoG5+BxH9eLdYgizkylgTS9z6ZzWqRM0FIBQ"
@@ -1808,6 +1817,13 @@ mod tests {
                 "openid urn:matrix:client:api:* urn:matrix:client:device:SIWX_43efbac7"
             ),
             Some("SIWX_43efbac7".to_string())
+        );
+        // MSC2967 unstable prefix (used by Element X)
+        assert_eq!(
+            extract_device_id_from_scope(
+                "urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:CW2fdkGgZZW8StwGioe2CVKBb3685OjKt8wRUR0iZyc"
+            ),
+            Some("CW2fdkGgZZW8StwGioe2CVKBb3685OjKt8wRUR0iZyc".to_string())
         );
         assert_eq!(extract_device_id_from_scope("openid"), None);
         assert_eq!(
