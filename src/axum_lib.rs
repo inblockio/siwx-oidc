@@ -402,7 +402,8 @@ async fn device_passkey_finish_handler(
         &state.rp_origin,
         &auth_response,
     )
-    .await?;
+    .await
+    .map_err(|e| CustomError::BadRequest(e.to_string()))?;
     device_auth::device_approve_passkey(&state.redis_client, &user_code, &resp.did).await
 }
 
