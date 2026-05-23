@@ -334,4 +334,53 @@ impl DBClient for RedisClient {
         let key = format!("{}/{}", KV_DEVICE_PREFIX, did);
         self.del_raw(&key).await
     }
+
+    // -- RFC 8628 device code storage -----------------------------------------
+
+    async fn set_device_code(&self, device_code: &str, entry: &DeviceCodeEntry, ttl: u64) -> Result<()> {
+        let key = format!("device_codes/{}", device_code);
+        let value = serde_json::to_string(entry)
+            .map_err(|e| anyhow!("Failed to serialize DeviceCodeEntry: {}", e))?;
+        self.set_ex_raw(&key, &value, ttl).await
+    }
+
+    async fn get_device_code(&self, device_code: &str) -> Result<Option<DeviceCodeEntry>> {
+        let key = format!("device_codes/{}", device_code);
+        match self.get_raw(&key).await? {
+            Some(v) => Ok(Some(serde_json::from_str(&v)
+                .map_err(|e| anyhow!("Failed to deserialize DeviceCodeEntry: {}", e))?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn update_device_code(&self, device_code: &str, entry: &DeviceCodeEntry, ttl: u64) -> Result<()> {
+        self.set_device_code(device_code, entry, ttl).await
+    }
+
+    async fn delete_device_code(&self, device_code: &str) -> Result<()> {
+        let key = format!("device_codes/{}", device_code);
+        self.del_raw(&key).await
+    }
+
+    async fn get_device_code_by_user_code(&self, user_code: &str) -> Result<Option<(String, DeviceCodeEntry)>> {
+        let mapping_key = format!("user_codes/{}", user_code);
+        let device_code = match self.get_raw(&mapping_key).await? {
+            Some(dc) => dc,
+            None => return Ok(None),
+        };
+        match self.get_device_code(&device_code).await? {
+            Some(entry) => Ok(Some((device_code, entry))),
+            None => Ok(None),
+        }
+    }
+
+    async fn set_user_code_mapping(&self, user_code: &str, device_code: &str, ttl: u64) -> Result<()> {
+        let key = format!("user_codes/{}", user_code);
+        self.set_ex_raw(&key, device_code, ttl).await
+    }
+
+    async fn delete_user_code_mapping(&self, user_code: &str) -> Result<()> {
+        let key = format!("user_codes/{}", user_code);
+        self.del_raw(&key).await
+    }
 }
