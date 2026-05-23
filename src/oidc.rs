@@ -1147,13 +1147,9 @@ fn extract_device_id_from_scope(scope: &str) -> Option<String> {
     scope
         .split_whitespace()
         .find_map(|s| {
-            if s.starts_with(STABLE_PREFIX) {
-                Some(s[STABLE_PREFIX.len()..].to_string())
-            } else if s.starts_with(MSC2967_PREFIX) {
-                Some(s[MSC2967_PREFIX.len()..].to_string())
-            } else {
-                None
-            }
+            s.strip_prefix(STABLE_PREFIX)
+                .or_else(|| s.strip_prefix(MSC2967_PREFIX))
+                .map(|id| id.to_string())
         })
         .filter(|id| !id.is_empty())
 }
