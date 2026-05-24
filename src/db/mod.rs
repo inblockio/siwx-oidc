@@ -63,6 +63,9 @@ pub struct SessionEntry {
     /// When present, sign_in trusts this DID without re-verifying a CAIP-122 cookie.
     #[serde(default)]
     pub verified_did: Option<String>,
+    /// Original scope from /authorize, preserved so sign_in can extract a client-proposed device_id.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 /// Status of an RFC 8628 device authorization code.

@@ -995,6 +995,7 @@ pub async fn authorize(
                 secret: session_secret.clone(),
                 signin_count: 0,
                 verified_did: None,
+                scope: Some(params.scope.as_str().to_string()),
             },
         )
         .await?;
@@ -1178,11 +1179,16 @@ fn extract_device_id_from_scope(scope: &str) -> Option<String> {
 
 /// Provision a Synapse device for a DID. Best-effort: failures are logged
 /// but never fail the auth flow. Returns the new device_id if Synapse is configured.
+///
+/// If `proposed_device_id` is `Some`, that ID is used instead of generating a new
+/// `SIWX_{uuid}`. This supports clients (e.g. Element X) that propose a device_id
+/// in the authorization scope.
 pub async fn provision_synapse_device(
     did: &str,
     synapse_client: Option<&SynapseClient>,
     db_client: &DBClientType,
     display_name: &str,
+    proposed_device_id: Option<&str>,
 ) -> Option<String> {
     let synapse = synapse_client?;
     let localpart = did_to_localpart(did);
@@ -1193,7 +1199,12 @@ pub async fn provision_synapse_device(
             warn!("delete_device (cleanup) failed: {}", e);
         }
     }
-    let dev_id = format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]);
+    let dev_id = if let Some(proposed) = proposed_device_id {
+        info!(proposed_device_id = %proposed, "using client-proposed device_id from scope");
+        proposed.to_string()
+    } else {
+        format!("SIWX_{}", &Uuid::new_v4().to_string()[..8])
+    };
     debug!("new device_id={} for did={}", dev_id, did);
     if let Err(e) = db_client.set_device_id(did, &dev_id).await {
         warn!("failed to persist device_id: {}", e);
@@ -1393,7 +1404,19 @@ pub async fn sign_in(
         siwx_cookie.did
     };
 
-    let device_id = provision_synapse_device(&did, synapse_client, db_client, "Element Web").await;
+    // Extract client-proposed device_id from the session's stored scope (if any).
+    let proposed_device_id = session_entry
+        .scope
+        .as_deref()
+        .and_then(extract_device_id_from_scope);
+    let device_id = provision_synapse_device(
+        &did,
+        synapse_client,
+        db_client,
+        "Element Web",
+        proposed_device_id.as_deref(),
+    )
+    .await;
 
     let code_entry = CodeEntry {
         did,
