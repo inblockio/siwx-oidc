@@ -970,14 +970,14 @@ pub async fn authorize(
     }
     let _response_type = params.response_type.as_ref().unwrap();
 
-    let has_openid = params
-        .scope
-        .as_str()
-        .trim()
-        .split(' ')
-        .any(|s| s == "openid");
-    if !has_openid {
-        return Err(anyhow!("The 'openid' scope is required.").into());
+    let scope_str = params.scope.as_str().trim();
+    let scopes: Vec<&str> = scope_str.split(' ').filter(|s| !s.is_empty()).collect();
+    let has_openid = scopes.contains(&"openid");
+    let has_matrix_scope = scopes.iter().any(|s| s.starts_with("urn:matrix:"));
+    if !has_openid && !has_matrix_scope {
+        return Err(
+            anyhow!("The 'openid' scope or a Matrix scope (urn:matrix:*) is required.").into(),
+        );
     }
 
     let session_id = Uuid::new_v4();
@@ -1853,6 +1853,57 @@ mod tests {
         assert!(
             scope_strings.contains(&"urn:matrix:org.matrix.msc2967.client:device:*"),
             "missing unstable urn:matrix:org.matrix.msc2967.client:device:*"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_accepts_matrix_only_scopes_without_openid() {
+        let (_config, db_client) = default_config().await;
+        let params = AuthorizeParams {
+            client_id: "client".into(),
+            redirect_uri: RedirectUrl::from_url(
+                Url::parse("https://example.com").unwrap(),
+            ),
+            scope: Scope::new(
+                "urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:ABCDEF".to_string(),
+            ),
+            response_type: Some(CoreResponseType::Code),
+            state: Some("state".into()),
+            nonce: None,
+            prompt: None,
+            request_uri: None,
+            request: None,
+            code_challenge: None,
+            code_challenge_method: None,
+        };
+        let result = authorize(params, &db_client).await;
+        assert!(
+            result.is_ok(),
+            "authorize must accept Matrix-only scopes (no openid): {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_rejects_invalid_scope() {
+        let (_config, db_client) = default_config().await;
+        let params = AuthorizeParams {
+            client_id: "client".into(),
+            redirect_uri: RedirectUrl::from_url(Url::parse("https://example.com").unwrap()),
+            scope: Scope::new("profile email".to_string()),
+            response_type: Some(CoreResponseType::Code),
+            state: Some("state".into()),
+            nonce: None,
+            prompt: None,
+            request_uri: None,
+            request: None,
+            code_challenge: None,
+            code_challenge_method: None,
+        };
+        let result = authorize(params, &db_client).await;
+        assert!(
+            result.is_err(),
+            "authorize must reject scopes without openid or urn:matrix:*"
         );
     }
 
