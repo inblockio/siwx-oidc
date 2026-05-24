@@ -1013,7 +1013,8 @@ pub async fn authorize(
         .redirect_uri
         .url()
         .host()
-        .ok_or_else(|| CustomError::BadRequest("redirect_uri has no host".to_string()))?;
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| params.redirect_uri.url().scheme().to_string());
     let oidc_nonce_param = if let Some(n) = &params.nonce {
         format!("&oidc_nonce={}", n.secret())
     } else {
