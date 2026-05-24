@@ -146,6 +146,7 @@ async fn provider_metadata(
     value["revocation_endpoint"] = serde_json::json!(format!("{}/oauth2/revoke", base_url));
     value["token_endpoint_auth_methods_supported"] =
         serde_json::json!(["client_secret_post", "none"]);
+    value["prompt_values_supported"] = serde_json::json!(["login", "create"]);
     // MSC4191: account management discovery (stable v1.18)
     let account_uri = state
         .config
