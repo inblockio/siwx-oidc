@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terms of Use - inblock.io</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<link href="https://api.fontshare.com/v2/css?f[]=satoshi@300,400,500,600,700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #f5f5f5;
+  --card-bg: #ffffff;
+  --text: #1a1a1a;
+  --text-dim: rgba(0,0,0,0.4);
+  --text-mute: rgba(0,0,0,0.3);
+  --border: rgba(0,0,0,0.06);
+  --border-strong: rgba(0,0,0,0.12);
+  --accent: #E8611A;
+  --accent-strong: #EF5402;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  background: var(--bg);
+  font-family: 'Satoshi', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color: var(--text);
+  line-height: 1.7;
+  font-size: 15px;
+}
+
+.page {
+  position: relative;
+  min-height: 100vh;
+  padding: 32px 20px 60px;
+}
+
+.ambient-glow {
+  position: fixed;
+  top: -30%;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 800px;
+  height: 600px;
+  background: radial-gradient(
+    ellipse at center,
+    rgba(232, 97, 26, 0.06) 0%,
+    rgba(232, 97, 26, 0.02) 40%,
+    transparent 70%
+  );
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Header */
+.header {
+  position: relative;
+  z-index: 1;
+  max-width: 800px;
+  margin: 0 auto 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.brand {
+  font-family: 'Satoshi', sans-serif;
+  font-weight: 700;
+  font-size: 20px;
+  color: var(--accent);
+  text-decoration: none;
+  letter-spacing: -0.3px;
+}
+
+.brand:hover {
+  color: var(--accent-strong);
+}
+
+.back-link {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-dim);
+  text-decoration: none;
+  transition: color 0.15s ease;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.back-link:hover {
+  color: var(--text);
+}
+
+.back-link svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* Card */
+.document-card {
+  position: relative;
+  z-index: 1;
+  max-width: 800px;
+  margin: 0 auto;
+  border-radius: 20px;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  box-shadow:
+    0 1px 3px rgba(0,0,0,0.04),
+    0 8px 32px -8px rgba(0,0,0,0.08);
+  padding: 48px 56px 56px;
+}
+
+/* Document title area */
+.doc-header {
+  margin-bottom: 40px;
+  padding-bottom: 32px;
+  border-bottom: 1px solid var(--border);
+}
+
+.doc-title {
+  font-family: 'Satoshi', sans-serif;
+  font-weight: 700;
+  font-size: 28px;
+  line-height: 1.3;
+  color: var(--text);
+  margin: 0 0 8px;
+  letter-spacing: -0.5px;
+}
+
+.doc-meta {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin: 0;
+}
+
+.doc-meta strong {
+  font-weight: 600;
+  color: var(--text-mute);
+}
+
+/* Table of contents */
+.toc {
+  margin: 0 0 40px;
+  padding: 24px 28px;
+  border-left: 3px solid var(--accent);
+  background: rgba(232, 97, 26, 0.02);
+  border-radius: 0 12px 12px 0;
+}
+
+.toc-title {
+  font-family: 'Satoshi', sans-serif;
+  font-weight: 700;
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--accent);
+  margin: 0 0 14px;
+}
+
+.toc-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.toc-list li {
+  margin: 0;
+  padding: 0;
+}
+
+.toc-list a {
+  display: block;
+  padding: 5px 0;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+  text-decoration: none;
+  transition: color 0.15s ease;
+}
+
+.toc-list a:hover {
+  color: var(--accent);
+}
+
+.toc-list .toc-number {
+  display: inline-block;
+  width: 24px;
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 13px;
+}
+
+/* Sections */
+.section {
+  margin-bottom: 2.5rem;
+}
+
+.section:last-of-type {
+  margin-bottom: 0;
+}
+
+.section-title {
+  font-family: 'Satoshi', sans-serif;
+  font-weight: 700;
+  font-size: 18px;
+  line-height: 1.4;
+  color: var(--text);
+  margin: 0 0 12px;
+  letter-spacing: -0.2px;
+  scroll-margin-top: 24px;
+}
+
+.section-number {
+  color: var(--accent);
+  margin-right: 6px;
+}
+
+.section p {
+  margin: 0 0 12px;
+  color: #333;
+}
+
+.section p:last-child {
+  margin-bottom: 0;
+}
+
+/* Lists inside sections */
+.section ul, .section ol {
+  margin: 8px 0 12px;
+  padding-left: 24px;
+}
+
+.section li {
+  margin-bottom: 6px;
+  color: #333;
+}
+
+.section ol[type="a"] {
+  list-style-type: lower-alpha;
+}
+
+.section ol[type="i"] {
+  list-style-type: lower-roman;
+}
+
+/* Links */
+.section a, .doc-footer a {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 500;
+  transition: color 0.15s ease;
+}
+
+.section a:hover, .doc-footer a:hover {
+  color: var(--accent-strong);
+}
+
+/* Strong / bold in body */
+.section strong {
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* Subsection titles */
+.subsection-title {
+  font-family: 'Satoshi', sans-serif;
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--text);
+  margin: 20px 0 8px;
+}
+
+/* Indented block for sub-items */
+.indent-block {
+  padding-left: 20px;
+  border-left: 2px solid var(--border);
+  margin: 12px 0;
+}
+
+/* Table styling */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+  font-size: 14px;
+}
+
+th, td {
+  text-align: left;
+  padding: 10px 14px;
+  border: 1px solid rgba(0,0,0,0.08);
+}
+
+th {
+  background: rgba(0,0,0,0.02);
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+}
+
+td {
+  color: #333;
+}
+
+/* Document footer */
+.doc-footer {
+  margin-top: 48px;
+  padding-top: 32px;
+  border-top: 1px solid var(--border);
+  text-align: center;
+}
+
+.doc-footer p {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin: 4px 0;
+}
+
+.doc-footer .company-name {
+  font-weight: 700;
+  color: var(--text);
+  font-size: 14px;
+}
+
+/* All-caps for legal emphasis */
+.legal-caps {
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+/* Responsive */
+@media (max-width: 640px) {
+  .document-card {
+    padding: 28px 24px 36px;
+    border-radius: 16px;
+  }
+
+  .doc-title {
+    font-size: 22px;
+  }
+
+  .section-title {
+    font-size: 16px;
+  }
+
+  .toc {
+    padding: 18px 20px;
+  }
+
+  .header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+  }
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="ambient-glow"></div>
+
+  <div class="header">
+    <a href="https://inblock.io" class="brand">inblock.io</a>
+    <a href="/" class="back-link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+        <path fill-rule="evenodd" d="M17 10a.75.75 0 0 0-.75-.75H5.612l4.158-3.96a.75.75 0 1 0-1.04-1.08l-5.5 5.25a.75.75 0 0 0 0 1.08l5.5 5.25a.75.75 0 1 0 1.04-1.08L5.612 10.75H16.25A.75.75 0 0 0 17 10Z" clip-rule="evenodd"/>
+      </svg>
+      Back to login
+    </a>
+  </div>
+
+  <div class="document-card">
+    <div class="doc-header">
+      <h1 class="doc-title">Terms of Use</h1>
+      <p class="doc-meta"><strong>Effective date:</strong> May 26, 2026</p>
+      <p class="doc-meta"><strong>Last updated:</strong> May 26, 2026</p>
+    </div>
+
+    <!-- Table of Contents -->
+    <nav class="toc">
+      <div class="toc-title">Contents</div>
+      <ol class="toc-list">
+        <li><a href="#s1"><span class="toc-number">1.</span> Introduction</a></li>
+        <li><a href="#s2"><span class="toc-number">2.</span> Will these Terms ever change?</a></li>
+        <li><a href="#s3"><span class="toc-number">3.</span> What about my privacy?</a></li>
+        <li><a href="#s4"><span class="toc-number">4.</span> Children's Online Privacy Protection</a></li>
+        <li><a href="#s5"><span class="toc-number">5.</span> What are the basics of using the Services?</a></li>
+        <li><a href="#s6"><span class="toc-number">6.</span> Are there restrictions on how I can use the Services?</a></li>
+        <li><a href="#s7"><span class="toc-number">7.</span> What are my rights in the Services?</a></li>
+        <li><a href="#s8"><span class="toc-number">8.</span> Who is responsible for what I see and do?</a></li>
+        <li><a href="#s9"><span class="toc-number">9.</span> Will the Services ever change?</a></li>
+        <li><a href="#s10"><span class="toc-number">10.</span> Do the Services cost anything?</a></li>
+        <li><a href="#s11"><span class="toc-number">11.</span> What if I want to stop using the Services?</a></li>
+        <li><a href="#s12"><span class="toc-number">12.</span> What else do I need to know?</a></li>
+      </ol>
+    </nav>
+
+    <!-- Section 1: Introduction -->
+    <div class="section" id="s1">
+      <h2 class="section-title"><span class="section-number">1.</span> Introduction</h2>
+
+      <p>Please read these Terms of Use (the "Terms" or "Agreement") carefully before using the services offered by inblock.io assets GmbH ("inblock.io," "we," "us," or "our"). This Agreement sets forth the legally binding terms and conditions for your use of the websites, applications, and services provided by inblock.io, including without limitation blockchain wallet-based authentication, passkey-based authentication, and related identity services (collectively, the "Services").</p>
+
+      <p>By accessing or using the Services in any manner, including but not limited to visiting or browsing our websites, registering for an account, or using any of our authentication services, you agree to be bound by these Terms. If you do not agree to all of these Terms, you may not access or use the Services.</p>
+
+      <p><strong>Please read Section 12 carefully, as it contains important information about the resolution of disputes.</strong></p>
+    </div>
+
+    <!-- Section 2: Will these Terms ever change? -->
+    <div class="section" id="s2">
+      <h2 class="section-title"><span class="section-number">2.</span> Will these Terms ever change?</h2>
+
+      <p>We are always working to improve our Services, so these Terms may need to change along with our Services. We reserve the right to change the Terms at any time, but if we do, we will place a notice on our site, send you an email, and/or notify you by some other means.</p>
+
+      <p>If you do not agree with the new Terms, you are free to reject them; unfortunately, that means you will no longer be able to use the Services. If you use the Services in any way after a change to the Terms is effective, that means you agree to all of the changes.</p>
+
+      <p>Except for changes by us as described here, no other amendment or modification of these Terms will be effective unless in writing and signed by both you and us.</p>
+    </div>
+
+    <!-- Section 3: Privacy -->
+    <div class="section" id="s3">
+      <h2 class="section-title"><span class="section-number">3.</span> What about my privacy?</h2>
+
+      <p>inblock.io takes the privacy of its users very seriously. For our current Privacy Policy, please see <a href="/legal/privacy-policy.html">our Privacy Policy</a>.</p>
+
+      <p>The Services may contain links to other websites or services that are not owned or controlled by inblock.io (each, a "Third-Party Service"). When you access Third-Party Services, you do so at your own risk. You acknowledge that inblock.io has no control over, and assumes no responsibility for, the content, accuracy, privacy policies, or practices of or opinions expressed in any Third-Party Services. In addition, inblock.io will not and cannot censor or edit the content of any Third-Party Service. You also acknowledge and agree that inblock.io is not responsible for the availability of any such Third-Party Services. By using the Services, you expressly relieve inblock.io from any and all liability arising from your use of any Third-Party Service. Accordingly, we encourage you to be aware when you leave the Services and to read the terms and conditions and privacy policy of each other service that you visit.</p>
+    </div>
+
+    <!-- Section 4: COPPA -->
+    <div class="section" id="s4">
+      <h2 class="section-title"><span class="section-number">4.</span> Children's Online Privacy Protection</h2>
+
+      <p>The Services are not directed to children under the age of 16, and we do not knowingly collect personal information from children under 16. If we learn that we have collected personal information of a child under 16, we will take steps to delete such information from our files as soon as possible. This policy complies with the U.S. Children's Online Privacy Protection Act (COPPA) and Article 8 of the EU General Data Protection Regulation (GDPR).</p>
+
+      <p>If you are a parent or guardian and believe your child has provided personal information through the Services, please contact us at <a href="mailto:hello@inblock.io">hello@inblock.io</a> so we can take the appropriate steps.</p>
+    </div>
+
+    <!-- Section 5: Basics -->
+    <div class="section" id="s5">
+      <h2 class="section-title"><span class="section-number">5.</span> What are the basics of using the Services?</h2>
+
+      <p>You may be required to authenticate using a blockchain wallet (such as an Ethereum wallet) or a WebAuthn-compatible passkey to access and use the Services. The Services verify your digital identity by asking you to sign a cryptographic challenge with your private key or passkey. You represent and warrant that you are the rightful owner of, or authorized user of, the cryptographic key or passkey used to verify your identity.</p>
+
+      <p>By using the Services you represent and warrant that:</p>
+
+      <ol type="a">
+        <li>You are of legal age to form a binding contract in your jurisdiction (or, if not, you have received your parent's or guardian's permission to use the Services and your parent or guardian has agreed to these Terms on your behalf);</li>
+        <li>All information you provide is accurate, truthful, and complete;</li>
+        <li>You will maintain the security of your private keys, seed phrases, and passkey credentials, and accept all risks of unauthorized access to any information you provide via the Services;</li>
+        <li>Your use of the Services does not violate any applicable law or regulation.</li>
+      </ol>
+
+      <p>You are responsible for all activity that occurs through or in connection with your digital identity as authenticated by the Services, whether or not you authorized that activity. You should immediately notify inblock.io of any unauthorized use of your digital identity by contacting us at <a href="mailto:hello@inblock.io">hello@inblock.io</a>.</p>
+    </div>
+
+    <!-- Section 6: Restrictions -->
+    <div class="section" id="s6">
+      <h2 class="section-title"><span class="section-number">6.</span> Are there restrictions on how I can use the Services?</h2>
+
+      <p>You represent, warrant, and agree that you will not use or provide information in connection with the Services in a manner that:</p>
+
+      <ol type="a">
+        <li>infringes or violates the intellectual property rights or any other rights of anyone else (including inblock.io);</li>
+        <li>violates any law or regulation, including any applicable export control laws, privacy laws, data protection regulations (including but not limited to the GDPR), or consumer protection laws;</li>
+        <li>is dangerous, harmful, fraudulent, deceptive, threatening, harassing, defamatory, obscene, or otherwise objectionable;</li>
+        <li>jeopardizes the security of your digital identity, private keys, passkey credentials, or any other authentication credentials in any way, such as by allowing someone else to use your credentials to access the Services;</li>
+        <li>attempts, in any manner, to obtain the private key, seed phrase, password, account, or other security information from any other user;</li>
+        <li>violates the security of any computer network, or cracks any passwords or security encryption codes;</li>
+        <li>runs Maillist, Listserv, any form of auto-responder or "spam" on the Services, or any processes that run or are activated while you are not logged into the Services, or that otherwise interfere with the proper working of the Services (including by placing an unreasonable load on the Services' infrastructure);</li>
+        <li>"crawls," "scrapes," or "spiders" any page, data, or portion of or relating to the Services or Content (through use of manual or automated means);</li>
+        <li>copies or stores any significant portion of the Content; or</li>
+        <li>decompiles, reverse engineers, or otherwise attempts to obtain the source code or underlying ideas or information of or relating to the Services.</li>
+      </ol>
+
+      <p>A violation of any of the foregoing is grounds for termination of your right to use or access the Services.</p>
+    </div>
+
+    <!-- Section 7: Rights / IP -->
+    <div class="section" id="s7">
+      <h2 class="section-title"><span class="section-number">7.</span> What are my rights in the Services?</h2>
+
+      <p class="subsection-title">Types of Content</p>
+
+      <p>For purposes of these Terms, "Content" means text, graphics, images, music, software, audio, video, works of authorship of any kind, and information or other materials that are posted, generated, provided, or otherwise made available through the Services. Content includes, without limitation, any user-provided information (such as blockchain addresses, DID identifiers, signed messages, and passkey credential metadata).</p>
+
+      <p class="subsection-title">Ownership of Content</p>
+
+      <p>inblock.io does not claim any ownership rights in any user-provided Content. Nothing in these Terms will be deemed to restrict any rights that you may have to your Content. You are solely responsible for your Content and the consequences of posting or publishing it.</p>
+
+      <p class="subsection-title">Rights You Grant to inblock.io</p>
+
+      <p>By making Content available through the Services, you grant inblock.io a non-exclusive, transferable, sub-licensable, worldwide, royalty-free license to use, copy, modify, distribute, and display your Content solely in connection with operating and providing the Services and Content to you and to other users. This license does not grant inblock.io the right to sell your Content or otherwise distribute it outside of the Services.</p>
+
+      <p>You acknowledge and agree that certain information you provide, such as your blockchain address or DID identifier, is inherently public on a blockchain network and is not considered private or confidential information. The Services merely facilitate the use of such information for authentication purposes.</p>
+
+      <p class="subsection-title">Rights in the Services</p>
+
+      <p>Subject to the terms and conditions of these Terms, you are hereby granted a non-exclusive, limited, non-transferable, non-sublicensable, freely revocable license to use the Services for your personal, non-commercial use only and as permitted by the features of the Services. inblock.io reserves all rights not expressly granted herein in the Services and the inblock.io Content. inblock.io may terminate this license at any time for any reason or no reason.</p>
+
+      <p>The Services and inblock.io Content are protected by copyright, trademark, and other laws of the Federal Republic of Germany, the European Union, and foreign countries. Except as otherwise provided in these Terms, inblock.io and its licensors exclusively own all right, title, and interest in and to the Services and inblock.io Content, including all associated intellectual property rights. You will not remove, alter, or obscure any copyright, trademark, service mark, or other proprietary rights notices incorporated in or accompanying the Services.</p>
+
+      <p class="subsection-title">Open-Source Software</p>
+
+      <p>Certain components of the Services may be offered under open-source license terms that we make available to you. There may be provisions in the open-source license that expressly override some of these Terms, in which case the open-source provisions will apply.</p>
+    </div>
+
+    <!-- Section 8: Third-party / Responsibility -->
+    <div class="section" id="s8">
+      <h2 class="section-title"><span class="section-number">8.</span> Who is responsible for what I see and do?</h2>
+
+      <p>Any information or Content publicly posted or privately transmitted through the Services is the sole responsibility of the person from whom such Content originated. You access all such information and Content at your own risk, and inblock.io is not liable for any errors or omissions in that information or Content or for any damages or loss you might suffer in connection with it.</p>
+
+      <p>We cannot control and have no duty to take any action regarding how you may interpret and use the Content or what actions you may take as a result of having been exposed to the Content. You hereby release inblock.io from all liability for you having acquired or not acquired Content through the Services.</p>
+
+      <p>The Services may contain, or direct you to other websites, applications, or services that contain, information that some people may find offensive or inappropriate. inblock.io makes no representations concerning the Content contained in or accessed through the Services, and inblock.io will not be responsible or liable for the accuracy, copyright compliance, legality, or decency of material contained in or accessed through the Services or any Third-Party Services.</p>
+
+      <p>The Services may enable interaction with, or rely upon, blockchain networks and decentralized protocols. inblock.io does not control the operation of any blockchain network. Blockchain transactions are irreversible and we have no ability to reverse or modify them. You understand and agree that inblock.io is not responsible for the operation of any blockchain protocol and that we make no guarantee of its functionality, security, or availability.</p>
+    </div>
+
+    <!-- Section 9: Changes -->
+    <div class="section" id="s9">
+      <h2 class="section-title"><span class="section-number">9.</span> Will the Services ever change?</h2>
+
+      <p>We are always trying to improve our Services, so they may change over time. We may suspend or discontinue any part of the Services, or we may introduce new features or impose limits on certain features or restrict access to parts or all of the Services. We will try to give you notice when we make a material change to the Services that would adversely affect you, but this is not always practical. We reserve the right to remove any Content from the Services at any time, for any reason (including, but not limited to, if someone alleges you contributed that Content in violation of these Terms), in our sole discretion, and without notice.</p>
+    </div>
+
+    <!-- Section 10: Cost -->
+    <div class="section" id="s10">
+      <h2 class="section-title"><span class="section-number">10.</span> Do the Services cost anything?</h2>
+
+      <p>The Services are currently free to use. We reserve the right to charge for certain or all Services in the future. We will notify you before any Services you are then using begin carrying a fee, and if you wish to continue using such Services, you will have to pay all applicable fees for such Services.</p>
+
+      <p>Please be aware that while the Services themselves may be free, blockchain transactions you initiate in connection with the Services (for example, signing messages with an Ethereum wallet) may require the payment of network fees ("gas fees") that are determined by the respective blockchain network and are not charged by or payable to inblock.io.</p>
+    </div>
+
+    <!-- Section 11: Stopping use -->
+    <div class="section" id="s11">
+      <h2 class="section-title"><span class="section-number">11.</span> What if I want to stop using the Services?</h2>
+
+      <p>You are free to stop using the Services at any time. Please refer to our <a href="/legal/privacy-policy.html">Privacy Policy</a> as well as the licenses you granted under these Terms to understand how we treat information you provide to us after you have stopped using our Services.</p>
+
+      <p>inblock.io is also free to terminate (or suspend access to) your use of the Services for any reason in our discretion, including your breach of these Terms. inblock.io has the sole right to decide whether you are in violation of any of the restrictions set forth in these Terms.</p>
+
+      <p>Provisions that, by their nature, should survive termination of these Terms shall survive termination. By way of example, all of the following will survive termination: any limitations on our liability, any terms regarding ownership or intellectual property rights, warranty disclaimers, and terms regarding disputes between us, including without limitation the choice of law and dispute resolution provisions.</p>
+    </div>
+
+    <!-- Section 12: Miscellaneous legal -->
+    <div class="section" id="s12">
+      <h2 class="section-title"><span class="section-number">12.</span> What else do I need to know?</h2>
+
+      <p class="subsection-title">Warranty Disclaimer</p>
+
+      <p>To the fullest extent permitted by applicable law, inblock.io and its licensors, suppliers, partners, parent, subsidiaries, or affiliated entities, and each of their respective officers, directors, members, employees, consultants, agents, and advisors (collectively, the "inblock.io Parties") make no representations or warranties concerning the Services, including without limitation regarding any Content contained in or accessed through the Services, and the inblock.io Parties will not be responsible or liable for the accuracy, copyright compliance, legality, or decency of material contained in or accessed through the Services or any claims, actions, suits, procedures, costs, expenses, damages, or liabilities arising out of or in any way related to your participation in or use of the Services.</p>
+
+      <p class="legal-caps">To the fullest extent permitted by applicable law, the Services are provided "as is" and "as available," without warranty of any kind, either express or implied, including, without limitation, implied warranties of merchantability, fitness for a particular purpose, non-infringement, and any warranty arising by course of dealing, usage, or trade practice. Without limiting the foregoing, neither inblock.io nor its affiliates or licensors represents or warrants that the content is accurate, complete, reliable, current, or error-free. inblock.io does not represent or warrant that the Services, including any features or Content, are free of viruses or other harmful components.</p>
+
+      <p>The foregoing does not affect any warranties that cannot be excluded or limited under applicable law. In particular, under German law, inblock.io remains liable for damages resulting from injury to life, body, or health caused by a negligent or intentional breach of duty by inblock.io or its legal representatives or vicarious agents.</p>
+
+      <p class="subsection-title">Limitation of Liability</p>
+
+      <p class="legal-caps">To the fullest extent permitted by applicable law, in no event shall the inblock.io Parties be liable to you for any lost profits, revenues, information, or data, or consequential, special, indirect, exemplary, punitive, or incidental damages arising out of or related to these Terms or the Services, regardless of the form of action, whether based in contract, tort, strict liability, or any other legal or equitable basis (even if the inblock.io Parties have been advised of the possibility of such damages).</p>
+
+      <p class="legal-caps">To the fullest extent permitted by applicable law, in no event shall the aggregate liability of the inblock.io Parties exceed the greater of EUR 100.00 or the amount you paid inblock.io, if any, in the last six (6) months for the Services giving rise to the claim.</p>
+
+      <p>The foregoing limitations of liability do not apply to liability resulting from (a) injury to life, body, or health; (b) intentional misconduct (Vorsatz); (c) gross negligence (grobe Fahrlassigkeit) by inblock.io, its legal representatives, or vicarious agents; or (d) mandatory statutory liability, including under product liability law. These exclusions reflect the requirements of German civil law (sections 276, 278, and 309 no. 7 of the German Civil Code, BGB).</p>
+
+      <p class="subsection-title">Indemnity</p>
+
+      <p>To the fullest extent permitted by applicable law, you agree to indemnify, defend, and hold harmless the inblock.io Parties from and against any and all claims, liabilities, damages (actual and consequential), losses, and expenses (including attorneys' fees and costs) arising from or in any way related to any claims relating to (a) your use of the Services (including any actions taken by a third party using your digital identity), and (b) your violation of these Terms.</p>
+
+      <p class="subsection-title">Assignment</p>
+
+      <p>You may not assign, delegate, or transfer these Terms or your rights or obligations hereunder, or your account, in any way (by operation of law or otherwise) without the prior written consent of inblock.io. We may transfer, assign, or delegate these Terms and our rights and obligations without consent.</p>
+
+      <p class="subsection-title">Choice of Law</p>
+
+      <p>These Terms are governed by and will be construed in accordance with the laws of the Federal Republic of Germany, without regard to its conflict of laws provisions. If you are a consumer habitually resident in the European Union, you additionally benefit from any mandatory provisions of the law of your country of residence. Nothing in these Terms affects your rights as a consumer to rely on such mandatory provisions of local law.</p>
+
+      <p class="subsection-title">Dispute Resolution</p>
+
+      <p>In the event of any dispute, controversy, or claim arising out of or relating to these Terms or the Services, the parties shall first attempt to resolve the matter through good-faith negotiation. Either party may initiate negotiation by sending a written notice describing the dispute to the other party. The parties agree to negotiate in good faith for at least thirty (30) days from the date such notice is received.</p>
+
+      <p>If the dispute cannot be resolved through negotiation within thirty (30) days, the dispute shall be submitted to the exclusive jurisdiction of the competent courts of Weimar, Germany, provided that you are a merchant (Kaufmann), a legal entity under public law, or a special fund under public law. If you are a consumer within the meaning of section 13 BGB, the statutory provisions on jurisdiction shall apply.</p>
+
+      <p>The European Commission provides a platform for online dispute resolution (ODR) at <a href="https://ec.europa.eu/consumers/odr" target="_blank" rel="noopener">https://ec.europa.eu/consumers/odr</a>. We are neither obligated nor willing to participate in a dispute resolution procedure before a consumer arbitration board.</p>
+
+      <p class="subsection-title">Miscellaneous</p>
+
+      <p>You will be responsible for paying, withholding, filing, and reporting all taxes, duties, and other governmental assessments associated with your activity in connection with the Services, provided that inblock.io may, in its sole discretion, do any of the foregoing on your behalf or for itself as it sees fit.</p>
+
+      <p>The failure of either you or us to exercise, in any way, any right herein shall not be deemed a waiver of any further rights hereunder. If any provision of these Terms are found to be unenforceable or invalid, that provision will be limited or eliminated to the minimum extent necessary so that these Terms shall otherwise remain in full force and effect and enforceable. These Terms, together with the <a href="/legal/privacy-policy.html">Privacy Policy</a>, constitute the entire and exclusive agreement between you and inblock.io with respect to the Services, and these Terms supersede and replace any prior agreements between you and inblock.io with respect to the Services. The Services are operated and provided by inblock.io assets GmbH. If you have any questions about these Terms, please contact us at <a href="mailto:hello@inblock.io">hello@inblock.io</a>.</p>
+
+      <p>We may give notice by means of a general notice through the Services, electronic mail to your email address on record, or by written communication sent by first-class post to your address on record. You may give notice to us at any time by letter delivered to the following address:</p>
+
+      <div class="indent-block">
+        <p>
+          inblock.io assets GmbH<br>
+          Humboldtstrasse 13<br>
+          99423 Weimar, Germany<br>
+          <a href="mailto:hello@inblock.io">hello@inblock.io</a>
+        </p>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="doc-footer">
+      <p class="company-name">inblock.io assets GmbH</p>
+      <p>Humboldtstrasse 13, 99423 Weimar, Germany</p>
+      <p><a href="mailto:hello@inblock.io">hello@inblock.io</a> &middot; <a href="https://inblock.io" target="_blank" rel="noopener">inblock.io</a></p>
+    </div>
+  </div>
+</div>
+</body>
+</html>

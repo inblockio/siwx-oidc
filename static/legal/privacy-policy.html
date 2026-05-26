@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy Policy · inblock.io</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<link href="https://api.fontshare.com/v2/css?f[]=satoshi@300,400,500,600,700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --accent: #E8611A;
+  --accent-strong: #EF5402;
+  --bg: #f5f5f5;
+  --card-bg: #ffffff;
+  --text: #1a1a1a;
+  --text-dim: rgba(0,0,0,0.4);
+  --text-mute: rgba(0,0,0,0.3);
+  --border: rgba(0,0,0,0.06);
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-height: 100%;
+  background: var(--bg);
+  font-family: 'Satoshi', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color: var(--text);
+  line-height: 1.7;
+  font-size: 15px;
+}
+
+.page-wrapper {
+  position: relative;
+  min-height: 100vh;
+  padding: 32px 20px 64px;
+}
+
+.ambient-glow {
+  position: fixed;
+  top: -30%;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 800px;
+  height: 600px;
+  background: radial-gradient(
+    ellipse at center,
+    rgba(232, 97, 26, 0.06) 0%,
+    rgba(232, 97, 26, 0.02) 40%,
+    transparent 70%
+  );
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ---- Header ---- */
+
+.page-header {
+  position: relative;
+  z-index: 1;
+  max-width: 800px;
+  margin: 0 auto 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.logo-text {
+  font-family: 'Satoshi', sans-serif;
+  font-weight: 700;
+  font-size: 20px;
+  color: var(--accent);
+  text-decoration: none;
+  letter-spacing: -0.3px;
+}
+
+.logo-text:hover {
+  color: var(--accent-strong);
+}
+
+.back-link {
+  font-family: 'Satoshi', sans-serif;
+  font-weight: 500;
+  font-size: 13px;
+  color: var(--text-dim);
+  text-decoration: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: color 0.15s ease;
+}
+
+.back-link:hover {
+  color: var(--text);
+}
+
+.back-link svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* ---- Card ---- */
+
+.document-card {
+  position: relative;
+  z-index: 1;
+  max-width: 800px;
+  margin: 0 auto;
+  border-radius: 20px;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.04),
+    0 8px 32px -8px rgba(0, 0, 0, 0.08);
+  padding: 48px 52px 52px;
+}
+
+/* ---- Document header ---- */
+
+.doc-header {
+  margin-bottom: 40px;
+  padding-bottom: 32px;
+  border-bottom: 1px solid rgba(0,0,0,0.06);
+}
+
+.doc-title {
+  font-family: 'Satoshi', sans-serif;
+  font-weight: 700;
+  font-size: 28px;
+  line-height: 1.3;
+  color: var(--text);
+  margin: 0 0 8px;
+  letter-spacing: -0.5px;
+}
+
+.doc-meta {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin: 0;
+}
+
+.doc-meta strong {
+  font-weight: 600;
+  color: var(--text-mute);
+}
+
+/* ---- Table of Contents ---- */
+
+.toc {
+  margin: 0 0 40px;
+  padding: 24px 28px;
+  border-left: 3px solid var(--accent);
+  background: rgba(232, 97, 26, 0.02);
+  border-radius: 0 12px 12px 0;
+}
+
+.toc-title {
+  font-family: 'Satoshi', sans-serif;
+  font-weight: 700;
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+  margin: 0 0 14px;
+}
+
+.toc ol {
+  margin: 0;
+  padding: 0 0 0 20px;
+  list-style: none;
+  counter-reset: toc-counter;
+}
+
+.toc ol li {
+  counter-increment: toc-counter;
+  margin-bottom: 6px;
+  line-height: 1.5;
+}
+
+.toc ol li::before {
+  content: counter(toc-counter) ".";
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 13px;
+  margin-right: 8px;
+}
+
+.toc a {
+  color: var(--text);
+  text-decoration: none;
+  font-size: 14px;
+  font-weight: 500;
+  transition: color 0.15s ease;
+}
+
+.toc a:hover {
+  color: var(--accent);
+}
+
+/* ---- Sections ---- */
+
+.section {
+  margin-bottom: 36px;
+}
+
+.section:last-of-type {
+  margin-bottom: 0;
+}
+
+.section-number {
+  display: inline-block;
+  font-family: 'Satoshi', sans-serif;
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+
+.section-title {
+  font-family: 'Satoshi', sans-serif;
+  font-weight: 700;
+  font-size: 20px;
+  line-height: 1.3;
+  color: var(--text);
+  margin: 0 0 16px;
+  letter-spacing: -0.3px;
+}
+
+.section p {
+  margin: 0 0 14px;
+  color: var(--text);
+  font-size: 15px;
+}
+
+.section p:last-child {
+  margin-bottom: 0;
+}
+
+.section ul, .section ol {
+  margin: 0 0 14px;
+  padding: 0 0 0 24px;
+}
+
+.section li {
+  margin-bottom: 6px;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.section li:last-child {
+  margin-bottom: 0;
+}
+
+.section a {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 500;
+  transition: color 0.15s ease;
+}
+
+.section a:hover {
+  color: var(--accent-strong);
+  text-decoration: underline;
+}
+
+.subsection-title {
+  font-family: 'Satoshi', sans-serif;
+  font-weight: 600;
+  font-size: 16px;
+  color: var(--text);
+  margin: 20px 0 10px;
+}
+
+/* ---- Tables ---- */
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 16px 0;
+  font-size: 14px;
+}
+
+.data-table thead th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  padding: 10px 14px;
+  border-bottom: 2px solid rgba(0,0,0,0.08);
+  background: rgba(0,0,0,0.015);
+}
+
+.data-table tbody td {
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(0,0,0,0.05);
+  color: var(--text);
+  vertical-align: top;
+}
+
+.data-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.data-table tbody tr:hover {
+  background: rgba(232, 97, 26, 0.015);
+}
+
+/* ---- Rights list ---- */
+
+.rights-list {
+  list-style: none;
+  padding: 0;
+  margin: 14px 0;
+}
+
+.rights-list li {
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(0,0,0,0.04);
+}
+
+.rights-list li:last-child {
+  border-bottom: none;
+}
+
+.rights-list strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* ---- Footer ---- */
+
+.doc-footer {
+  margin-top: 44px;
+  padding-top: 28px;
+  border-top: 1px solid rgba(0,0,0,0.06);
+  text-align: center;
+}
+
+.doc-footer p {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin: 0 0 4px;
+  line-height: 1.6;
+}
+
+.doc-footer a {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.doc-footer a:hover {
+  color: var(--accent-strong);
+  text-decoration: underline;
+}
+
+/* ---- Section divider ---- */
+
+.section-divider {
+  height: 1px;
+  background: rgba(0,0,0,0.05);
+  border: none;
+  margin: 36px 0;
+}
+
+/* ---- Responsive ---- */
+
+@media (max-width: 640px) {
+  .document-card {
+    padding: 32px 24px 36px;
+    border-radius: 16px;
+  }
+
+  .doc-title {
+    font-size: 22px;
+  }
+
+  .section-title {
+    font-size: 17px;
+  }
+
+  .toc {
+    padding: 18px 20px;
+  }
+
+  .data-table {
+    font-size: 13px;
+  }
+
+  .data-table thead th,
+  .data-table tbody td {
+    padding: 8px 10px;
+  }
+
+  .page-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+}
+
+/* ---- Scrollbar ---- */
+
+::-webkit-scrollbar-track {
+  border-radius: 8px;
+  background-color: #eee;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 8px;
+  background-color: #ccc;
+}
+
+::-webkit-scrollbar {
+  height: 6px;
+  width: 6px;
+  border-radius: 8px;
+  background-color: #eee;
+}
+</style>
+</head>
+<body>
+<div class="page-wrapper">
+  <div class="ambient-glow"></div>
+
+  <header class="page-header">
+    <a href="https://inblock.io" class="logo-text">inblock.io</a>
+    <a href="/" class="back-link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+        <path fill-rule="evenodd" d="M17 10a.75.75 0 0 1-.75.75H5.612l4.158 3.96a.75.75 0 1 1-1.04 1.08l-5.5-5.25a.75.75 0 0 1 0-1.08l5.5-5.25a.75.75 0 1 1 1.04 1.08L5.612 9.25H16.25A.75.75 0 0 1 17 10Z" clip-rule="evenodd"/>
+      </svg>
+      Back to login
+    </a>
+  </header>
+
+  <main class="document-card">
+    <div class="doc-header">
+      <h1 class="doc-title">Privacy Policy</h1>
+      <p class="doc-meta">
+        <strong>Effective date:</strong> May 26, 2026 &nbsp;·&nbsp;
+        <strong>Data controller:</strong> inblock.io assets GmbH
+      </p>
+    </div>
+
+    <!-- Table of Contents -->
+    <nav class="toc">
+      <div class="toc-title">Contents</div>
+      <ol>
+        <li><a href="#introduction">Introduction</a></li>
+        <li><a href="#coverage">What this Privacy Policy Covers</a></li>
+        <li><a href="#personal-data">Personal Data</a></li>
+        <li><a href="#legal-basis">Legal Basis for Processing (GDPR Art. 6)</a></li>
+        <li><a href="#sharing">How We Share Your Personal Data</a></li>
+        <li><a href="#cookies">Cookies and Similar Technologies</a></li>
+        <li><a href="#security-retention">Data Security and Retention</a></li>
+        <li><a href="#gdpr-rights">Your Rights Under GDPR</a></li>
+        <li><a href="#data-transfers">International Data Transfers</a></li>
+        <li><a href="#children">Children's Privacy</a></li>
+        <li><a href="#ccpa">California Resident Rights (CCPA)</a></li>
+        <li><a href="#other-us">Other U.S. State Privacy Rights</a></li>
+        <li><a href="#changes">Changes to this Privacy Policy</a></li>
+        <li><a href="#contact">Contact Information</a></li>
+      </ol>
+    </nav>
+
+    <!-- Section 1: Introduction -->
+    <section class="section" id="introduction">
+      <span class="section-number">Section 1</span>
+      <h2 class="section-title">Introduction</h2>
+      <p>
+        inblock.io assets GmbH ("inblock.io," "we," "us," or "our") is committed to protecting your privacy. This Privacy Policy explains how we collect, use, disclose, and safeguard your information when you use our siwx-oidc authentication service and related services (collectively, the "Service").
+      </p>
+      <p>
+        siwx-oidc is a CAIP-122 to OpenID Connect bridge. It allows you to sign in using a blockchain wallet (such as an Ethereum wallet) or a WebAuthn passkey and receive standard OIDC tokens in return. Any OIDC relying party can use it as an identity provider.
+      </p>
+      <p>
+        As a German company based in the European Union, we process your personal data in compliance with the General Data Protection Regulation (EU) 2016/679 ("GDPR") as our primary framework. We also respect the privacy rights of users in other jurisdictions, including the United States.
+      </p>
+      <p>
+        Please read this Privacy Policy carefully. By using the Service, you acknowledge that you have read and understood this Privacy Policy. If you do not agree with the terms of this Privacy Policy, please do not access or use the Service.
+      </p>
+    </section>
+
+    <hr class="section-divider">
+
+    <!-- Section 2: What this Privacy Policy Covers -->
+    <section class="section" id="coverage">
+      <span class="section-number">Section 2</span>
+      <h2 class="section-title">What this Privacy Policy Covers</h2>
+      <p>
+        This Privacy Policy covers the processing of personal data that we collect when you:
+      </p>
+      <ul>
+        <li>Visit or interact with the siwx-oidc authentication service;</li>
+        <li>Authenticate using a blockchain wallet or WebAuthn passkey;</li>
+        <li>Use the device authorization flow (e.g., QR code login);</li>
+        <li>Link a passkey to an existing wallet identity;</li>
+        <li>Interact with any relying party application that uses siwx-oidc as its identity provider.</li>
+      </ul>
+      <p>
+        This Privacy Policy does not apply to the practices of third parties that we do not own or control, including relying party applications that integrate with siwx-oidc. When you authenticate through siwx-oidc to access a third-party application, that application's own privacy policy governs how it handles your data after authentication.
+      </p>
+    </section>
+
+    <hr class="section-divider">
+
+    <!-- Section 3: Personal Data -->
+    <section class="section" id="personal-data">
+      <span class="section-number">Section 3</span>
+      <h2 class="section-title">Personal Data</h2>
+
+      <h3 class="subsection-title">3.1 Categories of Personal Data We Collect</h3>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Category</th>
+            <th>Data Elements</th>
+            <th>Purpose</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Digital Identity Information</strong></td>
+            <td>Blockchain wallet addresses (e.g., Ethereum addresses), Decentralized Identifiers (DIDs) in various formats (did:pkh, did:key, did:peer), ENS domain names (when resolved)</td>
+            <td>Identifying you within the authentication service and issuing OIDC tokens with your verified identity</td>
+          </tr>
+          <tr>
+            <td><strong>Authentication Credentials</strong></td>
+            <td>WebAuthn/passkey public keys and credential identifiers. We never store your private keys, seed phrases, or wallet secrets.</td>
+            <td>Verifying your identity during passkey authentication ceremonies</td>
+          </tr>
+          <tr>
+            <td><strong>Session Data</strong></td>
+            <td>Temporary session tokens, authorization codes, device codes, OIDC access tokens, refresh tokens, nonces</td>
+            <td>Managing the authentication flow and maintaining active sessions</td>
+          </tr>
+          <tr>
+            <td><strong>CAIP-122 Signature Data</strong></td>
+            <td>Signed messages (CAIP-122/SIWE format) containing domain, nonce, timestamp, and resources; cryptographic signatures</td>
+            <td>Verifying wallet ownership as part of the sign-in process</td>
+          </tr>
+          <tr>
+            <td><strong>Device Information</strong></td>
+            <td>Device identifiers provisioned during login (e.g., Matrix device IDs), user agent strings</td>
+            <td>Device provisioning for Matrix homeserver integration</td>
+          </tr>
+          <tr>
+            <td><strong>Account Linking Data</strong></td>
+            <td>Mappings between passkey credential identifiers and wallet DIDs</td>
+            <td>Enabling passkey login to produce your wallet DID when you have linked a passkey to a wallet identity</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3 class="subsection-title">3.2 Categories of Sources</h3>
+      <p>We collect personal data from the following categories of sources:</p>
+      <ul>
+        <li><strong>Directly from you:</strong> When you authenticate with a wallet or passkey, you provide your identity information and credentials directly through the sign-in process. When you link a passkey to a wallet, you initiate that connection.</li>
+        <li><strong>Public records:</strong> Blockchain addresses, DIDs, and ENS domain names are derived from publicly available blockchain data. We may resolve ENS names to provide a human-readable display name in your OIDC profile.</li>
+        <li><strong>Automated collection:</strong> Session cookies and tokens are generated automatically as part of the authentication flow. These are essential for the service to function.</li>
+      </ul>
+
+      <h3 class="subsection-title">3.3 Purposes for Collection</h3>
+      <p>We use your personal data for the following purposes:</p>
+      <ul>
+        <li><strong>Authentication:</strong> Verifying your identity through wallet signatures (CAIP-122) or WebAuthn passkey ceremonies, and issuing OIDC tokens (ID tokens, access tokens, refresh tokens) to relying parties.</li>
+        <li><strong>Session management:</strong> Maintaining authentication state, managing authorization codes, and handling token refresh operations.</li>
+        <li><strong>Device provisioning:</strong> When used with a Matrix homeserver (MSC3861), provisioning and managing user devices on the homeserver.</li>
+        <li><strong>Account management:</strong> Enabling account-related actions such as cross-signing key resets and passkey linking.</li>
+        <li><strong>Security:</strong> Detecting and preventing unauthorized access, fraud, and other malicious activity.</li>
+        <li><strong>Service improvement:</strong> Diagnosing technical issues, monitoring service health, and improving reliability.</li>
+        <li><strong>Legal compliance:</strong> Complying with applicable laws, regulations, and legal processes.</li>
+      </ul>
+    </section>
+
+    <hr class="section-divider">
+
+    <!-- Section 4: Legal Basis for Processing -->
+    <section class="section" id="legal-basis">
+      <span class="section-number">Section 4</span>
+      <h2 class="section-title">Legal Basis for Processing (GDPR Art. 6)</h2>
+      <p>
+        Under the GDPR, we must have a valid legal basis for processing your personal data. We rely on the following legal bases:
+      </p>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Legal Basis</th>
+            <th>Processing Activities</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Contractual necessity</strong> (Art. 6(1)(b))</td>
+            <td>Processing your identity data and authentication credentials to provide the authentication service you have requested. This includes verifying wallet signatures, verifying passkey assertions, issuing OIDC tokens, managing sessions, and provisioning devices on relying party services.</td>
+          </tr>
+          <tr>
+            <td><strong>Legitimate interest</strong> (Art. 6(1)(f))</td>
+            <td>Security monitoring, fraud prevention, and service diagnostics. Our legitimate interest is maintaining a secure and reliable authentication infrastructure. We balance this against your rights by minimizing data collection, applying short retention periods, and not engaging in profiling or automated decision-making.</td>
+          </tr>
+          <tr>
+            <td><strong>Consent</strong> (Art. 6(1)(a))</td>
+            <td>Where we explicitly request your consent for a specific processing activity that is not covered by the above bases. You have the right to withdraw consent at any time without affecting the lawfulness of processing performed before withdrawal.</td>
+          </tr>
+          <tr>
+            <td><strong>Legal obligation</strong> (Art. 6(1)(c))</td>
+            <td>Where we are required to process data to comply with applicable laws or regulations.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <hr class="section-divider">
+
+    <!-- Section 5: How We Share Your Personal Data -->
+    <section class="section" id="sharing">
+      <span class="section-number">Section 5</span>
+      <h2 class="section-title">How We Share Your Personal Data</h2>
+      <p>
+        We do not sell your personal data. We may share your personal data with the following categories of recipients:
+      </p>
+      <ul>
+        <li>
+          <strong>Relying parties you authorize:</strong> When you authenticate through siwx-oidc, the relying party application you are logging into receives your DID (and optionally your ENS name) as part of the OIDC token claims. You initiate this sharing each time you choose to sign in to a relying party. The specific data shared is limited to your identity (the "sub" claim) and the scopes requested during authentication.
+        </li>
+        <li>
+          <strong>Matrix homeserver (when applicable):</strong> If siwx-oidc is configured as the OIDC provider for a Matrix homeserver (via MSC3861), we share your DID and device information with the homeserver for user and device provisioning. The homeserver is operated under its own data processing terms.
+        </li>
+        <li>
+          <strong>Infrastructure and service providers:</strong> We use hosting and infrastructure providers (such as cloud hosting, Redis for session storage) to operate the Service. These providers process data on our behalf under data processing agreements that comply with GDPR Art. 28.
+        </li>
+        <li>
+          <strong>Legal requirements:</strong> We may disclose your personal data if required to do so by law, or in good faith belief that such disclosure is necessary to comply with a legal obligation, protect and defend our rights or property, prevent fraud, or protect the safety of users or the public.
+        </li>
+      </ul>
+      <p>
+        We do not share your data with advertising networks, data brokers, or analytics providers.
+      </p>
+    </section>
+
+    <hr class="section-divider">
+
+    <!-- Section 6: Cookies and Similar Technologies -->
+    <section class="section" id="cookies">
+      <span class="section-number">Section 6</span>
+      <h2 class="section-title">Cookies and Similar Technologies</h2>
+      <p>
+        We use only essential cookies that are strictly necessary for the authentication service to function. We do not use tracking cookies, analytics cookies, advertising cookies, or any third-party cookies.
+      </p>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Cookie</th>
+            <th>Type</th>
+            <th>Purpose</th>
+            <th>Duration</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>siwx</code></td>
+            <td>Essential (first-party)</td>
+            <td>Carries the signed CAIP-122 message and cryptographic signature from the wallet sign-in step to the server-side verification step. Required for the authentication flow to complete.</td>
+            <td>48 hours (or until the CAIP-122 message expires)</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        We do not use web beacons, tracking pixels, fingerprinting scripts, or any other similar tracking technologies. Server-side session data (session tokens, authorization codes, device codes) is stored in our Redis database, not in browser cookies.
+      </p>
+      <p>
+        Because we use only strictly necessary cookies, consent under Art. 5(3) of the ePrivacy Directive is not required. You may configure your browser to refuse cookies, but doing so will prevent you from authenticating through the Service.
+      </p>
+    </section>
+
+    <hr class="section-divider">
+
+    <!-- Section 7: Data Security and Retention -->
+    <section class="section" id="security-retention">
+      <span class="section-number">Section 7</span>
+      <h2 class="section-title">Data Security and Retention</h2>
+
+      <h3 class="subsection-title">7.1 Security Measures</h3>
+      <p>
+        We implement appropriate technical and organizational measures to protect your personal data against unauthorized access, alteration, disclosure, or destruction. These measures include:
+      </p>
+      <ul>
+        <li>All OIDC tokens are signed using ES256 (ECDSA with P-256) cryptographic keys.</li>
+        <li>All communication with the Service is encrypted in transit using TLS.</li>
+        <li>Session data is stored in a secured Redis instance with access controls.</li>
+        <li>WebAuthn ceremonies use challenge-response protocols with short-lived challenges (120 seconds) to prevent replay attacks.</li>
+        <li>We never store your private keys, wallet seed phrases, or passkey private keys. Only public keys and credential identifiers are stored.</li>
+        <li>Authorization codes are single-use and consumed immediately upon token issuance.</li>
+        <li>Refresh tokens are rotated on each use (the old token is deleted when a new one is issued).</li>
+      </ul>
+
+      <h3 class="subsection-title">7.2 Retention Periods</h3>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Data Type</th>
+            <th>Retention Period</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Session tokens</td>
+            <td>300 seconds (5 minutes)</td>
+            <td>Automatically deleted on expiry</td>
+          </tr>
+          <tr>
+            <td>Authorization codes</td>
+            <td>300 seconds (5 minutes)</td>
+            <td>Single-use; consumed on token exchange</td>
+          </tr>
+          <tr>
+            <td>WebAuthn challenges</td>
+            <td>120 seconds (2 minutes)</td>
+            <td>Automatically deleted on expiry or use</td>
+          </tr>
+          <tr>
+            <td>Device codes</td>
+            <td>1800 seconds (30 minutes)</td>
+            <td>Automatically deleted on expiry or approval</td>
+          </tr>
+          <tr>
+            <td>Access tokens</td>
+            <td>300 seconds (5 minutes)</td>
+            <td>Short-lived by design</td>
+          </tr>
+          <tr>
+            <td>Refresh tokens</td>
+            <td>86,400 seconds (24 hours)</td>
+            <td>Rotated on each use; old tokens deleted</td>
+          </tr>
+          <tr>
+            <td>Passkey credentials</td>
+            <td>Until deletion is requested</td>
+            <td>Retained to enable passkey authentication</td>
+          </tr>
+          <tr>
+            <td>Account linking data</td>
+            <td>Until deletion is requested</td>
+            <td>Retained to map passkeys to wallet DIDs</td>
+          </tr>
+          <tr>
+            <td>CAIP-122 signed messages</td>
+            <td>Not stored beyond the session</td>
+            <td>Verified and discarded after authentication</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        Blockchain wallet addresses and DIDs that appear on public blockchains remain publicly available regardless of any action we take. Our deletion of your data from our systems does not affect public blockchain records.
+      </p>
+    </section>
+
+    <hr class="section-divider">
+
+    <!-- Section 8: Your Rights Under GDPR -->
+    <section class="section" id="gdpr-rights">
+      <span class="section-number">Section 8</span>
+      <h2 class="section-title">Your Rights Under GDPR</h2>
+      <p>
+        If you are located in the European Economic Area (EEA), the United Kingdom, or Switzerland, you have the following rights under the GDPR with respect to your personal data:
+      </p>
+      <ul class="rights-list">
+        <li>
+          <strong>Right of access (Art. 15):</strong> You have the right to request confirmation of whether we process your personal data, and if so, to access that data along with information about the purposes, categories, recipients, retention periods, and your rights.
+        </li>
+        <li>
+          <strong>Right to rectification (Art. 16):</strong> You have the right to request correction of inaccurate personal data or completion of incomplete personal data. Note that blockchain-derived data (wallet addresses, DIDs) is determined by cryptographic keys and cannot be "corrected" in the traditional sense.
+        </li>
+        <li>
+          <strong>Right to erasure (Art. 17):</strong> You have the right to request deletion of your personal data when it is no longer necessary for the purposes for which it was collected, when you withdraw consent, or when there is no overriding legitimate ground for processing. We can delete passkey credentials, account linking data, and any session data from our systems. We cannot delete data that exists on public blockchains.
+        </li>
+        <li>
+          <strong>Right to data portability (Art. 20):</strong> You have the right to receive your personal data in a structured, commonly used, and machine-readable format, and to transmit that data to another controller. Your DID is inherently portable as it is derived from your own cryptographic keys.
+        </li>
+        <li>
+          <strong>Right to restriction of processing (Art. 18):</strong> You have the right to request restriction of processing in certain circumstances, such as when you contest the accuracy of data or when you have objected to processing pending verification.
+        </li>
+        <li>
+          <strong>Right to object (Art. 21):</strong> You have the right to object to processing based on legitimate interest. We will cease processing unless we demonstrate compelling legitimate grounds that override your interests, rights, and freedoms.
+        </li>
+        <li>
+          <strong>Right to withdraw consent (Art. 7(3)):</strong> Where processing is based on consent, you may withdraw your consent at any time. Withdrawal does not affect the lawfulness of processing performed before the withdrawal.
+        </li>
+        <li>
+          <strong>Right to lodge a complaint (Art. 77):</strong> You have the right to lodge a complaint with a supervisory authority. Because inblock.io assets GmbH is located in Weimar, Thuringia, Germany, the competent supervisory authority is:
+          <br><br>
+          <strong>Thuringian State Commissioner for Data Protection and Freedom of Information (TLfDI)</strong><br>
+          Haeusserstrasse 8, 99096 Erfurt, Germany<br>
+          Website: <a href="https://www.tlfdi.de" target="_blank" rel="noopener">www.tlfdi.de</a>
+          <br><br>
+          You may also lodge a complaint with the supervisory authority of your place of habitual residence or place of work.
+        </li>
+      </ul>
+      <h3 class="subsection-title">How to Exercise Your Rights</h3>
+      <p>
+        To exercise any of the above rights, please send a request to <a href="mailto:hello@inblock.io">hello@inblock.io</a>. We will respond to your request within 30 days, as required by the GDPR.
+      </p>
+      <p>
+        For identity verification purposes: if your identity is associated with a blockchain wallet, we may ask you to prove ownership by signing a challenge message with the relevant cryptographic key. For passkey-based identities, we may ask you to complete a WebAuthn authentication ceremony. This ensures that only the rightful owner of an identity can exercise rights over the associated data.
+      </p>
+      <p>
+        We do not charge a fee for exercising your rights, except in cases of manifestly unfounded or excessive requests, where we may charge a reasonable fee or refuse to act.
+      </p>
+    </section>
+
+    <hr class="section-divider">
+
+    <!-- Section 9: International Data Transfers -->
+    <section class="section" id="data-transfers">
+      <span class="section-number">Section 9</span>
+      <h2 class="section-title">International Data Transfers</h2>
+      <p>
+        inblock.io assets GmbH is based in Germany, within the European Union. Your personal data is primarily processed and stored within the EU/EEA.
+      </p>
+      <p>
+        If we transfer personal data to a country outside the EU/EEA that has not been deemed to provide an adequate level of data protection by the European Commission, we ensure that appropriate safeguards are in place. These safeguards include:
+      </p>
+      <ul>
+        <li>Standard Contractual Clauses (SCCs) adopted by the European Commission;</li>
+        <li>Transfers to countries with an adequacy decision by the European Commission;</li>
+        <li>Other appropriate safeguards as permitted under GDPR Art. 46.</li>
+      </ul>
+      <p>
+        You may request a copy of the safeguards we have in place by contacting us at <a href="mailto:hello@inblock.io">hello@inblock.io</a>.
+      </p>
+    </section>
+
+    <hr class="section-divider">
+
+    <!-- Section 10: Children's Privacy -->
+    <section class="section" id="children">
+      <span class="section-number">Section 10</span>
+      <h2 class="section-title">Children's Privacy</h2>
+      <p>
+        The Service is not directed to children under the age of 16, consistent with GDPR Art. 8 and the U.S. Children's Online Privacy Protection Act (COPPA). We do not knowingly collect personal data from children under 16.
+      </p>
+      <p>
+        If we become aware that we have collected personal data from a child under 16 without verification of parental consent, we will take steps to delete that information promptly. If you believe we have collected personal data from a child under 16, please contact us at <a href="mailto:hello@inblock.io">hello@inblock.io</a>.
+      </p>
+    </section>
+
+    <hr class="section-divider">
+
+    <!-- Section 11: California Resident Rights -->
+    <section class="section" id="ccpa">
+      <span class="section-number">Section 11</span>
+      <h2 class="section-title">California Resident Rights (CCPA)</h2>
+      <p>
+        If you are a California resident, you have additional rights under the California Consumer Privacy Act (CCPA) and the California Privacy Rights Act (CPRA). This section supplements the information provided in this Privacy Policy and applies solely to California residents.
+      </p>
+
+      <h3 class="subsection-title">11.1 Categories of Personal Information</h3>
+      <p>In the preceding 12 months, we have collected the following categories of personal information as defined by the CCPA:</p>
+      <ul>
+        <li><strong>Identifiers:</strong> Blockchain wallet addresses, DIDs, ENS domain names, device identifiers.</li>
+        <li><strong>Internet or other electronic network activity:</strong> Authentication session data, interactions with the Service.</li>
+      </ul>
+      <p>
+        We have not collected categories such as financial information, biometric information (passkey biometric checks happen locally on your device and are never transmitted to us), geolocation data, or sensory data.
+      </p>
+
+      <h3 class="subsection-title">11.2 Your California Privacy Rights</h3>
+      <p>As a California resident, you have the right to:</p>
+      <ul>
+        <li><strong>Know and access:</strong> Request the categories and specific pieces of personal information we have collected about you, the sources, business purposes, and categories of third parties with whom we share it.</li>
+        <li><strong>Delete:</strong> Request deletion of your personal information, subject to certain exceptions.</li>
+        <li><strong>Correct:</strong> Request correction of inaccurate personal information.</li>
+        <li><strong>Non-discrimination:</strong> Not receive discriminatory treatment for exercising your privacy rights.</li>
+      </ul>
+
+      <h3 class="subsection-title">11.3 Sale and Sharing of Personal Information</h3>
+      <p>
+        We do not sell your personal information. We do not share your personal information for cross-context behavioral advertising. We have not sold or shared personal information in the preceding 12 months.
+      </p>
+
+      <h3 class="subsection-title">11.4 Exercising Your California Rights</h3>
+      <p>
+        To exercise your California privacy rights, please contact us at <a href="mailto:hello@inblock.io">hello@inblock.io</a>. We will verify your identity before processing your request. For blockchain-based identities, verification can be done by signing a message with the relevant cryptographic key.
+      </p>
+      <p>
+        You may designate an authorized agent to make a request on your behalf. We may require the agent to provide proof of authorization and verify your identity directly.
+      </p>
+    </section>
+
+    <hr class="section-divider">
+
+    <!-- Section 12: Other U.S. State Privacy Rights -->
+    <section class="section" id="other-us">
+      <span class="section-number">Section 12</span>
+      <h2 class="section-title">Other U.S. State Privacy Rights</h2>
+
+      <h3 class="subsection-title">12.1 Nevada Residents</h3>
+      <p>
+        Under Nevada law (NRS 603A), Nevada residents may opt out of the sale of certain covered information. We do not sell your covered information as defined by Nevada law. If you have questions, please contact us at <a href="mailto:hello@inblock.io">hello@inblock.io</a>.
+      </p>
+
+      <h3 class="subsection-title">12.2 Other States</h3>
+      <p>
+        Several U.S. states have enacted or are enacting comprehensive privacy legislation (including Virginia, Colorado, Connecticut, Utah, and others). While the specifics vary by state, we generally provide the same rights to all users as described in this Privacy Policy. If you are a resident of a state with applicable privacy legislation and wish to exercise your rights, please contact us at <a href="mailto:hello@inblock.io">hello@inblock.io</a>.
+      </p>
+    </section>
+
+    <hr class="section-divider">
+
+    <!-- Section 13: Changes to this Privacy Policy -->
+    <section class="section" id="changes">
+      <span class="section-number">Section 13</span>
+      <h2 class="section-title">Changes to this Privacy Policy</h2>
+      <p>
+        We may update this Privacy Policy from time to time to reflect changes in our practices, technologies, legal requirements, or other factors. When we make material changes, we will update the "Effective date" at the top of this page.
+      </p>
+      <p>
+        We encourage you to review this Privacy Policy periodically to stay informed about how we are protecting your data. Your continued use of the Service after any changes to this Privacy Policy constitutes your acceptance of the updated terms.
+      </p>
+      <p>
+        If we make changes that materially affect your rights or the way we process your personal data, we will provide prominent notice (such as on the login page) before the changes take effect.
+      </p>
+    </section>
+
+    <hr class="section-divider">
+
+    <!-- Section 14: Contact Information -->
+    <section class="section" id="contact">
+      <span class="section-number">Section 14</span>
+      <h2 class="section-title">Contact Information</h2>
+      <p>
+        If you have questions, concerns, or requests regarding this Privacy Policy or our data practices, please contact us:
+      </p>
+      <p>
+        <strong>inblock.io assets GmbH</strong><br>
+        Humboldtstrasse 13<br>
+        99423 Weimar, Germany
+      </p>
+      <p>
+        Email: <a href="mailto:hello@inblock.io">hello@inblock.io</a><br>
+        Website: <a href="https://inblock.io" target="_blank" rel="noopener">https://inblock.io</a>
+      </p>
+      <p>
+        For GDPR-related inquiries, you may also contact the competent supervisory authority:
+      </p>
+      <p>
+        <strong>Thuringian State Commissioner for Data Protection and Freedom of Information (TLfDI)</strong><br>
+        Haeusserstrasse 8<br>
+        99096 Erfurt, Germany<br>
+        Website: <a href="https://www.tlfdi.de" target="_blank" rel="noopener">www.tlfdi.de</a>
+      </p>
+    </section>
+
+    <!-- Footer -->
+    <div class="doc-footer">
+      <p>&copy; 2026 inblock.io assets GmbH. All rights reserved.</p>
+      <p>
+        <a href="/legal/terms-of-use.html">Terms of Use</a> &nbsp;·&nbsp;
+        <a href="/legal/privacy-policy.html">Privacy Policy</a> &nbsp;·&nbsp;
+        <a href="https://inblock.io" target="_blank" rel="noopener">inblock.io</a>
+      </p>
+    </div>
+  </main>
+</div>
+</body>
+</html>

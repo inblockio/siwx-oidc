@@ -73,8 +73,8 @@ pub const CLIENT_PATH: &str = "/client";
 pub const USERINFO_PATH: &str = "/userinfo";
 pub const SIGNIN_PATH: &str = "/sign_in";
 pub const SIWX_COOKIE_KEY: &str = "siwx";
-pub const TOU_PATH: &str = "/legal/terms-of-use.pdf";
-pub const PP_PATH: &str = "/legal/privacy-policy.pdf";
+pub const TOU_PATH: &str = "/legal/terms-of-use.html";
+pub const PP_PATH: &str = "/legal/privacy-policy.html";
 
 type DBClientType = dyn DBClient + Sync;
 

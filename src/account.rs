@@ -270,8 +270,8 @@ pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
 
       <div class="footer">
         <p>By continuing you agree to the
-          <a href="/legal/terms-of-use.pdf">Terms of Use</a> and
-          <a href="/legal/privacy-policy.pdf">Privacy Policy</a>.
+          <a href="/legal/terms-of-use.html">Terms of Use</a> and
+          <a href="/legal/privacy-policy.html">Privacy Policy</a>.
         </p>
       </div>
     </div>

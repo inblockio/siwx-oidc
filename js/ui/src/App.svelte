@@ -498,8 +498,8 @@
 			<div class="footer">
 				<p>
 					By continuing you agree to the
-					<a href="/legal/terms-of-use.pdf">Terms of Use</a> and
-					<a href="/legal/privacy-policy.pdf">Privacy Policy</a>.
+					<a href="/legal/terms-of-use.html">Terms of Use</a> and
+					<a href="/legal/privacy-policy.html">Privacy Policy</a>.
 				</p>
 				{#if client_metadata.client_uri}
 					<p class="client-uri">Requested by {client_metadata.client_uri}</p>
