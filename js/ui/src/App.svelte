@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import { createConfig, connect, disconnect, getAccount, signMessage, reconnect, http, watchAccount } from '@wagmi/core';
 	import { injected } from '@wagmi/connectors';
-	import { mainnet, arbitrum, polygon } from 'viem/chains';
+	import { mainnet } from 'viem/chains';
 	import { createSiweMessage } from 'viem/siwe';
 	import Cookies from 'js-cookie';
 
@@ -26,12 +26,10 @@
 	let mounted = false;
 
 	const config = createConfig({
-		chains: [mainnet, arbitrum, polygon],
+		chains: [mainnet],
 		connectors: [injected()],
 		transports: {
 			[mainnet.id]: http(),
-			[arbitrum.id]: http(),
-			[polygon.id]: http(),
 		},
 	});
 
@@ -76,7 +74,7 @@
 			const result = await connect(config, { connector: injected() });
 
 			if (result.accounts.length > 0) {
-				await performSignIn(result.accounts[0], result.chainId);
+				await performSignIn(result.accounts[0]);
 			}
 		} catch (e: any) {
 			if (e.name === 'ConnectorNotFoundError' || e.message?.includes('No injected')) {
@@ -93,7 +91,7 @@
 		}
 	}
 
-	async function performSignIn(address: string, chainId: number) {
+	async function performSignIn(address: string) {
 		status = 'Signing message...';
 
 		const expirationTime = new Date(
@@ -103,7 +101,7 @@
 		const preparedMessage = createSiweMessage({
 			domain: window.location.host,
 			address: address as `0x${string}`,
-			chainId,
+			chainId: 1,
 			expirationTime,
 			uri: window.location.origin,
 			version: '1',
@@ -116,7 +114,7 @@
 			message: preparedMessage,
 		});
 
-		const did = `did:pkh:eip155:${chainId}:${address}`;
+		const did = `did:pkh:eip155:1:${address}`;
 		const session = {
 			did,
 			message: preparedMessage,
