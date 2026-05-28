@@ -20,7 +20,7 @@ pub const SESSION_COOKIE_NAME: &str = "session";
 /// TTL for opaque access tokens (MSC3861 mode).
 pub const ACCESS_TOKEN_TTL: u64 = 300; // 5 minutes
 /// TTL for opaque refresh tokens (MSC3861 mode).
-pub const REFRESH_TOKEN_TTL: u64 = 86400; // 24 hours
+pub const REFRESH_TOKEN_TTL: u64 = 7_776_000; // 90 days
 
 /// Default device code lifetime (RFC 8628 `expires_in`).
 pub const DEVICE_CODE_LIFETIME: u64 = 1800; // 30 minutes
