@@ -455,6 +455,51 @@ during device provisioning. Check siwx-oidc logs for `device approval: user has
 no cross-signing keys` warnings. Check browser console for `bootstrapCrossSigning`
 calls and `keys/device_signing/upload` requests during login.
 
+### Element X mobile passkey-first login (RESOLVED 2026-05-25)
+
+**Goal:** End-to-end passkey-first login on Element X mobile (Android/iOS). User enters
+homeserver, registers passkey with biometric, lands in working E2EE session. No wallet,
+no seed phrase, no manual verification prompt.
+
+**Status: iOS WORKING, Android OPEN.** iOS Element X passkey-first login works
+end-to-end. Android Element X does not work yet (under investigation).
+
+**Root cause was wrong server input, not an SDK bug.** Two OIDC discovery divergences
+from MAS caused the matrix-rust-sdk to silently fail cross-signing bootstrap. The SDK's
+`bootstrap_cross_signing_if_needed(None)` never reached the `keys/device_signing/upload`
+call because earlier steps failed due to missing metadata, and the error was swallowed:
+`error!("Couldn't bootstrap cross signing {e:?}")`.
+
+**Fixes deployed (2026-05-25):**
+
+| Fix | Endpoint | Value |
+|-----|----------|-------|
+| `prompt_values_supported` | OIDC discovery (`axum_lib.rs`) | `["login", "create"]` |
+| `m.authentication.account` | `.well-known/matrix/client` (Caddyfile) | `https://siwx-oidc.inblock.io/account` |
+
+**Investigation timeline (2026-05-24):**
+1. Symptom: passkey auth succeeds, then "Can't confirm your digital identity," reset fails
+2. Validated: Element Web passkey login works perfectly with same server (server code correct)
+3. Validated: QR code login works when cross-signing already set up (token/introspect/scope correct)
+4. Synapse logs confirmed: Element X never calls `keys/device_signing/upload`
+5. SDK source analysis confirmed: code path supports MSC3967 with `auth: None` (not a hard blocker)
+6. Live comparison against MAS found two missing fields in OIDC discovery / .well-known
+7. Fixes deployed, Element X passkey-first login works end-to-end
+
+**Lesson learned:** The matrix-rust-sdk silently swallows cross-signing bootstrap errors.
+When the SDK encounters unexpected/missing OIDC metadata, the bootstrap task fails before
+reaching the key upload HTTP call, and the error is logged at `error!` level with no retry
+or user-visible feedback. Always diff OIDC discovery and `.well-known` responses against
+MAS when debugging Element X issues.
+
+**Upstream context (still relevant for awareness):**
+- [matrix-rust-sdk #1641](https://github.com/matrix-org/matrix-rust-sdk/issues/1641):
+  silent bootstrap failure, no retry/recovery. OPEN since 2023.
+- [element-meta #2410](https://github.com/element-hq/element-meta/issues/2410):
+  richvdh: "no further attempt to publish public keys, account is totally broken."
+- These upstream issues mean any future OIDC metadata regression could silently break
+  Element X again with no user-visible error. Keep MAS parity as a deployment check.
+
 ### CAIP-122 wallet login fails
 
 Run `/debug-oidc` for the full OIDC flow debugging checklist.
