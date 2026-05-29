@@ -13,11 +13,9 @@ use axum_extra::{
 };
 use chrono::Utc;
 use serde::Deserialize;
-use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::introspect::generate_opaque_token;
-use crate::synapse_client::SynapseClient;
 use siwx_oidc::db::{DBClient, RedisClient, TokenMetadata, ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL};
 
 // -- Shared state for compat endpoints ----------------------------------------
@@ -25,7 +23,6 @@ use siwx_oidc::db::{DBClient, RedisClient, TokenMetadata, ACCESS_TOKEN_TTL, REFR
 #[derive(Clone)]
 pub struct CompatState {
     pub redis_client: RedisClient,
-    pub synapse_client: Option<Arc<SynapseClient>>,
 }
 
 // -- Request/response types ---------------------------------------------------
