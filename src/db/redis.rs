@@ -334,21 +334,6 @@ impl DBClient for RedisClient {
         Ok(())
     }
 
-    async fn get_device_id(&self, did: &str) -> Result<Option<String>> {
-        let key = format!("{}/{}", KV_DEVICE_PREFIX, did);
-        self.get_raw(&key).await
-    }
-
-    async fn set_device_id(&self, did: &str, device_id: &str) -> Result<()> {
-        let key = format!("{}/{}", KV_DEVICE_PREFIX, did);
-        self.set_raw(&key, device_id).await
-    }
-
-    async fn delete_device_id(&self, did: &str) -> Result<()> {
-        let key = format!("{}/{}", KV_DEVICE_PREFIX, did);
-        self.del_raw(&key).await
-    }
-
     // -- RFC 8628 device code storage -----------------------------------------
 
     async fn set_device_code(
