@@ -49,14 +49,6 @@ pub async fn revoke(
     State(state): State<CompatState>,
     axum::extract::Form(form): axum::extract::Form<RevokeForm>,
 ) -> StatusCode {
-    // Look up token metadata so we can clean up the Synapse device.
-    if let Ok(Some(meta)) = state.redis_client.get_token(&form.token).await {
-        if let Some(ref synapse) = state.synapse_client {
-            if let Err(e) = synapse.delete_device(&meta.username, &meta.device_id).await {
-                warn!("revoke: delete_device failed: {}", e);
-            }
-        }
-    }
     if let Err(e) = state.redis_client.delete_token(&form.token).await {
         warn!(error = %e, "revoke: failed to delete token from Redis");
     }
@@ -84,13 +76,6 @@ pub async fn logout(
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
 ) -> impl IntoResponse {
     if let Some(TypedHeader(auth)) = bearer {
-        if let Ok(Some(meta)) = state.redis_client.get_token(auth.token()).await {
-            if let Some(ref synapse) = state.synapse_client {
-                if let Err(e) = synapse.delete_device(&meta.username, &meta.device_id).await {
-                    warn!("logout: delete_device failed: {}", e);
-                }
-            }
-        }
         if let Err(e) = state.redis_client.delete_token(auth.token()).await {
             warn!(error = %e, "logout: failed to delete token from Redis");
         }
