@@ -590,12 +590,11 @@ async fn token_device_code(
                 generated
             };
 
-            provision_synapse_device_additive(
+            provision_synapse_device(
                 &did,
                 synapse_client,
-                db_client,
-                &dev_id,
                 "Element X",
+                Some(&dev_id),
             )
             .await;
 
@@ -1178,38 +1177,34 @@ fn extract_device_id_from_scope(scope: &str) -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
-/// Provision a Synapse device for a DID. Best-effort: failures are logged
-/// but never fail the auth flow. Returns the new device_id if Synapse is configured.
+/// Resolve the device_id to provision: use the client-proposed id when present,
+/// otherwise mint a fresh `SIWX_{uuid8}`.
+fn resolve_device_id(proposed_device_id: Option<&str>) -> String {
+    match proposed_device_id {
+        Some(proposed) => proposed.to_string(),
+        None => format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]),
+    }
+}
+
+/// Provision a Synapse user+device for a DID. Best-effort: failures are logged
+/// but never fail the auth flow. Idempotent: re-provisioning the same device_id
+/// is a plain upsert that preserves the device's E2EE keys. Never deletes an
+/// existing device and never resets cross-signing; those are explicit,
+/// user-initiated actions (see account.rs).
 ///
-/// If `proposed_device_id` is `Some`, that ID is used instead of generating a new
-/// `SIWX_{uuid}`. This supports clients (e.g. Element X) that propose a device_id
-/// in the authorization scope.
+/// `proposed_device_id`: the client-supplied device_id from the OAuth scope
+/// (stable for Element Web and Element X). When `None`, a fresh `SIWX_{uuid}`
+/// is minted.
 pub async fn provision_synapse_device(
     did: &str,
     synapse_client: Option<&SynapseClient>,
-    db_client: &DBClientType,
     display_name: &str,
     proposed_device_id: Option<&str>,
 ) -> Option<String> {
     let synapse = synapse_client?;
     let localpart = did_to_localpart(did);
-
-    if let Ok(Some(old_id)) = db_client.get_device_id(did).await {
-        debug!("cleaning up old device_id={} for did={}", old_id, did);
-        if let Err(e) = synapse.delete_device(&localpart, &old_id).await {
-            warn!("delete_device (cleanup) failed: {}", e);
-        }
-    }
-    let dev_id = if let Some(proposed) = proposed_device_id {
-        info!(proposed_device_id = %proposed, "using client-proposed device_id from scope");
-        proposed.to_string()
-    } else {
-        format!("SIWX_{}", &Uuid::new_v4().to_string()[..8])
-    };
-    debug!("new device_id={} for did={}", dev_id, did);
-    if let Err(e) = db_client.set_device_id(did, &dev_id).await {
-        warn!("failed to persist device_id: {}", e);
-    }
+    let dev_id = resolve_device_id(proposed_device_id);
+    debug!("provisioning device_id={} for did={}", dev_id, did);
 
     match synapse.is_localpart_available(&localpart).await {
         Ok(true) => {
@@ -1228,47 +1223,7 @@ pub async fn provision_synapse_device(
         warn!("upsert_device failed: {}", e);
     }
 
-    if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
-        warn!("allow_cross_signing_reset failed: {}", e);
-    }
-
     Some(dev_id)
-}
-
-/// Provision a Synapse device without deleting existing devices.
-/// Used by device_code grant (QR login) where we ADD a second device.
-async fn provision_synapse_device_additive(
-    did: &str,
-    synapse_client: Option<&SynapseClient>,
-    _db_client: &DBClientType,
-    device_id: &str,
-    display_name: &str,
-) -> Option<String> {
-    let synapse = synapse_client?;
-    let localpart = did_to_localpart(did);
-
-    match synapse.is_localpart_available(&localpart).await {
-        Ok(true) => {
-            if let Err(e) = synapse.provision_user(&localpart, did).await {
-                warn!("provision_user failed: {}", e);
-            }
-        }
-        Ok(false) => {}
-        Err(e) => warn!("is_localpart_available check failed: {}", e),
-    }
-
-    if let Err(e) = synapse
-        .upsert_device(&localpart, device_id, Some(display_name))
-        .await
-    {
-        warn!("upsert_device failed: {}", e);
-    }
-
-    if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
-        warn!("allow_cross_signing_reset failed: {}", e);
-    }
-
-    Some(device_id.to_string())
 }
 
 pub async fn sign_in(
@@ -1413,7 +1368,6 @@ pub async fn sign_in(
     let device_id = provision_synapse_device(
         &did,
         synapse_client,
-        db_client,
         "Element Web",
         proposed_device_id.as_deref(),
     )
@@ -1969,5 +1923,18 @@ mod tests {
             extract_device_id_from_scope("openid urn:matrix:client:device:"),
             None
         );
+    }
+
+    #[test]
+    fn test_resolve_device_id_uses_proposed() {
+        let id = resolve_device_id(Some("2VeUcPZUV5"));
+        assert_eq!(id, "2VeUcPZUV5");
+    }
+
+    #[test]
+    fn test_resolve_device_id_mints_when_absent() {
+        let id = resolve_device_id(None);
+        assert!(id.starts_with("SIWX_"));
+        assert_eq!(id.len(), "SIWX_".len() + 8);
     }
 }
