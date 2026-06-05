@@ -93,30 +93,6 @@ impl SynapseClient {
         Ok(())
     }
 
-    /// Delete a device for a user.
-    pub async fn delete_device(&self, localpart: &str, device_id: &str) -> Result<()> {
-        let url = format!("{}/_synapse/mas/delete_device", self.endpoint);
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.shared_secret)
-            .json(&json!({
-                "localpart": localpart,
-                "device_id": device_id,
-            }))
-            .send()
-            .await
-            .context("delete_device: request failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            warn!(%status, %body, "delete_device failed");
-            anyhow::bail!("delete_device: HTTP {status}");
-        }
-        Ok(())
-    }
-
     /// Allow the user to reset their cross-signing keys on next login.
     pub async fn allow_cross_signing_reset(&self, localpart: &str) -> Result<()> {
         let url = format!("{}/_synapse/mas/allow_cross_signing_reset", self.endpoint);
