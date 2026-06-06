@@ -5,8 +5,30 @@
 
 use anyhow::{Context, Result};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::warn;
+
+/// A user's device/session as reported by Synapse's admin API.
+///
+/// Used to render MSC4191 `devices_list` / `device_view`. All fields beyond
+/// `device_id` are best-effort (Synapse returns `null` for never-seen devices).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DeviceInfo {
+    pub device_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub last_seen_ip: Option<String>,
+    /// Last-seen timestamp in milliseconds since the Unix epoch.
+    #[serde(default)]
+    pub last_seen_ts: Option<i64>,
+}
+
+/// Build a fully-qualified Matrix user id (`@localpart:server_name`).
+fn matrix_user_id(localpart: &str, server_name: &str) -> String {
+    format!("@{}:{}", localpart, server_name)
+}
 
 /// Client for Synapse's MAS (Matrix Authentication Service) compatibility endpoints.
 ///
@@ -185,6 +207,100 @@ impl SynapseClient {
         warn!(%status, %body, "is_localpart_available: unexpected response");
         anyhow::bail!("is_localpart_available: HTTP {status}");
     }
+
+    /// List a user's devices via the Synapse admin API
+    /// (`GET /_synapse/admin/v2/users/{user_id}/devices`).
+    ///
+    /// Authenticated with the shared secret, which doubles as Synapse's
+    /// `admin_token` under MSC3861 (`matrix_server.sh` sets them equal).
+    pub async fn list_devices(
+        &self,
+        localpart: &str,
+        server_name: &str,
+    ) -> Result<Vec<DeviceInfo>> {
+        let user_id = matrix_user_id(localpart, server_name);
+        let url = format!(
+            "{}/_synapse/admin/v2/users/{}/devices",
+            self.endpoint,
+            urlencoding::encode(&user_id)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.shared_secret)
+            .send()
+            .await
+            .context("list_devices: request failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(%status, %body, "list_devices failed");
+            anyhow::bail!("list_devices: HTTP {status}");
+        }
+
+        #[derive(Deserialize)]
+        struct DevicesResponse {
+            #[serde(default)]
+            devices: Vec<DeviceInfo>,
+        }
+        let body: DevicesResponse = resp.json().await.context("list_devices: invalid JSON")?;
+        Ok(body.devices)
+    }
+
+    /// Fetch a single device belonging to the user, or `None` if no device with
+    /// that id is owned by the user.
+    ///
+    /// Implemented by listing the user's devices and filtering, so it inherently
+    /// scopes the lookup to the authenticated user (a foreign `device_id` yields
+    /// `None` rather than leaking another user's device).
+    pub async fn get_device(
+        &self,
+        localpart: &str,
+        device_id: &str,
+        server_name: &str,
+    ) -> Result<Option<DeviceInfo>> {
+        Ok(self
+            .list_devices(localpart, server_name)
+            .await?
+            .into_iter()
+            .find(|d| d.device_id == device_id))
+    }
+
+    /// Delete a user's device via the Synapse admin API
+    /// (`DELETE /_synapse/admin/v2/users/{user_id}/devices/{device_id}`).
+    ///
+    /// Scoped to the user's mxid, so a foreign `device_id` cannot affect another
+    /// user. Deleting the device invalidates Synapse's cached access token for it.
+    pub async fn delete_device(
+        &self,
+        localpart: &str,
+        device_id: &str,
+        server_name: &str,
+    ) -> Result<()> {
+        let user_id = matrix_user_id(localpart, server_name);
+        let url = format!(
+            "{}/_synapse/admin/v2/users/{}/devices/{}",
+            self.endpoint,
+            urlencoding::encode(&user_id),
+            urlencoding::encode(device_id)
+        );
+        let resp = self
+            .http
+            .delete(&url)
+            .bearer_auth(&self.shared_secret)
+            .send()
+            .await
+            .context("delete_device: request failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(%status, %body, "delete_device failed");
+            anyhow::bail!("delete_device: HTTP {status}");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -202,5 +318,66 @@ mod tests {
         let client = SynapseClient::new("https://synapse.example.com", "s3cr3t");
         assert_eq!(client.endpoint, "https://synapse.example.com");
         assert_eq!(client.shared_secret, "s3cr3t");
+    }
+
+    #[test]
+    fn matrix_user_id_builds_mxid() {
+        assert_eq!(
+            matrix_user_id("did-pkh-eip155-1-0xabc", "matrix.inblock.io"),
+            "@did-pkh-eip155-1-0xabc:matrix.inblock.io"
+        );
+    }
+
+    #[test]
+    fn mxid_url_encoding_escapes_at_and_colon() {
+        // The mxid must be percent-encoded for the admin-API path segment.
+        let encoded = urlencoding::encode(&matrix_user_id("alice", "example.com")).into_owned();
+        assert_eq!(encoded, "%40alice%3Aexample.com");
+        assert!(!encoded.contains('@'));
+        assert!(!encoded.contains(':'));
+    }
+
+    #[test]
+    fn device_info_deserializes_full_record() {
+        let json = r#"{
+            "device_id": "ABCDEFGHIJ",
+            "display_name": "Element Web",
+            "last_seen_ip": "1.2.3.4",
+            "last_seen_ts": 1700000000000,
+            "last_seen_user_agent": "Mozilla/5.0",
+            "user_id": "@alice:example.com"
+        }"#;
+        let d: DeviceInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(d.device_id, "ABCDEFGHIJ");
+        assert_eq!(d.display_name.as_deref(), Some("Element Web"));
+        assert_eq!(d.last_seen_ip.as_deref(), Some("1.2.3.4"));
+        assert_eq!(d.last_seen_ts, Some(1700000000000));
+    }
+
+    #[test]
+    fn device_info_tolerates_nulls_and_missing_fields() {
+        // Never-seen devices report null/absent optional fields.
+        let d: DeviceInfo =
+            serde_json::from_str(r#"{"device_id":"X","display_name":null,"last_seen_ts":null}"#)
+                .unwrap();
+        assert_eq!(d.device_id, "X");
+        assert_eq!(d.display_name, None);
+        assert_eq!(d.last_seen_ip, None);
+        assert_eq!(d.last_seen_ts, None);
+    }
+
+    #[test]
+    fn devices_response_extracts_device_array() {
+        // Mirrors the wrapper shape Synapse returns from the list endpoint.
+        #[derive(serde::Deserialize)]
+        struct DevicesResponse {
+            #[serde(default)]
+            devices: Vec<DeviceInfo>,
+        }
+        let body: DevicesResponse =
+            serde_json::from_str(r#"{"devices":[{"device_id":"A"},{"device_id":"B"}],"total":2}"#)
+                .unwrap();
+        let ids: Vec<&str> = body.devices.iter().map(|d| d.device_id.as_str()).collect();
+        assert_eq!(ids, vec!["A", "B"]);
     }
 }
