@@ -99,13 +99,6 @@ pub enum Action {
     CrossSigningReset,
 }
 
-impl Action {
-    /// Whether this action requires a `device_id` query parameter.
-    pub fn requires_device_id(self) -> bool {
-        matches!(self, Action::DeviceView | Action::DeviceDelete)
-    }
-}
-
 /// The full superset of MSC4191 action strings this server advertises in
 /// `account_management_actions_supported`, in stable-then-alias order.
 ///
@@ -387,18 +380,30 @@ pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
         .as_deref()
         .map(sanitize_action)
         .unwrap_or_default();
+    let device_id = query
+        .device_id
+        .as_deref()
+        .map(sanitize_device_id)
+        .unwrap_or_default();
     let base = base_url.trim_end_matches('/');
 
-    let (title, subtitle) = if action == ACTION_CROSS_SIGNING_RESET {
-        (
+    // Title/subtitle keyed on the canonical action so session_* aliases render
+    // identically to their device_* form.
+    let (title, subtitle) = match canonical_action(&action) {
+        Some(Action::CrossSigningReset) => (
             "Reset encryption keys",
             "Authenticate to confirm resetting your cross-signing keys. \
              This allows your client to set up new encryption keys.",
-        )
-    } else if action.is_empty() {
-        ("Account", "Manage your account settings.")
-    } else {
-        ("Account action", "Authenticate to continue.")
+        ),
+        Some(Action::Profile) => ("Your account", "Authenticate to view your account."),
+        Some(Action::DevicesList) => (
+            "Your sessions",
+            "Authenticate to view and manage your signed-in devices.",
+        ),
+        Some(Action::DeviceView) => ("Session details", "Authenticate to view this device."),
+        Some(Action::DeviceDelete) => ("Sign out device", "Authenticate to sign this device out."),
+        None if action.is_empty() => ("Account", "Manage your account settings."),
+        None => ("Account action", "Authenticate to continue."),
     };
 
     let html = format!(
@@ -412,7 +417,7 @@ pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
 <link href="https://api.fontshare.com/css?f[]=satoshi@300,400,500,700,900&display=swap" rel="stylesheet">
 <style>{css}</style>
 </head>
-<body data-action="{action}" data-base="{base}">
+<body data-action="{action}" data-base="{base}" data-device-id="{device_id}">
 <div class="login-page">
   <div class="ambient-glow"></div>
   <div class="login-card">
@@ -462,7 +467,10 @@ pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
         <div class="success-badge" id="terminal-badge"></div>
         <h1 class="title" id="terminal-title"></h1>
         <p class="subtitle" id="terminal-subtitle">You can close this page.</p>
+        <div id="terminal-actions"></div>
       </div>
+
+      <div id="result-section" class="result-section hidden"></div>
 
       <div id="status" class="error-msg hidden">
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="error-icon">
@@ -489,6 +497,7 @@ pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
         subtitle = subtitle,
         action = action,
         base = base,
+        device_id = device_id,
     );
     Html(html)
 }
@@ -694,11 +703,81 @@ html, body {
   transition: color 0.15s ease;
 }
 .footer a:hover { color: rgba(0,0,0,0.7); }
+.result-section { display: flex; flex-direction: column; align-items: stretch; text-align: center; }
+.result-section .title { text-align: center; }
+.btn-danger {
+  background: var(--danger);
+  color: #fff;
+  text-decoration: none;
+  margin-top: 16px;
+}
+.btn-danger:hover { background: #b91c1c; transform: translateY(-1px); }
+.btn-secondary[href] { text-decoration: none; margin-top: 16px; }
+.device-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; text-align: left; }
+.device-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--border-strong);
+  background: rgba(0,0,0,0.02);
+}
+.device-meta { min-width: 0; }
+.device-name {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.device-sub {
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.device-actions { display: flex; gap: 12px; flex-shrink: 0; }
+.btn-link {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent-strong);
+  text-decoration: none;
+  cursor: pointer;
+}
+.btn-link:hover { text-decoration: underline; }
+.btn-link.danger { color: var(--danger); }
+.info-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0;
+  text-align: left;
+}
+.info-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(0,0,0,0.03);
+}
+.info-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-mute);
+}
+.info-value { font-size: 13px; color: var(--text); word-break: break-all; }
 "##;
 
 const ACCOUNT_PAGE_JS: &str = r#"
 const BASE = document.body.dataset.base;
 const ACTION = document.body.dataset.action;
+const DEVICE_ID = document.body.dataset.deviceId || '';
 const $ = (id) => document.getElementById(id);
 
 const CHECK_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="success-icon"><path fill-rule="evenodd" d="M2.25 12c0-5.385 4.365-9.75 9.75-9.75s9.75 4.365 9.75 9.75-4.365 9.75-9.75 9.75S2.25 17.385 2.25 12Zm13.36-1.814a.75.75 0 1 0-1.22-.872l-3.236 4.53L9.53 12.22a.75.75 0 0 0-1.06 1.06l2.25 2.25a.75.75 0 0 0 1.14-.094l3.75-5.25Z" clip-rule="evenodd"/></svg>';
@@ -721,10 +800,10 @@ async function authWallet() {
     const r = await fetch(BASE + '/account/wallet', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: ACTION, did, message, signature })
+      body: JSON.stringify({ action: ACTION, did, message, signature, device_id: DEVICE_ID || null })
     });
     if (r.ok) {
-      showTerminal('Encryption keys reset', 'Your client can now set up new encryption keys. You can close this page.');
+      renderOutcome(await r.json());
     } else {
       const t = await r.text();
       showStatus(t || 'Action failed.');
@@ -763,6 +842,7 @@ async function authPasskey() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         action: ACTION,
+        device_id: DEVICE_ID || null,
         session_id: sessionId,
         id: credential.id,
         rawId: bufferToBase64(credential.rawId),
@@ -776,7 +856,7 @@ async function authPasskey() {
       })
     });
     if (finishR.ok) {
-      showTerminal('Encryption keys reset', 'Your client can now set up new encryption keys. You can close this page.');
+      renderOutcome(await finishR.json());
     } else {
       const t = await finishR.text();
       showStatus(t || 'Passkey authentication failed.');
@@ -788,16 +868,108 @@ async function authPasskey() {
   }
 }
 
-function showTerminal(title, subtitle) {
+// -- Outcome rendering (MSC4191) ---------------------------------------------
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function actionUrl(action, deviceId) {
+  let u = BASE + '/account?action=' + encodeURIComponent(action);
+  if (deviceId) u += '&device_id=' + encodeURIComponent(deviceId);
+  return u;
+}
+
+function lastSeen(d) {
+  if (!d.last_seen_ts) return 'never';
+  try { return new Date(d.last_seen_ts).toLocaleString(); } catch (_) { return String(d.last_seen_ts); }
+}
+
+function infoRow(label, value) {
+  return '<div class="info-row"><span class="info-label">' + esc(label) +
+    '</span><span class="info-value">' + esc(value) + '</span></div>';
+}
+
+function renderOutcome(data) {
+  switch (data && data.kind) {
+    case 'completed':
+      showTerminal('Encryption keys reset',
+        'Your client can now set up new encryption keys. You can close this page.', true);
+      break;
+    case 'deleted':
+      showTerminal('Session signed out', 'This device can no longer access your account.', false);
+      $('terminal-actions').innerHTML =
+        '<a class="btn btn-secondary" href="' + actionUrl('org.matrix.devices_list', null) + '">Back to your sessions</a>';
+      break;
+    case 'profile':
+      showResult('<div class="success-badge">' + CHECK_SVG + '</div>' +
+        '<h1 class="title">Your account</h1>' +
+        '<div class="info-list">' + infoRow('Matrix ID', data.user_id) + infoRow('DID', data.did) + '</div>');
+      break;
+    case 'devices':
+      renderDevices(data.devices || []);
+      break;
+    case 'device':
+      renderDevice(data.device);
+      break;
+    default:
+      showTerminal('Done', 'You can close this page.', true);
+  }
+}
+
+function deviceRow(d) {
+  const name = esc(d.display_name || d.device_id);
+  const ip = d.last_seen_ip ? ' &middot; ' + esc(d.last_seen_ip) : '';
+  return '<div class="device-row"><div class="device-meta">' +
+    '<div class="device-name">' + name + '</div>' +
+    '<div class="device-sub">' + esc(d.device_id) + ' &middot; ' + esc(lastSeen(d)) + ip + '</div>' +
+    '</div><div class="device-actions">' +
+    '<a class="btn-link" href="' + actionUrl('org.matrix.device_view', d.device_id) + '">View</a>' +
+    '<a class="btn-link danger" href="' + actionUrl('org.matrix.device_delete', d.device_id) + '">Sign out</a>' +
+    '</div></div>';
+}
+
+function renderDevices(devices) {
+  const body = devices.length
+    ? '<div class="device-list">' + devices.map(deviceRow).join('') + '</div>'
+    : '<p class="subtitle">No active sessions.</p>';
+  showResult('<h1 class="title">Your sessions</h1>' + body);
+}
+
+function renderDevice(d) {
+  if (!d) { showStatus('Device not found.'); return; }
+  showResult('<h1 class="title">Session details</h1>' +
+    '<div class="info-list">' +
+      infoRow('Name', d.display_name || '(unnamed)') +
+      infoRow('Device ID', d.device_id) +
+      infoRow('Last seen', lastSeen(d)) +
+      (d.last_seen_ip ? infoRow('Last IP', d.last_seen_ip) : '') +
+    '</div>' +
+    '<a class="btn btn-danger" href="' + actionUrl('org.matrix.device_delete', d.device_id) + '">Sign out this session</a>');
+}
+
+function showResult(html) {
   $('auth-section').classList.add('hidden');
+  $('terminal-section').classList.add('hidden');
+  hideStatus();
+  const el = $('result-section');
+  el.innerHTML = html;
+  el.classList.remove('hidden');
+}
+
+function showTerminal(title, subtitle, autoClose) {
+  $('auth-section').classList.add('hidden');
+  $('result-section').classList.add('hidden');
   hideStatus();
   const section = $('terminal-section');
   $('terminal-badge').innerHTML = CHECK_SVG;
   $('terminal-title').textContent = title;
   $('terminal-subtitle').textContent = subtitle || 'You can close this page.';
+  $('terminal-actions').innerHTML = '';
   section.classList.remove('hidden');
-  // Try to close the window after a short delay (works when opened by window.open).
-  setTimeout(() => { try { window.close(); } catch (_) {} }, 3000);
+  // Auto-close only for terminal side effects (works when opened by window.open).
+  if (autoClose) setTimeout(() => { try { window.close(); } catch (_) {} }, 3000);
 }
 
 function showStatus(msg) {
@@ -936,6 +1108,98 @@ mod tests {
     }
 
     #[test]
+    fn account_page_renders_device_view_with_device_id() {
+        // AC2: the device_view deep link must render without an "Unsupported
+        // action" error and carry the device_id through to the client.
+        let html = account_page(
+            AccountPageQuery {
+                action: Some("org.matrix.device_view".to_string()),
+                device_id: Some("ABCDEFGHIJ".to_string()),
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        assert!(html.contains(r#"data-action="org.matrix.device_view""#));
+        assert!(html.contains(r#"data-device-id="ABCDEFGHIJ""#));
+        assert!(html.contains("Session details"));
+        assert!(!html.contains("Unsupported action"));
+    }
+
+    #[test]
+    fn account_page_renders_session_alias_like_device() {
+        // session_view must render identically to device_view (same title).
+        let html = account_page(
+            AccountPageQuery {
+                action: Some("org.matrix.session_view".to_string()),
+                device_id: Some("DEV".to_string()),
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        assert!(html.contains("Session details"));
+    }
+
+    #[test]
+    fn account_page_titles_match_action() {
+        let title_for = |action: &str| {
+            account_page(
+                AccountPageQuery {
+                    action: Some(action.to_string()),
+                    device_id: Some("D".to_string()),
+                    id_token_hint: None,
+                },
+                "https://siwx.example.com",
+            )
+            .0
+        };
+        assert!(title_for("org.matrix.devices_list").contains("Your sessions"));
+        assert!(title_for("org.matrix.profile").contains("Your account"));
+        assert!(title_for("org.matrix.device_delete").contains("Sign out device"));
+    }
+
+    #[test]
+    fn account_page_sanitizes_device_id() {
+        let html = account_page(
+            AccountPageQuery {
+                action: Some("org.matrix.device_view".to_string()),
+                device_id: Some(r#""><script>alert(1)</script>"#.to_string()),
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        assert!(!html.contains("<script>alert"));
+        assert!(html.contains(r#"data-device-id="scriptalert1script""#));
+    }
+
+    #[test]
+    fn account_page_js_has_outcome_render_hooks() {
+        // The page JS must render every ActionOutcome kind (H8).
+        let html = account_page(
+            AccountPageQuery {
+                action: Some("org.matrix.devices_list".to_string()),
+                device_id: None,
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        for hook in [
+            "renderOutcome",
+            "renderDevices",
+            "renderDevice",
+            "result-section",
+            "org.matrix.device_delete",
+            "org.matrix.devices_list",
+            "DEVICE_ID",
+        ] {
+            assert!(html.contains(hook), "account page JS missing hook: {hook}");
+        }
+    }
+
+    #[test]
     fn sanitize_action_strips_unsafe_chars() {
         assert_eq!(sanitize_action(""), "");
         assert_eq!(
@@ -996,15 +1260,6 @@ mod tests {
         assert_eq!(canonical_action("org.matrix.unknown"), None);
         assert_eq!(canonical_action(""), None);
         assert_eq!(canonical_action("device_view"), None); // missing namespace
-    }
-
-    #[test]
-    fn requires_device_id_only_for_single_device_actions() {
-        assert!(Action::DeviceView.requires_device_id());
-        assert!(Action::DeviceDelete.requires_device_id());
-        assert!(!Action::DevicesList.requires_device_id());
-        assert!(!Action::Profile.requires_device_id());
-        assert!(!Action::CrossSigningReset.requires_device_id());
     }
 
     #[test]
