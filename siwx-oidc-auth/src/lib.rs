@@ -188,6 +188,26 @@ fn build_message(domain: &str, key: &SiwxKey, redirect_uri: &str, nonce: &str) -
 }
 
 // ---------------------------------------------------------------------------
+// OAuth scope construction
+// ---------------------------------------------------------------------------
+
+/// Build the OAuth `scope` requested at `/authorize`.
+///
+/// - `None`: the default `"openid profile"` (unchanged, backward compatible).
+/// - `Some(id)`: appends the stable Matrix device URN so the server pins this
+///   exact Synapse device_id instead of minting a fresh `SIWX_<uuid>` on every
+///   login. The siwx-oidc server validates the scope (it contains `openid`) and
+///   extracts the id via `extract_device_id_from_scope`, which strips the
+///   `urn:matrix:client:device:` prefix. The stable prefix is preferred over the
+///   `urn:matrix:org.matrix.msc2967.client:device:` (MSC2967 unstable) form.
+fn build_scope(device_id: Option<&str>) -> String {
+    match device_id {
+        None => "openid profile".to_string(),
+        Some(id) => format!("openid profile urn:matrix:client:device:{id}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Token response
 // ---------------------------------------------------------------------------
 
@@ -267,12 +287,39 @@ struct TokenErrorResponse {
 ///
 /// To re-authenticate when tokens expire, call this function again — the flow
 /// is stateless and the key is deterministic.
+///
+/// This is the backward-compatible entry point: it requests the default
+/// `"openid profile"` scope, so the server mints a fresh `SIWX_<uuid>` Synapse
+/// device on each login. To pin a stable device_id, use
+/// [`authenticate_with_device`].
 pub async fn authenticate(
     server_url: &str,
     client_id: &str,
     redirect_uri: &str,
     key: &SiwxKey,
 ) -> Result<AuthTokens> {
+    authenticate_with_device(server_url, client_id, redirect_uri, key, None).await
+}
+
+/// Perform the authorization code flow, optionally pinning a stable Matrix
+/// device_id.
+///
+/// Same as [`authenticate`], plus:
+///
+/// - `device_id`: when `Some(id)`, requests the `urn:matrix:client:device:{id}`
+///   scope so the siwx-oidc server provisions (and re-provisions) that exact
+///   Synapse device rather than minting a fresh `SIWX_<uuid>` on every login.
+///   Re-provisioning the same id is an idempotent upsert that preserves the
+///   device's E2EE keys, so a long-lived service account keeps one stable
+///   device. When `None`, behaves identically to [`authenticate`].
+pub async fn authenticate_with_device(
+    server_url: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    key: &SiwxKey,
+    device_id: Option<&str>,
+) -> Result<AuthTokens> {
+    let scope = build_scope(device_id);
     let base = Url::parse(server_url).context("invalid server_url")?;
     let client = reqwest::Client::builder()
         .redirect(Policy::none())
@@ -304,7 +351,7 @@ pub async fn authenticate(
         .query(&[
             ("client_id", client_id),
             ("redirect_uri", redirect_uri),
-            ("scope", "openid profile"),
+            ("scope", scope.as_str()),
             ("response_type", "code"),
             ("state", "headless"),
             ("code_challenge", code_challenge.as_str()),
@@ -624,5 +671,25 @@ pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Resu
                 bail!("/token error: {other}: {desc}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_scope_none_is_unchanged() {
+        assert_eq!(build_scope(None), "openid profile");
+    }
+
+    #[test]
+    fn build_scope_some_requests_stable_device() {
+        let scope = build_scope(Some("agent-x"));
+        // Must contain the stable Matrix device URN the server extracts from.
+        assert_eq!(scope, "openid profile urn:matrix:client:device:agent-x");
+        assert!(scope.contains("urn:matrix:client:device:agent-x"));
+        // Still an OIDC request (keeps openid + profile).
+        assert!(scope.starts_with("openid profile"));
     }
 }

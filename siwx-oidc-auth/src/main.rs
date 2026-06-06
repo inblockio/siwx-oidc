@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::{Parser, ValueEnum};
-use siwx_oidc_auth::{authenticate, authenticate_device_flow, refresh, SiwxKey};
+use siwx_oidc_auth::{authenticate_device_flow, authenticate_with_device, refresh, SiwxKey};
 
 /// Headless OIDC client for siwx-oidc.
 ///
@@ -33,6 +33,14 @@ struct Cli {
     /// Registered redirect URI (required for initial auth code flow).
     #[arg(long)]
     redirect_uri: Option<String>,
+
+    /// Pin a stable Matrix device_id for this session. When set, the server
+    /// provisions (and re-provisions) this exact Synapse device instead of
+    /// minting a fresh SIWX_<uuid> on every login. Use a stable value (e.g. the
+    /// service-account name) so a long-lived agent keeps one device across
+    /// re-authentications. Auth-code flow only.
+    #[arg(long)]
+    device_id: Option<String>,
 
     // -- Key input (priority: --key-file > SIWX_KEY_FILE > --key-hex > generate) --
     /// Path to a PKCS#8 PEM private key file. Auto-detects Ed25519 vs P-256.
@@ -122,7 +130,14 @@ async fn main() -> Result<()> {
         if redirect_uri.is_empty() {
             bail!("--redirect-uri must not be empty");
         }
-        authenticate(server, client_id, redirect_uri, &key).await?
+        authenticate_with_device(
+            server,
+            client_id,
+            redirect_uri,
+            &key,
+            cli.device_id.as_deref(),
+        )
+        .await?
     };
     println!("{}", serde_json::to_string_pretty(&tokens)?);
     Ok(())
