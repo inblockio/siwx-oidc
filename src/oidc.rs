@@ -590,13 +590,7 @@ async fn token_device_code(
                 generated
             };
 
-            provision_synapse_device(
-                &did,
-                synapse_client,
-                "Element X",
-                Some(&dev_id),
-            )
-            .await;
+            provision_synapse_device(&did, synapse_client, "Element X", Some(&dev_id)).await;
 
             let now = Utc::now();
             let iat = now.timestamp();
