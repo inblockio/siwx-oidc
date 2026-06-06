@@ -823,3 +823,76 @@ async fn returning_user_new_device() {
         .send()
         .await;
 }
+
+// ---------------------------------------------------------------------------
+// Test: MSC4191 account-management metadata (AC1, end-to-end through Synapse)
+// ---------------------------------------------------------------------------
+
+/// AC1: both siwx-oidc's OIDC discovery and Synapse's re-exposed
+/// `/_matrix/client/v1/auth_metadata` must advertise `account_management_uri`
+/// and an `account_management_actions_supported` array containing the four real
+/// MSC4191 actions (plus their `session_*` aliases and `cross_signing_reset`).
+///
+/// Run against a live deployment:
+///   MATRIX_HOST=https://matrix.inblock.io SIWEOIDC_HOST=https://siwx-oidc.inblock.io \
+///     cargo test --test e2e_msc3861 msc4191_metadata -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn msc4191_metadata_advertised_and_forwarded() {
+    let oidc = siweoidc_host();
+    let matrix = matrix_host();
+    let http = Client::new();
+
+    let required = [
+        "org.matrix.profile",
+        "org.matrix.devices_list",
+        "org.matrix.device_view",
+        "org.matrix.device_delete",
+        "org.matrix.cross_signing_reset",
+        "org.matrix.sessions_list",
+        "org.matrix.session_view",
+        "org.matrix.session_end",
+    ];
+
+    let assert_actions = |doc: &Value, source: &str| {
+        assert!(
+            doc["account_management_uri"].is_string(),
+            "{source}: account_management_uri must be present"
+        );
+        let actions: Vec<String> = doc["account_management_actions_supported"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{source}: actions array missing"))
+            .iter()
+            .map(|a| a.as_str().unwrap_or("").to_string())
+            .collect();
+        for want in required {
+            assert!(
+                actions.iter().any(|a| a == want),
+                "{source}: missing action {want} (got {actions:?})"
+            );
+        }
+    };
+
+    // 1. siwx-oidc's own OIDC discovery document.
+    let disco: Value = http
+        .get(format!("{}/.well-known/openid-configuration", oidc))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_actions(&disco, "OIDC discovery");
+
+    // 2. Synapse's re-exposed auth metadata (the document Element actually reads).
+    let auth_meta: Value = http
+        .get(format!("{}/_matrix/client/v1/auth_metadata", matrix))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_actions(&auth_meta, "Synapse auth_metadata");
+    eprintln!("[e2e] MSC4191 actions advertised in both discovery and auth_metadata");
+}

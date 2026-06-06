@@ -20,10 +20,16 @@ src/                                ← Axum OIDC server (binary)
   axum_lib.rs                        Routes, startup validation, state (incl. Webauthn)
   oidc.rs                            OIDC logic: authorize, sign_in, token, userinfo, ES256 key
   device_auth.rs                     RFC 8628 Device Authorization Grant (device_code, approval page)
-  account.rs                         MSC4191/MSC4312: account management page + cross-signing reset
+  account.rs                         MSC4191/MSC4312: account mgmt page + actions (profile, devices_list,
+                                     device_view, device_delete, cross_signing_reset + session_* aliases).
+                                     SUPPORTED_ACTIONS is the single source of truth (drives discovery +
+                                     dispatch); canonical_action() normalizes session_*→device_*.
+  synapse_client.rs                  Synapse MAS + admin-API client: provision/upsert/cross_signing_reset,
+                                     and list_devices/get_device/delete_device (admin_token = MAS secret).
   webauthn.rs                        WebAuthn ceremony: register + discoverable authenticate
   db/mod.rs                          DBClient trait, CodeEntry, SessionEntry, ClientEntry, DeviceCodeEntry
-  db/redis.rs                        Redis implementation + generic helpers (set_raw, get_raw, etc.)
+  db/redis.rs                        Redis impl + helpers; revoke_device_tokens(did, device_id) revokes
+                                     an OAuth session (MSC4191 device_delete -> introspection inactive)
 
 siwx-oidc-auth/src/                ← Headless OIDC client (library + CLI)
   lib.rs                             SiwxKey (PEM/hex/generate), authenticate(), refresh(), AuthTokens
@@ -442,6 +448,36 @@ needing user confirmation, it reads `account_management_uri` from OIDC
 discovery and opens `/account?action=org.matrix.cross_signing_reset`.
 The user re-authenticates (wallet or passkey), siwx-oidc calls
 `allow_cross_signing_reset`, and Element Web retries the upload.
+
+### MSC4191 account management (full action set)
+
+`/account` handles the full MSC4191 deep-link contract
+(`/account?action=<action>[&device_id=<id>]`), not just cross-signing reset:
+
+| Action (`device_*` + `session_*` alias) | Effect |
+|---|---|
+| `profile` | Show the user's identity (DID + Matrix ID) |
+| `devices_list` / `sessions_list` | List the user's Synapse devices |
+| `device_view` / `session_view` | Show one device's details (needs `device_id`) |
+| `device_delete` / `session_end` | Sign a device out (needs `device_id`) |
+| `cross_signing_reset` | Allow cross-signing reset (MSC4312) |
+
+**Model:** the page is stateless; each action re-authenticates (wallet CAIP-122
+or passkey), proving the DID, then runs the action and returns a `kind`-tagged
+`ActionOutcome` the page JS renders. The advertised set lives in **one place**
+(`account::SUPPORTED_ACTIONS`), consumed by `oidc::provider_metadata_value`;
+**Synapse forwards it verbatim** to `/_matrix/client/v1/auth_metadata` (verified
+live), so no matrix-server change is needed to advertise new actions.
+
+**Device source of truth = Synapse.** `devices_list`/`device_view` call the
+Synapse **admin API** (`GET /_synapse/admin/v2/users/{mxid}/devices`) using the
+MAS shared secret (which `matrix_server.sh` also sets as `admin_token`).
+`device_delete` deletes the Synapse device **and** calls
+`RedisClient::revoke_device_tokens` to revoke the OAuth session (introspection
+then reports it inactive). Device actions require `SIWEOIDC_MATRIX_SERVER_NAME`
+and a Synapse client; without them they return a clear `BadRequest` (standalone
+deployments degrade, never 500). Live AC check:
+`cargo test --test e2e_msc3861 msc4191_metadata -- --ignored`.
 
 **For QR code login specifically:** even with auto-bootstrap working, the
 approving device must have cross-signing private keys in Secure Backup so
