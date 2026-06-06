@@ -96,18 +96,23 @@ impl RedisClient {
         Ok(())
     }
 
-    /// Revoke (delete) every stored OAuth token whose session matches both `did`
-    /// and `device_id`. Returns the number of tokens removed.
+    /// Revoke (delete) every stored OAuth token for the given Matrix `username`
+    /// (localpart) and `device_id`. Returns the number of tokens removed.
     ///
     /// This implements the authorization-server side of MSC4191
     /// `device_delete`: removing the access/refresh tokens makes introspection
     /// report the session inactive, so the device can no longer use the C-S API.
     ///
-    /// There is no secondary index on (did, device_id), so this scans the token
-    /// keyspace. The volume is bounded (access tokens have a short TTL; refresh
-    /// tokens are the only long-lived entries), so a full scan is acceptable.
-    /// The removed count is logged so a large sweep is never silent.
-    pub async fn revoke_device_tokens(&self, did: &str, device_id: &str) -> Result<usize> {
+    /// Matching is keyed on `username` (the lowercased `did_to_localpart` value,
+    /// which is what Synapse uses) rather than the raw DID, so revocation is
+    /// robust to address-case differences between the original sign-in DID and
+    /// the re-authentication DID.
+    ///
+    /// There is no secondary index on (username, device_id), so this scans the
+    /// token keyspace. The volume is bounded (access tokens have a short TTL;
+    /// refresh tokens are the only long-lived entries), so a full scan is
+    /// acceptable. The removed count is logged so a large sweep is never silent.
+    pub async fn revoke_device_tokens(&self, username: &str, device_id: &str) -> Result<usize> {
         let keys = self.keys_raw(&format!("{}/*", KV_TOKEN_PREFIX)).await?;
         let mut revoked = 0usize;
         for key in keys {
@@ -119,14 +124,14 @@ impl RedisClient {
                 Ok(m) => m,
                 Err(_) => continue, // not a token entry / unparseable; leave it
             };
-            if meta.did == did && meta.device_id == device_id {
+            if meta.username == username && meta.device_id == device_id {
                 self.del_raw(&key).await?;
                 revoked += 1;
             }
         }
         debug!(
-            "revoke_device_tokens: did={} device_id={} revoked={}",
-            did, device_id, revoked
+            "revoke_device_tokens: username={} device_id={} revoked={}",
+            username, device_id, revoked
         );
         Ok(revoked)
     }
@@ -444,21 +449,23 @@ mod tests {
     use crate::db::{DBClient, TokenMetadata};
     use url::Url;
 
-    fn token_meta(device_id: &str, did: &str) -> TokenMetadata {
+    fn token_meta(device_id: &str, username: &str) -> TokenMetadata {
         TokenMetadata {
-            username: "u".to_string(),
+            username: username.to_string(),
             device_id: device_id.to_string(),
             scope: "openid".to_string(),
             client_id: "c".to_string(),
             iat: 0,
             exp: i64::MAX,
-            did: did.to_string(),
+            // did is stored verbatim from sign-in; revocation keys on username,
+            // so the did case here intentionally differs from the username.
+            did: format!("did:pkh:eip155:1:0X{}", username.to_uppercase()),
             name: "n".to_string(),
         }
     }
 
     /// H5: device_delete must revoke ONLY the OAuth session(s) for the targeted
-    /// (did, device_id), leaving other devices and other users untouched.
+    /// (username, device_id), leaving other devices and other users untouched.
     /// Requires Redis on localhost; skips cleanly if unavailable.
     #[tokio::test]
     async fn revoke_device_tokens_removes_only_matching_session() {
@@ -472,8 +479,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let did = format!("did:test:{nonce}");
-        let other_did = format!("did:other:{nonce}");
+        let user = format!("user-{nonce}");
+        let other_user = format!("other-{nonce}");
         let d1 = format!("DEV1_{nonce}");
         let d2 = format!("DEV2_{nonce}");
         let (t1, t2, t3) = (
@@ -483,20 +490,20 @@ mod tests {
         );
 
         client
-            .set_token(&t1, &token_meta(&d1, &did), 120)
+            .set_token(&t1, &token_meta(&d1, &user), 120)
             .await
             .unwrap(); // match
         client
-            .set_token(&t2, &token_meta(&d2, &did), 120)
+            .set_token(&t2, &token_meta(&d2, &user), 120)
             .await
-            .unwrap(); // same did, other device
+            .unwrap(); // same user, other device
         client
-            .set_token(&t3, &token_meta(&d1, &other_did), 120)
+            .set_token(&t3, &token_meta(&d1, &other_user), 120)
             .await
-            .unwrap(); // other did, same device
+            .unwrap(); // other user, same device
 
-        let revoked = client.revoke_device_tokens(&did, &d1).await.unwrap();
-        assert_eq!(revoked, 1, "exactly the (did, d1) token must be revoked");
+        let revoked = client.revoke_device_tokens(&user, &d1).await.unwrap();
+        assert_eq!(revoked, 1, "exactly the (user, d1) token must be revoked");
         assert!(
             client.get_token(&t1).await.unwrap().is_none(),
             "matching token must be gone"

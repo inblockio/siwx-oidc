@@ -260,9 +260,11 @@ async fn execute_action(
                     CustomError::BadRequest("Failed to sign out device".to_string())
                 })?;
             // Revoke the OAuth session so introspection reports it inactive (AC3).
+            // Key on the localpart (== TokenMetadata.username), which is stable
+            // across address-case differences between sign-in and re-auth DIDs.
             // Best-effort: the Synapse device is already gone if this fails.
             let revoked = db_client
-                .revoke_device_tokens(did, device_id)
+                .revoke_device_tokens(&localpart, device_id)
                 .await
                 .unwrap_or_else(|e| {
                     warn!(error = %e, "revoke_device_tokens failed during account action");
