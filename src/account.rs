@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::oidc::{did_to_localpart, CustomError};
-use crate::synapse_client::SynapseClient;
+use crate::synapse_client::{DeviceInfo, SynapseClient};
 use crate::webauthn as wa;
 use siwx_oidc::db::RedisClient;
 
@@ -21,6 +21,9 @@ use siwx_oidc::db::RedisClient;
 #[derive(Deserialize)]
 pub struct AccountPageQuery {
     pub action: Option<String>,
+    /// MSC4191 target device for `device_view` / `device_delete`.
+    #[serde(default)]
+    pub device_id: Option<String>,
     #[allow(dead_code)]
     pub id_token_hint: Option<String>,
 }
@@ -31,11 +34,17 @@ pub struct AccountWalletRequest {
     pub did: String,
     pub message: String,
     pub signature: String,
+    /// MSC4191 target device for `device_view` / `device_delete`.
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct AccountPasskeyFinishRequest {
     pub action: String,
+    /// MSC4191 target device for `device_view` / `device_delete`.
+    #[serde(default)]
+    pub device_id: Option<String>,
     #[serde(flatten)]
     pub credential: serde_json::Value,
 }
@@ -44,6 +53,26 @@ pub struct AccountPasskeyFinishRequest {
 pub struct AccountActionResponse {
     pub status: String,
     pub action: String,
+    /// What the (re-authenticated) action produced, for the page to render.
+    #[serde(flatten)]
+    pub outcome: ActionOutcome,
+}
+
+/// The result of a successfully executed account action, tagged by `kind` so
+/// the account page's client JS can render the appropriate view.
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ActionOutcome {
+    /// A side-effecting action with nothing to render (cross_signing_reset).
+    Completed,
+    /// The user's identity (profile).
+    Profile { did: String, user_id: String },
+    /// The user's full device list (devices_list).
+    Devices { devices: Vec<DeviceInfo> },
+    /// A single device's details (device_view).
+    Device { device: DeviceInfo },
+    /// Confirmation that a device was signed out (device_delete).
+    Deleted { device_id: String },
 }
 
 // -- Supported actions --------------------------------------------------------
@@ -109,10 +138,6 @@ pub fn canonical_action(action: &str) -> Option<Action> {
     }
 }
 
-fn is_supported_action(action: &str) -> bool {
-    action == ACTION_CROSS_SIGNING_RESET
-}
-
 /// Sanitize a user-supplied action string for safe HTML interpolation.
 fn sanitize_action(raw: &str) -> String {
     raw.chars()
@@ -121,21 +146,58 @@ fn sanitize_action(raw: &str) -> String {
         .collect()
 }
 
+/// Sanitize a user-supplied device id for safe HTML interpolation. Device ids
+/// (e.g. `SIWX_<uuid>`) may contain hyphens, so allow them in addition to the
+/// action character set.
+fn sanitize_device_id(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+        .take(255)
+        .collect()
+}
+
+// -- Action prerequisites -----------------------------------------------------
+
+fn require_synapse(synapse: Option<&SynapseClient>) -> Result<&SynapseClient, CustomError> {
+    synapse.ok_or_else(|| {
+        CustomError::BadRequest("This action requires Synapse integration".to_string())
+    })
+}
+
+fn require_server_name(server_name: Option<&str>) -> Result<&str, CustomError> {
+    server_name.filter(|s| !s.is_empty()).ok_or_else(|| {
+        CustomError::BadRequest(
+            "This action requires the Matrix server_name to be configured".to_string(),
+        )
+    })
+}
+
+fn require_device_id(device_id: Option<&str>) -> Result<&str, CustomError> {
+    device_id
+        .filter(|d| !d.is_empty())
+        .ok_or_else(|| CustomError::BadRequest("This action requires a device_id".to_string()))
+}
+
 // -- Action execution ---------------------------------------------------------
 
+/// Execute a (canonicalized) account action for an already-authenticated `did`.
+///
+/// `device_id` is required only for [`Action::DeviceView`] / [`Action::DeviceDelete`].
+/// Device actions need both a Synapse client and a configured `server_name`;
+/// when either is absent a clear `BadRequest` is returned rather than panicking,
+/// so standalone (no-Synapse) deployments degrade gracefully.
 async fn execute_action(
-    action: &str,
+    action: Action,
+    device_id: Option<&str>,
     did: &str,
     synapse_client: Option<&SynapseClient>,
-) -> Result<(), CustomError> {
+    db_client: &RedisClient,
+    server_name: Option<&str>,
+) -> Result<ActionOutcome, CustomError> {
+    let localpart = did_to_localpart(did);
     match action {
-        ACTION_CROSS_SIGNING_RESET => {
-            let synapse = synapse_client.ok_or_else(|| {
-                CustomError::BadRequest(
-                    "Cross-signing reset requires Synapse integration".to_string(),
-                )
-            })?;
-            let localpart = did_to_localpart(did);
+        Action::CrossSigningReset => {
+            let synapse = require_synapse(synapse_client)?;
             synapse
                 .allow_cross_signing_reset(&localpart)
                 .await
@@ -144,12 +206,80 @@ async fn execute_action(
                     CustomError::BadRequest("Failed to reset cross-signing keys".to_string())
                 })?;
             info!(did = %did, "cross-signing reset allowed via account management page");
-            Ok(())
+            Ok(ActionOutcome::Completed)
         }
-        _ => Err(CustomError::BadRequest(format!(
-            "Unsupported action: {}",
-            action
-        ))),
+        Action::Profile => {
+            let server = require_server_name(server_name)?;
+            Ok(ActionOutcome::Profile {
+                did: did.to_string(),
+                user_id: format!("@{localpart}:{server}"),
+            })
+        }
+        Action::DevicesList => {
+            let synapse = require_synapse(synapse_client)?;
+            let server = require_server_name(server_name)?;
+            let devices = synapse
+                .list_devices(&localpart, server)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "list_devices failed during account action");
+                    CustomError::BadRequest("Failed to list devices".to_string())
+                })?;
+            Ok(ActionOutcome::Devices { devices })
+        }
+        Action::DeviceView => {
+            let device_id = require_device_id(device_id)?;
+            let synapse = require_synapse(synapse_client)?;
+            let server = require_server_name(server_name)?;
+            let device = synapse
+                .get_device(&localpart, device_id, server)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "get_device failed during account action");
+                    CustomError::BadRequest("Failed to fetch device".to_string())
+                })?
+                // get_device is scoped to this user, so a missing/foreign id is "not found".
+                .ok_or_else(|| CustomError::BadRequest("Device not found".to_string()))?;
+            Ok(ActionOutcome::Device { device })
+        }
+        Action::DeviceDelete => {
+            let device_id = require_device_id(device_id)?;
+            let synapse = require_synapse(synapse_client)?;
+            let server = require_server_name(server_name)?;
+            // Confirm the device belongs to the authenticated user before deleting
+            // (defence in depth; the admin call is already mxid-scoped).
+            let owned = synapse
+                .get_device(&localpart, device_id, server)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "get_device (pre-delete) failed during account action");
+                    CustomError::BadRequest("Failed to verify device".to_string())
+                })?
+                .is_some();
+            if !owned {
+                return Err(CustomError::BadRequest("Device not found".to_string()));
+            }
+            synapse
+                .delete_device(&localpart, device_id, server)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "delete_device failed during account action");
+                    CustomError::BadRequest("Failed to sign out device".to_string())
+                })?;
+            // Revoke the OAuth session so introspection reports it inactive (AC3).
+            // Best-effort: the Synapse device is already gone if this fails.
+            let revoked = db_client
+                .revoke_device_tokens(did, device_id)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "revoke_device_tokens failed during account action");
+                    0
+                });
+            info!(did = %did, device_id = %device_id, revoked = revoked as u64, "device signed out via account management");
+            Ok(ActionOutcome::Deleted {
+                device_id: device_id.to_string(),
+            })
+        }
     }
 }
 
@@ -159,13 +289,11 @@ pub async fn account_wallet(
     config: &Config,
     req: AccountWalletRequest,
     synapse_client: Option<&SynapseClient>,
+    db_client: &RedisClient,
+    server_name: Option<&str>,
 ) -> Result<AccountActionResponse, CustomError> {
-    if !is_supported_action(&req.action) {
-        return Err(CustomError::BadRequest(format!(
-            "Unsupported action: {}",
-            req.action
-        )));
-    }
+    let action = canonical_action(&req.action)
+        .ok_or_else(|| CustomError::BadRequest(format!("Unsupported action: {}", req.action)))?;
 
     let sig_hex = req.signature.strip_prefix("0x").unwrap_or(&req.signature);
     let sig_bytes = hex::decode(sig_hex)
@@ -194,16 +322,26 @@ pub async fn account_wallet(
         ));
     }
 
-    execute_action(&req.action, &req.did, synapse_client).await?;
+    let outcome = execute_action(
+        action,
+        req.device_id.as_deref(),
+        &req.did,
+        synapse_client,
+        db_client,
+        server_name,
+    )
+    .await?;
 
     Ok(AccountActionResponse {
         status: "completed".to_string(),
         action: req.action,
+        outcome,
     })
 }
 
 // -- Passkey re-authentication ------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub async fn account_passkey_finish(
     db_client: &RedisClient,
     session_id: &str,
@@ -211,13 +349,10 @@ pub async fn account_passkey_finish(
     rp_origin: &str,
     req: AccountPasskeyFinishRequest,
     synapse_client: Option<&SynapseClient>,
+    server_name: Option<&str>,
 ) -> Result<AccountActionResponse, CustomError> {
-    if !is_supported_action(&req.action) {
-        return Err(CustomError::BadRequest(format!(
-            "Unsupported action: {}",
-            req.action
-        )));
-    }
+    let action = canonical_action(&req.action)
+        .ok_or_else(|| CustomError::BadRequest(format!("Unsupported action: {}", req.action)))?;
 
     let auth_response: webauthn_rs::prelude::PublicKeyCredential =
         serde_json::from_value(req.credential)
@@ -227,11 +362,20 @@ pub async fn account_passkey_finish(
         .await
         .map_err(|e| CustomError::BadRequest(e.to_string()))?;
 
-    execute_action(&req.action, &resp.did, synapse_client).await?;
+    let outcome = execute_action(
+        action,
+        req.device_id.as_deref(),
+        &resp.did,
+        synapse_client,
+        db_client,
+        server_name,
+    )
+    .await?;
 
     Ok(AccountActionResponse {
         status: "completed".to_string(),
         action: req.action,
+        outcome,
     })
 }
 
@@ -704,6 +848,7 @@ mod tests {
         let html = account_page(
             AccountPageQuery {
                 action: Some("org.matrix.cross_signing_reset".to_string()),
+                device_id: None,
                 id_token_hint: None,
             },
             "https://siwx.example.com",
@@ -720,6 +865,7 @@ mod tests {
         let html = account_page(
             AccountPageQuery {
                 action: None,
+                device_id: None,
                 id_token_hint: None,
             },
             "https://siwx.example.com",
@@ -735,6 +881,7 @@ mod tests {
         let html = account_page(
             AccountPageQuery {
                 action: Some("<script>alert(1)</script>".to_string()),
+                device_id: None,
                 id_token_hint: None,
             },
             "https://siwx.example.com",
@@ -749,6 +896,7 @@ mod tests {
         let html = account_page(
             AccountPageQuery {
                 action: Some("org.matrix.cross_signing_reset".to_string()),
+                device_id: None,
                 id_token_hint: None,
             },
             "https://siwx.example.com",
@@ -774,6 +922,7 @@ mod tests {
         let html = account_page(
             AccountPageQuery {
                 action: Some("org.matrix.cross_signing_reset".to_string()),
+                device_id: None,
                 id_token_hint: None,
             },
             "https://siwx.example.com",
@@ -799,13 +948,6 @@ mod tests {
         );
         assert_eq!(sanitize_action("'; DROP TABLE--"), "DROPTABLE");
         assert_eq!(sanitize_action(&"A".repeat(100)).len(), 64);
-    }
-
-    #[test]
-    fn is_supported_action_works() {
-        assert!(is_supported_action("org.matrix.cross_signing_reset"));
-        assert!(!is_supported_action("org.matrix.unknown"));
-        assert!(!is_supported_action(""));
     }
 
     #[test]
@@ -891,5 +1033,189 @@ mod tests {
                 "advertised action {action} has no canonical mapping"
             );
         }
+    }
+
+    // -- Prerequisite guards (H6/H7) ------------------------------------------
+
+    #[test]
+    fn require_device_id_rejects_missing_and_empty() {
+        assert!(require_device_id(None).is_err());
+        assert!(require_device_id(Some("")).is_err());
+        assert_eq!(require_device_id(Some("DEV")).unwrap(), "DEV");
+    }
+
+    #[test]
+    fn require_server_name_rejects_missing_and_empty() {
+        assert!(require_server_name(None).is_err());
+        assert!(require_server_name(Some("")).is_err());
+        assert_eq!(
+            require_server_name(Some("matrix.example.com")).unwrap(),
+            "matrix.example.com"
+        );
+    }
+
+    #[test]
+    fn require_synapse_rejects_absent_client() {
+        assert!(require_synapse(None).is_err());
+        let client = SynapseClient::new("http://synapse", "secret");
+        assert!(require_synapse(Some(&client)).is_ok());
+    }
+
+    #[test]
+    fn sanitize_device_id_keeps_safe_chars_strips_markup() {
+        assert_eq!(sanitize_device_id("SIWX_2b1f-9c"), "SIWX_2b1f-9c");
+        assert_eq!(sanitize_device_id("<script>x</script>"), "scriptxscript");
+        assert_eq!(sanitize_device_id(&"A".repeat(300)).len(), 255);
+    }
+
+    // -- ActionOutcome wire contract (H3/H8) ----------------------------------
+
+    #[test]
+    fn action_outcome_serializes_with_kind_tag() {
+        use serde_json::json;
+        assert_eq!(
+            serde_json::to_value(ActionOutcome::Completed).unwrap(),
+            json!({"kind": "completed"})
+        );
+        assert_eq!(
+            serde_json::to_value(ActionOutcome::Deleted {
+                device_id: "DEV".to_string()
+            })
+            .unwrap(),
+            json!({"kind": "deleted", "device_id": "DEV"})
+        );
+        let profile = serde_json::to_value(ActionOutcome::Profile {
+            did: "did:pkh:eip155:1:0xabc".to_string(),
+            user_id: "@did-pkh-eip155-1-0xabc:matrix.example.com".to_string(),
+        })
+        .unwrap();
+        assert_eq!(profile["kind"], "profile");
+        assert_eq!(
+            profile["user_id"],
+            "@did-pkh-eip155-1-0xabc:matrix.example.com"
+        );
+    }
+
+    #[test]
+    fn account_action_response_flattens_outcome() {
+        let resp = AccountActionResponse {
+            status: "completed".to_string(),
+            action: "org.matrix.device_view".to_string(),
+            outcome: ActionOutcome::Device {
+                device: DeviceInfo {
+                    device_id: "DEV".to_string(),
+                    display_name: Some("Element".to_string()),
+                    last_seen_ip: None,
+                    last_seen_ts: None,
+                },
+            },
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["action"], "org.matrix.device_view");
+        assert_eq!(v["kind"], "device"); // flattened from the outcome
+        assert_eq!(v["device"]["device_id"], "DEV");
+    }
+
+    // -- execute_action dispatch (H6/H7) --------------------------------------
+    //
+    // These connect to Redis on localhost and skip cleanly if it is unavailable.
+    // The guard branches exercised here fail before any Synapse network call.
+
+    async fn test_redis() -> Option<RedisClient> {
+        RedisClient::new(&url::Url::parse("redis://localhost").unwrap())
+            .await
+            .ok()
+    }
+
+    #[tokio::test]
+    async fn execute_profile_builds_user_id_without_synapse() {
+        let Some(redis) = test_redis().await else {
+            return;
+        };
+        let outcome = execute_action(
+            Action::Profile,
+            None,
+            "did:pkh:eip155:1:0xABC",
+            None, // no Synapse needed for profile
+            &redis,
+            Some("matrix.example.com"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            ActionOutcome::Profile {
+                did: "did:pkh:eip155:1:0xABC".to_string(),
+                user_id: "@did-pkh-eip155-1-0xabc:matrix.example.com".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_device_view_requires_device_id() {
+        let Some(redis) = test_redis().await else {
+            return;
+        };
+        let err = execute_action(
+            Action::DeviceView,
+            None,
+            "did:test",
+            None,
+            &redis,
+            Some("matrix.example.com"),
+        )
+        .await;
+        assert!(err.is_err(), "device_view without device_id must error");
+    }
+
+    #[tokio::test]
+    async fn execute_device_actions_require_synapse() {
+        let Some(redis) = test_redis().await else {
+            return;
+        };
+        // DevicesList with no Synapse client -> clear error, no panic.
+        let err = execute_action(
+            Action::DevicesList,
+            None,
+            "did:test",
+            None,
+            &redis,
+            Some("matrix.example.com"),
+        )
+        .await;
+        assert!(err.is_err(), "devices_list requires Synapse");
+
+        // cross_signing_reset preserves prior behaviour (requires Synapse).
+        let err = execute_action(
+            Action::CrossSigningReset,
+            None,
+            "did:test",
+            None,
+            &redis,
+            None,
+        )
+        .await;
+        assert!(err.is_err(), "cross_signing_reset requires Synapse");
+    }
+
+    #[tokio::test]
+    async fn execute_device_view_requires_server_name() {
+        let Some(redis) = test_redis().await else {
+            return;
+        };
+        let client = SynapseClient::new("http://synapse", "secret");
+        // device_id present + Synapse present, but server_name missing -> error
+        // before any network call.
+        let err = execute_action(
+            Action::DeviceView,
+            Some("DEV"),
+            "did:test",
+            Some(&client),
+            &redis,
+            None,
+        )
+        .await;
+        assert!(err.is_err(), "device_view requires server_name");
     }
 }

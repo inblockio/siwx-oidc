@@ -541,7 +541,14 @@ async fn account_wallet_handler(
     Json(req): Json<account::AccountWalletRequest>,
 ) -> Result<Json<account::AccountActionResponse>, CustomError> {
     let synapse = state.synapse_client.as_deref();
-    let resp = account::account_wallet(&state.config, req, synapse).await?;
+    let resp = account::account_wallet(
+        &state.config,
+        req,
+        synapse,
+        &state.redis_client,
+        state.config.matrix_server_name.as_deref(),
+    )
+    .await?;
     Ok(Json(resp))
 }
 
@@ -576,9 +583,15 @@ async fn account_passkey_finish_handler(
         .and_then(|v| v.as_str())
         .ok_or_else(|| CustomError::BadRequest("Missing session_id".to_string()))?;
 
+    let device_id = payload
+        .get("device_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let synapse = state.synapse_client.as_deref();
     let req = account::AccountPasskeyFinishRequest {
         action,
+        device_id,
         credential: payload.clone(),
     };
     let resp = account::account_passkey_finish(
@@ -588,6 +601,7 @@ async fn account_passkey_finish_handler(
         &state.rp_origin,
         req,
         synapse,
+        state.config.matrix_server_name.as_deref(),
     )
     .await?;
     Ok(Json(resp))
