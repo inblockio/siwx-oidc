@@ -241,6 +241,48 @@ pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
     Ok(pm)
 }
 
+/// Build the full OIDC provider-metadata document served at [`METADATA_PATH`],
+/// including the non-standard Matrix/MSC extensions that the `openidconnect`
+/// crate cannot represent natively (introspection, device authorization,
+/// revocation, prompt values, and MSC4191 account management).
+///
+/// `account_management_uri` is the MSC4191 account-management URL; when `None`
+/// it defaults to `{base_url}/account`. The advertised
+/// `account_management_actions_supported` list is sourced from
+/// [`crate::account::SUPPORTED_ACTIONS`] so discovery and dispatch never drift.
+pub fn provider_metadata_value(
+    base_url: Url,
+    account_management_uri: Option<&Url>,
+) -> Result<serde_json::Value, CustomError> {
+    let pm = metadata(base_url.clone())?;
+    let mut value =
+        serde_json::to_value(pm).map_err(|e| anyhow!("Failed to serialize metadata: {}", e))?;
+    let base = base_url.as_str().trim_end_matches('/');
+    value["code_challenge_methods_supported"] = serde_json::json!(["S256"]);
+    value["introspection_endpoint"] = serde_json::json!(format!("{}/oauth2/introspect", base));
+    value["introspection_endpoint_auth_methods_supported"] =
+        serde_json::json!(["client_secret_post", "bearer"]);
+    value["grant_types_supported"] = serde_json::json!([
+        "authorization_code",
+        "refresh_token",
+        "urn:ietf:params:oauth:grant-type:device_code"
+    ]);
+    value["device_authorization_endpoint"] =
+        serde_json::json!(format!("{}/device_authorization", base));
+    value["revocation_endpoint"] = serde_json::json!(format!("{}/oauth2/revoke", base));
+    value["token_endpoint_auth_methods_supported"] =
+        serde_json::json!(["client_secret_post", "none"]);
+    value["prompt_values_supported"] = serde_json::json!(["login", "create"]);
+    // MSC4191: account management discovery (stable v1.18).
+    let account_uri = account_management_uri
+        .map(|u| u.as_str().to_string())
+        .unwrap_or_else(|| format!("{}/account", base));
+    value["account_management_uri"] = serde_json::json!(account_uri);
+    value["account_management_actions_supported"] =
+        serde_json::json!(crate::account::SUPPORTED_ACTIONS);
+    Ok(value)
+}
+
 // -- ENS resolution -------------------------------------------------------
 //
 // Primary strategy: HTTP API (handles CCIP Read / NameWrapper / offchain
@@ -1825,6 +1867,51 @@ mod tests {
         assert!(
             scope_strings.contains(&"urn:matrix:org.matrix.msc2967.client:device:*"),
             "missing unstable urn:matrix:org.matrix.msc2967.client:device:*"
+        );
+    }
+
+    #[test]
+    fn provider_metadata_advertises_msc4191_account_management() {
+        // AC1: served metadata must include account_management_uri and an
+        // account_management_actions_supported array containing the four real
+        // actions plus their session_* aliases. Synapse forwards this document
+        // verbatim to /_matrix/client/v1/auth_metadata (verified live).
+        let base = Url::parse("https://siwx-oidc.example.com/").unwrap();
+        let value = provider_metadata_value(base, None).unwrap();
+
+        assert_eq!(
+            value["account_management_uri"], "https://siwx-oidc.example.com/account",
+            "account_management_uri must default to {{base}}/account"
+        );
+
+        let actions: Vec<&str> = value["account_management_actions_supported"]
+            .as_array()
+            .expect("account_management_actions_supported must be an array")
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        for required in [
+            "org.matrix.profile",
+            "org.matrix.devices_list",
+            "org.matrix.device_view",
+            "org.matrix.device_delete",
+            "org.matrix.cross_signing_reset",
+            "org.matrix.sessions_list",
+            "org.matrix.session_view",
+            "org.matrix.session_end",
+        ] {
+            assert!(actions.contains(&required), "missing action {required}");
+        }
+    }
+
+    #[test]
+    fn provider_metadata_honours_account_management_uri_override() {
+        let base = Url::parse("https://siwx-oidc.example.com/").unwrap();
+        let override_uri = Url::parse("https://account.example.com/manage").unwrap();
+        let value = provider_metadata_value(base, Some(&override_uri)).unwrap();
+        assert_eq!(
+            value["account_management_uri"],
+            "https://account.example.com/manage"
         );
     }
 

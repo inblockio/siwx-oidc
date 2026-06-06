@@ -50,6 +50,65 @@ pub struct AccountActionResponse {
 
 const ACTION_CROSS_SIGNING_RESET: &str = "org.matrix.cross_signing_reset";
 
+/// A normalized MSC4191 account-management action.
+///
+/// The wire protocol has two generations of action strings: the stable
+/// `device_*` set (Matrix v1.18) and the older `session_*` aliases. Both are
+/// accepted on input (see [`canonical_action`]) and collapse onto these
+/// variants, so the rest of the code only ever reasons about one set.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Action {
+    /// `org.matrix.profile` — view the account profile/identity.
+    Profile,
+    /// `org.matrix.devices_list` / `org.matrix.sessions_list`.
+    DevicesList,
+    /// `org.matrix.device_view` / `org.matrix.session_view` (needs `device_id`).
+    DeviceView,
+    /// `org.matrix.device_delete` / `org.matrix.session_end` (needs `device_id`).
+    DeviceDelete,
+    /// `org.matrix.cross_signing_reset` (MSC4312).
+    CrossSigningReset,
+}
+
+impl Action {
+    /// Whether this action requires a `device_id` query parameter.
+    pub fn requires_device_id(self) -> bool {
+        matches!(self, Action::DeviceView | Action::DeviceDelete)
+    }
+}
+
+/// The full superset of MSC4191 action strings this server advertises in
+/// `account_management_actions_supported`, in stable-then-alias order.
+///
+/// This is the single source of truth: it drives the discovery metadata
+/// (`oidc::provider_metadata_value`), page validation, and dispatch
+/// ([`canonical_action`]). matrix.org advertises both naming generations and
+/// different client versions emit different ones, so we advertise the superset.
+pub const SUPPORTED_ACTIONS: &[&str] = &[
+    "org.matrix.profile",
+    "org.matrix.devices_list",
+    "org.matrix.device_view",
+    "org.matrix.device_delete",
+    ACTION_CROSS_SIGNING_RESET,
+    // session_* aliases (older naming — accepted for compatibility):
+    "org.matrix.sessions_list",
+    "org.matrix.session_view",
+    "org.matrix.session_end",
+];
+
+/// Map an action string (stable `device_*` or legacy `session_*`) to its
+/// canonical [`Action`]. Returns `None` for unknown/unsupported actions.
+pub fn canonical_action(action: &str) -> Option<Action> {
+    match action {
+        "org.matrix.profile" => Some(Action::Profile),
+        "org.matrix.devices_list" | "org.matrix.sessions_list" => Some(Action::DevicesList),
+        "org.matrix.device_view" | "org.matrix.session_view" => Some(Action::DeviceView),
+        "org.matrix.device_delete" | "org.matrix.session_end" => Some(Action::DeviceDelete),
+        ACTION_CROSS_SIGNING_RESET => Some(Action::CrossSigningReset),
+        _ => None,
+    }
+}
+
 fn is_supported_action(action: &str) -> bool {
     action == ACTION_CROSS_SIGNING_RESET
 }
@@ -747,5 +806,90 @@ mod tests {
         assert!(is_supported_action("org.matrix.cross_signing_reset"));
         assert!(!is_supported_action("org.matrix.unknown"));
         assert!(!is_supported_action(""));
+    }
+
+    #[test]
+    fn canonical_action_maps_stable_names() {
+        assert_eq!(
+            canonical_action("org.matrix.profile"),
+            Some(Action::Profile)
+        );
+        assert_eq!(
+            canonical_action("org.matrix.devices_list"),
+            Some(Action::DevicesList)
+        );
+        assert_eq!(
+            canonical_action("org.matrix.device_view"),
+            Some(Action::DeviceView)
+        );
+        assert_eq!(
+            canonical_action("org.matrix.device_delete"),
+            Some(Action::DeviceDelete)
+        );
+        assert_eq!(
+            canonical_action("org.matrix.cross_signing_reset"),
+            Some(Action::CrossSigningReset)
+        );
+    }
+
+    #[test]
+    fn canonical_action_collapses_session_aliases() {
+        // session_* aliases must behave identically to their device_* form.
+        assert_eq!(
+            canonical_action("org.matrix.sessions_list"),
+            canonical_action("org.matrix.devices_list")
+        );
+        assert_eq!(
+            canonical_action("org.matrix.session_view"),
+            canonical_action("org.matrix.device_view")
+        );
+        assert_eq!(
+            canonical_action("org.matrix.session_end"),
+            canonical_action("org.matrix.device_delete")
+        );
+    }
+
+    #[test]
+    fn canonical_action_rejects_unknown() {
+        assert_eq!(canonical_action("org.matrix.unknown"), None);
+        assert_eq!(canonical_action(""), None);
+        assert_eq!(canonical_action("device_view"), None); // missing namespace
+    }
+
+    #[test]
+    fn requires_device_id_only_for_single_device_actions() {
+        assert!(Action::DeviceView.requires_device_id());
+        assert!(Action::DeviceDelete.requires_device_id());
+        assert!(!Action::DevicesList.requires_device_id());
+        assert!(!Action::Profile.requires_device_id());
+        assert!(!Action::CrossSigningReset.requires_device_id());
+    }
+
+    #[test]
+    fn supported_actions_cover_acceptance_criteria() {
+        // AC1: the advertised set must contain at least these four real actions
+        // plus their session_* aliases, plus cross_signing_reset.
+        for required in [
+            "org.matrix.profile",
+            "org.matrix.devices_list",
+            "org.matrix.device_view",
+            "org.matrix.device_delete",
+            "org.matrix.cross_signing_reset",
+            "org.matrix.sessions_list",
+            "org.matrix.session_view",
+            "org.matrix.session_end",
+        ] {
+            assert!(
+                SUPPORTED_ACTIONS.contains(&required),
+                "SUPPORTED_ACTIONS missing {required}"
+            );
+        }
+        // Every advertised action must be dispatchable (no advertised-but-unhandled drift).
+        for action in SUPPORTED_ACTIONS {
+            assert!(
+                canonical_action(action).is_some(),
+                "advertised action {action} has no canonical mapping"
+            );
+        }
     }
 }

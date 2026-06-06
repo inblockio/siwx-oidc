@@ -128,35 +128,10 @@ async fn jwk_set(State(state): State<AppState>) -> Result<Json<CoreJsonWebKeySet
 async fn provider_metadata(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, CustomError> {
-    let pm = oidc::metadata(state.config.base_url.clone())?;
-    let mut value = serde_json::to_value(pm)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize metadata: {}", e))?;
-    let base_url = state.config.base_url.as_str().trim_end_matches('/');
-    value["code_challenge_methods_supported"] = serde_json::json!(["S256"]);
-    value["introspection_endpoint"] = serde_json::json!(format!("{}/oauth2/introspect", base_url));
-    value["introspection_endpoint_auth_methods_supported"] =
-        serde_json::json!(["client_secret_post", "bearer"]);
-    value["grant_types_supported"] = serde_json::json!([
-        "authorization_code",
-        "refresh_token",
-        "urn:ietf:params:oauth:grant-type:device_code"
-    ]);
-    value["device_authorization_endpoint"] =
-        serde_json::json!(format!("{}/device_authorization", base_url));
-    value["revocation_endpoint"] = serde_json::json!(format!("{}/oauth2/revoke", base_url));
-    value["token_endpoint_auth_methods_supported"] =
-        serde_json::json!(["client_secret_post", "none"]);
-    value["prompt_values_supported"] = serde_json::json!(["login", "create"]);
-    // MSC4191: account management discovery (stable v1.18)
-    let account_uri = state
-        .config
-        .account_management_uri
-        .as_ref()
-        .map(|u| u.as_str().to_string())
-        .unwrap_or_else(|| format!("{}/account", base_url));
-    value["account_management_uri"] = serde_json::json!(account_uri);
-    value["account_management_actions_supported"] =
-        serde_json::json!(["org.matrix.cross_signing_reset"]);
+    let value = oidc::provider_metadata_value(
+        state.config.base_url.clone(),
+        state.config.account_management_uri.as_ref(),
+    )?;
     Ok(value.into())
 }
 
