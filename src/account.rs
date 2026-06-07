@@ -137,6 +137,21 @@ pub fn canonical_action(action: &str) -> Option<Action> {
     }
 }
 
+/// Parse an account action string, distinguishing an absent action from an
+/// unknown one so the client gets an actionable error.
+///
+/// Element Web's generic "Manage account" entry opens the account page with no
+/// `action`, then re-auth POSTs an empty action string; surfacing "Missing
+/// action" (rather than "Unsupported action: ") tells the client this is a
+/// menu-only page, not a bad action.
+fn parse_action(raw: &str) -> Result<Action, CustomError> {
+    if raw.is_empty() {
+        return Err(CustomError::BadRequest("Missing action".to_string()));
+    }
+    canonical_action(raw)
+        .ok_or_else(|| CustomError::BadRequest(format!("Unsupported action: {}", raw)))
+}
+
 /// Sanitize a user-supplied action string for safe HTML interpolation.
 fn sanitize_action(raw: &str) -> String {
     raw.chars()
@@ -312,8 +327,7 @@ pub async fn account_wallet(
     db_client: &RedisClient,
     server_name: Option<&str>,
 ) -> Result<AccountActionResponse, CustomError> {
-    let action = canonical_action(&req.action)
-        .ok_or_else(|| CustomError::BadRequest(format!("Unsupported action: {}", req.action)))?;
+    let action = parse_action(&req.action)?;
 
     let sig_hex = req.signature.strip_prefix("0x").unwrap_or(&req.signature);
     let sig_bytes = hex::decode(sig_hex)
@@ -371,8 +385,7 @@ pub async fn account_passkey_finish(
     synapse_client: Option<&SynapseClient>,
     server_name: Option<&str>,
 ) -> Result<AccountActionResponse, CustomError> {
-    let action = canonical_action(&req.action)
-        .ok_or_else(|| CustomError::BadRequest(format!("Unsupported action: {}", req.action)))?;
+    let action = parse_action(&req.action)?;
 
     let auth_response: webauthn_rs::prelude::PublicKeyCredential =
         serde_json::from_value(req.credential)
@@ -1274,6 +1287,36 @@ mod tests {
         assert_eq!(
             canonical_action("org.matrix.account_deactivate"),
             Some(Action::AccountDeactivate)
+        );
+    }
+
+    #[test]
+    fn parse_action_empty_is_missing_action() {
+        match parse_action("") {
+            Err(CustomError::BadRequest(msg)) => assert!(
+                msg.contains("Missing action"),
+                "empty action message should say 'Missing action', got: {msg}"
+            ),
+            other => panic!("expected BadRequest(Missing action), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_action_unknown_is_unsupported_action() {
+        match parse_action("org.matrix.foo") {
+            Err(CustomError::BadRequest(msg)) => assert!(
+                msg.contains("Unsupported action: org.matrix.foo"),
+                "unknown action message should echo the action, got: {msg}"
+            ),
+            other => panic!("expected BadRequest(Unsupported action), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_action_known_returns_action() {
+        assert_eq!(
+            parse_action("org.matrix.account_deactivate").unwrap(),
+            Action::AccountDeactivate
         );
     }
 
