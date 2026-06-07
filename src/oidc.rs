@@ -1896,6 +1896,7 @@ mod tests {
             "org.matrix.device_view",
             "org.matrix.device_delete",
             "org.matrix.cross_signing_reset",
+            "org.matrix.account_deactivate",
             "org.matrix.sessions_list",
             "org.matrix.session_view",
             "org.matrix.session_end",
