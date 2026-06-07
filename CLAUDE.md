@@ -461,6 +461,29 @@ The user re-authenticates (wallet or passkey), siwx-oidc calls
 | `device_view` / `session_view` | Show one device's details (needs `device_id`) |
 | `device_delete` / `session_end` | Sign a device out (needs `device_id`) |
 | `cross_signing_reset` | Allow cross-signing reset (MSC4312) |
+| `account_deactivate` | Permanently deactivate the account (Synapse admin `deactivate`, `erase:false`) + revoke ALL the user's tokens |
+
+**Bare/empty-action landing = account-home menu.** `GET /account` with NO `action`
+param (or an empty one) renders a navigation menu (links to `profile`,
+`devices_list`, and a danger-styled `account_deactivate`), NOT the dead-end
+re-auth buttons. This is required because Element Web's generic "Manage account"
+opens the bare `account_management_uri` with no action; previously the re-auth
+then POSTed `action:""` and got `400 "Unsupported action: "`. The menu is the
+only path an Element Web user has to reach deactivation (Element Web suppresses
+its in-app deactivate for externally-managed accounts). Element-X is unaffected
+(it deep-links specific actions). The POST handlers now distinguish an empty
+action (`400 "Missing action"`) from a truly unknown one
+(`400 "Unsupported action: {x}"`) via `parse_action`.
+
+**Account deactivation is irreversible.** `/account?action=org.matrix.account_deactivate`
+shows a permanent-deactivation confirmation (a "cannot be undone" warning +
+`#confirm-deactivate` checkbox gating the auth buttons) before re-auth. The
+checkbox is UX friction only; the real authorization is the wallet/passkey
+signature (same model as `device_delete`). On success `execute_action` calls
+`SynapseClient::deactivate_user` then `RedisClient::revoke_all_user_tokens` and
+returns `ActionOutcome::Deactivated`. Like the other device actions it requires
+`SIWEOIDC_MATRIX_SERVER_NAME` + a Synapse client (clear `BadRequest`, never 500,
+when absent).
 
 **Model:** the page is stateless; each action re-authenticates (wallet CAIP-122
 or passkey), proving the DID, then runs the action and returns a `kind`-tagged
