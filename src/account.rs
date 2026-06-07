@@ -1031,6 +1031,9 @@ function renderOutcome(data) {
       $('terminal-actions').innerHTML =
         '<a class="btn btn-secondary" href="' + actionUrl('org.matrix.devices_list', null) + '">Back to your sessions</a>';
       break;
+    case 'deactivated':
+      showTerminal('Account deactivated', 'Your account has been deactivated and you have been signed out everywhere.', false);
+      break;
     case 'profile':
       showResult('<div class="success-badge">' + CHECK_SVG + '</div>' +
         '<h1 class="title">Your account</h1>' +
@@ -1138,6 +1141,23 @@ function bufferToBase64(buf) {
   bytes.forEach((b) => s += String.fromCharCode(b));
   return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
+
+// Deactivate confirmation gate: keep the auth buttons disabled until the user
+// ticks the "I understand this is permanent" box. The buttons already start
+// disabled from the server; this only matters before the first click (after
+// that, setBusy owns the disabled state).
+(function () {
+  const cb = $('confirm-deactivate');
+  if (!cb) return;
+  const sync = () => {
+    ['btn-wallet', 'btn-passkey'].forEach((id) => {
+      const b = $(id);
+      if (b) b.disabled = !cb.checked;
+    });
+  };
+  cb.addEventListener('change', sync);
+  sync();
+})();
 "#;
 
 #[cfg(test)]
@@ -1427,6 +1447,33 @@ mod tests {
         ] {
             assert!(html.contains(hook), "account page JS missing hook: {hook}");
         }
+    }
+
+    #[test]
+    fn account_page_js_renders_deactivated_and_gates_confirm() {
+        // The page JS must render the 'deactivated' outcome and wire the
+        // confirm-deactivate checkbox to the auth buttons.
+        let html = account_page(
+            AccountPageQuery {
+                action: Some("org.matrix.account_deactivate".to_string()),
+                device_id: None,
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        assert!(
+            html.contains("case 'deactivated':"),
+            "JS must render the deactivated outcome"
+        );
+        assert!(
+            html.contains("Account deactivated"),
+            "deactivated terminal title must be present"
+        );
+        assert!(
+            html.contains("confirm-deactivate"),
+            "JS must reference the confirm-deactivate checkbox"
+        );
     }
 
     #[test]
