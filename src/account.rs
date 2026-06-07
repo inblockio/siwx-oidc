@@ -414,6 +414,86 @@ pub async fn account_passkey_finish(
 
 // -- Account management page --------------------------------------------------
 
+/// Wallet sign-in button. `{disabled}` is either `""` or `" disabled"` so the
+/// deactivate confirmation gate can render it disabled until the user confirms.
+const WALLET_BUTTON_HTML: &str = r##"<button class="btn btn-primary" id="btn-wallet" onclick="authWallet()"{disabled}>
+          <svg xmlns="http://www.w3.org/2000/svg" clip-rule="evenodd" fill-rule="evenodd" viewBox="170 30 220 350" class="btn-icon eth-icon">
+            <g fill-rule="nonzero" transform="matrix(.781253 0 0 .781253 180 37.1453)">
+              <path d="m127.961 0-2.795 9.5v275.668l2.795 2.79 127.962-75.638z" fill="#343434"/>
+              <path d="m127.962 0-127.962 212.32 127.962 75.639v-133.801z" fill="#8c8c8c"/>
+              <path d="m127.961 312.187-1.575 1.92v98.199l1.575 4.601 128.038-180.32z" fill="#3c3c3b"/>
+              <path d="m127.962 416.905v-104.72l-127.962-75.6z" fill="#8c8c8c"/>
+              <path d="m127.961 287.958 127.96-75.637-127.96-58.162z" fill="#141414"/>
+              <path d="m.001 212.321 127.96 75.637v-133.799z" fill="#393939"/>
+            </g>
+          </svg>
+          <span>Sign with wallet</span>
+        </button>"##;
+
+/// `or` divider between the wallet and passkey buttons.
+const BUTTON_DIVIDER_HTML: &str = r##"<div class="divider">
+          <div class="divider-line"></div>
+          <span class="divider-text">or</span>
+          <div class="divider-line"></div>
+        </div>"##;
+
+/// Passkey sign-in button. `{disabled}` works as for [`WALLET_BUTTON_HTML`].
+const PASSKEY_BUTTON_HTML: &str = r##"<button class="btn btn-secondary" id="btn-passkey" onclick="authPasskey()"{disabled}>
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="btn-icon">
+            <path fill-rule="evenodd" d="M15.75 1.5a6.75 6.75 0 0 0-6.651 7.906c.067.39-.032.717-.221.906l-6.5 6.499a3 3 0 0 0-.878 2.121v2.818c0 .414.336.75.75.75H6a.75.75 0 0 0 .75-.75v-1.5h1.5A.75.75 0 0 0 9 19.5V18h1.5a.75.75 0 0 0 .53-.22l2.658-2.658c.19-.189.517-.288.906-.22A6.75 6.75 0 1 0 15.75 1.5Zm0 3a.75.75 0 0 0 0 1.5A2.25 2.25 0 0 1 18 8.25a.75.75 0 0 0 1.5 0 3.75 3.75 0 0 0-3.75-3.75Z" clip-rule="evenodd"/>
+          </svg>
+          <span>Sign with passkey</span>
+        </button>"##;
+
+/// The wallet + passkey re-auth buttons, optionally rendered `disabled` (used by
+/// the deactivate confirmation gate, which enables them once the box is checked).
+fn auth_buttons_html(disabled: bool) -> String {
+    let attr = if disabled { " disabled" } else { "" };
+    format!(
+        "{wallet}\n\n        {divider}\n\n        {passkey}",
+        wallet = WALLET_BUTTON_HTML.replace("{disabled}", attr),
+        divider = BUTTON_DIVIDER_HTML,
+        passkey = PASSKEY_BUTTON_HTML.replace("{disabled}", attr),
+    )
+}
+
+/// Build the inner HTML of `#auth-section`, keyed on the (canonical) action.
+///
+/// Three shapes, collapsing every action onto one rendering path:
+/// - empty action: an account-home MENU of plain links (no signature, no auth
+///   buttons, so `authWallet` is never invoked with an empty action);
+/// - account_deactivate: a danger confirmation gate (warning + checkbox) above
+///   the auth buttons, which start `disabled` until the box is checked;
+/// - any other action: the plain wallet/passkey buttons (unchanged behaviour).
+fn auth_section_html(action_opt: Option<Action>, action_is_empty: bool, base: &str) -> String {
+    if action_is_empty {
+        return format!(
+            r##"<div class="menu-list">
+          <a class="btn btn-secondary" href="{base}/account?action=org.matrix.profile">Your account</a>
+          <a class="btn btn-secondary" href="{base}/account?action=org.matrix.devices_list">Your sessions</a>
+          <a class="btn btn-danger" href="{base}/account?action=org.matrix.account_deactivate">Deactivate account</a>
+        </div>"##,
+            base = base
+        );
+    }
+
+    if action_opt == Some(Action::AccountDeactivate) {
+        return format!(
+            r##"<div class="warning-box">
+          This permanently deactivates your Matrix account and signs you out of every session. This cannot be undone.
+        </div>
+        <label class="confirm-label">
+          <input type="checkbox" id="confirm-deactivate">
+          <span>I understand this is permanent</span>
+        </label>
+        {buttons}"##,
+            buttons = auth_buttons_html(true)
+        );
+    }
+
+    auth_buttons_html(false)
+}
+
 pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
     let action = query
         .action
@@ -450,6 +530,10 @@ pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
         None => ("Account action", "Authenticate to continue."),
     };
 
+    // Body of #auth-section depends on the action: menu (empty), danger
+    // confirmation gate (account_deactivate), or the plain auth buttons.
+    let auth_section = auth_section_html(canonical_action(&action), action.is_empty(), base);
+
     let html = format!(
         r##"<!DOCTYPE html>
 <html lang="en">
@@ -479,32 +563,7 @@ pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
         <h1 class="title">{title}</h1>
         <p class="subtitle">{subtitle}</p>
 
-        <button class="btn btn-primary" id="btn-wallet" onclick="authWallet()">
-          <svg xmlns="http://www.w3.org/2000/svg" clip-rule="evenodd" fill-rule="evenodd" viewBox="170 30 220 350" class="btn-icon eth-icon">
-            <g fill-rule="nonzero" transform="matrix(.781253 0 0 .781253 180 37.1453)">
-              <path d="m127.961 0-2.795 9.5v275.668l2.795 2.79 127.962-75.638z" fill="#343434"/>
-              <path d="m127.962 0-127.962 212.32 127.962 75.639v-133.801z" fill="#8c8c8c"/>
-              <path d="m127.961 312.187-1.575 1.92v98.199l1.575 4.601 128.038-180.32z" fill="#3c3c3b"/>
-              <path d="m127.962 416.905v-104.72l-127.962-75.6z" fill="#8c8c8c"/>
-              <path d="m127.961 287.958 127.96-75.637-127.96-58.162z" fill="#141414"/>
-              <path d="m.001 212.321 127.96 75.637v-133.799z" fill="#393939"/>
-            </g>
-          </svg>
-          <span>Sign with wallet</span>
-        </button>
-
-        <div class="divider">
-          <div class="divider-line"></div>
-          <span class="divider-text">or</span>
-          <div class="divider-line"></div>
-        </div>
-
-        <button class="btn btn-secondary" id="btn-passkey" onclick="authPasskey()">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="btn-icon">
-            <path fill-rule="evenodd" d="M15.75 1.5a6.75 6.75 0 0 0-6.651 7.906c.067.39-.032.717-.221.906l-6.5 6.499a3 3 0 0 0-.878 2.121v2.818c0 .414.336.75.75.75H6a.75.75 0 0 0 .75-.75v-1.5h1.5A.75.75 0 0 0 9 19.5V18h1.5a.75.75 0 0 0 .53-.22l2.658-2.658c.19-.189.517-.288.906-.22A6.75 6.75 0 1 0 15.75 1.5Zm0 3a.75.75 0 0 0 0 1.5A2.25 2.25 0 0 1 18 8.25a.75.75 0 0 0 1.5 0 3.75 3.75 0 0 0-3.75-3.75Z" clip-rule="evenodd"/>
-          </svg>
-          <span>Sign with passkey</span>
-        </button>
+        {auth_section}
       </div>
 
       <div id="terminal-section" class="auth-section hidden">
@@ -542,6 +601,7 @@ pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
         action = action,
         base = base,
         device_id = device_id,
+        auth_section = auth_section,
     );
     Html(html)
 }
@@ -749,6 +809,31 @@ html, body {
 .footer a:hover { color: rgba(0,0,0,0.7); }
 .result-section { display: flex; flex-direction: column; align-items: stretch; text-align: center; }
 .result-section .title { text-align: center; }
+.menu-list { display: flex; flex-direction: column; width: 100%; gap: 10px; }
+.menu-list .btn { text-decoration: none; margin-top: 0; }
+.warning-box {
+  width: 100%;
+  margin: 4px 0 16px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(220,38,38,0.06);
+  border: 1px solid rgba(220,38,38,0.18);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--danger);
+  text-align: left;
+}
+.confirm-label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  margin-bottom: 16px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+.confirm-label input { width: 16px; height: 16px; flex-shrink: 0; accent-color: var(--danger); }
 .btn-danger {
   background: var(--danger);
   color: #fff;
@@ -1090,6 +1175,107 @@ mod tests {
         assert!(html.contains("Account"));
         assert!(html.contains("Manage your account"));
         assert!(html.contains(r#"data-action="""#));
+    }
+
+    #[test]
+    fn account_page_empty_action_renders_menu() {
+        // Element Web's generic "Manage account" opens the bare page (no action).
+        // It must render a navigable menu, NOT the auth buttons.
+        let html = account_page(
+            AccountPageQuery {
+                action: None,
+                device_id: None,
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        assert!(
+            html.contains("action=org.matrix.profile"),
+            "menu must link to profile"
+        );
+        assert!(
+            html.contains("action=org.matrix.devices_list"),
+            "menu must link to sessions"
+        );
+        assert!(
+            html.contains("action=org.matrix.account_deactivate"),
+            "menu must link to deactivate"
+        );
+        // The auth BUTTONS (which invoke authWallet on click) must be absent so
+        // an empty action is never POSTed. The bare `authWallet` function lives
+        // in the shared embedded JS regardless, so assert on the onclick that is
+        // unique to the rendered button, not on the function name.
+        assert!(
+            !html.contains(r#"onclick="authWallet()""#),
+            "menu must NOT render the auth buttons (no empty-action POST)"
+        );
+    }
+
+    #[test]
+    fn account_page_deactivate_shows_confirmation() {
+        let html = account_page(
+            AccountPageQuery {
+                action: Some("org.matrix.account_deactivate".to_string()),
+                device_id: None,
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        assert!(
+            html.contains("permanently"),
+            "deactivate gate must warn it is permanent"
+        );
+        assert!(
+            html.contains("cannot be undone"),
+            "deactivate gate must warn it cannot be undone"
+        );
+        assert!(
+            html.contains(r#"id="confirm-deactivate""#),
+            "deactivate gate must have the confirm checkbox"
+        );
+        assert!(
+            html.contains(r#"onclick="authWallet()" disabled>"#),
+            "deactivate gate must start with the wallet button disabled"
+        );
+        assert!(
+            html.contains(r#"onclick="authPasskey()" disabled>"#),
+            "deactivate gate must start with the passkey button disabled"
+        );
+        assert!(
+            html.contains(r#"onclick="authWallet()""#),
+            "deactivate gate still has the (gated) auth buttons"
+        );
+    }
+
+    #[test]
+    fn account_page_normal_action_keeps_auth_buttons() {
+        let html = account_page(
+            AccountPageQuery {
+                action: Some("org.matrix.profile".to_string()),
+                device_id: None,
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        assert!(
+            html.contains(r#"onclick="authWallet()""#),
+            "normal action keeps wallet button"
+        );
+        assert!(
+            html.contains(r#"onclick="authPasskey()""#),
+            "normal action keeps passkey button"
+        );
+        assert!(
+            !html.contains(r#"id="confirm-deactivate""#),
+            "normal action has no deactivate confirm gate"
+        );
+        assert!(
+            !html.contains("action=org.matrix.devices_list"),
+            "normal action does not render the menu"
+        );
     }
 
     #[test]
