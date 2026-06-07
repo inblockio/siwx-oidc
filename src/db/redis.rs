@@ -113,6 +113,46 @@ impl RedisClient {
     /// refresh tokens are the only long-lived entries), so a full scan is
     /// acceptable. The removed count is logged so a large sweep is never silent.
     pub async fn revoke_device_tokens(&self, username: &str, device_id: &str) -> Result<usize> {
+        let revoked = self
+            .revoke_tokens_where(|meta| meta.username == username && meta.device_id == device_id)
+            .await?;
+        debug!(
+            "revoke_device_tokens: username={} device_id={} revoked={}",
+            username, device_id, revoked
+        );
+        Ok(revoked)
+    }
+
+    /// Revoke every stored OAuth token for `username` (localpart), across all devices.
+    /// Returns the count removed. Used by MSC4191 account_deactivate: after Synapse
+    /// deactivates the account, removing all tokens makes introspection report every
+    /// session inactive.
+    ///
+    /// Like [`revoke_device_tokens`](Self::revoke_device_tokens) this keys on
+    /// `username` (the lowercased `did_to_localpart` value Synapse uses) so it is
+    /// robust to address-case differences between sign-in and re-auth DIDs.
+    pub async fn revoke_all_user_tokens(&self, username: &str) -> Result<usize> {
+        let revoked = self
+            .revoke_tokens_where(|meta| meta.username == username)
+            .await?;
+        debug!(
+            "revoke_all_user_tokens: username={} revoked={}",
+            username, revoked
+        );
+        Ok(revoked)
+    }
+
+    /// Scan the token keyspace (`KV_TOKEN_PREFIX`) and delete every entry whose
+    /// [`TokenMetadata`] satisfies `pred`, returning the number removed.
+    ///
+    /// There is no secondary index on token metadata, so this scans the keyspace.
+    /// The volume is bounded (access tokens have a short TTL; refresh tokens are
+    /// the only long-lived entries), so a full scan is acceptable. Callers log
+    /// the removed count so a large sweep is never silent.
+    async fn revoke_tokens_where<F>(&self, pred: F) -> Result<usize>
+    where
+        F: Fn(&TokenMetadata) -> bool,
+    {
         let keys = self.keys_raw(&format!("{}/*", KV_TOKEN_PREFIX)).await?;
         let mut revoked = 0usize;
         for key in keys {
@@ -124,15 +164,11 @@ impl RedisClient {
                 Ok(m) => m,
                 Err(_) => continue, // not a token entry / unparseable; leave it
             };
-            if meta.username == username && meta.device_id == device_id {
+            if pred(&meta) {
                 self.del_raw(&key).await?;
                 revoked += 1;
             }
         }
-        debug!(
-            "revoke_device_tokens: username={} device_id={} revoked={}",
-            username, device_id, revoked
-        );
         Ok(revoked)
     }
 }
@@ -519,6 +555,63 @@ mod tests {
 
         // Best-effort cleanup.
         client.delete_token(&t2).await.ok();
+        client.delete_token(&t3).await.ok();
+    }
+
+    /// MSC4191 account_deactivate must revoke EVERY OAuth session for the user
+    /// (all devices), leaving other users untouched.
+    /// Requires Redis on localhost; skips cleanly if unavailable.
+    #[tokio::test]
+    async fn revoke_all_user_tokens_removes_all_user_sessions() {
+        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
+            Ok(c) => c,
+            Err(_) => return, // no Redis: skip (CI provides one)
+        };
+
+        // Unique per run so parallel tests / stale entries cannot interfere.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let user = format!("user-{nonce}");
+        let other_user = format!("other-{nonce}");
+        let d1 = format!("DEV1_{nonce}");
+        let d2 = format!("DEV2_{nonce}");
+        let (t1, t2, t3) = (
+            format!("tok1_{nonce}"),
+            format!("tok2_{nonce}"),
+            format!("tok3_{nonce}"),
+        );
+
+        client
+            .set_token(&t1, &token_meta(&d1, &user), 120)
+            .await
+            .unwrap(); // user, device 1
+        client
+            .set_token(&t2, &token_meta(&d2, &user), 120)
+            .await
+            .unwrap(); // user, device 2
+        client
+            .set_token(&t3, &token_meta(&d1, &other_user), 120)
+            .await
+            .unwrap(); // other user
+
+        let revoked = client.revoke_all_user_tokens(&user).await.unwrap();
+        assert_eq!(revoked, 2, "both of the user's tokens must be revoked");
+        assert!(
+            client.get_token(&t1).await.unwrap().is_none(),
+            "user device-1 token must be gone"
+        );
+        assert!(
+            client.get_token(&t2).await.unwrap().is_none(),
+            "user device-2 token must be gone"
+        );
+        assert!(
+            client.get_token(&t3).await.unwrap().is_some(),
+            "different-user token must remain"
+        );
+
+        // Best-effort cleanup.
         client.delete_token(&t3).await.ok();
     }
 }
