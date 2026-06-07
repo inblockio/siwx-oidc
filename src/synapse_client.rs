@@ -301,6 +301,42 @@ impl SynapseClient {
         }
         Ok(())
     }
+
+    /// Build the admin-API deactivation URL for a user's mxid (percent-encoded
+    /// path segment). Factored out so the encoding can be unit-tested directly.
+    fn deactivate_url(&self, localpart: &str, server_name: &str) -> String {
+        format!(
+            "{}/_synapse/admin/v1/deactivate/{}",
+            self.endpoint,
+            urlencoding::encode(&matrix_user_id(localpart, server_name))
+        )
+    }
+
+    /// Deactivate a user's account via the Synapse admin API
+    /// (`POST /_synapse/admin/v1/deactivate/{user_id}`) with `erase: false`.
+    ///
+    /// Authenticated with the shared secret (== Synapse `admin_token` under MSC3861).
+    /// Deactivation removes the account's access tokens and 3PIDs; `erase: false`
+    /// keeps profile data (no GDPR erasure). Scoped to the user's mxid.
+    pub async fn deactivate_user(&self, localpart: &str, server_name: &str) -> Result<()> {
+        let url = self.deactivate_url(localpart, server_name);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.shared_secret)
+            .json(&json!({ "erase": false }))
+            .send()
+            .await
+            .context("deactivate_user: request failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(%status, %body, "deactivate_user failed");
+            anyhow::bail!("deactivate_user: HTTP {status}");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -335,6 +371,22 @@ mod tests {
         assert_eq!(encoded, "%40alice%3Aexample.com");
         assert!(!encoded.contains('@'));
         assert!(!encoded.contains(':'));
+    }
+
+    #[test]
+    fn deactivate_url_encodes_mxid_path_segment() {
+        // The deactivate endpoint takes the mxid as a path segment, so the mxid
+        // must be percent-encoded (no raw @ or :) for a well-formed URL.
+        let client = SynapseClient::new("http://localhost:8008", "secret");
+        let url = client.deactivate_url("alice", "example.com");
+        assert_eq!(
+            url,
+            "http://localhost:8008/_synapse/admin/v1/deactivate/%40alice%3Aexample.com"
+        );
+        // The encoded segment must not contain raw mxid separators.
+        let segment = url.rsplit('/').next().unwrap();
+        assert!(!segment.contains('@'));
+        assert!(!segment.contains(':'));
     }
 
     #[test]
