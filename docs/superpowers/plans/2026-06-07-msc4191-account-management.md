@@ -135,3 +135,46 @@ canonical action list shared between the implementation and the advertised metad
 | AC1 | Metadata advertises uri + actions ⊇ {device_view, device_delete, devices_list, profile} (+ session_* aliases) | H1, H2 |
 | AC2 | Element "Manage this session" opens device detail, no "Unsupported action" | H2, H3, H4, H8 |
 | AC3 | Signing a device out revokes its access (C-S API rejected) | H5 |
+
+---
+
+## Phase 3 Audit (2026-06-07)
+
+**Verdict: SHIP.** Clean `cargo build`/`clippy`/`fmt`; 60 unit tests pass (8 lib + 52 bin)
+against live Redis; live happy-path is covered by an `#[ignore]`d e2e. Independent
+3-reviewer adversarial audit (hypothesis trace + bug hunt + completeness critic).
+
+### Hypothesis trace
+| ID | Status | Evidence |
+|----|--------|----------|
+| H1 | Confirmed | `oidc::provider_metadata_value` sources actions from `account::SUPPORTED_ACTIONS`; `provider_metadata_advertises_msc4191_account_management` passes |
+| H2 | Confirmed | `canonical_action` alias tests + `account_page_renders_session_alias_like_device` |
+| H3 | Confirmed | `device_id` threaded query→request→`execute_action`; `account_page_renders_device_view_with_device_id` |
+| H4 | Confirmed (code) / live-only (happy path) | `list_devices`/`get_device` admin-API; URL+mxid unit-tested; live call via ignored e2e |
+| H5 | Confirmed | `device_delete` → Synapse delete + `revoke_device_tokens` keyed on `username`; Redis test proves selective revocation |
+| H6 | Confirmed | guard tests: missing/foreign device_id, unknown action → `BadRequest`, no panic |
+| H7 | Confirmed | `execute_device_actions_require_synapse`; cross_signing_reset semantics unchanged |
+| H8 | Confirmed | JS render-hook test; `device_view` page has no "Unsupported action" |
+
+### Acceptance criteria
+| # | Met? | Evidence |
+|---|------|----------|
+| AC1 | Yes | unit test on metadata builder + live forwarding verified earlier |
+| AC2 | Yes | page renders device_view detail; "Unsupported action" only on POST for truly-unknown actions |
+| AC3 | Yes (code) | Synapse device delete + Redis token revoke; happy path via ignored live e2e (no Synapse mock in CI) |
+
+### Findings (none ship-blocking)
+1. **Account re-auth has no server nonce / origin binding** (medium, *pre-existing*): the
+   wallet/passkey proof isn't bound to a server-issued challenge, so a phished signature
+   could be replayed. Already true for `cross_signing_reset`; `device_delete` widens the
+   blast radius. Follow-up: bind a server nonce + origin to `/account` re-auth.
+2. **`revoke_device_tokens` uses Redis `KEYS`** (low): O(N) blocking scan + GET-per-key.
+   Fine at current scale; follow-up: switch to `SCAN`.
+3. **Test coverage** (medium, test-only): happy paths of devices_list/device_view/
+   device_delete, the foreign-device "not found" path, and invalid-proof rejection are
+   validated by reasoning + the ignored live e2e, not a Synapse mock. Follow-up: add a
+   `wiremock`/`httpmock` Synapse fixture to cover them in CI.
+4. **"login → resume"** is satisfied in intent (no action runs without proof) but collapsed
+   into one POST rather than a redirect-resume; documented in CLAUDE.md.
+
+All findings are reasonable follow-ups; the issue-#5 deliverable (bug fixed, ACs met) is complete.
