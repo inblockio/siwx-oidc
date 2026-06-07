@@ -73,6 +73,8 @@ pub enum ActionOutcome {
     Device { device: DeviceInfo },
     /// Confirmation that a device was signed out (device_delete).
     Deleted { device_id: String },
+    /// Confirmation that the account was deactivated (account_deactivate).
+    Deactivated,
 }
 
 // -- Supported actions --------------------------------------------------------
@@ -97,6 +99,8 @@ pub enum Action {
     DeviceDelete,
     /// `org.matrix.cross_signing_reset` (MSC4312).
     CrossSigningReset,
+    /// `org.matrix.account_deactivate`: permanently deactivate the account.
+    AccountDeactivate,
 }
 
 /// The full superset of MSC4191 action strings this server advertises in
@@ -112,7 +116,8 @@ pub const SUPPORTED_ACTIONS: &[&str] = &[
     "org.matrix.device_view",
     "org.matrix.device_delete",
     ACTION_CROSS_SIGNING_RESET,
-    // session_* aliases (older naming — accepted for compatibility):
+    "org.matrix.account_deactivate",
+    // session_* aliases (older naming, accepted for compatibility):
     "org.matrix.sessions_list",
     "org.matrix.session_view",
     "org.matrix.session_end",
@@ -127,6 +132,7 @@ pub fn canonical_action(action: &str) -> Option<Action> {
         "org.matrix.device_view" | "org.matrix.session_view" => Some(Action::DeviceView),
         "org.matrix.device_delete" | "org.matrix.session_end" => Some(Action::DeviceDelete),
         ACTION_CROSS_SIGNING_RESET => Some(Action::CrossSigningReset),
+        "org.matrix.account_deactivate" => Some(Action::AccountDeactivate),
         _ => None,
     }
 }
@@ -275,6 +281,25 @@ async fn execute_action(
                 device_id: device_id.to_string(),
             })
         }
+        Action::AccountDeactivate => {
+            let synapse = require_synapse(synapse_client)?;
+            let server = require_server_name(server_name)?;
+            synapse.deactivate_user(&localpart, server).await.map_err(|e| {
+                warn!(error = %e, "deactivate_user failed during account action");
+                CustomError::BadRequest("Failed to deactivate account".to_string())
+            })?;
+            // Revoke ALL of the user's OAuth sessions so introspection reports every
+            // session inactive (Synapse deactivate already drops Synapse-side tokens).
+            let revoked = db_client
+                .revoke_all_user_tokens(&localpart)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "revoke_all_user_tokens failed during account deactivation");
+                    0
+                });
+            info!(did = %did, revoked = revoked as u64, "account deactivated via account management");
+            Ok(ActionOutcome::Deactivated)
+        }
     }
 }
 
@@ -404,6 +429,10 @@ pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
         ),
         Some(Action::DeviceView) => ("Session details", "Authenticate to view this device."),
         Some(Action::DeviceDelete) => ("Sign out device", "Authenticate to sign this device out."),
+        Some(Action::AccountDeactivate) => (
+            "Deactivate account",
+            "Confirm to permanently deactivate your account.",
+        ),
         None if action.is_empty() => ("Account", "Manage your account settings."),
         None => ("Account action", "Authenticate to continue."),
     };
@@ -1241,6 +1270,14 @@ mod tests {
     }
 
     #[test]
+    fn canonical_action_accepts_account_deactivate() {
+        assert_eq!(
+            canonical_action("org.matrix.account_deactivate"),
+            Some(Action::AccountDeactivate)
+        );
+    }
+
+    #[test]
     fn canonical_action_collapses_session_aliases() {
         // session_* aliases must behave identically to their device_* form.
         assert_eq!(
@@ -1340,6 +1377,10 @@ mod tests {
             })
             .unwrap(),
             json!({"kind": "deleted", "device_id": "DEV"})
+        );
+        assert_eq!(
+            serde_json::to_value(ActionOutcome::Deactivated).unwrap(),
+            json!({"kind": "deactivated"})
         );
         let profile = serde_json::to_value(ActionOutcome::Profile {
             did: "did:pkh:eip155:1:0xabc".to_string(),
@@ -1454,6 +1495,28 @@ mod tests {
         )
         .await;
         assert!(err.is_err(), "cross_signing_reset requires Synapse");
+    }
+
+    #[tokio::test]
+    async fn execute_action_deactivate_requires_synapse() {
+        let Some(redis) = test_redis().await else {
+            return;
+        };
+        // account_deactivate with no Synapse client must degrade to a clear
+        // BadRequest (never a 500), matching the device actions.
+        let err = execute_action(
+            Action::AccountDeactivate,
+            None,
+            "did:test",
+            None,
+            &redis,
+            Some("matrix.example.com"),
+        )
+        .await;
+        assert!(
+            matches!(err, Err(CustomError::BadRequest(_))),
+            "account_deactivate without Synapse must be a BadRequest, got {err:?}"
+        );
     }
 
     #[tokio::test]
