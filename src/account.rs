@@ -299,10 +299,13 @@ async fn execute_action(
         Action::AccountDeactivate => {
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
-            synapse.deactivate_user(&localpart, server).await.map_err(|e| {
-                warn!(error = %e, "deactivate_user failed during account action");
-                CustomError::BadRequest("Failed to deactivate account".to_string())
-            })?;
+            synapse
+                .deactivate_user(&localpart, server)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "deactivate_user failed during account action");
+                    CustomError::BadRequest("Failed to deactivate account".to_string())
+                })?;
             // Revoke ALL of the user's OAuth sessions so introspection reports every
             // session inactive (Synapse deactivate already drops Synapse-side tokens).
             let revoked = db_client
