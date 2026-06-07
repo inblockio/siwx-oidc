@@ -735,3 +735,88 @@ async fn msc4191_device_management_live() {
     eprintln!("[e2e] AC3 PASS: token rejected ({last_status}) after device_delete (Synapse introspection cache expired)");
     eprintln!("[e2e] VERDICT: AC2 PASS, AC3 PASS in production.");
 }
+
+// ---------------------------------------------------------------------------
+// Test: MSC4191 account-home menu + account_deactivate confirmation (read-only)
+// ---------------------------------------------------------------------------
+//
+// Verifies, without performing any real deactivation, that:
+//   1. OIDC discovery now advertises org.matrix.account_deactivate;
+//   2. GET /account (no action) renders the account-home menu;
+//   3. GET /account?action=org.matrix.account_deactivate renders the danger
+//      confirmation gate.
+//
+// Run:
+//   SIWEOIDC_HOST=https://siwx-oidc.inblock.io \
+//     cargo test --test e2e_msc4191_live msc4191_account_menu_and_deactivate_page_live \
+//       -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn msc4191_account_menu_and_deactivate_page_live() {
+    let oidc = siweoidc_host();
+    let http = Client::new();
+
+    // 1. Discovery advertises account_deactivate.
+    let disco: Value = http
+        .get(format!("{}/.well-known/openid-configuration", oidc))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let actions: Vec<String> = disco["account_management_actions_supported"]
+        .as_array()
+        .expect("discovery must carry account_management_actions_supported")
+        .iter()
+        .map(|a| a.as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(
+        actions.iter().any(|a| a == "org.matrix.account_deactivate"),
+        "discovery must advertise org.matrix.account_deactivate (got {actions:?})"
+    );
+    eprintln!("[e2e] discovery advertises org.matrix.account_deactivate");
+
+    // 2. GET /account (no action) renders the account-home menu.
+    let menu = http
+        .get(format!("{}/account", oidc))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        menu.contains("action=org.matrix.account_deactivate")
+            && menu.contains("action=org.matrix.devices_list"),
+        "bare /account must render the menu with deactivate + sessions links"
+    );
+    assert!(
+        !menu.contains(r#"onclick="authWallet()""#),
+        "menu must NOT render the auth buttons (no empty-action POST)"
+    );
+    eprintln!("[e2e] GET /account renders the account-home menu");
+
+    // 3. GET /account?action=account_deactivate renders the confirmation gate.
+    let gate = http
+        .get(format!(
+            "{}/account?action=org.matrix.account_deactivate",
+            oidc
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        gate.contains("permanently") && gate.contains("cannot be undone"),
+        "deactivate page must warn it is permanent and cannot be undone"
+    );
+    assert!(
+        gate.contains(r#"id="confirm-deactivate""#),
+        "deactivate page must render the confirm checkbox"
+    );
+    eprintln!("[e2e] GET /account?action=account_deactivate renders the confirmation gate");
+    eprintln!("[e2e] VERDICT: menu + deactivate page PASS (no real deactivation performed).");
+}
