@@ -75,6 +75,10 @@ pub enum ActionOutcome {
     Deleted { device_id: String },
     /// Confirmation that the account was deactivated (account_deactivate).
     Deactivated,
+    /// Confirmation that the account was irreversibly erased (account_erase).
+    Erased,
+    /// Confirmation that the account was reactivated (account_reactivate).
+    Reactivated,
 }
 
 // -- Supported actions --------------------------------------------------------
@@ -99,8 +103,14 @@ pub enum Action {
     DeviceDelete,
     /// `org.matrix.cross_signing_reset` (MSC4312).
     CrossSigningReset,
-    /// `org.matrix.account_deactivate`: permanently deactivate the account.
+    /// `org.matrix.account_deactivate`: permanently deactivate the account
+    /// (keeps profile/media; reversible via [`Action::Reactivate`]).
     AccountDeactivate,
+    /// `org.matrix.account_erase`: irreversibly erase the account
+    /// (GDPR `erase:true` + Redis identity purge).
+    AccountErase,
+    /// `org.matrix.account_reactivate`: restore an `erase:false`-deactivated account.
+    Reactivate,
 }
 
 /// The full superset of MSC4191 action strings this server advertises in
@@ -117,6 +127,8 @@ pub const SUPPORTED_ACTIONS: &[&str] = &[
     "org.matrix.device_delete",
     ACTION_CROSS_SIGNING_RESET,
     "org.matrix.account_deactivate",
+    "org.matrix.account_erase",
+    "org.matrix.account_reactivate",
     // session_* aliases (older naming, accepted for compatibility):
     "org.matrix.sessions_list",
     "org.matrix.session_view",
@@ -133,6 +145,8 @@ pub fn canonical_action(action: &str) -> Option<Action> {
         "org.matrix.device_delete" | "org.matrix.session_end" => Some(Action::DeviceDelete),
         ACTION_CROSS_SIGNING_RESET => Some(Action::CrossSigningReset),
         "org.matrix.account_deactivate" => Some(Action::AccountDeactivate),
+        "org.matrix.account_erase" => Some(Action::AccountErase),
+        "org.matrix.account_reactivate" => Some(Action::Reactivate),
         _ => None,
     }
 }
@@ -318,6 +332,62 @@ async fn execute_action(
             info!(did = %did, revoked = revoked as u64, "account deactivated via account management");
             Ok(ActionOutcome::Deactivated)
         }
+        Action::AccountErase => {
+            let synapse = require_synapse(synapse_client)?;
+            let server = require_server_name(server_name)?;
+            // Irreversible: GDPR erasure removes profile, media, and room
+            // memberships in addition to deactivating the account.
+            synapse
+                .deactivate_user(&localpart, server, true)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "deactivate_user(erase=true) failed during account action");
+                    CustomError::BadRequest("Failed to erase account".to_string())
+                })?;
+            // Revoke ALL OAuth sessions (best-effort) so introspection reports
+            // every session inactive.
+            let revoked = db_client
+                .revoke_all_user_tokens(&localpart)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "revoke_all_user_tokens failed during account erasure");
+                    0
+                });
+            // Purge WebAuthn identity artifacts (best-effort) so the erased DID
+            // cannot be silently re-derived from a leftover passkey/link. The
+            // standalone-credential pass reuses the webauthn layer's single
+            // source of truth for did:key derivation.
+            let purged = db_client
+                .purge_identity(did, wa::derive_did_from_credential_json)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "purge_identity failed during account erasure");
+                    0
+                });
+            info!(
+                did = %did,
+                revoked = revoked as u64,
+                purged = purged as u64,
+                "account erased via account management"
+            );
+            Ok(ActionOutcome::Erased)
+        }
+        Action::Reactivate => {
+            let synapse = require_synapse(synapse_client)?;
+            let server = require_server_name(server_name)?;
+            // Valid only for accounts deactivated with erase:false; an erased
+            // account cannot be restored. See the MSC3861 feasibility caveat on
+            // SynapseClient::reactivate_user.
+            synapse
+                .reactivate_user(&localpart, server)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "reactivate_user failed during account action");
+                    CustomError::BadRequest("Failed to reactivate account".to_string())
+                })?;
+            info!(did = %did, "account reactivated via account management");
+            Ok(ActionOutcome::Reactivated)
+        }
     }
 }
 
@@ -449,7 +519,7 @@ const PASSKEY_BUTTON_HTML: &str = r##"<button class="btn btn-secondary" id="btn-
         </button>"##;
 
 /// The wallet + passkey re-auth buttons, optionally rendered `disabled` (used by
-/// the deactivate confirmation gate, which enables them once the box is checked).
+/// the danger confirmation gates, which enable them once their box is checked).
 fn auth_buttons_html(disabled: bool) -> String {
     let attr = if disabled { " disabled" } else { "" };
     format!(
@@ -460,14 +530,37 @@ fn auth_buttons_html(disabled: bool) -> String {
     )
 }
 
+/// A danger confirmation gate: a warning box + a single confirm checkbox that
+/// gates the (initially disabled) auth buttons. Shared by deactivate and erase
+/// so there is one rendering path; the checkbox `id` is what the page JS keys on
+/// to enable the buttons (see `gateButtons` in the embedded JS).
+fn danger_gate_html(checkbox_id: &str, warning: &str, confirm_label: &str) -> String {
+    format!(
+        r##"<div class="warning-box">
+          {warning}
+        </div>
+        <label class="confirm-label">
+          <input type="checkbox" id="{checkbox_id}">
+          <span>{confirm_label}</span>
+        </label>
+        {buttons}"##,
+        warning = warning,
+        checkbox_id = checkbox_id,
+        confirm_label = confirm_label,
+        buttons = auth_buttons_html(true)
+    )
+}
+
 /// Build the inner HTML of `#auth-section`, keyed on the (canonical) action.
 ///
 /// Three shapes, collapsing every action onto one rendering path:
 /// - empty action: an account-home MENU of plain links (no signature, no auth
 ///   buttons, so `authWallet` is never invoked with an empty action);
-/// - account_deactivate: a danger confirmation gate (warning + checkbox) above
-///   the auth buttons, which start `disabled` until the box is checked;
-/// - any other action: the plain wallet/passkey buttons (unchanged behaviour).
+/// - account_deactivate / account_erase: a danger confirmation gate (warning +
+///   checkbox) above the auth buttons, which start `disabled` until the box is
+///   checked. Erase uses stronger, irreversible-erasure copy than deactivate;
+/// - any other action (incl. account_reactivate): the plain wallet/passkey
+///   buttons (unchanged behaviour).
 fn auth_section_html(action_opt: Option<Action>, action_is_empty: bool, base: &str) -> String {
     if action_is_empty {
         return format!(
@@ -475,26 +568,26 @@ fn auth_section_html(action_opt: Option<Action>, action_is_empty: bool, base: &s
           <a class="btn btn-secondary" href="{base}/account?action=org.matrix.profile">Your account</a>
           <a class="btn btn-secondary" href="{base}/account?action=org.matrix.devices_list">Your sessions</a>
           <a class="btn btn-danger" href="{base}/account?action=org.matrix.account_deactivate">Deactivate account</a>
+          <a class="btn btn-danger" href="{base}/account?action=org.matrix.account_erase">Erase account</a>
+          <a class="btn btn-secondary" href="{base}/account?action=org.matrix.account_reactivate">Reactivate account</a>
         </div>"##,
             base = base
         );
     }
 
-    if action_opt == Some(Action::AccountDeactivate) {
-        return format!(
-            r##"<div class="warning-box">
-          This permanently deactivates your Matrix account and signs you out of every session. This cannot be undone.
-        </div>
-        <label class="confirm-label">
-          <input type="checkbox" id="confirm-deactivate">
-          <span>I understand this is permanent</span>
-        </label>
-        {buttons}"##,
-            buttons = auth_buttons_html(true)
-        );
+    match action_opt {
+        Some(Action::AccountDeactivate) => danger_gate_html(
+            "confirm-deactivate",
+            "This permanently deactivates your Matrix account and signs you out of every session. This cannot be undone.",
+            "I understand this is permanent",
+        ),
+        Some(Action::AccountErase) => danger_gate_html(
+            "confirm-erase",
+            "This is irreversible. Erasing your account permanently deletes your profile, media, and room memberships, and signs you out of every session. This cannot be undone.",
+            "I understand my account and all its data will be permanently erased",
+        ),
+        _ => auth_buttons_html(false),
     }
-
-    auth_buttons_html(false)
 }
 
 pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
@@ -528,6 +621,14 @@ pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
         Some(Action::AccountDeactivate) => (
             "Deactivate account",
             "Confirm to permanently deactivate your account.",
+        ),
+        Some(Action::AccountErase) => (
+            "Erase account",
+            "Confirm to irreversibly erase your account and all of its data.",
+        ),
+        Some(Action::Reactivate) => (
+            "Reactivate account",
+            "Authenticate to reactivate your previously deactivated account.",
         ),
         None if action.is_empty() => ("Account", "Manage your account settings."),
         None => ("Account action", "Authenticate to continue."),
@@ -1037,6 +1138,12 @@ function renderOutcome(data) {
     case 'deactivated':
       showTerminal('Account deactivated', 'Your account has been deactivated and you have been signed out everywhere.', false);
       break;
+    case 'erased':
+      showTerminal('Account erased', 'Your account and all of its data have been permanently erased. This cannot be undone.', false);
+      break;
+    case 'reactivated':
+      showTerminal('Account reactivated', 'Your account is active again. You can sign in as usual.', false);
+      break;
     case 'profile':
       showResult('<div class="success-badge">' + CHECK_SVG + '</div>' +
         '<h1 class="title">Your account</h1>' +
@@ -1145,12 +1252,13 @@ function bufferToBase64(buf) {
   return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-// Deactivate confirmation gate: keep the auth buttons disabled until the user
-// ticks the "I understand this is permanent" box. The buttons already start
-// disabled from the server; this only matters before the first click (after
-// that, setBusy owns the disabled state).
+// Danger confirmation gate (deactivate or erase): keep the auth buttons disabled
+// until the user ticks the confirm box. The buttons already start disabled from
+// the server; this only matters before the first click (after that, setBusy owns
+// the disabled state). Both gates share this wiring; only the checkbox id differs
+// (confirm-deactivate vs confirm-erase).
 (function () {
-  const cb = $('confirm-deactivate');
+  const cb = $('confirm-deactivate') || $('confirm-erase');
   if (!cb) return;
   const sync = () => {
     ['btn-wallet', 'btn-passkey'].forEach((id) => {
@@ -1269,6 +1377,124 @@ mod tests {
         assert!(
             html.contains(r#"onclick="authWallet()""#),
             "deactivate gate still has the (gated) auth buttons"
+        );
+    }
+
+    #[test]
+    fn account_page_erase_shows_stronger_confirmation() {
+        // AC3/AC5: erasure is irreversible and must gate the auth buttons behind
+        // a danger confirmation that is stronger than deactivate: it warns the
+        // erasure is permanent AND that profile/media/room memberships are
+        // deleted, behind a #confirm-erase checkbox.
+        let html = account_page(
+            AccountPageQuery {
+                action: Some("org.matrix.account_erase".to_string()),
+                device_id: None,
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        assert!(
+            html.contains("irreversible"),
+            "erase gate must warn it is irreversible"
+        );
+        assert!(
+            html.contains("permanently deletes"),
+            "erase gate must warn it permanently deletes data"
+        );
+        assert!(
+            html.to_lowercase().contains("room membership"),
+            "erase gate must spell out profile/media/room memberships are deleted"
+        );
+        assert!(
+            html.contains(r#"id="confirm-erase""#),
+            "erase gate must have the #confirm-erase checkbox"
+        );
+        assert!(
+            html.contains(r#"onclick="authWallet()" disabled>"#),
+            "erase gate must start with the wallet button disabled"
+        );
+        assert!(
+            html.contains(r#"onclick="authPasskey()" disabled>"#),
+            "erase gate must start with the passkey button disabled"
+        );
+    }
+
+    #[test]
+    fn account_page_menu_links_erase() {
+        // The bare /account home menu must offer a danger-styled erase entry.
+        let html = account_page(
+            AccountPageQuery {
+                action: None,
+                device_id: None,
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        assert!(
+            html.contains("action=org.matrix.account_erase"),
+            "home menu must link to account_erase"
+        );
+        // It must be the danger-styled entry (stronger than deactivate's link).
+        assert!(
+            html.contains(r#"class="btn btn-danger" href="https://siwx.example.com/account?action=org.matrix.account_erase""#),
+            "erase menu entry must be danger-styled"
+        );
+    }
+
+    #[test]
+    fn account_page_reactivate_is_benign_no_scary_gate() {
+        // Reactivation is benign: it keeps the plain auth buttons (no confirm
+        // gate, buttons NOT disabled) and renders its own title.
+        let html = account_page(
+            AccountPageQuery {
+                action: Some("org.matrix.account_reactivate".to_string()),
+                device_id: None,
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        assert!(
+            html.contains("Reactivate account"),
+            "reactivate page must have its own title"
+        );
+        assert!(
+            html.contains(r#"onclick="authWallet()""#)
+                && !html.contains(r#"onclick="authWallet()" disabled>"#),
+            "reactivate must keep the (enabled) auth buttons, no confirm gate"
+        );
+        assert!(
+            !html.contains(r#"id="confirm-erase""#),
+            "reactivate must not show the erase confirm gate"
+        );
+    }
+
+    #[test]
+    fn account_page_js_renders_erased_and_reactivated_and_gates_confirm() {
+        // The page JS must render the new outcomes and wire #confirm-erase.
+        let html = account_page(
+            AccountPageQuery {
+                action: Some("org.matrix.account_erase".to_string()),
+                device_id: None,
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        assert!(
+            html.contains("case 'erased':"),
+            "JS must render the erased outcome"
+        );
+        assert!(
+            html.contains("case 'reactivated':"),
+            "JS must render the reactivated outcome"
+        );
+        assert!(
+            html.contains("confirm-erase"),
+            "JS must reference the confirm-erase checkbox"
         );
     }
 
@@ -1523,6 +1749,51 @@ mod tests {
         assert_eq!(
             canonical_action("org.matrix.account_deactivate"),
             Some(Action::AccountDeactivate)
+        );
+    }
+
+    #[test]
+    fn canonical_action_accepts_erase_and_reactivate() {
+        assert_eq!(
+            canonical_action("org.matrix.account_erase"),
+            Some(Action::AccountErase)
+        );
+        assert_eq!(
+            canonical_action("org.matrix.account_reactivate"),
+            Some(Action::Reactivate)
+        );
+    }
+
+    #[test]
+    fn supported_actions_include_erase_and_reactivate() {
+        // H6/AC5: both new lifecycle actions must be advertised (and so flow into
+        // OIDC discovery), and every advertised action must be dispatchable.
+        assert!(
+            SUPPORTED_ACTIONS.contains(&"org.matrix.account_erase"),
+            "SUPPORTED_ACTIONS must advertise account_erase"
+        );
+        assert!(
+            SUPPORTED_ACTIONS.contains(&"org.matrix.account_reactivate"),
+            "SUPPORTED_ACTIONS must advertise account_reactivate"
+        );
+        for action in SUPPORTED_ACTIONS {
+            assert!(
+                canonical_action(action).is_some(),
+                "advertised action {action} has no canonical mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn erase_and_reactivate_outcomes_serialize_with_kind_tag() {
+        use serde_json::json;
+        assert_eq!(
+            serde_json::to_value(ActionOutcome::Erased).unwrap(),
+            json!({ "kind": "erased" })
+        );
+        assert_eq!(
+            serde_json::to_value(ActionOutcome::Reactivated).unwrap(),
+            json!({ "kind": "reactivated" })
         );
     }
 
@@ -1796,6 +2067,71 @@ mod tests {
         assert!(
             matches!(err, Err(CustomError::BadRequest(_))),
             "account_deactivate without Synapse must be a BadRequest, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_action_erase_requires_synapse() {
+        let Some(redis) = test_redis().await else {
+            return;
+        };
+        // AccountErase with no Synapse client must degrade to a clear BadRequest
+        // (never a 500), matching the other Synapse-backed actions.
+        let err = execute_action(
+            Action::AccountErase,
+            None,
+            "did:test",
+            None,
+            &redis,
+            Some("matrix.example.com"),
+        )
+        .await;
+        assert!(
+            matches!(err, Err(CustomError::BadRequest(_))),
+            "account_erase without Synapse must be a BadRequest, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_action_reactivate_requires_synapse() {
+        let Some(redis) = test_redis().await else {
+            return;
+        };
+        // Reactivate with no Synapse client must degrade to a clear BadRequest.
+        let err = execute_action(
+            Action::Reactivate,
+            None,
+            "did:test",
+            None,
+            &redis,
+            Some("matrix.example.com"),
+        )
+        .await;
+        assert!(
+            matches!(err, Err(CustomError::BadRequest(_))),
+            "account_reactivate without Synapse must be a BadRequest, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_action_reactivate_requires_server_name() {
+        let Some(redis) = test_redis().await else {
+            return;
+        };
+        let client = SynapseClient::new("http://synapse", "secret");
+        // Synapse present but server_name missing -> error before any network call.
+        let err = execute_action(
+            Action::Reactivate,
+            None,
+            "did:test",
+            Some(&client),
+            &redis,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(err, Err(CustomError::BadRequest(_))),
+            "reactivate without server_name must be a BadRequest, got {err:?}"
         );
     }
 
