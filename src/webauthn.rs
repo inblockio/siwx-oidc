@@ -511,3 +511,41 @@ pub fn build_webauthn(
         rp_origin: resolved_rp_origin,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `derive_did_from_credential_json` is the resolver `RedisClient::purge_identity`
+    /// uses for its best-effort standalone-credential pass (pass b). It MUST fail
+    /// closed: anything that is not a deserializable P-256 passkey returns `None`
+    /// (never panics). This is what keeps a webauthn-rs serialization drift from
+    /// turning purge into a silent crash; the load-bearing link-based pass (a) is
+    /// unaffected, and a drift surfaces as pass (b) returning `None` (covered here),
+    /// not as a panic in an erasure request.
+    ///
+    /// NOTE (residual coverage gap, tracked in the lifecycle audit): the POSITIVE
+    /// round-trip (a real serialized webauthn-rs `Passkey` JSON -> stable
+    /// `did:key:zDn…`) is exercised only by the ignored e2e webauthn path and the
+    /// production read path, not a hermetic fixture, because constructing a valid
+    /// `Passkey` needs a software authenticator dependency we deliberately do not add.
+    #[test]
+    fn derive_did_from_credential_json_fails_closed_on_non_passkey_input() {
+        assert_eq!(derive_did_from_credential_json(""), None, "empty input");
+        assert_eq!(
+            derive_did_from_credential_json("not json at all"),
+            None,
+            "garbage input"
+        );
+        assert_eq!(
+            derive_did_from_credential_json("{}"),
+            None,
+            "empty object is not a passkey"
+        );
+        assert_eq!(
+            derive_did_from_credential_json(r#"{"cred":{"unexpected":"shape"}}"#),
+            None,
+            "wrong-shaped JSON must not panic, must return None"
+        );
+    }
+}

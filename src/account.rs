@@ -383,7 +383,17 @@ async fn execute_action(
                 .await
                 .map_err(|e| {
                     warn!(error = %e, "reactivate_user failed during account action");
-                    CustomError::BadRequest("Failed to reactivate account".to_string())
+                    // Honest, MSC3861-aware message: under delegated auth the
+                    // Synapse admin reactivation endpoint may reject flipping
+                    // deactivated=false (it expects a local password, which
+                    // MSC3861 disables). Feasibility is unverified pending a live
+                    // probe; a server admin can always reactivate directly.
+                    CustomError::BadRequest(
+                        "Reactivation failed. Under delegated auth (MSC3861) the homeserver \
+                         may not support self-service reactivation; ask a server admin to \
+                         reactivate the account."
+                            .to_string(),
+                    )
                 })?;
             info!(did = %did, "account reactivated via account management");
             Ok(ActionOutcome::Reactivated)
