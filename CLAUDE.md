@@ -476,7 +476,9 @@ The user re-authenticates (wallet or passkey), siwx-oidc calls
 | `device_view` / `session_view` | Show one device's details (needs `device_id`) |
 | `device_delete` / `session_end` | Sign a device out (needs `device_id`) |
 | `cross_signing_reset` | Allow cross-signing reset (MSC4312) |
-| `account_deactivate` | Permanently deactivate the account (Synapse admin `deactivate`, `erase:false`) + revoke ALL the user's tokens |
+| `account_deactivate` | Deactivate the account (Synapse admin `deactivate`, `erase:false`, reversible by admin / `account_reactivate`) + revoke ALL the user's tokens |
+| `account_erase` | GDPR erasure: Synapse admin `deactivate` with `erase:true` (purges profile, media, room memberships) + revoke ALL tokens + `RedisClient::purge_identity` (deletes the DID's WebAuthn `credential`/`link` artifacts). Irreversible |
+| `account_reactivate` | Restore an `erase:false`-deactivated account (Synapse admin `PUT users {deactivated:false}`). Self-service feasibility under MSC3861 is **unverified** (admin PUT may reject without a local password); fails closed with a clear "ask an admin" message |
 
 **Bare/empty-action landing = account-home menu.** `GET /account` with NO `action`
 param (or an empty one) renders a navigation menu (links to `profile`,
@@ -499,6 +501,28 @@ signature (same model as `device_delete`). On success `execute_action` calls
 returns `ActionOutcome::Deactivated`. Like the other device actions it requires
 `SIWEOIDC_MATRIX_SERVER_NAME` + a Synapse client (clear `BadRequest`, never 500,
 when absent).
+
+**Account erasure (`account_erase`) is irreversible GDPR deletion.**
+`/account?action=org.matrix.account_erase` shows a stronger, danger-styled
+confirmation than deactivate ("permanently deletes your profile, media, and room
+memberships", a `#confirm-erase` checkbox gating the auth buttons). On success
+`execute_action` calls `SynapseClient::deactivate_user(.., erase = true)`, then
+best-effort `revoke_all_user_tokens` and best-effort
+`RedisClient::purge_identity(did)` (which deletes the DID's `webauthn:link/*`
+mappings + their credentials, and standalone `webauthn:credential/*` whose stored
+P-256 passkey derives to that `did:key` via
+`webauthn::derive_did_from_credential_json`). Returns `ActionOutcome::Erased`.
+Erasure removes the WebAuthn artifacts so the DID cannot be silently re-derived
+from a leftover passkey.
+
+**Reactivation (`account_reactivate`) is best-effort under MSC3861.**
+`SynapseClient::reactivate_user` issues admin `PUT /_synapse/admin/v2/users/{mxid}`
+with `{"deactivated": false}`; it is valid only for `erase:false` deactivations
+(an erased account cannot be restored). Whether self-service reactivation actually
+succeeds under delegated auth (MSC3861) is **unverified pending a live probe** -
+the admin PUT may expect a local password that MSC3861 disables. The action fails
+closed: on rejection it returns a clear `BadRequest` telling the user to ask a
+server admin, never a 500. See the doc comment on `SynapseClient::reactivate_user`.
 
 **Model:** the page is stateless; each action re-authenticates (wallet CAIP-122
 or passkey), proving the DID, then runs the action and returns a `kind`-tagged
