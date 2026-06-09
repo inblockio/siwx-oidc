@@ -123,7 +123,30 @@ async fn teardown_session(state: &CompatState, token: &str, ctx: &str) {
         }
     }
 
-    // Phase 2: revoke the OAuth session's tokens (access + paired refresh).
+    // Phase 2: revoke the OAuth session's tokens.
+    //
+    // Single-session semantics: in standalone mode every token carries an empty
+    // device_id, so `revoke_device_tokens(username, "")` would match (and revoke)
+    // EVERY session of that user. To keep single-session logout / revoke scoped to
+    // the presented session (RFC 7009), revoke only the presented token when there
+    // is no device_id. In Synapse mode the device_id is a unique `SIWX_{uuid}`, so
+    // revoking by (username, device_id) correctly scopes to this one device's
+    // access + paired refresh tokens.
+    if meta.device_id.is_empty() {
+        match state.redis_client.delete_token(token).await {
+            Ok(()) => info!(
+                ctx,
+                username = %meta.username,
+                "session torn down (standalone, presented token only)"
+            ),
+            Err(e) => {
+                warn!(error = %e, ctx, "teardown_session: delete_token failed")
+            }
+        }
+        return;
+    }
+
+    // Phase 2 (device session): revoke this device's tokens (access + paired refresh).
     match state
         .redis_client
         .revoke_device_tokens(&meta.username, &meta.device_id)
@@ -454,6 +477,85 @@ mod tests {
         );
 
         client.delete_token(&other).await.ok();
+    }
+
+    /// HIGH-defect regression guard: in standalone mode EVERY token carries an
+    /// empty device_id, so `revoke_device_tokens(user, "")` would match every
+    /// session of that user. A single-session logout must revoke ONLY the
+    /// presented token (RFC 7009 / single-session semantics), leaving the user's
+    /// other standalone sessions intact.
+    #[tokio::test]
+    async fn logout_standalone_empty_device_id_revokes_only_presented_token() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("empty-dev-user-{n}");
+        let session_a = format!("compat_empty_a_{n}");
+        let session_b = format!("compat_empty_b_{n}");
+
+        // Two distinct standalone sessions for the SAME user, both device_id == "".
+        client
+            .set_token(&session_a, &token_meta(&user, ""), 120)
+            .await
+            .unwrap();
+        client
+            .set_token(&session_b, &token_meta(&user, ""), 120)
+            .await
+            .unwrap();
+
+        let state = standalone_state(client.clone());
+        let resp = logout(State(state), bearer(&session_a))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(
+            client.get_token(&session_a).await.unwrap().is_none(),
+            "the presented session token must be revoked"
+        );
+        assert!(
+            client.get_token(&session_b).await.unwrap().is_some(),
+            "a DIFFERENT standalone session of the same user must survive a single logout"
+        );
+
+        client.delete_token(&session_b).await.ok();
+    }
+
+    /// Same single-session guarantee for RFC 7009 revoke with empty device_id.
+    #[tokio::test]
+    async fn revoke_standalone_empty_device_id_revokes_only_presented_token() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("empty-dev-revoke-{n}");
+        let session_a = format!("compat_empty_rev_a_{n}");
+        let session_b = format!("compat_empty_rev_b_{n}");
+
+        client
+            .set_token(&session_a, &token_meta(&user, ""), 120)
+            .await
+            .unwrap();
+        client
+            .set_token(&session_b, &token_meta(&user, ""), 120)
+            .await
+            .unwrap();
+
+        let state = standalone_state(client.clone());
+        let form = RevokeForm {
+            token: session_a.clone(),
+            token_type_hint: None,
+        };
+        let status = revoke(State(state), Form(form)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert!(
+            client.get_token(&session_a).await.unwrap().is_none(),
+            "the presented token must be revoked"
+        );
+        assert!(
+            client.get_token(&session_b).await.unwrap().is_some(),
+            "another standalone session of the same user must survive revoke"
+        );
+
+        client.delete_token(&session_b).await.ok();
     }
 
     /// H7: standalone revoke (RFC 7009) revokes the session's tokens and 200s.
