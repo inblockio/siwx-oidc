@@ -1897,6 +1897,8 @@ mod tests {
             "org.matrix.device_delete",
             "org.matrix.cross_signing_reset",
             "org.matrix.account_deactivate",
+            "org.matrix.account_erase",
+            "org.matrix.account_reactivate",
             "org.matrix.sessions_list",
             "org.matrix.session_view",
             "org.matrix.session_end",
