@@ -300,7 +300,7 @@ async fn execute_action(
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
             synapse
-                .deactivate_user(&localpart, server)
+                .deactivate_user(&localpart, server, false)
                 .await
                 .map_err(|e| {
                     warn!(error = %e, "deactivate_user failed during account action");

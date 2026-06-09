@@ -313,18 +313,26 @@ impl SynapseClient {
     }
 
     /// Deactivate a user's account via the Synapse admin API
-    /// (`POST /_synapse/admin/v1/deactivate/{user_id}`) with `erase: false`.
+    /// (`POST /_synapse/admin/v1/deactivate/{user_id}`).
     ///
     /// Authenticated with the shared secret (== Synapse `admin_token` under MSC3861).
-    /// Deactivation removes the account's access tokens and 3PIDs; `erase: false`
-    /// keeps profile data (no GDPR erasure). Scoped to the user's mxid.
-    pub async fn deactivate_user(&self, localpart: &str, server_name: &str) -> Result<()> {
+    /// Deactivation removes the account's access tokens and 3PIDs. The `erase`
+    /// flag selects GDPR behaviour: `erase=false` keeps profile/media (a plain
+    /// deactivation, reversible via [`reactivate_user`](Self::reactivate_user));
+    /// `erase=true` requests irreversible erasure of the user's profile, media,
+    /// and room memberships. Scoped to the user's mxid.
+    pub async fn deactivate_user(
+        &self,
+        localpart: &str,
+        server_name: &str,
+        erase: bool,
+    ) -> Result<()> {
         let url = self.deactivate_url(localpart, server_name);
         let resp = self
             .http
             .post(&url)
             .bearer_auth(&self.shared_secret)
-            .json(&json!({ "erase": false }))
+            .json(&deactivate_body(erase))
             .send()
             .await
             .context("deactivate_user: request failed")?;
@@ -337,6 +345,69 @@ impl SynapseClient {
         }
         Ok(())
     }
+
+    /// Build the admin-v2 user-modification URL for a user's mxid (percent-encoded
+    /// path segment). Factored out so the encoding can be unit-tested directly.
+    fn reactivate_url(&self, localpart: &str, server_name: &str) -> String {
+        format!(
+            "{}/_synapse/admin/v2/users/{}",
+            self.endpoint,
+            urlencoding::encode(&matrix_user_id(localpart, server_name))
+        )
+    }
+
+    /// Reactivate a previously (non-erased) deactivated account via the Synapse
+    /// admin API (`PUT /_synapse/admin/v2/users/{user_id}` with
+    /// `{ "deactivated": false }`).
+    ///
+    /// Authenticated with the shared secret (== Synapse `admin_token` under MSC3861).
+    /// Only meaningful for accounts deactivated with `erase=false`; an erased
+    /// account cannot be restored.
+    ///
+    /// FEASIBILITY CAVEAT (MSC3861, NOT verified against a live homeserver):
+    /// Under MSC3861, auth is fully delegated to this AS and Synapse's local
+    /// password database is disabled. Synapse's admin-v2 `PUT users` endpoint
+    /// historically refuses to flip `deactivated` back to `false` unless a
+    /// `password` is also supplied (it tries to (re)set local credentials), and
+    /// with `msc3861.enabled = true` Synapse rejects requests that set a local
+    /// password. The documented reactivation path may therefore return a 4xx
+    /// under MSC3861. This method is implemented per the documented admin API and
+    /// surfaces a clear error (warn! + bail!) on a non-success response; whether
+    /// the endpoint actually reactivates under MSC3861 needs a live probe against
+    /// the deployment. See the F3 open_issues / AC4 (documented as a verified
+    /// negative result if it does not work end-to-end).
+    pub async fn reactivate_user(&self, localpart: &str, server_name: &str) -> Result<()> {
+        let url = self.reactivate_url(localpart, server_name);
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(&self.shared_secret)
+            .json(&reactivate_body())
+            .send()
+            .await
+            .context("reactivate_user: request failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(%status, %body, "reactivate_user failed");
+            anyhow::bail!("reactivate_user: HTTP {status}");
+        }
+        Ok(())
+    }
+}
+
+/// Build the JSON body for the admin v1 deactivate endpoint. The `erase` flag
+/// is the GDPR selector (see [`SynapseClient::deactivate_user`]). Factored out
+/// so the parameter mapping can be unit-tested without a live homeserver.
+fn deactivate_body(erase: bool) -> serde_json::Value {
+    json!({ "erase": erase })
+}
+
+/// Build the JSON body for the admin v2 reactivation PUT (sets `deactivated`
+/// back to `false`). Factored out so the body shape can be unit-tested.
+fn reactivate_body() -> serde_json::Value {
+    json!({ "deactivated": false })
 }
 
 #[cfg(test)]
@@ -371,6 +442,36 @@ mod tests {
         assert_eq!(encoded, "%40alice%3Aexample.com");
         assert!(!encoded.contains('@'));
         assert!(!encoded.contains(':'));
+    }
+
+    #[test]
+    fn deactivate_body_reflects_erase_flag() {
+        // The admin v1 deactivate endpoint takes `{ "erase": <bool> }`. The body
+        // builder is the testable seam for the erase parameter: erase=false keeps
+        // GDPR-erasure off (deactivate only), erase=true requests full erasure.
+        assert_eq!(deactivate_body(false), json!({ "erase": false }));
+        assert_eq!(deactivate_body(true), json!({ "erase": true }));
+    }
+
+    #[test]
+    fn reactivate_url_encodes_mxid_path_segment() {
+        // Reactivation uses the admin v2 user-modification endpoint, which takes
+        // the mxid as a path segment, so the mxid must be percent-encoded.
+        let client = SynapseClient::new("http://localhost:8008", "secret");
+        let url = client.reactivate_url("alice", "example.com");
+        assert_eq!(
+            url,
+            "http://localhost:8008/_synapse/admin/v2/users/%40alice%3Aexample.com"
+        );
+        let segment = url.rsplit('/').next().unwrap();
+        assert!(!segment.contains('@'));
+        assert!(!segment.contains(':'));
+    }
+
+    #[test]
+    fn reactivate_body_sets_deactivated_false() {
+        // Reactivation flips `deactivated` back to false via the admin v2 PUT.
+        assert_eq!(reactivate_body(), json!({ "deactivated": false }));
     }
 
     #[test]
