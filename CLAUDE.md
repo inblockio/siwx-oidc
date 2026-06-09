@@ -312,27 +312,42 @@ Run `/deploy-check` for the full pre-deployment checklist.
 
 ### MSC3861 device lifecycle
 
-**Two provisioning modes:**
+**Provisioning at sign-in (no recycling):** Sign-in does NOT delete devices. Each
+login provisions a fresh `SIWX_{uuid}` via an idempotent `upsert_device`
+(`oidc::provision_synapse_device`); it never deletes-then-reuses a device id.
+The device_code grant (QR login) uses `provision_synapse_device_additive`, which
+likewise upserts without deleting existing devices: if the client supplies a
+device_id in the scope (`urn:matrix:client:device:XXX` or
+`urn:matrix:org.matrix.msc2967.client:device:XXX`) that exact id is provisioned,
+otherwise a `SIWX_{uuid}` is generated. The token response includes the scope so
+clients can discover the provisioned device_id. `allow_cross_signing_reset`
+fires unconditionally on sign-in.
 
-| Mode | Function | Behavior | Used by |
-|------|----------|----------|---------|
-| Replacement | `provision_synapse_device` | Deletes old device, creates `SIWX_{uuid}` | Regular sign_in (Element Web) |
-| Additive | `provision_synapse_device_additive` | Upserts without deleting existing devices | Device code grant (QR login) |
+**Session teardown (logout / revoke / logout-all):** Tearing down a session that
+is *ending* deletes its Synapse device once and revokes its OAuth tokens. This is
+distinct from recycling and is safe (the id is never reused), so it does not hit
+the stale-signature problem below. All teardown is best-effort, idempotent, and
+never returns 500; with no Synapse client / `server_name` it degrades to
+Redis-only token revocation. Revocation keys on `TokenMetadata.username` (the
+lowercased localpart), not the raw DID. Implemented in `src/compat.rs`:
 
-**Replacement mode (sign_in):** Each login generates a fresh `SIWX_{uuid}`. The old
-device (if any) is deleted from Synapse first. Both `revoke` and `logout` handlers
-call `delete_device` for cleanup. `allow_cross_signing_reset` fires unconditionally.
+| Endpoint | Handler | Synapse side effect | Token side effect |
+|----------|---------|---------------------|-------------------|
+| `POST /oauth2/revoke` (RFC 7009) | `compat::revoke` | `delete_device` for the ending session's device | `revoke_device_tokens(username, device_id)` (access + paired refresh) |
+| `POST /_matrix/client/v3/logout` | `compat::logout` | same as revoke, for the bearer token's session | same as revoke |
+| `POST /_matrix/client/v3/logout/all` | `compat::logout_all` | `list_devices` then `delete_device` for EACH device (best-effort per device) | `revoke_all_user_tokens(username)` |
 
-**Additive mode (device_code grant):** The device_code flow ALWAYS uses additive
-provisioning, never replacement. If the client includes a device_id in the scope
-(`urn:matrix:client:device:XXX` or `urn:matrix:org.matrix.msc2967.client:device:XXX`),
-that exact device_id is provisioned. If no device_id is in the scope, a `SIWX_{uuid}`
-is generated. In both cases, existing devices are preserved. The token response
-includes the scope so clients can discover the actual provisioned device_id.
+`logout/all` is session invalidation, NOT account deactivation: it never calls
+`deactivate_user`, so the account stays active and the user can sign in again.
+(Account deactivation lives in `account.rs` under
+`/account?action=org.matrix.account_deactivate`.) Single-session `logout`/`revoke`
+delete only the ending session's device; sign-in is unchanged.
 
 **Why no recycling:** Synapse's `delete_device` (MAS API) does not remove cross-signing
 signatures, and its signature-upload handler skips new uploads when a stale one exists.
 Recycling a device_id with new keys creates unrecoverable verification failures.
+Deleting a device that is *ending* (in teardown above) is safe precisely because the
+id is not reused.
 See `../siwx-oidc-matrix-server/docs/2026-05-19-device-verification-analysis.md`.
 
 ## WebAuthn/Passkey architecture
