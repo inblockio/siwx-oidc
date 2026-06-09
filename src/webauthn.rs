@@ -65,6 +65,18 @@ fn did_from_passkey(passkey: &Passkey) -> Result<String> {
     Ok(did_from_p256_compressed(&compressed))
 }
 
+/// Derive the `did:key:zDn…` for a stored WebAuthn credential from its raw JSON
+/// (the value stored at `webauthn:credential/{cred_id}`), or `None` if the JSON
+/// is not a deserializable P-256 passkey.
+///
+/// This is the resolver `RedisClient::purge_identity` uses for its best-effort
+/// standalone-credential pass: it lets the DB layer stay free of the webauthn-rs
+/// types while still reusing the single source of truth for DID derivation.
+pub fn derive_did_from_credential_json(cred_json: &str) -> Option<String> {
+    let passkey: Passkey = serde_json::from_str(cred_json).ok()?;
+    did_from_passkey(&passkey).ok()
+}
+
 // -- Request/response types for the HTTP API --
 
 #[derive(Deserialize)]
