@@ -65,6 +65,18 @@ fn did_from_passkey(passkey: &Passkey) -> Result<String> {
     Ok(did_from_p256_compressed(&compressed))
 }
 
+/// Derive the `did:key:zDn…` for a stored WebAuthn credential from its raw JSON
+/// (the value stored at `webauthn:credential/{cred_id}`), or `None` if the JSON
+/// is not a deserializable P-256 passkey.
+///
+/// This is the resolver `RedisClient::purge_identity` uses for its best-effort
+/// standalone-credential pass: it lets the DB layer stay free of the webauthn-rs
+/// types while still reusing the single source of truth for DID derivation.
+pub fn derive_did_from_credential_json(cred_json: &str) -> Option<String> {
+    let passkey: Passkey = serde_json::from_str(cred_json).ok()?;
+    did_from_passkey(&passkey).ok()
+}
+
 // -- Request/response types for the HTTP API --
 
 #[derive(Deserialize)]
@@ -498,4 +510,42 @@ pub fn build_webauthn(
         rp_id: resolved_rp_id,
         rp_origin: resolved_rp_origin,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `derive_did_from_credential_json` is the resolver `RedisClient::purge_identity`
+    /// uses for its best-effort standalone-credential pass (pass b). It MUST fail
+    /// closed: anything that is not a deserializable P-256 passkey returns `None`
+    /// (never panics). This is what keeps a webauthn-rs serialization drift from
+    /// turning purge into a silent crash; the load-bearing link-based pass (a) is
+    /// unaffected, and a drift surfaces as pass (b) returning `None` (covered here),
+    /// not as a panic in an erasure request.
+    ///
+    /// NOTE (residual coverage gap, tracked in the lifecycle audit): the POSITIVE
+    /// round-trip (a real serialized webauthn-rs `Passkey` JSON -> stable
+    /// `did:key:zDn…`) is exercised only by the ignored e2e webauthn path and the
+    /// production read path, not a hermetic fixture, because constructing a valid
+    /// `Passkey` needs a software authenticator dependency we deliberately do not add.
+    #[test]
+    fn derive_did_from_credential_json_fails_closed_on_non_passkey_input() {
+        assert_eq!(derive_did_from_credential_json(""), None, "empty input");
+        assert_eq!(
+            derive_did_from_credential_json("not json at all"),
+            None,
+            "garbage input"
+        );
+        assert_eq!(
+            derive_did_from_credential_json("{}"),
+            None,
+            "empty object is not a passkey"
+        );
+        assert_eq!(
+            derive_did_from_credential_json(r#"{"cred":{"unexpected":"shape"}}"#),
+            None,
+            "wrong-shaped JSON must not panic, must return None"
+        );
+    }
 }

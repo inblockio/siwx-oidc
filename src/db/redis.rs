@@ -142,6 +142,76 @@ impl RedisClient {
         Ok(revoked)
     }
 
+    /// Purge a user's WebAuthn identity artifacts so the DID cannot be silently
+    /// re-derived after account erasure. Returns the total number of Redis keys
+    /// removed (links + credentials).
+    ///
+    /// Two passes, both best-effort and idempotent:
+    ///
+    /// (a) **Linked credentials (MUST):** scan `webauthn:link/*`; for each entry
+    ///     whose `primary_did` equals `did`, delete the link AND the credential
+    ///     it points at (`webauthn:credential/{cred_id}`, where `cred_id` is the
+    ///     link key's suffix). This is the path that maps a passkey back to a
+    ///     wallet DID, so it is the load-bearing case.
+    ///
+    /// (b) **Standalone credentials (BEST-EFFORT):** scan `webauthn:credential/*`
+    ///     and delete any whose stored passkey derives to this exact `did:key`.
+    ///     The P-256 -> `did:key:zDn…` derivation lives in the webauthn layer
+    ///     (which owns the webauthn-rs types), so the caller passes a `derive`
+    ///     resolver mapping a stored credential JSON to its derived DID; this
+    ///     keeps the DB layer free of a webauthn-rs dependency. A resolver that
+    ///     always returns `None` cleanly limits the purge to part (a).
+    ///
+    /// Credentials already removed in pass (a) are skipped in pass (b) (they no
+    /// longer exist), so the count never double-counts.
+    pub async fn purge_identity<F>(&self, did: &str, derive: F) -> Result<usize>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let mut purged = 0usize;
+
+        // -- (a) Linked credentials: webauthn:link/{cred_id} -> { primary_did } --
+        let link_prefix = "webauthn:link/";
+        for link_key in self.keys_raw(&format!("{}*", link_prefix)).await? {
+            let raw = match self.get_raw(&link_key).await? {
+                Some(v) => v,
+                None => continue, // raced with another purge / expiry
+            };
+            let link: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(_) => continue, // not a link entry; leave it
+            };
+            if link.get("primary_did").and_then(|d| d.as_str()) != Some(did) {
+                continue;
+            }
+            // The credential id is the link key's suffix.
+            let cred_id = &link_key[link_prefix.len()..];
+            let cred_key = format!("webauthn:credential/{}", cred_id);
+            if self.get_raw(&cred_key).await?.is_some() {
+                self.del_raw(&cred_key).await?;
+                purged += 1;
+            }
+            self.del_raw(&link_key).await?;
+            purged += 1;
+        }
+
+        // -- (b) Standalone credentials whose passkey derives to this did:key --
+        let cred_prefix = "webauthn:credential/";
+        for cred_key in self.keys_raw(&format!("{}*", cred_prefix)).await? {
+            let raw = match self.get_raw(&cred_key).await? {
+                Some(v) => v,
+                None => continue, // already removed in pass (a) or expired
+            };
+            if derive(&raw).as_deref() == Some(did) {
+                self.del_raw(&cred_key).await?;
+                purged += 1;
+            }
+        }
+
+        debug!("purge_identity: did={} purged={}", did, purged);
+        Ok(purged)
+    }
+
     /// Scan the token keyspace (`KV_TOKEN_PREFIX`) and delete every entry whose
     /// [`TokenMetadata`] satisfies `pred`, returning the number removed.
     ///
@@ -613,5 +683,140 @@ mod tests {
 
         // Best-effort cleanup.
         client.delete_token(&t3).await.ok();
+    }
+
+    /// H4 (part a, MUST): purge_identity must delete the `webauthn:link/*` entry
+    /// whose `primary_did` matches the DID AND the credential that link points at,
+    /// while leaving links/credentials for OTHER DIDs untouched. Uses a no-op
+    /// credential resolver so part (b) does not interfere with the part-(a)
+    /// assertion. Requires Redis on localhost; skips cleanly if unavailable.
+    #[tokio::test]
+    async fn purge_identity_removes_linked_credential_for_did() {
+        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
+            Ok(c) => c,
+            Err(_) => return, // no Redis: skip (CI provides one)
+        };
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let did = format!("did:pkh:eip155:1:0xPURGE{nonce}");
+        let other_did = format!("did:pkh:eip155:1:0xKEEP{nonce}");
+        let cred = format!("cred-{nonce}");
+        let other_cred = format!("othercred-{nonce}");
+
+        let link_key = format!("webauthn:link/{cred}");
+        let cred_key = format!("webauthn:credential/{cred}");
+        let other_link_key = format!("webauthn:link/{other_cred}");
+        let other_cred_key = format!("webauthn:credential/{other_cred}");
+
+        // Linked credential for the target DID (must be purged).
+        client
+            .set_raw(
+                &link_key,
+                &format!(r#"{{"primary_did":"{did}","label":"linked"}}"#),
+            )
+            .await
+            .unwrap();
+        client
+            .set_raw(&cred_key, r#"{"stub":"credential"}"#)
+            .await
+            .unwrap();
+
+        // Linked credential for an unrelated DID (must survive).
+        client
+            .set_raw(
+                &other_link_key,
+                &format!(r#"{{"primary_did":"{other_did}","label":"linked"}}"#),
+            )
+            .await
+            .unwrap();
+        client
+            .set_raw(&other_cred_key, r#"{"stub":"other"}"#)
+            .await
+            .unwrap();
+
+        // No-op resolver: part (b) finds nothing, so the count reflects part (a) only.
+        let purged = client.purge_identity(&did, |_json| None).await.unwrap();
+        assert_eq!(purged, 2, "the link AND its credential must be purged");
+        assert!(
+            client.get_raw(&link_key).await.unwrap().is_none(),
+            "matching link must be gone"
+        );
+        assert!(
+            client.get_raw(&cred_key).await.unwrap().is_none(),
+            "credential the matching link pointed at must be gone"
+        );
+        assert!(
+            client.get_raw(&other_link_key).await.unwrap().is_some(),
+            "unrelated link must remain"
+        );
+        assert!(
+            client.get_raw(&other_cred_key).await.unwrap().is_some(),
+            "unrelated credential must remain"
+        );
+
+        // Best-effort cleanup of the surviving unrelated keys.
+        client.del_raw(&other_link_key).await.ok();
+        client.del_raw(&other_cred_key).await.ok();
+    }
+
+    /// H4 (part b, BEST-EFFORT): a standalone credential (no link entry) whose
+    /// stored passkey derives to the target did:key must also be purged, using
+    /// the supplied derivation resolver. A credential deriving to a different
+    /// DID must survive. Requires Redis on localhost; skips cleanly if absent.
+    #[tokio::test]
+    async fn purge_identity_removes_standalone_credential_by_derived_did() {
+        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let did = format!("did:key:zDnPURGE{nonce}");
+        let mine = format!("mine-{nonce}");
+        let theirs = format!("theirs-{nonce}");
+        let mine_key = format!("webauthn:credential/{mine}");
+        let theirs_key = format!("webauthn:credential/{theirs}");
+
+        // The stored JSON carries the derived-DID marker the resolver keys on.
+        client
+            .set_raw(&mine_key, &format!(r#"{{"derives_to":"{did}"}}"#))
+            .await
+            .unwrap();
+        client
+            .set_raw(
+                &theirs_key,
+                &format!(r#"{{"derives_to":"did:key:zDnOTHER{nonce}"}}"#),
+            )
+            .await
+            .unwrap();
+
+        // Resolver maps a credential JSON to its derived did:key.
+        let target = did.clone();
+        let resolver = |json: &str| {
+            let v: serde_json::Value = serde_json::from_str(json).ok()?;
+            v.get("derives_to")?.as_str().map(|s| s.to_string())
+        };
+
+        let purged = client.purge_identity(&target, resolver).await.unwrap();
+        assert_eq!(
+            purged, 1,
+            "only the credential deriving to the DID is purged"
+        );
+        assert!(
+            client.get_raw(&mine_key).await.unwrap().is_none(),
+            "standalone credential deriving to the DID must be gone"
+        );
+        assert!(
+            client.get_raw(&theirs_key).await.unwrap().is_some(),
+            "credential deriving to another DID must remain"
+        );
+
+        client.del_raw(&theirs_key).await.ok();
     }
 }
