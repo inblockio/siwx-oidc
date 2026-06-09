@@ -709,6 +709,8 @@ pub async fn main() {
     let introspect_state = IntrospectState::from(&state);
     let compat_state = compat::CompatState {
         redis_client: state.redis_client.clone(),
+        synapse_client: state.synapse_client.clone(),
+        server_name: state.config.matrix_server_name.clone(),
     };
 
     let app = Router::new()
@@ -779,6 +781,10 @@ pub async fn main() {
         .route(
             "/_matrix/client/v3/logout",
             post(compat::logout).with_state(compat_state.clone()),
+        )
+        .route(
+            "/_matrix/client/v3/logout/all",
+            post(compat::logout_all).with_state(compat_state.clone()),
         )
         .route(
             "/_matrix/client/v3/refresh",
