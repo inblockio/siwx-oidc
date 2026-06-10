@@ -515,14 +515,16 @@ P-256 passkey derives to that `did:key` via
 Erasure removes the WebAuthn artifacts so the DID cannot be silently re-derived
 from a leftover passkey.
 
-**Reactivation (`account_reactivate`) is best-effort under MSC3861.**
+**Reactivation (`account_reactivate`) is verified working under MSC3861.**
 `SynapseClient::reactivate_user` issues admin `PUT /_synapse/admin/v2/users/{mxid}`
 with `{"deactivated": false}`; it is valid only for `erase:false` deactivations
-(an erased account cannot be restored). Whether self-service reactivation actually
-succeeds under delegated auth (MSC3861) is **unverified pending a live probe** -
-the admin PUT may expect a local password that MSC3861 disables. The action fails
-closed: on rejection it returns a clear `BadRequest` telling the user to ask a
-server admin, never a 500. See the doc comment on `SynapseClient::reactivate_user`.
+(an erased account cannot be restored). Live probe (2026-06-10, prod
+agentic.inblock.io, throwaway user): the PUT succeeds with HTTP 200 and the
+account comes back `deactivated: false`; no local password is demanded as long
+as no `password` key is sent. The action still fails closed on genuine errors
+(erased account, Synapse unreachable): a clear `BadRequest` telling the user to
+ask a server admin, never a 500. See the doc comment on
+`SynapseClient::reactivate_user` and `scripts/verify-lifecycle-live.sh` section 3.
 
 **Model:** the page is stateless; each action re-authenticates (wallet CAIP-122
 or passkey), proving the DID, then runs the action and returns a `kind`-tagged
