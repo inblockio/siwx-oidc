@@ -364,18 +364,14 @@ impl SynapseClient {
     /// Only meaningful for accounts deactivated with `erase=false`; an erased
     /// account cannot be restored.
     ///
-    /// FEASIBILITY CAVEAT (MSC3861, NOT verified against a live homeserver):
-    /// Under MSC3861, auth is fully delegated to this AS and Synapse's local
-    /// password database is disabled. Synapse's admin-v2 `PUT users` endpoint
-    /// historically refuses to flip `deactivated` back to `false` unless a
-    /// `password` is also supplied (it tries to (re)set local credentials), and
-    /// with `msc3861.enabled = true` Synapse rejects requests that set a local
-    /// password. The documented reactivation path may therefore return a 4xx
-    /// under MSC3861. This method is implemented per the documented admin API and
-    /// surfaces a clear error (warn! + bail!) on a non-success response; whether
-    /// the endpoint actually reactivates under MSC3861 needs a live probe against
-    /// the deployment. See the F3 open_issues / AC4 (documented as a verified
-    /// negative result if it does not work end-to-end).
+    /// VERIFIED under MSC3861 (live probe, 2026-06-10): the admin-v2 `PUT users`
+    /// endpoint accepts `{"deactivated": false}` WITHOUT a `password` field and
+    /// reactivates the account (HTTP 200, `deactivated: false` confirmed on
+    /// re-read) on a production MSC3861 deployment (agentic.inblock.io). The
+    /// historical concern that reactivation demands a local password does not
+    /// apply when no `password` key is sent. Probe: section 3 of
+    /// `scripts/verify-lifecycle-live.sh` against a throwaway user. This method
+    /// still surfaces a clear error (warn! + bail!) on any non-success response.
     pub async fn reactivate_user(&self, localpart: &str, server_name: &str) -> Result<()> {
         let url = self.reactivate_url(localpart, server_name);
         let resp = self

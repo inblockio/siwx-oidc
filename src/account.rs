@@ -376,18 +376,17 @@ async fn execute_action(
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
             // Valid only for accounts deactivated with erase:false; an erased
-            // account cannot be restored. See the MSC3861 feasibility caveat on
-            // SynapseClient::reactivate_user.
+            // account cannot be restored. Self-service reactivation is verified
+            // working under MSC3861 (see SynapseClient::reactivate_user).
             synapse
                 .reactivate_user(&localpart, server)
                 .await
                 .map_err(|e| {
                     warn!(error = %e, "reactivate_user failed during account action");
-                    // Honest, MSC3861-aware message: under delegated auth the
-                    // Synapse admin reactivation endpoint may reject flipping
-                    // deactivated=false (it expects a local password, which
-                    // MSC3861 disables). Feasibility is unverified pending a live
-                    // probe; a server admin can always reactivate directly.
+                    // Reactivation is verified working under MSC3861 (live probe
+                    // 2026-06-10), so this branch is a genuine error path (e.g.
+                    // erased account, Synapse unreachable). Keep the honest
+                    // fallback: a server admin can always reactivate directly.
                     CustomError::BadRequest(
                         "Reactivation failed. Under delegated auth (MSC3861) the homeserver \
                          may not support self-service reactivation; ask a server admin to \
