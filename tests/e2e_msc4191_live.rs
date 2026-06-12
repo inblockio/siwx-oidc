@@ -14,10 +14,14 @@
 //!   SIWEOIDC_HOST=https://siwx-oidc.inblock.io MATRIX_HOST=https://matrix.inblock.io \
 //!     cargo test --test e2e_msc4191_live -- --ignored --nocapture
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use chrono::Utc;
+use ed25519_dalek::{Signer, SigningKey as EdSigningKey};
 use k256::ecdsa::SigningKey;
-use rand::thread_rng;
+use rand::{thread_rng, RngCore};
 use reqwest::{redirect::Policy, Client, StatusCode};
 use serde_json::Value;
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -819,4 +823,206 @@ async fn msc4191_account_menu_and_deactivate_page_live() {
     );
     eprintln!("[e2e] GET /account?action=account_deactivate renders the confirmation gate");
     eprintln!("[e2e] VERDICT: menu + deactivate page PASS (no real deactivation performed).");
+}
+
+// ---------------------------------------------------------------------------
+// Test: cross-signing reset round-trip (closes incident findings F3/F8)
+// ---------------------------------------------------------------------------
+//
+// Proves the keystone of the 2026-06-12 login incident end to end against prod:
+//   1. an INITIAL device_signing/upload publishes cross-signing keys (200);
+//   2. a REPLACEMENT upload is blocked (401) and the 401 points the client at
+//      .../account?action=org.matrix.cross_signing_reset (proves the live
+//      account_management_url fix, A1/B1);
+//   3. driving the REAL /account cross_signing_reset action (CAIP-122 re-auth ->
+//      siwx-oidc -> Synapse allow_cross_signing_reset) grants the replacement;
+//   4. the replacement upload then SUCCEEDS (200), so the account un-wedges.
+// The reset action had 0 prod invocations before this, so "implemented" was not
+// yet "works"; this is the proof. Run:
+//   SIWEOIDC_HOST=https://siwx-oidc.inblock.io MATRIX_HOST=https://matrix.inblock.io \
+//     cargo test --test e2e_msc4191_live cross_signing_reset_round_trip_live -- --ignored --nocapture
+
+/// Matrix "unpadded base64" (standard alphabet, no `=` padding).
+fn matrix_b64(bytes: &[u8]) -> String {
+    STANDARD_NO_PAD.encode(bytes)
+}
+
+/// GET the caller's full Matrix user id (`@localpart:server`) for an access token.
+async fn whoami_user_id(matrix: &str, token: &str) -> String {
+    let http = Client::new();
+    let resp = http
+        .get(format!("{matrix}/_matrix/client/v3/account/whoami"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("whoami request failed");
+    let j: Value = resp.json().await.expect("whoami body must be JSON");
+    j["user_id"]
+        .as_str()
+        .expect("whoami must return user_id")
+        .to_string()
+}
+
+/// Build a complete, validly-signed cross-signing key set for `user_id`, suitable
+/// for `POST /_matrix/client/v3/keys/device_signing/upload`. self/user-signing keys
+/// are signed by the master key over Matrix canonical JSON (sorted keys, compact,
+/// unpadded standard base64). Each call mints fresh keys, so two calls produce a
+/// publish and a distinct replacement.
+fn build_cross_signing_upload(user_id: &str) -> Value {
+    let mk_key = || {
+        let mut seed = [0u8; 32];
+        thread_rng().fill_bytes(&mut seed);
+        EdSigningKey::from_bytes(&seed)
+    };
+    let master = mk_key();
+    let self_signing = mk_key();
+    let user_signing = mk_key();
+
+    let mpub = matrix_b64(master.verifying_key().as_bytes());
+    let spub = matrix_b64(self_signing.verifying_key().as_bytes());
+    let upub = matrix_b64(user_signing.verifying_key().as_bytes());
+
+    // Canonical signable JSON (keys sorted: keys < usage < user_id; no whitespace).
+    // Synapse reconstructs exactly this (minus the `signatures` field) and verifies
+    // the master signature over it, so it is hand-formatted to match byte for byte.
+    let signable = |pubkey: &str, usage: &str| {
+        format!(
+            "{{\"keys\":{{\"ed25519:{pubkey}\":\"{pubkey}\"}},\"usage\":[\"{usage}\"],\"user_id\":\"{user_id}\"}}"
+        )
+    };
+    let sign_with_master =
+        |msg: &str| matrix_b64(&master.sign(msg.as_bytes()).to_bytes());
+
+    let self_sig = sign_with_master(&signable(&spub, "self_signing"));
+    let user_sig = sign_with_master(&signable(&upub, "user_signing"));
+
+    serde_json::json!({
+        // The master key needs no signature in the upload body; it is the root.
+        "master_key": {
+            "user_id": user_id,
+            "usage": ["master"],
+            "keys": { format!("ed25519:{mpub}"): mpub },
+        },
+        "self_signing_key": {
+            "user_id": user_id,
+            "usage": ["self_signing"],
+            "keys": { format!("ed25519:{spub}"): spub },
+            "signatures": { user_id: { format!("ed25519:{mpub}"): self_sig } },
+        },
+        "user_signing_key": {
+            "user_id": user_id,
+            "usage": ["user_signing"],
+            "keys": { format!("ed25519:{upub}"): upub },
+            "signatures": { user_id: { format!("ed25519:{mpub}"): user_sig } },
+        },
+    })
+}
+
+#[tokio::test]
+#[ignore = "hits production; run explicitly with --ignored"]
+async fn cross_signing_reset_round_trip_live() {
+    let oidc = siweoidc_host();
+    let matrix = matrix_host();
+    eprintln!("[e2e] SIWEOIDC_HOST={oidc} MATRIX_HOST={matrix}");
+
+    // 1. Throwaway identity + full wallet login (provisions the Synapse user+device).
+    let secret_key = k256::SecretKey::random(&mut thread_rng());
+    let signing_key = SigningKey::from(&secret_key);
+    let address = eip55_checksum(&address_from_key(signing_key.verifying_key()));
+    let did = format!("did:pkh:eip155:1:{address}");
+    eprintln!("[e2e] throwaway did={did}");
+    let login = login_with_key(&signing_key, &address, &did).await;
+    let user_id = whoami_user_id(&matrix, &login.access_token).await;
+    eprintln!("[e2e] user_id={user_id} device_id={}", login.device_id);
+
+    let http = Client::new();
+    let upload_url = format!("{matrix}/_matrix/client/v3/keys/device_signing/upload");
+
+    // 2. Initial cross-signing publish must succeed (MSC3967: no UIA on first upload).
+    let keys_initial = build_cross_signing_upload(&user_id);
+    let r1 = http
+        .post(&upload_url)
+        .bearer_auth(&login.access_token)
+        .json(&keys_initial)
+        .send()
+        .await
+        .expect("upload #1 request failed");
+    let s1 = r1.status();
+    let b1 = r1.text().await.unwrap_or_default();
+    eprintln!("[e2e] upload#1 (initial publish) -> {s1} {b1}");
+    assert_eq!(s1, StatusCode::OK, "initial cross-signing upload must 200: {b1}");
+
+    // 3. Replacement is blocked pre-approval, and the 401 points at the /account
+    //    reset page (proves the live account_management_url fix).
+    let keys_replacement = build_cross_signing_upload(&user_id);
+    let r2 = http
+        .post(&upload_url)
+        .bearer_auth(&login.access_token)
+        .json(&keys_replacement)
+        .send()
+        .await
+        .expect("upload #2 request failed");
+    let s2 = r2.status();
+    let b2 = r2.text().await.unwrap_or_default();
+    eprintln!("[e2e] upload#2 (pre-approval) -> {s2} {b2}");
+    assert_eq!(
+        s2,
+        StatusCode::UNAUTHORIZED,
+        "replacement must be blocked before approval: {b2}"
+    );
+    assert!(
+        b2.contains("org.matrix.cross_signing_reset"),
+        "the 401 must advertise the cross_signing_reset flow: {b2}"
+    );
+    assert!(
+        b2.contains("/account"),
+        "the 401 reset url must point at the /account page, not the bare issuer root: {b2}"
+    );
+
+    // 4. Drive the REAL reset approval via /account (CAIP-122 re-auth -> siwx-oidc
+    //    -> Synapse allow_cross_signing_reset).
+    let (rs, rb) = post_account_action(
+        &signing_key,
+        &address,
+        &did,
+        "org.matrix.cross_signing_reset",
+        None,
+    )
+    .await;
+    eprintln!("[e2e] /account cross_signing_reset -> {rs} {rb}");
+    assert_eq!(rs, StatusCode::OK, "reset action should 200: {rb}");
+    assert!(
+        rb.contains("completed"),
+        "reset action outcome should be completed: {rb}"
+    );
+
+    // 5. The replacement upload now succeeds: the account is un-wedged (F3/F8).
+    let r3 = http
+        .post(&upload_url)
+        .bearer_auth(&login.access_token)
+        .json(&keys_replacement)
+        .send()
+        .await
+        .expect("upload #2 retry request failed");
+    let s3 = r3.status();
+    let b3 = r3.text().await.unwrap_or_default();
+    eprintln!("[e2e] upload#2 (post-approval) -> {s3} {b3}");
+    assert_eq!(
+        s3,
+        StatusCode::OK,
+        "replacement upload must succeed after the reset approval: {b3}"
+    );
+
+    // 6. Cleanup: deactivate the throwaway identity (best-effort, never fails the test).
+    let (ds, db) = post_account_action(
+        &signing_key,
+        &address,
+        &did,
+        "org.matrix.account_deactivate",
+        None,
+    )
+    .await;
+    eprintln!("[e2e] cleanup account_deactivate -> {ds} {db}");
+
+    eprintln!("[e2e] PASS: cross-signing reset round-trip proven live (F3/F8 closed).");
 }
