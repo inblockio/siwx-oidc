@@ -890,8 +890,7 @@ fn build_cross_signing_upload(user_id: &str) -> Value {
             "{{\"keys\":{{\"ed25519:{pubkey}\":\"{pubkey}\"}},\"usage\":[\"{usage}\"],\"user_id\":\"{user_id}\"}}"
         )
     };
-    let sign_with_master =
-        |msg: &str| matrix_b64(&master.sign(msg.as_bytes()).to_bytes());
+    let sign_with_master = |msg: &str| matrix_b64(&master.sign(msg.as_bytes()).to_bytes());
 
     let self_sig = sign_with_master(&signable(&spub, "self_signing"));
     let user_sig = sign_with_master(&signable(&upub, "user_signing"));
@@ -950,7 +949,11 @@ async fn cross_signing_reset_round_trip_live() {
     let s1 = r1.status();
     let b1 = r1.text().await.unwrap_or_default();
     eprintln!("[e2e] upload#1 (initial publish) -> {s1} {b1}");
-    assert_eq!(s1, StatusCode::OK, "initial cross-signing upload must 200: {b1}");
+    assert_eq!(
+        s1,
+        StatusCode::OK,
+        "initial cross-signing upload must 200: {b1}"
+    );
 
     // 3. Replacement is blocked pre-approval, and the 401 points at the /account
     //    reset page (proves the live account_management_url fix).
