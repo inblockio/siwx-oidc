@@ -53,11 +53,26 @@
 	}
 
 	onMount(async () => {
-		try {
-			const resp = await fetch(`${window.location.origin}/client/${client_id}`);
-			client_metadata = await resp.json();
-		} catch (e) {
-			console.error(e);
+		// MSC4191/MSC4312 account-management deep links can land on the bare issuer
+		// root (e.g. a homeserver whose account_management_url points here instead of
+		// /account). Forward them to the account page, preserving the query, rather
+		// than dead-ending on the sign-in SPA (which then fetched /client/null).
+		const params = new URLSearchParams(window.location.search);
+		if (params.has('action')) {
+			window.location.replace(`/account${window.location.search}`);
+			return;
+		}
+
+		// Only fetch client metadata when a real client_id is present. A bare-root
+		// visit carries no client_id; fetching /client/null (or /client/undefined)
+		// 404s and dead-ends the page.
+		if (client_id != null && client_id !== '' && client_id !== 'null' && client_id !== 'undefined') {
+			try {
+				const resp = await fetch(`${window.location.origin}/client/${client_id}`);
+				client_metadata = await resp.json();
+			} catch (e) {
+				console.error(e);
+			}
 		}
 
 		await reconnect(config);
