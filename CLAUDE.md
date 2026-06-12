@@ -323,25 +323,35 @@ otherwise a `SIWX_{uuid}` is generated. The token response includes the scope so
 clients can discover the provisioned device_id. `allow_cross_signing_reset`
 fires unconditionally on sign-in.
 
-**Session teardown (logout / revoke / logout-all):** Tearing down a session that
-is *ending* deletes its Synapse device once and revokes its OAuth tokens. This is
-distinct from recycling and is safe (the id is never reused), so it does not hit
-the stale-signature problem below. All teardown is best-effort, idempotent, and
-never returns 500; with no Synapse client / `server_name` it degrades to
-Redis-only token revocation. Revocation keys on `TokenMetadata.username` (the
-lowercased localpart), not the raw DID. Implemented in `src/compat.rs`:
+**Session teardown (logout / revoke / logout-all):** Teardown always revokes the
+*ending* session's OAuth tokens. Whether it also deletes the Synapse device is
+gated by `compat::TeardownPolicy`, which keys on the caller's intent, NOT on the
+transport: an explicit sign-out deletes; bare token hygiene does not. Deleting a
+device that is ending is distinct from recycling and is safe (the id is never
+reused), so it does not hit the stale-signature problem below. All teardown is
+best-effort, idempotent, and never returns 500; with no Synapse client /
+`server_name` it degrades to Redis-only token revocation. Revocation keys on
+`TokenMetadata.username` (the lowercased localpart), not the raw DID. Implemented
+in `src/compat.rs`:
 
-| Endpoint | Handler | Synapse side effect | Token side effect |
-|----------|---------|---------------------|-------------------|
-| `POST /oauth2/revoke` (RFC 7009) | `compat::revoke` | `delete_device` for the ending session's device | `revoke_device_tokens(username, device_id)` (access + paired refresh) |
-| `POST /_matrix/client/v3/logout` | `compat::logout` | same as revoke, for the bearer token's session | same as revoke |
-| `POST /_matrix/client/v3/logout/all` | `compat::logout_all` | `list_devices` then `delete_device` for EACH device (best-effort per device) | `revoke_all_user_tokens(username)` |
+| Endpoint | Handler | Policy | Synapse side effect | Token side effect |
+|----------|---------|--------|---------------------|-------------------|
+| `POST /oauth2/revoke` (RFC 7009) | `compat::revoke` | `TokensOnly` | none (never deletes the device) | `revoke_device_tokens(username, device_id)` (access + paired refresh) |
+| `POST /_matrix/client/v3/logout` | `compat::logout` | `DeleteDevice` | `delete_device` for the bearer token's session | same token revoke as revoke |
+| `POST /_matrix/client/v3/logout/all` | `compat::logout_all` | n/a (bulk) | `list_devices` then `delete_device` for EACH device (best-effort per device) | `revoke_all_user_tokens(username)` |
+
+**Revoke must not delete the device (2026-06-12 login incident).** RFC 7009
+`/oauth2/revoke` is token hygiene: clients fire it on token rotation and on dialog
+dismissals. Deleting the Synapse device there raced in-flight key uploads and
+wedged users' cross-signing identity (amplifier B of the incident). Device
+deletion is therefore restricted to explicit-intent paths: `compat::logout` and
+the MSC4191 `device_delete` / `session_end` actions in `account.rs`.
 
 `logout/all` is session invalidation, NOT account deactivation: it never calls
 `deactivate_user`, so the account stays active and the user can sign in again.
 (Account deactivation lives in `account.rs` under
-`/account?action=org.matrix.account_deactivate`.) Single-session `logout`/`revoke`
-delete only the ending session's device; sign-in is unchanged.
+`/account?action=org.matrix.account_deactivate`.) Single-session `logout` deletes
+only the ending session's device; `revoke` deletes nothing; sign-in is unchanged.
 
 **Why no recycling:** Synapse's `delete_device` (MAS API) does not remove cross-signing
 signatures, and its signature-upload handler skips new uploads when a stale one exists.
