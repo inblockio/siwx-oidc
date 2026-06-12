@@ -300,7 +300,13 @@ server pulls and runs them. No repos or builds on the server.
 
 **Production server:** `deploy@142.93.168.4` (`agentic.inblock.io`)
 - Stack directory: `/home/deploy/matrix/stack/` (docker-compose.yml + .env only)
-- Watchtower auto-pulls new GHCR images every 5 minutes
+- **Deploys are MANUAL, not automatic.** A `matrix-watchtower-1` container exists but runs
+  with `WATCHTOWER_SCOPE=matrix` and the only container carrying that scope label is
+  watchtower ITSELF, so it updates nothing in the stack (verified 2026-06-12). A push to
+  `main` builds and publishes `ghcr.io/inblockio/siwx-oidc:main` via CI, but it does NOT
+  reach prod until someone runs, on the server:
+  `cd /home/deploy/matrix/stack && docker compose pull siwx-oidc && docker compose up -d siwx-oidc`.
+  (Do not trust the old "watchtower auto-deploys within 5 min" claim.)
 - Caddy reverse proxy in portal stack (`portal-caddy-1`, config at `/home/portal/portal/Caddyfile`)
 
 **CORS rule:** Caddy must strip siwx-oidc's upstream CORS headers (`header_down
