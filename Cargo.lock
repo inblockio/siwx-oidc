@@ -4640,6 +4640,7 @@ dependencies = [
  "bs58",
  "chrono",
  "cookie",
+ "ed25519-dalek",
  "env_logger",
  "figment",
  "headers",
