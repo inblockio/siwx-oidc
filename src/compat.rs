@@ -9,17 +9,21 @@
 //!
 //! ## Session teardown vs. account deactivation
 //!
-//! Logout and revocation tear down the *ending* session: when a Synapse client
-//! and `server_name` are configured they delete that session's Synapse device
-//! (a clean, one-time deletion of a session that is going away) and then revoke
-//! the OAuth tokens for it. This is deliberately distinct from device *recycling*
-//! (re-issuing the same `device_id` with new keys), which Synapse cannot do
-//! cleanly: its `delete_device` does not drop the device's
+//! Teardown always revokes the *ending* session's OAuth tokens. Whether it also
+//! deletes the Synapse device depends on the caller's intent (see
+//! [`TeardownPolicy`]): an explicit `POST /_matrix/client/v3/logout` deletes the
+//! device; a bare RFC 7009 `POST /oauth2/revoke` is token hygiene and does NOT
+//! (clients fire revoke on rotation and on dialog dismissals, where deleting the
+//! device strands the user's identity — the 2026-06-12 login incident).
+//!
+//! Deleting a device that is *ending* (on explicit logout) is distinct from device
+//! *recycling* (re-issuing the same `device_id` with new keys), which Synapse
+//! cannot do cleanly: its `delete_device` does not drop the device's
 //! `e2e_cross_signing_signatures` rows, and the signature-upload handler then
 //! skips fresh uploads. Sign-in therefore never deletes-then-reuses a device id;
-//! it upserts a fresh `SIWX_{uuid}`. Deleting a device that is *ending* (here) is
-//! safe precisely because the id is not reused. None of this code touches sign-in
-//! or token issuance (`oidc.rs`); see CLAUDE.md "MSC3861 device lifecycle".
+//! it upserts a fresh `SIWX_{uuid}`, so the explicit-logout delete is safe
+//! precisely because the id is not reused. None of this code touches sign-in or
+//! token issuance (`oidc.rs`); see CLAUDE.md "MSC3861 device lifecycle".
 
 use std::sync::Arc;
 
@@ -70,24 +74,58 @@ pub struct RefreshRequest {
 
 // -- Session teardown (shared by logout + revoke) -----------------------------
 
+/// Whether a teardown is allowed to delete the ending session's Synapse device.
+///
+/// Deleting a Synapse device is destructive: it drops the device's E2EE / cross
+/// signing state, and if it races an in-flight key upload it strands the user's
+/// identity. It must therefore be driven by an explicit "sign this device out"
+/// intent, never by transport-level token hygiene.
+///
+/// - A bare RFC 7009 `POST /oauth2/revoke` is token hygiene: clients fire it on
+///   token rotation and on dialog dismissals (Element's forced-recovery loop
+///   revoked tokens on every escape). Deleting the device there destroyed devices
+///   mid-flight and wedged accounts (2026-06-12 login incident, amplifier B). So
+///   revoke is [`TeardownPolicy::TokensOnly`].
+/// - `POST /_matrix/client/v3/logout` is an explicit sign-out, so it is
+///   [`TeardownPolicy::DeleteDevice`]. (The MSC4191 `device_delete` / `session_end`
+///   actions in `account.rs` are the other explicit-intent path and delete there.)
+///
+/// Device ids are never recycled (sign-in upserts a fresh `SIWX_{uuid}`), so in
+/// Synapse mode exactly one session references a given device; an explicit logout
+/// can delete it safely without racing another live session.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TeardownPolicy {
+    /// Revoke the session's OAuth tokens only; leave the Synapse device intact.
+    TokensOnly,
+    /// Revoke tokens AND delete the ending session's Synapse device.
+    DeleteDevice,
+}
+
+impl TeardownPolicy {
+    /// True only for explicit-sign-out callers that should delete the device.
+    fn deletes_device(self) -> bool {
+        matches!(self, TeardownPolicy::DeleteDevice)
+    }
+}
+
 /// Tear down the single session identified by `token`.
 ///
 /// Two-phase, best-effort, idempotent, and graceful:
-/// 1. If the token resolves to [`TokenMetadata`] AND a Synapse client +
-///    `server_name` are configured, delete that session's Synapse device
-///    (best-effort: a failure is logged at `warn!` and does not abort), then
-///    revoke every OAuth token for `(username, device_id)` in Redis (this
-///    removes the access token and its paired refresh token).
-/// 2. If the token is unknown (already gone, or this is a no-op call) OR there
-///    is no Synapse integration, fall back to deleting just this token so the
-///    behaviour is at least the prior Redis-only teardown.
+/// 1. If `policy` is [`TeardownPolicy::DeleteDevice`] AND the token resolves to
+///    [`TokenMetadata`] AND a Synapse client + `server_name` are configured,
+///    delete that session's Synapse device (best-effort: a failure is logged at
+///    `warn!` and does not abort). [`TeardownPolicy::TokensOnly`] skips this
+///    entirely, so a bare RFC 7009 revoke never destroys a device.
+/// 2. Always revoke the OAuth tokens for the session: every token for
+///    `(username, device_id)` in Redis (access + paired refresh), or just the
+///    presented token when there is no device_id / no Synapse integration.
 ///
 /// Never fails the caller: every error is logged and swallowed so the HTTP
 /// handler can always return 200 (RFC 7009 for revoke; Matrix expects 200 for
 /// logout). Keyed on [`TokenMetadata::username`] (the lowercased localpart
 /// Synapse uses), never the raw DID, so revocation is robust to address-case
 /// differences between sign-in and re-auth DIDs.
-async fn teardown_session(state: &CompatState, token: &str, ctx: &str) {
+async fn teardown_session(state: &CompatState, token: &str, ctx: &str, policy: TeardownPolicy) {
     let meta = match state.redis_client.get_token(token).await {
         Ok(m) => m,
         Err(e) => {
@@ -104,22 +142,26 @@ async fn teardown_session(state: &CompatState, token: &str, ctx: &str) {
         return;
     };
 
-    // Phase 1: delete the ending session's Synapse device (best-effort).
-    if let (Some(synapse), Some(server_name)) =
-        (state.synapse_client.as_ref(), state.server_name.as_deref())
-    {
-        if meta.device_id.is_empty() {
-            debug!(
-                ctx,
-                username = %meta.username,
-                "teardown_session: token has no device_id; skipping Synapse device delete"
-            );
-        } else if let Err(e) = synapse
-            .delete_device(&meta.username, &meta.device_id, server_name)
-            .await
+    // Phase 1: delete the ending session's Synapse device (best-effort) — only for
+    // explicit-sign-out callers. A bare RFC 7009 revoke (TokensOnly) must never
+    // delete a device: that is what wedged users in the 2026-06-12 login incident.
+    if policy.deletes_device() {
+        if let (Some(synapse), Some(server_name)) =
+            (state.synapse_client.as_ref(), state.server_name.as_deref())
         {
-            warn!(error = %e, ctx, username = %meta.username, device_id = %meta.device_id,
-                "teardown_session: Synapse delete_device failed (best-effort)");
+            if meta.device_id.is_empty() {
+                debug!(
+                    ctx,
+                    username = %meta.username,
+                    "teardown_session: token has no device_id; skipping Synapse device delete"
+                );
+            } else if let Err(e) = synapse
+                .delete_device(&meta.username, &meta.device_id, server_name)
+                .await
+            {
+                warn!(error = %e, ctx, username = %meta.username, device_id = %meta.device_id,
+                    "teardown_session: Synapse delete_device failed (best-effort)");
+            }
         }
     }
 
@@ -175,7 +217,9 @@ pub async fn revoke(
     State(state): State<CompatState>,
     axum::extract::Form(form): axum::extract::Form<RevokeForm>,
 ) -> StatusCode {
-    teardown_session(&state, &form.token, "revoke").await;
+    // RFC 7009 is token hygiene, not a device sign-out: revoke tokens only, never
+    // delete the Synapse device (see TeardownPolicy).
+    teardown_session(&state, &form.token, "revoke", TeardownPolicy::TokensOnly).await;
     StatusCode::OK
 }
 
@@ -203,7 +247,8 @@ pub async fn logout(
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
 ) -> impl IntoResponse {
     if let Some(TypedHeader(auth)) = bearer {
-        teardown_session(&state, auth.token(), "logout").await;
+        // Explicit single-session sign-out: revoke tokens AND delete the device.
+        teardown_session(&state, auth.token(), "logout", TeardownPolicy::DeleteDevice).await;
     }
     (StatusCode::OK, Json(serde_json::json!({})))
 }
@@ -431,6 +476,22 @@ mod tests {
 
     fn bearer(token: &str) -> Option<TypedHeader<Authorization<Bearer>>> {
         Some(TypedHeader(Authorization::bearer(token).unwrap()))
+    }
+
+    /// Policy mapping (no Redis needed): only an explicit sign-out deletes the
+    /// Synapse device; a bare RFC 7009 revoke must not. Regression guard for the
+    /// 2026-06-12 login incident, where revoke deleted a device on every dialog
+    /// escape and wedged the user's cross-signing identity.
+    #[test]
+    fn teardown_policy_only_deletes_device_on_explicit_signout() {
+        assert!(
+            !TeardownPolicy::TokensOnly.deletes_device(),
+            "RFC 7009 revoke must never delete the Synapse device"
+        );
+        assert!(
+            TeardownPolicy::DeleteDevice.deletes_device(),
+            "explicit logout must delete the ending session's device"
+        );
     }
 
     /// H7: standalone (no Synapse) logout still revokes the session's Redis
