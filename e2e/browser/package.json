@@ -1,0 +1,10 @@
+{
+  "name": "siwx-account-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Headless browser E2E for siwx-oidc /account flows (mock wallet + WebAuthn virtual authenticator)",
+  "devDependencies": {
+    "@playwright/test": "1.50.1",
+    "ethers": "6.13.4"
+  }
+}
