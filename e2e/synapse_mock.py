@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse, parse_qs
 
@@ -35,6 +36,19 @@ LIFECYCLE = {}
 CALL_LOG = []  # list of "METHOD path"
 # Mutable expected secret (so a test can flip it to force 401s).
 STATE = {"secret": SECRET}
+# Per-logical-endpoint fault injection (H14). Maps a logical endpoint name to a
+# mode string: "500" returns HTTP 500, "timeout" sleeps long enough that the
+# siwx-oidc reqwest client times out. Cleared by /__reset.
+#   POST /__fail {"endpoint": "delete_device", "mode": "500"|"timeout"|"off"}
+# Recognized endpoints: delete_device, list_devices, get_device, deactivate.
+FAIL = {}
+# How long a "timeout" fault sleeps before (not) responding, in seconds. Must
+# exceed the siwx-oidc Synapse HTTP client timeout so the call fails.
+TIMEOUT_SLEEP_SECS = float(os.environ.get("SYNAPSE_MOCK_TIMEOUT_SLEEP", "30"))
+# Counts effective device-DELETE operations per (user_id, device_id) so a race
+# test can prove at most one DELETE actually mutated state. Distinct from
+# CALL_LOG (which records every request, including idempotent no-ops).
+EFFECTIVE_DELETES = {}
 
 
 def _device(device_id, display_name=None, last_seen_ip=None, last_seen_ts=None):
@@ -78,6 +92,29 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             CALL_LOG.append(f"{method} {path}")
 
+    def _maybe_fail(self, endpoint):
+        """If a fault is armed for `endpoint`, enact it and return True.
+
+        "500"     -> respond 500 immediately.
+        "timeout" -> sleep past the client's timeout, then respond 500 (the
+                     siwx-oidc client will already have given up). Returns True
+                     either way so the caller skips its normal handling.
+        """
+        with LOCK:
+            mode = FAIL.get(endpoint)
+        if not mode or mode == "off":
+            return False
+        if mode == "timeout":
+            time.sleep(TIMEOUT_SLEEP_SECS)
+            try:
+                self._send(500, {"errcode": "M_UNKNOWN", "error": "simulated timeout"})
+            except Exception:
+                pass
+            return True
+        # default: "500"
+        self._send(500, {"errcode": "M_UNKNOWN", "error": "simulated failure"})
+        return True
+
     # -- routing ----------------------------------------------------------
     def do_GET(self):
         p = urlparse(self.path)
@@ -88,7 +125,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {
                     "devices": DEVICES,
                     "lifecycle": LIFECYCLE,
-                    "calls": CALL_LOG,
+                    "calls": list(CALL_LOG),
+                    "fail": dict(FAIL),
+                    "effective_deletes": dict(EFFECTIVE_DELETES),
                 })
         if path == "/health":
             return self._send(200, {"ok": True})
@@ -98,13 +137,27 @@ class Handler(BaseHTTPRequestHandler):
         # GET /_synapse/mas/is_localpart_available
         if p.path.startswith("/_synapse/mas/is_localpart_available"):
             return self._send(200, {"available": True})
-        # GET /_synapse/admin/v2/users/{user_id}/devices
-        m = re.match(r"^/_synapse/admin/v2/users/(.+)/devices$", path)
+        # GET /_synapse/admin/v2/users/{user_id}/devices  (list_devices)
+        m = re.match(r"^/_synapse/admin/v2/users/([^/]+)/devices$", path)
         if m:
+            if self._maybe_fail("list_devices"):
+                return
             user_id = m.group(1)
             with LOCK:
                 devs = DEVICES.get(user_id, [])
                 return self._send(200, {"devices": devs, "total": len(devs)})
+        # GET /_synapse/admin/v2/users/{user_id}/devices/{device_id}  (get_device)
+        m = re.match(r"^/_synapse/admin/v2/users/(.+)/devices/(.+)$", path)
+        if m:
+            if self._maybe_fail("get_device"):
+                return
+            user_id, device_id = m.group(1), m.group(2)
+            with LOCK:
+                devs = DEVICES.get(user_id, [])
+                dev = next((d for d in devs if d["device_id"] == device_id), None)
+            if dev is None:
+                return self._send(404, {"errcode": "M_NOT_FOUND", "error": "device"})
+            return self._send(200, dev)
         return self._send(404, {"errcode": "M_NOT_FOUND", "error": path})
 
     def do_POST(self):
@@ -122,12 +175,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/__reset":
             with LOCK:
                 DEVICES.clear(); LIFECYCLE.clear(); CALL_LOG.clear()
+                FAIL.clear(); EFFECTIVE_DELETES.clear()
                 STATE["secret"] = SECRET
             return self._send(200, {"ok": True})
         if path == "/__set_secret":
             with LOCK:
                 STATE["secret"] = body.get("secret", SECRET)
             return self._send(200, {"ok": True})
+        # Arm/disarm a fault on a logical endpoint (H14). mode "off"/absent clears.
+        if path == "/__fail":
+            endpoint = body.get("endpoint", "")
+            mode = body.get("mode", "off")
+            with LOCK:
+                if not endpoint or mode in ("off", None):
+                    FAIL.pop(endpoint, None)
+                else:
+                    FAIL[endpoint] = mode
+            return self._send(200, {"ok": True, "fail": dict(FAIL)})
         # authed synapse endpoints ----------------------------------------
         if not self._authed():
             return self._send(401, {"errcode": "M_UNKNOWN_TOKEN", "error": "bad admin token"})
@@ -149,6 +213,8 @@ class Handler(BaseHTTPRequestHandler):
         # POST /_synapse/admin/v1/deactivate/{user_id}
         m = re.match(r"^/_synapse/admin/v1/deactivate/(.+)$", path)
         if m:
+            if self._maybe_fail("deactivate"):
+                return
             user_id = m.group(1)
             erase = bool(body.get("erase", False))
             with LOCK:
@@ -167,10 +233,18 @@ class Handler(BaseHTTPRequestHandler):
         # DELETE /_synapse/admin/v2/users/{user_id}/devices/{device_id}
         m = re.match(r"^/_synapse/admin/v2/users/(.+)/devices/(.+)$", path)
         if m:
+            if self._maybe_fail("delete_device"):
+                return
             user_id, device_id = m.group(1), m.group(2)
             with LOCK:
                 devs = DEVICES.get(user_id, [])
+                existed = any(d["device_id"] == device_id for d in devs)
                 DEVICES[user_id] = [d for d in devs if d["device_id"] != device_id]
+                if existed:
+                    # Count only the DELETE that actually mutated state, so a race
+                    # test can assert at most one *effective* deletion occurred.
+                    key = f"{user_id}/{device_id}"
+                    EFFECTIVE_DELETES[key] = EFFECTIVE_DELETES.get(key, 0) + 1
             return self._send(200, {})
         return self._send(404, {"errcode": "M_NOT_FOUND", "error": path})
 
