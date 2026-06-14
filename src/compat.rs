@@ -27,7 +27,12 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use axum_extra::{
     headers::{authorization::Bearer, Authorization},
     TypedHeader,
@@ -317,6 +322,117 @@ pub async fn logout_all(
         }
     }
 
+    (StatusCode::OK, Json(serde_json::json!({})))
+}
+
+// -- Legacy CS-API device management (MSC3861 delegated) ----------------------
+//
+// Element's in-client "session manager" signs a device out with the legacy CS
+// API (`DELETE /_matrix/client/v3/devices/{id}` or `POST .../delete_devices`),
+// NOT the MSC4191 account-page deep link. Under MSC3861 the homeserver delegates
+// auth, so — when the deployment proxies these specific paths to siwx-oidc — we
+// service them here: resolve the user from their bearer token, delete the target
+// Synapse device via the admin API, and revoke that device's OAuth tokens. This
+// is the same safe "delete an ending device" teardown as logout/revoke (the id is
+// never reused), just initiated by the client's session manager.
+//
+// We accept the bearer as sufficient authorization (no UIA challenge): auth is
+// delegated to us, so a valid access token already proves the caller, mirroring
+// how MAS makes delegated device deletion UIA-free.
+
+/// Body of `POST /_matrix/client/v3/delete_devices`.
+#[derive(Deserialize)]
+pub struct DeleteDevicesRequest {
+    #[serde(default)]
+    pub devices: Vec<String>,
+}
+
+/// Resolve the bearer token to its owning localpart (`TokenMetadata.username`),
+/// or `None` if the token is missing/unknown.
+async fn username_from_bearer(
+    state: &CompatState,
+    bearer: &Option<TypedHeader<Authorization<Bearer>>>,
+) -> Option<String> {
+    let TypedHeader(auth) = bearer.as_ref()?;
+    state
+        .redis_client
+        .get_token(auth.token())
+        .await
+        .ok()
+        .flatten()
+        .map(|m| m.username)
+}
+
+/// Delete one of `username`'s Synapse devices (admin API) and revoke its tokens.
+/// Best-effort, idempotent, never fails the caller — same teardown as logout.
+async fn teardown_device(state: &CompatState, username: &str, device_id: &str, ctx: &str) {
+    if device_id.is_empty() {
+        return;
+    }
+    if let (Some(synapse), Some(server_name)) =
+        (state.synapse_client.as_ref(), state.server_name.as_deref())
+    {
+        if let Err(e) = synapse
+            .delete_device(username, device_id, server_name)
+            .await
+        {
+            warn!(error = %e, ctx, username = %username, device_id = %device_id,
+                "compat device teardown: Synapse delete_device failed (best-effort)");
+        }
+    }
+    match state
+        .redis_client
+        .revoke_device_tokens(username, device_id)
+        .await
+    {
+        Ok(revoked) => info!(
+            ctx,
+            username = %username, device_id = %device_id, revoked = revoked as u64,
+            "compat device torn down"
+        ),
+        Err(e) => warn!(error = %e, ctx, "compat device teardown: revoke_device_tokens failed"),
+    }
+}
+
+const UNKNOWN_TOKEN: &str = "M_UNKNOWN_TOKEN";
+
+fn unknown_token_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "errcode": UNKNOWN_TOKEN,
+            "error": "Invalid or missing access token"
+        })),
+    )
+}
+
+/// `DELETE /_matrix/client/v3/devices/{device_id}` — sign out a single device
+/// from the in-client session manager. Scoped to the bearer's user (a foreign
+/// device id is a no-op, since the admin delete is mxid-scoped).
+pub async fn delete_device(
+    State(state): State<CompatState>,
+    Path(device_id): Path<String>,
+    bearer: Option<TypedHeader<Authorization<Bearer>>>,
+) -> impl IntoResponse {
+    let Some(username) = username_from_bearer(&state, &bearer).await else {
+        return unknown_token_response();
+    };
+    teardown_device(&state, &username, &device_id, "compat_delete_device").await;
+    (StatusCode::OK, Json(serde_json::json!({})))
+}
+
+/// `POST /_matrix/client/v3/delete_devices` — bulk sign-out of specific devices.
+pub async fn delete_devices(
+    State(state): State<CompatState>,
+    bearer: Option<TypedHeader<Authorization<Bearer>>>,
+    Json(body): Json<DeleteDevicesRequest>,
+) -> impl IntoResponse {
+    let Some(username) = username_from_bearer(&state, &bearer).await else {
+        return unknown_token_response();
+    };
+    for device_id in &body.devices {
+        teardown_device(&state, &username, device_id, "compat_delete_devices").await;
+    }
     (StatusCode::OK, Json(serde_json::json!({})))
 }
 
@@ -775,5 +891,134 @@ mod tests {
             "no-op logout_all must not revoke unrelated tokens"
         );
         client.delete_token(&survivor).await.ok();
+    }
+
+    // -- Legacy CS-API device delete (Fix A: client session-manager wiring) ---
+
+    /// H5: `DELETE /devices/{id}` resolves the user from the bearer, revokes the
+    /// TARGET device's tokens (standalone: no Synapse), and leaves other devices'
+    /// tokens intact. Returns 200.
+    #[tokio::test]
+    async fn compat_delete_device_revokes_target_and_keeps_others() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("legacy-user-{n}");
+        let bearer_tok = format!("compat_dd_bearer_{n}");
+        let target_tok = format!("compat_dd_target_{n}");
+        let other_tok = format!("compat_dd_other_{n}");
+
+        // Bearer belongs to the user (its own device). Target + other are two of
+        // the user's device sessions.
+        client
+            .set_token(&bearer_tok, &token_meta(&user, &format!("SELF_{n}")), 120)
+            .await
+            .unwrap();
+        client
+            .set_token(&target_tok, &token_meta(&user, &format!("TARGET_{n}")), 120)
+            .await
+            .unwrap();
+        client
+            .set_token(&other_tok, &token_meta(&user, &format!("OTHER_{n}")), 120)
+            .await
+            .unwrap();
+
+        let state = standalone_state(client.clone());
+        let resp = delete_device(
+            State(state),
+            axum::extract::Path(format!("TARGET_{n}")),
+            bearer(&bearer_tok),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(
+            client.get_token(&target_tok).await.unwrap().is_none(),
+            "the targeted device's token must be revoked"
+        );
+        assert!(
+            client.get_token(&other_tok).await.unwrap().is_some(),
+            "a different device's token must survive"
+        );
+        // bearer's own session is untouched by deleting a *different* device.
+        assert!(
+            client.get_token(&bearer_tok).await.unwrap().is_some(),
+            "the caller's own session must survive deleting another device"
+        );
+
+        client.delete_token(&bearer_tok).await.ok();
+        client.delete_token(&other_tok).await.ok();
+    }
+
+    /// `DELETE /devices/{id}` with no/unknown bearer must be 401 (M_UNKNOWN_TOKEN).
+    #[tokio::test]
+    async fn compat_delete_device_unknown_bearer_is_401() {
+        let Some(client) = redis().await else { return };
+        let state = standalone_state(client);
+        let resp = delete_device(
+            State(state.clone()),
+            axum::extract::Path("ANY".to_string()),
+            None,
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = delete_device(
+            State(state),
+            axum::extract::Path("ANY".to_string()),
+            bearer("compat_dd_nope"),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// H5: `POST /delete_devices` bulk-revokes every named device's tokens.
+    #[tokio::test]
+    async fn compat_delete_devices_bulk_revokes_each() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("bulk-user-{n}");
+        let bearer_tok = format!("compat_bulk_bearer_{n}");
+        let d1 = format!("D1_{n}");
+        let d2 = format!("D2_{n}");
+        let t1 = format!("compat_bulk_t1_{n}");
+        let t2 = format!("compat_bulk_t2_{n}");
+
+        client
+            .set_token(&bearer_tok, &token_meta(&user, &format!("SELF_{n}")), 120)
+            .await
+            .unwrap();
+        client
+            .set_token(&t1, &token_meta(&user, &d1), 120)
+            .await
+            .unwrap();
+        client
+            .set_token(&t2, &token_meta(&user, &d2), 120)
+            .await
+            .unwrap();
+
+        let state = standalone_state(client.clone());
+        let resp = delete_devices(
+            State(state),
+            bearer(&bearer_tok),
+            Json(DeleteDevicesRequest {
+                devices: vec![d1.clone(), d2.clone()],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(
+            client.get_token(&t1).await.unwrap().is_none(),
+            "D1 token must be revoked"
+        );
+        assert!(
+            client.get_token(&t2).await.unwrap().is_none(),
+            "D2 token must be revoked"
+        );
+        client.delete_token(&bearer_tok).await.ok();
     }
 }

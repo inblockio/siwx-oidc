@@ -2,7 +2,7 @@ use axum::{
     extract::{Form, Json, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use axum_extra::{
@@ -529,19 +529,99 @@ async fn webauthn_link_finish(
 
 // -- Account management route handlers (MSC4191/MSC4312) --------------------
 
+/// `Set-Cookie` value that establishes the authenticated account session.
+fn account_cookie_set(base_url: &url::Url, token: &str) -> String {
+    let secure = if base_url.scheme() == "https" {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!(
+        "{}={}; Max-Age={}; Path=/account; HttpOnly; SameSite=Strict{}",
+        account::ACCOUNT_SESSION_COOKIE,
+        token,
+        account::ACCOUNT_SESSION_TTL,
+        secure
+    )
+}
+
+/// `Set-Cookie` value that clears the account session (terminal actions).
+fn account_cookie_clear(base_url: &url::Url) -> String {
+    let secure = if base_url.scheme() == "https" {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!(
+        "{}=; Max-Age=0; Path=/account; HttpOnly; SameSite=Strict{}",
+        account::ACCOUNT_SESSION_COOKIE,
+        secure
+    )
+}
+
+/// True for outcomes that destroy the identity the session was bound to, so the
+/// cookie must be cleared rather than (re)issued.
+fn outcome_is_terminal(outcome: &account::ActionOutcome) -> bool {
+    matches!(
+        outcome,
+        account::ActionOutcome::Erased | account::ActionOutcome::Deactivated
+    )
+}
+
+/// Read the account-session cookie value, tolerating a wholly-absent Cookie
+/// header (first-time visitors have no cookies at all).
+fn account_session_token(cookies: &Option<TypedHeader<headers::Cookie>>) -> Option<&str> {
+    cookies
+        .as_ref()
+        .and_then(|TypedHeader(c)| c.get(account::ACCOUNT_SESSION_COOKIE))
+}
+
+/// Turn a successful re-auth ([`account::AuthedAction`]) into a response that
+/// also (a) issues the account-session cookie, and (b) carries the CSRF token so
+/// the page can drive subsequent actions without a fresh signature. Terminal
+/// outcomes (erase/deactivate) clear the cookie instead.
+async fn authed_action_response(
+    state: &AppState,
+    authed: account::AuthedAction,
+) -> Result<(axum::http::HeaderMap, Json<account::AccountActionResponse>), CustomError> {
+    let mut response = authed.response;
+    let mut headers = axum::http::HeaderMap::new();
+    let cookie = if outcome_is_terminal(&response.outcome) {
+        account_cookie_clear(&state.config.base_url)
+    } else {
+        let (token, csrf) =
+            account::create_account_session(&state.redis_client, &authed.did).await?;
+        response.csrf = Some(csrf);
+        account_cookie_set(&state.config.base_url, &token)
+    };
+    if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+        headers.insert(axum::http::header::SET_COOKIE, v);
+    }
+    Ok((headers, Json(response)))
+}
+
 async fn account_page_handler(
     State(state): State<AppState>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
     Query(query): Query<account::AccountPageQuery>,
 ) -> axum::response::Html<String> {
-    account::account_page(query, state.config.base_url.as_str())
+    // If a live account session is present, render the page already-authenticated
+    // (no fresh signature for this or subsequent actions).
+    let csrf = match account_session_token(&cookies) {
+        Some(token) => account::lookup_account_session(&state.redis_client, token)
+            .await
+            .map(|s| s.csrf),
+        None => None,
+    };
+    account::account_page_inner(query, state.config.base_url.as_str(), csrf.as_deref())
 }
 
 async fn account_wallet_handler(
     State(state): State<AppState>,
     Json(req): Json<account::AccountWalletRequest>,
-) -> Result<Json<account::AccountActionResponse>, CustomError> {
+) -> Result<(axum::http::HeaderMap, Json<account::AccountActionResponse>), CustomError> {
     let synapse = state.synapse_client.as_deref();
-    let resp = account::account_wallet(
+    let authed = account::account_wallet(
         &state.config,
         req,
         synapse,
@@ -549,7 +629,40 @@ async fn account_wallet_handler(
         state.config.matrix_server_name.as_deref(),
     )
     .await?;
-    Ok(Json(resp))
+    authed_action_response(&state, authed).await
+}
+
+/// `POST /account/action` — execute an action against the live account session
+/// (cookie + CSRF), with NO fresh wallet/passkey signature. This is what removes
+/// the "multiple authentications" defect: one re-auth covers the whole session.
+async fn account_action_handler(
+    State(state): State<AppState>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
+    Json(req): Json<account::AccountActionRequest>,
+) -> Result<(axum::http::HeaderMap, Json<account::AccountActionResponse>), CustomError> {
+    let token = account_session_token(&cookies);
+    let synapse = state.synapse_client.as_deref();
+    let response = account::account_action(
+        &state.redis_client,
+        token,
+        req,
+        synapse,
+        state.config.matrix_server_name.as_deref(),
+    )
+    .await?;
+
+    let mut headers = axum::http::HeaderMap::new();
+    if outcome_is_terminal(&response.outcome) {
+        if let Some(t) = token {
+            account::destroy_account_session(&state.redis_client, t).await;
+        }
+        if let Ok(v) =
+            axum::http::HeaderValue::from_str(&account_cookie_clear(&state.config.base_url))
+        {
+            headers.insert(axum::http::header::SET_COOKIE, v);
+        }
+    }
+    Ok((headers, Json(response)))
 }
 
 async fn account_passkey_start_handler(
@@ -571,7 +684,7 @@ async fn account_passkey_start_handler(
 async fn account_passkey_finish_handler(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
-) -> Result<Json<account::AccountActionResponse>, CustomError> {
+) -> Result<(axum::http::HeaderMap, Json<account::AccountActionResponse>), CustomError> {
     let action = payload
         .get("action")
         .and_then(|v| v.as_str())
@@ -594,7 +707,7 @@ async fn account_passkey_finish_handler(
         device_id,
         credential: payload.clone(),
     };
-    let resp = account::account_passkey_finish(
+    let authed = account::account_passkey_finish(
         &state.redis_client,
         session_id,
         &state.rp_id,
@@ -604,7 +717,7 @@ async fn account_passkey_finish_handler(
         state.config.matrix_server_name.as_deref(),
     )
     .await?;
-    Ok(Json(resp))
+    authed_action_response(&state, authed).await
 }
 
 // -- Application entry point -----------------------------------------------
@@ -758,6 +871,7 @@ pub async fn main() {
         // MSC4191/MSC4312: account management + cross-signing reset
         .route("/account", get(account_page_handler))
         .route("/account/wallet", post(account_wallet_handler))
+        .route("/account/action", post(account_action_handler))
         .route(
             "/account/passkey/start",
             post(account_passkey_start_handler),
@@ -778,6 +892,17 @@ pub async fn main() {
             post(compat::revoke).with_state(compat_state.clone()),
         )
         .route("/_matrix/client/v3/login", get(compat::login_flows))
+        // Legacy CS-API device management (in-client session manager). Effective
+        // only when the deployment proxies these paths to siwx-oidc; harmless
+        // otherwise. See docs/2026-06-14-account-management-e2e-findings.md.
+        .route(
+            "/_matrix/client/v3/devices/{device_id}",
+            delete(compat::delete_device).with_state(compat_state.clone()),
+        )
+        .route(
+            "/_matrix/client/v3/delete_devices",
+            post(compat::delete_devices).with_state(compat_state.clone()),
+        )
         .route(
             "/_matrix/client/v3/logout",
             post(compat::logout).with_state(compat_state.clone()),

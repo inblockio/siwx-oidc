@@ -1,0 +1,5 @@
+browser/node_modules/
+browser/package-lock.json
+browser/test-results/
+browser/playwright-report/
+*.log

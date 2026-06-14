@@ -7,14 +7,94 @@
 //! - `POST /account/passkey/finish` — finish passkey auth + action execution
 
 use axum::response::Html;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::config::Config;
 use crate::oidc::{did_to_localpart, CustomError};
 use crate::synapse_client::{DeviceInfo, SynapseClient};
 use crate::webauthn as wa;
 use siwx_oidc::db::RedisClient;
+
+// -- Authenticated account-management session ---------------------------------
+//
+// The account page is a sequence of sensitive actions (list sessions, sign one
+// out, view the profile, erase). Requiring a fresh wallet/passkey signature for
+// EACH action is the "multiple authentications" defect. Instead, the first
+// successful re-auth mints a short-lived session bound to the verified DID; the
+// page then executes subsequent actions against `POST /account/action` carrying
+// only the session cookie (no new signature) until it expires.
+//
+// Security: the cookie is HttpOnly + SameSite=Strict + Path=/account and lives
+// for [`ACCOUNT_SESSION_TTL`] only. Every action POST must also echo the
+// session's CSRF token (defence in depth on top of SameSite=Strict). The session
+// is bound to one verified DID and never grants cross-user access.
+
+/// Cookie name for the authenticated account-management session.
+pub const ACCOUNT_SESSION_COOKIE: &str = "acct_session";
+/// Redis key prefix for stored account sessions.
+const ACCOUNT_SESSION_PREFIX: &str = "account_session";
+/// How long one re-auth keeps the account page authenticated (seconds).
+pub const ACCOUNT_SESSION_TTL: u64 = 600; // 10 minutes
+
+/// A short-lived authenticated account-management session.
+#[derive(Serialize, Deserialize)]
+pub struct AccountSession {
+    /// The verified DID this session acts as.
+    pub did: String,
+    /// CSRF token that every `/account/action` POST must echo.
+    pub csrf: String,
+    /// Absolute Unix-seconds expiry (defence in depth on top of the Redis TTL).
+    pub exp: i64,
+}
+
+/// Mint a fresh account session bound to `did`, store it in Redis (TTL
+/// [`ACCOUNT_SESSION_TTL`]), and return `(session_token, csrf_token)`.
+pub async fn create_account_session(
+    db: &RedisClient,
+    did: &str,
+) -> Result<(String, String), CustomError> {
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let csrf = Uuid::new_v4().simple().to_string();
+    let session = AccountSession {
+        did: did.to_string(),
+        csrf: csrf.clone(),
+        exp: Utc::now().timestamp() + ACCOUNT_SESSION_TTL as i64,
+    };
+    let json = serde_json::to_string(&session)
+        .map_err(|e| anyhow::anyhow!("serialize account session: {e}"))?;
+    db.set_ex_raw(
+        &format!("{}/{}", ACCOUNT_SESSION_PREFIX, token),
+        &json,
+        ACCOUNT_SESSION_TTL,
+    )
+    .await?;
+    Ok((token, csrf))
+}
+
+/// Look up a live account session by token, or `None` if it is missing, expired,
+/// or unreadable (fail-safe: any failure forces a fresh re-auth).
+pub async fn lookup_account_session(db: &RedisClient, token: &str) -> Option<AccountSession> {
+    let raw = db
+        .get_raw(&format!("{}/{}", ACCOUNT_SESSION_PREFIX, token))
+        .await
+        .ok()??;
+    let session: AccountSession = serde_json::from_str(&raw).ok()?;
+    if session.exp < Utc::now().timestamp() {
+        return None;
+    }
+    Some(session)
+}
+
+/// Delete an account session (used after a terminal action like erase/deactivate
+/// invalidates the identity it was bound to). Best-effort.
+pub async fn destroy_account_session(db: &RedisClient, token: &str) {
+    let _ = db
+        .del_raw(&format!("{}/{}", ACCOUNT_SESSION_PREFIX, token))
+        .await;
+}
 
 // -- Request/response types ---------------------------------------------------
 
@@ -49,13 +129,37 @@ pub struct AccountPasskeyFinishRequest {
     pub credential: serde_json::Value,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct AccountActionResponse {
     pub status: String,
     pub action: String,
+    /// CSRF token for the active account session, returned so the page JS can
+    /// drive subsequent `POST /account/action` calls without a new signature.
+    /// Present only when this response established/continued a session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub csrf: Option<String>,
     /// What the (re-authenticated) action produced, for the page to render.
     #[serde(flatten)]
     pub outcome: ActionOutcome,
+}
+
+/// A successfully re-authenticated action plus the verified DID it ran as, so the
+/// route handler can mint the account session cookie.
+pub struct AuthedAction {
+    pub response: AccountActionResponse,
+    pub did: String,
+}
+
+/// Body of `POST /account/action`: execute an action using the existing account
+/// session (no fresh signature). The session cookie carries the identity; `csrf`
+/// must match the session's stored token.
+#[derive(Deserialize)]
+pub struct AccountActionRequest {
+    pub action: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub csrf: Option<String>,
 }
 
 /// The result of a successfully executed account action, tagged by `kind` so
@@ -251,7 +355,7 @@ async fn execute_action(
                 .await
                 .map_err(|e| {
                     warn!(error = %e, "list_devices failed during account action");
-                    CustomError::BadRequest("Failed to list devices".to_string())
+                    CustomError::BadRequest(format!("Failed to list devices: {e}"))
                 })?;
             Ok(ActionOutcome::Devices { devices })
         }
@@ -264,10 +368,16 @@ async fn execute_action(
                 .await
                 .map_err(|e| {
                     warn!(error = %e, "get_device failed during account action");
-                    CustomError::BadRequest("Failed to fetch device".to_string())
+                    CustomError::BadRequest(
+                        "Could not reach the homeserver to fetch this device".to_string(),
+                    )
                 })?
                 // get_device is scoped to this user, so a missing/foreign id is "not found".
-                .ok_or_else(|| CustomError::BadRequest("Device not found".to_string()))?;
+                .ok_or_else(|| {
+                    CustomError::BadRequest(
+                        "That device is not among your active sessions".to_string(),
+                    )
+                })?;
             Ok(ActionOutcome::Device { device })
         }
         Action::DeviceDelete => {
@@ -281,11 +391,15 @@ async fn execute_action(
                 .await
                 .map_err(|e| {
                     warn!(error = %e, "get_device (pre-delete) failed during account action");
-                    CustomError::BadRequest("Failed to verify device".to_string())
+                    CustomError::BadRequest(
+                        "Could not reach the homeserver to verify this device".to_string(),
+                    )
                 })?
                 .is_some();
             if !owned {
-                return Err(CustomError::BadRequest("Device not found".to_string()));
+                return Err(CustomError::BadRequest(
+                    "That device is not among your active sessions".to_string(),
+                ));
             }
             synapse
                 .delete_device(&localpart, device_id, server)
@@ -318,7 +432,7 @@ async fn execute_action(
                 .await
                 .map_err(|e| {
                     warn!(error = %e, "deactivate_user failed during account action");
-                    CustomError::BadRequest("Failed to deactivate account".to_string())
+                    CustomError::BadRequest(format!("Failed to deactivate account: {e}"))
                 })?;
             // Revoke ALL of the user's OAuth sessions so introspection reports every
             // session inactive (Synapse deactivate already drops Synapse-side tokens).
@@ -342,7 +456,7 @@ async fn execute_action(
                 .await
                 .map_err(|e| {
                     warn!(error = %e, "deactivate_user(erase=true) failed during account action");
-                    CustomError::BadRequest("Failed to erase account".to_string())
+                    CustomError::BadRequest(format!("Failed to erase account: {e}"))
                 })?;
             // Revoke ALL OAuth sessions (best-effort) so introspection reports
             // every session inactive.
@@ -408,7 +522,7 @@ pub async fn account_wallet(
     synapse_client: Option<&SynapseClient>,
     db_client: &RedisClient,
     server_name: Option<&str>,
-) -> Result<AccountActionResponse, CustomError> {
+) -> Result<AuthedAction, CustomError> {
     let action = parse_action(&req.action)?;
 
     let sig_hex = req.signature.strip_prefix("0x").unwrap_or(&req.signature);
@@ -448,10 +562,14 @@ pub async fn account_wallet(
     )
     .await?;
 
-    Ok(AccountActionResponse {
-        status: "completed".to_string(),
-        action: req.action,
-        outcome,
+    Ok(AuthedAction {
+        response: AccountActionResponse {
+            status: "completed".to_string(),
+            action: req.action,
+            csrf: None,
+            outcome,
+        },
+        did: req.did,
     })
 }
 
@@ -466,7 +584,7 @@ pub async fn account_passkey_finish(
     req: AccountPasskeyFinishRequest,
     synapse_client: Option<&SynapseClient>,
     server_name: Option<&str>,
-) -> Result<AccountActionResponse, CustomError> {
+) -> Result<AuthedAction, CustomError> {
     let action = parse_action(&req.action)?;
 
     let auth_response: webauthn_rs::prelude::PublicKeyCredential =
@@ -487,9 +605,61 @@ pub async fn account_passkey_finish(
     )
     .await?;
 
+    Ok(AuthedAction {
+        response: AccountActionResponse {
+            status: "completed".to_string(),
+            action: req.action,
+            csrf: None,
+            outcome,
+        },
+        did: resp.did,
+    })
+}
+
+// -- Session-backed action (no fresh signature) -------------------------------
+
+/// Execute an account action using an existing authenticated account session
+/// (the [`ACCOUNT_SESSION_COOKIE`] established by a prior wallet/passkey re-auth),
+/// so the user does not have to sign again for every action.
+///
+/// `session_token` is the cookie value; `csrf` is the token the page echoed.
+/// Fails closed: a missing/expired session is `Unauthorized` (the page falls
+/// back to re-auth), a CSRF mismatch is `Unauthorized` as well.
+pub async fn account_action(
+    db_client: &RedisClient,
+    session_token: Option<&str>,
+    req: AccountActionRequest,
+    synapse_client: Option<&SynapseClient>,
+    server_name: Option<&str>,
+) -> Result<AccountActionResponse, CustomError> {
+    let action = parse_action(&req.action)?;
+
+    let token =
+        session_token.ok_or_else(|| CustomError::Unauthorized("No account session".to_string()))?;
+    let session = lookup_account_session(db_client, token)
+        .await
+        .ok_or_else(|| CustomError::Unauthorized("Account session expired".to_string()))?;
+
+    // CSRF: the page must echo the session's token (defence in depth over
+    // SameSite=Strict). Constant work either way; a mismatch is unauthorized.
+    if req.csrf.as_deref() != Some(session.csrf.as_str()) {
+        return Err(CustomError::Unauthorized("CSRF token mismatch".to_string()));
+    }
+
+    let outcome = execute_action(
+        action,
+        req.device_id.as_deref(),
+        &session.did,
+        synapse_client,
+        db_client,
+        server_name,
+    )
+    .await?;
+
     Ok(AccountActionResponse {
         status: "completed".to_string(),
         action: req.action,
+        csrf: Some(session.csrf),
         outcome,
     })
 }
@@ -560,46 +730,131 @@ fn danger_gate_html(checkbox_id: &str, warning: &str, confirm_label: &str) -> St
     )
 }
 
-/// Build the inner HTML of `#auth-section`, keyed on the (canonical) action.
-///
-/// Three shapes, collapsing every action onto one rendering path:
-/// - empty action: an account-home MENU of plain links (no signature, no auth
-///   buttons, so `authWallet` is never invoked with an empty action);
-/// - account_deactivate / account_erase: a danger confirmation gate (warning +
-///   checkbox) above the auth buttons, which start `disabled` until the box is
-///   checked. Erase uses stronger, irreversible-erasure copy than deactivate;
-/// - any other action (incl. account_reactivate): the plain wallet/passkey
-///   buttons (unchanged behaviour).
-fn auth_section_html(action_opt: Option<Action>, action_is_empty: bool, base: &str) -> String {
-    if action_is_empty {
-        return format!(
-            r##"<div class="menu-list">
+/// An already-authenticated single-click action button (no signature). `id` is
+/// `btn-confirm`, which the page JS wires to `confirmAction()`. Used when the
+/// account session is live, so a destructive action needs one click, not a fresh
+/// wallet/passkey ceremony.
+fn authed_confirm_button_html(label: &str, danger: bool, disabled: bool) -> String {
+    let cls = if danger {
+        "btn btn-danger"
+    } else {
+        "btn btn-primary"
+    };
+    let attr = if disabled { " disabled" } else { "" };
+    format!(
+        r##"<button class="{cls}" id="btn-confirm" onclick="confirmAction()"{attr}>
+          <span>{label}</span>
+        </button>"##
+    )
+}
+
+/// An already-authenticated danger gate: warning + confirm checkbox gating a
+/// single confirm button (no signature). The checkbox `id` matches the
+/// non-authenticated gate so the page JS gate wiring is shared.
+fn danger_gate_authed_html(
+    checkbox_id: &str,
+    warning: &str,
+    confirm_label: &str,
+    button_label: &str,
+) -> String {
+    format!(
+        r##"<div class="warning-box">
+          {warning}
+        </div>
+        <label class="confirm-label">
+          <input type="checkbox" id="{checkbox_id}">
+          <span>{confirm_label}</span>
+        </label>
+        {button}"##,
+        button = authed_confirm_button_html(button_label, true, true)
+    )
+}
+
+/// The account-home menu of links (shown for the empty/landing action).
+fn menu_html(base: &str) -> String {
+    format!(
+        r##"<div class="menu-list">
           <a class="btn btn-secondary" href="{base}/account?action=org.matrix.profile">Your account</a>
           <a class="btn btn-secondary" href="{base}/account?action=org.matrix.devices_list">Your sessions</a>
           <a class="btn btn-danger" href="{base}/account?action=org.matrix.account_deactivate">Deactivate account</a>
           <a class="btn btn-danger" href="{base}/account?action=org.matrix.account_erase">Erase account</a>
           <a class="btn btn-secondary" href="{base}/account?action=org.matrix.account_reactivate">Reactivate account</a>
         </div>"##,
-            base = base
-        );
+        base = base
+    )
+}
+
+/// Build the inner HTML of `#auth-section`, keyed on the (canonical) action and
+/// whether an account session is already live (`authed`).
+///
+/// - empty action: the account-home MENU of links (both states);
+/// - `authed == false`: the original re-auth shapes (wallet/passkey buttons, or a
+///   danger gate above them for deactivate/erase);
+/// - `authed == true`: NO signature needed. Destructive actions render a single
+///   confirm button (gated by the danger checkbox for deactivate/erase); the
+///   read actions render a placeholder and the page JS auto-runs them.
+fn auth_section_html(
+    action_opt: Option<Action>,
+    action_is_empty: bool,
+    base: &str,
+    authed: bool,
+) -> String {
+    if action_is_empty {
+        return menu_html(base);
     }
 
+    if !authed {
+        return match action_opt {
+            Some(Action::AccountDeactivate) => danger_gate_html(
+                "confirm-deactivate",
+                "This permanently deactivates your Matrix account and signs you out of every session. This cannot be undone.",
+                "I understand this is permanent",
+            ),
+            Some(Action::AccountErase) => danger_gate_html(
+                "confirm-erase",
+                "This is irreversible. Erasing your account permanently deletes your profile, media, and room memberships, and signs you out of every session. This cannot be undone.",
+                "I understand my account and all its data will be permanently erased",
+            ),
+            _ => auth_buttons_html(false),
+        };
+    }
+
+    // Authenticated: reuse the live session, no fresh signature.
     match action_opt {
-        Some(Action::AccountDeactivate) => danger_gate_html(
+        Some(Action::AccountDeactivate) => danger_gate_authed_html(
             "confirm-deactivate",
             "This permanently deactivates your Matrix account and signs you out of every session. This cannot be undone.",
             "I understand this is permanent",
+            "Deactivate my account",
         ),
-        Some(Action::AccountErase) => danger_gate_html(
+        Some(Action::AccountErase) => danger_gate_authed_html(
             "confirm-erase",
             "This is irreversible. Erasing your account permanently deletes your profile, media, and room memberships, and signs you out of every session. This cannot be undone.",
             "I understand my account and all its data will be permanently erased",
+            "Erase my account",
         ),
-        _ => auth_buttons_html(false),
+        Some(Action::DeviceDelete) => authed_confirm_button_html("Sign out this device", true, false),
+        // Read actions + benign actions: the page JS auto-runs them on load.
+        _ => r##"<p class="subtitle" id="auto-hint">Loading…</p>"##.to_string(),
     }
 }
 
+/// Render the account page with no active session (the common unauthenticated
+/// entry, and the signature used by the page-rendering unit tests).
+#[allow(dead_code)]
 pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
+    account_page_inner(query, base_url, None)
+}
+
+/// Render the account page. `authed_csrf` is `Some(csrf)` when the request
+/// carried a live account session, which switches the page into "already
+/// authenticated" mode: no fresh signature, and subsequent actions are driven
+/// in-page against `POST /account/action` carrying `csrf`.
+pub fn account_page_inner(
+    query: AccountPageQuery,
+    base_url: &str,
+    authed_csrf: Option<&str>,
+) -> Html<String> {
     let action = query
         .action
         .as_deref()
@@ -643,9 +898,16 @@ pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
         None => ("Account action", "Authenticate to continue."),
     };
 
-    // Body of #auth-section depends on the action: menu (empty), danger
-    // confirmation gate (account_deactivate), or the plain auth buttons.
-    let auth_section = auth_section_html(canonical_action(&action), action.is_empty(), base);
+    // Body of #auth-section depends on the action AND whether a session is live:
+    // menu (empty), re-auth buttons / danger gate (unauthenticated), or a
+    // single-click confirm / auto-run (authenticated).
+    let authenticated = authed_csrf.is_some();
+    let auth_section = auth_section_html(
+        canonical_action(&action),
+        action.is_empty(),
+        base,
+        authenticated,
+    );
 
     let html = format!(
         r##"<!DOCTYPE html>
@@ -658,7 +920,7 @@ pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
 <link href="https://api.fontshare.com/css?f[]=satoshi@300,400,500,700,900&display=swap" rel="stylesheet">
 <style>{css}</style>
 </head>
-<body data-action="{action}" data-base="{base}" data-device-id="{device_id}">
+<body data-action="{action}" data-base="{base}" data-device-id="{device_id}" data-authenticated="{authenticated}" data-csrf="{csrf}">
 <div class="login-page">
   <div class="ambient-glow"></div>
   <div class="login-card">
@@ -714,6 +976,8 @@ pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
         action = action,
         base = base,
         device_id = device_id,
+        authenticated = authenticated,
+        csrf = authed_csrf.unwrap_or(""),
         auth_section = auth_section,
     );
     Html(html)
@@ -1020,9 +1284,56 @@ const ACCOUNT_PAGE_JS: &str = r#"
 const BASE = document.body.dataset.base;
 const ACTION = document.body.dataset.action;
 const DEVICE_ID = document.body.dataset.deviceId || '';
+// Session state: set by the server on load (returning visit), or by the first
+// re-auth response (this visit). Once authenticated, actions run against
+// /account/action with the CSRF token and no fresh signature.
+let AUTHED = document.body.dataset.authenticated === 'true';
+let CSRF = document.body.dataset.csrf || '';
 const $ = (id) => document.getElementById(id);
 
 const CHECK_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="success-icon"><path fill-rule="evenodd" d="M2.25 12c0-5.385 4.365-9.75 9.75-9.75s9.75 4.365 9.75 9.75-4.365 9.75-9.75 9.75S2.25 17.385 2.25 12Zm13.36-1.814a.75.75 0 1 0-1.22-.872l-3.236 4.53L9.53 12.22a.75.75 0 0 0-1.06 1.06l2.25 2.25a.75.75 0 0 0 1.14-.094l3.75-5.25Z" clip-rule="evenodd"/></svg>';
+
+// -- Session-backed action (no fresh signature) ------------------------------
+// Runs an action against the live account session. Returns true on success.
+async function accountAction(action, deviceId) {
+  hideStatus();
+  try {
+    const r = await fetch(BASE + '/account/action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: action, device_id: deviceId || null, csrf: CSRF })
+    });
+    if (r.ok) {
+      const data = await r.json();
+      if (data.csrf) CSRF = data.csrf;
+      renderOutcome(data);
+      return true;
+    }
+    if (r.status === 401) {
+      // Session expired/invalid: drop back to a fresh re-auth.
+      AUTHED = false;
+      showReauth('Your session expired — please authenticate again.');
+      return false;
+    }
+    showStatus((await r.text()) || 'Action failed.');
+    return false;
+  } catch (e) {
+    showStatus('Error: ' + (e.message || e));
+    return false;
+  }
+}
+
+// Single-click confirm button (authenticated device_delete / deactivate / erase).
+function confirmAction() {
+  setBusy('btn-confirm', true, 'Working...');
+  accountAction(ACTION, DEVICE_ID).finally(() => setBusy('btn-confirm', false));
+}
+
+// Session gone: reload so the page renders the unauthenticated re-auth buttons.
+function showReauth(msg) {
+  if (msg) showStatus(msg);
+  setTimeout(() => { try { location.reload(); } catch (_) {} }, 1200);
+}
 
 async function authWallet() {
   hideStatus();
@@ -1045,7 +1356,9 @@ async function authWallet() {
       body: JSON.stringify({ action: ACTION, did, message, signature, device_id: DEVICE_ID || null })
     });
     if (r.ok) {
-      renderOutcome(await r.json());
+      const data = await r.json();
+      AUTHED = true; if (data.csrf) CSRF = data.csrf;
+      renderOutcome(data);
     } else {
       const t = await r.text();
       showStatus(t || 'Action failed.');
@@ -1098,7 +1411,9 @@ async function authPasskey() {
       })
     });
     if (finishR.ok) {
-      renderOutcome(await finishR.json());
+      const data = await finishR.json();
+      AUTHED = true; if (data.csrf) CSRF = data.csrf;
+      renderOutcome(data);
     } else {
       const t = await finishR.text();
       showStatus(t || 'Passkey authentication failed.');
@@ -1141,8 +1456,9 @@ function renderOutcome(data) {
       break;
     case 'deleted':
       showTerminal('Session signed out', 'This device can no longer access your account.', false);
+      // Stay in-session: re-list without a fresh signature.
       $('terminal-actions').innerHTML =
-        '<a class="btn btn-secondary" href="' + actionUrl('org.matrix.devices_list', null) + '">Back to your sessions</a>';
+        '<button class="btn btn-secondary" data-act="org.matrix.devices_list">Back to your sessions</button>';
       break;
     case 'deactivated':
       showTerminal('Account deactivated', 'Your account has been deactivated and you have been signed out everywhere.', false);
@@ -1176,8 +1492,8 @@ function deviceRow(d) {
     '<div class="device-name">' + name + '</div>' +
     '<div class="device-sub">' + esc(d.device_id) + ' &middot; ' + esc(lastSeen(d)) + ip + '</div>' +
     '</div><div class="device-actions">' +
-    '<a class="btn-link" href="' + actionUrl('org.matrix.device_view', d.device_id) + '">View</a>' +
-    '<a class="btn-link danger" href="' + actionUrl('org.matrix.device_delete', d.device_id) + '">Sign out</a>' +
+    '<button class="btn-link" data-act="org.matrix.device_view" data-dev="' + esc(d.device_id) + '">View</button>' +
+    '<button class="btn-link danger" data-act="org.matrix.device_delete" data-dev="' + esc(d.device_id) + '">Sign out</button>' +
     '</div></div>';
 }
 
@@ -1197,7 +1513,7 @@ function renderDevice(d) {
       infoRow('Last seen', lastSeen(d)) +
       (d.last_seen_ip ? infoRow('Last IP', d.last_seen_ip) : '') +
     '</div>' +
-    '<a class="btn btn-danger" href="' + actionUrl('org.matrix.device_delete', d.device_id) + '">Sign out this session</a>');
+    '<button class="btn btn-danger" data-act="org.matrix.device_delete" data-dev="' + esc(d.device_id) + '">Sign out this session</button>');
 }
 
 function showResult(html) {
@@ -1261,22 +1577,46 @@ function bufferToBase64(buf) {
   return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-// Danger confirmation gate (deactivate or erase): keep the auth buttons disabled
-// until the user ticks the confirm box. The buttons already start disabled from
-// the server; this only matters before the first click (after that, setBusy owns
-// the disabled state). Both gates share this wiring; only the checkbox id differs
-// (confirm-deactivate vs confirm-erase).
+// Danger confirmation gate (deactivate or erase): keep the action buttons
+// disabled until the user ticks the confirm box. Covers BOTH the unauthenticated
+// re-auth buttons (btn-wallet/btn-passkey) and the authenticated single-click
+// confirm button (btn-confirm). Only the checkbox id differs per gate.
 (function () {
   const cb = $('confirm-deactivate') || $('confirm-erase');
   if (!cb) return;
   const sync = () => {
-    ['btn-wallet', 'btn-passkey'].forEach((id) => {
+    ['btn-wallet', 'btn-passkey', 'btn-confirm'].forEach((id) => {
       const b = $(id);
       if (b) b.disabled = !cb.checked;
     });
   };
   cb.addEventListener('change', sync);
   sync();
+})();
+
+// In-page session actions: device View/Sign out buttons and the "back to
+// sessions" button carry data-act/data-dev and run against the live session
+// (no navigation, no fresh signature).
+document.addEventListener('click', (ev) => {
+  const b = ev.target.closest('[data-act]');
+  if (!b) return;
+  ev.preventDefault();
+  accountAction(b.getAttribute('data-act'), b.getAttribute('data-dev') || null);
+});
+
+// Authenticated landing: read actions auto-run on load (no button); destructive
+// actions render their own single confirm button (handled above). The empty
+// landing action shows the menu, which navigates normally.
+(function () {
+  if (!AUTHED || !ACTION) return;
+  const AUTO_RUN = [
+    'org.matrix.profile',
+    'org.matrix.devices_list', 'org.matrix.sessions_list',
+    'org.matrix.device_view', 'org.matrix.session_view',
+    'org.matrix.account_reactivate',
+    'org.matrix.cross_signing_reset'
+  ];
+  if (AUTO_RUN.indexOf(ACTION) !== -1) accountAction(ACTION, DEVICE_ID);
 })();
 "#;
 
@@ -1959,6 +2299,7 @@ mod tests {
         let resp = AccountActionResponse {
             status: "completed".to_string(),
             action: "org.matrix.device_view".to_string(),
+            csrf: None,
             outcome: ActionOutcome::Device {
                 device: DeviceInfo {
                     device_id: "DEV".to_string(),
@@ -2162,5 +2503,106 @@ mod tests {
         )
         .await;
         assert!(err.is_err(), "device_view requires server_name");
+    }
+
+    // -- Account session + session-backed action (Fix C) ----------------------
+
+    #[tokio::test]
+    async fn account_session_roundtrips_and_unknown_token_is_none() {
+        let Some(redis) = test_redis().await else {
+            return;
+        };
+        let did = "did:pkh:eip155:1:0xSESSION";
+        let (token, csrf) = create_account_session(&redis, did).await.unwrap();
+        let s = lookup_account_session(&redis, &token)
+            .await
+            .expect("freshly created session must be found");
+        assert_eq!(s.did, did);
+        assert_eq!(s.csrf, csrf);
+        assert!(
+            lookup_account_session(&redis, "no-such-token")
+                .await
+                .is_none(),
+            "an unknown token must not resolve to a session"
+        );
+        destroy_account_session(&redis, &token).await;
+        assert!(
+            lookup_account_session(&redis, &token).await.is_none(),
+            "a destroyed session must not resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_action_requires_a_session() {
+        let Some(redis) = test_redis().await else {
+            return;
+        };
+        let err = account_action(
+            &redis,
+            None, // no session cookie
+            AccountActionRequest {
+                action: "org.matrix.profile".to_string(),
+                device_id: None,
+                csrf: None,
+            },
+            None,
+            Some("matrix.test"),
+        )
+        .await;
+        assert!(
+            matches!(err, Err(CustomError::Unauthorized(_))),
+            "no session must be Unauthorized, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_action_rejects_csrf_mismatch() {
+        let Some(redis) = test_redis().await else {
+            return;
+        };
+        let (token, _csrf) = create_account_session(&redis, "did:pkh:eip155:1:0xCSRF")
+            .await
+            .unwrap();
+        let err = account_action(
+            &redis,
+            Some(&token),
+            AccountActionRequest {
+                action: "org.matrix.profile".to_string(),
+                device_id: None,
+                csrf: Some("wrong-token".to_string()),
+            },
+            None,
+            Some("matrix.test"),
+        )
+        .await;
+        assert!(
+            matches!(err, Err(CustomError::Unauthorized(_))),
+            "csrf mismatch must be Unauthorized, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_action_with_valid_session_runs_without_signature() {
+        let Some(redis) = test_redis().await else {
+            return;
+        };
+        let did = "did:pkh:eip155:1:0xRUN";
+        let (token, csrf) = create_account_session(&redis, did).await.unwrap();
+        // Profile needs only server_name (no Synapse), so it exercises the
+        // session+csrf path end-to-end without a network dependency.
+        let resp = account_action(
+            &redis,
+            Some(&token),
+            AccountActionRequest {
+                action: "org.matrix.profile".to_string(),
+                device_id: None,
+                csrf: Some(csrf),
+            },
+            None,
+            Some("matrix.test"),
+        )
+        .await
+        .expect("valid session + csrf must execute the action");
+        assert!(matches!(resp.outcome, ActionOutcome::Profile { .. }));
     }
 }

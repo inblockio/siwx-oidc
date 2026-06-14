@@ -30,6 +30,17 @@ fn matrix_user_id(localpart: &str, server_name: &str) -> String {
     format!("@{}:{}", localpart, server_name)
 }
 
+/// A human hint appended to admin-API error messages so an auth failure (the
+/// shared secret is not accepted as Synapse's `admin_token`) is never mistaken
+/// for a missing device / absent user. Empty for non-auth failures.
+fn admin_status_hint(status: reqwest::StatusCode) -> &'static str {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        " — Synapse rejected the admin token (check that the MAS shared secret is also Synapse's admin_token)"
+    } else {
+        ""
+    }
+}
+
 /// Client for Synapse's MAS (Matrix Authentication Service) compatibility endpoints.
 ///
 /// All requests use Bearer authentication with a shared secret configured in
@@ -236,7 +247,7 @@ impl SynapseClient {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             warn!(%status, %body, "list_devices failed");
-            anyhow::bail!("list_devices: HTTP {status}");
+            anyhow::bail!("list_devices: HTTP {status}{}", admin_status_hint(status));
         }
 
         #[derive(Deserialize)]
@@ -297,7 +308,7 @@ impl SynapseClient {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             warn!(%status, %body, "delete_device failed");
-            anyhow::bail!("delete_device: HTTP {status}");
+            anyhow::bail!("delete_device: HTTP {status}{}", admin_status_hint(status));
         }
         Ok(())
     }
@@ -341,7 +352,10 @@ impl SynapseClient {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             warn!(%status, %body, "deactivate_user failed");
-            anyhow::bail!("deactivate_user: HTTP {status}");
+            anyhow::bail!(
+                "deactivate_user: HTTP {status}{}",
+                admin_status_hint(status)
+            );
         }
         Ok(())
     }
