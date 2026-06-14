@@ -1248,6 +1248,14 @@ html, body {
 }
 .device-actions { display: flex; gap: 12px; flex-shrink: 0; }
 .btn-link {
+  appearance: none;
+  -webkit-appearance: none;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font-family: inherit;
+  line-height: inherit;
   font-size: 13px;
   font-weight: 600;
   color: var(--accent-strong);
