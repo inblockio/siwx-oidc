@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::oidc::{did_to_localpart, CustomError};
+use crate::oidc::{constant_time_eq, did_to_localpart, CustomError};
 use crate::synapse_client::{DeviceInfo, SynapseClient};
 use crate::webauthn as wa;
 use siwx_oidc::db::RedisClient;
@@ -657,8 +657,10 @@ pub async fn account_action(
         .ok_or_else(|| CustomError::Unauthorized("Account session expired".to_string()))?;
 
     // CSRF: the page must echo the session's token (defence in depth over
-    // SameSite=Strict). Constant work either way; a mismatch is unauthorized.
-    if req.csrf.as_deref() != Some(session.csrf.as_str()) {
+    // SameSite=Strict). Compared in constant time — `constant_time_eq` checks
+    // equal length first then `ct_eq`s the bytes, so it does not short-circuit
+    // on the first differing byte. A mismatch (or absent token) is unauthorized.
+    if !constant_time_eq(req.csrf.as_deref().unwrap_or(""), session.csrf.as_str()) {
         return Err(CustomError::Unauthorized("CSRF token mismatch".to_string()));
     }
 

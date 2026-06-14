@@ -24,7 +24,7 @@ use openidconnect::{
 };
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
-    pkcs8::{DecodePrivateKey, EncodePrivateKey},
+    pkcs8::DecodePrivateKey,
 };
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,7 @@ use crate::synapse_client::SynapseClient;
 use crate::introspect::generate_opaque_token;
 
 /// Constant-time string comparison to prevent timing attacks on secrets.
-fn constant_time_eq(a: &str, b: &str) -> bool {
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
@@ -98,12 +98,15 @@ impl EcdsaSigningKey {
         Self { key, kid }
     }
 
-    pub fn to_pem(&self) -> Result<String> {
-        let pem = self
-            .key
-            .to_pkcs8_pem(Default::default())
-            .map_err(|e| anyhow!("Failed to encode key as PEM: {}", e))?;
-        Ok(pem.to_string())
+    /// Non-sensitive identifier for the signing key: the first 16 hex chars of a
+    /// SHA-256 over the SEC1-encoded *public* key. Safe to log — it reveals no
+    /// private material but lets operators correlate which ephemeral key is live.
+    pub fn public_key_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let pubkey = self.key.verifying_key().to_encoded_point(false);
+        let digest = Sha256::digest(pubkey.as_bytes());
+        let hex = hex::encode(digest);
+        hex[..16].to_string()
     }
 }
 
