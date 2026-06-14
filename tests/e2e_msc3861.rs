@@ -211,8 +211,13 @@ async fn perform_auth_flow() -> AuthResult {
     let domain = query.get("domain").expect("redirect must contain domain");
     eprintln!("[e2e] nonce={}, domain={}", nonce, domain);
 
-    // 4. Build a CAIP-122 (EIP-4361) message.
-    let issued_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    // 4. Build a CAIP-122 (EIP-4361) message. The login path now enforces the
+    //    Expiration Time (C1 safe subset), exactly as the real Svelte frontend
+    //    already sets it (48h via createSiweMessage), so set a future exp.
+    let now = Utc::now();
+    let issued_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let expiration_time =
+        (now + chrono::Duration::hours(48)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let message = format!(
         "{domain} wants you to sign in with your Ethereum account:\n\
          {address}\n\n\
@@ -222,6 +227,7 @@ async fn perform_auth_flow() -> AuthResult {
          Chain ID: 1\n\
          Nonce: {nonce}\n\
          Issued At: {issued_at}\n\
+         Expiration Time: {expiration_time}\n\
          Resources:\n\
          - {redirect_uri}",
         domain = domain,
@@ -229,6 +235,7 @@ async fn perform_auth_flow() -> AuthResult {
         base = base,
         nonce = nonce,
         issued_at = issued_at,
+        expiration_time = expiration_time,
         redirect_uri = redirect_uri,
     );
 
@@ -643,7 +650,10 @@ async fn returning_user_new_device() {
         let nonce = query.get("nonce").unwrap();
         let domain = query.get("domain").unwrap();
 
-        let issued_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let now = Utc::now();
+        let issued_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let expiration_time = (now + chrono::Duration::hours(48))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let message = format!(
             "{domain} wants you to sign in with your Ethereum account:\n\
              {address}\n\n\
@@ -653,6 +663,7 @@ async fn returning_user_new_device() {
              Chain ID: 1\n\
              Nonce: {nonce}\n\
              Issued At: {issued_at}\n\
+             Expiration Time: {expiration_time}\n\
              Resources:\n\
              - {redirect_uri}",
             domain = domain,
@@ -660,6 +671,7 @@ async fn returning_user_new_device() {
             base = base,
             nonce = nonce,
             issued_at = issued_at,
+            expiration_time = expiration_time,
             redirect_uri = redirect_uri,
         );
 

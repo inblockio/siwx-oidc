@@ -797,7 +797,26 @@ async fn token_authorization_code(
         })
     })?;
 
-    let client_id = if let Some(c) = form.client_id.clone() {
+    // C2 Step 1: bind the auth code to the client it was issued to. A correct
+    // client presents the same `client_id` at /authorize and /token. If the code
+    // carries a client_id (always set by `sign_in`), the request's client_id —
+    // when present — must match it, and the rest of the function runs against the
+    // code's client (never the request's). This prevents a leaked confidential
+    // client's code from being redeemed by a different (public) client.
+    if !code_entry.client_id.is_empty() {
+        if let Some(ref req_client_id) = form.client_id {
+            if !constant_time_eq(req_client_id, &code_entry.client_id) {
+                return Err(CustomError::BadRequestToken(TokenError {
+                    error: CoreErrorResponseType::InvalidGrant,
+                    error_description: "client_id does not match the authorization code."
+                        .to_string(),
+                }));
+            }
+        }
+    }
+    let client_id = if !code_entry.client_id.is_empty() {
+        code_entry.client_id.clone()
+    } else if let Some(c) = form.client_id.clone() {
         c
     } else {
         code_entry.client_id.clone()
@@ -844,17 +863,21 @@ async fn token_authorization_code(
             .code_challenge_method
             .as_deref()
             .unwrap_or("S256");
+        // C2 Step 4b: reject the `plain` PKCE method. Discovery advertises S256
+        // only (`code_challenge_methods_supported = ["S256"]`); no compliant
+        // client sends `plain`, and the downgrade weakens the PKCE binding.
         let computed = match method {
             "S256" => {
                 use sha2::{Digest, Sha256};
                 let hash = Sha256::digest(verifier.as_bytes());
                 URL_SAFE_NO_PAD.encode(hash)
             }
-            "plain" => verifier.clone(),
             _ => {
-                return Err(CustomError::BadRequest(
-                    "Unsupported code_challenge_method.".to_string(),
-                ))
+                return Err(CustomError::BadRequestToken(TokenError {
+                    error: CoreErrorResponseType::InvalidGrant,
+                    error_description: "Unsupported code_challenge_method (only S256 is allowed)."
+                        .to_string(),
+                }));
             }
         };
         if !constant_time_eq(&computed, challenge) {
@@ -1110,6 +1133,16 @@ pub async fn authorize(
     } else {
         "".to_string()
     };
+    // C2 Step 4b: reject `code_challenge_method=plain` up front so a `plain`
+    // challenge is never carried into /sign_in or stored on the CodeEntry.
+    // Discovery advertises S256 only. A missing method defaults to S256.
+    if let Some(ccm) = &params.code_challenge_method {
+        if ccm != "S256" {
+            return Err(CustomError::BadRequest(
+                "Unsupported code_challenge_method (only S256 is allowed).".to_string(),
+            ));
+        }
+    }
     let pkce_params = match (&params.code_challenge, &params.code_challenge_method) {
         (Some(cc), Some(ccm)) => format!("&code_challenge={cc}&code_challenge_method={ccm}"),
         (Some(cc), None) => format!("&code_challenge={cc}&code_challenge_method=S256"),
@@ -1150,6 +1183,37 @@ fn extract_nonce(message: &str) -> Option<&str> {
         .map(|l| l.trim_start_matches("Nonce: ").trim())
 }
 
+/// Extract the `Expiration Time: {value}` line from a CAIP-122 message.
+fn extract_expiration_time(message: &str) -> Option<&str> {
+    message
+        .lines()
+        .find(|l| l.starts_with("Expiration Time: "))
+        .map(|l| l.trim_start_matches("Expiration Time: ").trim())
+}
+
+/// C1 (login path): enforce the CAIP-122 `Expiration Time`. The login frontend
+/// (`App.svelte`) already sets a 48h `expirationTime`, so requiring it here is a
+/// non-breaking, server-only change that closes the "valid forever" replay gap on
+/// the login path. A ~120s skew allowance absorbs client/server clock drift.
+/// Out of scope: the device-approval and account paths (their builders do not set
+/// an expiration yet — those are the breaking C1 parts handled in a follow-up).
+const CAIP122_EXPIRY_SKEW_SECS: i64 = 120;
+
+fn enforce_login_expiration(message: &str, now: chrono::DateTime<Utc>) -> Result<(), CustomError> {
+    let raw = extract_expiration_time(message).ok_or_else(|| {
+        CustomError::BadRequest("CAIP-122 message is missing an Expiration Time".to_string())
+    })?;
+    let exp = chrono::DateTime::parse_from_rfc3339(raw)
+        .map_err(|e| CustomError::BadRequest(format!("Invalid Expiration Time: {}", e)))?
+        .with_timezone(&Utc);
+    if now - chrono::Duration::seconds(CAIP122_EXPIRY_SKEW_SECS) >= exp {
+        return Err(CustomError::BadRequest(
+            "CAIP-122 signature has expired".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Extract resource URIs from the `Resources:` section of a CAIP-122 message.
 fn extract_resources(message: &str) -> Vec<&str> {
     let mut in_resources = false;
@@ -1164,6 +1228,40 @@ fn extract_resources(message: &str) -> Vec<&str> {
         }
     }
     out
+}
+
+/// C2 Step 3: re-validate a `redirect_uri` against the client's *registered*
+/// redirect_uris, mirroring the exact check in `authorize` (query-stripped exact
+/// match). Used by `sign_in` so a code is never appended to an unregistered (e.g.
+/// attacker-controlled) redirect_uri — closing the open-redirect on BOTH the
+/// wallet (Path B) and WebAuthn (Path A) login paths.
+async fn validate_registered_redirect_uri(
+    client_id: &str,
+    redirect_uri: &RedirectUrl,
+    db_client: &DBClientType,
+) -> Result<(), CustomError> {
+    let client_entry = db_client
+        .get_client(client_id.to_string())
+        .await
+        .map_err(|e| anyhow!("Failed to get kv: {}", e))?
+        .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
+
+    let mut r_u = redirect_uri.url().clone();
+    r_u.set_query(None);
+    let mut r_us: Vec<Url> = client_entry
+        .metadata
+        .redirect_uris()
+        .clone()
+        .iter_mut()
+        .map(|u| u.url().clone())
+        .collect();
+    r_us.iter_mut().for_each(|u| u.set_query(None));
+    if !r_us.contains(&r_u) {
+        return Err(CustomError::BadRequest(
+            "redirect_uri is not registered for this client.".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Verify the `siwx` cookie's CAIP-122 signature and nonce against the session.
@@ -1232,6 +1330,9 @@ pub fn verify_siwx_cookie(
     if msg_nonce != session.siwe_nonce {
         return Err(CustomError::BadRequest("Nonce mismatch".to_string()));
     }
+
+    // C1 (login path): enforce the message Expiration Time.
+    enforce_login_expiration(&siwx_cookie.message, Utc::now())?;
 
     Ok(siwx_cookie.did)
 }
@@ -1448,8 +1549,23 @@ pub async fn sign_in(
             return Err(anyhow!("Missing or mismatched resource in CAIP-122 message").into());
         }
 
+        // C1 (login path): enforce the message Expiration Time. The login
+        // frontend already sets a 48h `expirationTime`, so this is server-only
+        // and non-breaking. Only the wallet (Path B) CAIP-122 path is affected;
+        // the WebAuthn (Path A) ceremony has no CAIP-122 message to expire.
+        enforce_login_expiration(&siwx_cookie.message, Utc::now())?;
+
         siwx_cookie.did
     };
+
+    // C2 Step 3: re-validate the request redirect_uri against the client's
+    // registered set before issuing the code. `authorize` checks this, but
+    // `sign_in` re-receives `redirect_uri` as a query param and previously
+    // appended the code to whatever URL was supplied. This closes the open
+    // redirect on BOTH the wallet (Path B) and WebAuthn (Path A) paths. Path B
+    // additionally binds the redirect via the signed `Resources:` list above;
+    // this is the only redirect binding Path A has.
+    validate_registered_redirect_uri(&params.client_id, &params.redirect_uri, db_client).await?;
 
     // Extract client-proposed device_id from the session's stored scope (if any).
     let proposed_device_id = session_entry
@@ -1800,7 +1916,11 @@ mod tests {
             serde_urlencoded::from_str(redirect_url.split("/?").collect::<Vec<&str>>()[1]).unwrap();
         let params: SignInParams = serde_urlencoded::from_str(&redirect_url).unwrap();
 
-        // Build the CAIP-122 message (EIP-4361 format for eip155).
+        // Build the CAIP-122 message (EIP-4361 format for eip155). The login
+        // path now enforces the Expiration Time (C1 safe subset), so include a
+        // future exp — exactly as the real frontend already does.
+        let expiration_time =
+            (Utc::now() + Duration::hours(48)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let message = format!(
             "example.com wants you to sign in with your Ethereum account:\n\
              {address_str}\n\n\
@@ -1810,6 +1930,7 @@ mod tests {
              Chain ID: 1\n\
              Nonce: {}\n\
              Issued At: 2023-04-17T11:01:24.862Z\n\
+             Expiration Time: {expiration_time}\n\
              Resources:\n\
              - https://example.com",
             authorize_params.nonce,

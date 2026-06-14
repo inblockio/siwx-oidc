@@ -254,6 +254,12 @@ async fn wallet_login(c: &Client, base: &str, w: &Wallet) -> LoginResult {
     let domain = q.get("domain").unwrap();
 
     // Build + sign the CAIP-122 message (resources must contain the redirect_uri).
+    // The login path now enforces the Expiration Time (C1 safe subset), so set a
+    // fresh future exp — matching what the real Svelte frontend already sends.
+    let now = chrono::Utc::now();
+    let issued_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let expiration_time =
+        (now + chrono::Duration::hours(48)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let message = format!(
         "{domain} wants you to sign in with your Ethereum account:\n\
          {addr}\n\n\
@@ -262,7 +268,8 @@ async fn wallet_login(c: &Client, base: &str, w: &Wallet) -> LoginResult {
          Version: 1\n\
          Chain ID: 1\n\
          Nonce: {nonce}\n\
-         Issued At: 2026-06-14T00:00:00.000Z\n\
+         Issued At: {issued_at}\n\
+         Expiration Time: {expiration_time}\n\
          Resources:\n\
          - {redirect}",
         addr = w.address,
@@ -358,6 +365,11 @@ async fn wallet_login_to_code(
     let q = parse_query(&location);
     let nonce = q.get("nonce").unwrap();
     let domain = q.get("domain").unwrap();
+    // Login path enforces Expiration Time (C1 safe subset) — set a future exp.
+    let now = chrono::Utc::now();
+    let issued_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let expiration_time =
+        (now + chrono::Duration::hours(48)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let message = format!(
         "{domain} wants you to sign in with your Ethereum account:\n\
          {addr}\n\n\
@@ -366,7 +378,8 @@ async fn wallet_login_to_code(
          Version: 1\n\
          Chain ID: 1\n\
          Nonce: {nonce}\n\
-         Issued At: 2026-06-14T00:00:00.000Z\n\
+         Issued At: {issued_at}\n\
+         Expiration Time: {expiration_time}\n\
          Resources:\n\
          - {redirect}",
         addr = w.address,
