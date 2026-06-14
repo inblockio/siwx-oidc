@@ -10,9 +10,30 @@ use url::Url;
 
 use super::*;
 
+/// How long a device-revoked / user-deactivation tombstone lives. It only needs
+/// to outlast an in-flight refresh that started before the sweep; a few minutes
+/// is ample (access tokens live 5 min). It is also harmless if it lingers: it
+/// just makes a refresh refuse, and a fresh sign-in does not consult it.
+const TOMBSTONE_TTL_SECS: u64 = 600; // 10 min
+
 #[derive(Clone)]
 pub struct RedisClient {
     pool: Pool<RedisConnectionManager>,
+}
+
+/// Redis key for the per-`(username, device_id)` token index SET.
+fn device_token_idx_key(username: &str, device_id: &str) -> String {
+    format!("{}/{}/{}", KV_DEVICE_TOKEN_IDX_PREFIX, username, device_id)
+}
+
+/// Redis key for the short-lived device-revoked tombstone.
+fn device_tombstone_key(username: &str, device_id: &str) -> String {
+    format!("{}/{}/{}", KV_DEVICE_TOMBSTONE_PREFIX, username, device_id)
+}
+
+/// Redis key for the per-user deactivation tombstone.
+fn user_tombstone_key(username: &str) -> String {
+    format!("{}/{}", KV_USER_TOMBSTONE_PREFIX, username)
 }
 
 impl RedisClient {
@@ -108,17 +129,63 @@ impl RedisClient {
     /// robust to address-case differences between the original sign-in DID and
     /// the re-authentication DID.
     ///
-    /// There is no secondary index on (username, device_id), so this scans the
-    /// token keyspace. The volume is bounded (access tokens have a short TTL;
-    /// refresh tokens are the only long-lived entries), so a full scan is
-    /// acceptable. The removed count is logged so a large sweep is never silent.
+    /// Revocation is **atomic and race-free** (S3-3 / H3): a single Lua script
+    /// reads the per-`(username, device_id)` index SET, deletes every member token
+    /// plus the index itself, and plants a short-lived *device-revoked tombstone*
+    /// — all in one Redis round trip (Redis runs Lua single-threaded, so no
+    /// concurrent writer can interleave). The tombstone closes the residual
+    /// window: a token refresh that *started* before the sweep but completes just
+    /// after it consults the tombstone and refuses, so no resurrected token
+    /// survives an explicit sign-out.
+    ///
+    /// A best-effort legacy keyspace scan runs afterwards as a backstop for any
+    /// pre-index token (e.g. minted before an upgrade); it never re-creates the
+    /// race because the tombstone already blocks new mints.
     pub async fn revoke_device_tokens(&self, username: &str, device_id: &str) -> Result<usize> {
-        let revoked = self
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+
+        // Atomic: delete every indexed token + the index + set the tombstone in
+        // ONE server-side Lua call (Redis runs Lua single-threaded, so no
+        // concurrent writer interleaves). Issued via raw EVAL so no extra crate
+        // feature is required. KEYS[1] = index set, KEYS[2] = tombstone.
+        // ARGV[1] = tombstone TTL.
+        const REVOKE_LUA: &str = r#"
+            local members = redis.call('SMEMBERS', KEYS[1])
+            local n = 0
+            for _, k in ipairs(members) do
+              n = n + redis.call('DEL', k)
+            end
+            redis.call('DEL', KEYS[1])
+            redis.call('SET', KEYS[2], '1', 'EX', tonumber(ARGV[1]))
+            return n
+        "#;
+        let idx_key = device_token_idx_key(username, device_id);
+        let tomb_key = device_tombstone_key(username, device_id);
+        let revoked_idx: usize = bb8_redis::redis::cmd("EVAL")
+            .arg(REVOKE_LUA)
+            .arg(2) // numkeys
+            .arg(&idx_key)
+            .arg(&tomb_key)
+            .arg(TOMBSTONE_TTL_SECS)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("revoke_device_tokens Lua failed: {}", e))?;
+        drop(conn);
+
+        // Backstop: catch any token not present in the index (pre-upgrade tokens).
+        let revoked_scan = self
             .revoke_tokens_where(|meta| meta.username == username && meta.device_id == device_id)
-            .await?;
+            .await
+            .unwrap_or(0);
+
+        let revoked = revoked_idx + revoked_scan;
         debug!(
-            "revoke_device_tokens: username={} device_id={} revoked={}",
-            username, device_id, revoked
+            "revoke_device_tokens: username={} device_id={} revoked_idx={} revoked_scan={} total={}",
+            username, device_id, revoked_idx, revoked_scan, revoked
         );
         Ok(revoked)
     }
@@ -131,15 +198,45 @@ impl RedisClient {
     /// Like [`revoke_device_tokens`](Self::revoke_device_tokens) this keys on
     /// `username` (the lowercased `did_to_localpart` value Synapse uses) so it is
     /// robust to address-case differences between sign-in and re-auth DIDs.
+    ///
+    /// **Race-free (S3-4 / H6):** the caller (`account_deactivate`/`account_erase`)
+    /// plants the per-user deactivation tombstone via
+    /// [`mark_user_deactivated`](Self::mark_user_deactivated) BEFORE calling this,
+    /// so a concurrent refresh/mint refuses to issue tokens during/after the
+    /// sweep. As a defence-in-depth backstop this method also (re)sets the
+    /// tombstone itself, then loops the scan until a pass finds zero tokens, so a
+    /// writer that slipped in between the tombstone and the first scan is still
+    /// cleaned up. No new token can be minted (the refresh path is tombstoned), so
+    /// the loop terminates.
     pub async fn revoke_all_user_tokens(&self, username: &str) -> Result<usize> {
-        let revoked = self
-            .revoke_tokens_where(|meta| meta.username == username)
-            .await?;
+        // Defence-in-depth: ensure the tombstone is present even if the caller
+        // did not set it (the explicit callers do, before this point).
+        self.mark_user_deactivated(username).await?;
+
+        let mut total = 0usize;
+        for _ in 0..5 {
+            let n = self
+                .revoke_tokens_where(|meta| meta.username == username)
+                .await?;
+            total += n;
+            if n == 0 {
+                break;
+            }
+        }
         debug!(
             "revoke_all_user_tokens: username={} revoked={}",
-            username, revoked
+            username, total
         );
-        Ok(revoked)
+        Ok(total)
+    }
+
+    /// Plant the per-user deactivation tombstone so any concurrent (or later)
+    /// refresh/mint for this user refuses to issue tokens. Set FIRST, before the
+    /// `revoke_all_user_tokens` sweep, by `account_deactivate`/`account_erase`
+    /// (S3-4 / H6). Idempotent.
+    pub async fn mark_user_deactivated(&self, username: &str) -> Result<()> {
+        self.set_ex_raw(&user_tombstone_key(username), "1", TOMBSTONE_TTL_SECS)
+            .await
     }
 
     /// Purge a user's WebAuthn identity artifacts so the DID cannot be silently
@@ -169,13 +266,25 @@ impl RedisClient {
         F: Fn(&str) -> Option<String>,
     {
         let mut purged = 0usize;
+        // Accumulate per-key errors instead of `?`-aborting mid-sweep (S3-4): a
+        // single Redis hiccup must not leave the purge half-done while the caller
+        // still claims "Erased". We complete the whole sweep, then surface a
+        // partial failure so the caller can distinguish a clean erase from one
+        // where artifacts may remain.
+        let mut errors = 0usize;
 
         // -- (a) Linked credentials: webauthn:link/{cred_id} -> { primary_did } --
         let link_prefix = "webauthn:link/";
-        for link_key in self.keys_raw(&format!("{}*", link_prefix)).await? {
-            let raw = match self.get_raw(&link_key).await? {
-                Some(v) => v,
-                None => continue, // raced with another purge / expiry
+        let link_keys = self.keys_raw(&format!("{}*", link_prefix)).await?;
+        for link_key in link_keys {
+            let raw = match self.get_raw(&link_key).await {
+                Ok(Some(v)) => v,
+                Ok(None) => continue, // raced with another purge / expiry
+                Err(e) => {
+                    debug!("purge_identity: get link {} failed: {}", link_key, e);
+                    errors += 1;
+                    continue;
+                }
             };
             let link: serde_json::Value = match serde_json::from_str(&raw) {
                 Ok(v) => v,
@@ -187,28 +296,65 @@ impl RedisClient {
             // The credential id is the link key's suffix.
             let cred_id = &link_key[link_prefix.len()..];
             let cred_key = format!("webauthn:credential/{}", cred_id);
-            if self.get_raw(&cred_key).await?.is_some() {
-                self.del_raw(&cred_key).await?;
-                purged += 1;
+            match self.get_raw(&cred_key).await {
+                Ok(Some(_)) => match self.del_raw(&cred_key).await {
+                    Ok(()) => purged += 1,
+                    Err(e) => {
+                        debug!("purge_identity: del cred {} failed: {}", cred_key, e);
+                        errors += 1;
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    debug!("purge_identity: get cred {} failed: {}", cred_key, e);
+                    errors += 1;
+                }
             }
-            self.del_raw(&link_key).await?;
-            purged += 1;
+            match self.del_raw(&link_key).await {
+                Ok(()) => purged += 1,
+                Err(e) => {
+                    debug!("purge_identity: del link {} failed: {}", link_key, e);
+                    errors += 1;
+                }
+            }
         }
 
         // -- (b) Standalone credentials whose passkey derives to this did:key --
         let cred_prefix = "webauthn:credential/";
-        for cred_key in self.keys_raw(&format!("{}*", cred_prefix)).await? {
-            let raw = match self.get_raw(&cred_key).await? {
-                Some(v) => v,
-                None => continue, // already removed in pass (a) or expired
+        let cred_keys = self.keys_raw(&format!("{}*", cred_prefix)).await?;
+        for cred_key in cred_keys {
+            let raw = match self.get_raw(&cred_key).await {
+                Ok(Some(v)) => v,
+                Ok(None) => continue, // already removed in pass (a) or expired
+                Err(e) => {
+                    debug!("purge_identity: get cred {} failed: {}", cred_key, e);
+                    errors += 1;
+                    continue;
+                }
             };
             if derive(&raw).as_deref() == Some(did) {
-                self.del_raw(&cred_key).await?;
-                purged += 1;
+                match self.del_raw(&cred_key).await {
+                    Ok(()) => purged += 1,
+                    Err(e) => {
+                        debug!("purge_identity: del cred {} failed: {}", cred_key, e);
+                        errors += 1;
+                    }
+                }
             }
         }
 
-        debug!("purge_identity: did={} purged={}", did, purged);
+        debug!(
+            "purge_identity: did={} purged={} errors={}",
+            did, purged, errors
+        );
+        if errors > 0 {
+            return Err(anyhow!(
+                "purge_identity completed with {} error(s); {} artifact(s) purged \
+                 (some identity artifacts may remain)",
+                errors,
+                purged
+            ));
+        }
         Ok(purged)
     }
 
@@ -430,6 +576,41 @@ impl DBClient for RedisClient {
         Ok(was_set)
     }
 
+    async fn try_claim_device_code(&self, device_code: &str) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+
+        // Atomic: SET .../redeemed 1 NX EX <ttl> — only the first poll wins, so
+        // exactly one concurrent redemption issues tokens (S3-1 / H9). EX is part
+        // of the same atomic SET (not a separate EXPIRE), so the claim cannot leak.
+        let claim_key = format!("device_codes/{}/redeemed", device_code);
+        let was_set: Option<String> = bb8_redis::redis::cmd("SET")
+            .arg(&claim_key)
+            .arg("1")
+            .arg("NX")
+            .arg("EX")
+            .arg(DEVICE_CODE_LIFETIME)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("Failed to SET NX device-code claim: {}", e))?;
+        // Redis returns "OK" when the key was set, nil (None) when NX rejected it.
+        Ok(was_set.is_some())
+    }
+
+    async fn is_device_revoked(&self, username: &str, device_id: &str) -> Result<bool> {
+        Ok(self
+            .get_raw(&device_tombstone_key(username, device_id))
+            .await?
+            .is_some())
+    }
+
+    async fn is_user_deactivated(&self, username: &str) -> Result<bool> {
+        Ok(self.get_raw(&user_tombstone_key(username)).await?.is_some())
+    }
+
     // -- Opaque token storage (MSC3861) ----------------------------------------
 
     async fn set_token(&self, token: &str, metadata: &TokenMetadata, ttl: u64) -> Result<()> {
@@ -444,6 +625,24 @@ impl DBClient for RedisClient {
         conn.set_ex::<_, _, ()>(&key, &value, ttl)
             .await
             .map_err(|e| anyhow!("Failed to SET EX token: {}", e))?;
+        // Maintain the per-(username, device_id) secondary index so revocation is
+        // an atomic O(members) delete rather than a racy keyspace scan (S3-3 / H3).
+        // Standalone-mode tokens carry an empty device_id and are revoked by the
+        // presented token only, so they are not indexed.
+        if !metadata.device_id.is_empty() {
+            let idx_key = device_token_idx_key(&metadata.username, &metadata.device_id);
+            // SADD the token key, then bump the set TTL to outlive its longest
+            // member (refresh-token TTL). One round trip via a pipeline-free Lua
+            // would be tidier, but two simple commands are fine here and the
+            // index is advisory (the legacy scan in revoke_tokens_where remains a
+            // backstop).
+            conn.sadd::<_, _, ()>(&idx_key, &key)
+                .await
+                .map_err(|e| anyhow!("Failed to SADD device token index: {}", e))?;
+            conn.expire::<_, ()>(&idx_key, REFRESH_TOKEN_TTL as i64)
+                .await
+                .map_err(|e| anyhow!("Failed to EXPIRE device token index: {}", e))?;
+        }
         debug!("set_token: stored key={} ttl={}s", key, ttl);
         Ok(())
     }
@@ -553,7 +752,24 @@ impl DBClient for RedisClient {
 mod tests {
     use super::RedisClient;
     use crate::db::{DBClient, TokenMetadata};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use url::Url;
+
+    /// A globally-unique nonce for test keys on the shared Redis. The nanosecond
+    /// clock alone can collide across tests that start in the same instant on
+    /// different threads (observed when running only the two `revoke_*` tests as a
+    /// pair); a process-wide atomic counter makes every nonce distinct regardless
+    /// of scheduling, so tests are isolated for ANY subset, not just the full run.
+    fn unique_nonce() -> u128 {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // Shift the wall-clock left and OR in a monotonically-increasing counter so
+        // the suffix is unique even for same-nanosecond callers.
+        (base << 20) | u128::from(COUNTER.fetch_add(1, Ordering::Relaxed) & 0xF_FFFF)
+    }
 
     fn token_meta(device_id: &str, username: &str) -> TokenMetadata {
         TokenMetadata {
@@ -581,10 +797,7 @@ mod tests {
         };
 
         // Unique per run so parallel tests / stale entries cannot interfere.
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nonce = unique_nonce();
         let user = format!("user-{nonce}");
         let other_user = format!("other-{nonce}");
         let d1 = format!("DEV1_{nonce}");
@@ -639,10 +852,7 @@ mod tests {
         };
 
         // Unique per run so parallel tests / stale entries cannot interfere.
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nonce = unique_nonce();
         let user = format!("user-{nonce}");
         let other_user = format!("other-{nonce}");
         let d1 = format!("DEV1_{nonce}");
@@ -697,10 +907,7 @@ mod tests {
             Err(_) => return, // no Redis: skip (CI provides one)
         };
 
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nonce = unique_nonce();
         let did = format!("did:pkh:eip155:1:0xPURGE{nonce}");
         let other_did = format!("did:pkh:eip155:1:0xKEEP{nonce}");
         let cred = format!("cred-{nonce}");
@@ -773,10 +980,7 @@ mod tests {
             Err(_) => return,
         };
 
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nonce = unique_nonce();
         let did = format!("did:key:zDnPURGE{nonce}");
         let mine = format!("mine-{nonce}");
         let theirs = format!("theirs-{nonce}");

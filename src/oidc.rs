@@ -480,6 +480,22 @@ async fn token_refresh(
         }));
     }
 
+    // Race guard (S3-3 / H3 + S3-4 / H6): refuse to rotate if this device was just
+    // signed out or the user was just deactivated/erased. Mirrors the same check
+    // in compat::refresh so neither refresh entry point can resurrect access for a
+    // torn-down device / terminated account.
+    let device_revoked = !metadata.device_id.is_empty()
+        && db_client
+            .is_device_revoked(&metadata.username, &metadata.device_id)
+            .await?;
+    if device_revoked || db_client.is_user_deactivated(&metadata.username).await? {
+        let _ = db_client.delete_token(&rt).await;
+        return Err(CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "Session has been revoked.".to_string(),
+        }));
+    }
+
     let (access_prefix, refresh_prefix) = if config.mas_shared_secret.is_some() {
         ("mat_", "mcr_")
     } else {
@@ -519,6 +535,27 @@ async fn token_refresh(
         .await?;
 
     let _ = db_client.delete_token(&rt).await;
+
+    // Check-mint-recheck (S3-3 / H3 + S3-4 / H6): if a revoke/deactivate sweep
+    // tombstoned this device/user in the gap between our pre-mint check and our
+    // writes, roll back the just-minted tokens so none can be resurrected.
+    let revoked_now = (!metadata.device_id.is_empty()
+        && db_client
+            .is_device_revoked(&metadata.username, &metadata.device_id)
+            .await
+            .unwrap_or(true))
+        || db_client
+            .is_user_deactivated(&metadata.username)
+            .await
+            .unwrap_or(true);
+    if revoked_now {
+        let _ = db_client.delete_token(&new_access).await;
+        let _ = db_client.delete_token(&new_refresh).await;
+        return Err(CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "Session has been revoked.".to_string(),
+        }));
+    }
 
     let mut response = CoreTokenResponse::new(
         AccessToken::new(new_access),
@@ -609,6 +646,21 @@ async fn token_device_code(
             ))
         }
         DeviceCodeStatus::Approved => {
+            // Atomically claim this approved device_code BEFORE issuing any token
+            // (S3-1 / H9). Without this, two concurrent polls both pass the
+            // `status == Approved` check and each mint a token pair (+ a phantom
+            // device). The SETNX-style claim ensures exactly one poll issues
+            // tokens; concurrent losers fall back to authorization_pending (the
+            // winner deletes the device_code at the end, so a subsequent poll then
+            // gets expired_token — same as a normal completed flow).
+            if !db_client.try_claim_device_code(&dc).await? {
+                debug!(device_code = %dc, "device_code already claimed by a concurrent poll");
+                return Err(device_code_error(
+                    "authorization_pending",
+                    "Device code is being processed.",
+                ));
+            }
+
             let did = entry
                 .did
                 .as_ref()

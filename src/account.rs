@@ -443,6 +443,13 @@ async fn execute_action(
         Action::AccountDeactivate => {
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
+            // Plant the deactivation tombstone FIRST (S3-4 / H6): from now on any
+            // concurrent refresh/mint for this user refuses to issue tokens, so a
+            // refresh racing the sweep below cannot resurrect access. Best-effort:
+            // the sweep itself re-plants it, so a transient error here is not fatal.
+            if let Err(e) = db_client.mark_user_deactivated(&localpart).await {
+                warn!(error = %e, "mark_user_deactivated failed (pre-deactivate)");
+            }
             synapse
                 .deactivate_user(&localpart, server, false)
                 .await
@@ -465,6 +472,11 @@ async fn execute_action(
         Action::AccountErase => {
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
+            // Plant the deactivation tombstone FIRST (S3-4 / H6) so a concurrent
+            // refresh/mint cannot resurrect access during the erase sweep.
+            if let Err(e) = db_client.mark_user_deactivated(&localpart).await {
+                warn!(error = %e, "mark_user_deactivated failed (pre-erase)");
+            }
             // Irreversible: GDPR erasure removes profile, media, and room
             // memberships in addition to deactivating the account.
             synapse

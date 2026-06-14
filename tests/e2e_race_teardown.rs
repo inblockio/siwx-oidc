@@ -18,8 +18,10 @@
 //! few rounds to defeat flakiness. Every test resets the mock and uses a fresh
 //! DID so they can share the stack.
 //!
-//! CONFIRMED-BUG reproducers (parallel security review) are `#[ignore]`d with a
-//! `repro <ID>` note so the suite is GREEN; un-ignore after the src/ fix lands.
+//! The S3-1 / S3-3 / S3-4 race fixes (H9 / H3 / H6) have landed, so their former
+//! `RUN_REPRO=1`-gated reproducers now run unconditionally as permanent regression
+//! guards (search "REGRESSION GUARD") asserting no token resurrection / a single
+//! device-code redemption.
 
 use k256::ecdsa::{RecoveryId, Signature, SigningKey};
 use rand::rngs::OsRng;
@@ -1042,23 +1044,13 @@ async fn h14_synapse_delete_failure_is_surfaced_not_500() {
 }
 
 // ===========================================================================
-// CONFIRMED-BUG REPRODUCERS (expected RED until src/ fixes land). Each asserts
-// the DESIRED behavior and is #[ignore]'d with a repro id.
-//
-// They are ALSO gated behind `RUN_REPRO=1` so the normal green run
-// (`cargo test --test e2e_race_teardown -- --ignored`) stays GREEN: without the
-// env var they early-return as a no-op. To watch a reproducer go RED against the
-// buggy code (or PASS once a fix lands), run e.g.:
-//   RUN_REPRO=1 cargo test --test e2e_race_teardown h3 -- --ignored --nocapture
+// RACE REGRESSION GUARDS (formerly CONFIRMED-BUG reproducers for S3-1/S3-3/S3-4,
+// gated behind RUN_REPRO=1 while RED). The fixes have landed, so these now run
+// unconditionally with the live stack and assert the DESIRED behavior (no token
+// resurrection / single device-code redemption). They go RED again if a future
+// change reintroduces the race.
+//   cargo test --test e2e_race_teardown -- --ignored --test-threads=1
 // ===========================================================================
-
-/// True only when the operator opted in to running the confirmed-bug
-/// reproducers. Keeps the standard `--ignored` suite green.
-fn repro_enabled() -> bool {
-    std::env::var("RUN_REPRO")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-}
 
 // --- H3 / S3-3: concurrent device_delete on the SAME device ----------------
 // Desired: no 500; at most one effective DELETE; AND after the device is deleted,
@@ -1069,13 +1061,14 @@ fn repro_enabled() -> bool {
 // deterministically we run a refresh "pump" (chained rotations, each minting a
 // fresh access+refresh) throughout the delete window and require that, once the
 // dust settles, EVERY minted token is inactive.
+// REGRESSION GUARD (was repro S3-3 / H3): device_delete TOCTOU + KEYS-scan revoke
+// races a refresh and a stale token survived. Fixed by the per-(user,device) token
+// index + atomic Lua revoke + device-revoked tombstone (check-mint-recheck in the
+// refresh paths). See fix commit for S3-3/H3. Now runs unconditionally with the
+// live stack (no RUN_REPRO gate), asserting survivors == 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "repro S3-3/H3: device_delete TOCTOU + KEYS-scan revoke races refresh => stale token survives (src/account.rs ~399-442 + src/db/redis.rs); un-ignore after fix"]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn h3_concurrent_same_device_delete_revokes_all_tokens() {
-    if !repro_enabled() {
-        eprintln!("[h3] skipped (set RUN_REPRO=1 to exercise the S3-3 reproducer)");
-        return;
-    }
     let base = oidc();
     let c = Client::new();
     for round in 0..6 {
@@ -1193,13 +1186,13 @@ async fn h3_concurrent_same_device_delete_revokes_all_tokens() {
 // confirmed bug: the deactivate sweep is a non-atomic one-shot, so a refresh
 // chain keeps minting usable tokens (resurrection). A refresh pump exposes it
 // deterministically (same shape as H3).
+// REGRESSION GUARD (was repro S3-4 / H6): account_deactivate's non-atomic sweep let
+// an in-flight refresh resurrect access. Fixed by planting a per-user deactivation
+// tombstone BEFORE the sweep (checked + check-mint-rechecked by the refresh paths).
+// See fix commit for S3-4/H6. Now runs unconditionally, asserting survivors == 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "repro S3-4/H6: deactivate/erase non-atomic sweep => refresh resurrects access (src/account.rs ~443-504); un-ignore after fix"]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn h6_deactivate_racing_refresh_no_resurrection() {
-    if !repro_enabled() {
-        eprintln!("[h6] skipped (set RUN_REPRO=1 to exercise the S3-4 reproducer)");
-        return;
-    }
     let base = oidc();
     let c = Client::new();
     for round in 0..6 {
@@ -1287,13 +1280,13 @@ async fn h6_deactivate_racing_refresh_no_resurrection() {
 // Desired: two concurrent token polls for one approved device_code mint at most
 // one token pair. The bug: delete-after-issuance with no atomic claim, so both
 // polls can mint tokens.
+// REGRESSION GUARD (was repro S3-1 / H9): the device-code Approved branch deleted the
+// code only AFTER token issuance, so two concurrent polls each minted a token pair.
+// Fixed by an atomic SETNX claim (try_claim_device_code) before issuing. See fix
+// commit for S3-1/H9. Now runs unconditionally, asserting at most one token minted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "repro S3-1/H9: device-code Approved branch double-redeemable (delete after issuance, no atomic claim) (src/oidc.rs ~608-720); un-ignore after fix"]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn h9_device_code_approved_no_double_redemption() {
-    if !repro_enabled() {
-        eprintln!("[h9] skipped (set RUN_REPRO=1 to exercise the S3-1 reproducer)");
-        return;
-    }
     let base = oidc();
     let c = Client::new();
     for round in 0..8 {
