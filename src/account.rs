@@ -278,14 +278,30 @@ fn sanitize_action(raw: &str) -> String {
         .collect()
 }
 
-/// Sanitize a user-supplied device id for safe HTML interpolation. Device ids
-/// (e.g. `SIWX_<uuid>`) may contain hyphens, so allow them in addition to the
-/// action character set.
-fn sanitize_device_id(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
-        .take(255)
-        .collect()
+/// Escape a user-supplied device id for safe interpolation into the
+/// `data-device-id="..."` HTML attribute, PRESERVING the exact id.
+///
+/// A character allowlist (the previous approach) corrupts real device ids:
+/// matrix-rust-sdk / Element X mint device ids as standard base64, which contain
+/// `/`, `+`, and `=`. Stripping those produced a different id, so the MSC4191
+/// `device_view` / `device_delete` deep links ("Manage this session") could never
+/// match the device — the page showed "That device is not among your active
+/// sessions". Escaping the five HTML metacharacters keeps the attribute injection
+/// -safe while the browser hands the id back verbatim via `dataset.deviceId`. A
+/// length cap bounds pathological input.
+fn escape_device_id_attr(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars().take(255) {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 // -- Action prerequisites -----------------------------------------------------
@@ -863,7 +879,7 @@ pub fn account_page_inner(
     let device_id = query
         .device_id
         .as_deref()
-        .map(sanitize_device_id)
+        .map(escape_device_id_attr)
         .unwrap_or_default();
     let base = base_url.trim_end_matches('/');
 
@@ -1996,7 +2012,9 @@ mod tests {
     }
 
     #[test]
-    fn account_page_sanitizes_device_id() {
+    fn account_page_escapes_device_id_no_xss() {
+        // A malicious device_id must not break out of the data-device-id attribute
+        // or inject a <script>: the HTML metacharacters are escaped, not stripped.
         let html = account_page(
             AccountPageQuery {
                 action: Some("org.matrix.device_view".to_string()),
@@ -2006,8 +2024,49 @@ mod tests {
             "https://siwx.example.com",
         )
         .0;
-        assert!(!html.contains("<script>alert"));
-        assert!(html.contains(r#"data-device-id="scriptalert1script""#));
+        assert!(!html.contains("<script>alert"), "no raw script injection");
+        assert!(
+            !html.contains(r#"data-device-id=""><script"#),
+            "the closing quote must be escaped so the attribute cannot break out"
+        );
+        assert!(
+            html.contains(r#"data-device-id="&quot;&gt;&lt;script&gt;"#),
+            "device_id metacharacters must be HTML-escaped, not stripped"
+        );
+    }
+
+    #[test]
+    fn account_page_preserves_base64_device_id() {
+        // REGRESSION: matrix-rust-sdk / Element X device ids are standard base64
+        // (contain '/', '+', '='). The page must embed them VERBATIM so the
+        // device_view / device_delete deep link can match the real device.
+        let dev = "MjGFNfjj95k5VngxejhaWTG0i0/apJk84AyFCtzlVjQ";
+        let html = account_page(
+            AccountPageQuery {
+                action: Some("org.matrix.device_view".to_string()),
+                device_id: Some(dev.to_string()),
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        assert!(
+            html.contains(&format!(r#"data-device-id="{dev}""#)),
+            "base64 device id (with '/') must be preserved verbatim, got page:\n{}",
+            &html[..html.find("data-device-id").map(|i| i + 80).unwrap_or(0)]
+        );
+        // And the plus/equals variants survive too.
+        let dev2 = "dU+Mpp7R3CwoAmVUyJlVEFxpdxxDQbx3OD9Gtv0OxnU=";
+        let html2 = account_page(
+            AccountPageQuery {
+                action: Some("org.matrix.device_delete".to_string()),
+                device_id: Some(dev2.to_string()),
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        assert!(html2.contains(&format!(r#"data-device-id="{dev2}""#)));
     }
 
     #[test]
@@ -2264,10 +2323,23 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_device_id_keeps_safe_chars_strips_markup() {
-        assert_eq!(sanitize_device_id("SIWX_2b1f-9c"), "SIWX_2b1f-9c");
-        assert_eq!(sanitize_device_id("<script>x</script>"), "scriptxscript");
-        assert_eq!(sanitize_device_id(&"A".repeat(300)).len(), 255);
+    fn escape_device_id_attr_preserves_base64_escapes_markup() {
+        // Plain Synapse ids and base64 (matrix-rust-sdk) ids pass through verbatim.
+        assert_eq!(escape_device_id_attr("SIWX_2b1f-9c"), "SIWX_2b1f-9c");
+        assert_eq!(escape_device_id_attr("OztBTB56qC"), "OztBTB56qC");
+        assert_eq!(
+            escape_device_id_attr("MjGFNfjj95k5VngxejhaWTG0i0/apJk84AyFCtzlVjQ"),
+            "MjGFNfjj95k5VngxejhaWTG0i0/apJk84AyFCtzlVjQ"
+        );
+        assert_eq!(escape_device_id_attr("dU+Mpp/v0=="), "dU+Mpp/v0==");
+        // HTML metacharacters are escaped (not stripped) so they cannot break out.
+        assert_eq!(
+            escape_device_id_attr(r#""><script>x</script>"#),
+            "&quot;&gt;&lt;script&gt;x&lt;/script&gt;"
+        );
+        assert_eq!(escape_device_id_attr("a&b"), "a&amp;b");
+        // Length is capped (after counting chars, before escaping expands).
+        assert!(escape_device_id_attr(&"A".repeat(300)).len() <= 255);
     }
 
     // -- ActionOutcome wire contract (H3/H8) ----------------------------------

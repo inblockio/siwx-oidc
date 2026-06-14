@@ -157,6 +157,32 @@ test('wallet: erase runs end-to-end after one signature', async ({ page }) => {
   expect(s.lifecycle[WALLET_MXID]?.erased).toBe(true);
 });
 
+test('deep-link manage-session with a base64 (slash) device id resolves', async ({ page }) => {
+  // REGRESSION (Element X / matrix-rust-sdk device ids are standard base64): the
+  // "Manage this session" deep link carries a device_id containing '/'. It must
+  // resolve to the session, not "That device is not among your active sessions".
+  await mockReset();
+  const dev = 'MjGFNfjj95k5VngxejhaWTG0i0/apJk84AyFCtzlVjQ';
+  await mockSeed(WALLET_MXID, dev);
+  await instrumentCeremonyCounters(page);
+  await injectWallet(page);
+
+  // Establish a session with one wallet signature (via the sessions list).
+  await page.goto('/account?action=org.matrix.devices_list');
+  await page.click('#btn-wallet');
+  await expect(page.locator('.device-row')).toHaveCount(1);
+
+  // Follow the deep link for the slash id (authenticated -> auto-runs, no new sig).
+  await page.goto(`/account?action=org.matrix.device_view&device_id=${encodeURIComponent(dev)}`);
+  // Success renders the device into #result-section (it would stay on the
+  // auth-section with an error if the id were corrupted).
+  await expect(page.locator('#result-section')).toContainText('Session details');
+  await expect(page.locator('#result-section')).toContainText(dev);
+  await expect(page.getByText('not among your active sessions')).toHaveCount(0);
+  // The deep link reused the session: no wallet signature on this page.
+  expect(await page.evaluate(() => window.__signCount())).toBe(0);
+});
+
 test('passkey: one ceremony covers list + sign-out (virtual authenticator)', async ({ page }) => {
   await mockReset();
   await instrumentCeremonyCounters(page);
