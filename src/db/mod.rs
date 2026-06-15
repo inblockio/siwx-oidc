@@ -11,6 +11,18 @@ const KV_CLIENT_PREFIX: &str = "clients";
 const KV_SESSION_PREFIX: &str = "sessions";
 const KV_CODE_PREFIX: &str = "codes";
 const KV_TOKEN_PREFIX: &str = "token";
+/// Secondary index: a Redis SET of token keys per `(username, device_id)`, kept
+/// in sync on every token mint/refresh so revocation is an atomic O(members)
+/// delete instead of a racy `KEYS` scan (S3-3 / H3 fix).
+const KV_DEVICE_TOKEN_IDX_PREFIX: &str = "idx:user_device";
+/// Short-lived tombstone marking a `(username, device_id)` as just-revoked, so an
+/// in-flight refresh that completes right after the sweep cannot leave a survivor
+/// (S3-3 / H3 fix). Checked by the refresh/mint paths.
+const KV_DEVICE_TOMBSTONE_PREFIX: &str = "tombstone:device";
+/// Per-user deactivation tombstone set BEFORE the deactivate/erase sweep so any
+/// concurrent refresh/mint refuses to issue tokens for a terminating user
+/// (S3-4 / H6 fix). Checked by the refresh/mint paths.
+const KV_USER_TOMBSTONE_PREFIX: &str = "tombstone:user";
 pub const ENTRY_LIFETIME: usize = 300; // 5min — auth codes must outlive redirect chains
 pub const SESSION_LIFETIME: u64 = 300; // 5min
 pub const CLIENT_LIFETIME: u64 = 30 * 24 * 3600; // 30 days
@@ -124,6 +136,23 @@ pub trait DBClient {
     /// Atomically mark a session as signed-in. Returns true on first call,
     /// false if the session was already signed-in.
     async fn try_mark_session_signed_in(&self, id: String) -> Result<bool>;
+
+    /// Atomically claim an *approved* device code for redemption. Returns `true`
+    /// only for the first caller; concurrent polls get `false` and must not issue
+    /// tokens (S3-1 / H9). Mirrors [`try_consume_code`](Self::try_consume_code):
+    /// a `SET .../redeemed 1 NX EX <ttl>` so exactly one poll wins.
+    async fn try_claim_device_code(&self, device_code: &str) -> Result<bool>;
+
+    /// Whether a `(username, device_id)` pair currently carries a device-revoked
+    /// tombstone (set by [`revoke_device_tokens`]). A refresh/mint that sees this
+    /// must refuse so it cannot resurrect a just-signed-out device (S3-3 / H3).
+    async fn is_device_revoked(&self, username: &str, device_id: &str) -> Result<bool>;
+
+    /// Whether a user currently carries a deactivation tombstone (set by
+    /// `account_deactivate` / `account_erase` BEFORE the token sweep). A
+    /// refresh/mint that sees this must refuse so it cannot resurrect access for a
+    /// terminating account (S3-4 / H6).
+    async fn is_user_deactivated(&self, username: &str) -> Result<bool>;
 
     // -- Opaque token storage (MSC3861) ----------------------------------------
 

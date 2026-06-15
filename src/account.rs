@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::oidc::{did_to_localpart, CustomError};
+use crate::oidc::{constant_time_eq, did_to_localpart, CustomError};
 use crate::synapse_client::{DeviceInfo, SynapseClient};
 use crate::webauthn as wa;
 use siwx_oidc::db::RedisClient;
@@ -443,6 +443,13 @@ async fn execute_action(
         Action::AccountDeactivate => {
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
+            // Plant the deactivation tombstone FIRST (S3-4 / H6): from now on any
+            // concurrent refresh/mint for this user refuses to issue tokens, so a
+            // refresh racing the sweep below cannot resurrect access. Best-effort:
+            // the sweep itself re-plants it, so a transient error here is not fatal.
+            if let Err(e) = db_client.mark_user_deactivated(&localpart).await {
+                warn!(error = %e, "mark_user_deactivated failed (pre-deactivate)");
+            }
             synapse
                 .deactivate_user(&localpart, server, false)
                 .await
@@ -465,6 +472,11 @@ async fn execute_action(
         Action::AccountErase => {
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
+            // Plant the deactivation tombstone FIRST (S3-4 / H6) so a concurrent
+            // refresh/mint cannot resurrect access during the erase sweep.
+            if let Err(e) = db_client.mark_user_deactivated(&localpart).await {
+                warn!(error = %e, "mark_user_deactivated failed (pre-erase)");
+            }
             // Irreversible: GDPR erasure removes profile, media, and room
             // memberships in addition to deactivating the account.
             synapse
@@ -657,8 +669,10 @@ pub async fn account_action(
         .ok_or_else(|| CustomError::Unauthorized("Account session expired".to_string()))?;
 
     // CSRF: the page must echo the session's token (defence in depth over
-    // SameSite=Strict). Constant work either way; a mismatch is unauthorized.
-    if req.csrf.as_deref() != Some(session.csrf.as_str()) {
+    // SameSite=Strict). Compared in constant time — `constant_time_eq` checks
+    // equal length first then `ct_eq`s the bytes, so it does not short-circuit
+    // on the first differing byte. A mismatch (or absent token) is unauthorized.
+    if !constant_time_eq(req.csrf.as_deref().unwrap_or(""), session.csrf.as_str()) {
         return Err(CustomError::Unauthorized("CSRF token mismatch".to_string()));
     }
 

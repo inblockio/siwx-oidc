@@ -787,9 +787,18 @@ pub async fn main() {
         EcdsaSigningKey::from_pem(key, Some(JsonWebKeyId::new("key1".to_string())))
             .expect("Failed to load signing key from PEM")
     } else {
-        info!("Generating ES256 signing key...");
+        info!("Generating ephemeral ES256 signing key...");
         let key = EcdsaSigningKey::generate(Some(JsonWebKeyId::new("key1".to_string())));
-        info!("Generated ES256 key. PEM:\n{}", key.to_pem().unwrap());
+        // SECURITY: never log private key material. Log only a non-sensitive
+        // fingerprint of the *public* key so operators can correlate the live
+        // key without exposing the secret. This key rotates on every restart
+        // (sessions break on restart) — set SIWEOIDC_SIGNING_KEY_PEM to persist.
+        info!(
+            kid = "key1",
+            pubkey_fp = %key.public_key_fingerprint(),
+            "Generated ephemeral ES256 signing key (NOT persisted). \
+             Set SIWEOIDC_SIGNING_KEY_PEM to use a stable key in production."
+        );
         key
     };
 

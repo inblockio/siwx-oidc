@@ -467,6 +467,41 @@ pub async fn refresh(
         );
     }
 
+    // Race guard (S3-3 / H3 + S3-4 / H6): refuse to mint if this device was just
+    // signed out, or this user was just deactivated/erased. The tombstone is
+    // planted atomically by the revoke sweep, so a refresh that started before the
+    // sweep but lands after it cannot resurrect access for a torn-down device /
+    // terminated account. (Best-effort: a Redis error here fails closed below.)
+    let device_revoked = !metadata.device_id.is_empty()
+        && state
+            .redis_client
+            .is_device_revoked(&metadata.username, &metadata.device_id)
+            .await
+            .unwrap_or(true);
+    let user_deactivated = state
+        .redis_client
+        .is_user_deactivated(&metadata.username)
+        .await
+        .unwrap_or(true);
+    if device_revoked || user_deactivated {
+        // Also revoke the presented refresh token so the chain cannot continue.
+        let _ = state.redis_client.delete_token(&body.refresh_token).await;
+        debug!(
+            username = %metadata.username,
+            device_id = %metadata.device_id,
+            device_revoked,
+            user_deactivated,
+            "refresh refused: device/account torn down"
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "errcode": "M_UNKNOWN_TOKEN",
+                "error": "Session has been revoked"
+            })),
+        );
+    }
+
     // Generate new access token with same metadata.
     let new_access_token = generate_opaque_token("mat_");
     let now = Utc::now().timestamp();
@@ -527,6 +562,39 @@ pub async fn refresh(
     // Delete the old refresh token.
     let _ = state.redis_client.delete_token(&body.refresh_token).await;
 
+    // Re-check the tombstones AFTER minting (check-mint-recheck). This closes the
+    // last race window (S3-3 / H3 + S3-4 / H6): if a revoke/deactivate sweep
+    // planted a tombstone in the gap between our pre-mint check and our writes,
+    // the sweep's atomic index-delete may have missed our just-minted tokens
+    // (they were written after its SMEMBERS snapshot). Detecting the tombstone now
+    // and deleting our own tokens guarantees no resurrected token survives.
+    let revoked_now = (!metadata.device_id.is_empty()
+        && state
+            .redis_client
+            .is_device_revoked(&metadata.username, &metadata.device_id)
+            .await
+            .unwrap_or(true))
+        || state
+            .redis_client
+            .is_user_deactivated(&metadata.username)
+            .await
+            .unwrap_or(true);
+    if revoked_now {
+        let _ = state.redis_client.delete_token(&new_access_token).await;
+        let _ = state.redis_client.delete_token(&new_refresh_token).await;
+        debug!(
+            username = %metadata.username,
+            "refresh: tombstoned mid-mint; rolled back just-minted tokens"
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "errcode": "M_UNKNOWN_TOKEN",
+                "error": "Session has been revoked"
+            })),
+        );
+    }
+
     debug!(
         username = %metadata.username,
         "refresh: tokens rotated successfully"
@@ -557,13 +625,18 @@ mod tests {
             .ok()
     }
 
-    /// A unique nanosecond nonce so parallel tests / stale entries never collide
-    /// on the shared Redis instance.
+    /// A unique nonce so parallel tests / stale entries never collide on the
+    /// shared Redis instance. The nanosecond clock alone can collide across tests
+    /// that start in the same instant on different threads, so a process-wide
+    /// atomic counter is OR'd in to guarantee uniqueness for any run subset.
     fn nonce() -> u128 {
-        std::time::SystemTime::now()
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let base = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos();
+        (base << 20) | u128::from(COUNTER.fetch_add(1, Ordering::Relaxed) & 0xF_FFFF)
     }
 
     fn token_meta(username: &str, device_id: &str) -> TokenMetadata {

@@ -24,7 +24,7 @@ use openidconnect::{
 };
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
-    pkcs8::{DecodePrivateKey, EncodePrivateKey},
+    pkcs8::DecodePrivateKey,
 };
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,7 @@ use crate::synapse_client::SynapseClient;
 use crate::introspect::generate_opaque_token;
 
 /// Constant-time string comparison to prevent timing attacks on secrets.
-fn constant_time_eq(a: &str, b: &str) -> bool {
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
@@ -98,12 +98,15 @@ impl EcdsaSigningKey {
         Self { key, kid }
     }
 
-    pub fn to_pem(&self) -> Result<String> {
-        let pem = self
-            .key
-            .to_pkcs8_pem(Default::default())
-            .map_err(|e| anyhow!("Failed to encode key as PEM: {}", e))?;
-        Ok(pem.to_string())
+    /// Non-sensitive identifier for the signing key: the first 16 hex chars of a
+    /// SHA-256 over the SEC1-encoded *public* key. Safe to log — it reveals no
+    /// private material but lets operators correlate which ephemeral key is live.
+    pub fn public_key_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let pubkey = self.key.verifying_key().to_encoded_point(false);
+        let digest = Sha256::digest(pubkey.as_bytes());
+        let hex = hex::encode(digest);
+        hex[..16].to_string()
     }
 }
 
@@ -477,6 +480,22 @@ async fn token_refresh(
         }));
     }
 
+    // Race guard (S3-3 / H3 + S3-4 / H6): refuse to rotate if this device was just
+    // signed out or the user was just deactivated/erased. Mirrors the same check
+    // in compat::refresh so neither refresh entry point can resurrect access for a
+    // torn-down device / terminated account.
+    let device_revoked = !metadata.device_id.is_empty()
+        && db_client
+            .is_device_revoked(&metadata.username, &metadata.device_id)
+            .await?;
+    if device_revoked || db_client.is_user_deactivated(&metadata.username).await? {
+        let _ = db_client.delete_token(&rt).await;
+        return Err(CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "Session has been revoked.".to_string(),
+        }));
+    }
+
     let (access_prefix, refresh_prefix) = if config.mas_shared_secret.is_some() {
         ("mat_", "mcr_")
     } else {
@@ -516,6 +535,27 @@ async fn token_refresh(
         .await?;
 
     let _ = db_client.delete_token(&rt).await;
+
+    // Check-mint-recheck (S3-3 / H3 + S3-4 / H6): if a revoke/deactivate sweep
+    // tombstoned this device/user in the gap between our pre-mint check and our
+    // writes, roll back the just-minted tokens so none can be resurrected.
+    let revoked_now = (!metadata.device_id.is_empty()
+        && db_client
+            .is_device_revoked(&metadata.username, &metadata.device_id)
+            .await
+            .unwrap_or(true))
+        || db_client
+            .is_user_deactivated(&metadata.username)
+            .await
+            .unwrap_or(true);
+    if revoked_now {
+        let _ = db_client.delete_token(&new_access).await;
+        let _ = db_client.delete_token(&new_refresh).await;
+        return Err(CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "Session has been revoked.".to_string(),
+        }));
+    }
 
     let mut response = CoreTokenResponse::new(
         AccessToken::new(new_access),
@@ -606,6 +646,21 @@ async fn token_device_code(
             ))
         }
         DeviceCodeStatus::Approved => {
+            // Atomically claim this approved device_code BEFORE issuing any token
+            // (S3-1 / H9). Without this, two concurrent polls both pass the
+            // `status == Approved` check and each mint a token pair (+ a phantom
+            // device). The SETNX-style claim ensures exactly one poll issues
+            // tokens; concurrent losers fall back to authorization_pending (the
+            // winner deletes the device_code at the end, so a subsequent poll then
+            // gets expired_token — same as a normal completed flow).
+            if !db_client.try_claim_device_code(&dc).await? {
+                debug!(device_code = %dc, "device_code already claimed by a concurrent poll");
+                return Err(device_code_error(
+                    "authorization_pending",
+                    "Device code is being processed.",
+                ));
+            }
+
             let did = entry
                 .did
                 .as_ref()
@@ -742,7 +797,26 @@ async fn token_authorization_code(
         })
     })?;
 
-    let client_id = if let Some(c) = form.client_id.clone() {
+    // C2 Step 1: bind the auth code to the client it was issued to. A correct
+    // client presents the same `client_id` at /authorize and /token. If the code
+    // carries a client_id (always set by `sign_in`), the request's client_id —
+    // when present — must match it, and the rest of the function runs against the
+    // code's client (never the request's). This prevents a leaked confidential
+    // client's code from being redeemed by a different (public) client.
+    if !code_entry.client_id.is_empty() {
+        if let Some(ref req_client_id) = form.client_id {
+            if !constant_time_eq(req_client_id, &code_entry.client_id) {
+                return Err(CustomError::BadRequestToken(TokenError {
+                    error: CoreErrorResponseType::InvalidGrant,
+                    error_description: "client_id does not match the authorization code."
+                        .to_string(),
+                }));
+            }
+        }
+    }
+    let client_id = if !code_entry.client_id.is_empty() {
+        code_entry.client_id.clone()
+    } else if let Some(c) = form.client_id.clone() {
         c
     } else {
         code_entry.client_id.clone()
@@ -789,17 +863,21 @@ async fn token_authorization_code(
             .code_challenge_method
             .as_deref()
             .unwrap_or("S256");
+        // C2 Step 4b: reject the `plain` PKCE method. Discovery advertises S256
+        // only (`code_challenge_methods_supported = ["S256"]`); no compliant
+        // client sends `plain`, and the downgrade weakens the PKCE binding.
         let computed = match method {
             "S256" => {
                 use sha2::{Digest, Sha256};
                 let hash = Sha256::digest(verifier.as_bytes());
                 URL_SAFE_NO_PAD.encode(hash)
             }
-            "plain" => verifier.clone(),
             _ => {
-                return Err(CustomError::BadRequest(
-                    "Unsupported code_challenge_method.".to_string(),
-                ))
+                return Err(CustomError::BadRequestToken(TokenError {
+                    error: CoreErrorResponseType::InvalidGrant,
+                    error_description: "Unsupported code_challenge_method (only S256 is allowed)."
+                        .to_string(),
+                }));
             }
         };
         if !constant_time_eq(&computed, challenge) {
@@ -1055,6 +1133,31 @@ pub async fn authorize(
     } else {
         "".to_string()
     };
+    // C2 Step 4b: reject `code_challenge_method=plain` up front so a `plain`
+    // challenge is never carried into /sign_in or stored on the CodeEntry.
+    // Discovery advertises S256 only. A missing method defaults to S256.
+    if let Some(ccm) = &params.code_challenge_method {
+        if ccm != "S256" {
+            return Err(CustomError::BadRequest(
+                "Unsupported code_challenge_method (only S256 is allowed).".to_string(),
+            ));
+        }
+    }
+    // C2 Step 4a: require S256 PKCE for the authorization-code flow. PKCE is the
+    // only backstop that binds a redeemed code to the browser that initiated the
+    // request; without it, a leaked or stolen code is freely redeemable. Every
+    // real client already sends S256 (Element X per the Matrix OAuth 2.0 profile,
+    // the in-house `siwx-oidc-auth` lib, and all e2e flows), so requiring it is a
+    // spec-compliance tightening that breaks no compliant client. Scope: ALL
+    // code-flow clients — every registered `ClientEntry` carries a server-issued
+    // secret regardless of `token_endpoint_auth_method`, so there is no client
+    // class that legitimately omits PKCE to exempt. The device-code grant (RFC
+    // 8628) does NOT pass through /authorize and is unaffected.
+    if matches!(_response_type, CoreResponseType::Code) && params.code_challenge.is_none() {
+        return Err(CustomError::BadRequest(
+            "code_challenge is required (S256 PKCE) for the authorization-code flow.".to_string(),
+        ));
+    }
     let pkce_params = match (&params.code_challenge, &params.code_challenge_method) {
         (Some(cc), Some(ccm)) => format!("&code_challenge={cc}&code_challenge_method={ccm}"),
         (Some(cc), None) => format!("&code_challenge={cc}&code_challenge_method=S256"),
@@ -1095,6 +1198,49 @@ fn extract_nonce(message: &str) -> Option<&str> {
         .map(|l| l.trim_start_matches("Nonce: ").trim())
 }
 
+/// Extract the `Expiration Time: {value}` line from a CAIP-122 message.
+fn extract_expiration_time(message: &str) -> Option<&str> {
+    message
+        .lines()
+        .find(|l| l.starts_with("Expiration Time: "))
+        .map(|l| l.trim_start_matches("Expiration Time: ").trim())
+}
+
+/// C1 (login path): enforce the CAIP-122 `Expiration Time` **only when present**.
+/// The browser login frontend (`App.svelte`) sets a 48h `expirationTime`, so for
+/// it this closes the "valid forever" replay gap on the login path. A ~120s skew
+/// allowance absorbs client/server clock drift.
+///
+/// **Enforce-if-present (don't break headless clients).** The in-house headless
+/// client `siwx-oidc-auth` (the exact login path used by the production agent
+/// fleet) does NOT emit an `Expiration Time` line in its CAIP-122 message
+/// (`siwx-oidc-auth/src/lib.rs::build_message`). Rejecting messages that omit the
+/// line would brick every agent. So a message with NO `Expiration Time` is
+/// accepted; a message that HAS one is rejected only when it is actually expired
+/// (past, beyond the skew). The replay window for an omitted exp is bounded
+/// elsewhere by the single-use nonce / session lifetime.
+///
+/// Out of scope: the device-approval and account paths (their builders do not set
+/// an expiration yet — those are the breaking C1 parts handled in a follow-up).
+const CAIP122_EXPIRY_SKEW_SECS: i64 = 120;
+
+fn enforce_login_expiration(message: &str, now: chrono::DateTime<Utc>) -> Result<(), CustomError> {
+    // Enforce-if-present: a missing Expiration Time is accepted (headless clients
+    // like siwx-oidc-auth legitimately omit it). Only enforce when one is set.
+    let Some(raw) = extract_expiration_time(message) else {
+        return Ok(());
+    };
+    let exp = chrono::DateTime::parse_from_rfc3339(raw)
+        .map_err(|e| CustomError::BadRequest(format!("Invalid Expiration Time: {}", e)))?
+        .with_timezone(&Utc);
+    if now - chrono::Duration::seconds(CAIP122_EXPIRY_SKEW_SECS) >= exp {
+        return Err(CustomError::BadRequest(
+            "CAIP-122 signature has expired".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Extract resource URIs from the `Resources:` section of a CAIP-122 message.
 fn extract_resources(message: &str) -> Vec<&str> {
     let mut in_resources = false;
@@ -1109,6 +1255,40 @@ fn extract_resources(message: &str) -> Vec<&str> {
         }
     }
     out
+}
+
+/// C2 Step 3: re-validate a `redirect_uri` against the client's *registered*
+/// redirect_uris, mirroring the exact check in `authorize` (query-stripped exact
+/// match). Used by `sign_in` so a code is never appended to an unregistered (e.g.
+/// attacker-controlled) redirect_uri — closing the open-redirect on BOTH the
+/// wallet (Path B) and WebAuthn (Path A) login paths.
+async fn validate_registered_redirect_uri(
+    client_id: &str,
+    redirect_uri: &RedirectUrl,
+    db_client: &DBClientType,
+) -> Result<(), CustomError> {
+    let client_entry = db_client
+        .get_client(client_id.to_string())
+        .await
+        .map_err(|e| anyhow!("Failed to get kv: {}", e))?
+        .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
+
+    let mut r_u = redirect_uri.url().clone();
+    r_u.set_query(None);
+    let mut r_us: Vec<Url> = client_entry
+        .metadata
+        .redirect_uris()
+        .clone()
+        .iter_mut()
+        .map(|u| u.url().clone())
+        .collect();
+    r_us.iter_mut().for_each(|u| u.set_query(None));
+    if !r_us.contains(&r_u) {
+        return Err(CustomError::BadRequest(
+            "redirect_uri is not registered for this client.".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Verify the `siwx` cookie's CAIP-122 signature and nonce against the session.
@@ -1177,6 +1357,9 @@ pub fn verify_siwx_cookie(
     if msg_nonce != session.siwe_nonce {
         return Err(CustomError::BadRequest("Nonce mismatch".to_string()));
     }
+
+    // C1 (login path): enforce the message Expiration Time.
+    enforce_login_expiration(&siwx_cookie.message, Utc::now())?;
 
     Ok(siwx_cookie.did)
 }
@@ -1393,8 +1576,23 @@ pub async fn sign_in(
             return Err(anyhow!("Missing or mismatched resource in CAIP-122 message").into());
         }
 
+        // C1 (login path): enforce the message Expiration Time. The login
+        // frontend already sets a 48h `expirationTime`, so this is server-only
+        // and non-breaking. Only the wallet (Path B) CAIP-122 path is affected;
+        // the WebAuthn (Path A) ceremony has no CAIP-122 message to expire.
+        enforce_login_expiration(&siwx_cookie.message, Utc::now())?;
+
         siwx_cookie.did
     };
+
+    // C2 Step 3: re-validate the request redirect_uri against the client's
+    // registered set before issuing the code. `authorize` checks this, but
+    // `sign_in` re-receives `redirect_uri` as a query param and previously
+    // appended the code to whatever URL was supplied. This closes the open
+    // redirect on BOTH the wallet (Path B) and WebAuthn (Path A) paths. Path B
+    // additionally binds the redirect via the signed `Resources:` list above;
+    // this is the only redirect binding Path A has.
+    validate_registered_redirect_uri(&params.client_id, &params.redirect_uri, db_client).await?;
 
     // Extract client-proposed device_id from the session's stored scope (if any).
     let proposed_device_id = session_entry
@@ -1745,7 +1943,11 @@ mod tests {
             serde_urlencoded::from_str(redirect_url.split("/?").collect::<Vec<&str>>()[1]).unwrap();
         let params: SignInParams = serde_urlencoded::from_str(&redirect_url).unwrap();
 
-        // Build the CAIP-122 message (EIP-4361 format for eip155).
+        // Build the CAIP-122 message (EIP-4361 format for eip155). The login
+        // path now enforces the Expiration Time (C1 safe subset), so include a
+        // future exp — exactly as the real frontend already does.
+        let expiration_time =
+            (Utc::now() + Duration::hours(48)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let message = format!(
             "example.com wants you to sign in with your Ethereum account:\n\
              {address_str}\n\n\
@@ -1755,6 +1957,7 @@ mod tests {
              Chain ID: 1\n\
              Nonce: {}\n\
              Issued At: 2023-04-17T11:01:24.862Z\n\
+             Expiration Time: {expiration_time}\n\
              Resources:\n\
              - https://example.com",
             authorize_params.nonce,
@@ -1824,8 +2027,10 @@ mod tests {
             prompt: None,
             request_uri: None,
             request: None,
-            code_challenge: None,
-            code_challenge_method: None,
+            // C2 Step 4a: PKCE is mandatory for the code flow — a valid S256
+            // challenge so this scope-acceptance test exercises the real path.
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
         };
         let result = authorize(params, &db_client).await;
         assert!(
@@ -1935,8 +2140,10 @@ mod tests {
             prompt: None,
             request_uri: None,
             request: None,
-            code_challenge: None,
-            code_challenge_method: None,
+            // C2 Step 4a: PKCE is mandatory for the code flow — a valid S256
+            // challenge so this scope-acceptance test exercises the real path.
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
         };
         let result = authorize(params, &db_client).await;
         assert!(
@@ -2020,5 +2227,68 @@ mod tests {
         let id = resolve_device_id(None);
         assert!(id.starts_with("SIWX_"));
         assert_eq!(id.len(), "SIWX_".len() + 8);
+    }
+
+    /// Build a minimal CAIP-122-shaped message, optionally carrying an
+    /// `Expiration Time:` line (mirrors what the browser frontend would emit).
+    fn login_message_with_exp(exp: Option<&str>) -> String {
+        let mut msg = String::from(
+            "example.com wants you to sign in with your Ethereum account:\n\
+             0xabc\n\n\
+             You are signing-in to example.com.\n\n\
+             URI: https://example.com\n\
+             Version: 1\n\
+             Chain ID: 1\n\
+             Nonce: deadbeef\n\
+             Issued At: 2023-04-17T11:01:24.862Z\n",
+        );
+        if let Some(e) = exp {
+            msg.push_str(&format!("Expiration Time: {e}\n"));
+        }
+        msg.push_str("Resources:\n- https://example.com");
+        msg
+    }
+
+    /// Enforce-if-present: a message with NO `Expiration Time` line is ACCEPTED.
+    /// This is the headless-client (siwx-oidc-auth) login path — its
+    /// `build_message` omits the line, and rejecting it would brick the agent
+    /// fleet.
+    #[test]
+    fn login_expiration_missing_is_accepted() {
+        let now = Utc::now();
+        let msg = login_message_with_exp(None);
+        assert!(
+            enforce_login_expiration(&msg, now).is_ok(),
+            "a message with no Expiration Time must be accepted (headless clients omit it)"
+        );
+    }
+
+    /// Enforce-if-present: a message WITH an Expiration Time in the PAST (beyond
+    /// the skew) is REJECTED with an "expired" error.
+    #[test]
+    fn login_expiration_present_but_expired_is_rejected() {
+        let now = Utc::now();
+        let past = (now - Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let msg = login_message_with_exp(Some(&past));
+        let err = enforce_login_expiration(&msg, now)
+            .expect_err("a present-but-expired Expiration Time must be rejected");
+        let rendered = format!("{err:?}").to_lowercase();
+        assert!(
+            rendered.contains("expire"),
+            "rejection must mention expiry: {rendered}"
+        );
+    }
+
+    /// Enforce-if-present: a message WITH a future Expiration Time is ACCEPTED.
+    #[test]
+    fn login_expiration_present_and_future_is_accepted() {
+        let now = Utc::now();
+        let future =
+            (now + Duration::hours(48)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let msg = login_message_with_exp(Some(&future));
+        assert!(
+            enforce_login_expiration(&msg, now).is_ok(),
+            "a future Expiration Time must be accepted"
+        );
     }
 }
