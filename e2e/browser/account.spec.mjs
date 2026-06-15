@@ -11,16 +11,14 @@
 // The stack (siwx-oidc + Synapse mock + Redis) runs externally; see e2e/up.sh.
 
 import { test, expect } from '@playwright/test';
-import { Wallet } from 'ethers';
+import { makeWallet, DEFAULT_PRIV, injectMockWallet } from './wallet-helper.mjs';
+import { countCeremonies, registerPasskeyInPage } from './webauthn-helper.mjs';
 
 const BASE = process.env.SIWEOIDC_HOST || 'http://localhost:8080';
 const MOCK = process.env.SYNAPSE_MOCK || 'http://localhost:8090';
 
 // A fixed throwaway test key — never used anywhere real.
-const PRIV = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
-const wallet = new Wallet(PRIV);
-const ADDRESS = wallet.address; // EIP-55 checksummed
-const WALLET_MXID = `@${`did:pkh:eip155:1:${ADDRESS}`.replaceAll(':', '-').toLowerCase()}:matrix.test`;
+const { wallet, address: ADDRESS, mxid: WALLET_MXID } = makeWallet(DEFAULT_PRIV);
 
 // -- mock helpers (Synapse stand-in) -----------------------------------------
 async function mockReset() {
@@ -39,81 +37,21 @@ async function mockDevices(mxid) {
 }
 
 // Count navigator.credentials ceremonies, so we can prove "exactly one".
+// Thin wrapper over the shared helper, preserved as a local name so the existing
+// test bodies read unchanged.
 async function instrumentCeremonyCounters(page) {
-  await page.addInitScript(() => {
-    window.__wa = { create: 0, get: 0 };
-    if (navigator.credentials) {
-      const c = navigator.credentials;
-      const oc = c.create && c.create.bind(c);
-      const og = c.get && c.get.bind(c);
-      if (oc) c.create = (...a) => { window.__wa.create++; return oc(...a); };
-      if (og) c.get = (...a) => { window.__wa.get++; return og(...a); };
-    }
-  });
+  await countCeremonies(page);
 }
 
-// Inject a mock EIP-1193 wallet that signs with the real ethers key.
+// Inject a mock EIP-1193 wallet that signs with the real ethers key (the fixed
+// DEFAULT_PRIV identity this spec asserts against). Thin wrapper over the shared
+// helper so call-sites stay identical.
 async function injectWallet(page) {
-  await page.exposeFunction('__ethSign', (msg) => wallet.signMessage(msg));
-  await page.addInitScript((addr) => {
-    let n = 0;
-    window.__signCount = () => n;
-    window.ethereum = {
-      isMetaMask: true,
-      isConnected: () => true,
-      request: async ({ method, params }) => {
-        if (method === 'eth_requestAccounts' || method === 'eth_accounts') return [addr];
-        if (method === 'eth_chainId') return '0x1';
-        if (method === 'personal_sign') { n++; return await window.__ethSign(params[0]); }
-        throw Object.assign(new Error('unsupported ' + method), { code: 4200 });
-      },
-      on() {}, removeListener() {},
-    };
-  }, ADDRESS);
+  await injectMockWallet(page, wallet);
 }
 
-// In-page WebAuthn registration ceremony (uses the virtual authenticator).
-// Returns the derived did:key.
-function registerPasskeyInPage() {
-  const b64uToBuf = (s) => {
-    const pad = '='.repeat((4 - (s.length % 4)) % 4);
-    const b = (s + pad).replace(/-/g, '+').replace(/_/g, '/');
-    const r = atob(b); const u = new Uint8Array(r.length);
-    for (let i = 0; i < r.length; i++) u[i] = r.charCodeAt(i);
-    return u.buffer;
-  };
-  const bufToB64u = (buf) => {
-    const by = new Uint8Array(buf); let s = '';
-    by.forEach((x) => (s += String.fromCharCode(x)));
-    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  };
-  return (async () => {
-    const sr = await fetch('/webauthn/register/start', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ display_name: null }),
-    });
-    if (!sr.ok) throw new Error('register start ' + sr.status + ' ' + (await sr.text()));
-    const opts = await sr.json();
-    opts.publicKey.challenge = b64uToBuf(opts.publicKey.challenge);
-    opts.publicKey.user.id = b64uToBuf(opts.publicKey.user.id);
-    if (opts.publicKey.excludeCredentials)
-      for (const c of opts.publicKey.excludeCredentials) c.id = b64uToBuf(c.id);
-    const cred = await navigator.credentials.create({ publicKey: opts.publicKey });
-    const att = cred.response;
-    const fr = await fetch('/webauthn/register/finish', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        id: cred.id, rawId: bufToB64u(cred.rawId), type: cred.type,
-        response: {
-          attestationObject: bufToB64u(att.attestationObject),
-          clientDataJSON: bufToB64u(att.clientDataJSON),
-        },
-      }),
-    });
-    if (!fr.ok) throw new Error('register finish ' + fr.status + ' ' + (await fr.text()));
-    return (await fr.json()).did;
-  })();
-}
+// `registerPasskeyInPage` is imported from ./webauthn-helper.mjs (the single
+// source of truth for the in-page registration ceremony).
 
 // ---------------------------------------------------------------------------
 
