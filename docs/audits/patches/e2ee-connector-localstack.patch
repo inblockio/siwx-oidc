@@ -1,0 +1,265 @@
+diff --git a/crates/aqua-matrix-agent/tests/e2e.rs b/crates/aqua-matrix-agent/tests/e2e.rs
+index 3749db1..80b28a2 100644
+--- a/crates/aqua-matrix-agent/tests/e2e.rs
++++ b/crates/aqua-matrix-agent/tests/e2e.rs
+@@ -38,6 +38,7 @@ fn resolve_key_file(default: &str) -> String {
+     std::env::var(var).unwrap_or_else(|_| default.to_string())
+ }
+ 
++#[allow(dead_code)] // superseded by the store-root override in agent_config; kept for reference.
+ fn persistent_store(key_file: &str) -> PathBuf {
+     let stem = Path::new(key_file)
+         .file_stem()
+@@ -50,13 +51,34 @@ fn persistent_store(key_file: &str) -> PathBuf {
+ 
+ fn agent_config(key_file: &str) -> AgentConfig {
+     let key_file = resolve_key_file(key_file);
++    // URL overrides let the suite run against a LOCAL real stack (siwx-oidc +
++    // Synapse on localhost) instead of prod. Defaults stay prod so existing
++    // behaviour is unchanged when the vars are unset. Mirrors the
++    // SIWX_E2E_KEY_A/B key-file override pattern above.
++    let siwx_url = std::env::var("SIWX_E2E_SIWX_URL")
++        .unwrap_or_else(|_| "https://siwx-oidc.inblock.io".to_string());
++    let matrix_url = std::env::var("SIWX_E2E_MATRIX_URL")
++        .unwrap_or_else(|_| "https://matrix.inblock.io".to_string());
++    // The crypto store binds to (homeserver, device_id). Running the SAME key
++    // file against a DIFFERENT homeserver (local vs prod) must use a SEPARATE
++    // store, or connect() sees a store/device mismatch. Allow an explicit store
++    // root override so a local run never collides with the prod `.e2e-store`.
++    let store_root = std::env::var("SIWX_E2E_STORE_ROOT")
++        .map(PathBuf::from)
++        .unwrap_or_else(|_| repo_root().join(".e2e-store"));
++    let stem = Path::new(&key_file)
++        .file_stem()
++        .and_then(|s| s.to_str())
++        .unwrap_or("agent");
++    let store_dir = store_root.join(stem);
++    std::fs::create_dir_all(&store_dir).expect("create e2e store dir");
+     AgentConfig {
+         key_file: repo_root().join(&key_file),
+-        siwx_url: "https://siwx-oidc.inblock.io".into(),
+-        matrix_url: "https://matrix.inblock.io".into(),
++        siwx_url,
++        matrix_url,
+         client_id: None,
+         redirect_uri: None,
+-        store_dir: persistent_store(&key_file),
++        store_dir,
+         // None → connect() derives a stable device_id from the DID.
+         device_id: None,
+     }
+@@ -135,6 +157,38 @@ async fn e2ee_bidirectional_messaging() {
+         .expect("failed to get DM room")
+         .expect("no DM room found between agents");
+ 
++    // R-K1 encryption proof: the shared room MUST have `m.room.encryption` set.
++    // create_dm() seeds RoomEncryptionEventContent::with_recommended_defaults()
++    // (Megolm v1) when the e2e-encryption feature is on, so a non-encrypted room
++    // here would mean the DM is plaintext — exactly what this regression rules
++    // out. Assert it from BOTH participants' views.
++    {
++        use matrix_sdk::ruma::RoomId;
++        let rid: &RoomId = room_id.as_str().try_into().expect("room id parse");
++        let room_a = agent_a.client().get_room(rid).expect("A: room missing");
++        let enc_a = room_a
++            .latest_encryption_state()
++            .await
++            .expect("A: query encryption state");
++        println!("Room {room_id} encryption (A's view): {enc_a:?}");
++        assert!(
++            enc_a.is_encrypted(),
++            "ROOM IS NOT ENCRYPTED (A's view) — m.room.encryption missing; DM would be plaintext"
++        );
++
++        let room_b = agent_b.client().get_room(rid).expect("B: room missing");
++        let enc_b = room_b
++            .latest_encryption_state()
++            .await
++            .expect("B: query encryption state");
++        println!("Room {room_id} encryption (B's view): {enc_b:?}");
++        assert!(
++            enc_b.is_encrypted(),
++            "ROOM IS NOT ENCRYPTED (B's view) — m.room.encryption missing"
++        );
++        println!("m.room.encryption CONFIRMED set (Megolm) — both participants agree the room is encrypted");
++    }
++
+     let messages = agent_a
+         .messages(&room_id, 10)
+         .await
+@@ -192,6 +246,175 @@ async fn e2ee_bidirectional_messaging() {
+     println!("  Messages verified decryptable in both directions");
+ }
+ 
++/// R-K2: after a healthy encrypted exchange, sign ONE participant's device out
++/// (Agent B) via the Matrix CS-API logout (`/_matrix/client/v3/logout`, which
++/// Synapse forwards to siwx-oidc under MSC3861 delegated auth — the same path
++/// the deployed Element device sign-out uses). Then prove:
++///   1. The OTHER participant (Agent A), on a SEPARATE device/session, can still
++///      DECRYPT the message Agent B sent BEFORE the logout (history survives).
++///   2. The room is still E2E-encrypted from A's view (no encryption downgrade).
++///   3. A can send a NEW message and read it back decrypted (its own Megolm
++///      session is intact — no collateral cross-signing/crypto damage).
++/// This is the encrypted-stack survivability proof for a single-device sign-out.
++///
++/// Gated behind `SIWX_E2E_RUN_RK2=1` so it never logs out the prod test device
++/// by accident; it is meant to run against the LOCAL stack right after the
++/// bidirectional test.
++#[tokio::test]
++async fn e2ee_device_logout_history_survives() {
++    if std::env::var("SIWX_E2E_RUN_RK2").as_deref() != Ok("1") {
++        eprintln!("SKIP e2ee_device_logout_history_survives: set SIWX_E2E_RUN_RK2=1 to run");
++        return;
++    }
++
++    tracing_subscriber::fmt()
++        .with_env_filter("warn,aqua_matrix_agent=info")
++        .try_init()
++        .ok();
++
++    let _serial = E2E_LOCK.lock().await;
++
++    let agent_a = AgentClient::connect(agent_config("agent.pem"))
++        .await
++        .expect("Agent A failed to connect");
++    let agent_b = AgentClient::connect(agent_config("agent-b.pem"))
++        .await
++        .expect("Agent B failed to connect");
++    println!("A = {} ({})", agent_a.user_id(), agent_a.did());
++    println!("B = {} ({})  device={:?}", agent_b.user_id(), agent_b.did(), agent_b.device_id());
++
++    // --- Establish the shared encrypted room + exchange keys -----------------
++    agent_a
++        .send_dm(agent_b.user_id(), "rk2-room-setup")
++        .await
++        .expect("A failed to create DM room");
++    sync_n(&agent_b, 2).await;
++    agent_b.join_invited_rooms().await.expect("B join failed");
++    sync_n(&agent_b, 2).await;
++    sync_n(&agent_a, 2).await;
++
++    // B sends first so its outbound Megolm session is shared with A from the
++    // start (same key-ordering the bidi test relies on). This is the message
++    // whose decryptability must SURVIVE B's logout.
++    let tag = uuid::Uuid::new_v4().to_string();
++    let pre_logout = format!("rk2-before-logout-{tag}");
++    agent_b
++        .send_dm(agent_a.user_id(), &pre_logout)
++        .await
++        .expect("B failed to send pre-logout message");
++    println!("B sent pre-logout message: {pre_logout}");
++    sync_n(&agent_a, 3).await;
++
++    let room_a = agent_a
++        .dm_room_id(agent_b.user_id())
++        .await
++        .expect("dm_room_id failed")
++        .expect("no DM room");
++
++    // Sanity: A decrypts the pre-logout message NOW (before the logout).
++    let before = agent_a.messages(&room_a, 20).await.expect("A read");
++    let pre = before.iter().find(|m| m.body == pre_logout);
++    assert!(
++        pre.is_some() && pre.unwrap().body != "[unable to decrypt]",
++        "PRECONDITION FAILED: A could not decrypt B's message before logout: {:?}",
++        before.iter().map(|m| &m.body).collect::<Vec<_>>()
++    );
++    println!("PRECONDITION OK: A decrypted B's pre-logout message");
++
++    // --- Sign Agent B's device out via siwx-oidc's /_matrix/client/v3/logout -
++    // FINDING: matrix-sdk's `matrix_auth().logout()` POSTs to the HOMESERVER's
++    // native CS-API logout — but under MSC3861 delegated auth Synapse DISABLES
++    // its native `/logout` and returns 404 "Unrecognized request". The endpoint
++    // is OWNED by siwx-oidc (compat::logout, TeardownPolicy::DeleteDevice:
++    // deletes the Synapse device + revokes the session's tokens). In prod a
++    // Caddy method-route forwards `/_matrix/client/v3/logout` to siwx-oidc; the
++    // local stack has no Caddy, so we POST siwx-oidc DIRECTLY at :8081 with
++    // Agent B's live bearer token (the same token its connector session holds).
++    let b_token = agent_b
++        .client()
++        .access_token()
++        .expect("Agent B has no access token to sign out with");
++    let siwx_url = std::env::var("SIWX_E2E_SIWX_URL")
++        .unwrap_or_else(|_| "https://siwx-oidc.inblock.io".to_string());
++    let logout_url = format!("{}/_matrix/client/v3/logout", siwx_url.trim_end_matches('/'));
++    println!("Signing Agent B's device out via siwx-oidc {logout_url} (explicit DeleteDevice) ...");
++    let resp = reqwest::Client::new()
++        .post(&logout_url)
++        .bearer_auth(&b_token)
++        .json(&serde_json::json!({}))
++        .send()
++        .await
++        .expect("POST to siwx-oidc /logout failed (transport)");
++    let status = resp.status();
++    let body = resp.text().await.unwrap_or_default();
++    println!("siwx-oidc /logout HTTP {status}: {body}");
++    assert!(
++        status.is_success(),
++        "siwx-oidc /logout did not return 2xx (device sign-out failed): HTTP {status} {body}"
++    );
++    println!("Agent B device signed out (siwx-oidc deleted the Synapse device + revoked B's tokens)");
++
++    // Give Synapse a moment; it caches introspection ~2min but the logout itself
++    // is immediate server-side. A's session is on a DIFFERENT device and is
++    // untouched, so A keeps syncing normally.
++    sync_n(&agent_a, 3).await;
++
++    // --- (1) A still DECRYPTS the pre-logout history ------------------------
++    let after = agent_a
++        .messages(&room_a, 20)
++        .await
++        .expect("A read after B logout");
++    let still = after.iter().find(|m| m.body == pre_logout);
++    assert!(
++        still.is_some(),
++        "A lost B's pre-logout message after B logged out: {:?}",
++        after.iter().map(|m| &m.body).collect::<Vec<_>>()
++    );
++    assert_ne!(
++        still.unwrap().body, "[unable to decrypt]",
++        "COLLATERAL DAMAGE: A can no longer DECRYPT B's pre-logout message after B's device sign-out \
++         (the Megolm history key was lost) — E2EE history did NOT survive"
++    );
++    println!("R-K2 (1) PASS: A still decrypts B's pre-logout message after B's sign-out: {pre_logout}");
++
++    // --- (2) Room is still encrypted from A's view -------------------------
++    {
++        use matrix_sdk::ruma::RoomId;
++        let rid: &RoomId = room_a.as_str().try_into().expect("room id parse");
++        let room = agent_a.client().get_room(rid).expect("A: room missing");
++        let enc = room
++            .latest_encryption_state()
++            .await
++            .expect("A: query encryption state");
++        println!("Room {room_a} encryption after B logout (A's view): {enc:?}");
++        assert!(
++            enc.is_encrypted(),
++            "ENCRYPTION DOWNGRADE: room no longer encrypted after B's sign-out"
++        );
++    }
++    println!("R-K2 (2) PASS: room E2EE intact (m.room.encryption still set) after B's sign-out");
++
++    // --- (3) A's own crypto is undamaged: send + read-back decrypted -------
++    let post = format!("rk2-after-logout-{tag}");
++    agent_a
++        .send_dm(agent_b.user_id(), &post)
++        .await
++        .expect("A failed to send after B logout");
++    sync_n(&agent_a, 2).await;
++    let final_msgs = agent_a.messages(&room_a, 20).await.expect("A read own");
++    let own = final_msgs.iter().find(|m| m.body == post);
++    assert!(
++        own.is_some() && own.unwrap().body != "[unable to decrypt]",
++        "A could not send + decrypt its OWN new message after B's sign-out (A's Megolm session damaged): {:?}",
++        final_msgs.iter().map(|m| &m.body).collect::<Vec<_>>()
++    );
++    println!("R-K2 (3) PASS: A sent + read-back-decrypted a NEW message after B's sign-out: {post}");
++
++    println!("\nR-K2 device-logout survivability test PASSED");
++    println!("  B's device signed out via /_matrix/client/v3/logout (MSC3861 → siwx-oidc)");
++    println!("  A (other participant) retained decryptable history + encrypted room + working crypto");
++}
++
+ /// Regression test for the `413 M_TOO_LARGE` streaming-edit failure: a large
+ /// streamed reply must roll over onto multiple messages and arrive intact,
+ /// never as one oversize (and rejected) edit.
