@@ -23,6 +23,15 @@ const KV_DEVICE_TOMBSTONE_PREFIX: &str = "tombstone:device";
 /// concurrent refresh/mint refuses to issue tokens for a terminating user
 /// (S3-4 / H6 fix). Checked by the refresh/mint paths.
 const KV_USER_TOMBSTONE_PREFIX: &str = "tombstone:user";
+/// Prefix for server-issued, single-use CAIP-122 nonces (C1). Used by the
+/// device-approval and account CAIP-122 paths, which (unlike the login path) have
+/// no session to carry the nonce: it is minted on a dedicated GET and consumed on
+/// submit. The stored value is the operation context the nonce is bound to.
+const KV_CAIP122_NONCE_PREFIX: &str = "caip122_nonce";
+/// TTL for a server-issued CAIP-122 device/account nonce (seconds). Long enough
+/// for the user to read the page and complete a wallet signing prompt, short
+/// enough to bound the replay window. Matches the auth-code lifetime.
+pub const CAIP122_NONCE_TTL_SECS: u64 = 300; // 5 min
 pub const ENTRY_LIFETIME: usize = 300; // 5min — auth codes must outlive redirect chains
 pub const SESSION_LIFETIME: u64 = 300; // 5min
 pub const CLIENT_LIFETIME: u64 = 30 * 24 * 3600; // 30 days
@@ -197,4 +206,22 @@ pub trait DBClient {
     ) -> Result<()>;
     /// Delete the user_code -> device_code mapping.
     async fn delete_user_code_mapping(&self, user_code: &str) -> Result<()>;
+
+    // -- CAIP-122 server-issued single-use nonce store (C1) -------------------
+
+    /// Mint a server-issued single-use CAIP-122 nonce in `category`, bound to
+    /// `binding` (the operation context, e.g. the device `user_code` or the
+    /// account `action`). Returns the nonce string to embed in the page's signed
+    /// message. TTL is [`CAIP122_NONCE_TTL_SECS`].
+    async fn mint_caip122_nonce(&self, category: &str, binding: &str) -> Result<String>;
+
+    /// Atomically consume a previously-minted CAIP-122 nonce in `category`.
+    /// Returns `Some(binding)` for the FIRST consumer (the operation context the
+    /// nonce was minted for); `None` if the nonce is unknown/expired OR was already
+    /// consumed (replay). Single-use via SETNX, mirroring [`Self::try_consume_code`].
+    async fn try_consume_caip122_nonce(
+        &self,
+        category: &str,
+        nonce: &str,
+    ) -> Result<Option<String>>;
 }

@@ -746,6 +746,73 @@ impl DBClient for RedisClient {
         let key = format!("user_codes/{}", user_code);
         self.del_raw(&key).await
     }
+
+    // -- CAIP-122 server-issued single-use nonce store (C1) -------------------
+    //
+    // The device-approval (`POST /device`) and account (`POST /account/wallet`)
+    // CAIP-122 paths must bind every accepted signature to a fresh, server-issued,
+    // single-use nonce so a captured/replayed victim signature cannot approve an
+    // attacker's device or drive an account action. This mirrors the login path,
+    // which already binds the session nonce. Those two flows have no equivalent
+    // session, so the nonce is minted on a dedicated GET (`/device/nonce`,
+    // `/account/nonce`) and consumed here.
+    //
+    // The stored value is the *binding context* the nonce was minted for (the
+    // device `user_code` or the account `action`). The consumer checks it, so a
+    // nonce minted for one context cannot be redeemed for another (cross-context /
+    // operation replay rejected). Single-use is enforced atomically via SETNX on a
+    // companion `consumed` flag, exactly like `try_consume_code`.
+
+    async fn mint_caip122_nonce(&self, category: &str, binding: &str) -> Result<String> {
+        // 16 random bytes hex-encoded (128 bits) — well above the login nonce.
+        let nonce: String = {
+            let mut bytes = [0u8; 16];
+            rand::Rng::fill(&mut rand::thread_rng(), &mut bytes[..]);
+            hex::encode(bytes)
+        };
+        let key = format!("{}/{}/{}", KV_CAIP122_NONCE_PREFIX, category, nonce);
+        self.set_ex_raw(&key, binding, CAIP122_NONCE_TTL_SECS)
+            .await?;
+        Ok(nonce)
+    }
+
+    async fn try_consume_caip122_nonce(
+        &self,
+        category: &str,
+        nonce: &str,
+    ) -> Result<Option<String>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+
+        let key = format!("{}/{}/{}", KV_CAIP122_NONCE_PREFIX, category, nonce);
+        let consumed_key = format!("{}/consumed", key);
+
+        // Atomic: SETNX on the consumed flag — only the first caller wins.
+        let was_set: bool = conn
+            .set_nx(&consumed_key, "1")
+            .await
+            .map_err(|e| anyhow!("Failed to SETNX caip122 nonce consumed flag: {}", e))?;
+        if was_set {
+            let _: () = conn
+                .expire(&consumed_key, CAIP122_NONCE_TTL_SECS as i64)
+                .await
+                .unwrap_or(());
+        } else {
+            // Already consumed by an earlier request — reject as replay.
+            return Ok(None);
+        }
+
+        // Winner reads the binding context. A missing value means the nonce never
+        // existed or expired (the consumed flag we just set is harmless).
+        let binding: Option<String> = conn
+            .get(&key)
+            .await
+            .map_err(|e| anyhow!("Failed to read caip122 nonce binding: {}", e))?;
+        Ok(binding)
+    }
 }
 
 #[cfg(test)]

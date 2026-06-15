@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::oidc::{constant_time_eq, did_to_localpart, CustomError};
 use crate::synapse_client::{DeviceInfo, SynapseClient};
 use crate::webauthn as wa;
-use siwx_oidc::db::RedisClient;
+use siwx_oidc::db::{DBClient, RedisClient, CAIP122_NONCE_TTL_SECS};
 
 // -- Authenticated account-management session ---------------------------------
 //
@@ -31,6 +31,23 @@ use siwx_oidc::db::RedisClient;
 // for [`ACCOUNT_SESSION_TTL`] only. Every action POST must also echo the
 // session's CSRF token (defence in depth on top of SameSite=Strict). The session
 // is bound to one verified DID and never grants cross-user access.
+
+/// CAIP-122 nonce-store category for account re-auth nonces (C1). The stored
+/// binding is the `action` the nonce was minted for, so a signature minted for
+/// one action (e.g. `cross_signing_reset`) cannot be replayed for another (e.g.
+/// `account_erase`).
+pub const CAIP122_NONCE_CATEGORY_ACCOUNT: &str = "account";
+
+/// The Resources audience an account-action CAIP-122 message must name. It embeds
+/// the specific `action`, so the signed message is bound to that exact operation
+/// (operation binding, defence in depth on top of the action-bound nonce).
+fn account_action_resource(config: &Config, action: &str) -> String {
+    format!(
+        "{}/account?action={}",
+        config.base_url.as_str().trim_end_matches('/'),
+        action
+    )
+}
 
 /// Cookie name for the authenticated account-management session.
 pub const ACCOUNT_SESSION_COOKIE: &str = "acct_session";
@@ -542,6 +559,39 @@ async fn execute_action(
     }
 }
 
+// -- Server-issued single-use nonce (C1) --------------------------------------
+
+/// Server-issued single-use nonce for an account action (C1). The account page
+/// fetches this immediately before asking the wallet to sign, then embeds the
+/// returned `nonce` + `expiration_time` + `resources` in the CAIP-122 message.
+/// The nonce is bound to this exact `action` and consumed once in `account_wallet`.
+#[derive(Serialize)]
+pub struct AccountNonceResponse {
+    pub nonce: String,
+    /// RFC3339 Expiration Time the page must copy into the signed message.
+    pub expiration_time: String,
+    /// Resource URIs the page must include in the message `Resources:` block.
+    pub resources: Vec<String>,
+}
+
+pub async fn account_nonce(
+    config: &Config,
+    db_client: &RedisClient,
+    action: &str,
+) -> Result<AccountNonceResponse, CustomError> {
+    // Only mint for a recognised action (reject empty/unknown up front).
+    parse_action(action)?;
+    let nonce = db_client
+        .mint_caip122_nonce(CAIP122_NONCE_CATEGORY_ACCOUNT, action)
+        .await?;
+    let exp = Utc::now() + chrono::Duration::seconds(CAIP122_NONCE_TTL_SECS as i64);
+    Ok(AccountNonceResponse {
+        nonce,
+        expiration_time: exp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        resources: vec![account_action_resource(config, action)],
+    })
+}
+
 // -- Wallet re-authentication -------------------------------------------------
 
 pub async fn account_wallet(
@@ -579,6 +629,36 @@ pub async fn account_wallet(
             "Signature verification failed".to_string(),
         ));
     }
+
+    // C1: a bare valid signature is NOT enough. The message must carry the exact
+    // server-issued single-use nonce minted for THIS action (GET /account/nonce),
+    // an unexpired Expiration Time, and the action-specific Resources audience.
+    // Consume the nonce (single-use) and confirm it was minted for this very
+    // action, so a captured/replayed signature — or one minted for a different
+    // action (e.g. cross_signing_reset replayed for account_erase) — is rejected.
+    let msg_nonce = crate::oidc::extract_nonce_pub(&req.message).ok_or_else(|| {
+        CustomError::BadRequest("Nonce not found in CAIP-122 message".to_string())
+    })?;
+    let bound_action = db_client
+        .try_consume_caip122_nonce(CAIP122_NONCE_CATEGORY_ACCOUNT, msg_nonce)
+        .await?
+        .ok_or_else(|| {
+            CustomError::Unauthorized("Invalid, expired, or replayed account nonce".to_string())
+        })?;
+    if bound_action != req.action {
+        return Err(CustomError::Unauthorized(
+            "Account nonce was issued for a different action".to_string(),
+        ));
+    }
+    let resources = [account_action_resource(config, &req.action)];
+    crate::oidc::validate_caip122_envelope(
+        &req.message,
+        &crate::oidc::Caip122Expectation {
+            nonce: msg_nonce,
+            resources: &resources,
+        },
+        Utc::now(),
+    )?;
 
     let outcome = execute_action(
         action,
@@ -1382,11 +1462,20 @@ async function authWallet() {
     const address = accounts[0];
     const did = 'did:pkh:eip155:1:' + address;
     const domain = new URL(BASE).hostname;
-    const nonce = Math.random().toString(36).substring(2, 18);
+    // C1: fetch a server-issued single-use nonce (+ Expiration Time + Resources)
+    // bound to THIS action. The wallet signs these exact values; the server
+    // consumes the nonce once and rejects any replay or cross-action reuse.
+    const nr = await fetch(BASE + '/account/nonce?action=' + encodeURIComponent(ACTION));
+    if (!nr.ok) { const t = await nr.text(); showStatus(t || 'Could not start the action.'); return; }
+    const np = await nr.json();
     const issuedAt = new Date().toISOString();
-    const message = domain + ' wants you to sign in with your Ethereum account:\n' +
+    let message = domain + ' wants you to sign in with your Ethereum account:\n' +
       address + '\n\nConfirm account action.\n\nURI: ' + BASE + '\nVersion: 1\nChain ID: 1\n' +
-      'Nonce: ' + nonce + '\nIssued At: ' + issuedAt;
+      'Nonce: ' + np.nonce + '\nIssued At: ' + issuedAt + '\nExpiration Time: ' + np.expiration_time;
+    if (np.resources && np.resources.length) {
+      message += '\nResources:';
+      for (const r of np.resources) message += '\n- ' + r;
+    }
     const signature = await window.ethereum.request({ method: 'personal_sign', params: [message, address] });
     const r = await fetch(BASE + '/account/wallet', {
       method: 'POST',

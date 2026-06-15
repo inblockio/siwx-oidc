@@ -128,17 +128,79 @@ fn eip191_sign(key: &SigningKey, message: &str) -> String {
 }
 
 /// The CAIP-122 message the `/account` page JS signs (`Confirm account action.`
-/// body, self-generated nonce). The account re-auth verifies only the signature
-/// and DID method (no session nonce), so a self-consistent message suffices.
-fn sign_account_message(w: &Wallet, base: &str) -> (String, String) {
+/// body). C1: the account re-auth now requires a server-issued single-use nonce
+/// bound to the `action`, plus an Expiration Time and the action Resources, so we
+/// fetch the nonce from `GET /account/nonce?action=...` and sign those exact
+/// values — mirroring the embedded page.
+async fn sign_account_message(
+    c: &Client,
+    w: &Wallet,
+    base: &str,
+    action: &str,
+) -> (String, String) {
     let domain = reqwest::Url::parse(base)
         .unwrap()
         .host_str()
         .unwrap()
         .to_string();
+    let np: Value = c
+        .get(format!("{base}/account/nonce?action={action}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let nonce = np["nonce"].as_str().unwrap();
+    let expiration_time = np["expiration_time"].as_str().unwrap();
+    let resources: Vec<String> = np["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| format!("\n- {}", r.as_str().unwrap()))
+        .collect();
     let message = format!(
-        "{domain} wants you to sign in with your Ethereum account:\n{addr}\n\nConfirm account action.\n\nURI: {base}\nVersion: 1\nChain ID: 1\nNonce: testnonce0001\nIssued At: 2026-06-14T00:00:00.000Z",
+        "{domain} wants you to sign in with your Ethereum account:\n{addr}\n\nConfirm account action.\n\nURI: {base}\nVersion: 1\nChain ID: 1\nNonce: {nonce}\nIssued At: 2026-06-14T00:00:00.000Z\nExpiration Time: {expiration_time}\nResources:{res}",
         addr = w.address,
+        res = resources.concat(),
+    );
+    let sig = eip191_sign(&w.key, &message);
+    (message, sig)
+}
+
+/// Fetch a server-issued device-approval nonce and build the CAIP-122 message the
+/// `/device` page JS signs (C1). Returns `(message, 0x-signature)`.
+async fn sign_device_message(
+    c: &Client,
+    w: &Wallet,
+    base: &str,
+    user_code: &str,
+) -> (String, String) {
+    let domain = reqwest::Url::parse(base)
+        .unwrap()
+        .host_str()
+        .unwrap()
+        .to_string();
+    let np: Value = c
+        .get(format!("{base}/device/nonce?user_code={user_code}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let nonce = np["nonce"].as_str().unwrap();
+    let expiration_time = np["expiration_time"].as_str().unwrap();
+    let resources: Vec<String> = np["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| format!("\n- {}", r.as_str().unwrap()))
+        .collect();
+    let message = format!(
+        "{domain} wants you to sign in with your Ethereum account:\n{addr}\n\nApprove device login.\n\nURI: {base}\nVersion: 1\nChain ID: 1\nNonce: {nonce}\nIssued At: 2026-06-14T00:00:00.000Z\nExpiration Time: {expiration_time}\nResources:{res}",
+        addr = w.address,
+        res = resources.concat(),
     );
     let sig = eip191_sign(&w.key, &message);
     (message, sig)
@@ -558,7 +620,7 @@ async fn account_reauth(
     w: &Wallet,
     action: &str,
 ) -> (String, String, Value) {
-    let (message, signature) = sign_account_message(w, base);
+    let (message, signature) = sign_account_message(c, w, base, action).await;
     let resp = c
         .post(format!("{base}/account/wallet"))
         .json(&json!({
@@ -1321,17 +1383,8 @@ async fn h9_device_code_approved_no_double_redemption() {
         let user_code = da["user_code"].as_str().unwrap().to_string();
 
         // Approve it with the wallet (CAIP-122 over the device-approval message).
-        let domain = reqwest::Url::parse(&base)
-            .unwrap()
-            .host_str()
-            .unwrap()
-            .to_string();
-        let nonce = "deviceapprovalnonce";
-        let message = format!(
-            "{domain} wants you to sign in with your Ethereum account:\n{addr}\n\nApprove device login.\n\nURI: {base}\nVersion: 1\nChain ID: 1\nNonce: {nonce}\nIssued At: 2026-06-14T00:00:00.000Z",
-            addr = w.address,
-        );
-        let signature = eip191_sign(&w.key, &message);
+        // C1: fetch the server-issued single-use nonce bound to this user_code.
+        let (message, signature) = sign_device_message(&c, &w, &base, &user_code).await;
         let approve = c
             .post(format!("{base}/device"))
             .json(&json!({

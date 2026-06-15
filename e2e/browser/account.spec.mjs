@@ -183,6 +183,36 @@ test('deep-link manage-session with a base64 (slash) device id resolves', async 
   expect(await page.evaluate(() => window.__signCount())).toBe(0);
 });
 
+test('C1: a bare (no server nonce) wallet signature is rejected by the server', async ({ page }) => {
+  // The old account-takeover vector: any leaked EIP-191 signature replayed as a
+  // re-auth. The page now fetches a server nonce; here we bypass the page and POST
+  // a bare self-signed message straight to /account/wallet to prove the SERVER
+  // (not just the page) rejects it. Most destructive action: account_erase.
+  await mockReset();
+  await mockSeed(WALLET_MXID, 'SIWX_bare_x');
+  await injectWallet(page);
+  await page.goto('/account?action=org.matrix.account_erase');
+
+  const status = await page.evaluate(async (addr) => {
+    const base = location.origin;
+    const domain = new URL(base).hostname;
+    // No server nonce, no Expiration Time, no Resources — exactly the pre-C1 shape.
+    const message = domain + ' wants you to sign in with your Ethereum account:\n' +
+      addr + '\n\nConfirm account action.\n\nURI: ' + base + '\nVersion: 1\nChain ID: 1\n' +
+      'Nonce: leakedoldnonce01\nIssued At: 2026-06-14T00:00:00.000Z';
+    const signature = await window.ethereum.request({ method: 'personal_sign', params: [message, addr] });
+    const r = await fetch(base + '/account/wallet', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'org.matrix.account_erase', did: 'did:pkh:eip155:1:' + addr, message, signature, device_id: null }),
+    });
+    return r.status;
+  }, ADDRESS);
+
+  expect(status).not.toBe(200); // 401/400 — the bare signature is refused
+  const s = await (await fetch(`${MOCK}/__state`)).json();
+  expect(s.lifecycle[WALLET_MXID]?.erased ?? false).toBe(false); // and NOT executed
+});
+
 test('passkey: one ceremony covers list + sign-out (virtual authenticator)', async ({ page }) => {
   await mockReset();
   await instrumentCeremonyCounters(page);
