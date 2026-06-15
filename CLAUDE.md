@@ -105,7 +105,7 @@ scope format.
 | Refresh token prefix | `mcr_` | (none) |
 | Scope format | `openid urn:matrix:client:api:* urn:matrix:client:device:{id}` | `openid profile` |
 | Access token TTL | 300s | 300s |
-| Refresh token TTL | 86400s (24h) | 86400s (24h) |
+| Refresh token TTL | 7776000s (90d) | 7776000s (90d) |
 | Introspection | Active (`/oauth2/introspect`) | Not available |
 | Device ID | Synapse-managed `SIWX_{uuid}` | Empty string (no Synapse) |
 
@@ -161,6 +161,163 @@ cargo run -p siwx-oidc-auth -- --help
 The aqua-auth tests are self-contained (pure crypto). The server e2e test
 (`oidc::tests::e2e_flow`) requires a running Redis instance.
 
+## E2E & Security Test Harness (audit 2026-06-14)
+
+This is the complete, self-contained recipe to re-run **everything** from the
+2026-06-14 resilience/security audit. Each item lists the EXACT command. Unless
+noted, run from the repo root (`~/siwx-oidc`) with the mock stack up.
+
+### Audit documents (read these first)
+
+- **Requirement map + hazard register:** `docs/audits/2026-06-14-siwx-oidc-requirement-map.md`
+  — every wallet/WebAuthn/device flow as falsifiable if-then hypotheses (R-A1…R-K2)
+  plus the race/cleanup hazard register **H1…H14** that drove the suites.
+- **Morning summary:** `docs/audits/2026-06-14-OVERNIGHT-SUMMARY.md` — what landed,
+  commit index, owner-decision queue, how-to-run.
+- **Security review** (on the security branch, `~/siwx-oidc-sec`):
+  `docs/audits/2026-06-14-siwx-oidc-security-review.md` (consolidated, C1/C2 + H-a…H-i)
+  and the breaking-fix spec `docs/audits/2026-06-14-remediation-spec-criticals.md`.
+
+### Mock stack (Redis + Synapse mock + siwx-oidc, all podman)
+
+```bash
+bash e2e/up.sh      # builds the debug binary, starts 3 containers, waits for /health
+bash e2e/down.sh    # tear down
+```
+
+Containers (host sandbox reaps host-bound listeners, so every listener is
+containerised; `ubuntu:rolling` matches host glibc 2.43 so the native debug binary
+runs as-is):
+
+| Container | Port (127.0.0.1) | Role |
+|---|---|---|
+| `siwx-e2e-redis` | 6379 | session/token/credential store |
+| `siwx-e2e-mock`  | 8090 | Synapse admin/MAS mock (Bearer `testsecret`) |
+| `siwx-e2e-oidc`  | 8080 | siwx-oidc provider (audited local debug binary) |
+
+**Synapse mock (`e2e/synapse_mock.py`)** — faithful in-memory mock of the Synapse
+admin/MAS endpoints siwx-oidc calls, with test hooks used by the race suite:
+
+| Hook | Purpose |
+|---|---|
+| `POST /__reset` | clear all state (devices, call log, armed faults, secret) |
+| `POST /__seed_device {mxid, device_id}` | pre-create a device for a user |
+| `GET /__state` | dump devices + per-call ordering log; now also exposes `effective_deletes` accounting + currently-armed faults |
+| `POST /__fail {endpoint, mode}` | fault injection — `mode` = `500` \| `timeout` \| `off` for e.g. `delete_device` (drives H14 / Synapse-unreachable tests) |
+| `POST /__set_secret` | rotate the admin/MAS shared secret at runtime |
+
+### One-shot pipeline
+
+```bash
+bash e2e/run-all.sh
+```
+Stages: (1) bring up stack → (2) `cargo test --bin siwx-oidc` (unit) →
+(3) HTTP-level account E2E (`e2e_account_management`) → (4) legacy CS-API
+device-delete probe (`e2e/legacy-cs-api-probe.sh`) → (5) headless browser E2E
+(`e2e/browser/run.sh`).
+
+### Rust suites (run with the mock stack up)
+
+```bash
+# Unit tests (needs Redis on :6379)
+cargo test --bin siwx-oidc
+
+# HTTP-level account-management E2E (real EIP-191 wallet sigs + account session)
+cargo test --test e2e_account_management -- --ignored --test-threads=1
+
+# Race / teardown deterministic interleavings (mock + Redis, forced ordering)
+cargo test --test e2e_race_teardown -- --ignored --test-threads=1
+```
+
+`e2e_race_teardown` contains the **H1/H2/H4/H8/H10/H12/H14 guards** (revoke≠delete,
+no device-id recycling, concurrent-delete crosstalk, single auth-code winner,
+post-terminal-action session death, targeted delete, Synapse-failure-not-500) AND
+the **un-gated H3/H6/H9 race-regression guards** — these were the original bug
+reproducers (device_delete TOCTOU + KEYS-scan revoke racing refresh; deactivate's
+non-atomic sweep letting refresh resurrect access; device-code Approved branch
+double-redemption). After the fixes landed they run **unconditionally** as permanent
+regression guards.
+
+```bash
+# C1/C2 OAuth/auth-binding negative tests (the safe-subset fixes, commit 6e16b47)
+cargo test --test e2e_oauth_binding -- --ignored --test-threads=1
+```
+`e2e_oauth_binding` (security branch) is the C1/C2 negative suite: expired login
+CAIP-122 signature rejected, mismatched `client_id` at `/token` rejected, unregistered
+`redirect_uri` at `/sign_in` rejected (no code leaked), and `plain`-PKCE rejected
+(at `/authorize` and `/token`).
+
+### Browser suite (Playwright in a container)
+
+```bash
+bash e2e/browser/run.sh      # runs in mcr.microsoft.com/playwright on host network
+```
+Drives the real DOM with a mock `window.ethereum` (real `ethers` EIP-191 signing) +
+CDP **WebAuthn virtual authenticator**. Helpers: `e2e/browser/wallet-helper.mjs`,
+`e2e/browser/webauthn-helper.mjs`. Specs:
+
+- `account.spec.mjs` — one re-auth covers a whole account session; device sign-out
+  deletes the Synapse device + revokes tokens; erase runs `deactivate(erase=true)`;
+  legacy in-client delete endpoints; legible admin-token rejection.
+- `device-lifecycle.spec.mjs` — passkey register→login→token; one-re-auth-covers-many;
+  base64 `device_view`; **H13** erase purges WebAuthn creds from Redis; **H11**
+  challenge session-binding; CSRF (R-G8); cross-signing-reset (R-G4).
+
+### Live suites vs a REAL homeserver
+
+Run against a real Synapse (see the REAL stack recipe below):
+
+```bash
+SIWEOIDC_HOST=http://localhost:8081 MATRIX_HOST=http://localhost:8448 \
+  cargo test --test e2e_msc3861 -- --ignored --test-threads=1
+SIWEOIDC_HOST=http://localhost:8081 MATRIX_HOST=http://localhost:8448 \
+  cargo test --test e2e_session_teardown -- --ignored --test-threads=1
+SIWEOIDC_HOST=http://localhost:8081 MATRIX_HOST=http://localhost:8448 \
+  cargo test --test e2e_msc4191_live -- --ignored --test-threads=1
+SIWEOIDC_HOST=http://localhost:8081 MATRIX_HOST=http://localhost:8448 \
+  cargo test --test e2e_messaging -- --ignored --test-threads=1
+```
+
+**Known follow-up:** `e2e_session_teardown` asserts `whoami == 401` *immediately*
+after revocation and can fail on Synapse's ~120s introspection cache (siwx-oidc
+revokes instantly per logs; a sibling polling test flips 200→401 at exactly t+120s).
+It should **poll** past the cache rather than assert immediately.
+
+### REAL stack recipe (Synapse + Redis + siwx-oidc via MSC3861)
+
+Full reproducible detail (containers, secrets, the issuer split-horizon trick,
+smoke-test output): `/tmp/track2-real-stack.md`. Summary:
+
+1. `git clone https://github.com/inblockio/siwx-oidc-matrix-server`
+   (into `~/siwx-oidc-matrix-server`, OUTSIDE this repo).
+2. No `docker compose` on this box — the `docker-compose.local.yml` stack is
+   translated into individual `podman run` commands on a dedicated bridge network
+   `siwx-real-net` (for inter-container DNS).
+3. **Issuer split-horizon trick:** the live tests reach the OIDC issuer at
+   `http://localhost:8081`, but Synapse-in-container cannot reach `localhost`. Use
+   Synapse `experimental_features.msc3861.issuer_metadata` to advertise the **public**
+   issuer (`http://localhost:8081`) to clients while pointing
+   `introspection_endpoint` at the **internal** docker address
+   (`http://siwx-real-oidc:8081/oauth2/introspect`). siwx-oidc reaches Synapse for
+   provisioning via `SIWEOIDC_SYNAPSE_ENDPOINT=http://siwx-real-synapse:8008`.
+4. Containers: `siwx-real-redis` (net-internal), `siwx-real-oidc` (`127.0.0.1:8081`,
+   runs the audited local debug binary mounted read-only — `podman restart` after a
+   rebuild), `siwx-real-synapse` (`127.0.0.1:8448`).
+5. **Teardown:**
+   `podman rm -f siwx-real-redis siwx-real-oidc siwx-real-synapse && podman network rm siwx-real-net`
+   (add `podman volume rm siwx-real-matrix-data && podman rmi localhost/siwx-real-synapse:local` for a full clean).
+
+Never touch `aqua-agent-*` (production) or `siwx-e2e-*` (mock stack) containers.
+
+### REAL E2EE messaging regression
+
+The plaintext two-client messaging regression (`e2e_messaging::two_client_messaging`)
+proves provisioning + delivery (R-K1/K2). A true **E2EE** two-client test needs a
+Matrix crypto client, so it is run via the **aqua-matrix-connector** (`~/aqua-matrix-agent`,
+matrix-sdk e2e) logging in through siwx-oidc and pointed at the local real stack
+(`:8081`/`:8448`). Runbook lives at `/tmp/e2ee-regression.md` / `docs/audits/`.
+(Approach only — do not invent commands; another agent owns `~/aqua-matrix-agent`.)
+
 ## Headless client (siwx-oidc-auth)
 
 Two authentication modes:
@@ -188,7 +345,8 @@ siwx-oidc-auth --server https://siwx.example.com \
 Key input priority: `--key-file` > `SIWX_KEY_FILE` env > `--key-hex` > generate ephemeral.
 PEM format is canonical (PKCS#8, auto-detects Ed25519 vs P-256).
 
-**Refresh tokens:** Both standalone and MSC3861 modes issue refresh tokens (24h TTL).
+**Refresh tokens:** Both standalone and MSC3861 modes issue refresh tokens with a TTL
+of **90 days** (`REFRESH_TOKEN_TTL = 7_776_000` s) — intentional.
 The `refresh()` library function and `--refresh-token` CLI flag exchange a refresh
 token for new access + refresh tokens without repeating the full CAIP-122 sign-in.
 The server rotates the refresh token on each use (old token is deleted).

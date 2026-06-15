@@ -77,8 +77,20 @@ Stood up a **real local stack** (Synapse 1.154 + MSC3861 + siwx-oidc from local 
 
 1. **CRITICAL C1 & C2 — remaining (breaking) parts** — the verified-safe subset is already fixed (`6e16b47`). What's LEFT needs your review because it changes the CAIP-122 message shape / OAuth contract and requires coordinated frontend (device/account embedded pages) + test edits: (a) **C1** server-issued single-use nonce binding on the device-approval + account-management paths (the full account-takeover fix — login path is already mitigated by expiry); (b) **C2** make `redirect_uri` mandatory at `/token` and PKCE mandatory for public clients. Full ready-to-apply detail (files, frontend, tests, verification, effort/risk): `~/siwx-oidc-sec/docs/audits/2026-06-14-remediation-spec-criticals.md`.
 2. **Push the branches?** Both are local + committed, nothing pushed. Say the word and I'll push + open PRs.
-3. **HIGH recommendations not auto-fixed** (token-type tagging + refresh-TTL value, gating dynamic client + WebAuthn registration) — these have UX/compat tradeoffs; want them applied?
-4. **E2EE messaging (R6 stretch):** the regression is currently a *plaintext* room. A true E2EE two-client test needs a matrix crypto client (matrix-rust-sdk dev-dep, heavy). I documented it as a recommendation rather than build it overnight; the cross-signing half is already covered by `msc4191_live`. Want the full E2EE test built?
+3. **HIGH recommendations — OWNER TRIAGE (2026-06-14):**
+   - **Refresh-TTL: RESOLVED.** The 90-day TTL (`REFRESH_TOKEN_TTL = 7_776_000` s) is the
+     **intended** behavior; the old "24h" documentation was simply wrong. Docs corrected
+     (`CLAUDE.md` token model + refresh-tokens prose). No code change.
+   - **Token-type tagging** (access/refresh interchangeable; no `mat_`/`mcr_`/type check on
+     the refresh & bearer paths) remains an **optional recommendation** worth applying.
+   - **Dynamic client registration (DCR): ACCEPTED — left open intentionally by owner
+     decision.** Do **not** gate it now; revisit if/when abused.
+   - **No-TTL WebAuthn-credential growth (H-i)** is related to the DCR decision —
+     **accepted-for-now** alongside DCR, but worth **monitoring** (Redis storage growth).
+4. **E2EE messaging (R6 stretch):** the plaintext regression (`two_client_messaging`) proves
+   provisioning + delivery. The true **E2EE** two-client test is now being **executed via the
+   aqua-matrix-connector** (matrix-sdk e2e, logs in through siwx-oidc) pointed at the local
+   real stack (`:8081`/`:8448`); the cross-signing half is already covered by `msc4191_live`.
 5. **Teardown tests** should poll past the 120s Synapse introspection cache (currently assert immediately). One-line-ish improvement — want it?
 
 ---
