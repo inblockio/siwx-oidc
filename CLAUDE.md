@@ -309,14 +309,68 @@ smoke-test output): `/tmp/track2-real-stack.md`. Summary:
 
 Never touch `aqua-agent-*` (production) or `siwx-e2e-*` (mock stack) containers.
 
-### REAL E2EE messaging regression
+### REAL E2EE messaging regression + edge route
 
 The plaintext two-client messaging regression (`e2e_messaging::two_client_messaging`)
-proves provisioning + delivery (R-K1/K2). A true **E2EE** two-client test needs a
-Matrix crypto client, so it is run via the **aqua-matrix-connector** (`~/aqua-matrix-agent`,
-matrix-sdk e2e) logging in through siwx-oidc and pointed at the local real stack
-(`:8081`/`:8448`). Runbook lives at `/tmp/e2ee-regression.md` / `docs/audits/`.
-(Approach only — do not invent commands; another agent owns `~/aqua-matrix-agent`.)
+proves provisioning + delivery. A true **E2EE** two-client test needs a Matrix crypto
+client, so it runs via the **aqua-matrix-connector** (`~/aqua-matrix-agent`, matrix-sdk
+e2e) logging in through siwx-oidc. Full writeup + evidence:
+`docs/audits/2026-06-14-e2ee-regression.md` (R-K1 encrypted bidirectional decrypt +
+R-K2 device-sign-out survivability, both PASS). Connector test delta (test-only) is
+kept as a patch at `docs/audits/patches/e2ee-connector-localstack.patch`.
+
+**The edge route (why it is needed).** Under MSC3861 Synapse **disables its native
+CS-API logout / device-management endpoints** (`404 "Unrecognized request"`); those
+are **owned by siwx-oidc** (`src/compat.rs`: `login_flows`/`logout`/`logout_all`/
+`delete_device`/`delete_devices`/`refresh`). So matrix-sdk's native
+`client.matrix_auth().logout()` (the deployed in-client "Sign out this session" path)
+404s against a bare Synapse. PROD forwards those paths to siwx-oidc with a Caddy
+method-route on `matrix.inblock.io`. The local real stack mirrors that with a
+`siwx-real-caddy` edge (`e2e/real-stack/Caddyfile`, brought up by
+`e2e/real-stack-edge.sh`) on `http://localhost:8450`, routing the six owned paths →
+`siwx-real-oidc:8081` and everything else → `siwx-real-synapse:8008`. The connector
+points its homeserver at the **edge**, so native sign-out reaches siwx-oidc through the
+real client → edge → siwx-oidc path (no direct-to-:8081 workaround).
+
+**Exact run commands** (real stack up → add edge → run the connector E2EE test via the
+regression worktree; localhost only):
+
+```bash
+# 1) real stack up (see recipe above); then add the prod-mirroring edge:
+cd ~/siwx-oidc
+bash e2e/real-stack-edge.sh up        # siwx-real-caddy on :8450
+bash e2e/real-stack-edge.sh verify    # POST /logout: direct-Synapse 404 vs edge 200
+
+# 2) connector regression worktree (concurrent agent owns the main tree):
+git -C ~/aqua-matrix-agent worktree add ~/aqua-matrix-agent-e2ee regression/local-e2ee-track2
+cd ~/aqua-matrix-agent-e2ee
+git apply ~/siwx-oidc/docs/audits/patches/e2ee-connector-localstack.patch || true
+cargo build --test e2e --features e2e
+mkdir -p /tmp/rk-e2ee/keys
+./target/debug/aqua-matrix-agent --key-file /tmp/rk-e2ee/keys/a.pem --print-did
+./target/debug/aqua-matrix-agent --key-file /tmp/rk-e2ee/keys/b.pem --print-did
+
+# 3) R-K1 (encrypted bidirectional decrypt) — client points at the EDGE :8450:
+SIWX_E2E_SIWX_URL=http://localhost:8081 SIWX_E2E_MATRIX_URL=http://localhost:8450 \
+SIWX_E2E_KEY_A=/tmp/rk-e2ee/keys/a.pem SIWX_E2E_KEY_B=/tmp/rk-e2ee/keys/b.pem \
+SIWX_E2E_STORE_ROOT=/tmp/rk-e2ee/store \
+cargo test --test e2e --features e2e e2ee_bidirectional_messaging -- --nocapture --test-threads=1
+
+# 4) R-K2 (NATIVE matrix-sdk logout → edge → siwx-oidc; fresh keys+store, full-life tokens):
+SIWX_E2E_RUN_RK2=1 SIWX_E2E_SIWX_URL=http://localhost:8081 SIWX_E2E_MATRIX_URL=http://localhost:8450 \
+SIWX_E2E_KEY_A=/tmp/rk-e2ee/keys/rk2-a.pem SIWX_E2E_KEY_B=/tmp/rk-e2ee/keys/rk2-b.pem \
+SIWX_E2E_STORE_ROOT=/tmp/rk-e2ee/store-rk2 \
+cargo test --test e2e --features e2e e2ee_device_logout_history_survives -- --nocapture --test-threads=1
+
+# teardown the edge when done (leaves the real stack up):
+bash ~/siwx-oidc/e2e/real-stack-edge.sh down
+```
+
+Gotchas: keep R-K1 / R-K2 on SEPARATE store roots + identities (the crypto store binds
+to (homeserver, device_id); reusing a store across homeserver URLs collides server-side
+one-time keys → all events `[unable to decrypt]`). R-K2's native `logout()` invalidates
+B's session client-side immediately, so never sync B after logout. Do not touch
+`~/aqua-matrix-agent`'s working tree — use the worktree.
 
 ## Headless client (siwx-oidc-auth)
 

@@ -1,5 +1,5 @@
 diff --git a/crates/aqua-matrix-agent/tests/e2e.rs b/crates/aqua-matrix-agent/tests/e2e.rs
-index 3749db1..80b28a2 100644
+index 3749db1..4b1add4 100644
 --- a/crates/aqua-matrix-agent/tests/e2e.rs
 +++ b/crates/aqua-matrix-agent/tests/e2e.rs
 @@ -38,6 +38,7 @@ fn resolve_key_file(default: &str) -> String {
@@ -87,7 +87,7 @@ index 3749db1..80b28a2 100644
      let messages = agent_a
          .messages(&room_id, 10)
          .await
-@@ -192,6 +246,175 @@ async fn e2ee_bidirectional_messaging() {
+@@ -192,6 +246,182 @@ async fn e2ee_bidirectional_messaging() {
      println!("  Messages verified decryptable in both directions");
  }
  
@@ -166,38 +166,45 @@ index 3749db1..80b28a2 100644
 +    );
 +    println!("PRECONDITION OK: A decrypted B's pre-logout message");
 +
-+    // --- Sign Agent B's device out via siwx-oidc's /_matrix/client/v3/logout -
-+    // FINDING: matrix-sdk's `matrix_auth().logout()` POSTs to the HOMESERVER's
-+    // native CS-API logout — but under MSC3861 delegated auth Synapse DISABLES
-+    // its native `/logout` and returns 404 "Unrecognized request". The endpoint
-+    // is OWNED by siwx-oidc (compat::logout, TeardownPolicy::DeleteDevice:
-+    // deletes the Synapse device + revokes the session's tokens). In prod a
-+    // Caddy method-route forwards `/_matrix/client/v3/logout` to siwx-oidc; the
-+    // local stack has no Caddy, so we POST siwx-oidc DIRECTLY at :8081 with
-+    // Agent B's live bearer token (the same token its connector session holds).
-+    let b_token = agent_b
-+        .client()
-+        .access_token()
-+        .expect("Agent B has no access token to sign out with");
-+    let siwx_url = std::env::var("SIWX_E2E_SIWX_URL")
-+        .unwrap_or_else(|_| "https://siwx-oidc.inblock.io".to_string());
-+    let logout_url = format!("{}/_matrix/client/v3/logout", siwx_url.trim_end_matches('/'));
-+    println!("Signing Agent B's device out via siwx-oidc {logout_url} (explicit DeleteDevice) ...");
-+    let resp = reqwest::Client::new()
-+        .post(&logout_url)
-+        .bearer_auth(&b_token)
-+        .json(&serde_json::json!({}))
-+        .send()
-+        .await
-+        .expect("POST to siwx-oidc /logout failed (transport)");
-+    let status = resp.status();
-+    let body = resp.text().await.unwrap_or_default();
-+    println!("siwx-oidc /logout HTTP {status}: {body}");
-+    assert!(
-+        status.is_success(),
-+        "siwx-oidc /logout did not return 2xx (device sign-out failed): HTTP {status} {body}"
++    // --- Sign Agent B's device out via matrix-sdk's NATIVE logout -------------
++    // This is the deployed in-client "Sign out this session" path: matrix-sdk's
++    // `matrix_auth().logout()` POSTs to the HOMESERVER's CS-API
++    // `/_matrix/client/v3/logout`. Under MSC3861 delegated auth Synapse DISABLES
++    // its native logout and returns 404 "Unrecognized request" — the endpoint is
++    // OWNED by siwx-oidc (compat::logout, TeardownPolicy::DeleteDevice: deletes
++    // the Synapse device + revokes the session's tokens).
++    //
++    // In PROD a Caddy method-route on matrix.inblock.io forwards
++    // `/_matrix/client/v3/logout` to siwx-oidc. We mirror that with a local edge
++    // (e2e/real-stack/Caddyfile, container siwx-real-caddy on :8450). When
++    // SIWX_E2E_MATRIX_URL points at the EDGE, this native call lands on siwx-oidc
++    // through the same client→edge→siwx-oidc path the deployed device sign-out
++    // takes — NOT the old direct-to-:8081 workaround.
++    //
++    // Pre-flight: confirm the connector's matrix_url is the edge, not a bare
++    // Synapse (a bare Synapse would 404 this and the test would be meaningless).
++    let matrix_url = std::env::var("SIWX_E2E_MATRIX_URL")
++        .unwrap_or_else(|_| "https://matrix.inblock.io".to_string());
++    println!(
++        "Signing Agent B's device out via matrix-sdk NATIVE logout \
++         (POST {}/_matrix/client/v3/logout → edge → siwx-oidc) ...",
++        matrix_url.trim_end_matches('/')
 +    );
-+    println!("Agent B device signed out (siwx-oidc deleted the Synapse device + revoked B's tokens)");
++    agent_b
++        .client()
++        .matrix_auth()
++        .logout()
++        .await
++        .expect(
++            "matrix-sdk native logout() failed — if this is a 404 'Unrecognized request', \
++             SIWX_E2E_MATRIX_URL is pointing at a bare Synapse (MSC3861 disables native \
++             CS-API logout); point it at the Caddy edge (e.g. http://localhost:8450) so the \
++             request reaches siwx-oidc's compat::logout",
++        );
++    println!(
++        "Agent B device signed out via NATIVE client→edge→siwx-oidc logout \
++         (siwx-oidc deleted the Synapse device + revoked B's tokens, no 404)"
++    );
 +
 +    // Give Synapse a moment; it caches introspection ~2min but the logout itself
 +    // is immediate server-side. A's session is on a DIFFERENT device and is
@@ -256,7 +263,7 @@ index 3749db1..80b28a2 100644
 +    println!("R-K2 (3) PASS: A sent + read-back-decrypted a NEW message after B's sign-out: {post}");
 +
 +    println!("\nR-K2 device-logout survivability test PASSED");
-+    println!("  B's device signed out via /_matrix/client/v3/logout (MSC3861 → siwx-oidc)");
++    println!("  B's device signed out via matrix-sdk NATIVE logout → edge → siwx-oidc (no 404)");
 +    println!("  A (other participant) retained decryptable history + encrypted room + working crypto");
 +}
 +
