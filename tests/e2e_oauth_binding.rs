@@ -10,6 +10,9 @@
 //!   4. C2 Step 4b (reject `plain` PKCE) — a `/token` exchange of a code carrying
 //!      a `plain` code_challenge is rejected, and `/authorize` rejects
 //!      `code_challenge_method=plain` up front.
+//!   5. C2 Step 4a (mandatory PKCE) — a `response_type=code` `/authorize` request
+//!      WITHOUT a `code_challenge` is rejected; the same request WITH S256 PKCE
+//!      still succeeds.
 //!
 //! Targets the MOCK stack brought up by `e2e/up.sh` (siwx-oidc :8080, Synapse
 //! mock :8090, Redis :6379). Run single-threaded with the stack up:
@@ -570,5 +573,60 @@ async fn plain_pkce_is_rejected() {
     assert!(
         body.to_lowercase().contains("s256") || body.contains("invalid_grant"),
         "rejection must reference the S256-only policy: {body}"
+    );
+}
+
+// ===========================================================================
+// 5. C2 Step 4a — a code-flow /authorize WITHOUT a code_challenge is rejected.
+//    Scope: ALL code-flow clients (every registered client carries a secret;
+//    there is no client class that legitimately omits PKCE). The control proves
+//    the SAME request WITH S256 PKCE still succeeds, so it is the missing
+//    challenge — not unrelated breakage — that drives the rejection.
+// ===========================================================================
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn authorize_without_pkce_is_rejected() {
+    let base = oidc();
+    let nrc = no_redirect_client();
+    let c = Client::new();
+    let rc = register_client(&c, &base).await;
+
+    // (a) response_type=code with NO code_challenge → rejected.
+    let no_pkce_url = format!(
+        "{base}/authorize?client_id={}&redirect_uri={}&scope=openid&response_type=code&state=nopkce_state",
+        urlencoding::encode(&rc.client_id),
+        urlencoding::encode(&rc.redirect_uri),
+    );
+    let resp = nrc.get(&no_pkce_url).send().await.unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_ne!(
+        status,
+        StatusCode::SEE_OTHER,
+        "a code-flow /authorize without PKCE MUST NOT proceed to the login redirect"
+    );
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a code-flow /authorize without a code_challenge must be a clean 400, got {status}: {body}"
+    );
+    assert!(
+        body.to_lowercase().contains("code_challenge") || body.to_lowercase().contains("pkce"),
+        "rejection must mention the missing PKCE challenge: {body}"
+    );
+
+    // (b) Control: the SAME request WITH S256 PKCE succeeds (303 to the login UI).
+    let (_verifier, challenge) = pkce_pair();
+    let with_pkce_url = format!(
+        "{base}/authorize?client_id={}&redirect_uri={}&scope=openid&response_type=code&state=nopkce_state&code_challenge={}&code_challenge_method=S256",
+        urlencoding::encode(&rc.client_id),
+        urlencoding::encode(&rc.redirect_uri),
+        urlencoding::encode(&challenge),
+    );
+    let ok = nrc.get(&with_pkce_url).send().await.unwrap();
+    assert_eq!(
+        ok.status(),
+        StatusCode::SEE_OTHER,
+        "a code-flow /authorize WITH S256 PKCE must still succeed"
     );
 }

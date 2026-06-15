@@ -1143,6 +1143,21 @@ pub async fn authorize(
             ));
         }
     }
+    // C2 Step 4a: require S256 PKCE for the authorization-code flow. PKCE is the
+    // only backstop that binds a redeemed code to the browser that initiated the
+    // request; without it, a leaked or stolen code is freely redeemable. Every
+    // real client already sends S256 (Element X per the Matrix OAuth 2.0 profile,
+    // the in-house `siwx-oidc-auth` lib, and all e2e flows), so requiring it is a
+    // spec-compliance tightening that breaks no compliant client. Scope: ALL
+    // code-flow clients — every registered `ClientEntry` carries a server-issued
+    // secret regardless of `token_endpoint_auth_method`, so there is no client
+    // class that legitimately omits PKCE to exempt. The device-code grant (RFC
+    // 8628) does NOT pass through /authorize and is unaffected.
+    if matches!(_response_type, CoreResponseType::Code) && params.code_challenge.is_none() {
+        return Err(CustomError::BadRequest(
+            "code_challenge is required (S256 PKCE) for the authorization-code flow.".to_string(),
+        ));
+    }
     let pkce_params = match (&params.code_challenge, &params.code_challenge_method) {
         (Some(cc), Some(ccm)) => format!("&code_challenge={cc}&code_challenge_method={ccm}"),
         (Some(cc), None) => format!("&code_challenge={cc}&code_challenge_method=S256"),
@@ -2000,8 +2015,10 @@ mod tests {
             prompt: None,
             request_uri: None,
             request: None,
-            code_challenge: None,
-            code_challenge_method: None,
+            // C2 Step 4a: PKCE is mandatory for the code flow — a valid S256
+            // challenge so this scope-acceptance test exercises the real path.
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
         };
         let result = authorize(params, &db_client).await;
         assert!(
@@ -2111,8 +2128,10 @@ mod tests {
             prompt: None,
             request_uri: None,
             request: None,
-            code_challenge: None,
-            code_challenge_method: None,
+            // C2 Step 4a: PKCE is mandatory for the code flow — a valid S256
+            // challenge so this scope-acceptance test exercises the real path.
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
         };
         let result = authorize(params, &db_client).await;
         assert!(
