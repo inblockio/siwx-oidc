@@ -1,0 +1,131 @@
+# Edge Caddyfile for the LOCAL REAL stack (siwx-real-* podman containers).
+#
+# WHY this edge exists
+# --------------------
+# Under MSC3861 delegated auth, Synapse DISABLES its native Client-Server API
+# logout/device-management endpoints and returns 404 "Unrecognized request".
+# Those endpoints are OWNED by siwx-oidc (src/compat.rs: compat::logout /
+# logout_all / delete_device / delete_devices / refresh / login_flows). In
+# production a Caddy method-route on matrix.inblock.io forwards exactly those
+# paths to siwx-oidc so an in-client device sign-out (Element "Sign out this
+# session") reaches siwx-oidc instead of dead-ending at Synapse.
+#
+# The bare real stack (siwx-real-oidc + siwx-real-synapse) has NO edge, so a
+# matrix-sdk client's native `matrix_auth().logout()` 404s. This file mirrors the
+# prod method-route over plain HTTP so a client can point its homeserver at the
+# edge and have native CS-API teardown land on siwx-oidc.
+#
+# Source of truth for the route split:
+#   - which /_matrix/... paths siwx-oidc owns: src/axum_lib.rs route table
+#   - the prod edge that productizes them: ~/siwx-oidc-matrix-server/Caddyfile.production
+#     (login/logout/refresh) PLUS the legacy CS-API device-management paths that
+#     siwx-oidc also registers (devices/{id}, delete_devices, logout/all) and that
+#     the deployed account-management edge route already forwards on prod.
+#
+# Topology (podman, network siwx-real-net):
+#   - upstream siwx-oidc : siwx-real-oidc:8081
+#   - upstream Synapse   : siwx-real-synapse:8008   (Synapse's INTERNAL port; the
+#                          host publishes it as 127.0.0.1:8448, but inside the
+#                          podman network Synapse listens on 8008)
+#   - this edge listens on :8450 inside the container, published 127.0.0.1:8450.
+
+(strip_upstream_cors) {
+	header_down -Access-Control-Allow-Origin
+	header_down -Access-Control-Allow-Methods
+	header_down -Access-Control-Allow-Headers
+	header_down -Access-Control-Allow-Credentials
+	header_down -Access-Control-Expose-Headers
+	header_down -Access-Control-Max-Age
+	header_down -Vary
+}
+
+(public_cors) {
+	@cors_preflight method OPTIONS
+	header Access-Control-Allow-Origin "*"
+	header Access-Control-Allow-Methods "GET, HEAD, POST, PUT, DELETE, OPTIONS"
+	header Access-Control-Allow-Headers "X-Requested-With, Content-Type, Authorization, Date"
+	header Access-Control-Max-Age "86400"
+	respond @cors_preflight 204
+}
+
+# Matrix homeserver edge.
+:8450 {
+	encode zstd gzip
+
+	# Synapse server discovery.
+	handle /.well-known/matrix/server {
+		respond `{"m.server": "localhost:8450"}`
+	}
+
+	# Client discovery — points clients at the OIDC issuer for MSC3861.
+	handle /.well-known/matrix/client {
+		header Access-Control-Allow-Origin *
+		respond `{"m.homeserver": {"base_url": "http://localhost:8450"}, "m.authentication": {"issuer": "http://localhost:8081/", "account": "http://localhost:8081/account"}}`
+	}
+
+	# --- MSC3861-owned endpoints → siwx-real-oidc -------------------------------
+	# These are the endpoints siwx-oidc registers in src/axum_lib.rs. Synapse 404s
+	# them under MSC3861; the edge routes them to siwx-oidc, exactly as prod does.
+
+	# Login flow discovery (GET).
+	handle /_matrix/client/v3/login {
+		import public_cors
+		reverse_proxy siwx-real-oidc:8081 {
+			import strip_upstream_cors
+		}
+	}
+	# Single-session logout (POST) — the in-client "Sign out this session" path
+	# (TeardownPolicy::DeleteDevice: deletes the Synapse device + revokes tokens).
+	handle /_matrix/client/v3/logout {
+		import public_cors
+		reverse_proxy siwx-real-oidc:8081 {
+			import strip_upstream_cors
+		}
+	}
+	# Bulk sign-out of all the user's sessions (POST).
+	handle /_matrix/client/v3/logout/all {
+		import public_cors
+		reverse_proxy siwx-real-oidc:8081 {
+			import strip_upstream_cors
+		}
+	}
+	# Legacy CS-API single-device delete (DELETE /devices/{id}) — in-client
+	# device manager sign-out of a specific device.
+	handle /_matrix/client/v3/delete_devices {
+		import public_cors
+		reverse_proxy siwx-real-oidc:8081 {
+			import strip_upstream_cors
+		}
+	}
+	# Caddy `handle` matches a path prefix, so this also covers
+	# `DELETE /_matrix/client/v3/devices/{device_id}` (and the GET device list,
+	# which siwx-oidc does not own — but Synapse 404s the delete under MSC3861,
+	# so forwarding the whole subtree to siwx-oidc matches the owned method).
+	handle /_matrix/client/v3/devices/* {
+		import public_cors
+		reverse_proxy siwx-real-oidc:8081 {
+			import strip_upstream_cors
+		}
+	}
+	# Token refresh (POST).
+	handle /_matrix/client/v3/refresh {
+		import public_cors
+		reverse_proxy siwx-real-oidc:8081 {
+			import strip_upstream_cors
+		}
+	}
+
+	# SEC-0003 parity: never expose the Synapse admin / MAS provisioning surfaces
+	# at the edge. siwx-oidc reaches them directly over the podman network.
+	handle /_synapse/admin/* {
+		respond 404
+	}
+	handle /_synapse/mas/* {
+		respond 404
+	}
+
+	# Everything else (sync, rooms, keys, whoami, auth_metadata, …) → Synapse.
+	handle {
+		reverse_proxy siwx-real-synapse:8008
+	}
+}
