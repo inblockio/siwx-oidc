@@ -1206,18 +1206,30 @@ fn extract_expiration_time(message: &str) -> Option<&str> {
         .map(|l| l.trim_start_matches("Expiration Time: ").trim())
 }
 
-/// C1 (login path): enforce the CAIP-122 `Expiration Time`. The login frontend
-/// (`App.svelte`) already sets a 48h `expirationTime`, so requiring it here is a
-/// non-breaking, server-only change that closes the "valid forever" replay gap on
-/// the login path. A ~120s skew allowance absorbs client/server clock drift.
+/// C1 (login path): enforce the CAIP-122 `Expiration Time` **only when present**.
+/// The browser login frontend (`App.svelte`) sets a 48h `expirationTime`, so for
+/// it this closes the "valid forever" replay gap on the login path. A ~120s skew
+/// allowance absorbs client/server clock drift.
+///
+/// **Enforce-if-present (don't break headless clients).** The in-house headless
+/// client `siwx-oidc-auth` (the exact login path used by the production agent
+/// fleet) does NOT emit an `Expiration Time` line in its CAIP-122 message
+/// (`siwx-oidc-auth/src/lib.rs::build_message`). Rejecting messages that omit the
+/// line would brick every agent. So a message with NO `Expiration Time` is
+/// accepted; a message that HAS one is rejected only when it is actually expired
+/// (past, beyond the skew). The replay window for an omitted exp is bounded
+/// elsewhere by the single-use nonce / session lifetime.
+///
 /// Out of scope: the device-approval and account paths (their builders do not set
 /// an expiration yet — those are the breaking C1 parts handled in a follow-up).
 const CAIP122_EXPIRY_SKEW_SECS: i64 = 120;
 
 fn enforce_login_expiration(message: &str, now: chrono::DateTime<Utc>) -> Result<(), CustomError> {
-    let raw = extract_expiration_time(message).ok_or_else(|| {
-        CustomError::BadRequest("CAIP-122 message is missing an Expiration Time".to_string())
-    })?;
+    // Enforce-if-present: a missing Expiration Time is accepted (headless clients
+    // like siwx-oidc-auth legitimately omit it). Only enforce when one is set.
+    let Some(raw) = extract_expiration_time(message) else {
+        return Ok(());
+    };
     let exp = chrono::DateTime::parse_from_rfc3339(raw)
         .map_err(|e| CustomError::BadRequest(format!("Invalid Expiration Time: {}", e)))?
         .with_timezone(&Utc);
@@ -2215,5 +2227,68 @@ mod tests {
         let id = resolve_device_id(None);
         assert!(id.starts_with("SIWX_"));
         assert_eq!(id.len(), "SIWX_".len() + 8);
+    }
+
+    /// Build a minimal CAIP-122-shaped message, optionally carrying an
+    /// `Expiration Time:` line (mirrors what the browser frontend would emit).
+    fn login_message_with_exp(exp: Option<&str>) -> String {
+        let mut msg = String::from(
+            "example.com wants you to sign in with your Ethereum account:\n\
+             0xabc\n\n\
+             You are signing-in to example.com.\n\n\
+             URI: https://example.com\n\
+             Version: 1\n\
+             Chain ID: 1\n\
+             Nonce: deadbeef\n\
+             Issued At: 2023-04-17T11:01:24.862Z\n",
+        );
+        if let Some(e) = exp {
+            msg.push_str(&format!("Expiration Time: {e}\n"));
+        }
+        msg.push_str("Resources:\n- https://example.com");
+        msg
+    }
+
+    /// Enforce-if-present: a message with NO `Expiration Time` line is ACCEPTED.
+    /// This is the headless-client (siwx-oidc-auth) login path — its
+    /// `build_message` omits the line, and rejecting it would brick the agent
+    /// fleet.
+    #[test]
+    fn login_expiration_missing_is_accepted() {
+        let now = Utc::now();
+        let msg = login_message_with_exp(None);
+        assert!(
+            enforce_login_expiration(&msg, now).is_ok(),
+            "a message with no Expiration Time must be accepted (headless clients omit it)"
+        );
+    }
+
+    /// Enforce-if-present: a message WITH an Expiration Time in the PAST (beyond
+    /// the skew) is REJECTED with an "expired" error.
+    #[test]
+    fn login_expiration_present_but_expired_is_rejected() {
+        let now = Utc::now();
+        let past = (now - Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let msg = login_message_with_exp(Some(&past));
+        let err = enforce_login_expiration(&msg, now)
+            .expect_err("a present-but-expired Expiration Time must be rejected");
+        let rendered = format!("{err:?}").to_lowercase();
+        assert!(
+            rendered.contains("expire"),
+            "rejection must mention expiry: {rendered}"
+        );
+    }
+
+    /// Enforce-if-present: a message WITH a future Expiration Time is ACCEPTED.
+    #[test]
+    fn login_expiration_present_and_future_is_accepted() {
+        let now = Utc::now();
+        let future =
+            (now + Duration::hours(48)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let msg = login_message_with_exp(Some(&future));
+        assert!(
+            enforce_login_expiration(&msg, now).is_ok(),
+            "a future Expiration Time must be accepted"
+        );
     }
 }

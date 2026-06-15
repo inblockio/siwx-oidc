@@ -1,7 +1,9 @@
 //! Negative E2E tests proving the C1/C2 "safe subset" OAuth/auth hardening:
 //!
-//!   1. C1 login Expiration-Time enforcement — a login CAIP-122 signature whose
-//!      `Expiration Time` is in the past is rejected at `/sign_in`.
+//!   1. C1 login Expiration-Time enforcement (enforce-if-present) — a login
+//!      CAIP-122 signature whose `Expiration Time` is in the past is rejected at
+//!      `/sign_in`, while a signature with NO `Expiration Time` line at all (the
+//!      headless `siwx-oidc-auth` shape) is accepted.
 //!   2. C2 Step 1 (code↔client binding) — exchanging a code with a MISMATCHED
 //!      `client_id` at `/token` is rejected `invalid_grant`.
 //!   3. C2 Step 3 (`/sign_in` redirect re-validation) — `/sign_in` with an
@@ -229,6 +231,33 @@ fn build_login_message(
     )
 }
 
+/// Build a login CAIP-122 message with NO `Expiration Time` line at all — this is
+/// exactly what the in-house headless client (`siwx-oidc-auth`) emits. The server
+/// must ACCEPT it (enforce-if-present), otherwise the production agent fleet bricks.
+fn build_login_message_no_exp(
+    w: &Wallet,
+    base: &str,
+    domain: &str,
+    nonce: &str,
+    resource: &str,
+) -> String {
+    let now = chrono::Utc::now();
+    let issued_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    format!(
+        "{domain} wants you to sign in with your Ethereum account:\n\
+         {addr}\n\n\
+         You are signing-in to {domain}.\n\n\
+         URI: {base}\n\
+         Version: 1\n\
+         Chain ID: 1\n\
+         Nonce: {nonce}\n\
+         Issued At: {issued_at}\n\
+         Resources:\n\
+         - {resource}",
+        addr = w.address,
+    )
+}
+
 fn siwx_cookie_header(session_cookie: &str, w: &Wallet, message: &str) -> String {
     let signature = eip191_sign(&w.key, message);
     let val =
@@ -300,6 +329,24 @@ async fn expired_login_signature_is_rejected() {
         ok.status(),
         StatusCode::SEE_OTHER,
         "a fresh (future-exp) login signature must still succeed"
+    );
+
+    // Headless-client control: a message with NO Expiration Time line at all
+    // (the siwx-oidc-auth shape) must ALSO succeed — enforce-if-present must not
+    // reject omitted expirations, or the production agent fleet would brick.
+    let (session_cookie3, nonce3, domain3) =
+        authorize_session(&nrc, &base, &rc, &challenge, "exp_state").await;
+    let no_exp = build_login_message_no_exp(&w, &base, &domain3, &nonce3, &rc.redirect_uri);
+    let ok_no_exp = nrc
+        .get(&sign_in_url)
+        .header("cookie", siwx_cookie_header(&session_cookie3, &w, &no_exp))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ok_no_exp.status(),
+        StatusCode::SEE_OTHER,
+        "a login signature with NO Expiration Time (headless client) must succeed"
     );
 }
 
