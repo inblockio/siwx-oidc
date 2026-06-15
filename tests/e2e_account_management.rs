@@ -81,18 +81,8 @@ fn new_wallet() -> Wallet {
     }
 }
 
-/// Build the exact CAIP-122/EIP-191 message the account page JS signs, and sign
-/// it. Returns `(message, 0x-hex-signature)`.
-fn sign_account_message(w: &Wallet, base: &str) -> (String, String) {
-    let domain = reqwest::Url::parse(base)
-        .unwrap()
-        .host_str()
-        .unwrap()
-        .to_string();
-    let message = format!(
-        "{domain} wants you to sign in with your Ethereum account:\n{addr}\n\nConfirm account action.\n\nURI: {base}\nVersion: 1\nChain ID: 1\nNonce: testnonce0001\nIssued At: 2026-06-14T00:00:00.000Z",
-        addr = w.address,
-    );
+/// EIP-191 sign an arbitrary message with the wallet key. Returns `0x`-hex sig.
+fn eip191_sign(w: &Wallet, message: &str) -> String {
     let prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
     let prehash: [u8; 32] = {
         let mut h = Keccak256::new();
@@ -104,7 +94,46 @@ fn sign_account_message(w: &Wallet, base: &str) -> (String, String) {
     let mut bytes = [0u8; 65];
     bytes[..64].copy_from_slice(&sig.to_bytes());
     bytes[64] = u8::from(rec) + 27;
-    (message, format!("0x{}", hex::encode(bytes)))
+    format!("0x{}", hex::encode(bytes))
+}
+
+/// Build the exact CAIP-122/EIP-191 message the account page JS signs for
+/// `action`, fetching the server-issued single-use nonce first (C1), and sign it.
+/// Returns `(message, 0x-hex-signature)`.
+async fn sign_account_message(
+    c: &Client,
+    w: &Wallet,
+    base: &str,
+    action: &str,
+) -> (String, String) {
+    let domain = reqwest::Url::parse(base)
+        .unwrap()
+        .host_str()
+        .unwrap()
+        .to_string();
+    let np: Value = c
+        .get(format!("{base}/account/nonce?action={action}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let nonce = np["nonce"].as_str().unwrap();
+    let expiration_time = np["expiration_time"].as_str().unwrap();
+    let resources: Vec<String> = np["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| format!("\n- {}", r.as_str().unwrap()))
+        .collect();
+    let message = format!(
+        "{domain} wants you to sign in with your Ethereum account:\n{addr}\n\nConfirm account action.\n\nURI: {base}\nVersion: 1\nChain ID: 1\nNonce: {nonce}\nIssued At: 2026-06-14T00:00:00.000Z\nExpiration Time: {expiration_time}\nResources:{res}",
+        addr = w.address,
+        res = resources.concat(),
+    );
+    let sig = eip191_sign(w, &message);
+    (message, sig)
 }
 
 // -- mock helpers -------------------------------------------------------------
@@ -186,7 +215,7 @@ async fn wallet_single_reauth_covers_list_delete_profile() {
     mock_seed_device(&c, &w.mxid, "SIWX_dev_bbb").await;
 
     // --- the ONE and only signature: list sessions ---
-    let (message, signature) = sign_account_message(&w, &base);
+    let (message, signature) = sign_account_message(&c, &w, &base, "org.matrix.devices_list").await;
     let resp = c
         .post(format!("{base}/account/wallet"))
         .json(&json!({
@@ -260,7 +289,8 @@ async fn wallet_erase_runs_erasure_and_clears_session() {
     let w = new_wallet();
     mock_seed_device(&c, &w.mxid, "SIWX_dev_erase").await;
 
-    let (message, signature) = sign_account_message(&w, &base);
+    let (message, signature) =
+        sign_account_message(&c, &w, &base, "org.matrix.account_erase").await;
     let resp = c
         .post(format!("{base}/account/wallet"))
         .json(&json!({
@@ -309,7 +339,7 @@ async fn account_action_csrf_mismatch_is_unauthorized() {
     let base = oidc();
     mock_reset(&c).await;
     let w = new_wallet();
-    let (message, signature) = sign_account_message(&w, &base);
+    let (message, signature) = sign_account_message(&c, &w, &base, "org.matrix.profile").await;
     let resp = c
         .post(format!("{base}/account/wallet"))
         .json(&json!({
@@ -343,7 +373,7 @@ async fn admin_token_rejection_is_legible_not_a_500_or_notfound() {
     mock_set_secret(&c, "WRONG-SECRET").await; // siwx's admin calls now 401
 
     let w = new_wallet();
-    let (message, signature) = sign_account_message(&w, &base);
+    let (message, signature) = sign_account_message(&c, &w, &base, "org.matrix.devices_list").await;
     let resp = c
         .post(format!("{base}/account/wallet"))
         .json(&json!({
