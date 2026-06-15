@@ -1190,6 +1190,13 @@ pub struct SiwxCookie {
     pub signature: String,
 }
 
+/// Extract the `Nonce: {value}` line from a CAIP-122 message. Public so the
+/// device/account CAIP-122 paths can read the nonce to consume it from the
+/// server-issued single-use nonce store (C1) before validating the envelope.
+pub fn extract_nonce_pub(message: &str) -> Option<&str> {
+    extract_nonce(message)
+}
+
 /// Extract the `Nonce: {value}` line from a CAIP-122 message.
 fn extract_nonce(message: &str) -> Option<&str> {
     message
@@ -1255,6 +1262,72 @@ fn extract_resources(message: &str) -> Vec<&str> {
         }
     }
     out
+}
+
+/// What a CAIP-122 message MUST satisfy for the device-approval / account paths.
+///
+/// `nonce` is the exact server-issued single-use nonce that was minted for this
+/// operation; `resources` is the set of resource URIs that MUST all appear in the
+/// message `Resources:` block (this is the operation/domain binding — e.g. the
+/// account audience names the specific `action`, so a signature minted for one
+/// action cannot be replayed for another).
+pub struct Caip122Expectation<'a> {
+    pub nonce: &'a str,
+    pub resources: &'a [String],
+}
+
+/// C1 shared envelope validator for the device-approval and account CAIP-122
+/// paths. Unlike the login path (`enforce_login_expiration`, which is lenient
+/// because the headless `siwx-oidc-auth` lib omits an Expiration Time), these
+/// paths are driven ONLY by the embedded pages, which we update to always emit a
+/// server nonce + Expiration Time + Resources — so here all three are MANDATORY.
+///
+/// Checks, in order:
+///  - `Nonce:` is present and exactly equals the expected server-issued nonce
+///    (single-use consumption happens at the caller, against the Redis store);
+///  - `Expiration Time:` is present, RFC3339-parseable, and not expired (with a
+///    [`CAIP122_EXPIRY_SKEW_SECS`] clock-skew allowance) — ABSENT is rejected;
+///  - every expected resource URI appears in the message `Resources:` block.
+///
+/// The single-use / cross-context-binding guarantee is provided by the caller
+/// consuming the nonce from the Redis nonce store and checking the bound context;
+/// this function validates the *contents* of the signed message.
+pub fn validate_caip122_envelope(
+    message: &str,
+    expected: &Caip122Expectation,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), CustomError> {
+    let msg_nonce = extract_nonce(message).ok_or_else(|| {
+        CustomError::BadRequest("Nonce not found in CAIP-122 message".to_string())
+    })?;
+    if msg_nonce != expected.nonce {
+        return Err(CustomError::BadRequest("Nonce mismatch".to_string()));
+    }
+
+    // Expiration Time is MANDATORY on these paths (the pages always set it).
+    let raw_exp = extract_expiration_time(message).ok_or_else(|| {
+        CustomError::BadRequest("CAIP-122 message is missing an Expiration Time".to_string())
+    })?;
+    let exp = chrono::DateTime::parse_from_rfc3339(raw_exp)
+        .map_err(|e| CustomError::BadRequest(format!("Invalid Expiration Time: {}", e)))?
+        .with_timezone(&Utc);
+    if now - chrono::Duration::seconds(CAIP122_EXPIRY_SKEW_SECS) >= exp {
+        return Err(CustomError::BadRequest(
+            "CAIP-122 signature has expired".to_string(),
+        ));
+    }
+
+    // Operation/domain binding: every expected resource must be present.
+    let present = extract_resources(message);
+    for want in expected.resources {
+        if !present.iter().any(|r| r == want) {
+            return Err(CustomError::BadRequest(format!(
+                "Missing or mismatched resource: {}",
+                want
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// C2 Step 3: re-validate a `redirect_uri` against the client's *registered*

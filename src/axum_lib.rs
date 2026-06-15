@@ -349,6 +349,15 @@ async fn device_verify_handler(
     Ok(StatusCode::OK)
 }
 
+async fn device_nonce_handler(
+    State(state): State<AppState>,
+    Query(query): Query<device_auth::DevicePageQuery>,
+) -> Result<Json<device_auth::DeviceNonceResponse>, CustomError> {
+    let code = query.user_code.as_deref().unwrap_or("");
+    let resp = device_auth::device_nonce(&state.config, &state.redis_client, code).await?;
+    Ok(Json(resp))
+}
+
 async fn device_approve_handler(
     State(state): State<AppState>,
     Json(req): Json<device_auth::DeviceApproveRequest>,
@@ -616,6 +625,15 @@ async fn account_page_handler(
     account::account_page_inner(query, state.config.base_url.as_str(), csrf.as_deref())
 }
 
+async fn account_nonce_handler(
+    State(state): State<AppState>,
+    Query(query): Query<account::AccountPageQuery>,
+) -> Result<Json<account::AccountNonceResponse>, CustomError> {
+    let action = query.action.as_deref().unwrap_or("");
+    let resp = account::account_nonce(&state.config, &state.redis_client, action).await?;
+    Ok(Json(resp))
+}
+
 async fn account_wallet_handler(
     State(state): State<AppState>,
     Json(req): Json<account::AccountWalletRequest>,
@@ -872,6 +890,7 @@ pub async fn main() {
             get(device_page_handler).post(device_approve_handler),
         )
         .route("/device/verify", get(device_verify_handler))
+        .route("/device/nonce", get(device_nonce_handler))
         .route("/device/passkey/start", post(device_passkey_start_handler))
         .route(
             "/device/passkey/finish",
@@ -879,6 +898,7 @@ pub async fn main() {
         )
         // MSC4191/MSC4312: account management + cross-signing reset
         .route("/account", get(account_page_handler))
+        .route("/account/nonce", get(account_nonce_handler))
         .route("/account/wallet", post(account_wallet_handler))
         .route("/account/action", post(account_action_handler))
         .route(

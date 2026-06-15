@@ -9,6 +9,18 @@ use crate::oidc::{did_to_localpart, CustomError};
 use crate::synapse_client::SynapseClient;
 use siwx_oidc::db::*;
 
+/// CAIP-122 nonce-store category for device-approval nonces (C1). The stored
+/// binding is the `user_code` the nonce was minted for.
+pub const CAIP122_NONCE_CATEGORY_DEVICE: &str = "device";
+
+/// The Resources audience a device-approval CAIP-122 message must name. Binding
+/// the message to this audience (operation binding) prevents a signature minted
+/// for another purpose (e.g. login or an account action) from being replayed to
+/// approve a device. Built identically at mint time and at validation time.
+fn device_approval_resource(config: &Config) -> String {
+    format!("{}/device", config.base_url.as_str().trim_end_matches('/'))
+}
+
 /// Consonant alphabet for user codes (base-20, no vowels to avoid profanity).
 const USER_CODE_ALPHABET: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ";
 
@@ -563,11 +575,20 @@ async function approveWallet() {
     const address = accounts[0];
     const did = 'did:pkh:eip155:1:' + address;
     const domain = new URL(BASE).hostname;
-    const nonce = Math.random().toString(36).substring(2, 18);
+    // C1: fetch a server-issued single-use nonce (+ Expiration Time + Resources)
+    // bound to this user_code. The wallet must sign THESE exact values; the server
+    // consumes the nonce once, rejecting any replay or signature minted elsewhere.
+    const nr = await fetch(BASE + '/device/nonce?user_code=' + encodeURIComponent(currentUserCode));
+    if (!nr.ok) { const t = await nr.text(); showStatus(t || 'Could not start approval.', true); return; }
+    const np = await nr.json();
     const issuedAt = new Date().toISOString();
-    const message = domain + ' wants you to sign in with your Ethereum account:\n' +
+    let message = domain + ' wants you to sign in with your Ethereum account:\n' +
       address + '\n\nApprove device login.\n\nURI: ' + BASE + '\nVersion: 1\nChain ID: 1\n' +
-      'Nonce: ' + nonce + '\nIssued At: ' + issuedAt;
+      'Nonce: ' + np.nonce + '\nIssued At: ' + issuedAt + '\nExpiration Time: ' + np.expiration_time;
+    if (np.resources && np.resources.length) {
+      message += '\nResources:';
+      for (const r of np.resources) message += '\n- ' + r;
+    }
     const signature = await window.ethereum.request({ method: 'personal_sign', params: [message, address] });
     const r = await fetch(BASE + '/device', {
       method: 'POST',
@@ -822,6 +843,37 @@ pub async fn device_verify(
     Ok(())
 }
 
+/// Server-issued single-use nonce for a device approval (C1). The approval page
+/// fetches this immediately before asking the wallet to sign, then embeds the
+/// returned `nonce` + `expiration_time` + `resources` in the CAIP-122 message.
+/// The nonce is bound to this `user_code` and consumed once in `device_approve`.
+#[derive(Serialize)]
+pub struct DeviceNonceResponse {
+    pub nonce: String,
+    /// RFC3339 Expiration Time the page must copy into the signed message.
+    pub expiration_time: String,
+    /// Resource URIs the page must include in the message `Resources:` block.
+    pub resources: Vec<String>,
+}
+
+pub async fn device_nonce(
+    config: &Config,
+    db_client: &(dyn DBClient + Sync),
+    user_code: &str,
+) -> Result<DeviceNonceResponse, CustomError> {
+    // Only mint a nonce for a real, still-pending code.
+    device_verify(db_client, user_code).await?;
+    let nonce = db_client
+        .mint_caip122_nonce(CAIP122_NONCE_CATEGORY_DEVICE, user_code)
+        .await?;
+    let exp = chrono::Utc::now() + chrono::Duration::seconds(CAIP122_NONCE_TTL_SECS as i64);
+    Ok(DeviceNonceResponse {
+        nonce,
+        expiration_time: exp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        resources: vec![device_approval_resource(config)],
+    })
+}
+
 #[derive(Deserialize)]
 pub struct DeviceApproveRequest {
     pub user_code: String,
@@ -899,6 +951,38 @@ pub async fn device_approve(
             "Signature verification failed".to_string(),
         ));
     }
+
+    // C1: a bare valid signature is NOT enough. The message must carry the exact
+    // server-issued single-use nonce minted for THIS device approval (GET
+    // /device/nonce), an unexpired Expiration Time, and the device-approval
+    // Resources audience. Consume the nonce (single-use) and confirm it was minted
+    // for this very user_code, so a captured/replayed signature — or a signature
+    // minted for a different device login — cannot approve this device.
+    let msg_nonce = crate::oidc::extract_nonce_pub(message).ok_or_else(|| {
+        CustomError::BadRequest("Nonce not found in CAIP-122 message".to_string())
+    })?;
+    let bound_user_code = db_client
+        .try_consume_caip122_nonce(CAIP122_NONCE_CATEGORY_DEVICE, msg_nonce)
+        .await?
+        .ok_or_else(|| {
+            CustomError::Unauthorized(
+                "Invalid, expired, or replayed device-approval nonce".to_string(),
+            )
+        })?;
+    if bound_user_code != req.user_code {
+        return Err(CustomError::Unauthorized(
+            "Device-approval nonce was issued for a different device login".to_string(),
+        ));
+    }
+    let resources = [device_approval_resource(config)];
+    crate::oidc::validate_caip122_envelope(
+        message,
+        &crate::oidc::Caip122Expectation {
+            nonce: msg_nonce,
+            resources: &resources,
+        },
+        chrono::Utc::now(),
+    )?;
 
     let warning =
         check_cross_signing(did, synapse_client, config.matrix_server_name.as_deref()).await;

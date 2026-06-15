@@ -677,3 +677,313 @@ async fn authorize_without_pkce_is_rejected() {
         "a code-flow /authorize WITH S256 PKCE must still succeed"
     );
 }
+
+// ===========================================================================
+// C1 — server-issued single-use nonce on device-approval & account paths
+// ===========================================================================
+
+fn host(base: &str) -> String {
+    reqwest::Url::parse(base)
+        .unwrap()
+        .host_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Request a fresh device code and return its `user_code`.
+async fn new_device_user_code(c: &Client, base: &str) -> String {
+    let rc = register_client(c, base).await;
+    let da: Value = c
+        .post(format!("{base}/device_authorization"))
+        .form(&[("client_id", rc.client_id.as_str()), ("scope", "openid")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    da["user_code"].as_str().unwrap().to_string()
+}
+
+/// Fetch a server-issued device-approval nonce envelope for `user_code`.
+async fn device_nonce(c: &Client, base: &str, user_code: &str) -> Value {
+    c.get(format!("{base}/device/nonce?user_code={user_code}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Build + sign a device-approval message from a nonce envelope.
+fn build_device_message(w: &Wallet, base: &str, np: &Value) -> (String, String) {
+    let res: String = np["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| format!("\n- {}", r.as_str().unwrap()))
+        .collect();
+    let message = format!(
+        "{domain} wants you to sign in with your Ethereum account:\n{addr}\n\nApprove device login.\n\nURI: {base}\nVersion: 1\nChain ID: 1\nNonce: {nonce}\nIssued At: 2026-06-14T00:00:00.000Z\nExpiration Time: {exp}\nResources:{res}",
+        domain = host(base),
+        addr = w.address,
+        nonce = np["nonce"].as_str().unwrap(),
+        exp = np["expiration_time"].as_str().unwrap(),
+    );
+    let sig = eip191_sign(&w.key, &message);
+    (message, sig)
+}
+
+async fn post_device_approve(
+    c: &Client,
+    base: &str,
+    user_code: &str,
+    w: &Wallet,
+    message: &str,
+    signature: &str,
+) -> reqwest::Response {
+    c.post(format!("{base}/device"))
+        .json(&json!({
+            "user_code": user_code, "action": "approve",
+            "did": w.did, "message": message, "signature": signature
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// C1 device: a fresh, properly-nonced approval SUCCEEDS; replaying the very same
+/// signature (same nonce) is REJECTED (single-use nonce consumed).
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn device_approval_replay_is_rejected_fresh_succeeds() {
+    let c = Client::new();
+    let base = oidc();
+    let w = new_wallet();
+
+    // (a) Fresh, correctly nonced approval → 200.
+    let uc1 = new_device_user_code(&c, &base).await;
+    let np = device_nonce(&c, &base, &uc1).await;
+    let (message, signature) = build_device_message(&w, &base, &np);
+    let ok = post_device_approve(&c, &base, &uc1, &w, &message, &signature).await;
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "a fresh server-nonced device approval must succeed"
+    );
+
+    // (b) Replay the SAME {message, signature} on a NEW device login → rejected.
+    // The nonce was single-use (consumed in (a)); the device-code is also new, so
+    // this isolates the nonce check from the "code already used" guard.
+    let uc2 = new_device_user_code(&c, &base).await;
+    let replay = post_device_approve(&c, &base, &uc2, &w, &message, &signature).await;
+    let status = replay.status();
+    let body = replay.text().await.unwrap_or_default();
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a replayed device-approval signature must be rejected, got 200: {body}"
+    );
+    assert!(
+        status == StatusCode::UNAUTHORIZED || status == StatusCode::BAD_REQUEST,
+        "replay must be 401/400, got {status}: {body}"
+    );
+}
+
+/// C1 device: a message with NO server nonce (a bare self-signed EIP-191 message,
+/// the OLD attack) is REJECTED — this is the exact signature-replay vector.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn device_approval_without_server_nonce_is_rejected() {
+    let c = Client::new();
+    let base = oidc();
+    let w = new_wallet();
+    let uc = new_device_user_code(&c, &base).await;
+
+    // A self-invented nonce, no Expiration Time, no Resources — exactly what the
+    // pre-C1 page sent and what an attacker can mint from any leaked signature.
+    let message = format!(
+        "{domain} wants you to sign in with your Ethereum account:\n{addr}\n\nApprove device login.\n\nURI: {base}\nVersion: 1\nChain ID: 1\nNonce: attackerchosen01\nIssued At: 2026-06-14T00:00:00.000Z",
+        domain = host(&base),
+        addr = w.address,
+    );
+    let signature = eip191_sign(&w.key, &message);
+    let resp = post_device_approve(&c, &base, &uc, &w, &message, &signature).await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a bare (no server nonce) device approval must be rejected, got 200: {body}"
+    );
+}
+
+/// C1 device: a nonce minted for one user_code cannot approve a DIFFERENT device
+/// login (cross-context binding).
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn device_approval_cross_user_code_nonce_is_rejected() {
+    let c = Client::new();
+    let base = oidc();
+    let w = new_wallet();
+
+    let uc_a = new_device_user_code(&c, &base).await;
+    let uc_b = new_device_user_code(&c, &base).await;
+    // Mint a nonce bound to uc_a, but try to use it to approve uc_b.
+    let np = device_nonce(&c, &base, &uc_a).await;
+    let (message, signature) = build_device_message(&w, &base, &np);
+    let resp = post_device_approve(&c, &base, &uc_b, &w, &message, &signature).await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a nonce minted for another user_code must not approve this device, got 200: {body}"
+    );
+}
+
+/// Fetch a server-issued account nonce envelope for `action`.
+async fn account_nonce(c: &Client, base: &str, action: &str) -> Value {
+    c.get(format!("{base}/account/nonce?action={action}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+fn build_account_message(w: &Wallet, base: &str, np: &Value) -> (String, String) {
+    let res: String = np["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| format!("\n- {}", r.as_str().unwrap()))
+        .collect();
+    let message = format!(
+        "{domain} wants you to sign in with your Ethereum account:\n{addr}\n\nConfirm account action.\n\nURI: {base}\nVersion: 1\nChain ID: 1\nNonce: {nonce}\nIssued At: 2026-06-14T00:00:00.000Z\nExpiration Time: {exp}\nResources:{res}",
+        domain = host(base),
+        addr = w.address,
+        nonce = np["nonce"].as_str().unwrap(),
+        exp = np["expiration_time"].as_str().unwrap(),
+    );
+    let sig = eip191_sign(&w.key, &message);
+    (message, sig)
+}
+
+async fn post_account_wallet(
+    c: &Client,
+    base: &str,
+    action: &str,
+    w: &Wallet,
+    message: &str,
+    signature: &str,
+) -> reqwest::Response {
+    c.post(format!("{base}/account/wallet"))
+        .json(&json!({
+            "action": action,
+            "did": w.did, "message": message, "signature": signature, "device_id": null
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// C1 account: a bare signature with NO server nonce (the OLD signature-replay
+/// vector — any previously-leaked EIP-191 signature) is REJECTED, NOT executed.
+/// Uses `account_erase` to prove the most destructive action is gated.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn account_action_without_server_nonce_is_rejected() {
+    let c = Client::new();
+    let base = oidc();
+    let w = new_wallet();
+
+    let message = format!(
+        "{domain} wants you to sign in with your Ethereum account:\n{addr}\n\nConfirm account action.\n\nURI: {base}\nVersion: 1\nChain ID: 1\nNonce: leakedoldnonce01\nIssued At: 2026-06-14T00:00:00.000Z",
+        domain = host(&base),
+        addr = w.address,
+    );
+    let signature = eip191_sign(&w.key, &message);
+    let resp = post_account_wallet(
+        &c,
+        &base,
+        "org.matrix.account_erase",
+        &w,
+        &message,
+        &signature,
+    )
+    .await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a bare (no server nonce) account_erase must be rejected, got 200: {body}"
+    );
+}
+
+/// C1 account: replaying a once-used (single-use) account signature is REJECTED.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn account_action_nonce_replay_is_rejected() {
+    let c = Client::new();
+    let base = oidc();
+    let w = new_wallet();
+
+    // Use `profile` (idempotent, needs no Synapse) so the first call succeeds.
+    let np = account_nonce(&c, &base, "org.matrix.profile").await;
+    let (message, signature) = build_account_message(&w, &base, &np);
+    let first =
+        post_account_wallet(&c, &base, "org.matrix.profile", &w, &message, &signature).await;
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "a fresh server-nonced account action must succeed"
+    );
+
+    // Replay the SAME signature → the nonce is already consumed → rejected.
+    let replay =
+        post_account_wallet(&c, &base, "org.matrix.profile", &w, &message, &signature).await;
+    let status = replay.status();
+    let body = replay.text().await.unwrap_or_default();
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a replayed account signature must be rejected, got 200: {body}"
+    );
+}
+
+/// C1 account OPERATION BINDING: a signature minted for `cross_signing_reset`
+/// must NOT be accepted for `account_erase` (its nonce is bound to the action).
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn account_action_operation_binding_is_enforced() {
+    let c = Client::new();
+    let base = oidc();
+    let w = new_wallet();
+
+    // Mint + sign for cross_signing_reset...
+    let np = account_nonce(&c, &base, "org.matrix.cross_signing_reset").await;
+    let (message, signature) = build_account_message(&w, &base, &np);
+
+    // ...then submit it against account_erase. Rejected: the nonce was bound to a
+    // different action, and the Resources audience names cross_signing_reset.
+    let resp = post_account_wallet(
+        &c,
+        &base,
+        "org.matrix.account_erase",
+        &w,
+        &message,
+        &signature,
+    )
+    .await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a cross_signing_reset signature must not drive account_erase, got 200: {body}"
+    );
+}
