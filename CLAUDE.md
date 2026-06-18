@@ -427,9 +427,39 @@ and substitutes `primary_did` if a mapping exists.
    will only offer passkeys registered for the exact RP ID domain. Check that the
    domain users see in the browser matches `SIWEOIDC_RP_ID`.
 
-5. **"Credential not found" after selecting a passkey** → credential was stored on a
-   different Redis instance, or Redis was flushed. Credential keys have no TTL but
-   are lost on `--reset`. Check `redis-cli KEYS 'webauthn:credential/*'`.
+5. **Selecting a stale/revoked passkey** → the credential was stored on a different
+   Redis instance, Redis was flushed (`--reset`; credential keys have no TTL but are
+   not persisted), or the credential was revoked/erased. Check
+   `redis-cli KEYS 'webauthn:credential/*'`.
+
+   **Behavior (since 2026-06-18):** the unknown-credential case is no longer a raw
+   500. `verify_credential` returns the typed `VerifyError::UnknownCredential` (the
+   *only* failure mode that does so; the other five stay 500/Other), which the
+   handlers render as **HTTP 401** with a machine-readable body
+   `{"error":"unknown_credential","credential_id":"<b64url>","message":...}`, logged
+   as `unknown_credential` (not `internal_error`). The frontends key on that
+   discriminator to (a) show an actionable message and (b) best-effort, feature-
+   detected, call `PublicKeyCredential.signalUnknownCredential({rpId, credentialId})`
+   so the platform prunes the stale key from the picker next time. This is privacy-
+   safe: we only ever signal an id the client just presented, never enumerate stored
+   credentials. Support is partial (recent Chrome/Safari), so it is a progressive
+   enhancement; the 401 + message is the guaranteed floor on every browser. The
+   signal fires ONLY on the discriminator, never on signature/challenge/counter
+   failures, so a valid passkey is never pruned.
+
+   **Migration (pre-discoverable-fix credentials):** the discoverable fix requires
+   resident keys only for NEW registrations, and removes the credential enumeration
+   that `authenticate_start` previously did. A passkey registered before that fix may
+   not be resident/discoverable and so may not surface in the picker (or may resolve
+   but no longer match). There is no server-side migration (the server cannot reach a
+   credential it never stored as resident). Re-enrollment path: sign in another way
+   (wallet) and register a fresh passkey via "Link a passkey", or register a new one
+   on the login page. The unknown-credential message points the user here.
+
+   **Held in reserve (not implemented):** `signalAllAcceptedCredentials` (needs a user
+   handle / identity scope) and identifier-first `allowCredentials` (a hard pre-
+   filtered picker, but it costs the usernameless flow). Use these only if hard
+   prevention is ever required; `signalUnknownCredential` keeps usernameless intact.
 
 6. **"Session not found"** → session expired (300s TTL) between authenticate_finish
    and sign_in redirect. Check for network/proxy delays.

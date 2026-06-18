@@ -701,7 +701,12 @@ pub async fn account_passkey_finish(
 
     let resp = wa::verify_credential(db_client, session_id, rp_id, rp_origin, &auth_response)
         .await
-        .map_err(|e| CustomError::BadRequest(e.to_string()))?;
+        // Route the stale-passkey case to the structured 401 discriminator; keep every
+        // other verification failure as the existing 400 BadRequest for this flow.
+        .map_err(|e| match e {
+            wa::VerifyError::UnknownCredential(id) => CustomError::UnknownCredential(id),
+            wa::VerifyError::Other(inner) => CustomError::BadRequest(inner.to_string()),
+        })?;
 
     let outcome = execute_action(
         action,
@@ -1511,11 +1516,10 @@ async function authPasskey() {
     const sessionId = startData.session_id;
     const options = startData;
     options.publicKey.challenge = base64ToBuffer(options.publicKey.challenge);
+    // Discoverable login: the server returns an empty allowCredentials, so the
+    // authenticator surfaces the user's own resident passkey. An empty/absent list
+    // is a no-op here, never treat it as an error.
     if (options.publicKey.allowCredentials) {
-      if (options.publicKey.allowCredentials.length === 0) {
-        showStatus('No passkeys registered on this server. Register a passkey first.');
-        return;
-      }
       options.publicKey.allowCredentials = options.publicKey.allowCredentials.map((c) => ({ ...c, id: base64ToBuffer(c.id) }));
     }
     const credential = await navigator.credentials.get({ publicKey: options.publicKey });
@@ -1542,8 +1546,20 @@ async function authPasskey() {
       AUTHED = true; if (data.csrf) CSRF = data.csrf;
       renderOutcome(data);
     } else {
-      const t = await finishR.text();
-      showStatus(t || 'Passkey authentication failed.');
+      const errBody = await finishR.clone().json().catch(() => null);
+      if (errBody && errBody.error === 'unknown_credential') {
+        // Progressive enhancement: prune the stale passkey from the picker. Privacy-safe
+        // (only signals an id the client just presented), best-effort + feature-detected.
+        try {
+          if (window.PublicKeyCredential && typeof PublicKeyCredential.signalUnknownCredential === 'function' && options.publicKey.rpId) {
+            await PublicKeyCredential.signalUnknownCredential({ rpId: options.publicKey.rpId, credentialId: errBody.credential_id });
+          }
+        } catch (e) { /* best-effort prune; ignore */ }
+        showStatus(errBody.message || 'This passkey is no longer valid. Remove it from your device settings or use another sign-in method.');
+      } else {
+        const t = await finishR.text();
+        showStatus(t || 'Passkey authentication failed.');
+      }
     }
   } catch (e) {
     showStatus('Passkey error: ' + (e.message || e));

@@ -92,6 +92,10 @@ impl IntoResponse for CustomError {
             CustomError::Unauthorized(msg) => {
                 warn!(error = %msg, "unauthorized");
             }
+            CustomError::UnknownCredential(cred_id) => {
+                // Expected user condition (stale/revoked passkey), NOT a server fault.
+                warn!(credential_id = %cred_id, "unknown_credential");
+            }
             CustomError::Other(e) => {
                 warn!(error = %e, "internal_error");
             }
@@ -109,6 +113,21 @@ impl IntoResponse for CustomError {
             CustomError::Unauthorized(_) => {
                 (StatusCode::UNAUTHORIZED, self.to_string()).into_response()
             }
+            // 401 + machine-readable discriminator. The client keys on `error` to
+            // call `signalUnknownCredential` and shows `message` to the user. The
+            // echoed `credential_id` is the exact id the client just presented, so
+            // signaling enumerates nothing the caller did not already hold.
+            CustomError::UnknownCredential(cred_id) => (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "unknown_credential",
+                    "credential_id": cred_id,
+                    "message": "This passkey is no longer valid on this server. \
+                                Remove it from your device's passkey settings, or sign \
+                                in another way and register a new passkey.",
+                })),
+            )
+                .into_response(),
             CustomError::NotFound => (StatusCode::NOT_FOUND, self.to_string()).into_response(),
             CustomError::Redirect(uri) => Redirect::to(&uri).into_response(),
             CustomError::Other(_) => {
@@ -402,7 +421,12 @@ async fn device_passkey_finish_handler(
         &auth_response,
     )
     .await
-    .map_err(|e| CustomError::BadRequest(e.to_string()))?;
+    // Route the stale-passkey case to the structured 401 discriminator; keep every
+    // other verification failure as the existing 400 BadRequest for this flow.
+    .map_err(|e| match e {
+        wa::VerifyError::UnknownCredential(id) => CustomError::UnknownCredential(id),
+        wa::VerifyError::Other(inner) => CustomError::BadRequest(inner.to_string()),
+    })?;
     let synapse = state.synapse_client.as_deref();
     let server_name = state.config.matrix_server_name.as_deref();
     let result = device_auth::device_approve_passkey(
@@ -987,4 +1011,51 @@ pub async fn main() {
     info!("Listening on {}", addr);
     let listener = TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod unknown_credential_response_tests {
+    //! Deterministic, infra-free guards for the stale-passkey server contract.
+    //! No Redis or network: they exercise the typed-error mapping and the HTTP
+    //! rendering the frontend keys on. The full ceremony path is covered by the
+    //! browser E2E (`e2e/browser/stale-credential.spec.mjs`).
+    use super::*;
+    use crate::webauthn::VerifyError;
+
+    /// H1/H2: the unknown-credential case maps to `CustomError::UnknownCredential`
+    /// and renders as HTTP 401 with the machine-readable JSON discriminator
+    /// `{error:"unknown_credential", credential_id, message}` (NOT a 500).
+    #[tokio::test]
+    async fn unknown_credential_maps_to_401_discriminator() {
+        let ce: CustomError = VerifyError::UnknownCredential("AAAABBBB".to_string()).into();
+        assert!(
+            matches!(&ce, CustomError::UnknownCredential(id) if id == "AAAABBBB"),
+            "VerifyError::UnknownCredential must map to CustomError::UnknownCredential"
+        );
+
+        let resp = ce.into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "unknown_credential");
+        assert_eq!(json["credential_id"], "AAAABBBB");
+        assert!(json["message"]
+            .as_str()
+            .expect("message present")
+            .contains("no longer valid"));
+    }
+
+    /// H1 isolation: every OTHER verification failure (signature, challenge, flags,
+    /// counter, I/O) stays `Other` -> HTTP 500 and is never mistaken for the
+    /// unknown-credential discriminator, so a valid passkey is never signaled.
+    #[tokio::test]
+    async fn other_verify_error_stays_internal_error() {
+        let ce: CustomError = VerifyError::Other(anyhow::anyhow!("signature failed")).into();
+        assert!(matches!(ce, CustomError::Other(_)));
+        let resp = ce.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

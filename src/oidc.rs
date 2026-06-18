@@ -162,12 +162,33 @@ pub enum CustomError {
     BadRequestToken(TokenError),
     #[error("{0}")]
     Unauthorized(String),
+    /// A presented passkey credential is not registered on this server (a stale or
+    /// revoked key chosen from the platform picker). Renders as HTTP 401 with a
+    /// machine-readable JSON discriminator so the client can prune it via
+    /// `signalUnknownCredential`. Carries the base64url credential id. This is an
+    /// EXPECTED user condition, not an internal error: it is logged as
+    /// `unknown_credential`, never `internal_error`.
+    #[error("unknown_credential: {0}")]
+    UnknownCredential(String),
     #[error("Not found")]
     NotFound,
     #[error("{0:?}")]
     Redirect(String),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+impl From<crate::webauthn::VerifyError> for CustomError {
+    fn from(e: crate::webauthn::VerifyError) -> Self {
+        match e {
+            // The single typed case: surface it so handlers return a structured 401.
+            crate::webauthn::VerifyError::UnknownCredential(cred_id) => {
+                CustomError::UnknownCredential(cred_id)
+            }
+            // Every other verification failure keeps its existing 500/Other behavior.
+            crate::webauthn::VerifyError::Other(inner) => CustomError::Other(inner),
+        }
+    }
 }
 
 // -- JWK / metadata helpers ------------------------------------------------

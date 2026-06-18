@@ -11,10 +11,11 @@ use aqua_auth::{verify_webauthn_assertion, WebAuthnAssertionParams};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use p256::ecdsa::Signature;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use tracing::info;
 use url::Url;
 use webauthn_rs::prelude::*;
-use webauthn_rs_proto::AllowCredentials;
+use webauthn_rs_proto::{AuthenticatorSelectionCriteria, ResidentKeyRequirement};
 
 use siwx_oidc::db::RedisClient;
 
@@ -96,6 +97,29 @@ pub struct AuthenticateFinishResponse {
     pub did: String,
 }
 
+/// Typed outcome of a failed assertion verification.
+///
+/// `UnknownCredential` is the single, narrowly-scoped case where the presented
+/// credential is not registered on this server (a stale/revoked passkey selected
+/// from the platform picker). It is constructed at exactly one site (the Redis
+/// credential lookup miss) and carries the base64url credential id so the handler
+/// can echo it back to the client for a privacy-safe `signalUnknownCredential`
+/// prune. Every OTHER failure mode (expired/decoded challenge, empty id, signature
+/// mismatch, missing UV flag, sign-count regression) stays `Other` and keeps its
+/// existing 500/internal-error classification. This isolation is load-bearing: a
+/// valid passkey must never be signaled for pruning because of a transient or
+/// unrelated failure.
+#[derive(Debug, Error)]
+pub enum VerifyError {
+    /// The presented credential id is not registered on this server.
+    /// Carries the base64url credential id.
+    #[error("Credential not found: {0}")]
+    UnknownCredential(String),
+    /// Any other verification failure (challenge, signature, flags, counter, I/O).
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
 // -- Account linking (Phase 2) --
 
 /// Stored at `webauthn:link/{cred_id_b64}` — maps a passkey credential to a primary DID.
@@ -118,6 +142,24 @@ pub struct LinkFinishResponse {
     pub primary_did: String,
 }
 
+/// Upgrade a passkey registration challenge to require a **discoverable (resident)**
+/// credential. `webauthn-rs`'s `start_passkey_registration` requests
+/// `residentKey: discouraged`, which yields non-discoverable credentials usable only
+/// when the server supplies their id in `allowCredentials`. In a usernameless flow
+/// that forces enumerating EVERY credential to the browser (a privacy leak + a
+/// server-wide passkey picker). Requesting a resident key instead lets the
+/// authenticator surface only the user's own passkey, so `authenticate_start` can use
+/// an empty `allowCredentials`. (Existing non-resident credentials predate this and
+/// must be re-registered to gain discoverability.)
+fn require_resident_key(ccr: &mut CreationChallengeResponse) {
+    let sel = ccr
+        .public_key
+        .authenticator_selection
+        .get_or_insert_with(AuthenticatorSelectionCriteria::default);
+    sel.resident_key = Some(ResidentKeyRequirement::Required);
+    sel.require_resident_key = true;
+}
+
 // -- Registration ceremony --
 
 pub async fn register_start(
@@ -129,9 +171,10 @@ pub async fn register_start(
     let user_unique_id = Uuid::new_v4();
     let name = display_name.as_deref().unwrap_or("passkey-user");
 
-    let (ccr, reg_state) = webauthn
+    let (mut ccr, reg_state) = webauthn
         .start_passkey_registration(user_unique_id, name, name, None)
         .map_err(|e| anyhow!("WebAuthn registration start failed: {:?}", e))?;
+    require_resident_key(&mut ccr);
 
     // Store registration state in Redis (consumed by register_finish).
     let state_json = serde_json::to_string(&reg_state)
@@ -199,25 +242,15 @@ pub async fn authenticate_start(
     redis: &RedisClient,
     session_id: &str,
 ) -> Result<RequestChallengeResponse> {
-    let (mut rcr, _auth_state) = webauthn
+    // Discoverable (usernameless) authentication: leave `allow_credentials` EMPTY.
+    // Credentials are registered as discoverable resident keys (see
+    // `require_resident_key`), so the authenticator surfaces only the user's own
+    // passkey and `verify_credential` resolves it by raw id. We must NOT enumerate
+    // stored credentials here: that leaked every credential id to unauthenticated
+    // callers and produced a server-wide passkey picker.
+    let (rcr, _auth_state) = webauthn
         .start_discoverable_authentication()
         .map_err(|e| anyhow!("WebAuthn auth start failed: {:?}", e))?;
-
-    let credential_keys = redis.keys_raw(&format!("{}/*", CREDENTIAL_PREFIX)).await?;
-    let prefix_len = CREDENTIAL_PREFIX.len() + 1; // "webauthn:credential/"
-    let allow_list: Vec<AllowCredentials> = credential_keys
-        .iter()
-        .filter_map(|key| {
-            let cred_id_b64 = &key[prefix_len..];
-            let bytes = URL_SAFE_NO_PAD.decode(cred_id_b64).ok()?;
-            Some(AllowCredentials {
-                type_: "public-key".to_string(),
-                id: Base64UrlSafeData::from(bytes),
-                transports: None,
-            })
-        })
-        .collect();
-    rcr.public_key.allow_credentials = allow_list;
 
     let challenge_b64 = URL_SAFE_NO_PAD.encode(&*rcr.public_key.challenge);
     redis
@@ -241,7 +274,7 @@ pub async fn verify_credential(
     rp_id: &str,
     rp_origin: &str,
     auth_response: &PublicKeyCredential,
-) -> Result<AuthenticateFinishResponse> {
+) -> Result<AuthenticateFinishResponse, VerifyError> {
     let challenge_key = format!("{}/{}", CHALLENGE_PREFIX, session_id);
     let challenge_b64 = redis
         .get_raw(&challenge_key)
@@ -255,13 +288,17 @@ pub async fn verify_credential(
 
     let cred_id_b64 = URL_SAFE_NO_PAD.encode(&*auth_response.raw_id);
     if cred_id_b64.is_empty() {
-        return Err(anyhow!("Empty credential ID in WebAuthn assertion"));
+        return Err(anyhow!("Empty credential ID in WebAuthn assertion").into());
     }
     let cred_key = format!("{}/{}", CREDENTIAL_PREFIX, cred_id_b64);
     let cred_json = redis
         .get_raw(&cred_key)
         .await?
-        .ok_or_else(|| anyhow!("Credential not found: {}", cred_id_b64))?;
+        // The ONLY site that yields VerifyError::UnknownCredential. A stale/revoked
+        // passkey selected from the picker lands here (lookup precedes signature
+        // verification), so this is reachable without a forged signature. Keeping the
+        // lookup before verification is load-bearing for the 401-not-500 path.
+        .ok_or_else(|| VerifyError::UnknownCredential(cred_id_b64.clone()))?;
     let passkey: Passkey = serde_json::from_str(&cred_json)
         .map_err(|e| anyhow!("Failed to deserialize credential: {}", e))?;
 
@@ -284,13 +321,15 @@ pub async fn verify_credential(
 
     match verify_webauthn_assertion(&params) {
         Ok(true) => {}
-        Ok(false) => return Err(anyhow!("WebAuthn assertion signature verification failed")),
-        Err(e) => return Err(anyhow!("WebAuthn assertion verification error: {}", e)),
+        Ok(false) => {
+            return Err(anyhow!("WebAuthn assertion signature verification failed").into())
+        }
+        Err(e) => return Err(anyhow!("WebAuthn assertion verification error: {}", e).into()),
     }
 
     let flags = auth_response.response.authenticator_data[32];
     if flags & 0x04 == 0 {
-        return Err(anyhow!("User Verification flag not set"));
+        return Err(anyhow!("User Verification flag not set").into());
     }
 
     let passkey_did = did_from_passkey(&passkey)?;
@@ -315,7 +354,8 @@ pub async fn verify_credential(
     if auth_data.len() >= 37 {
         let new_counter =
             u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
-        let mut passkey_value: serde_json::Value = serde_json::from_str(&cred_json)?;
+        let mut passkey_value: serde_json::Value = serde_json::from_str(&cred_json)
+            .map_err(|e| anyhow!("Failed to parse stored credential for counter update: {}", e))?;
         if let Some(cred) = passkey_value.get_mut("cred") {
             let stored_counter = cred.get("counter").and_then(|c| c.as_u64()).unwrap_or(0) as u32;
             if (new_counter > 0 || stored_counter > 0) && new_counter < stored_counter {
@@ -323,12 +363,17 @@ pub async fn verify_credential(
                     "Sign count regression (stored={}, got={}), possible cloned authenticator",
                     stored_counter,
                     new_counter
-                ));
+                )
+                .into());
             }
             cred["counter"] = serde_json::json!(new_counter);
         }
         redis
-            .set_raw(&cred_key, &serde_json::to_string(&passkey_value)?)
+            .set_raw(
+                &cred_key,
+                &serde_json::to_string(&passkey_value)
+                    .map_err(|e| anyhow!("Failed to serialize credential counter: {}", e))?,
+            )
             .await?;
     }
 
@@ -347,7 +392,7 @@ pub async fn authenticate_finish(
     rp_id: &str,
     rp_origin: &str,
     auth_response: PublicKeyCredential,
-) -> Result<AuthenticateFinishResponse> {
+) -> Result<AuthenticateFinishResponse, VerifyError> {
     let resp = verify_credential(redis, session_id, rp_id, rp_origin, &auth_response).await?;
 
     let session_key = format!("sessions/{}", session_id);
@@ -383,9 +428,10 @@ pub async fn link_start(
     let user_unique_id = Uuid::new_v4();
     let name = display_name.as_deref().unwrap_or("linked-passkey");
 
-    let (ccr, reg_state) = webauthn
+    let (mut ccr, reg_state) = webauthn
         .start_passkey_registration(user_unique_id, name, name, None)
         .map_err(|e| anyhow!("WebAuthn registration start failed: {:?}", e))?;
+    require_resident_key(&mut ccr);
 
     // Store registration state + primary_did in Redis.
     let reg_state_json = serde_json::to_string(&reg_state)
