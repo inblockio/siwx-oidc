@@ -618,11 +618,9 @@ async function approvePasskey() {
     if (!startR.ok) { showStatus('Failed to start passkey authentication.', true); return; }
     const options = await startR.json();
     options.publicKey.challenge = base64ToBuffer(options.publicKey.challenge);
+    // Discoverable login: empty allowCredentials is expected (resident passkeys);
+    // it is a no-op here, not an error.
     if (options.publicKey.allowCredentials) {
-      if (options.publicKey.allowCredentials.length === 0) {
-        showStatus('No passkeys registered on this server. Register a passkey first.', true);
-        return;
-      }
       options.publicKey.allowCredentials = options.publicKey.allowCredentials.map((c) => ({ ...c, id: base64ToBuffer(c.id) }));
     }
     const credential = await navigator.credentials.get({ publicKey: options.publicKey });
@@ -645,7 +643,22 @@ async function approvePasskey() {
     if (finishR.ok) {
       const data = await finishR.json().catch(() => ({}));
       showTerminal(data.status || 'approved', data.warning);
-    } else { const t = await finishR.text(); showStatus(t || 'Passkey authentication failed.', true); }
+    } else {
+      const errBody = await finishR.clone().json().catch(() => null);
+      if (errBody && errBody.error === 'unknown_credential') {
+        // Progressive enhancement: prune the stale passkey from the picker. Privacy-safe
+        // (only signals an id the client just presented), best-effort + feature-detected.
+        try {
+          if (window.PublicKeyCredential && typeof PublicKeyCredential.signalUnknownCredential === 'function' && options.publicKey.rpId) {
+            await PublicKeyCredential.signalUnknownCredential({ rpId: options.publicKey.rpId, credentialId: errBody.credential_id });
+          }
+        } catch (e) { /* best-effort prune; ignore */ }
+        showStatus(errBody.message || 'This passkey is no longer valid. Remove it from your device settings or use another sign-in method.', true);
+      } else {
+        const t = await finishR.text();
+        showStatus(t || 'Passkey authentication failed.', true);
+      }
+    }
   } catch (e) {
     showStatus('Passkey error: ' + (e.message || e), true);
   } finally {

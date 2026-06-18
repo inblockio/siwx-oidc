@@ -153,9 +153,15 @@ async function loginToToken(page, { did, signMessage, passkey = false }) {
     // redirect and read the nonce/domain off the resulting same-origin URL (the
     // SPA root echoes them in its query string). One authorize call only.
     const state = 'st_' + Math.random().toString(36).slice(2);
+    // PKCE (S256) is required by /authorize (OAuth hardening). Generate a verifier
+    // and its SHA-256 challenge; the verifier is replayed at /token below.
+    const codeVerifier = bufToB64u(crypto.getRandomValues(new Uint8Array(32)).buffer);
+    const challengeBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier));
+    const codeChallenge = bufToB64u(challengeBuf);
     const authorizeUrl = BASE + '/authorize?' + q({
       client_id, redirect_uri: redirectUri, scope: 'openid',
       response_type: 'code', state,
+      code_challenge: codeChallenge, code_challenge_method: 'S256',
     });
     const authFollowed = await fetch(authorizeUrl, { redirect: 'follow' });
     const au = new URL(authFollowed.url);
@@ -223,6 +229,7 @@ async function loginToToken(page, { did, signMessage, passkey = false }) {
     // 5. /token (authorization_code).
     const form = new URLSearchParams({
       code, client_id, client_secret, grant_type: 'authorization_code',
+      code_verifier: codeVerifier,
     });
     const tk = await fetch(BASE + '/token', {
       method: 'POST',
@@ -287,6 +294,36 @@ test('R-C1/R-C2/R-C3: passkey register -> login -> token (same DID)', async ({ p
   const wa = await ceremonyCounts(page);
   expect(wa.create).toBe(1);
   expect(wa.get).toBe(1);
+});
+
+test('R-C4: authenticate/start does not enumerate credentials (empty allowCredentials)', async ({ page }) => {
+  // Regression guard for the discoverable-auth credential leak. authenticate_start
+  // must NOT enumerate stored credentials: doing so leaked all credential ids to
+  // unauthenticated callers and produced a server-wide passkey picker. With >=2
+  // credentials registered, the start response must still return empty
+  // allowCredentials (login works because the credentials are discoverable resident
+  // keys, exercised by R-C2 above).
+  await mockReset();
+  await addVirtualAuthenticator(page);
+  await page.context().addCookies([{ name: 'session', value: 'pk-leak-sess', url: BASE }]);
+  await page.goto('/account');
+
+  const did1 = await registerPasskey(page);
+  const did2 = await registerPasskey(page);
+  expect(did1).toMatch(/^did:key:zDn/);
+  expect(did2).toMatch(/^did:key:zDn/);
+  expect(did1).not.toBe(did2);
+
+  const allow = await page.evaluate(async () => {
+    const sr = await fetch('/webauthn/authenticate/start', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    if (!sr.ok) throw new Error('authenticate start ' + sr.status + ' ' + (await sr.text()));
+    const opts = await sr.json();
+    return opts.publicKey.allowCredentials || [];
+  });
+  expect(Array.isArray(allow)).toBe(true);
+  expect(allow.length).toBe(0);
 });
 
 test('R-G1: one re-auth covers list + view + delete (single signature)', async ({ page }) => {
