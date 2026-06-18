@@ -22,9 +22,21 @@ import net from 'node:net';
 import { addVirtualAuthenticator, registerPasskey } from './webauthn-helper.mjs';
 
 const BASE = process.env.SIWEOIDC_HOST || 'http://localhost:8080';
+const MOCK = process.env.SYNAPSE_MOCK || 'http://localhost:8090';
 const REDIS_HOST = process.env.REDIS_HOST || '127.0.0.1';
 const REDIS_PORT = Number(process.env.REDIS_PORT || 6379);
 const CRED_PREFIX = 'webauthn:credential/';
+
+// Mark a DID's localpart as an EXISTING account so the account flow's new-identity
+// gate treats a passkey re-auth as a returning user (the gate rejects brand-new
+// identities outside the login screen; these tests use existing accounts).
+async function mockSeedUser(did) {
+  await fetch(`${MOCK}/__seed_user`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ localpart: did.replaceAll(':', '-').toLowerCase() }),
+  });
+}
 
 // -- minimal RESP-over-TCP client: resolves on the first complete reply, handling
 //    arrays (KEYS), integers (DEL), bulk/simple strings, and errors ---------------
@@ -188,6 +200,9 @@ test('H5: a VALID passkey auth never fires signalUnknownCredential (trigger isol
   await page.goto('/account');
   const did = await registerPasskey(page);
   expect(did).toMatch(/^did:key:zDn/);
+  // `profile` runs in the account flow, which rejects NEW identities; this test is
+  // about a VALID (returning) passkey, so mark its account as existing.
+  await mockSeedUser(did);
 
   // `profile` succeeds on passkey auth alone (no stale credential, no 401).
   await page.goto('/account?action=org.matrix.profile');

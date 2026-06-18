@@ -660,6 +660,12 @@ pub async fn account_wallet(
         Utc::now(),
     )?;
 
+    // New-account creation is reachable ONLY from the login screen. Account
+    // management operates on an EXISTING account, so a wallet DID with no Synapse
+    // account is REJECTED here (nothing is provisioned). No-op when the DID
+    // already has an account or when no Synapse client is configured.
+    wa::reject_if_new_identity(synapse_client, &req.did).await?;
+
     let outcome = execute_action(
         action,
         req.device_id.as_deref(),
@@ -707,6 +713,12 @@ pub async fn account_passkey_finish(
             wa::VerifyError::UnknownCredential(id) => CustomError::UnknownCredential(id),
             wa::VerifyError::Other(inner) => CustomError::BadRequest(inner.to_string()),
         })?;
+
+    // New-account creation is reachable ONLY from the login screen. Account
+    // management operates on an EXISTING account, so a passkey resolving to a DID
+    // with no Synapse account is REJECTED here (nothing is provisioned). No-op when
+    // the DID already has an account or when no Synapse client is configured.
+    wa::reject_if_new_identity(synapse_client, &resp.did).await?;
 
     let outcome = execute_action(
         action,

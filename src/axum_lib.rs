@@ -217,8 +217,12 @@ async fn sign_in(
     State(state): State<AppState>,
     Query(params): Query<oidc::SignInParams>,
     TypedHeader(cookies): TypedHeader<headers::Cookie>,
-) -> Result<Redirect, CustomError> {
-    let url = oidc::sign_in(
+) -> Result<(HeaderMap, Redirect), CustomError> {
+    // `sign_in` returns ONLY on the success path (a real login that issued a code),
+    // surfacing the resolved DID (covers BOTH passkey and wallet, and runs only
+    // after the browser confirmed the new-user gate). Error/early returns short-
+    // circuit via `?` so the cookie is never set on a failed login.
+    let (url, did) = oidc::sign_in(
         &state.config.base_url,
         &state.config.supported_did_methods,
         &state.config.supported_pkh_namespaces,
@@ -228,7 +232,22 @@ async fn sign_in(
         state.synapse_client.as_deref(),
     )
     .await?;
-    Ok(Redirect::to(url.as_str()))
+
+    // Mint an opaque login user-session bound to the DID and Set-Cookie it (Path=/,
+    // HttpOnly, SameSite=Strict, Secure on https). The cookie value is the opaque
+    // token only; the DID lives solely in Redis. A failure to mint must not break a
+    // successful login, so it degrades to no cookie (next login is usernameless).
+    let mut headers = HeaderMap::new();
+    match state.redis_client.create_user_session(&did).await {
+        Ok(token) => {
+            let cookie = user_cookie_set(&state.config.base_url, &token);
+            if let Ok(v) = cookie.parse() {
+                headers.insert(header::SET_COOKIE, v);
+            }
+        }
+        Err(e) => warn!(error = %e, "sign_in: failed to mint user-session cookie"),
+    }
+    Ok((headers, Redirect::to(url.as_str())))
 }
 
 async fn register(
@@ -397,7 +416,10 @@ async fn device_passkey_start_handler(
         .ok_or_else(|| CustomError::BadRequest("Missing user_code".to_string()))?;
     device_auth::device_verify(&state.redis_client, user_code).await?;
     let session_id = format!("device_passkey_{}", user_code);
-    let rcr = wa::authenticate_start(&state.webauthn, &state.redis_client, &session_id).await?;
+    // None scope = usernameless (Task 6 may scope this once the device flow knows
+    // the approving identity); keeps current behavior identical.
+    let rcr =
+        wa::authenticate_start(&state.webauthn, &state.redis_client, &session_id, None).await?;
     Ok(Json(rcr))
 }
 
@@ -478,22 +500,148 @@ async fn webauthn_register_finish(
     Ok(Json(resp))
 }
 
+/// Optional escape-hatch signals for `/webauthn/authenticate/start`. Both forms
+/// force usernameless (all keys) even when a valid `siwx_user` cookie is present,
+/// for the "use a different passkey" affordance (H11). The body is OPTIONAL: the
+/// `#[serde(default)]` + `Option<Json<…>>` keep the existing `body: '{}'` callers
+/// working untouched (`{}` deserializes with `all = false`; a missing/unparseable
+/// body -> `None` -> not forced).
+#[derive(serde::Deserialize, Default)]
+struct AuthenticateStartBody {
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct AuthenticateStartQuery {
+    /// `?all=1` (or any truthy value) forces usernameless from a GET-style caller.
+    all: Option<String>,
+}
+
+/// Wrapper around the WebAuthn `RequestChallengeResponse` returned by
+/// `/webauthn/authenticate/start`. The challenge fields stay EXACTLY where the
+/// frontend expects them (`#[serde(flatten)]` keeps `publicKey.challenge` /
+/// `publicKey.allowCredentials` / `publicKey.rpId` at the top level), and we add
+/// two sibling fields the login page uses for the detected-account affordance and
+/// the method grey-out:
+///
+/// * `detected_mxid` — `@{localpart}:{server_name}` of the DID this request is
+///   scoped to, or `null` when UNSCOPED (no/forged `siwx_user` cookie, `all=1`,
+///   or no `server_name` configured). Never leaks anything the caller cannot
+///   already prove ownership of (the cookie is an opaque server token).
+/// * `methods` — `{wallet, passkey}` for the scoped DID, or `null` when unscoped.
+///
+/// When unscoped both extras are `null` and the response is byte-shape-identical
+/// (modulo the two null siblings) to the previous bare `RequestChallengeResponse`,
+/// so behavior is unchanged for the usernameless path.
+#[derive(serde::Serialize)]
+struct AuthenticateStartResponse {
+    #[serde(flatten)]
+    challenge: RequestChallengeResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detected_mxid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    methods: Option<wa::MethodsForDid>,
+}
+
 async fn webauthn_authenticate_start(
     State(state): State<AppState>,
     TypedHeader(cookies): TypedHeader<headers::Cookie>,
-) -> Result<Json<RequestChallengeResponse>, CustomError> {
+    Query(query): Query<AuthenticateStartQuery>,
+    body: Option<Json<AuthenticateStartBody>>,
+) -> Result<Json<AuthenticateStartResponse>, CustomError> {
     let session_id = cookies
         .get(SESSION_COOKIE_NAME)
         .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
-    let rcr = wa::authenticate_start(&state.webauthn, &state.redis_client, session_id).await?;
-    Ok(Json(rcr))
+
+    // Escape hatch: `?all=1` OR JSON `{"all": true}` forces usernameless even with
+    // a cookie ("use a different passkey").
+    let force_all = body.map(|Json(b)| b.all).unwrap_or(false)
+        || query
+            .all
+            .as_deref()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+    // Read the opaque `siwx_user` cookie -> DID (Redis). A missing/forged/expired
+    // token resolves to None -> usernameless (enumeration-safe). When forced, skip
+    // the lookup entirely.
+    let scope_did = if force_all {
+        None
+    } else {
+        match cookies.get(USER_SESSION_COOKIE) {
+            Some(token) => state
+                .redis_client
+                .lookup_user_session(token)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        }
+    };
+
+    let challenge = wa::authenticate_start(
+        &state.webauthn,
+        &state.redis_client,
+        session_id,
+        scope_did.as_deref(),
+    )
+    .await?;
+
+    // When (and only when) scoped by a valid cookie, surface the detected account
+    // and its available methods so the login page can show "Signing in as …" and
+    // grey out an unavailable choice. detected_mxid additionally needs server_name;
+    // without it we report null (the methods grey-out can still apply).
+    let (detected_mxid, methods) = match scope_did.as_deref() {
+        Some(did) => {
+            let detected_mxid = state
+                .config
+                .matrix_server_name
+                .as_deref()
+                .map(|server_name| format!("@{}:{}", oidc::did_to_localpart(did), server_name));
+            // methods_for_did is read-only and never leaks credential ids.
+            let methods = wa::methods_for_did(&state.redis_client, did).await.ok();
+            (detected_mxid, methods)
+        }
+        // Unscoped (no/forged cookie or all=1): behavior identical to before.
+        None => (None, None),
+    };
+
+    Ok(Json(AuthenticateStartResponse {
+        challenge,
+        detected_mxid,
+        methods,
+    }))
+}
+
+/// Login passkey-finish response: the verified DID plus a server-REPORTED
+/// new-user signal so the browser can gate accidental new-account creation.
+///
+/// New-account creation at login is GATED in the FRONTEND (Task 5): the server
+/// does NOT block here. `authenticate_finish` only stores `verified_did` in the
+/// session; provisioning still happens exclusively at `/sign_in`, which the
+/// browser navigates to only after the user confirms. So `new_user: true` +
+/// cancel = no `/sign_in` = zero Synapse state. When no Synapse client is
+/// configured we cannot detect new identities, so `new_user` is `false` (behaves
+/// exactly as before) and `mxid` is empty.
+#[derive(serde::Serialize)]
+struct WebauthnAuthenticateFinishResponse {
+    ok: bool,
+    did: String,
+    /// True iff this DID has NO existing Matrix account (signing in would CREATE
+    /// one). Server-reported only; the browser decides whether to proceed.
+    new_user: bool,
+    /// The `@localpart:server_name` this DID resolves to (empty when no Synapse
+    /// client / server_name is configured), so the gate can show the user which
+    /// account they are about to create / enter.
+    mxid: String,
 }
 
 async fn webauthn_authenticate_finish(
     State(state): State<AppState>,
     TypedHeader(cookies): TypedHeader<headers::Cookie>,
     Json(auth_response): Json<PublicKeyCredential>,
-) -> Result<Json<wa::AuthenticateFinishResponse>, CustomError> {
+) -> Result<Json<WebauthnAuthenticateFinishResponse>, CustomError> {
     let session_id = cookies
         .get(SESSION_COOKIE_NAME)
         .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
@@ -505,7 +653,36 @@ async fn webauthn_authenticate_finish(
         auth_response,
     )
     .await?;
-    Ok(Json(resp))
+
+    // Detection only (no blocking, no change to provisioning). The verified DID
+    // is already stored in the session by authenticate_finish; the new-user gate
+    // is enforced by the frontend, which navigates to /sign_in only on confirm.
+    // new_user detection depends ONLY on the Synapse client (None -> false, i.e.
+    // behave as today, cannot detect). mxid additionally needs server_name to be
+    // a well-formed @localpart:server_name; without it we report the empty string.
+    let (new_user, mxid) = match state.synapse_client.as_deref() {
+        Some(synapse) => {
+            // is_new_identity == true means the localpart is AVAILABLE (no account).
+            let new_user = wa::is_new_identity(synapse, &resp.did).await.unwrap_or(false);
+            let mxid = match state.config.matrix_server_name.as_deref() {
+                Some(server_name) => {
+                    let localpart = oidc::did_to_localpart(&resp.did);
+                    format!("@{}:{}", localpart, server_name)
+                }
+                None => String::new(),
+            };
+            (new_user, mxid)
+        }
+        // No Synapse client -> cannot detect; behave as today.
+        None => (false, String::new()),
+    };
+
+    Ok(Json(WebauthnAuthenticateFinishResponse {
+        ok: resp.ok,
+        did: resp.did,
+        new_user,
+        mxid,
+    }))
 }
 
 // -- Account linking route handlers (Phase 2) ------------------------------
@@ -592,6 +769,43 @@ fn account_cookie_clear(base_url: &url::Url) -> String {
     )
 }
 
+/// Cookie name for the opaque login user-session (the identity hint that scopes
+/// the passkey picker). Distinct from [`account::ACCOUNT_SESSION_COOKIE`]: this
+/// one is `Path=/` so it is sent to `/webauthn/authenticate/start`, and its value
+/// is an OPAQUE token (never a DID). A forged/expired value is a Redis miss ->
+/// usernameless fallback (the enumeration-safety invariant).
+const USER_SESSION_COOKIE: &str = "siwx_user";
+
+/// `Set-Cookie` value that establishes the opaque login user-session. Mirrors
+/// [`account_cookie_set`] but with `Path=/` (so it reaches the login-time
+/// `/webauthn/authenticate/start`) and the longer [`USER_SESSION_LIFETIME`].
+fn user_cookie_set(base_url: &url::Url, token: &str) -> String {
+    let secure = if base_url.scheme() == "https" {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!(
+        "{}={}; Max-Age={}; Path=/; HttpOnly; SameSite=Strict{}",
+        USER_SESSION_COOKIE, token, USER_SESSION_LIFETIME, secure
+    )
+}
+
+/// `Set-Cookie` value that clears the opaque login user-session (escape hatch /
+/// sign-out). Mirrors [`account_cookie_clear`] with `Path=/`.
+#[allow(dead_code)]
+fn user_cookie_clear(base_url: &url::Url) -> String {
+    let secure = if base_url.scheme() == "https" {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!(
+        "{}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict{}",
+        USER_SESSION_COOKIE, secure
+    )
+}
+
 /// True for outcomes that destroy the identity the session was bound to, so the
 /// cookie must be cleared rather than (re)issued.
 fn outcome_is_terminal(outcome: &account::ActionOutcome) -> bool {
@@ -625,10 +839,24 @@ async fn authed_action_response(
         let (token, csrf) =
             account::create_account_session(&state.redis_client, &authed.did).await?;
         response.csrf = Some(csrf);
+        // Re-inject the login scoping cookie: a user who just proved ownership of
+        // `authed.did` to manage their account also gets an opaque login
+        // user-session, so their next login picker is scoped. Reuses the same DID;
+        // best-effort (a mint failure must not fail account management).
+        match state.redis_client.create_user_session(&authed.did).await {
+            Ok(user_token) => {
+                let user_cookie = user_cookie_set(&state.config.base_url, &user_token);
+                if let Ok(v) = axum::http::HeaderValue::from_str(&user_cookie) {
+                    // append (not insert): coexist with the account-session Set-Cookie.
+                    headers.append(axum::http::header::SET_COOKIE, v);
+                }
+            }
+            Err(e) => warn!(error = %e, "account re-auth: failed to mint user-session cookie"),
+        }
         account_cookie_set(&state.config.base_url, &token)
     };
     if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
-        headers.insert(axum::http::header::SET_COOKIE, v);
+        headers.append(axum::http::header::SET_COOKIE, v);
     }
     Ok((headers, Json(response)))
 }
@@ -716,7 +944,10 @@ async fn account_passkey_start_handler(
         return Err(CustomError::BadRequest("Missing action".to_string()));
     }
     let session_id = format!("account_passkey_{}", uuid::Uuid::new_v4());
-    let rcr = wa::authenticate_start(&state.webauthn, &state.redis_client, &session_id).await?;
+    // None scope = usernameless. Task 6 wires the cookie/known-identity DID here to
+    // scope the account re-auth picker; until then behavior is unchanged.
+    let rcr =
+        wa::authenticate_start(&state.webauthn, &state.redis_client, &session_id, None).await?;
     let mut value = serde_json::to_value(&rcr)
         .map_err(|e| anyhow::anyhow!("Failed to serialize challenge: {}", e))?;
     value["session_id"] = serde_json::json!(session_id);
@@ -1057,5 +1288,87 @@ mod unknown_credential_response_tests {
         assert!(matches!(ce, CustomError::Other(_)));
         let resp = ce.into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// H4: the login passkey-finish response now carries the server-REPORTED
+    /// new-user signal (`new_user`) and the resolved `mxid`, in addition to the
+    /// `ok`/`did` fields the existing frontend already reads. This is a pure
+    /// detection signal: the server does NOT block, and provisioning still happens
+    /// only at /sign_in (which the browser reaches on confirm). Deterministic,
+    /// infra-free: just the wire contract.
+    #[test]
+    fn login_finish_response_carries_new_user_and_mxid() {
+        let json = serde_json::to_value(WebauthnAuthenticateFinishResponse {
+            ok: true,
+            did: "did:key:zDnNEW".to_string(),
+            new_user: true,
+            mxid: "@did-key-zdnnew:matrix.example.com".to_string(),
+        })
+        .unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["did"], "did:key:zDnNEW");
+        assert_eq!(json["new_user"], true);
+        assert_eq!(json["mxid"], "@did-key-zdnnew:matrix.example.com");
+
+        // Existing-identity / no-Synapse shape: new_user false, mxid empty. The
+        // frontend gate (Task 5) only fires on new_user==true, so this is the
+        // unchanged-behavior path.
+        let json = serde_json::to_value(WebauthnAuthenticateFinishResponse {
+            ok: true,
+            did: "did:key:zDnEXISTING".to_string(),
+            new_user: false,
+            mxid: String::new(),
+        })
+        .unwrap();
+        assert_eq!(json["new_user"], false);
+        assert_eq!(json["mxid"], "");
+    }
+
+    /// H7/H8: the `/webauthn/authenticate/start` wrapper keeps the WebAuthn
+    /// challenge fields EXACTLY where the existing JS reads them
+    /// (`publicKey.challenge` / `publicKey.allowCredentials`, via `#[serde(flatten)]`)
+    /// while adding the scoped-only `detected_mxid` + `methods` siblings. Unscoped,
+    /// both extras are omitted, so the shape is byte-compatible with the previous
+    /// bare `RequestChallengeResponse`. Deterministic, infra-free: pure wire contract.
+    #[test]
+    fn authenticate_start_wrapper_preserves_publickey_and_adds_siblings() {
+        // Minimal valid RequestChallengeResponse (deserializable) the wrapper flattens.
+        let rcr: RequestChallengeResponse = serde_json::from_value(serde_json::json!({
+            "publicKey": {
+                "challenge": "AAECAwQFBgcICQ",
+                "allowCredentials": [],
+                "rpId": "matrix.example.com",
+                "userVerification": "preferred"
+            }
+        }))
+        .unwrap();
+
+        // Scoped: detected_mxid + methods present; publicKey untouched at top level.
+        let scoped = serde_json::to_value(AuthenticateStartResponse {
+            challenge: rcr.clone(),
+            detected_mxid: Some("@did-key-zdn:matrix.example.com".to_string()),
+            methods: Some(wa::MethodsForDid {
+                wallet: false,
+                passkey: true,
+            }),
+        })
+        .unwrap();
+        assert_eq!(scoped["publicKey"]["challenge"], "AAECAwQFBgcICQ");
+        assert_eq!(scoped["publicKey"]["rpId"], "matrix.example.com");
+        assert!(scoped["publicKey"]["allowCredentials"].is_array());
+        assert_eq!(scoped["detected_mxid"], "@did-key-zdn:matrix.example.com");
+        assert_eq!(scoped["methods"]["wallet"], false);
+        assert_eq!(scoped["methods"]["passkey"], true);
+
+        // Unscoped: extras omitted entirely; publicKey still intact.
+        let unscoped = serde_json::to_value(AuthenticateStartResponse {
+            challenge: rcr,
+            detected_mxid: None,
+            methods: None,
+        })
+        .unwrap();
+        assert_eq!(unscoped["publicKey"]["challenge"], "AAECAwQFBgcICQ");
+        assert!(unscoped.get("detected_mxid").is_none());
+        assert!(unscoped.get("methods").is_none());
     }
 }

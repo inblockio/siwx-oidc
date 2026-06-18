@@ -12,10 +12,12 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use p256::ecdsa::Signature;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 use webauthn_rs::prelude::*;
-use webauthn_rs_proto::{AuthenticatorSelectionCriteria, ResidentKeyRequirement};
+use webauthn_rs_proto::{
+    AllowCredentials, AuthenticatorSelectionCriteria, ResidentKeyRequirement,
+};
 
 use siwx_oidc::db::RedisClient;
 
@@ -76,6 +78,74 @@ fn did_from_passkey(passkey: &Passkey) -> Result<String> {
 pub fn derive_did_from_credential_json(cred_json: &str) -> Option<String> {
     let passkey: Passkey = serde_json::from_str(cred_json).ok()?;
     did_from_passkey(&passkey).ok()
+}
+
+/// Whether `did` resolves to a Matrix identity that does NOT yet exist on this
+/// homeserver, i.e. signing in with it would CREATE a brand-new account.
+///
+/// This is the read-only detector the new-user gate and the account/QR reject
+/// paths share: it is exactly `SynapseClient::is_localpart_available(localpart)`,
+/// where `localpart` is `oidc::did_to_localpart(did)` (the same lowercasing the
+/// provisioning path uses, so the answer matches what `sign_in` would do). It
+/// performs no writes, so probing it before any provisioning leaves zero Synapse
+/// state behind.
+///
+/// A free fn taking `&SynapseClient` (rather than a method on `SynapseClient`)
+/// because `did_to_localpart` lives in the binary's `oidc` module while
+/// `SynapseClient` lives in the `siwx_oidc` library crate; keeping the wrapper
+/// here avoids a library->binary dependency.
+pub async fn is_new_identity(
+    synapse: &crate::synapse_client::SynapseClient,
+    did: &str,
+) -> Result<bool> {
+    let localpart = crate::oidc::did_to_localpart(did);
+    synapse.is_localpart_available(&localpart).await
+}
+
+/// The error message returned by every server-enforced new-account-creation
+/// reject (account re-auth + QR/device approval). New-account creation is
+/// permitted ONLY at the login screen, behind the new-user gate; in the
+/// account-management and QR/device-approval flows it is impossible.
+pub const NEW_IDENTITY_REJECT_MSG: &str =
+    "This passkey/wallet is not linked to an existing account. \
+     Create an account at sign-in first.";
+
+/// Server-enforced reject for the account + QR/device flows: if a Synapse client
+/// is configured AND the authenticated `did` resolves to a NON-existent account
+/// (`is_new_identity == true`), return a clear `BadRequest` and provision
+/// nothing. Call this AFTER the DID is cryptographically verified but BEFORE any
+/// action runs / any device-code entry is mutated.
+///
+/// Graceful degradation: when `synapse` is `None` the new-identity status cannot
+/// be detected, so this is a no-op (the flow's existing `require_synapse` /
+/// `server_name` guards already `BadRequest` for the actions that need Synapse).
+/// Returning the existing-identity path unchanged keeps `is_new_identity == false`
+/// a strict no-op.
+pub async fn reject_if_new_identity(
+    synapse: Option<&crate::synapse_client::SynapseClient>,
+    did: &str,
+) -> Result<(), crate::oidc::CustomError> {
+    let synapse = match synapse {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    match is_new_identity(synapse, did).await {
+        Ok(true) => {
+            info!(did = %did, "rejecting new-identity (no existing account) outside login flow");
+            Err(crate::oidc::CustomError::BadRequest(
+                NEW_IDENTITY_REJECT_MSG.to_string(),
+            ))
+        }
+        Ok(false) => Ok(()),
+        // A detection failure (Synapse unreachable) must not silently create an
+        // account: fail closed with the same clear message rather than provisioning.
+        Err(e) => {
+            warn!(did = %did, "new-identity detection failed, rejecting to avoid silent creation: {}", e);
+            Err(crate::oidc::CustomError::BadRequest(
+                NEW_IDENTITY_REJECT_MSG.to_string(),
+            ))
+        }
+    }
 }
 
 // -- Request/response types for the HTTP API --
@@ -225,6 +295,15 @@ pub async fn register_finish(
         )
         .await?;
 
+    // Maintain the webauthn:by_did reverse index so a returning login can scope
+    // the passkey picker to this DID's keys without a credential keyspace scan.
+    // A standalone passkey resolves to its derived did:key. Best-effort: the index
+    // is advisory (get_passkeys_for_did self-heals via scan), so a hiccup here must
+    // not fail the registration the user just completed.
+    if let Err(e) = redis.index_add_passkey(&did, &cred_id_b64).await {
+        info!("webauthn register_finish: by_did index update failed: {}", e);
+    }
+
     info!(
         "webauthn register_finish: did={} cred_id={}",
         did, cred_id_b64
@@ -237,20 +316,79 @@ pub async fn register_finish(
 
 // -- Authentication ceremony (discoverable / passkeys) --
 
+/// Begin a WebAuthn assertion ceremony.
+///
+/// Two paths, selected by `scope_did`:
+///
+/// * `None` — **discoverable (usernameless)** authentication: `allow_credentials`
+///   is left EMPTY. Credentials are registered as discoverable resident keys (see
+///   `require_resident_key`), so the authenticator surfaces only the user's own
+///   passkey and `verify_credential` resolves it by raw id. We must NOT enumerate
+///   stored credentials here: that leaked every credential id to unauthenticated
+///   callers and produced a server-wide passkey picker. This is the historical
+///   (and still-default) behavior; ALL callers pass `None` until the cookie wiring
+///   lands, so the runtime behavior is identical to before.
+///
+/// * `Some(did)` — **scoped** authentication: `allow_credentials` is set to exactly
+///   the credentials that resolve to `did` (its standalone passkeys plus any
+///   wallet-linked ones), via `get_passkeys_for_did`. The picker then shows only
+///   that account. Enumeration-safety: this path runs ONLY when a caller supplies a
+///   DID, and a caller may only do so after resolving it from a VALID opaque
+///   user-session token (a forged/guessed token is a Redis miss -> `None` ->
+///   usernameless). If the resolved credential set is EMPTY (e.g. a wallet-only DID
+///   with no linked passkey), we fall back to leaving `allow_credentials` empty
+///   (discoverable) rather than emitting a broken empty picker that would block
+///   every key.
+///
+/// Note: we deliberately do NOT use `start_passkey_authentication` / persist a
+/// `PasskeyAuthentication` finish-state. `verify_credential` verifies the assertion
+/// MANUALLY (via `aqua_auth::verify_webauthn_assertion`) against the challenge
+/// STRING stored in Redis; it never consumes a webauthn-rs finish-state. So for the
+/// scoped path we obtain a `RequestChallengeResponse` exactly as the usernameless
+/// path does and set `allow_credentials` directly (the shape the pre-discoverable
+/// code used). The stored challenge and `verify_credential` are unchanged.
 pub async fn authenticate_start(
     webauthn: &Webauthn,
     redis: &RedisClient,
     session_id: &str,
+    scope_did: Option<&str>,
 ) -> Result<RequestChallengeResponse> {
-    // Discoverable (usernameless) authentication: leave `allow_credentials` EMPTY.
-    // Credentials are registered as discoverable resident keys (see
-    // `require_resident_key`), so the authenticator surfaces only the user's own
-    // passkey and `verify_credential` resolves it by raw id. We must NOT enumerate
-    // stored credentials here: that leaked every credential id to unauthenticated
-    // callers and produced a server-wide passkey picker.
-    let (rcr, _auth_state) = webauthn
+    let (mut rcr, _auth_state) = webauthn
         .start_discoverable_authentication()
         .map_err(|e| anyhow!("WebAuthn auth start failed: {:?}", e))?;
+
+    if let Some(did) = scope_did {
+        let cred_ids = redis
+            .get_passkeys_for_did(did, derive_did_from_credential_json)
+            .await?;
+        // Empty set -> fall back to discoverable (leave allow_credentials empty) so a
+        // wallet-only DID does not produce a broken empty picker that blocks all keys.
+        if !cred_ids.is_empty() {
+            let allow_list: Vec<AllowCredentials> = cred_ids
+                .iter()
+                .filter_map(|cred_id_b64| {
+                    let bytes = URL_SAFE_NO_PAD.decode(cred_id_b64).ok()?;
+                    Some(AllowCredentials {
+                        type_: "public-key".to_string(),
+                        id: Base64UrlSafeData::from(bytes),
+                        transports: None,
+                    })
+                })
+                .collect();
+            rcr.public_key.allow_credentials = allow_list;
+            info!(
+                "webauthn authenticate_start: session={} scoped did={} creds={}",
+                session_id,
+                did,
+                rcr.public_key.allow_credentials.len()
+            );
+        } else {
+            info!(
+                "webauthn authenticate_start: session={} scope did={} resolved 0 creds -> discoverable fallback",
+                session_id, did
+            );
+        }
+    }
 
     let challenge_b64 = URL_SAFE_NO_PAD.encode(&*rcr.public_key.challenge);
     redis
@@ -263,6 +401,38 @@ pub async fn authenticate_start(
 
     info!("webauthn authenticate_start: session={}", session_id);
     Ok(rcr)
+}
+
+/// Which authentication methods a known DID can use, for greying-out the
+/// unavailable choice in a known-identity context.
+///
+/// * `wallet` — the DID is a `did:pkh:` (a wallet identity); it can re-auth via a
+///   CAIP-122 wallet signature.
+/// * `passkey` — the DID has at least one resolvable WebAuthn credential (a
+///   standalone passkey or a wallet-linked one), per `get_passkeys_for_did`.
+///
+/// These are not mutually exclusive: a wallet DID that has linked a passkey is both.
+///
+/// Enumeration-safety: like `get_passkeys_for_did`, this is a server-side helper
+/// called only with a DID the server already resolved; it returns booleans, never
+/// credential ids.
+// Wired into the detected-accounts UI / grey-out at the authenticate_start handler.
+pub async fn methods_for_did(redis: &RedisClient, did: &str) -> Result<MethodsForDid> {
+    let passkey = !redis
+        .get_passkeys_for_did(did, derive_did_from_credential_json)
+        .await?
+        .is_empty();
+    Ok(MethodsForDid {
+        wallet: did.starts_with("did:pkh:"),
+        passkey,
+    })
+}
+
+/// The methods a known DID can authenticate with. See [`methods_for_did`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MethodsForDid {
+    pub wallet: bool,
+    pub passkey: bool,
 }
 
 /// Core WebAuthn assertion verification: challenge retrieval, credential lookup,
@@ -503,6 +673,16 @@ pub async fn link_finish(
         .set_raw(&format!("{}/{}", LINK_PREFIX, cred_id_b64), &link_json)
         .await?;
 
+    // Maintain the webauthn:by_did reverse index against the PRIMARY (wallet) DID:
+    // a linked passkey resolves to primary_did at verify time, so a returning login
+    // scoped to the wallet DID must surface this passkey. Best-effort (advisory).
+    if let Err(e) = redis
+        .index_add_passkey(&link_state.primary_did, &cred_id_b64)
+        .await
+    {
+        info!("webauthn link_finish: by_did index update failed: {}", e);
+    }
+
     info!(
         "webauthn link_finish: cred_id={} primary_did={}",
         cred_id_b64, link_state.primary_did
@@ -592,6 +772,122 @@ mod tests {
             derive_did_from_credential_json(r#"{"cred":{"unexpected":"shape"}}"#),
             None,
             "wrong-shaped JSON must not panic, must return None"
+        );
+    }
+
+    /// `methods_for_did` reports `wallet` purely from the DID prefix and `passkey`
+    /// from whether `get_passkeys_for_did` resolves anything. This exercises both:
+    /// a freshly-minted `did:pkh:` wallet with NO credentials must be
+    /// `{wallet:true, passkey:false}`; a fresh `did:key:` with no credentials must
+    /// be `{wallet:false, passkey:false}`. Requires Redis on localhost and skips
+    /// cleanly when unavailable, mirroring the redis.rs test gating (the passkey
+    /// branch is unavoidably Redis-backed). H8.
+    #[tokio::test]
+    async fn methods_for_did_wallet_prefix_and_empty_passkey() {
+        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
+            Ok(c) => c,
+            Err(_) => return, // no Redis: skip (CI provides one)
+        };
+
+        // Unique unregistered DIDs -> get_passkeys_for_did resolves to empty.
+        let nonce = Uuid::new_v4().simple().to_string();
+        let wallet_did = format!("did:pkh:eip155:1:0xNOKEYS{nonce}");
+        let key_did = format!("did:key:zDnNOKEYS{nonce}");
+
+        let m_wallet = methods_for_did(&client, &wallet_did).await.unwrap();
+        assert_eq!(
+            m_wallet,
+            MethodsForDid {
+                wallet: true,
+                passkey: false
+            },
+            "did:pkh with no credentials = wallet-only"
+        );
+
+        let m_key = methods_for_did(&client, &key_did).await.unwrap();
+        assert_eq!(
+            m_key,
+            MethodsForDid {
+                wallet: false,
+                passkey: false
+            },
+            "did:key with no credentials = neither method available"
+        );
+    }
+
+    /// H5 (graceful degradation): when no Synapse client is configured the
+    /// account/QR flows cannot detect a new identity, so `reject_if_new_identity`
+    /// is a strict no-op (returns Ok). Deterministic, no network: this is the
+    /// branch that preserves standalone-deployment behavior. (The other guards in
+    /// those flows already BadRequest for the actions that need Synapse.)
+    #[tokio::test]
+    async fn reject_if_new_identity_is_noop_without_synapse() {
+        assert!(
+            reject_if_new_identity(None, "did:key:zDnANYTHING")
+                .await
+                .is_ok(),
+            "no Synapse client must be a no-op (cannot detect, do not reject)"
+        );
+    }
+
+    /// H5 (fail-closed): a Synapse client that is present but UNREACHABLE is a
+    /// detection failure. We must NOT fall through and provision a new account; we
+    /// reject with the same clear `BadRequest` message. Points at an unroutable
+    /// endpoint so the request fails fast without a live Synapse.
+    #[tokio::test]
+    async fn reject_if_new_identity_fails_closed_on_synapse_error() {
+        // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): guaranteed non-routable.
+        let synapse = crate::synapse_client::SynapseClient::new("http://192.0.2.1:1", "secret");
+        let err = reject_if_new_identity(Some(&synapse), "did:key:zDnUNREACHABLE")
+            .await
+            .expect_err("detection failure must reject, not silently create");
+        match err {
+            crate::oidc::CustomError::BadRequest(msg) => {
+                assert_eq!(msg, NEW_IDENTITY_REJECT_MSG);
+            }
+            other => panic!("expected BadRequest, got {:?}", other),
+        }
+    }
+
+    /// H2 (enumeration-safety): a FORGED `siwx_user` cookie token is a Redis miss,
+    /// so the handler resolves `scope_did = None` and `authenticate_start` runs the
+    /// usernameless (discoverable) path with an EMPTY `allowCredentials` — leaking
+    /// zero credential ids. This exercises the exact seam the HTTP handler uses
+    /// (`lookup_user_session` -> `authenticate_start(scope_did)`), end to end against
+    /// Redis. Requires Redis on localhost; skips cleanly when unavailable.
+    #[tokio::test]
+    async fn forged_user_cookie_yields_usernameless_empty_allow_credentials() {
+        let redis = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
+            Ok(c) => c,
+            Err(_) => return, // no Redis: skip (CI provides one)
+        };
+
+        // A localhost RP is valid for WebauthnBuilder (origin must be https OR
+        // localhost); this lets the test build a real Webauthn without TLS.
+        let base = Url::parse("http://localhost:8000").unwrap();
+        let cfg = build_webauthn(&base, None, None).expect("build webauthn");
+
+        // A forged/guessed token that was never minted -> lookup must miss -> None.
+        let nonce = Uuid::new_v4().simple().to_string();
+        let forged = format!("forged{nonce}deadbeefcafe");
+        let scope_did = redis
+            .lookup_user_session(&forged)
+            .await
+            .expect("lookup must not error");
+        assert!(
+            scope_did.is_none(),
+            "a forged token must be a Redis miss -> None (usernameless fallback)"
+        );
+
+        // Drive authenticate_start with the resolved (None) scope: usernameless.
+        let session_id = format!("forgedsess{nonce}");
+        let rcr =
+            authenticate_start(&cfg.webauthn, &redis, &session_id, scope_did.as_deref())
+                .await
+                .expect("authenticate_start must succeed");
+        assert!(
+            rcr.public_key.allow_credentials.is_empty(),
+            "forged cookie -> usernameless -> allowCredentials MUST be empty (no enumeration)"
         );
     }
 }

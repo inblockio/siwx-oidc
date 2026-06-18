@@ -25,6 +25,17 @@
 	let client_metadata: any = {};
 	let mounted = false;
 
+	// --- Passkey scoping + new-user gate (Task 5) ---
+	// When /webauthn/authenticate/start is scoped by a valid siwx_user cookie the
+	// server returns `detected_mxid` + `methods`. Unscoped (no/forged cookie or
+	// the `all:true` escape) both are null and the UI behaves exactly as before.
+	let detectedMxid: string | null = null;
+	let methods: { wallet: boolean; passkey: boolean } | null = null;
+	// Set when authenticate/finish reports `new_user: true`: signing in would CREATE
+	// a brand-new account, so we gate instead of auto-redirecting. Holds the mxid to
+	// show. null = no gate.
+	let newUserGate: { mxid: string } | null = null;
+
 	const config = createConfig({
 		chains: [mainnet],
 		connectors: [injected()],
@@ -211,22 +222,33 @@
 		}
 	}
 
-	async function handlePasskeySignIn() {
+	// `forceAll` drives the "use a different passkey" escape hatch: it re-runs
+	// authenticate/start with {"all": true}, forcing usernameless (all keys) even
+	// when a valid siwx_user cookie would otherwise scope the picker to one account.
+	async function handlePasskeySignIn(forceAll = false) {
 		if (passkeyLoading) return;
 		passkeyLoading = true;
 		error = null;
+		// Re-running start clears any prior gate so we never show stale gate copy.
+		newUserGate = null;
 		status = 'Authenticating with passkey...';
 
 		try {
 			const startResp = await fetch('/webauthn/authenticate/start', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: '{}',
+				body: forceAll ? JSON.stringify({ all: true }) : '{}',
 			});
 			if (!startResp.ok) {
 				throw new Error(await startResp.text());
 			}
 			const options = await startResp.json();
+
+			// Detected-account affordance + method grey-out: present ONLY when the
+			// server scoped this request (valid cookie, not the escape hatch). When
+			// unscoped these are null/absent and the UI shows no account hint.
+			detectedMxid = forceAll ? null : (options.detected_mxid ?? null);
+			methods = forceAll ? null : (options.methods ?? null);
 
 			options.publicKey.challenge = base64urlToBuffer(options.publicKey.challenge);
 			// Discoverable login: the server returns an empty `allowCredentials`, so the
@@ -284,6 +306,19 @@
 				throw new Error(await finishResp.text());
 			}
 
+			// New-user gate: when the server reports this passkey resolves to a DID
+			// with NO existing account, signing in would CREATE one. Do NOT auto-
+			// redirect; show the gate and let the user confirm or pick another key.
+			// Nothing is provisioned until the browser navigates to /sign_in (the
+			// "Continue" action), so cancelling leaves zero Synapse state.
+			const result = await finishResp.json().catch(() => ({}));
+			if (result && result.new_user === true) {
+				newUserGate = { mxid: result.mxid || '' };
+				status = 'New account — confirm to continue';
+				return;
+			}
+
+			// Existing user: keep the current immediate redirect.
 			status = 'Redirecting...';
 			window.location.replace(buildSignInUrl());
 		} catch (e: any) {
@@ -297,6 +332,20 @@
 		} finally {
 			passkeyLoading = false;
 		}
+	}
+
+	// New-user gate actions.
+	function confirmNewUser() {
+		newUserGate = null;
+		status = 'Redirecting...';
+		window.location.replace(buildSignInUrl());
+	}
+
+	function gateTryAnother() {
+		// Back to the picker: re-run start usernameless (all keys) so the user can
+		// pick a different passkey. Clears the gate first.
+		newUserGate = null;
+		handlePasskeySignIn(true);
 	}
 
 	async function handlePasskeyRegister() {
@@ -397,7 +446,38 @@
 				{/if}
 			</div>
 
-			{#if !showLinkOption}
+			{#if newUserGate}
+				<!-- === New-user gate: a passkey resolving to a brand-new account === -->
+				<!-- Nothing is provisioned yet; Continue navigates to /sign_in (which
+				     creates the account), Try another returns to the picker. -->
+				<div class="auth-section gate-section">
+					<h1 class="title">Create a new account?</h1>
+					<p class="subtitle">
+						This passkey will create a <strong>new account</strong>{#if newUserGate.mxid}
+							(<span class="gate-mxid">{newUserGate.mxid}</span>){/if}.
+					</p>
+					<p class="gate-note">
+						You can restore your messages later with your recovery key.
+					</p>
+
+					<div class="link-actions">
+						<button class="btn btn-primary" on:click={confirmNewUser}>
+							<span>Continue</span>
+							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="btn-icon btn-icon-right">
+								<path fill-rule="evenodd" d="M3 10a.75.75 0 0 1 .75-.75h10.638L10.23 5.29a.75.75 0 1 1 1.04-1.08l5.5 5.25a.75.75 0 0 1 0 1.08l-5.5 5.25a.75.75 0 1 1-1.04-1.08l4.158-3.96H3.75A.75.75 0 0 1 3 10Z" clip-rule="evenodd" />
+							</svg>
+						</button>
+						<button
+							class="btn btn-ghost"
+							disabled={passkeyLoading}
+							on:click={gateTryAnother}
+						>
+							<span>{#if passkeyLoading}Opening picker...{:else}Try another passkey{/if}</span>
+						</button>
+					</div>
+				</div>
+
+			{:else if !showLinkOption}
 				<!-- === Default state: choose auth method === -->
 				<div class="auth-section">
 					<h1 class="title">Sign in</h1>
@@ -405,10 +485,18 @@
 						Continue to {client_metadata.client_name || domain}
 					</p>
 
+					{#if detectedMxid}
+						<!-- Detected-account affordance: the picker is scoped to this account. -->
+						<div class="detected-account">
+							<span class="detected-label">Signing in as</span>
+							<span class="detected-mxid">{detectedMxid}</span>
+						</div>
+					{/if}
+
 					<!-- Primary: Ethereum -->
 					<button
 						class="btn btn-primary"
-						disabled={connecting}
+						disabled={connecting || (methods != null && methods.wallet === false)}
 						on:click={handleConnect}
 					>
 						<svg
@@ -442,14 +530,27 @@
 					<!-- Secondary: Passkey sign-in -->
 					<button
 						class="btn btn-secondary"
-						disabled={passkeyLoading}
-						on:click={handlePasskeySignIn}
+						disabled={passkeyLoading || (methods != null && methods.passkey === false)}
+						on:click={() => handlePasskeySignIn()}
 					>
 						<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="btn-icon">
 							<path fill-rule="evenodd" d="M15.75 1.5a6.75 6.75 0 0 0-6.651 7.906c.067.39-.032.717-.221.906l-6.5 6.499a3 3 0 0 0-.878 2.121v2.818c0 .414.336.75.75.75H6a.75.75 0 0 0 .75-.75v-1.5h1.5A.75.75 0 0 0 9 19.5V18h1.5a.75.75 0 0 0 .53-.22l2.658-2.658c.19-.189.517-.288.906-.22A6.75 6.75 0 1 0 15.75 1.5Zm0 3a.75.75 0 0 0 0 1.5A2.25 2.25 0 0 1 18 8.25a.75.75 0 0 0 1.5 0 3.75 3.75 0 0 0-3.75-3.75Z" clip-rule="evenodd" />
 						</svg>
 						<span>{#if passkeyLoading}Authenticating...{:else}Sign in with Passkey{/if}</span>
 					</button>
+
+					{#if detectedMxid}
+						<!-- Escape hatch: re-run usernameless so the picker shows ALL keys. -->
+						<p class="register-hint">
+							<button
+								class="link-btn"
+								disabled={passkeyLoading}
+								on:click={() => handlePasskeySignIn(true)}
+							>
+								Use a different passkey
+							</button>
+						</p>
+					{/if}
 
 					<p class="register-hint">
 						No passkey yet?
@@ -686,6 +787,41 @@
 		line-height: 1.5;
 		color: rgba(0, 0, 0, 0.4);
 		margin: 0 0 28px;
+	}
+
+	/* ---- Detected-account affordance + new-user gate (Task 5) ---- */
+
+	.detected-account {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		padding: 10px 14px;
+		margin: 0 0 16px;
+		border-radius: 12px;
+		background: rgba(232, 97, 26, 0.06);
+		border: 1px solid rgba(232, 97, 26, 0.16);
+		text-align: left;
+	}
+
+	.detected-label {
+		font-size: 12px;
+		color: rgba(0, 0, 0, 0.4);
+	}
+
+	.detected-mxid,
+	.gate-mxid {
+		font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+		font-size: 13px;
+		font-weight: 600;
+		color: rgba(0, 0, 0, 0.75);
+		word-break: break-all;
+	}
+
+	.gate-note {
+		font-size: 13px;
+		line-height: 1.5;
+		color: rgba(0, 0, 0, 0.5);
+		margin: 0 0 24px;
 	}
 
 	/* ---- Buttons ---- */

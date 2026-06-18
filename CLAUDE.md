@@ -379,16 +379,36 @@ webauthn:challenge/{session_id}        TTL 120s  — ceremony state (register or
 webauthn:credential/{cred_id_b64}      no TTL    — stored Passkey (JSON-serialized)
 webauthn:link/{cred_id_b64}            no TTL    — { primary_did, label } (account linking)
 webauthn:link_challenge/{session_id}   TTL 120s  — link ceremony state (reg_state + primary_did)
+webauthn:by_did/{did}                  no TTL    — SET of cred_id_b64 for this DID (reverse index)
+user:session/{token}                   TTL 30d   — opaque login user-session: token -> DID
 device_codes/{device_code}             TTL 1800s — DeviceCodeEntry (RFC 8628)
 user_codes/{user_code}                 TTL 1800s — reverse lookup to device_code
 ```
+
+**`webauthn:by_did/{did}` reverse index (passkey-picker scoping).** A Redis SET of
+the `cred_id_b64` values that resolve to a DID, maintained at `register_finish`
+(under the derived `did:key`) and `link_finish` (under the wallet `primary_did`),
+and pruned by `purge_identity`. It backs `get_passkeys_for_did(did)`, which returns
+exactly that DID's credentials (its standalone passkeys plus any wallet-linked
+ones). The index is **advisory**: on a cold/missing index `get_passkeys_for_did`
+self-heals by SCANning the credential keyspace and back-filling the SET (verified by
+`get_passkeys_for_did_scan_fallback_equals_index`), so a missed `index_add_passkey`
+can never lose a passkey — it only costs one scan. A best-effort index-update failure
+never fails the registration/link the user just completed.
+
+**`user:session/{token}` opaque login user-session (identity hint).** Mirrors the
+`acct_session` pattern: a random opaque `token` -> DID, with a 30-day TTL. It is the
+identity hint that scopes the passkey picker (see below). The DID lives ONLY in
+Redis; the token is opaque, so a forged/guessed value is a Redis miss -> usernameless
+fallback. Minted at `sign_in` (after the new-user gate is cleared) and at account
+re-auth; resolved at `authenticate_start`.
 
 **Endpoints:**
 ```
 POST /webauthn/register/start       — returns CreationChallengeResponse
 POST /webauthn/register/finish      — verifies attestation, stores credential
-POST /webauthn/authenticate/start   — returns RequestChallengeResponse (discoverable)
-POST /webauthn/authenticate/finish  — verifies assertion, stores verified_did in session
+POST /webauthn/authenticate/start   — RequestChallengeResponse, scoped by siwx_user cookie (see below)
+POST /webauthn/authenticate/finish  — verifies assertion, stores verified_did + reports new_user gate
 POST /link/webauthn/start           — begin passkey registration (verifies siwx cookie for DID ownership)
 POST /link/webauthn/finish          — verifies attestation, stores credential + link mapping
 POST /device_authorization          — RFC 8628: returns device_code + user_code + verification_uri
@@ -408,6 +428,59 @@ After linking, authenticating with that passkey produces the wallet's DID (not a
 The `/link/webauthn/start` endpoint verifies the `siwx` cookie's CAIP-122 signature to prove
 DID ownership before creating the link. `authenticate_finish` checks `webauthn:link/{cred_id}`
 and substitutes `primary_did` if a mapping exists.
+
+### Passkey-picker scoping (`siwx_user` cookie) — 2026-06-18
+
+Usernameless/discoverable login sends an EMPTY `allowCredentials`, so the OS passkey
+picker shows EVERY resident passkey for the RP. To show only the relevant account
+for a returning user, `/webauthn/authenticate/start` scopes `allowCredentials` to the
+caller's DID — but ONLY when the caller proves identity with an opaque server token,
+never a client-supplied identifier (that would re-open the credential-enumeration leak
+the discoverable fix closed).
+
+- **`siwx_user` cookie** (`USER_SESSION_COOKIE` in `axum_lib.rs`): an OPAQUE token,
+  `Path=/` (so it reaches login-time `authenticate_start`), `HttpOnly; SameSite=Strict`,
+  `Secure` on https, `Max-Age` = `USER_SESSION_LIFETIME` (30d). Its value is the token
+  only; the DID lives solely at `user:session/{token}` in Redis. Distinct from the
+  `acct_session` cookie (`Path=/account`). Minted at `sign_in` (after the new-user gate
+  is cleared) and at account re-auth.
+- **Scoping:** `authenticate_start` reads `siwx_user` -> `lookup_user_session(token)`
+  -> DID -> `get_passkeys_for_did(did)` -> `allowCredentials` = exactly that DID's
+  credentials. The response is a wrapper around `RequestChallengeResponse`:
+  `{ publicKey..., detected_mxid, methods }` (the `publicKey` fields stay flattened at
+  the top level so the frontend is unchanged); `detected_mxid` = `@localpart:server`
+  and `methods` = `{wallet, passkey}` are present ONLY when scoped, else absent/null.
+- **Empty scope set:** a wallet-only DID (no linked passkey) resolves to zero creds;
+  `authenticate_start` falls back to leaving `allowCredentials` empty (discoverable)
+  rather than emitting a broken empty picker that blocks every key.
+- **Escape hatch ("use a different passkey"):** body `{"all": true}` OR `?all=1` forces
+  usernameless (empty `allowCredentials`) even with a valid cookie.
+- **Enumeration-safety invariant:** a forged/guessed/expired `siwx_user` is a Redis
+  miss -> `scope_did = None` -> usernameless, leaking ZERO credential ids and a null
+  `detected_mxid`. The identity hint can never be a plaintext DID or free-form id.
+  (`get_passkeys_for_did` / `methods_for_did` are server-side; they never echo cred ids
+  to an unscoped caller.)
+
+### New-account creation policy (login-only gate) — 2026-06-18
+
+Authenticating with an unrecognised passkey/wallet resolves a DID whose Matrix
+localpart is unprovisioned, so `sign_in` would silently CREATE a brand-new account.
+"New" is detected read-only, BEFORE any Synapse write, via
+`is_new_identity(did)` = `SynapseClient::is_localpart_available(did_to_localpart(did))`.
+Creating a new identity is permitted **ONLY at the login screen**; the account and
+QR/device flows hard-REJECT it:
+
+| Flow | New identity (`is_localpart_available == true`) |
+|------|--------------------------------------------------|
+| Login (`/webauthn/authenticate/finish`, wallet `/sign_in`) | **GATE:** `finish` returns `{ok, did, new_user:true, mxid}` and does NOT provision. The browser shows a confirm/cancel gate; provisioning happens only at `/sign_in` AFTER confirm. Cancel = no `/sign_in` = zero Synapse state. |
+| Account re-auth (`/account/passkey/finish`, `/account/wallet`) | **REJECT:** `reject_if_new_identity` -> `400` with `NEW_IDENTITY_REJECT_MSG` ("not linked to an existing account. Create an account at sign-in first."). Nothing provisioned. |
+| QR / device approval (`/device/passkey/finish`, `/device` wallet) | **REJECT:** same `400`, BEFORE `entry.did` is set, so the token grant never provisions. |
+
+`reject_if_new_identity` fails **closed**: if detection itself fails (Synapse
+unreachable) it rejects with the same message rather than risk a silent creation. It
+is a strict no-op when no Synapse client is configured (standalone deployments
+degrade, never 500). `login_finish` only reports `new_user`/`mxid` when a Synapse
+client + `server_name` are configured (else `new_user:false`, behaves as before).
 
 ## Troubleshooting
 
@@ -456,10 +529,17 @@ and substitutes `primary_did` if a mapping exists.
    (wallet) and register a fresh passkey via "Link a passkey", or register a new one
    on the login page. The unknown-credential message points the user here.
 
+   **Returning-user picker scoping (since 2026-06-18):** `authenticate_start` now
+   scopes `allowCredentials` to the returning user's DID when a valid opaque
+   `siwx_user` cookie is present, WITHOUT costing the usernameless flow (no cookie ->
+   empty `allowCredentials` as before; escape hatch `{"all":true}`/`?all=1` forces
+   usernameless on demand). See "Passkey-picker scoping" above. A stale/scoped key
+   still falls through to the `signalUnknownCredential` prune below.
+
    **Held in reserve (not implemented):** `signalAllAcceptedCredentials` (needs a user
-   handle / identity scope) and identifier-first `allowCredentials` (a hard pre-
-   filtered picker, but it costs the usernameless flow). Use these only if hard
-   prevention is ever required; `signalUnknownCredential` keeps usernameless intact.
+   handle / identity scope). The cookie-scoping above is the safe form of an
+   identifier-first picker (opaque token only, escape hatch preserved);
+   `signalUnknownCredential` keeps usernameless intact.
 
 6. **"Session not found"** → session expired (300s TTL) between authenticate_finish
    and sign_in redirect. Check for network/proxy delays.
@@ -480,9 +560,19 @@ nothing to transfer, the rendezvous session expires, and Element X aborts.
 3. Complete the key backup setup
 4. Then use "Link new device" to add Element X
 
-**Pre-flight warning:** When `SIWEOIDC_MATRIX_SERVER_NAME` is configured, the
-device approval page checks for cross-signing keys and warns the user if they
-are missing. Set this env var to the Matrix server_name (e.g. `matrix.inblock.io`).
+**No more approval-time pre-flight warning (false positive REMOVED 2026-06-18).**
+The device approval page USED to probe the published cross-signing master key (via
+`keys/query`) at approval time and warn "no Secure Backup" when it was absent. That
+check raced the client's first-time cross-signing bootstrap
+(`keys/device_signing/upload`) and mislabelled a still-publishing or in-flux master
+key as missing — a confirmed false positive that fired for healthy users. It is
+removed: `check_cross_signing` / `CROSS_SIGNING_WARNING` are gone from
+`device_auth.rs`, and `DeviceApproveResponse.warning` is now always `None`/absent on
+the approve path (covered by the browser e2e `H9`). The real MSC4108 prerequisite
+(cross-signing PRIVATE keys on the SENDING device) is not observable server-side;
+Element Web's force-first-device-recovery patch enforces it. `SIWEOIDC_MATRIX_SERVER_NAME`
+is still used elsewhere (account/device admin-API actions); it no longer drives an
+approval-time warning.
 
 **Cross-signing auto-bootstrap (investigated 2026-05-23):** MAS contains zero
 cross-signing code. First-time cross-signing key upload is handled by Synapse
