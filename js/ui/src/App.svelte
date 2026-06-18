@@ -229,10 +229,10 @@
 			const options = await startResp.json();
 
 			options.publicKey.challenge = base64urlToBuffer(options.publicKey.challenge);
+			// Discoverable login: the server returns an empty `allowCredentials`, so the
+			// authenticator offers the user's own resident passkeys (not a server-wide
+			// picker). An empty/absent list is a no-op here — never treat it as an error.
 			if (options.publicKey.allowCredentials) {
-				if (options.publicKey.allowCredentials.length === 0) {
-					throw new Error('No passkeys registered on this server. Register a passkey first.');
-				}
 				for (const c of options.publicKey.allowCredentials) {
 					c.id = base64urlToBuffer(c.id);
 				}
@@ -260,6 +260,27 @@
 				}),
 			});
 			if (!finishResp.ok) {
+				const errBody = await finishResp.clone().json().catch(() => null);
+				if (errBody && errBody.error === 'unknown_credential') {
+					// Progressive enhancement: ask the platform to prune this stale passkey
+					// from the picker. Privacy-safe (we only signal an id the client just
+					// presented). Best-effort + feature-detected; unsupported browsers skip it.
+					try {
+						const pkc = window.PublicKeyCredential as any;
+						if (pkc && typeof pkc.signalUnknownCredential === 'function' && options.publicKey.rpId) {
+							await pkc.signalUnknownCredential({
+								rpId: options.publicKey.rpId,
+								credentialId: errBody.credential_id,
+							});
+						}
+					} catch (_) {
+						/* best-effort prune; ignore */
+					}
+					throw new Error(
+						errBody.message ||
+							'This passkey is no longer valid. Remove it from your device settings or use another sign-in method.'
+					);
+				}
 				throw new Error(await finishResp.text());
 			}
 

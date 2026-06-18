@@ -289,6 +289,36 @@ test('R-C1/R-C2/R-C3: passkey register -> login -> token (same DID)', async ({ p
   expect(wa.get).toBe(1);
 });
 
+test('R-C4: authenticate/start does not enumerate credentials (empty allowCredentials)', async ({ page }) => {
+  // Regression guard for the discoverable-auth credential leak. authenticate_start
+  // must NOT enumerate stored credentials: doing so leaked all credential ids to
+  // unauthenticated callers and produced a server-wide passkey picker. With >=2
+  // credentials registered, the start response must still return empty
+  // allowCredentials (login works because the credentials are discoverable resident
+  // keys, exercised by R-C2 above).
+  await mockReset();
+  await addVirtualAuthenticator(page);
+  await page.context().addCookies([{ name: 'session', value: 'pk-leak-sess', url: BASE }]);
+  await page.goto('/account');
+
+  const did1 = await registerPasskey(page);
+  const did2 = await registerPasskey(page);
+  expect(did1).toMatch(/^did:key:zDn/);
+  expect(did2).toMatch(/^did:key:zDn/);
+  expect(did1).not.toBe(did2);
+
+  const allow = await page.evaluate(async () => {
+    const sr = await fetch('/webauthn/authenticate/start', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    if (!sr.ok) throw new Error('authenticate start ' + sr.status + ' ' + (await sr.text()));
+    const opts = await sr.json();
+    return opts.publicKey.allowCredentials || [];
+  });
+  expect(Array.isArray(allow)).toBe(true);
+  expect(allow.length).toBe(0);
+});
+
 test('R-G1: one re-auth covers list + view + delete (single signature)', async ({ page }) => {
   await mockReset();
   const w = makeWallet();
