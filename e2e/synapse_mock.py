@@ -15,6 +15,13 @@ Mirrors the exact contract in src/synapse_client.rs:
 All require `Authorization: Bearer <SECRET>` (set via SYNAPSE_MOCK_SECRET, default
 "testsecret"); a wrong/missing token yields 401 so the admin-auth-failure path can be
 exercised. State is in-memory; test-only helpers live under /__.
+
+`is_localpart_available` models EXISTING vs NEW accounts: a localpart that has been
+provisioned (provision_user / upsert_device), has a seeded device (__seed_device), or
+is explicitly seeded (POST /__seed_user {localpart|user_id}) returns HTTP 400
+(M_USER_IN_USE, read by siwx-oidc as an existing account); any other localpart
+returns 200 {available:true} (a NEW identity). This lets the new-identity gate
+distinguish a returning user from a brand-new one. __reset clears all of it.
 """
 import json
 import os
@@ -31,6 +38,18 @@ PORT = int(os.environ.get("SYNAPSE_MOCK_PORT", "8090"))
 LOCK = threading.Lock()
 # user_id ("@lp:server") -> list[device dict]
 DEVICES = {}
+# Set of localparts that EXIST on this homeserver. Drives the contract of
+# GET /_synapse/mas/is_localpart_available: a localpart NOT in this set is
+# "available" (HTTP 200 -> the siwx-oidc gate reads it as a NEW identity); a
+# localpart in this set is taken (HTTP 400 M_USER_IN_USE -> EXISTING identity).
+#
+# A user becomes existing when it is provisioned (provision_user / upsert_device),
+# when a device is seeded for it (__seed_device), or when it is explicitly seeded
+# (__seed_user). This faithfully models the real Synapse: an account that has been
+# provisioned or carries devices exists. Without it the mock answered "available"
+# for everyone, which made the new-identity gate (correctly) reject every account /
+# QR re-auth — masking the real behaviour the lifecycle suite relies on.
+EXISTING_USERS = set()
 # user_id -> {"deactivated": bool, "erased": bool}
 LIFECYCLE = {}
 CALL_LOG = []  # list of "METHOD path"
@@ -49,6 +68,16 @@ TIMEOUT_SLEEP_SECS = float(os.environ.get("SYNAPSE_MOCK_TIMEOUT_SLEEP", "30"))
 # test can prove at most one DELETE actually mutated state. Distinct from
 # CALL_LOG (which records every request, including idempotent no-ops).
 EFFECTIVE_DELETES = {}
+
+
+def _localpart_of(user_id):
+    """Extract the localpart from an mxid `@localpart:server` (or pass through a
+    bare localpart). Mirrors how siwx-oidc queries is_localpart_available with the
+    `did_to_localpart` value, so the seeded mxid and the queried localpart match."""
+    if not user_id:
+        return user_id
+    s = user_id[1:] if user_id.startswith("@") else user_id
+    return s.split(":", 1)[0]
 
 
 def _device(device_id, display_name=None, last_seen_ip=None, last_seen_ts=None):
@@ -128,6 +157,7 @@ class Handler(BaseHTTPRequestHandler):
                     "calls": list(CALL_LOG),
                     "fail": dict(FAIL),
                     "effective_deletes": dict(EFFECTIVE_DELETES),
+                    "existing_users": sorted(EXISTING_USERS),
                 })
         if path == "/health":
             return self._send(200, {"ok": True})
@@ -136,6 +166,14 @@ class Handler(BaseHTTPRequestHandler):
         self._log("GET", path)
         # GET /_synapse/mas/is_localpart_available
         if p.path.startswith("/_synapse/mas/is_localpart_available"):
+            qs = parse_qs(p.query)
+            localpart = (qs.get("localpart") or [""])[0]
+            with LOCK:
+                exists = localpart in EXISTING_USERS
+            if exists:
+                # Taken: the siwx-oidc client treats any 4xx as "not available"
+                # (an EXISTING account), so the new-identity gate does NOT reject.
+                return self._send(400, {"errcode": "M_USER_IN_USE", "error": "in use"})
             return self._send(200, {"available": True})
         # GET /_synapse/admin/v2/users/{user_id}/devices  (list_devices)
         m = re.match(r"^/_synapse/admin/v2/users/([^/]+)/devices$", path)
@@ -171,11 +209,24 @@ class Handler(BaseHTTPRequestHandler):
                 DEVICES.setdefault(uid, []).append(_device(
                     body["device_id"], body.get("display_name"),
                     body.get("last_seen_ip"), body.get("last_seen_ts")))
+                # A user that carries a device EXISTS (so the new-identity gate
+                # treats it as a returning account, not a fresh registration).
+                EXISTING_USERS.add(_localpart_of(uid))
             return self._send(200, {"ok": True, "user_id": uid})
+        # Explicitly mark a user as EXISTING without seeding a device. Accepts a
+        # `user_id` mxid or a bare `localpart`. Used to test flows that must
+        # distinguish a returning account from a brand-new identity.
+        if path == "/__seed_user":
+            lp = body.get("localpart") or _localpart_of(body.get("user_id", ""))
+            with LOCK:
+                if lp:
+                    EXISTING_USERS.add(lp)
+            return self._send(200, {"ok": True, "localpart": lp})
         if path == "/__reset":
             with LOCK:
                 DEVICES.clear(); LIFECYCLE.clear(); CALL_LOG.clear()
                 FAIL.clear(); EFFECTIVE_DELETES.clear()
+                EXISTING_USERS.clear()
                 STATE["secret"] = SECRET
             return self._send(200, {"ok": True})
         if path == "/__set_secret":
@@ -197,10 +248,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(401, {"errcode": "M_UNKNOWN_TOKEN", "error": "bad admin token"})
         self._log("POST", path)
         if path == "/_synapse/mas/provision_user":
+            lp = body.get("localpart")
+            if lp:
+                with LOCK:
+                    EXISTING_USERS.add(lp)
             return self._send(200, {})
         if path == "/_synapse/mas/upsert_device":
             uid = f"@{body['localpart']}:matrix.test"
             with LOCK:
+                # Provisioning a device for a user implies the user EXISTS.
+                EXISTING_USERS.add(body["localpart"])
                 devs = DEVICES.setdefault(uid, [])
                 if not any(d["device_id"] == body["device_id"] for d in devs):
                     devs.append(_device(body["device_id"], body.get("display_name")))

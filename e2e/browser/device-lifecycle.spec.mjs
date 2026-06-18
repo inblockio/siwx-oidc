@@ -42,6 +42,20 @@ async function mockSeed(mxid, deviceId, displayName = 'Element') {
     body: JSON.stringify({ user_id: mxid, device_id: deviceId, display_name: displayName }),
   });
 }
+// Mark a DID's localpart as an EXISTING account so the new-identity gate treats a
+// re-auth in the account/QR flow as a returning user (not an attempt to create a
+// new account, which those flows reject). These lifecycle tests operate on
+// accounts that already exist.
+function localpartOfDid(did) {
+  return did.replaceAll(':', '-').toLowerCase();
+}
+async function mockSeedUser(did) {
+  await fetch(`${MOCK}/__seed_user`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ localpart: localpartOfDid(did) }),
+  });
+}
 async function mockState() {
   return (await fetch(`${MOCK}/__state`)).json();
 }
@@ -381,6 +395,9 @@ test('R-G2: device_view deep-link resolves a base64 (slash) device id', async ({
 test('R-G4: cross_signing_reset calls allow_cross_signing_reset on Synapse', async ({ page }) => {
   await mockReset();
   const w = makeWallet();
+  // cross_signing_reset operates on an EXISTING account; mark it so the account
+  // flow's new-identity gate does not reject this returning user.
+  await mockSeedUser(w.did);
   await injectMockWallet(page, w);
 
   await page.goto('/account?action=org.matrix.cross_signing_reset');
@@ -505,6 +522,10 @@ test('H11b: an auth challenge is single-use within its own session', async ({ pa
   await page.goto('/account');
   const did = await registerPasskey(page);
   expect(did).toMatch(/^did:key:zDn/);
+  // The profile re-auth runs in the account flow, which rejects NEW identities;
+  // this test exercises challenge single-use for a returning user, so mark the
+  // freshly-registered passkey's account as existing.
+  await mockSeedUser(did);
 
   const replay = await page.evaluate(async () => {
     const b64uToBuf = (s) => {

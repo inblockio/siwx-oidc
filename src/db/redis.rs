@@ -117,6 +117,51 @@ impl RedisClient {
         Ok(())
     }
 
+    /// Add `member` to the Redis SET at `key` (idempotent; SADD of an existing
+    /// member is a no-op). Mirrors the command-issue pattern of the other raw
+    /// helpers so callers stay free of the bb8/redis types.
+    pub async fn sadd_raw(&self, key: &str, member: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+        conn.sadd::<_, _, ()>(key, member)
+            .await
+            .map_err(|e| anyhow!("Redis SADD: {}", e))?;
+        Ok(())
+    }
+
+    /// Remove `member` from the Redis SET at `key` (idempotent; SREM of an absent
+    /// member is a no-op). Returns the number of members removed (0 or 1).
+    pub async fn srem_raw(&self, key: &str, member: &str) -> Result<usize> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+        let removed: usize = conn
+            .srem(key, member)
+            .await
+            .map_err(|e| anyhow!("Redis SREM: {}", e))?;
+        Ok(removed)
+    }
+
+    /// Return every member of the Redis SET at `key` (empty vec if the key is
+    /// absent, which Redis treats as the empty set).
+    pub async fn smembers_raw(&self, key: &str) -> Result<Vec<String>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+        let members: Vec<String> = conn
+            .smembers(key)
+            .await
+            .map_err(|e| anyhow!("Redis SMEMBERS: {}", e))?;
+        Ok(members)
+    }
+
     /// Revoke (delete) every stored OAuth token for the given Matrix `username`
     /// (localpart) and `device_id`. Returns the number of tokens removed.
     ///
@@ -317,6 +362,12 @@ impl RedisClient {
                     errors += 1;
                 }
             }
+            // Keep the by_did reverse index consistent: drop this cred from the
+            // DID's set (and the set itself once emptied). Best-effort — the index
+            // is advisory, so a failure here must not mark the erase incomplete.
+            if let Err(e) = self.index_remove_passkey(did, cred_id).await {
+                debug!("purge_identity: index_remove_passkey {} failed: {}", cred_id, e);
+            }
         }
 
         // -- (b) Standalone credentials whose passkey derives to this did:key --
@@ -340,6 +391,14 @@ impl RedisClient {
                         errors += 1;
                     }
                 }
+                // Keep the by_did reverse index consistent (best-effort, advisory).
+                let cred_id = &cred_key[cred_prefix.len()..];
+                if let Err(e) = self.index_remove_passkey(did, cred_id).await {
+                    debug!(
+                        "purge_identity: index_remove_passkey {} failed: {}",
+                        cred_id, e
+                    );
+                }
             }
         }
 
@@ -356,6 +415,177 @@ impl RedisClient {
             ));
         }
         Ok(purged)
+    }
+
+    // -- webauthn:by_did reverse index ----------------------------------------
+    //
+    // `webauthn:by_did/{did}` is a Redis SET of the `cred_id_b64` values that
+    // resolve to `did` (a derived `did:key` from `register_finish`, or a wallet
+    // `primary_did` from `link_finish`). It lets a returning login scope the
+    // passkey picker to one DID's keys with a single SMEMBERS instead of a full
+    // credential keyspace scan. It is advisory: `get_passkeys_for_did` self-heals
+    // from a read-only scan when the index is absent/empty, so a missed update
+    // never causes a wrong answer — only a slower one until it back-fills.
+
+    /// SADD `cred_id_b64` into the `webauthn:by_did/{did}` index. Called by
+    /// `register_finish` (derived did:key) and `link_finish` (wallet primary_did)
+    /// after the credential/link itself is stored. Idempotent.
+    pub async fn index_add_passkey(&self, did: &str, cred_id_b64: &str) -> Result<()> {
+        self.sadd_raw(
+            &format!("{}/{}", KV_WEBAUTHN_BY_DID_PREFIX, did),
+            cred_id_b64,
+        )
+        .await
+    }
+
+    /// SREM `cred_id_b64` from the `webauthn:by_did/{did}` index, and DEL the index
+    /// key entirely once it is emptied so the keyspace stays clean. Called by
+    /// `purge_identity` for every credential/link it removes. Idempotent.
+    pub async fn index_remove_passkey(&self, did: &str, cred_id_b64: &str) -> Result<()> {
+        let key = format!("{}/{}", KV_WEBAUTHN_BY_DID_PREFIX, did);
+        self.srem_raw(&key, cred_id_b64).await?;
+        // Drop the index key when it holds nothing, so an emptied DID leaves no
+        // dangling SET behind (SMEMBERS of a missing key is the empty set anyway).
+        if self.smembers_raw(&key).await?.is_empty() {
+            self.del_raw(&key).await?;
+        }
+        Ok(())
+    }
+
+    /// Return the `cred_id_b64` values registered/linked for `did`.
+    ///
+    /// Fast path: read the `webauthn:by_did/{did}` SET (SMEMBERS). FALLBACK: when
+    /// that index is absent/empty, run the read-only twin of `purge_identity`'s two
+    /// scans to self-heal —
+    ///
+    /// (a) every `webauthn:link/{cred_id}` whose stored `primary_did == did`
+    ///     (wallet-linked passkeys), and
+    /// (b) every standalone `webauthn:credential/{cred_id}` whose stored passkey
+    ///     `derive`s to this exact `did:key` (the resolver mirrors
+    ///     `purge_identity`'s, keeping the DB layer free of webauthn-rs types).
+    ///
+    /// Results from the scan are best-effort populated back into the index (SADD)
+    /// so the next call hits the fast path. A populate failure is non-fatal: the
+    /// scan result is still returned. The fallback makes the index advisory rather
+    /// than load-bearing, so a missed `index_add_passkey` cannot lose a passkey.
+    ///
+    /// Enumeration-safety: this is a server-side helper called only with a DID the
+    /// server already resolved (from a valid opaque user-session); it never enables
+    /// an unauthenticated caller to enumerate credentials.
+    pub async fn get_passkeys_for_did<F>(&self, did: &str, derive: F) -> Result<Vec<String>>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let index_key = format!("{}/{}", KV_WEBAUTHN_BY_DID_PREFIX, did);
+        let indexed = self.smembers_raw(&index_key).await?;
+        if !indexed.is_empty() {
+            return Ok(indexed);
+        }
+
+        // Index miss: self-heal from a read-only scan (the twin of purge_identity).
+        let mut found: Vec<String> = Vec::new();
+
+        // (a) Linked credentials: webauthn:link/{cred_id} -> { primary_did }.
+        let link_prefix = "webauthn:link/";
+        let link_keys = self.keys_raw(&format!("{}*", link_prefix)).await?;
+        for link_key in link_keys {
+            let raw = match self.get_raw(&link_key).await {
+                Ok(Some(v)) => v,
+                Ok(None) => continue,
+                Err(e) => {
+                    debug!("get_passkeys_for_did: get link {} failed: {}", link_key, e);
+                    continue;
+                }
+            };
+            let link: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if link.get("primary_did").and_then(|d| d.as_str()) == Some(did) {
+                let cred_id = link_key[link_prefix.len()..].to_string();
+                if !found.contains(&cred_id) {
+                    found.push(cred_id);
+                }
+            }
+        }
+
+        // (b) Standalone credentials whose passkey derives to this did:key.
+        let cred_prefix = "webauthn:credential/";
+        let cred_keys = self.keys_raw(&format!("{}*", cred_prefix)).await?;
+        for cred_key in cred_keys {
+            let raw = match self.get_raw(&cred_key).await {
+                Ok(Some(v)) => v,
+                Ok(None) => continue,
+                Err(e) => {
+                    debug!("get_passkeys_for_did: get cred {} failed: {}", cred_key, e);
+                    continue;
+                }
+            };
+            if derive(&raw).as_deref() == Some(did) {
+                let cred_id = cred_key[cred_prefix.len()..].to_string();
+                if !found.contains(&cred_id) {
+                    found.push(cred_id);
+                }
+            }
+        }
+
+        // Best-effort back-fill so subsequent calls hit the fast path. Never fatal.
+        for cred_id in &found {
+            if let Err(e) = self.sadd_raw(&index_key, cred_id).await {
+                debug!("get_passkeys_for_did: back-fill SADD failed: {}", e);
+                break;
+            }
+        }
+
+        debug!(
+            "get_passkeys_for_did: did={} index_miss scanned={}",
+            did,
+            found.len()
+        );
+        Ok(found)
+    }
+
+    // -- Opaque login user-session --------------------------------------------
+    //
+    // Mirrors account.rs's create/lookup_account_session, but generic: the value
+    // is just the DID and there is no CSRF (this token only scopes the passkey
+    // picker, it never authorizes a state change). The token is OPAQUE (two random
+    // UUIDs), so a forged/guessed value is a Redis miss -> None -> usernameless
+    // fallback. This is the load-bearing enumeration-safety invariant: the
+    // identity hint can never be a client-supplied plaintext DID.
+
+    /// Mint an opaque login user-session bound to `did`, store
+    /// `user:session/{token}` -> did with TTL [`USER_SESSION_LIFETIME`], and return
+    /// the opaque token to Set-Cookie.
+    pub async fn create_user_session(&self, did: &str) -> Result<String> {
+        let token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        self.set_ex_raw(
+            &format!("{}/{}", KV_USER_SESSION_PREFIX, token),
+            did,
+            USER_SESSION_LIFETIME,
+        )
+        .await?;
+        Ok(token)
+    }
+
+    /// Resolve an opaque login user-session token to its DID, or `None` if the
+    /// token is unknown/expired (a forged or guessed token lands here -> the caller
+    /// falls back to usernameless discoverable login, leaking nothing).
+    pub async fn lookup_user_session(&self, token: &str) -> Result<Option<String>> {
+        self.get_raw(&format!("{}/{}", KV_USER_SESSION_PREFIX, token))
+            .await
+    }
+
+    /// Delete an opaque login user-session (best-effort; used to clear the hint on
+    /// explicit "use a different passkey" / sign-out).
+    #[allow(dead_code)]
+    pub async fn destroy_user_session(&self, token: &str) -> Result<()> {
+        self.del_raw(&format!("{}/{}", KV_USER_SESSION_PREFIX, token))
+            .await
     }
 
     /// Scan the token keyspace (`KV_TOKEN_PREFIX`) and delete every entry whose
@@ -1089,5 +1319,165 @@ mod tests {
         );
 
         client.del_raw(&theirs_key).await.ok();
+    }
+
+    /// H3: `get_passkeys_for_did`'s scan-fallback (cold index) must return EXACTLY
+    /// the same set as the maintained index (warm), for a DID that has BOTH a
+    /// wallet-linked passkey (`webauthn:link`, primary_did == did) AND a standalone
+    /// credential that derives to that same DID. Unrelated link/credential entries
+    /// for OTHER DIDs must be excluded from both. Requires Redis on localhost;
+    /// skips cleanly if unavailable. Mirrors the `purge_identity_*` style/gating.
+    #[tokio::test]
+    async fn get_passkeys_for_did_scan_fallback_equals_index() {
+        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
+            Ok(c) => c,
+            Err(_) => return, // no Redis: skip (CI provides one)
+        };
+
+        let nonce = unique_nonce();
+        let did = format!("did:pkh:eip155:1:0xWALLET{nonce}");
+        let other_did = format!("did:pkh:eip155:1:0xOTHER{nonce}");
+
+        // (1) wallet-linked passkey: link/{linked_cred} -> primary_did == did.
+        let linked_cred = format!("linkedcred-{nonce}");
+        let link_key = format!("webauthn:link/{linked_cred}");
+        let linked_cred_key = format!("webauthn:credential/{linked_cred}");
+        client
+            .set_raw(
+                &link_key,
+                &format!(r#"{{"primary_did":"{did}","label":"linked"}}"#),
+            )
+            .await
+            .unwrap();
+        // The linked credential's own JSON derives to some unrelated did:key; it is
+        // in scope for `did` ONLY via the link, never via derivation.
+        client
+            .set_raw(
+                &linked_cred_key,
+                &format!(r#"{{"derives_to":"did:key:zDnLINKED{nonce}"}}"#),
+            )
+            .await
+            .unwrap();
+
+        // (2) standalone passkey: credential/{standalone} derives to `did`.
+        let standalone = format!("standalone-{nonce}");
+        let standalone_key = format!("webauthn:credential/{standalone}");
+        client
+            .set_raw(&standalone_key, &format!(r#"{{"derives_to":"{did}"}}"#))
+            .await
+            .unwrap();
+
+        // (3) unrelated entries for OTHER DIDs (must be excluded from both paths).
+        let other_link_cred = format!("otherlink-{nonce}");
+        let other_link_key = format!("webauthn:link/{other_link_cred}");
+        let other_link_cred_key = format!("webauthn:credential/{other_link_cred}");
+        client
+            .set_raw(
+                &other_link_key,
+                &format!(r#"{{"primary_did":"{other_did}","label":"linked"}}"#),
+            )
+            .await
+            .unwrap();
+        client
+            .set_raw(
+                &other_link_cred_key,
+                &format!(r#"{{"derives_to":"did:key:zDnELSE{nonce}"}}"#),
+            )
+            .await
+            .unwrap();
+        let other_standalone = format!("otherstandalone-{nonce}");
+        let other_standalone_key = format!("webauthn:credential/{other_standalone}");
+        client
+            .set_raw(
+                &other_standalone_key,
+                &format!(r#"{{"derives_to":"{other_did}"}}"#),
+            )
+            .await
+            .unwrap();
+
+        // Test resolver: mirrors webauthn::derive_did_from_credential_json's role
+        // (maps a stored credential JSON to its derived did:key), but reads the
+        // test fixture's `derives_to` marker so we exercise pure DB-layer logic
+        // with no webauthn-rs dependency.
+        let resolver = |json: &str| -> Option<String> {
+            let v: serde_json::Value = serde_json::from_str(json).ok()?;
+            v.get("derives_to")?.as_str().map(|s| s.to_string())
+        };
+
+        // COLD path: no index key exists yet -> get_passkeys_for_did must scan and
+        // self-heal. Expect exactly the linked cred + the standalone cred.
+        let index_key = format!("{}/{}", super::KV_WEBAUTHN_BY_DID_PREFIX, did);
+        client.del_raw(&index_key).await.ok(); // ensure cold
+        let mut cold = client.get_passkeys_for_did(&did, resolver).await.unwrap();
+        cold.sort();
+        let mut expected = vec![linked_cred.clone(), standalone.clone()];
+        expected.sort();
+        assert_eq!(
+            cold, expected,
+            "scan fallback must return exactly the linked + standalone creds for the DID"
+        );
+
+        // The scan should have back-filled the index, so a WARM read returns the
+        // same set directly from SMEMBERS (proving index == scan).
+        let mut warm = client.smembers_raw(&index_key).await.unwrap();
+        warm.sort();
+        assert_eq!(
+            warm, expected,
+            "back-filled index (SMEMBERS) must equal the scan result"
+        );
+
+        // And a second get_passkeys_for_did now takes the fast path with the same
+        // answer.
+        let mut warm2 = client.get_passkeys_for_did(&did, resolver).await.unwrap();
+        warm2.sort();
+        assert_eq!(warm2, expected, "warm index lookup must equal the scan result");
+
+        // Best-effort cleanup.
+        for k in [
+            &link_key,
+            &linked_cred_key,
+            &standalone_key,
+            &other_link_key,
+            &other_link_cred_key,
+            &other_standalone_key,
+            &index_key,
+        ] {
+            client.del_raw(k).await.ok();
+        }
+    }
+
+    /// Opaque login user-session: create -> lookup round-trips the DID; a
+    /// forged/guessed token is a miss (None). Requires Redis on localhost; skips
+    /// cleanly if unavailable.
+    #[tokio::test]
+    async fn user_session_create_lookup_roundtrip_and_forged_miss() {
+        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        let nonce = unique_nonce();
+        let did = format!("did:key:zDnUSERSESS{nonce}");
+
+        let token = client.create_user_session(&did).await.unwrap();
+        assert_eq!(
+            client.lookup_user_session(&token).await.unwrap().as_deref(),
+            Some(did.as_str()),
+            "a valid token must resolve to its DID"
+        );
+
+        // A forged token (never minted) must miss -> None (usernameless fallback).
+        let forged = format!("forged{nonce}deadbeef");
+        assert!(
+            client.lookup_user_session(&forged).await.unwrap().is_none(),
+            "a forged/guessed token must be a Redis miss -> None"
+        );
+
+        // destroy -> subsequent lookup misses.
+        client.destroy_user_session(&token).await.unwrap();
+        assert!(
+            client.lookup_user_session(&token).await.unwrap().is_none(),
+            "a destroyed session must no longer resolve"
+        );
     }
 }

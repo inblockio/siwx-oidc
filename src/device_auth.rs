@@ -1,11 +1,11 @@
 use axum::response::Html;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::config::Config;
 use crate::introspect::generate_opaque_token;
-use crate::oidc::{did_to_localpart, CustomError};
+use crate::oidc::CustomError;
 use crate::synapse_client::SynapseClient;
 use siwx_oidc::db::*;
 
@@ -814,32 +814,13 @@ pub struct DeviceApproveResponse {
     pub warning: Option<String>,
 }
 
-const CROSS_SIGNING_WARNING: &str = "Your account has no Secure Backup set up. \
-     The QR code login will fail because encryption keys cannot be transferred. \
-     Please set up Secure Backup in Element Web first, then retry the QR code flow.";
-
-async fn check_cross_signing(
-    did: &str,
-    synapse_client: Option<&SynapseClient>,
-    server_name: Option<&str>,
-) -> Option<String> {
-    let (synapse, sn) = match (synapse_client, server_name) {
-        (Some(s), Some(n)) => (s, n),
-        _ => return None,
-    };
-    let localpart = did_to_localpart(did);
-    match synapse.has_cross_signing_keys(&localpart, sn).await {
-        Ok(true) => None,
-        Ok(false) => {
-            warn!(did = %did, "device approval: user has no cross-signing keys");
-            Some(CROSS_SIGNING_WARNING.to_string())
-        }
-        Err(e) => {
-            debug!("cross-signing check failed (skipping warning): {}", e);
-            None
-        }
-    }
-}
+// The approval-time cross-signing pre-flight check (check_cross_signing +
+// CROSS_SIGNING_WARNING) was removed 2026-06-18: it queried the published master
+// cross-signing key at device-approval time, which races the client's first-time
+// bootstrap (keys/device_signing/upload), so it mislabelled a still-publishing or
+// in-flux key as "no Secure Backup" (a confirmed false positive). The real MSC4108
+// prerequisite (cross-signing PRIVATE keys present on the SENDING device) is not
+// observable server-side; Element Web's force-first-device-recovery patch enforces it.
 
 /// Verify that a user code exists and is pending.
 pub async fn device_verify(
@@ -997,8 +978,17 @@ pub async fn device_approve(
         chrono::Utc::now(),
     )?;
 
-    let warning =
-        check_cross_signing(did, synapse_client, config.matrix_server_name.as_deref()).await;
+    // QR linking is for an EXISTING account only; new-account creation is reachable
+    // ONLY from the login screen. Reject a wallet DID with no Synapse account BEFORE
+    // entry.did is set/persisted, so the token grant never provisions one. No-op when
+    // the DID already has an account or when no Synapse client is configured.
+    crate::webauthn::reject_if_new_identity(synapse_client, did).await?;
+
+    // Cross-signing readiness is enforced by Element Web's force-first-device-recovery
+    // patch. The old approval-time keys/query check raced the client's first-time
+    // cross-signing bootstrap and mislabelled a still-publishing master key as "no
+    // Secure Backup" (confirmed false positive 2026-06-18), so it is removed.
+    let warning: Option<String> = None;
 
     entry.status = DeviceCodeStatus::Approved;
     entry.did = Some(did.clone());
@@ -1031,7 +1021,17 @@ pub async fn device_approve_passkey(
         return Err(CustomError::BadRequest("Code already used".to_string()));
     }
 
-    let warning = check_cross_signing(verified_did, synapse_client, matrix_server_name).await;
+    // QR linking is for an EXISTING account only; new-account creation is reachable
+    // ONLY from the login screen. Reject a passkey DID with no Synapse account BEFORE
+    // entry.did is set/persisted, so the token grant never provisions one. No-op when
+    // the DID already has an account or when no Synapse client is configured.
+    crate::webauthn::reject_if_new_identity(synapse_client, verified_did).await?;
+
+    // See device_approve: the racy approval-time cross-signing check was removed
+    // (false-positive "no Secure Backup" warning). Element Web enforces the real
+    // prerequisite via force-first-device-recovery.
+    let _ = matrix_server_name; // retained in signature; no longer used for a warning
+    let warning: Option<String> = None;
 
     entry.status = DeviceCodeStatus::Approved;
     entry.did = Some(verified_did.to_string());

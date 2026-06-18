@@ -147,42 +147,9 @@ impl SynapseClient {
         Ok(())
     }
 
-    /// Check whether a user has master cross-signing keys set up.
-    ///
-    /// Queries Synapse's `/_matrix/client/v3/keys/query` using the admin token.
-    /// Returns `false` on any error (graceful degradation: the caller shows no
-    /// warning rather than blocking the flow).
-    pub async fn has_cross_signing_keys(&self, localpart: &str, server_name: &str) -> Result<bool> {
-        let user_id = format!("@{}:{}", localpart, server_name);
-        let url = format!("{}/_matrix/client/v3/keys/query", self.endpoint);
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.shared_secret)
-            .json(&json!({ "device_keys": { &user_id: [] } }))
-            .send()
-            .await
-            .context("has_cross_signing_keys: request failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            warn!(%status, %body, "has_cross_signing_keys: query failed");
-            anyhow::bail!("has_cross_signing_keys: HTTP {status}");
-        }
-
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .context("has_cross_signing_keys: invalid JSON")?;
-
-        let has_master = body
-            .get("master_keys")
-            .and_then(|mk| mk.get(&user_id))
-            .is_some();
-
-        Ok(has_master)
-    }
+    // has_cross_signing_keys was removed 2026-06-18 along with the racy approval-time
+    // pre-flight check in device_auth.rs (it produced a false "no Secure Backup"
+    // warning by racing the client's cross-signing bootstrap).
 
     /// Check whether a localpart is available for registration.
     ///

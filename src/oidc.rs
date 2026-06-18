@@ -1547,7 +1547,7 @@ pub async fn sign_in(
     cookies: headers::Cookie,
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
-) -> Result<Url, CustomError> {
+) -> Result<(Url, String), CustomError> {
     let session_id = if let Some(c) = cookies.get(SESSION_COOKIE_NAME) {
         c
     } else {
@@ -1702,7 +1702,7 @@ pub async fn sign_in(
     .await;
 
     let code_entry = CodeEntry {
-        did,
+        did: did.clone(),
         nonce: params.oidc_nonce.clone(),
         exchange_count: 0,
         client_id: params.client_id.clone(),
@@ -1718,7 +1718,10 @@ pub async fn sign_in(
     let mut url = params.redirect_uri.url().clone();
     url.query_pairs_mut().append_pair("code", &code.to_string());
     url.query_pairs_mut().append_pair("state", &params.state);
-    Ok(url)
+    // Surface the resolved DID alongside the redirect so the HTTP handler can mint
+    // the opaque login user-session cookie ONLY on this success path (a real login
+    // that just issued a code). Error/early returns never reach here.
+    Ok((url, did))
 }
 
 // -- Client registration ---------------------------------------------------
@@ -2076,7 +2079,7 @@ mod tests {
             "ed25519".to_string(),
             "p256".to_string(),
         ];
-        let redirect_url = sign_in(
+        let (redirect_url, _did) = sign_in(
             &base_url,
             &default_methods,
             &default_namespaces,

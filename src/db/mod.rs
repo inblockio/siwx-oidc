@@ -37,6 +37,26 @@ pub const SESSION_LIFETIME: u64 = 300; // 5min
 pub const CLIENT_LIFETIME: u64 = 30 * 24 * 3600; // 30 days
 pub const SESSION_COOKIE_NAME: &str = "session";
 
+/// Redis key prefix for the `webauthn:by_did/{did}` reverse index: a SET of the
+/// `cred_id_b64` values registered/linked for a DID. Maintained at
+/// `register_finish` / `link_finish` (SADD) and `purge_identity` (SREM), so a
+/// login-time `get_passkeys_for_did` lookup is an O(members) SMEMBERS instead of
+/// a full credential keyspace scan. Advisory: a read-only scan twin self-heals a
+/// missing/stale index, so the index never becomes load-bearing for correctness.
+pub const KV_WEBAUTHN_BY_DID_PREFIX: &str = "webauthn:by_did";
+
+/// Redis key prefix for the opaque login user-session: `user:session/{token}` ->
+/// DID. The token is the identity hint that scopes the passkey picker's
+/// `allowCredentials` on a returning login. It is an OPAQUE random token (never a
+/// plaintext DID), so a forged/guessed value is a Redis miss -> safe usernameless
+/// fallback (the load-bearing enumeration-safety invariant).
+pub const KV_USER_SESSION_PREFIX: &str = "user:session";
+
+/// TTL for an opaque login user-session (seconds). Long enough that a returning
+/// user's picker stays scoped across normal usage, bounded so a leaked token does
+/// not scope forever. 30 days mirrors a typical "remember this device" horizon.
+pub const USER_SESSION_LIFETIME: u64 = 30 * 24 * 3600; // 30 days
+
 /// TTL for opaque access tokens (MSC3861 mode).
 pub const ACCESS_TOKEN_TTL: u64 = 300; // 5 minutes
 /// TTL for opaque refresh tokens (MSC3861 mode).
