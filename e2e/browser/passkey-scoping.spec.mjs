@@ -198,9 +198,10 @@ test('H1/H11/H2: cookie scopes the picker; escape + forged cookie fall back to u
   expect(ids).toEqual([a.credId]);            // exactly A, never B
   expect(ids).not.toContain(b.credId);
   expect(scoped.detected_mxid).toBe(didToMxid(a.did));
-  expect(scoped.methods).toBeTruthy();
-  expect(scoped.methods.passkey).toBe(true);  // DID A has a passkey
-  expect(scoped.methods.wallet).toBe(false);  // a did:key is not a wallet
+  // No server-side method prediction: the offer is scoped by identity
+  // (allowCredentials) only; method availability is resolved live/locally, so the
+  // response carries no `methods` hint.
+  expect(scoped.methods).toBeUndefined();
 
   // ESCAPE (H11): body {"all":true} forces usernameless even with the cookie.
   const escapeBody = await authenticateStart(page, { body: JSON.stringify({ all: true }) });

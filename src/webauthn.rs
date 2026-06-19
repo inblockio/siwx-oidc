@@ -403,38 +403,6 @@ pub async fn authenticate_start(
     Ok(rcr)
 }
 
-/// Which authentication methods a known DID can use, for greying-out the
-/// unavailable choice in a known-identity context.
-///
-/// * `wallet` — the DID is a `did:pkh:` (a wallet identity); it can re-auth via a
-///   CAIP-122 wallet signature.
-/// * `passkey` — the DID has at least one resolvable WebAuthn credential (a
-///   standalone passkey or a wallet-linked one), per `get_passkeys_for_did`.
-///
-/// These are not mutually exclusive: a wallet DID that has linked a passkey is both.
-///
-/// Enumeration-safety: like `get_passkeys_for_did`, this is a server-side helper
-/// called only with a DID the server already resolved; it returns booleans, never
-/// credential ids.
-// Wired into the detected-accounts UI / grey-out at the authenticate_start handler.
-pub async fn methods_for_did(redis: &RedisClient, did: &str) -> Result<MethodsForDid> {
-    let passkey = !redis
-        .get_passkeys_for_did(did, derive_did_from_credential_json)
-        .await?
-        .is_empty();
-    Ok(MethodsForDid {
-        wallet: did.starts_with("did:pkh:"),
-        passkey,
-    })
-}
-
-/// The methods a known DID can authenticate with. See [`methods_for_did`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct MethodsForDid {
-    pub wallet: bool,
-    pub passkey: bool,
-}
-
 /// Core WebAuthn assertion verification: challenge retrieval, credential lookup,
 /// cryptographic verification, counter update, and DID resolution. Shared by
 /// both the OIDC login flow and the device approval flow.
@@ -772,46 +740,6 @@ mod tests {
             derive_did_from_credential_json(r#"{"cred":{"unexpected":"shape"}}"#),
             None,
             "wrong-shaped JSON must not panic, must return None"
-        );
-    }
-
-    /// `methods_for_did` reports `wallet` purely from the DID prefix and `passkey`
-    /// from whether `get_passkeys_for_did` resolves anything. This exercises both:
-    /// a freshly-minted `did:pkh:` wallet with NO credentials must be
-    /// `{wallet:true, passkey:false}`; a fresh `did:key:` with no credentials must
-    /// be `{wallet:false, passkey:false}`. Requires Redis on localhost and skips
-    /// cleanly when unavailable, mirroring the redis.rs test gating (the passkey
-    /// branch is unavoidably Redis-backed). H8.
-    #[tokio::test]
-    async fn methods_for_did_wallet_prefix_and_empty_passkey() {
-        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return, // no Redis: skip (CI provides one)
-        };
-
-        // Unique unregistered DIDs -> get_passkeys_for_did resolves to empty.
-        let nonce = Uuid::new_v4().simple().to_string();
-        let wallet_did = format!("did:pkh:eip155:1:0xNOKEYS{nonce}");
-        let key_did = format!("did:key:zDnNOKEYS{nonce}");
-
-        let m_wallet = methods_for_did(&client, &wallet_did).await.unwrap();
-        assert_eq!(
-            m_wallet,
-            MethodsForDid {
-                wallet: true,
-                passkey: false
-            },
-            "did:pkh with no credentials = wallet-only"
-        );
-
-        let m_key = methods_for_did(&client, &key_did).await.unwrap();
-        assert_eq!(
-            m_key,
-            MethodsForDid {
-                wallet: false,
-                passkey: false
-            },
-            "did:key with no credentials = neither method available"
         );
     }
 

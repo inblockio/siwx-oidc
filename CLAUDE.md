@@ -447,9 +447,18 @@ the discoverable fix closed).
 - **Scoping:** `authenticate_start` reads `siwx_user` -> `lookup_user_session(token)`
   -> DID -> `get_passkeys_for_did(did)` -> `allowCredentials` = exactly that DID's
   credentials. The response is a wrapper around `RequestChallengeResponse`:
-  `{ publicKey..., detected_mxid, methods }` (the `publicKey` fields stay flattened at
+  `{ publicKey..., detected_mxid }` (the `publicKey` fields stay flattened at
   the top level so the frontend is unchanged); `detected_mxid` = `@localpart:server`
-  and `methods` = `{wallet, passkey}` are present ONLY when scoped, else absent/null.
+  is present ONLY when scoped, else absent/null.
+- **No server-side method prediction (rolled back 2026-06-19):** the offer is scoped
+  by *identity* only (`allowCredentials`). The login `authenticate_start` does NOT
+  emit a `methods` hint and the frontend does NOT grey out a button from one. Wallet
+  availability is detected locally (is an EIP-1193 provider injected?); passkeys roam
+  across devices/transports, so reachability is resolved live by the ceremony and the
+  passkey button is always offered, falling open with a friendly message if no key is
+  present. (Removed: `webauthn::methods_for_did` / `MethodsForDid`, the response
+  `methods` field, and the App.svelte `disabled` grey-out clauses.) See
+  `docs/design/2026-06-19-passkey-offer-scoping-minimal-behavior.md`.
 - **Empty scope set:** a wallet-only DID (no linked passkey) resolves to zero creds;
   `authenticate_start` falls back to leaving `allowCredentials` empty (discoverable)
   rather than emitting a broken empty picker that blocks every key.
@@ -458,8 +467,8 @@ the discoverable fix closed).
 - **Enumeration-safety invariant:** a forged/guessed/expired `siwx_user` is a Redis
   miss -> `scope_did = None` -> usernameless, leaking ZERO credential ids and a null
   `detected_mxid`. The identity hint can never be a plaintext DID or free-form id.
-  (`get_passkeys_for_did` / `methods_for_did` are server-side; they never echo cred ids
-  to an unscoped caller.)
+  (`get_passkeys_for_did` is server-side; it never echoes cred ids to an unscoped
+  caller.)
 
 ### New-account creation policy (login-only gate) — 2026-06-18
 

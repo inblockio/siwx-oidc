@@ -522,26 +522,25 @@ struct AuthenticateStartQuery {
 /// `/webauthn/authenticate/start`. The challenge fields stay EXACTLY where the
 /// frontend expects them (`#[serde(flatten)]` keeps `publicKey.challenge` /
 /// `publicKey.allowCredentials` / `publicKey.rpId` at the top level), and we add
-/// two sibling fields the login page uses for the detected-account affordance and
-/// the method grey-out:
+/// one sibling field the login page uses for the detected-account affordance:
 ///
 /// * `detected_mxid` — `@{localpart}:{server_name}` of the DID this request is
 ///   scoped to, or `null` when UNSCOPED (no/forged `siwx_user` cookie, `all=1`,
 ///   or no `server_name` configured). Never leaks anything the caller cannot
 ///   already prove ownership of (the cookie is an opaque server token).
-/// * `methods` — `{wallet, passkey}` for the scoped DID, or `null` when unscoped.
 ///
-/// When unscoped both extras are `null` and the response is byte-shape-identical
-/// (modulo the two null siblings) to the previous bare `RequestChallengeResponse`,
-/// so behavior is unchanged for the usernameless path.
+/// When unscoped `detected_mxid` is `null` and the response is byte-shape-identical
+/// (modulo the null sibling) to the previous bare `RequestChallengeResponse`,
+/// so behavior is unchanged for the usernameless path. Method availability is NOT
+/// predicted server-side: the offer is scoped by identity (`allowCredentials`) and
+/// whether a method can run here is resolved live by the ceremony / locally by the
+/// client, never by a server-reported `methods` hint.
 #[derive(serde::Serialize)]
 struct AuthenticateStartResponse {
     #[serde(flatten)]
     challenge: RequestChallengeResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     detected_mxid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    methods: Option<wa::MethodsForDid>,
 }
 
 async fn webauthn_authenticate_start(
@@ -589,28 +588,23 @@ async fn webauthn_authenticate_start(
     .await?;
 
     // When (and only when) scoped by a valid cookie, surface the detected account
-    // and its available methods so the login page can show "Signing in as …" and
-    // grey out an unavailable choice. detected_mxid additionally needs server_name;
-    // without it we report null (the methods grey-out can still apply).
-    let (detected_mxid, methods) = match scope_did.as_deref() {
-        Some(did) => {
-            let detected_mxid = state
-                .config
-                .matrix_server_name
-                .as_deref()
-                .map(|server_name| format!("@{}:{}", oidc::did_to_localpart(did), server_name));
-            // methods_for_did is read-only and never leaks credential ids.
-            let methods = wa::methods_for_did(&state.redis_client, did).await.ok();
-            (detected_mxid, methods)
-        }
+    // so the login page can show "Signing in as …". Needs server_name; without it
+    // we report null. The picker is scoped by identity (allowCredentials); whether a
+    // method can actually run here is resolved live by the ceremony / locally by the
+    // client, never predicted server-side.
+    let detected_mxid = match scope_did.as_deref() {
+        Some(did) => state
+            .config
+            .matrix_server_name
+            .as_deref()
+            .map(|server_name| format!("@{}:{}", oidc::did_to_localpart(did), server_name)),
         // Unscoped (no/forged cookie or all=1): behavior identical to before.
-        None => (None, None),
+        None => None,
     };
 
     Ok(Json(AuthenticateStartResponse {
         challenge,
         detected_mxid,
-        methods,
     }))
 }
 
@@ -1327,9 +1321,9 @@ mod unknown_credential_response_tests {
     /// H7/H8: the `/webauthn/authenticate/start` wrapper keeps the WebAuthn
     /// challenge fields EXACTLY where the existing JS reads them
     /// (`publicKey.challenge` / `publicKey.allowCredentials`, via `#[serde(flatten)]`)
-    /// while adding the scoped-only `detected_mxid` + `methods` siblings. Unscoped,
-    /// both extras are omitted, so the shape is byte-compatible with the previous
-    /// bare `RequestChallengeResponse`. Deterministic, infra-free: pure wire contract.
+    /// while adding the scoped-only `detected_mxid` sibling. Unscoped, the extra is
+    /// omitted, so the shape is byte-compatible with the previous bare
+    /// `RequestChallengeResponse`. Deterministic, infra-free: pure wire contract.
     #[test]
     fn authenticate_start_wrapper_preserves_publickey_and_adds_siblings() {
         // Minimal valid RequestChallengeResponse (deserializable) the wrapper flattens.
@@ -1343,32 +1337,24 @@ mod unknown_credential_response_tests {
         }))
         .unwrap();
 
-        // Scoped: detected_mxid + methods present; publicKey untouched at top level.
+        // Scoped: detected_mxid present; publicKey untouched at top level.
         let scoped = serde_json::to_value(AuthenticateStartResponse {
             challenge: rcr.clone(),
             detected_mxid: Some("@did-key-zdn:matrix.example.com".to_string()),
-            methods: Some(wa::MethodsForDid {
-                wallet: false,
-                passkey: true,
-            }),
         })
         .unwrap();
         assert_eq!(scoped["publicKey"]["challenge"], "AAECAwQFBgcICQ");
         assert_eq!(scoped["publicKey"]["rpId"], "matrix.example.com");
         assert!(scoped["publicKey"]["allowCredentials"].is_array());
         assert_eq!(scoped["detected_mxid"], "@did-key-zdn:matrix.example.com");
-        assert_eq!(scoped["methods"]["wallet"], false);
-        assert_eq!(scoped["methods"]["passkey"], true);
 
-        // Unscoped: extras omitted entirely; publicKey still intact.
+        // Unscoped: extra omitted entirely; publicKey still intact.
         let unscoped = serde_json::to_value(AuthenticateStartResponse {
             challenge: rcr,
             detected_mxid: None,
-            methods: None,
         })
         .unwrap();
         assert_eq!(unscoped["publicKey"]["challenge"], "AAECAwQFBgcICQ");
         assert!(unscoped.get("detected_mxid").is_none());
-        assert!(unscoped.get("methods").is_none());
     }
 }

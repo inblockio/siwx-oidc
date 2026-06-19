@@ -27,10 +27,11 @@
 
 	// --- Passkey scoping + new-user gate (Task 5) ---
 	// When /webauthn/authenticate/start is scoped by a valid siwx_user cookie the
-	// server returns `detected_mxid` + `methods`. Unscoped (no/forged cookie or
-	// the `all:true` escape) both are null and the UI behaves exactly as before.
+	// server returns `detected_mxid`. Unscoped (no/forged cookie or the `all:true`
+	// escape) it is null and the UI behaves exactly as before. Method availability
+	// is resolved live (the passkey ceremony) / locally (is a wallet provider
+	// injected?), never predicted from a server-reported hint.
 	let detectedMxid: string | null = null;
-	let methods: { wallet: boolean; passkey: boolean } | null = null;
 	// Set when authenticate/finish reports `new_user: true`: signing in would CREATE
 	// a brand-new account, so we gate instead of auto-redirecting. Holds the mxid to
 	// show. null = no gate.
@@ -244,11 +245,10 @@
 			}
 			const options = await startResp.json();
 
-			// Detected-account affordance + method grey-out: present ONLY when the
-			// server scoped this request (valid cookie, not the escape hatch). When
-			// unscoped these are null/absent and the UI shows no account hint.
+			// Detected-account affordance: present ONLY when the server scoped this
+			// request (valid cookie, not the escape hatch). When unscoped this is
+			// null/absent and the UI shows no account hint.
 			detectedMxid = forceAll ? null : (options.detected_mxid ?? null);
-			methods = forceAll ? null : (options.methods ?? null);
 
 			options.publicKey.challenge = base64urlToBuffer(options.publicKey.challenge);
 			// Discoverable login: the server returns an empty `allowCredentials`, so the
@@ -496,7 +496,7 @@
 					<!-- Primary: Ethereum -->
 					<button
 						class="btn btn-primary"
-						disabled={connecting || (methods != null && methods.wallet === false)}
+						disabled={connecting}
 						on:click={handleConnect}
 					>
 						<svg
@@ -530,7 +530,7 @@
 					<!-- Secondary: Passkey sign-in -->
 					<button
 						class="btn btn-secondary"
-						disabled={passkeyLoading || (methods != null && methods.passkey === false)}
+						disabled={passkeyLoading}
 						on:click={() => handlePasskeySignIn()}
 					>
 						<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="btn-icon">
