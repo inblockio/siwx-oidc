@@ -219,6 +219,8 @@ pub fn device_page(query: DevicePageQuery, base_url: &str) -> Html<String> {
           <span>Sign with passkey</span>
         </button>
 
+        <p id="passkey-scope" class="hidden" style="font-size:13px;opacity:0.75;margin-top:8px;text-align:center;"></p>
+
         <button class="btn btn-ghost btn-deny" onclick="denyDevice()">
           <span>Deny request</span>
         </button>
@@ -606,20 +608,27 @@ async function approveWallet() {
   }
 }
 
-async function approvePasskey() {
+async function approvePasskey(forceAll) {
   hideStatus();
   setBusy('btn-passkey', true, 'Authenticating...');
   try {
     const startR = await fetch(BASE + '/device/passkey/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user_code: currentUserCode })
+      // `all:true` is the escape hatch: re-run usernameless (offer every key) even
+      // when the siwx_user cookie scoped this picker to the approver's account.
+      body: JSON.stringify({ user_code: currentUserCode, all: !!forceAll })
     });
     if (!startR.ok) { showStatus('Failed to start passkey authentication.', true); return; }
     const options = await startR.json();
+    // Identity-scoped picker: when the server recognises the approver's account it
+    // returns `detected_mxid` and an allowCredentials limited to that account's keys.
+    // Surface "use a different passkey" so approving as another account is possible.
+    renderPasskeyScope(forceAll ? null : options.detected_mxid);
     options.publicKey.challenge = base64ToBuffer(options.publicKey.challenge);
-    // Discoverable login: empty allowCredentials is expected (resident passkeys);
-    // it is a no-op here, not an error.
+    // The server may return a scoped allowCredentials (the approver's keys) or an
+    // empty list (usernameless/discoverable). An empty/absent list is a no-op here,
+    // not an error.
     if (options.publicKey.allowCredentials) {
       options.publicKey.allowCredentials = options.publicKey.allowCredentials.map((c) => ({ ...c, id: base64ToBuffer(c.id) }));
     }
@@ -660,10 +669,37 @@ async function approvePasskey() {
       }
     }
   } catch (e) {
-    showStatus('Passkey error: ' + (e.message || e), true);
+    // A cancelled / no-credential ceremony (NotAllowedError) is common when the
+    // scoped key lives on another device; steer to the escape hatch / wallet rather
+    // than a raw error string.
+    if (e && (e.name === 'NotAllowedError' || e.name === 'AbortError')) {
+      showStatus('No passkey was used. Try "Use a different passkey" above, approve on another device, or sign with your wallet.', true);
+    } else {
+      showStatus('Passkey error: ' + (e.message || e), true);
+    }
   } finally {
     setBusy('btn-passkey', false);
   }
+}
+
+// Render the "Showing passkeys for @mxid — use a different passkey" hint when the
+// picker is identity-scoped (detected_mxid present), or hide it (usernameless). The
+// mxid is set via textContent (never innerHTML), and the link is styled inline so it
+// does not depend on a page-specific CSS class.
+function renderPasskeyScope(mxid) {
+  const el = $('passkey-scope');
+  if (!el) return;
+  el.textContent = '';
+  if (!mxid) { el.classList.add('hidden'); return; }
+  el.appendChild(document.createTextNode('Showing passkeys for ' + mxid + '. '));
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.id = 'passkey-escape';
+  btn.textContent = 'Use a different passkey';
+  btn.style.cssText = 'background:none;border:none;padding:0;font:inherit;color:inherit;text-decoration:underline;cursor:pointer;';
+  btn.onclick = () => approvePasskey(true);
+  el.appendChild(btn);
+  el.classList.remove('hidden');
 }
 
 async function denyDevice() {
