@@ -226,6 +226,197 @@ test('H1/H11/H2: cookie scopes the picker; escape + forged cookie fall back to u
 });
 
 // ---------------------------------------------------------------------------
+// 3b: ACCOUNT-FLOW SCOPING (self-contained, siwx_user cookie — no client change).
+// /account/passkey/start scopes the re-auth picker to the cookie DID's keys; the
+// escape hatch and an absent cookie fall back to usernameless. Same enumeration-
+// safety as login: the cookie is opaque, the offer is never the auth check.
+// ---------------------------------------------------------------------------
+test('account: siwx_user cookie scopes /account/passkey/start; escape + no cookie fall open', async ({ page }) => {
+  await mockReset();
+  await addVirtualAuthenticator(page);
+
+  const a = await registerPasskeyWithCredId(page, 'acct-scope-sess');
+  const b = await registerPasskeyWithCredId(page, 'acct-scope-sess');
+  expect(a.did).not.toBe(b.did);
+  expect(a.credId).not.toBe(b.credId);
+
+  const accountStart = (body) =>
+    page.evaluate(async (body) => {
+      const r = await fetch('/account/passkey/start', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body,
+      });
+      if (!r.ok) throw new Error('account start ' + r.status + ' ' + (await r.text()));
+      return r.json();
+    }, body);
+
+  // (a) NO siwx_user cookie -> usernameless: allowCredentials EMPTY, no detected_mxid.
+  await page.context().clearCookies();
+  const unscoped = await accountStart(JSON.stringify({ action: 'org.matrix.profile' }));
+  expect(unscoped.publicKey.allowCredentials || []).toEqual([]);
+  expect(unscoped.detected_mxid == null).toBe(true);
+
+  // (b) VALID siwx_user -> DID A: scope to A's credential ONLY, never B's.
+  const token = 'accttoken' + Date.now().toString(16) + Math.random().toString(16).slice(2);
+  expect(await redisCmd(['SET', `${USER_SESSION_PREFIX}${token}`, a.did])).toBe('OK');
+  await page.context().addCookies([{ name: 'siwx_user', value: token, url: BASE }]);
+  const scoped = await accountStart(JSON.stringify({ action: 'org.matrix.profile' }));
+  const ids = (scoped.publicKey.allowCredentials || []).map((c) => c.id);
+  expect(ids).toEqual([a.credId]);
+  expect(ids).not.toContain(b.credId);
+  expect(scoped.detected_mxid).toBe(didToMxid(a.did));
+
+  // (c) ESCAPE hatch {"all":true} -> usernameless even with the cookie present.
+  const escaped = await accountStart(JSON.stringify({ action: 'org.matrix.profile', all: true }));
+  expect(escaped.publicKey.allowCredentials || []).toEqual([]);
+  expect(escaped.detected_mxid == null).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// 3c: DEVICE/QR-FLOW SCOPING. /device/passkey/start scopes the approver's picker
+// to their own keys via the same siwx_user cookie (Path=/ reaches /device too);
+// escape + absent cookie fall open. Needs a pending RFC-8628 user_code.
+// ---------------------------------------------------------------------------
+test('device: siwx_user cookie scopes /device/passkey/start; escape + no cookie fall open', async ({ page }) => {
+  await mockReset();
+  await addVirtualAuthenticator(page);
+
+  const a = await registerPasskeyWithCredId(page, 'dev-scope-sess');
+  const b = await registerPasskeyWithCredId(page, 'dev-scope-sess');
+  expect(a.did).not.toBe(b.did);
+  expect(a.credId).not.toBe(b.credId);
+
+  // Mint a pending device code (register a device_code-grant client first).
+  const userCode = await page.evaluate(async () => {
+    const reg = await fetch('/register', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        redirect_uris: [location.origin + '/callback'],
+        grant_types: ['urn:ietf:params:oauth:grant-type:device_code'],
+        response_types: ['code'],
+      }),
+    });
+    if (!reg.ok) throw new Error('register ' + reg.status + ' ' + (await reg.text()));
+    const { client_id } = await reg.json();
+    const r = await fetch('/device_authorization', {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'client_id=' + encodeURIComponent(client_id),
+    });
+    if (!r.ok) throw new Error('device_authorization ' + r.status + ' ' + (await r.text()));
+    return (await r.json()).user_code;
+  });
+  expect(userCode).toBeTruthy();
+
+  const deviceStart = (body) =>
+    page.evaluate(async (body) => {
+      const r = await fetch('/device/passkey/start', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body,
+      });
+      if (!r.ok) throw new Error('device start ' + r.status + ' ' + (await r.text()));
+      return r.json();
+    }, body);
+
+  // (a) NO siwx_user cookie -> usernameless.
+  await page.context().clearCookies();
+  const unscoped = await deviceStart(JSON.stringify({ user_code: userCode }));
+  expect(unscoped.publicKey.allowCredentials || []).toEqual([]);
+  expect(unscoped.detected_mxid == null).toBe(true);
+
+  // (b) VALID siwx_user -> DID A (the approver): scope to A's credential ONLY.
+  const token = 'devtoken' + Date.now().toString(16) + Math.random().toString(16).slice(2);
+  expect(await redisCmd(['SET', `${USER_SESSION_PREFIX}${token}`, a.did])).toBe('OK');
+  await page.context().addCookies([{ name: 'siwx_user', value: token, url: BASE }]);
+  const scoped = await deviceStart(JSON.stringify({ user_code: userCode }));
+  const ids = (scoped.publicKey.allowCredentials || []).map((c) => c.id);
+  expect(ids).toEqual([a.credId]);
+  expect(ids).not.toContain(b.credId);
+  expect(scoped.detected_mxid).toBe(didToMxid(a.did));
+
+  // (c) ESCAPE hatch {"all":true} -> usernameless even with the cookie present.
+  const escaped = await deviceStart(JSON.stringify({ user_code: userCode, all: true }));
+  expect(escaped.publicKey.allowCredentials || []).toEqual([]);
+  expect(escaped.detected_mxid == null).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// 3d: ACCOUNT FRONTEND AFFORDANCE (DOM). The served account.rs JS must render the
+// scope hint + "Use a different passkey" escape button when detected_mxid is present,
+// the escape must re-issue /account/passkey/start with {"all":true}, and the hint
+// must then hide. Guards renderPasskeyScope + the escape wiring (not just the JSON).
+// ---------------------------------------------------------------------------
+test('account DOM: scope hint + escape render when scoped; escape re-runs usernameless', async ({ page }) => {
+  await mockReset();
+  await addVirtualAuthenticator(page);
+
+  // Register passkey A (left a NEW identity so finish 400-rejects and the auth UI
+  // stays put for DOM assertions) and scope the picker to it via a valid cookie.
+  const a = await registerPasskeyWithCredId(page, 'acct-dom-sess');
+  const token = 'acctdom' + Date.now().toString(16) + Math.random().toString(16).slice(2);
+  expect(await redisCmd(['SET', `${USER_SESSION_PREFIX}${token}`, a.did])).toBe('OK');
+  await page.context().addCookies([{ name: 'siwx_user', value: token, url: BASE }]);
+
+  await page.goto('/account?action=org.matrix.profile');
+
+  // Sign with passkey -> start returns detected_mxid -> hint + escape button render.
+  await page.click('#btn-passkey');
+  const scope = page.locator('#passkey-scope');
+  await expect(scope).toBeVisible();
+  await expect(scope).toContainText(didToMxid(a.did));
+  await expect(page.locator('#passkey-escape')).toBeVisible();
+
+  // Clicking the escape re-issues /account/passkey/start with {"all":true}...
+  const escReqP = page.waitForRequest(
+    (r) => r.url().includes('/account/passkey/start') && r.method() === 'POST'
+  );
+  await page.locator('#passkey-escape').click();
+  const escReq = await escReqP;
+  expect(JSON.parse(escReq.postData() || '{}').all).toBe(true);
+
+  // ...and the usernameless re-run (detected_mxid null) hides the hint again.
+  await expect(scope).toBeHidden();
+});
+
+// ---------------------------------------------------------------------------
+// 3e: DEVICE FRONTEND AFFORDANCE (DOM). Guards device_auth.rs's OWN copy of the
+// scope hint + escape button (distinct from account.rs's). Presence is enough here;
+// the escape JSON re-run is already proven by 3c + the account DOM test.
+// ---------------------------------------------------------------------------
+test('device DOM: scope hint + escape render when scoped', async ({ page }) => {
+  await mockReset();
+  await addVirtualAuthenticator(page);
+
+  const a = await registerPasskeyWithCredId(page, 'dev-dom-sess');
+  const userCode = await page.evaluate(async () => {
+    const reg = await fetch('/register', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        redirect_uris: [location.origin + '/callback'],
+        grant_types: ['urn:ietf:params:oauth:grant-type:device_code'],
+        response_types: ['code'],
+      }),
+    });
+    const { client_id } = await reg.json();
+    const r = await fetch('/device_authorization', {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'client_id=' + encodeURIComponent(client_id),
+    });
+    return (await r.json()).user_code;
+  });
+  const token = 'devdom' + Date.now().toString(16) + Math.random().toString(16).slice(2);
+  expect(await redisCmd(['SET', `${USER_SESSION_PREFIX}${token}`, a.did])).toBe('OK');
+  await page.context().addCookies([{ name: 'siwx_user', value: token, url: BASE }]);
+
+  // Open the approval page for the pending code: it auto-verifies and reveals
+  // #auth-section, so #btn-passkey becomes clickable.
+  await page.goto('/device?user_code=' + encodeURIComponent(userCode));
+  await page.click('#btn-passkey');
+
+  const scope = page.locator('#passkey-scope');
+  await expect(scope).toBeVisible();
+  await expect(scope).toContainText(didToMxid(a.did));
+  await expect(page.locator('#passkey-escape')).toBeVisible();
+});
+
+// ---------------------------------------------------------------------------
 // 4: NEW-USER GATE (login). A brand-new passkey at /webauthn/authenticate/finish
 // returns new_user:true + mxid and provisions NOTHING (provisioning happens only
 // at /sign_in, which the browser reaches only after the user CONFIRMS the gate).

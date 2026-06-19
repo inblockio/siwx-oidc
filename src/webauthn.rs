@@ -818,4 +818,59 @@ mod tests {
             "forged cookie -> usernameless -> allowCredentials MUST be empty (no enumeration)"
         );
     }
+
+    /// H1/H2 (positive scoping): a VALID `siwx_user` session for DID A makes
+    /// `authenticate_start` offer EXACTLY A's credential and NEVER B's. This is the
+    /// other half of the forged-cookie test — it proves the scoped path is correct,
+    /// not merely safe, and is the server-side twin of the browser two-credential
+    /// case. Seeds the `by_did` index directly (the SMEMBERS fast path) so it needs no
+    /// real attestation. Requires Redis on localhost; skips cleanly when unavailable.
+    #[tokio::test]
+    async fn valid_user_session_scopes_allow_credentials_to_its_did_only() {
+        let redis = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
+            Ok(c) => c,
+            Err(_) => return, // no Redis: skip (CI provides one)
+        };
+        let base = Url::parse("http://localhost:8000").unwrap();
+        let cfg = build_webauthn(&base, None, None).expect("build webauthn");
+
+        let nonce = Uuid::new_v4().simple().to_string();
+        let did_a = format!("did:key:zDnA{nonce}");
+        let did_b = format!("did:key:zDnB{nonce}");
+        let cred_a = URL_SAFE_NO_PAD.encode(format!("credA-{nonce}").as_bytes());
+        let cred_b = URL_SAFE_NO_PAD.encode(format!("credB-{nonce}").as_bytes());
+        redis.index_add_passkey(&did_a, &cred_a).await.expect("seed A");
+        redis.index_add_passkey(&did_b, &cred_b).await.expect("seed B");
+
+        // Mint the opaque user-session the handler resolves from the siwx_user cookie.
+        let token = redis.create_user_session(&did_a).await.expect("mint session");
+        let scope_did = redis.lookup_user_session(&token).await.expect("lookup");
+        assert_eq!(scope_did.as_deref(), Some(did_a.as_str()));
+
+        let session_id = format!("scopesess{nonce}");
+        let rcr = authenticate_start(&cfg.webauthn, &redis, &session_id, scope_did.as_deref())
+            .await
+            .expect("authenticate_start");
+
+        let offered: Vec<String> = rcr
+            .public_key
+            .allow_credentials
+            .iter()
+            .map(|c| URL_SAFE_NO_PAD.encode(&*c.id))
+            .collect();
+        assert_eq!(
+            offered,
+            vec![cred_a.clone()],
+            "scoped to A: offer exactly A's credential"
+        );
+        assert!(
+            !offered.contains(&cred_b),
+            "B's credential must NEVER be offered when scoped to A"
+        );
+
+        // Cleanup so reruns stay isolated (no TTL on by_did / user-session here).
+        redis.index_remove_passkey(&did_a, &cred_a).await.ok();
+        redis.index_remove_passkey(&did_b, &cred_b).await.ok();
+        redis.destroy_user_session(&token).await.ok();
+    }
 }
