@@ -105,7 +105,7 @@ scope format.
 | Refresh token prefix | `mcr_` | (none) |
 | Scope format | `openid urn:matrix:client:api:* urn:matrix:client:device:{id}` | `openid profile` |
 | Access token TTL | 300s | 300s |
-| Refresh token TTL | 86400s (24h) | 86400s (24h) |
+| Refresh token TTL | 7776000s (90d) | 7776000s (90d) |
 | Introspection | Active (`/oauth2/introspect`) | Not available |
 | Device ID | Synapse-managed `SIWX_{uuid}` | Empty string (no Synapse) |
 
@@ -113,7 +113,14 @@ scope format.
 1. `POST /token` (grant_type=authorization_code) creates both access and refresh
    `TokenMetadata` entries in Redis. The authorization code (`CodeEntry`) is consumed.
 2. `POST /token` (grant_type=refresh_token) rotates both tokens: new access + new
-   refresh, old refresh deleted. `device_id` is preserved across rotations.
+   refresh, old refresh deleted. `device_id` is preserved across rotations. A
+   bounded grace pointer (`token_rotated/{old_refresh}` -> successor pair, TTL
+   `REFRESH_GRACE_TTL` = 60s) is written on the committed success path, so a client
+   that LOST the rotation response (common on mobile) can replay the old refresh
+   token once within the window and recover instead of being signed out by
+   `invalid_grant`. Same mechanism in `compat::refresh`
+   (`POST /_matrix/client/v3/refresh`). See
+   `docs/audits/2026-06-23-elementx-refresh-rotation-signout.md`.
 3. `POST /token` (grant_type=device_code) provisions Synapse device, issues tokens,
    cleans up device code and user code entries.
 4. `userinfo` resolves tokens via `get_token` first (covers both modes), then falls
@@ -188,10 +195,11 @@ siwx-oidc-auth --server https://siwx.example.com \
 Key input priority: `--key-file` > `SIWX_KEY_FILE` env > `--key-hex` > generate ephemeral.
 PEM format is canonical (PKCS#8, auto-detects Ed25519 vs P-256).
 
-**Refresh tokens:** Both standalone and MSC3861 modes issue refresh tokens (24h TTL).
+**Refresh tokens:** Both standalone and MSC3861 modes issue refresh tokens (90d TTL).
 The `refresh()` library function and `--refresh-token` CLI flag exchange a refresh
 token for new access + refresh tokens without repeating the full CAIP-122 sign-in.
-The server rotates the refresh token on each use (old token is deleted).
+The server rotates the refresh token on each use (old token is deleted, with a
+short replay grace window; see the Token lifecycle note above).
 
 **Device flow** (RFC 8628, no local key needed; user approves on another device):
 

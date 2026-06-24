@@ -62,6 +62,20 @@ pub const ACCESS_TOKEN_TTL: u64 = 300; // 5 minutes
 /// TTL for opaque refresh tokens (MSC3861 mode).
 pub const REFRESH_TOKEN_TTL: u64 = 7_776_000; // 90 days
 
+/// Prefix for the short-lived refresh-token rotation grace pointer:
+/// `token_rotated/{old_refresh}` -> the successor token pair already minted by the
+/// rotation that consumed `old_refresh`. Lets a client that LOST the rotation
+/// response (common on mobile: radio handoff, app suspension, cross-process
+/// refresh) replay the old refresh token once within the grace window and receive
+/// the same successor, instead of being signed out by `invalid_grant`.
+const KV_ROTATED_PREFIX: &str = "token_rotated";
+/// Grace window (seconds) for replaying a just-rotated refresh token. Bounded well
+/// under [`ACCESS_TOKEN_TTL`] so the successor access token stored in the pointer
+/// is still valid when replayed. It does NOT widen the refresh lifetime: the old
+/// token is still removed as a live credential, and unknown/expired tokens are
+/// still rejected.
+pub const REFRESH_GRACE_TTL: u64 = 60; // 1 min
+
 /// Default device code lifetime (RFC 8628 `expires_in`).
 pub const DEVICE_CODE_LIFETIME: u64 = 1800; // 30 minutes
 /// Minimum polling interval for device code grant (seconds).
@@ -150,6 +164,19 @@ pub struct TokenMetadata {
     pub name: String,
 }
 
+/// The successor token pair recorded under [`KV_ROTATED_PREFIX`] when a refresh
+/// token is rotated, so a lost-response replay of the old refresh token can recover
+/// it idempotently within the grace window.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RotatedToken {
+    /// The successor access token minted by the rotation.
+    pub access_token: String,
+    /// The successor refresh token minted by the rotation.
+    pub refresh_token: String,
+    /// Absolute Unix expiry of the successor access token (drives `expires_in` on replay).
+    pub access_exp: i64,
+}
+
 #[async_trait]
 pub trait DBClient {
     async fn set_client(&self, client_id: String, client_entry: ClientEntry) -> Result<()>;
@@ -191,6 +218,20 @@ pub trait DBClient {
     async fn get_token(&self, token: &str) -> Result<Option<TokenMetadata>>;
     /// Delete an opaque token (e.g. on revocation).
     async fn delete_token(&self, token: &str) -> Result<()>;
+
+    /// Record the successor pair for a just-rotated refresh token so a lost-response
+    /// replay of `old_refresh` within the grace window returns the same pair instead
+    /// of `invalid_grant`. Best-effort at the call site: a failure must not fail the
+    /// rotation the client already observed.
+    async fn set_rotated_token(
+        &self,
+        old_refresh: &str,
+        successor: &RotatedToken,
+        ttl: u64,
+    ) -> Result<()>;
+    /// Look up the successor pair for a just-rotated refresh token (grace replay).
+    /// Returns None once the grace window has expired (Redis TTL).
+    async fn get_rotated_token(&self, old_refresh: &str) -> Result<Option<RotatedToken>>;
 
     // -- RFC 8628 device code storage -----------------------------------------
 

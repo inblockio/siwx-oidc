@@ -1443,3 +1443,118 @@ async fn h9_device_code_approved_no_double_redemption() {
         );
     }
 }
+
+// ===========================================================================
+// Refresh-token rotation GRACE WINDOW (Element-X mobile sign-out fix)
+//
+// Root cause (see docs/audits/2026-06-23-elementx-refresh-rotation-signout.md):
+// rotation hard-deletes the old refresh token with NO grace, so a client that
+// LOSES the rotation response (mobile: radio handoff, app suspension,
+// cross-process refresh) replays the old token, gets `invalid_grant`, and is
+// signed out. Desired: a replay within REFRESH_GRACE_TTL returns the SAME
+// successor pair. Covers BOTH refresh entry points (OAuth /token = the path
+// Element-X uses, and the compat /_matrix/client/v3/refresh CS-API path). A
+// never-issued token still fails closed (grace must not blanket-accept).
+//
+// This is a normal #[ignore] guard (not RUN_REPRO-gated): it is RED against the
+// pre-fix server (replay -> invalid_grant / M_UNKNOWN_TOKEN) and GREEN once the
+// grace window lands.
+// ===========================================================================
+
+/// Refresh via the OAuth /token endpoint (grant_type=refresh_token) — the path
+/// Element-X's matrix-rust-sdk OAuth client uses. Returns (status, json|null).
+async fn oauth_refresh(c: &Client, base: &str, refresh_token: &str) -> (StatusCode, Value) {
+    let resp = c
+        .post(format!("{base}/token"))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.json::<Value>().await.unwrap_or(Value::Null);
+    (status, body)
+}
+
+/// Refresh via the compat CS-API endpoint POST /_matrix/client/v3/refresh.
+async fn compat_refresh(c: &Client, base: &str, refresh_token: &str) -> (StatusCode, Value) {
+    let resp = c
+        .post(format!("{base}/_matrix/client/v3/refresh"))
+        .json(&json!({ "refresh_token": refresh_token }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.json::<Value>().await.unwrap_or(Value::Null);
+    (status, body)
+}
+
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn refresh_grace_window_tolerates_replay() {
+    let base = oidc();
+    let c = Client::new();
+
+    // ---- OAuth /token path (the path Element-X uses) ----
+    mock_reset(&c).await;
+    let w = new_wallet();
+    let login = wallet_login(&c, &base, &w).await;
+
+    // First refresh rotates: login.refresh_token is consumed; rt1/at1 are minted.
+    let (s1, v1) = oauth_refresh(&c, &base, &login.refresh_token).await;
+    assert_eq!(s1, StatusCode::OK, "first /token refresh must succeed");
+    let rt1 = v1["refresh_token"].as_str().unwrap().to_string();
+    assert!(
+        token_active(&c, v1["access_token"].as_str().unwrap()).await,
+        "freshly rotated access token must be active"
+    );
+
+    // Replay the OLD (just-rotated) refresh token within the grace window.
+    // PRE-FIX: invalid_grant (400). POST-FIX: 200 with the SAME successor pair.
+    let (s2, v2) = oauth_refresh(&c, &base, &login.refresh_token).await;
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "grace replay of a just-rotated refresh token must succeed (got {s2}); \
+         this is the Element-X mobile sign-out bug"
+    );
+    assert!(
+        token_active(&c, v2["access_token"].as_str().unwrap()).await,
+        "the access token returned on grace replay must be active"
+    );
+    assert_eq!(
+        v2["refresh_token"].as_str().unwrap(),
+        rt1,
+        "grace replay must return the SAME successor refresh token (idempotent)"
+    );
+
+    // Negative: a well-formed but never-issued refresh token still fails closed.
+    let (sbad, _) = oauth_refresh(&c, &base, "mcr_never_issued_grace_probe").await;
+    assert_ne!(
+        sbad,
+        StatusCode::OK,
+        "an unknown refresh token must be rejected, never graced"
+    );
+
+    // ---- Compat /_matrix/client/v3/refresh path ----
+    mock_reset(&c).await;
+    let w2 = new_wallet();
+    let login2 = wallet_login(&c, &base, &w2).await;
+
+    let (cs1, _) = compat_refresh(&c, &base, &login2.refresh_token).await;
+    assert_eq!(cs1, StatusCode::OK, "compat first refresh must succeed");
+
+    // Replay the OLD refresh token on the compat endpoint -> grace.
+    let (cs2, cv2) = compat_refresh(&c, &base, &login2.refresh_token).await;
+    assert_eq!(
+        cs2,
+        StatusCode::OK,
+        "compat grace replay of a just-rotated refresh token must succeed (got {cs2})"
+    );
+    assert!(
+        token_active(&c, cv2["access_token"].as_str().unwrap()).await,
+        "compat grace replay access token must be active"
+    );
+}

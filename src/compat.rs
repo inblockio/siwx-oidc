@@ -47,7 +47,10 @@ use crate::introspect::generate_opaque_token;
 // `AppState.synapse_client`. The lib crate re-exposes the same file as
 // `siwx_oidc::synapse_client`, which is a *distinct* type here.
 use crate::synapse_client::SynapseClient;
-use siwx_oidc::db::{DBClient, RedisClient, TokenMetadata, ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL};
+use siwx_oidc::db::{
+    DBClient, RedisClient, RotatedToken, TokenMetadata, ACCESS_TOKEN_TTL, REFRESH_GRACE_TTL,
+    REFRESH_TOKEN_TTL,
+};
 
 // -- Shared state for compat endpoints ----------------------------------------
 
@@ -445,7 +448,35 @@ pub async fn refresh(
     // Look up the refresh token.
     let metadata = match state.redis_client.get_token(&body.refresh_token).await {
         Ok(Some(m)) => m,
-        _ => {
+        Ok(None) => {
+            // Grace replay (lost-response recovery): mirror oidc::token_refresh. A
+            // just-rotated refresh token is deleted but its successor is recorded
+            // under a short grace window; a client that lost the rotation response
+            // can replay the old token once and recover instead of being logged out.
+            if let Ok(Some(succ)) = state
+                .redis_client
+                .get_rotated_token(&body.refresh_token)
+                .await
+            {
+                let expires_in = (succ.access_exp - Utc::now().timestamp()).max(0) as u64;
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "access_token": succ.access_token,
+                        "expires_in_ms": expires_in * 1000,
+                        "refresh_token": succ.refresh_token,
+                    })),
+                );
+            }
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "errcode": "M_UNKNOWN_TOKEN",
+                    "error": "Invalid refresh token"
+                })),
+            );
+        }
+        Err(_) => {
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
@@ -594,6 +625,23 @@ pub async fn refresh(
             })),
         );
     }
+
+    // Grace window (mirror oidc::token_refresh): record old refresh token -> the
+    // successor pair, so a lost rotation response can be replayed once within
+    // REFRESH_GRACE_TTL instead of signing the client out. Written only on the
+    // committed success path (after the H3/H6 recheck above). Best-effort.
+    let _ = state
+        .redis_client
+        .set_rotated_token(
+            &body.refresh_token,
+            &RotatedToken {
+                access_token: new_access_token.clone(),
+                refresh_token: new_refresh_token.clone(),
+                access_exp: now + ACCESS_TOKEN_TTL as i64,
+            },
+            REFRESH_GRACE_TTL,
+        )
+        .await;
 
     debug!(
         username = %metadata.username,

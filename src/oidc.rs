@@ -487,12 +487,32 @@ async fn token_refresh(
         })
     })?;
 
-    let metadata = db_client.get_token(&rt).await?.ok_or_else(|| {
-        CustomError::BadRequestToken(TokenError {
-            error: CoreErrorResponseType::InvalidGrant,
-            error_description: "Unknown or expired refresh token.".to_string(),
-        })
-    })?;
+    let metadata = match db_client.get_token(&rt).await? {
+        Some(m) => m,
+        None => {
+            // Grace replay (lost-response recovery): a rotated refresh token is
+            // deleted, but its successor pair is recorded under a short grace
+            // window. If the client lost the rotation response and retries with the
+            // old token, return the SAME successor instead of signing it out.
+            // Bounded by REFRESH_GRACE_TTL; genuinely unknown/expired tokens (no
+            // grace record) still fail closed below.
+            if let Some(succ) = db_client.get_rotated_token(&rt).await? {
+                let expires_in = (succ.access_exp - Utc::now().timestamp()).max(0) as u64;
+                let mut response = CoreTokenResponse::new(
+                    AccessToken::new(succ.access_token),
+                    CoreTokenType::Bearer,
+                    CoreIdTokenFields::new(None, EmptyExtraTokenFields {}),
+                );
+                response.set_expires_in(Some(&time::Duration::from_secs(expires_in)));
+                response.set_refresh_token(Some(RefreshToken::new(succ.refresh_token)));
+                return Ok(response);
+            }
+            return Err(CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::InvalidGrant,
+                error_description: "Unknown or expired refresh token.".to_string(),
+            }));
+        }
+    };
 
     if metadata.exp <= Utc::now().timestamp() {
         return Err(CustomError::BadRequestToken(TokenError {
@@ -577,6 +597,24 @@ async fn token_refresh(
             error_description: "Session has been revoked.".to_string(),
         }));
     }
+
+    // Grace window: record old refresh token -> the successor pair we just minted,
+    // so a client that LOSES this rotation response (common on mobile) can replay
+    // the old token once within REFRESH_GRACE_TTL and recover instead of being
+    // signed out. Written only here, on the committed success path (after the
+    // H3/H6 check-mint-recheck), so it can never resolve to rolled-back tokens.
+    // Best-effort: a failure must not fail the rotation the client will observe.
+    let _ = db_client
+        .set_rotated_token(
+            &rt,
+            &RotatedToken {
+                access_token: new_access.clone(),
+                refresh_token: new_refresh.clone(),
+                access_exp: now + ACCESS_TOKEN_TTL as i64,
+            },
+            REFRESH_GRACE_TTL,
+        )
+        .await;
 
     let mut response = CoreTokenResponse::new(
         AccessToken::new(new_access),

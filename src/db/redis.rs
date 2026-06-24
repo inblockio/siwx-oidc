@@ -36,6 +36,11 @@ fn user_tombstone_key(username: &str) -> String {
     format!("{}/{}", KV_USER_TOMBSTONE_PREFIX, username)
 }
 
+/// Redis key for the short-lived refresh-token rotation grace pointer.
+fn rotated_token_key(old_refresh: &str) -> String {
+    format!("{}/{}", KV_ROTATED_PREFIX, old_refresh)
+}
+
 impl RedisClient {
     pub async fn new(url: &Url) -> Result<Self> {
         let manager = RedisConnectionManager::new(url.as_str())
@@ -841,6 +846,29 @@ impl DBClient for RedisClient {
         Ok(self.get_raw(&user_tombstone_key(username)).await?.is_some())
     }
 
+    async fn set_rotated_token(
+        &self,
+        old_refresh: &str,
+        successor: &RotatedToken,
+        ttl: u64,
+    ) -> Result<()> {
+        let value = serde_json::to_string(successor)
+            .map_err(|e| anyhow!("Failed to serialize rotated token: {}", e))?;
+        self.set_ex_raw(&rotated_token_key(old_refresh), &value, ttl)
+            .await
+    }
+
+    async fn get_rotated_token(&self, old_refresh: &str) -> Result<Option<RotatedToken>> {
+        match self.get_raw(&rotated_token_key(old_refresh)).await? {
+            Some(v) => {
+                Ok(Some(serde_json::from_str(&v).map_err(|e| {
+                    anyhow!("Failed to deserialize rotated token: {}", e)
+                })?))
+            }
+            None => Ok(None),
+        }
+    }
+
     // -- Opaque token storage (MSC3861) ----------------------------------------
 
     async fn set_token(&self, token: &str, metadata: &TokenMetadata, ttl: u64) -> Result<()> {
@@ -1430,7 +1458,10 @@ mod tests {
         // answer.
         let mut warm2 = client.get_passkeys_for_did(&did, resolver).await.unwrap();
         warm2.sort();
-        assert_eq!(warm2, expected, "warm index lookup must equal the scan result");
+        assert_eq!(
+            warm2, expected,
+            "warm index lookup must equal the scan result"
+        );
 
         // Best-effort cleanup.
         for k in [
