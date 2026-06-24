@@ -406,21 +406,91 @@ async fn device_approve_handler(
     Ok(Json(resp))
 }
 
+/// `true` when a `/account|/device/passkey/start` body carries `{"all": true}` — the
+/// "use a different passkey" escape hatch that forces usernameless even with a valid
+/// `siwx_user` cookie (mirrors the login `AuthenticateStartBody.all`, H11).
+fn payload_force_all(payload: &serde_json::Value) -> bool {
+    payload
+        .get("all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Extract the opaque `siwx_user` cookie token to scope a passkey picker, or `None`
+/// when `force_all` (the `{"all":true}` escape hatch wins) or the cookie is absent.
+/// Pure (no Redis) so the escape-hatch + absent-cookie branches are unit-testable; the
+/// resolve-to-DID step is [`user_session_scope_did`].
+fn user_session_token<'a>(
+    cookies: &'a Option<TypedHeader<headers::Cookie>>,
+    force_all: bool,
+) -> Option<&'a str> {
+    if force_all {
+        return None;
+    }
+    cookies
+        .as_ref()
+        .and_then(|TypedHeader(c)| c.get(USER_SESSION_COOKIE))
+}
+
+/// Resolve the opaque `siwx_user` login cookie to a DID for scoping a passkey picker,
+/// or `None` (usernameless) when `force_all`, or when the cookie is absent, forged, or
+/// expired. NEVER errors: a Redis hiccup degrades to `None`. The login handler inlines
+/// the same read; the account + device re-auth start handlers share this.
+///
+/// Enumeration-safety: the cookie value is an opaque server token (two UUIDs); a
+/// forged/guessed value is a Redis miss -> `None` -> usernameless, leaking nothing.
+/// The picker is only an OFFER — `verify_credential` (+ `reject_if_new_identity` on
+/// the re-auth flows) still runs under the PROVEN DID, so this never relaxes auth.
+async fn user_session_scope_did(
+    redis: &RedisClient,
+    cookies: &Option<TypedHeader<headers::Cookie>>,
+    force_all: bool,
+) -> Option<String> {
+    let token = user_session_token(cookies, force_all)?;
+    redis.lookup_user_session(token).await.ok().flatten()
+}
+
+/// Build the `detected_mxid` affordance (`@localpart:server_name`) for a scoped
+/// picker, or `None` when unscoped or no `matrix_server_name` is configured. Leaks
+/// nothing: the DID came from an opaque server-side cookie the caller already owns.
+fn detected_mxid_for(server_name: Option<&str>, scope_did: Option<&str>) -> Option<String> {
+    let did = scope_did?;
+    let server_name = server_name?;
+    Some(format!("@{}:{}", oidc::did_to_localpart(did), server_name))
+}
+
 async fn device_passkey_start_handler(
     State(state): State<AppState>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
     Json(payload): Json<serde_json::Value>,
-) -> Result<Json<RequestChallengeResponse>, CustomError> {
+) -> Result<Json<AuthenticateStartResponse>, CustomError> {
     let user_code = payload
         .get("user_code")
         .and_then(|v| v.as_str())
         .ok_or_else(|| CustomError::BadRequest("Missing user_code".to_string()))?;
     device_auth::device_verify(&state.redis_client, user_code).await?;
     let session_id = format!("device_passkey_{}", user_code);
-    // None scope = usernameless (Task 6 may scope this once the device flow knows
-    // the approving identity); keeps current behavior identical.
-    let rcr =
-        wa::authenticate_start(&state.webauthn, &state.redis_client, &session_id, None).await?;
-    Ok(Json(rcr))
+    // Identity-scope the picker to the APPROVER's own passkeys when their opaque
+    // `siwx_user` login cookie is present (Path=/ reaches this endpoint via the
+    // same-origin fetch from the served /device page — no client change needed). The
+    // offer is never the security check: `verify_credential` + `reject_if_new_identity`
+    // still run under the PROVEN DID. Degrade open: absent/forged/expired cookie, or
+    // the `{"all":true}` escape hatch -> None -> usernameless, never an error.
+    let scope_did =
+        user_session_scope_did(&state.redis_client, &cookies, payload_force_all(&payload)).await;
+    let rcr = wa::authenticate_start(
+        &state.webauthn,
+        &state.redis_client,
+        &session_id,
+        scope_did.as_deref(),
+    )
+    .await?;
+    let detected_mxid =
+        detected_mxid_for(state.config.matrix_server_name.as_deref(), scope_did.as_deref());
+    Ok(Json(AuthenticateStartResponse {
+        challenge: rcr,
+        detected_mxid,
+    }))
 }
 
 async fn device_passkey_finish_handler(
@@ -931,6 +1001,7 @@ async fn account_action_handler(
 
 async fn account_passkey_start_handler(
     State(state): State<AppState>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, CustomError> {
     let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
@@ -938,13 +1009,28 @@ async fn account_passkey_start_handler(
         return Err(CustomError::BadRequest("Missing action".to_string()));
     }
     let session_id = format!("account_passkey_{}", uuid::Uuid::new_v4());
-    // None scope = usernameless. Task 6 wires the cookie/known-identity DID here to
-    // scope the account re-auth picker; until then behavior is unchanged.
-    let rcr =
-        wa::authenticate_start(&state.webauthn, &state.redis_client, &session_id, None).await?;
+    // Identity-scope the account re-auth picker to the OWNER's own passkeys when their
+    // opaque `siwx_user` login cookie is present (Path=/ reaches this endpoint). The
+    // offer is never the security check: `reject_if_new_identity` + the proven DID at
+    // `/account/passkey/finish` enforce account ownership. Degrade open: absent/forged/
+    // expired cookie or the `{"all":true}` escape hatch -> None -> usernameless.
+    let scope_did =
+        user_session_scope_did(&state.redis_client, &cookies, payload_force_all(&payload)).await;
+    let rcr = wa::authenticate_start(
+        &state.webauthn,
+        &state.redis_client,
+        &session_id,
+        scope_did.as_deref(),
+    )
+    .await?;
     let mut value = serde_json::to_value(&rcr)
         .map_err(|e| anyhow::anyhow!("Failed to serialize challenge: {}", e))?;
     value["session_id"] = serde_json::json!(session_id);
+    if let Some(mxid) =
+        detected_mxid_for(state.config.matrix_server_name.as_deref(), scope_did.as_deref())
+    {
+        value["detected_mxid"] = serde_json::json!(mxid);
+    }
     Ok(Json(value))
 }
 
@@ -1356,5 +1442,96 @@ mod unknown_credential_response_tests {
         .unwrap();
         assert_eq!(unscoped["publicKey"]["challenge"], "AAECAwQFBgcICQ");
         assert!(unscoped.get("detected_mxid").is_none());
+    }
+
+    /// H3 (escape hatch): the account/device `{"all":true}` body flag forces
+    /// usernameless; everything else (absent, non-bool, unrelated body) means "scope
+    /// as normal". Pure wire contract, infra-free.
+    #[test]
+    fn payload_force_all_reads_escape_hatch_only_on_literal_true() {
+        assert!(payload_force_all(&serde_json::json!({ "all": true })));
+        assert!(!payload_force_all(&serde_json::json!({ "all": false })));
+        // Absent / wrong-typed / unrelated payloads must NOT force open.
+        assert!(!payload_force_all(&serde_json::json!({ "action": "org.matrix.profile" })));
+        assert!(!payload_force_all(&serde_json::json!({ "user_code": "ABC-DEF" })));
+        assert!(!payload_force_all(&serde_json::json!({ "all": "true" })));
+        assert!(!payload_force_all(&serde_json::json!({})));
+    }
+
+    /// H3 (cookie extraction + escape hatch): `user_session_token` returns the
+    /// opaque `siwx_user` value when present and not forced, `None` for an absent
+    /// cookie (first-time visitor, no Cookie header), `None` when another cookie is
+    /// present but `siwx_user` is not, and `None` whenever `force_all` is set even if
+    /// a valid cookie is present. Pure (no Redis).
+    #[test]
+    fn user_session_token_reads_cookie_and_honors_escape_hatch() {
+        // Absent Cookie header entirely -> None (degrade open; no panic).
+        let none: Option<TypedHeader<headers::Cookie>> = None;
+        assert_eq!(user_session_token(&none, false), None);
+        assert_eq!(user_session_token(&none, true), None);
+
+        // A present `siwx_user` cookie is read out verbatim (the opaque token).
+        let hv = axum::http::HeaderValue::from_static("siwx_user=tok123abc; foo=bar");
+        let cookie = headers::Cookie::decode(&mut std::iter::once(&hv)).expect("decode cookie");
+        let present = Some(TypedHeader(cookie));
+        assert_eq!(user_session_token(&present, false), Some("tok123abc"));
+        // ...but the `{"all":true}` escape hatch wins even with a valid cookie present.
+        assert_eq!(user_session_token(&present, true), None);
+
+        // A Cookie header WITHOUT `siwx_user` -> None (other cookies never scope).
+        let hv2 = axum::http::HeaderValue::from_static("acct_session=zzz; foo=bar");
+        let cookie2 = headers::Cookie::decode(&mut std::iter::once(&hv2)).expect("decode cookie");
+        assert_eq!(user_session_token(&Some(TypedHeader(cookie2)), false), None);
+    }
+
+    /// The `detected_mxid` affordance is present ONLY when both a scoped DID and a
+    /// configured `matrix_server_name` exist; otherwise `None` (unscoped, or a
+    /// standalone deployment with no server_name). Pure, infra-free.
+    #[test]
+    fn detected_mxid_only_when_scoped_and_server_named() {
+        // Unscoped (no DID) -> None regardless of server_name.
+        assert_eq!(detected_mxid_for(Some("matrix.example.com"), None), None);
+        // Scoped but no server_name configured -> None (standalone degrades cleanly).
+        assert_eq!(detected_mxid_for(None, Some("did:key:zDnABC")), None);
+        // Scoped + server_name -> @localpart:server.
+        let mxid = detected_mxid_for(Some("matrix.example.com"), Some("did:key:zDnABC"))
+            .expect("scoped + server_name -> Some");
+        assert!(mxid.starts_with('@'), "mxid starts with @: {mxid}");
+        assert!(
+            mxid.ends_with(":matrix.example.com"),
+            "mxid ends with the server name: {mxid}"
+        );
+    }
+
+    /// H3/AC6 (degrade-open on a Redis ERROR, not merely a miss): the load-bearing
+    /// `.ok().flatten()` in `user_session_scope_did` must turn a Redis fault into a
+    /// usernameless `None`, NEVER propagate it (which would 500 the picker). A future
+    /// refactor to `?` would break this invariant while every miss-path test stayed
+    /// green — so pin the error path here. We force a real, fast `WRONGTYPE` error by
+    /// storing the `user:session/{token}` key as a SET, so the `GET` in
+    /// `lookup_user_session` errors. Requires Redis on localhost; skips if absent.
+    #[tokio::test]
+    async fn user_session_scope_did_degrades_open_on_redis_error() {
+        let redis = match RedisClient::new(&url::Url::parse("redis://localhost").unwrap()).await {
+            Ok(c) => c,
+            Err(_) => return, // no Redis: skip (CI provides one)
+        };
+        let token = format!("wrongtype{}", uuid::Uuid::new_v4().simple());
+        // KV_USER_SESSION_PREFIX is in scope via `use siwx_oidc::db::*` at the top.
+        let key = format!("{}/{}", KV_USER_SESSION_PREFIX, token);
+        // SET-typed value at the exact key lookup_user_session GETs -> WRONGTYPE error.
+        redis.sadd_raw(&key, "x").await.expect("seed wrong-type key");
+
+        let header = format!("siwx_user={token}");
+        let hv = axum::http::HeaderValue::from_str(&header).expect("header value");
+        let cookie = headers::Cookie::decode(&mut std::iter::once(&hv)).expect("decode cookie");
+
+        let scope = user_session_scope_did(&redis, &Some(TypedHeader(cookie)), false).await;
+        assert!(
+            scope.is_none(),
+            "a Redis GET error MUST degrade open to None (usernameless), never propagate"
+        );
+
+        redis.del_raw(&key).await.ok();
     }
 }
