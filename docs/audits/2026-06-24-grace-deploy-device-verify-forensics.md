@@ -347,3 +347,268 @@ re-cut on its own merits (it fixes the Element-X mobile sign-out). Confidence: H
 ```
 
 Full-window systemic check: `keys/device_signing/upload` = 14 lines, 100% this DID, 100% 401.
+
+---
+
+# UPDATE: reauth executed, grant not delivered — root cause
+
+**Date appended:** 2026-06-24 (later same day).
+**Supersedes** the §3 conclusion ("the client never opened the reauth path"). **New
+operator evidence** from the affected user (`@did-pkh-eip155-1-0x23d673…`): they *did*
+open `GET /account?action=org.matrix.cross_signing_reset`, completed the wallet/passkey
+re-auth, and **the account page showed a SUCCESS message** — yet a subsequent
+`POST /_matrix/client/v3/keys/device_signing/upload` **still returned 401**. So the
+question is no longer "did they reauth?" (they did) but "why did a *successful* reauth
+not produce a grant Synapse honors for the next upload?" This section answers that with
+file:line evidence and corrects the record.
+
+> Note on the surviving Synapse log: the 14×401 burst at 05:36–05:37 in §1 with **no
+> later retry** is consistent with the reauth happening *after* the user gave up the
+> first burst (the `/account` round-trip is on the siwx-oidc host and is invisible to the
+> Synapse access log; only a *post-reauth* `device_signing/upload` would show, and the
+> user reports that one ALSO 401'd, off the captured window). The mechanism below is
+> independent of which build was running and explains the 401-after-success directly.
+
+## A. The exact end-to-end mechanism (read from source)
+
+**1. siwx-oidc side — what "success" actually means.**
+The reauth POSTs to `/account/wallet` (`account::account_wallet`,
+`src/account.rs:597`) or `/account/passkey/finish` (`account::account_passkey_finish`,
+`src/account.rs:693`). Both verify the signature/assertion + single-use nonce, then call
+the SAME `execute_action(Action::CrossSigningReset, …)` (`src/account.rs:354`). The
+reset arm is `src/account.rs:364-375`:
+
+```rust
+Action::CrossSigningReset => {
+    let synapse = require_synapse(synapse_client)?;
+    synapse
+        .allow_cross_signing_reset(&localpart)            // src/account.rs:366-368
+        .await
+        .map_err(|e| { warn!(…); CustomError::BadRequest("Failed to reset cross-signing keys"…) })?;
+    info!(did = %did, "cross-signing reset allowed via account management page");
+    Ok(ActionOutcome::Completed)                          // src/account.rs:374
+}
+```
+
+`ActionOutcome::Completed` flows back as `status:"completed"` and the page JS renders the
+green terminal banner **"Encryption keys reset / Your client can now set up new
+encryption keys. You can close this page."** (`renderOutcome` `case 'completed'`,
+`src/account.rs:1608-1610`).
+
+`allow_cross_signing_reset` (`src/synapse_client.rs:130-148`) does exactly one thing:
+
+```rust
+let url = format!("{}/_synapse/mas/allow_cross_signing_reset", self.endpoint);  // :131
+let resp = self.http.post(&url).bearer_auth(&self.shared_secret)
+    .json(&json!({ "localpart": localpart })).send().await …;                   // :132-139
+if !resp.status().is_success() { … bail!("…: HTTP {status}"); }                 // :141-146
+Ok(())
+```
+
+So **siwx-oidc's notion of "success" is precisely: the MAS admin endpoint
+`POST /_synapse/mas/allow_cross_signing_reset` returned a 2xx for this `localpart`.**
+Nothing more is checked.
+
+**2. Synapse side — what gates `device_signing/upload`, and what the MAS call sets.**
+From the grounded source citations in
+`../siwx-oidc-matrix-server/docs/2026-05-29-cross-signing-identity-stability-handover.md:29-30`
+(Synapse v1.153.0) and `skills/siwx-matrix-device-verify.md:249-273`:
+
+- The upload gate is `rest/client/keys.py:403`: `device_signing/upload` is rejected
+  (the MSC3861 out-of-band-auth challenge, observed here as **401**) **iff**
+  `is_cross_signing_setup AND NOT master_key_updatable_without_uia`.
+- `master_key_updatable_without_uia` is true **iff** the master row's
+  `updatable_without_uia_before_ms` is in the future. That is a **per-user, time-boxed,
+  master-key-row-scoped** flag on `e2e_cross_signing_keys WHERE keytype='master'`
+  (verify query in `skills/siwx-matrix-device-verify.md:255-268`).
+- The MAS `allow_cross_signing_reset` admin endpoint sets that column to
+  `now + REPLACEMENT_PERIOD_MS`, where **`REPLACEMENT_PERIOD_MS = 10 min`**
+  (`rest/admin/users.py:1290-1318`). It does so with an **UPDATE … WHERE keytype='master'**
+  on the storage path (`storage/databases/main/end_to_end_keys.py:1679-1716`).
+
+**The contract, stated exactly:** siwx-oidc *pushes* a grant; it does NOT get called back.
+The grant is **a 10-minute, per-USER (localpart), master-key-row-scoped UIA-bypass window**
+(`updatable_without_uia_before_ms`). It is **not** keyed to the upload's access
+token/device/session — any `device_signing/upload` from that user within 10 min passes the
+gate. Crucially, the write is an **UPDATE of an existing master row**: if there is **no
+published master-key row** for the user at the instant the MAS call runs, the UPDATE
+matches `rowcount == 0` — the window is **not** planted on a row the upload gate will read.
+
+## B. The gap — why SUCCESS is shown but the grant is not effective
+
+Put the two halves together against the §1 timeline and the failure is structural, not a
+typo. **At the moment the user completes reauth, the relevant master-key row is in a state
+where the MAS UPDATE does not produce an effective bypass for the upload that follows** —
+and siwx-oidc reports success anyway because it only inspects the *HTTP status of its own
+push*, never the *resulting gate state the client's upload will hit*.
+
+Two concrete, code-confirmed contributors, either of which alone yields "success shown,
+401 persists":
+
+**(b) + (a) The success banner is decoupled from the gate's effectiveness
+(PRIMARY — confirmed).** `execute_action` renders `Completed` (→ "Encryption keys reset")
+**purely** from `allow_cross_signing_reset` returning `Ok(())`
+(`src/account.rs:366-374` + `src/synapse_client.rs:141-147`), i.e. purely from the MAS
+endpoint's 2xx. siwx-oidc performs **zero** post-grant verification that
+`updatable_without_uia_before_ms` is now in the future on a master row, and **zero**
+confirmation that a publishable master key even exists. So whenever the MAS endpoint
+returns 2xx **without** actually arming an honored window (see (f)), the user is shown an
+unconditional "you can now set up new encryption keys," while Synapse's gate is unchanged
+and the very next `device_signing/upload` 401s. **This is the bug: the reauth-success
+signal does not measure the thing it claims** (`src/account.rs:374`, `src/account.rs:1609-1610`).
+
+**(f) The MAS UPDATE is a no-op against the master row the *reset* needs
+(MECHANISM — confirmed by the timeline).** This incident is a **reset that DELETED the old
+identity and never republished a new public master**: §1 shows
+`DELETE /room_keys/version/3` then private-half writes to account-data, with
+`device_signing/upload` 401ing 14× — i.e. **the new public master key was never landed**,
+and the old one is being replaced. In that window the `allow_cross_signing_reset` UPDATE
+`WHERE keytype='master'` has **no current/target master row to flip into the future** (the
+handover doc's "virgin account" no-op is the same code path:
+`…handover.md:30`, "with no master key `rowcount==0`"). The grant therefore does not become
+effective for the pending upload even though the admin call may return 2xx. Because of (b),
+this is invisible to the user.
+
+**Failure modes ruled out (so the report is precise):**
+- *(c) wrong localpart/case scope* — RULED OUT for this user. The grant keys on
+  `did_to_localpart(did)` = `did.replace(':','-').to_lowercase()` (`src/oidc.rs:1513-1515`);
+  this DID is already all-lowercase, so the localpart is identical between any sign-in and
+  the reauth. (It remains a latent hazard for mixed-case wallet addresses, but it is not
+  what bit here.)
+- *(c') wrong token/device scope* — N/A by contract: the grant is per-USER, not per-token
+  or per-device (§A.2). The upload not "carrying" the grant is not the failure; a per-user
+  window would cover any of the user's uploads.
+- *(d) TTL expiry / one-shot consumption* — POSSIBLE as a *secondary* aggravator (the
+  window is 10 min and the user retried/looped through two 4S setups), but it is **not the
+  primary cause**: even a freshly-issued window is ineffective under (f) because there is no
+  master row to carry it, and (b) hides that regardless of TTL.
+- *(e) account-session vs upload token mismatch* — N/A for the same reason as (c'): the
+  bypass is not token-scoped.
+- The earlier §3 verdict *"the client never called reauth"* — **CORRECTED**: the operator
+  evidence is that reauth ran and reported success; the defect is in grant
+  delivery/effectiveness + an unverified success signal, not in the client failing to
+  navigate.
+
+**One-line root cause:** siwx-oidc shows an unconditional cross-signing-reset SUCCESS the
+moment its `POST /_synapse/mas/allow_cross_signing_reset` returns 2xx
+(`src/account.rs:366-374`, `src/synapse_client.rs:141-147`, banner at
+`src/account.rs:1609-1610`), but that admin call only arms an **honored** UIA-bypass window
+when a **published master-key row already exists** (it is an `UPDATE … WHERE
+keytype='master'`); during a destructive *reset* — exactly this incident — no current
+master row is present, so the window is never planted on the row the upload gate reads, the
+grant is not effective, and the next `device_signing/upload` keeps 401ing while the user has
+been told it succeeded.
+
+## C. Recommended FIX shape (analysis only — not implemented here)
+
+The fix must make a rendered reset-SUCCESS **imply** an effective, upload-honored grant.
+Smallest correct change, in two parts:
+
+1. **Make "success" measure the gate, not the push (closes (b)).** After
+   `allow_cross_signing_reset` returns `Ok(())`, do **not** immediately return
+   `Completed`. Confirm the grant is effective for the user before claiming success — e.g.
+   read back the master row's `updatable_without_uia_before_ms` and require it to be in the
+   future (preferred: add a tiny MAS/admin read, or reuse the admin `GET users/{mxid}` key
+   info), OR have the MAS endpoint return a typed result that distinguishes "window armed
+   on an existing master" from "no master to arm." If it is not effective, render an
+   actionable non-success state instead of the green banner.
+
+2. **Handle the no-current-master reset case explicitly (closes (f)).** A reset that has
+   no published master (deleted/never-republished) cannot be "allowed" by flipping a
+   non-existent row. The grant for that case must arm a window that the *first publish* of a
+   brand-new master will honor (i.e. the bypass must apply to the upcoming
+   `device_signing/upload` even when `is_cross_signing_setup` is currently false/empty), or
+   the flow must drive the client to publish first then authorize. This is partly a
+   Synapse/MAS-contract question: confirm whether `allow_cross_signing_reset` (the
+   `REPLACEMENT_PERIOD` window) can be armed **pre-publish** for a user whose master row is
+   absent; if the upstream endpoint cannot, siwx-oidc must detect the no-master case and
+   surface "your client will publish a new identity; keep this page open" rather than a
+   false "done." Either way, **the success banner must be gated on the grant actually being
+   honored**, per part 1.
+
+   *Belt-and-suspenders (cheap, do it too):* lowercase-normalize is already correct, but
+   add a regression assertion that the localpart used for `allow_cross_signing_reset`
+   byte-matches the localpart Synapse stores, so the latent mixed-case (c) hazard cannot
+   regress into this same symptom.
+
+**Behavioral acceptance:** after the fix, completing reauth either (i) yields a state where
+the immediately following `device_signing/upload` returns **200**, or (ii) shows a truthful
+non-success message — but it never shows "Encryption keys reset" while the upload still
+401s.
+
+## D. How to TEST it end-to-end (reset → reauth → `device_signing/upload` 200)
+
+Use the project's real-Synapse harness, not mocks (the gate lives in Synapse). The
+matrix-server e2e stack already has a live round-trip slot:
+`../siwx-oidc-matrix-server/e2e-harness/run.sh:115`
+(`siwx-oidc.msc4191_live.cross_signing_reset_round_trip_live`) and the ignored AC test
+`cargo test --test e2e_msc4191_live cross_signing_reset_round_trip_live -- --ignored`.
+Extend it to assert the **upload-honored** property, covering BOTH master states:
+
+1. **Bootstrapped-master case (must stay green):** provision a user, publish a master via a
+   first `device_signing/upload` (200, MSC3967 no-UIA), then attempt a *second*
+   `device_signing/upload` (the reset) → expect **401**. Drive the siwx-oidc reset reauth
+   (`/account/wallet` or `/account/passkey/finish` with a valid single-use nonce) → assert
+   the JSON outcome is `completed`. Then re-issue `device_signing/upload` within 10 min →
+   **assert 200** (today's gap: this leg is what currently regresses to 401). Also assert,
+   via the admin/DB probe in `skills/siwx-matrix-device-verify.md:255-268`, that
+   `updatable_without_uia_before_ms` is in the future for that user's master row.
+
+2. **Destructive-reset / no-current-master case (the actual incident — currently red):**
+   reproduce the §1 sequence — delete the key backup + master and leave the public master
+   unpublished — then call the siwx-oidc reset reauth. **Assert the contract:** the page
+   must NOT render `completed`/"Encryption keys reset" unless a following
+   `device_signing/upload` actually returns **200**. (Pre-fix this test FAILS: siwx-oidc
+   returns `completed` while the upload still 401s — that failing assertion is the bug
+   captured as a test.)
+
+3. **Negative/keying guard:** run the reset reauth with a mixed-case wallet DID and assert
+   the localpart sent to `/_synapse/mas/allow_cross_signing_reset` equals the lowercased
+   localpart Synapse uses (regression lock for (c)).
+
+Local stack to run against: the hermetic `docker-compose.e2e.yml` Synapse + siwx-oidc in
+`../siwx-oidc-matrix-server` (see that repo's CLAUDE.md "Build and deployment model" and
+`e2e-harness/`), with `SIWEOIDC_MATRIX_SERVER_NAME` + a Synapse client configured so
+`execute_action` reaches the live MAS endpoint rather than the standalone `BadRequest`
+degrade path.
+
+## E. Citations (this section)
+
+```
+siwx-oidc (eff6044):
+  src/account.rs:354-375      execute_action → Action::CrossSigningReset (success = MAS 2xx only)
+  src/account.rs:374          Ok(ActionOutcome::Completed)               ← unconditional success
+  src/account.rs:597-688      account_wallet  (reauth path → execute_action)
+  src/account.rs:693-742      account_passkey_finish (reauth path → execute_action)
+  src/account.rs:1608-1610    renderOutcome 'completed' → "Encryption keys reset" banner
+  src/synapse_client.rs:130-148  allow_cross_signing_reset → POST /_synapse/mas/allow_cross_signing_reset {localpart}
+  src/synapse_client.rs:141-146  only the HTTP status is inspected; no gate read-back
+  src/oidc.rs:1513-1515       did_to_localpart = replace(':','-').to_lowercase()  (grant key)
+
+Synapse v1.153.0 contract (cited in matrix-server docs, not vendored here):
+  rest/client/keys.py:403                       upload gate: reject iff is_cross_signing_setup AND NOT master_key_updatable_without_uia
+  rest/admin/users.py:1290-1318                 REPLACEMENT_PERIOD_MS = 10 min; sets updatable_without_uia_before_ms
+  storage/databases/main/end_to_end_keys.py:1679-1716  UPDATE … WHERE keytype='master' (rowcount==0 if no master)
+  → ../siwx-oidc-matrix-server/docs/2026-05-29-cross-signing-identity-stability-handover.md:29-30
+  → ../siwx-oidc-matrix-server/skills/siwx-matrix-device-verify.md:249-273 (403/401 window-expiry symptom + DB probe)
+
+Test slots:
+  ../siwx-oidc-matrix-server/e2e-harness/run.sh:115   cross_signing_reset_round_trip_live
+```
+
+## F. Design-doc cross-check (did the code drift?)
+
+- `docs/superpowers/plans/2026-05-29-cross-signing-identity-stability.md` (H3) and the
+  matrix-server CLAUDE.md "Device lifecycle" deliberately moved `allow_cross_signing_reset`
+  to be fired **only** on the explicit `account.rs` reset path (removing per-login resets).
+  The code matches that intent — the single caller is `execute_action`
+  (`src/account.rs:367`). **No drift there.**
+- What the design docs **never specified** is a *post-grant effectiveness check* or the
+  *no-current-master reset* case. The MAS-compat design
+  (`docs/superpowers/specs/2026-05-18-msc3861-siwx-oidc-mas-compat-design.md:112,209`) and
+  the handover both describe `allow_cross_signing_reset` only as "called → no verification
+  prompt," implicitly assuming an already-bootstrapped master. The implementation faithfully
+  encodes that optimistic assumption (success = MAS 2xx), so this is a **design gap carried
+  verbatim into code**, not a regression from the documented design. The grace deploy
+  (`db79e75..main`) does not touch any of these lines (confirmed in §5), so the bug is
+  pre-existing and build-independent — consistent with the original causation verdict.
