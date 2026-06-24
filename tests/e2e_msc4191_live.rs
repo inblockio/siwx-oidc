@@ -340,23 +340,37 @@ async fn whoami_device_id(token: &str) -> Option<String> {
 }
 
 /// CAIP-122 message for an MSC4191 account action, matching the format the
-/// account page's `authWallet` JS builds. The server only checks the signature
-/// is valid for the DID (no nonce binding), so any well-formed message works.
-fn account_action_message(address: &str) -> String {
+/// account page's `authWallet` JS builds. The current server REQUIRES a
+/// server-issued single-use nonce (bound to THIS action) from
+/// `GET /account/nonce?action=<action>`, an Expiration Time, and the action's
+/// Resources audience (`{base}/account?action=<action>`). This mirrors the
+/// working reference `sign_account_message` in `tests/e2e_account_management.rs`.
+async fn account_action_message(address: &str, action: &str) -> String {
     let base = siweoidc_host();
+    let http = Client::new();
     let domain = reqwest::Url::parse(&base)
         .ok()
         .and_then(|u| u.host_str().map(|h| h.to_string()))
         .unwrap_or_else(|| base.clone());
-    let nonce: String = {
-        use rand::Rng;
-        thread_rng()
-            .sample_iter(&rand::distributions::Alphanumeric)
-            .take(16)
-            .map(char::from)
-            .collect::<String>()
-            .to_lowercase()
-    };
+    // Fetch the server-issued nonce bound to this action.
+    let np: Value = http
+        .get(format!("{base}/account/nonce?action={action}"))
+        .send()
+        .await
+        .expect("account/nonce request failed")
+        .json()
+        .await
+        .expect("account/nonce body must be JSON");
+    let nonce = np["nonce"].as_str().expect("nonce response must carry nonce");
+    let expiration_time = np["expiration_time"]
+        .as_str()
+        .expect("nonce response must carry expiration_time");
+    let resources: Vec<String> = np["resources"]
+        .as_array()
+        .expect("nonce response must carry resources")
+        .iter()
+        .map(|r| format!("\n- {}", r.as_str().unwrap()))
+        .collect();
     let issued_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     format!(
         "{domain} wants you to sign in with your Ethereum account:\n\
@@ -366,12 +380,16 @@ fn account_action_message(address: &str) -> String {
          Version: 1\n\
          Chain ID: 1\n\
          Nonce: {nonce}\n\
-         Issued At: {issued_at}",
+         Issued At: {issued_at}\n\
+         Expiration Time: {expiration_time}\n\
+         Resources:{res}",
         domain = domain,
         address = address,
         base = base,
         nonce = nonce,
         issued_at = issued_at,
+        expiration_time = expiration_time,
+        res = resources.concat(),
     )
 }
 
@@ -387,7 +405,7 @@ async fn post_account_action(
 ) -> (StatusCode, String) {
     let base = siweoidc_host();
     let http = Client::new();
-    let message = account_action_message(address);
+    let message = account_action_message(address, action).await;
     let signature = eip191_sign(signing_key, &message);
     let body = serde_json::json!({
         "action": action,

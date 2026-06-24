@@ -303,6 +303,32 @@ async fn whoami_status(token: &str) -> StatusCode {
         .status()
 }
 
+/// Poll `whoami` until the token is rejected (401/403), returning the final
+/// status. Synapse caches MSC3861 introspection results for ~2 minutes, so a
+/// token whose OAuth session was already torn down server-side (visible in the
+/// OIDC logs as "session torn down") still authenticates against Matrix for a
+/// short window. The 401 only appears once that cache expires. Bounded at 150s
+/// (just past the 2-minute window) with a 5s interval, exiting early on the
+/// first 401/403 — mirrors the poll in `msc4191_device_management_live`.
+async fn poll_whoami_rejected(token: &str) -> StatusCode {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
+    let mut last = whoami_status(token).await;
+    let mut attempt = 0u32;
+    while std::time::Instant::now() < deadline {
+        if last == StatusCode::UNAUTHORIZED || last == StatusCode::FORBIDDEN {
+            return last;
+        }
+        attempt += 1;
+        eprintln!(
+            "[e2e] whoami still {} (introspection cache); retry {attempt} in 5s",
+            last
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        last = whoami_status(token).await;
+    }
+    last
+}
+
 // ---------------------------------------------------------------------------
 // H1: logout tears down the ending session's Synapse device + tokens
 // ---------------------------------------------------------------------------
@@ -344,7 +370,7 @@ async fn logout_deletes_ending_session_device() {
     );
 
     assert_eq!(
-        whoami_status(&token).await,
+        poll_whoami_rejected(&token).await,
         StatusCode::UNAUTHORIZED,
         "after logout the session token must be rejected (device deleted + tokens revoked)"
     );
@@ -381,7 +407,7 @@ async fn revoke_deletes_session_device() {
     );
 
     assert_eq!(
-        whoami_status(&token).await,
+        poll_whoami_rejected(&token).await,
         StatusCode::UNAUTHORIZED,
         "after revoke the session token must be rejected"
     );
@@ -426,14 +452,14 @@ async fn logout_all_invalidates_all_sessions_without_deactivating() {
         return;
     }
 
-    // Both sessions must now be rejected.
+    // Both sessions must now be rejected (poll past the introspection cache).
     assert_eq!(
-        whoami_status(&token1).await,
+        poll_whoami_rejected(&token1).await,
         StatusCode::UNAUTHORIZED,
         "session 1 must be invalidated by logout/all"
     );
     assert_eq!(
-        whoami_status(&token2).await,
+        poll_whoami_rejected(&token2).await,
         StatusCode::UNAUTHORIZED,
         "session 2 (other device) must be invalidated by logout/all"
     );

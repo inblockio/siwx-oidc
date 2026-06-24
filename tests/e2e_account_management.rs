@@ -339,6 +339,7 @@ async fn account_action_csrf_mismatch_is_unauthorized() {
     let base = oidc();
     mock_reset(&c).await;
     let w = new_wallet();
+    mock_seed_device(&c, &w.mxid, "SIWX_dev_csrf").await;
     let (message, signature) = sign_account_message(&c, &w, &base, "org.matrix.profile").await;
     let resp = c
         .post(format!("{base}/account/wallet"))
