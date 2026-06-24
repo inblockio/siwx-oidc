@@ -186,6 +186,17 @@ pub struct AccountActionRequest {
 pub enum ActionOutcome {
     /// A side-effecting action with nothing to render (cross_signing_reset).
     Completed,
+    /// A cross-signing reset whose grant could NOT be confirmed effective.
+    ///
+    /// The MAS `allow_cross_signing_reset` call returned 2xx, but the post-grant
+    /// readback (`has_cross_signing_keys`) could not confirm the reset is in a
+    /// state Synapse's `keys/device_signing/upload` gate will honor (e.g. the
+    /// readback itself failed, so effectiveness is indeterminate). This is the
+    /// TRUTHFUL non-success outcome that replaces the historical unconditional
+    /// "Encryption keys reset" banner whenever effectiveness is not established,
+    /// so the user is never told a half-applied reset succeeded. Carries
+    /// human-readable `guidance` the page renders verbatim.
+    ResetUnconfirmed { guidance: String },
     /// The user's identity (profile).
     Profile { did: String, user_id: String },
     /// The user's full device list (devices_list).
@@ -343,6 +354,95 @@ fn require_device_id(device_id: Option<&str>) -> Result<&str, CustomError> {
         .ok_or_else(|| CustomError::BadRequest("This action requires a device_id".to_string()))
 }
 
+// -- Cross-signing-reset truthful-success gating ------------------------------
+//
+// The reset lever is `SynapseClient::allow_cross_signing_reset`, which plants a
+// 10-minute, per-user, master-row-scoped UIA-bypass window via Synapse's MAS
+// admin endpoint (`UPDATE e2e_cross_signing_keys SET
+// updatable_without_uia_before_ms WHERE keytype='master'`). Empirically
+// (Synapse 1.154.0):
+//
+//   - master row exists + window planted  -> `keys/device_signing/upload` OK
+//   - NO master row                        -> the upload gate is SKIPPED entirely
+//     (`is_cross_signing_setup` is false), so the upload is honored ANYWAY; the
+//     `UPDATE` matched 0 rows but that is harmless here.
+//   - master row exists + window NOT planted (a genuine Synapse write error) ->
+//     the upload still 401s. THIS is the only "allow returned 2xx but the reset
+//     is not effective" case, and historically siwx-oidc still rendered SUCCESS
+//     because it inspected only its own 2xx.
+//
+// The MAS call NEVER returns the window timestamp, so siwx-oidc cannot read the
+// window back directly. What it CAN read back is master-row presence
+// (`has_cross_signing_keys`). [`reset_outcome`] turns `(allow_ok, readback)` into
+// a truthful [`ActionOutcome`]: success is rendered ONLY when effectiveness is
+// established by the contract above; otherwise a truthful non-success is returned
+// (fail-closed), never the success banner.
+
+/// Stable `tracing` target for every cross-signing-reset log line, so a future
+/// "reset shown success but upload 401" occurrence is greppable in aggregated
+/// logs (the prod logs for the original incident were lost). Grep: `target=cross_signing_reset`.
+pub(crate) const CROSS_SIGNING_RESET_LOG_TARGET: &str = "cross_signing_reset";
+
+/// Guidance shown to the user when a cross-signing reset grant could not be
+/// confirmed effective (the truthful non-success path). Kept as one constant so
+/// the wording is testable and consistent across the wallet/passkey/session
+/// re-auth entry points.
+pub(crate) const RESET_UNCONFIRMED_GUIDANCE: &str =
+    "We could not confirm your encryption identity reset took effect. Your keys were \
+     not changed. Please try again in a moment, or contact support if this keeps happening.";
+
+/// The post-grant readback of the user's master cross-signing key, the load-bearing
+/// input to [`reset_outcome`]. Distinguishes the three states siwx-oidc can observe
+/// after calling `allow_cross_signing_reset`:
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ResetReadback {
+    /// A published master row exists. Per the contract the MAS `UPDATE … WHERE
+    /// keytype='master'` had a row to plant the window on, so the reset is taken to
+    /// be effective for the next `device_signing/upload`.
+    MasterPresent,
+    /// No published master row. The Synapse upload gate is skipped entirely
+    /// (`is_cross_signing_setup` is false), so the next upload is honored anyway —
+    /// effective by a different branch of the contract.
+    NoMaster,
+    /// The readback itself could not be performed (Synapse unreachable / malformed
+    /// response). Effectiveness is INDETERMINATE; we fail closed and refuse to
+    /// claim success.
+    Indeterminate,
+}
+
+/// Pure decision: given whether `allow_cross_signing_reset` returned Ok(2xx) and
+/// the post-grant master-key [`ResetReadback`], decide the truthful
+/// [`ActionOutcome`]. This is the testable seam for the honesty fix.
+///
+/// Truth table (Synapse 1.154.0 contract):
+///
+/// | `allow_ok` | `readback`      | outcome                              |
+/// |------------|-----------------|--------------------------------------|
+/// | `false`    | (any)           | (caller already errored — see below) |
+/// | `true`     | `MasterPresent` | `Completed` (window planted)         |
+/// | `true`     | `NoMaster`      | `Completed` (gate skipped, upload OK) |
+/// | `true`     | `Indeterminate` | `ResetUnconfirmed` (fail closed)     |
+///
+/// `allow_ok == false` is handled at the call site by the existing error path
+/// (`allow_cross_signing_reset` bails on a non-2xx, mapped to `CustomError`), so it
+/// never reaches a rendered `Completed`; it is included here for completeness and
+/// to lock the invariant in tests: a failed allow can NEVER yield `Completed`.
+pub(crate) fn reset_outcome(allow_ok: bool, readback: ResetReadback) -> ActionOutcome {
+    match (allow_ok, readback) {
+        // The grant landed AND a master row exists -> the UIA-bypass window was
+        // planted on it; the reset is effective.
+        (true, ResetReadback::MasterPresent) => ActionOutcome::Completed,
+        // The grant landed and there is no master row -> Synapse skips the upload
+        // gate, so the next upload is honored regardless. Effective.
+        (true, ResetReadback::NoMaster) => ActionOutcome::Completed,
+        // Either the grant did not land, or we could not confirm effectiveness.
+        // Fail closed: never claim success when it is not established.
+        (_, ResetReadback::Indeterminate) | (false, _) => ActionOutcome::ResetUnconfirmed {
+            guidance: RESET_UNCONFIRMED_GUIDANCE.to_string(),
+        },
+    }
+}
+
 // -- Action execution ---------------------------------------------------------
 
 /// Execute a (canonicalized) account action for an already-authenticated `did`.
@@ -363,15 +463,71 @@ async fn execute_action(
     match action {
         Action::CrossSigningReset => {
             let synapse = require_synapse(synapse_client)?;
-            synapse
-                .allow_cross_signing_reset(&localpart)
-                .await
-                .map_err(|e| {
-                    warn!(error = %e, "allow_cross_signing_reset failed during account action");
-                    CustomError::BadRequest("Failed to reset cross-signing keys".to_string())
-                })?;
-            info!(did = %did, "cross-signing reset allowed via account management page");
-            Ok(ActionOutcome::Completed)
+            // The readback needs the mxid, so the reset now requires a configured
+            // server_name (consistent with the other Synapse-backed actions). In the
+            // MSC3861 deployment where reset runs, SIWEOIDC_MATRIX_SERVER_NAME is set;
+            // a clear BadRequest (never a 500) is returned if it is absent.
+            let server = require_server_name(server_name)?;
+
+            // 1) Plant the grant. A non-2xx here is a genuine failure: surface it as
+            //    the existing error path so the user is NEVER shown success. Logged on
+            //    the stable target with the localpart for forensics.
+            if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
+                warn!(
+                    target: CROSS_SIGNING_RESET_LOG_TARGET,
+                    localpart = %localpart,
+                    allow_ok = false,
+                    error = %e,
+                    "allow_cross_signing_reset failed during account action"
+                );
+                return Err(CustomError::BadRequest(
+                    "Failed to reset cross-signing keys".to_string(),
+                ));
+            }
+
+            // 2) Truthful-success readback (the honesty fix). The MAS call never
+            //    returns the bypass-window timestamp, so confirm effectiveness via the
+            //    master-row presence the upload gate keys on. A readback I/O failure is
+            //    INDETERMINATE -> fail closed (ResetUnconfirmed), never a false success.
+            let readback = match synapse.has_cross_signing_keys(&localpart, server).await {
+                Ok(true) => ResetReadback::MasterPresent,
+                Ok(false) => ResetReadback::NoMaster,
+                Err(e) => {
+                    warn!(
+                        target: CROSS_SIGNING_RESET_LOG_TARGET,
+                        localpart = %localpart,
+                        allow_ok = true,
+                        readback = "indeterminate",
+                        error = %e,
+                        "has_cross_signing_keys readback failed; cannot confirm reset effectiveness"
+                    );
+                    ResetReadback::Indeterminate
+                }
+            };
+
+            // 3) Decide truthfully and log the derived decision with evidence so a
+            //    future "success shown but upload 401" is captured (greppable).
+            let outcome = reset_outcome(true, readback);
+            let effective = matches!(outcome, ActionOutcome::Completed);
+            info!(
+                target: CROSS_SIGNING_RESET_LOG_TARGET,
+                did = %did,
+                localpart = %localpart,
+                allow_ok = true,
+                master_present_after = matches!(readback, ResetReadback::MasterPresent),
+                readback = ?readback,
+                effective = effective,
+                "cross-signing reset reauth: derived effectiveness decision"
+            );
+            if !effective {
+                warn!(
+                    target: CROSS_SIGNING_RESET_LOG_TARGET,
+                    did = %did,
+                    localpart = %localpart,
+                    "cross-signing reset could not be confirmed effective; returning truthful non-success"
+                );
+            }
+            Ok(outcome)
         }
         Action::Profile => {
             let server = require_server_name(server_name)?;
@@ -1609,6 +1765,12 @@ function renderOutcome(data) {
       showTerminal('Encryption keys reset',
         'Your client can now set up new encryption keys. You can close this page.', true);
       break;
+    case 'reset_unconfirmed':
+      // Truthful non-success: the reset grant could not be confirmed effective.
+      // NEVER show the success banner here. Surface the server's guidance and keep
+      // the page open so the user can retry.
+      showStatus(data.guidance || 'We could not confirm your encryption identity reset took effect. Please try again or contact support.');
+      break;
     case 'deleted':
       showTerminal('Session signed out', 'This device can no longer access your account.', false);
       // Stay in-session: re-list without a fresh signature.
@@ -2815,5 +2977,156 @@ mod tests {
         .await
         .expect("valid session + csrf must execute the action");
         assert!(matches!(resp.outcome, ActionOutcome::Profile { .. }));
+    }
+
+    // -- Cross-signing-reset truthful-success gating (honesty fix) ------------
+    //
+    // These prove the RED->GREEN of the honesty logic WITHOUT a live stack, via
+    // the pure decision fn `reset_outcome`. It is the testable seam the
+    // `Action::CrossSigningReset` arm now routes through: it calls
+    // `allow_cross_signing_reset`, reads master-row presence back with
+    // `has_cross_signing_keys`, then renders `reset_outcome(allow_ok, readback)`.
+    //
+    // PRE-FIX BEHAVIOR (the bug): the arm returned `Ok(ActionOutcome::Completed)`
+    // unconditionally the moment `allow_cross_signing_reset` returned 2xx
+    // (`account.rs` reset arm + `synapse_client.rs` only checked its own HTTP
+    // status). So for EVERY 2xx allow — including the dangerous case where the
+    // reset is not actually effective — the pre-fix code rendered the green
+    // "Encryption keys reset" banner. The assertions below that demand a
+    // non-`Completed` outcome are exactly the ones that FAIL on the pre-fix code
+    // and PASS on the fixed code.
+
+    #[test]
+    fn reset_outcome_effective_master_present_is_completed() {
+        // Master row exists + grant landed -> the UIA-bypass window was planted on
+        // the master row -> the next device_signing/upload is honored. This is the
+        // working round-trip and MUST remain `Completed` (no regression).
+        assert_eq!(
+            reset_outcome(true, ResetReadback::MasterPresent),
+            ActionOutcome::Completed,
+            "master present + allow ok must stay Completed (working round-trip preserved)"
+        );
+    }
+
+    #[test]
+    fn reset_outcome_no_master_is_completed() {
+        // No master row -> Synapse skips the upload gate entirely
+        // (`is_cross_signing_setup` is false), so the next upload is honored anyway.
+        // Effective by a different branch of the contract -> `Completed`.
+        assert_eq!(
+            reset_outcome(true, ResetReadback::NoMaster),
+            ActionOutcome::Completed,
+            "no-master + allow ok is effective (gate skipped), must be Completed"
+        );
+    }
+
+    #[test]
+    fn reset_outcome_indeterminate_readback_is_truthful_non_success() {
+        // RED->GREEN: allow returned 2xx, but the readback could not confirm the
+        // reset is effective (the dangerous master-exists-but-not-effective /
+        // inconsistent case surfaces here as an unverifiable post-state). The
+        // PRE-FIX code returned `Completed` for this (the false success = the bug);
+        // the fixed code must return the truthful non-success `ResetUnconfirmed`.
+        let outcome = reset_outcome(true, ResetReadback::Indeterminate);
+        assert_ne!(
+            outcome,
+            ActionOutcome::Completed,
+            "indeterminate readback must NOT be Completed (this is the pre-fix false success / the bug)"
+        );
+        match outcome {
+            ActionOutcome::ResetUnconfirmed { guidance } => {
+                assert!(
+                    guidance.to_lowercase().contains("could not confirm")
+                        && guidance.to_lowercase().contains("not changed"),
+                    "guidance must be truthful + actionable, got: {guidance}"
+                );
+            }
+            other => panic!("expected ResetUnconfirmed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reset_outcome_failed_allow_is_never_completed() {
+        // Invariant lock: a failed allow can never yield `Completed`, regardless of
+        // readback. (At the call site a non-2xx allow short-circuits to the error
+        // path before this fn; this pins the contract so a future refactor that
+        // routes the error result through `reset_outcome` cannot regress it into a
+        // false success.)
+        for readback in [
+            ResetReadback::MasterPresent,
+            ResetReadback::NoMaster,
+            ResetReadback::Indeterminate,
+        ] {
+            assert_ne!(
+                reset_outcome(false, readback),
+                ActionOutcome::Completed,
+                "allow_ok=false must never be Completed (readback={readback:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_unconfirmed_serializes_with_kind_tag_and_guidance() {
+        // Wire contract: the truthful non-success outcome is tagged `reset_unconfirmed`
+        // and carries the guidance string the page renders. It must be DISTINCT from
+        // the `completed` success the banner keys on.
+        let v = serde_json::to_value(ActionOutcome::ResetUnconfirmed {
+            guidance: "x".to_string(),
+        })
+        .unwrap();
+        assert_eq!(v["kind"], "reset_unconfirmed");
+        assert_eq!(v["guidance"], "x");
+        assert_ne!(
+            v["kind"], "completed",
+            "the unconfirmed outcome must not collide with the success kind"
+        );
+    }
+
+    #[test]
+    fn account_page_js_renders_reset_unconfirmed() {
+        // The page JS must render the truthful non-success WITHOUT the success
+        // banner: a `reset_unconfirmed` case that surfaces the guidance.
+        let html = account_page(
+            AccountPageQuery {
+                action: Some("org.matrix.cross_signing_reset".to_string()),
+                device_id: None,
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        assert!(
+            html.contains("case 'reset_unconfirmed':"),
+            "JS must handle the reset_unconfirmed outcome"
+        );
+        assert!(
+            html.contains("data.guidance"),
+            "JS must surface the server guidance for an unconfirmed reset"
+        );
+    }
+
+    #[test]
+    fn cross_signing_reset_localpart_is_canonical_lowercase() {
+        // Mixed-case-DID guard: the localpart used for BOTH allow_cross_signing_reset
+        // and the has_cross_signing_keys readback is derived from the same
+        // `did_to_localpart`, which lowercases. A mixed-case wallet DID must resolve
+        // to the exact localpart Synapse stores, so the grant and the readback key on
+        // the same user (regression lock for the latent mixed-case hazard).
+        let mixed = "did:pkh:eip155:1:0xAbCdEf0123456789ABCDEF0123456789aAbBcCdD";
+        let lower = "did:pkh:eip155:1:0xabcdef0123456789abcdef0123456789aabbccdd";
+        let lp_mixed = did_to_localpart(mixed);
+        let lp_lower = did_to_localpart(lower);
+        assert_eq!(
+            lp_mixed, lp_lower,
+            "mixed-case and lowercase DID must yield the same localpart"
+        );
+        assert_eq!(
+            lp_mixed, "did-pkh-eip155-1-0xabcdef0123456789abcdef0123456789aabbccdd",
+            "localpart must be the canonical lowercased, colon->dash form"
+        );
+        assert!(
+            !lp_mixed.chars().any(|c| c.is_ascii_uppercase()),
+            "the localpart used for the reset grant + readback must have no uppercase"
+        );
     }
 }

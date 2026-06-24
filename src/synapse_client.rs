@@ -147,9 +147,57 @@ impl SynapseClient {
         Ok(())
     }
 
-    // has_cross_signing_keys was removed 2026-06-18 along with the racy approval-time
-    // pre-flight check in device_auth.rs (it produced a false "no Secure Backup"
-    // warning by racing the client's cross-signing bootstrap).
+    /// Read back whether the user currently has a **published master cross-signing
+    /// key** server-side (`POST /_matrix/client/v3/keys/query`, reading
+    /// `master_keys[user_id]` presence).
+    ///
+    /// This is the empirically-faithful signal for the `e2e_cross_signing_keys`
+    /// master row that gates `keys/device_signing/upload` under MSC3861: Synapse's
+    /// upload gate (`rest/client/keys.py`) 401s ONLY when `is_cross_signing_setup`
+    /// (a master row exists) AND the UIA-bypass window is not in the future. So the
+    /// master-present bit is the load-bearing input to deciding whether a
+    /// just-granted reset is effective for the next upload (see
+    /// [`account::reset_outcome`]).
+    ///
+    /// History: removed 2026-06-18 (it had been mis-used as a racy approval-time
+    /// pre-flight in `device_auth.rs` that produced a false "no Secure Backup"
+    /// warning). Re-introduced 2026-06-24 for POST-grant readback in the
+    /// cross-signing-reset reauth path, where it does NOT race the client's
+    /// bootstrap (it runs only after the user-initiated reset grant) and is used to
+    /// gate the truthful-success signal, never a pre-flight warning. It does NOT
+    /// expose the window timestamp (Synapse never returns it on this query); it
+    /// reports master-row presence only.
+    pub async fn has_cross_signing_keys(&self, localpart: &str, server_name: &str) -> Result<bool> {
+        let user_id = matrix_user_id(localpart, server_name);
+        let url = format!("{}/_matrix/client/v3/keys/query", self.endpoint);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.shared_secret)
+            .json(&json!({ "device_keys": { &user_id: [] } }))
+            .send()
+            .await
+            .context("has_cross_signing_keys: request failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(%status, %body, "has_cross_signing_keys: query failed");
+            anyhow::bail!("has_cross_signing_keys: HTTP {status}");
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("has_cross_signing_keys: invalid JSON")?;
+
+        let has_master = body
+            .get("master_keys")
+            .and_then(|mk| mk.get(&user_id))
+            .is_some();
+
+        Ok(has_master)
+    }
 
     /// Check whether a localpart is available for registration.
     ///

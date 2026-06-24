@@ -1047,3 +1047,314 @@ async fn cross_signing_reset_round_trip_live() {
 
     eprintln!("[e2e] PASS: cross-signing reset round-trip proven live (F3/F8 closed).");
 }
+
+// ===========================================================================
+// B2 — cross-signing-reset CONTRACT-LOCK e2e tests (real Synapse 1.154)
+// ===========================================================================
+//
+// These lock the EFFECTIVE behaviour of the cross-signing-reset flow against a
+// real Synapse, so the B1 honesty fix (truthful-success gating in
+// `account::reset_outcome` + the `has_cross_signing_keys` post-grant readback)
+// is proven to PRESERVE the working round-trip. They are regression + contract
+// locks, NOT an e2e RED->GREEN: the honesty change only alters the rare
+// readback-failure/error case, which is not naturally inducible against a healthy
+// stack (Synapse never returns the bypass-window timestamp, and the readback only
+// fails on Synapse I/O failure). That failure path is covered by the unit tests
+// (`account::tests::reset_outcome_*`). What these e2e tests confirm is that the
+// THREE empirically-observed live states all still un-wedge / report truthfully:
+//
+//   Leg A  (round-trip)        master published -> replacement upload 401 ->
+//                              /account cross_signing_reset returns `completed`
+//                              -> replacement upload 200.
+//   Stale/expired-window wedge master present, NO active bypass window (the real
+//                              wedge from the spike: a second upload before any
+//                              reset always sees an absent window) -> 401 ->
+//                              reset -> 200.
+//   No-master leg              no master row -> the Synapse upload gate is SKIPPED
+//                              (`is_cross_signing_setup` false) so the FIRST
+//                              device_signing/upload is honoured 200 directly;
+//                              the reset action still reports `completed`
+//                              (truthfully — the upload is/was allowed).
+//
+// All three drive the REAL `/account?action=org.matrix.cross_signing_reset` flow
+// with a real wallet CAIP-122 signature, against the fixed siwx-oidc.
+//
+// Run (whole group, against the fixed e2eh stack):
+//   SIWEOIDC_HOST=http://localhost:18081 MATRIX_HOST=http://localhost:18080 \
+//     cargo test --test e2e_msc4191_live cross_signing_reset -- --ignored --nocapture
+
+/// POST a `device_signing/upload`, retrying a small bounded number of times on a
+/// transient Synapse 5xx (observed: a freshly-provisioned user's FIRST upload can
+/// intermittently 500 with `M_UNKNOWN` — a Synapse-side hiccup orthogonal to the
+/// cross-signing-reset contract under test). A 401 (the wedge) or 200 is returned
+/// immediately; only 5xx is retried, so the contract assertions stay meaningful.
+async fn upload_device_signing_with_5xx_retry(
+    http: &Client,
+    upload_url: &str,
+    token: &str,
+    body: &Value,
+) -> (StatusCode, String) {
+    let mut last = (StatusCode::INTERNAL_SERVER_ERROR, String::new());
+    for attempt in 1..=4u32 {
+        let r = http
+            .post(upload_url)
+            .bearer_auth(token)
+            .json(body)
+            .send()
+            .await
+            .expect("device_signing/upload request failed");
+        let s = r.status();
+        let b = r.text().await.unwrap_or_default();
+        if !s.is_server_error() {
+            return (s, b);
+        }
+        eprintln!(
+            "[e2e] device_signing/upload attempt {attempt} got transient {s} ({}); retrying",
+            b.trim()
+        );
+        last = (s, b);
+        tokio::time::sleep(Duration::from_millis(750)).await;
+    }
+    last
+}
+
+/// Shared body for the "master present -> wedge -> reset -> un-wedge" legs.
+/// Performs the full live round-trip and returns the `(reset_status, reset_body)`
+/// so the caller can additionally assert on the reset outcome. Cleans up the
+/// throwaway identity best-effort.
+async fn run_master_present_reset_roundtrip(label: &str) {
+    let oidc = siweoidc_host();
+    let matrix = matrix_host();
+    eprintln!("[e2e:{label}] SIWEOIDC_HOST={oidc} MATRIX_HOST={matrix}");
+
+    // Fresh throwaway identity + full wallet login (provisions user+device).
+    let secret_key = k256::SecretKey::random(&mut thread_rng());
+    let signing_key = SigningKey::from(&secret_key);
+    let address = eip55_checksum(&address_from_key(signing_key.verifying_key()));
+    let did = format!("did:pkh:eip155:1:{address}");
+    eprintln!("[e2e:{label}] throwaway did={did}");
+    let login = login_with_key(&signing_key, &address, &did).await;
+    let user_id = whoami_user_id(&matrix, &login.access_token).await;
+    eprintln!("[e2e:{label}] user_id={user_id} device_id={}", login.device_id);
+
+    let http = Client::new();
+    let upload_url = format!("{matrix}/_matrix/client/v3/keys/device_signing/upload");
+
+    // 1) Publish the master (MSC3967: first upload skips UIA). Retry a transient
+    //    Synapse 5xx on this first upload (orthogonal to the reset contract).
+    let keys_initial = build_cross_signing_upload(&user_id);
+    let (s1, b1) = upload_device_signing_with_5xx_retry(
+        &http,
+        &upload_url,
+        &login.access_token,
+        &keys_initial,
+    )
+    .await;
+    eprintln!("[e2e:{label}] upload#1 (publish master) -> {s1} {b1}");
+    assert_eq!(s1, StatusCode::OK, "initial master upload must 200: {b1}");
+
+    // 2) A REPLACEMENT upload is now wedged: master row exists + NO active
+    //    bypass window -> Synapse 401s and points at the reset flow. This IS the
+    //    stale/expired-window wedge (a window is only ever planted by a reset).
+    let keys_replacement = build_cross_signing_upload(&user_id);
+    let r2 = http
+        .post(&upload_url)
+        .bearer_auth(&login.access_token)
+        .json(&keys_replacement)
+        .send()
+        .await
+        .expect("upload #2 request failed");
+    let s2 = r2.status();
+    let b2 = r2.text().await.unwrap_or_default();
+    eprintln!("[e2e:{label}] upload#2 (pre-reset, no window) -> {s2} {b2}");
+    assert_eq!(
+        s2,
+        StatusCode::UNAUTHORIZED,
+        "replacement must be wedged (master present, no bypass window): {b2}"
+    );
+    assert!(
+        b2.contains("org.matrix.cross_signing_reset"),
+        "the 401 must advertise the cross_signing_reset flow: {b2}"
+    );
+    assert!(
+        b2.contains("/account"),
+        "the 401 reset url must point at the /account page: {b2}"
+    );
+
+    // 3) Drive the REAL reset (CAIP-122 wallet re-auth -> fixed siwx-oidc ->
+    //    Synapse allow_cross_signing_reset + has_cross_signing_keys readback).
+    //    The fixed code must STILL report `completed` here (master present after
+    //    grant => MasterPresent readback => reset_outcome == Completed), i.e. no
+    //    regression from the honesty fix.
+    let (rs, rb) = post_account_action(
+        &signing_key,
+        &address,
+        &did,
+        "org.matrix.cross_signing_reset",
+        None,
+    )
+    .await;
+    eprintln!("[e2e:{label}] /account cross_signing_reset -> {rs} {rb}");
+    assert_eq!(rs, StatusCode::OK, "reset action should 200: {rb}");
+    let rj: Value = serde_json::from_str(&rb).expect("reset body must be JSON");
+    assert_eq!(
+        rj["status"], "completed",
+        "reset must report status=completed for the master-present round-trip \
+         (the fixed code's MasterPresent readback path): {rb}"
+    );
+    assert_eq!(
+        rj["kind"], "completed",
+        "reset outcome kind must be `completed` (NOT `reset_unconfirmed`) when the \
+         reset is effective: {rb}"
+    );
+    assert_ne!(
+        rj["kind"], "reset_unconfirmed",
+        "a healthy master-present reset must never surface the truthful non-success \
+         outcome: {rb}"
+    );
+
+    // 4) The replacement upload now SUCCEEDS: the account un-wedged (the window was
+    //    planted on the master row), confirming the effective behaviour is preserved.
+    let r3 = http
+        .post(&upload_url)
+        .bearer_auth(&login.access_token)
+        .json(&keys_replacement)
+        .send()
+        .await
+        .expect("upload #2 retry request failed");
+    let s3 = r3.status();
+    let b3 = r3.text().await.unwrap_or_default();
+    eprintln!("[e2e:{label}] upload#2 (post-reset) -> {s3} {b3}");
+    assert_eq!(
+        s3,
+        StatusCode::OK,
+        "replacement upload must succeed after the reset un-wedges it: {b3}"
+    );
+
+    // Cleanup: deactivate the throwaway identity (best-effort, never fails).
+    let (ds, db) = post_account_action(
+        &signing_key,
+        &address,
+        &did,
+        "org.matrix.account_deactivate",
+        None,
+    )
+    .await;
+    eprintln!("[e2e:{label}] cleanup account_deactivate -> {ds} {db}");
+    eprintln!("[e2e:{label}] PASS.");
+}
+
+/// Leg A (round-trip) — the canonical working path: master published ->
+/// replacement upload 401 (advertising the reset flow) -> real /account reset
+/// returns `completed` -> replacement upload 200. Confirms the FIXED siwx-oidc
+/// preserves the round-trip and renders the success (Completed) outcome, never
+/// the truthful non-success, for a healthy reset.
+#[tokio::test]
+#[ignore = "hits a live stack; run explicitly with --ignored"]
+async fn cross_signing_reset_leg_a_roundtrip_completed_live() {
+    run_master_present_reset_roundtrip("legA").await;
+}
+
+/// Stale/expired-window wedge — the real wedge from the spike. A master row is
+/// present but there is NO active UIA-bypass window (every replacement upload
+/// before a reset is in exactly this state: a window is only ever planted by a
+/// reset, so "absent" and "expired" are observationally identical for a fresh
+/// second upload). The upload 401s; the real reset plants the window; the upload
+/// then 200s. This is the same effective path Leg A exercises, named separately
+/// to lock the wedge explicitly as a regression guard for the honesty fix.
+#[tokio::test]
+#[ignore = "hits a live stack; run explicitly with --ignored"]
+async fn cross_signing_reset_stale_window_wedge_live() {
+    run_master_present_reset_roundtrip("stale_window").await;
+}
+
+/// No-master leg — no master cross-signing row exists for the user, so Synapse's
+/// `keys/device_signing/upload` gate is SKIPPED entirely (`is_cross_signing_setup`
+/// is false) and the FIRST upload is honoured 200 directly. The reset action still
+/// reports `completed` TRUTHFULLY, because the upload is/was allowed (the fixed
+/// code's NoMaster readback branch maps to `Completed`, NOT `reset_unconfirmed`).
+///
+/// Order matters: the reset is driven BEFORE any master is published, so the
+/// post-grant `has_cross_signing_keys` readback sees no master row -> NoMaster ->
+/// `reset_outcome(true, NoMaster) == Completed`. Then a first full upload still
+/// succeeds, confirming the gate-skipped branch un-wedges (trivially) too.
+#[tokio::test]
+#[ignore = "hits a live stack; run explicitly with --ignored"]
+async fn cross_signing_reset_no_master_completed_live() {
+    let oidc = siweoidc_host();
+    let matrix = matrix_host();
+    eprintln!("[e2e:no_master] SIWEOIDC_HOST={oidc} MATRIX_HOST={matrix}");
+
+    // Fresh throwaway identity + login. Crucially we do NOT publish a master.
+    let secret_key = k256::SecretKey::random(&mut thread_rng());
+    let signing_key = SigningKey::from(&secret_key);
+    let address = eip55_checksum(&address_from_key(signing_key.verifying_key()));
+    let did = format!("did:pkh:eip155:1:{address}");
+    eprintln!("[e2e:no_master] throwaway did={did}");
+    let login = login_with_key(&signing_key, &address, &did).await;
+    let user_id = whoami_user_id(&matrix, &login.access_token).await;
+    eprintln!("[e2e:no_master] user_id={user_id} device_id={}", login.device_id);
+
+    let http = Client::new();
+    let upload_url = format!("{matrix}/_matrix/client/v3/keys/device_signing/upload");
+
+    // 1) Drive the reset with NO master row present. The fixed siwx-oidc calls
+    //    allow_cross_signing_reset (the MAS UPDATE matches 0 rows, harmless) then
+    //    reads master-row presence back: absent -> NoMaster -> Completed. The
+    //    server must report `completed` truthfully (the upload would be allowed).
+    let (rs, rb) = post_account_action(
+        &signing_key,
+        &address,
+        &did,
+        "org.matrix.cross_signing_reset",
+        None,
+    )
+    .await;
+    eprintln!("[e2e:no_master] /account cross_signing_reset (no master) -> {rs} {rb}");
+    assert_eq!(rs, StatusCode::OK, "reset action should 200 even with no master: {rb}");
+    let rj: Value = serde_json::from_str(&rb).expect("reset body must be JSON");
+    assert_eq!(
+        rj["status"], "completed",
+        "no-master reset must report status=completed (gate is skipped, upload allowed): {rb}"
+    );
+    assert_eq!(
+        rj["kind"], "completed",
+        "no-master reset outcome kind must be `completed` (the fixed NoMaster branch), \
+         not `reset_unconfirmed`: {rb}"
+    );
+    assert_ne!(
+        rj["kind"], "reset_unconfirmed",
+        "no-master is an EFFECTIVE branch (upload honoured), must NOT be the truthful \
+         non-success outcome: {rb}"
+    );
+
+    // 2) Confirm the contract's premise: with no master row, the FIRST
+    //    device_signing/upload is honoured 200 directly (the gate is skipped).
+    //    Retry a transient Synapse 5xx (orthogonal to the gate-skipped contract).
+    let keys_initial = build_cross_signing_upload(&user_id);
+    let (s1, b1) = upload_device_signing_with_5xx_retry(
+        &http,
+        &upload_url,
+        &login.access_token,
+        &keys_initial,
+    )
+    .await;
+    eprintln!("[e2e:no_master] first device_signing/upload (gate skipped) -> {s1} {b1}");
+    assert_eq!(
+        s1,
+        StatusCode::OK,
+        "with no prior master, the first upload must be honoured 200 (gate skipped): {b1}"
+    );
+
+    // Cleanup: deactivate the throwaway identity (best-effort, never fails).
+    let (ds, db) = post_account_action(
+        &signing_key,
+        &address,
+        &did,
+        "org.matrix.account_deactivate",
+        None,
+    )
+    .await;
+    eprintln!("[e2e:no_master] cleanup account_deactivate -> {ds} {db}");
+    eprintln!("[e2e:no_master] PASS.");
+}
