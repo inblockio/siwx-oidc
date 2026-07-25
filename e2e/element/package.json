@@ -1,0 +1,9 @@
+{
+  "name": "siwx-oidc-element-e2e",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@playwright/test": "1.50.1",
+    "ethers": "^6.13.0"
+  }
+}

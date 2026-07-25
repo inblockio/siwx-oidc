@@ -3,7 +3,7 @@
 import { chromium } from '@playwright/test';
 import { Wallet } from 'ethers';
 
-const BASE = process.env.SIWEOIDC_HOST || 'http://localhost:8080';
+const BASE = process.env.SIWEOIDC_HOST || 'http://localhost:18080';
 const MOCK = process.env.SYNAPSE_MOCK || 'http://localhost:8090';
 const wallet = new Wallet('0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d');
 const ADDRESS = wallet.address;

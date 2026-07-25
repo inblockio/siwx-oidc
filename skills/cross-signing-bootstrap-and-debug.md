@@ -55,9 +55,9 @@ digraph cross_signing_debug {
   first_console [label="Check browser console:\nbootstrapCrossSigning called?"];
   first_synapse_log [label="Check Synapse logs:\nkeys/device_signing/upload request?"];
 
-  reset_check [label="Check: allow_cross_signing_reset\ncalled on login?"];
-  reset_api [label="Verify: POST /_synapse/mas/\nallow_cross_signing_reset\nreturns 200"];
-  reset_timing [label="Check: upload happens within\nthe reset window?"];
+  reset_check [label="Did user complete MSC4312 reauth\nOR recent login (3B allow)?"];
+  reset_api [label="Verify allow_cross_signing_reset\nfired (account page and/or login)"];
+  reset_timing [label="Check: upload within window\n+ honesty gate if account path"];
 
   fix_synapse [label="Upgrade Synapse" shape=note];
   fix_wellknown [label="Add m.authentication\nto .well-known" shape=note];
@@ -177,15 +177,21 @@ shows a login failure after ~30-60s. This means the rendezvous timed out
 because Element Web had no cross-signing keys to transfer.
 
 **Diagnostic:**
-1. Check if approving user has cross-signing keys: `has_cross_signing_keys`
-   in siwx-oidc logs (the pre-flight check on device approval page)
+1. Check whether the approving user has PUBLISHED cross-signing keys:
+   authenticated `POST /_matrix/client/v3/keys/query` for the user — an
+   absent `master_keys` entry means MSC4108 Phase 4 cannot complete
+   (covered by Playwright EW-D2 in `e2e/element/ew-device-link.spec.mjs`)
 2. Check if Secure Backup is set up in Element Web: Settings > Security &
    Privacy > Secure Backup status
 3. If no Secure Backup: user must set it up before QR login works
 
-**The pre-flight warning** on the device approval page already covers this
-case. It checks `has_cross_signing_keys` via Synapse's keys/query API and
-warns the user if no master key exists.
+**There is NO approval-time pre-flight warning (removed 2026-06-18).** The
+old `check_cross_signing` probe raced first-time cross-signing bootstrap and
+fired for healthy users (confirmed false positive); it is gone and
+`DeviceApproveResponse.warning` is always absent on the approve path. The
+real prerequisite (cross-signing PRIVATE keys on the SENDING device) is not
+observable server-side; the published-master-key check above is the only
+honest server-side signal.
 
 ## siwx-oidc Code Reference
 
@@ -193,9 +199,8 @@ warns the user if no master key exists.
 |----------|------|---------|
 | `allow_cross_signing_reset` | `src/synapse_client.rs` | Calls `/_synapse/mas/allow_cross_signing_reset` |
 | `has_cross_signing_keys` | `src/synapse_client.rs` | Queries `/_matrix/client/v3/keys/query` for master key |
-| `provision_synapse_device` | `src/oidc.rs` | Replacement mode: deletes old device, creates new, calls allow_cross_signing_reset |
-| `provision_synapse_device_additive` | `src/oidc.rs` | Additive mode (device code): preserves devices, calls allow_cross_signing_reset |
-| `check_cross_signing` | `src/device_auth.rs` | Pre-flight check on device approval page |
+| `provision_synapse_device` | `src/oidc.rs` | Upsert-only provision (no delete). **Also best-effort `allow_cross_signing_reset` after every login (3B).** Used for auth-code and device_code grants. |
+| _(removed)_ `check_cross_signing` | `src/device_auth.rs` | Approval-time pre-flight REMOVED 2026-06-18 (false positive); `has_cross_signing_keys` remains in `synapse_client.rs` for non-approval uses |
 | `account_page` | `src/account.rs` | MSC4191 account management page (HTML) |
 | `account_wallet` | `src/account.rs` | Wallet re-auth + cross-signing reset (MSC4312) |
 | `account_passkey_finish` | `src/account.rs` | Passkey re-auth + cross-signing reset (MSC4312) |

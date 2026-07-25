@@ -14,7 +14,7 @@ import { test, expect } from '@playwright/test';
 import { makeWallet, DEFAULT_PRIV, injectMockWallet } from './wallet-helper.mjs';
 import { countCeremonies, registerPasskeyInPage } from './webauthn-helper.mjs';
 
-const BASE = process.env.SIWEOIDC_HOST || 'http://localhost:8080';
+const BASE = process.env.SIWEOIDC_HOST || 'http://localhost:18080';
 const MOCK = process.env.SYNAPSE_MOCK || 'http://localhost:8090';
 
 // A fixed throwaway test key — never used anywhere real.

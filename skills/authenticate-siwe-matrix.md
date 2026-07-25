@@ -74,11 +74,13 @@ Injected JS shims in Element Web (`siwx-gate.js`, `siwx-redirect.js`):
    - Checks nonce matches `session.siwe_nonce`
    - Checks `redirect_uri` in CAIP-122 `Resources:` section
 3. **Synapse device lifecycle** (if `SIWEOIDC_SYNAPSE_ENDPOINT` + `MAS_SHARED_SECRET` configured):
-   - Deletes old device via `/_synapse/mas/delete_device` (never recycle device IDs)
-   - Generates `SIWX_{uuid8}` device ID
-   - Provisions user via `/_synapse/mas/provision_user` if new
-   - Creates device via `/_synapse/mas/upsert_device`
-   - Calls `/_synapse/mas/allow_cross_signing_reset`
+   - **Never deletes** existing devices on sign-in (no recycle of device IDs)
+   - Generates `SIWX_{uuid8}` device ID when the client did not propose one in scope
+   - Provisions user via `/_synapse/mas/provision_user` if localpart free
+   - Creates/upserts device via `/_synapse/mas/upsert_device`
+   - **Best-effort** `POST /_synapse/mas/allow_cross_signing_reset` after every login
+     provision (product 3B): arms a short Synapse window so a half-reset client can
+     republish public cross-signing keys; failures are logged and do **not** fail sign-in
    - Localpart: DID with colons replaced by dashes, lowercased
 4. Creates `CodeEntry` in Redis (UUID key, 300s TTL)
 5. Redirects to `redirect_uri?code={uuid}&state={state}`
@@ -97,7 +99,7 @@ Injected JS shims in Element Web (`siwx-gate.js`, `siwx-redirect.js`):
 2. Validates PKCE: SHA-256(code_verifier) == stored code_challenge
 3. **MSC3861 mode**: issues opaque tokens stored in Redis:
    - Access: `mat_{32 base62}` (300s TTL)
-   - Refresh: `mcr_{32 base62}` (86400s TTL)
+   - Refresh: `mcr_{32 base62}` (7_776_000s TTL / 90 days)
    - `TokenMetadata`: `{ username, device_id, scope, client_id, iat, exp, did, name }`
    - Scope: `openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}`
 4. Signs ES256 ID token: `sub`=DID, `preferred_username`=DID, `name`=ENS name or DID
@@ -157,9 +159,8 @@ Steps 5-8 identical.
 | `sessions/{uuid}` | 300s | Session (siwe_nonce, verified_did, signin_count) |
 | `codes/{uuid}` | 300s | Auth code (did, client_id, code_challenge, device_id) |
 | `token/{mat_...}` | 300s | Access token metadata |
-| `token/{mcr_...}` | 86400s | Refresh token metadata |
+| `token/{mcr_...}` | 7776000s (90d) | Refresh token metadata |
 | `clients/{uuid}` | 30d | Client registration |
-| `device_ids/{did}` | none | Persistent device ID mapping |
 | `webauthn:challenge/{session_id}` | 120s | Ceremony state |
 | `webauthn:credential/{cred_id_b64}` | none | Stored passkey |
 | `webauthn:link/{cred_id_b64}` | none | Account linking map |
@@ -181,9 +182,15 @@ experimental_features:
 
 ## Logout / Revocation
 
-`POST /oauth2/revoke` and `POST /_matrix/client/v3/logout`:
-- Look up token metadata, delete Synapse device via `/_synapse/mas/delete_device`
-- Delete token from Redis
+Policy is **intent-based** (`compat::TeardownPolicy`), not transport-based:
+
+| Endpoint | Device | Tokens |
+|----------|--------|--------|
+| `POST /oauth2/revoke` (RFC 7009) | **Keep** (TokensOnly) | Revoke access + paired refresh |
+| `POST /_matrix/client/v3/logout` | **Delete** ending session device | Revoke that session's tokens |
+| `POST /_matrix/client/v3/logout/all` | Delete each device (best-effort) | Revoke all user tokens |
+
+Revoke must **not** delete the device (2026-06-12 incident). Under MSC3861 these CS-API paths are owned by siwx-oidc and must be edge-routed from the homeserver hostname.
 
 ## Common Failure Points
 

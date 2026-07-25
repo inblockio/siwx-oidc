@@ -984,11 +984,14 @@ const PASSKEY_BUTTON_HTML: &str = r##"<button class="btn btn-secondary" id="btn-
 /// the danger confirmation gates, which enable them once their box is checked).
 fn auth_buttons_html(disabled: bool) -> String {
     let attr = if disabled { " disabled" } else { "" };
+    // `passkey-scope` is populated by the page JS (renderPasskeyScope) once the
+    // /account/passkey/start response reveals whether the picker is identity-scoped.
     format!(
-        "{wallet}\n\n        {divider}\n\n        {passkey}",
+        "{wallet}\n\n        {divider}\n\n        {passkey}\n\n        {scope}",
         wallet = WALLET_BUTTON_HTML.replace("{disabled}", attr),
         divider = BUTTON_DIVIDER_HTML,
         passkey = PASSKEY_BUTTON_HTML.replace("{disabled}", attr),
+        scope = r#"<p id="passkey-scope" class="hidden" style="font-size:13px;opacity:0.75;margin-top:10px;text-align:center;"></p>"#,
     )
 }
 
@@ -1670,23 +1673,29 @@ async function authWallet() {
   }
 }
 
-async function authPasskey() {
+async function authPasskey(forceAll) {
   hideStatus();
   setBusy('btn-passkey', true, 'Authenticating...');
   try {
     const startR = await fetch(BASE + '/account/passkey/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: ACTION })
+      // `all:true` is the escape hatch: re-run usernameless (offer every key) even
+      // when the siwx_user cookie scoped this picker to one account.
+      body: JSON.stringify({ action: ACTION, all: !!forceAll })
     });
     if (!startR.ok) { showStatus('Failed to start passkey authentication.'); return; }
     const startData = await startR.json();
+    // Identity-scoped picker: when the server recognises this browser's account it
+    // returns `detected_mxid` and an allowCredentials limited to that account's keys.
+    // Surface "use a different passkey" so another account is never locked out.
+    renderPasskeyScope(forceAll ? null : startData.detected_mxid);
     const sessionId = startData.session_id;
     const options = startData;
     options.publicKey.challenge = base64ToBuffer(options.publicKey.challenge);
-    // Discoverable login: the server returns an empty allowCredentials, so the
-    // authenticator surfaces the user's own resident passkey. An empty/absent list
-    // is a no-op here, never treat it as an error.
+    // The server may return a scoped allowCredentials (this account's keys) or an
+    // empty list (usernameless/discoverable). An empty/absent list is a no-op here,
+    // never treat it as an error.
     if (options.publicKey.allowCredentials) {
       options.publicKey.allowCredentials = options.publicKey.allowCredentials.map((c) => ({ ...c, id: base64ToBuffer(c.id) }));
     }
@@ -1730,10 +1739,38 @@ async function authPasskey() {
       }
     }
   } catch (e) {
-    showStatus('Passkey error: ' + (e.message || e));
+    // A cancelled / no-credential ceremony (NotAllowedError) is common when the
+    // scoped key lives on another device; steer to the escape hatch / wallet rather
+    // than a raw error string.
+    if (e && (e.name === 'NotAllowedError' || e.name === 'AbortError')) {
+      showStatus('No passkey was used. Try "Use a different passkey" above, approve on another device, or sign with your wallet.');
+    } else {
+      showStatus('Passkey error: ' + (e.message || e));
+    }
   } finally {
     setBusy('btn-passkey', false);
   }
+}
+
+// Render the "Showing passkeys for @mxid — use a different passkey" hint when the
+// picker is identity-scoped (detected_mxid present), or hide it (usernameless). The
+// mxid is set via textContent (never innerHTML) so it can never inject markup, and
+// the link is styled inline so it does not depend on a page-specific CSS class.
+function renderPasskeyScope(mxid) {
+  const el = $('passkey-scope');
+  if (!el) return;
+  el.textContent = '';
+  if (!mxid) { el.classList.add('hidden'); return; }
+  el.appendChild(document.createTextNode('Showing passkeys for ' + mxid + '. '));
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn-link';
+  btn.id = 'passkey-escape';
+  btn.textContent = 'Use a different passkey';
+  btn.style.cssText = 'background:none;border:none;padding:0;font:inherit;color:inherit;text-decoration:underline;cursor:pointer;';
+  btn.onclick = () => authPasskey(true);
+  el.appendChild(btn);
+  el.classList.remove('hidden');
 }
 
 // -- Outcome rendering (MSC4191) ---------------------------------------------

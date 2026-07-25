@@ -1,0 +1,339 @@
+/**
+ * TEMPORARY diagnostic spec — Element Web version-bump probe (v1.12.24 on
+ * :28089). DELETE AFTER USE; never commit.
+ *
+ * Purpose: Finding 2 (reload → "Confirm your digital identity" gate with no
+ * recovery-key exit on 1.12.20). Probes whether vanilla v1.12.24 (a) restores
+ * crypto across reload, (b) offers a recovery-key affordance on the gate.
+ *
+ * matrix-js-sdk v42 (bundled in EW 1.12.24) hard-requires
+ * response_modes_supported ⊇ {query, fragment} in auth_metadata; the lab/siwx
+ * metadata omits the field, so v1.12.24 falls back to legacy /login/sso/redirect
+ * (404 dead-end). The route shim below injects the field CLIENT-SIDE only — no
+ * lab container is touched.
+ */
+import { test } from '@playwright/test';
+import {
+  requireElementStack,
+  ELEMENT_URL,
+  SIWX_URL,
+} from './helpers/element.mjs';
+import { makeWallet, injectMockWallet } from '../browser/wallet-helper.mjs';
+
+test.beforeAll(async () => {
+  await requireElementStack();
+});
+
+async function shimAuthMetadata(page) {
+  await page.route('**/auth_metadata', async (route) => {
+    const resp = await route.fetch();
+    const json = await resp.json();
+    json.response_modes_supported = ['query', 'fragment'];
+    console.log('SHIM: auth_metadata intercepted + response_modes_supported injected');
+    await route.fulfill({ response: resp, json });
+  });
+  // siwx delivers ?code=&state= in the QUERY; matrix-js-sdk v42 requests
+  // response_mode=fragment and only looks in the fragment. Server-redirect hops
+  // are not routable in Playwright, so rewrite the /sign_in 303 Location itself.
+  // Self-detecting: only rewrite when THIS session's /authorize actually asked
+  // for response_mode=fragment (older js-sdk uses query mode and would break).
+  let fragmentMode = false;
+  page.on('request', (r) => {
+    const u = r.url();
+    if (u.includes('/authorize') && u.includes('response_mode=fragment')) fragmentMode = true;
+  });
+  await page.route((u) => u.pathname === '/sign_in', async (route) => {
+    if (!fragmentMode) return route.fallback();
+    const resp = await route.fetch({ maxRedirects: 0 });
+    const loc = resp.headers()['location'];
+    if (resp.status() >= 300 && resp.status() < 400 && loc) {
+      const u = new URL(loc, SIWX_URL);
+      if (u.searchParams.has('code') && u.searchParams.has('state')) {
+        const code = u.searchParams.get('code');
+        const state = u.searchParams.get('state');
+        u.searchParams.delete('code');
+        u.searchParams.delete('state');
+        u.hash = `code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`;
+        console.log('SHIM: /sign_in redirect rewritten query→fragment');
+        return route.fulfill({ status: 303, headers: { location: u.toString() } });
+      }
+    }
+    return route.fulfill({ response: resp });
+  });
+  // Full visibility on the decision path.
+  page.on('console', (m) => {
+    const t = m.text();
+    if (/oauth|oidc|sso|register|metadata|delegated|error/i.test(t)) {
+      console.log(`BROWSER ${m.type()}: ${t.slice(0, 500)}`);
+    }
+  });
+  page.on('pageerror', (e) => console.log(`PAGEERROR: ${String(e).slice(0, 300)}`));
+  page.on('response', async (r) => {
+    const u = r.url();
+    if (/auth_metadata|\/register|\/authorize|openid-configuration|auth_issuer|\/login/.test(u) && !/bundles|\.js|\.css/.test(u)) {
+      let body = '';
+      if (r.status() >= 400) body = (await r.text().catch(() => '')).slice(0, 300);
+      console.log(`NET: ${r.request().method()} ${u} -> ${r.status()} ${body}`);
+    }
+  });
+}
+
+async function dumpState(page, label) {
+  const buttons = await page
+    .locator('button:visible, [role="button"]:visible')
+    .allInnerTexts()
+    .catch(() => []);
+  const h1s = await page.locator('h1:visible, h2:visible').allInnerTexts().catch(() => []);
+  const gate = await page.locator('.mx_CompleteSecurityBody').count();
+  const chat = await page.locator('.mx_MatrixChat').count();
+  const bodyText = await page
+    .evaluate(() => (document.body?.innerText || '').slice(0, 1500))
+    .catch(() => '');
+  console.log(`\n===== ${label} =====`);
+  console.log(`chat=${chat} gateBody=${gate}`);
+  console.log(`headings: ${JSON.stringify(h1s)}`);
+  console.log(`buttons: ${JSON.stringify(buttons.map((b) => b.trim()).filter(Boolean))}`);
+  console.log(`bodyText: ${JSON.stringify(bodyText)}`);
+  console.log(`===== end ${label} =====\n`);
+  return { buttons, h1s, gate, chat, bodyText };
+}
+
+/** siwx UI leg of the click-login (mock wallet already injected). */
+async function siwxWalletLeg(page) {
+  await page.waitForURL((u) => u.origin === new URL(SIWX_URL).origin, {
+    timeout: 60_000,
+  });
+  await page.getByRole('button', { name: 'Sign in with Ethereum' }).click();
+  await page.getByRole('button', { name: 'Skip for now' }).click();
+  await page.waitForURL((u) => u.origin === new URL(ELEMENT_URL).origin, {
+    timeout: 60_000,
+  });
+}
+
+/**
+ * Wait for chat shell OR the first-device wizard OR the security gate; if the
+ * wizard shows, walk it adaptively, logging every screen. Returns final state.
+ */
+async function settleAfterLogin(page) {
+  const chat = page.locator('.mx_MatrixChat');
+  const cont = page.getByRole('button', { name: /^Continue$/, disabled: false }).first();
+  await chat.or(cont).first().waitFor({ timeout: 150_000 });
+  if (await chat.count()) {
+    console.log('WIZARD: did NOT appear (vanilla build, no force-first-device-recovery patch)');
+    return 'chat-direct';
+  }
+  console.log('WIZARD: appeared — walking adaptively');
+  for (let i = 0; i < 8; i++) {
+    await dumpState(page, `wizard step ${i}`);
+    if (await chat.count()) return 'chat-after-wizard';
+    for (const name of [/^Continue$/, /^Copy$/, /^Done$/, /^Finish/i]) {
+      const b = page.getByRole('button', { name, disabled: false }).first();
+      if (await b.isVisible().catch(() => false)) {
+        console.log(`WIZARD: clicking ${name}`);
+        await b.click({ timeout: 30_000 });
+        break;
+      }
+    }
+    await page.waitForTimeout(3_000);
+  }
+  await chat.waitFor({ timeout: 90_000 });
+  return 'chat-after-wizard';
+}
+
+async function reloadAndProbe(page, tag) {
+  const authorizeHits = [];
+  page.on('request', (r) => {
+    if (r.url().startsWith(SIWX_URL) && r.url().includes('/authorize')) {
+      authorizeHits.push(r.url());
+    }
+  });
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  const chat = page.locator('.mx_MatrixChat');
+  const gate = page.locator('.mx_CompleteSecurityBody');
+  await chat.or(gate).first().waitFor({ timeout: 120_000 });
+  // Give the gate a moment to resolve async affordances (e.g. 4S probe).
+  await page.waitForTimeout(5_000);
+  const state = await dumpState(page, `${tag}: after reload`);
+  const restored = await page.evaluate(() => ({
+    user_id: localStorage.getItem('mx_user_id'),
+    device_id: localStorage.getItem('mx_device_id'),
+  }));
+  console.log(`${tag}: authorizeHits=${authorizeHits.length} restored=${JSON.stringify(restored)}`);
+  if (state.gate && !state.chat) {
+    // Enumerate gate affordances precisely, incl. non-button links.
+    const links = await page
+      .locator('.mx_CompleteSecurityBody a, .mx_AuthPage a')
+      .allInnerTexts()
+      .catch(() => []);
+    console.log(`${tag}: gate links: ${JSON.stringify(links)}`);
+    const hasRecovery = /recovery key|security key/i.test(
+      state.buttons.join('|') + '|' + state.bodyText,
+    );
+    console.log(`${tag}: RECOVERY-KEY AFFORDANCE PRESENT: ${hasRecovery}`);
+  } else {
+    console.log(`${tag}: NO GATE — chat shell restored directly (crypto survived reload)`);
+  }
+  await page.screenshot({
+    path: `test-results/zdiag-${tag}.png`,
+    fullPage: true,
+  }).catch(() => {});
+  return state;
+}
+
+test('ZD1: v1.12.24 login → reload → gate probe (no explicit 4S setup)', async ({ page }) => {
+  test.setTimeout(600_000);
+  await shimAuthMetadata(page);
+  const w = makeWallet(undefined, 'localhost');
+  await injectMockWallet(page, w);
+  await page.goto(ELEMENT_URL, { waitUntil: 'domcontentloaded' });
+  await siwxWalletLeg(page);
+  const settled = await settleAfterLogin(page);
+  console.log(`ZD1: post-login state: ${settled}`);
+  await dumpState(page, 'ZD1: post-login');
+  await reloadAndProbe(page, 'ZD1');
+});
+
+test('ZD2: v1.12.24 login → set up recovery in settings → reload → gate probe', async ({ page }) => {
+  test.setTimeout(600_000);
+  await shimAuthMetadata(page);
+  const w = makeWallet(undefined, 'localhost');
+  await injectMockWallet(page, w);
+  await page.goto(ELEMENT_URL, { waitUntil: 'domcontentloaded' });
+  await siwxWalletLeg(page);
+  await settleAfterLogin(page);
+
+  // Best-effort: create a recovery key via Settings → Encryption ("Set up
+  // recovery"). Adaptive: dump each screen; abort with a clear note if the DOM
+  // diverges — the reload probe still runs.
+  let recoverySetUp = false;
+  try {
+    // v1.12.24 shows a "Back up your chats" banner with a Continue button that
+    // opens the recovery-key flow directly. Prefer it; fall back to settings.
+    const banner = page.getByRole('button', { name: /^Continue$/ }).first();
+    if (await banner.isVisible().catch(() => false)) {
+      console.log('ZD2: using "Back up your chats" banner Continue');
+      await banner.click();
+    } else {
+      await page.locator('.mx_UserMenu').click();
+      await page.getByRole('menuitem', { name: /all settings/i }).click({ timeout: 20_000 });
+      await page.waitForTimeout(2_000);
+      const tabs = await page
+        .locator('[role="tab"], .mx_TabbedView_tabLabel')
+        .allInnerTexts()
+        .catch(() => []);
+      console.log(`ZD2: settings tabs: ${JSON.stringify(tabs.map((t) => t.trim()))}`);
+      await page
+        .locator('[role="tab"], .mx_TabbedView_tabLabel')
+        .filter({ hasText: /encryption|security/i })
+        .first()
+        .click({ timeout: 20_000 });
+      await page.waitForTimeout(2_000);
+      await dumpState(page, 'ZD2: encryption tab');
+      const setUp = page
+        .getByRole('button', { name: /set up recovery|set up secure backup|set up/i })
+        .first();
+      await setUp.click({ timeout: 20_000 });
+    }
+    // Walk the recovery-key creation flow adaptively. Track the displayed key
+    // across steps; the confirm step asks to re-enter it.
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+    let capturedKey = null;
+    let copiedOnce = false;
+    for (let i = 0; i < 12; i++) {
+      await page.waitForTimeout(2_000);
+      const s = await dumpState(page, `ZD2: recovery step ${i}`);
+      if (/recovery set ?up|device verified|backup successful/i.test(s.bodyText) && i > 0) {
+        recoverySetUp = true;
+        break;
+      }
+      // Stash any recovery-key-looking text (groups of 4 alnum chars).
+      const k = await page
+        .evaluate(() => (document.body.innerText.match(/\b([A-Za-z0-9]{4}( [A-Za-z0-9]{4}){5,})\b/) || [])[1] || null)
+        .catch(() => null);
+      if (k) {
+        capturedKey = k;
+        console.log(`ZD2: captured displayed recovery key (${k.length} chars)`);
+      }
+      // Confirm step: an input in a dialog whose text asks for the recovery key.
+      const confirmDlg = page
+        .locator('.mx_Dialog:visible, [role="dialog"]:visible')
+        .filter({ hasText: /enter (your )?recovery key|confirm (your )?recovery key/i })
+        .first();
+      if (await confirmDlg.isVisible().catch(() => false)) {
+        const input = confirmDlg.locator('input:visible').first();
+        if ((await input.isVisible().catch(() => false)) && capturedKey) {
+          const already = await input.inputValue().catch(() => '');
+          if (already !== capturedKey) {
+            console.log('ZD2: typing captured recovery key into confirm input');
+            await input.fill(capturedKey);
+            await page.waitForTimeout(1_500);
+          }
+        }
+      }
+      let clicked = false;
+      const names = [/^Get recovery key$/i, /^Set up recovery$/i];
+      if (!copiedOnce) names.push(/^Copy$/);
+      names.push(/^Continue$/, /^Done$/, /^Finish( set ?up)?$/i, /^Confirm$/i, /^Submit$/i, /^Verify$/i, /^Next$/);
+      for (const name of names) {
+        // Prefer a button inside the topmost dialog that is NOT the settings
+        // container; else fall back to the page (banner button etc.).
+        const dlgBtn = page
+          .locator('.mx_Dialog:visible, [role="dialog"]:visible')
+          .last()
+          .getByRole('button', { name, disabled: false })
+          .first();
+        const pageBtn = page.getByRole('button', { name, disabled: false }).first();
+        for (const b of [dlgBtn, pageBtn]) {
+          if (await b.isVisible().catch(() => false)) {
+            console.log(`ZD2: clicking ${name}`);
+            await b.click({ timeout: 20_000 });
+            if (String(name).includes('Copy')) copiedOnce = true;
+            clicked = true;
+            break;
+          }
+        }
+        if (clicked) break;
+      }
+      if (!clicked) {
+        console.log(`ZD2: no known enabled button on step ${i} — dumping dialog and retrying once`);
+        const dlgTxt = await page
+          .locator('.mx_Dialog:visible, [role="dialog"]:visible')
+          .last()
+          .innerText()
+          .catch(() => '(no dialog)');
+        console.log(`ZD2: dialog content: ${JSON.stringify(dlgTxt.slice(0, 600))}`);
+        if (i > 0 && !capturedKey) break;
+        await page.waitForTimeout(3_000);
+      }
+    }
+  } catch (e) {
+    console.log(`ZD2: recovery setup leg diverged: ${e.message.split('\n')[0]}`);
+  }
+  console.log(`ZD2: recoverySetUp=${recoverySetUp}`);
+  // Verify server-side whether 4S/backup now exists (account_data + backup ver).
+  await page.keyboard.press('Escape').catch(() => {});
+  await page.waitForTimeout(1_000);
+  const backupProbe = await page.evaluate(async () => {
+    // Use Element's own session token for a direct CS-API probe.
+    // OAuth-native v42 no longer mirrors the token to localStorage.
+    const cli = window.mxMatrixClientPeg?.get?.();
+    const tok = cli?.getAccessToken?.() || localStorage.getItem('mx_access_token');
+    const base = (cli?.baseUrl || localStorage.getItem('mx_hs_url') || 'http://localhost:28080').replace(/\/$/, '');
+    const uid = localStorage.getItem('mx_user_id');
+    const out = {};
+    for (const [k, url] of [
+      ['backup', `${base}/_matrix/client/v3/room_keys/version`],
+      ['default_key', `${base}/_matrix/client/v3/user/${encodeURIComponent(uid)}/account_data/m.secret_storage.default_key`],
+    ]) {
+      try {
+        const r = await fetch(url, { headers: { Authorization: `Bearer ${tok}` } });
+        out[k] = r.status;
+      } catch (e) {
+        out[k] = String(e);
+      }
+    }
+    return out;
+  }).catch((e) => ({ error: String(e) }));
+  console.log(`ZD2: server-side 4S/backup probe: ${JSON.stringify(backupProbe)}`);
+  await reloadAndProbe(page, 'ZD2');
+});

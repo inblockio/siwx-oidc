@@ -6,7 +6,7 @@
 // is that it exercises the identical server-side CAIP-122 verification path as a
 // real MetaMask would (only the provider plumbing is mocked, not the crypto).
 
-import { Wallet } from 'ethers';
+import { Wallet, getBytes } from 'ethers';
 
 // A fixed throwaway test key — never used anywhere real. Kept here so callers
 // that want the *default* shared identity can import it; tests that need a fresh
@@ -46,7 +46,14 @@ export async function injectMockWallet(page, walletOrBundle) {
     ? walletOrBundle.wallet
     : walletOrBundle;
   const address = wallet.address;
-  await page.exposeFunction('__ethSign', (msg) => wallet.signMessage(msg));
+  // viem/wagmi (the real siwx login UI) hex-encodes the personal_sign payload;
+  // headless helpers pass plain text. Sign the decoded BYTES for hex input so
+  // both paths produce the same EIP-191 signature a real MetaMask would.
+  await page.exposeFunction('__ethSign', (msg) => {
+    const m =
+      typeof msg === 'string' && /^0x[0-9a-fA-F]*$/.test(msg) ? getBytes(msg) : msg;
+    return wallet.signMessage(m);
+  });
   await page.addInitScript((addr) => {
     let n = 0;
     window.__signCount = () => n;

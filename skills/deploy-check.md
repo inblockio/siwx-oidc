@@ -5,8 +5,11 @@ to the production server (`deploy@142.93.168.4`).
 
 ## Deploy model
 
-Code on dev machine, push to GitHub, CI builds Docker images to GHCR,
-Watchtower on the server auto-pulls new images every 5 minutes.
+Code on dev machine, push to GitHub, CI builds Docker images to GHCR.
+**Deploys are MANUAL** (verified 2026-06-12): the watchtower container is scoped
+to `matrix` but nothing else carries that scope label, so it updates NOTHING.
+After CI publishes, someone must run on the server:
+`cd /home/deploy/matrix/stack && docker compose pull siwx-oidc && docker compose up -d siwx-oidc`.
 
 **No repos or builds on the server.** Server has only `docker-compose.yml` + `.env`
 at `/home/deploy/matrix/stack/`.
@@ -48,7 +51,25 @@ ssh deploy@142.93.168.4 "
 "
 ```
 
-## 4. CORS verification
+## 4. MSC3861 auth_metadata guard
+
+Synapse forwards `experimental_features.msc3861.issuer_metadata` VERBATIM to
+browsers via `GET /_matrix/client/v1/auth_metadata`; if it is missing capability
+fields (`response_types_supported`, `grant_types_supported`,
+`code_challenge_methods_supported`) or contains non-public endpoint URLs,
+matrix-js-sdk rejects the issuer and Element Web silently falls back to the
+legacy `/login/sso/redirect` route. That route 404s under MSC3861 (siwx-oidc
+has no MAS compat shim), so any auth_metadata regression is a total, silent
+login dead-end — this check fails loudly instead.
+
+```bash
+scripts/check-auth-metadata.sh https://matrix.inblock.io https://siwx-oidc.inblock.io/
+```
+
+Must end with `== PASS ... ==` (exit 0). The 404 WARNING for the legacy SSO
+route is expected and informational.
+
+## 5. CORS verification
 
 siwx-oidc's tower_http CorsLayer and Caddy both emit CORS headers. Caddy must
 strip siwx-oidc's headers to avoid dual Access-Control-Allow-Origin (browsers reject it).
@@ -63,7 +84,7 @@ If two lines appear, update `/home/portal/portal/Caddyfile` to add `header_down
 -Access-Control-Allow-Origin` in the siwx-oidc reverse_proxy block. See Caddyfile.local
 `(strip_upstream_cors)` snippet.
 
-## 5. DNS records
+## 6. DNS records
 
 Two domains needed:
 - **matrix.inblock.io** — Synapse homeserver
@@ -72,16 +93,17 @@ Two domains needed:
 
 All point to `142.93.168.4`. Caddy handles TLS via Let's Encrypt.
 
-## 6. Watchtower auto-deploy
+## 7. Manual deploy (watchtower is a NO-OP)
+
+Watchtower runs scoped to `com.centurylinklabs.watchtower.scope=matrix`, but the
+only container carrying that label is watchtower itself — it deploys nothing
+(verified 2026-06-12; see CLAUDE.md "Deployment"). Pull and restart manually:
 
 ```bash
-ssh deploy@142.93.168.4 "cd /home/deploy/matrix/stack && docker compose logs watchtower --tail 5"
+ssh deploy@142.93.168.4 "cd /home/deploy/matrix/stack && docker compose pull siwx-oidc && docker compose up -d siwx-oidc"
 ```
 
-Should show polling every 300s. Watchtower is scoped to containers labeled
-`com.centurylinklabs.watchtower.scope=matrix`.
-
-## 7. Login test
+## 8. Login test
 
 1. Open `https://element.inblock.io` in incognito (clear localStorage)
 2. Should see "Connecting wallet..." splash (siwx-gate.js blocks Element)
@@ -93,7 +115,7 @@ For passkey login: register a passkey first, then use "Sign in with Passkey".
 
 ## Common issues
 
-- **Element shows #/welcome instead of wallet prompt**: CORS issue (dual ACAO headers). See step 4.
+- **Element shows #/welcome instead of wallet prompt**: CORS issue (dual ACAO headers, see step 5) or an auth_metadata regression sent Element down the legacy SSO 404 route (see step 4).
 - **Watchtower crash-looping**: Needs `DOCKER_API_VERSION: "1.40"` in environment.
 - **"DID method 'key' not enabled"**: Add `"key"` to `SIWEOIDC_SUPPORTED_DID_METHODS` in .env.
 - **Stale client_id 401 loops**: Element caches client_id; siwx-redirect.js now always registers fresh.
