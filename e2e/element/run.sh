@@ -10,9 +10,9 @@ exec podman run --rm --network host --userns=keep-id \
   -v "$E2E_ROOT:/e2e:z" \
   -w /e2e/element \
   -e HOME=/tmp \
-  -e ELEMENT_URL="${ELEMENT_URL:-http://localhost:8088}" \
-  -e MATRIX_URL="${MATRIX_URL:-http://localhost:8080}" \
-  -e SIWX_URL="${SIWX_URL:-http://localhost:8081}" \
+  -e ELEMENT_URL="${ELEMENT_URL:-http://localhost:28088}" \
+  -e MATRIX_URL="${MATRIX_URL:-http://localhost:28080}" \
+  -e SIWX_URL="${SIWX_URL:-http://localhost:28081}" \
   -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
   -e PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
   -e npm_config_cache=/tmp/.npm \

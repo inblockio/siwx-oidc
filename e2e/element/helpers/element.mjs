@@ -6,9 +6,10 @@
  * http://localhost:8081 (see siwx-oidc-matrix-server/Caddyfile.local).
  */
 
-export const ELEMENT_URL = process.env.ELEMENT_URL || 'http://localhost:8088';
-export const MATRIX_URL = process.env.MATRIX_URL || 'http://localhost:8080';
-export const SIWX_URL = process.env.SIWX_URL || 'http://localhost:8081';
+// Defaults match Phase-2 lab remaps (portal-e2e often owns host :8080).
+export const ELEMENT_URL = process.env.ELEMENT_URL || 'http://localhost:28088';
+export const MATRIX_URL = process.env.MATRIX_URL || 'http://localhost:28080';
+export const SIWX_URL = process.env.SIWX_URL || 'http://localhost:28081';
 
 /** True if Element is reachable. */
 export async function elementHealthy() {

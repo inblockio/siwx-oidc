@@ -31,14 +31,23 @@ fi
 echo "[stack-up] building + starting Element stack (siwx build context: $SIWX_REPO) ..."
 "${COMPOSE[@]}" up --build -d
 
-echo "[stack-up] waiting for health ..."
+# Host ports (read from .env.local via already-exported compose env, or defaults
+# that avoid portal-e2e on :8080).
+set -a; # shellcheck disable=SC1091
+. .env.local
+set +a
+MATRIX_P="${MATRIX_HOST_PORT:-28080}"
+SIWX_P="${SIWEOIDC_HOST_PORT:-28081}"
+ELEM_P="${CLIENT_HOST_PORT:-28088}"
+
+echo "[stack-up] waiting for health (matrix :${MATRIX_P} siwx :${SIWX_P} element :${ELEM_P}) ..."
 for i in $(seq 1 90); do
   ok=0
-  curl -sf http://localhost:8081/health >/dev/null 2>&1 && \
-  curl -sf http://localhost:8080/_matrix/client/versions >/dev/null 2>&1 && \
-  curl -sf http://localhost:8088/ >/dev/null 2>&1 && ok=1
+  curl -sf "http://localhost:${SIWX_P}/health" >/dev/null 2>&1 && \
+  curl -sf "http://localhost:${MATRIX_P}/_matrix/client/versions" >/dev/null 2>&1 && \
+  curl -sf "http://localhost:${ELEM_P}/" >/dev/null 2>&1 && ok=1
   if [ "$ok" = "1" ]; then
-    echo "[stack-up] ready: Element :8088  Matrix :8080  siwx :8081"
+    echo "[stack-up] ready: Element :${ELEM_P}  Matrix :${MATRIX_P}  siwx :${SIWX_P}"
     exit 0
   fi
   sleep 2
