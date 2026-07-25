@@ -30,6 +30,9 @@ export async function exposeCaipSigner(page, walletOrBundle) {
  * @param {string} opts.siwxUrl   e.g. http://localhost:28081
  * @param {string} opts.matrixUrl e.g. http://localhost:28080
  * @param {{ wallet: import('ethers').Wallet, did: string, address?: string }} opts.wallet
+ * @param {boolean} [opts.whoami=true]  When false, skip Matrix whoami (avoids
+ *   Synapse's 2‑minute introspection cache so a subsequent logout → whoami can
+ *   hard-assert 401 immediately — see EW-S4).
  * @returns {Promise<{
  *   access_token: string,
  *   refresh_token: string,
@@ -38,9 +41,10 @@ export async function exposeCaipSigner(page, walletOrBundle) {
  *   id_token?: string,
  *   client_id: string,
  *   did: string,
+ *   scope?: string,
  * }>}
  */
-export async function loginWalletToTokens(page, { siwxUrl, matrixUrl, wallet }) {
+export async function loginWalletToTokens(page, { siwxUrl, matrixUrl, wallet, whoami = true }) {
   if (!siwxUrl || !matrixUrl || !wallet?.did || !wallet?.wallet) {
     throw new Error('loginWalletToTokens requires { siwxUrl, matrixUrl, wallet: makeWallet() bundle }');
   }
@@ -191,6 +195,7 @@ export async function loginWalletToTokens(page, { siwxUrl, matrixUrl, wallet }) 
       access_token: body.access_token,
       refresh_token: body.refresh_token,
       id_token: body.id_token,
+      scope: body.scope || '',
       client_id,
       did,
     };
@@ -206,7 +211,27 @@ export async function loginWalletToTokens(page, { siwxUrl, matrixUrl, wallet }) 
     );
   }
 
+  // device_id often appears in the issued scope (urn:matrix:client:device:ID).
+  const scopeDevice =
+    String(tok.scope || '').match(/urn:matrix:client:device:([^\s]+)/)?.[1] || '';
+
+  if (!whoami) {
+    return {
+      access_token: tok.access_token,
+      refresh_token: tok.refresh_token || '',
+      device_id: scopeDevice,
+      user_id: '',
+      id_token: tok.id_token,
+      client_id: tok.client_id,
+      did: tok.did,
+      scope: tok.scope || '',
+    };
+  }
+
   // whoami on the Matrix edge (Caddy → introspect → Synapse).
+  // NOTE: a successful whoami warms Synapse's 2‑minute introspection cache, so
+  // a later logout will not flip whoami to 401 until the cache entry expires.
+  // Use whoami:false when the next step is logout → whoami 401 (EW-S4).
   const who = await fetch(`${MATRIX}/_matrix/client/v3/account/whoami`, {
     headers: { Authorization: `Bearer ${tok.access_token}` },
   });
@@ -228,5 +253,6 @@ export async function loginWalletToTokens(page, { siwxUrl, matrixUrl, wallet }) 
     id_token: tok.id_token,
     client_id: tok.client_id,
     did: tok.did,
+    scope: tok.scope || '',
   };
 }
