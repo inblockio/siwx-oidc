@@ -14,6 +14,7 @@
 	export let client_id: string;
 	export let code_challenge: string;
 	export let code_challenge_method: string;
+	export let response_mode: string;
 
 	let status = 'Not Logged In';
 	let error: string | null = null;
@@ -60,8 +61,13 @@
 		}
 	}
 
+	let response_mode_param = '';
+	if (response_mode != null && response_mode != '') {
+		response_mode_param = `&response_mode=${response_mode}`;
+	}
+
 	function buildSignInUrl(): string {
-		return `/sign_in?redirect_uri=${encodeURI(redirect)}&state=${encodeURI(state)}&client_id=${encodeURI(client_id)}${encodeURI(oidc_nonce_param)}${encodeURI(pkce_params)}`;
+		return `/sign_in?redirect_uri=${encodeURI(redirect)}&state=${encodeURI(state)}&client_id=${encodeURI(client_id)}${encodeURI(oidc_nonce_param)}${encodeURI(pkce_params)}${encodeURI(response_mode_param)}`;
 	}
 
 	onMount(async () => {
