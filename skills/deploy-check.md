@@ -5,8 +5,11 @@ to the production server (`deploy@142.93.168.4`).
 
 ## Deploy model
 
-Code on dev machine, push to GitHub, CI builds Docker images to GHCR,
-Watchtower on the server auto-pulls new images every 5 minutes.
+Code on dev machine, push to GitHub, CI builds Docker images to GHCR.
+**Deploys are MANUAL** (verified 2026-06-12): the watchtower container is scoped
+to `matrix` but nothing else carries that scope label, so it updates NOTHING.
+After CI publishes, someone must run on the server:
+`cd /home/deploy/matrix/stack && docker compose pull siwx-oidc && docker compose up -d siwx-oidc`.
 
 **No repos or builds on the server.** Server has only `docker-compose.yml` + `.env`
 at `/home/deploy/matrix/stack/`.
@@ -90,14 +93,15 @@ Two domains needed:
 
 All point to `142.93.168.4`. Caddy handles TLS via Let's Encrypt.
 
-## 7. Watchtower auto-deploy
+## 7. Manual deploy (watchtower is a NO-OP)
+
+Watchtower runs scoped to `com.centurylinklabs.watchtower.scope=matrix`, but the
+only container carrying that label is watchtower itself — it deploys nothing
+(verified 2026-06-12; see CLAUDE.md "Deployment"). Pull and restart manually:
 
 ```bash
-ssh deploy@142.93.168.4 "cd /home/deploy/matrix/stack && docker compose logs watchtower --tail 5"
+ssh deploy@142.93.168.4 "cd /home/deploy/matrix/stack && docker compose pull siwx-oidc && docker compose up -d siwx-oidc"
 ```
-
-Should show polling every 300s. Watchtower is scoped to containers labeled
-`com.centurylinklabs.watchtower.scope=matrix`.
 
 ## 8. Login test
 
