@@ -308,3 +308,27 @@ Orchestrator re-ran full Element suite after merges. Memory admission was GREEN;
 ---
 
 *End handover. New session: checkout `phase2/session-onboarding-lab`, re-green suites, continue backlog §9.*
+
+---
+
+## 14. Continuation addendum (same day, follow-up session)
+
+Backlog §9 execution status after the continuation session of 2026-07-25:
+
+| Pri | Work | Status |
+|-----|------|--------|
+| P1 | Passkey EW paths | **Done** — `ew-passkey.spec.mjs` EW-P1–P3 (new-user gate, scoped picker + second device, synced-key second context) |
+| P2 | Element DOM click-paths | **Done** — `ew-clickpath.spec.mjs` EW-C1–C3 (real SSO click-login + Secure Backup wizard, Settings→Sessions "Remove this session" sign-out, Manage-account deep-link) |
+| P3 | EW-D2 | **Done** — honest terminal in `ew-device-link.spec.mjs` (tokens granted, no fabricated crypto claim, dead-end detectable via keys/query; contrast leg) |
+| P4 | EW-L1b | **Done** — un-skipped as a real-DOM sentinel: reload restores AUTH (no OIDC round-trip); crypto gate documented (see finding below) |
+| P5 | 3B in lab container | **Verified** — `allow_cross_signing_reset armed after login provision` in container logs; compose image = branch tip |
+| P7 | Skills/CLAUDE/README truth pass | **Done** — README no delete-on-login + 90d refresh TTL; cross-signing skill pre-flight removal documented |
+| P6 | Hermetic e2e-harness vs branch | Attempted same session (branch image retagged `localhost/siwx-oidc:local-grace`; LiveKit UDP range moved to 20100–20200 below the ephemeral floor) — see §13 of the audited proposal for the outcome |
+| P8 | Owner complete gate → prod ship | **Still blocked on owner** |
+
+**Element suite: 17 passed / 0 skipped** (was 9/1 at handover). Mock suite still 22 green.
+
+### Two significant findings (owner attention)
+
+1. **Lab fix with prod relevance:** Synapse forwards `msc3861.issuer_metadata` VERBATIM to browsers (`/_matrix/client/v1/auth_metadata`). The lab's endpoints-only dict (internal docker URLs, no capability fields) failed matrix-js-sdk issuer validation → Element silently fell back to legacy `/login/sso/redirect` → 404 dead-end. Fixed in matrix-server `entrypoints/matrix_server.sh` (full OP metadata + internal introspection only; first-boot-guard means existing volumes need a one-time patch — Element lab volume patched live). Prod metadata is all-public and unaffected, but keep MAS parity as a deploy check: ANY future auth_metadata regression re-opens this dead-end because prod also 404s the legacy route and prod Element also sets `sso_redirect_options.immediate`.
+2. **P0-class Element UX finding (reload → verify gate → reset loop):** see the FINDING row in the audited proposal §13. Backup exists and is fetchable at gate time; the gate still offers no recovery-key path. Lab reproduction of the prod half-reset forensics.
