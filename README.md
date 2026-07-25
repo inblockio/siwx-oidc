@@ -179,10 +179,10 @@ siwx-oidc implements the full MSC3861 surface required by Synapse delegated auth
 | `POST /oauth2/revoke` | Token revocation |
 | `GET /account` | Account management page (MSC4191) |
 | `POST /device_authorization` | RFC 8628 device code grant (Element X QR login) |
-| Device provisioning | Synapse admin API: create/delete devices per login |
+| Device provisioning | Synapse MAS API: idempotent upsert of a fresh device per login (never delete/recycle) |
 | Cross-signing reset | `allow_cross_signing_reset` on every login (MSC4312) |
 
-Token model: access tokens (5min TTL, `mat_` prefix), refresh tokens (24h TTL, `mcr_` prefix), rotation on refresh.
+Token model: access tokens (5min TTL, `mat_` prefix), refresh tokens (90d TTL, `mcr_` prefix), rotation on refresh.
 
 ## Architecture
 

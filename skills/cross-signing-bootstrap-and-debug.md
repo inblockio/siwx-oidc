@@ -177,15 +177,21 @@ shows a login failure after ~30-60s. This means the rendezvous timed out
 because Element Web had no cross-signing keys to transfer.
 
 **Diagnostic:**
-1. Check if approving user has cross-signing keys: `has_cross_signing_keys`
-   in siwx-oidc logs (the pre-flight check on device approval page)
+1. Check whether the approving user has PUBLISHED cross-signing keys:
+   authenticated `POST /_matrix/client/v3/keys/query` for the user — an
+   absent `master_keys` entry means MSC4108 Phase 4 cannot complete
+   (covered by Playwright EW-D2 in `e2e/element/ew-device-link.spec.mjs`)
 2. Check if Secure Backup is set up in Element Web: Settings > Security &
    Privacy > Secure Backup status
 3. If no Secure Backup: user must set it up before QR login works
 
-**The pre-flight warning** on the device approval page already covers this
-case. It checks `has_cross_signing_keys` via Synapse's keys/query API and
-warns the user if no master key exists.
+**There is NO approval-time pre-flight warning (removed 2026-06-18).** The
+old `check_cross_signing` probe raced first-time cross-signing bootstrap and
+fired for healthy users (confirmed false positive); it is gone and
+`DeviceApproveResponse.warning` is always absent on the approve path. The
+real prerequisite (cross-signing PRIVATE keys on the SENDING device) is not
+observable server-side; the published-master-key check above is the only
+honest server-side signal.
 
 ## siwx-oidc Code Reference
 
@@ -194,7 +200,7 @@ warns the user if no master key exists.
 | `allow_cross_signing_reset` | `src/synapse_client.rs` | Calls `/_synapse/mas/allow_cross_signing_reset` |
 | `has_cross_signing_keys` | `src/synapse_client.rs` | Queries `/_matrix/client/v3/keys/query` for master key |
 | `provision_synapse_device` | `src/oidc.rs` | Upsert-only provision (no delete). **Also best-effort `allow_cross_signing_reset` after every login (3B).** Used for auth-code and device_code grants. |
-| `check_cross_signing` | `src/device_auth.rs` | Pre-flight check on device approval page |
+| _(removed)_ `check_cross_signing` | `src/device_auth.rs` | Approval-time pre-flight REMOVED 2026-06-18 (false positive); `has_cross_signing_keys` remains in `synapse_client.rs` for non-approval uses |
 | `account_page` | `src/account.rs` | MSC4191 account management page (HTML) |
 | `account_wallet` | `src/account.rs` | Wallet re-auth + cross-signing reset (MSC4312) |
 | `account_passkey_finish` | `src/account.rs` | Passkey re-auth + cross-signing reset (MSC4312) |
