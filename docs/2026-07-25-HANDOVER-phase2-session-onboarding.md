@@ -323,7 +323,7 @@ Backlog §9 execution status after the continuation session of 2026-07-25:
 | P4 | EW-L1b | **Done** — un-skipped as a real-DOM sentinel: reload restores AUTH (no OIDC round-trip); crypto gate documented (see finding below) |
 | P5 | 3B in lab container | **Verified** — `allow_cross_signing_reset armed after login provision` in container logs; compose image = branch tip |
 | P7 | Skills/CLAUDE/README truth pass | **Done** — README no delete-on-login + 90d refresh TTL; cross-signing skill pre-flight removal documented |
-| P6 | Hermetic e2e-harness vs branch | Attempted same session (branch image retagged `localhost/siwx-oidc:local-grace`; LiveKit UDP range moved to 20100–20200 below the ephemeral floor) — see §13 of the audited proposal for the outcome |
+| P6 | Hermetic e2e-harness vs branch | **Done — PASS** (run `20260725-174923`: 16 pass / 0 fail / 1 known-flagged msc4191-metadata re-export). Branch image retagged `localhost/siwx-oidc:local-grace`; LiveKit UDP range moved to 20100–20200 (below the ephemeral floor — 501xx collides with rootless containers' ephemeral sockets) |
 | P8 | Owner complete gate → prod ship | **Still blocked on owner** |
 
 **Element suite: 17 passed / 0 skipped** (was 9/1 at handover). Mock suite still 22 green.
