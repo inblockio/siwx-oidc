@@ -439,15 +439,19 @@ Honesty gate (main) is separate: it only fixes **false success UI** when allow i
 | Item | Status |
 |------|--------|
 | Branch `phase2/session-onboarding-lab` from `origin/main` | **Done** |
-| 3B login-time `allow_cross_signing_reset` in `provision_synapse_device` | **Done** (code) |
-| Playwright assertion R-A1 allow call on mock | **Done** (spec) |
-| Element suite scaffold `e2e/element/` + stack-up/down | **Done** (scaffold) |
-| Caddyfile.local MSC3861 device routes | **Done** (matrix-server) |
-| Skills authenticate + cross-signing HIGH fixes | **Done** (partial) |
-| Mock e2e green for 3B | In progress |
-| Full Element stack up + EW-* green | Pending |
-| EW-S* sessions / remove device via Element UI | Pending |
-| Prod deploy | Blocked until complete |
+| 3B login-time `allow_cross_signing_reset` in `provision_synapse_device` | **Done** |
+| Playwright R-A1 allow assert + full mock browser suite (22) | **Done green** |
+| Element compose stack (ports 2808x on this host) | **Done** |
+| Caddy MSC3861 device routes + issuer_metadata | **Done** (matrix-server) |
+| Skills HIGH fixes (3B + teardown) | **Done** |
+| **EW-L0** Element shell + discovery | **Green** |
+| **EW-L1** wallet OIDC → whoami | **Green** (hard pass) |
+| **EW-S1–S4** account URI, list devices, delete second device, logout | **Green** |
+| **EW-X1–X2** XS upload + account reset honesty | **Green** |
+| **EW-D1** device_code grant + approve + whoami | **Green** |
+| EW-L1b Element SPA room-list restore | Skipped (IndexedDB; not mx_* localStorage) |
+| EW Element DOM click-paths (SSO button, Settings UI) | Pending polish |
+| Prod deploy | **Blocked until complete** |
 
 ---
 
