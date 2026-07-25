@@ -30,6 +30,52 @@ The body was written before two adversarial re-checks. Where they conflict, **th
 fails-closed guards, 4 introspect guards; `--lib` 24 passed, `--bin` 119 passed, 0 failed).
 A9 merged. Remaining: A7 proof, R5 recovery-entry coverage, state-machine completeness.
 
+### A14 — **OPEN P0: two competing root causes for F16. Do not ship a third patch until measured.**
+
+Two independent agents produced **incompatible** explanations for the missing recovery-key
+entry, and **two patch commits were already merged on the strength of the first one.**
+
+| | Account 1 (basis of `9ec414d` + `b7e594f`) | Account 2 (`2026-07-25-recovery-entry-and-qr-capability-audit.md`) |
+|---|---|---|
+| Mechanism | Cold local `account_data` cache makes the readiness probe read false on restore | 4S exists (default key + megolm backup) but **`m.cross_signing.master` was never encrypted into it** |
+| Predicate blamed | `isSecretStorageReady()` / `secretStorage.hasKey()` | `keyInfo` ← `secretStorage.isStored("m.cross_signing.master")` (`SetupEncryptionStore.ts:90-100`) |
+| Status of the fix | Merged, **never validated** — `9ec414d` was falsified by its own EW-L1b run; no post-`b7e594f` run exists | Not fixed at all |
+
+Account 2's decisive claim: the shipped matrix-js-sdk 41.6.0 `isStored`, extracted verbatim
+from the running lab (chunk `6065.js`), calls `getAccountDataFromServer` — **a server read**.
+If true, the cold-cache story cannot explain the withheld button, three different predicates
+are in play, and the merged patch fixes only the middle one. The `room_keys/version` 200
+originally cited as counter-evidence is the **megolm backup**, a different artifact from the
+master secret.
+
+**Why this is worse than a plain miss:** the merged fix plausibly repairs the *reload* symptom
+while leaving **R5/R6 broken and less visible**. Worst state is context **C5** — new device, no
+live session, i.e. exactly R5/R6: the gate fires, "Use another device" is unavailable *by
+construction*, and with `keyInfo` null the only exits are destructive reset or sign-out.
+
+**Structural support for Account 2 (static, no lab needed):** the wizard's success condition is
+`!(await this.shouldForceVerification())`, which proves only that a **default 4S key exists** —
+never that the master was stored under it. A device whose cross-signing *private* keys are not
+locally held cannot encrypt the master into 4S even though `bootstrapSecretStorage` succeeds in
+creating the key. That is a coherent path to "recovery key that recovers nothing".
+
+**Proposed P0 (NOT APPLIED):** make the wizard's success condition assert the secret is actually
+retrievable — `isStored("m.cross_signing.master")` — not merely that a key exists.
+
+**Decision: measure before patching.** `EW-R1-0` is the one cheap assertion that discriminates
+the two accounts. Shipping the P0 now would be a third unvalidated patch stacked on two others,
+and a stricter success condition that is never satisfiable would loop users through
+Retry/Sign-out. **Gate: run EW-R1-0 against an image built from `main`, then patch.**
+
+**Caveat on all lab evidence (A15):** the running lab image emits `response_modes_supported`,
+which is **absent from `main` @ `d21329e`**. The lab is NOT representative of main, so any
+lab-derived conclusion — including Account 2's chunk extraction — must be re-confirmed against
+a main-built image before it is treated as settled.
+
+**Unaffected by this conflict:** `cb75cce` (the `forceReset` cold-cache data-loss fix) stands on
+its own — never take an irreversible branch on an indeterminate probe — regardless of which
+account explains the withheld button.
+
 **Pipeline:** `process-pipeline` Phase 1 (logic-model → hypothesis register → plan → gate).
 **Entry mode:** Goal mode (one goal, decomposed into four workstreams).
 **Branch of record:** `phase2/session-onboarding-lab` (this doc), base `main`.
