@@ -17,9 +17,9 @@ use chrono::Utc;
 use rand::{thread_rng, Rng};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
-use tracing::{debug, warn};
+use tracing::warn;
 
-use siwx_oidc::db::DBClient;
+use siwx_oidc::db::{DBClient, TokenMetadata};
 
 use super::axum_lib::IntrospectState;
 
@@ -91,32 +91,52 @@ pub async fn introspect(
     }
 
     // Look up the token in Redis.
-    let metadata = state
-        .redis_client
-        .get_token(&form.token)
-        .await
-        .map_err(|e| {
-            debug!("introspect: Redis error: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let lookup = state.redis_client.get_token(&form.token).await;
+    render_introspection(lookup, Utc::now().timestamp())
+}
+
+/// Render an introspection lookup outcome.
+///
+/// **Load-bearing invariant: a store ERROR must never render as
+/// `{"active": false}`.** Synapse caches a *negative* introspection result for
+/// two minutes with no invalidation path (`msc3861_delegated.py`, `ResponseCache`
+/// with a 2-minute timeout), and under MSC3861 an inactive token is a HARD logout
+/// — `InvalidClientTokenError` is raised with `soft_logout` left at its default
+/// `false`, so the client wipes its crypto store and the user loses their
+/// cryptographic identity. One transient Redis error rendered as `active:false`
+/// would therefore become two minutes of unrecoverable sign-outs for that token.
+/// A 5xx is retryable and Synapse does not cache it.
+///
+/// Extracted from the handler purely so this property can be pinned by a test.
+fn render_introspection(
+    lookup: anyhow::Result<Option<TokenMetadata>>,
+    now: i64,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let metadata = match lookup {
+        Ok(m) => m,
+        Err(e) => {
+            // NOT `active:false` — see the invariant above.
+            warn!(error = %e, "introspect: token store unavailable; returning 500 (never active:false)");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
 
     match metadata {
-        Some(m) if m.exp > Utc::now().timestamp() => {
-            let now = Utc::now().timestamp();
-            Ok(Json(serde_json::json!({
-                "active": true,
-                "username": m.username,
-                "device_id": m.device_id,
-                "scope": m.scope,
-                "sub": m.did,
-                "name": m.name,
-                "client_id": m.client_id,
-                "token_type": "Bearer",
-                "exp": m.exp,
-                "expires_in": m.exp - now,
-                "iat": m.iat,
-            })))
-        }
+        Some(m) if m.exp > now => Ok(Json(serde_json::json!({
+            "active": true,
+            "username": m.username,
+            "device_id": m.device_id,
+            "scope": m.scope,
+            "sub": m.did,
+            "name": m.name,
+            "client_id": m.client_id,
+            "token_type": "Bearer",
+            "exp": m.exp,
+            "expires_in": m.exp - now,
+            "iat": m.iat,
+        }))),
+        // A genuinely absent or expired token IS inactive. This is the only path
+        // allowed to produce `active:false`.
         _ => Ok(Json(serde_json::json!({"active": false}))),
     }
 }
@@ -149,5 +169,59 @@ mod tests {
         let t1 = generate_opaque_token("mat_");
         let t2 = generate_opaque_token("mat_");
         assert_ne!(t1, t2);
+    }
+
+    // -- Guard: a store error must NEVER render as active:false ----------------
+    // Synapse caches a negative introspection for 2 minutes with no invalidation,
+    // and under MSC3861 inactive == hard logout + crypto-store wipe. One
+    // transient error rendered as active:false becomes 2 minutes of
+    // unrecoverable sign-outs. If this test fails, do NOT relax it.
+
+    fn meta(exp: i64) -> TokenMetadata {
+        TokenMetadata {
+            username: "alice".into(),
+            device_id: "SIWX_test".into(),
+            scope: "openid".into(),
+            client_id: "c".into(),
+            iat: 0,
+            exp,
+            did: "did:key:zDnTest".into(),
+            name: String::new(),
+        }
+    }
+
+    #[test]
+    fn store_error_is_5xx_never_inactive() {
+        let out = render_introspection(Err(anyhow::anyhow!("redis down")), 1_000);
+        match out {
+            Err(code) => assert!(
+                code.is_server_error(),
+                "store error must be a retryable 5xx, got {code}"
+            ),
+            Ok(json) => panic!(
+                "store error rendered as a 200 body ({:?}) — Synapse would cache \
+                 this negative for 2 minutes and hard-log-out the user",
+                json.0
+            ),
+        }
+    }
+
+    #[test]
+    fn absent_token_is_inactive() {
+        let out = render_introspection(Ok(None), 1_000).expect("absent token is a 200");
+        assert_eq!(out.0["active"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn expired_token_is_inactive() {
+        let out = render_introspection(Ok(Some(meta(500))), 1_000).expect("expired token is a 200");
+        assert_eq!(out.0["active"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn live_token_is_active() {
+        let out = render_introspection(Ok(Some(meta(2_000))), 1_000).expect("live token is a 200");
+        assert_eq!(out.0["active"], serde_json::json!(true));
+        assert_eq!(out.0["expires_in"], serde_json::json!(1_000));
     }
 }

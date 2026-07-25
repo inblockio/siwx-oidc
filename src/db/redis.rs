@@ -10,11 +10,9 @@ use url::Url;
 
 use super::*;
 
-/// How long a device-revoked / user-deactivation tombstone lives. It only needs
-/// to outlast an in-flight refresh that started before the sweep; a few minutes
-/// is ample (access tokens live 5 min). It is also harmless if it lingers: it
-/// just makes a refresh refuse, and a fresh sign-in does not consult it.
-const TOMBSTONE_TTL_SECS: u64 = 600; // 10 min
+// `TOMBSTONE_TTL_SECS` now lives in `super` (db/mod.rs), next to
+// `ACCESS_TOKEN_TTL`, so the const assertion tying the two together can see both.
+// It reaches here via the `use super::*` above.
 
 #[derive(Clone)]
 pub struct RedisClient {
