@@ -46,6 +46,29 @@ export async function injectMockWallet(page, walletOrBundle) {
     ? walletOrBundle.wallet
     : walletOrBundle;
   const address = wallet.address;
+
+  // Idempotence guard. A spec that drives Element through a UI login and THEN
+  // runs a headless OIDC login on the same page injects twice, and Playwright's
+  // exposeFunction throws `Function "__ethSign" has been already registered` --
+  // an opaque harness failure that reads like a product defect.
+  //
+  // Re-injecting the SAME wallet is a no-op, so allow it. Re-injecting a
+  // DIFFERENT wallet must be loud: the first binding wins, so the page would
+  // silently keep signing as the previous identity and the test would "pass"
+  // while proving something about the wrong user.
+  const prior = page.__mockWalletAddress;
+  if (prior) {
+    if (prior.toLowerCase() !== address.toLowerCase()) {
+      throw new Error(
+        `injectMockWallet: page already has wallet ${prior}; refusing to inject ${address}. ` +
+          `exposeFunction cannot rebind, so the page would keep signing as ${prior}. ` +
+          `Use a fresh browser context for the second identity.`,
+      );
+    }
+    return; // same wallet, already wired
+  }
+  page.__mockWalletAddress = address;
+
   // viem/wagmi (the real siwx login UI) hex-encodes the personal_sign payload;
   // headless helpers pass plain text. Sign the decoded BYTES for hex input so
   // both paths produce the same EIP-191 signature a real MetaMask would.
