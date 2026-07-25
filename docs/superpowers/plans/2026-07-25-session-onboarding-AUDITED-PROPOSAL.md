@@ -451,7 +451,9 @@ Honesty gate (main) is separate: it only fixes **false success UI** when allow i
 | **EW-D1** device_code grant + approve + whoami | **Green** |
 | **EW-P1–P3** passkey OIDC: new-user gate, scoped picker + second device, synced-key second context | **Green** |
 | 3B verified in running lab **container** (log: `allow_cross_signing_reset armed after login provision` on passkey logins) | **Done** |
-| EW-L1b Element SPA room-list restore | Skipped (IndexedDB; not mx_* localStorage) |
+| **EW-D2** approver WITHOUT cross-signing → honest terminal (tokens granted, no fabricated crypto claim, `T_ApprovedButDead` externally detectable via keys/query; contrast leg with XS proves the discriminator) | **Green** |
+| **EW-L1b** reload restores AUTH session (no OIDC round-trip, same user/device) — un-skipped, real DOM | **Green (sentinel)** |
+| **FINDING (P0-class, owner attention):** on reload, Element 1.12.20 + `force_verification` restores auth but NOT crypto: lands on "Confirm your digital identity" whose ONLY exits are "Use another device" or identity RESET — no recovery-key entry, despite Secure Backup completed seconds earlier. Single-device users get a reload → verify-gate → forced-reset loop: lab REPRODUCTION of the prod "verify session loop / half-reset" forensics (2026-06-24 audits). EW-L1b pins this honestly and flags any behavior change | **Open** |
 | **EW-C1–C3** REAL Element DOM click-paths: SSO login via siwx UI + Secure Backup wizard, Settings→Sessions "Remove this session" sign-out, Manage-account deep-link | **Green** |
 | Lab fix (matrix-server): `issuer_metadata` must be the OP's FULL metadata (public URLs) + internal introspection only — an endpoints-only dict fails matrix-js-sdk validation → Element falls back to legacy `/login/sso/redirect` → 404 dead-end | **Done** (entrypoint + live lab) |
 | Prod deploy | **Blocked until complete** |

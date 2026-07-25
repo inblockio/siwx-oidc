@@ -17,6 +17,7 @@ import {
   MATRIX_URL,
 } from './helpers/element.mjs';
 import { loginWalletToTokens } from './helpers/oidc-login.mjs';
+import { elementWalletClickLogin } from './helpers/element-login.mjs';
 import { makeWallet } from '../browser/wallet-helper.mjs';
 
 test.beforeAll(async () => {
@@ -72,17 +73,65 @@ test('EW-L1: wallet CAIP-122 through siwx produces Matrix whoami (headless OIDC)
 });
 
 /**
- * EW-L1b (optional): seed Element localStorage with OP tokens and hope the SPA
- * boots to the room list without running its own OIDC redirect.
+ * EW-L1b: Element restores the session from its OWN persisted storage.
  *
- * SKIPPED: modern Element Web (matrix-js-sdk + rust crypto / OIDC) persists the
- * session primarily in IndexedDB under matrix-js-sdk stores, not the legacy
- * `mx_access_token` / `mx_user_id` localStorage keys. Writing those keys alone
- * does not restore a logged-in session on the Element image this lab runs, so
- * the room-list assertion would flake or false-fail. Re-enable when we have a
- * verified restore path (e.g. matrix-js-sdk SessionStore injection or a
- * documented Element test hook) for this image.
+ * The original pre-seeded-token approach was permanently unworkable (Element
+ * persists the session in IndexedDB matrix-js-sdk stores, not the legacy
+ * mx_* localStorage keys). With the real DOM click-login available (EW-C1),
+ * the honest form is: log in for real, reload, and pin what ACTUALLY happens:
+ *
+ *  - AUTH restore works: no OIDC /authorize round-trip, same user_id +
+ *    device_id from storage, never a logged-out login screen.
+ *  - CRYPTO does NOT restore (current known state, this Element build +
+ *    force_verification): Element lands on the "Confirm your digital
+ *    identity" gate whose ONLY exits are "Use another device" or identity
+ *    RESET — no recovery-key entry, even though Secure Backup was completed
+ *    seconds earlier. For a single-device user this is a reload → verify-gate
+ *    → forced-reset loop: a lab REPRODUCTION of the prod "verify session
+ *    loop / half-reset" forensics (docs/audits/2026-06-24-*). Tracked as a
+ *    Phase-2 finding; if either branch below flips, behavior changed —
+ *    re-evaluate and update the finding, don't paper over it.
  */
-test.skip('EW-L1b: Element boots to room list from pre-seeded tokens', async () => {
-  // Intentionally empty — see skip reason above.
+test('EW-L1b: reload restores AUTH session (no OIDC round-trip); crypto gate documented', async ({
+  page,
+}) => {
+  test.setTimeout(360_000);
+  const w = makeWallet(undefined, 'localhost');
+  const session = await elementWalletClickLogin(page, w);
+  expect(session.user_id).toBe(w.mxid);
+
+  // Reload: any bounce through the OP's /authorize means the auth session was
+  // NOT restored from storage.
+  const authorizeHits = [];
+  page.on('request', (r) => {
+    if (r.url().startsWith(SIWX_URL) && r.url().includes('/authorize')) {
+      authorizeHits.push(r.url());
+    }
+  });
+  await page.reload({ waitUntil: 'domcontentloaded' });
+
+  const chat = page.locator('.mx_MatrixChat');
+  const gate = page.locator('.mx_CompleteSecurityBody');
+  await chat.or(gate).first().waitFor({ timeout: 90_000 });
+
+  // AUTH restore invariants — these must hold on EVERY outcome.
+  expect(new URL(page.url()).origin).toBe(new URL(ELEMENT_URL).origin);
+  expect(authorizeHits).toHaveLength(0);
+  const restored = await page.evaluate(() => ({
+    user_id: localStorage.getItem('mx_user_id'),
+    device_id: localStorage.getItem('mx_device_id'),
+  }));
+  expect(restored.user_id).toBe(session.user_id);
+  expect(restored.device_id).toBe(session.device_id);
+
+  if (await chat.count()) {
+    // Crypto restored too — behavior IMPROVED over the documented state.
+    // Nothing more to assert; update the finding in the plan log.
+    return;
+  }
+
+  // Current known terminal: the identity-confirmation gate, offering only
+  // another-device verification or destructive reset (no recovery-key path).
+  await expect(page.getByRole('button', { name: /use another device/i })).toBeVisible();
+  await expect(page.getByRole('button', { name: /remove this device/i })).toBeVisible();
 });

@@ -25,6 +25,11 @@ import {
   pollDeviceToken,
   matrixWhoami,
 } from './helpers/device-code.mjs';
+import {
+  buildCrossSigningUpload,
+  uploadDeviceSigning,
+  keysQuery,
+} from './helpers/crypto.mjs';
 import { makeWallet } from '../browser/wallet-helper.mjs';
 
 test.beforeAll(async () => {
@@ -123,4 +128,102 @@ test('EW-D1: device_authorization → wallet approve → device_code token → M
   expect(who.body.device_id).toBe(linkedDeviceId);
   // Linked device is distinct from the seed login device.
   expect(who.body.device_id).not.toBe(seedDeviceId);
+});
+
+/**
+ * Approve the pending user_code with the given wallet and poll the grant.
+ * Returns the device_code token response.
+ */
+async function approveAndPoll(w, clientId, da) {
+  const approve = await approveDeviceWithWallet(
+    { wallet: w.wallet, did: w.did, userCode: da.user_code },
+    SIWX_URL,
+  );
+  expect(
+    approve.status,
+    `device approve must 200: ${typeof approve.body === 'string' ? approve.body : JSON.stringify(approve.body)}`,
+  ).toBe(200);
+  return {
+    approve,
+    token: await pollDeviceToken(
+      {
+        clientId,
+        deviceCode: da.device_code,
+        intervalSec: da.interval || 2,
+        maxWaitMs: 45_000,
+      },
+      SIWX_URL,
+    ),
+  };
+}
+
+test('EW-D2: approver with NO cross-signing → honest terminal — tokens granted, no fabricated crypto claim, dead-end detectable', async ({
+  page,
+  browser,
+}) => {
+  // The MSC4108 Phase-4 prerequisite (XS private keys on the SENDING device)
+  // is not observable server-side; the removed approval-time pre-flight probe
+  // was a confirmed false positive (raced first-time bootstrap). The honest
+  // contract this spec pins:
+  //   1. approval + token grant report TOKEN truth only (they succeed);
+  //   2. the server fabricates NO crypto claim (no warning, no XS state);
+  //   3. the M5 Q2 dead-end (T_ApprovedButDead) stays externally DETECTABLE:
+  //      keys/query from the linked device shows the approver has no master
+  //      key, which is exactly what a real client's Phase-4 would trip on.
+  // A contrast leg (approver WITH cross-signing) proves the discriminator
+  // actually discriminates.
+  const rc = await registerDeviceClient(SIWX_URL);
+
+  // --- Leg A: approver WITHOUT cross-signing (fresh account, no XS upload).
+  const wA = makeWallet();
+  const seedA = await loginWalletToTokens(page, {
+    siwxUrl: SIWX_URL,
+    matrixUrl: MATRIX_URL,
+    wallet: wA,
+  });
+  const daA = await requestDeviceAuthorization({ clientId: rc.client_id }, SIWX_URL);
+  const { approve: approveA, token: tokenA } = await approveAndPoll(wA, rc.client_id, daA);
+
+  // (2) No fabricated crypto claim on the approve terminal (H9 counterpart).
+  if (typeof approveA.body === 'object' && approveA.body !== null) {
+    expect(approveA.body.warning ?? null).toBeNull();
+  }
+
+  // (1) Token truth: the linked device signs in.
+  expect(tokenA.access_token).toMatch(/^mat_/);
+  const whoA = await matrixWhoami(tokenA.access_token, MATRIX_URL);
+  expect(whoA.status).toBe(200);
+  expect(whoA.body.user_id).toBe(seedA.user_id);
+
+  // (3) The dead-end is detectable: no master cross-signing key published, so
+  // a real client CANNOT complete MSC4108 Phase 4 — and nothing masks that.
+  const kqA = await keysQuery(tokenA.access_token, seedA.user_id, MATRIX_URL);
+  expect(kqA.status).toBe(200);
+  expect(kqA.body.master_keys?.[seedA.user_id]).toBeUndefined();
+
+  // --- Leg B (contrast): approver WITH published cross-signing keys.
+  const ctxB = await browser.newContext();
+  try {
+    const pageB = await ctxB.newPage();
+    const wB = makeWallet();
+    const seedB = await loginWalletToTokens(pageB, {
+      siwxUrl: SIWX_URL,
+      matrixUrl: MATRIX_URL,
+      wallet: wB,
+    });
+    const up = await uploadDeviceSigning(
+      seedB.access_token,
+      buildCrossSigningUpload(seedB.user_id),
+      MATRIX_URL,
+    );
+    expect(up.status, `XS upload must 200: ${up.body.slice(0, 200)}`).toBe(200);
+
+    const daB = await requestDeviceAuthorization({ clientId: rc.client_id }, SIWX_URL);
+    const { token: tokenB } = await approveAndPoll(wB, rc.client_id, daB);
+    const kqB = await keysQuery(tokenB.access_token, seedB.user_id, MATRIX_URL);
+    expect(kqB.status).toBe(200);
+    expect(kqB.body.master_keys?.[seedB.user_id]).toBeTruthy();
+  } finally {
+    await ctxB.close();
+  }
 });
