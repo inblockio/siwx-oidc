@@ -135,4 +135,38 @@ test('EW-PROBE: what does a reloaded first device actually render?', async ({ pa
     await page.waitForTimeout(t === 5 ? 5_000 : 10_000);
     await snapshot(page, `after-reload-~${t}s`);
   }
+
+  // ---------------------------------------------------------------------
+  // Fix-direction check. The gate is on screen with keyInfo effectively null
+  // (no "Use recovery key" button, zero inputs). If the SAME predicate the
+  // store uses returns a live value NOW, then the state is merely STALE and
+  // recomputing after hydration is sufficient -- no change to the predicate
+  // itself is needed. If it returns null now too, the predicate is wrong and
+  // a different fix is required. This distinguishes those two worlds without
+  // rebuilding Element.
+  // ---------------------------------------------------------------------
+  const live = await page.evaluate(async () => {
+    const cli = window.mxMatrixClientPeg?.get?.();
+    if (!cli) return { error: 'no client' };
+    const out = {};
+    try {
+      const ks = await cli.secretStorage.isStored('m.cross_signing.master');
+      out.isStored_master = ks ? Object.keys(ks) : null;
+    } catch (e) {
+      out.isStored_master = `ERR ${e}`;
+    }
+    try {
+      out.defaultKeyId = await cli.secretStorage.getDefaultKeyId();
+    } catch (e) {
+      out.defaultKeyId = `ERR ${e}`;
+    }
+    try {
+      out.storePhase = window.mxSetupEncryptionStore?.phase ?? null;
+      out.storeKeyInfo = window.mxSetupEncryptionStore?.keyInfo ?? null;
+    } catch (e) {
+      out.storeKeyInfo = `ERR ${e}`;
+    }
+    return out;
+  });
+  console.log(`\n[EW-PROBE live-predicate] ${JSON.stringify(live, null, 2)}\n`);
 });
