@@ -1540,8 +1540,15 @@ fn resolve_device_id(proposed_device_id: Option<&str>) -> String {
 /// Provision a Synapse user+device for a DID. Best-effort: failures are logged
 /// but never fail the auth flow. Idempotent: re-provisioning the same device_id
 /// is a plain upsert that preserves the device's E2EE keys. Never deletes an
-/// existing device and never resets cross-signing; those are explicit,
-/// user-initiated actions (see account.rs).
+/// existing device (device teardown is explicit — see `compat` / account actions).
+///
+/// **Cross-signing reset arm (product 3B, 2026-07-25):** after upsert, always
+/// best-effort `allow_cross_signing_reset` so a half-reset client can publish
+/// replacement public keys without requiring a separate `/account` visit on
+/// every recovery path. First-time bootstrap still relies on MSC3967 when no
+/// master exists; this call is a no-op or soft-fail in that case and must not
+/// fail sign-in. Explicit MSC4312 account reauth remains available and still
+/// uses the honesty gate in `account.rs`.
 ///
 /// `proposed_device_id`: the client-supplied device_id from the OAuth scope
 /// (stable for Element Web and Element X). When `None`, a fresh `SIWX_{uuid}`
@@ -1572,6 +1579,20 @@ pub async fn provision_synapse_device(
         .await
     {
         warn!("upsert_device failed: {}", e);
+    }
+
+    // 3B: arm reset window after every successful login provision (best-effort).
+    if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
+        warn!(
+            did = %did,
+            error = %e,
+            "allow_cross_signing_reset after login provision failed (non-fatal)"
+        );
+    } else {
+        info!(
+            did = %did,
+            "allow_cross_signing_reset armed after login provision"
+        );
     }
 
     Some(dev_id)

@@ -24,7 +24,7 @@ import net from 'node:net';
 import { addVirtualAuthenticator, registerPasskey } from './webauthn-helper.mjs';
 import { makeWallet, injectMockWallet } from './wallet-helper.mjs';
 
-const BASE = process.env.SIWEOIDC_HOST || 'http://localhost:8080';
+const BASE = process.env.SIWEOIDC_HOST || 'http://localhost:18080';
 const MOCK = process.env.SYNAPSE_MOCK || 'http://localhost:8090';
 const REDIS_HOST = process.env.REDIS_HOST || '127.0.0.1';
 const REDIS_PORT = Number(process.env.REDIS_PORT || 6379);

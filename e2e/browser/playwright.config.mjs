@@ -10,7 +10,7 @@ export default defineConfig({
   expect: { timeout: 8_000 },
   reporter: [['list']],
   use: {
-    baseURL: process.env.SIWEOIDC_HOST || 'http://localhost:8080',
+    baseURL: process.env.SIWEOIDC_HOST || 'http://localhost:18080',
     headless: true,
     ...devices['Desktop Chrome'],
   },

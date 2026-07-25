@@ -55,9 +55,9 @@ digraph cross_signing_debug {
   first_console [label="Check browser console:\nbootstrapCrossSigning called?"];
   first_synapse_log [label="Check Synapse logs:\nkeys/device_signing/upload request?"];
 
-  reset_check [label="Check: allow_cross_signing_reset\ncalled on login?"];
-  reset_api [label="Verify: POST /_synapse/mas/\nallow_cross_signing_reset\nreturns 200"];
-  reset_timing [label="Check: upload happens within\nthe reset window?"];
+  reset_check [label="Did user complete MSC4312 reauth\nOR recent login (3B allow)?"];
+  reset_api [label="Verify allow_cross_signing_reset\nfired (account page and/or login)"];
+  reset_timing [label="Check: upload within window\n+ honesty gate if account path"];
 
   fix_synapse [label="Upgrade Synapse" shape=note];
   fix_wellknown [label="Add m.authentication\nto .well-known" shape=note];
@@ -193,8 +193,7 @@ warns the user if no master key exists.
 |----------|------|---------|
 | `allow_cross_signing_reset` | `src/synapse_client.rs` | Calls `/_synapse/mas/allow_cross_signing_reset` |
 | `has_cross_signing_keys` | `src/synapse_client.rs` | Queries `/_matrix/client/v3/keys/query` for master key |
-| `provision_synapse_device` | `src/oidc.rs` | Replacement mode: deletes old device, creates new, calls allow_cross_signing_reset |
-| `provision_synapse_device_additive` | `src/oidc.rs` | Additive mode (device code): preserves devices, calls allow_cross_signing_reset |
+| `provision_synapse_device` | `src/oidc.rs` | Upsert-only provision (no delete). **Also best-effort `allow_cross_signing_reset` after every login (3B).** Used for auth-code and device_code grants. |
 | `check_cross_signing` | `src/device_auth.rs` | Pre-flight check on device approval page |
 | `account_page` | `src/account.rs` | MSC4191 account management page (HTML) |
 | `account_wallet` | `src/account.rs` | Wallet re-auth + cross-signing reset (MSC4312) |

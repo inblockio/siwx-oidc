@@ -23,7 +23,7 @@ import {
   countCeremonies, ceremonyCounts,
 } from './webauthn-helper.mjs';
 
-const BASE = process.env.SIWEOIDC_HOST || 'http://localhost:8080';
+const BASE = process.env.SIWEOIDC_HOST || 'http://localhost:18080';
 const MOCK = process.env.SYNAPSE_MOCK || 'http://localhost:8090';
 // Redis is reachable on the host network (the Playwright container runs with
 // --network host), so we speak RESP directly over TCP rather than shelling out
@@ -277,6 +277,12 @@ test('R-A1: wallet login issues a token (authorize -> sign_in -> token)', async 
   // S: a fresh SIWX_* device was provisioned for this DID on token issuance.
   const ids = await mockDevices(w.mxid);
   expect(ids.some((d) => d.startsWith('SIWX_'))).toBe(true);
+
+  // 3B: login provision best-effort arms allow_cross_signing_reset (every sign-in).
+  const st = await mockState();
+  const allowCalls = (st.calls || []).filter((c) =>
+    String(c).includes('allow_cross_signing_reset'));
+  expect(allowCalls.length).toBeGreaterThanOrEqual(1);
 });
 
 test('R-C1/R-C2/R-C3: passkey register -> login -> token (same DID)', async ({ page }) => {
