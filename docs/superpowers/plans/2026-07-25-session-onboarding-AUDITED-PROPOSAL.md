@@ -449,6 +449,8 @@ Honesty gate (main) is separate: it only fixes **false success UI** when allow i
 | **EW-S1–S4** account URI, list devices, delete second device, logout | **Green** |
 | **EW-X1–X2** XS upload + account reset honesty | **Green** |
 | **EW-D1** device_code grant + approve + whoami | **Green** |
+| **EW-P1–P3** passkey OIDC: new-user gate, scoped picker + second device, synced-key second context | **Green** |
+| 3B verified in running lab **container** (log: `allow_cross_signing_reset armed after login provision` on passkey logins) | **Done** |
 | EW-L1b Element SPA room-list restore | Skipped (IndexedDB; not mx_* localStorage) |
 | EW Element DOM click-paths (SSO button, Settings UI) | Pending polish |
 | Prod deploy | **Blocked until complete** |
