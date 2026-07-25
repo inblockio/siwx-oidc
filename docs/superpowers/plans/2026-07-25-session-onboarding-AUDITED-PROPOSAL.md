@@ -452,7 +452,8 @@ Honesty gate (main) is separate: it only fixes **false success UI** when allow i
 | **EW-P1–P3** passkey OIDC: new-user gate, scoped picker + second device, synced-key second context | **Green** |
 | 3B verified in running lab **container** (log: `allow_cross_signing_reset armed after login provision` on passkey logins) | **Done** |
 | EW-L1b Element SPA room-list restore | Skipped (IndexedDB; not mx_* localStorage) |
-| EW Element DOM click-paths (SSO button, Settings UI) | Pending polish |
+| **EW-C1–C3** REAL Element DOM click-paths: SSO login via siwx UI + Secure Backup wizard, Settings→Sessions "Remove this session" sign-out, Manage-account deep-link | **Green** |
+| Lab fix (matrix-server): `issuer_metadata` must be the OP's FULL metadata (public URLs) + internal introspection only — an endpoints-only dict fails matrix-js-sdk validation → Element falls back to legacy `/login/sso/redirect` → 404 dead-end | **Done** (entrypoint + live lab) |
 | Prod deploy | **Blocked until complete** |
 
 ---
