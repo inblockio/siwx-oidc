@@ -33,6 +33,32 @@ fn oidc() -> String {
     std::env::var("SIWEOIDC_HOST").unwrap_or_else(|_| "http://localhost:8080".to_string())
 }
 
+fn mock() -> String {
+    std::env::var("SYNAPSE_MOCK").unwrap_or_else(|_| "http://localhost:8090".to_string())
+}
+
+/// Mark this wallet's identity as an EXISTING account in the Synapse mock.
+///
+/// `reject_if_new_identity` (`src/webauthn.rs`) 400s an unprovisioned identity on
+/// every non-login path — device approval and account actions included — logging
+/// `rejecting new-identity (no existing account) outside login flow`. That gate is
+/// CORRECT and is documented policy: creating a Matrix account is permitted ONLY at
+/// the login screen.
+///
+/// These tests predate the gate and were asserting 200 for a wallet that had never
+/// signed in, so they failed against a server that is behaving properly. Seeding
+/// models the RETURNING user the tests actually mean to exercise, leaving the
+/// replay/race assertion itself untouched. The Playwright suite already got this
+/// right — `passkey-scoping.spec.mjs` calls `mockSeedUser` before the same approval.
+async fn mock_seed_user(c: &Client, did: &str) {
+    let localpart = did.replace(':', "-").to_lowercase();
+    c.post(format!("{}/__seed_user", mock()))
+        .json(&json!({ "localpart": localpart }))
+        .send()
+        .await
+        .unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Wallet identity + EIP-191 signing
 // ---------------------------------------------------------------------------
@@ -761,6 +787,9 @@ async fn device_approval_replay_is_rejected_fresh_succeeds() {
     let c = Client::new();
     let base = oidc();
     let w = new_wallet();
+    // Returning user, not a brand-new identity: see `mock_seed_user`. Without this
+    // the new-identity gate 400s step (a) and the replay assertion never runs.
+    mock_seed_user(&c, &w.did).await;
 
     // (a) Fresh, correctly nonced approval → 200.
     let uc1 = new_device_user_code(&c, &base).await;
@@ -931,6 +960,9 @@ async fn account_action_nonce_replay_is_rejected() {
     let c = Client::new();
     let base = oidc();
     let w = new_wallet();
+    // Returning user, not a brand-new identity: see `mock_seed_user`. The account
+    // path rejects new identities outright, so without this the first call 400s.
+    mock_seed_user(&c, &w.did).await;
 
     // Use `profile` (idempotent, needs no Synapse) so the first call succeeds.
     let np = account_nonce(&c, &base, "org.matrix.profile").await;

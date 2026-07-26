@@ -23,8 +23,136 @@ jobs:
       - name: Fmt
         run: cargo fmt -- --check
 
+      # Runs the unit tests only. Every tests/*.rs integration test is #[ignore]d
+      # and stays that way: all 43 of them need a live siwx-oidc HTTP listener,
+      # which this job does not have (Redis alone is not enough). The promotable
+      # subset runs in the `rust-e2e-mock` job below.
       - name: Test
         run: cargo test
+
+  # ---------------------------------------------------------------------------
+  # Rust integration E2E against the MOCK stack. Added 2026-07-26 to close the
+  # remaining half of audit finding C-0: all 43 `#[ignore]` tests in tests/*.rs
+  # ran NOWHERE automatically, so every protocol-level assertion about session
+  # teardown, OAuth binding and account management was an unguarded manual claim.
+  #
+  # This job promotes the 28 of them that need nothing beyond the self-contained
+  # mock stack (Redis + synapse_mock.py + siwx-oidc) -- the same infrastructure
+  # browser-e2e already stands up. The remaining 15 are NOT promotable: they need
+  # a REAL Synapse (they call /_matrix/client/v3/... Client-Server endpoints that
+  # synapse_mock.py does not implement and 404s).
+  #
+  # Three of the 28 were initially RED and were briefly skipped by name. They were
+  # not weakened -- they were WRONG, and are now fixed (see finding F-1): each
+  # approved a device / ran an account action for a wallet that had never signed
+  # in, so `reject_if_new_identity` correctly 400d it. They now seed the identity
+  # via the mock's `__seed_user`, exactly as the Playwright suite already did.
+  # Full classification + evidence: docs/audits/2026-07-26-ci-promotion-C0.md
+  #
+  # `#[ignore]` is deliberately NOT removed from the source: the `build` job runs
+  # a plain `cargo test` with Redis but no siwx-oidc listener, so un-ignoring any
+  # of these would break it. Explicit `-- --ignored` here is the correct lever.
+  #
+  # `--test-threads=1` is REQUIRED, not a performance choice: these suites share
+  # one stack and each resets the Synapse mock (`POST /__reset`), so running them
+  # concurrently makes them clobber each other's state.
+  # ---------------------------------------------------------------------------
+  rust-e2e-mock:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      SIWEOIDC_ADDRESS: 127.0.0.1
+      SIWEOIDC_PORT: "18080"
+      SIWEOIDC_BASE_URL: http://localhost:18080
+      SIWEOIDC_REDIS_URL: redis://localhost:6379
+      SIWEOIDC_MAS_SHARED_SECRET: testsecret
+      SIWEOIDC_SYNAPSE_ENDPOINT: http://localhost:8090
+      SIWEOIDC_MATRIX_SERVER_NAME: matrix.test
+      SIWEOIDC_REQUIRE_SECRET: "false"
+      SIWEOIDC_LOG_FORMAT: pretty
+      RUST_LOG: siwx_oidc=info,tower_http=warn,warn
+      SYNAPSE_MOCK_SECRET: testsecret
+      SYNAPSE_MOCK_PORT: "8090"
+      # What the tests themselves read (tests/e2e_*.rs `oidc()` / `mock()`).
+      SIWEOIDC_HOST: http://localhost:18080
+      SYNAPSE_MOCK: http://localhost:8090
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Build siwx-oidc
+        run: cargo build --bin siwx-oidc
+
+      # Same rationale as browser-e2e: e2e/up.sh is podman-specific and
+      # force-removes fixed-name containers, which is right for a dev box and
+      # wrong for CI. Keep the logs so a dead service is not an opaque timeout.
+      - name: Start Synapse mock
+        run: |
+          nohup python3 e2e/synapse_mock.py > /tmp/synapse-mock.log 2>&1 &
+          for i in $(seq 1 40); do
+            if curl -sf "http://localhost:${SYNAPSE_MOCK_PORT}/health" >/dev/null 2>&1; then
+              echo "synapse mock healthy"; exit 0
+            fi
+            sleep 0.5
+          done
+          echo "synapse mock did not become healthy on :${SYNAPSE_MOCK_PORT}" >&2
+          cat /tmp/synapse-mock.log >&2
+          exit 1
+
+      - name: Start siwx-oidc
+        run: |
+          nohup ./target/debug/siwx-oidc > /tmp/siwx-oidc.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf "${SIWEOIDC_BASE_URL}/health" >/dev/null 2>&1; then
+              echo "siwx-oidc healthy"; exit 0
+            fi
+            sleep 0.5
+          done
+          echo "siwx-oidc did not become healthy on ${SIWEOIDC_BASE_URL}" >&2
+          cat /tmp/siwx-oidc.log >&2
+          exit 1
+
+      # MSC4191 account-management protocol flows (5/5 promoted).
+      - name: E2E account management
+        run: cargo test --test e2e_account_management -- --ignored --test-threads=1
+
+      # C1/C2 OAuth + CAIP-122 signature-binding hardening (11/11 promoted).
+      - name: E2E OAuth binding
+        run: cargo test --test e2e_oauth_binding -- --ignored --test-threads=1
+
+      # Race/teardown hazard register H1..H14 (12/12 promoted).
+      # h9 -- "at most one token per device_code across 8 concurrent rounds" -- is
+      # the double-redemption guard, and is the single most consequential assertion
+      # in this job. It must never be skipped to obtain a green run.
+      - name: E2E race and teardown
+        run: cargo test --test e2e_race_teardown -- --ignored --test-threads=1
+
+      - name: Collect service logs
+        if: failure()
+        run: |
+          echo "===== siwx-oidc ====="; cat /tmp/siwx-oidc.log || true
+          echo "===== synapse mock ====="; cat /tmp/synapse-mock.log || true
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-e2e-mock-logs
+          path: |
+            /tmp/siwx-oidc.log
+            /tmp/synapse-mock.log
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
   # Browser E2E. Added 2026-07-25 to close audit finding C-0: BEFORE this job, no
