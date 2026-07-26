@@ -15,6 +15,10 @@ import { injectMockWallet } from '../../browser/wallet-helper.mjs';
  * Complete Element's mandatory first-device Secure Backup wizard
  * (force_verification + first-device-recovery): Continue (generate recovery
  * key) → Copy → Continue → Done. No-op if the app shell is already up.
+ *
+ * @returns {Promise<boolean>} true when the wizard was actually walked (the
+ *   vendored patch forced recovery setup), false when the app shell appeared
+ *   directly (vanilla Element / already set up).
  */
 export async function completeSecureBackupWizard(page) {
   const chat = page.locator('.mx_MatrixChat');
@@ -22,13 +26,14 @@ export async function completeSecureBackupWizard(page) {
 
   // "Setting up keys" spinner can run a while before the wizard renders.
   await chat.or(btn(/^Continue$/)).first().waitFor({ timeout: 150_000 });
-  if (await chat.count()) return;
+  if (await chat.count()) return false;
 
   await btn(/^Continue$/).click(); // Set up Secure Backup (generate key default)
   await btn(/^Copy$/).click({ timeout: 120_000 }); // Save your Recovery Key
   await btn(/^Continue$/).click({ timeout: 30_000 });
   await btn(/^Done$/).click({ timeout: 60_000 }); // Secure Backup successful
   await chat.waitFor({ timeout: 90_000 });
+  return true;
 }
 
 /**
@@ -57,7 +62,7 @@ export async function elementWalletClickLogin(page, wallet) {
   await page.waitForURL((u) => u.origin === new URL(ELEMENT_URL).origin, {
     timeout: 60_000,
   });
-  await completeSecureBackupWizard(page);
+  const wizard = await completeSecureBackupWizard(page);
 
   const session = await page.evaluate(() => ({
     user_id: localStorage.getItem('mx_user_id'),
@@ -67,5 +72,5 @@ export async function elementWalletClickLogin(page, wallet) {
   if (!session.user_id || !session.device_id) {
     throw new Error('Element session storage missing: ' + JSON.stringify(session));
   }
-  return session;
+  return { ...session, wizard };
 }

@@ -51,6 +51,12 @@ test('EW-C1: full SSO click-path — Element → siwx wallet UI → Secure Backu
   expect(session.user_id).toBe(w.mxid);
   expect(session.device_id).toBeTruthy();
 
+  // Lab runs the vendored force-first-device-recovery build: a FRESH user must
+  // be walked through the recovery-key wizard (H2 — the restore-gate fix must
+  // not weaken first-login enforcement). Vanilla Element would return false
+  // here; this assert intentionally pins the patched-lab behavior.
+  expect(session.wizard).toBe(true);
+
   // And it is a live Synapse session (not just localStorage residue).
   if (session.access_token) {
     const who = await matrixWhoami(session.access_token);
