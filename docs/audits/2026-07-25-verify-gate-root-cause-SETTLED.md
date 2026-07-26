@@ -234,3 +234,43 @@ and R5/R6 is not satisfied until it is fixed, but nothing is lost or unrecoverab
 
 **Do not delete `EW-V1` assertion 8 or `EW-R1-2` to get a green suite.** They are the only
 watchers on this dead end.
+
+---
+
+# UPDATE 2026-07-26 (second) — `EW-R1-2` was a HARNESS gap. The "same bug" claim is REFUTED.
+
+The section above states: *"`EW-R1-2` and `EW-V1` assertion 8 are the **same** bug, and it is the
+only one left."* **That is wrong.** Measured with instrumentation (10 samples, ~3s..~30s, flat):
+
+```
+EW-R1-2 after the phrase is accepted:
+  phase=3 (Done)  crossSigningReady=true  secretStorageReady=true  keyId=present
+  heading "Device verified"   buttons ["Done"]   .mx_MatrixChat absent
+```
+
+The ceremony **succeeded**. Element terminates on a confirmation screen whose only control is a
+"Done" button; the app shell cannot render until it is clicked, and the test never clicked it.
+Adding the click: `EW-R1-2` 3.6m FAIL → **12.2s PASS**; `ew-recovery-entry` **4 passed**.
+
+The two states are opposite in kind and only looked alike because neither was named:
+
+| | `EW-R1-2` | `EW-V1` a8 |
+|---|---|---|
+| phase | 3 (Done) | 2 (Busy) |
+| buttons | `["Done"]` — user can act | **zero** — user cannot act |
+| kind | valid OK terminal | genuine dead end |
+
+**Fix B is validated.** `ew-verify-sas` now passes (22.0s) *including assertion 8*, which had
+failed on three consecutive runs. A test that was red is green — the standard this project set.
+
+**R5/R6 is SATISFIED**: the phrase is demanded, enterable, accepted, restores the identity, and
+the user reaches the app.
+
+**One more inference of mine was refuted the same day:** I read the Element image's `.Created`
+(04:17) against `cd17c90`'s commit time (04:25) and concluded the patch was not in the image
+under test. Grepping the built bundle for the patch's own log strings shows **both** Fix B halves
+present. The image was built from the working tree before the commit landed. Timestamps are
+derivation; the bundle grep is observation. Same lesson as §L1, committed by the same author.
+
+See `2026-07-26-state-machine-reconciliation-ceremony-terminals.md` for the state-machine gap
+that made a success indistinguishable from a trap.
