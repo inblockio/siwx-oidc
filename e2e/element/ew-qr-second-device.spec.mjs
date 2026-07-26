@@ -58,6 +58,7 @@ import {
   SIWX_URL,
 } from './helpers/element.mjs';
 import { makeWallet, injectMockWallet } from '../browser/wallet-helper.mjs';
+import { openSessionsTab } from './helpers/verify-sas.mjs';
 
 const SERVER_NAME = 'localhost';
 const RZ_CREATE = '/_matrix/client/unstable/org.matrix.msc4108/rendezvous';
@@ -283,7 +284,14 @@ test('EW-Q1-c: Element "Show QR code" is enabled and opens a REAL rendezvous ses
 
   // Settings -> Sessions. SessionManagerTab renders <LoginWithQRSection/> unconditionally;
   // only the button's `disabled` is gated, so reaching the section proves nothing on its own.
-  await page.goto(`${ELEMENT_URL}/#/settings/sessions`, { waitUntil: 'domcontentloaded' });
+  // NOT `page.goto('#/settings/sessions')`. Element 1.12.20's MatrixChat.showScreen
+  // matches `screen === "settings"` EXACTLY (MatrixChat.tsx:1899) -- there is no
+  // `settings/...` prefix branch, so "settings/sessions" falls through every branch and
+  // NOTHING is dispatched. The settings dialog never opens, SessionManagerTab never
+  // mounts, and LoginWithQRSection is legitimately absent. This spec's original failure
+  // was that no-op, not a missing feature. (`#/settings` alone is also wrong -- it opens
+  // UserTab.Account.) Drive the real user path instead.
+  await openSessionsTab(page);
 
   const qrSection = page.getByText('Link new device', { exact: false }).first();
   await expect(
@@ -329,7 +337,10 @@ test('EW-Q1-c: Element "Show QR code" is enabled and opens a REAL rendezvous ses
     .toBeGreaterThan(0);
 
   // ...and a QR must actually be drawn for a second device to scan.
-  const qrRendered = page.locator('svg[data-testid="qr-code"], canvas, .mx_QRCode svg, .mx_QRCode canvas');
+  const qrRendered = page.locator(// Must include `.mx_LoginWithQR` — that is where Element 1.12.20 paints it.
+    // Measured 2026-07-26: the narrower selector missed a QR that WAS rendered, so this
+    // test reported "the flow is dead at the display step" for a working flow.
+    '.mx_LoginWithQR svg, .mx_LoginWithQR canvas, [data-testid="qr-code"], .mx_QRCode svg, .mx_QRCode canvas');
   await expect(
     qrRendered.first(),
     'a rendezvous session was opened but no QR code was rendered for the second device ' +
