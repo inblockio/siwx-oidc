@@ -268,6 +268,36 @@ emoji | requestVerification | startVerification` over `src/`, `tests/`, `e2e/` r
 matches (reproduced from the 2026-07-25 verify-with-other-device evaluation §4.5, whose method I
 re-checked against the specs above and confirm). See §7.2 for the reachability gate.
 
+### 5.9 M4c — Ceremony view (Element client) — 6 states — **ADDED 2026-07-26**
+
+> **Appended, not merged into §5.7.** This document is pinned to `dd34e3f` and to element-web
+> v1.12.20 @ `b7e594f`; rewriting §5.7's rows in place would falsify that provenance. M4c is new
+> territory rather than a correction to those rows. Authority: the map's new §M4c. Element claims
+> here are pinned to **`siwx-oidc-matrix-server` `cd17c90`** (Fix B, both race sites), verified
+> present in the running bundle by grepping the built asset — *not* inferred from image timestamps,
+> which were misleading (the image's `.Created` predates the commit; it was built from the working
+> tree).
+
+| State | Coverage | Evidence / gap |
+|---|---|---|
+| `C_Gate` | **Covered** | `EW-R1-2` asserts `.mx_CompleteSecurityBody` is present for a new device with no other session — the R5/R6 negative requirement (a silent bypass would be a security regression, not a pass) |
+| `C_Working` | **Uncovered** | No test distinguishes a healthy transient Busy (≥1 button) from `T_C_Wedged`. The distinction is button count; nothing asserts it directly |
+| `T_C_OkAwaitAck` | **Covered** | `EW-R1-2` instrumented run: 10 samples ~3s→~30s, all `phase=3`, `crossSigningReady=true`, `keyId=present`, buttons `["Done"]`. This is the state that was mistaken for a trap |
+| `T_C_App` | **Covered** | `EW-R1-2` (`.mx_MatrixChat` after clicking Done — **12.2s PASS**, was a 3.6m timeout); `EW-R1-1`, `EW-R1-3` |
+| `T_C_Wedged` | **Covered (as a breach) — CLOSED** | `EW-V1` assertion 8 is the sole watcher; red on three consecutive runs, **green (22.0s) on the Fix B image**. `EW-R1-2` is a second watcher on the 4S-unlock path |
+| `T_C_ResetOffered` | **Partial** | `EW-R1-3` records that a non-destructive exit is offered alongside it; no test asserts what the destructive branch actually does |
+
+**Correction to §7.1 and to the SETTLED root-cause doc.** Both treated `EW-R1-2` and `EW-V1`
+assertion 8 as *the same bug*. **Refuted by measurement:** `EW-R1-2` is `phase=3` with a `Done`
+button (a valid terminal the harness never clicked); assertion 8 was `phase=2` with **zero**
+buttons (a genuine dead end). Opposite in kind. They looked identical only because neither state
+had a name — which is the whole argument for M4c existing.
+
+**Transition-totality finding T-M4c.** Unlike M4's private half, M4c *is* total for the paths under
+test, but its coverage rests entirely on the Element suite — which **§C-0 still applies to**: none
+of it runs in CI. Every verdict above means "a test exists that genuinely asserts this", not
+"this is guarded".
+
 ---
 
 ## 6. UNDEFINED-STATES REGISTER
@@ -299,6 +329,23 @@ asserts something untrue.
 > **silent and destructive** — it does not block the user or lie to them, it *succeeds* while
 > orphaning the recovery key and message-key backup that U4, U6, R5 and R6 all depend on existing.
 > Every other undefined state costs the user a session; U3′ costs them their history.
+
+### 6.3 Addendum — 2026-07-26
+
+| ID | State | How a real user gets there | What they see | Status |
+|---|---|---|---|---|
+| **U10** | **`T_C_Wedged`** — ceremony succeeds, view never transitions | Completes SAS verification from a live session, or unlocks 4S with the recovery phrase. `SetupEncryptionStore` samples `getCrossSigningKeyId()` once at completion, loses the race, sets `Phase.Busy`, and nothing re-checks | A "Verify this device" screen with **ZERO buttons**, for the full 180s budget, while the device is *already* cross-signed and every private key is cached. One reload clears it | **CLOSED** by Fix B (`6c23298` + `cd17c90`). `EW-V1` a8 red ×3 → **green 22.0s**; `EW-R1-2` green 12.2s. Watched by both — deleting either re-opens it unobserved |
+
+**Status correction to U6.** U6 ("verify gate with no recovery-key entry", `store.keyInfo == null`)
+is **CLOSED** by `patch(v4)` (`00e76f4`): a raw authed GET replaced both 4S probes after it was
+measured that js-sdk 41.6.0's `getAccountDataFromServer` short-circuits to the local store and
+never issues HTTP. `keyInfo` is now non-null at the gate. §7.1's analysis of *why* the gate fired
+is superseded — see the UPDATE sections in `2026-07-25-verify-gate-root-cause-SETTLED.md`.
+
+**What U10 cost, and the general lesson.** U10 was not merely unlisted — it was
+**indistinguishable from a passing flow**, because `T_C_OkAwaitAck` (success awaiting a click) was
+also unnamed and both render as "no app shell". A register that names only *failures* cannot
+separate them. That is the argument for M4c naming the OK terminals too.
 
 ---
 

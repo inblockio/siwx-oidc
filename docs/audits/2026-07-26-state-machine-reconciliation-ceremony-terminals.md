@@ -114,9 +114,13 @@ terminals have to be in the model for the goals to be checkable.
 
 ## 6. Actions
 
-- [ ] Add §M4c to the state-machine map; update the transition row for "unlock with recovery
-      key" to continue into `T_C_OkAwaitAck → T_C_App` instead of ending at "secrets local".
-- [ ] Add the M4c rows to the 72-state coverage matrix with their watchers.
+- [x] **DONE 2026-07-26.** §M4c merged into the state-machine map, with invariant **I-C1**; the
+      "unlock with recovery key" transition row now continues into
+      `T_C_OkAwaitAck → (user clicks Done) → T_C_App`, with `T_C_Wedged` as its failure direction.
+- [x] **DONE 2026-07-26.** Coverage matrix §5.9 (M4c, 6 states) **appended** rather than merged
+      into §5.7 — that section is pinned to `dd34e3f` / element-web v1.12.20 @ `b7e594f`, and
+      rewriting its rows in place would falsify its own provenance contract. Register entry
+      **U10** added in §6.3, plus a status correction closing **U6**.
 - [ ] Keep `EW-V1` assertion 8 and `EW-R1-2` — they are the only watchers on `T_C_Wedged`.
 - [ ] Open: whether `cd17c90`'s `usePassphrase` else-branch ever fires. Both Fix B halves are
       confirmed **present in the running bundle** (grepped the built asset; an earlier reading
