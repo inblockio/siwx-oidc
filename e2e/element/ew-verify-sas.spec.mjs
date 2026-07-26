@@ -101,6 +101,7 @@ import {
   readSasEmoji,
   readTripwire,
 } from './helpers/verify-sas.mjs';
+import { assertCeremonyInvariant, ceremonySample } from './helpers/ceremony-view.mjs';
 
 test.beforeAll(async () => {
   await requireElementStack();
@@ -382,8 +383,15 @@ test('EW-V1: second session cross-signed by SAS/emoji from a live first session 
     // Keep confirming whatever terminal affordance appears (a real user would)
     // while waiting for B to land in the app shell.
     const shellDeadline = Date.now() + 180_000;
+    const ceremonyT0 = Date.now();
+    const ceremonySamples = [];
     let bInShell = false;
     while (Date.now() < shellDeadline) {
+      // [8a] I-C1 WATCHER (M4c). Sampled BEFORE finishVerification clicks
+      // anything, so what is recorded is what a real user would be looking at —
+      // not what the harness just dismissed on their behalf. Never throws; the
+      // verdict is evaluated once, after the loop.
+      ceremonySamples.push(await ceremonySample(pageB, { at: Date.now() - ceremonyT0 }));
       for (const [tag, p] of [
         ['B', pageB],
         ['A', pageA],
@@ -438,6 +446,20 @@ test('EW-V1: second session cross-signed by SAS/emoji from a live first session 
       }
       throw new Error(`${diagnosis}\nreload probe: ${afterReload}`);
     }
+
+    // [8a] I-C1 VERDICT — evaluated on the SUCCESS path, which is the point.
+    //
+    // Assertion 8 above only fires when B never reaches the app shell at all. A
+    // run where B sat in a buttonless "Verify this device" screen for 60s and
+    // *then* recovered passed it silently — the user was trapped, the test said
+    // nothing. That is the `C_Working` coverage gap in matrix §5.9: nothing
+    // asserted the difference between a healthy transient Busy (>=1 control) and
+    // `T_C_Wedged` (zero controls). This states it.
+    //
+    // Deliberately placed AFTER the block above so the failure path keeps its
+    // richer diagnosis (including the reload severity probe) — this is additive,
+    // and assertion 8 is not weakened by it.
+    assertCeremonyInvariant(ceremonySamples, { label: 'EW-V1 device B post-SAS' });
 
     // [5b] The tripwire must still be clean after the terminal leg.
     await assertNoPhrase('final');

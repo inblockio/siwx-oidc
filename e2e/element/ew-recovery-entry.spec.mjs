@@ -49,6 +49,7 @@ import {
 import { loginWalletToTokens } from './helpers/oidc-login.mjs';
 import { postAccountWallet } from './helpers/crypto.mjs';
 import { makeWallet, injectMockWallet } from '../browser/wallet-helper.mjs';
+import { assertCeremonyInvariant, ceremonySample } from './helpers/ceremony-view.mjs';
 
 // The lab server_name; wallet mxids must match it (see EW-L1b).
 const SERVER_NAME = 'localhost';
@@ -582,11 +583,24 @@ test('EW-R1-2: new device with NO other verified session can ENTER the recovery 
       .locator('.mx_CompleteSecurityBody')
       .getByRole('button', { name: /^Done$/ });
 
+    // I-C1 watcher (M4c) alongside the existing diagnostic. `samplePostUnlockState`
+    // logs; `ceremonySample` CLASSIFIES and feeds an assertion. Both run because
+    // they answer different questions: the first is "what was on screen", the
+    // second is "was it a state the user could act from".
+    const unlockSamples = [];
+    const unlockT0 = Date.now();
     for (let i = 1; i <= 10; i += 1) {
       await pageB.waitForTimeout(3_000);
       await samplePostUnlockState(pageB, i * 3);
+      unlockSamples.push(await ceremonySample(pageB, { at: Date.now() - unlockT0 }));
       if ((await chatB.count()) || (await doneButton.count())) break;
     }
+
+    // The post-unlock window is where `T_C_Wedged` would appear on THIS path (the
+    // 4S-unlock route into the ceremony, as opposed to EW-V1's post-SAS route).
+    // Asserted before the Done click, so a wedge cannot be masked by the harness
+    // completing the journey on the user's behalf.
+    assertCeremonyInvariant(unlockSamples, { label: 'EW-R1-2 device B post-unlock' });
 
     // Best-effort by design: dismiss the confirmation the way a user would, but if
     // that screen is NOT up, click nothing and let the unchanged assertion below
