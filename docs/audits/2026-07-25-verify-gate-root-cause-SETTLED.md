@@ -142,3 +142,95 @@ unaffected by that delta, but any siwx-oidc-side conclusion drawn on this lab is
 - `cb75cce` (never `forceReset` on a cold-cache probe) — **independently correct and
   unaffected.** Never take an irreversible branch on an indeterminate probe, regardless of which
   account explains the gate.
+
+---
+
+# UPDATE 2026-07-26 — measured against the v4 image. My §3 root cause was WRONG.
+
+Everything above §3 stands. **§3's identification of `isCrossSigningReady()` as the cold input
+is wrong, and the Fix A derived from it has been withdrawn** (branch deleted, never merged).
+
+## What actually caused the gate
+
+`patch(v4)` (`00e76f4`, now on `main`): **js-sdk 41.6.0's `getAccountDataFromServer`
+short-circuits to the LOCAL store whenever `isInitialSyncComplete()`** — which on session
+restore is true almost immediately from the persisted IndexedDB store, while `account_data`
+is still cold. It returned null **without ever issuing HTTP**, verified on the wire.
+
+So the gate fired through the **4S conjunct**, not the cross-signing conjunct. `b7e594f`'s
+"server probe" was never reaching the server. v4 replaces both probes with a raw authed GET
+via `client.http`, keeping the opposite failure directions (gate: any failure ⇒ enforce;
+forceReset: only a definitive `M_NOT_FOUND` permits a reset).
+
+**Why I got it wrong:** I *inferred* `crossSigningReady` was cold because I measured it true at
++5s and reasoned backwards. v4's author *measured* the absent HTTP request. An inference that
+fits the evidence is not the same as evidence, and I should have probed the wire before
+proposing a predicate change.
+
+## Measured outcome on the v4 image
+
+| Check | Result |
+|---|---|
+| Reload probe | `matrixChat: true`, `completeSecurityBody: false`, `phase = null` — **app shell renders, gate never engages** |
+| `EW-R1-0` master stored in 4S | **PASS** |
+| `EW-R1-1` reload restores app | **PASS** (4.9s) |
+| `EW-R1-3` new device + live session has a non-destructive exit | **PASS** |
+| `EW-R1-2` **recovery phrase on a device with NO other session (R5/R6)** | **FAIL** |
+| `EW-V1` assertion 8 (B reaches app shell after successful SAS) | **FAIL** |
+
+## A second harness artifact I nearly recorded as a defect
+
+`EW-R1-1`'s original failure was **not** a product defect. Under OIDC/MSC3861 Element never
+persists the access token in localStorage — it writes only the boolean `mx_has_access_token`
+and keeps the real token pickled in IndexedDB. So `localStorage.mx_access_token` is always
+null, `tokenForUser()` always fell through to a headless OIDC login, and that login
+**navigated the Element tab to the siwx origin**. The subsequent `page.reload()` reloaded
+*siwx*, so neither Element locator could match and the wait timed out after 120s — reading
+exactly like "the user is trapped with no app and no gate."
+
+Fixed by minting the token on a throwaway page. `EW-R1-1` then passes in 4.9s.
+
+**Both harness bugs this session presented as product defects.** The plain probe disagreeing
+with `EW-R1-1` is what exposed it; without that contradiction I would have written up a trap
+that does not exist.
+
+## What actually remains: one upstream Element race (Fix B)
+
+`EW-R1-2` and `EW-V1` assertion 8 are the **same** bug, and it is the only one left:
+
+```
+post-SAS probe B: phase=2 (Busy)  keyInfo=true  hasDevicesToVerifyAgainst=true
+                  crossSigningReady=true  secretStorageReady=true
+                  privateKeysCachedLocally={master,self,user all true}
+                  ownDeviceStatus={crossSigningVerified:true, signedByOwner:true}
+```
+
+The crypto is **completely healthy and the device is genuinely cross-signed** — the
+verification succeeded. `SetupEncryptionStore` is simply stuck in `Phase.Busy`:
+`onVerificationRequestChange` samples `getCrossSigningKeyId()` at the instant the request
+completes, loses the race, sets Busy, and no later `UserTrustStatusChanged` re-checks. The
+user sees a buttonless "Verify this device" screen. **One reload clears it.**
+
+Note `keyInfo` is now `true` (it was `null` before v4), so v4 fixed that half too. The residual
+defect is purely the phase transition.
+
+**Status of the three symptoms from §3:**
+
+| Symptom | Status |
+|---|---|
+| False reload gate | **FIXED** by v4, verified |
+| Missing recovery-key exit (`keyInfo` null) | **FIXED** by v4 — `keyInfo: true` |
+| Post-verification `Phase.Busy` wedge | **OPEN** — Fix B, upstream Element 1.12.20 |
+
+## Fix B, scoped
+
+Recompute the phase after a verification or 4S unlock completes, instead of sampling once at
+completion. It belongs upstream in `SetupEncryptionStore`; it can be carried in the vendored
+patch, but that file is currently MatrixChat-only, so it is a new surface rather than an edit.
+
+**Severity: moderate, not critical.** The user's identity, cross-signing and message keys are
+all correct and durable; the cost is one confusing screen and a reload. That is a real defect
+and R5/R6 is not satisfied until it is fixed, but nothing is lost or unrecoverable.
+
+**Do not delete `EW-V1` assertion 8 or `EW-R1-2` to get a green suite.** They are the only
+watchers on this dead end.

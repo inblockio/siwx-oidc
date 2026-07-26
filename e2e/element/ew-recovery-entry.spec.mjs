@@ -183,12 +183,30 @@ async function tokenForUser(page, walletBundle, elementSession) {
   if (elementSession?.access_token) {
     return { token: elementSession.access_token, extraDevice: null };
   }
-  const s = await loginWalletToTokens(page, {
-    siwxUrl: SIWX_URL,
-    matrixUrl: MATRIX_URL,
-    wallet: walletBundle,
-  });
-  return { token: s.access_token, extraDevice: s.device_id };
+  // MEASURED 2026-07-26: under OIDC/MSC3861 Element never persists the access
+  // token in localStorage. It writes only the boolean flag `mx_has_access_token`
+  // (alongside mx_has_refresh_token / mx_has_pickle_key) and keeps the real token
+  // pickled in IndexedDB. So `elementSession.access_token` is ALWAYS null here and
+  // this fallback ALWAYS runs.
+  //
+  // It must therefore not run on the Element page. loginWalletToTokens navigates
+  // wherever it is given, so passing `page` moved the Element tab to the siwx
+  // origin; the caller's subsequent page.reload() then reloaded siwx, and waiting
+  // for .mx_MatrixChat / .mx_CompleteSecurityBody timed out after 120s. That read
+  // exactly like "the user is trapped with no app and no gate" -- a product defect
+  // that does not exist. Mint the token on a throwaway page instead and leave the
+  // Element tab where it is.
+  const helper = await page.context().newPage();
+  try {
+    const s = await loginWalletToTokens(helper, {
+      siwxUrl: SIWX_URL,
+      matrixUrl: MATRIX_URL,
+      wallet: walletBundle,
+    });
+    return { token: s.access_token, extraDevice: s.device_id };
+  } finally {
+    await helper.close();
+  }
 }
 
 /**
