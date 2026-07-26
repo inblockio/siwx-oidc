@@ -39,115 +39,13 @@ import { requireElementStack, ELEMENT_URL, MATRIX_URL, SIWX_URL, openElement } f
 import { loginWalletToTokens } from './helpers/oidc-login.mjs';
 import { elementWalletClickLogin, completeSecureBackupWizard } from './helpers/element-login.mjs';
 import { makeWallet, injectMockWallet } from '../browser/wallet-helper.mjs';
+import { settle, assertExit } from './helpers/journey.mjs';
 
 const SERVER_NAME = 'localhost';
 
 test.beforeAll(async () => {
   await requireElementStack();
 });
-
-/** One user-visible screen, reduced to "what can this person do?". */
-async function readScreen(page) {
-  return page
-    .evaluate(() => {
-      const vis = (el) => {
-        const r = el.getBoundingClientRect();
-        if (!(r.width > 0 && r.height > 0)) return false;
-        const cs = window.getComputedStyle(el);
-        return cs.visibility !== 'hidden' && cs.display !== 'none';
-      };
-      const actionable = (el) =>
-        vis(el) &&
-        !el.hasAttribute('disabled') &&
-        el.getAttribute('aria-disabled') !== 'true' &&
-        el.getAttribute('aria-hidden') !== 'true';
-      const label = (el) =>
-        (el.innerText || '').replace(/\s+/g, ' ').trim() ||
-        el.getAttribute('aria-label') ||
-        el.getAttribute('title') ||
-        '';
-
-      const appShell = !!document.querySelector('.mx_MatrixChat');
-      // When the app shell is up, the chrome is full of controls and counting them
-      // says nothing. Only pre-shell / modal surfaces are interesting here.
-      const scope =
-        document.querySelector('.mx_Dialog') ||
-        document.querySelector('.mx_CompleteSecurityBody') ||
-        document.querySelector('.mx_AuthPage') ||
-        (appShell ? null : document.body);
-
-      const controls = scope
-        ? [
-            ...new Set(
-              [...scope.querySelectorAll('button, [role="button"], a[href], input:not([type=hidden])')]
-                .filter(actionable)
-                .map(label)
-                .filter(Boolean),
-            ),
-          ].slice(0, 25)
-        : [];
-
-      const disabled = scope
-        ? [
-            ...new Set(
-              [...scope.querySelectorAll('button, [role="button"]')]
-                .filter((el) => vis(el) && (el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'))
-                .map(label)
-                .filter(Boolean),
-            ),
-          ].slice(0, 15)
-        : [];
-
-      return {
-        url: location.href,
-        appShell,
-        spinner: !!document.querySelector('.mx_Spinner'),
-        headings: [...document.querySelectorAll('h1,h2,h3')].filter(vis).map((h) => h.textContent.trim()).slice(0, 5),
-        controls,
-        disabled,
-        body: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 220),
-      };
-    })
-    .catch((e) => ({ error: String(e).slice(0, 160) }));
-}
-
-const hasExit = (s) => !!s && !s.error && (s.appShell || (s.controls || []).length > 0);
-
-/**
- * Poll until the screen offers an exit, then return it. A screen is only called a
- * dead end after it has had `budgetMs` to resolve -- a transient spinner is not a
- * trap, and calling it one would produce a flaky test that gets deleted.
- */
-async function settle(page, label, { budgetMs = 30_000, intervalMs = 2_000 } = {}) {
-  let s = null;
-  const deadline = Date.now() + budgetMs;
-  for (;;) {
-    s = await readScreen(page);
-    if (hasExit(s)) break;
-    if (Date.now() >= deadline) break;
-    await page.waitForTimeout(intervalMs);
-  }
-  const verdict = hasExit(s) ? 'EXIT' : 'DEAD-END';
-  // eslint-disable-next-line no-console
-  console.log(
-    `[JOURNEY] ${label.padEnd(34)} ${verdict.padEnd(9)} ` +
-      `shell=${s.appShell} headings=${JSON.stringify(s.headings)} ` +
-      `controls=${JSON.stringify(s.controls)}` +
-      ((s.disabled || []).length ? ` disabledControls=${JSON.stringify(s.disabled)}` : ''),
-  );
-  return { ...s, label, verdict };
-}
-
-function assertExit(s) {
-  expect(
-    s.verdict,
-    `DEAD END at "${s.label}" — the user has no enabled control and no app shell after the ` +
-      `settle budget.\n  url: ${s.url}\n  headings: ${JSON.stringify(s.headings)}\n` +
-      `  disabled-but-visible controls: ${JSON.stringify(s.disabled)}\n  body: ${s.body}\n` +
-      `  This is the product invariant: a user must always be able to act. Do not resolve this ` +
-      `by widening the budget — name the missing transition.`,
-  ).toBe('EXIT');
-}
 
 // ---------------------------------------------------------------------------
 // J1 — first login on a brand-new identity, through to a usable session.
