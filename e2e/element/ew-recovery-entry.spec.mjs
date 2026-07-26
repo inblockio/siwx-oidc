@@ -261,6 +261,96 @@ async function enterRecoveryKey(page, recoveryKey) {
     .click();
 }
 
+// SetupEncryptionStore.Phase, mirrored from ew-reload-state-probe.spec.mjs so the
+// EW-R1-2 diagnostic below reads the same vocabulary as that probe's output.
+const PHASE_NAMES = {
+  0: 'Loading',
+  1: 'Intro',
+  2: 'Busy',
+  3: 'Done',
+  4: 'ConfirmSkip',
+  5: 'Finished',
+  6: 'ConfirmReset',
+};
+
+/**
+ * EW-R1-2 DIAGNOSTIC ONLY — not an assertion, asserts nothing, and must never
+ * throw. Reports what `pageB` actually looks like at one instant so a run that
+ * fails the (unchanged) post-unlock `.mx_MatrixChat` assertion below carries
+ * evidence instead of forcing another guess. Two prior guesses in this exact
+ * area were wrong; this function's only job is to observe and log.
+ *
+ * Every `page.evaluate` is individually wrapped (`.catch`) so a probe-side
+ * failure (e.g. a torn-down store mid-navigation) degrades to a logged error
+ * string rather than propagating and masquerading as a product defect.
+ */
+async function samplePostUnlockState(page, label) {
+  try {
+    const dom = await page
+      .evaluate(() => {
+        const vis = (el) => {
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        };
+        const store = window.mxSetupEncryptionStore;
+        return {
+          phase: store ? store.phase ?? null : null,
+          keyId: store ? store.keyId ?? null : null,
+          keyInfo: store && store.keyInfo ? JSON.parse(JSON.stringify(store.keyInfo)) : null,
+          hasDevicesToVerifyAgainst: store ? store.hasDevicesToVerifyAgainst ?? null : null,
+          containers: {
+            matrixChat: !!document.querySelector('.mx_MatrixChat'),
+            completeSecurityBody: !!document.querySelector('.mx_CompleteSecurityBody'),
+            accessSecretStorageDialog: !!document.querySelector('.mx_AccessSecretStorageDialog'),
+            spinner: !!document.querySelector('.mx_Spinner'),
+            errorBoundary: !!document.querySelector('.mx_ErrorBoundary'),
+          },
+          headings: [...document.querySelectorAll('h1,h2,h3')]
+            .filter(vis)
+            .map((h) => h.textContent.trim())
+            .slice(0, 10),
+          buttons: [...document.querySelectorAll('button,[role=button]')]
+            .filter(vis)
+            .map((b) => b.textContent.trim())
+            .filter(Boolean)
+            .slice(0, 20),
+          bodyTextHead: document.body.innerText.replace(/\s+/g, ' ').slice(0, 300),
+        };
+      })
+      .catch((e) => ({ evalError: String(e) }));
+
+    const crypto = await page
+      .evaluate(async () => {
+        const cli = window.mxMatrixClientPeg?.get?.();
+        const c = cli?.getCrypto?.();
+        if (!c) return { available: false };
+        return {
+          available: true,
+          crossSigningReady: await c.isCrossSigningReady().catch((e) => `ERR ${e}`),
+          secretStorageReady: await c.isSecretStorageReady().catch((e) => `ERR ${e}`),
+          keyId: (await c.getCrossSigningKeyId().catch(() => null)) ? 'present' : 'absent',
+        };
+      })
+      .catch((e) => ({ available: false, error: String(e) }));
+
+    const phase = dom.phase;
+    console.log(
+      `[EW-R1-2 post-unlock ~${label}s] phase=${phase} (${PHASE_NAMES[phase] ?? 'n/a'}) ` +
+        `keyId=${JSON.stringify(dom.keyId)} keyInfo=${JSON.stringify(dom.keyInfo)} ` +
+        `hasDevicesToVerifyAgainst=${JSON.stringify(dom.hasDevicesToVerifyAgainst)}\n` +
+        `  crypto:      ${JSON.stringify(crypto)}\n` +
+        `  containers:  ${JSON.stringify(dom.containers)}\n` +
+        `  headings:    ${JSON.stringify(dom.headings)}\n` +
+        `  buttons:     ${JSON.stringify(dom.buttons)}\n` +
+        `  bodyText:    ${dom.bodyTextHead}\n` +
+        `  evalError:   ${dom.evalError ?? 'none'}`,
+    );
+  } catch (e) {
+    // Belt-and-braces: even a failure inside the logging itself must not throw.
+    console.log(`[EW-R1-2 post-unlock ~${label}s] PROBE FAILED (non-fatal): ${String(e)}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // R1-0 — the root discriminator. Cheap, decisive, and it settles the whole
 // question of whether a recovery phrase can EVER be entered in this deployment.
@@ -472,6 +562,39 @@ test('EW-R1-2: new device with NO other verified session can ENTER the recovery 
     // The requirement is that it WORKS, not that it renders.
     await useRecovery.click();
     await enterRecoveryKey(pageB, recoveryKey);
+
+    // The ceremony's terminal screen is a CONFIRMATION the user must dismiss.
+    //
+    // Measured 2026-07-26 (instrumented run, 10 samples from ~3s to ~30s, flat at
+    // every one): the phrase is accepted, `SetupEncryptionStore.phase` is 3 (Done),
+    // `crossSigningReady` and `secretStorageReady` are both true and the
+    // cross-signing key id is present -- and Element renders the heading "Device
+    // verified" whose ONLY control is a "Done" button. `.mx_MatrixChat` cannot
+    // render until that button is clicked. Never clicking it was a HARNESS gap, not
+    // a product trap: a real user clicks Done and reaches the app. This is NOT the
+    // post-SAS Phase.Busy wedge (EW-V1 assertion 8) -- that state is phase=2 with
+    // zero buttons, a genuine dead end. Do not conflate them again.
+    //
+    // The sampling is retained, bounded and early-exiting, because it is the
+    // evidence that the cryptographic identity was genuinely RESTORED rather than
+    // the dialog merely dismissed.
+    const doneButton = pageB
+      .locator('.mx_CompleteSecurityBody')
+      .getByRole('button', { name: /^Done$/ });
+
+    for (let i = 1; i <= 10; i += 1) {
+      await pageB.waitForTimeout(3_000);
+      await samplePostUnlockState(pageB, i * 3);
+      if ((await chatB.count()) || (await doneButton.count())) break;
+    }
+
+    // Best-effort by design: dismiss the confirmation the way a user would, but if
+    // that screen is NOT up, click nothing and let the unchanged assertion below
+    // report whatever the real state is. A click must never be able to MASK a
+    // failure -- it only completes the user journey the test claims to model.
+    if (await doneButton.count()) {
+      await doneButton.click();
+    }
 
     await expect(
       chatB,
