@@ -1,7 +1,11 @@
 # Finding: Element Web ≥ 1.12.24 (matrix-js-sdk v42) cannot log in against siwx-oidc
 
 **Date:** 2026-07-25 (parallel-container investigation on the local Element lab)
-**Status:** OPEN — blocks any future Element Web upgrade past 1.12.23
+**Status:** FIXED on `fix/finding3-fragment-response-mode` (siwx-oidc `3018ffe`:
+`response_modes_supported` advertised + `response_mode=fragment` honored end to
+end). Verified 2026-07-26: vanilla Element 1.12.24 completes OIDC-native login
+with zero shims against the fixed lab. Unblocks Element upgrades past 1.12.23
+once merged + deployed; flip the deploy-guard WARN to FAIL after prod deploy.
 **Evidence:** `2026-07-25-elementweb-jssdk-v42-compat-evidence.spec.mjs.txt` (the
 Playwright shim spec that isolated both causes), lab run logs in the Phase-2
 session records.

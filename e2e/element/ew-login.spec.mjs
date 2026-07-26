@@ -73,26 +73,22 @@ test('EW-L1: wallet CAIP-122 through siwx produces Matrix whoami (headless OIDC)
 });
 
 /**
- * EW-L1b: Element restores the session from its OWN persisted storage.
+ * EW-L1b: Element restores the session — AUTH and CRYPTO — on reload.
  *
- * The original pre-seeded-token approach was permanently unworkable (Element
- * persists the session in IndexedDB matrix-js-sdk stores, not the legacy
- * mx_* localStorage keys). With the real DOM click-login available (EW-C1),
- * the honest form is: log in for real, reload, and pin what ACTUALLY happens:
+ * History: the pre-seeded-token approach was permanently unworkable; then this
+ * spec documented a reload → "Confirm your digital identity" gate (FINDING 2,
+ * 2026-07-25) — root-caused to the vendored force-first-device-recovery patch
+ * gating on transient `isSecretStorageReady()` during session RESTORE. The
+ * patch now treats server-side 4S existence (`secretStorage.hasKey()`) as
+ * satisfying the recoverable-identity mandate (H1), so a set-up session must
+ * restore straight to the app shell:
  *
- *  - AUTH restore works: no OIDC /authorize round-trip, same user_id +
- *    device_id from storage, never a logged-out login screen.
- *  - CRYPTO does NOT restore (current known state, this Element build +
- *    force_verification): Element lands on the "Confirm your digital
- *    identity" gate whose ONLY exits are "Use another device" or identity
- *    RESET — no recovery-key entry, even though Secure Backup was completed
- *    seconds earlier. For a single-device user this is a reload → verify-gate
- *    → forced-reset loop: a lab REPRODUCTION of the prod "verify session
- *    loop / half-reset" forensics (docs/audits/2026-06-24-*). Tracked as a
- *    Phase-2 finding; if either branch below flips, behavior changed —
- *    re-evaluate and update the finding, don't paper over it.
+ *  - AUTH: no OIDC /authorize round-trip, same user_id + device_id, never a
+ *    logged-out login screen.
+ *  - CRYPTO: NO identity-confirmation gate. The gate reappearing here is a
+ *    REGRESSION of the FINDING 2 fix — fail loudly, do not re-widen this spec.
  */
-test('EW-L1b: reload restores AUTH session (no OIDC round-trip); crypto gate documented', async ({
+test('EW-L1b: reload restores AUTH + CRYPTO (no OIDC round-trip, no identity gate)', async ({
   page,
 }) => {
   test.setTimeout(360_000);
@@ -114,7 +110,7 @@ test('EW-L1b: reload restores AUTH session (no OIDC round-trip); crypto gate doc
   const gate = page.locator('.mx_CompleteSecurityBody');
   await chat.or(gate).first().waitFor({ timeout: 90_000 });
 
-  // AUTH restore invariants — these must hold on EVERY outcome.
+  // AUTH restore invariants.
   expect(new URL(page.url()).origin).toBe(new URL(ELEMENT_URL).origin);
   expect(authorizeHits).toHaveLength(0);
   const restored = await page.evaluate(() => ({
@@ -124,14 +120,10 @@ test('EW-L1b: reload restores AUTH session (no OIDC round-trip); crypto gate doc
   expect(restored.user_id).toBe(session.user_id);
   expect(restored.device_id).toBe(session.device_id);
 
-  if (await chat.count()) {
-    // Crypto restored too — behavior IMPROVED over the documented state.
-    // Nothing more to assert; update the finding in the plan log.
-    return;
-  }
-
-  // Current known terminal: the identity-confirmation gate, offering only
-  // another-device verification or destructive reset (no recovery-key path).
-  await expect(page.getByRole('button', { name: /use another device/i })).toBeVisible();
-  await expect(page.getByRole('button', { name: /remove this device/i })).toBeVisible();
+  // CRYPTO restore invariant: the app shell, not the identity gate (H1).
+  expect(
+    await gate.count(),
+    'identity-confirmation gate on reload = FINDING 2 regression (vendored patch restore gating)',
+  ).toBe(0);
+  await expect(chat).toBeVisible();
 });

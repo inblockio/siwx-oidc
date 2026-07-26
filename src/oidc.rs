@@ -283,6 +283,11 @@ pub fn provider_metadata_value(
         serde_json::to_value(pm).map_err(|e| anyhow!("Failed to serialize metadata: {}", e))?;
     let base = base_url.as_str().trim_end_matches('/');
     value["code_challenge_methods_supported"] = serde_json::json!(["S256"]);
+    // matrix-js-sdk v42 (Element Web >= 1.12.24) `isValidAuthMetadata` hard-
+    // requires BOTH modes here, else it silently falls back to legacy SSO
+    // (404 under MSC3861). Only advertised because /sign_in honors fragment —
+    // advertising without honoring would be strictly worse for v42 clients.
+    value["response_modes_supported"] = serde_json::json!(["query", "fragment"]);
     value["introspection_endpoint"] = serde_json::json!(format!("{}/oauth2/introspect", base));
     value["introspection_endpoint_auth_methods_supported"] =
         serde_json::json!(["client_secret_post", "bearer"]);
@@ -1057,6 +1062,10 @@ pub struct AuthorizeParams {
     pub code_challenge: Option<String>,
     /// PKCE code_challenge_method ("S256" or "plain").
     pub code_challenge_method: Option<String>,
+    /// OAuth response_mode ("query" or "fragment"). matrix-js-sdk v42
+    /// (Element Web >= 1.12.24) sends `fragment` and reads the authorization
+    /// response ONLY from the URL fragment.
+    pub response_mode: Option<String>,
 }
 
 pub async fn authorize(
@@ -1192,6 +1201,24 @@ pub async fn authorize(
     } else {
         "".to_string()
     };
+    // Validate response_mode strictly (invalid_request semantics): discovery
+    // advertises exactly {"query","fragment"}, so anything else is a 400 rather
+    // than a silently-ignored param the client then waits on.
+    if let Some(rm) = &params.response_mode {
+        if rm != "query" && rm != "fragment" {
+            return Err(CustomError::BadRequest(format!(
+                "Unsupported response_mode '{rm}' (only 'query' and 'fragment' are supported)."
+            )));
+        }
+    }
+    // Round-trip the non-default mode through the login SPA to /sign_in (same
+    // client-side round-trip as the PKCE params). Absent/"query" appends
+    // nothing, keeping the SPA URL byte-identical for existing clients.
+    let response_mode_param = if params.response_mode.as_deref() == Some("fragment") {
+        "&response_mode=fragment".to_string()
+    } else {
+        "".to_string()
+    };
     // C2 Step 4b: reject `code_challenge_method=plain` up front so a `plain`
     // challenge is never carried into /sign_in or stored on the CodeEntry.
     // Discovery advertises S256 only. A missing method defaults to S256.
@@ -1224,14 +1251,15 @@ pub async fn authorize(
     };
     Ok((
         format!(
-            "/?nonce={}&domain={}&redirect_uri={}&state={}&client_id={}{}{}",
+            "/?nonce={}&domain={}&redirect_uri={}&state={}&client_id={}{}{}{}",
             nonce,
             domain,
             *params.redirect_uri,
             state,
             params.client_id,
             oidc_nonce_param,
-            pkce_params
+            pkce_params,
+            response_mode_param
         ),
         Box::new(session_cookie),
     ))
@@ -1506,6 +1534,8 @@ pub struct SignInParams {
     pub code_challenge: Option<String>,
     /// PKCE code_challenge_method ("S256" or "plain").
     pub code_challenge_method: Option<String>,
+    /// OAuth response_mode (passed through from /authorize; validated there).
+    pub response_mode: Option<String>,
 }
 
 /// Derive a Matrix-compatible localpart from a DID by replacing colons with
@@ -1775,8 +1805,21 @@ pub async fn sign_in(
     db_client.set_code(code.to_string(), code_entry).await?;
 
     let mut url = params.redirect_uri.url().clone();
-    url.query_pairs_mut().append_pair("code", &code.to_string());
-    url.query_pairs_mut().append_pair("state", &params.state);
+    if params.response_mode.as_deref() == Some("fragment") {
+        // matrix-js-sdk v42 requested `response_mode=fragment` on /authorize
+        // (round-tripped here via the login SPA) and reads the authorization
+        // response ONLY from the URL fragment. ALL response params go in the
+        // fragment; any query the registered redirect_uri already carries stays
+        // untouched with nothing appended to it.
+        let fragment = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("code", &code.to_string())
+            .append_pair("state", &params.state)
+            .finish();
+        url.set_fragment(Some(&fragment));
+    } else {
+        url.query_pairs_mut().append_pair("code", &code.to_string());
+        url.query_pairs_mut().append_pair("state", &params.state);
+    }
     // Surface the resolved DID alongside the redirect so the HTTP handler can mint
     // the opaque login user-session cookie ONLY on this success path (a real login
     // that just issued a code). Error/early returns never reach here.
@@ -2093,6 +2136,7 @@ mod tests {
             request: None,
             code_challenge: None,
             code_challenge_method: None,
+            response_mode: None,
         };
         let (redirect_url, cookie) = authorize(params, &db_client).await.unwrap();
         let authorize_params: AuthorizeQueryParams =
@@ -2149,6 +2193,11 @@ mod tests {
         )
         .await
         .unwrap();
+        // Default (no response_mode): query delivery, never a fragment.
+        assert!(
+            redirect_url.fragment().is_none(),
+            "default sign_in redirect must not carry a fragment: {redirect_url}"
+        );
         let signin_params: SignInQueryParams =
             serde_urlencoded::from_str(redirect_url.query().unwrap()).unwrap();
         let oidc_signing_key =
@@ -2164,6 +2213,169 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// js-sdk v42 path: authorize with `response_mode=fragment` forwards the
+    /// mode to the SPA, and sign_in delivers `#code=…&state=…` with NO query
+    /// residue (v42 reads the authorization response ONLY from the fragment).
+    #[tokio::test]
+    async fn e2e_flow_fragment_response_mode() {
+        let (_config, db_client) = default_config().await;
+
+        let secret = k256::SecretKey::random(&mut rand::thread_rng());
+        let signing_key = k256::ecdsa::SigningKey::from(&secret);
+        let addr = address_from_verifying_key(signing_key.verifying_key());
+        let address_str = format!("0x{}", eip55_checksum(&addr));
+        let did = format!("did:pkh:eip155:1:{address_str}");
+
+        let base_url = Url::parse("https://example.com").unwrap();
+        let params = AuthorizeParams {
+            client_id: "client".into(),
+            redirect_uri: RedirectUrl::from_url(base_url.clone()),
+            scope: Scope::new("openid".to_string()),
+            response_type: Some(CoreResponseType::IdToken),
+            state: Some("state".into()),
+            nonce: None,
+            prompt: None,
+            request_uri: None,
+            request: None,
+            code_challenge: None,
+            code_challenge_method: None,
+            response_mode: Some("fragment".into()),
+        };
+        let (redirect_url, cookie) = authorize(params, &db_client).await.unwrap();
+        assert!(
+            redirect_url.contains("&response_mode=fragment"),
+            "authorize must forward response_mode to the SPA: {redirect_url}"
+        );
+        let authorize_params: AuthorizeQueryParams =
+            serde_urlencoded::from_str(redirect_url.split("/?").collect::<Vec<&str>>()[1]).unwrap();
+        // Same client round-trip as the real SPA: SignInParams reads
+        // response_mode back out of the forwarded URL.
+        let params: SignInParams = serde_urlencoded::from_str(&redirect_url).unwrap();
+        assert_eq!(params.response_mode.as_deref(), Some("fragment"));
+
+        let expiration_time =
+            (Utc::now() + Duration::hours(48)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let message = format!(
+            "example.com wants you to sign in with your Ethereum account:\n\
+             {address_str}\n\n\
+             You are signing-in to example.com.\n\n\
+             URI: https://example.com\n\
+             Version: 1\n\
+             Chain ID: 1\n\
+             Nonce: {}\n\
+             Issued At: 2023-04-17T11:01:24.862Z\n\
+             Expiration Time: {expiration_time}\n\
+             Resources:\n\
+             - https://example.com",
+            authorize_params.nonce,
+        );
+        let signature = eth_sign(&signing_key, &message);
+        let siwx_cookie = serde_json::to_string(&SiwxCookie {
+            did,
+            message,
+            signature,
+        })
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("{cookie}; {SIWX_COOKIE_KEY}={siwx_cookie}")).unwrap(),
+        );
+        let cookie = headers.typed_get::<headers::Cookie>().unwrap();
+        let (redirect_url, _did) = sign_in(
+            &base_url,
+            &["pkh".to_string()],
+            &["eip155".to_string()],
+            params,
+            cookie,
+            &db_client,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            redirect_url.query().is_none(),
+            "fragment mode must leave the redirect query untouched: {redirect_url}"
+        );
+        let fragment = redirect_url
+            .fragment()
+            .expect("fragment mode must deliver the response in the fragment");
+        assert!(
+            fragment.contains("code="),
+            "fragment must carry the code: {redirect_url}"
+        );
+        assert!(
+            fragment.contains("state=state"),
+            "fragment must carry the state: {redirect_url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_rejects_unsupported_response_mode() {
+        let (_config, db_client) = default_config().await;
+        let params = AuthorizeParams {
+            client_id: "client".into(),
+            redirect_uri: RedirectUrl::from_url(Url::parse("https://example.com").unwrap()),
+            scope: Scope::new("openid".to_string()),
+            response_type: Some(CoreResponseType::Code),
+            state: Some("state".into()),
+            nonce: None,
+            prompt: None,
+            request_uri: None,
+            request: None,
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
+            response_mode: Some("form_post".into()),
+        };
+        match authorize(params, &db_client).await {
+            Err(CustomError::BadRequest(msg)) => {
+                assert!(
+                    msg.contains("form_post"),
+                    "rejection must name the bad value: {msg}"
+                );
+            }
+            other => panic!("expected BadRequest for response_mode=form_post, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn authorize_accepts_query_response_mode_without_forwarding() {
+        // Explicit "query" is valid but default: the SPA URL stays byte-identical
+        // to the absent-param case (nothing forwarded).
+        let (_config, db_client) = default_config().await;
+        let params = AuthorizeParams {
+            client_id: "client".into(),
+            redirect_uri: RedirectUrl::from_url(Url::parse("https://example.com").unwrap()),
+            scope: Scope::new("openid".to_string()),
+            response_type: Some(CoreResponseType::Code),
+            state: Some("state".into()),
+            nonce: None,
+            prompt: None,
+            request_uri: None,
+            request: None,
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
+            response_mode: Some("query".into()),
+        };
+        let (redirect_url, _cookie) = authorize(params, &db_client).await.unwrap();
+        assert!(
+            !redirect_url.contains("response_mode"),
+            "explicit query mode must not be forwarded: {redirect_url}"
+        );
+    }
+
+    #[test]
+    fn provider_metadata_advertises_response_modes() {
+        // js-sdk v42 `isValidAuthMetadata` hard-requires both modes.
+        let base = Url::parse("https://siwx-oidc.example.com/").unwrap();
+        let value = provider_metadata_value(base, None).unwrap();
+        assert_eq!(
+            value["response_modes_supported"],
+            serde_json::json!(["query", "fragment"])
+        );
     }
 
     #[tokio::test]
@@ -2187,6 +2399,7 @@ mod tests {
             // challenge so this scope-acceptance test exercises the real path.
             code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
             code_challenge_method: Some("S256".into()),
+            response_mode: None,
         };
         let result = authorize(params, &db_client).await;
         assert!(
@@ -2300,6 +2513,7 @@ mod tests {
             // challenge so this scope-acceptance test exercises the real path.
             code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
             code_challenge_method: Some("S256".into()),
+            response_mode: None,
         };
         let result = authorize(params, &db_client).await;
         assert!(
@@ -2324,6 +2538,7 @@ mod tests {
             request: None,
             code_challenge: None,
             code_challenge_method: None,
+            response_mode: None,
         };
         let result = authorize(params, &db_client).await;
         assert!(

@@ -15,6 +15,7 @@ const app = new App({
 		client_id: params.get('client_id'),
 		code_challenge: params.get('code_challenge'),
 		code_challenge_method: params.get('code_challenge_method'),
+		response_mode: params.get('response_mode'),
 	}
 });
 
