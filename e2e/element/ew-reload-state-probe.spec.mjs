@@ -125,6 +125,19 @@ test('EW-PROBE: what does a reloaded first device actually render?', async ({ pa
   const w = makeWallet(undefined, SERVER_NAME);
   await loginThroughWizard(page, w);
 
+  // Does Element persist an access token under `mx_access_token`? EW-R1-1/R1-2
+  // branch on exactly that: when it is absent, tokenForUser() falls through to a
+  // headless OIDC login which NAVIGATES THE PAGE to the siwx origin, so the
+  // subsequent page.reload() reloads siwx and no Element locator can ever match.
+  // That would make their timeouts harness artifacts rather than product defects.
+  const ls = await page.evaluate(() => ({
+    keys: Object.keys(localStorage).filter((k) => k.startsWith('mx_')).sort(),
+    has_access_token: localStorage.getItem('mx_access_token') !== null,
+    has_user_id: localStorage.getItem('mx_user_id') !== null,
+    has_device_id: localStorage.getItem('mx_device_id') !== null,
+  }));
+  console.log(`\n[EW-PROBE localStorage] ${JSON.stringify(ls, null, 2)}\n`);
+
   await snapshot(page, 'before-reload');
 
   await page.reload({ waitUntil: 'domcontentloaded' });
