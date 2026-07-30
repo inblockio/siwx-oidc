@@ -46,3 +46,57 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  # Deploys the just-published `main` image to the dev-staging box
+  # (dev-aquafire, 207.154.209.103). Only fires on an actual push to `main`
+  # (not `fork-stable`, which also satisfies the `on: push` trigger above,
+  # and not a GitHub release) or an explicit manual dispatch. The
+  # dev-staging compose stack pins its own SIWX_OIDC_TAG (currently
+  # `main`), so this deploy always converges to whatever `main` currently
+  # resolves to on GHCR — it never overrides that pin.
+  #
+  # The SSH key is a dedicated, restricted deploy key (see
+  # siwx-oidc-matrix-server's docs/2026-07-30-dev-staging-dev-aquafire.md,
+  # "CI auto-deploy — pending user actions"): the box's authorized_keys
+  # pins it to a forced command (`/home/dev/matrix-staging/ci-deploy.sh`)
+  # with no-pty/no-port-forwarding/no-agent-forwarding/no-X11-forwarding,
+  # so this key can never do anything on the box except run that one
+  # script — the `deploy` argument below is never seen by the server, it's
+  # just a readable label in the Actions log.
+  #
+  # The host key is pinned to a known_hosts line captured directly from the
+  # box (`ssh-keyscan -p 8022 207.154.209.103`) rather than trusted on
+  # first use, so a DNS hijack or MITM can't silently swap in a different
+  # host.
+  deploy-dev-staging:
+    name: Deploy to dev-staging
+    needs: build-and-push
+    if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install deploy key
+        run: |
+          install -m 700 -d ~/.ssh
+          umask 077
+          printf '%s\n' "${{ secrets.DEV_STAGING_DEPLOY_KEY }}" > ~/.ssh/dev_staging_deploy_key
+          chmod 600 ~/.ssh/dev_staging_deploy_key
+
+      - name: Pin dev-aquafire host key
+        run: |
+          install -m 700 -d ~/.ssh
+          cat > ~/.ssh/dev_staging_known_hosts <<'EOF'
+          [207.154.209.103]:8022 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILz/wItQKuTDUzsdBpvqVETE9+CHHlKMgXh6rbimvWy0
+          EOF
+
+      - name: Deploy to dev-staging (forced command runs ci-deploy.sh)
+        run: |
+          ssh -p 8022 \
+            -i ~/.ssh/dev_staging_deploy_key \
+            -o UserKnownHostsFile=~/.ssh/dev_staging_known_hosts \
+            -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes \
+            dev@207.154.209.103 'deploy'
+
+      - name: Clean up deploy key
+        if: always()
+        run: rm -f ~/.ssh/dev_staging_deploy_key
