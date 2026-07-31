@@ -2,7 +2,14 @@ name: Publish Docker
 
 on:
   push:
-    branches: [main, fork-stable]
+    branches: [main, fork-stable, dev]
+    # Doc-only commits were rebuilding+moving the :main digest with no code
+    # change (observed 2026-07-31) — that breaks digest-based promotion
+    # tracking. Skip the build when a push touches only docs/markdown.
+    # Deliberately NOT excluding .github/workflows/** — a workflow-file
+    # change must still trigger a build. Does not affect the `release` or
+    # `workflow_dispatch` triggers below (paths-ignore only scopes `push`).
+    paths-ignore: ['docs/**', '**.md']
   release:
     types: [published]
   workflow_dispatch:
