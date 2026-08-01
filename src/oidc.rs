@@ -1591,17 +1591,25 @@ fn resolve_device_id(proposed_device_id: Option<&str>) -> String {
 /// (stable for Element Web and Element X). When `None`, a fresh `SIWX_{uuid}`
 /// is minted.
 ///
-/// **Loud failure + self-heal (2026-08-01 incident):** a `provision_user`
-/// failure at first sign-in used to be logged at `warn!` and never retried,
-/// leaving the account with a Synapse `users` row but no `profiles` row —
-/// permanently unable to set a displayname (upstream Synapse #19702). A
-/// first-sign-in failure is now logged at `error!`. For an *existing* account
-/// (the `is_localpart_available == false` branch), if `server_name` is
-/// supplied this also best-effort self-heals: it checks
-/// `SynapseClient::has_profile_row` and, only when the row is missing,
-/// re-runs `provision_user`. The row check is the clobber guard — a row with
-/// a null/cleared displayname still returns `Ok(true)`, so a deliberately
-/// empty displayname is never overwritten. `server_name: None` (no
+/// **Loud failure + self-heal (2026-08-01 incident, discriminator corrected
+/// 2026-08-02):** a `provision_user` failure at first sign-in used to be
+/// logged at `warn!` and never retried, leaving the account with a Synapse
+/// `users` row but no `profiles` row — permanently unable to set a
+/// displayname (upstream Synapse #19702). A first-sign-in failure is now
+/// logged at `error!`. For an *existing* account (the
+/// `is_localpart_available == false` branch), if `server_name` is supplied
+/// this also best-effort self-heals: it checks
+/// `SynapseClient::has_profile_row` and, only when the row is confirmed
+/// truly absent, re-runs `provision_user`. That confirmation is
+/// errcode-discriminated (`M_UNKNOWN` = absent, everything else = present or
+/// unknown/fail-safe) — a naive "404 = absent" check was live-falsified on
+/// Synapse 1.154.0 (a row with a null displayname AND null avatar also
+/// 404s) and clobbered a deliberately-cleared displayname before this fix.
+/// See the table on `SynapseClient::has_profile_row`. The repair call itself
+/// is currently inert on Synapse builds still affected by
+/// element-hq/synapse#19702 (`set_displayname` 500s on a row-less account);
+/// it self-activates once the deployment's Synapse image is bumped past that
+/// fix — see the comment on the heal branch below. `server_name: None` (no
 /// `SIWEOIDC_MATRIX_SERVER_NAME` configured) skips the check entirely,
 /// preserving prior behavior for standalone deployments. See
 /// `docs/superpowers/plans/2026-08-01-provision-retry-hardening.md`.
@@ -1631,7 +1639,36 @@ pub async fn provision_synapse_device(
             // Self-heal: re-check for the case where a PRIOR first-sign-in
             // provision_user call failed, leaving a `users` row but no
             // `profiles` row. Never runs when server_name is unavailable
-            // (standalone deployments) and never overwrites an existing row.
+            // (standalone deployments) and never overwrites an existing row
+            // (see SynapseClient::has_profile_row's discriminator table —
+            // corrected 2026-08-02 after a live falsification on Synapse
+            // 1.154.0 where the original "any 404 = absent" premise clobbered
+            // a deliberately-cleared displayname).
+            //
+            // Repair is currently INERT on Synapse builds affected by
+            // element-hq/synapse#19702 (`_check_profile_size` crashes on a
+            // row-less account): the has_profile_row check correctly detects
+            // the absent row and this branch correctly re-calls
+            // provision_user, but that MAS `set_displayname` call itself hits
+            // the same upstream bug and 500s (traced live to
+            // profile_handler.set_displayname -> profile.py:354). The
+            // resulting `error!` line below is intentional per-login
+            // observability, not a new failure mode — first-time provisioning
+            // is unaffected (registration creates the row before
+            // set_displayname is ever called). The heal becomes effective
+            // automatically once the deployment's pinned Synapse image is
+            // bumped past the upstream fix; no code change will be needed
+            // here when that happens.
+            //
+            // Erasure note: `has_profile_row` also reads a GDPR-erased
+            // account's purged row (see account::execute_action's
+            // `org.matrix.account_erase`, which calls
+            // `SynapseClient::deactivate_user(.., erase: true)`) as "truly
+            // absent" by the same M_UNKNOWN discriminator. If an erased
+            // account ever completed sign-in again, this would resurrect a
+            // bare profile row (displayname = DID) — accepted, since that
+            // reveals nothing beyond the mxid the caller already presented to
+            // authenticate.
             if let Some(server_name) = server_name {
                 match synapse.has_profile_row(&localpart, server_name).await {
                     Ok(true) => {}
@@ -1644,7 +1681,7 @@ pub async fn provision_synapse_device(
                             error!(
                                 did = %did,
                                 error = %e,
-                                "provision_user self-heal retry failed — account remains half-provisioned"
+                                "provision_user self-heal retry failed — account remains half-provisioned (expected on Synapse builds still affected by element-hq/synapse#19702; resolves automatically once the pinned image is bumped)"
                             );
                         }
                     }

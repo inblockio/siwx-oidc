@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// A user's device/session as reported by Synapse's admin API.
 ///
@@ -246,14 +246,39 @@ impl SynapseClient {
     /// failed every subsequent displayname write. See
     /// `docs/superpowers/plans/2026-08-01-provision-retry-hardening.md`.
     ///
-    /// **Discriminator guarantee:** Synapse returns HTTP 200 for ANY existing
-    /// profile row, including one whose displayname has been intentionally
-    /// cleared (null). So `Ok(false)` means the row itself is missing, never that
-    /// the displayname happens to be empty — driving a re-provision off this
-    /// signal can never clobber a user-set (or deliberately cleared) displayname.
+    /// **Discriminator corrected 2026-08-02 (live-falsified on Synapse 1.154.0):**
+    /// the original "any 404 means the row is absent" premise was wrong — Synapse
+    /// ALSO 404s a row that exists but is empty (displayname AND avatar_url both
+    /// null), which made the first version of this heal clobber a
+    /// deliberately-cleared displayname back to the DID (observed live). Both 404
+    /// shapes were measured live and are discriminated by the JSON `errcode`
+    /// field (the primary key — the human-readable `error` string is not part of
+    /// any stability contract and may drift across Synapse versions):
     ///
-    /// Returns `Ok(true)` on HTTP 200 (row exists), `Ok(false)` on HTTP 404 (no
-    /// row), `Err` for any other response or transport failure.
+    /// | HTTP | `errcode` | `error` (measured example) | Row state | Heal? |
+    /// |------|-----------|------------------------------|-----------|-------|
+    /// | 200 | — | — | present (any displayname/avatar, incl. both null) | no |
+    /// | 404 | `M_UNKNOWN` | `"No row found"` | **truly absent** | **yes** |
+    /// | 404 | `M_NOT_FOUND` | `"Profile was not found"` | present, empty (displayname+avatar both null) | no |
+    /// | 404 | anything else / unparseable body | — | unknown — FAIL SAFE | no |
+    ///
+    /// The fail-safe row exists because healing (re-running `provision_user`) is
+    /// the destructive direction: it can clobber a real, empty profile, whereas
+    /// wrongly skipping a heal just leaves the account half-provisioned for one
+    /// more login (already loud at `error!`). See `profile_404_means_row_absent`
+    /// (below) for the pure decision function and its unit tests.
+    ///
+    /// **Erasure interplay:** a GDPR-erased account (`account::execute_action`'s
+    /// `org.matrix.account_erase`, which purges the profile via Synapse admin
+    /// `deactivate(erase: true)`) also 404s as "truly absent" by this same
+    /// discriminator. If an erased account ever completed sign-in again this
+    /// heal would resurrect a bare profile row (`displayname = DID`) — accepted,
+    /// since that reveals nothing beyond the mxid the caller already presented.
+    ///
+    /// Returns `Ok(true)` when the row is present (200, or a 404 the
+    /// discriminator reads as present/unknown — the fail-safe default), `Ok(false)`
+    /// only for a discriminator-confirmed absent row, `Err` for any non-404 error
+    /// response or transport failure.
     pub async fn has_profile_row(&self, localpart: &str, server_name: &str) -> Result<bool> {
         let user_id = matrix_user_id(localpart, server_name);
         let url = format!(
@@ -273,7 +298,15 @@ impl SynapseClient {
             return Ok(true);
         }
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(false);
+            let body = resp.text().await.unwrap_or_default();
+            let row_absent = profile_404_means_row_absent(&body);
+            if !row_absent {
+                debug!(
+                    %body,
+                    "has_profile_row: 404 read as a present-but-empty (or unrecognized) profile shape — treating as present, skipping heal"
+                );
+            }
+            return Ok(!row_absent);
         }
 
         let status = resp.status();
@@ -483,6 +516,32 @@ fn reactivate_body() -> serde_json::Value {
     json!({ "deactivated": false })
 }
 
+/// Discriminate a 404 response body from `GET /_matrix/client/v3/profile/{mxid}`,
+/// distinguishing a truly ABSENT profile row from a row that exists but is
+/// empty (both `displayname` and `avatar_url` null — Synapse 1.154.0 also 404s
+/// that case). See the table on [`SynapseClient::has_profile_row`] for the
+/// live-measured shapes this decodes.
+///
+/// `errcode` is the primary (and only) signal: `"M_UNKNOWN"` means absent,
+/// anything else (including `"M_NOT_FOUND"`, a missing `errcode`, or a body
+/// that isn't valid JSON) means "not confirmed absent". The `error` message
+/// text is deliberately NOT part of the gate — it is an informal, measured
+/// signal only, since Synapse's human-readable strings are not covered by any
+/// stability contract and may drift across versions; an `M_UNKNOWN` body with
+/// unexpected `error` text still returns `true` here (errcode is primary).
+///
+/// FAIL-SAFE: any unrecognized shape returns `false` (present — do not heal).
+/// Healing (re-running `provision_user`) is the destructive direction: it can
+/// clobber a real, empty profile if this is wrong, whereas wrongly skipping a
+/// heal only leaves an already-loud (`error!`-logged) half-provisioned account
+/// unhealed for one more login.
+fn profile_404_means_row_absent(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    value.get("errcode").and_then(|v| v.as_str()) == Some("M_UNKNOWN")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,6 +604,53 @@ mod tests {
     fn reactivate_body_sets_deactivated_false() {
         // Reactivation flips `deactivated` back to false via the admin v2 PUT.
         assert_eq!(reactivate_body(), json!({ "deactivated": false }));
+    }
+
+    // -- profile_404_means_row_absent (2026-08-02 discriminator fix) --------
+    //
+    // Live-measured on Synapse 1.154.0. errcode is the primary (only) gate;
+    // the error text is documented but not load-bearing.
+
+    #[test]
+    fn profile_404_m_unknown_no_row_found_is_absent() {
+        // Truly missing row (never provisioned, or purged by account_erase).
+        let body = r#"{"errcode":"M_UNKNOWN","error":"No row found"}"#;
+        assert!(profile_404_means_row_absent(body));
+    }
+
+    #[test]
+    fn profile_404_m_not_found_profile_was_not_found_is_present() {
+        // Row exists but is empty (displayname AND avatar_url both null) —
+        // Synapse 1.154.0 also 404s this shape. Must NOT be read as absent,
+        // or the heal clobbers a deliberately-cleared displayname (observed
+        // live before this fix).
+        let body = r#"{"errcode":"M_NOT_FOUND","error":"Profile was not found"}"#;
+        assert!(!profile_404_means_row_absent(body));
+    }
+
+    #[test]
+    fn profile_404_empty_body_is_present_fail_safe() {
+        assert!(!profile_404_means_row_absent(""));
+    }
+
+    #[test]
+    fn profile_404_garbage_json_is_present_fail_safe() {
+        assert!(!profile_404_means_row_absent("not json at all {{{"));
+    }
+
+    #[test]
+    fn profile_404_m_unknown_unexpected_error_text_is_still_absent() {
+        // errcode is the primary (and only) signal — the human-readable
+        // `error` string is not part of any stability contract and may
+        // drift across Synapse versions, so it must not gate the decision.
+        let body = r#"{"errcode":"M_UNKNOWN","error":"some future wording Synapse might use"}"#;
+        assert!(profile_404_means_row_absent(body));
+    }
+
+    #[test]
+    fn profile_404_missing_errcode_is_present_fail_safe() {
+        let body = r#"{"error":"something went wrong"}"#;
+        assert!(!profile_404_means_row_absent(body));
     }
 
     #[test]
