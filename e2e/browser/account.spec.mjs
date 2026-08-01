@@ -121,6 +121,42 @@ test('deep-link manage-session with a base64 (slash) device id resolves', async 
   expect(await page.evaluate(() => window.__signCount())).toBe(0);
 });
 
+test('session details: View then Back returns to the list, no second signature', async ({ page }) => {
+  // REGRESSION GUARD for the detail view's only non-destructive exit. Every
+  // `data-act` click is handled in-page (preventDefault, no history entry), so
+  // the browser's own Back button leaves /account entirely. Without the
+  // "Back to your sessions" button the detail view is a dead end whose only way
+  // out is signing the session out.
+  await mockReset();
+  await mockSeed(WALLET_MXID, 'SIWX_walk_a');
+  await mockSeed(WALLET_MXID, 'SIWX_walk_b');
+  await instrumentCeremonyCounters(page);
+  await injectWallet(page);
+
+  await page.goto('/account?action=org.matrix.devices_list');
+  // The ONE and only signature for the whole walk:
+  await page.click('#btn-wallet');
+  await expect(page.locator('.device-row')).toHaveCount(2);
+
+  // Walk IN to the detail view for device A.
+  await page.locator('.device-row', { hasText: 'SIWX_walk_a' })
+    .getByRole('button', { name: 'View' }).click();
+  await expect(page.locator('#result-section')).toContainText('Session details');
+  await expect(page.locator('#result-section')).toContainText('SIWX_walk_a');
+
+  // ...and back OUT of it, without ending the session.
+  await page.getByRole('button', { name: 'Back to your sessions' }).click();
+  await expect(page.locator('#result-section')).toContainText('Your sessions');
+  await expect(page.locator('.device-row')).toHaveCount(2);
+  await expect(page.locator('#result-section')).not.toContainText('Session details');
+
+  // The round trip reused the session and destroyed nothing.
+  expect(await page.evaluate(() => window.__signCount())).toBe(1);
+  const ids = await mockDevices(WALLET_MXID);
+  expect(ids).toContain('SIWX_walk_a');
+  expect(ids).toContain('SIWX_walk_b');
+});
+
 test('passkey: one ceremony covers list + sign-out (virtual authenticator)', async ({ page }) => {
   await mockReset();
   await instrumentCeremonyCounters(page);
