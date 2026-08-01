@@ -329,13 +329,28 @@ Run `/deploy-check` for the full pre-deployment checklist.
 **Provisioning at sign-in (no recycling):** Sign-in does NOT delete devices. Each
 login provisions a fresh `SIWX_{uuid}` via an idempotent `upsert_device`
 (`oidc::provision_synapse_device`); it never deletes-then-reuses a device id.
-The device_code grant (QR login) uses `provision_synapse_device_additive`, which
-likewise upserts without deleting existing devices: if the client supplies a
-device_id in the scope (`urn:matrix:client:device:XXX` or
+The device_code grant (QR login) calls the SAME `oidc::provision_synapse_device`
+(there is no separate "additive" function — both call sites share one
+implementation), which likewise upserts without deleting existing devices: if
+the client supplies a device_id in the scope (`urn:matrix:client:device:XXX` or
 `urn:matrix:org.matrix.msc2967.client:device:XXX`) that exact id is provisioned,
 otherwise a `SIWX_{uuid}` is generated. The token response includes the scope so
 clients can discover the provisioned device_id. `allow_cross_signing_reset`
 fires unconditionally on sign-in.
+
+**`provision_user` failure logging + self-heal (2026-08-01):** A `provision_user`
+failure at first sign-in (new account) is logged at `error!` (previously silently
+`warn!`), because it can leave a half-provisioned account — a Synapse `users` row
+with no `profiles` row — that then permanently fails every future displayname
+write (upstream Synapse bug #19702). For an *existing* account (the
+`is_localpart_available == false` branch), `provision_synapse_device` best-effort
+self-heals: when `SIWEOIDC_MATRIX_SERVER_NAME` is configured, it calls the new
+`SynapseClient::has_profile_row(localpart, server_name)` (`GET
+/_matrix/client/v3/profile/{mxid}`) and re-runs `provision_user` only when the
+row is missing (404). A row with a null/cleared displayname still returns 200,
+so a deliberately empty displayname is never clobbered. `server_name: None`
+(standalone deployments, no Matrix server configured) skips the check entirely.
+See `docs/superpowers/plans/2026-08-01-provision-retry-hardening.md`.
 
 **Session teardown (logout / revoke / logout-all):** Teardown always revokes the
 *ending* session's OAuth tokens. Whether it also deletes the Synapse device is

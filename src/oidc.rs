@@ -30,7 +30,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 use std::time;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use urlencoding::decode;
 use uuid::Uuid;
 
@@ -751,7 +751,14 @@ async fn token_device_code(
                 generated
             };
 
-            provision_synapse_device(&did, synapse_client, "Element X", Some(&dev_id)).await;
+            provision_synapse_device(
+                &did,
+                synapse_client,
+                "Element X",
+                Some(&dev_id),
+                config.matrix_server_name.as_deref(),
+            )
+            .await;
 
             let now = Utc::now();
             let iat = now.timestamp();
@@ -1583,11 +1590,27 @@ fn resolve_device_id(proposed_device_id: Option<&str>) -> String {
 /// `proposed_device_id`: the client-supplied device_id from the OAuth scope
 /// (stable for Element Web and Element X). When `None`, a fresh `SIWX_{uuid}`
 /// is minted.
+///
+/// **Loud failure + self-heal (2026-08-01 incident):** a `provision_user`
+/// failure at first sign-in used to be logged at `warn!` and never retried,
+/// leaving the account with a Synapse `users` row but no `profiles` row —
+/// permanently unable to set a displayname (upstream Synapse #19702). A
+/// first-sign-in failure is now logged at `error!`. For an *existing* account
+/// (the `is_localpart_available == false` branch), if `server_name` is
+/// supplied this also best-effort self-heals: it checks
+/// `SynapseClient::has_profile_row` and, only when the row is missing,
+/// re-runs `provision_user`. The row check is the clobber guard — a row with
+/// a null/cleared displayname still returns `Ok(true)`, so a deliberately
+/// empty displayname is never overwritten. `server_name: None` (no
+/// `SIWEOIDC_MATRIX_SERVER_NAME` configured) skips the check entirely,
+/// preserving prior behavior for standalone deployments. See
+/// `docs/superpowers/plans/2026-08-01-provision-retry-hardening.md`.
 pub async fn provision_synapse_device(
     did: &str,
     synapse_client: Option<&SynapseClient>,
     display_name: &str,
     proposed_device_id: Option<&str>,
+    server_name: Option<&str>,
 ) -> Option<String> {
     let synapse = synapse_client?;
     let localpart = did_to_localpart(did);
@@ -1597,10 +1620,44 @@ pub async fn provision_synapse_device(
     match synapse.is_localpart_available(&localpart).await {
         Ok(true) => {
             if let Err(e) = synapse.provision_user(&localpart, did).await {
-                warn!("provision_user failed: {}", e);
+                error!(
+                    did = %did,
+                    error = %e,
+                    "provision_user failed at first sign-in — account may be half-provisioned (no profile row); will retry at next login"
+                );
             }
         }
-        Ok(false) => {}
+        Ok(false) => {
+            // Self-heal: re-check for the case where a PRIOR first-sign-in
+            // provision_user call failed, leaving a `users` row but no
+            // `profiles` row. Never runs when server_name is unavailable
+            // (standalone deployments) and never overwrites an existing row.
+            if let Some(server_name) = server_name {
+                match synapse.has_profile_row(&localpart, server_name).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        warn!(
+                            did = %did,
+                            "existing account has no profile row — re-running provisioning (self-heal)"
+                        );
+                        if let Err(e) = synapse.provision_user(&localpart, did).await {
+                            error!(
+                                did = %did,
+                                error = %e,
+                                "provision_user self-heal retry failed — account remains half-provisioned"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            did = %did,
+                            error = %e,
+                            "has_profile_row check failed — skipping self-heal this login"
+                        );
+                    }
+                }
+            }
+        }
         Err(e) => warn!("is_localpart_available check failed: {}", e),
     }
 
@@ -1628,6 +1685,7 @@ pub async fn provision_synapse_device(
     Some(dev_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn sign_in(
     _base_url: &Url,
     allowed_did_methods: &[String],
@@ -1636,6 +1694,7 @@ pub async fn sign_in(
     cookies: headers::Cookie,
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
+    server_name: Option<&str>,
 ) -> Result<(Url, String), CustomError> {
     let session_id = if let Some(c) = cookies.get(SESSION_COOKIE_NAME) {
         c
@@ -1787,6 +1846,7 @@ pub async fn sign_in(
         synapse_client,
         "Element Web",
         proposed_device_id.as_deref(),
+        server_name,
     )
     .await;
 
@@ -2190,6 +2250,7 @@ mod tests {
             cookie,
             &db_client,
             None, // no synapse_client in tests
+            None, // no matrix_server_name in tests
         )
         .await
         .unwrap();
@@ -2292,6 +2353,7 @@ mod tests {
             params,
             cookie,
             &db_client,
+            None,
             None,
         )
         .await
