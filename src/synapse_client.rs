@@ -234,6 +234,54 @@ impl SynapseClient {
         anyhow::bail!("is_localpart_available: HTTP {status}");
     }
 
+    /// Check whether a user's Synapse **profile row** exists
+    /// (`GET /_matrix/client/v3/profile/{mxid}`, the unauthenticated client API —
+    /// still sent with the shared secret bearer token for consistency with the
+    /// rest of this client, though Synapse does not require it for this route).
+    ///
+    /// This is the half-provisioning discriminator behind the self-heal in
+    /// [`crate::oidc::provision_synapse_device`]: the 2026-08-01 dev incident
+    /// found an account with a Synapse `users` row but no `profiles` row (because
+    /// `provision_user` failed transiently at first sign-in), which then silently
+    /// failed every subsequent displayname write. See
+    /// `docs/superpowers/plans/2026-08-01-provision-retry-hardening.md`.
+    ///
+    /// **Discriminator guarantee:** Synapse returns HTTP 200 for ANY existing
+    /// profile row, including one whose displayname has been intentionally
+    /// cleared (null). So `Ok(false)` means the row itself is missing, never that
+    /// the displayname happens to be empty — driving a re-provision off this
+    /// signal can never clobber a user-set (or deliberately cleared) displayname.
+    ///
+    /// Returns `Ok(true)` on HTTP 200 (row exists), `Ok(false)` on HTTP 404 (no
+    /// row), `Err` for any other response or transport failure.
+    pub async fn has_profile_row(&self, localpart: &str, server_name: &str) -> Result<bool> {
+        let user_id = matrix_user_id(localpart, server_name);
+        let url = format!(
+            "{}/_matrix/client/v3/profile/{}",
+            self.endpoint,
+            urlencoding::encode(&user_id)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.shared_secret)
+            .send()
+            .await
+            .context("has_profile_row: request failed")?;
+
+        if resp.status().is_success() {
+            return Ok(true);
+        }
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        warn!(%status, %body, "has_profile_row: unexpected response");
+        anyhow::bail!("has_profile_row: HTTP {status}");
+    }
+
     /// List a user's devices via the Synapse admin API
     /// (`GET /_synapse/admin/v2/users/{user_id}/devices`).
     ///
