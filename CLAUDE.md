@@ -338,19 +338,27 @@ otherwise a `SIWX_{uuid}` is generated. The token response includes the scope so
 clients can discover the provisioned device_id. `allow_cross_signing_reset`
 fires unconditionally on sign-in.
 
-**`provision_user` failure logging + self-heal (2026-08-01):** A `provision_user`
-failure at first sign-in (new account) is logged at `error!` (previously silently
-`warn!`), because it can leave a half-provisioned account — a Synapse `users` row
-with no `profiles` row — that then permanently fails every future displayname
-write (upstream Synapse bug #19702). For an *existing* account (the
-`is_localpart_available == false` branch), `provision_synapse_device` best-effort
-self-heals: when `SIWEOIDC_MATRIX_SERVER_NAME` is configured, it calls the new
+**`provision_user` failure logging + self-heal (2026-08-01, discriminator fixed
+2026-08-02):** A `provision_user` failure at first sign-in (new account) is
+logged at `error!` (previously silently `warn!`), because it can leave a
+half-provisioned account — a Synapse `users` row with no `profiles` row — that
+then permanently fails every future displayname write (upstream Synapse bug
+#19702). For an *existing* account (the `is_localpart_available == false`
+branch), `provision_synapse_device` best-effort self-heals: when
+`SIWEOIDC_MATRIX_SERVER_NAME` is configured, it calls
 `SynapseClient::has_profile_row(localpart, server_name)` (`GET
 /_matrix/client/v3/profile/{mxid}`) and re-runs `provision_user` only when the
-row is missing (404). A row with a null/cleared displayname still returns 200,
-so a deliberately empty displayname is never clobbered. `server_name: None`
-(standalone deployments, no Matrix server configured) skips the check entirely.
-See `docs/superpowers/plans/2026-08-01-provision-retry-hardening.md`.
+row is confirmed **truly absent**. "Truly absent" is decided by the response's
+JSON `errcode` (`M_UNKNOWN` = absent, anything else — including `M_NOT_FOUND`,
+which Synapse 1.154.0 also returns for a *present* row whose displayname AND
+avatar are both null — is treated as present/fail-safe), not by HTTP status
+alone: a naive "any 404 = absent" check was live-falsified and clobbered a
+deliberately-cleared displayname before this fix. The repair call itself is
+currently inert on Synapse builds still hitting element-hq/synapse#19702
+(`set_displayname` 500s on a row-less account) and self-activates once the
+pinned Synapse image is bumped past that fix. `server_name: None` (standalone
+deployments, no Matrix server configured) skips the check entirely. See
+`docs/superpowers/plans/2026-08-01-provision-retry-hardening.md`.
 
 **Session teardown (logout / revoke / logout-all):** Teardown always revokes the
 *ending* session's OAuth tokens. Whether it also deletes the Synapse device is
