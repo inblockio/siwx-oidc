@@ -2,7 +2,7 @@
 # Run Element Web Playwright specs against the live compose.local stack.
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
-IMG=mcr.microsoft.com/playwright:v1.50.1-noble
+IMG=mcr.microsoft.com/playwright:v1.62.1-noble
 
 # Mount whole e2e/ so ../browser imports resolve inside the container.
 E2E_ROOT="$(cd "$DIR/.." && pwd)"
