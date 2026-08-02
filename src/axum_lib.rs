@@ -230,6 +230,7 @@ async fn sign_in(
         cookies,
         &state.redis_client,
         state.synapse_client.as_deref(),
+        state.config.matrix_server_name.as_deref(),
     )
     .await?;
 

@@ -1867,7 +1867,10 @@ function renderDevice(d) {
       infoRow('Last seen', lastSeen(d)) +
       (d.last_seen_ip ? infoRow('Last IP', d.last_seen_ip) : '') +
     '</div>' +
-    '<button class="btn btn-danger" data-act="org.matrix.device_delete" data-dev="' + esc(d.device_id) + '">Sign out this session</button>');
+    '<button class="btn btn-danger" data-act="org.matrix.device_delete" data-dev="' + esc(d.device_id) + '">Sign out this session</button>' +
+    // Clicks are handled in-page (preventDefault, no history entry), so browser
+    // Back leaves the account page entirely. This is the only way back to the list.
+    '<button class="btn btn-secondary" data-act="org.matrix.devices_list">Back to your sessions</button>');
 }
 
 function showResult(html) {
@@ -2422,6 +2425,44 @@ mod tests {
         ] {
             assert!(html.contains(hook), "account page JS missing hook: {hook}");
         }
+    }
+
+    #[test]
+    fn account_page_js_device_detail_offers_back_to_sessions() {
+        // The session-detail view must offer a way back to the list. Every
+        // `data-act` click is handled in-page (`preventDefault`, no history
+        // entry), so browser Back leaves the account page entirely: without this
+        // button the detail view is a dead end whose only exit is signing the
+        // session out.
+        let html = account_page(
+            AccountPageQuery {
+                action: Some("org.matrix.device_view".to_string()),
+                device_id: Some("SIWX_abc".to_string()),
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        // Scope the assertion to renderDevice's own body. The 'deleted' terminal
+        // carries a byte-identical button, so a page-wide `contains` would still
+        // pass after the detail view lost its own.
+        let start = html
+            .find("function renderDevice(d) {")
+            .expect("page JS must define renderDevice");
+        let after_start = &html[start..];
+        let end = after_start[1..]
+            .find("\nfunction ")
+            .map(|i| i + 1)
+            .unwrap_or(after_start.len());
+        let body = &after_start[..end];
+        assert!(
+            body.contains(r#"data-act="org.matrix.devices_list""#),
+            "renderDevice must offer a back-to-sessions action, got: {body}"
+        );
+        assert!(
+            body.contains("Back to your sessions"),
+            "renderDevice back action must carry its user-facing label, got: {body}"
+        );
     }
 
     #[test]
