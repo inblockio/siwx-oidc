@@ -10,6 +10,12 @@
 
 ## 1. The open question
 
+> **RESOLVED 2026-08-02 — see `2026-08-02-elementx-verify-RESOLVED-identity-binding-walk.md`.**
+> Root cause was an identity split (wallet-EW vs unlinked-passkey-EX = two different Matrix
+> users), not any of the three candidates below. After linking the passkey to the wallet DID,
+> the walk completed end-to-end on dev (SAS emoji + recovery fallback). Candidates kept for
+> reference only.
+
 > "Is it expected that when signing in with Element X, *verify with other device* does not work if
 > the other device is Element Web?"
 
