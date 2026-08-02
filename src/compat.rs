@@ -48,8 +48,8 @@ use crate::introspect::generate_opaque_token;
 // `siwx_oidc::synapse_client`, which is a *distinct* type here.
 use crate::synapse_client::SynapseClient;
 use siwx_oidc::db::{
-    DBClient, RedisClient, RotatedToken, TokenMetadata, ACCESS_TOKEN_TTL, REFRESH_GRACE_TTL,
-    REFRESH_TOKEN_TTL,
+    DBClient, RedisClient, RevocationState, RotatedToken, TokenMetadata, ACCESS_TOKEN_TTL,
+    REFRESH_GRACE_TTL, REFRESH_TOKEN_TTL,
 };
 
 // -- Shared state for compat endpoints ----------------------------------------
@@ -476,12 +476,18 @@ pub async fn refresh(
                 })),
             );
         }
-        Err(_) => {
+        Err(e) => {
+            // Infrastructure failure, NOT an authorization failure. `M_UNKNOWN_TOKEN`
+            // is terminal for a Matrix client (it signs out and clears its crypto
+            // store, and under MSC3861 Synapse never offers a soft logout), so
+            // reporting a Redis error that way would turn a transient fault into
+            // permanent session and cryptographic-identity loss. 503 is retryable.
+            warn!(error = %e, "refresh: token lookup failed (infrastructure); returning retryable 503");
             return (
-                StatusCode::UNAUTHORIZED,
+                StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
-                    "errcode": "M_UNKNOWN_TOKEN",
-                    "error": "Invalid refresh token"
+                    "errcode": "M_UNKNOWN",
+                    "error": "Token store temporarily unavailable; retry"
                 })),
             );
         }
@@ -503,25 +509,38 @@ pub async fn refresh(
     // planted atomically by the revoke sweep, so a refresh that started before the
     // sweep but lands after it cannot resurrect access for a torn-down device /
     // terminated account. (Best-effort: a Redis error here fails closed below.)
-    let device_revoked = !metadata.device_id.is_empty()
-        && state
-            .redis_client
-            .is_device_revoked(&metadata.username, &metadata.device_id)
-            .await
-            .unwrap_or(true);
-    let user_deactivated = state
+    //
+    // PRE-mint: nothing has been destroyed yet and the client still holds a usable
+    // refresh token, so an indeterminate probe must NOT be resolved by guessing.
+    // Minting under uncertainty is unsafe; deleting the client's token over an I/O
+    // error is destructive. Return a retryable 503 instead and let the client come
+    // back — the strictly safest option, available only because we are pre-mint.
+    let revocation = state
         .redis_client
-        .is_user_deactivated(&metadata.username)
-        .await
-        .unwrap_or(true);
-    if device_revoked || user_deactivated {
+        .probe_revocation(&metadata.username, &metadata.device_id)
+        .await;
+    if revocation == RevocationState::Indeterminate {
+        warn!(
+            username = %metadata.username,
+            device_id = %metadata.device_id,
+            "refresh: revocation probe indeterminate before mint; returning \
+             retryable 503 without touching the client's refresh token"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "errcode": "M_UNKNOWN",
+                "error": "Revocation state temporarily unavailable; retry"
+            })),
+        );
+    }
+    if revocation.must_refuse() {
         // Also revoke the presented refresh token so the chain cannot continue.
         let _ = state.redis_client.delete_token(&body.refresh_token).await;
         debug!(
             username = %metadata.username,
             device_id = %metadata.device_id,
-            device_revoked,
-            user_deactivated,
+            revocation = ?revocation,
             "refresh refused: device/account torn down"
         );
         return (
@@ -599,18 +618,24 @@ pub async fn refresh(
     // the sweep's atomic index-delete may have missed our just-minted tokens
     // (they were written after its SMEMBERS snapshot). Detecting the tombstone now
     // and deleting our own tokens guarantees no resurrected token survives.
-    let revoked_now = (!metadata.device_id.is_empty()
-        && state
-            .redis_client
-            .is_device_revoked(&metadata.username, &metadata.device_id)
-            .await
-            .unwrap_or(true))
-        || state
-            .redis_client
-            .is_user_deactivated(&metadata.username)
-            .await
-            .unwrap_or(true);
-    if revoked_now {
+    //
+    // Fail OPEN on an indeterminate probe, CLOSED only on a definite tombstone —
+    // same reasoning as `oidc::token_refresh`: the presented refresh token is
+    // already gone by this point, so rolling back on a mere I/O error would sign
+    // the client out with no recoverable credential.
+    let revoked_now = state
+        .redis_client
+        .probe_revocation(&metadata.username, &metadata.device_id)
+        .await;
+    if revoked_now == RevocationState::Indeterminate {
+        warn!(
+            username = %metadata.username,
+            device_id = %metadata.device_id,
+            "refresh: revocation probe indeterminate after mint; committing \
+             (fail-open, bounded by tombstone TTL)"
+        );
+    }
+    if revoked_now.must_refuse() {
         let _ = state.redis_client.delete_token(&new_access_token).await;
         let _ = state.redis_client.delete_token(&new_refresh_token).await;
         debug!(

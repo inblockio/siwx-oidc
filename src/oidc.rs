@@ -585,16 +585,26 @@ async fn token_refresh(
     // Check-mint-recheck (S3-3 / H3 + S3-4 / H6): if a revoke/deactivate sweep
     // tombstoned this device/user in the gap between our pre-mint check and our
     // writes, roll back the just-minted tokens so none can be resurrected.
-    let revoked_now = (!metadata.device_id.is_empty()
-        && db_client
-            .is_device_revoked(&metadata.username, &metadata.device_id)
-            .await
-            .unwrap_or(true))
-        || db_client
-            .is_user_deactivated(&metadata.username)
-            .await
-            .unwrap_or(true);
-    if revoked_now {
+    //
+    // Fail OPEN on an indeterminate probe (Redis I/O error), CLOSED only on a
+    // definite tombstone. By this point `rt` has already been deleted and the
+    // grace pointer is not yet written, so a rollback here leaves the client
+    // holding neither the old nor the new refresh token — an unrecoverable
+    // sign-out. Treating an I/O error as a tombstone would convert a transient
+    // fault into permanent session loss; the tombstone TTL bounds the opposite
+    // risk to one access-token cycle (see `RevocationState`).
+    let revoked_now = db_client
+        .probe_revocation(&metadata.username, &metadata.device_id)
+        .await;
+    if revoked_now == RevocationState::Indeterminate {
+        warn!(
+            username = %metadata.username,
+            device_id = %metadata.device_id,
+            "refresh: revocation probe indeterminate after mint; committing \
+             (fail-open, bounded by tombstone TTL)"
+        );
+    }
+    if revoked_now.must_refuse() {
         let _ = db_client.delete_token(&new_access).await;
         let _ = db_client.delete_token(&new_refresh).await;
         return Err(CustomError::BadRequestToken(TokenError {

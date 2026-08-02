@@ -1,0 +1,374 @@
+/**
+ * EW-J — JOURNEY EXIT WALK. The product question, asked directly.
+ *
+ * The anchored goal, in the owner's words:
+ *
+ *     "All user exposed states are well defined and users never land in an
+ *      undefined state. All states can be clearly recovered from."
+ *
+ * This spec tests exactly that, and nothing else. It is deliberately NOT built on
+ * the ~89-state model: that model is inference over code and documents carrying
+ * ~20 unsettled assumptions, and a model can be wrong about which states are even
+ * REACHABLE. Walking the journey cannot be. Every screen recorded here is a screen
+ * a real user actually reached in a real browser against a real stack.
+ *
+ * THE ONE INVARIANT
+ *
+ *     At every screen a user reaches, they must be able to DO something:
+ *     either the app shell is present (they are in), or at least one enabled,
+ *     visible control is offered (they can act).
+ *
+ * A screen with neither, that does not resolve, is a dead end -- the user's only
+ * escape is a page reload they have no reason to expect, or abandoning the account.
+ *
+ * SCOPE, STATED HONESTLY. This walks the LAB. Verified by grepping the served
+ * bundle at authoring time, the lab Element carries force-first-device-recovery
+ * and the Busy-wedge fix, and does NOT carry the U5/U7 patches. The Busy-wedge fix
+ * is UNPUSHED, so the lab is AHEAD of production. A green run here is a statement
+ * about the lab, not about what users have today. Do not quote it as the latter.
+ *
+ * WHAT COUNTS AS AN EXIT is deliberately strict:
+ *   - controls must be visible AND not disabled AND not aria-disabled.
+ *     A greyed-out button is not an exit; it is the shape of the U5 complaint
+ *     ("Show QR code", disabled, with a false explanation).
+ *   - a spinner is not an exit; it is permission to wait, which is why the check
+ *     polls before judging rather than sampling once.
+ */
+import { test, expect } from '@playwright/test';
+import { requireElementStack, ELEMENT_URL, MATRIX_URL, SIWX_URL, openElement } from './helpers/element.mjs';
+import { loginWalletToTokens } from './helpers/oidc-login.mjs';
+import { elementWalletClickLogin, completeSecureBackupWizard } from './helpers/element-login.mjs';
+import { makeWallet, injectMockWallet } from '../browser/wallet-helper.mjs';
+import { settle, assertExit } from './helpers/journey.mjs';
+
+const SERVER_NAME = 'localhost';
+
+test.beforeAll(async () => {
+  await requireElementStack();
+});
+
+// ---------------------------------------------------------------------------
+// J1 — first login on a brand-new identity, through to a usable session.
+// ---------------------------------------------------------------------------
+test('EW-J1: first login (new wallet identity) — every screen offers an exit', async ({ page }) => {
+  test.setTimeout(600_000);
+  const w = makeWallet(undefined, SERVER_NAME);
+
+  await injectMockWallet(page, w);
+  await page.goto(ELEMENT_URL, { waitUntil: 'domcontentloaded' });
+  assertExit(await settle(page, 'J1.1 siwx login page'));
+
+  // Driven step-by-step, NOT via elementWalletClickLogin, deliberately. That helper
+  // completes the whole Secure Backup wizard internally, so sampling around it only
+  // ever observes "logged out" and "in the app" -- the two screens nobody doubted.
+  // The wizard's interior is where a dead end would actually live, so it is walked
+  // one click at a time.
+  await page.getByRole('button', { name: 'Sign in with Ethereum' }).click();
+  assertExit(await settle(page, 'J1.2 after signature'));
+
+  await page.getByRole('button', { name: 'Skip for now' }).click();
+  await page.waitForURL((u) => u.origin === new URL(ELEMENT_URL).origin, { timeout: 120_000 });
+  assertExit(await settle(page, 'J1.3 back in Element', { budgetMs: 150_000 }));
+
+  // Forced first-device recovery: Continue -> Copy -> Continue -> Done. Each step is
+  // sampled BEFORE its click, so a screen that offers nothing is caught here rather
+  // than being clicked past by a helper.
+  const chat = page.locator('.mx_MatrixChat');
+  const steps = [/^Continue$/, /^Copy$/, /^Continue$/, /^Done$/];
+  for (let i = 0; i < steps.length; i += 1) {
+    if (await chat.count()) break;
+    const s = await settle(page, `J1.4.${i + 1} wizard step`, { budgetMs: 150_000 });
+    assertExit(s);
+    const btn = page.getByRole('button', { name: steps[i], disabled: false }).first();
+    if (!(await btn.count())) break;
+    await btn.click({ timeout: 120_000 }).catch(() => {});
+  }
+
+  assertExit(await settle(page, 'J1.5 after wizard', { budgetMs: 120_000 }));
+  await expect(chat).toBeVisible({ timeout: 120_000 });
+});
+
+// ---------------------------------------------------------------------------
+// J2 — reload. The single most common thing a user does, and historically the
+// state that produced hard logouts and the verify gate.
+// ---------------------------------------------------------------------------
+test('EW-J2: reload an established session — every screen offers an exit', async ({ page }) => {
+  test.setTimeout(600_000);
+  const w = makeWallet(undefined, SERVER_NAME);
+  await elementWalletClickLogin(page, w);
+  await expect(page.locator('.mx_MatrixChat')).toBeVisible({ timeout: 120_000 });
+
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  const s = await settle(page, 'J2.1 after reload', { budgetMs: 60_000 });
+  assertExit(s);
+
+  // Not an assertion, an observation worth having in the log: did the reload put
+  // the user back in the app, or in front of a gate they must satisfy?
+  // eslint-disable-next-line no-console
+  console.log(`[JOURNEY] J2 reload outcome: ${s.appShell ? 'APP SHELL' : 'GATE — ' + JSON.stringify(s.headings)}`);
+});
+
+// ---------------------------------------------------------------------------
+// J3 — THE DANGEROUS ONE. A second device, no other signed-in session, and the
+// user does NOT have their recovery key to hand. This is the composition the
+// audit calls "reset is the only visible exit" — and reset is the destructive
+// path that orphans the message-key backup.
+//
+// This test does NOT assert that a non-destructive exit exists (that is the open
+// product question). It asserts the weaker, non-negotiable invariant — the user
+// can act at all — and RECORDS what they are offered, so the answer is measured
+// rather than argued.
+// ---------------------------------------------------------------------------
+test('EW-J3: second device, no other session, no recovery key — what exits exist?', async ({ browser }) => {
+  test.setTimeout(900_000);
+  const w = makeWallet(undefined, SERVER_NAME);
+
+  const ctxA = await browser.newContext();
+  const ctxB = await browser.newContext();
+  try {
+    // Device A: establish the account and its 4S.
+    const pageA = await ctxA.newPage();
+    await elementWalletClickLogin(pageA, w);
+    await expect(pageA.locator('.mx_MatrixChat')).toBeVisible({ timeout: 120_000 });
+
+    // Device A goes away entirely — no live session to verify against.
+    await ctxA.close();
+
+    // Device B: same identity, fresh browser, nothing cached.
+    const pageB = await ctxB.newPage();
+    await injectMockWallet(pageB, w);
+    await pageB.goto(ELEMENT_URL, { waitUntil: 'domcontentloaded' });
+    await pageB.getByRole('button', { name: 'Sign in with Ethereum' }).click().catch(() => {});
+    await pageB.getByRole('button', { name: 'Skip for now' }).click().catch(() => {});
+    await pageB.waitForURL((u) => u.origin === new URL(ELEMENT_URL).origin, { timeout: 120_000 });
+
+    const gate = await settle(pageB, 'J3.1 second device gate', { budgetMs: 90_000 });
+    assertExit(gate);
+
+    // GROUNDED FINDING, recorded because it contradicts a document rather than
+    // confirming one: "Use recovery key" IS offered here. U6 ("verify gate with no
+    // recovery-key entry") is therefore fixed in this build, by direct observation
+    // on the exact path the audit said was worst -- a new device with NO other
+    // session. Asserted so a regression is caught, not just noted.
+    expect(
+      gate.controls.some((c) => /recovery key/i.test(c)),
+      `U6 REGRESSION — the second-device gate offers no recovery-key entry. Controls: ` +
+        `${JSON.stringify(gate.controls)}. Without it, a user with no live session has only the ` +
+        `destructive path.`,
+    ).toBe(true);
+
+    // Now the part the first version of this test got WRONG. It classified the gate
+    // as "no destructive controls" because its regex did not match "Can't confirm?"
+    // -- which is precisely the disclosure that leads to reset. A classifier that
+    // cannot see the destructive path will always report that none exists.
+    // So: open it and look, rather than pattern-matching the top-level labels.
+    const disclosure = pageB.getByRole('button', { name: /can'?t confirm/i }).first();
+    let behind = null;
+    if (await disclosure.count()) {
+      await disclosure.click().catch(() => {});
+      behind = await settle(pageB, 'J3.2 behind "Can\'t confirm?"', { budgetMs: 20_000 });
+      assertExit(behind);
+    }
+
+    // NOT classified by label. Measured 2026-07-26: behind "Can't confirm?" the
+    // destructive action is labelled **"Continue"**, under the heading "Are you sure
+    // you want to reset your digital identity?". A regex over control labels cannot
+    // see that, and the first version of this test duly reported "destructive=[]"
+    // for a screen whose whole purpose is a destructive confirmation. Label-based
+    // classification of destructive actions is unsound and is not used here.
+    //
+    // Instead: assert that the two exits that are non-destructive BY CONSTRUCTION
+    // are present. "Use recovery key" unlocks; "Use another device" verifies from a
+    // peer. Neither can orphan the backup. Their presence is the product claim.
+    // eslint-disable-next-line no-console
+    console.log(
+      `[JOURNEY] J3 FULL exit set — gate=${JSON.stringify(gate.controls)} ` +
+        `behindDisclosure=${JSON.stringify((behind && behind.controls) || [])} ` +
+        `behindHeadings=${JSON.stringify((behind && behind.headings) || [])}`,
+    );
+
+    const nonDestructive = gate.controls.filter((c) => /recovery key|another device/i.test(c));
+    expect(
+      nonDestructive,
+      `RESET IS THE ONLY EXIT at the second-device gate. Neither "Use recovery key" nor ` +
+        `"Use another device" is offered, so every route forward runs through the reset ` +
+        `confirmation — which orphans the user's message-key backup. Controls seen: ` +
+        `${JSON.stringify(gate.controls)}. This would be the U5+U6+U7 composition actually ` +
+        `reproducing; as measured on 2026-07-26 it does NOT.`,
+    ).toHaveLength(2);
+  } finally {
+    await ctxA.close().catch(() => {});
+    await ctxB.close().catch(() => {});
+  }
+});
+
+// ---------------------------------------------------------------------------
+// J4 — the first device, and the user clicks CANCEL on forced recovery setup.
+//
+// Why this matters more than it looks: a user who cancels here never gets a
+// recovery key. They are, precisely, the population that later arrives at J3's
+// gate with nothing to type — the origin of the entire lost-key problem. The
+// forced-recovery patch exists to make that impossible, and its own comment states
+// the requirement: "we must never trap them on the (now inert) setup screen if
+// they cancel", with dismissal treated as sign-out "so the requirement cannot be
+// slipped past".
+//
+// This measures whether that holds. The failing outcomes are BOTH interesting:
+//   - no exit at all            -> trapped on the inert screen (the patch's own fear)
+//   - app shell with NO 4S      -> mandate defeated; user silently joins the
+//                                  unrecoverable population, which is worse than
+//                                  being trapped because nothing tells them
+// ---------------------------------------------------------------------------
+
+/**
+ * Server truth for "does this user have a 4S default key?".
+ *
+ * NOT read from localStorage. Measured 2026-07-26: `mx_access_token` is absent
+ * there, so the first version of this probe silently returned known:false and the
+ * mandate assertion never ran -- a check that cannot fail, which is the exact
+ * failure mode this whole effort exists to stop. Mint an independent token for the
+ * same wallet over the headless OIDC path instead; it is server truth either way.
+ */
+async function serverHas4S(page, wallet) {
+  const helper = await page.context().newPage();
+  let token;
+  try {
+    const s = await loginWalletToTokens(helper, { siwxUrl: SIWX_URL, matrixUrl: MATRIX_URL, wallet });
+    token = s.access_token;
+  } finally {
+    await helper.close();
+  }
+  const url =
+    `${MATRIX_URL.replace(/\/$/, '')}/_matrix/client/v3/user/${encodeURIComponent(wallet.mxid)}` +
+    `/account_data/m.secret_storage.default_key`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  return { known: true, status: res.status, present: res.status === 200 };
+}
+
+test('EW-J4: first device — cancelling forced recovery setup must not strand or silently exempt', async ({
+  page,
+}) => {
+  test.setTimeout(600_000);
+  const w = makeWallet(undefined, SERVER_NAME);
+
+  await injectMockWallet(page, w);
+  await page.goto(ELEMENT_URL, { waitUntil: 'domcontentloaded' });
+  await page.getByRole('button', { name: 'Sign in with Ethereum' }).click();
+  await page.getByRole('button', { name: 'Skip for now' }).click();
+  await page.waitForURL((u) => u.origin === new URL(ELEMENT_URL).origin, { timeout: 120_000 });
+
+  const wizard = await settle(page, 'J4.1 forced recovery wizard', { budgetMs: 150_000 });
+  assertExit(wizard);
+  expect(
+    wizard.controls.some((c) => /^Cancel$/i.test(c)),
+    `J4 needs the wizard to actually offer Cancel; it offered ${JSON.stringify(wizard.controls)}. ` +
+      `If Cancel is gone this test is obsolete — delete it rather than weakening it.`,
+  ).toBe(true);
+
+  await page.getByRole('button', { name: /^Cancel$/, disabled: false }).first().click();
+
+  // The invariant first: whatever happens, the user must be able to act.
+  const confirm = await settle(page, 'J4.2 after Cancel', { budgetMs: 60_000 });
+  assertExit(confirm);
+
+  // Measured 2026-07-26: the first Cancel opens Element's own "Are you sure?"
+  // confirmation (Cancel / Go back) — a checkpoint, not a destination. The first
+  // version of this test stopped here and concluded nothing while reporting green.
+  // Follow the cancellation through; where it LANDS is the entire question.
+  if (/are you sure/i.test((confirm.headings || []).join(' '))) {
+    await page
+      .getByRole('button', { name: /^Cancel$/, disabled: false })
+      .first()
+      .click()
+      .catch(() => {});
+  }
+
+  const after = await settle(page, 'J4.3 cancellation destination', { budgetMs: 90_000 });
+  assertExit(after);
+
+  const s4 = await serverHas4S(page, w);
+  // eslint-disable-next-line no-console
+  console.log(
+    `[JOURNEY] J4 destination — shell=${after.appShell} headings=${JSON.stringify(after.headings)} ` +
+      `controls=${JSON.stringify(after.controls)} server4S=${JSON.stringify(s4)}`,
+  );
+
+  // The mandate. Reaching the app with no recovery key is the silent failure: the
+  // user is not told, and only discovers it when they need the key they never got.
+  if (after.appShell) {
+    expect(
+      s4.present,
+      `MANDATE DEFEATED — Cancel put the user in the app shell with NO server-side 4S ` +
+        `(default_key HTTP ${s4.status}). They now have an account with no recovery key and no ` +
+        `warning, and will arrive at the second-device gate with nothing to type. ` +
+        `force-first-device-recovery exists specifically to make this unreachable.`,
+    ).toBe(true);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// J5 — the same cancellation, escaped via the dialog's X rather than its buttons.
+//
+// The patch asserts, in a comment, that "any dismissal of this dialog (cancel/Esc/
+// background) is treated as 'sign out', so the requirement cannot be slipped past,
+// and the user can never be trapped with no way forward." That is a claim about
+// QuestionDialog's close affordance, and it was never measured. J4 established that
+// the dialog also renders a "Close dialog" control the comment does not name.
+//
+// If the claim is right, dismissing lands the user back at login. If it is wrong,
+// they are left on the inert "Setting up keys" screen with the dialog gone and
+// nothing to click -- the precise trap the patch was written to prevent, reached by
+// the one control most users instinctively press.
+// ---------------------------------------------------------------------------
+test('EW-J5: dismissing the "Set up recovery to continue" dialog must not strand the user', async ({
+  page,
+}) => {
+  test.setTimeout(600_000);
+  const w = makeWallet(undefined, SERVER_NAME);
+
+  await injectMockWallet(page, w);
+  await page.goto(ELEMENT_URL, { waitUntil: 'domcontentloaded' });
+  await page.getByRole('button', { name: 'Sign in with Ethereum' }).click();
+  await page.getByRole('button', { name: 'Skip for now' }).click();
+  await page.waitForURL((u) => u.origin === new URL(ELEMENT_URL).origin, { timeout: 120_000 });
+
+  assertExit(await settle(page, 'J5.1 forced recovery wizard', { budgetMs: 150_000 }));
+  await page.getByRole('button', { name: /^Cancel$/, disabled: false }).first().click();
+  const confirm = await settle(page, 'J5.2 after Cancel', { budgetMs: 60_000 });
+  if (/are you sure/i.test((confirm.headings || []).join(' '))) {
+    await page.getByRole('button', { name: /^Cancel$/, disabled: false }).first().click().catch(() => {});
+  }
+
+  const gate = await settle(page, 'J5.3 recovery-required dialog', { budgetMs: 90_000 });
+  assertExit(gate);
+  expect(
+    gate.controls.some((c) => /close dialog/i.test(c)),
+    `J5 needs the dialog to offer a close affordance; it offered ${JSON.stringify(gate.controls)}.`,
+  ).toBe(true);
+
+  // Press the X — the escape hatch the patch comment does not name.
+  await page.getByRole('button', { name: /close dialog/i }).first().click().catch(() => {});
+
+  const after = await settle(page, 'J5.4 after dismissing', { budgetMs: 90_000 });
+  // eslint-disable-next-line no-console
+  console.log(
+    `[JOURNEY] J5 dismissal outcome — verdict=${after.verdict} shell=${after.appShell} ` +
+      `url=${after.url} headings=${JSON.stringify(after.headings)} controls=${JSON.stringify(after.controls)}`,
+  );
+
+  // The invariant, unchanged: the user must be able to act.
+  assertExit(after);
+
+  // And the mandate: dismissal must NOT have quietly admitted them to the app
+  // without a recovery key. Either they are signed out / re-prompted, or they are
+  // in the app WITH 4S.
+  if (after.appShell) {
+    const s4 = await serverHas4S(page, w);
+    expect(
+      s4.present,
+      `MANDATE SLIPPED — dismissing the recovery dialog with the X put the user in the app ` +
+        `shell with NO server-side 4S (default_key HTTP ${s4.status}). The patch comment claims ` +
+        `any dismissal is treated as sign-out; measured, it is not.`,
+    ).toBe(true);
+  }
+});

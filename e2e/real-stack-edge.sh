@@ -9,9 +9,12 @@
 # container (siwx-real-caddy) that mirrors the prod route split, so a client can
 # point its homeserver at the edge and have native device sign-out reach siwx-oidc.
 #
-# Prereq: the real stack must already be up (see /tmp/track2-real-stack.md):
-#   siwx-real-oidc (8081), siwx-real-synapse (8008 internal), siwx-real-redis,
-#   all on the podman network `siwx-real-net`.
+# Prereq: siwx-real-oidc (8081) and siwx-real-synapse (8008 internal) must
+#   already be up (see /tmp/track2-real-stack.md) on the podman network
+#   `siwx-real-net`. `up` also ensures siwx-real-redis itself (named volume +
+#   AOF, see ensure_redis() below / F11) so bringing up the edge can no
+#   longer leave Redis durability resting on a hand-run command that nobody
+#   re-runs identically.
 #
 # Edge endpoint (host): http://localhost:8450
 #
@@ -25,6 +28,8 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 NET="siwx-real-net"
 EDGE_NAME="siwx-real-caddy"
 EDGE_PORT="8450"
+REDIS_NAME="siwx-real-redis"
+REDIS_VOLUME="siwx-real-redis-data"
 CADDYFILE="$REPO/e2e/real-stack/Caddyfile"
 ACTION="${1:-up}"
 
@@ -41,9 +46,34 @@ require_stack() {
   fi
 }
 
+# F11. OBSERVED: `podman inspect siwx-real-redis` showed its /data mount was a
+# volume whose Name is a 64-hex id -- an ANONYMOUS volume -- and no committed
+# script in any worktree creates this container, so it was hand-run and the
+# exact command line is unrecoverable. The mechanism does not depend on that
+# command: the redis image itself declares `VOLUME /data`, so podman mints an
+# anonymous volume whenever no named one is supplied, with or without a `-v`
+# flag. (Same thing was measured on siwx-e2e-redis, whose up.sh passed no `-v`
+# at all.) With --appendonly yes that is worse than no AOF: both
+# `podman inspect` and the redis-server command line show a fully durable
+# setup, but the anonymous volume is discarded the moment anyone does the
+# obvious `podman rm` + `run` recreate (exactly what this function does, and
+# exactly what the edge container itself already does on every `up` below),
+# so the "durable" Redis silently comes back empty with no error and no
+# warning. Naming the volume once makes that same recreate safe forever
+# after instead of a data-loss trap. Mirrors the sibling fix for the mock
+# stack's own Redis in e2e/up.sh (siwx-e2e-redis / siwx-e2e-redis-data, F10).
+ensure_redis() {
+  podman volume exists "$REDIS_VOLUME" || podman volume create "$REDIS_VOLUME" >/dev/null
+  podman rm -f "$REDIS_NAME" >/dev/null 2>&1 || true
+  podman run -d --name "$REDIS_NAME" --network "$NET" \
+    -v "${REDIS_VOLUME}:/data" \
+    docker.io/library/redis:7-alpine redis-server --appendonly yes >/dev/null
+}
+
 case "$ACTION" in
   up)
     require_stack
+    ensure_redis
     podman rm -f "$EDGE_NAME" >/dev/null 2>&1 || true
     podman run -d --name "$EDGE_NAME" --network "$NET" \
       -p "127.0.0.1:${EDGE_PORT}:${EDGE_PORT}" \

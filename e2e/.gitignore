@@ -4,3 +4,6 @@ browser/test-results/
 browser/playwright-report/
 browser/*.png
 *.log
+
+# T5 restart-survival state — holds live access/refresh tokens. Never commit.
+.t5-state.json

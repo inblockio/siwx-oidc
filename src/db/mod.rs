@@ -76,6 +76,170 @@ const KV_ROTATED_PREFIX: &str = "token_rotated";
 /// still rejected.
 pub const REFRESH_GRACE_TTL: u64 = 60; // 1 min
 
+/// TTL for the short-lived device/user revocation tombstones. Long enough to
+/// outlast an in-flight refresh that started before a revoke sweep, **and** to
+/// outlive the bounded fail-open window below with real margin.
+///
+/// Raised from 600s to 900s on 2026-07-25: at 600 the margin against
+/// `2 * ACCESS_TOKEN_TTL` was exactly **zero** (600 == 600), so a tombstone
+/// expired at precisely the moment the second refresh cycle completed, leaving no
+/// slack for clock skew or a delayed refresh. The assertion below caught this on
+/// its first compile. Lengthening is cheap: a lingering tombstone only makes a
+/// refresh refuse, and a fresh sign-in never consults it.
+pub const TOMBSTONE_TTL_SECS: u64 = 900; // 15 min
+
+/// Compile-time guarantee that failing OPEN on an *indeterminate* revocation
+/// probe (see [`RevocationState::Indeterminate`]) is self-limiting.
+///
+/// A tombstone must still be readable on the refresh that follows an outage. As
+/// long as the tombstone outlives two access-token cycles, a genuine revocation
+/// planted while Redis was unreachable is observed at the next rotation, so the
+/// fail-open window is bounded by one access-token lifetime rather than being
+/// open-ended. Shortening the tombstone TTL or lengthening the access-token TTL
+/// past this bound breaks the build instead of silently widening the hole.
+const _: () = assert!(
+    TOMBSTONE_TTL_SECS > 2 * ACCESS_TOKEN_TTL,
+    "fail-open on an indeterminate revocation probe is only safe while the \
+     tombstone outlives two access-token cycles; adjust TOMBSTONE_TTL_SECS"
+);
+
+/// Outcome of probing the revocation tombstones for a session.
+///
+/// The distinction that matters is **definite vs indeterminate**. A definite
+/// tombstone must tear the session down; an infrastructure error must NOT.
+///
+/// Why the asymmetry is load-bearing: at the post-mint recheck the caller has
+/// already deleted the presented refresh token and has not yet written the grace
+/// pointer, so rolling back leaves the client holding *neither* the old nor the
+/// new token — an unrecoverable sign-out. Treating an I/O error as a revocation
+/// therefore converts a transient fault into permanent, silent session loss.
+/// Treating it as "proceed" costs at most one access-token cycle of extra life
+/// for a session that may already be revoked, which the tombstone TTL bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevocationState {
+    /// A tombstone is definitely present. Fail **closed**: refuse or roll back.
+    Revoked,
+    /// No tombstone is present. Proceed.
+    Live,
+    /// The probe could not complete (I/O error). Fail **open**: proceed.
+    Indeterminate,
+}
+
+impl RevocationState {
+    /// Whether this outcome must tear the session down.
+    ///
+    /// Only [`Revoked`](Self::Revoked) does. This is the single place the
+    /// fail-open policy is expressed, so it cannot drift between call sites.
+    pub fn must_refuse(self) -> bool {
+        matches!(self, RevocationState::Revoked)
+    }
+}
+
+/// Collapse the two tombstone probes into one [`RevocationState`].
+///
+/// Extracted as a pure function so the policy can be exercised exhaustively
+/// (all nine combinations) without standing up a `DBClient` double — the
+/// decision here is security-relevant enough that it should not be reachable
+/// only through an integration path.
+///
+/// Precedence is deliberate: a **definite** `Ok(true)` on either axis wins even
+/// when the other probe errored. Erring on one axis must never mask a tombstone
+/// we did successfully read on the other.
+pub(crate) fn collapse_revocation(device: Result<bool>, user: Result<bool>) -> RevocationState {
+    if matches!(device, Ok(true)) || matches!(user, Ok(true)) {
+        return RevocationState::Revoked;
+    }
+    if device.is_err() || user.is_err() {
+        return RevocationState::Indeterminate;
+    }
+    RevocationState::Live
+}
+
+#[cfg(test)]
+mod revocation_policy_tests {
+    use super::*;
+    use anyhow::anyhow;
+
+    fn err() -> Result<bool> {
+        Err(anyhow!("redis i/o"))
+    }
+
+    // -- The regression guard. A DEFINITE tombstone must always fail closed. ----
+    // If any of these three start returning anything but `Revoked`, the fail-open
+    // change has destroyed the property it was required to preserve (invariant
+    // I8). Do not "fix" a failure here by relaxing the assertion.
+
+    #[test]
+    fn definite_device_tombstone_fails_closed() {
+        assert_eq!(
+            collapse_revocation(Ok(true), Ok(false)),
+            RevocationState::Revoked
+        );
+    }
+
+    #[test]
+    fn definite_user_tombstone_fails_closed() {
+        assert_eq!(
+            collapse_revocation(Ok(false), Ok(true)),
+            RevocationState::Revoked
+        );
+    }
+
+    #[test]
+    fn definite_tombstone_wins_over_an_errored_sibling_probe() {
+        // The dangerous middle case: one axis errored, the other definitively
+        // says revoked. Fail-open must NOT swallow the tombstone we did read.
+        assert_eq!(
+            collapse_revocation(err(), Ok(true)),
+            RevocationState::Revoked
+        );
+        assert_eq!(
+            collapse_revocation(Ok(true), err()),
+            RevocationState::Revoked
+        );
+    }
+
+    // -- Fail open only when the answer is genuinely unknown -------------------
+
+    #[test]
+    fn io_error_on_either_axis_is_indeterminate() {
+        assert_eq!(
+            collapse_revocation(err(), Ok(false)),
+            RevocationState::Indeterminate
+        );
+        assert_eq!(
+            collapse_revocation(Ok(false), err()),
+            RevocationState::Indeterminate
+        );
+        assert_eq!(collapse_revocation(err(), err()), RevocationState::Indeterminate);
+    }
+
+    #[test]
+    fn no_tombstone_is_live() {
+        assert_eq!(
+            collapse_revocation(Ok(false), Ok(false)),
+            RevocationState::Live
+        );
+    }
+
+    #[test]
+    fn only_revoked_refuses() {
+        assert!(RevocationState::Revoked.must_refuse());
+        assert!(!RevocationState::Live.must_refuse());
+        assert!(!RevocationState::Indeterminate.must_refuse());
+    }
+
+    #[test]
+    fn fail_open_window_is_bounded_by_the_tombstone_ttl() {
+        // Mirrors the compile-time assertion, so the reasoning is visible in the
+        // test suite too rather than only as a build error.
+        assert!(
+            TOMBSTONE_TTL_SECS > 2 * ACCESS_TOKEN_TTL,
+            "tombstone must outlive two access-token cycles for fail-open to be bounded"
+        );
+    }
+}
+
 /// Default device code lifetime (RFC 8628 `expires_in`).
 pub const DEVICE_CODE_LIFETIME: u64 = 1800; // 30 minutes
 /// Minimum polling interval for device code grant (seconds).
@@ -209,6 +373,27 @@ pub trait DBClient {
     /// refresh/mint that sees this must refuse so it cannot resurrect access for a
     /// terminating account (S3-4 / H6).
     async fn is_user_deactivated(&self, username: &str) -> Result<bool>;
+
+    /// Probe both revocation tombstones for a session and collapse them into a
+    /// single [`RevocationState`].
+    ///
+    /// `Revoked` **dominates**: a definite tombstone on either axis fails closed
+    /// even if the other probe errored. Only when neither probe found a tombstone
+    /// *and* at least one could not complete is the result `Indeterminate`.
+    /// An empty `device_id` means "no device to revoke" and skips that probe.
+    ///
+    /// This is the one place the fail-open policy lives, so the four call sites
+    /// (pre- and post-mint, in both `oidc::token_refresh` and `compat::refresh`)
+    /// cannot drift apart.
+    async fn probe_revocation(&self, username: &str, device_id: &str) -> RevocationState {
+        let device = if device_id.is_empty() {
+            Ok(false)
+        } else {
+            self.is_device_revoked(username, device_id).await
+        };
+        let user = self.is_user_deactivated(username).await;
+        collapse_revocation(device, user)
+    }
 
     // -- Opaque token storage (MSC3861) ----------------------------------------
 

@@ -548,6 +548,22 @@ async fn mock_seed_device(c: &Client, mxid: &str, device_id: &str) {
         .await
         .unwrap();
 }
+/// Mark a localpart as an EXISTING account without seeding a device.
+///
+/// `reject_if_new_identity` (`src/webauthn.rs`) 400s an unprovisioned identity on
+/// the device-approval path, logging `rejecting new-identity (no existing account)
+/// outside login flow`. That gate is correct and is documented policy. Tests that
+/// approve a device for a wallet which has never signed in must therefore declare
+/// the account as returning, or they assert against the wrong precondition.
+///
+/// Must be called AFTER `mock_reset`, which clears the existing-user set.
+async fn mock_seed_user(c: &Client, localpart: &str) {
+    c.post(format!("{}/__seed_user", mock()))
+        .json(&json!({ "localpart": localpart }))
+        .send()
+        .await
+        .unwrap();
+}
 async fn mock_state(c: &Client) -> Value {
     c.get(format!("{}/__state", mock()))
         .send()
@@ -1367,6 +1383,10 @@ async fn h9_device_code_approved_no_double_redemption() {
     for round in 0..8 {
         mock_reset(&c).await;
         let w = new_wallet();
+        // AFTER the reset (which clears the existing-user set): this test is about
+        // double-redemption, not about account creation policy. Without it the
+        // new-identity gate 400s the approval and the race is never exercised.
+        mock_seed_user(&c, &w.localpart).await;
 
         // Register a client and request a device code (RFC 8628 = form-encoded).
         let rc = register_client(&c, &base).await;

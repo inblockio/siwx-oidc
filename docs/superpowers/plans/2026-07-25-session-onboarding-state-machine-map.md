@@ -338,12 +338,43 @@ This is where “session authentication / reset loops” live. Split **public** 
 | `Backup_Vn` | megolm backup version n |
 | `Backup_Deleted` | DELETE room_keys/version |
 
+#### M4c — Ceremony view (Element client) — ADDED 2026-07-26
+
+> **Why this exists.** M4's public/private halves above describe *crypto*. R5/R6 are requirements
+> about what the **user** can do, and the states that decide that live in Element's own
+> `SetupEncryptionStore.Phase` — which had no representation here at all. That omission was not
+> academic: on 2026-07-26 a **succeeding** recovery-phrase flow and a **wedged** post-SAS flow were
+> indistinguishable, because both present as "the app shell never renders" and neither had a name.
+> Two wrong diagnoses and roughly a session were spent on that ambiguity. §0 crit. 1 already lists
+> "client UI" as a valid observable and crit. 3 requires every path to end in a named terminal
+> where the **user can act**, so these states were always in scope.
+
+| State | Meaning | Observable | Kind |
+|-------|---------|------------|------|
+| `C_Gate` | identity-confirmation gate on screen | `phase=1` (Intro) + `.mx_CompleteSecurityBody` | transient |
+| `C_Working` | ceremony in flight | `phase=2` (Busy) **with ≥1 button** | transient |
+| `T_C_OkAwaitAck` | ceremony succeeded, awaiting acknowledgement | `phase=3` (Done), heading "Device verified", buttons `["Done"]` | **OK terminal** |
+| `T_C_App` | user acknowledged; app shell rendered | `.mx_MatrixChat` | **OK terminal** |
+| `T_C_Wedged` | success with no way forward | `phase=2` (Busy) **stable, ZERO buttons**, crypto healthy | **VIOLATES §0 crit. 3** |
+| `T_C_ResetOffered` | destructive branch offered | `phase=6` (ConfirmReset) | terminal, destructive |
+
+**Invariant I-C1 (the one that matters).** *No terminal may present zero user-actionable controls
+while the underlying crypto is healthy.* `T_C_Wedged` is the name for breaching it.
+
+`T_C_OkAwaitAck` is a **legitimate** terminal, not a defect: a real user clicks "Done" and reaches
+`T_C_App`. Measured 2026-07-26 (10 samples, ~3s→~30s, flat): `phase=3`, `crossSigningReady=true`,
+`secretStorageReady=true`, `keyId=present`. Do not "fix" it.
+
+`T_C_Wedged` was real and is now closed by Fix B (`siwx-oidc-matrix-server` `6c23298` + `cd17c90`,
+bounded poll at both race sites). Watchers: `EW-V1` assertion 8 and `EW-R1-2`. **Do not delete
+either to get a green suite** — they are the only things watching this breach.
+
 #### Critical transition table (must be total)
 
 | From | Event | Intended next | Failure / honesty |
 |------|-------|---------------|-------------------|
 | `XS_Absent` | first `device_signing/upload` (MSC3967) | `T_XS_OK` | if 401 → config/discovery bug (not UIA) |
-| `XS_Present` | unlock with recovery key | stay `XS_Present`, secrets local | wrong key → client-local fail (no server) |
+| `XS_Present` | unlock with recovery key | stay `XS_Present`, secrets local → **`T_C_OkAwaitAck` → (user clicks Done) → `T_C_App`** *(amended 2026-07-26)* | wrong key → client-local fail (no server); ceremony succeeds but view stalls → **`T_C_Wedged`** |
 | `XS_Present` | **reset** (DELETE backup + new secrets) | needs arm → upload | without arm → `XS_UploadRejected` → **`T_XS_HalfReset`** |
 | any | `allow_cross_signing_reset` HTTP 2xx + master exists | `XS_ResetArmed` | |
 | any | `allow_…` 2xx + **no master** | prod: false `Completed`; main: `T_XS_HonestFail` / special case | **must not say success** |

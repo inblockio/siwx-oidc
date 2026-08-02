@@ -232,8 +232,17 @@
 	// `forceAll` drives the "use a different passkey" escape hatch: it re-runs
 	// authenticate/start with {"all": true}, forcing usernameless (all keys) even
 	// when a valid siwx_user cookie would otherwise scope the picker to one account.
-	async function handlePasskeySignIn(forceAll = false) {
-		if (passkeyLoading) return;
+	// `chained` marks the call made by handlePasskeyRegister after a successful
+	// registration. That caller already owns `passkeyLoading`, so applying the
+	// re-entrancy guard to it made the auto-sign-in a GUARANTEED no-op: the user
+	// completed a biometric prompt, the credential WAS stored server-side, and then
+	// nothing happened -- same "Sign in" page, no gate, no error, no redirect. Their
+	// only way forward was to guess that "Sign in with Passkey" now worked.
+	// Measured on the served bundle 2026-07-26; present since edff2b2, i.e. this
+	// one-step flow has never completed. The guard still protects every real user
+	// entry point (all of which pass `chained = false`).
+	async function handlePasskeySignIn(forceAll = false, chained = false) {
+		if (passkeyLoading && !chained) return;
 		passkeyLoading = true;
 		error = null;
 		// Re-running start clears any prior gate so we never show stale gate copy.
@@ -404,7 +413,9 @@
 			status = `Passkey registered! DID: ${result.did.substring(0, 24)}...`;
 			error = null;
 
-			await handlePasskeySignIn();
+			// `chained: true` — we already hold `passkeyLoading`; without it this call
+			// returns immediately and registration dead-ends on an unchanged page.
+			await handlePasskeySignIn(false, true);
 		} catch (e: any) {
 			if (e.name === 'NotAllowedError') {
 				error = 'Passkey registration was cancelled.';
