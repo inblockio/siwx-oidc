@@ -174,14 +174,27 @@ fn sanitize_action(raw: &str) -> String {
         .collect()
 }
 
-/// Sanitize a user-supplied device id for safe HTML interpolation. Device ids
-/// (e.g. `SIWX_<uuid>`) may contain hyphens, so allow them in addition to the
-/// action character set.
-fn sanitize_device_id(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
-        .take(255)
-        .collect()
+/// HTML-escape a value for interpolation into a double-quoted attribute.
+///
+/// Lossless (unlike stripping): the browser decodes it back to the exact string
+/// when the client reads it via `dataset`. Matrix device_ids are OPAQUE per the
+/// Client-Server API -- Element X supplies base64 ids carrying `+`/`/`/`=` -- so
+/// they must be escaped for display, never stripped, or the identity is corrupted
+/// and "Sign out" targets a phantom device ("Device not found"). Mirrors the
+/// client-side `esc()` set so server- and client-rendered values agree.
+fn html_attr_escape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 // -- Action prerequisites -----------------------------------------------------
@@ -605,11 +618,11 @@ pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
         .as_deref()
         .map(sanitize_action)
         .unwrap_or_default();
-    let device_id = query
-        .device_id
-        .as_deref()
-        .map(sanitize_device_id)
-        .unwrap_or_default();
+    // device_id is OPAQUE (Matrix C-S API): keep it verbatim so it round-trips to
+    // get_device/delete_device intact. Display safety is handled by escaping at the
+    // single interpolation site below, not by stripping (which corrupts the identity
+    // for base64 Element X ids and wedges "Sign out" -> "Device not found").
+    let device_id = query.device_id.as_deref().unwrap_or_default().to_string();
     let base = base_url.trim_end_matches('/');
 
     // Title/subtitle keyed on the canonical action so session_* aliases render
@@ -713,7 +726,7 @@ pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
         subtitle = subtitle,
         action = action,
         base = base,
-        device_id = device_id,
+        device_id = html_attr_escape(&device_id),
         auth_section = auth_section,
     );
     Html(html)
@@ -1615,6 +1628,50 @@ mod tests {
     }
 
     #[test]
+    fn account_page_preserves_base64_device_id_in_attr() {
+        // Element X device_ids are base64 (the device key material) and carry
+        // '+'/'/'/'='. They are opaque per the Matrix spec and MUST round-trip
+        // unchanged, or "Sign out" targets a phantom id -> "Device not found".
+        let dev = "Yw+vNuhUTaNa+dAXjkVkBZk6xcPVsv3RrLGmjBtwHAg";
+        let html = account_page(
+            AccountPageQuery {
+                action: Some("org.matrix.device_delete".to_string()),
+                device_id: Some(dev.to_string()),
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        assert!(
+            html.contains(&format!(r#"data-device-id="{dev}""#)),
+            "base64 device_id must survive verbatim in the rendered attribute"
+        );
+    }
+
+    #[test]
+    fn account_page_escapes_xss_device_id() {
+        // Stopping the strip must NOT reintroduce XSS: the device_id is escaped
+        // (lossless) for the double-quoted attribute, never stripped.
+        let html = account_page(
+            AccountPageQuery {
+                action: Some("org.matrix.device_delete".to_string()),
+                device_id: Some(r#""><script>alert(1)</script>"#.to_string()),
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+        )
+        .0;
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "raw markup must not appear in the page"
+        );
+        assert!(
+            html.contains("&quot;&gt;&lt;script&gt;"),
+            "the payload must be HTML-escaped"
+        );
+    }
+
+    #[test]
     fn account_page_renders_session_alias_like_device() {
         // session_view must render identically to device_view (same title).
         let html = account_page(
@@ -1916,10 +1973,14 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_device_id_keeps_safe_chars_strips_markup() {
-        assert_eq!(sanitize_device_id("SIWX_2b1f-9c"), "SIWX_2b1f-9c");
-        assert_eq!(sanitize_device_id("<script>x</script>"), "scriptxscript");
-        assert_eq!(sanitize_device_id(&"A".repeat(300)).len(), 255);
+    fn html_attr_escape_preserves_opaque_chars_and_escapes_markup() {
+        // base64 / opaque device-id chars are NOT html-special -> preserved verbatim.
+        assert_eq!(
+            html_attr_escape("Yw+vNuhU/a=SIWX_2b1f-9c.x"),
+            "Yw+vNuhU/a=SIWX_2b1f-9c.x"
+        );
+        // the five html-significant chars are escaped (mirrors the client esc()).
+        assert_eq!(html_attr_escape("a\"<b>&'"), "a&quot;&lt;b&gt;&amp;&#39;");
     }
 
     // -- ActionOutcome wire contract (H3/H8) ----------------------------------
