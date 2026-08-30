@@ -27,8 +27,11 @@ src/                                ← Axum OIDC server (binary)
   admin_token.rs                     POST /oauth2/admin_token: mints a short-TTL token whose introspected
                                      scope carries `urn:synapse:admin:*`, the ONLY way to reach
                                      /_synapse/admin/* on Synapse 1.157+ (the `admin_token` shim is gone)
-  synapse_client.rs                  Synapse MAS + admin-API client: provision/upsert/cross_signing_reset,
-                                     and list_devices/get_device/delete_device (admin_token = MAS secret).
+  synapse_client.rs                  Synapse client, TWO credentials: MAS shared secret on /_synapse/mas/*
+                                     (provision_user, upsert_device, allow_cross_signing_reset,
+                                     is_localpart_available, delete_device, deactivate_user, reactivate_user)
+                                     and a MINTED admin token on /_synapse/admin/* + the authenticated
+                                     C-S API (list_devices, get_device, has_cross_signing_keys).
   webauthn.rs                        WebAuthn ceremony: register + discoverable authenticate
   db/mod.rs                          DBClient trait, CodeEntry, SessionEntry, ClientEntry, DeviceCodeEntry
   db/redis.rs                        Redis impl + helpers; revoke_device_tokens(did, device_id) revokes
@@ -101,9 +104,12 @@ No `inventory` crate (WASM-unsafe).
 **Why:** Synapse 1.157 **deleted** the `admin_token` shim that let siwx-oidc call
 `/_synapse/admin/*` by presenting the MAS shared secret. On 1.157+ the shared secret
 is honoured **only** on `/_synapse/mas/*`; every `/_synapse/admin/*` route answers
-`401 M_UNKNOWN_TOKEN`. (Still true on the currently-deployed 1.154, where the shim
-exists — the statements elsewhere in this file about `admin_token` = MAS secret
-describe 1.154 and become false the moment the 1.159 migration lands.)
+`401 M_UNKNOWN_TOKEN`.
+
+**`synapse_client.rs` has been ported to that split (Task 3).** The per-call-site
+claims elsewhere in this file that the MAS shared secret doubles as Synapse's
+`admin_token` described 1.154 and are now corrected in place. There is no
+`admin_token` setting to configure on 1.157+; do not reintroduce one.
 
 **How:** `is_server_admin()` in Synapse 1.159 is literally
 `"urn:synapse:admin:*" in requester.scope`, and that scope comes verbatim from
@@ -154,6 +160,17 @@ scope format.
 | Refresh token TTL | 7776000s (90d) | 7776000s (90d) |
 | Introspection | Active (`/oauth2/introspect`) | Not available |
 | Device ID | Synapse-managed `SIWX_{uuid}` | Empty string (no Synapse) |
+
+**An empty `device_id` is rendered on the wire as JSON `null`, never `""`.**
+Synapse 1.159 (`api/auth/mas.py`) rejects a present-but-empty `device_id` with
+`AuthError(500, "Invalid device ID in introspection result")`; only `null` means
+"this token has no device". Three token kinds carry an empty `device_id`:
+minted admin tokens, standalone-mode tokens, and — the one that matters —
+**MSC3861-mode tokens whose `CodeEntry.device_id` was `None`** because device
+provisioning failed (`oidc.rs`, `.unwrap_or_default()`). Standalone tokens are
+never introspected (the endpoint 404s without `mas_shared_secret`), but that
+third case IS introspected by a real Synapse, where pre-fix it was a hard 500
+and is now a graceful deviceless token. Do not "simplify" the null back to `""`.
 
 **Token lifecycle:**
 1. `POST /token` (grant_type=authorization_code) creates both access and refresh
@@ -700,9 +717,9 @@ The user re-authenticates (wallet or passkey), siwx-oidc calls
 | `device_view` / `session_view` | Show one device's details (needs `device_id`) |
 | `device_delete` / `session_end` | Sign a device out (needs `device_id`) |
 | `cross_signing_reset` | Allow cross-signing reset (MSC4312) |
-| `account_deactivate` | Deactivate the account (Synapse admin `deactivate`, `erase:false`, reversible by admin / `account_reactivate`) + revoke ALL the user's tokens |
-| `account_erase` | GDPR erasure: Synapse admin `deactivate` with `erase:true` (purges profile, media, room memberships) + revoke ALL tokens + `RedisClient::purge_identity` (deletes the DID's WebAuthn `credential`/`link` artifacts). Irreversible |
-| `account_reactivate` | Restore an `erase:false`-deactivated account (Synapse admin `PUT users {deactivated:false}`). Self-service feasibility under MSC3861 is **unverified** (admin PUT may reject without a local password); fails closed with a clear "ask an admin" message |
+| `account_deactivate` | Deactivate the account (`POST /_synapse/mas/delete_user` with `erase:false`, reversible via `account_reactivate`) + revoke ALL the user's tokens |
+| `account_erase` | GDPR erasure: the SAME `/_synapse/mas/delete_user` with `erase:true` (purges profile, media, room memberships) + revoke ALL tokens + `RedisClient::purge_identity` (deletes the DID's WebAuthn `credential`/`link` artifacts). Irreversible |
+| `account_reactivate` | Restore an `erase:false`-deactivated account (`POST /_synapse/mas/reactivate_user`). Fails closed with a clear "ask an admin" message |
 
 **Bare/empty-action landing = account-home menu.** `GET /account` with NO `action`
 param (or an empty one) renders a navigation menu (links to `profile`,
@@ -739,16 +756,19 @@ P-256 passkey derives to that `did:key` via
 Erasure removes the WebAuthn artifacts so the DID cannot be silently re-derived
 from a leftover passkey.
 
-**Reactivation (`account_reactivate`) is verified working under MSC3861.**
-`SynapseClient::reactivate_user` issues admin `PUT /_synapse/admin/v2/users/{mxid}`
-with `{"deactivated": false}`; it is valid only for `erase:false` deactivations
-(an erased account cannot be restored). Live probe (2026-06-10, prod
-agentic.inblock.io, throwaway user): the PUT succeeds with HTTP 200 and the
-account comes back `deactivated: false`; no local password is demanded as long
-as no `password` key is sent. The action still fails closed on genuine errors
-(erased account, Synapse unreachable): a clear `BadRequest` telling the user to
-ask a server admin, never a 500. See the doc comment on
-`SynapseClient::reactivate_user` and `scripts/verify-lifecycle-live.sh` section 3.
+**Reactivation (`account_reactivate`).** `SynapseClient::reactivate_user` issues
+`POST /_synapse/mas/reactivate_user` with `{"localpart": …}`; it is valid only
+for `erase:false` deactivations (an erased account cannot be restored). The MAS
+resource calls the same `deactivate_account_handler.activate_account` the old
+admin `PUT /_synapse/admin/v2/users/{mxid}` reached, so the semantics are
+unchanged. The historical worry that reactivation demands a local password
+cannot arise on this wire format — the body carries only the localpart, so
+there is no `password` key to omit. (It did not apply to the old admin PUT
+either: live probe 2026-06-10, prod, throwaway user, HTTP 200 and
+`deactivated: false` on re-read — `scripts/verify-lifecycle-live.sh` section 3.)
+The action still fails closed on genuine errors (erased account, Synapse
+unreachable): a clear `BadRequest` telling the user to ask a server admin, never
+a 500.
 
 **Model:** the page is stateless; each action re-authenticates (wallet CAIP-122
 or passkey), proving the DID, then runs the action and returns a `kind`-tagged
@@ -758,8 +778,11 @@ or passkey), proving the DID, then runs the action and returns a `kind`-tagged
 live), so no matrix-server change is needed to advertise new actions.
 
 **Device source of truth = Synapse.** `devices_list`/`device_view` call the
-Synapse **admin API** (`GET /_synapse/admin/v2/users/{mxid}/devices`) using the
-MAS shared secret (which `matrix_server.sh` also sets as `admin_token`).
+Synapse **admin API** (`GET /_synapse/admin/v2/users/{mxid}/devices`) using a
+**minted admin token** (`admin_token.rs`), because there is no MAS device-listing
+endpoint: `synapse/rest/synapse/mas/devices.py` exposes only upsert / delete /
+update_display_name / sync_devices, all POST and all write-only (`sync_devices`
+looks list-shaped but is reconciliation — it returns `{}`, never the list).
 `device_delete` deletes the Synapse device **and** calls
 `RedisClient::revoke_device_tokens` to revoke the OAuth session (introspection
 then reports it inactive). Device actions require `SIWEOIDC_MATRIX_SERVER_NAME`

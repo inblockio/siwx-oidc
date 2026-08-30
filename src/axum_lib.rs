@@ -1198,10 +1198,24 @@ pub async fn main() {
     .expect("Failed to initialize WebAuthn — check SIWEOIDC_BASE_URL, SIWEOIDC_RP_ID, SIWEOIDC_RP_ORIGIN");
 
     // Initialize Synapse client for MSC3861 device lifecycle (optional).
+    //
+    // The client is given a token store so it can mint itself the admin-scoped
+    // access token that `/_synapse/admin/*` and the authenticated client-server
+    // API require from Synapse 1.157 on. Without it, `list_devices` /
+    // `get_device` / `has_cross_signing_keys` fail closed with a clear error
+    // instead of silently presenting a credential Synapse no longer accepts.
     let synapse_client = match (&config.synapse_endpoint, &config.mas_shared_secret) {
         (Some(endpoint), Some(secret)) => {
             info!("Synapse client enabled: {}", endpoint);
-            Some(Arc::new(SynapseClient::new(endpoint.as_str(), secret)))
+            Some(Arc::new(
+                SynapseClient::new(endpoint.as_str(), secret).with_admin_mint(
+                    redis_client.clone(),
+                    config.admin_token_localpart.clone(),
+                    // Clamped here, at the configuration boundary, exactly as
+                    // `AdminTokenState` clamps it for the HTTP mint endpoint.
+                    admin_token::clamp_admin_token_ttl(config.admin_token_ttl_secs),
+                ),
+            ))
         }
         _ => None,
     };

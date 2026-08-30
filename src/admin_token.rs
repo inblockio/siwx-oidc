@@ -116,7 +116,34 @@ const ADMIN_CLIENT_ID: &str = "siwx-oidc-admin";
 const ADMIN_SUBJECT: &str = "urn:siwx:service:admin";
 
 /// Display name set on the admin service user when it is first provisioned.
-const ADMIN_DISPLAY_NAME: &str = "siwx-oidc service admin";
+pub const ADMIN_DISPLAY_NAME: &str = "siwx-oidc service admin";
+
+/// Build the `TokenMetadata` for an admin-scoped token.
+///
+/// This is the SINGLE definition of the admin credential's claims. It is shared
+/// by the HTTP mint endpoint ([`admin_token`], used by shell callers such as
+/// `scripts/matrix-storage-controller.sh`) and by the in-process mint that
+/// [`crate::synapse_client::SynapseClient`] performs for its own admin-API
+/// calls. Sharing it is load-bearing: the four Synapse-1.159 acceptance
+/// conditions in the module docs above are properties of THESE FIELDS, so two
+/// independent constructions would be two independent chances to drop one.
+///
+/// In particular `device_id` is the empty string, which `introspect` renders as
+/// JSON `null` — see requirement 4. Do not set it to a placeholder.
+pub fn admin_token_metadata(localpart: &str, ttl: u64, now: i64) -> TokenMetadata {
+    TokenMetadata {
+        username: localpart.to_string(),
+        // No device. Rendered as JSON `null` by `introspect` — see module docs
+        // requirement 4; an empty string on the wire would make Synapse 500.
+        device_id: String::new(),
+        scope: ADMIN_SCOPE.to_string(),
+        client_id: ADMIN_CLIENT_ID.to_string(),
+        iat: now,
+        exp: now + ttl as i64,
+        did: ADMIN_SUBJECT.to_string(),
+        name: ADMIN_DISPLAY_NAME.to_string(),
+    }
+}
 
 /// Floor for the minted-token TTL (seconds). Below this the token is unusable
 /// for a real admin operation.
@@ -248,18 +275,9 @@ pub async fn admin_token(
     let ttl = state.admin_token_ttl_secs;
     let now = Utc::now().timestamp();
     let token = generate_opaque_token(ADMIN_TOKEN_PREFIX);
-    let metadata = TokenMetadata {
-        username: localpart.to_string(),
-        // No device. Rendered as JSON `null` by `introspect` — see module docs
-        // requirement 4; an empty string here would make Synapse 500.
-        device_id: String::new(),
-        scope: ADMIN_SCOPE.to_string(),
-        client_id: ADMIN_CLIENT_ID.to_string(),
-        iat: now,
-        exp: now + ttl as i64,
-        did: ADMIN_SUBJECT.to_string(),
-        name: ADMIN_DISPLAY_NAME.to_string(),
-    };
+    // Shared with the in-process mint in `crate::synapse_client` — see
+    // `admin_token_metadata`. Do not inline these fields again here.
+    let metadata = admin_token_metadata(localpart, ttl, now);
 
     state
         .redis_client

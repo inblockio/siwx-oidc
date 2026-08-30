@@ -1,13 +1,43 @@
-//! HTTP client for Synapse's `/_synapse/mas/` management endpoints (MSC3861).
+//! HTTP client for Synapse's management endpoints, as the delegated auth
+//! provider for a Synapse homeserver.
 //!
-//! This module provides provisioning and device management calls that siwx-oidc
-//! uses as the delegated auth provider for a Synapse homeserver.
+//! # Two authentication schemes, and why
+//!
+//! Synapse **1.157 deleted** the `experimental_features.msc3861.admin_token`
+//! shim that made the MAS shared secret usable as a server-admin credential.
+//! From 1.157 on (verified live against **1.159.0**) the shared secret is
+//! honoured on exactly one surface, and the calls here split accordingly:
+//!
+//! | Surface | Auth | Calls |
+//! |---|---|---|
+//! | `/_synapse/mas/*` | `Authorization: Bearer {shared_secret}`, compared for **exact string equality** against `matrix_authentication_service.secret` | `provision_user`, `upsert_device`, `allow_cross_signing_reset`, `is_localpart_available`, `delete_device`, `deactivate_user`, `reactivate_user` |
+//! | `/_synapse/admin/*` and the authenticated C-S API | a **minted, admin-scoped access token** ([`crate::admin_token`]) | `list_devices`, `get_device`, `has_cross_signing_keys` |
+//!
+//! Presenting the shared secret on the second surface answers **401
+//! `M_UNKNOWN_TOKEN`** on 1.159 — it is not a token at all there, it is a
+//! shared secret. That is why this client can mint itself a real access token;
+//! see [`SynapseClient::with_admin_mint`].
+//!
+//! # The MAS wire format is localpart-scoped
+//!
+//! `/_synapse/mas/*` routes are **literal path segments** (Twisted `putChild`,
+//! `synapse/rest/synapse/mas/__init__.py`) and every identifier travels in the
+//! JSON body or a query param as a bare `localpart`. There are no `{mxid}` path
+//! parameters and no percent-encoding to get right — unlike the admin API,
+//! which does take a percent-encoded mxid path segment. Do not "unify" the two.
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::{debug, warn};
+use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
+
+use siwx_oidc::db::{DBClient, RedisClient};
+
+use crate::admin_token::{admin_token_metadata, ADMIN_DISPLAY_NAME, ADMIN_TOKEN_PREFIX};
+use crate::introspect::generate_opaque_token;
 
 /// A user's device/session as reported by Synapse's admin API.
 ///
@@ -30,25 +60,66 @@ fn matrix_user_id(localpart: &str, server_name: &str) -> String {
     format!("@{}:{}", localpart, server_name)
 }
 
-/// A human hint appended to admin-API error messages so an auth failure (the
-/// shared secret is not accepted as Synapse's `admin_token`) is never mistaken
-/// for a missing device / absent user. Empty for non-auth failures.
+/// A human hint appended to admin-scoped error messages so an auth failure is
+/// never mistaken for a missing device / absent user. Empty for non-auth
+/// failures.
+///
+/// The 1.154-era wording ("check that the MAS shared secret is also Synapse's
+/// `admin_token`") is deliberately gone: on 1.157+ there IS no `admin_token`
+/// setting to check, and pointing an operator at it sent them looking for a
+/// config key that no longer exists.
 fn admin_status_hint(status: reqwest::StatusCode) -> &'static str {
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        " — Synapse rejected the admin token (check that the MAS shared secret is also Synapse's admin_token)"
+        " — Synapse rejected the minted admin token (its scope must carry both \
+         urn:matrix:client:api:* and urn:synapse:admin:*, and its `username` must \
+         resolve to a real Synapse user)"
     } else {
         ""
     }
 }
 
-/// Client for Synapse's MAS (Matrix Authentication Service) compatibility endpoints.
+/// A cached minted admin token and the instant it stops being safe to reuse.
+struct CachedAdminToken {
+    token: String,
+    /// Unix seconds. Deliberately EARLIER than the token's true `exp` — see
+    /// [`ADMIN_TOKEN_REUSE_MARGIN_SECS`].
+    reuse_until: i64,
+}
+
+/// Safety margin subtracted from a minted token's TTL before it is reused.
 ///
-/// All requests use Bearer authentication with a shared secret configured in
-/// Synapse's `auth_service.issuer` block.
+/// A token handed to Synapse must still be valid when Synapse introspects it,
+/// not merely when we picked it off the cache. The margin covers that round
+/// trip plus clock skew between the two containers. It is NOT about Synapse's
+/// 2-minute introspection cache, which only ever makes a token live *longer*
+/// than it should.
+const ADMIN_TOKEN_REUSE_MARGIN_SECS: i64 = 15;
+
+/// Everything the client needs to mint itself an admin-scoped access token.
+///
+/// Present only when siwx-oidc is running with both a Synapse endpoint and a
+/// token store; absent in unit tests and in standalone deployments, where the
+/// admin-scoped calls degrade to a clear error instead of a panic.
+struct AdminMint {
+    db: RedisClient,
+    /// Localpart the minted token's `username` claim resolves to.
+    localpart: String,
+    /// Already clamped to the permitted window by the caller.
+    ttl: u64,
+    cached: Mutex<Option<CachedAdminToken>>,
+}
+
+/// Client for Synapse's management endpoints.
+///
+/// Carries BOTH credentials described in the module docs: the MAS shared secret
+/// (for `/_synapse/mas/*`) and, when configured, the ability to mint a
+/// short-lived admin-scoped access token (for `/_synapse/admin/*` and the
+/// authenticated client-server API).
 pub struct SynapseClient {
     endpoint: String,
     shared_secret: String,
     http: Client,
+    admin: Option<AdminMint>,
 }
 
 impl SynapseClient {
@@ -56,12 +127,135 @@ impl SynapseClient {
     ///
     /// `endpoint` is the scheme + host (+ optional port) of the Synapse instance,
     /// e.g. `http://localhost:8008`. Trailing slashes are stripped.
+    ///
+    /// The client created here can call `/_synapse/mas/*` only. Chain
+    /// [`with_admin_mint`](Self::with_admin_mint) to enable the admin-scoped
+    /// calls.
     pub fn new(endpoint: &str, shared_secret: &str) -> Self {
         Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             shared_secret: shared_secret.to_string(),
             http: Client::new(),
+            admin: None,
         }
+    }
+
+    /// Enable the admin-scoped calls by giving the client a token store to mint
+    /// into.
+    ///
+    /// `ttl` must already be clamped by
+    /// [`crate::admin_token::clamp_admin_token_ttl`]; the clamp is the
+    /// enforcement point for the "short TTL, minted on demand" invariant and
+    /// belongs at the single configuration boundary, not here.
+    pub fn with_admin_mint(mut self, db: RedisClient, localpart: String, ttl: u64) -> Self {
+        self.admin = Some(AdminMint {
+            db,
+            localpart,
+            ttl,
+            cached: Mutex::new(None),
+        });
+        self
+    }
+
+    /// Return a usable admin-scoped bearer token, minting one if the cache is
+    /// empty or too close to expiry.
+    ///
+    /// The mint is idempotent and cheap (one Redis `SET`), so the cache exists
+    /// to avoid a Synapse round trip per call, not to avoid a Redis write.
+    ///
+    /// Fails **closed**: any error propagates and the caller's request is not
+    /// attempted, rather than being sent unauthenticated and answering a
+    /// confusing 401 from Synapse.
+    async fn admin_bearer(&self) -> Result<String> {
+        let admin = self.admin.as_ref().context(
+            "admin-scoped Synapse call attempted without a token store; \
+             siwx-oidc must be configured with SIWEOIDC_REDIS_URL, \
+             SIWEOIDC_SYNAPSE_ENDPOINT and SIWEOIDC_MAS_SHARED_SECRET",
+        )?;
+
+        let mut cached = admin.cached.lock().await;
+        let now = Utc::now().timestamp();
+        if let Some(c) = cached.as_ref() {
+            if now < c.reuse_until {
+                return Ok(c.token.clone());
+            }
+        }
+
+        // Requirement 3 of `crate::admin_token`: Synapse resolves the
+        // introspected `username` against its own `users` table and raises
+        // AuthError(500, "User not found") if the row is missing. The existence
+        // probe comes first so the common path performs no write.
+        if self
+            .is_localpart_available(&admin.localpart)
+            .await
+            .context("admin mint: could not check whether the admin service user exists")?
+        {
+            info!(
+                localpart = %admin.localpart,
+                "synapse_client: provisioning the admin service user"
+            );
+            self.provision_user(&admin.localpart, ADMIN_DISPLAY_NAME)
+                .await
+                .context("admin mint: could not provision the admin service user")?;
+        }
+
+        let token = generate_opaque_token(ADMIN_TOKEN_PREFIX);
+        let metadata = admin_token_metadata(&admin.localpart, admin.ttl, now);
+        admin
+            .db
+            .set_token(&token, &metadata, admin.ttl)
+            .await
+            .context("admin mint: could not store the minted token")?;
+
+        debug!(
+            localpart = %admin.localpart,
+            ttl_secs = admin.ttl,
+            "synapse_client: minted an admin-scoped token for its own use"
+        );
+
+        *cached = Some(CachedAdminToken {
+            token: token.clone(),
+            reuse_until: now + admin.ttl as i64 - ADMIN_TOKEN_REUSE_MARGIN_SECS,
+        });
+        Ok(token)
+    }
+
+    /// Drop the cached admin token so the next call mints a fresh one.
+    async fn invalidate_admin_token(&self) {
+        if let Some(admin) = self.admin.as_ref() {
+            *admin.cached.lock().await = None;
+        }
+    }
+
+    /// Send an admin-scoped request, re-minting **once** on 401/403.
+    ///
+    /// The retry is not defensive padding: a cached token can be rejected for
+    /// reasons that a fresh mint genuinely fixes — the token store was flushed
+    /// out from under us, or the admin service user was deleted (the re-mint
+    /// re-provisions it). Retrying once converts those into a self-heal instead
+    /// of a user-visible failure, and a second 401 is surfaced honestly.
+    ///
+    /// `build` is called once per attempt because a `RequestBuilder` is consumed
+    /// by `send()`.
+    async fn admin_request<F>(&self, build: F) -> Result<reqwest::Response>
+    where
+        F: Fn(&Client, &str) -> reqwest::RequestBuilder,
+    {
+        let token = self.admin_bearer().await?;
+        let resp = build(&self.http, &token).send().await?;
+
+        let status = resp.status();
+        if status != reqwest::StatusCode::UNAUTHORIZED && status != reqwest::StatusCode::FORBIDDEN {
+            return Ok(resp);
+        }
+
+        warn!(
+            %status,
+            "synapse_client: admin token rejected; re-minting and retrying once"
+        );
+        self.invalidate_admin_token().await;
+        let token = self.admin_bearer().await?;
+        Ok(build(&self.http, &token).send().await?)
     }
 
     /// Provision (register) a user in Synapse.
@@ -167,15 +361,25 @@ impl SynapseClient {
     /// gate the truthful-success signal, never a pre-flight warning. It does NOT
     /// expose the window timestamp (Synapse never returns it on this query); it
     /// reports master-row presence only.
+    ///
+    /// # Auth (changed for Synapse 1.157+)
+    ///
+    /// `KeyQueryServlet.on_POST` calls `self.auth.get_user_by_req(...)`
+    /// **unconditionally** — there is no config flag that makes `keys/query`
+    /// anonymous. Before 1.157 the MAS shared secret satisfied that check via
+    /// the `admin_token` shim; on 1.159 it answers
+    /// `401 M_UNKNOWN_TOKEN {"error":"Token is not active"}` (verified live).
+    ///
+    /// That 401 was NOT a loud failure: it surfaced as a `ResetUnconfirmed`
+    /// readback, i.e. every cross-signing reset telling the user "we could not
+    /// confirm your reset took effect" while the reset had in fact been
+    /// granted. The call therefore uses a minted admin token.
     pub async fn has_cross_signing_keys(&self, localpart: &str, server_name: &str) -> Result<bool> {
         let user_id = matrix_user_id(localpart, server_name);
         let url = format!("{}/_matrix/client/v3/keys/query", self.endpoint);
+        let body = json!({ "device_keys": { &user_id: [] } });
         let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.shared_secret)
-            .json(&json!({ "device_keys": { &user_id: [] } }))
-            .send()
+            .admin_request(|http, token| http.post(&url).bearer_auth(token).json(&body))
             .await
             .context("has_cross_signing_keys: request failed")?;
 
@@ -183,7 +387,7 @@ impl SynapseClient {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             warn!(%status, %body, "has_cross_signing_keys: query failed");
-            anyhow::bail!("has_cross_signing_keys: HTTP {status}");
+            anyhow::bail!("has_cross_signing_keys: HTTP {status}{}", admin_status_hint(status));
         }
 
         let body: serde_json::Value = resp
@@ -286,10 +490,31 @@ impl SynapseClient {
             self.endpoint,
             urlencoding::encode(&user_id)
         );
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.shared_secret)
+        // AUTH (verified live on 1.159, both legs): `ProfileRestServlet.on_GET`
+        // authenticates only `if self.hs.config.server.require_auth_for_profile_requests`,
+        // which defaults to FALSE. So this endpoint answers 200 with no
+        // Authorization header at all, and the shared secret this used to send
+        // was simply ignored rather than honoured — it did not break in the
+        // 1.157 admin_token removal, and it was never doing anything.
+        //
+        // A minted admin token is attached when one is available so the call
+        // keeps working on a deployment that DOES set
+        // `require_auth_for_profile_requests: true`. Best-effort by design: this
+        // sits on the login-time provisioning self-heal path, so a mint failure
+        // must degrade to the unauthenticated request that works today, never
+        // fail the login.
+        let mut req = self.http.get(&url);
+        if self.admin.is_some() {
+            match self.admin_bearer().await {
+                Ok(token) => req = req.bearer_auth(token),
+                Err(e) => debug!(
+                    error = %e,
+                    "has_profile_row: no admin token available; sending unauthenticated \
+                     (fine unless require_auth_for_profile_requests is set)"
+                ),
+            }
+        }
+        let resp = req
             .send()
             .await
             .context("has_profile_row: request failed")?;
@@ -318,8 +543,16 @@ impl SynapseClient {
     /// List a user's devices via the Synapse admin API
     /// (`GET /_synapse/admin/v2/users/{user_id}/devices`).
     ///
-    /// Authenticated with the shared secret, which doubles as Synapse's
-    /// `admin_token` under MSC3861 (`matrix_server.sh` sets them equal).
+    /// **There is no MAS equivalent.** `synapse/rest/synapse/mas/devices.py` on
+    /// 1.159 exposes only `upsert_device`, `delete_device`,
+    /// `update_device_display_name` and `sync_devices` — all POST, all
+    /// write-only. `sync_devices` looks list-shaped but is a reconciliation
+    /// call: it takes the desired device list and returns `{}`, never the
+    /// server's list. So reading devices REQUIRES the admin API, which since
+    /// 1.157 requires a real admin-scoped access token.
+    ///
+    /// Authenticated with a minted admin token ([`crate::admin_token`]), NOT the
+    /// shared secret — the shared secret answers 401 on `/_synapse/admin/*`.
     pub async fn list_devices(
         &self,
         localpart: &str,
@@ -332,10 +565,7 @@ impl SynapseClient {
             urlencoding::encode(&user_id)
         );
         let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.shared_secret)
-            .send()
+            .admin_request(|http, token| http.get(&url).bearer_auth(token))
             .await
             .context("list_devices: request failed")?;
 
@@ -374,28 +604,33 @@ impl SynapseClient {
             .find(|d| d.device_id == device_id))
     }
 
-    /// Delete a user's device via the Synapse admin API
-    /// (`DELETE /_synapse/admin/v2/users/{user_id}/devices/{device_id}`).
+    /// Delete a user's device via the MAS API
+    /// (`POST /_synapse/mas/delete_device`, body `{localpart, device_id}`).
     ///
-    /// Scoped to the user's mxid, so a foreign `device_id` cannot affect another
-    /// user. Deleting the device invalidates Synapse's cached access token for it.
+    /// Ported from `DELETE /_synapse/admin/v2/users/{mxid}/devices/{device_id}`,
+    /// which answers 401 on 1.157+. The MAS resource resolves the localpart
+    /// itself and calls the same `device_handler.delete_devices`, so the
+    /// behaviour is unchanged; only the wire format and the credential differ.
+    ///
+    /// Scoped to the user's own localpart, so a foreign `device_id` cannot
+    /// affect another user. Deleting the device invalidates Synapse's cached
+    /// access token for it. Answers **204 No Content** on success.
+    ///
+    /// `server_name` is no longer sent — the MAS API is localpart-scoped — and
+    /// is kept only to log the mxid an operator would actually grep for, and so
+    /// that every account-management call site keeps one uniform precondition.
     pub async fn delete_device(
         &self,
         localpart: &str,
         device_id: &str,
         server_name: &str,
     ) -> Result<()> {
-        let user_id = matrix_user_id(localpart, server_name);
-        let url = format!(
-            "{}/_synapse/admin/v2/users/{}/devices/{}",
-            self.endpoint,
-            urlencoding::encode(&user_id),
-            urlencoding::encode(device_id)
-        );
+        let url = format!("{}/_synapse/mas/delete_device", self.endpoint);
         let resp = self
             .http
-            .delete(&url)
+            .post(&url)
             .bearer_auth(&self.shared_secret)
+            .json(&json!({ "localpart": localpart, "device_id": device_id }))
             .send()
             .await
             .context("delete_device: request failed")?;
@@ -403,43 +638,52 @@ impl SynapseClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            warn!(%status, %body, "delete_device failed");
-            anyhow::bail!("delete_device: HTTP {status}{}", admin_status_hint(status));
+            let user_id = matrix_user_id(localpart, server_name);
+            warn!(%status, %body, %user_id, %device_id, "delete_device failed");
+            anyhow::bail!("delete_device: HTTP {status}{}", mas_status_hint(status));
         }
         Ok(())
     }
 
-    /// Build the admin-API deactivation URL for a user's mxid (percent-encoded
-    /// path segment). Factored out so the encoding can be unit-tested directly.
-    fn deactivate_url(&self, localpart: &str, server_name: &str) -> String {
-        format!(
-            "{}/_synapse/admin/v1/deactivate/{}",
-            self.endpoint,
-            urlencoding::encode(&matrix_user_id(localpart, server_name))
-        )
-    }
-
-    /// Deactivate a user's account via the Synapse admin API
-    /// (`POST /_synapse/admin/v1/deactivate/{user_id}`).
+    /// Deactivate a user's account via the MAS API
+    /// (`POST /_synapse/mas/delete_user`, body `{localpart, erase}`).
     ///
-    /// Authenticated with the shared secret (== Synapse `admin_token` under MSC3861).
-    /// Deactivation removes the account's access tokens and 3PIDs. The `erase`
-    /// flag selects GDPR behaviour: `erase=false` keeps profile/media (a plain
-    /// deactivation, reversible via [`reactivate_user`](Self::reactivate_user));
-    /// `erase=true` requests irreversible erasure of the user's profile, media,
-    /// and room memberships. Scoped to the user's mxid.
+    /// Ported from `POST /_synapse/admin/v1/deactivate/{mxid}`, which answers
+    /// 401 on 1.157+.
+    ///
+    /// # The `erase` flag means exactly what it meant before
+    ///
+    /// This was the one semantic risk in the port, because the endpoint is named
+    /// `delete_user` rather than `deactivate`. It is not a deletion: the
+    /// resource is a thin pass-through to the SAME handler the old admin route
+    /// used —
+    /// `deactivate_account_handler.deactivate_account(user_id, erase_data=erase)`
+    /// — with no branching of its own. So the reversible/irreversible
+    /// distinction this codebase depends on is preserved:
+    ///
+    /// * `erase = false` → deactivation only; profile and media are kept, and
+    ///   the account is restorable via [`reactivate_user`](Self::reactivate_user).
+    ///   This backs `/account?action=org.matrix.account_deactivate`.
+    /// * `erase = true` → the same deactivation **plus** GDPR erasure of the
+    ///   user's data. Irreversible. This backs
+    ///   `/account?action=org.matrix.account_erase`.
+    ///
+    /// `erase` is a **required** `StrictBool` in the MAS request model (no
+    /// default, and no coercion from `"true"` or `1`), so it must be sent as a
+    /// real JSON boolean or the request fails validation. Omitting it would NOT
+    /// quietly default to the safe value.
     pub async fn deactivate_user(
         &self,
         localpart: &str,
         server_name: &str,
         erase: bool,
     ) -> Result<()> {
-        let url = self.deactivate_url(localpart, server_name);
+        let url = format!("{}/_synapse/mas/delete_user", self.endpoint);
         let resp = self
             .http
             .post(&url)
             .bearer_auth(&self.shared_secret)
-            .json(&deactivate_body(erase))
+            .json(&deactivate_body(localpart, erase))
             .send()
             .await
             .context("deactivate_user: request failed")?;
@@ -447,48 +691,35 @@ impl SynapseClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            warn!(%status, %body, "deactivate_user failed");
-            anyhow::bail!(
-                "deactivate_user: HTTP {status}{}",
-                admin_status_hint(status)
-            );
+            let user_id = matrix_user_id(localpart, server_name);
+            warn!(%status, %body, %user_id, erase, "deactivate_user failed");
+            anyhow::bail!("deactivate_user: HTTP {status}{}", mas_status_hint(status));
         }
         Ok(())
     }
 
-    /// Build the admin-v2 user-modification URL for a user's mxid (percent-encoded
-    /// path segment). Factored out so the encoding can be unit-tested directly.
-    fn reactivate_url(&self, localpart: &str, server_name: &str) -> String {
-        format!(
-            "{}/_synapse/admin/v2/users/{}",
-            self.endpoint,
-            urlencoding::encode(&matrix_user_id(localpart, server_name))
-        )
-    }
-
-    /// Reactivate a previously (non-erased) deactivated account via the Synapse
-    /// admin API (`PUT /_synapse/admin/v2/users/{user_id}` with
-    /// `{ "deactivated": false }`).
+    /// Reactivate a previously (non-erased) deactivated account via the MAS API
+    /// (`POST /_synapse/mas/reactivate_user`, body `{localpart}`).
     ///
-    /// Authenticated with the shared secret (== Synapse `admin_token` under MSC3861).
-    /// Only meaningful for accounts deactivated with `erase=false`; an erased
-    /// account cannot be restored.
+    /// Ported from `PUT /_synapse/admin/v2/users/{mxid}` with
+    /// `{"deactivated": false}`, which answers 401 on 1.157+. The MAS resource
+    /// calls `deactivate_account_handler.activate_account(user_id)` — the same
+    /// handler the admin PUT reached — so the semantics carry over, including
+    /// the constraint that only an `erase = false` deactivation can be restored.
     ///
-    /// VERIFIED under MSC3861 (live probe, 2026-06-10): the admin-v2 `PUT users`
-    /// endpoint accepts `{"deactivated": false}` WITHOUT a `password` field and
-    /// reactivates the account (HTTP 200, `deactivated: false` confirmed on
-    /// re-read) on a production MSC3861 deployment (agentic.inblock.io). The
-    /// historical concern that reactivation demands a local password does not
-    /// apply when no `password` key is sent. Probe: section 3 of
-    /// `scripts/verify-lifecycle-live.sh` against a throwaway user. This method
-    /// still surfaces a clear error (warn! + bail!) on any non-success response.
+    /// The historical worry that reactivation demands a local password does not
+    /// apply here at all: the MAS body carries only the localpart, so there is
+    /// no `password` key that could be missing. (It did not apply to the old
+    /// admin PUT either — live probe, 2026-06-10, section 3 of
+    /// `scripts/verify-lifecycle-live.sh`.) This method still surfaces a clear
+    /// error on any non-success response.
     pub async fn reactivate_user(&self, localpart: &str, server_name: &str) -> Result<()> {
-        let url = self.reactivate_url(localpart, server_name);
+        let url = format!("{}/_synapse/mas/reactivate_user", self.endpoint);
         let resp = self
             .http
-            .put(&url)
+            .post(&url)
             .bearer_auth(&self.shared_secret)
-            .json(&reactivate_body())
+            .json(&reactivate_body(localpart))
             .send()
             .await
             .context("reactivate_user: request failed")?;
@@ -496,24 +727,45 @@ impl SynapseClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            warn!(%status, %body, "reactivate_user failed");
-            anyhow::bail!("reactivate_user: HTTP {status}");
+            let user_id = matrix_user_id(localpart, server_name);
+            warn!(%status, %body, %user_id, "reactivate_user failed");
+            anyhow::bail!("reactivate_user: HTTP {status}{}", mas_status_hint(status));
         }
         Ok(())
     }
 }
 
-/// Build the JSON body for the admin v1 deactivate endpoint. The `erase` flag
-/// is the GDPR selector (see [`SynapseClient::deactivate_user`]). Factored out
-/// so the parameter mapping can be unit-tested without a live homeserver.
-fn deactivate_body(erase: bool) -> serde_json::Value {
-    json!({ "erase": erase })
+/// A human hint for a failed `/_synapse/mas/*` call.
+///
+/// The MAS surface rejects a bad credential with **403** ("This endpoint must
+/// only be called by MAS"), not 401, and a 404 there means Synapse has never
+/// heard of the localpart — two failures that look nothing alike but are easy
+/// to confuse in a log.
+fn mas_status_hint(status: reqwest::StatusCode) -> &'static str {
+    match status {
+        reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::UNAUTHORIZED => {
+            " — Synapse rejected the MAS shared secret (it must equal \
+             matrix_authentication_service.secret in homeserver.yaml)"
+        }
+        reqwest::StatusCode::NOT_FOUND => " — no such user on this homeserver",
+        _ => "",
+    }
 }
 
-/// Build the JSON body for the admin v2 reactivation PUT (sets `deactivated`
-/// back to `false`). Factored out so the body shape can be unit-tested.
-fn reactivate_body() -> serde_json::Value {
-    json!({ "deactivated": false })
+/// Build the JSON body for `POST /_synapse/mas/delete_user`.
+///
+/// `erase` is the GDPR selector (see [`SynapseClient::deactivate_user`]).
+/// Factored out so the parameter mapping can be unit-tested without a live
+/// homeserver — this is the seam that pins "deactivate" and "erase" to the one
+/// endpoint that now serves both.
+fn deactivate_body(localpart: &str, erase: bool) -> serde_json::Value {
+    json!({ "localpart": localpart, "erase": erase })
+}
+
+/// Build the JSON body for `POST /_synapse/mas/reactivate_user`. Factored out
+/// so the body shape can be unit-tested.
+fn reactivate_body(localpart: &str) -> serde_json::Value {
+    json!({ "localpart": localpart })
 }
 
 /// Discriminate a 404 response body from `GET /_matrix/client/v3/profile/{mxid}`,
@@ -578,32 +830,65 @@ mod tests {
 
     #[test]
     fn deactivate_body_reflects_erase_flag() {
-        // The admin v1 deactivate endpoint takes `{ "erase": <bool> }`. The body
-        // builder is the testable seam for the erase parameter: erase=false keeps
-        // GDPR-erasure off (deactivate only), erase=true requests full erasure.
-        assert_eq!(deactivate_body(false), json!({ "erase": false }));
-        assert_eq!(deactivate_body(true), json!({ "erase": true }));
-    }
-
-    #[test]
-    fn reactivate_url_encodes_mxid_path_segment() {
-        // Reactivation uses the admin v2 user-modification endpoint, which takes
-        // the mxid as a path segment, so the mxid must be percent-encoded.
-        let client = SynapseClient::new("http://localhost:8008", "secret");
-        let url = client.reactivate_url("alice", "example.com");
+        // `POST /_synapse/mas/delete_user` takes `{localpart, erase}`. The body
+        // builder is the testable seam for the erase parameter, and this is the
+        // ONE place the reversible/irreversible distinction is expressed:
+        // erase=false is a plain deactivation (restorable by reactivate_user),
+        // erase=true additionally GDPR-erases. Synapse routes both through the
+        // same `deactivate_account(user_id, erase_data=erase)` handler, so the
+        // flag is the whole difference.
         assert_eq!(
-            url,
-            "http://localhost:8008/_synapse/admin/v2/users/%40alice%3Aexample.com"
+            deactivate_body("alice", false),
+            json!({ "localpart": "alice", "erase": false })
         );
-        let segment = url.rsplit('/').next().unwrap();
-        assert!(!segment.contains('@'));
-        assert!(!segment.contains(':'));
+        assert_eq!(
+            deactivate_body("alice", true),
+            json!({ "localpart": "alice", "erase": true })
+        );
     }
 
     #[test]
-    fn reactivate_body_sets_deactivated_false() {
-        // Reactivation flips `deactivated` back to false via the admin v2 PUT.
-        assert_eq!(reactivate_body(), json!({ "deactivated": false }));
+    fn deactivate_body_erase_is_a_real_json_bool() {
+        // The MAS request model declares `erase: StrictBool` — pydantic strict,
+        // so it accepts neither "true" nor 1, and it has NO default, meaning an
+        // absent field is a validation error rather than a silent `false`.
+        // Serialising it as a string or number would break account_deactivate
+        // and account_erase together.
+        for erase in [false, true] {
+            let body = deactivate_body("alice", erase);
+            assert!(
+                body["erase"].is_boolean(),
+                "erase must serialise as a JSON boolean, got {}",
+                body["erase"]
+            );
+            assert!(body.get("erase").is_some(), "erase must always be present");
+        }
+    }
+
+    #[test]
+    fn mas_bodies_carry_a_bare_localpart_not_an_mxid() {
+        // The MAS API is localpart-scoped: routes are literal path segments and
+        // identifiers travel in the body. Sending an mxid here would 404 with
+        // "no such user". This is the specific mistake the port had to avoid,
+        // because the admin API it replaced took a percent-encoded mxid.
+        for body in [deactivate_body("alice", false), reactivate_body("alice")] {
+            let lp = body["localpart"].as_str().unwrap();
+            assert_eq!(lp, "alice");
+            assert!(!lp.contains('@'), "must not be an mxid: {lp}");
+            assert!(!lp.contains(':'), "must not be an mxid: {lp}");
+            assert!(!lp.contains('%'), "must not be percent-encoded: {lp}");
+        }
+    }
+
+    #[test]
+    fn reactivate_body_carries_only_the_localpart() {
+        // `POST /_synapse/mas/reactivate_user` takes `{localpart}` and nothing
+        // else. In particular there is no `password` key to omit — the old
+        // concern that self-service reactivation demands a local password
+        // cannot arise on this wire format at all.
+        let body = reactivate_body("alice");
+        assert_eq!(body, json!({ "localpart": "alice" }));
+        assert!(body.get("password").is_none());
     }
 
     // -- profile_404_means_row_absent (2026-08-02 discriminator fix) --------
@@ -654,19 +939,59 @@ mod tests {
     }
 
     #[test]
-    fn deactivate_url_encodes_mxid_path_segment() {
-        // The deactivate endpoint takes the mxid as a path segment, so the mxid
-        // must be percent-encoded (no raw @ or :) for a well-formed URL.
+    fn admin_mint_is_opt_in() {
+        // A bare client can call /_synapse/mas/* but must NOT silently pretend
+        // it can reach the admin API. Unit tests and standalone deployments
+        // build clients this way.
         let client = SynapseClient::new("http://localhost:8008", "secret");
-        let url = client.deactivate_url("alice", "example.com");
-        assert_eq!(
-            url,
-            "http://localhost:8008/_synapse/admin/v1/deactivate/%40alice%3Aexample.com"
+        assert!(client.admin.is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_scoped_call_without_a_mint_fails_closed_with_a_clear_error() {
+        // The failure mode that matters: with no token store configured, an
+        // admin-scoped call must refuse locally with an actionable message,
+        // NOT fall back to presenting the shared secret (which Synapse 1.157+
+        // answers with a bare 401 that reads like a broken deployment).
+        let client = SynapseClient::new("http://127.0.0.1:1", "secret");
+        let err = client.admin_bearer().await.unwrap_err().to_string();
+        assert!(
+            err.contains("without a token store"),
+            "error must name the missing precondition, got: {err}"
         );
-        // The encoded segment must not contain raw mxid separators.
-        let segment = url.rsplit('/').next().unwrap();
-        assert!(!segment.contains('@'));
-        assert!(!segment.contains(':'));
+    }
+
+    #[test]
+    fn admin_status_hint_no_longer_mentions_the_removed_admin_token_setting() {
+        // Regression guard on operator-facing wording. `admin_token` was
+        // DELETED in Synapse 1.157; telling an operator to go check it sends
+        // them looking for a config key that does not exist.
+        let hint = admin_status_hint(reqwest::StatusCode::UNAUTHORIZED);
+        assert!(!hint.is_empty(), "a 401 must still be explained");
+        assert!(
+            !hint.contains("admin_token"),
+            "must not point at the removed setting: {hint}"
+        );
+        assert!(hint.contains("urn:synapse:admin:*"));
+        assert!(
+            admin_status_hint(reqwest::StatusCode::NOT_FOUND).is_empty(),
+            "a 404 is not an auth failure and must not carry the auth hint"
+        );
+    }
+
+    #[test]
+    fn mas_status_hint_distinguishes_a_bad_secret_from_an_unknown_user() {
+        // The MAS surface rejects a bad credential with 403 ("This endpoint
+        // must only be called by MAS"), NOT 401 — so both must be explained,
+        // and a 404 there means the localpart is unknown, not unauthorised.
+        for s in [
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::UNAUTHORIZED,
+        ] {
+            assert!(mas_status_hint(s).contains("matrix_authentication_service.secret"));
+        }
+        assert!(mas_status_hint(reqwest::StatusCode::NOT_FOUND).contains("no such user"));
+        assert!(mas_status_hint(reqwest::StatusCode::INTERNAL_SERVER_ERROR).is_empty());
     }
 
     #[test]
