@@ -1,8 +1,15 @@
 End-to-end authentication flow reference: Element Web to siwx-oidc to Matrix Synapse.
 
-Use when tracing, debugging, or explaining the authentication flow. Covers both wallet (CAIP-122) and passkey (WebAuthn) paths through MSC3861 delegated auth.
+Use when tracing, debugging, or explaining the authentication flow. Covers both wallet (CAIP-122) and passkey (WebAuthn) paths through OIDC delegated auth.
 
-**Key fact:** siwx-oidc **replaces MAS entirely**. It is not an upstream IdP behind MAS. Synapse delegates auth to siwx-oidc directly via MSC3861.
+**Key fact:** siwx-oidc **replaces MAS entirely**. It is not an upstream IdP behind MAS. Synapse delegates auth to siwx-oidc directly.
+
+**Key fact 2 (the config key changed):** the delegation is configured with
+`matrix_authentication_service` on Synapse >= 1.157 (dev-staging runs 1.159.0) and with
+`experimental_features.msc3861` on <= 1.156 (prod still runs 1.154.0). The `msc3861`
+key was **removed** in 1.157.0 and now crashes Synapse on startup. "MSC3861" still
+names the *protocol* and siwx-oidc's internal token mode; it is no longer the name of
+a Synapse setting on current versions. See "Synapse delegated-auth config" below.
 
 ## Service Topology
 
@@ -17,7 +24,7 @@ Four containers (`docker-compose.yml` in `../siwx-oidc-matrix-server`):
 - **element-web** (nginx + injected JS shims)
 - **siwx-oidc** (Axum OIDC server)
 - **redis** (session, code, token, credential storage)
-- **matrix_synapse** (homeserver, MSC3861 delegated auth)
+- **matrix_synapse** (homeserver, OIDC delegated auth — `matrix_authentication_service` on >= 1.157)
 
 ## Two Authentication Paths
 
@@ -165,9 +172,32 @@ Steps 5-8 identical.
 | `webauthn:credential/{cred_id_b64}` | none | Stored passkey |
 | `webauthn:link/{cred_id_b64}` | none | Account linking map |
 
-## Synapse MSC3861 Config
+## Synapse delegated-auth config (VERSION-DEPENDENT — read before copying)
 
-Set by `entrypoints/matrix_server.sh`:
+Written by `entrypoints/matrix_server.sh`. **The config key changed in Synapse 1.157.0.**
+Check the homeserver version before applying either block.
+
+### Synapse >= 1.157 — stable `matrix_authentication_service` (dev-staging: 1.159.0)
+
+```yaml
+matrix_authentication_service:
+  enabled: true
+  endpoint: ${SIWEOIDC_INTERNAL_URL:-$SIWEOIDC_BASE_URL}
+  secret: ${MAS_SHARED_SECRET}
+
+experimental_features:
+  msc4108_enabled: true      # QR login (2024/ECIES) — see /element-x-qr-code-specialist
+  msc4143_enabled: true      # MatrixRTC
+  msc3266_enabled: true
+  msc4222_enabled: true
+```
+
+`issuer`, `account_management_url`, `client_id`, `client_secret` and `admin_token`
+have **no equivalent here**. Synapse discovers all of that itself by fetching
+siwx-oidc's OIDC metadata from `endpoint` — `api/auth/mas.py::auth_metadata()` is
+`self._server_metadata.get()`, which does `get_json(self._metadata_url)`.
+
+### Synapse <= 1.156 — legacy `experimental_features.msc3861` (prod today: 1.154.0)
 
 ```yaml
 experimental_features:
@@ -179,6 +209,40 @@ experimental_features:
     client_secret: ${MAS_SHARED_SECRET}
     admin_token: ${MAS_SHARED_SECRET}
 ```
+
+**Never carry this block onto 1.157+.** It is a hard startup failure, not a warning
+(verified locally against the 1.159.0 image, 2026-08-30):
+
+```
+Error in configuration at 'experimental.msc3861':
+  experimental_features.msc3861 was removed. Use the matrix_authentication_service
+  configuration instead.
+```
+
+Process exit code **1** — the container crash-loops. `matrix_server.sh` therefore runs
+`yq -i "del(.experimental_features.msc3861)"` before writing the new block.
+
+Synapse 1.154.0 **already** understands `matrix_authentication_service`, so migrating
+the config forward does not require the image bump, and a 1.159 -> 1.154 image
+rollback does not lose auth.
+
+### Reaching the Synapse admin API = a SECOND credential (changed in 1.157)
+
+The MAS shared secret is **not** an admin credential on 1.157+.
+
+| Credential | Accepted on |
+|---|---|
+| `MAS_SHARED_SECRET` | `/_synapse/mas/*` only — provision, upsert/delete device, deactivate, cross-signing reset |
+| Short-TTL minted `urn:synapse:admin:*` token | `/_synapse/admin/*` — device listing, media/retention admin |
+
+Synapse 1.157 deleted the `admin_token` shim that let the raw shared secret reach
+`/_synapse/admin/*`; those routes now answer 401 for it. siwx-oidc mints itself an
+admin-scoped token on demand at `POST /oauth2/admin_token` (authenticated by the
+shared secret) — see `src/admin_token.rs`. `is_server_admin()` in 1.159 is literally
+`"urn:synapse:admin:*" in requester.scope`, and that scope comes verbatim from
+siwx-oidc's own introspection response. The minted scope must carry **both**
+`urn:matrix:client:api:*` and `urn:synapse:admin:*`, or Synapse rejects the token
+before it ever looks at the admin scope.
 
 ## Logout / Revocation
 

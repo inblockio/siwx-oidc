@@ -131,7 +131,9 @@ POST /_matrix/client/v3/keys/device_signing/upload (200 OK)
 # Bad signs:
 No bootstrapCrossSigning call at all --> Element Web client-side issue
 POST keys/device_signing/upload returns 401 --> MSC3967 not active
-"UIA not supported with MSC3861" error --> Synapse config issue
+"UIA not supported with MSC3861" error --> Synapse config issue (<= 1.156 wording;
+    on >= 1.157 the same class of problem shows up under the
+    matrix_authentication_service block instead)
 ```
 
 ### Step 5: Check Synapse logs
@@ -210,7 +212,7 @@ honest server-side signal.
 | Spec | Title | Relevance |
 |------|-------|-----------|
 | MSC3967 | No UIA for first cross-signing upload | Why first-time bootstrap works without UIA |
-| MSC3861 | Delegated OIDC auth | How siwx-oidc integrates with Synapse |
+| MSC3861 | Delegated OIDC auth | How siwx-oidc integrates with Synapse. **Config key note:** productised as the `matrix_authentication_service` block in Synapse >= 1.157; `experimental_features.msc3861` was removed in 1.157.0 and crashes startup |
 | MSC4312 | Cross-signing reset in OAuth world | `m.oauth` UIA stage for key reset |
 | MSC4191 | Account management deep-linking | `account_management_uri` in OIDC discovery |
 | MSC2965 | OIDC discovery for Matrix | `m.authentication` in .well-known |
