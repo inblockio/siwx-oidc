@@ -8,6 +8,10 @@ pub mod credential_identity;
 /// store.
 pub mod credential_migration;
 
+/// The optional aqua-auth credential store: dual-write and read-through, off by
+/// default, selected by `AQUA_WEBAUTHN_REDIS_URL`.
+pub mod credential_store;
+
 // `synapse_client` is DELIBERATELY not re-exposed here.
 //
 // It used to be `pub mod synapse_client;`, which compiled the same file into

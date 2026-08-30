@@ -11,7 +11,22 @@ repository = "https://github.com/inblockio/siwx-oidc/"
 description = "CAIP-122 to OpenID Connect bridge — Sign-In With X for any DID method."
 
 [dependencies]
-aqua-auth = { git = "https://github.com/inblockio/aqua-rs-auth", features = ["webauthn", "ceremony", "redis"] }
+# PINNED and on the `ssh://` spelling, both deliberately.
+#
+# It was unpinned, floating on the default branch: a bare `cargo update` could
+# move this crate onto a new aqua-auth without anyone asking for it. And it was
+# the only consumer on `https://`, which matters because Cargo treats `ssh://`
+# and `https://` as two DIFFERENT sources: the same crate would be built twice
+# with features unmerged between the copies.
+#
+# TODO(aqua-auth 0.7.0): move this to the 0.7.0 tag once it is cut. The rev below
+# is aqua-auth `main` (0.6.0), which is what this crate already resolved to, so
+# the pin changes nothing about what a clean checkout builds. The source HERE
+# targets 0.7.0 (async credential store) and is verified against the aqua-auth
+# working tree through the local `[patch]` in .cargo/config.toml, exactly as
+# aqua-node, aquafier-rs and aqua-state-viewer are: every aqua-auth consumer
+# moves to the new tag in one batch. See CONSUMERS.md in aqua-auth.
+aqua-auth = { git = "ssh://git@github.com/inblockio/aqua-rs-auth", rev = "0d9350a59148b887067ef8d41048952cd3cd3c9f", features = ["webauthn", "ceremony", "redis"] }
 alloy-primitives = { version = "1", features = ["serde"] }
 alloy = { version = "1", features = ["providers", "transport-http", "contract", "sol-types", "ens"] }
 anyhow = "1"

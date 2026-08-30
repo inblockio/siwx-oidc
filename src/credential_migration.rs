@@ -246,7 +246,7 @@ impl<'a> CredentialMigration<'a> {
 /// `verify_credential` rewrites it. A blob with no `cred` object is not a
 /// passkey; a `cred` object with no `counter` is a passkey that has never been
 /// used, which is a legitimate 0.
-fn sign_count_from_blob(blob: &serde_json::Value) -> Result<u32> {
+pub fn sign_count_from_blob(blob: &serde_json::Value) -> Result<u32> {
     let cred = blob
         .get("cred")
         .ok_or_else(|| anyhow!("stored credential has no `cred` object"))?;

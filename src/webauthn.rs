@@ -32,42 +32,24 @@ const LINK_CHALLENGE_PREFIX: &str = "webauthn:link_challenge";
 const CHALLENGE_TTL: u64 = 120; // 2 min
 
 // -- DID derivation from P-256 public key --
+//
+// Not implemented here. `aqua_auth::p256_compressed_from_passkey` and
+// `aqua_auth::did_key_from_p256_compressed` are the same computation, and since
+// the `=0.6.1-dev` alignment `Passkey` is literally the same type in both
+// crates, so the local copies (a multicodec constant, a COSE -> compressed-SEC1
+// extractor, and a base58 encoder) were duplicates rather than an independent
+// implementation. Byte-identity is pinned by
+// `derivation_is_byte_identical_to_the_pre_0_7_0_local_helpers` below, against
+// the values the deleted code produced for the real fixture blob.
 
-/// Multicodec varint for P-256 (0x1200), same as aqua-auth key module.
-const P256_MULTICODEC: &[u8] = &[0x80, 0x24];
-
-/// Derive a `did:key:zDn…` from a P-256 compressed SEC1 public key (33 bytes).
-fn did_from_p256_compressed(compressed: &[u8]) -> String {
-    let mut bytes = P256_MULTICODEC.to_vec();
-    bytes.extend_from_slice(compressed);
-    format!("did:key:z{}", bs58::encode(&bytes).into_string())
-}
-
-fn compressed_pubkey_from_passkey(passkey: &Passkey) -> Result<Vec<u8>> {
-    let cose_key = passkey.get_public_key();
-    match &cose_key.key {
-        COSEKeyType::EC_EC2(ec2) => {
-            if ec2.curve != ECDSACurve::SECP256R1 {
-                return Err(anyhow!(
-                    "WebAuthn credential uses unsupported curve (expected P-256)"
-                ));
-            }
-            let y_bytes: &[u8] = ec2.y.as_ref();
-            let y_is_odd = y_bytes.last().is_some_and(|b| b & 1 == 1);
-            let prefix = if y_is_odd { 0x03 } else { 0x02 };
-            let mut compressed = vec![prefix];
-            compressed.extend_from_slice(ec2.x.as_ref());
-            Ok(compressed)
-        }
-        _ => Err(anyhow!(
-            "WebAuthn credential is not EC2/P-256 — cannot derive did:key"
-        )),
-    }
+/// The compressed (33-byte SEC1) P-256 public key a passkey authenticates with.
+fn compressed_pubkey_from_passkey(passkey: &Passkey) -> Result<[u8; 33]> {
+    aqua_auth::p256_compressed_from_passkey(passkey).map_err(|e| anyhow!("{}", e))
 }
 
 fn did_from_passkey(passkey: &Passkey) -> Result<String> {
     let compressed = compressed_pubkey_from_passkey(passkey)?;
-    Ok(did_from_p256_compressed(&compressed))
+    Ok(aqua_auth::did_key_from_p256_compressed(&compressed))
 }
 
 /// Derive the `did:key:zDn…` for a stored WebAuthn credential from its raw JSON
@@ -309,6 +291,12 @@ pub async fn register_finish(
         );
     }
 
+    // Dual-write into aqua-auth's credential store when it is enabled. A fresh
+    // registration is unlinked, so its identity is the derived did:key. No-op
+    // when the flag is off, and best-effort when it is on: the legacy write
+    // above already succeeded, so the user is not locked out either way.
+    siwx_oidc::credential_store::mirror_credential(&cred_id_b64, &cred_json, &did, None).await;
+
     info!(
         "webauthn register_finish: did={} cred_id={}",
         did, cred_id_b64
@@ -363,9 +351,16 @@ pub async fn authenticate_start(
         .map_err(|e| anyhow!("WebAuthn auth start failed: {:?}", e))?;
 
     if let Some(did) = scope_did {
-        let cred_ids = redis
-            .get_passkeys_for_did(did, derive_did_from_credential_json)
-            .await?;
+        // Read-through, same as the credential read: aqua-auth's did index first
+        // when the flag is on, the legacy webauthn:by_did index (with its scan
+        // self-heal) otherwise. Advisory either way, an empty result means
+        // usernameless rather than denied.
+        let cred_ids = siwx_oidc::credential_store::list_credential_ids(
+            redis,
+            did,
+            derive_did_from_credential_json,
+        )
+        .await?;
         // Empty set -> fall back to discoverable (leave allow_credentials empty) so a
         // wallet-only DID does not produce a broken empty picker that blocks all keys.
         if !cred_ids.is_empty() {
@@ -438,8 +433,10 @@ pub async fn verify_credential(
         return Err(anyhow!("Empty credential ID in WebAuthn assertion").into());
     }
     let cred_key = format!("{}/{}", CREDENTIAL_PREFIX, cred_id_b64);
-    let cred_json = redis
-        .get_raw(&cred_key)
+    // Read-through: aqua-auth's credential store first when the flag is on, this
+    // namespace on a miss. The fallback is what makes the flag safe to flip
+    // before the backfill has run.
+    let cred_json = siwx_oidc::credential_store::read_blob(redis, &cred_id_b64)
         .await?
         // The ONLY site that yields VerifyError::UnknownCredential. A stale/revoked
         // passkey selected from the picker lands here (lookup precedes signature
@@ -523,6 +520,11 @@ pub async fn verify_credential(
                     .map_err(|e| anyhow!("Failed to serialize credential counter: {}", e))?,
             )
             .await?;
+        // Dual-write the counter. aqua-auth keeps it in a sidecar field rather
+        // than inside the blob, and its store is monotonic, so a replayed lower
+        // value is ignored there exactly as the regression check above rejects
+        // it here.
+        siwx_oidc::credential_store::mirror_sign_count(&cred_id_b64, new_counter).await;
     }
 
     info!(
@@ -661,6 +663,20 @@ pub async fn link_finish(
         info!("webauthn link_finish: by_did index update failed: {}", e);
     }
 
+    // Dual-write into aqua-auth's credential store when it is enabled, under the
+    // PRIMARY did and with the link's label, because that is what
+    // `resolve_credential_identity` (and therefore a login) resolves for this
+    // credential. Writing the derived did:key here would record a principal the
+    // login path never produces. The link entry itself is NOT mirrored: it stays
+    // owned by, and readable only from, this namespace.
+    siwx_oidc::credential_store::mirror_credential(
+        &cred_id_b64,
+        &cred_json,
+        &link_state.primary_did,
+        Some(link_entry.label.clone()),
+    )
+    .await;
+
     info!(
         "webauthn link_finish: cred_id={} primary_did={}",
         cred_id_b64, link_state.primary_did
@@ -750,6 +766,46 @@ mod tests {
             derive_did_from_credential_json(r#"{"cred":{"unexpected":"shape"}}"#),
             None,
             "wrong-shaped JSON must not panic, must return None"
+        );
+    }
+
+    /// Byte-identity across the 0.7.0 helper deletion.
+    ///
+    /// `compressed_pubkey_from_passkey` and `did_from_passkey` used to be
+    /// implemented here (a `P256_MULTICODEC` constant, a COSE -> compressed-SEC1
+    /// extractor, a base58 encoder) and now delegate to aqua-auth. The two
+    /// values below were produced by the DELETED local implementation against
+    /// this exact fixture, so this test fails if the delegation is not
+    /// bit-for-bit the same computation.
+    ///
+    /// The compressed key matters as much as the DID: it is what
+    /// `verify_credential` hands to `verify_webauthn_assertion` as
+    /// `credential_public_key`, so a single flipped byte would reject every
+    /// login rather than merely rename an identity.
+    #[test]
+    fn derivation_is_byte_identical_to_the_pre_0_7_0_local_helpers() {
+        const BLOB: &str = include_str!("../tests/fixtures/passkey_webauthn_rs_0_6_0_dev.json");
+        const PRE_0_7_0_COMPRESSED_HEX: &str =
+            "02a463503d9518bd64a40f5760b9b3b4cd2c419848896a959109434c4453773da4";
+        const PRE_0_7_0_DID: &str = "did:key:zDnaebVfjz61NuRbnMfF2gA6NZM6DRWTeauDnFH1DhG2MFivF";
+
+        let passkey: Passkey = serde_json::from_str(BLOB).expect("fixture parses");
+        let compressed = compressed_pubkey_from_passkey(&passkey).expect("P-256");
+        assert_eq!(compressed.len(), 33, "compressed SEC1 is 33 bytes");
+        assert_eq!(
+            hex::encode(compressed),
+            PRE_0_7_0_COMPRESSED_HEX,
+            "the compressed public key must be byte-identical to the deleted local helper"
+        );
+        assert_eq!(
+            did_from_passkey(&passkey).expect("derives"),
+            PRE_0_7_0_DID,
+            "the derived did:key must be byte-identical to the deleted local helper"
+        );
+        assert_eq!(
+            derive_did_from_credential_json(BLOB).as_deref(),
+            Some(PRE_0_7_0_DID),
+            "the purge-path resolver must agree too"
         );
     }
 
