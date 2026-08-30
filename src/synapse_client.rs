@@ -387,7 +387,10 @@ impl SynapseClient {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             warn!(%status, %body, "has_cross_signing_keys: query failed");
-            anyhow::bail!("has_cross_signing_keys: HTTP {status}{}", admin_status_hint(status));
+            anyhow::bail!(
+                "has_cross_signing_keys: HTTP {status}{}",
+                admin_status_hint(status)
+            );
         }
 
         let body: serde_json::Value = resp

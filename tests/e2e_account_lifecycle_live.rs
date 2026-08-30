@@ -387,7 +387,9 @@ async fn account_action_message(address: &str, action: &str) -> String {
         .json()
         .await
         .expect("account/nonce body must be JSON");
-    let nonce = np["nonce"].as_str().expect("nonce response must carry nonce");
+    let nonce = np["nonce"]
+        .as_str()
+        .expect("nonce response must carry nonce");
     let expiration_time = np["expiration_time"]
         .as_str()
         .expect("nonce response must carry expiration_time");
@@ -579,10 +581,7 @@ async fn account_lifecycle_round_trip_live() {
     let address = eip55_checksum(&addr_bytes);
     let did = format!("did:pkh:eip155:1:{}", address);
     let login = login_with_key(&signing_key, &address, &did).await;
-    let localpart = did
-        .replace(':', "-")
-        .replace('.', "-")
-        .to_lowercase();
+    let localpart = did.replace(':', "-").replace('.', "-").to_lowercase();
     eprintln!("[e2e:lifecycle] did={did}");
     eprintln!("[e2e:lifecycle] device_id={}", login.device_id);
 
