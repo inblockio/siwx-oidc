@@ -369,7 +369,10 @@ impl RedisClient {
             // DID's set (and the set itself once emptied). Best-effort — the index
             // is advisory, so a failure here must not mark the erase incomplete.
             if let Err(e) = self.index_remove_passkey(did, cred_id).await {
-                debug!("purge_identity: index_remove_passkey {} failed: {}", cred_id, e);
+                debug!(
+                    "purge_identity: index_remove_passkey {} failed: {}",
+                    cred_id, e
+                );
             }
         }
 

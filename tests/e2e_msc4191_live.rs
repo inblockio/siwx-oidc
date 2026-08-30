@@ -361,7 +361,9 @@ async fn account_action_message(address: &str, action: &str) -> String {
         .json()
         .await
         .expect("account/nonce body must be JSON");
-    let nonce = np["nonce"].as_str().expect("nonce response must carry nonce");
+    let nonce = np["nonce"]
+        .as_str()
+        .expect("nonce response must carry nonce");
     let expiration_time = np["expiration_time"]
         .as_str()
         .expect("nonce response must carry expiration_time");
@@ -1135,7 +1137,10 @@ async fn run_master_present_reset_roundtrip(label: &str) {
     eprintln!("[e2e:{label}] throwaway did={did}");
     let login = login_with_key(&signing_key, &address, &did).await;
     let user_id = whoami_user_id(&matrix, &login.access_token).await;
-    eprintln!("[e2e:{label}] user_id={user_id} device_id={}", login.device_id);
+    eprintln!(
+        "[e2e:{label}] user_id={user_id} device_id={}",
+        login.device_id
+    );
 
     let http = Client::new();
     let upload_url = format!("{matrix}/_matrix/client/v3/keys/device_signing/upload");
@@ -1293,7 +1298,10 @@ async fn cross_signing_reset_no_master_completed_live() {
     eprintln!("[e2e:no_master] throwaway did={did}");
     let login = login_with_key(&signing_key, &address, &did).await;
     let user_id = whoami_user_id(&matrix, &login.access_token).await;
-    eprintln!("[e2e:no_master] user_id={user_id} device_id={}", login.device_id);
+    eprintln!(
+        "[e2e:no_master] user_id={user_id} device_id={}",
+        login.device_id
+    );
 
     let http = Client::new();
     let upload_url = format!("{matrix}/_matrix/client/v3/keys/device_signing/upload");
@@ -1311,7 +1319,11 @@ async fn cross_signing_reset_no_master_completed_live() {
     )
     .await;
     eprintln!("[e2e:no_master] /account cross_signing_reset (no master) -> {rs} {rb}");
-    assert_eq!(rs, StatusCode::OK, "reset action should 200 even with no master: {rb}");
+    assert_eq!(
+        rs,
+        StatusCode::OK,
+        "reset action should 200 even with no master: {rb}"
+    );
     let rj: Value = serde_json::from_str(&rb).expect("reset body must be JSON");
     assert_eq!(
         rj["status"], "completed",
