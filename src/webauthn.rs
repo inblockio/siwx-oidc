@@ -15,9 +15,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 use url::Url;
 use webauthn_rs::prelude::*;
-use webauthn_rs_proto::{
-    AllowCredentials, AuthenticatorSelectionCriteria, ResidentKeyRequirement,
-};
+use webauthn_rs_proto::{AllowCredentials, AuthenticatorSelectionCriteria, ResidentKeyRequirement};
 
 use siwx_oidc::db::RedisClient;
 
@@ -301,7 +299,10 @@ pub async fn register_finish(
     // is advisory (get_passkeys_for_did self-heals via scan), so a hiccup here must
     // not fail the registration the user just completed.
     if let Err(e) = redis.index_add_passkey(&did, &cred_id_b64).await {
-        info!("webauthn register_finish: by_did index update failed: {}", e);
+        info!(
+            "webauthn register_finish: by_did index update failed: {}",
+            e
+        );
     }
 
     info!(
@@ -370,7 +371,11 @@ pub async fn authenticate_start(
                     let bytes = URL_SAFE_NO_PAD.decode(cred_id_b64).ok()?;
                     Some(AllowCredentials {
                         type_: "public-key".to_string(),
-                        id: Base64UrlSafeData::from(bytes),
+                        // webauthn-rs-proto 0.6.1-dev types this as a plain
+                        // `Vec<u8>` (it was `Base64UrlSafeData` in 0.6.0-dev).
+                        // The JSON wire form is unchanged: the field still
+                        // serializes as unpadded base64url via `serde_as`.
+                        id: bytes,
                         transports: None,
                     })
                 })
@@ -459,9 +464,7 @@ pub async fn verify_credential(
 
     match verify_webauthn_assertion(&params) {
         Ok(true) => {}
-        Ok(false) => {
-            return Err(anyhow!("WebAuthn assertion signature verification failed").into())
-        }
+        Ok(false) => return Err(anyhow!("WebAuthn assertion signature verification failed").into()),
         Err(e) => return Err(anyhow!("WebAuthn assertion verification error: {}", e).into()),
     }
 
@@ -492,8 +495,13 @@ pub async fn verify_credential(
     if auth_data.len() >= 37 {
         let new_counter =
             u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
-        let mut passkey_value: serde_json::Value = serde_json::from_str(&cred_json)
-            .map_err(|e| anyhow!("Failed to parse stored credential for counter update: {}", e))?;
+        let mut passkey_value: serde_json::Value =
+            serde_json::from_str(&cred_json).map_err(|e| {
+                anyhow!(
+                    "Failed to parse stored credential for counter update: {}",
+                    e
+                )
+            })?;
         if let Some(cred) = passkey_value.get_mut("cred") {
             let stored_counter = cred.get("counter").and_then(|c| c.as_u64()).unwrap_or(0) as u32;
             if (new_counter > 0 || stored_counter > 0) && new_counter < stored_counter {
@@ -743,6 +751,54 @@ mod tests {
         );
     }
 
+    /// The serialized `Passkey` blob written by webauthn-rs **0.6.0-dev** (the
+    /// version this crate ran before the `=0.6.1-dev` alignment) must still
+    /// deserialize under 0.6.1-dev, and must still derive the same
+    /// `did:key:zDn…`. That is what makes the credential store shareable with
+    /// aqua-auth/aqua-node/aquafier: a passkey registered by the old binary is
+    /// readable by the new one, and both agree on the identity it maps to.
+    ///
+    /// The fixture is a REAL blob, produced by a full `start_passkey_registration`
+    /// /`finish_passkey_registration` ceremony against a `webauthn-authenticator-rs`
+    /// SoftToken linked to webauthn-rs 0.6.0-dev, then copied verbatim. It closes the
+    /// positive-round-trip coverage gap noted on the test above without adding a
+    /// software-authenticator dependency to this crate.
+    #[test]
+    fn passkey_blob_from_webauthn_rs_060dev_still_deserializes_and_derives_same_did() {
+        const BLOB: &str = include_str!("../tests/fixtures/passkey_webauthn_rs_0_6_0_dev.json");
+        const EXPECTED_DID: &str = "did:key:zDnaebVfjz61NuRbnMfF2gA6NZM6DRWTeauDnFH1DhG2MFivF";
+        const EXPECTED_CRED_ID: &str = "437HJ4gJirHMj5bDSeoDN6ODix56R_i5GgCLhqF0L9I";
+
+        let passkey: Passkey = serde_json::from_str(BLOB)
+            .expect("a 0.6.0-dev Passkey blob must deserialize under the pinned webauthn-rs");
+
+        assert_eq!(
+            URL_SAFE_NO_PAD.encode(passkey.cred_id()),
+            EXPECTED_CRED_ID,
+            "credential id must be stable across the webauthn-rs bump"
+        );
+        assert_eq!(
+            did_from_passkey(&passkey).expect("P-256 passkey"),
+            EXPECTED_DID,
+            "did:key derivation must be stable across the webauthn-rs bump"
+        );
+        assert_eq!(
+            derive_did_from_credential_json(BLOB).as_deref(),
+            Some(EXPECTED_DID),
+            "the purge-path resolver must agree with did_from_passkey"
+        );
+
+        // Re-serializing must not rewrite the stored blob: the counter-update
+        // path in `verify_credential` writes the value back, so a serialization
+        // drift here would silently rewrite every credential on first login.
+        let reserialized = serde_json::to_string(&passkey).expect("serialize");
+        assert_eq!(
+            reserialized.trim(),
+            BLOB.trim(),
+            "re-serialization must be byte-identical to the 0.6.0-dev blob"
+        );
+    }
+
     /// H5 (graceful degradation): when no Synapse client is configured the
     /// account/QR flows cannot detect a new identity, so `reject_if_new_identity`
     /// is a strict no-op (returns Ok). Deterministic, no network: this is the
@@ -809,10 +865,9 @@ mod tests {
 
         // Drive authenticate_start with the resolved (None) scope: usernameless.
         let session_id = format!("forgedsess{nonce}");
-        let rcr =
-            authenticate_start(&cfg.webauthn, &redis, &session_id, scope_did.as_deref())
-                .await
-                .expect("authenticate_start must succeed");
+        let rcr = authenticate_start(&cfg.webauthn, &redis, &session_id, scope_did.as_deref())
+            .await
+            .expect("authenticate_start must succeed");
         assert!(
             rcr.public_key.allow_credentials.is_empty(),
             "forged cookie -> usernameless -> allowCredentials MUST be empty (no enumeration)"
@@ -839,11 +894,20 @@ mod tests {
         let did_b = format!("did:key:zDnB{nonce}");
         let cred_a = URL_SAFE_NO_PAD.encode(format!("credA-{nonce}").as_bytes());
         let cred_b = URL_SAFE_NO_PAD.encode(format!("credB-{nonce}").as_bytes());
-        redis.index_add_passkey(&did_a, &cred_a).await.expect("seed A");
-        redis.index_add_passkey(&did_b, &cred_b).await.expect("seed B");
+        redis
+            .index_add_passkey(&did_a, &cred_a)
+            .await
+            .expect("seed A");
+        redis
+            .index_add_passkey(&did_b, &cred_b)
+            .await
+            .expect("seed B");
 
         // Mint the opaque user-session the handler resolves from the siwx_user cookie.
-        let token = redis.create_user_session(&did_a).await.expect("mint session");
+        let token = redis
+            .create_user_session(&did_a)
+            .await
+            .expect("mint session");
         let scope_did = redis.lookup_user_session(&token).await.expect("lookup");
         assert_eq!(scope_did.as_deref(), Some(did_a.as_str()));
 
