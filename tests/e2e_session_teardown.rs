@@ -115,13 +115,18 @@ fn parse_query(url: &str) -> HashMap<String, String> {
 }
 
 /// Perform a full OIDC auth flow with the given key and return
-/// `(access_token, device_id)`. `device_id` is `None` if Matrix introspection
-/// is unavailable (then the Synapse-side assertions self-skip).
+/// `(access_token, device_id, whoami_status)`.
+///
+/// `device_id` is `None` whenever whoami did not return 200. The CALLER must
+/// decide what that means, which is why the raw status is returned alongside:
+/// only a 503 (introspection unreachable) is a legitimate environmental skip,
+/// while a 401/403/404/5xx is a real defect. Collapsing both into `None` is how
+/// a broken teardown path used to report itself as a pass.
 async fn login_with_key(
     signing_key: &SigningKey,
     address: &str,
     did: &str,
-) -> (String, Option<String>) {
+) -> (String, Option<String>, StatusCode) {
     let base = siweoidc_host();
     let http = Client::new();
 
@@ -269,14 +274,15 @@ async fn login_with_key(
         .send()
         .await
         .unwrap();
-    let device_id = if whoami_resp.status() == StatusCode::OK {
+    let whoami_status = whoami_resp.status();
+    let device_id = if whoami_status == StatusCode::OK {
         let wj: Value = whoami_resp.json().await.unwrap();
         wj["device_id"].as_str().map(|s| s.to_string())
     } else {
         None
     };
 
-    (access_token, device_id)
+    (access_token, device_id, whoami_status)
 }
 
 /// Fresh throwaway Ethereum identity.
@@ -333,6 +339,39 @@ async fn poll_whoami_rejected(token: &str) -> StatusCode {
 // H1: logout tears down the ending session's Synapse device + tokens
 // ---------------------------------------------------------------------------
 
+/// Decide what a missing Synapse device id MEANS, instead of silently passing.
+///
+/// A test that early-`return`s is reported by cargo as `ok` -- a green pass that
+/// asserted nothing, indistinguishable from a real one. Two rules make it honest:
+///
+///  * Only a 503 (Synapse cannot reach the siwx-oidc introspection endpoint) is a
+///    legitimate environmental skip. That is the documented rationale, and it is
+///    the condition the sibling suites (`e2e_device_code`, `e2e_msc3861`) actually
+///    guard on. ANY other non-200 -- 401/403/404/5xx -- means the login or teardown
+///    path is genuinely broken, and MUST fail rather than self-skip.
+///  * Even a legitimate skip is never silent: it prints an `E2E_SKIP:` marker the
+///    harness greps for, and under `E2E_STRICT_SKIPS=1` (the pipeline's strict
+///    mode) it panics outright.
+fn skip_or_fail(test: &str, whoami_status: StatusCode) {
+    assert_eq!(
+        whoami_status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{test}: no Synapse device id after a fresh login, and whoami returned {whoami_status}. \
+         Only 503 (introspection unreachable) is a legitimate skip; {whoami_status} means the \
+         login/teardown path is broken. Refusing to report this as a pass."
+    );
+
+    let marker = format!(
+        "E2E_SKIP: {test}: Matrix introspection unavailable (whoami 503); \
+         Synapse-side assertions NOT exercised"
+    );
+    assert!(
+        std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+        "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure, not a pass"
+    );
+    eprintln!("{marker}");
+}
+
 /// After `POST /_matrix/client/v3/logout` with the session's bearer token, the
 /// token must no longer authenticate against Matrix (the Synapse device for the
 /// ending session was deleted and the OAuth tokens revoked). One-time deletion
@@ -344,11 +383,11 @@ async fn logout_deletes_ending_session_device() {
     let http = Client::new();
 
     let (key, address, did) = fresh_identity();
-    let (token, device_id) = login_with_key(&key, &address, &did).await;
+    let (token, device_id, whoami_st) = login_with_key(&key, &address, &did).await;
     eprintln!("[e2e] logged in: device={:?}", device_id);
 
     if device_id.is_none() {
-        eprintln!("[e2e] Matrix introspection unavailable; skipping Synapse-side assertion.");
+        skip_or_fail("logout_deletes_ending_session_device", whoami_st);
         return;
     }
     assert_eq!(
@@ -388,9 +427,9 @@ async fn revoke_deletes_session_device() {
     let http = Client::new();
 
     let (key, address, did) = fresh_identity();
-    let (token, device_id) = login_with_key(&key, &address, &did).await;
+    let (token, device_id, whoami_st) = login_with_key(&key, &address, &did).await;
     if device_id.is_none() {
-        eprintln!("[e2e] Matrix introspection unavailable; skipping Synapse-side assertion.");
+        skip_or_fail("revoke_deletes_session_device", whoami_st);
         return;
     }
 
@@ -428,8 +467,8 @@ async fn logout_all_invalidates_all_sessions_without_deactivating() {
 
     // Same identity, two independent sessions (two devices).
     let (key, address, did) = fresh_identity();
-    let (token1, device1) = login_with_key(&key, &address, &did).await;
-    let (token2, device2) = login_with_key(&key, &address, &did).await;
+    let (token1, device1, whoami_st1) = login_with_key(&key, &address, &did).await;
+    let (token2, device2, whoami_st2) = login_with_key(&key, &address, &did).await;
     eprintln!("[e2e] two sessions: d1={:?} d2={:?}", device1, device2);
 
     // Route-wiring assertion works even without a healthy introspection path:
@@ -448,7 +487,8 @@ async fn logout_all_invalidates_all_sessions_without_deactivating() {
     assert_eq!(bulk.status(), StatusCode::OK, "logout/all must return 200");
 
     if device1.is_none() || device2.is_none() {
-        eprintln!("[e2e] Matrix introspection unavailable; skipping Synapse-side assertions.");
+        let st = if device1.is_none() { whoami_st1 } else { whoami_st2 };
+        skip_or_fail("logout_all_invalidates_all_sessions_without_deactivating", st);
         return;
     }
 
@@ -466,7 +506,7 @@ async fn logout_all_invalidates_all_sessions_without_deactivating() {
 
     // The account must remain ACTIVE: a fresh sign-in with the same identity
     // must still succeed (logout/all must never deactivate).
-    let (token3, _device3) = login_with_key(&key, &address, &did).await;
+    let (token3, _device3, _whoami_st3) = login_with_key(&key, &address, &did).await;
     assert!(
         token3.starts_with("mat_"),
         "the account must stay active: re-login after logout/all must succeed"
