@@ -53,6 +53,20 @@ pub struct Config {
     /// When absent, defaults to `{base_url}/account`.
     /// Env: `SIWEOIDC_ACCOUNT_MANAGEMENT_URI`
     pub account_management_uri: Option<Url>,
+    /// Lifetime, in seconds, of an admin-scoped token minted at
+    /// `POST /oauth2/admin_token`.
+    ///
+    /// Clamped in code to `admin_token::ADMIN_TOKEN_TTL_MIN..=ADMIN_TOKEN_TTL_MAX`
+    /// — the configured value cannot promote the mint into a long-lived standing
+    /// admin credential. Default: 300 (5 minutes).
+    /// Env: `SIWEOIDC_ADMIN_TOKEN_TTL_SECS`
+    pub admin_token_ttl_secs: u64,
+    /// Localpart of the Synapse service user that admin-scoped tokens are bound
+    /// to. Synapse 1.159 resolves the introspected `username` against its own
+    /// `users` table, so this account is auto-provisioned (idempotently) on the
+    /// first mint. Default: `siwx-admin`.
+    /// Env: `SIWEOIDC_ADMIN_TOKEN_LOCALPART`
+    pub admin_token_localpart: String,
 }
 
 impl Default for Config {
@@ -81,6 +95,8 @@ impl Default for Config {
             log_format: "pretty".to_string(),
             matrix_server_name: None,
             account_management_uri: None,
+            admin_token_ttl_secs: 300,
+            admin_token_localpart: "siwx-admin".to_string(),
         }
     }
 }

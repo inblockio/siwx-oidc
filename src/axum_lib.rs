@@ -35,6 +35,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 use webauthn_rs::prelude::*;
 
 use super::account;
+use super::admin_token;
 use super::compat;
 use super::config;
 use super::device_auth;
@@ -71,6 +72,39 @@ impl From<&AppState> for IntrospectState {
         Self {
             mas_shared_secret: state.config.mas_shared_secret.clone(),
             redis_client: state.redis_client.clone(),
+        }
+    }
+}
+
+/// State subset exposed to the admin-token mint endpoint.
+///
+/// Carries a Synapse client because the mint is only meaningful when the token
+/// can be bound to an existing Synapse user — see [`crate::admin_token`].
+#[derive(Clone)]
+pub struct AdminTokenState {
+    pub mas_shared_secret: Option<String>,
+    pub redis_client: RedisClient,
+    pub synapse_client: Option<Arc<SynapseClient>>,
+    /// Localpart the minted token's `username` claim resolves to.
+    pub admin_localpart: String,
+    /// Already clamped to the permitted window at construction.
+    pub admin_token_ttl_secs: u64,
+    pub server_name: Option<String>,
+}
+
+impl From<&AppState> for AdminTokenState {
+    fn from(state: &AppState) -> Self {
+        Self {
+            mas_shared_secret: state.config.mas_shared_secret.clone(),
+            redis_client: state.redis_client.clone(),
+            synapse_client: state.synapse_client.clone(),
+            admin_localpart: state.config.admin_token_localpart.clone(),
+            // Clamped HERE, once, at construction, so no request path can ever
+            // observe an out-of-window TTL.
+            admin_token_ttl_secs: admin_token::clamp_admin_token_ttl(
+                state.config.admin_token_ttl_secs,
+            ),
+            server_name: state.config.matrix_server_name.clone(),
         }
     }
 }
@@ -1183,6 +1217,7 @@ pub async fn main() {
     };
 
     let introspect_state = IntrospectState::from(&state);
+    let admin_token_state = AdminTokenState::from(&state);
     let compat_state = compat::CompatState {
         redis_client: state.redis_client.clone(),
         synapse_client: state.synapse_client.clone(),
@@ -1250,6 +1285,14 @@ pub async fn main() {
         .route(
             "/oauth2/introspect",
             post(introspect::introspect).with_state(introspect_state),
+        )
+        // Admin-scoped token mint (Synapse 1.157+ dropped the `admin_token`
+        // shim, so `/_synapse/admin/*` is reachable only via a token whose
+        // introspected scope carries `urn:synapse:admin:*`). Shared-secret
+        // authenticated, same secret as introspection.
+        .route(
+            "/oauth2/admin_token",
+            post(admin_token::admin_token).with_state(admin_token_state),
         )
         // MSC3861 compat endpoints — revocation + Matrix legacy login/logout/refresh
         .route(

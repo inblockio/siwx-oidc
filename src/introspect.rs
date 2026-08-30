@@ -37,6 +37,18 @@ pub fn generate_opaque_token(prefix: &str) -> String {
     format!("{}{}", prefix, random)
 }
 
+/// Constant-time comparison of a caller-presented secret against the configured
+/// MAS shared secret.
+///
+/// Length is compared first because `ct_eq` requires equal-length inputs; the
+/// length of a shared secret is not itself a secret. Shared with
+/// [`crate::admin_token`] so both shared-secret-authenticated endpoints
+/// authenticate identically and neither can drift into a short-circuiting
+/// `==` comparison.
+pub fn verify_shared_secret(provided: &[u8], expected: &[u8]) -> bool {
+    provided.len() == expected.len() && bool::from(provided.ct_eq(expected))
+}
+
 /// Form body for the introspection request.
 #[derive(Deserialize)]
 pub struct IntrospectForm {
@@ -85,7 +97,7 @@ pub async fn introspect(
     };
 
     let expected = secret.as_bytes();
-    if provided.len() != expected.len() || !bool::from(provided.ct_eq(expected)) {
+    if !verify_shared_secret(provided, expected) {
         warn!("introspect: invalid shared secret");
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -122,10 +134,24 @@ fn render_introspection(
     };
 
     match metadata {
-        Some(m) if m.exp > now => Ok(Json(serde_json::json!({
+        Some(m) if m.exp > now => {
+            // An EMPTY device_id must be rendered as JSON `null`, not `""`.
+            // Synapse 1.159 (`synapse/api/auth/mas.py`) treats a present-but-empty
+            // `device_id` as a zero-length device id and raises
+            // `AuthError(500, "Invalid device ID in introspection result")`; only
+            // `null`/absent means "this token has no device". Deviceless tokens
+            // are the admin tokens minted by `crate::admin_token` and the
+            // standalone-mode tokens (which no Synapse introspects, but which
+            // would otherwise be a latent 500 the day one does).
+            let device_id = if m.device_id.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(m.device_id.clone())
+            };
+            Ok(Json(serde_json::json!({
             "active": true,
             "username": m.username,
-            "device_id": m.device_id,
+            "device_id": device_id,
             "scope": m.scope,
             "sub": m.did,
             "name": m.name,
@@ -134,7 +160,8 @@ fn render_introspection(
             "exp": m.exp,
             "expires_in": m.exp - now,
             "iat": m.iat,
-        }))),
+            })))
+        }
         // A genuinely absent or expired token IS inactive. This is the only path
         // allowed to produce `active:false`.
         _ => Ok(Json(serde_json::json!({"active": false}))),

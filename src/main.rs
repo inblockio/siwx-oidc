@@ -3,6 +3,7 @@
 // that dev-staging's pull-model timer converges onto it. See
 // siwx-oidc-matrix-server's docs/2026-07-30-dev-staging-dev-aquafire.md §9.
 mod account;
+mod admin_token;
 mod axum_lib;
 mod compat;
 mod config;

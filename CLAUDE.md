@@ -24,6 +24,9 @@ src/                                ← Axum OIDC server (binary)
                                      device_view, device_delete, cross_signing_reset + session_* aliases).
                                      SUPPORTED_ACTIONS is the single source of truth (drives discovery +
                                      dispatch); canonical_action() normalizes session_*→device_*.
+  admin_token.rs                     POST /oauth2/admin_token: mints a short-TTL token whose introspected
+                                     scope carries `urn:synapse:admin:*`, the ONLY way to reach
+                                     /_synapse/admin/* on Synapse 1.157+ (the `admin_token` shim is gone)
   synapse_client.rs                  Synapse MAS + admin-API client: provision/upsert/cross_signing_reset,
                                      and list_devices/get_device/delete_device (admin_token = MAS secret).
   webauthn.rs                        WebAuthn ceremony: register + discoverable authenticate
@@ -92,6 +95,49 @@ No `inventory` crate (WASM-unsafe).
 2. Device polls `POST /token` with `grant_type=urn:ietf:params:oauth:grant-type:device_code`
 3. User opens `/device?user_code=XXX-XXX`, authenticates with wallet/passkey
 4. Approval updates device code status → next poll returns tokens + provisions Synapse device
+
+## Admin-scoped token mint (`POST /oauth2/admin_token`)
+
+**Why:** Synapse 1.157 **deleted** the `admin_token` shim that let siwx-oidc call
+`/_synapse/admin/*` by presenting the MAS shared secret. On 1.157+ the shared secret
+is honoured **only** on `/_synapse/mas/*`; every `/_synapse/admin/*` route answers
+`401 M_UNKNOWN_TOKEN`. (Still true on the currently-deployed 1.154, where the shim
+exists — the statements elsewhere in this file about `admin_token` = MAS secret
+describe 1.154 and become false the moment the 1.159 migration lands.)
+
+**How:** `is_server_admin()` in Synapse 1.159 is literally
+`"urn:synapse:admin:*" in requester.scope`, and that scope comes verbatim from
+siwx-oidc's own introspection response. So the provider mints itself a credential.
+
+```bash
+curl -sS -X POST "$OIDC/oauth2/admin_token" -H "Authorization: Bearer $MAS_SHARED_SECRET"
+# {"access_token":"msa_…","token_type":"Bearer","expires_in":300,
+#  "scope":"urn:matrix:client:api:* urn:synapse:admin:*","user_id":"@siwx-admin:localhost"}
+```
+
+**Non-obvious constraints (all verified against the 1.159.0 source of
+`MasDelegatedAuth::get_user_by_access_token`, and pinned by unit tests):**
+
+- The scope must carry **both** `urn:matrix:client:api:*` and `urn:synapse:admin:*`.
+  The C-S API scope is checked *first*; an admin-only scope is rejected outright.
+- `username` must resolve to an **existing** Synapse user row, so the mint
+  idempotently provisions `SIWEOIDC_ADMIN_TOKEN_LOCALPART` (default `siwx-admin`)
+  before issuing. **This creates a real Matrix account on the homeserver.**
+- `device_id` must be **`null`**, not `""` — an empty string is a zero-length device
+  id to Synapse and raises `AuthError(500, "Invalid device ID")`. `introspect` now
+  renders an empty `device_id` as JSON `null` for exactly this reason.
+- Because Synapse demands the C-S API scope, the admin token can also act **as
+  `@siwx-admin`** on the ordinary client API. That is inherent to the mechanism, and
+  is the reason for the short TTL.
+
+**Lifetime:** minted on demand, TTL clamped **in code** to 30..=900s
+(`admin_token::clamp_admin_token_ttl`), so a large `SIWEOIDC_ADMIN_TOKEN_TTL_SECS`
+cannot promote this into a standing admin key. Never put a long-lived admin
+credential in `.env`.
+
+**Caller caveat:** Synapse caches an introspection result for **2 minutes with no
+invalidation**, so a token can keep working *at Synapse* past its own expiry. Our
+introspection response is the authority; never infer validity from Synapse.
 
 ## Token model
 
@@ -261,6 +307,8 @@ Prefix: `SIWEOIDC_` (via Figment: `siwe-oidc.toml` or env vars)
 | `SIWEOIDC_LOG_FORMAT` | Log output format | `pretty` (or `json`) |
 | `SIWEOIDC_MATRIX_SERVER_NAME` | Matrix server_name for cross-signing checks | (none) |
 | `SIWEOIDC_ACCOUNT_MANAGEMENT_URI` | MSC4191 account management URL (override) | `{base_url}/account` |
+| `SIWEOIDC_ADMIN_TOKEN_TTL_SECS` | Lifetime of a minted admin-scoped token. Clamped in code to 30..=900 | `300` |
+| `SIWEOIDC_ADMIN_TOKEN_LOCALPART` | Synapse localpart admin tokens are bound to (auto-provisioned) | `siwx-admin` |
 
 **For passkey login:** add `"key"` to `SIWEOIDC_SUPPORTED_DID_METHODS` so the `did:key:zDn…`
 DIDs derived from passkeys are accepted by `sign_in`.
