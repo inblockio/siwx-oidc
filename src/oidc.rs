@@ -1874,6 +1874,15 @@ pub async fn sign_in(
         siwx_cookie.did
     };
 
+    // Deactivation gate. Synapse's delegated-auth path never checks
+    // `users.deactivated` (zero references in `api/auth/mas.py`, 1.159.0) — it
+    // trusts our introspection — and `is_localpart_available` reports a
+    // deactivated user's localpart as *taken*, so without this a deactivated or
+    // erased account signed straight back in and got a full session. Placed
+    // after the DID is proven but BEFORE `provision_synapse_device`, so a
+    // rejected sign-in leaves no Synapse state behind.
+    crate::webauthn::reject_if_deactivated(synapse_client, &did).await?;
+
     // C2 Step 3: re-validate the request redirect_uri against the client's
     // registered set before issuing the code. `authorize` checks this, but
     // `sign_in` re-receives `redirect_uri` as a query param and previously

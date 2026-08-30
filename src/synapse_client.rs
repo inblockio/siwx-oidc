@@ -10,7 +10,7 @@
 //!
 //! | Surface | Auth | Calls |
 //! |---|---|---|
-//! | `/_synapse/mas/*` | `Authorization: Bearer {shared_secret}`, compared for **exact string equality** against `matrix_authentication_service.secret` | `provision_user`, `upsert_device`, `allow_cross_signing_reset`, `is_localpart_available`, `delete_device`, `deactivate_user`, `reactivate_user` |
+//! | `/_synapse/mas/*` | `Authorization: Bearer {shared_secret}`, compared for **exact string equality** against `matrix_authentication_service.secret` | `provision_user`, `upsert_device`, `allow_cross_signing_reset`, `is_localpart_available`, `query_user`, `delete_device`, `deactivate_user`, `reactivate_user` |
 //! | `/_synapse/admin/*` and the authenticated C-S API | a **minted, admin-scoped access token** ([`crate::admin_token`]) | `list_devices`, `get_device`, `has_cross_signing_keys` |
 //!
 //! Presenting the shared secret on the second surface answers **401
@@ -38,6 +38,29 @@ use siwx_oidc::db::{DBClient, RedisClient};
 
 use crate::admin_token::{admin_token_metadata, ADMIN_DISPLAY_NAME, ADMIN_TOKEN_PREFIX};
 use crate::introspect::generate_opaque_token;
+
+/// A user's account status as reported by the MAS query endpoint.
+///
+/// Mirrors `MasQueryUserResource.Response` in
+/// `synapse/rest/synapse/mas/users.py` (verified against 1.159.0). Every field
+/// past `user_id` is `#[serde(default)]` so a future Synapse that adds or drops
+/// an optional field cannot turn this into a hard parse error on a security
+/// gate path.
+// Fields beyond `is_deactivated` are parsed for wire fidelity and future use
+// (a suspension policy would key on `is_suspended`); they document the contract.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct MasUserInfo {
+    pub user_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+    #[serde(default)]
+    pub is_suspended: bool,
+    #[serde(default)]
+    pub is_deactivated: bool,
+}
 
 /// A user's device/session as reported by Synapse's admin API.
 ///
@@ -439,6 +462,51 @@ impl SynapseClient {
         let body = resp.text().await.unwrap_or_default();
         warn!(%status, %body, "is_localpart_available: unexpected response");
         anyhow::bail!("is_localpart_available: HTTP {status}");
+    }
+
+    /// A user's account status from the MAS query endpoint
+    /// (`GET /_synapse/mas/query_user?localpart=…`,
+    /// `synapse/rest/synapse/mas/users.py::MasQueryUserResource`).
+    ///
+    /// `Ok(None)` means Synapse answered **404 "User not found"** — the account
+    /// does not exist. That is the *new identity* case, which
+    /// [`crate::webauthn::reject_if_new_identity`] owns; this method deliberately
+    /// does not conflate it with a deactivated account.
+    ///
+    /// Note the response also carries `is_suspended`. Suspension is NOT a login
+    /// gate in Synapse (a suspended user may authenticate but not act), so
+    /// [`crate::webauthn::reject_if_deactivated`] keys on `is_deactivated` only.
+    /// The field is parsed so a future suspension policy has it available.
+    pub async fn query_user(&self, localpart: &str) -> Result<Option<MasUserInfo>> {
+        let url = format!(
+            "{}/_synapse/mas/query_user?localpart={}",
+            self.endpoint,
+            urlencoding::encode(localpart)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.shared_secret)
+            .send()
+            .await
+            .context("query_user: request failed")?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(%status, %body, "query_user: unexpected response");
+            anyhow::bail!("query_user: HTTP {status}{}", mas_status_hint(status));
+        }
+
+        let info: MasUserInfo = resp
+            .json()
+            .await
+            .context("query_user: could not parse response")?;
+        Ok(Some(info))
     }
 
     /// Check whether a user's Synapse **profile row** exists

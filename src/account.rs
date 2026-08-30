@@ -821,6 +821,16 @@ pub async fn account_wallet(
     // account is REJECTED here (nothing is provisioned). No-op when the DID
     // already has an account or when no Synapse client is configured.
     wa::reject_if_new_identity(synapse_client, &req.did).await?;
+    // The account page re-authenticates directly (it does not require a prior
+    // login), so a deactivated user can still reach it — the deactivation gate
+    // therefore applies here too, or the sign-in fix would just move rather than
+    // close. ONE deliberate exemption: `Reactivate` is the documented, auditable
+    // way back from an `erase:false` deactivation, and gating it would make
+    // self-service reactivation impossible. An erased account cannot be restored
+    // regardless: Synapse refuses, and `reactivate_user` surfaces that.
+    if !matches!(action, Action::Reactivate) {
+        wa::reject_if_deactivated(synapse_client, &req.did).await?;
+    }
 
     let outcome = execute_action(
         action,
@@ -875,6 +885,16 @@ pub async fn account_passkey_finish(
     // with no Synapse account is REJECTED here (nothing is provisioned). No-op when
     // the DID already has an account or when no Synapse client is configured.
     wa::reject_if_new_identity(synapse_client, &resp.did).await?;
+    // The account page re-authenticates directly (it does not require a prior
+    // login), so a deactivated user can still reach it — the deactivation gate
+    // therefore applies here too, or the sign-in fix would just move rather than
+    // close. ONE deliberate exemption: `Reactivate` is the documented, auditable
+    // way back from an `erase:false` deactivation, and gating it would make
+    // self-service reactivation impossible. An erased account cannot be restored
+    // regardless: Synapse refuses, and `reactivate_user` surfaces that.
+    if !matches!(action, Action::Reactivate) {
+        wa::reject_if_deactivated(synapse_client, &resp.did).await?;
+    }
 
     let outcome = execute_action(
         action,

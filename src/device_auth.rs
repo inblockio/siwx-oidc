@@ -1019,6 +1019,8 @@ pub async fn device_approve(
     // entry.did is set/persisted, so the token grant never provisions one. No-op when
     // the DID already has an account or when no Synapse client is configured.
     crate::webauthn::reject_if_new_identity(synapse_client, did).await?;
+    // A deactivated account must not be able to approve a new device login.
+    crate::webauthn::reject_if_deactivated(synapse_client, did).await?;
 
     // Cross-signing readiness is enforced by Element Web's force-first-device-recovery
     // patch. The old approval-time keys/query check raced the client's first-time
@@ -1062,6 +1064,8 @@ pub async fn device_approve_passkey(
     // entry.did is set/persisted, so the token grant never provisions one. No-op when
     // the DID already has an account or when no Synapse client is configured.
     crate::webauthn::reject_if_new_identity(synapse_client, verified_did).await?;
+    // A deactivated account must not be able to approve a new device login.
+    crate::webauthn::reject_if_deactivated(synapse_client, verified_did).await?;
 
     // See device_approve: the racy approval-time cross-signing check was removed
     // (false-positive "no Secure Backup" warning). Element Web enforces the real

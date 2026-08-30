@@ -148,6 +148,72 @@ pub async fn reject_if_new_identity(
     }
 }
 
+/// The error message returned by every server-enforced deactivated-account
+/// reject. Deliberately does NOT distinguish "deactivated" from "erased" to the
+/// caller: both mean the same thing to the person at the keyboard, and Synapse
+/// reports them identically (`is_deactivated == true`) anyway.
+pub const DEACTIVATED_REJECT_MSG: &str = "This account has been deactivated and cannot sign in. \
+     Contact a server administrator if you believe this is a mistake.";
+
+/// Server-enforced reject for a **deactivated** account.
+///
+/// # Why this exists
+///
+/// Deactivation was enforceable nowhere before this gate. Synapse's delegated
+/// auth path (`synapse/api/auth/mas.py`, 1.159.0) contains **zero** references
+/// to `deactivated` — under MSC3861 Synapse does not own the tokens, so it
+/// trusts our introspection response and never consults `users.deactivated`.
+/// On our side the Redis tombstone (`DBClient::is_user_deactivated`) is a
+/// bounded-TTL race guard for the refresh/mint path (S3-4 / H6), not a durable
+/// authority, and nothing consulted it at sign-in. The net effect was that
+/// `account_deactivate` and `account_erase` were undone by simply signing in
+/// again: `is_localpart_available` reports a deactivated user's localpart as
+/// *taken*, so the new-identity gate classified them as a normal returning
+/// account and issued a full session.
+///
+/// Synapse is therefore the authority here, via
+/// [`SynapseClient::query_user`](crate::synapse_client::SynapseClient::query_user).
+///
+/// # Semantics
+///
+/// * `synapse == None` — no-op. Standalone deployments have no account to
+///   deactivate, and this must never 500 a working standalone login.
+/// * account exists and `is_deactivated == true` — `Unauthorized`.
+/// * account exists and `is_deactivated == false` — `Ok(())`.
+/// * account does **not** exist (`query_user` → `None`) — `Ok(())`. That is the
+///   new-identity case and belongs to [`reject_if_new_identity`]; conflating the
+///   two here would break first-time sign-in, which is legitimate at the login
+///   screen.
+/// * probe failed — **fails closed** with the same message, matching
+///   [`reject_if_new_identity`]. A Synapse outage must not silently re-open
+///   access to deactivated accounts.
+pub async fn reject_if_deactivated(
+    synapse: Option<&crate::synapse_client::SynapseClient>,
+    did: &str,
+) -> Result<(), crate::oidc::CustomError> {
+    let synapse = match synapse {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    let localpart = crate::oidc::did_to_localpart(did);
+    match synapse.query_user(&localpart).await {
+        Ok(Some(info)) if info.is_deactivated => {
+            info!(did = %did, "rejecting sign-in for deactivated account");
+            Err(crate::oidc::CustomError::Unauthorized(
+                DEACTIVATED_REJECT_MSG.to_string(),
+            ))
+        }
+        // Active account, or no account at all (the new-identity case).
+        Ok(_) => Ok(()),
+        Err(e) => {
+            warn!(did = %did, "deactivation probe failed, rejecting to avoid reviving a deactivated account: {}", e);
+            Err(crate::oidc::CustomError::Unauthorized(
+                DEACTIVATED_REJECT_MSG.to_string(),
+            ))
+        }
+    }
+}
+
 // -- Request/response types for the HTTP API --
 
 #[derive(Deserialize)]
@@ -775,6 +841,70 @@ mod tests {
             }
             other => panic!("expected BadRequest, got {:?}", other),
         }
+    }
+
+    /// Graceful degradation, mirroring `reject_if_new_identity_is_noop_without_synapse`:
+    /// a standalone deployment has no Synapse account to deactivate, so the gate
+    /// must be a strict no-op rather than failing closed and breaking every login.
+    #[tokio::test]
+    async fn reject_if_deactivated_is_noop_without_synapse() {
+        assert!(
+            reject_if_deactivated(None, "did:key:zDnANYTHING")
+                .await
+                .is_ok(),
+            "no Synapse client must be a no-op (cannot detect, do not reject)"
+        );
+    }
+
+    /// Fail-closed: a present-but-UNREACHABLE Synapse is a detection failure. It
+    /// must NOT fall through to a working session — that is exactly the bypass
+    /// this gate exists to close, and a Synapse outage is the moment it would
+    /// matter most. Unlike the new-identity gate this surfaces `Unauthorized`,
+    /// because the semantic is "you may not sign in", not "your request was bad".
+    #[tokio::test]
+    async fn reject_if_deactivated_fails_closed_on_synapse_error() {
+        // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): guaranteed non-routable.
+        let synapse = crate::synapse_client::SynapseClient::new("http://192.0.2.1:1", "secret");
+        let err = reject_if_deactivated(Some(&synapse), "did:key:zDnUNREACHABLE")
+            .await
+            .expect_err("probe failure must reject, not revive a deactivated account");
+        match err {
+            crate::oidc::CustomError::Unauthorized(msg) => {
+                assert_eq!(msg, DEACTIVATED_REJECT_MSG);
+            }
+            other => panic!("expected Unauthorized, got {:?}", other),
+        }
+    }
+
+    /// The gate reads exactly one field off the MAS wire, so pin the shape of
+    /// `MasQueryUserResource.Response` (synapse 1.159.0). Two properties matter:
+    /// an ACTIVE user must parse to `is_deactivated == false` (a parse that
+    /// defaulted the wrong way would silently lock every user out), and an
+    /// unknown extra field must not break parsing on a security path.
+    #[test]
+    fn mas_user_info_parses_the_synapse_wire_shape() {
+        use crate::synapse_client::MasUserInfo;
+
+        let active: MasUserInfo = serde_json::from_str(
+            r#"{"user_id":"@alice:example.org","display_name":"Alice","avatar_url":null,
+                 "is_suspended":false,"is_deactivated":false}"#,
+        )
+        .expect("active user must parse");
+        assert!(
+            !active.is_deactivated,
+            "active user must not read as deactivated"
+        );
+        assert_eq!(active.user_id, "@alice:example.org");
+
+        let gone: MasUserInfo = serde_json::from_str(
+            r#"{"user_id":"@bob:example.org","display_name":null,"avatar_url":null,
+                 "is_suspended":false,"is_deactivated":true,"future_field":42}"#,
+        )
+        .expect("unknown fields must not break a security-gate parse");
+        assert!(
+            gone.is_deactivated,
+            "deactivated user must read as deactivated"
+        );
     }
 
     /// H2 (enumeration-safety): a FORGED `siwx_user` cookie token is a Redis miss,
