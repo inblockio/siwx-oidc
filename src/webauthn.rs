@@ -22,8 +22,12 @@ use siwx_oidc::db::RedisClient;
 // -- Redis key prefixes for WebAuthn state --
 
 const CHALLENGE_PREFIX: &str = "webauthn:challenge";
-const CREDENTIAL_PREFIX: &str = "webauthn:credential";
-const LINK_PREFIX: &str = "webauthn:link";
+const CREDENTIAL_PREFIX: &str = siwx_oidc::db::KV_WEBAUTHN_CREDENTIAL_PREFIX;
+// The same constant the library's credential-identity resolver and the backfill
+// read, so a reader and this writer cannot drift onto different key spellings.
+// Ownership of the namespace is unchanged: `link_finish` is still the only
+// writer.
+const LINK_PREFIX: &str = siwx_oidc::db::KV_WEBAUTHN_LINK_PREFIX;
 const LINK_CHALLENGE_PREFIX: &str = "webauthn:link_challenge";
 const CHALLENGE_TTL: u64 = 120; // 2 min
 
@@ -475,21 +479,19 @@ pub async fn verify_credential(
 
     let passkey_did = did_from_passkey(&passkey)?;
 
-    let did = match redis
-        .get_raw(&format!("{}/{}", LINK_PREFIX, cred_id_b64))
-        .await?
-    {
-        Some(link_json) => {
-            let link_entry: LinkEntry = serde_json::from_str(&link_json)
-                .map_err(|e| anyhow!("Failed to deserialize link entry: {}", e))?;
-            info!(
-                "webauthn verify_credential: linked cred={} primary_did={}",
-                cred_id_b64, link_entry.primary_did
-            );
-            link_entry.primary_did
-        }
-        None => passkey_did,
-    };
+    // A `webauthn:link` entry OVERRIDES the DID derived from the passkey. That
+    // rule now lives in one place, `credential_identity`, because the
+    // credential-store backfill has to reproduce it exactly: if the two ever
+    // disagreed, every linked credential would be stored under one principal and
+    // authenticate as another. Read-only; linking is still written only by
+    // `link_finish` below.
+    let did = siwx_oidc::credential_identity::resolve_credential_identity(
+        redis,
+        &cred_id_b64,
+        &passkey_did,
+    )
+    .await?
+    .did;
 
     let auth_data = &*auth_response.response.authenticator_data;
     if auth_data.len() >= 37 {

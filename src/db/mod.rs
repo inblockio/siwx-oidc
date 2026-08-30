@@ -45,6 +45,23 @@ pub const SESSION_COOKIE_NAME: &str = "session";
 /// missing/stale index, so the index never becomes load-bearing for correctness.
 pub const KV_WEBAUTHN_BY_DID_PREFIX: &str = "webauthn:by_did";
 
+/// Redis key prefix for a stored passkey credential:
+/// `webauthn:credential/{cred_id_b64}` -> the raw serialized `webauthn_rs::Passkey`
+/// JSON. Written by `register_finish`/`link_finish` and rewritten on every login
+/// (the sign counter lives INSIDE this blob, at `cred.counter`).
+pub const KV_WEBAUTHN_CREDENTIAL_PREFIX: &str = "webauthn:credential";
+
+/// Redis key prefix for an account link: `webauthn:link/{cred_id_b64}` -> a JSON
+/// `{ primary_did, label }`. Owned and written by the binary's account-linking
+/// ceremony (`link_start`/`link_finish`); nothing else may write it.
+///
+/// It is declared here because it is part of the credential **read** path, not
+/// because ownership moves: a link OVERRIDES the DID derived from the passkey, so
+/// any reader that resolves a credential's identity has to consult it or it will
+/// silently attribute a linked credential to the wrong principal. Reading is not
+/// owning. See [`crate::credential_migration`].
+pub const KV_WEBAUTHN_LINK_PREFIX: &str = "webauthn:link";
+
 /// Redis key prefix for the opaque login user-session: `user:session/{token}` ->
 /// DID. The token is the identity hint that scopes the passkey picker's
 /// `allowCredentials` on a returning login. It is an OPAQUE random token (never a
@@ -211,7 +228,10 @@ mod revocation_policy_tests {
             collapse_revocation(Ok(false), err()),
             RevocationState::Indeterminate
         );
-        assert_eq!(collapse_revocation(err(), err()), RevocationState::Indeterminate);
+        assert_eq!(
+            collapse_revocation(err(), err()),
+            RevocationState::Indeterminate
+        );
     }
 
     #[test]

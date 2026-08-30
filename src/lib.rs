@@ -1,5 +1,13 @@
 pub mod db;
 
+/// The link-aware rule for which identity a stored passkey authenticates. Shared
+/// by the login path and the credential-store backfill.
+pub mod credential_identity;
+
+/// Additive backfill of the passkey credentials into aqua-auth's credential
+/// store.
+pub mod credential_migration;
+
 // `synapse_client` is DELIBERATELY not re-exposed here.
 //
 // It used to be `pub mod synapse_client;`, which compiled the same file into
