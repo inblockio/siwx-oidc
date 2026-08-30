@@ -51,16 +51,27 @@ ssh deploy@142.93.168.4 "
 "
 ```
 
-## 4. MSC3861 auth_metadata guard
+## 4. auth_metadata guard
 
-Synapse forwards `experimental_features.msc3861.issuer_metadata` VERBATIM to
-browsers via `GET /_matrix/client/v1/auth_metadata`; if it is missing capability
-fields (`response_types_supported`, `grant_types_supported`,
+Synapse republishes siwx-oidc's OIDC metadata to browsers via
+`GET /_matrix/client/v1/auth_metadata`. If it is missing capability fields
+(`response_types_supported`, `grant_types_supported`,
 `code_challenge_methods_supported`) or contains non-public endpoint URLs,
 matrix-js-sdk rejects the issuer and Element Web silently falls back to the
-legacy `/login/sso/redirect` route. That route 404s under MSC3861 (siwx-oidc
-has no MAS compat shim), so any auth_metadata regression is a total, silent
-login dead-end — this check fails loudly instead.
+legacy `/login/sso/redirect` route. That route 404s under delegated auth
+(siwx-oidc has no MAS compat shim), so any auth_metadata regression is a total,
+silent login dead-end — this check fails loudly instead.
+
+**Where that metadata comes from is version-dependent** — it changes what you fix
+when the check fails:
+
+| Synapse | Source of `auth_metadata` |
+|---|---|
+| >= 1.157 (dev-staging 1.159.0) | **Fetched live over HTTP** from `matrix_authentication_service.endpoint`. `api/auth/mas.py::auth_metadata()` is `self._server_metadata.get()` -> `get_json(self._metadata_url)`. There is no `issuer_metadata` config key; grep of the 1.159.0 tree finds zero occurrences. Fix regressions in **siwx-oidc's `/.well-known/openid-configuration`**, then let Synapse's metadata cache expire. |
+| <= 1.156 (prod today 1.154.0) | Forwarded **verbatim** from the `experimental_features.msc3861.issuer_metadata` config blob, when set. Fix regressions in the **homeserver.yaml blob**. |
+
+Either way the guard script below asserts the same public contract, so it is valid
+against both deployments.
 
 ```bash
 scripts/check-auth-metadata.sh https://matrix.inblock.io https://siwx-oidc.inblock.io/

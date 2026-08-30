@@ -51,23 +51,81 @@ Element X (mobile)                    Element Web (desktop, logged in)
 |-------|----------|---------|--------|
 | Transport | MSC4108 rendezvous (2024 version) | Encrypted device-to-device relay via Synapse | Built into Synapse >= 1.106.0 |
 | Auth | RFC 8628 / MSC4341 | Device Authorization Grant | Implemented in siwx-oidc |
-| Tokens | MSC3861 | OIDC delegated auth, token introspection | Already implemented |
+| Tokens | OIDC delegated auth (`matrix_authentication_service` on Synapse >= 1.157; `experimental_features.msc3861` on <= 1.156) | Token introspection | Already implemented |
 | E2EE | MSC4108 Phase 4 | Cross-signing key transfer via rendezvous | Handled by Element clients |
 
 ---
 
 ## Version Compatibility (CRITICAL)
 
-There are two versions of MSC4108. **siwx-oidc must use the 2024 version.**
+There are two generations of the QR-login secure channel. **Use the 2024 version
+(MSC4108).** As of the 2026-08-30 re-audit this is a *client-support* decision, no
+longer a server-config one.
 
-| Version | Encryption | Synapse config | Compatible with msc3861? |
-|---------|------------|----------------|--------------------------|
-| **2024** | ECIES | `experimental_features.msc4108_enabled: true` | YES |
-| 2025 | HPKE | `experimental_features.msc4388_mode` | NO (requires `matrix_authentication_service` block) |
+| Generation | MSC | Encryption | Rendezvous endpoint | Synapse config |
+|---|---|---|---|---|
+| **2024 (use this)** | MSC4108 | ECIES | `/_matrix/client/unstable/org.matrix.msc4108/rendezvous` | `experimental_features.msc4108_enabled: true` |
+| 2025 | MSC4388 | HPKE | `/_matrix/client/unstable/io.element.msc4388/rendezvous` | `experimental_features.msc4388_mode: off\|open\|authenticated` |
 
-The 2025 version (MSC4388) requires the `matrix_authentication_service` config block,
-which is the stable MAS integration. siwx-oidc uses `experimental_features.msc3861`,
-so only the 2024 version works.
+**On Synapse >= 1.157 BOTH generations require the `matrix_authentication_service`
+block.** The old table implied only the 2025 one did. `config/experimental.py` in
+1.159.0 raises `ConfigError: MSC4108 requires matrix_authentication_service to be
+enabled` if `msc4108_enabled` (or `msc4108_delegation_endpoint`) is set without it.
+So on 1.157+ "needs the MAS block" no longer discriminates between the two at all.
+
+### The old blocker is GONE — the real blocker is client support (re-audited 2026-08-30)
+
+This skill previously claimed MSC4388 was impossible because it "requires the
+`matrix_authentication_service` block, and siwx-oidc uses
+`experimental_features.msc3861`". **Both halves of that are now false.** dev-staging
+runs Synapse 1.159.0 on the stable `matrix_authentication_service` block, and
+`experimental_features.msc3861` no longer exists at all (removed in 1.157.0).
+
+Verified directly against the Synapse 1.159.0 image on an isolated local stack:
+
+- `msc4388_mode` is a real, parsed setting (`synapse/config/experimental.py`),
+  accepting `off` / `open` / `authenticated`; anything else is a `ConfigError`.
+- Synapse boots cleanly with `msc4108_enabled: true` **and** `msc4388_mode: "open"`
+  at the same time. The flags are independent and **purely additive** — separate
+  servlets, registered separately in `synapse/rest/client/rendezvous.py`.
+- With both on: `POST …/org.matrix.msc4108/rendezvous` -> `201`, and
+  `GET …/io.element.msc4388/rendezvous` -> `200 {"create_available":true}`.
+- `msc4388_mode` **without** the MAS block -> `ConfigError: MSC4388 requires
+  matrix_authentication_service to be enabled`.
+
+**So why is it still off? No shipping client can use it.**
+
+| Client | MSC4388 status (2026-08-30) |
+|---|---|
+| Element X iOS | **Not implemented** — `CHANGES.md` through 26.08.4 has zero hits |
+| Element X Android | **Not implemented** — same matrix-rust-sdk core |
+| Element Web | **Not implemented** — draft PoC `element-web#32799`, stalled 2026-03-30 |
+| matrix-js-sdk | Draft `#5219`, labelled `X-Blocked`; tracking issue `#5186` open |
+| matrix-rust-sdk | QR data types + a capability probe merged, but the **actual flow PR `#6173` was auto-closed unmerged on 2026-08-13**, no successor |
+
+Our own vendored Element Web (v1.12.24 / matrix-js-sdk 42.0.0) contains no MSC4388
+code at all — only `MSC4108SignInWithQR` / `MSC4108SecureChannel` /
+`MSC4108RendezvousSession`.
+
+**Discovery is an endpoint probe, NOT `unstable_features`.** `/_matrix/client/versions`
+advertises `org.matrix.msc4108: true`, but has **no `io.element.msc4388` key at all**,
+even with the mode on and the endpoint live. Clients discover MSC4388 by `GET`ing the
+endpoint and reading `create_available` (404/403 = unsupported). Never add a
+`/versions` assertion for MSC4388 — it will always fail.
+
+**DO NOT set `msc4388_mode` on a live deployment yet** — but for the *current* reason:
+it is dormant on every shipping client, and `open` mode adds an unauthenticated public
+write endpoint for zero present benefit. NOT because it "conflicts with msc3861".
+Revisit when matrix-rust-sdk lands the login flow.
+
+**If it is ever enabled, keep `msc4108_enabled: true`.** The compatibility cliff is
+real but self-inflicted: with `msc4108_enabled: false`, `/versions` flips
+`org.matrix.msc4108` to `false` and the 2024 endpoint answers `M_UNRECOGNIZED`,
+breaking QR login for every client shipping today. Verified on the same stack.
+
+**`authenticated` mode does not suit QR sign-in.** It calls `auth.get_user_by_req()`
+on the *create* call, so an unauthenticated new device cannot open the channel
+(`401 M_MISSING_TOKEN`, verified). Only `open` fits the new-device-scans-QR direction.
 
 ---
 
@@ -75,7 +133,7 @@ so only the 2024 version works.
 
 | Component | Status | Blocker? |
 |-----------|--------|----------|
-| Synapse rendezvous server | Available (>= 1.106.0, current is 1.153.0+) | No |
+| Synapse rendezvous server | Available (>= 1.106.0; dev-staging 1.159.0, prod 1.154.0) | No |
 | Synapse `msc4108_enabled` config | Deployed | No |
 | Reverse proxy (Caddy) | Works | No |
 | siwx-oidc: `POST /device_authorization` | Implemented | No |
@@ -91,15 +149,19 @@ so only the 2024 version works.
 
 ### Prerequisites
 
-- Synapse >= 1.106.0 (current `matrixdotorg/synapse:latest` satisfies this)
+- Synapse >= 1.106.0 for the rendezvous server itself. On >= 1.157 you additionally
+  need the `matrix_authentication_service` block configured, or `msc4108_enabled`
+  is a startup `ConfigError` (image is `ghcr.io/element-hq/synapse`)
 - siwx-oidc with RFC 8628 implemented (Phase 3 of PLAN_webauthn.md)
 - Element Web with "Link new device" feature (production Element Web has this)
 - Element X mobile app (production iOS/Android)
-- Working MSC3861 delegated auth (already deployed)
+- Working OIDC delegated auth, already deployed — via `matrix_authentication_service`
+  on Synapse >= 1.157, or `experimental_features.msc3861` on <= 1.156
 
 ### Step 1: Enable MSC4108 in Synapse (siwx-oidc-matrix-server repo)
 
-Edit `entrypoints/matrix_server.sh`, add after the existing MSC3861 config block:
+Edit `entrypoints/matrix_server.sh`, add after the delegated-auth config block
+(`matrix_authentication_service` on 1.157+, `msc3861` on older):
 
 ```bash
 # Enable QR code login rendezvous server (MSC4108 2024 version)
@@ -193,6 +255,25 @@ Settings > Sessions).
 
 ### Synapse homeserver.yaml
 
+**Synapse >= 1.157 (dev-staging 1.159.0) — stable `matrix_authentication_service`:**
+
+```yaml
+matrix_authentication_service:
+  enabled: true
+  endpoint: ${SIWEOIDC_INTERNAL_URL:-$SIWEOIDC_BASE_URL}
+  secret: ${MAS_SHARED_SECRET}
+
+experimental_features:
+  # QR code login (MSC4108 2024 version)
+  msc4108_enabled: true
+```
+
+There is no `admin_token` here — the shared secret is honoured only on
+`/_synapse/mas/*` on 1.157+. Admin-API calls use a short-TTL `urn:synapse:admin:*`
+token minted at `POST /oauth2/admin_token` (siwx-oidc `src/admin_token.rs`).
+
+**Synapse <= 1.156 (prod today 1.154.0) — legacy `experimental_features.msc3861`:**
+
 ```yaml
 experimental_features:
   msc3861:
@@ -207,11 +288,16 @@ experimental_features:
   msc4108_enabled: true
 ```
 
+**Never carry the `msc3861` block onto 1.157+.** Synapse exits 1 with
+`experimental_features.msc3861 was removed. Use the matrix_authentication_service
+configuration instead.` — the container crash-loops.
+
 DO NOT set both `msc4108_enabled` and `msc4108_delegation_endpoint` (Synapse raises
 ConfigError). Use `msc4108_delegation_endpoint` only if running a separate rendezvous
 server (not needed; Synapse has one built in).
 
-DO NOT set `msc4388_mode` (2025 version; incompatible with msc3861).
+DO NOT set `msc4388_mode` yet — see "Version Compatibility" above. On 1.159 it is
+supported and additive, but no shipping client speaks it, so it buys nothing today.
 
 ### Redis keys (new for RFC 8628)
 
