@@ -33,6 +33,38 @@ use siwx_oidc::db::{RedisClient, KV_WEBAUTHN_CREDENTIAL_PREFIX, KV_WEBAUTHN_LINK
 const FIXTURE: &str = include_str!("fixtures/passkey_webauthn_rs_0_6_0_dev.json");
 const FIXTURE_DID: &str = "did:key:zDnaebVfjz61NuRbnMfF2gA6NZM6DRWTeauDnFH1DhG2MFivF";
 
+/// ONE runtime for the whole binary.
+///
+/// # Why this is not cosmetic
+///
+/// `credential_store::shared_store()` memoises the store in a process-wide
+/// `OnceCell`, and the `ConnectionManager` inside it owns a background task
+/// bound to whichever tokio runtime happened to initialise it. Under
+/// `#[tokio::test]` every test gets its OWN runtime: the first test to touch the
+/// store initialises it, that runtime is dropped at the end of that test, and
+/// every mirror operation in every LATER test then fails against a dead
+/// connection.
+///
+/// That is invisible, because mirror writes are deliberately best-effort. The
+/// tests that assert something is ABSENT from the aqua-auth namespace go on
+/// passing -- for the wrong reason -- so the suite reports green while the flag
+/// is on and nothing is being mirrored at all. Observed directly: each test in
+/// this file passes when run ALONE with the flag on, and three of five fail when
+/// run together.
+///
+/// Production is unaffected (siwx-oidc has one runtime for the process), so the
+/// fix belongs here and not in the store: give the whole binary one runtime, and
+/// the test topology matches the deployment topology.
+fn shared_rt() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    })
+}
+
 async fn redis() -> Option<RedisClient> {
     RedisClient::new(&Url::parse("redis://localhost").unwrap())
         .await
@@ -85,8 +117,12 @@ async fn links_for(r: &RedisClient, ids: &[&str]) -> Vec<(String, Option<String>
 /// second Redis is down) and a terrible gate behaviour: every `Some(store)`
 /// assertion below would be skipped and the suite would report a green "flag on"
 /// run that never touched the store. This test makes that impossible.
-#[tokio::test]
-async fn the_declared_mode_is_the_actual_mode() {
+#[test]
+fn the_declared_mode_is_the_actual_mode() {
+    shared_rt().block_on(the_declared_mode_is_the_actual_mode_impl());
+}
+
+async fn the_declared_mode_is_the_actual_mode_impl() {
     let declared_on = std::env::var(credential_store::ENABLE_ENV)
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
@@ -99,13 +135,46 @@ async fn the_declared_mode_is_the_actual_mode() {
         if declared_on { "set" } else { "unset" },
         if actual_on { "enabled" } else { "disabled" },
     );
+
+    // `is_some()` alone is NOT enough, and that gap has already produced a false
+    // green here. A store can be present and UNUSABLE -- a dead connection, a
+    // Redis that accepted the handshake and then went away. Every mirror write
+    // in this suite is deliberately best-effort, so nothing errors; the writes
+    // just silently do not happen, and every "the credential is absent"
+    // assertion keeps passing for entirely the wrong reason.
+    //
+    // Prove a real round-trip instead of trusting the handle.
+    if declared_on {
+        let store = credential_store::shared_store()
+            .await
+            .expect("declared on, so the store must exist");
+        let n = nonce();
+        let id = URL_SAFE_NO_PAD.encode(format!("probe-{n}").as_bytes());
+        let did = format!("did:key:zProbe{n}");
+        credential_store::mirror_credential(&id, FIXTURE, &did, None).await;
+        let got = store
+            .get_by_id(&cid(&id))
+            .await
+            .expect("the store must answer, not error");
+        assert!(
+            got.is_some(),
+            "the shared store is enabled but a mirrored credential did not read \
+             back: it is present and UNUSABLE, so every absence assertion in this \
+             suite would pass vacuously"
+        );
+        credential_store::mirror_delete(&did, &id).await;
+    }
 }
 
 /// A link overrides the derived `did:key`, in both modes. This is the property
 /// account linking exists for, and the one a careless credential-store change
 /// would silently break.
-#[tokio::test]
-async fn a_link_still_overrides_the_derived_did() {
+#[test]
+fn a_link_still_overrides_the_derived_did() {
+    shared_rt().block_on(a_link_still_overrides_the_derived_did_impl());
+}
+
+async fn a_link_still_overrides_the_derived_did_impl() {
     let Some(r) = redis().await else {
         eprintln!("skip: no Redis on localhost");
         return;
@@ -154,8 +223,12 @@ async fn a_link_still_overrides_the_derived_did() {
 /// Mirroring a linked credential must write the credential and NOTHING in the
 /// link namespace. The mirror stores the resolved principal, so a linked
 /// credential lands under its `primary_did`, never under the derived `did:key`.
-#[tokio::test]
-async fn mirroring_never_writes_the_link_namespace() {
+#[test]
+fn mirroring_never_writes_the_link_namespace() {
+    shared_rt().block_on(mirroring_never_writes_the_link_namespace_impl());
+}
+
+async fn mirroring_never_writes_the_link_namespace_impl() {
     let Some(r) = redis().await else {
         eprintln!("skip: no Redis on localhost");
         return;
@@ -244,8 +317,12 @@ async fn mirroring_never_writes_the_link_namespace() {
 /// Purging a linked identity must clear it from BOTH namespaces. Without the
 /// delete-through, an erased identity's passkey would survive in the aqua-auth
 /// namespace as soon as the flag is on, and erasure would be incomplete.
-#[tokio::test]
-async fn purging_a_linked_identity_clears_both_namespaces() {
+#[test]
+fn purging_a_linked_identity_clears_both_namespaces() {
+    shared_rt().block_on(purging_a_linked_identity_clears_both_namespaces_impl());
+}
+
+async fn purging_a_linked_identity_clears_both_namespaces_impl() {
     let Some(r) = redis().await else {
         eprintln!("skip: no Redis on localhost");
         return;
@@ -288,4 +365,154 @@ async fn purging_a_linked_identity_clears_both_namespaces() {
             "flag on: the mirrored did index must be empty"
         );
     }
+}
+
+/// The counter the login path reads back must be the ADVANCED one, in both
+/// modes.
+///
+/// # Why this test exists
+///
+/// aqua-auth stores the blob and the sign count SEPARATELY: `public_key` is the
+/// opaque `Passkey` JSON, `sign_count` is a sidecar that `update_sign_count`
+/// advances monotonically. `mirror_credential` -- the only writer of the blob --
+/// runs at register/link, never on login. So with the flag on, read-through
+/// returned a blob whose `cred.counter` was frozen at registration (or, for a
+/// backfilled credential, at migration time) and never moved, while the freshly
+/// advanced counter went on being written to the legacy namespace that
+/// read-through no longer reads.
+///
+/// `verify_credential`'s cloned-authenticator check reads the counter from
+/// INSIDE that blob. Frozen counter => the check compares every future assertion
+/// against a constant, i.e. clone detection is silently defeated for every
+/// credential the moment the flag is on. That is a security regression the
+/// mirror-write assertions in this file could not see, because they assert the
+/// mirror WROTE, not that the value read back had moved.
+///
+/// Flag off, the legacy blob is the only blob and the legacy write keeps it
+/// fresh, so the counter must come back untouched at the fixture's 0.
+#[test]
+fn the_sign_counter_read_back_is_the_advanced_one() {
+    shared_rt().block_on(the_sign_counter_read_back_is_the_advanced_one_impl());
+}
+
+async fn the_sign_counter_read_back_is_the_advanced_one_impl() {
+    let Some(r) = redis().await else {
+        eprintln!("skip: no Redis on localhost");
+        return;
+    };
+    let n = nonce();
+    let id = URL_SAFE_NO_PAD.encode(format!("counter-{n}").as_bytes());
+    let did = format!("did:pkh:eip155:1:0xCOUNTER{n}");
+
+    r.set_raw(&cred_key(&id), FIXTURE).await.unwrap();
+
+    fn counter_in(blob: &str) -> u64 {
+        serde_json::from_str::<serde_json::Value>(blob)
+            .expect("blob parses")
+            .get("cred")
+            .and_then(|c| c.get("counter"))
+            .and_then(|c| c.as_u64())
+            .expect("cred.counter present")
+    }
+
+    // The fixture starts at 0; that is the value a naive read-through freezes.
+    assert_eq!(counter_in(FIXTURE), 0, "fixture precondition");
+
+    credential_store::mirror_credential(&id, FIXTURE, &did, None).await;
+    credential_store::mirror_sign_count(&id, 77).await;
+
+    let blob = credential_store::read_blob(&r, &id)
+        .await
+        .unwrap()
+        .expect("credential is readable");
+
+    if credential_store::shared_store().await.is_some() {
+        assert_eq!(
+            counter_in(&blob),
+            77,
+            "flag ON: read_blob must reconcile the store's advanced sign_count \
+             into cred.counter, or verify_credential's clone detection compares \
+             against a frozen value forever"
+        );
+        // And the blob must still be a usable credential, not just a counter
+        // carrier -- the same bytes feed the P-256 verification.
+        assert_eq!(
+            derive_did_from_passkey_blob(&blob).expect("reconciled blob still derives"),
+            FIXTURE_DID,
+            "reconciling the counter must not disturb the key material"
+        );
+        credential_store::mirror_delete(&did, &id).await;
+    } else {
+        assert_eq!(
+            counter_in(&blob),
+            0,
+            "flag OFF: the legacy blob is returned verbatim"
+        );
+    }
+
+    let _ = r.del_raw(&cred_key(&id)).await;
+}
+
+/// A partially backfilled user must still be offered EVERY passkey.
+///
+/// # Why this test exists
+///
+/// A non-empty `allowCredentials` RESTRICTS the authenticator to exactly the set
+/// it names. `list_credential_ids` used to return the aqua-auth store's answer
+/// whenever it was non-empty, never unioning it with the legacy index -- so a
+/// user whose backfill covered one of two passkeys was offered only that one.
+/// An empty list is "usernameless, not denied"; a PARTIAL list is a lockout for
+/// the device it omits, with nothing in the flow explaining why.
+///
+/// Per-row backfill failures do not abort a run, and the flag can be flipped
+/// mid-backfill, so the partial state is reachable in normal operation rather
+/// than only under fault injection.
+#[test]
+fn a_partially_backfilled_user_is_offered_every_passkey() {
+    shared_rt().block_on(a_partially_backfilled_user_is_offered_every_passkey_impl());
+}
+
+async fn a_partially_backfilled_user_is_offered_every_passkey_impl() {
+    let Some(r) = redis().await else {
+        eprintln!("skip: no Redis on localhost");
+        return;
+    };
+    let n = nonce();
+    let did = format!("did:key:zPARTIAL{n}");
+    let mirrored = URL_SAFE_NO_PAD.encode(format!("partial-mirrored-{n}").as_bytes());
+    let legacy_only = URL_SAFE_NO_PAD.encode(format!("partial-legacy-{n}").as_bytes());
+
+    // Both passkeys belong to the user, and the legacy index knows both.
+    r.set_raw(&cred_key(&mirrored), FIXTURE).await.unwrap();
+    r.set_raw(&cred_key(&legacy_only), FIXTURE).await.unwrap();
+    r.index_add_passkey(&did, &mirrored).await.unwrap();
+    r.index_add_passkey(&did, &legacy_only).await.unwrap();
+
+    // The backfill reached exactly one of them.
+    credential_store::mirror_credential(&mirrored, FIXTURE, &did, None).await;
+
+    let ids = credential_store::list_credential_ids(&r, &did, |_| None)
+        .await
+        .unwrap();
+
+    assert!(
+        ids.contains(&legacy_only),
+        "the passkey the backfill missed vanished from allowCredentials -- that \
+         does not degrade the picker, it locks that device out: {ids:?}"
+    );
+    assert!(
+        ids.contains(&mirrored),
+        "the mirrored passkey must still be offered: {ids:?}"
+    );
+    assert_eq!(
+        ids.len(),
+        2,
+        "the two sources must dedupe, not duplicate: {ids:?}"
+    );
+
+    credential_store::mirror_delete(&did, &mirrored).await;
+    let _ = r.del_raw(&cred_key(&mirrored)).await;
+    let _ = r.del_raw(&cred_key(&legacy_only)).await;
+    let _ = r.index_remove_passkey(&did, &mirrored).await;
+    let _ = r.index_remove_passkey(&did, &legacy_only).await;
 }
