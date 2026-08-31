@@ -795,7 +795,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 [[package]]
 name = "aqua-auth"
 version = "0.7.0"
-source = "git+ssh://git@github.com/inblockio/aqua-rs-auth?rev=1edee34622889a71098cec9b593ddcec794f5f88#1edee34622889a71098cec9b593ddcec794f5f88"
+source = "git+https://github.com/inblockio/aqua-rs-auth?rev=1edee34622889a71098cec9b593ddcec794f5f88#1edee34622889a71098cec9b593ddcec794f5f88"
 dependencies = [
  "async-trait",
  "base64 0.21.7",
