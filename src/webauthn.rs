@@ -417,10 +417,13 @@ pub async fn authenticate_start(
         .map_err(|e| anyhow!("WebAuthn auth start failed: {:?}", e))?;
 
     if let Some(did) = scope_did {
-        // Read-through, same as the credential read: aqua-auth's did index first
-        // when the flag is on, the legacy webauthn:by_did index (with its scan
-        // self-heal) otherwise. Advisory either way, an empty result means
-        // usernameless rather than denied.
+        // The UNION of the legacy webauthn:by_did index (with its scan
+        // self-heal) and, when the flag is on, aqua-auth's did index -- not a
+        // preference for one over the other. An EMPTY result is advisory and
+        // means usernameless rather than denied, but a PARTIAL result is not:
+        // a non-empty allow_credentials restricts the authenticator to exactly
+        // that set, so omitting a passkey the backfill has not reached yet
+        // locks that device out. See credential_store::list_credential_ids.
         let cred_ids = siwx_oidc::credential_store::list_credential_ids(
             redis,
             did,
