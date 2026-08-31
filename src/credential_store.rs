@@ -48,7 +48,7 @@ use aqua_auth::webauthn_store::{
 use aqua_auth::RedisWebauthnStore;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use tokio::sync::OnceCell;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::credential_migration::sign_count_from_blob;
 use crate::db::{RedisClient, KV_WEBAUTHN_CREDENTIAL_PREFIX};
@@ -102,6 +102,39 @@ fn credential_id(cred_id_b64: &str) -> Option<CredentialId> {
 
 fn legacy_key(cred_id_b64: &str) -> String {
     format!("{KV_WEBAUTHN_CREDENTIAL_PREFIX}/{cred_id_b64}")
+}
+
+/// Resolve the dual-write mode ONCE at boot: log what it actually is, and refuse
+/// to start if the flag names a Redis that cannot be opened.
+///
+/// # Why this exists
+///
+/// [`shared_store`] is lazy and fails OPEN. If the store cannot be opened at the
+/// moment of the first passkey operation it memoises `None` for the remaining
+/// process lifetime, logs one warning, and serves legacy-only forever -- while
+/// the operator, seeing the env var set, believes dual-write is running. Every
+/// credential registered during that window lands in the legacy namespace only,
+/// and is lost the day that namespace is retired.
+///
+/// aqua-auth's `RedisWebauthnStore::connect` is deliberately eager so an
+/// unreachable Redis fails at boot rather than at first login. That property is
+/// only real for a service that actually connects at boot. This is that call.
+pub async fn probe_at_boot() -> Result<()> {
+    let declared = std::env::var(ENABLE_ENV).ok();
+    let Some(url) = enabled_url(declared.as_deref()) else {
+        info!("credential store: dual-write DISABLED ({ENABLE_ENV} unset); legacy namespace only");
+        return Ok(());
+    };
+    if shared_store().await.is_none() {
+        error!("credential store: {ENABLE_ENV} is set but the store could not be opened");
+        anyhow::bail!(
+            "{ENABLE_ENV} is set to {url} but the aqua-auth credential store could not be \
+             opened. Refusing to start: serving legacy-only while the operator believes \
+             dual-write is on silently strands every credential registered from now on."
+        );
+    }
+    info!("credential store: dual-write ENABLED -> {url}");
+    Ok(())
 }
 
 /// Mirror a newly stored credential into the aqua-auth store. No-op when the
@@ -255,10 +288,24 @@ pub async fn read_blob(redis: &RedisClient, cred_id_b64: &str) -> Result<Option<
 /// The credential ids registered to `did`, for the passkey picker's
 /// `allowCredentials`.
 ///
-/// The aqua-auth store's `did` index first when the flag is on, the legacy
-/// `webauthn:by_did` index (with its own scan self-heal) otherwise or on a miss.
-/// Both are advisory: an empty result means "usernameless", never "denied", so a
-/// wrong answer here degrades the picker rather than blocking a login.
+/// The UNION of the legacy `webauthn:by_did` index (with its own scan self-heal)
+/// and, when the flag is on, the aqua-auth store's `did` index.
+///
+/// # Why a union and not a preference
+///
+/// A non-empty `allowCredentials` RESTRICTS the authenticator to exactly the set
+/// it names. So while an EMPTY result is merely "usernameless, not denied", a
+/// PARTIAL result is a lockout for every credential it omits.
+///
+/// Preferring the aqua-auth answer whenever it came back non-empty did exactly
+/// that. A user with two passkeys -- one mirrored, one the backfill missed (a
+/// per-row failure does not abort a run) or one registered before a mid-backfill
+/// flag flip -- would be offered only the mirrored one. If the other device is
+/// the one in their hand, they cannot log in, and nothing in the flow says why.
+///
+/// The union also removes an ordering constraint from the cutover: the flag can
+/// be flipped before, during or after the backfill with no window in which
+/// anyone's picker is incomplete.
 pub async fn list_credential_ids<F>(
     redis: &RedisClient,
     did: &str,
@@ -267,19 +314,24 @@ pub async fn list_credential_ids<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    if let Some(store) = shared_store().await {
-        match store.list_for_did(did).await {
-            Ok(rows) if !rows.is_empty() => {
-                return Ok(rows
-                    .into_iter()
-                    .map(|r| URL_SAFE_NO_PAD.encode(&r.credential_id.0))
-                    .collect())
+    let mut ids = redis.get_passkeys_for_did(did, derive).await?;
+    let Some(store) = shared_store().await else {
+        return Ok(ids);
+    };
+    match store.list_for_did(did).await {
+        Ok(rows) => {
+            for row in rows {
+                let id = URL_SAFE_NO_PAD.encode(&row.credential_id.0);
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
             }
-            Ok(_) => {}
-            Err(e) => warn!("list_credential_ids: aqua-auth store failed ({e}); falling back"),
         }
+        // Legacy has already answered, so a store failure degrades to
+        // legacy-only rather than failing the login.
+        Err(e) => warn!("list_credential_ids: aqua-auth store failed ({e}); legacy only"),
     }
-    redis.get_passkeys_for_did(did, derive).await
+    Ok(ids)
 }
 
 #[cfg(test)]

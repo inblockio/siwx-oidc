@@ -1137,6 +1137,13 @@ pub async fn main() {
         }
     }
 
+    // Fail fast when the dual-write flag names a Redis we cannot open. Lazy
+    // resolution would degrade to legacy-only, silently and permanently, while
+    // the operator believed the shared store was live.
+    siwx_oidc::credential_store::probe_at_boot()
+        .await
+        .unwrap_or_else(|e| panic!("FATAL: {e}"));
+
     // Validate configured DID methods against the aqua-auth registry.
     {
         let registered: Vec<String> = all_did_methods()
