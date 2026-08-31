@@ -191,13 +191,56 @@ pub async fn mirror_delete(did: &str, cred_id_b64: &str) {
 /// backfill: a credential that only exists in the legacy namespace still logs
 /// in. A store error also falls back rather than failing the login, for the same
 /// reason a mirror-write failure is best-effort.
+/// Overlay the store's authoritative `sign_count` onto the blob's `cred.counter`
+/// before the login path reads it.
+///
+/// # Why this exists
+///
+/// aqua-auth stores the two SEPARATELY: `public_key` is the opaque `Passkey`
+/// JSON and `sign_count` is a sidecar field that `update_sign_count` advances
+/// monotonically. Nothing ever rewrites the blob after `mirror_credential`, and
+/// that runs at register/link only -- never on login.
+///
+/// `verify_credential`'s cloned-authenticator check reads the counter from
+/// INSIDE the blob. Handing back the stored blob verbatim therefore gives it a
+/// counter frozen at registration (or, for a backfilled credential, at migration
+/// time) that never advances -- silently defeating clone detection for every
+/// credential the moment the flag is on, while the freshly advanced value went
+/// on being written to the legacy namespace that read-through no longer reads.
+///
+/// `max`, not assignment: if the blob is somehow ahead of the sidecar it stays
+/// ahead, so this can only ever raise the bar an assertion has to clear.
+fn reconcile_sign_count(cred_id_b64: &str, blob: String, stored: u32) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&blob) else {
+        return blob;
+    };
+    // An unreadable counter is treated as 0 so the sidecar wins; that is the
+    // safe direction, and `mirror_credential` refuses to store such a blob.
+    let in_blob = sign_count_from_blob(&value).unwrap_or(0);
+    if stored <= in_blob {
+        return blob;
+    }
+    let Some(cred) = value.get_mut("cred") else {
+        return blob;
+    };
+    cred["counter"] = serde_json::json!(stored);
+    match serde_json::to_string(&value) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("read_blob: {cred_id_b64} sign-count reconcile failed ({e}); using stored blob");
+            blob
+        }
+    }
+}
+
 pub async fn read_blob(redis: &RedisClient, cred_id_b64: &str) -> Result<Option<String>> {
     if let Some(store) = shared_store().await {
         if let Some(id) = credential_id(cred_id_b64) {
             match store.get_by_id(&id).await {
                 Ok(Some(row)) => {
+                    let stored_count = row.sign_count;
                     if let Ok(blob) = String::from_utf8(row.public_key) {
-                        return Ok(Some(blob));
+                        return Ok(Some(reconcile_sign_count(cred_id_b64, blob, stored_count)));
                     }
                     warn!("read_blob: {cred_id_b64} in the aqua-auth store is not UTF-8; falling back");
                 }
