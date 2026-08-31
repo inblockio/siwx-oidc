@@ -15,7 +15,10 @@ name = "siwx-oidc-auth"
 path = "src/main.rs"
 
 [dependencies]
-aqua-auth = { git = "https://github.com/inblockio/aqua-rs-auth" }
+# Same source spelling and rev as the root package: `ssh://` and `https://` are
+# two Cargo sources, so a mismatch here would build aqua-auth twice in one
+# workspace with features unmerged between the copies.
+aqua-auth = { git = "ssh://git@github.com/inblockio/aqua-rs-auth", rev = "0d9350a59148b887067ef8d41048952cd3cd3c9f" }
 
 anyhow = "1"
 bs58 = "0.5"

@@ -520,8 +520,10 @@ async fn device_passkey_start_handler(
         scope_did.as_deref(),
     )
     .await?;
-    let detected_mxid =
-        detected_mxid_for(state.config.matrix_server_name.as_deref(), scope_did.as_deref());
+    let detected_mxid = detected_mxid_for(
+        state.config.matrix_server_name.as_deref(),
+        scope_did.as_deref(),
+    );
     Ok(Json(AuthenticateStartResponse {
         challenge: rcr,
         detected_mxid,
@@ -762,7 +764,9 @@ async fn webauthn_authenticate_finish(
     let (new_user, mxid) = match state.synapse_client.as_deref() {
         Some(synapse) => {
             // is_new_identity == true means the localpart is AVAILABLE (no account).
-            let new_user = wa::is_new_identity(synapse, &resp.did).await.unwrap_or(false);
+            let new_user = wa::is_new_identity(synapse, &resp.did)
+                .await
+                .unwrap_or(false);
             let mxid = match state.config.matrix_server_name.as_deref() {
                 Some(server_name) => {
                     let localpart = oidc::did_to_localpart(&resp.did);
@@ -1061,9 +1065,10 @@ async fn account_passkey_start_handler(
     let mut value = serde_json::to_value(&rcr)
         .map_err(|e| anyhow::anyhow!("Failed to serialize challenge: {}", e))?;
     value["session_id"] = serde_json::json!(session_id);
-    if let Some(mxid) =
-        detected_mxid_for(state.config.matrix_server_name.as_deref(), scope_did.as_deref())
-    {
+    if let Some(mxid) = detected_mxid_for(
+        state.config.matrix_server_name.as_deref(),
+        scope_did.as_deref(),
+    ) {
         value["detected_mxid"] = serde_json::json!(mxid);
     }
     Ok(Json(value))
@@ -1510,8 +1515,12 @@ mod unknown_credential_response_tests {
         assert!(payload_force_all(&serde_json::json!({ "all": true })));
         assert!(!payload_force_all(&serde_json::json!({ "all": false })));
         // Absent / wrong-typed / unrelated payloads must NOT force open.
-        assert!(!payload_force_all(&serde_json::json!({ "action": "org.matrix.profile" })));
-        assert!(!payload_force_all(&serde_json::json!({ "user_code": "ABC-DEF" })));
+        assert!(!payload_force_all(
+            &serde_json::json!({ "action": "org.matrix.profile" })
+        ));
+        assert!(!payload_force_all(
+            &serde_json::json!({ "user_code": "ABC-DEF" })
+        ));
         assert!(!payload_force_all(&serde_json::json!({ "all": "true" })));
         assert!(!payload_force_all(&serde_json::json!({})));
     }
@@ -1578,7 +1587,10 @@ mod unknown_credential_response_tests {
         // KV_USER_SESSION_PREFIX is in scope via `use siwx_oidc::db::*` at the top.
         let key = format!("{}/{}", KV_USER_SESSION_PREFIX, token);
         // SET-typed value at the exact key lookup_user_session GETs -> WRONGTYPE error.
-        redis.sadd_raw(&key, "x").await.expect("seed wrong-type key");
+        redis
+            .sadd_raw(&key, "x")
+            .await
+            .expect("seed wrong-type key");
 
         let header = format!("siwx_user={token}");
         let hv = axum::http::HeaderValue::from_str(&header).expect("header value");

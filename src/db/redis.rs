@@ -369,8 +369,15 @@ impl RedisClient {
             // DID's set (and the set itself once emptied). Best-effort — the index
             // is advisory, so a failure here must not mark the erase incomplete.
             if let Err(e) = self.index_remove_passkey(did, cred_id).await {
-                debug!("purge_identity: index_remove_passkey {} failed: {}", cred_id, e);
+                debug!(
+                    "purge_identity: index_remove_passkey {} failed: {}",
+                    cred_id, e
+                );
             }
+            // Delete-through: without this, an erased identity's passkey would
+            // survive in aqua-auth's namespace the moment the dual-write flag is
+            // on, and erasure would be incomplete. No-op when the flag is off.
+            crate::credential_store::mirror_delete(did, cred_id).await;
         }
 
         // -- (b) Standalone credentials whose passkey derives to this did:key --
@@ -402,6 +409,8 @@ impl RedisClient {
                         cred_id, e
                     );
                 }
+                // Delete-through, as in pass (a).
+                crate::credential_store::mirror_delete(did, cred_id).await;
             }
         }
 

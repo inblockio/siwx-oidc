@@ -487,8 +487,15 @@ async fn logout_all_invalidates_all_sessions_without_deactivating() {
     assert_eq!(bulk.status(), StatusCode::OK, "logout/all must return 200");
 
     if device1.is_none() || device2.is_none() {
-        let st = if device1.is_none() { whoami_st1 } else { whoami_st2 };
-        skip_or_fail("logout_all_invalidates_all_sessions_without_deactivating", st);
+        let st = if device1.is_none() {
+            whoami_st1
+        } else {
+            whoami_st2
+        };
+        skip_or_fail(
+            "logout_all_invalidates_all_sessions_without_deactivating",
+            st,
+        );
         return;
     }
 
