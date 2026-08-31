@@ -794,8 +794,8 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "aqua-auth"
-version = "0.6.0"
-source = "git+ssh://git@github.com/inblockio/aqua-rs-auth?rev=0d9350a59148b887067ef8d41048952cd3cd3c9f#0d9350a59148b887067ef8d41048952cd3cd3c9f"
+version = "0.7.0"
+source = "git+ssh://git@github.com/inblockio/aqua-rs-auth?rev=1edee34622889a71098cec9b593ddcec794f5f88#1edee34622889a71098cec9b593ddcec794f5f88"
 dependencies = [
  "async-trait",
  "base64 0.21.7",
@@ -1213,6 +1213,15 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
 ]
 
 [[package]]
@@ -3901,14 +3910,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09d8f99a4090c89cc489a94833c901ead69bfbf3877b4867d5482e321ee875bc"
 dependencies = [
  "arc-swap",
+ "async-trait",
+ "backon",
+ "bytes",
  "combine",
+ "futures",
+ "futures-util",
  "itertools 0.13.0",
  "itoa",
  "num-bigint",
  "percent-encoding",
+ "pin-project-lite",
  "ryu",
  "sha1_smol",
  "socket2 0.5.10",
+ "tokio",
+ "tokio-util",
  "url",
 ]
 

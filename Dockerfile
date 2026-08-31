@@ -30,6 +30,11 @@ RUN cargo build --release
 
 FROM alpine
 COPY --from=builder /siwx-oidc/target/x86_64-unknown-linux-musl/release/siwx-oidc /usr/local/bin/
+# The credential backfill operator tool. `cargo build --release` above already
+# produces it, so shipping it costs nothing but is REQUIRED: the aqua-auth 0.7.0
+# migration cannot be run anywhere it is actually needed (dev-staging, prod) if
+# the only artifact in the image is the server.
+COPY --from=builder /siwx-oidc/target/x86_64-unknown-linux-musl/release/migrate-credentials /usr/local/bin/
 WORKDIR /siwx-oidc
 RUN mkdir -p ./static
 COPY --from=node_builder /siwx-oidc/static/ ./static/

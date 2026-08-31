@@ -20,13 +20,16 @@ description = "CAIP-122 to OpenID Connect bridge — Sign-In With X for any DID 
 # with features unmerged between the copies.
 #
 # TODO(aqua-auth 0.7.0): move this to the 0.7.0 tag once it is cut. The rev below
-# is aqua-auth `main` (0.6.0), which is what this crate already resolved to, so
-# the pin changes nothing about what a clean checkout builds. The source HERE
-# targets 0.7.0 (async credential store) and is verified against the aqua-auth
-# working tree through the local `[patch]` in .cargo/config.toml, exactly as
-# aqua-node, aquafier-rs and aqua-state-viewer are: every aqua-auth consumer
-# moves to the new tag in one batch. See CONSUMERS.md in aqua-auth.
-aqua-auth = { git = "ssh://git@github.com/inblockio/aqua-rs-auth", rev = "0d9350a59148b887067ef8d41048952cd3cd3c9f", features = ["webauthn", "ceremony", "redis"] }
+# is the tip of aqua-auth's `refactor/async-credential-store` -- 0.7.0, the async
+# credential store this crate's source actually targets. It is pinned to a rev
+# that EXISTS ON THE REMOTE so a clean checkout (CI, the :dev image build,
+# dev-staging) compiles without the machine-local `[patch]` the migration was
+# developed under. The previous pin was aqua-auth `main` (0.6.0, the SYNC trait):
+# resolvable, but it could not build this source at all off the one dev box.
+# Until the tag is cut this is a branch rev, not a release; aqua-node,
+# aquafier-rs and aqua-state-viewer still resolve 0.6.0 and move in one batch
+# when it is. See CONSUMERS.md in aqua-auth.
+aqua-auth = { git = "ssh://git@github.com/inblockio/aqua-rs-auth", rev = "1edee34622889a71098cec9b593ddcec794f5f88", features = ["webauthn", "ceremony", "redis"] }
 alloy-primitives = { version = "1", features = ["serde"] }
 alloy = { version = "1", features = ["providers", "transport-http", "contract", "sol-types", "ens"] }
 anyhow = "1"
