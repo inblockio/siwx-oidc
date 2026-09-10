@@ -71,6 +71,35 @@ established over the 256 non-ignored tests plus nine live suites the auditor ran
    the auditor found 31 users / 31 profiles and had to manufacture one. The "3 of 102"
    figure is about the dev deployment, not the local harness.
 
+## Remediation
+
+All six should-fix findings and the nits were closed in `58865de`; D12 in `1a6740e`.
+Every fix is mutation-tested — break the guard, confirm a named test fails, restore
+byte-identically.
+
+Two findings turned into measurements rather than arguments:
+
+- **D1** was settled by manufacturing a *genuine* non-#19702 500 (a scoped, reversible
+  SQLite trigger aborting an `UPDATE profiles` for one throwaway user) and observing that
+  its body is **byte-identical** to the row-less one. The classifier now confirms the row
+  is absent instead of inferring it from a status code.
+- **D4**'s mutation output *is* the finding: with the degraded-path guard disabled, the
+  test prints a fully-formed, validly-signed proof minted for a localpart nobody resolved.
+
+Two things were found during remediation that this audit missed:
+
+- a **second** instance of D10's mangled-whitespace defect, at `src/oidc.rs:4073`;
+- **h6_deactivate_racing_refresh_no_resurrection was passing while proving nothing.** Its
+  refresh pump minted 0 tokens in all six rounds — the deactivate won the barrier race
+  every time, so `survivors == 0` was asserted against an empty set. Fixed by seeding one
+  refresh before the barrier (keeping the race) *and* by making the vacuity an explicit
+  assertion failure, so it cannot silently return.
+
+D12's substantive half is closed — `grandfathered_legacy_account_keeps_legacy_localpart_on_real_signin`
+now runs and passes (14/14 and 6/6 across the two suites). Its **structural** half is not:
+both suites remain `#[ignore]`d and outside `cargo test --workspace` and the harness check
+list, so only the new drift check in `e2e/README.md` guards them.
+
 ## Not verified
 
 - The Synapse patch's **upstream provenance** (that PR #19980's merge base is

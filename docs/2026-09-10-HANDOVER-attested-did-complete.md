@@ -16,7 +16,7 @@ commit here.
 
 | Repo | Commits added |
 |---|---|
-| `siwx-oidc` | `c2cab99` `8d39fbe` `64eb620` `fc681b4` `01d37f6` `58865de` (+ the mock work, if it landed) |
+| `siwx-oidc` | `c2cab99` `8d39fbe` `64eb620` `fc681b4` `01d37f6` `58865de` `1a6740e` |
 | `siwx-oidc-matrix-server` | `9105a33` `a351300` `9736d59` |
 
 `cargo test --workspace`: EXIT=0, 19 targets ok, 279 passed, 0 failed.
@@ -97,6 +97,10 @@ that turned out to be wrong*, not merely missing code:
   (`:18080`) because the Caddy edge does not proxy `/_synapse/admin/*`; it passes at
   `:18448`. Pre-existing, not from this work, but it means that suite has been running
   against a host the harness would not use.
+- **`e2e_race_teardown` and `e2e_account_management` are still `#[ignore]`d** and outside
+  both `cargo test --workspace` and the harness check list. They now PASS (14/14, 6/6)
+  against a modernised mock, and `e2e/README.md` carries a one-line drift check, but
+  nothing runs them automatically. This is D12's structural half and it is open.
 - **Not deployed anywhere.** Everything above is the local hermetic harness. Dev and prod
   are untouched, per the plan's exclusions and memory `prod-promotion-gate`.
 - **The login-path probe count grew** from ~2 to ~5 Synapse calls. Timeouts now bound each
