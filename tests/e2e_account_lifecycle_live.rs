@@ -581,7 +581,6 @@ async fn account_lifecycle_round_trip_live() {
     let address = eip55_checksum(&addr_bytes);
     let did = format!("did:pkh:eip155:1:{}", address);
     let login = login_with_key(&signing_key, &address, &did).await;
-    let localpart = did.replace(':', "-").replace('.', "-").to_lowercase();
     eprintln!("[e2e:lifecycle] did={did}");
     eprintln!("[e2e:lifecycle] device_id={}", login.device_id);
 
@@ -608,7 +607,7 @@ async fn account_lifecycle_round_trip_live() {
         .as_str()
         .expect("whoami must carry user_id")
         .to_string();
-    eprintln!("[e2e:lifecycle] mxid={mxid} (derived localpart would be {localpart})");
+    eprintln!("[e2e:lifecycle] mxid={mxid}");
 
     // -----------------------------------------------------------------------
     // LEG 1 — baseline: a live account is not deactivated.

@@ -26,6 +26,11 @@ use reqwest::{redirect::Policy, Client, StatusCode};
 use serde_json::Value;
 use sha2::{Digest as Sha2Digest, Sha256};
 use sha3::Keccak256;
+// The REAL localpart derivation, called rather than hand-copied. `src/mxid.rs`
+// lives in the library crate (see `src/lib.rs`) precisely so integration tests
+// can link the production implementation; a hand-copy in a test file has
+// already silently drifted from it once.
+use siwx_oidc::mxid::{legacy_localpart, localpart_for};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -39,6 +44,22 @@ fn siweoidc_host() -> String {
 
 fn matrix_host() -> String {
     std::env::var("MATRIX_HOST").unwrap_or_else(|_| "http://localhost:8448".to_string())
+}
+
+/// Split an mxid (`@localpart:server.name`) into its localpart.
+///
+/// Exists so the localpart assertion below can test for EQUALITY against the
+/// real derivation instead of `contains`-ing a substring of the mxid. A
+/// `contains` check is far weaker than it looks: it is satisfied by ANY
+/// substring of the mxid, so a derivation that changed shape but kept a common
+/// prefix would still pass, and it cannot distinguish `@abc:host` from
+/// `@abcdef:host` at all.
+fn localpart_of(user_id: &str) -> &str {
+    user_id
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(localpart, _server_name)| localpart)
+        .unwrap_or_else(|| panic!("whoami user_id {user_id:?} is not a well-formed mxid"))
 }
 
 /// Derive the 20-byte Ethereum address from a k256 verifying key.
@@ -628,10 +649,50 @@ async fn msc4191_device_management_live() {
         );
         let wj: Value = whoami_before.json().await.unwrap();
         let user_id = wj["user_id"].as_str().unwrap();
-        let expected_localpart = did.replace(':', "-").to_lowercase();
-        assert!(
-            user_id.contains(&expected_localpart),
-            "whoami user_id '{user_id}' should contain localpart '{expected_localpart}'"
+        // The localpart must be the OPAQUE base36 shape, not the legacy
+        // hyphenated one.
+        //
+        // This test mints a FRESH random k256 throwaway wallet on every run
+        // (see the top of the function), so the DID owns no Matrix account
+        // under either shape when `/sign_in` first provisions it.
+        // `resolve_identity` (`src/localpart.rs`, binary crate) therefore
+        // classifies it as a genuinely NEW identity and hands it
+        // `siwx_oidc::mxid::localpart_for` — 16 lowercase base36 characters,
+        // exactly one alphanumeric run.
+        //
+        // This assertion used to hardcode
+        // `did.replace(':', "-").to_lowercase()`, the pre-2026-09 derivation
+        // that commit c2cab99 replaced. That shape produces an 82-character,
+        // five-"word" mxid, and matrix.org's MSC4284 policy server runs a
+        // `UserIdContainsWordsFilter` that refuses to sign messages from it —
+        // a controlled A/B against the dev homeserver (2026-09-09, in
+        // c2cab99's commit message) confirmed the long shape is refused while
+        // a short single-run localpart on the SAME server is signed. That is
+        // the entire reason `src/mxid.rs` exists; see its module doc and
+        // `docs/design/2026-09-09-did-profile-field-feasibility.md`.
+        //
+        // The legacy shape is still reachable, but ONLY by grandfathering an
+        // account that already existed before the migration (Synapse has no
+        // user-rename API), which is covered by `e2e_race_teardown`'s
+        // `grandfathered_legacy_account_keeps_legacy_localpart_on_real_signin`
+        // — never by a fresh identity like this one. Do NOT "fix" this back to
+        // the legacy derivation; the `assert_ne!` below is what stops that
+        // happening silently.
+        let localpart = localpart_of(user_id);
+        assert_eq!(
+            localpart,
+            localpart_for(&did),
+            "a genuinely new identity must get the opaque base36 localpart \
+             derived by siwx_oidc::mxid::localpart_for (see src/mxid.rs); \
+             whoami returned user_id '{user_id}'"
+        );
+        assert_ne!(
+            localpart,
+            legacy_localpart(&did),
+            "a genuinely new identity must NOT get the legacy hyphenated \
+             localpart: matrix.org's policy server refuses the long multi-word \
+             mxid it produces (see src/mxid.rs and the A/B in commit c2cab99). \
+             whoami returned user_id '{user_id}'"
         );
         eprintln!("[e2e] whoami(before) user_id={user_id} (AC3 precondition OK)");
     }

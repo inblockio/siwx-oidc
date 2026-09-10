@@ -17,6 +17,11 @@ use reqwest::{redirect::Policy, Client, StatusCode};
 use serde_json::Value;
 use sha2::{Digest as Sha2Digest, Sha256};
 use sha3::Keccak256;
+// The REAL localpart derivation, called rather than hand-copied. `src/mxid.rs`
+// lives in the library crate (see `src/lib.rs`) precisely so integration tests
+// can link the production implementation; a hand-copy in a test file has
+// already silently drifted from it once.
+use siwx_oidc::mxid::{legacy_localpart, localpart_for};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -29,6 +34,22 @@ fn siweoidc_host() -> String {
 
 fn matrix_host() -> String {
     std::env::var("MATRIX_HOST").unwrap_or_else(|_| "http://localhost:8448".to_string())
+}
+
+/// Split an mxid (`@localpart:server.name`) into its localpart.
+///
+/// Exists so the localpart assertions below can test for EQUALITY against the
+/// real derivation instead of `contains`-ing a substring of the mxid. A
+/// `contains` check is far weaker than it looks: it is satisfied by ANY
+/// substring of the mxid, so a derivation that changed shape but kept a common
+/// prefix would still pass, and it cannot distinguish `@abc:host` from
+/// `@abcdef:host` at all.
+fn localpart_of(user_id: &str) -> &str {
+    user_id
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(localpart, _server_name)| localpart)
+        .unwrap_or_else(|| panic!("whoami user_id {user_id:?} is not a well-formed mxid"))
 }
 
 /// Derive the 20-byte Ethereum address from a k256 verifying key.
@@ -419,13 +440,48 @@ async fn full_lifecycle() {
     let user_id = whoami_json["user_id"].as_str().unwrap();
     eprintln!("[e2e] user_id={}", user_id);
 
-    // The user_id should contain the DID-derived localpart.
-    let expected_localpart = auth.did.replace(':', "-").to_lowercase();
-    assert!(
-        user_id.contains(&expected_localpart),
-        "user_id '{}' should contain localpart '{}'",
-        user_id,
-        expected_localpart
+    // The localpart must be the OPAQUE base36 shape, not the legacy hyphenated
+    // one.
+    //
+    // `perform_auth_flow` mints a FRESH random k256 key on every run, so this
+    // DID owns no Matrix account under either shape at the moment `/sign_in`
+    // first provisions it. `resolve_identity` (`src/localpart.rs`, binary
+    // crate) therefore classifies it as a genuinely NEW identity and hands it
+    // `siwx_oidc::mxid::localpart_for` — 16 lowercase base36 characters,
+    // exactly one alphanumeric run.
+    //
+    // This assertion used to hardcode `did.replace(':', "-").to_lowercase()`,
+    // the pre-2026-09 derivation that commit c2cab99 replaced. That shape
+    // produces an 82-character, five-"word" mxid, and matrix.org's MSC4284
+    // policy server runs a `UserIdContainsWordsFilter` that refuses to sign
+    // messages from it — a controlled A/B against the dev homeserver
+    // (2026-09-09, in c2cab99's commit message) confirmed the long shape is
+    // refused while a short single-run localpart on the SAME server is signed.
+    // That is the entire reason `src/mxid.rs` exists; see its module doc and
+    // `docs/design/2026-09-09-did-profile-field-feasibility.md`.
+    //
+    // The legacy shape is still reachable, but ONLY by grandfathering an
+    // account that already existed before the migration (Synapse has no
+    // user-rename API), which is covered by `e2e_race_teardown`'s
+    // `grandfathered_legacy_account_keeps_legacy_localpart_on_real_signin` —
+    // never by a fresh identity like this one. Do NOT "fix" this back to the
+    // legacy derivation; the `assert_ne!` below is what stops that happening
+    // silently.
+    let localpart = localpart_of(user_id);
+    assert_eq!(
+        localpart,
+        localpart_for(&auth.did),
+        "a genuinely new identity must get the opaque base36 localpart derived \
+         by siwx_oidc::mxid::localpart_for (see src/mxid.rs); whoami returned \
+         user_id '{user_id}'"
+    );
+    assert_ne!(
+        localpart,
+        legacy_localpart(&auth.did),
+        "a genuinely new identity must NOT get the legacy hyphenated localpart: \
+         matrix.org's policy server refuses the long multi-word mxid it produces \
+         (see src/mxid.rs and the A/B in commit c2cab99). whoami returned \
+         user_id '{user_id}'"
     );
 
     // Verify device_id is present.
@@ -588,12 +644,21 @@ async fn returning_user_new_device() {
     let address = eip55_checksum(&addr_bytes);
     let did = format!("did:pkh:eip155:1:{}", address);
 
-    // Helper: perform a full login with the given key and return (access_token, device_id).
+    // Helper: perform a full login with the given key and return
+    // (access_token, device_id, user_id).
+    //
+    // `user_id` is the mxid Synapse itself reports for the freshly issued
+    // token. It is returned (it used to be read from whoami and thrown away)
+    // so the second login can be compared against the FIRST login's mxid
+    // directly — see the assertion below for why that is the invariant this
+    // test is actually named after. `device_id` and `user_id` are `None` only
+    // when whoami did not return 200, i.e. the known "Synapse cannot reach the
+    // introspect endpoint" deployment condition this file degrades around.
     async fn login_with_key(
         signing_key: &SigningKey,
         address: &str,
         did: &str,
-    ) -> (String, Option<String>) {
+    ) -> (String, Option<String>, Option<String>) {
         let base = siweoidc_host();
         let http_inner = Client::new();
 
@@ -741,22 +806,26 @@ async fn returning_user_new_device() {
             .send()
             .await
             .unwrap();
-        let device_id = if whoami_resp.status() == StatusCode::OK {
+        let (device_id, user_id) = if whoami_resp.status() == StatusCode::OK {
             let wj: Value = whoami_resp.json().await.unwrap();
-            wj["device_id"].as_str().map(|s| s.to_string())
+            (
+                wj["device_id"].as_str().map(|s| s.to_string()),
+                wj["user_id"].as_str().map(|s| s.to_string()),
+            )
         } else {
-            None
+            (None, None)
         };
 
-        (access_token, device_id)
+        (access_token, device_id, user_id)
     }
 
     // First login.
-    let (token1, device1) = login_with_key(&signing_key, &address, &did).await;
+    let (token1, device1, user_id1) = login_with_key(&signing_key, &address, &did).await;
     eprintln!(
-        "[e2e] first login: token={}, device={:?}",
+        "[e2e] first login: token={}, device={:?}, user_id={:?}",
         &token1[..12],
-        device1
+        device1,
+        user_id1
     );
 
     // Revoke (simulate logout).
@@ -769,8 +838,11 @@ async fn returning_user_new_device() {
     assert_eq!(revoke_resp.status(), StatusCode::OK);
     eprintln!("[e2e] first session revoked");
 
-    // Second login (same user, new session).
-    let (token2, device2) = login_with_key(&signing_key, &address, &did).await;
+    // Second login (same user, new session). The helper's own whoami result is
+    // discarded here: the assertions below use the outer whoami2 call, which is
+    // gated on `matrix_introspection_healthy` and so degrades cleanly when
+    // Synapse cannot reach the introspect endpoint.
+    let (token2, device2, _) = login_with_key(&signing_key, &address, &did).await;
     eprintln!(
         "[e2e] second login: token={}, device={:?}",
         &token2[..12],
@@ -805,11 +877,58 @@ async fn returning_user_new_device() {
         let user_id2 = wj2["user_id"].as_str().unwrap();
         eprintln!("[e2e] second login user_id={}", user_id2);
 
-        // Same user should have same user_id.
-        let expected_localpart = did.replace(':', "-").to_lowercase();
-        assert!(
-            user_id2.contains(&expected_localpart),
-            "second login should yield same user"
+        // "Second login should yield the same user" is the invariant this
+        // test is named after, and it is now checked DIRECTLY: the two logins
+        // must report the identical mxid.
+        //
+        // Previously it was only checked INDIRECTLY, by asserting the second
+        // login's mxid contained a hardcoded
+        // `did.replace(':', "-").to_lowercase()` localpart. That made this a
+        // test of the derivation rule rather than of user identity, so when
+        // commit c2cab99 replaced the rule the assertion encoded a falsehood
+        // (and, being `#[ignore]`d, stayed green under `cargo test` while
+        // doing it). Comparing the two observed mxids needs no knowledge of
+        // the derivation at all and cannot go stale the same way.
+        //
+        // The whoami here is gated on `matrix_introspection_healthy(&token2)`,
+        // and the block already hard-asserts the second whoami returned 200,
+        // so the first login's whoami must have succeeded too; a `None` here
+        // is a real failure, not the 503 deployment condition (which is
+        // handled by the `else` branch below).
+        let user_id1 = user_id1
+            .as_deref()
+            .expect("first login's whoami must return a user_id when introspection is healthy");
+        assert_eq!(
+            user_id2, user_id1,
+            "second login must yield the SAME user as the first"
+        );
+
+        // ...and that shared mxid must carry the OPAQUE base36 localpart a
+        // genuinely new identity gets, not the legacy hyphenated one. This
+        // test generates a fresh random k256 key per run (see the top of the
+        // function), so `resolve_identity` (`src/localpart.rs`) classifies it
+        // as new and applies `siwx_oidc::mxid::localpart_for`. The legacy
+        // shape is reserved for grandfathering accounts that predate the
+        // 2026-09 migration; matrix.org's MSC4284 policy server refuses the
+        // long, five-"word" mxid it produces (A/B in commit c2cab99, plus
+        // `docs/design/2026-09-09-did-profile-field-feasibility.md`), which is
+        // why `src/mxid.rs` exists. Do NOT "fix" this back to the legacy
+        // derivation.
+        let localpart2 = localpart_of(user_id2);
+        assert_eq!(
+            localpart2,
+            localpart_for(&did),
+            "a genuinely new identity must get the opaque base36 localpart \
+             derived by siwx_oidc::mxid::localpart_for (see src/mxid.rs); \
+             whoami returned user_id '{user_id2}'"
+        );
+        assert_ne!(
+            localpart2,
+            legacy_localpart(&did),
+            "a genuinely new identity must NOT get the legacy hyphenated \
+             localpart: matrix.org's policy server refuses the long multi-word \
+             mxid it produces (see src/mxid.rs and the A/B in commit c2cab99). \
+             whoami returned user_id '{user_id2}'"
         );
 
         // Device IDs should be different (new device per login).

@@ -31,15 +31,26 @@ src/                                ← Axum OIDC server (binary)
                                      (provision_user, upsert_device, allow_cross_signing_reset,
                                      is_localpart_available, delete_device, deactivate_user, reactivate_user)
                                      and a MINTED admin token on /_synapse/admin/* + the authenticated
-                                     C-S API (list_devices, get_device, has_cross_signing_keys).
+                                     C-S API (list_devices, get_device, has_cross_signing_keys,
+                                     publish_did_field -> PUT …/profile/{mxid}/io.inblock.did).
+  did_assertion.rs                   DID tier: DID_PROFILE_FIELD, mint_did_assertion (compact ES256 JWS),
+                                     did_profile_value ({did, proof}), DidPublication. See "Identity model".
+  localpart.rs                       Grandfathering POLICY (binary crate, needs SynapseClient):
+                                     resolve_identity / resolve_identity_or_legacy. Fail-safe direction
+                                     on error is LEGACY, never modern.
   webauthn.rs                        WebAuthn ceremony: register + discoverable authenticate
+  lib.rs / mxid.rs                   Library crate. mxid.rs is the PURE derivation (sha2 only, so tests/*.rs
+                                     can link it): localpart_for, legacy_localpart, canonicalize.
   db/mod.rs                          DBClient trait, CodeEntry, SessionEntry, ClientEntry, DeviceCodeEntry
   db/redis.rs                        Redis impl + helpers; revoke_device_tokens(did, device_id) revokes
                                      an OAuth session (MSC4191 device_delete -> introspection inactive)
 
 siwx-oidc-auth/src/                ← Headless OIDC client (library + CLI)
   lib.rs                             SiwxKey (PEM/hex/generate), authenticate(), refresh(), AuthTokens
-  main.rs                            CLI: --key-file, --print-did, --server, --refresh-token
+  did_assertion.rs                   The SHIPPED verifier: fetch_and_verify_did / verify_did_assertion,
+                                     VerifiedDid, DidAssertionError. mxid binding is inside, no opt-out.
+  main.rs                            CLI: --key-file, --print-did, --server, --refresh-token,
+                                     --verify-did <MXID> --homeserver <url>
 
 js/ui/src/App.svelte               ← Svelte frontend (Ethereum-only via Web3Modal)
 ```
@@ -98,6 +109,270 @@ No `inventory` crate (WASM-unsafe).
 2. Device polls `POST /token` with `grant_type=urn:ietf:params:oauth:grant-type:device_code`
 3. User opens `/device?user_code=XXX-XXX`, authenticates with wallet/passkey
 4. Approval updates device code status → next poll returns tokens + provisions Synapse device
+
+## Identity model — three tiers (2026-09-10)
+
+Every user carries exactly three identifiers, with three different owners.
+Conflating any two of them is the bug class this section exists to prevent.
+
+| Tier | Value | Owner | Mutable | Where it lives |
+|---|---|---|---|---|
+| **Alias** | a human display name | **the user** | yes, freely | Synapse `displayname` |
+| **MXID** | `@{base36(sha256(did)[..10])}:{server}` — 16 lowercase base36 chars, one alphanumeric run (`mxid::localpart_for`) | derived | **no** — Synapse has no user-rename API | Synapse `users` row |
+| **DID** | `did:key:…` / `did:pkh:…` + the provider's signature | **the provider** | **no** | Synapse profile field `io.inblock.did` |
+
+**The boundary is enforced structurally, not by convention.** Synapse's write-ACL
+guard sits in `ProfileHandler.set_profile_field`; `displayname` routes through
+`set_field` → `set_displayname` and reaches the store without ever passing that
+method. So the alias **cannot** be locked and the DID **cannot** be user-written,
+by construction. Verified live — leg 5 of
+`docs/audits/2026-09-10-msc4133-acl-probe.md`: on one image, a plain user's PUT to
+`displayname` is **200** while their PUT to `io.inblock.did` is **403**. Putting
+`"displayname"` in the denylist would have zero effect, and that is desirable.
+
+Until 2026-09-10 tiers 1 and 3 were the *same field*: `provision_user`'s second
+argument is the displayname and it was the raw DID, so the only published copy of a
+user's DID lived in a surface the user could rewrite — a consumer reading
+displayname-as-DID could be handed **someone else's** DID. The seed is now the
+localpart (see MSC3861 device lifecycle below). MXID derivation and the
+grandfathering rule live in `mxid.rs` (pure) + `localpart.rs` (policy).
+
+### The `io.inblock.did` wire contract
+
+The field holds a JSON **object**, written atomically as one PUT
+(`did_assertion::did_profile_value`):
+
+```json
+{ "did": "did:key:zDnaeUKTWU…", "proof": "eyJhbGciOiJFUzI1NiIsImtpZCI6…" }
+```
+
+- `did` is the **exact-case** DID. Never normalised, never lowercased — a
+  `did:key` multibase payload carries meaning in its case, and it is NOT
+  recoverable from the (lowercased) localpart. See MEMORY.md "MXID to DID is not
+  invertible" / siwx-oidc#17.
+- `proof` is **absent** — not `null`, not `""` — when the provider's signing key
+  is ephemeral. Do not "improve" that to an empty string: the shipped consumer
+  filters `""` back out (`.filter(|s| !s.is_empty())`), so both spellings land in
+  the same bucket while making the stored JSON claim something exists that does
+  not. Pinned by `did_assertion::tests::h5_ephemeral_key_publishes_a_did_with_no_proof_key`.
+- **One field, not two** (`…did` + `…did.proof`): one PUT is one canonical-JSON
+  blob so the two cannot drift apart, and it is **one** denylist entry to
+  forward-port on every Synapse bump.
+
+`proof` is a compact ES256 JWS (RFC 7515 §3.1), signed over
+`BASE64URL(header) "." BASE64URL(payload)`, base64url **unpadded**, signature raw
+**r‖s exactly 64 bytes, never DER** (`EcdsaSigningKey::sign_es256`;
+`signature_is_64_raw_bytes_never_der`):
+
+```
+header  = {"alg":"ES256","typ":"JWT","kid":"<key fingerprint>"}
+payload = {"iss":"<base_url>","sub":"<exact-case DID>","mxid":"@localpart:server","iat":<unix seconds>}
+```
+
+Field order in both documents is the struct declaration order of
+`DidAssertionHeader` / `DidAssertionClaims` — serde emits declaration order, and
+those bytes are what gets signed.
+
+- `sub` is deliberately the DID, the same claim the ID token carries (breaking
+  change #1 below), so a consumer compares assertion-`sub` to ID-token-`sub` with
+  zero translation — and translation is exactly where DID identity goes wrong.
+- `mxid` is the replay guard. See the trust model below.
+- **There is no `exp`, on purpose.** The binding is permanent: localparts are
+  never recycled and a DID does not stop being that user's DID. An expiry would
+  turn a statement that stays **true** into a credential that goes **stale**, and
+  would demand re-minting for accounts that may never sign in again. Asserted on
+  the raw decoded JSON keys by `payload_has_no_exp_claim`, so an accidentally
+  added `exp` fails the suite instead of shipping.
+
+**The field name is a THREE-SIDED contract.** The same literal must be identical
+in three independently-deployed places, and they fail *apart*, silently:
+
+| Side | Where |
+|---|---|
+| provider | `src/did_assertion.rs::DID_PROFILE_FIELD` |
+| consumer | `siwx-oidc-auth/src/did_assertion.rs::DID_PROFILE_FIELD` (pinned equal at compile time by the interop test) |
+| homeserver | `experimental_features.msc4133_key_denylist` in `../siwx-oidc-matrix-server/entrypoints/matrix_server.sh` (`apply_did_field_protection`) |
+
+Renaming it is a **migration, not an edit**: all three move together, and the
+consumer must dual-read both names for a full upgrade cycle or every account that
+has not signed in since the rename reads as "no published DID". The homeserver
+side fails **open** — a denylist still naming the old key leaves the new field
+user-writable, which is exactly the hole this feature closes. The name also has to
+satisfy Synapse's Common Namespaced Identifier Grammar `^[a-z][a-z0-9_.-]{0,254}$`
+(1.159.0 `util/stringutils.py:53`), which forbids uppercase and colons — which is
+why a DID can never be a field *name*.
+
+### Trust model: a discovery hint, NEVER an authorization source
+
+**Authorization MUST resolve the DID from the OIDC `sub` claim of a token this
+provider issued, or from a fresh signature by the DID's own key.** A DID read out
+of a profile — proof or no proof — tells you what to *look up*, never what to
+*permit*.
+
+A verified assertion proves exactly one thing: **the provider asserted this DID ↔
+MXID binding at `iat`**. It does not prove the holder controls the key now, and it
+authorizes nothing. This is the same discipline siwx-oidc#17 established for the
+localpart problem: resolve DIDs from `sub` or from this field, never by
+reconstructing them, and compare byte-for-byte.
+
+**Everything in this object is world-readable, forever.**
+`GET /_matrix/client/v3/profile/{user}/{field}` authenticates only when
+`require_auth_for_profile_requests` is set, and it defaults to **False** (1.159.0
+`config/server.py:561`); custom fields also federate via
+`handlers/profile.py::on_profile_query`. The live probe read the object back with
+no `Authorization` header at all. **Nothing private may ever be added to it** — no
+email, no session id, no internal identifier.
+
+### `kid` is derived from the public key — do not reintroduce a caller-supplied one
+
+`axum_lib.rs` used to stamp the literal `kid = "key1"` on **both** the configured
+key and the randomly generated fallback. Assertions are stored durably in someone
+else's database but may be signed by a key that dies at restart, so a constant kid
+means a restart produces a **different key under the same kid** and every stored
+assertion fails as a silent "bad signature". `kid` is now the first 16 hex chars of
+SHA-256 over the SEC1-uncompressed public key (`EcdsaSigningKey::fingerprint_of`),
+so that failure becomes an honest, diagnosable "kid not present in JWKS"
+(`h4_two_generated_keys_get_different_kids`,
+`h4_the_same_pem_yields_the_same_kid_across_constructions`).
+
+- **Do not reintroduce a `kid` constructor parameter.** It was *removed*, not
+  defaulted — the absence of the argument is the fix. Both constructors funnel
+  through `with_derived_kid` so a third one cannot forget.
+- Do not "simplify" `kid` back to an `Option`: a JWKS entry without a `kid` forces
+  every verifier into trial-verification against every key, erasing the
+  unknown-kid diagnostic this exists to produce.
+- `PrivateSigningKey::sign` delegates to the same `sign_es256`, so ID tokens and
+  assertions cannot drift onto different signature encodings.
+- **An ephemeral key mints no proof at all.** `mint_did_assertion` returns `None`
+  for a generated key and the profile gets `{"did": …}` alone; the startup banner
+  says so at `warn!` and the per-call suppression is a once-per-process `warn!`
+  plus `debug!`. Writing a durable assertion with a key we know will disappear is
+  writing garbage into a stranger's profile.
+
+### Publication — operational facts
+
+- **One call site.** Published from `oidc::provision_synapse_device`, the single
+  function both sign-in paths already route through (`sign_in` and the
+  device-code/QR grant). The `DidPublication { key, issuer }` context is built in
+  `axum_lib.rs` (sign_in) and in the device-code branch of `oidc.rs`; `issuer` must
+  be the value OIDC discovery reports, because the verifier compares it.
+- **Best-effort, never fails sign-in** — the same contract as `upsert_device` and
+  `allow_cross_signing_reset` immediately beside it. Every outcome is logged and
+  dropped.
+- **Re-asserted on EVERY sign-in, and that is load-bearing, not belt-and-braces.**
+  The Synapse ACL guard is **prospective only**: it blocks new writes but does not
+  validate or migrate a value written before the denylist existed (upstream has
+  the identical gap — synapse#19980 review thread `r3783167037`). Re-asserting
+  closes it from the other side, so a clobbered value self-heals at the user's next
+  login with **no janitor process and no migration script**. Verified live
+  (`clobbered_did_field_is_restored_at_next_signin_live`).
+- **A 500 from this route means "row-less account, state unknown", not "error".**
+  element-hq/synapse#19702 is still present in 1.159.0 on **reads and writes**
+  (`_check_profile_size` and `get_profile_field` both subscript an unguarded
+  `txn.fetchone()`), so an account with a `users` row but no `profiles` row 500s
+  where a healthy account 404s — 3 of 102 dev accounts are in that state.
+  `classify_publish_status` matches **exactly 500** and deliberately NOT
+  `is_server_error()`, so 502/503/504 stay hard errors and a dead upstream is never
+  hidden behind a known-bug branch. **Do not "simplify" that to `is_server_error()`.**
+  The outcome is a typed `PublishOutcome::RowLessAccount`, not `Ok(())`, because
+  "published" and "state unknown" are different facts.
+- **Requires `SIWEOIDC_MATRIX_SERVER_NAME`.** The assertion binds an `mxid`, which
+  cannot be built without the server name, and binding a guessed mxid would be
+  worse than publishing nothing. A standalone deployment skips publication
+  entirely: degrade, never 500.
+- Wire details: `PUT /_matrix/client/v3/profile/{mxid}/io.inblock.did` with a
+  **minted admin-scoped token** (`synapse_client::admin_request`, which re-mints
+  once on 401/403 — the MAS shared secret does not work here). The mxid is a **path
+  segment** and is percent-encoded (`@` and `:` are sub-delims); the MAS
+  `/_synapse/mas/*` routes take a bare localpart in the body instead — do not
+  "unify" the two. The body echoes the field name as its single key, built from the
+  shared constant so it cannot drift into a literal. A **404** on this route means
+  the homeserver has never heard of that user (the stable v3 route is registered
+  unconditionally on 1.159.0, `rest/client/profile.py:100-103`), NOT that the field
+  is merely unset.
+
+### The Synapse patch dependency (new — the image is no longer stock)
+
+The homeserver image now carries a backport of
+[element-hq/synapse#19980](https://github.com/element-hq/synapse/pull/19980) (head
+`d4758f2d2`) onto `matrixdotorg/synapse:v1.159.0`, giving
+`experimental_features.msc4133_key_denylist`. Registry, evidence and retirement
+condition: **`../siwx-oidc-matrix-server/patches/synapse/README.md`**.
+
+- This is our **first** Synapse patch, so every `FROM matrixdotorg/synapse:vX.Y.Z`
+  bump now carries a forward-port obligation — run the registry's dry-run bump
+  procedure *before* merging the bump, and check the retirement condition first (a
+  patch that stops applying often means upstream merged it).
+- **Denylist, never allowlist.** `msc4133_key_allowlist` is a hard whitelist over
+  *every* custom profile field on the homeserver; `[]` is not `None` and would
+  brick all custom-field writes. Leg 4 of the probe pins that other custom fields
+  stay user-writable.
+- Take head `d4758f2d2` only — an earlier revision of that branch lacked the
+  `not by_admin and` prefix and would have locked out **our own** admin write
+  (probe leg 1).
+- Upstream key names are kept **verbatim** so adopting the merged PR is a no-op for
+  our config. #19980 is OPEN but stalled (`CHANGES_REQUESTED` 2026-08-13). Do not
+  open a competing PR while the author is active.
+- The patch is applied with `patch --forward --batch --fuzz=0`, so a patch that
+  stops applying **fails the image build** rather than silently shipping an
+  unpatched Synapse (deliberately falsified once, 2026-09-10).
+
+### Verifying a published DID (`siwx-oidc-auth`)
+
+```bash
+siwx-oidc-auth --verify-did '@k3f9x2q7ab4d8m1p:inblock.io' \
+  --homeserver https://matrix.example.org \
+  --server     https://siwx.example.com     # the ISSUER: a trust anchor, not a hint
+```
+
+Library API: `fetch_and_verify_did(homeserver, mxid, issuer)` (prefer this) and
+`verify_did_assertion(issuer_base_url, jws, expected_mxid)`, both returning
+`VerifiedDid { did, mxid, issuer, issued_at }` — every field out of the signed
+payload. Reading is unauthenticated and client-less by design; sending a token
+would only leak the caller's identity to every homeserver polled.
+
+**A successful verification is still only a discovery hint.** It says the provider
+asserted this binding at `iat` — not that whoever you are talking to controls the
+DID key. Authorize from an OIDC `sub` this provider issued, or from a fresh
+signature by the DID key itself. The `--verify-did` CLI help says the same thing,
+in the same words, on purpose.
+
+- **The mxid binding is INSIDE the helper, with no opt-out — that is the whole
+  security property.** Without it, user B copies A's valid proof into B's profile
+  and it verifies. `fetch_and_verify_did` passes the mxid it just fetched *from* as
+  the mxid it verifies *against*, so the check cannot be forgotten by a caller.
+  Pinned by `h6_valid_assertion_replayed_for_another_user_is_rejected`. Do not add
+  a `verify_did_assertion_unbound()`.
+- **`alg` is gated before any network I/O** — `none` and the `HS*` family are
+  rejected by name (RFC 8725 §3.1 algorithm confusion: an attacker choosing the alg
+  turns a *public* key into an HMAC secret). Pinned by tests that point discovery at
+  a dead port and assert the error never mentions a GET.
+- **An unknown `kid` is a hard error naming the kid**, never a try-every-key
+  fallback, so a rotated or ephemeral key fails loudly instead of
+  indistinguishably.
+- The signature is verified over the **received** first two parts, never over a
+  re-serialization of the decoded JSON.
+- `iss` must equal the discovery document's `issuer` (trailing slashes normalised).
+- Two expected non-verifying outcomes get a downcastable discriminator —
+  `DidAssertionError::FieldAbsent` and `::ProofAbsent` (ephemeral issuer key;
+  treat as absent, **not** as a usable DID). Everything else is an untyped error,
+  because the correct response to all of them is identical: do not trust the DID.
+- If the object's plain `did` member disagrees with the verified `sub`, the
+  **verified** value wins — the plain member is untrusted decoration.
+
+Interop is proven, not assumed: minter and verifier were written independently by
+two agents against one written spec, so `did_assertion.rs`'s
+`interop_with_the_shipped_verifier` module mints server-side, serves the real JWKS
+from `oidc::jwks` over real HTTP, and verifies with the shipped client verifier
+(plus the replay case). It lives in the **binary** crate's `#[cfg(test)]` tree
+because `tests/*.rs` link the *library* crate and cannot name `mint_did_assertion`,
+`EcdsaSigningKey` or `oidc::jwks`. `siwx-oidc-auth` is a **dev-dependency** only, so
+the shipped binary links none of it.
+
+Live coverage (`--ignored`, against the local e2e harness):
+`tests/e2e_did_field_live.rs` — `did_field_is_published_verifiable_and_public_live`,
+`did_field_user_write_is_forbidden_live`,
+`clobbered_did_field_is_restored_at_next_signin_live`.
 
 ## Admin-scoped token mint (`POST /oauth2/admin_token`)
 
@@ -316,19 +591,24 @@ Prefix: `SIWEOIDC_` (via Figment: `siwe-oidc.toml` or env vars)
 | `SIWEOIDC_PORT` | Port | `8000` |
 | `SIWEOIDC_BASE_URL` | Advertised OIDC issuer URL | `http://127.0.0.1:8000` |
 | `SIWEOIDC_REDIS_URL` | Redis URL | `redis://localhost` |
-| `SIWEOIDC_SIGNING_KEY_PEM` | PKCS#8 PEM for ES256 signing key | generated |
+| `SIWEOIDC_SIGNING_KEY_PEM` | PKCS#8 PEM for ES256 signing key. Also gates DID-assertion minting: absent → ephemeral key → profiles carry `did` with **no `proof`** | generated |
 | `SIWEOIDC_SUPPORTED_DID_METHODS` | DID methods accepted at sign-in | `["pkh"]` |
 | `SIWEOIDC_SUPPORTED_PKH_NAMESPACES` | did:pkh namespaces accepted | `["eip155","ed25519","p256"]` |
 | `SIWEOIDC_RP_ID` | WebAuthn Relying Party ID (domain) | hostname of `BASE_URL` |
 | `SIWEOIDC_RP_ORIGIN` | WebAuthn expected origin URL | `BASE_URL` |
 | `SIWEOIDC_LOG_FORMAT` | Log output format | `pretty` (or `json`) |
-| `SIWEOIDC_MATRIX_SERVER_NAME` | Matrix server_name for cross-signing checks | (none) |
+| `SIWEOIDC_MATRIX_SERVER_NAME` | Matrix server_name for cross-signing checks, device actions, and `io.inblock.did` publication (no server_name → no `mxid` → publication skipped) | (none) |
 | `SIWEOIDC_ACCOUNT_MANAGEMENT_URI` | MSC4191 account management URL (override) | `{base_url}/account` |
 | `SIWEOIDC_ADMIN_TOKEN_TTL_SECS` | Lifetime of a minted admin-scoped token. Clamped in code to 30..=900 | `300` |
 | `SIWEOIDC_ADMIN_TOKEN_LOCALPART` | Synapse localpart admin tokens are bound to (auto-provisioned) | `siwx-admin` |
 
 **For passkey login:** add `"key"` to `SIWEOIDC_SUPPORTED_DID_METHODS` so the `did:key:zDn…`
 DIDs derived from passkeys are accepted by `sign_in`.
+
+**The attested-DID feature added NO new env vars.** It is gated entirely by the two
+rows above (`SIGNING_KEY_PEM` → whether a `proof` is minted; `MATRIX_SERVER_NAME` →
+whether anything is published at all). The homeserver-side denylist is Synapse
+config, not ours — see "The Synapse patch dependency".
 
 ## Breaking changes vs siwe-oidc
 
@@ -343,6 +623,7 @@ DIDs derived from passkeys are accepted by `sign_in`.
 |------|---------|
 | `../siwe-oidc` | Upstream Ethereum-only predecessor (abandoned) |
 | `../aqua-auth` | Crypto layer (aqua-auth 0.2.0) providing DIDMethod/CipherSuite traits. Workspace dependency. |
+| `../siwx-oidc-matrix-server` | Synapse + Element deployment. Carries `patches/synapse/README.md` (the MSC4133 write-ACL backport this repo now DEPENDS on) and `entrypoints/matrix_server.sh` (the `io.inblock.did` denylist). |
 
 ## Frontend (js/ui/src/App.svelte)
 
@@ -401,7 +682,24 @@ the client supplies a device_id in the scope (`urn:matrix:client:device:XXX` or
 `urn:matrix:org.matrix.msc2967.client:device:XXX`) that exact id is provisioned,
 otherwise a `SIWX_{uuid}` is generated. The token response includes the scope so
 clients can discover the provisioned device_id. `allow_cross_signing_reset`
-fires unconditionally on sign-in.
+fires unconditionally on sign-in. Since 2026-09-10 the same function also
+publishes the attested DID (`io.inblock.did`) on every sign-in — see "Identity
+model — three tiers".
+
+**The displayname seed is the LOCALPART, never the DID (2026-09-10).**
+`provision_user`'s second argument is the user's *displayname*, and it used to be
+the raw DID. That was a security problem, not an aesthetic one: `displayname`
+routes through `set_field` → `set_displayname` and never reaches the guarded
+`set_profile_field`, so it is user-writable (probe leg 5) — publishing a
+provider-asserted-looking DID there means a consumer reading displayname-as-DID
+can be handed **someone else's** DID. The localpart is a valid non-empty string,
+so the `profiles` row is still created (which is what keeps #19702 away from new
+accounts), and it is exactly what Element renders when displayname is unset.
+Existing users are unaffected: `provision_user` runs only at first sign-in and on
+a confirmed-absent-row self-heal. Pinned by
+`h11_first_signin_seeds_displayname_with_the_localpart_never_the_did` and its
+`h11_self_heal_…` twin. A friendlier generated alias is a deliberate non-goal
+(product decision, not a security one).
 
 **`provision_user` failure logging + self-heal (2026-08-01, discriminator fixed
 2026-08-02):** A `provision_user` failure at first sign-in (new account) is
@@ -571,7 +869,11 @@ the discoverable fix closed).
 Authenticating with an unrecognised passkey/wallet resolves a DID whose Matrix
 localpart is unprovisioned, so `sign_in` would silently CREATE a brand-new account.
 "New" is detected read-only, BEFORE any Synapse write, via
-`is_new_identity(did)` = `SynapseClient::is_localpart_available(did_to_localpart(did))`.
+`localpart::resolve_identity(did, synapse)` → `ResolvedIdentity.is_new`, which is
+true only when **neither** the legacy nor the modern localpart is taken. (The old
+one-shot `is_new_identity(did)` = `is_localpart_available(did_to_localpart(did))`
+is gone: with two derivations in play, probing a single fixed shape would read
+"no account" for a user who has one under the other shape.)
 Creating a new identity is permitted **ONLY at the login screen**; the account and
 QR/device flows hard-REJECT it:
 

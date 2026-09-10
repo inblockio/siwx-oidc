@@ -253,10 +253,18 @@ mod revocation_policy_tests {
     fn fail_open_window_is_bounded_by_the_tombstone_ttl() {
         // Mirrors the compile-time assertion, so the reasoning is visible in the
         // test suite too rather than only as a build error.
-        assert!(
-            TOMBSTONE_TTL_SECS > 2 * ACCESS_TOKEN_TTL,
-            "tombstone must outlive two access-token cycles for fail-open to be bounded"
-        );
+        //
+        // `const { .. }` because both operands are constants: clippy's
+        // `assertions_on_constants` correctly points out that a plain `assert!`
+        // over constants is evaluated at compile time anyway. Keeping it in a
+        // const block preserves the intent (a build error if the invariant is
+        // broken) while making that explicit rather than incidental.
+        const {
+            assert!(
+                TOMBSTONE_TTL_SECS > 2 * ACCESS_TOKEN_TTL,
+                "tombstone must outlive two access-token cycles for fail-open to be bounded"
+            );
+        }
     }
 }
 
