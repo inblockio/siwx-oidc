@@ -15,6 +15,7 @@ use rand::rngs::OsRng;
 use reqwest::Client;
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
+use siwx_oidc::mxid::legacy_localpart;
 
 fn oidc() -> String {
     std::env::var("SIWEOIDC_HOST").unwrap_or_else(|_| "http://localhost:8080".to_string())
@@ -30,7 +31,17 @@ struct Wallet {
     /// EIP-55 checksummed 0x address.
     address: String,
     did: String,
-    /// Matrix localpart `did_to_localpart(did)` and the mxid the mock keys on.
+    /// The legacy-shaped (`siwx_oidc::mxid::legacy_localpart`) mxid. Every
+    /// test in this file that uses `mxid` first `mock_seed_device`s (or
+    /// `__seed_user`s) THIS exact value, which is what actually makes
+    /// `resolve_identity` (`src/localpart.rs`) resolve to it: a legacy-shaped
+    /// localpart seeded as existing is found on `resolve_identity`'s FIRST
+    /// probe (grandfathering checks legacy before modern), so these tests
+    /// model a pre-2026-09 (grandfathered) account by construction, not "the
+    /// localpart every DID gets" — a brand-new DID's real first sign-in would
+    /// get the modern base36 shape instead (see `tests/e2e_race_teardown.rs`'s
+    /// `grandfathered_legacy_account_keeps_legacy_localpart_on_real_signin`
+    /// and its use of `siwx_oidc::mxid::localpart_for`).
     mxid: String,
 }
 
@@ -71,7 +82,7 @@ fn new_wallet() -> Wallet {
     let addr = address_from_key(key.verifying_key());
     let address = eip55_checksum(&addr);
     let did = format!("did:pkh:eip155:1:{address}");
-    let localpart = did.replace(':', "-").to_lowercase();
+    let localpart = legacy_localpart(&did);
     let mxid = format!("@{localpart}:matrix.test");
     Wallet {
         key,

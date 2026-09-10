@@ -9,6 +9,7 @@ mod compat;
 mod config;
 mod device_auth;
 mod introspect;
+mod localpart;
 mod oidc;
 mod synapse_client;
 mod webauthn;

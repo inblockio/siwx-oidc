@@ -455,10 +455,10 @@ fn payload_force_all(payload: &serde_json::Value) -> bool {
 /// when `force_all` (the `{"all":true}` escape hatch wins) or the cookie is absent.
 /// Pure (no Redis) so the escape-hatch + absent-cookie branches are unit-testable; the
 /// resolve-to-DID step is [`user_session_scope_did`].
-fn user_session_token<'a>(
-    cookies: &'a Option<TypedHeader<headers::Cookie>>,
+fn user_session_token(
+    cookies: &Option<TypedHeader<headers::Cookie>>,
     force_all: bool,
-) -> Option<&'a str> {
+) -> Option<&str> {
     if force_all {
         return None;
     }
@@ -488,10 +488,20 @@ async fn user_session_scope_did(
 /// Build the `detected_mxid` affordance (`@localpart:server_name`) for a scoped
 /// picker, or `None` when unscoped or no `matrix_server_name` is configured. Leaks
 /// nothing: the DID came from an opaque server-side cookie the caller already owns.
-fn detected_mxid_for(server_name: Option<&str>, scope_did: Option<&str>) -> Option<String> {
+///
+/// Async (since 2026-09) because showing the RIGHT mxid — legacy or modern —
+/// needs `resolve_identity`, a display-only, best-effort probe (never fails
+/// the caller): a Synapse error falls back to the legacy localpart, never the
+/// modern one, per `resolve_identity_or_legacy`'s fail-safe direction.
+async fn detected_mxid_for(
+    synapse: Option<&SynapseClient>,
+    server_name: Option<&str>,
+    scope_did: Option<&str>,
+) -> Option<String> {
     let did = scope_did?;
     let server_name = server_name?;
-    Some(format!("@{}:{}", oidc::did_to_localpart(did), server_name))
+    let resolved = crate::localpart::resolve_identity_or_legacy(did, synapse).await;
+    Some(format!("@{}:{}", resolved.localpart, server_name))
 }
 
 async fn device_passkey_start_handler(
@@ -521,9 +531,11 @@ async fn device_passkey_start_handler(
     )
     .await?;
     let detected_mxid = detected_mxid_for(
+        state.synapse_client.as_deref(),
         state.config.matrix_server_name.as_deref(),
         scope_did.as_deref(),
-    );
+    )
+    .await;
     Ok(Json(AuthenticateStartResponse {
         challenge: rcr,
         detected_mxid,
@@ -698,16 +710,14 @@ async fn webauthn_authenticate_start(
     // so the login page can show "Signing in as …". Needs server_name; without it
     // we report null. The picker is scoped by identity (allowCredentials); whether a
     // method can actually run here is resolved live by the ceremony / locally by the
-    // client, never predicted server-side.
-    let detected_mxid = match scope_did.as_deref() {
-        Some(did) => state
-            .config
-            .matrix_server_name
-            .as_deref()
-            .map(|server_name| format!("@{}:{}", oidc::did_to_localpart(did), server_name)),
-        // Unscoped (no/forged cookie or all=1): behavior identical to before.
-        None => None,
-    };
+    // client, never predicted server-side. Unscoped (no/forged cookie or all=1) ->
+    // detected_mxid_for's own scope_did?-check yields None, identical to before.
+    let detected_mxid = detected_mxid_for(
+        state.synapse_client.as_deref(),
+        state.config.matrix_server_name.as_deref(),
+        scope_did.as_deref(),
+    )
+    .await;
 
     Ok(Json(AuthenticateStartResponse {
         challenge,
@@ -761,20 +771,18 @@ async fn webauthn_authenticate_finish(
     // new_user detection depends ONLY on the Synapse client (None -> false, i.e.
     // behave as today, cannot detect). mxid additionally needs server_name to be
     // a well-formed @localpart:server_name; without it we report the empty string.
+    // Both come from resolve_identity_or_legacy, which is infallible: a Synapse
+    // probe error degrades to `{ legacy_localpart, is_new: false }` rather than
+    // blocking this response (matches the historical `.unwrap_or(false)` degrade).
     let (new_user, mxid) = match state.synapse_client.as_deref() {
         Some(synapse) => {
-            // is_new_identity == true means the localpart is AVAILABLE (no account).
-            let new_user = wa::is_new_identity(synapse, &resp.did)
-                .await
-                .unwrap_or(false);
+            let resolved =
+                crate::localpart::resolve_identity_or_legacy(&resp.did, Some(synapse)).await;
             let mxid = match state.config.matrix_server_name.as_deref() {
-                Some(server_name) => {
-                    let localpart = oidc::did_to_localpart(&resp.did);
-                    format!("@{}:{}", localpart, server_name)
-                }
+                Some(server_name) => format!("@{}:{}", resolved.localpart, server_name),
                 None => String::new(),
             };
-            (new_user, mxid)
+            (resolved.is_new, mxid)
         }
         // No Synapse client -> cannot detect; behave as today.
         None => (false, String::new()),
@@ -1066,9 +1074,12 @@ async fn account_passkey_start_handler(
         .map_err(|e| anyhow::anyhow!("Failed to serialize challenge: {}", e))?;
     value["session_id"] = serde_json::json!(session_id);
     if let Some(mxid) = detected_mxid_for(
+        state.synapse_client.as_deref(),
         state.config.matrix_server_name.as_deref(),
         scope_did.as_deref(),
-    ) {
+    )
+    .await
+    {
         value["detected_mxid"] = serde_json::json!(mxid);
     }
     Ok(Json(value))
@@ -1560,15 +1571,25 @@ mod unknown_credential_response_tests {
 
     /// The `detected_mxid` affordance is present ONLY when both a scoped DID and a
     /// configured `matrix_server_name` exist; otherwise `None` (unscoped, or a
-    /// standalone deployment with no server_name). Pure, infra-free.
-    #[test]
-    fn detected_mxid_only_when_scoped_and_server_named() {
+    /// standalone deployment with no server_name). No Synapse client is passed in
+    /// any branch here: `resolve_identity_or_legacy(..., None)` is infallible and
+    /// deterministic (always the legacy localpart, no network), so this stays
+    /// infra-free despite `detected_mxid_for` now being async.
+    #[tokio::test]
+    async fn detected_mxid_only_when_scoped_and_server_named() {
         // Unscoped (no DID) -> None regardless of server_name.
-        assert_eq!(detected_mxid_for(Some("matrix.example.com"), None), None);
+        assert_eq!(
+            detected_mxid_for(None, Some("matrix.example.com"), None).await,
+            None
+        );
         // Scoped but no server_name configured -> None (standalone degrades cleanly).
-        assert_eq!(detected_mxid_for(None, Some("did:key:zDnABC")), None);
+        assert_eq!(
+            detected_mxid_for(None, None, Some("did:key:zDnABC")).await,
+            None
+        );
         // Scoped + server_name -> @localpart:server.
-        let mxid = detected_mxid_for(Some("matrix.example.com"), Some("did:key:zDnABC"))
+        let mxid = detected_mxid_for(None, Some("matrix.example.com"), Some("did:key:zDnABC"))
+            .await
             .expect("scoped + server_name -> Some");
         assert!(mxid.starts_with('@'), "mxid starts with @: {mxid}");
         assert!(

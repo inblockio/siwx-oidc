@@ -13,7 +13,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::oidc::{constant_time_eq, did_to_localpart, CustomError};
+use crate::localpart::resolve_identity;
+use crate::oidc::{constant_time_eq, CustomError};
 use crate::synapse_client::{DeviceInfo, SynapseClient};
 use crate::webauthn as wa;
 use siwx_oidc::db::{DBClient, RedisClient, CAIP122_NONCE_TTL_SECS};
@@ -459,7 +460,24 @@ async fn execute_action(
     db_client: &RedisClient,
     server_name: Option<&str>,
 ) -> Result<ActionOutcome, CustomError> {
-    let localpart = did_to_localpart(did);
+    // EVERY action (all 8 variants, including Profile, which needs it only to
+    // format "@localpart:server") requires a configured server_name. Validate
+    // it FIRST, before `resolve_identity` below can make a network call, so a
+    // request that is missing this prerequisite still fails fast with a clean
+    // local `BadRequest` regardless of whether Synapse is even reachable —
+    // each arm still binds its own `server` from `server_name` where it needs
+    // the value; this call is deliberately for the fail-fast ordering only.
+    require_server_name(server_name)?;
+
+    // Account actions operate on an EXISTING account only (the caller already
+    // ran `reject_if_new_identity` before this is reached). Resolve via
+    // `resolve_identity` — grandfathered legacy first, then modern — rather
+    // than guessing a fixed scheme, and propagate a resolution failure as a
+    // genuine error instead of falling back to a guess: unlike the
+    // best-effort provisioning paths, this action already requires Synapse
+    // and can safely fail the request rather than risk operating against the
+    // wrong account.
+    let localpart = resolve_identity(did, synapse_client).await?.localpart;
     match action {
         Action::CrossSigningReset => {
             let synapse = require_synapse(synapse_client)?;
@@ -3203,20 +3221,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cross_signing_reset_localpart_is_canonical_lowercase() {
-        // Mixed-case-DID guard: the localpart used for BOTH allow_cross_signing_reset
-        // and the has_cross_signing_keys readback is derived from the same
-        // `did_to_localpart`, which lowercases. A mixed-case wallet DID must resolve
-        // to the exact localpart Synapse stores, so the grant and the readback key on
-        // the same user (regression lock for the latent mixed-case hazard).
+    /// Mixed-case-DID guard: the localpart used for BOTH `allow_cross_signing_reset`
+    /// and the `has_cross_signing_keys` readback comes from ONE `resolve_identity`
+    /// call at the top of `execute_action`, reused for every action arm — so a
+    /// mixed-case wallet DID must resolve to the exact same localpart as its
+    /// all-lowercase form, or the grant and the readback would key on different
+    /// users (regression lock for the latent mixed-case hazard).
+    ///
+    /// Exercised with `synapse_client: None` (`resolve_identity` is then
+    /// infallible and deterministic — no network needed), which lands on
+    /// `legacy_localpart`. That is still "the new scheme": `resolve_identity` is
+    /// the one and only entry point `execute_action` now goes through, and
+    /// `legacy_localpart` is the permanent grandfathering branch of it, not a
+    /// bypass of it. `localpart::resolve_identity_tests` separately pins the same
+    /// case-folding invariant for the `localpart_for` (modern) branch.
+    #[tokio::test]
+    async fn cross_signing_reset_localpart_is_canonical_lowercase() {
         let mixed = "did:pkh:eip155:1:0xAbCdEf0123456789ABCDEF0123456789aAbBcCdD";
         let lower = "did:pkh:eip155:1:0xabcdef0123456789abcdef0123456789aabbccdd";
-        let lp_mixed = did_to_localpart(mixed);
-        let lp_lower = did_to_localpart(lower);
+        let lp_mixed = resolve_identity(mixed, None)
+            .await
+            .expect("no Synapse client is infallible")
+            .localpart;
+        let lp_lower = resolve_identity(lower, None)
+            .await
+            .expect("no Synapse client is infallible")
+            .localpart;
         assert_eq!(
             lp_mixed, lp_lower,
-            "mixed-case and lowercase DID must yield the same localpart"
+            "mixed-case and lowercase DID must resolve to the same localpart"
         );
         assert_eq!(
             lp_mixed, "did-pkh-eip155-1-0xabcdef0123456789abcdef0123456789aabbccdd",

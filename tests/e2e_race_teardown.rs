@@ -29,6 +29,7 @@ use reqwest::{redirect::Policy, Client, StatusCode};
 use serde_json::{json, Value};
 use sha2::{Digest as Sha2Digest, Sha256};
 use sha3::Keccak256;
+use siwx_oidc::mxid::{legacy_localpart, localpart_for};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Barrier;
@@ -57,7 +58,21 @@ struct Wallet {
     key: SigningKey,
     address: String,
     did: String,
-    /// `did_to_localpart(did)` — the lowercased localpart Synapse/TokenMetadata uses.
+    /// The localpart Synapse/TokenMetadata actually ends up using for this
+    /// wallet. Every test in this file `mock_reset()`s and then generates a
+    /// FRESH random wallet, so the DID has no account under either scheme
+    /// (legacy or modern) when the real `/sign_in` (via `wallet_login`) first
+    /// provisions it — `resolve_identity` (`src/localpart.rs`, binary crate)
+    /// therefore classifies it as genuinely new and hands it the MODERN
+    /// base36 shape (`siwx_oidc::mxid::localpart_for`, imported above — the
+    /// pure derivation lives in the library crate precisely so this
+    /// integration test can call the real implementation instead of
+    /// hand-copying it). This is deliberately NOT the legacy
+    /// `did.replace(':', "-").to_lowercase()` shape any more: that shape is
+    /// used ONLY for an account that already existed before this DID's first
+    /// sign-in (grandfathering — see `tests/e2e_oauth_binding.rs`'s
+    /// `mock_seed_user`, which pre-seeds the LEGACY shape for exactly that
+    /// scenario and is unaffected by this change).
     localpart: String,
     /// `@{localpart}:matrix.test` — the mxid the mock keys devices on.
     mxid: String,
@@ -100,7 +115,10 @@ fn new_wallet() -> Wallet {
     let addr = address_from_key(key.verifying_key());
     let address = eip55_checksum(&addr);
     let did = format!("did:pkh:eip155:1:{address}");
-    let localpart = did.replace(':', "-").to_lowercase();
+    // A brand-new random DID with no existing account -> resolve_identity
+    // hands it the MODERN (base36) localpart. See the Wallet doc for why this
+    // is no longer the legacy shape.
+    let localpart = localpart_for(&did);
     let mxid = format!("@{localpart}:{SERVER_NAME}");
     Wallet {
         key,
@@ -675,6 +693,66 @@ async fn account_action(
         .send()
         .await
         .unwrap()
+}
+
+// ===========================================================================
+// GRANDFATHER (2026-09-09, Tim): an account that already exists under the
+// LEGACY localpart (`did.replace(':', "-").to_lowercase()`) keeps it forever
+// on real sign-in — Synapse has no user-rename API, so `resolve_identity`
+// checks the legacy shape FIRST and, if it is already taken, never considers
+// the modern base36 shape. This is the one invariant the whole
+// matrix.org-policy-server migration depends on: get it wrong and every
+// pre-migration user is silently handed a brand-new, empty account.
+// ===========================================================================
+
+/// A DID that already has an account under the LEGACY localpart must sign in
+/// under that SAME legacy localpart — never the modern base36 shape a
+/// genuinely new DID would get today. Drives the real `/authorize ->
+/// /sign_in -> /token` flow (not just a direct provisioning call), so this
+/// proves the end-to-end HTTP behavior, not just the resolution function.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn grandfathered_legacy_account_keeps_legacy_localpart_on_real_signin() {
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+
+    // new_wallet()'s `localpart`/`mxid` are the MODERN (base36) shape a
+    // brand-new DID gets today — see the Wallet doc. Compute the legacy shape
+    // separately to simulate a pre-2026-09 account for this same DID.
+    let w = new_wallet();
+    let legacy_localpart = legacy_localpart(&w.did);
+    let legacy_mxid = format!("@{legacy_localpart}:{SERVER_NAME}");
+    assert_ne!(
+        legacy_localpart, w.localpart,
+        "sanity: legacy and modern really differ for this DID"
+    );
+
+    // Simulate a pre-2026-09 account: the LEGACY localpart already exists,
+    // BEFORE this wallet ever signs in through this server.
+    mock_seed_user(&c, &legacy_localpart).await;
+
+    // A REAL sign-in through the actual /authorize -> /sign_in -> /token flow.
+    let login = wallet_login(&c, &base, &w).await;
+
+    // TokenMetadata.username (surfaced via introspection) must be the LEGACY
+    // localpart, never the modern shape a genuinely new DID would get.
+    let intro = introspect(&c, &login.access_token).await;
+    assert_eq!(
+        intro["username"], legacy_localpart,
+        "a grandfathered account must sign in under its LEGACY localpart"
+    );
+
+    // The Synapse device must land on the LEGACY mxid, never the modern one.
+    let state = mock_state(&c).await;
+    assert!(
+        device_ids(&state, &legacy_mxid).contains(&login.device_id),
+        "sign-in must provision the device under the grandfathered legacy mxid"
+    );
+    assert!(
+        !device_ids(&state, &w.mxid).contains(&login.device_id),
+        "sign-in must NOT create a second, modern-shaped account for an existing user"
+    );
 }
 
 // ===========================================================================

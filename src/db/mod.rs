@@ -282,6 +282,19 @@ pub struct CodeEntry {
     /// Device ID generated during Synapse provisioning (MSC3861).
     #[serde(default)]
     pub device_id: Option<String>,
+    /// The Matrix localpart `resolve_identity` resolved at `sign_in` time
+    /// (grandfathered legacy, already-migrated modern, or a genuinely new
+    /// modern identity — see `localpart::resolve_identity`). The
+    /// `authorization_code` grant runs in a SEPARATE request from the sign_in
+    /// that provisioned the account, so it reads this back rather than
+    /// recomputing a localpart from `did` (which could otherwise land on the
+    /// wrong scheme for a grandfathered account). `#[serde(default)]` so an
+    /// entry written by a pre-migration build deserializes to `None`; callers
+    /// fall back to `localpart::legacy_localpart(&did)` in that case — correct
+    /// for every account that predates this field, since accounts that
+    /// existed before grandfathering are, by definition, legacy accounts.
+    #[serde(default)]
+    pub localpart: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -330,7 +343,14 @@ pub struct DeviceCodeEntry {
 /// Metadata stored alongside an opaque token in Redis (MSC3861 introspection).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenMetadata {
-    /// The Matrix-compatible username (DID with colons replaced by dashes).
+    /// The Matrix-compatible username: the localpart `resolve_identity`
+    /// resolved for this DID (`localpart::resolve_identity`). NOT simply "DID
+    /// with colons replaced by dashes" any more — that legacy, always-colons-
+    /// to-dashes shape (`localpart::legacy_localpart`) is used ONLY for an
+    /// account that already existed under it (grandfathering); a genuinely new
+    /// identity gets the opaque base36 shape (`localpart::localpart_for`)
+    /// instead, because matrix.org's policy server refuses the long,
+    /// hyphen-heavy legacy shape (see `localpart` module doc).
     pub username: String,
     /// Device ID assigned by this provider (deterministic from token).
     pub device_id: String,

@@ -64,28 +64,6 @@ pub fn derive_did_from_credential_json(cred_json: &str) -> Option<String> {
     did_from_passkey(&passkey).ok()
 }
 
-/// Whether `did` resolves to a Matrix identity that does NOT yet exist on this
-/// homeserver, i.e. signing in with it would CREATE a brand-new account.
-///
-/// This is the read-only detector the new-user gate and the account/QR reject
-/// paths share: it is exactly `SynapseClient::is_localpart_available(localpart)`,
-/// where `localpart` is `oidc::did_to_localpart(did)` (the same lowercasing the
-/// provisioning path uses, so the answer matches what `sign_in` would do). It
-/// performs no writes, so probing it before any provisioning leaves zero Synapse
-/// state behind.
-///
-/// A free fn taking `&SynapseClient` (rather than a method on `SynapseClient`)
-/// because `did_to_localpart` lives in the binary's `oidc` module while
-/// `SynapseClient` lives in the `siwx_oidc` library crate; keeping the wrapper
-/// here avoids a library->binary dependency.
-pub async fn is_new_identity(
-    synapse: &crate::synapse_client::SynapseClient,
-    did: &str,
-) -> Result<bool> {
-    let localpart = crate::oidc::did_to_localpart(did);
-    synapse.is_localpart_available(&localpart).await
-}
-
 /// The error message returned by every server-enforced new-account-creation
 /// reject (account re-auth + QR/device approval). New-account creation is
 /// permitted ONLY at the login screen, behind the new-user gate; in the
@@ -96,14 +74,16 @@ pub const NEW_IDENTITY_REJECT_MSG: &str =
 
 /// Server-enforced reject for the account + QR/device flows: if a Synapse client
 /// is configured AND the authenticated `did` resolves to a NON-existent account
-/// (`is_new_identity == true`), return a clear `BadRequest` and provision
+/// under EITHER localpart scheme (`resolve_identity(..).is_new == true` — see
+/// `crate::localpart`, which checks the grandfathered legacy shape first and
+/// only then the modern one), return a clear `BadRequest` and provision
 /// nothing. Call this AFTER the DID is cryptographically verified but BEFORE any
 /// action runs / any device-code entry is mutated.
 ///
 /// Graceful degradation: when `synapse` is `None` the new-identity status cannot
 /// be detected, so this is a no-op (the flow's existing `require_synapse` /
 /// `server_name` guards already `BadRequest` for the actions that need Synapse).
-/// Returning the existing-identity path unchanged keeps `is_new_identity == false`
+/// Returning the existing-identity path unchanged keeps `is_new == false`
 /// a strict no-op.
 pub async fn reject_if_new_identity(
     synapse: Option<&crate::synapse_client::SynapseClient>,
@@ -113,14 +93,14 @@ pub async fn reject_if_new_identity(
         Some(s) => s,
         None => return Ok(()),
     };
-    match is_new_identity(synapse, did).await {
-        Ok(true) => {
+    match crate::localpart::resolve_identity(did, Some(synapse)).await {
+        Ok(resolved) if resolved.is_new => {
             info!(did = %did, "rejecting new-identity (no existing account) outside login flow");
             Err(crate::oidc::CustomError::BadRequest(
                 NEW_IDENTITY_REJECT_MSG.to_string(),
             ))
         }
-        Ok(false) => Ok(()),
+        Ok(_) => Ok(()),
         // A detection failure (Synapse unreachable) must not silently create an
         // account: fail closed with the same clear message rather than provisioning.
         Err(e) => {
@@ -171,6 +151,13 @@ pub const DEACTIVATED_REJECT_MSG: &str = "This account has been deactivated and 
 /// * probe failed — **fails closed** with the same message, matching
 ///   [`reject_if_new_identity`]. A Synapse outage must not silently re-open
 ///   access to deactivated accounts.
+///
+/// **Grandfathering-aware (2026-09):** which localpart to query is itself
+/// resolved via [`crate::localpart::resolve_identity`] (grandfathered legacy
+/// first, then modern) rather than a single fixed derivation — querying the
+/// wrong scheme for a migrated/modern-only account would silently read back
+/// "no account" and treat a deactivated user as new-identity-safe. A
+/// resolution failure fails closed exactly like a `query_user` failure below.
 pub async fn reject_if_deactivated(
     synapse: Option<&crate::synapse_client::SynapseClient>,
     did: &str,
@@ -179,7 +166,15 @@ pub async fn reject_if_deactivated(
         Some(s) => s,
         None => return Ok(()),
     };
-    let localpart = crate::oidc::did_to_localpart(did);
+    let localpart = match crate::localpart::resolve_identity(did, Some(synapse)).await {
+        Ok(resolved) => resolved.localpart,
+        Err(e) => {
+            warn!(did = %did, "identity resolution failed, rejecting to avoid reviving a deactivated account: {}", e);
+            return Err(crate::oidc::CustomError::Unauthorized(
+                DEACTIVATED_REJECT_MSG.to_string(),
+            ));
+        }
+    };
     match synapse.query_user(&localpart).await {
         Ok(Some(info)) if info.is_deactivated => {
             info!(did = %did, "rejecting sign-in for deactivated account");

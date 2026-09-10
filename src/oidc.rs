@@ -761,8 +761,15 @@ async fn token_device_code(
                 generated
             };
 
+            // Resolve ONCE (grandfathering decision) and reuse it for both
+            // provisioning and TokenMetadata.username, exactly like sign_in.
+            // Best-effort: a Synapse hiccup degrades to the legacy localpart
+            // (never modern — see resolve_identity_or_legacy's fail-safe
+            // direction), matching the pre-existing degraded-provisioning path.
+            let resolved = crate::localpart::resolve_identity_or_legacy(&did, synapse_client).await;
             provision_synapse_device(
                 &did,
+                &resolved.localpart,
                 synapse_client,
                 "Element X",
                 Some(&dev_id),
@@ -772,7 +779,7 @@ async fn token_device_code(
 
             let now = Utc::now();
             let iat = now.timestamp();
-            let username = did_to_localpart(&did);
+            let username = resolved.localpart;
             let scope = format!(
                 "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
                 dev_id
@@ -973,7 +980,16 @@ async fn token_authorization_code(
 
     let now = Utc::now();
     let iat = now.timestamp();
-    let username = did_to_localpart(&code_entry.did);
+    // This request is DIFFERENT from the sign_in that provisioned the account,
+    // so the resolved localpart travels via `CodeEntry.localpart` (set at
+    // sign_in) rather than being recomputed here. `None` means the entry was
+    // written by a pre-migration build with no such field — every account
+    // that predates this field is, by definition, a legacy account, so
+    // `legacy_localpart` is the correct (not merely best-effort) fallback.
+    let username = code_entry
+        .localpart
+        .clone()
+        .unwrap_or_else(|| crate::localpart::legacy_localpart(&code_entry.did));
     let claims = resolve_claims(config, &code_entry.did).await;
     let display_name = claims
         .name()
@@ -1555,12 +1571,6 @@ pub struct SignInParams {
     pub response_mode: Option<String>,
 }
 
-/// Derive a Matrix-compatible localpart from a DID by replacing colons with
-/// dashes and lowercasing.
-pub(crate) fn did_to_localpart(did: &str) -> String {
-    did.replace(':', "-").to_lowercase()
-}
-
 /// Extract a device_id from a scope string containing `urn:matrix:client:device:XXX`.
 fn extract_device_id_from_scope(scope: &str) -> Option<String> {
     const STABLE_PREFIX: &str = "urn:matrix:client:device:";
@@ -1623,21 +1633,29 @@ fn resolve_device_id(proposed_device_id: Option<&str>) -> String {
 /// `SIWEOIDC_MATRIX_SERVER_NAME` configured) skips the check entirely,
 /// preserving prior behavior for standalone deployments. See
 /// `docs/superpowers/plans/2026-08-01-provision-retry-hardening.md`.
+///
+/// `localpart` is the value already decided by
+/// [`crate::localpart::resolve_identity`] for this sign-in (grandfathered
+/// legacy, already-migrated modern, or a genuinely new modern identity) — it
+/// is the single source of truth here; this function does not (re)compute a
+/// localpart from `did` itself. The `is_localpart_available` probe below is
+/// therefore an idempotent re-confirmation of a decision already made by the
+/// caller, not a fresh decision.
 pub async fn provision_synapse_device(
     did: &str,
+    localpart: &str,
     synapse_client: Option<&SynapseClient>,
     display_name: &str,
     proposed_device_id: Option<&str>,
     server_name: Option<&str>,
 ) -> Option<String> {
     let synapse = synapse_client?;
-    let localpart = did_to_localpart(did);
     let dev_id = resolve_device_id(proposed_device_id);
     debug!("provisioning device_id={} for did={}", dev_id, did);
 
-    match synapse.is_localpart_available(&localpart).await {
+    match synapse.is_localpart_available(localpart).await {
         Ok(true) => {
-            if let Err(e) = synapse.provision_user(&localpart, did).await {
+            if let Err(e) = synapse.provision_user(localpart, did).await {
                 error!(
                     did = %did,
                     error = %e,
@@ -1680,14 +1698,14 @@ pub async fn provision_synapse_device(
             // reveals nothing beyond the mxid the caller already presented to
             // authenticate.
             if let Some(server_name) = server_name {
-                match synapse.has_profile_row(&localpart, server_name).await {
+                match synapse.has_profile_row(localpart, server_name).await {
                     Ok(true) => {}
                     Ok(false) => {
                         warn!(
                             did = %did,
                             "existing account has no profile row — re-running provisioning (self-heal)"
                         );
-                        if let Err(e) = synapse.provision_user(&localpart, did).await {
+                        if let Err(e) = synapse.provision_user(localpart, did).await {
                             error!(
                                 did = %did,
                                 error = %e,
@@ -1709,14 +1727,14 @@ pub async fn provision_synapse_device(
     }
 
     if let Err(e) = synapse
-        .upsert_device(&localpart, &dev_id, Some(display_name))
+        .upsert_device(localpart, &dev_id, Some(display_name))
         .await
     {
         warn!("upsert_device failed: {}", e);
     }
 
     // 3B: arm reset window after every successful login provision (best-effort).
-    if let Err(e) = synapse.allow_cross_signing_reset(&localpart).await {
+    if let Err(e) = synapse.allow_cross_signing_reset(localpart).await {
         warn!(
             did = %did,
             error = %e,
@@ -1897,8 +1915,16 @@ pub async fn sign_in(
         .scope
         .as_deref()
         .and_then(extract_device_id_from_scope);
+    // Resolve ONCE (grandfathering decision), and reuse the result as the
+    // single source of truth for both provisioning and the CodeEntry the
+    // eventual /token exchange reads back. Best-effort: a Synapse hiccup here
+    // must not fail sign-in, so an error degrades to the legacy localpart
+    // (never the modern one — see resolve_identity_or_legacy's fail-safe
+    // direction) exactly like the pre-existing degraded-provisioning path.
+    let resolved = crate::localpart::resolve_identity_or_legacy(&did, synapse_client).await;
     let device_id = provision_synapse_device(
         &did,
+        &resolved.localpart,
         synapse_client,
         "Element Web",
         proposed_device_id.as_deref(),
@@ -1914,6 +1940,7 @@ pub async fn sign_in(
         auth_time: Utc::now(),
         code_challenge: params.code_challenge.clone(),
         code_challenge_method: params.code_challenge_method.clone(),
+        localpart: Some(resolved.localpart.clone()),
         device_id,
     };
 

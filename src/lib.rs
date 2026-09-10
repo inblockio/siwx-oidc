@@ -1,5 +1,13 @@
 pub mod db;
 
+/// Pure, dependency-light Matrix localpart derivation from a DID (opaque
+/// base36 hash + the legacy grandfathering shape). No Synapse, no axum, no
+/// tokio — safe to declare here (unlike `synapse_client`, see the note
+/// below) and to link against from `tests/*.rs` integration tests, which is
+/// the whole reason it lives in the library crate rather than only in the
+/// binary's `src/localpart.rs`.
+pub mod mxid;
+
 /// The link-aware rule for which identity a stored passkey authenticates. Shared
 /// by the login path and the credential-store backfill.
 pub mod credential_identity;

@@ -172,8 +172,10 @@ impl RedisClient {
     /// `device_delete`: removing the access/refresh tokens makes introspection
     /// report the session inactive, so the device can no longer use the C-S API.
     ///
-    /// Matching is keyed on `username` (the lowercased `did_to_localpart` value,
-    /// which is what Synapse uses) rather than the raw DID, so revocation is
+    /// Matching is keyed on `username` (the localpart `resolve_identity`
+    /// resolved for this DID — grandfathered legacy or modern, whichever
+    /// Synapse actually has the account under; see the `localpart` module)
+    /// rather than the raw DID, so revocation is
     /// robust to address-case differences between the original sign-in DID and
     /// the re-authentication DID.
     ///
@@ -244,7 +246,9 @@ impl RedisClient {
     /// session inactive.
     ///
     /// Like [`revoke_device_tokens`](Self::revoke_device_tokens) this keys on
-    /// `username` (the lowercased `did_to_localpart` value Synapse uses) so it is
+    /// `username` (the localpart `resolve_identity` resolved for this DID —
+    /// grandfathered legacy or modern, whichever Synapse actually has the
+    /// account under) so it is
     /// robust to address-case differences between sign-in and re-auth DIDs.
     ///
     /// **Race-free (S3-4 / H6):** the caller (`account_deactivate`/`account_erase`)
