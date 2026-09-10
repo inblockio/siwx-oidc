@@ -21,7 +21,7 @@ podman rm -f siwx-e2e-redis siwx-e2e-mock siwx-e2e-oidc >/dev/null 2>&1 || true
 # there), so the data survives a routine stack recycle.
 podman volume exists siwx-e2e-redis-data || podman volume create siwx-e2e-redis-data >/dev/null
 
-podman run -d --name siwx-e2e-redis -p 127.0.0.1:6379:6379 \
+podman run -d --name siwx-e2e-redis -p "127.0.0.1:${SIWEOIDC_REDIS_PORT}:6379" \
   -v siwx-e2e-redis-data:/data \
   docker.io/library/redis:7-alpine redis-server --appendonly yes >/dev/null
 
@@ -47,6 +47,8 @@ fi
 podman run -d --name siwx-e2e-mock --network host \
   -v "$REPO/e2e:/app:ro" \
   -e SYNAPSE_MOCK_SECRET="$SYNAPSE_MOCK_SECRET" -e SYNAPSE_MOCK_PORT="$SYNAPSE_MOCK_PORT" \
+  -e SYNAPSE_MOCK_SERVER_NAME="$SYNAPSE_MOCK_SERVER_NAME" \
+  -e SYNAPSE_MOCK_OIDC_BASE="$SYNAPSE_MOCK_OIDC_BASE" \
   docker.io/library/python:3-alpine python /app/synapse_mock.py >/dev/null
 
 podman run -d --name siwx-e2e-oidc --network host -w /app -v "$REPO:/app:z" \

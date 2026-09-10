@@ -5,7 +5,15 @@
 //! Targets the MOCK stack brought up by `e2e/up.sh`:
 //!   - siwx-oidc on :8080  (SIWEOIDC_HOST)
 //!   - Synapse mock on :8090 (SYNAPSE_MOCK) — records a call log, supports
-//!     /__reset, /__seed_device, /__state, /__set_secret, /__fail.
+//!     /__reset, /__seed_user, /__seed_device, /__state, /__set_secret,
+//!     /__reject_admin_token, /__profile, /__fail.
+//!
+//! The mock serves the TWO Synapse credential surfaces siwx-oidc has used since
+//! the 1.157 port (MAS shared secret vs a minted admin-scoped token) and
+//! validates the latter by really introspecting it, so an authorization
+//! regression fails here rather than in production. It mirrors
+//! `src/synapse_client.rs`'s route list and drifts silently when that file moves
+//! an endpoint — see `e2e/README.md` for the one-line drift check.
 //!   - Redis on :6379 (only used indirectly via siwx-oidc).
 //!
 //! Run single-threaded with the stack up (matches the repo `#[ignore]` e2e
@@ -582,6 +590,17 @@ async fn mock_seed_user(c: &Client, localpart: &str) {
         .await
         .unwrap();
 }
+/// Force a user's Synapse `profiles` row into one of the three states
+/// `synapse_client::has_profile_row` must tell apart: `"present"`, `"empty"`
+/// (row exists, displayname and avatar both null) or `"absent"` (a `users` row
+/// with NO `profiles` row — element-hq/synapse#19702).
+async fn mock_profile(c: &Client, mxid: &str, state: &str) {
+    c.post(format!("{}/__profile", mock()))
+        .json(&json!({ "user_id": mxid, "state": state }))
+        .send()
+        .await
+        .unwrap();
+}
 async fn mock_state(c: &Client) -> Value {
     c.get(format!("{}/__state", mock()))
         .send()
@@ -610,6 +629,23 @@ fn device_ids(state: &Value, mxid: &str) -> Vec<String> {
         })
         .unwrap_or_default()
 }
+
+/// The wire shape of a Synapse device deletion, as of the Synapse 1.157 port.
+///
+/// `synapse_client::delete_device` used to issue
+/// `DELETE /_synapse/admin/v2/users/{mxid}/devices/{id}`. Synapse 1.157 deleted
+/// the `admin_token` shim that made the admin API reachable with the MAS shared
+/// secret, so the call moved to `POST /_synapse/mas/delete_device` with a
+/// `{localpart, device_id}` body.
+///
+/// H1's invariant did not change — revoke must delete NO device, an explicit
+/// logout must delete exactly the ending one — but the mock call log this is
+/// read out of now speaks the new dialect, and the old needle (`"DELETE "`)
+/// matched nothing at all afterwards. That is a needle that can only ever go
+/// green, which is worse than no assertion: it is why the logout half of this
+/// test was the single failure left after the mock was brought up to the
+/// current contract (audit finding D12).
+const DELETE_DEVICE_CALL: &str = "POST /_synapse/mas/delete_device";
 
 /// Count of "METHOD path" entries in the mock call log matching a substring.
 fn count_calls(state: &Value, needle: &str) -> usize {
@@ -790,9 +826,18 @@ async fn h1_revoke_does_not_delete_device_but_logout_does() {
 
     let state = mock_state(&c).await;
     assert_eq!(
+        count_calls(&state, DELETE_DEVICE_CALL),
+        0,
+        "REVOKE MUST NOT delete the Synapse device (H1 incident guard)"
+    );
+    // Belt and braces: the PRE-1.157 dialect must be absent too. Without this a
+    // revert to `DELETE /_synapse/admin/v2/users/{mxid}/devices/{id}` would slip
+    // past the needle above and this guard would pass while revoke was once
+    // again wedging users' cross-signing identity.
+    assert_eq!(
         count_calls(&state, "DELETE "),
         0,
-        "REVOKE MUST NOT issue any Synapse DELETE /devices (H1 incident guard)"
+        "REVOKE MUST NOT issue the legacy admin-API DELETE /devices either"
     );
     assert!(
         device_ids(&state, &w.mxid).contains(&login.device_id),
@@ -821,8 +866,9 @@ async fn h1_revoke_does_not_delete_device_but_logout_does() {
 
     let state = mock_state(&c).await;
     assert!(
-        count_calls(&state, "DELETE ") >= 1,
-        "logout (explicit sign-out) MUST issue a Synapse DELETE /devices"
+        count_calls(&state, DELETE_DEVICE_CALL) >= 1,
+        "logout (explicit sign-out) MUST issue a Synapse device deletion \
+         ({DELETE_DEVICE_CALL})"
     );
     assert!(
         !device_ids(&state, &w2.mxid).contains(&login2.device_id),
@@ -1362,6 +1408,7 @@ async fn h3_concurrent_same_device_delete_revokes_all_tokens() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn h6_deactivate_racing_refresh_no_resurrection() {
+    let mut total_minted = 0usize;
     let base = oidc();
     let c = Client::new();
     for round in 0..6 {
@@ -1391,9 +1438,40 @@ async fn h6_deactivate_racing_refresh_no_resurrection() {
         });
         // Pump chained refreshes throughout the deactivate window.
         let pump = tokio::spawn(async move {
-            bp.wait().await;
             let mut minted: Vec<String> = Vec::new();
             let mut rt = first_refresh;
+
+            // SEED ONE REFRESH *BEFORE* THE BARRIER.
+            //
+            // Measured 2026-09-10: without this the pump minted NOTHING in all
+            // six rounds. It breaks on the first non-200, and the deactivate
+            // won the barrier race every single time, so the very first refresh
+            // answered 401 and the `survivors == 0` assertion below passed
+            // while checking an EMPTY set — a test that could only ever pass.
+            //
+            // Seeding guarantees at least one refreshed token exists when the
+            // deactivate sweep runs, which is precisely the resurrection risk
+            // this test is named for. The barrier race below is deliberately
+            // KEPT, so any refresh that does land inside the window still
+            // exercises the concurrent path: this widens the test, it does not
+            // replace it. Do not "simplify" the seed away.
+            let seed = cp
+                .post(format!("{basep}/_matrix/client/v3/refresh"))
+                .json(&json!({ "refresh_token": rt }))
+                .send()
+                .await
+                .unwrap();
+            if seed.status() == StatusCode::OK {
+                let j: Value = seed.json().await.unwrap();
+                if let Some(at) = j["access_token"].as_str() {
+                    minted.push(at.to_string());
+                }
+                if let Some(next) = j["refresh_token"].as_str() {
+                    rt = next.to_string();
+                }
+            }
+
+            bp.wait().await;
             for _ in 0..12 {
                 let r = cp
                     .post(format!("{basep}/_matrix/client/v3/refresh"))
@@ -1442,7 +1520,29 @@ async fn h6_deactivate_racing_refresh_no_resurrection() {
             "round {round}: {survivors} of {} refreshed tokens survived account_deactivate (resurrection)",
             minted.len()
         );
+        total_minted += minted.len();
     }
+
+    // THE ASSERTION ABOVE IS VACUOUS WHEN THE PUMP MINTS NOTHING.
+    //
+    // `survivors == 0` is trivially true if `minted` is empty, so a run where the
+    // refresh pump never won a single round would report a confident green while
+    // proving nothing about resurrection at all. That is not hypothetical: it was
+    // measured on 2026-09-10 against the modernised mock, where all six rounds
+    // minted zero tokens and this test still passed. (h3's identical pump minted
+    // one per round on the same stack, so the mechanism is sound — it is the race
+    // window that is timing-sensitive.)
+    //
+    // So the vacuity is now a FAILURE rather than a footnote in a report nobody
+    // will read. If this fires, the test did not run the scenario it is named
+    // for; the fix is to widen the race window (or redesign the pump), NOT to
+    // delete this check. Deleting it restores a test that can only ever pass.
+    assert!(
+        total_minted > 0,
+        "VACUOUS RUN: the refresh pump minted 0 tokens across all rounds, so \
+         `survivors == 0` proved nothing. The resurrection scenario was never \
+         exercised — see the comment above before touching this assertion."
+    );
 }
 
 // --- H9 / S3-1: device-code Approved branch is double-redeemable ------------
@@ -1654,5 +1754,108 @@ async fn refresh_grace_window_tolerates_replay() {
     assert!(
         token_active(&c, cv2["access_token"].as_str().unwrap()).await,
         "compat grace replay access token must be active"
+    );
+}
+
+// ===========================================================================
+// ATTESTED DID PROFILE FIELD (`io.inblock.did`) — the SIGN-IN path.
+//
+// `synapse_client::publish_did_field`'s own discrimination logic is unit-tested
+// in-process (`synapse_client::tests::h2_*` / `d1_*`), and its behaviour against
+// a real patched Synapse is covered by `tests/e2e_did_field_live.rs`. Neither
+// answers the question this test asks, which is about `sign_in` rather than
+// about the client: publication is best-effort and sits INSIDE
+// `oidc::provision_synapse_device`, so a homeserver that cannot accept the write
+// must cost the user nothing.
+//
+// The row-less half is only reachable against a mock. You cannot ask a real
+// Synapse for an account with a `users` row and no `profiles` row on demand —
+// the three that exist on the dev homeserver are erasure artifacts — which is
+// exactly why the mock grew `POST /__profile` (audit finding D12).
+// ===========================================================================
+
+/// A healthy sign-in publishes the attested DID field; a sign-in for an account
+/// hit by element-hq/synapse#19702 (a `users` row with no `profiles` row) still
+/// succeeds, publishing nothing.
+///
+/// The second half is the one that matters. On a row-less account BOTH the
+/// publication PUT and the `provision_user` self-heal answer Synapse's generic
+/// 500, so this asserts the login survives two independent server-side failures
+/// on its provisioning path. If publication were ever promoted from best-effort
+/// to fatal, a handful of pre-existing accounts would become permanently unable
+/// to sign in, and nothing else in the suite would notice.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn did_field_is_published_at_signin_and_a_rowless_account_still_signs_in() {
+    let c = Client::new();
+    let base = oidc();
+
+    // --- healthy account: the field lands --------------------------------
+    mock_reset(&c).await;
+    let w = new_wallet();
+    let login = wallet_login(&c, &base, &w).await;
+    assert!(
+        !login.access_token.is_empty(),
+        "healthy sign-in must issue a token"
+    );
+    let state = mock_state(&c).await;
+    assert_eq!(
+        state["profile_fields"][&w.mxid]["io.inblock.did"]["did"],
+        json!(w.did),
+        "a healthy sign-in must publish the attested DID field for its own mxid"
+    );
+
+    // --- row-less account (element-hq/synapse#19702) ----------------------
+    // Same wallet, so the account already EXISTS (a `users` row); drop only its
+    // `profiles` row. That is the exact shape of the bug: the two rows are
+    // independent, and siwx-oidc's D1 logic exists to tell this apart from a
+    // homeserver whose database is simply on fire.
+    mock_reset(&c).await;
+    let w2 = new_wallet();
+    wallet_login(&c, &base, &w2).await;
+    mock_profile(&c, &w2.mxid, "absent").await;
+
+    let second = wallet_login(&c, &base, &w2).await;
+    assert!(
+        !second.access_token.is_empty(),
+        "a row-less account MUST still be able to sign in — publication is \
+         best-effort and must never cost the user their login"
+    );
+    assert!(
+        token_active(&c, &second.access_token).await,
+        "the token issued to a row-less account must be a real, usable token"
+    );
+
+    let state = mock_state(&c).await;
+    // The publication could not be attempted (the PUT 500s), and the self-heal
+    // could not repair the row either (`provision_user` with a displayname 500s
+    // on the same unguarded fetchone). Both are known conditions of a known-buggy
+    // dependency; both resolve when the pinned Synapse image is bumped.
+    assert!(
+        state["profiles"].get(&w2.mxid).is_none(),
+        "the #19702 self-heal is inert on 1.159 — it must NOT appear to succeed \
+         here, or this test would prove behaviour no deployed homeserver has"
+    );
+    assert!(
+        state["profile_fields"].get(&w2.mxid).is_none(),
+        "no profile row means no MSC4133 field: the publication must not appear \
+         to have landed"
+    );
+    // The D1 "confirm before excusing" probe: a 500 on the PUT is only a
+    // HYPOTHESIS of a row-less account, so the client must follow it with a
+    // whole-profile GET before reporting the known condition.
+    assert!(
+        count_calls(
+            &state,
+            &format!("GET /_matrix/client/v3/profile/{}", w2.mxid)
+        ) >= 1,
+        "a 500 on the publication PUT must be CONFIRMED by a profile-row probe, \
+         never inferred from the status code alone (audit finding D1)"
+    );
+    // And the sign-in device was still provisioned: the failures are confined to
+    // publication, they do not poison the rest of provisioning.
+    assert!(
+        device_ids(&state, &w2.mxid).contains(&second.device_id),
+        "device provisioning must still happen for a row-less account"
     );
 }

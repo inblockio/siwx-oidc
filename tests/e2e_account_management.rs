@@ -168,6 +168,22 @@ async fn mock_state(c: &Client) -> Value {
         .await
         .unwrap()
 }
+/// Make the mock's ADMIN surface reject every token, leaving the MAS shared
+/// secret working.
+///
+/// Since the Synapse 1.157 port these are two DIFFERENT credentials
+/// (`src/synapse_client.rs` module docs): `/_synapse/mas/*` takes the shared
+/// secret, `/_synapse/admin/*` and the authenticated C-S API take a minted
+/// admin-scoped token (`src/admin_token.rs`). `mock_set_secret` therefore can no
+/// longer isolate an admin-token failure — see
+/// `admin_token_rejection_is_legible_not_a_500_or_notfound` for why that matters.
+async fn mock_reject_admin_token(c: &Client, reject: bool) {
+    c.post(format!("{}/__reject_admin_token", mock()))
+        .json(&json!({ "reject": reject }))
+        .send()
+        .await
+        .unwrap();
+}
 async fn mock_set_secret(c: &Client, secret: &str) {
     c.post(format!("{}/__set_secret", mock()))
         .json(&json!({ "secret": secret }))
@@ -376,15 +392,99 @@ async fn account_action_csrf_mismatch_is_unauthorized() {
 /// AC6 + H6: when Synapse rejects the admin token, the action fails *legibly* —
 /// a 400 whose message names the admin token, NEVER a misleading "not found" or
 /// a 500.
+///
+/// # Why this drives `__reject_admin_token` and not `__set_secret`
+///
+/// It used to flip the mock's shared secret, back when ONE credential reached
+/// every Synapse surface. The Synapse 1.157 port split that in two (see
+/// `src/synapse_client.rs`'s module docs): the shared secret is honoured only on
+/// `/_synapse/mas/*`, and `list_devices` now presents a separately minted
+/// admin-scoped token. Flipping the shared secret today breaks the MAS surface
+/// FIRST — `query_user` 401s, and the deactivated-account gate
+/// (`webauthn::reject_if_deactivated`) correctly fails closed with a **401**
+/// before any admin call is attempted. That is the product working as designed,
+/// so the old set-up could no longer reach the code path this test is named
+/// after; it was asserting 400 against a 401 raised three layers earlier.
+///
+/// `__reject_admin_token` rejects exactly the credential in the test's name and
+/// leaves the shared secret alone, which is what restores the original
+/// intent — a stricter test than before, not a looser one: the assertions
+/// below are unchanged and now actually run against `list_devices`.
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn admin_token_rejection_is_legible_not_a_500_or_notfound() {
     let c = Client::builder().build().unwrap();
     let base = oidc();
     mock_reset(&c).await;
-    mock_set_secret(&c, "WRONG-SECRET").await; // siwx's admin calls now 401
-
     let w = new_wallet();
+    // The account must EXIST first, or `reject_if_new_identity` turns the
+    // re-auth away for a DIFFERENT (also correct) reason — "not linked to an
+    // existing account" — and `list_devices` is never reached, so nothing about
+    // admin-token legibility would be exercised. The old wrong-secret set-up got
+    // this for free by accident: a 401 from `is_localpart_available` is a 4xx,
+    // which the client reads as "localpart taken". With only the admin
+    // credential broken, the MAS probe answers honestly and a fresh wallet is
+    // genuinely new, so the account has to be seeded on purpose.
+    mock_seed_device(&c, &w.mxid, "SIWX_pre_existing").await;
+    mock_reject_admin_token(&c, true).await; // siwx's admin calls now 401
+
+    let (message, signature) = sign_account_message(&c, &w, &base, "org.matrix.devices_list").await;
+    let resp = c
+        .post(format!("{base}/account/wallet"))
+        .json(&json!({
+            "action": "org.matrix.devices_list",
+            "did": w.did, "message": message, "signature": signature, "device_id": null
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    // Restore the admin surface for any later tests regardless of assertions.
+    mock_reject_admin_token(&c, false).await;
+
+    assert_eq!(
+        status, 400,
+        "admin-auth failure must be a clean 400, not a 500"
+    );
+    let lower = text.to_lowercase();
+    assert!(
+        !lower.contains("not found"),
+        "must NOT masquerade as 'device not found': {text}"
+    );
+    assert!(
+        lower.contains("admin token") || lower.contains("failed to list devices"),
+        "message must name the admin-token problem legibly: {text}"
+    );
+}
+
+/// The OTHER half of the two-credential split: when the **MAS shared secret**
+/// is wrong, the account re-auth fails CLOSED with a 401 — it does not fall
+/// through to the admin path, and it does not silently succeed.
+///
+/// This test exists because the behaviour used to be covered by accident.
+/// `admin_token_rejection_is_legible_not_a_500_or_notfound` flipped the shared
+/// secret back when one credential reached every Synapse surface; after the
+/// Synapse 1.157 port that set-up stopped reaching `list_devices` at all and
+/// started measuring THIS path instead, while still asserting the admin path's
+/// 400. Rather than delete the coverage along with the stale set-up, the two
+/// halves are now two tests.
+///
+/// 401 (not 400) is correct and deliberate: with `query_user` unreachable,
+/// `webauthn::reject_if_deactivated` cannot rule out a deactivated account, and
+/// it must not revive one on a probe failure. The message intentionally does not
+/// distinguish "deactivated" from "we could not tell" — see
+/// `DEACTIVATED_REJECT_MSG`.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn wrong_mas_shared_secret_fails_closed_not_open() {
+    let c = Client::builder().build().unwrap();
+    let base = oidc();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    mock_seed_device(&c, &w.mxid, "SIWX_pre_existing").await;
+    mock_set_secret(&c, "WRONG-SECRET").await; // the whole MAS surface now 401s
+
     let (message, signature) = sign_account_message(&c, &w, &base, "org.matrix.devices_list").await;
     let resp = c
         .post(format!("{base}/account/wallet"))
@@ -401,16 +501,12 @@ async fn admin_token_rejection_is_legible_not_a_500_or_notfound() {
     mock_set_secret(&c, "testsecret").await;
 
     assert_eq!(
-        status, 400,
-        "admin-auth failure must be a clean 400, not a 500"
+        status, 401,
+        "an unreachable MAS surface must fail CLOSED, never open: {text}"
     );
-    let lower = text.to_lowercase();
+    // And it must not have handed out an account session on the way through.
     assert!(
-        !lower.contains("not found"),
-        "must NOT masquerade as 'device not found': {text}"
-    );
-    assert!(
-        lower.contains("admin token") || lower.contains("failed to list devices"),
-        "message must name the admin-token problem legibly: {text}"
+        !text.contains("csrf"),
+        "a fail-closed re-auth must not mint an account session: {text}"
     );
 }
