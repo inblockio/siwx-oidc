@@ -539,10 +539,11 @@ async fn did_field_is_published_verifiable_and_public_live() {
         .await
         .expect("the shipped verifier must accept the deployed server's proof");
     assert_eq!(
-        verified.did, did,
+        verified.did(),
+        did,
         "the verified DID must be the signed-in DID"
     );
-    assert_eq!(verified.mxid, mxid);
+    assert_eq!(verified.mxid(), mxid);
 
     // -- LEG 3 (H11 live): the alias tier carries no DID ---------------------
     let profile = read_profile_unauthenticated(&mxid).await;
@@ -697,6 +698,6 @@ async fn clobbered_did_field_is_restored_at_next_signin_live() {
     let verified = fetch_and_verify_did(&matrix_host(), &mxid, &siweoidc_host())
         .await
         .expect("the restored value must carry a proof that verifies, not just the right string");
-    assert_eq!(verified.did, did);
-    assert_eq!(verified.mxid, mxid);
+    assert_eq!(verified.did(), did);
+    assert_eq!(verified.mxid(), mxid);
 }

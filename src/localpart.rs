@@ -48,13 +48,48 @@ use tracing::warn;
 
 // -- Grandfathering policy ---------------------------------------------------
 
-/// The outcome of [`resolve_identity`]: which localpart a DID should use, and
-/// whether using it would create a brand-new Synapse account.
+/// The outcome of [`resolve_identity`]: which localpart a DID should use,
+/// whether using it would create a brand-new Synapse account, and — the field
+/// that exists purely to stop a guess being laundered into an assertion —
+/// whether the answer was actually RESOLVED or merely GUESSED.
 pub(crate) struct ResolvedIdentity {
     pub localpart: String,
     /// True when signing in would CREATE a brand-new Synapse account (neither
     /// the legacy nor the modern localpart is taken).
     pub is_new: bool,
+    /// True when this identity was NOT resolved but fell back — i.e.
+    /// [`resolve_identity_or_legacy`] swallowed a probe error and returned
+    /// [`legacy_localpart`] on the fail-safe assumption that the account
+    /// predates the modern scheme. `localpart` is then a GUESS, and `is_new` is
+    /// a placeholder (`false`) rather than a finding.
+    ///
+    /// # Why this field exists (2026-09-10 audit, D4)
+    ///
+    /// The fail-safe fallback is correct and is not changing — guessing legacy
+    /// for a modern account yields a working (if badly-shaped) account, while
+    /// guessing modern for a legacy account severs the user from their rooms
+    /// and keys forever, and Synapse has no rename API. But the DID-publication
+    /// feature added a way for that benign guess to become permanent damage:
+    /// when the fallback fires for a user whose real account IS modern-shaped,
+    /// `oidc::provision_synapse_device` re-probes, finds the legacy shape free,
+    /// provisions it, and publishes a **fully valid, correctly-verifying**
+    /// `{did, proof}` assertion binding that DID to the new, WRONG mxid. Two
+    /// Matrix accounts then carry provider-signed assertions for one DID and no
+    /// consumer can tell which is canonical — a signed lie is strictly worse
+    /// than no signature, because the signature is exactly what a consumer is
+    /// supposed to trust.
+    ///
+    /// So this flag is threaded to the publication decision and suppresses it.
+    /// Publishing nothing costs one login's worth of freshness; the next
+    /// healthy sign-in re-asserts (the write is idempotent and unconditional —
+    /// see `provision_synapse_device`'s "why re-assert every time" note).
+    ///
+    /// **Not a general "degraded" flag.** It says one thing: *this localpart
+    /// came from the error path.* Do not overload it with "Synapse was slow" or
+    /// "the account looked odd"; a caller that widens it will start suppressing
+    /// publication for healthy logins, which silently turns the whole feature
+    /// off.
+    pub degraded: bool,
 }
 
 /// Decide which localpart a DID should use, honouring the GRANDFATHER rule
@@ -104,6 +139,7 @@ pub(crate) async fn resolve_identity(
             return Ok(ResolvedIdentity {
                 localpart: legacy_localpart(did),
                 is_new: false,
+                degraded: false,
             });
         }
     };
@@ -114,6 +150,7 @@ pub(crate) async fn resolve_identity(
         return Ok(ResolvedIdentity {
             localpart: legacy,
             is_new: false,
+            degraded: false,
         });
     }
 
@@ -123,12 +160,14 @@ pub(crate) async fn resolve_identity(
         return Ok(ResolvedIdentity {
             localpart: modern,
             is_new: false,
+            degraded: false,
         });
     }
 
     Ok(ResolvedIdentity {
         localpart: modern,
         is_new: true,
+        degraded: false,
     })
 }
 
@@ -146,6 +185,28 @@ pub(crate) async fn resolve_identity(
 /// under. When in doubt, assume the account predates this feature (the vast
 /// majority do) and let the worst case be a bad-shaped brand-new account
 /// rather than a lost one.
+///
+/// ## That justification is TIME-LIMITED — re-examine it, do not inherit it
+///
+/// "The vast majority of accounts predate this feature" is an empirical claim
+/// about 2026-09-10, not a property of the design, and it decays monotonically:
+/// every genuinely-new identity from here on is provisioned under
+/// [`localpart_for`], so the modern-shaped population only grows and the
+/// legacy-shaped one only shrinks. Once modern-shaped accounts are the
+/// majority, "guess legacy" stops being the *likely-right* answer and is merely
+/// the *less-catastrophic-when-wrong* answer — still the correct direction (the
+/// asymmetry between "badly-shaped new account" and "user severed from their
+/// rooms forever" does not decay), but no longer cheap.
+///
+/// What actually changes with the ratio is the COST of the fallback, not its
+/// direction, so the thing to revisit is not this `if` but the surrounding
+/// blast radius: how often the fallback fires (i.e. Synapse reachability on the
+/// login path — see `synapse_client`'s timeout constants), and what is
+/// suppressed while it does (see [`ResolvedIdentity::degraded`]). If a future
+/// reader is weighing "should we flip the fallback to modern now that most
+/// accounts are modern": no. A wrong-but-working account is recoverable by a
+/// later correct sign-in; a severed account is not recoverable at all, at any
+/// population ratio.
 ///
 /// Use this only where the caller must produce SOME localpart and cannot fail
 /// the whole request over a transient Synapse hiccup (sign-in provisioning,
@@ -171,6 +232,10 @@ pub(crate) async fn resolve_identity_or_legacy(
             ResolvedIdentity {
                 localpart: legacy_localpart(did),
                 is_new: false,
+                // THE marker. Everything downstream that would write a durable,
+                // externally-verifiable artifact keyed on this localpart must
+                // check it and skip — see the field's own doc.
+                degraded: true,
             }
         }
     }
@@ -377,6 +442,73 @@ mod resolve_identity_tests {
         assert!(
             !resolved.is_new,
             "a fallback must never claim to know an account is new"
+        );
+        assert!(
+            resolved.degraded,
+            "a fallback must ANNOUNCE that it guessed — this flag is what stops \
+             oidc::provision_synapse_device publishing a signed assertion for a \
+             localpart nobody resolved (2026-09-10 audit, D4)"
+        );
+    }
+
+    /// The other half of the D4 contract: a SUCCESSFUL resolution must never
+    /// set `degraded`, or the suppression would fire on healthy logins and
+    /// silently turn DID publication off for everyone.
+    ///
+    /// Covers all three reachable-Synapse branches plus the no-Synapse one, so
+    /// a new branch added to `resolve_identity` that forgets the field is
+    /// caught here rather than in production by the absence of a feature.
+    #[tokio::test]
+    async fn a_successful_resolution_is_never_degraded() {
+        let legacy_did = "did:pkh:eip155:1:0x7a760ea15d76f935c8646b449af488c2b0021734";
+        let key_did = "did:key:z6MkmWziJJ2k3ckqVqnmMGVKefMhDSe4ZxrfvqksxDMGBa4v";
+
+        // Branch 2: existing legacy account.
+        let (synapse, handle) =
+            spawn_mock_synapse(HashSet::from([legacy_localpart(legacy_did)])).await;
+        assert!(
+            !resolve_identity(legacy_did, Some(&synapse))
+                .await
+                .expect("reachable mock")
+                .degraded,
+            "a grandfathered legacy account is RESOLVED, not guessed"
+        );
+        // Branch 4: genuinely new identity.
+        assert!(
+            !resolve_identity(key_did, Some(&synapse))
+                .await
+                .expect("reachable mock")
+                .degraded,
+            "a genuinely new identity is RESOLVED, not guessed"
+        );
+        handle.abort();
+
+        // Branch 3: already-migrated modern account.
+        let (synapse, handle) = spawn_mock_synapse(HashSet::from([localpart_for(key_did)])).await;
+        assert!(
+            !resolve_identity(key_did, Some(&synapse))
+                .await
+                .expect("reachable mock")
+                .degraded,
+            "an already-modern account is RESOLVED, not guessed"
+        );
+        // And the infallible wrapper must agree when nothing went wrong.
+        assert!(
+            !resolve_identity_or_legacy(key_did, Some(&synapse))
+                .await
+                .degraded,
+            "resolve_identity_or_legacy must only set `degraded` on the error path"
+        );
+        handle.abort();
+
+        // Branch 1: no Synapse configured at all. Deterministic, not a failure.
+        assert!(
+            !resolve_identity(legacy_did, None)
+                .await
+                .expect("no-Synapse path is infallible")
+                .degraded,
+            "a standalone deployment is not degraded — it has no Matrix account to \
+             resolve, which is a different fact from a probe that failed"
         );
     }
 }

@@ -3233,8 +3233,23 @@ mod tests {
     /// `legacy_localpart`. That is still "the new scheme": `resolve_identity` is
     /// the one and only entry point `execute_action` now goes through, and
     /// `legacy_localpart` is the permanent grandfathering branch of it, not a
-    /// bypass of it. `localpart::resolve_identity_tests` separately pins the same
-    /// case-folding invariant for the `localpart_for` (modern) branch.
+    /// bypass of it.
+    ///
+    /// **Scope, stated honestly (corrected 2026-09-10, audit D9).** Because
+    /// `synapse_client: None` takes the `legacy_localpart` branch
+    /// unconditionally, this test covers the LEGACY derivation only — it says
+    /// nothing about `localpart_for`. The modern branch's case-folding
+    /// invariant is pinned separately by
+    /// `siwx_oidc::mxid::tests::pkh_case_folding_is_canonical_lowercase`
+    /// (`src/mxid.rs`), which asserts
+    /// `localpart_for(PKH_LOWER) == localpart_for(PKH_MIXED)`, together with its
+    /// deliberate counterpart `key_case_is_preserved_not_folded` — `did:key`
+    /// case is key material, not an EIP-55 checksum, and folding it reproduces
+    /// siwx-oidc#17. This comment previously cited
+    /// `localpart::resolve_identity_tests` for that invariant; it does not pin
+    /// it (those six tests are about grandfathering, not case), so a reader
+    /// following the citation would have found nothing. Check the citation
+    /// before trusting it, and re-check it if these tests move.
     #[tokio::test]
     async fn cross_signing_reset_localpart_is_canonical_lowercase() {
         let mixed = "did:pkh:eip155:1:0xAbCdEf0123456789ABCDEF0123456789aAbBcCdD";

@@ -139,6 +139,80 @@ struct AdminMint {
     cached: Mutex<Option<CachedAdminToken>>,
 }
 
+/// Connect timeout for every Synapse call.
+///
+/// **`reqwest::Client::new()` has NO timeout of any kind** — that was the whole
+/// of this client's configuration until 2026-09-10, which meant a black-holed
+/// Synapse (SYNs dropped rather than refused) blocked each call until the
+/// KERNEL gave up: Linux's `tcp_syn_retries` defaults to 6, i.e. ~127 seconds
+/// per connect. "Best-effort, never fails sign-in" was true of Synapse *errors*
+/// and false of Synapse *hangs*, and this branch made that much worse by
+/// putting new awaits on the login path (`provision_synapse_device`'s profile
+/// PUT, and `detected_mxid_for` — which turned
+/// `POST /webauthn/authenticate/start`, a route with no Synapse dependency at
+/// all before, into one with two `is_localpart_available` probes).
+///
+/// 2 seconds because every deployment reaches Synapse over loopback, a compose
+/// network, or a LAN — `SIWEOIDC_SYNAPSE_ENDPOINT` is an internal address by
+/// construction (it presents the MAS shared secret in the clear on the
+/// `/_synapse/mas/*` surface, so it must never traverse the public internet).
+/// A TCP handshake that has not completed in 2s on such a path is not slow, it
+/// is gone.
+const SYNAPSE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Total per-request timeout (connect + response + body) for every Synapse call.
+///
+/// 8 seconds, chosen from BOTH directions rather than picked round:
+///
+/// - **Upper bound.** Every one of these calls sits on an interactive path a
+///   human is waiting on (sign-in, the passkey picker, an account action). The
+///   slowest legitimate call is `provision_user` at a first sign-in, which is a
+///   real registration + profile write on a possibly-loaded homeserver; 8s
+///   leaves generous headroom over that while staying an order of magnitude
+///   below the ~127s kernel default this replaces.
+/// - **Lower bound.** A timeout SHORTER than a legitimately slow call would
+///   manufacture failures rather than surface them. That is survivable here only
+///   because every write this client issues is idempotent (`provision_user`,
+///   `upsert_device`, `publish_did_field` are all re-run on the next sign-in),
+///   but it would still spend a user-visible login on a retry. Do not tighten
+///   this without checking that property still holds for every call site.
+///
+/// **Known residual — this bounds a CALL, not a LOGIN.** A single `/sign_in`
+/// can make up to ~8 Synapse calls in sequence (two `is_localpart_available`
+/// probes in `localpart::resolve_identity`, one more in
+/// `oidc::provision_synapse_device`, `has_profile_row`, the profile PUT and its
+/// D1 confirmation probe, `upsert_device`, `allow_cross_signing_reset`), plus
+/// the admin mint's own two. Against a Synapse that accepts connections and
+/// then never answers, the worst case is therefore ~8 × 8s, not 8s. What this
+/// constant buys is that the worst case is BOUNDED and roughly a minute instead
+/// of unbounded and roughly twenty; the real fix for the rest is a per-login
+/// deadline, which is a larger change and deliberately not attempted here.
+/// The black-hole case that actually motivated the finding is bounded by
+/// [`SYNAPSE_CONNECT_TIMEOUT`] instead, at ~8 × 2s.
+///
+/// Deliberately a CONSTANT and not a config knob: a timeout nobody sets is a
+/// timeout nobody tunes correctly under pressure, and there is no deployment
+/// shape (see the connect-timeout note above) where a Synapse call legitimately
+/// takes longer than this.
+const SYNAPSE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// The one place a `reqwest::Client` is built for Synapse traffic.
+///
+/// Single-sourced so a future second constructor cannot reintroduce the
+/// untimed `Client::new()` this replaced. See [`SYNAPSE_REQUEST_TIMEOUT`] for
+/// why the values are what they are.
+fn build_http_client() -> Client {
+    Client::builder()
+        .connect_timeout(SYNAPSE_CONNECT_TIMEOUT)
+        .timeout(SYNAPSE_REQUEST_TIMEOUT)
+        .build()
+        // Building a client only fails if the TLS backend cannot initialise,
+        // which is a broken process, not a runtime condition. Failing loudly at
+        // construction beats silently falling back to an untimed client — the
+        // exact defect this function exists to prevent.
+        .expect("failed to build the Synapse HTTP client (TLS backend init)")
+}
+
 /// Client for Synapse's management endpoints.
 ///
 /// Carries BOTH credentials described in the module docs: the MAS shared secret
@@ -165,7 +239,7 @@ impl SynapseClient {
         Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             shared_secret: shared_secret.to_string(),
-            http: Client::new(),
+            http: build_http_client(),
             admin: None,
         }
     }
@@ -835,7 +909,7 @@ impl SynapseClient {
     /// → 200) against legs 2 and 3 (user PUT / DELETE → 403) on one image, with
     /// the `msc4133_key_denylist` config as the only variable.
     ///
-    /// # A 500 here means "row-less account", NOT "error"
+    /// # A 500 is only a HYPOTHESIS of "row-less account" — it must be CONFIRMED
     ///
     /// [element-hq/synapse#19702](https://github.com/element-hq/synapse/issues/19702)
     /// is still present in **1.159.0**, on reads *and* writes: both
@@ -843,18 +917,58 @@ impl SynapseClient {
     /// `txn.fetchone()`, so an account with a `users` row but **no `profiles`
     /// row** raises an uncaught `TypeError` and Synapse answers a bare 500 —
     /// where a healthy account answers 404. 3 of 102 accounts on the dev
-    /// homeserver are in that state (erasure artifacts). It is therefore a
-    /// KNOWN CONDITION of a known-buggy dependency, reported as
+    /// homeserver are in that state (erasure artifacts). That is a KNOWN
+    /// CONDITION of a known-buggy dependency, reported as
     /// [`PublishOutcome::RowLessAccount`] and logged at `warn!`, not `error!`:
-    /// nothing is broken here, the write simply could not be attempted and the
-    /// field's state is **unknown** (not "absent" — the route cannot tell us).
+    /// nothing of ours is broken, the write simply could not be attempted and
+    /// the field's state is **unknown** (not "absent" — the route cannot tell
+    /// us).
     ///
-    /// Do not "simplify" this back into a plain `Err`. Sign-in calls this
-    /// best-effort, so an `Err` is swallowed by the caller either way — the
-    /// distinction exists so an operator reading logs (and the live test) can
-    /// tell a systemic breakage apart from three known-bad accounts, and so
-    /// this stops being special automatically once the pinned Synapse image is
-    /// bumped past the upstream fix.
+    /// **But the status code alone does not establish it, and until 2026-09-10
+    /// this code assumed it did.** #19702's 500 carries Twisted's *generic*
+    /// body — `{"errcode":"M_UNKNOWN","error":"Internal server error"}` —
+    /// byte-identical to the 500 from an exhausted database connection pool or
+    /// any other uncaught exception. So the failure mode of the old code was:
+    /// Synapse's database degrades, EVERY sign-in's publication 500s, and the
+    /// log asserts a known, bounded, self-resolving condition affecting a
+    /// handful of accounts while the publication path is 100% down. A `warn!`
+    /// that says "known upstream bug, resolves on the next image bump" is worse
+    /// than silence when it is wrong, because it actively spends an operator's
+    /// attention budget on not looking.
+    ///
+    /// This is the SAME MISTAKE CLASS the team already fixed on 2026-08-02 for
+    /// the 404 case, and the fix is the same one, in this same file: a status
+    /// code is not a diagnosis. So a 500 now triggers a confirmation probe —
+    /// [`has_profile_row`](Self::has_profile_row), which carries the JSON
+    /// `errcode` discriminator (`M_UNKNOWN` + a whole-profile `GET` 404 =
+    /// "truly absent"; re-verified live during the 2026-09-10 audit, where a
+    /// row-less account answered
+    /// `404 {"errcode":"M_UNKNOWN","error":"No row found (profiles)"}`) — and
+    /// only a CONFIRMED-absent row is reported as
+    /// [`PublishOutcome::RowLessAccount`]. Anything else is a genuine `Err`.
+    ///
+    /// **The confirmation fails LOUD, which is the opposite of
+    /// `has_profile_row`'s own internal fail-safe — deliberately, and the two
+    /// are not in conflict.** Inside `has_profile_row` the risky action is
+    /// HEALING (re-running `provision_user`, a write that can clobber a real
+    /// profile), so an undecidable answer resolves to "present, do not heal".
+    /// Here the risky action is SILENCING, so an undecidable answer resolves to
+    /// "genuine error, surface it". Both rules point away from the destructive
+    /// outcome; they only look opposite because the destructive outcome is
+    /// opposite. Do not "unify" them.
+    ///
+    /// **Cost:** the probe is on the FAILURE path only. A healthy publication
+    /// (2xx, which is the steady state — one idempotent PUT per login) makes
+    /// exactly one request and never touches `has_profile_row`. Keep it that
+    /// way: pre-probing to "know in advance" would double the login-path
+    /// Synapse traffic to buy nothing.
+    ///
+    /// Do not "simplify" the `RowLessAccount` outcome back into a plain `Err`
+    /// either. Sign-in calls this best-effort, so an `Err` is swallowed by the
+    /// caller either way — the distinction exists so an operator reading logs
+    /// (and the live test) can tell a systemic breakage apart from three
+    /// known-bad accounts, and so this stops being special automatically once
+    /// the pinned Synapse image is bumped past the upstream fix.
     ///
     /// Every other non-2xx **is** a genuine `Err`, including 404: unlike the
     /// GET twin, a 404 on this PUT does not mean "no such field". The stable v3
@@ -902,22 +1016,66 @@ impl SynapseClient {
 
         let status = resp.status();
         match classify_publish_status(status) {
-            Some(PublishOutcome::Written) => {
+            PublishStatusClass::Written => {
                 debug!(%user_id, "publish_did_field: wrote the attested DID object");
                 Ok(PublishOutcome::Written)
             }
-            Some(PublishOutcome::RowLessAccount) => {
+            // CONFIRM BEFORE EXCUSING. A 500 is only *consistent* with #19702;
+            // it does not establish it. See the "A 500 is only a HYPOTHESIS"
+            // section on this method for why this probe is mandatory and why it
+            // fails LOUD rather than fail-safe.
+            PublishStatusClass::MaybeRowLess => {
                 let body = resp.text().await.unwrap_or_default();
-                warn!(
-                    %user_id, %body,
-                    "publish_did_field: Synapse answered 500 — this account has a `users` row but \
-                     no `profiles` row (element-hq/synapse#19702, unfixed in 1.159.0). The DID \
-                     field's state is UNKNOWN for this account; it will be re-attempted at the \
-                     user's next sign-in and resolves once the pinned Synapse image is bumped"
-                );
-                Ok(PublishOutcome::RowLessAccount)
+                match self.has_profile_row(localpart, server_name).await {
+                    // Confirmed: the profile row really is absent. This is
+                    // #19702 and nothing else.
+                    Ok(false) => {
+                        warn!(
+                            %user_id, %body,
+                            "publish_did_field: Synapse answered 500 and the profile-row probe \
+                             CONFIRMED the row is absent — this account has a `users` row but no \
+                             `profiles` row (element-hq/synapse#19702, unfixed in 1.159.0). The \
+                             DID field's state is UNKNOWN for this account; it will be \
+                             re-attempted at the user's next sign-in and resolves once the pinned \
+                             Synapse image is bumped"
+                        );
+                        Ok(PublishOutcome::RowLessAccount)
+                    }
+                    // The row is there (or the probe's own fail-safe says
+                    // "assume present"). Whatever made the PUT 500, it was not
+                    // the missing row — surface it.
+                    Ok(true) => {
+                        warn!(
+                            %status, %body, %user_id,
+                            "publish_did_field failed with 500, but the profile row EXISTS — this \
+                             is NOT element-hq/synapse#19702. Treating it as a genuine error"
+                        );
+                        anyhow::bail!(
+                            "publish_did_field: HTTP {status} with a present profile row (not \
+                             element-hq/synapse#19702 — a real Synapse-side failure){}",
+                            publish_status_hint(status)
+                        );
+                    }
+                    // The confirmation probe itself failed. That is MORE
+                    // evidence of a degraded homeserver, not less, so it must
+                    // never be resolved in the reassuring direction.
+                    Err(e) => {
+                        warn!(
+                            %status, %body, %user_id, error = %e,
+                            "publish_did_field failed with 500 and the profile-row probe could \
+                             not confirm the cause — refusing to report it as the known \
+                             element-hq/synapse#19702 condition"
+                        );
+                        anyhow::bail!(
+                            "publish_did_field: HTTP {status}, and the profile-row probe that \
+                             would distinguish element-hq/synapse#19702 from a real failure also \
+                             failed ({e}){}",
+                            publish_status_hint(status)
+                        );
+                    }
+                }
             }
-            None => {
+            PublishStatusClass::Failed => {
                 let body = resp.text().await.unwrap_or_default();
                 warn!(%status, %body, %user_id, "publish_did_field failed");
                 anyhow::bail!(
@@ -940,15 +1098,43 @@ impl SynapseClient {
 pub enum PublishOutcome {
     /// Synapse accepted the write (2xx). The field now holds the value sent.
     Written,
-    /// Synapse answered 500 because the target account has a `users` row but no
-    /// `profiles` row — element-hq/synapse#19702, still unfixed in 1.159.0.
-    /// **The field's state is unknown**, not absent: the request never reached
-    /// the storage layer, and the same bug makes the GET twin 500 as well.
+    /// Synapse answered 500 **and a follow-up profile-row probe confirmed** the
+    /// target account has a `users` row but no `profiles` row —
+    /// element-hq/synapse#19702, still unfixed in 1.159.0. **The field's state
+    /// is unknown**, not absent: the request never reached the storage layer,
+    /// and the same bug makes the field-scoped GET twin 500 as well (the
+    /// whole-profile GET that [`SynapseClient::has_profile_row`] uses is the
+    /// one route that still answers usefully — a 404 with `errcode:
+    /// M_UNKNOWN`).
+    ///
+    /// A bare 500 is NOT enough to produce this variant, and must never again
+    /// be: Twisted's generic 500 body is identical for an exhausted DB pool.
+    /// See the "A 500 is only a HYPOTHESIS" section on
+    /// [`SynapseClient::publish_did_field`].
     RowLessAccount,
 }
 
-/// Map a `PUT …/profile/{mxid}/{field}` status to its outcome, or `None` when
-/// it is a genuine error.
+/// What a `PUT …/profile/{mxid}/{field}` status can be concluded from the
+/// STATUS CODE ALONE.
+///
+/// Note the middle variant is `MaybeRowLess`, not `RowLessAccount`: a status
+/// code cannot decide that question, and pretending it can was the defect this
+/// type exists to make unrepresentable. See
+/// [`SynapseClient::publish_did_field`]'s "confirm before excusing a 500"
+/// section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishStatusClass {
+    /// 2xx — the field now holds the value sent.
+    Written,
+    /// Exactly 500 — CONSISTENT with element-hq/synapse#19702 and with nothing
+    /// else observable at this layer. Requires confirmation before it may be
+    /// reported as [`PublishOutcome::RowLessAccount`].
+    MaybeRowLess,
+    /// Any other non-2xx — an unambiguous, genuine error.
+    Failed,
+}
+
+/// Map a `PUT …/profile/{mxid}/{field}` status to what the status alone proves.
 ///
 /// Pure and separate from the request for the same reason
 /// [`profile_404_means_row_absent`] is: the interesting decision here is a
@@ -956,19 +1142,24 @@ pub enum PublishOutcome {
 /// a live homeserver, a Redis instance to mint a token into, or an HTTP mock.
 /// The full-path tests below exercise it through a real request as well; this
 /// function is what keeps that coverage non-vacuous when they skip.
-fn classify_publish_status(status: reqwest::StatusCode) -> Option<PublishOutcome> {
+fn classify_publish_status(status: reqwest::StatusCode) -> PublishStatusClass {
     if status.is_success() {
-        return Some(PublishOutcome::Written);
+        return PublishStatusClass::Written;
     }
     // Deliberately exactly 500, not `is_server_error()`. #19702 surfaces as an
     // uncaught `TypeError` → Twisted's generic 500. A 502/503/504 is a proxy or
     // a homeserver that is down, which is a genuine failure an operator must
     // see, and swallowing those as "known condition" would hide a total outage
     // of the publication path behind a `warn!`.
+    //
+    // KEEP THIS HALF. The 2026-09-10 audit finding (D1) was about what happens
+    // AFTER this returns `MaybeRowLess`, not about which statuses reach it; the
+    // "exactly 500, never `is_server_error()`" property is correct and was
+    // re-affirmed, not relaxed.
     if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR {
-        return Some(PublishOutcome::RowLessAccount);
+        return PublishStatusClass::MaybeRowLess;
     }
-    None
+    PublishStatusClass::Failed
 }
 
 /// A human hint appended to a failed profile-field write.
@@ -1305,19 +1496,28 @@ mod tests {
         for code in [200u16, 201, 204] {
             assert_eq!(
                 classify_publish_status(reqwest::StatusCode::from_u16(code).unwrap()),
-                Some(PublishOutcome::Written),
+                PublishStatusClass::Written,
                 "HTTP {code} must count as a completed write"
             );
         }
     }
 
-    /// H2 (classifier half): a 500 is the known row-less-account condition
-    /// (element-hq/synapse#19702), NOT an error.
+    /// H2 (classifier half): a 500 is the *candidate* row-less-account
+    /// condition (element-hq/synapse#19702) — `MaybeRowLess`, never
+    /// `RowLessAccount`.
+    ///
+    /// The variant name is the assertion. Since the 2026-09-10 audit (D1) the
+    /// classifier is explicitly forbidden from concluding "#19702" from a
+    /// status code, because Twisted's generic 500 body is byte-identical for an
+    /// exhausted DB pool; only `publish_did_field`'s confirmation probe may
+    /// promote this to `PublishOutcome::RowLessAccount`. If a refactor ever
+    /// makes this return a settled outcome again, this test is what fails.
     #[test]
-    fn publish_status_500_is_the_rowless_account_condition() {
+    fn publish_status_500_is_only_a_candidate_rowless_account() {
         assert_eq!(
             classify_publish_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
-            Some(PublishOutcome::RowLessAccount)
+            PublishStatusClass::MaybeRowLess,
+            "a 500 is a hypothesis, not a diagnosis"
         );
     }
 
@@ -1334,7 +1534,7 @@ mod tests {
         for code in [502u16, 503, 504] {
             assert_eq!(
                 classify_publish_status(reqwest::StatusCode::from_u16(code).unwrap()),
-                None,
+                PublishStatusClass::Failed,
                 "HTTP {code} is a dead upstream, not a row-less account"
             );
         }
@@ -1351,7 +1551,7 @@ mod tests {
     fn publish_status_404_is_an_error_with_a_disambiguating_hint() {
         assert_eq!(
             classify_publish_status(reqwest::StatusCode::NOT_FOUND),
-            None
+            PublishStatusClass::Failed
         );
         let hint = publish_status_hint(reqwest::StatusCode::NOT_FOUND);
         assert!(
@@ -1400,11 +1600,57 @@ mod tests {
         body: serde_json::Value,
     }
 
+    /// The `(status, body)` a mock answers the WHOLE-PROFILE
+    /// `GET /_matrix/client/v3/profile/{mxid}` with — i.e. what
+    /// [`SynapseClient::has_profile_row`] sees when `publish_did_field`
+    /// confirms a 500.
+    ///
+    /// `404 {"errcode":"M_UNKNOWN", …}` is the ONLY shape that reads as "row
+    /// truly absent" (see `has_profile_row`'s discriminator table), so it is
+    /// the only shape that may promote a 500 to
+    /// [`PublishOutcome::RowLessAccount`].
+    fn profile_row_absent() -> (axum::http::StatusCode, serde_json::Value) {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            json!({"errcode": "M_UNKNOWN", "error": "No row found (profiles)"}),
+        )
+    }
+
+    /// A present profile row: a plain 200.
+    fn profile_row_present() -> (axum::http::StatusCode, serde_json::Value) {
+        (
+            axum::http::StatusCode::OK,
+            json!({"displayname": "someone"}),
+        )
+    }
+
     /// Spin up a mock Synapse that answers `is_localpart_available` with
     /// "taken" (so the admin mint performs no `provision_user`) and records
     /// every other request, answering it with `reply_status`.
+    ///
+    /// Defaults the whole-profile GET to "row absent", which is the shape the
+    /// pre-2026-09-10 tests implicitly assumed when a 500 needed no
+    /// confirmation at all. Use [`spawn_publish_mock_with_profile`] to vary it.
     async fn spawn_publish_mock(
         reply_status: axum::http::StatusCode,
+    ) -> (
+        SynapseClient,
+        std::sync::Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        spawn_publish_mock_with_profile(reply_status, profile_row_absent()).await
+    }
+
+    /// [`spawn_publish_mock`], with control over what the whole-profile GET
+    /// answers.
+    ///
+    /// That GET is `publish_did_field`'s D1 confirmation probe. Passing
+    /// `reply_status` for it too (rather than a separate shape) is what the
+    /// mock did before this split, and it is exactly the case that must NOT be
+    /// classified as a row-less account: a homeserver 500ing on everything.
+    async fn spawn_publish_mock_with_profile(
+        reply_status: axum::http::StatusCode,
+        profile_reply: (axum::http::StatusCode, serde_json::Value),
     ) -> (
         SynapseClient,
         std::sync::Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
@@ -1423,6 +1669,20 @@ mod tests {
         struct MockState {
             log: std::sync::Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
             reply_status: axum::http::StatusCode,
+            profile_reply: (axum::http::StatusCode, serde_json::Value),
+        }
+
+        /// True for the WHOLE-profile GET (`…/profile/{mxid}`) and false for
+        /// the field-scoped PUT (`…/profile/{mxid}/io.inblock.did`).
+        ///
+        /// Matched on the path suffix rather than by a router route so the
+        /// request still lands in the same recording fallback — an assertion
+        /// on the recorded log is how the tests below prove the confirmation
+        /// probe was (or was not) made at all.
+        fn is_whole_profile_get(method: &str, path: &str) -> bool {
+            method == "GET"
+                && path.starts_with("/_matrix/client/v3/profile/")
+                && !path.ends_with(DID_PROFILE_FIELD)
         }
 
         async fn record(State(state): State<MockState>, req: Request) -> axum::response::Response {
@@ -1438,12 +1698,17 @@ mod tests {
                 .unwrap_or_default();
             let body: serde_json::Value =
                 serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            let whole_profile_get = is_whole_profile_get(&method, &path);
             state.log.lock().unwrap().push(RecordedRequest {
                 method,
                 path,
                 authorization,
                 body,
             });
+            if whole_profile_get {
+                let (status, body) = state.profile_reply.clone();
+                return (status, axum::Json(body)).into_response();
+            }
             (state.reply_status, "{}").into_response()
         }
 
@@ -1468,6 +1733,7 @@ mod tests {
             .with_state(MockState {
                 log: log.clone(),
                 reply_status,
+                profile_reply,
             });
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("mock-synapse");
@@ -1577,9 +1843,294 @@ mod tests {
         let outcome = client
             .publish_did_field("k3f9x2q7ab4d8m1p", "inblock.io", &sample_value())
             .await
-            .expect("a 500 is a KNOWN condition, not an Err");
+            .expect("a CONFIRMED row-less 500 is a KNOWN condition, not an Err");
         assert_eq!(outcome, PublishOutcome::RowLessAccount);
         handle.abort();
+    }
+
+    // -- D1 (2026-09-10 audit): a 500 must be CONFIRMED, not assumed ---------
+    //
+    // The old code classified ANY 500 on the profile PUT as #19702. Synapse's
+    // #19702 500 carries Twisted's generic body
+    // (`{"errcode":"M_UNKNOWN","error":"Internal server error"}`), which is
+    // byte-identical to the 500 from an exhausted DB pool — so a degraded
+    // database made every login log a reassuring "known bounded upstream bug,
+    // resolves on the next image bump" while the publication path was 100%
+    // down. These three tests pin the confirmation probe and BOTH of its
+    // non-confirming answers.
+
+    /// D1, the positive half: a 500 whose profile-row probe confirms the row is
+    /// absent is still `RowLessAccount` — the fix must not regress the real
+    /// #19702 case into a hard error.
+    ///
+    /// Also asserts the probe actually happened, so a refactor that "optimises"
+    /// the confirmation away and reverts to assuming fails here rather than
+    /// silently passing on the outcome alone.
+    #[tokio::test]
+    async fn d1_500_with_a_confirmed_absent_row_is_still_a_rowless_account() {
+        let (client, log, handle) = spawn_publish_mock_with_profile(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            profile_row_absent(),
+        )
+        .await;
+        let Some(client) = with_redis_mint(client).await else {
+            eprintln!(
+                "SKIP d1_500_with_a_confirmed_absent_row_is_still_a_rowless_account: no Redis on localhost"
+            );
+            handle.abort();
+            return;
+        };
+
+        let outcome = client
+            .publish_did_field("k3f9x2q7ab4d8m1p", "inblock.io", &sample_value())
+            .await
+            .expect("a CONFIRMED row-less 500 must stay a known condition, not become an Err");
+        assert_eq!(outcome, PublishOutcome::RowLessAccount);
+
+        let requests = log.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.method == "GET" && !r.path.ends_with(DID_PROFILE_FIELD)),
+            "the whole-profile confirmation probe must have been made: {requests:?}"
+        );
+        handle.abort();
+    }
+
+    /// D1, the finding itself: a 500 on an account whose profile row EXISTS is
+    /// not #19702 and must surface as a genuine error.
+    ///
+    /// This is the shape of the outage the old code hid — a homeserver failing
+    /// for some other reason on accounts that are perfectly well-formed.
+    #[tokio::test]
+    async fn d1_500_with_a_present_profile_row_is_a_genuine_error() {
+        let (client, _log, handle) = spawn_publish_mock_with_profile(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            profile_row_present(),
+        )
+        .await;
+        let Some(client) = with_redis_mint(client).await else {
+            eprintln!(
+                "SKIP d1_500_with_a_present_profile_row_is_a_genuine_error: no Redis on localhost"
+            );
+            handle.abort();
+            return;
+        };
+
+        let err = client
+            .publish_did_field("k3f9x2q7ab4d8m1p", "inblock.io", &sample_value())
+            .await
+            .expect_err(
+                "a 500 on an account that HAS a profile row is not element-hq/synapse#19702 and \
+                 must not be excused as one",
+            )
+            .to_string();
+        assert!(
+            err.contains("500"),
+            "the status must be in the message: {err}"
+        );
+        assert!(
+            err.contains("present profile row"),
+            "the message must say WHY this 500 is not the known bug: {err}"
+        );
+        handle.abort();
+    }
+
+    /// D1, the fail-LOUD direction: when the confirmation probe itself fails,
+    /// the 500 must NOT be resolved in the reassuring direction.
+    ///
+    /// This is the literal database-degradation scenario: the homeserver 500s
+    /// on everything, including the probe. A probe failure is MORE evidence of
+    /// an outage, not less — so it becomes an `Err`, and the message says the
+    /// cause could not be distinguished rather than asserting a diagnosis.
+    ///
+    /// Note this mock (one `reply_status` for every route) is exactly what the
+    /// pre-fix `spawn_publish_mock` was, i.e. the old H2 test was passing
+    /// against a homeserver that was 500ing on everything and calling it a
+    /// known bounded upstream bug.
+    #[tokio::test]
+    async fn d1_500_with_an_unconfirmable_row_is_a_genuine_error() {
+        let (client, _log, handle) = spawn_publish_mock_with_profile(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"errcode": "M_UNKNOWN", "error": "Internal server error"}),
+            ),
+        )
+        .await;
+        let Some(client) = with_redis_mint(client).await else {
+            eprintln!(
+                "SKIP d1_500_with_an_unconfirmable_row_is_a_genuine_error: no Redis on localhost"
+            );
+            handle.abort();
+            return;
+        };
+
+        let err = client
+            .publish_did_field("k3f9x2q7ab4d8m1p", "inblock.io", &sample_value())
+            .await
+            .expect_err("an unconfirmable 500 must never be reported as the known condition")
+            .to_string();
+        assert!(
+            err.contains("500"),
+            "the status must be in the message: {err}"
+        );
+        assert!(
+            err.contains("also failed"),
+            "the message must say the confirmation probe also failed, not assert a diagnosis: {err}"
+        );
+        handle.abort();
+    }
+
+    // -- D1, against a LIVE Synapse -----------------------------------------
+    //
+    // The mock tests above are only as good as the mock. These two run the real
+    // `has_profile_row` — the discriminator the D1 fix rests on — against a
+    // real homeserver, on two accounts deliberately put into the two states
+    // that produce an INDISTINGUISHABLE 500 from the profile PUT.
+    //
+    // # What was measured live (2026-09-10, Synapse 1.159.0, e2e stack)
+    //
+    // | account state | `PUT …/profile/{mxid}/io.inblock.did` | `GET …/profile/{mxid}` |
+    // |---|---|---|
+    // | `users` row, NO `profiles` row | `500 {"errcode":"M_UNKNOWN","error":"Internal server error"}` | `404 {"errcode":"M_UNKNOWN","error":"No row found (profiles)"}` |
+    // | `profiles` row present, writes to it failing | `500 {"errcode":"M_UNKNOWN","error":"Internal server error"}` | `200 {"displayname":…}` |
+    //
+    // The two PUT bodies are **byte-identical** — that is the finding. The
+    // second state was produced by a scoped, reversible SQLite trigger raising
+    // `ABORT` on `UPDATE profiles` for one throwaway user, which is a genuine
+    // Synapse-side write failure of exactly the class ("the database degraded")
+    // that the pre-fix code reported as a reassuring known upstream bug.
+    //
+    // # Scope, stated honestly
+    //
+    // These cover the GET leg with the real server. The PUT leg is NOT driven
+    // from here: `publish_did_field` needs a minted admin token, whose
+    // introspection has to be served by the same siwx-oidc instance Synapse is
+    // configured against, and that instance's Redis is not reachable from a
+    // `cargo test` on the host. The PUT statuses in the table above were
+    // measured with `curl` instead, and `classify_publish_status` is pinned by
+    // its own pure unit tests, so the composition is covered — but do not read
+    // these two tests as end-to-end.
+    //
+    // Set up (both accounts, provisioned via `/_synapse/mas/provision_user`):
+    //
+    // ```sh
+    // SIWX_LIVE_SYNAPSE=http://localhost:18448 \
+    // SIWX_LIVE_SERVER_NAME=localhost \
+    // SIWX_LIVE_ROWLESS_LOCALPART=… SIWX_LIVE_PRESENT_LOCALPART=… \
+    //   cargo test --bin siwx-oidc d1_live -- --ignored --nocapture
+    // ```
+
+    /// The live environment for the `d1_live_*` probes, or `None` when it is
+    /// not configured (so the tests skip in the repo's established style rather
+    /// than failing on a developer machine with no stack up).
+    fn live_probe_env(localpart_var: &str) -> Option<(SynapseClient, String, String)> {
+        let endpoint = std::env::var("SIWX_LIVE_SYNAPSE").ok()?;
+        let server_name = std::env::var("SIWX_LIVE_SERVER_NAME").ok()?;
+        let localpart = std::env::var(localpart_var).ok()?;
+        // No admin mint: `has_profile_row` is unauthenticated on a default
+        // Synapse (`require_auth_for_profile_requests` defaults to false — see
+        // its own doc), which is exactly why this leg can be driven from here.
+        Some((
+            SynapseClient::new(&endpoint, "unused-no-admin-mint"),
+            server_name,
+            localpart,
+        ))
+    }
+
+    /// D1 live, the CONFIRMING answer: a real row-less account's whole-profile
+    /// GET must resolve to "truly absent", which is the only thing that may
+    /// promote a 500 to `PublishOutcome::RowLessAccount`.
+    #[tokio::test]
+    #[ignore = "requires a live Synapse; see the SIWX_LIVE_* setup above"]
+    async fn d1_live_rowless_account_is_confirmed_absent() {
+        let Some((client, server_name, localpart)) = live_probe_env("SIWX_LIVE_ROWLESS_LOCALPART")
+        else {
+            eprintln!("SKIP d1_live_rowless_account_is_confirmed_absent: SIWX_LIVE_* not set");
+            return;
+        };
+        let present = client
+            .has_profile_row(&localpart, &server_name)
+            .await
+            .expect("the live probe must answer, not error");
+        assert!(
+            !present,
+            "a row-less account must be CONFIRMED absent, or the real              element-hq/synapse#19702 case regresses into a hard error"
+        );
+    }
+
+    /// D1 live, the REFUSING answer — this is the finding itself.
+    ///
+    /// An account whose `profiles` row exists but whose writes fail produces a
+    /// PUT 500 byte-identical to #19702's. The discriminator must say "row
+    /// present", so `publish_did_field` surfaces it as a genuine error instead
+    /// of logging the reassuring "known bounded upstream bug" line while the
+    /// publication path is down for everyone.
+    #[tokio::test]
+    #[ignore = "requires a live Synapse; see the SIWX_LIVE_* setup above"]
+    async fn d1_live_account_with_a_row_is_not_confirmed_absent() {
+        let Some((client, server_name, localpart)) = live_probe_env("SIWX_LIVE_PRESENT_LOCALPART")
+        else {
+            eprintln!(
+                "SKIP d1_live_account_with_a_row_is_not_confirmed_absent: SIWX_LIVE_* not set"
+            );
+            return;
+        };
+        let present = client
+            .has_profile_row(&localpart, &server_name)
+            .await
+            .expect("the live probe must answer, not error");
+        assert!(
+            present,
+            "an account that HAS a profile row must never be read as absent — that reading is              what excuses a real outage as element-hq/synapse#19702"
+        );
+    }
+
+    /// Mock fidelity: the mock's 500 body must be the LIVE one, verbatim.
+    ///
+    /// The D1 mock tests are only evidence if the mock reproduces what Synapse
+    /// actually sends. The whole finding is that #19702's 500 body and a
+    /// degraded-database 500 body are the same bytes, so if this ever stops
+    /// being the body Synapse emits, the mock tests are testing a fiction and
+    /// the classifier's premise needs re-measuring. Measured live 2026-09-10 on
+    /// Synapse 1.159.0, from BOTH account states.
+    #[test]
+    fn the_generic_500_body_is_indistinguishable_between_both_causes() {
+        let live_rowless_500 = json!({"errcode": "M_UNKNOWN", "error": "Internal server error"});
+        let live_degraded_db_500 =
+            json!({"errcode": "M_UNKNOWN", "error": "Internal server error"});
+        assert_eq!(
+            live_rowless_500, live_degraded_db_500,
+            "if these ever differ, a 500 could be classified from its body alone and the              confirmation probe could be reconsidered — re-measure before assuming so"
+        );
+        // And the discriminator that DOES separate them, on the GET leg.
+        assert!(
+            profile_404_means_row_absent(
+                &json!({"errcode": "M_UNKNOWN", "error": "No row found (profiles)"}).to_string()
+            ),
+            "the live row-less 404 body must read as truly absent"
+        );
+    }
+
+    /// D5 (2026-09-10 audit): a black-holed Synapse must fail fast.
+    #[tokio::test]
+    #[ignore = "timing probe: takes ~2s by design"]
+    async fn d5_a_blackholed_synapse_gives_up_in_about_the_connect_timeout() {
+        // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): guaranteed non-routable, so
+        // SYNs are dropped rather than refused — the black-hole case, not the
+        // connection-refused case. Before the timeouts landed this blocked
+        // until the kernel gave up (~127s on Linux defaults).
+        let client = SynapseClient::new("http://192.0.2.1:1", "secret");
+        let started = std::time::Instant::now();
+        let err = client.is_localpart_available("whoever").await;
+        let elapsed = started.elapsed();
+        assert!(err.is_err(), "a black hole must error, not hang forever");
+        assert!(
+            elapsed < SYNAPSE_CONNECT_TIMEOUT + std::time::Duration::from_secs(2),
+            "must give up near the connect timeout, not at the OS TCP timeout: {elapsed:?}"
+        );
+        eprintln!("gave up after {elapsed:?} (connect timeout {SYNAPSE_CONNECT_TIMEOUT:?})");
     }
 
     /// A 404 is a genuine `Err`, carrying the hint that disambiguates it from

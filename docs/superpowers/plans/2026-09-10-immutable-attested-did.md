@@ -121,7 +121,15 @@ so a user-clobbered value self-heals at next login with no janitor process.
 `element-hq/synapse#19702` is still present in 1.159.0 on both reads and writes
 (`_check_profile_size` and `get_profile_field` both subscript an unguarded
 `txn.fetchone()`), so an account with a `users` row but no `profiles` row 500s
-where a healthy account 404s. 3 of 102 dev accounts are in that state.
+where a healthy account 404s. 3 of 102 accounts **on the dev deployment**
+(207.154.209.103, counted 2026-09-09, all erasure artifacts) are in that state — that
+figure is about dev, NOT about the local e2e harness, whose volumes are recreated per
+run and which normally has none.
+
+**Corrected after audit:** "a 500 means row-less account" is over-narrow. Synapse's 500
+body here is the generic `{"errcode":"M_UNKNOWN","error":"Internal server error"}`,
+byte-identical to a 500 from an exhausted DB pool, so the status code alone cannot
+discriminate. See the audit report and the D1 remediation.
 
 ---
 
@@ -138,7 +146,7 @@ where a healthy account 404s. 3 of 102 dev accounts are in that state.
 | **H7** | the proof's payload, signature, or `alg` is altered | verification fails | — | unit: tampered payload, truncated sig, `alg:none`, `alg:HS256`, unknown `kid` — each → `Err` |
 | **H8** | the server mints an assertion and the client crate verifies it against the server's real JWKS | it verifies | both sides agree on r‖s (not DER) ES256 encoding | integration test spanning both crates |
 | **H9** | the backported #19980 guard is applied and `msc4133_key_denylist: ["io.inblock.did"]` is set | a user's own PUT **and** DELETE of that field answer 403, while the admin-token PUT still answers 200 | `by_admin` is exempt in the upstream guard | live: three curl legs against the patched image |
-| **H10** | the upstream hunks are rebased onto v1.159.0 | the image builds, Synapse starts, and every other profile operation is unchanged | 1.159.0's function bodies match the anchors found | `podman build` + container healthy + `/_matrix/client/versions` 200 + full harness green |
+| **H10** | the upstream hunks are rebased onto v1.159.0 | the image builds, Synapse starts, and every other profile operation is unchanged | 1.159.0's function bodies match the anchors found | `podman build` + container healthy + `/_matrix/client/versions` 200 + **every siwx-oidc harness check green**. NOT "full harness green": `run.sh full` reports `OVERALL: FAIL` because the five `connector.*` checks refuse to run against a dirty sibling checkout in an unrelated repo. The correct bar is `fail=0` with no siwx-oidc check in the harness-error list. |
 | **H11** | the DID is published only into the ACL-protected field, and `displayname` is seeded with something that is not the DID | no user-writable surface carries a provider-asserted DID | nothing else writes the DID to a user-writable place | unit: `provision_user` is never called with the DID. live: a new account's displayname ≠ its DID |
 | **H12** | all of the above ship | the existing suite stays green and sign-in / token / introspect are unaffected | — | `cargo test --workspace` EXIT=0, ≥18 targets ok; clippy `-D warnings`; `fmt --check` |
 

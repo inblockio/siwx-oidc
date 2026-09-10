@@ -13,6 +13,17 @@ pub struct Config {
     /// PKCS#8 PEM for the ES256 (P-256 ECDSA) signing key.
     /// If absent, a random key is generated on startup.
     pub signing_key_pem: Option<String>,
+    /// One or more **public** (SPKI `-----BEGIN PUBLIC KEY-----`) P-256 PEM
+    /// blocks, concatenated, for signing keys this provider has RETIRED.
+    ///
+    /// They are appended to the published JWKS with their own derived `kid`s so
+    /// that DID assertions minted before a rotation stay verifiable. Signing
+    /// always uses `signing_key_pem` alone. A **private** key here is a hard
+    /// startup error — see `oidc::parse_retired_verification_keys` for why the
+    /// public-only restriction is load-bearing rather than fussy.
+    ///
+    /// Env: `SIWEOIDC_RETIRED_SIGNING_KEYS_PEM`
+    pub retired_signing_keys_pem: Option<String>,
     pub redis_url: Url,
     pub default_clients: HashMap<String, String>,
     pub require_secret: bool,
@@ -76,6 +87,7 @@ impl Default for Config {
             port: 8000,
             base_url: Url::parse("http://127.0.0.1:8000").unwrap(),
             signing_key_pem: None,
+            retired_signing_keys_pem: None,
             redis_url: Url::parse("redis://localhost").unwrap(),
             default_clients: HashMap::default(),
             require_secret: true,

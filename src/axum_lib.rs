@@ -52,6 +52,10 @@ use siwx_oidc::db::*;
 #[derive(Clone)]
 struct AppState {
     signing_key: Arc<EcdsaSigningKey>,
+    /// Verification JWKs for signing keys this provider has RETIRED, published
+    /// alongside the live one so that DID assertions minted before a rotation
+    /// stay verifiable. Never used to sign — see `oidc::jwks`.
+    retired_verification_keys: Arc<Vec<openidconnect::core::CoreJsonWebKey>>,
     config: config::Config,
     redis_client: RedisClient,
     webauthn: Arc<Webauthn>,
@@ -174,7 +178,7 @@ impl IntoResponse for CustomError {
 // -- Route handlers --------------------------------------------------------
 
 async fn jwk_set(State(state): State<AppState>) -> Result<Json<CoreJsonWebKeySet>, CustomError> {
-    let jwks = oidc::jwks(&state.signing_key)?;
+    let jwks = oidc::jwks(&state.signing_key, &state.retired_verification_keys)?;
     Ok(jwks.into())
 }
 
@@ -1247,6 +1251,40 @@ pub async fn main() {
         key
     };
 
+    // Retired verification keys (SIWEOIDC_RETIRED_SIGNING_KEYS_PEM).
+    //
+    // Parsed here, at startup, and PANICS on bad input — deliberately. This
+    // config exists so that assertions minted before a key rotation stay
+    // verifiable; a server that boots happily while silently dropping a
+    // malformed retired key would present exactly the symptom the feature
+    // prevents ("unknown kid" at some consumer, months later), with the cause
+    // buried in a startup log nobody read. See
+    // `oidc::parse_retired_verification_keys`.
+    let retired_verification_keys = match &config.retired_signing_keys_pem {
+        Some(pem) => {
+            let keys = oidc::parse_retired_verification_keys(pem)
+                .expect("Failed to parse SIWEOIDC_RETIRED_SIGNING_KEYS_PEM");
+            // Log only the derived kids — public, non-sensitive, and exactly
+            // the strings an operator needs to match against the `kid` in a
+            // stored proof they are debugging.
+            let kids: Vec<&str> = keys
+                .iter()
+                .filter_map(|k| {
+                    use openidconnect::JsonWebKey;
+                    k.key_id().map(|id| id.as_str())
+                })
+                .collect();
+            info!(
+                count = keys.len(),
+                kids = ?kids,
+                "Publishing retired verification keys in the JWKS. Assertions minted under these \
+                 kids remain verifiable; signing still uses the live key only."
+            );
+            keys
+        }
+        None => Vec::new(),
+    };
+
     let wa_config = wa::build_webauthn(
         &config.base_url,
         config.rp_id.as_deref(),
@@ -1279,6 +1317,7 @@ pub async fn main() {
 
     let state = AppState {
         signing_key: Arc::new(signing_key),
+        retired_verification_keys: Arc::new(retired_verification_keys),
         config: config.clone(),
         redis_client,
         webauthn: Arc::new(wa_config.webauthn),

@@ -934,7 +934,10 @@ mod interop_with_the_shipped_verifier {
         let issuer = format!("http://{addr}");
 
         let jwks_json = serde_json::to_value(
-            crate::oidc::jwks(key).expect("the production JWKS builder must succeed"),
+            // No retired keys: this fixture is about the LIVE key's JWK shape.
+            // `oidc::tests::after_rotation_the_jwks_carries_both_the_live_and_the_retired_kid`
+            // covers the retired half.
+            crate::oidc::jwks(key, &[]).expect("the production JWKS builder must succeed"),
         )
         .expect("a JWKS always serializes");
         let discovery = serde_json::json!({
@@ -972,14 +975,15 @@ mod interop_with_the_shipped_verifier {
             .expect("the shipped verifier must accept a genuinely minted assertion");
 
         assert_eq!(
-            verified.did, DID,
+            verified.did(),
+            DID,
             "the DID must survive the round trip byte for byte"
         );
-        assert_eq!(verified.mxid, MXID);
-        assert_eq!(verified.issued_at, IAT);
+        assert_eq!(verified.mxid(), MXID);
+        assert_eq!(verified.issued_at(), IAT);
         // Trailing-slash-insensitive on the verifier's side; assert the exact
         // string here because our issuer never grows one.
-        assert_eq!(verified.issuer, issuer);
+        assert_eq!(verified.issuer(), issuer);
 
         handle.abort();
     }
@@ -1047,7 +1051,10 @@ mod interop_with_the_shipped_verifier {
         assert!(proof.is_none());
         let e = DidAssertionError::ProofAbsent {
             mxid: MXID.to_string(),
-            did: DID.to_string(),
+            // Named `unverified_did` on the consumer side on purpose: the value
+            // is whatever the profile happened to contain, with nothing
+            // vouching for it. Do not rename it back to `did` here.
+            unverified_did: DID.to_string(),
         };
         assert!(
             e.to_string().contains("UNVERIFIABLE"),

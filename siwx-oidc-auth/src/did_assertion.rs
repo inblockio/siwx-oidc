@@ -69,14 +69,16 @@
 //! Two details of that contract are load-bearing and have already been chosen
 //! for us by the server side; do not "normalize" them here:
 //!
-//! - **r‖s, not DER.** `src/oidc.rs:116-124` signs with
+//! - **r‖s, not DER.** `EcdsaSigningKey::sign_es256` (`src/oidc.rs:219-222`
+//!   as of 01d37f6 — cite the symbol, the line number drifts) signs with
 //!   `Signature::to_bytes()` and comments the reason. A DER-accepting verifier
 //!   would quietly accept a shape we never emit and widen the parser surface.
 //! - **`kid` identifies the key, not the slot.** `src/axum_lib.rs` historically
 //!   stamped `kid = "key1"` on both the configured and the generated key, so a
 //!   restart with an ephemeral key would leave every stored assertion failing
 //!   as "bad signature" — indistinguishable from an attack. Deriving `kid` from
-//!   the public key (`src/oidc.rs:104-110` `public_key_fingerprint()`) turns
+//!   the public key (`EcdsaSigningKey::public_key_fingerprint`,
+//!   `src/oidc.rs:188-190`) turns
 //!   that into an honest, diagnosable "kid not present in JWKS", which is
 //!   exactly why [`verify_did_assertion`] treats a missing `kid` match as a
 //!   **hard error** and never falls back to trying every key in the set.
@@ -96,6 +98,7 @@ use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use p256::EncodedPoint;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 /// The MSC4133 custom profile field that carries the provider-attested DID.
 ///
@@ -124,30 +127,79 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 /// A DID assertion that verified against the issuer's JWKS **and** bound the
 /// Matrix ID it was read from.
 ///
-/// Every field here came out of the signed payload, so all four are covered by
-/// the signature. In particular `issuer` is the assertion's own `iss` claim
-/// (already checked equal to the discovery document's `issuer`, modulo a
-/// trailing slash) rather than the discovery value, so a caller that stores
-/// this struct is storing only attested data.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// # Exactly what is attested, and by whom
+///
+/// All four values came out of the signed payload, so all four are covered by
+/// the signature — but a signature only ever means something relative to a
+/// key, and the key came from the JWKS of the **`issuer_base_url` the caller
+/// passed in**. That URL is the trust anchor and the caller chooses it: this
+/// type says nothing at all to a caller who points it at a server they do not
+/// trust. Read the guarantee as *"whoever is authoritative at
+/// `issuer_base_url` asserted, at `issued_at`, that `did` belongs to `mxid`"*.
+///
+/// What verification does guarantee is that **the anchor cannot be
+/// laundered**. `issuer` is pinned to `issuer_base_url` itself (OpenID Connect
+/// Discovery 1.0 §4.3, step 3 of [`verify_did_assertion`]), so a server cannot
+/// answer discovery with somebody else's issuer string and have its own
+/// signature come back out of here wearing that somebody's name. The previous
+/// version of this comment claimed a caller "is storing only attested data";
+/// that was false, because `issuer` was then whatever text the queried server
+/// chose to return. Do not restore that wording without restoring the check
+/// that would make it true.
+///
+/// # Why the fields are private
+///
+/// This type is a capability: holding one is supposed to mean a signature
+/// check passed. So there is no public constructor, the fields are private,
+/// and the type deliberately does **NOT** derive `Deserialize`. With that
+/// derive, `serde_json::from_str::<VerifiedDid>(untrusted_json)` mints a value
+/// that never passed any check and then reads as verified at every call site
+/// downstream — the audit finding this is a fix for. `Serialize` stays,
+/// because the CLI prints one (`--verify-did`, `siwx-oidc-auth/src/main.rs`):
+/// serialization is an exit, deserialization would be an entrance.
+/// `verified_did_cannot_be_deserialized` pins the absence at test time (it
+/// detects the trait impl at compile time and fails if it reappears), so
+/// re-adding the derive to make some caller's round-trip compile will be
+/// caught. Give that caller a constructor that verifies instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VerifiedDid {
+    did: String,
+    mxid: String,
+    issuer: String,
+    issued_at: i64,
+}
+
+impl VerifiedDid {
     /// The DID, exact case, from the `sub` claim.
     ///
     /// This is deliberately the same claim the ID token carries (CLAUDE.md
     /// breaking change #1: `sub` is `did:pkh:eip155:1:0x…`, not a bare
     /// address), so a consumer can compare an assertion's `sub` to an ID
     /// token's `sub` with no translation step in between.
-    pub did: String,
+    pub fn did(&self) -> &str {
+        &self.did
+    }
+
     /// The Matrix ID this DID is bound to. Always equal to the `expected_mxid`
     /// the caller passed — the comparison is what makes replay fail.
-    pub mxid: String,
-    /// The issuer that signed the assertion (`iss` claim).
-    pub issuer: String,
+    pub fn mxid(&self) -> &str {
+        &self.mxid
+    }
+
+    /// The issuer that signed the assertion: the `iss` claim, which by this
+    /// point has been checked equal to *both* the discovery document's
+    /// `issuer` and the `issuer_base_url` that document was fetched from.
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
     /// Unix seconds at which the provider made the assertion (`iat` claim).
     ///
     /// Informational only. There is no `exp`, and age is **not** grounds for
     /// rejection; see the module docs.
-    pub issued_at: i64,
+    pub fn issued_at(&self) -> i64 {
+        self.issued_at
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +211,7 @@ pub struct VerifiedDid {
 /// These are conditions a healthy deployment produces on purpose, so they get a
 /// discriminator a caller can `match` on instead of a string a caller would
 /// have to grep. Same reasoning as the server's
-/// `CustomError::UnknownCredential` (`src/oidc.rs:170-178`): an expected user
+/// `CustomError::UnknownCredential` (`src/oidc.rs:280-287`): an expected user
 /// condition must not be logged, or handled, as an internal error.
 ///
 /// Everything else — a bad signature, a tampered payload, an `alg` we do not
@@ -176,9 +228,16 @@ pub enum DidAssertionError {
     /// The field exists but has no `proof` — the issuer's signing key was
     /// ephemeral, so it refused to mint a durable assertion (plan H5).
     ///
-    /// The `did` here is the plain, **unverified** value. It is reported so an
-    /// operator can see what the profile claims; it must not be trusted.
-    ProofAbsent { mxid: String, did: String },
+    /// `unverified_did` is named for what it is: the plain `did` member of the
+    /// profile object, copied out verbatim, with **no signature over it**. It
+    /// is reported so an operator can see what the profile claims, and for no
+    /// other purpose. Do not rename it back to `did`: under the old name every
+    /// `match` site read as if it were destructuring a verified value, which is
+    /// the exact confusion this module exists to prevent.
+    ProofAbsent {
+        mxid: String,
+        unverified_did: String,
+    },
 }
 
 impl fmt::Display for DidAssertionError {
@@ -191,12 +250,16 @@ impl fmt::Display for DidAssertionError {
                  published before this account existed, or the homeserver is withholding custom \
                  profile fields)"
             ),
-            DidAssertionError::ProofAbsent { mxid, did } => write!(
+            DidAssertionError::ProofAbsent {
+                mxid,
+                unverified_did,
+            } => write!(
                 f,
-                "the `{DID_PROFILE_FIELD}` field of {mxid} carries did `{did}` but NO `proof`: the \
-                 issuer refused to mint one because its signing key is ephemeral (no configured \
-                 signing key PEM). The binding is UNVERIFIABLE — treat it as absent, not as a DID \
-                 you may act on"
+                "the `{DID_PROFILE_FIELD}` field of {mxid} carries the UNVERIFIED did \
+                 `{unverified_did}` but NO `proof`: the issuer refused to mint one because its \
+                 signing key is ephemeral (no configured signing key PEM). Nothing signed that \
+                 value, so anyone who can write the profile could have chosen it. The binding is \
+                 UNVERIFIABLE — treat it as absent, not as a DID you may act on"
             ),
         }
     }
@@ -211,6 +274,12 @@ impl std::error::Error for DidAssertionError {}
 /// The two OIDC discovery fields we need. Both are REQUIRED by OpenID Connect
 /// Discovery 1.0 §3, so a document missing either is a broken issuer and a
 /// deserialization failure is the right, loud answer.
+///
+/// **Neither field is trusted on arrival.** This whole document is supplied by
+/// the server the caller pointed at, so `issuer` is checked against the URL it
+/// was fetched from (Discovery 1.0 §4.3) and `jwks_uri` is constrained to that
+/// issuer's own origin before either is used. See [`verify_did_assertion`]
+/// steps 3 and 4 for what goes wrong without those two checks.
 #[derive(Deserialize)]
 struct Discovery {
     issuer: String,
@@ -241,6 +310,18 @@ struct Jwk {
     y: Option<String>,
     #[serde(default)]
     kid: Option<String>,
+    /// RFC 7517 §4.2 `use`. Renamed because `use` is a Rust keyword.
+    #[serde(default, rename = "use")]
+    use_: Option<String>,
+    /// RFC 7517 §4.3 `key_ops`. Typed as a raw `Value`, not `Vec<String>`, on
+    /// purpose: a `Vec<String>` makes one malformed key a serde error for the
+    /// WHOLE key set, which would take the healthy keys down with it — the same
+    /// reason every other field here is optional.
+    #[serde(default)]
+    key_ops: Option<serde_json::Value>,
+    /// RFC 7517 §4.4 `alg`.
+    #[serde(default)]
+    alg: Option<String>,
 }
 
 /// The JWS protected header. Optional fields for the same reason as [`Jwk`]:
@@ -253,6 +334,14 @@ struct JwsHeader {
     typ: Option<String>,
     #[serde(default)]
     kid: Option<String>,
+    /// RFC 7515 §4.1.11 `crit`. A raw `Value` rather than `Vec<String>` because
+    /// this verifier rejects on *presence*: typing it strictly would report a
+    /// hostile `"crit": 7` as "the header is not valid JSON", hiding what is
+    /// really "the producer demands an extension we must refuse". The shape
+    /// only has to be good enough to tell an empty array — itself an RFC
+    /// violation — from a non-empty one.
+    #[serde(default)]
+    crit: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -284,8 +373,14 @@ struct ProfileFieldResponse {
 /// # Trust model — this is a discovery hint, not authorization
 ///
 /// A successful return proves that `issuer_base_url`'s signing key asserted the
-/// `did` ↔ `expected_mxid` binding at `issued_at`. It does **not** prove the
-/// holder controls the DID key right now, and it grants nothing. Authorization
+/// `did` ↔ `expected_mxid` binding at `issued_at`. **`issuer_base_url` is the
+/// trust anchor and the caller picks it** — point this at a server you do not
+/// trust and a successful return means only that that server signed something.
+/// What the verifier does guarantee is that the anchor cannot be laundered:
+/// the returned [`VerifiedDid::issuer`] is pinned to the URL you passed (step 3
+/// below), so no server can get its signature attributed to a different issuer.
+/// A successful return does **not** prove the holder controls the DID key right
+/// now, and it grants nothing. Authorization
 /// MUST come from the OIDC `sub` claim of a token this provider issued, or from
 /// a fresh signature by the DID key itself. See the module docs for the full
 /// statement, including the fact that the source field is world-readable and
@@ -306,23 +401,34 @@ struct ProfileFieldResponse {
 /// # Order of operations (each step exists to close a specific hole)
 ///
 /// 1. exactly three dot-separated parts;
-/// 2. **`alg` is checked before any key is fetched** — `none` and the HMAC
-///    family are rejected by name (RFC 8725 §3.1 algorithm confusion: an
-///    attacker who can pick the alg turns a *public* verification key into an
-///    HMAC secret);
-/// 3. discovery → `jwks_uri` → JWKS;
-/// 4. the JWK is selected **by `kid`, with no fallback**. "Try every key" would
+/// 2. the header is judged **before any key is fetched**: `alg` must be ES256,
+///    with `none` and the HMAC family rejected by name (RFC 8725 §3.1
+///    algorithm confusion: an attacker who can pick the alg turns a *public*
+///    verification key into an HMAC secret), and a `crit` header is refused
+///    outright (RFC 7515 §4.1.11 — we implement no extensions, so we are not
+///    allowed to ignore one someone declared critical);
+/// 3. discovery is fetched, and the document's `issuer` is **pinned to the URL
+///    it was fetched from** (OpenID Connect Discovery 1.0 §4.3). Without this,
+///    `issuer` is attacker-chosen text: step 9 compares the proof's `iss`
+///    against a value the very same server supplied;
+/// 4. `jwks_uri` must share an origin with that pinned issuer, so the one
+///    field a hostile-but-pinned issuer still fully controls cannot redirect
+///    key resolution to a host nobody vouched for;
+/// 5. the JWK is selected **by `kid`, with no fallback**. "Try every key" would
 ///    turn a rotated or ephemeral key into a silent bad-signature failure
 ///    instead of a loud, diagnosable "unknown kid";
-/// 5. the verifying key is rebuilt from the JWK's affine `x`/`y`;
-/// 6. the signature must be exactly 64 raw bytes (r‖s) and is verified over the
+/// 6. that JWK's own RFC 7517 restrictions are honoured — `use`, `key_ops`,
+///    `alg` — so a key the issuer published for encryption can never be used
+///    to verify a signature;
+/// 7. the verifying key is rebuilt from the JWK's affine `x`/`y`;
+/// 8. the signature must be exactly 64 raw bytes (r‖s) and is verified over the
 ///    ASCII of the *original* first two parts — never over a re-serialization
 ///    of the decoded JSON, which would let a semantically-equal-but-textually-
 ///    different payload verify;
-/// 7. `iss` must equal the discovery document's `issuer`, trailing slashes
-///    normalized away on both sides;
-/// 8. `mxid` must equal `expected_mxid`;
-/// 9. `sub` becomes [`VerifiedDid::did`].
+/// 9. `iss` must equal the discovery document's `issuer` (itself now pinned to
+///    `issuer_base_url`), trailing slashes normalized away on both sides;
+/// 10. `mxid` must equal `expected_mxid`;
+/// 11. `sub` becomes [`VerifiedDid::did`].
 ///
 /// # Arguments
 ///
@@ -385,6 +491,40 @@ pub async fn verify_did_assertion(
         ),
     }
 
+    // RFC 7515 §4.1.11: `crit` lists header parameters that the producer
+    // requires the recipient to UNDERSTAND, and a recipient that does not
+    // understand one of them MUST reject the JWS. This verifier implements no
+    // JWS extensions whatsoever, so the only correct handling of `crit` is
+    // unconditional rejection on presence: there is no member we could find in
+    // that list and honour.
+    //
+    // This is not hygiene, it is a live hole being closed. Before this gate,
+    // `{"alg":"ES256","typ":"JWT","kid":"…","crit":["exp"]}` verified `Ok`: the
+    // producer said "you MUST enforce `exp`", we silently did not (this module
+    // has no expiry logic at all, deliberately — see the module docs), and the
+    // caller was handed a proof it had every reason to believe was
+    // expiry-checked. Rejecting costs a genuine proof nothing: siwx-oidc's
+    // minter stamps exactly `alg`/`typ`/`kid` and never a `crit`.
+    //
+    // Placed here, with the `alg` gate, so it runs before any network I/O —
+    // `crit_header_is_rejected_before_any_key_is_fetched` asserts the absence
+    // of a fetch in the error text, which is what keeps it there.
+    if let Some(crit) = &header.crit {
+        if crit.as_array().is_some_and(|c| c.is_empty()) {
+            bail!(
+                "proof header carries an EMPTY `crit` array, which RFC 7515 §4.1.11 forbids in so \
+                 many words (\"MUST NOT be an empty list\"). A header this malformed was not \
+                 minted by siwx-oidc"
+            );
+        }
+        bail!(
+            "proof header carries `crit`: {crit}. RFC 7515 §4.1.11 requires a recipient that does \
+             not understand every extension named there to REJECT the JWS, and this verifier \
+             implements none. siwx-oidc's minter never stamps a `crit`, so this proof is either \
+             not ours, or is demanding we enforce something we cannot"
+        );
+    }
+
     // `typ` is a media type, so RFC 7515 §4.1.9 makes the comparison
     // case-insensitive. Absent is fine: `typ` is optional and only advisory.
     if let Some(typ) = header.typ.as_deref() {
@@ -403,26 +543,79 @@ pub async fn verify_did_assertion(
         .ok_or_else(|| {
             anyhow!(
                 "proof header carries no `kid`. siwx-oidc always stamps one (the public-key \
-                 fingerprint, `src/oidc.rs:104-110`), so a proof without one was not minted by \
-                 this provider"
+                 fingerprint, `public_key_fingerprint`, `src/oidc.rs:188-190`), so a proof \
+                 without one was not minted by this provider"
             )
         })?;
 
-    // -- 3. Discovery ------------------------------------------------------
+    // -- 3. Discovery, and PIN THE ISSUER TO THE URL IT CAME FROM ----------
     let http = reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()
         .context("failed to build HTTP client")?;
 
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        issuer_base_url.trim_end_matches('/')
-    );
+    // The caller's URL, minus a trailing slash, is the trust anchor for
+    // everything below. Named rather than inlined because it is compared as
+    // well as fetched from, and those two uses must not drift apart.
+    let anchor = issuer_base_url.trim_end_matches('/');
+    let discovery_url = format!("{anchor}/.well-known/openid-configuration");
     let discovery: Discovery = get_json(&http, &discovery_url)
         .await
         .context("OIDC discovery fetch failed")?;
 
-    // -- 4. JWKS, selected by kid, with NO fallback ------------------------
+    // OpenID Connect Discovery 1.0 §4.3 (Provider Configuration Validation):
+    // "The issuer value returned MUST be identical to the Issuer URL that was
+    // used as the prefix to /.well-known/openid-configuration to retrieve the
+    // configuration information."
+    //
+    // WITHOUT THIS CHECK, `issuer` IS ATTACKER-CHOSEN TEXT — and it is the text
+    // this function returns as [`VerifiedDid::issuer`]. Step 9 only compares
+    // the proof's `iss` against `discovery.issuer`, and a single hostile server
+    // supplies BOTH sides of that comparison. Demonstrated, not theorised: a
+    // throwaway server on `http://127.0.0.1:44199` answering discovery with
+    // `{"issuer":"https://siwx-oidc.inblock.io","jwks_uri":"http://127.0.0.1:44199/jwks"}`
+    // and signing the proof with its own freshly generated key satisfied every
+    // other step in this function and returned
+    // `Ok(VerifiedDid { issuer: "https://siwx-oidc.inblock.io", .. })`. The
+    // signature was real; the identity it was attributed to was not. Pinned by
+    // `discovery_issuer_must_match_the_url_it_was_fetched_from`.
+    //
+    // The trailing-slash normalisation is load-bearing, not cosmetic:
+    // `SIWEOIDC_BASE_URL` is configured as `http://host:18081` while both `iss`
+    // and the discovery `issuer` render through `Url` as `http://host:18081/`,
+    // so a byte-exact `==` here would reject every real deployment. ONLY the
+    // trailing slash is forgiven — see `normalize_issuer`.
+    if normalize_issuer(&discovery.issuer) != normalize_issuer(anchor) {
+        bail!(
+            "ISSUER MISMATCH: the discovery document fetched from `{anchor}` \
+             ({discovery_url}) declares its issuer to be `{}`. OpenID Connect Discovery 1.0 §4.3 \
+             requires those to be identical. A server naming an issuer it is not served from is \
+             either misconfigured or is trying to have its own signing key attributed to that \
+             other issuer",
+            discovery.issuer
+        );
+    }
+
+    // -- 4. The JWKS URL must live at the issuer's own origin ---------------
+    //
+    // `jwks_uri` is the field a hostile issuer still fully controls after the
+    // pin above, and it decides WHICH KEY the signature is checked against —
+    // i.e. the entire trust decision. Unconstrained, it is an open redirect for
+    // key resolution: name any host, serve a key you hold, and every proof you
+    // mint verifies as the pinned issuer. Same-origin (RFC 6454 §4: scheme,
+    // host, effective port) keeps key resolution inside the authority that was
+    // just pinned.
+    //
+    // This is deliberately stricter than OIDC, which only requires the URL to
+    // be https. We give up nothing real: a deployment that wants its JWKS
+    // served elsewhere can route a path at its own origin to it, which is what
+    // the Caddy reverse proxy in front of every siwx-oidc deployment already
+    // does for everything else.
+    require_same_origin(&discovery.jwks_uri, anchor).with_context(|| {
+        format!("the `jwks_uri` in the discovery document at {discovery_url} is not acceptable")
+    })?;
+
+    // -- 5. JWKS, selected by kid, with NO fallback ------------------------
     let jwks: Jwks = get_json(&http, &discovery.jwks_uri)
         .await
         .with_context(|| format!("JWKS fetch from {} failed", discovery.jwks_uri))?;
@@ -446,16 +639,16 @@ pub async fn verify_did_assertion(
             )
         })?;
 
-    // -- 5. Rebuild the verifying key from the JWK -------------------------
+    // -- 6-7. Honour the JWK's own restrictions, then rebuild the key ------
     let verifying_key = verifying_key_from_jwk(jwk, kid)?;
 
-    // -- 6. Signature: exactly 64 raw bytes, r||s --------------------------
+    // -- 8. Signature: exactly 64 raw bytes, r||s --------------------------
     let signature_bytes =
         decode_b64url(signature_b64).context("proof signature is not valid unpadded base64url")?;
     if signature_bytes.len() != 64 {
         bail!(
             "proof signature is {} bytes; ES256 is exactly 64 (raw r||s, 32 bytes each). A ~70-byte \
-             value is DER, which siwx-oidc never emits (`src/oidc.rs:116-124`)",
+             value is DER, which siwx-oidc never emits (`sign_es256`, `src/oidc.rs:219-222`)",
             signature_bytes.len()
         );
     }
@@ -471,7 +664,7 @@ pub async fn verify_did_assertion(
             )
         })?;
 
-    // -- 7-9. Claims (only now that the bytes are proven authentic) --------
+    // -- 9-11. Claims (only now that the bytes are proven authentic) -------
     let payload_bytes =
         decode_b64url(payload_b64).context("proof payload is not valid unpadded base64url")?;
     let claims: AssertionClaims =
@@ -483,7 +676,8 @@ pub async fn verify_did_assertion(
     if normalize_issuer(&iss) != normalize_issuer(&discovery.issuer) {
         bail!(
             "proof `iss` is `{iss}` but the discovery document at {discovery_url} says the issuer \
-             is `{}`. This proof was minted by a different provider",
+             is `{}` (a value already pinned to `{anchor}` by the §4.3 check above). This proof \
+             was minted by a different provider",
             discovery.issuer
         );
     }
@@ -501,7 +695,7 @@ pub async fn verify_did_assertion(
         .mxid
         .ok_or_else(|| anyhow!("proof payload has no `mxid` claim, so it binds nothing"))?;
 
-    // -- 8. THE BINDING. Do not remove, do not make optional. --------------
+    // -- 10. THE BINDING. Do not remove, do not make optional. -------------
     //
     // Byte-exact comparison, deliberately not case-folded. Our localparts are
     // lowercase base36 by construction, and case-folding here would let a
@@ -653,7 +847,7 @@ pub async fn fetch_and_verify_did(
     let Some(proof) = proof else {
         return Err(DidAssertionError::ProofAbsent {
             mxid: mxid.to_string(),
-            did: plain_did.unwrap_or_default(),
+            unverified_did: plain_did.unwrap_or_default(),
         }
         .into());
     };
@@ -703,6 +897,50 @@ fn normalize_issuer(s: &str) -> &str {
     s.trim_end_matches('/')
 }
 
+/// Require `url` to sit at the same origin as `issuer`: same scheme, same
+/// host, same effective port (RFC 6454 §4).
+///
+/// Written as an explicit three-part comparison rather than `a.origin() ==
+/// b.origin()` on purpose. For a scheme the `url` crate does not consider
+/// "special", `Url::origin()` returns an **opaque** origin that is not equal
+/// even to itself, so that spelling would be correct for http/https and
+/// silently unfalsifiable-by-inspection for everything else. Spelling out the
+/// tuple also makes `port_or_known_default()` visible, and that call is what
+/// makes `https://h` and `https://h:443` the same origin — which they are, and
+/// a naive `port()` comparison would say otherwise.
+///
+/// A URL with no authority (`file:///…`, `data:…`) shares an origin with
+/// nothing: it is rejected rather than compared, because an empty host equal to
+/// another empty host is not a match, it is two things we cannot locate.
+fn require_same_origin(url: &str, issuer: &str) -> Result<()> {
+    fn origin_of(raw: &str) -> Result<(String, String, Option<u16>)> {
+        let parsed = Url::parse(raw).with_context(|| format!("`{raw}` is not a valid URL"))?;
+        let host = parsed
+            .host_str()
+            .filter(|h| !h.is_empty())
+            .ok_or_else(|| anyhow!("`{raw}` has no host, so it has no origin to compare"))?;
+        Ok((
+            parsed.scheme().to_ascii_lowercase(),
+            host.to_ascii_lowercase(),
+            parsed.port_or_known_default(),
+        ))
+    }
+
+    let (u_scheme, u_host, u_port) = origin_of(url)?;
+    let (i_scheme, i_host, i_port) = origin_of(issuer)?;
+
+    if (&u_scheme, &u_host, u_port) != (&i_scheme, &i_host, i_port) {
+        bail!(
+            "`{url}` is on a different origin than the issuer `{issuer}` \
+             ({u_scheme}://{u_host}:{u_port:?} vs {i_scheme}://{i_host}:{i_port:?}). Key material \
+             is only fetched from the issuer's own origin: a discovery document that sends key \
+             resolution elsewhere is asking us to verify the issuer's proofs against somebody \
+             else's key"
+        );
+    }
+    Ok(())
+}
+
 fn decode_b64url(s: &str) -> Result<Vec<u8>> {
     URL_SAFE_NO_PAD
         .decode(s)
@@ -714,6 +952,53 @@ fn decode_b64url(s: &str) -> Result<Vec<u8>> {
 /// `kid` is only used to make the errors nameable; it has already been matched
 /// by the caller.
 fn verifying_key_from_jwk(jwk: &Jwk, kid: &str) -> Result<VerifyingKey> {
+    // -- RFC 7517 §4.2-4.4: may this key verify an ES256 signature at all? --
+    //
+    // DEFENCE FOR A FUTURE MULTI-KEY JWKS, not a live bug. Today siwx-oidc
+    // publishes exactly one key and stamps it `"use":"sig","alg":"ES256"`, so
+    // none of these three can fire in production and none of them is on the
+    // path of any real proof. They are here because `kid` stops being a
+    // sufficient selector the moment the set grows: a JWKS is fetched over the
+    // network, and "this key is for encryption" is the issuer itself telling us
+    // not to verify with it — ignoring that is how a key ends up used for an
+    // operation its owner never authorised (RFC 7517 §4.2 calls the two uses
+    // out precisely so they can be kept apart).
+    //
+    // Each is presence-conditional, because each of these members is OPTIONAL
+    // and absent means "unrestricted" — which is why they are `if let Some`
+    // and not defaults. Keep them small; this is not the place to grow a JWK
+    // policy engine.
+    if let Some(use_) = jwk.use_.as_deref() {
+        if use_ != "sig" {
+            bail!(
+                "JWK `{kid}` declares use=`{use_}`; RFC 7517 §4.2 makes that the key's intended \
+                 use, and a key published for anything but `sig` must not be used to verify a \
+                 signature no matter what its bytes would happen to accept"
+            );
+        }
+    }
+    if let Some(ops) = &jwk.key_ops {
+        // Fail closed on a non-array too: a `key_ops` that is not a list of
+        // strings does not grant `verify`, it is simply malformed.
+        let permits_verify = ops
+            .as_array()
+            .is_some_and(|ops| ops.iter().any(|op| op.as_str() == Some("verify")));
+        if !permits_verify {
+            bail!(
+                "JWK `{kid}` has key_ops={ops}, which does not include `verify`; RFC 7517 §4.3 \
+                 makes key_ops the exhaustive list of operations the key may be used for"
+            );
+        }
+    }
+    if let Some(alg) = jwk.alg.as_deref() {
+        if alg != "ES256" {
+            bail!(
+                "JWK `{kid}` declares alg=`{alg}`; RFC 7517 §4.4 restricts the key to that one \
+                 algorithm, and this verifier only ever verifies ES256"
+            );
+        }
+    }
+
     match jwk.kty.as_deref() {
         Some("EC") => {}
         other => bail!(
@@ -821,8 +1106,8 @@ mod tests {
         let p = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap());
         let signing_input = format!("{h}.{p}");
         // `to_bytes()` is the raw r||s form the server also emits
-        // (`src/oidc.rs:116-124`). A DER encoding here would make every test
-        // pass against a verifier we do not ship.
+        // (`sign_es256`, `src/oidc.rs:219-222`). A DER encoding here would
+        // make every test pass against a verifier we do not ship.
         let sig: Signature = key.sign(signing_input.as_bytes());
         format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
     }
@@ -954,10 +1239,10 @@ mod tests {
         let jws = mint(&key, &header_of(KID), &payload_of(&base, DID, ALICE));
         let verified = verify_did_assertion(&base, &jws, ALICE).await.unwrap();
 
-        assert_eq!(verified.did, DID);
-        assert_eq!(verified.mxid, ALICE);
-        assert_eq!(verified.issuer, base);
-        assert_eq!(verified.issued_at, IAT);
+        assert_eq!(verified.did(), DID);
+        assert_eq!(verified.mxid(), ALICE);
+        assert_eq!(verified.issuer(), base);
+        assert_eq!(verified.issued_at(), IAT);
     }
 
     // -- H6: THE test. Replay across accounts must fail. --------------------
@@ -1261,7 +1546,7 @@ mod tests {
 
         let jws = mint(&key, &header_of(KID), &payload_of(&base, DID, ALICE));
         let verified = verify_did_assertion(&base, &jws, ALICE).await.unwrap();
-        assert_eq!(verified.did, DID);
+        assert_eq!(verified.did(), DID);
     }
 
     #[tokio::test]
@@ -1277,6 +1562,285 @@ mod tests {
         assert!(
             format!("{err:#}").contains("not a DID"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    // -- D3: the trust anchor cannot be laundered ---------------------------
+
+    #[tokio::test]
+    async fn discovery_issuer_must_match_the_url_it_was_fetched_from() {
+        // Everything below is INTERNALLY consistent, which is the whole point:
+        // the document names IMPERSONATED as its issuer, the proof's `iss` says
+        // IMPERSONATED, the `kid` matches, and the signature is genuine under
+        // the JWKS the document points at. All of it is served by a throwaway
+        // localhost server that anyone can run. Before the OIDC Discovery 1.0
+        // §4.3 pin, this returned
+        // `Ok(VerifiedDid { issuer: "https://siwx-oidc.inblock.io", .. })` --
+        // a real signature attributed to an issuer that never made it.
+        const IMPERSONATED: &str = "https://siwx-oidc.inblock.io";
+
+        let key = SigningKey::random(&mut OsRng);
+        let jwks = json!({ "keys": [jwk_of(&key, KID)] });
+        let base = spawn_mock_http(move |b| discovery_and_jwks(b, IMPERSONATED, jwks)).await;
+
+        let jws = mint(&key, &header_of(KID), &payload_of(IMPERSONATED, DID, ALICE));
+        let err = verify_did_assertion(&base, &jws, ALICE)
+            .await
+            .expect_err("a discovery document may not name an issuer it is not served from");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(IMPERSONATED),
+            "error must name the issuer the document CLAIMED: {msg}"
+        );
+        assert!(
+            msg.contains(&base),
+            "error must name the URL it was actually fetched from, or an operator cannot tell \
+             which of the two is the lie: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn jwks_uri_on_a_foreign_origin_is_rejected() {
+        // The attacker holds a key and serves it from a host of their own. The
+        // anchor's discovery document is HONEST about `issuer` (so the §4.3 pin
+        // above passes cleanly) and merely points `jwks_uri` at the attacker.
+        // Without the same-origin constraint this verifies end to end: the
+        // proof names the real issuer, and the key it is checked against is the
+        // attacker's, because the attacker got to say where "the issuer's keys"
+        // live. `jwks_uri` is the last field a pinned-but-hostile issuer still
+        // fully controls, which is exactly why it needs a constraint of its own.
+        let attacker_key = SigningKey::random(&mut OsRng);
+        let jwks = json!({ "keys": [jwk_of(&attacker_key, KID)] });
+        let foreign =
+            spawn_mock_http(move |_| vec![("/jwk".to_string(), 200, jwks.to_string())]).await;
+        let foreign_jwks = format!("{foreign}/jwk");
+
+        let anchor = spawn_mock_http({
+            let foreign_jwks = foreign_jwks.clone();
+            move |b| {
+                vec![(
+                    "/.well-known/openid-configuration".to_string(),
+                    200,
+                    json!({ "issuer": b, "jwks_uri": foreign_jwks }).to_string(),
+                )]
+            }
+        })
+        .await;
+
+        let jws = mint(
+            &attacker_key,
+            &header_of(KID),
+            &payload_of(&anchor, DID, ALICE),
+        );
+        let err = verify_did_assertion(&anchor, &jws, ALICE)
+            .await
+            .expect_err("key resolution must not follow jwks_uri off the issuer's origin");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&foreign_jwks),
+            "error must name the foreign jwks_uri: {msg}"
+        );
+        assert!(
+            msg.contains(&anchor),
+            "error must name the origin key resolution was supposed to stay on: {msg}"
+        );
+    }
+
+    // -- D6: RFC 7515 §4.1.11 `crit` ----------------------------------------
+
+    #[tokio::test]
+    async fn crit_header_is_rejected_before_any_key_is_fetched() {
+        // The producer declares `exp` critical. This module has no expiry logic
+        // at all (deliberately -- see the module docs), so honouring it is
+        // impossible and ignoring it is forbidden: RFC 7515 §4.1.11 leaves
+        // exactly one option, reject. Before this gate the JWS below verified.
+        let payload = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload_of(UNREACHABLE_ISSUER, DID, ALICE)).unwrap());
+        let header = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(
+                &json!({"alg":"ES256","typ":"JWT","kid":KID,"crit":["exp"],"exp":1}),
+            )
+            .unwrap(),
+        );
+        let jws = format!("{header}.{payload}.{}", URL_SAFE_NO_PAD.encode([0u8; 64]));
+
+        let err = verify_did_assertion(UNREACHABLE_ISSUER, &jws, ALICE)
+            .await
+            .expect_err("an unrecognised `crit` extension MUST be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("crit"), "error must name the header: {msg}");
+        assert!(msg.contains("7515"), "error must cite the RFC: {msg}");
+        assert!(
+            !msg.contains("GET "),
+            "the crit gate must run before any fetch: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_crit_header_is_rejected() {
+        // RFC 7515 §4.1.11: "MUST NOT be an empty list". Its own separate
+        // message, because an empty `crit` means a broken producer while a
+        // populated one means a producer demanding something of us.
+        let payload = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload_of(UNREACHABLE_ISSUER, DID, ALICE)).unwrap());
+        let header = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({"alg":"ES256","typ":"JWT","kid":KID,"crit":[]})).unwrap(),
+        );
+        let jws = format!("{header}.{payload}.{}", URL_SAFE_NO_PAD.encode([0u8; 64]));
+
+        let err = verify_did_assertion(UNREACHABLE_ISSUER, &jws, ALICE)
+            .await
+            .expect_err("an empty `crit` array is itself an RFC 7515 violation");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("EMPTY"), "error must say it is empty: {msg}");
+        assert!(msg.contains("7515"), "error must cite the RFC: {msg}");
+    }
+
+    // -- D6: RFC 7517 §4.2-4.4 JWK restrictions -----------------------------
+    //
+    // In all three the signature is genuine and the kid matches, so before
+    // these checks each verified `Ok`. Latent today (siwx-oidc publishes one
+    // signing key), live the day the JWKS holds more than one.
+
+    #[tokio::test]
+    async fn jwk_marked_for_encryption_never_verifies_a_signature() {
+        let key = SigningKey::random(&mut OsRng);
+        let mut jwk = jwk_of(&key, KID);
+        jwk["use"] = json!("enc");
+        let jwks = json!({ "keys": [jwk] });
+        let base = spawn_mock_http(move |b| discovery_and_jwks(b, b, jwks)).await;
+
+        let jws = mint(&key, &header_of(KID), &payload_of(&base, DID, ALICE));
+        let err = verify_did_assertion(&base, &jws, ALICE)
+            .await
+            .expect_err("a key the issuer published for encryption must not verify a signature");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("enc"),
+            "error must name the declared use: {msg}"
+        );
+        assert!(msg.contains("7517"), "error must cite the RFC: {msg}");
+    }
+
+    #[tokio::test]
+    async fn jwk_key_ops_without_verify_is_rejected() {
+        let key = SigningKey::random(&mut OsRng);
+        let mut jwk = jwk_of(&key, KID);
+        jwk.as_object_mut().unwrap().remove("use");
+        jwk["key_ops"] = json!(["encrypt"]);
+        let jwks = json!({ "keys": [jwk] });
+        let base = spawn_mock_http(move |b| discovery_and_jwks(b, b, jwks)).await;
+
+        let jws = mint(&key, &header_of(KID), &payload_of(&base, DID, ALICE));
+        let err = verify_did_assertion(&base, &jws, ALICE)
+            .await
+            .expect_err("key_ops is exhaustive: without `verify` the key may not verify");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("key_ops"), "error must name the member: {msg}");
+        assert!(
+            msg.contains("verify"),
+            "error must say what is missing: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn jwk_with_a_foreign_alg_is_rejected() {
+        let key = SigningKey::random(&mut OsRng);
+        let mut jwk = jwk_of(&key, KID);
+        jwk["alg"] = json!("ES384");
+        let jwks = json!({ "keys": [jwk] });
+        let base = spawn_mock_http(move |b| discovery_and_jwks(b, b, jwks)).await;
+
+        let jws = mint(&key, &header_of(KID), &payload_of(&base, DID, ALICE));
+        let err = verify_did_assertion(&base, &jws, ALICE)
+            .await
+            .expect_err("a JWK restricted to another alg must not verify an ES256 proof");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ES384"),
+            "error must name the JWK's alg: {msg}"
+        );
+        assert!(msg.contains("7517"), "error must cite the RFC: {msg}");
+    }
+
+    #[test]
+    fn require_same_origin_compares_scheme_host_and_effective_port() {
+        // The implicit default port is the subtle half: `https://h` and
+        // `https://h:443` ARE the same origin, and a `port()` comparison (which
+        // returns None for the first) would call them different and break a
+        // legitimate deployment.
+        require_same_origin("https://h.example/jwks", "https://h.example").unwrap();
+        require_same_origin("https://h.example:443/jwks", "https://h.example").unwrap();
+        require_same_origin("http://127.0.0.1:8000/jwk", "http://127.0.0.1:8000/").unwrap();
+
+        // One component different in each.
+        require_same_origin("http://h.example/jwks", "https://h.example").unwrap_err();
+        require_same_origin("https://evil.example/jwks", "https://h.example").unwrap_err();
+        require_same_origin("https://h.example:8443/jwks", "https://h.example").unwrap_err();
+
+        // No authority at all, and not a URL at all: neither has an origin to
+        // share, and both must fail closed rather than compare empty-to-empty.
+        require_same_origin("file:///etc/jwks.json", "https://h.example").unwrap_err();
+        require_same_origin("not a url", "https://h.example").unwrap_err();
+    }
+
+    // -- D7: VerifiedDid is a capability ------------------------------------
+
+    #[test]
+    fn verified_did_cannot_be_deserialized() {
+        // A COMPILE-TIME property asserted at run time. `Probe::<T>` has an
+        // inherent `deserializable()` only when `T: DeserializeOwned`; when the
+        // bound does not hold, method resolution falls through to the blanket
+        // trait impl, which answers `false`. So this test flips to FAILING the
+        // moment somebody re-adds `#[derive(Deserialize)]` to `VerifiedDid` --
+        // which is the point, because that derive would let
+        // `serde_json::from_str::<VerifiedDid>(untrusted)` mint a value that
+        // never passed a signature check and reads as verified everywhere
+        // downstream. `AuthTokens` is the control: it IS deserialized (it comes
+        // off the token endpoint), so if this mechanism ever silently stopped
+        // detecting anything, the second assertion catches it.
+        //
+        // Kept in preference to a `trybuild` compile-fail test purely because
+        // that would mean a new dependency for a one-line property.
+        #[allow(dead_code)] // never constructed; only its associated fn is called
+        struct Probe<T>(std::marker::PhantomData<T>);
+
+        impl<T: serde::de::DeserializeOwned> Probe<T> {
+            fn deserializable() -> bool {
+                true
+            }
+        }
+
+        trait NotDeserializable {
+            fn deserializable() -> bool {
+                false
+            }
+        }
+        impl<T> NotDeserializable for Probe<T> {}
+
+        assert!(
+            !Probe::<VerifiedDid>::deserializable(),
+            "VerifiedDid must NOT implement Deserialize: with it, an unverified value can be \
+             conjured straight out of untrusted JSON and is indistinguishable downstream from one \
+             that passed the signature check"
+        );
+        assert!(
+            Probe::<crate::AuthTokens>::deserializable(),
+            "control: the probe must be able to SEE a Deserialize impl, or the assertion above \
+             passes for the wrong reason"
+        );
+
+        // Serialize must stay -- the CLI's --verify-did prints one.
+        let verified = VerifiedDid {
+            did: DID.to_string(),
+            mxid: ALICE.to_string(),
+            issuer: "https://issuer.example".to_string(),
+            issued_at: IAT,
+        };
+        let json = serde_json::to_string(&verified).unwrap();
+        assert!(
+            json.contains(DID),
+            "the CLI still has to print this: {json}"
         );
     }
 
@@ -1300,8 +1864,8 @@ mod tests {
         .await;
 
         let verified = fetch_and_verify_did(&base, ALICE, &base).await.unwrap();
-        assert_eq!(verified.did, DID);
-        assert_eq!(verified.mxid, ALICE);
+        assert_eq!(verified.did(), DID);
+        assert_eq!(verified.mxid(), ALICE);
     }
 
     #[tokio::test]
@@ -1358,16 +1922,22 @@ mod tests {
             typed,
             &DidAssertionError::ProofAbsent {
                 mxid: ALICE.to_string(),
-                did: DID.to_string(),
+                unverified_did: DID.to_string(),
             }
         );
         assert!(
             !matches!(typed, DidAssertionError::FieldAbsent { .. }),
             "proof-absent must be distinguishable from field-absent"
         );
+        let msg = format!("{err:#}");
         assert!(
-            format!("{err:#}").contains("UNVERIFIABLE"),
-            "message must say the binding cannot be trusted: {err:#}"
+            msg.contains("UNVERIFIABLE"),
+            "message must say the binding cannot be trusted: {msg}"
+        );
+        assert!(
+            msg.contains("UNVERIFIED"),
+            "the message must call the DID it prints untrusted, or an operator will act on it \
+             purely because it was printed: {msg}"
         );
     }
 
@@ -1394,10 +1964,11 @@ mod tests {
 
         let verified = fetch_and_verify_did(&base, ALICE, &base).await.unwrap();
         assert_eq!(
-            verified.did, DID,
+            verified.did(),
+            DID,
             "the SIGNED sub must win over the plain member"
         );
-        assert_ne!(verified.did, OTHER_DID);
+        assert_ne!(verified.did(), OTHER_DID);
     }
 
     #[test]

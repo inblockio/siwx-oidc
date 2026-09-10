@@ -592,6 +592,7 @@ Prefix: `SIWEOIDC_` (via Figment: `siwe-oidc.toml` or env vars)
 | `SIWEOIDC_BASE_URL` | Advertised OIDC issuer URL | `http://127.0.0.1:8000` |
 | `SIWEOIDC_REDIS_URL` | Redis URL | `redis://localhost` |
 | `SIWEOIDC_SIGNING_KEY_PEM` | PKCS#8 PEM for ES256 signing key. Also gates DID-assertion minting: absent → ephemeral key → profiles carry `did` with **no `proof`** | generated |
+| `SIWEOIDC_RETIRED_SIGNING_KEYS_PEM` | One or more concatenated **public** (SPKI `-----BEGIN PUBLIC KEY-----`) P-256 PEMs for RETIRED signing keys. Appended to the JWKS with their derived `kid`s so DID assertions minted before a rotation stay verifiable. Signing always uses the live key only; a **private** PEM here is a hard startup error (`openssl pkey -in old.pem -pubout`) | (none) |
 | `SIWEOIDC_SUPPORTED_DID_METHODS` | DID methods accepted at sign-in | `["pkh"]` |
 | `SIWEOIDC_SUPPORTED_PKH_NAMESPACES` | did:pkh namespaces accepted | `["eip155","ed25519","p256"]` |
 | `SIWEOIDC_RP_ID` | WebAuthn Relying Party ID (domain) | hostname of `BASE_URL` |
@@ -601,6 +602,25 @@ Prefix: `SIWEOIDC_` (via Figment: `siwe-oidc.toml` or env vars)
 | `SIWEOIDC_ACCOUNT_MANAGEMENT_URI` | MSC4191 account management URL (override) | `{base_url}/account` |
 | `SIWEOIDC_ADMIN_TOKEN_TTL_SECS` | Lifetime of a minted admin-scoped token. Clamped in code to 30..=900 | `300` |
 | `SIWEOIDC_ADMIN_TOKEN_LOCALPART` | Synapse localpart admin tokens are bound to (auto-provisioned) | `siwx-admin` |
+
+**Key rotation (added after the 2026-09-10 audit, finding D2).** DID assertions are
+stored durably in Synapse and deliberately carry **no `exp`**, so the JWKS is their only
+verification anchor. Rotating `SIWEOIDC_SIGNING_KEY_PEM` *without* listing the old key's
+public half in `SIWEOIDC_RETIRED_SIGNING_KEYS_PEM` makes every proof already written
+permanently unverifiable for any user who does not sign in again. The key-derived `kid`
+makes that failure honest ("kid not present in JWKS") rather than a silent bad signature —
+but honest is not recoverable.
+
+Public keys only, and a **private** PEM in the retired list is a hard startup error, not a
+warning. The motivating case for rotation is a *compromised* key, and accepting the private
+form would make "keep the compromised secret in the environment forever" the path of least
+resistance — which is exactly the shape of the 2026-09-09 dev exposure, where
+`SIWEOIDC_SIGNING_KEY_PEM` was read out of a bare `printenv`.
+
+Retiring a key is **not** a way to neutralise a compromise: a key that was compromised
+before retirement can still mint proofs that verify against the retired entry. If a key is
+known to have been *abused*, drop it from the list and let its proofs die — the next
+sign-in re-asserts.
 
 **For passkey login:** add `"key"` to `SIWEOIDC_SUPPORTED_DID_METHODS` so the `did:key:zDn…`
 DIDs derived from passkeys are accepted by `sign_in`.

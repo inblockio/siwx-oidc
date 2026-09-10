@@ -170,11 +170,7 @@ impl EcdsaSigningKey {
     /// the wrong key of our own, and the signature check then fails. It is not a
     /// security boundary; the signature is.
     fn fingerprint_of(key: &SigningKey) -> String {
-        use sha2::{Digest, Sha256};
-        let pubkey = key.verifying_key().to_encoded_point(false);
-        let digest = Sha256::digest(pubkey.as_bytes());
-        let hex = hex::encode(digest);
-        hex[..16].to_string()
+        fingerprint_of_public(key.verifying_key())
     }
 
     /// Non-sensitive identifier for the signing key: the first 16 hex chars of a
@@ -237,26 +233,56 @@ impl PrivateSigningKey for EcdsaSigningKey {
     }
 
     fn as_verification_key(&self) -> CoreJsonWebKey {
-        let verifying_key = self.key.verifying_key();
-        let point = verifying_key.to_encoded_point(false);
-        let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
-        let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
-
-        let mut jwk_value = serde_json::json!({
-            "kty": "EC",
-            "crv": "P-256",
-            "x": x,
-            "y": y,
-            "use": "sig",
-            "alg": "ES256",
-        });
-        // Always present: a JWKS entry with no `kid` forces verifiers to
-        // trial-verify against every published key, which destroys the
-        // "unknown kid" diagnostic that the key-derived `kid` exists to give
-        // (see the `EcdsaSigningKey` doc, H4).
-        jwk_value["kid"] = serde_json::Value::String(self.kid.as_str().to_string());
-        serde_json::from_value(jwk_value).expect("Failed to construct EC JWK")
+        verification_jwk(self.key.verifying_key(), self.kid.as_str())
     }
+}
+
+/// The `kid` for a P-256 **public** key: first 16 hex chars of SHA-256 over the
+/// SEC1 uncompressed encoding.
+///
+/// Split out of `EcdsaSigningKey::fingerprint_of` (which now delegates here) so
+/// that a RETIRED key — of which we hold only the public half — derives a `kid`
+/// **byte-identically** to the one it had while it was live. That identity is
+/// the entire mechanism: a durably-stored DID assertion carries the `kid` its
+/// signer had at mint time, and a verifier resolves it against the JWKS by that
+/// string. Two derivations that agree "in principle" but differ in one byte
+/// would leave every retired proof unverifiable while looking correct. Do not
+/// give the retired path its own copy of this.
+fn fingerprint_of_public(key: &p256::ecdsa::VerifyingKey) -> String {
+    use sha2::{Digest, Sha256};
+    let pubkey = key.to_encoded_point(false);
+    let digest = Sha256::digest(pubkey.as_bytes());
+    let hex = hex::encode(digest);
+    hex[..16].to_string()
+}
+
+/// The one place a published verification JWK is constructed, for the live key
+/// and for retired keys alike.
+///
+/// Single-sourced for the same reason as [`fingerprint_of_public`]: a retired
+/// key must be indistinguishable, to a verifier, from what the live key
+/// published before rotation. `use`/`alg`/`crv` all matter to a strict verifier.
+fn verification_jwk(verifying_key: &p256::ecdsa::VerifyingKey, kid: &str) -> CoreJsonWebKey {
+    let point = verifying_key.to_encoded_point(false);
+    let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
+    let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
+
+    let mut jwk_value = serde_json::json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "x": x,
+        "y": y,
+        "use": "sig",
+        "alg": "ES256",
+    });
+    // Always present: a JWKS entry with no `kid` forces verifiers to
+    // trial-verify against every published key, which destroys the
+    // "unknown kid" diagnostic that the key-derived `kid` exists to give
+    // (see the `EcdsaSigningKey` doc, H4). It also stops mattering as a
+    // nicety the moment more than one key is published, which is exactly
+    // what retired keys do.
+    jwk_value["kid"] = serde_json::Value::String(kid.to_string());
+    serde_json::from_value(jwk_value).expect("Failed to construct EC JWK")
 }
 
 // -- Error types -----------------------------------------------------------
@@ -308,9 +334,162 @@ impl From<crate::webauthn::VerifyError> for CustomError {
 
 // -- JWK / metadata helpers ------------------------------------------------
 
-pub fn jwks(signing_key: &EcdsaSigningKey) -> Result<CoreJsonWebKeySet, CustomError> {
-    let jwks = CoreJsonWebKeySet::new(vec![signing_key.as_verification_key()]);
-    Ok(jwks)
+/// PEM armour of the only key form [`parse_retired_verification_keys`] accepts.
+const PUBLIC_PEM_BEGIN: &str = "-----BEGIN PUBLIC KEY-----";
+const PUBLIC_PEM_END: &str = "-----END PUBLIC KEY-----";
+
+/// Parse `SIWEOIDC_RETIRED_SIGNING_KEYS_PEM` into verification JWKs.
+///
+/// # Why retired keys have to stay published at all (2026-09-10 audit, D2)
+///
+/// A DID assertion is written into a user's Synapse profile **durably and with
+/// no `exp`** — deliberately, because the DID↔mxid binding it attests is
+/// permanent (see [`crate::did_assertion`]). But its only verification anchor
+/// is this provider's JWKS, and until now that JWKS contained exactly one key:
+/// the live one. So rotating `SIWEOIDC_SIGNING_KEY_PEM` did not merely
+/// invalidate sessions (which is fine — clients re-authenticate); it made every
+/// proof ever written **permanently unverifiable** for anyone who does not sign
+/// in again to have it re-asserted. The key-derived `kid` makes that state
+/// diagnosable ("unknown kid" rather than "bad signature") but not recoverable.
+///
+/// This is not hypothetical: dev's signing key was exposed on 2026-09-09, and
+/// rotation is the correct response to an exposure. The point of this config is
+/// that responding correctly to an incident must not also destroy the evidence
+/// trail every consumer relies on.
+///
+/// # PUBLIC keys only — and this REJECTS a private PEM on purpose
+///
+/// A retired key needs to *verify*, never to *sign*; signing always uses the
+/// live key alone (see [`jwks`]). Accepting the private form would therefore
+/// grant a capability nothing needs, and — the decisive argument — the
+/// motivating case is a key that was **compromised**. The lazy path for an
+/// operator holding a compromised private PEM is to paste it straight into the
+/// retired list, where it would live on indefinitely in the process
+/// environment; that is precisely how the 2026-09-09 dev exposure happened
+/// (`SIWEOIDC_SIGNING_KEY_PEM` read out of a bare `printenv`). A config that
+/// makes "keep the compromised secret around forever" the path of least
+/// resistance is a bad config. So a private PEM is a hard error with the
+/// one-line fix in the message:
+///
+/// ```text
+/// openssl pkey -in old-signing-key.pem -pubout
+/// ```
+///
+/// # Format
+///
+/// One or more SPKI `-----BEGIN PUBLIC KEY-----` blocks concatenated, in any
+/// order, with arbitrary text between them (so a comment naming each retired
+/// key and the date it was retired is fine, and encouraged). Each must be a
+/// P-256 key, because ES256 is the only algorithm this provider has ever
+/// signed with.
+///
+/// # Fails LOUD
+///
+/// Any unparseable input is an `Err`, and the caller ([`crate::axum_lib`])
+/// turns it into a startup panic. Skipping a bad entry with a `warn!` would
+/// produce a server that boots fine and silently cannot verify the exact
+/// artifacts this feature exists to keep verifiable — the failure would surface
+/// months later, in someone else's consumer, as an unexplained "unknown kid".
+pub fn parse_retired_verification_keys(pem_bundle: &str) -> Result<Vec<CoreJsonWebKey>> {
+    use p256::pkcs8::DecodePublicKey;
+
+    if pem_bundle.contains("PRIVATE KEY") {
+        return Err(anyhow!(
+            "SIWEOIDC_RETIRED_SIGNING_KEYS_PEM contains a PRIVATE key. Retired keys are              published for VERIFICATION only and must be the public half — a retired key never              signs anything, and keeping a rotated-out (often compromised) private key in the              process environment is exactly the exposure that motivates rotation. Convert it              with: openssl pkey -in <old-key>.pem -pubout"
+        ));
+    }
+
+    let mut keys = Vec::new();
+    let mut rest = pem_bundle;
+    while let Some(begin) = rest.find(PUBLIC_PEM_BEGIN) {
+        let after_begin = &rest[begin..];
+        let end = after_begin.find(PUBLIC_PEM_END).ok_or_else(|| {
+            anyhow!(
+                "SIWEOIDC_RETIRED_SIGNING_KEYS_PEM has a '{PUBLIC_PEM_BEGIN}' with no matching                  '{PUBLIC_PEM_END}' — the PEM block is truncated"
+            )
+        })? + PUBLIC_PEM_END.len();
+        let block = &after_begin[..end];
+
+        let public_key = p256::PublicKey::from_public_key_pem(block).map_err(|e| {
+            anyhow!(
+                "SIWEOIDC_RETIRED_SIGNING_KEYS_PEM entry {} is not a valid P-256 SPKI public                  key: {e}. ES256 is the only algorithm this provider has ever signed with, so a                  retired key of any other curve could not have produced a proof to verify.",
+                keys.len() + 1
+            )
+        })?;
+        let verifying_key = p256::ecdsa::VerifyingKey::from(&public_key);
+        let kid = fingerprint_of_public(&verifying_key);
+        keys.push(verification_jwk(&verifying_key, &kid));
+
+        rest = &after_begin[end..];
+    }
+
+    if keys.is_empty() {
+        return Err(anyhow!(
+            "SIWEOIDC_RETIRED_SIGNING_KEYS_PEM is set but contains no '{PUBLIC_PEM_BEGIN}' block.              Unset it, or supply the public half of each retired signing key              (openssl pkey -in <old-key>.pem -pubout)."
+        ));
+    }
+    Ok(keys)
+}
+
+/// The published JWKS: the LIVE signing key first, then any retired
+/// verification keys.
+///
+/// # Signing is unaffected
+///
+/// `retired` are JWKs — public material with no signing capability by
+/// construction. There is no code path by which a retired key can sign
+/// anything; the live [`EcdsaSigningKey`] is the only thing
+/// [`PrivateSigningKey`] is implemented for. Publishing a key is *permission to
+/// verify*, never permission to issue.
+///
+/// # Order and de-duplication
+///
+/// The live key is first so a verifier that (wrongly) trial-verifies in
+/// document order hits the common case immediately. Entries are de-duplicated
+/// by `kid`, which makes the operationally likely mistake harmless: an operator
+/// rotating keys naturally appends the OLD key to the retired list and, at some
+/// point, forgets to remove one — or leaves the still-live key in it. A JWKS
+/// with the same `kid` twice is legal but invites a verifier to pick the first
+/// match and stop, so collapsing them is strictly better than publishing both.
+///
+/// # This does NOT make rotation free
+///
+/// Retired keys keep OLD proofs verifiable. They do nothing for a key that was
+/// compromised *before* it was retired: an attacker holding the private half
+/// can mint assertions that verify against the retired JWK exactly as well as
+/// genuine ones. Retiring a compromised key is therefore a trade — recoverable
+/// history against a live forgery window — and the reason [`crate::did_assertion`]
+/// stamps `iat`. If a key is known to have been abused, DROP it from this list
+/// and accept that its proofs die; re-assertion happens on the next sign-in.
+/// Do not document this feature as "rotation is now safe".
+pub fn jwks(
+    signing_key: &EcdsaSigningKey,
+    retired: &[CoreJsonWebKey],
+) -> Result<CoreJsonWebKeySet, CustomError> {
+    use openidconnect::JsonWebKey;
+
+    let live = signing_key.as_verification_key();
+    let live_kid = live.key_id().map(|k| k.as_str().to_string());
+    let mut seen: Vec<String> = live_kid.into_iter().collect();
+    let mut keys = vec![live];
+
+    for jwk in retired {
+        let kid = jwk.key_id().map(|k| k.as_str().to_string());
+        match kid {
+            // A retired JWK always has a derived kid (verification_jwk sets it
+            // unconditionally); the `None` arm exists only because the JWK type
+            // permits it, and is kept rather than published so a hand-built
+            // key-id-less entry cannot silently defeat the de-duplication.
+            Some(kid) if !seen.contains(&kid) => {
+                seen.push(kid);
+                keys.push(jwk.clone());
+            }
+            Some(_) => {}
+            None => keys.push(jwk.clone()),
+        }
+    }
+
+    Ok(CoreJsonWebKeySet::new(keys))
 }
 
 pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
@@ -893,7 +1072,7 @@ async fn token_device_code(
             };
             provision_synapse_device(
                 &did,
-                &resolved.localpart,
+                &resolved,
                 synapse_client,
                 "Element X",
                 Some(&dev_id),
@@ -1787,9 +1966,23 @@ fn resolve_device_id(proposed_device_id: Option<&str>) -> String {
 ///
 /// `did_publication` carries the signing key and issuer for that third tier;
 /// `None` disables publication entirely.
+///
+/// # Why this takes a `ResolvedIdentity` and not a `localpart: &str`
+///
+/// Because the localpart's PROVENANCE decides whether the DID tier may be
+/// written at all, and a bare `&str` cannot carry it. `resolve_identity_or_legacy`
+/// is infallible by design: on a probe error it GUESSES the legacy shape (the
+/// correct fail-safe direction — see its doc). Before 2026-09-10 that guess
+/// flowed in here as an anonymous string, and this function then re-probed,
+/// found the guessed localpart free, provisioned it, and published a
+/// **correctly-signed** assertion binding the user's DID to a brand-new WRONG
+/// mxid — see [`crate::localpart::ResolvedIdentity::degraded`] for the full
+/// scenario. Taking the whole struct makes it impossible to call this with a
+/// localpart whose origin nobody stated, which is the only structural way to
+/// stop a future third call site from reintroducing the bug.
 pub async fn provision_synapse_device(
     did: &str,
-    localpart: &str,
+    identity: &crate::localpart::ResolvedIdentity,
     synapse_client: Option<&SynapseClient>,
     display_name: &str,
     proposed_device_id: Option<&str>,
@@ -1797,6 +1990,7 @@ pub async fn provision_synapse_device(
     did_publication: Option<&DidPublication<'_>>,
 ) -> Option<String> {
     let synapse = synapse_client?;
+    let localpart = identity.localpart.as_str();
     let dev_id = resolve_device_id(proposed_device_id);
     debug!("provisioning device_id={} for did={}", dev_id, did);
 
@@ -1920,7 +2114,35 @@ pub async fn provision_synapse_device(
     // homeserver that later adopts that name). A standalone deployment with no
     // `SIWEOIDC_MATRIX_SERVER_NAME` therefore skips this entirely, exactly like
     // the self-heal branch above: degrade, never 500.
-    if let (Some(publication), Some(server_name)) = (did_publication, server_name) {
+    //
+    // # A GUESSED localpart is never asserted (2026-09-10 audit, D4)
+    //
+    // `identity.degraded` means `resolve_identity_or_legacy` could not reach
+    // Synapse and fell back to the legacy shape. Everything ELSE in this
+    // function stays best-effort on that guess — provisioning a possibly-wrong
+    // account is recoverable, and refusing to provision would fail the login,
+    // which invariant 1 forbids. Publication is the one step that is NOT
+    // recoverable: it mints a durable, off-server, cryptographically valid
+    // `{did, proof}` that a consumer is *supposed* to trust, and Synapse has no
+    // rename API to undo the account it names. So the assertion is suppressed
+    // and only the assertion.
+    //
+    // The asymmetry is the whole point: a wrong `upsert_device` is noise, a
+    // wrong SIGNED assertion is a second account claiming the same DID with
+    // provider authority behind it, indistinguishable to any verifier from the
+    // real one. Publishing nothing is strictly better than publishing a
+    // confident lie, and it costs one login of staleness because the write is
+    // idempotent and unconditional on every subsequent healthy sign-in.
+    if identity.degraded {
+        warn!(
+            did = %did,
+            localpart = %localpart,
+            "attested DID field NOT asserted: identity resolution had DEGRADED (Synapse probe \
+             failed, localpart is the fail-safe legacy guess). Publishing a signed assertion for \
+             a guessed mxid could bind this DID to a duplicate account permanently. Re-asserted \
+             automatically at the next healthy sign-in"
+        );
+    } else if let (Some(publication), Some(server_name)) = (did_publication, server_name) {
         let mxid = crate::synapse_client::matrix_user_id(localpart, server_name);
         let value = crate::did_assertion::did_profile_value(
             publication.key,
@@ -1944,7 +2166,9 @@ pub async fn provision_synapse_device(
             Ok(PublishOutcome::RowLessAccount) => warn!(
                 did = %did,
                 %mxid,
-                "attested DID field not written: this account has no profile row                  (element-hq/synapse#19702). Retried automatically at the next sign-in"
+                "attested DID field not written: this account has no profile row \
+                 (element-hq/synapse#19702, confirmed by a profile-row probe). Retried \
+                 automatically at the next sign-in"
             ),
             Err(e) => warn!(
                 did = %did,
@@ -2159,7 +2383,7 @@ pub async fn sign_in(
     let resolved = crate::localpart::resolve_identity_or_legacy(&did, synapse_client).await;
     let device_id = provision_synapse_device(
         &did,
-        &resolved.localpart,
+        &resolved,
         synapse_client,
         "Element Web",
         proposed_device_id.as_deref(),
@@ -2495,6 +2719,185 @@ mod tests {
                 "every published JWK must carry the key-derived kid"
             );
         }
+    }
+
+    // -- D2 (2026-09-10 audit): retired signing keys stay in the JWKS -------
+    //
+    // A DID assertion is stored durably in a user's Synapse profile with no
+    // `exp`, and its only verification anchor is this provider's JWKS. Before
+    // this, the JWKS held exactly one key — the live one — so rotating
+    // `SIWEOIDC_SIGNING_KEY_PEM` made every proof ever written permanently
+    // unverifiable. Dev's signing key was exposed on 2026-09-09, and rotation
+    // is the correct response to that, so this is a real path, not a thought
+    // experiment.
+
+    /// The public half of a private PEM, in the SPKI form the config accepts.
+    fn public_pem_of(private_pem: &str) -> String {
+        use p256::pkcs8::{DecodePrivateKey, EncodePublicKey, LineEnding};
+        p256::SecretKey::from_pkcs8_pem(private_pem)
+            .expect("test PEM must load")
+            .public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .expect("P-256 public key always encodes to SPKI PEM")
+    }
+
+    /// THE invariant of the whole feature: a retired key's published `kid` is
+    /// **byte-identical** to the `kid` it had while live.
+    ///
+    /// A stored proof carries the `kid` its signer had at mint time, and a
+    /// verifier resolves it against the JWKS by that exact string. If the two
+    /// derivations ever diverge by one byte, every retired proof stays
+    /// unverifiable while the JWKS *looks* correct — the failure surfaces in
+    /// somebody else's consumer, long after the rotation, as "unknown kid".
+    /// This is why `fingerprint_of_public` is single-sourced.
+    #[test]
+    fn a_retired_key_keeps_the_exact_kid_it_had_while_live() {
+        use openidconnect::JsonWebKey;
+        let private_pem = crate::did_assertion::test_p256_pem();
+        let live = EcdsaSigningKey::from_pem(&private_pem).expect("test PEM must load");
+        let live_kid = live.kid().to_string();
+
+        let retired = parse_retired_verification_keys(&public_pem_of(&private_pem))
+            .expect("the public half of a valid signing key must parse");
+
+        assert_eq!(retired.len(), 1);
+        assert_eq!(
+            retired[0].key_id().map(|k| k.as_str().to_string()),
+            Some(live_kid),
+            "a retired key MUST publish the same kid it published while live, or every \
+             already-stored proof becomes unresolvable"
+        );
+    }
+
+    /// The retired JWK must be byte-identical to what the live key published,
+    /// not merely carry the same `kid`: `crv`/`use`/`alg`/`x`/`y` all matter to
+    /// a strict verifier, and a retired key is supposed to be indistinguishable
+    /// from its pre-rotation self.
+    #[test]
+    fn a_retired_jwk_is_identical_to_what_the_live_key_published() {
+        let private_pem = crate::did_assertion::test_p256_pem();
+        let live = EcdsaSigningKey::from_pem(&private_pem).expect("test PEM must load");
+        let retired = parse_retired_verification_keys(&public_pem_of(&private_pem)).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&retired[0]).unwrap(),
+            serde_json::to_value(live.as_verification_key()).unwrap(),
+            "the retired JWK must be the same document the live key published"
+        );
+    }
+
+    /// The end-to-end shape an operator gets after a rotation: the NEW key
+    /// signs, and BOTH kids are published.
+    #[test]
+    fn after_rotation_the_jwks_carries_both_the_live_and_the_retired_kid() {
+        use openidconnect::JsonWebKey;
+        let old_pem = crate::did_assertion::test_p256_pem();
+        let old_key = EcdsaSigningKey::from_pem(&old_pem).unwrap();
+        let new_key = EcdsaSigningKey::from_pem(&crate::did_assertion::test_p256_pem()).unwrap();
+
+        let retired = parse_retired_verification_keys(&public_pem_of(&old_pem)).unwrap();
+        let set = jwks(&new_key, &retired).expect("jwks must build");
+        let kids: Vec<String> = set
+            .keys()
+            .iter()
+            .filter_map(|k| k.key_id().map(|i| i.as_str().to_string()))
+            .collect();
+
+        assert_eq!(
+            kids,
+            vec![new_key.kid().to_string(), old_key.kid().to_string()],
+            "the live key comes first, the retired key follows"
+        );
+    }
+
+    /// With no retired keys configured, the JWKS is exactly what it was before
+    /// this feature: one key, the live one. The feature is inert until used.
+    #[test]
+    fn no_retired_keys_publishes_exactly_the_live_key() {
+        let key = EcdsaSigningKey::generate();
+        let set = jwks(&key, &[]).expect("jwks must build");
+        assert_eq!(set.keys().len(), 1);
+    }
+
+    /// The operationally likely mistake: an operator leaves the still-live key
+    /// in the retired list (or lists the same retired key twice). A `kid`
+    /// published twice invites a verifier to take the first match and stop, so
+    /// duplicates are collapsed rather than emitted.
+    #[test]
+    fn a_duplicated_kid_is_published_once() {
+        let pem = crate::did_assertion::test_p256_pem();
+        let key = EcdsaSigningKey::from_pem(&pem).unwrap();
+        let public = public_pem_of(&pem);
+        // The live key listed as retired, twice over.
+        let retired = parse_retired_verification_keys(&format!("{public}\n{public}")).unwrap();
+        assert_eq!(retired.len(), 2, "the parser itself does not de-duplicate");
+
+        let set = jwks(&key, &retired).expect("jwks must build");
+        assert_eq!(
+            set.keys().len(),
+            1,
+            "the live key must not be republished under its own kid"
+        );
+    }
+
+    /// Several retired keys in one bundle, with prose between them — the shape
+    /// an operator actually writes after two rotations, annotating which key is
+    /// which.
+    #[test]
+    fn multiple_retired_keys_parse_with_comments_between_them() {
+        let a = public_pem_of(&crate::did_assertion::test_p256_pem());
+        let b = public_pem_of(&crate::did_assertion::test_p256_pem());
+        let bundle = format!("# retired 2026-09-09 (exposed)\n{a}\n# retired 2026-06-01\n{b}\n");
+        let keys = parse_retired_verification_keys(&bundle).expect("both blocks must parse");
+        assert_eq!(keys.len(), 2);
+    }
+
+    /// A PRIVATE key is refused, with the fix in the message.
+    ///
+    /// Not fussiness: a retired key never signs, so the private half grants a
+    /// capability nothing needs, and the motivating case is a key that was
+    /// COMPROMISED. Accepting it would make "keep the compromised secret in the
+    /// environment forever" the path of least resistance — which is exactly how
+    /// the 2026-09-09 dev exposure happened (read out of a bare `printenv`).
+    #[test]
+    fn a_private_key_is_refused_with_the_openssl_fix() {
+        let err = parse_retired_verification_keys(&crate::did_assertion::test_p256_pem())
+            .expect_err("a private key must never be accepted as a retired key")
+            .to_string();
+        assert!(
+            err.contains("PRIVATE"),
+            "the message must name the problem: {err}"
+        );
+        assert!(
+            err.contains("openssl pkey"),
+            "the message must carry the one-line fix: {err}"
+        );
+    }
+
+    /// Garbage fails LOUD rather than being skipped.
+    ///
+    /// Silently dropping a bad entry would boot a server that cannot verify the
+    /// very artifacts this config exists to keep verifiable, with the cause
+    /// buried in a startup log. Both shapes of "bad" are covered: no PEM block
+    /// at all, and a block that is not a P-256 SPKI key.
+    #[test]
+    fn malformed_retired_keys_are_a_hard_error_never_a_skip() {
+        let err = parse_retired_verification_keys("not a pem at all")
+            .expect_err("a bundle with no PEM block must be an error, not an empty Vec")
+            .to_string();
+        assert!(err.contains("BEGIN PUBLIC KEY"), "{err}");
+
+        let err = parse_retired_verification_keys(
+            "-----BEGIN PUBLIC KEY-----\nbm90IGEga2V5\n-----END PUBLIC KEY-----\n",
+        )
+        .expect_err("a well-armoured non-key must be an error")
+        .to_string();
+        assert!(err.contains("P-256"), "{err}");
+
+        let err = parse_retired_verification_keys("-----BEGIN PUBLIC KEY-----\nabc\n")
+            .expect_err("a truncated block must be an error")
+            .to_string();
+        assert!(err.contains("truncated"), "{err}");
     }
 
     async fn default_config() -> (Config, RedisClient) {
@@ -3177,6 +3580,31 @@ mod provision_synapse_device_tests {
     const LOCALPART: &str = "k3f9x2q7ab4d8m1p";
     const SERVER_NAME: &str = "inblock.io";
 
+    /// A localpart that was genuinely RESOLVED against Synapse — the normal
+    /// case, and the only one under which the DID tier may be written.
+    ///
+    /// Spelled out per call site rather than defaulted so that `degraded` stays
+    /// visible: it is the field that decides whether a durable signed assertion
+    /// is minted, and hiding it behind a `Default` would stop these tests
+    /// documenting which case they exercise.
+    fn resolved_identity() -> crate::localpart::ResolvedIdentity {
+        crate::localpart::ResolvedIdentity {
+            localpart: LOCALPART.to_string(),
+            is_new: false,
+            degraded: false,
+        }
+    }
+
+    /// A localpart that was GUESSED because the Synapse probe failed
+    /// (`localpart::resolve_identity_or_legacy`'s fail-safe fallback).
+    fn degraded_identity() -> crate::localpart::ResolvedIdentity {
+        crate::localpart::ResolvedIdentity {
+            localpart: LOCALPART.to_string(),
+            is_new: false,
+            degraded: true,
+        }
+    }
+
     #[derive(Clone)]
     struct MockState {
         /// Request bodies, keyed by the MAS endpoint's last path segment.
@@ -3357,7 +3785,7 @@ mod provision_synapse_device_tests {
 
         let device_id = provision_synapse_device(
             DID,
-            LOCALPART,
+            &resolved_identity(),
             Some(&synapse),
             "Element Web",
             Some("SIWX_test"),
@@ -3396,7 +3824,7 @@ mod provision_synapse_device_tests {
 
         provision_synapse_device(
             DID,
-            LOCALPART,
+            &resolved_identity(),
             Some(&synapse),
             "Element Web",
             Some("SIWX_test"),
@@ -3437,7 +3865,7 @@ mod provision_synapse_device_tests {
 
         provision_synapse_device(
             DID,
-            LOCALPART,
+            &resolved_identity(),
             Some(&synapse),
             "Element Web",
             Some("SIWX_test"),
@@ -3498,7 +3926,7 @@ mod provision_synapse_device_tests {
 
         provision_synapse_device(
             DID,
-            LOCALPART,
+            &resolved_identity(),
             Some(&synapse),
             "Element Web",
             Some("SIWX_test"),
@@ -3529,6 +3957,82 @@ mod provision_synapse_device_tests {
         handle.abort();
     }
 
+    /// **D4 (2026-09-10 audit): a GUESSED localpart is never asserted.**
+    ///
+    /// Identical setup to `publication_is_wired_into_the_shared_signin_path`
+    /// above — same mock, same Redis-backed admin mint, same publication
+    /// context, same `server_name` — with EXACTLY ONE variable changed:
+    /// `degraded: true`. So a failure here can only mean the suppression
+    /// stopped working, not that publication was broken for some other reason.
+    /// That pairing is deliberate; do not "simplify" this test by weakening its
+    /// setup, because a test that would also pass with publication globally
+    /// broken proves nothing.
+    ///
+    /// The scenario: `resolve_identity_or_legacy` could not reach Synapse and
+    /// guessed the legacy localpart for a user whose real account is
+    /// modern-shaped. Provisioning proceeds (recoverable); publication must not
+    /// (a valid, correctly-verifying assertion binding the DID to a duplicate
+    /// account is permanent — Synapse has no rename API).
+    ///
+    /// The other provisioning calls are asserted to still happen, so a
+    /// regression that "fixes" this by bailing out of the whole function fails
+    /// here too.
+    #[tokio::test]
+    async fn a_degraded_identity_provisions_but_never_publishes_an_assertion() {
+        let (synapse, calls, handle) = spawn(
+            /* localpart_free */ false,
+            (axum::http::StatusCode::OK, serde_json::json!({})),
+        )
+        .await;
+        let Ok(redis) =
+            siwx_oidc::db::RedisClient::new(&url::Url::parse("redis://localhost").unwrap()).await
+        else {
+            eprintln!(
+                "SKIP a_degraded_identity_provisions_but_never_publishes_an_assertion: no Redis on localhost"
+            );
+            handle.abort();
+            return;
+        };
+        let synapse = synapse.with_admin_mint(redis, "siwx-admin".to_string(), 300);
+
+        let key = EcdsaSigningKey::from_pem(&crate::did_assertion::test_p256_pem())
+            .expect("test PEM must load");
+        let publication = DidPublication {
+            key: &key,
+            issuer: "https://issuer.example",
+        };
+
+        provision_synapse_device(
+            DID,
+            &degraded_identity(),
+            Some(&synapse),
+            "Element Web",
+            Some("SIWX_test"),
+            Some(SERVER_NAME),
+            Some(&publication),
+        )
+        .await;
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.get("publish_did_field"),
+            None,
+            "a signed assertion must NEVER be minted for a localpart nobody resolved: {calls:?}"
+        );
+        // ...and the rest of provisioning is untouched: the suppression is
+        // surgical, not a bail-out. Failing the login is what invariant 1
+        // forbids, and refusing to provision would do exactly that.
+        assert!(
+            calls.contains_key("upsert_device"),
+            "degraded identity must still provision its device: {calls:?}"
+        );
+        assert!(
+            calls.contains_key("allow_cross_signing_reset"),
+            "degraded identity must still arm the cross-signing reset window: {calls:?}"
+        );
+        handle.abort();
+    }
+
     /// With no `server_name`, nothing is published and nothing 500s.
     ///
     /// A standalone deployment (no `SIWEOIDC_MATRIX_SERVER_NAME`) cannot build
@@ -3552,7 +4056,7 @@ mod provision_synapse_device_tests {
 
         let device_id = provision_synapse_device(
             DID,
-            LOCALPART,
+            &resolved_identity(),
             Some(&synapse),
             "Element Web",
             Some("SIWX_test"),
@@ -3566,7 +4070,8 @@ mod provision_synapse_device_tests {
         assert_eq!(
             calls.get("unmatched"),
             None,
-            "no request may be made outside the four MAS endpoints — in particular no              PUT to the profile route — when there is no server_name to build an mxid from"
+            "no request may be made outside the four MAS endpoints — in particular no PUT to \
+             the profile route — when there is no server_name to build an mxid from"
         );
         assert!(calls.contains_key("provision_user"));
         assert!(calls.contains_key("upsert_device"));
