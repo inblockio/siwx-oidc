@@ -22,6 +22,19 @@
 //! }
 //! ```
 
+pub mod did_assertion;
+
+/// Verification of the provider-attested DID published in a Matrix profile.
+///
+/// Re-exported at the crate root so a consumer never has to know which module
+/// the binding check lives in. Read [`did_assertion`]'s module docs before
+/// using any of it: the field is a **discovery hint**, not an authorization
+/// source, and [`fetch_and_verify_did`] is the entry point that makes the
+/// anti-replay mxid binding impossible to forget.
+pub use did_assertion::{
+    fetch_and_verify_did, verify_did_assertion, DidAssertionError, VerifiedDid, DID_PROFILE_FIELD,
+};
+
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;

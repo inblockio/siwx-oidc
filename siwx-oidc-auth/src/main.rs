@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::{Parser, ValueEnum};
-use siwx_oidc_auth::{authenticate_device_flow, authenticate_with_device, refresh, SiwxKey};
+use siwx_oidc_auth::{
+    authenticate_device_flow, authenticate_with_device, fetch_and_verify_did, refresh, SiwxKey,
+};
 
 /// Headless OIDC client for siwx-oidc.
 ///
@@ -23,11 +25,39 @@ struct Cli {
     device_flow: bool,
 
     /// Base URL of the siwx-oidc server (required unless --print-did).
+    ///
+    /// With --verify-did this is the ISSUER whose JWKS must have signed the
+    /// assertion. It is a trust anchor, not a hint: pointing it at a server the
+    /// user controls would make any DID "verify".
     #[arg(long, required_unless_present = "print_did")]
     server: Option<String>,
 
+    /// Verify the provider-attested DID published in this Matrix ID's profile
+    /// (`@localpart:server`) and print it as JSON.
+    ///
+    /// Fetches `io.inblock.did` from --homeserver, verifies the proof against
+    /// --server's JWKS, and — the part that matters — checks that the proof's
+    /// `mxid` claim is this exact account, so a proof copied out of somebody
+    /// else's public profile is rejected rather than accepted.
+    ///
+    /// The result is a DISCOVERY HINT, not authorization: it proves the
+    /// provider asserted this binding, not that whoever you are talking to
+    /// controls the DID key. Authorize from an OIDC `sub` this provider issued,
+    /// or from a fresh signature by the DID key itself.
+    #[arg(long, value_name = "MXID", requires = "homeserver")]
+    verify_did: Option<String>,
+
+    /// Base URL of the Matrix homeserver's client API (e.g.
+    /// https://matrix.example.org). Used with --verify-did.
+    #[arg(long)]
+    homeserver: Option<String>,
+
     /// OIDC client ID registered with the server.
-    #[arg(long, required_unless_present = "print_did")]
+    ///
+    /// Not needed for --verify-did: reading and verifying a published DID is an
+    /// unauthenticated, client-less operation (the profile GET is public and
+    /// the JWKS is public), so requiring a registered client would be theatre.
+    #[arg(long, required_unless_present_any = ["print_did", "verify_did"])]
     client_id: Option<String>,
 
     /// Registered redirect URI (required for initial auth code flow).
@@ -106,6 +136,21 @@ async fn main() -> Result<()> {
     }
 
     let server = cli.server.as_deref().unwrap();
+
+    // --verify-did is a read-only lookup: no key, no client_id, no tokens. It
+    // must run before client_id is unwrapped, which is None for this mode.
+    if let Some(mxid) = cli.verify_did.as_deref() {
+        // clap's `requires = "homeserver"` already enforces this; the explicit
+        // error keeps the failure honest if that attribute is ever dropped.
+        let homeserver = cli
+            .homeserver
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--homeserver is required with --verify-did"))?;
+        let verified = fetch_and_verify_did(homeserver, mxid, server).await?;
+        println!("{}", serde_json::to_string_pretty(&verified)?);
+        return Ok(());
+    }
+
     let client_id = cli.client_id.as_deref().unwrap();
 
     if server.is_empty() || client_id.is_empty() {

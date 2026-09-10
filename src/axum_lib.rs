@@ -44,7 +44,6 @@ use super::oidc::{self, CustomError, EcdsaSigningKey};
 use super::synapse_client::SynapseClient;
 use super::webauthn as wa;
 use aqua_auth::{all_cipher_suites, all_did_methods};
-use openidconnect::JsonWebKeyId;
 use siwx_oidc::db::*;
 
 // -- Shared application state ----------------------------------------------
@@ -1194,20 +1193,41 @@ pub async fn main() {
             .unwrap();
     }
 
+    // The `kid` is NOT chosen here. Both branches let `EcdsaSigningKey` derive
+    // it from the public key, because this used to stamp the literal `"key1"` on
+    // BOTH branches — configured key and random fallback shared one identifier,
+    // so a restart silently swapped the key underneath a stable `kid` and every
+    // durably-stored assertion started failing as "bad signature". See the
+    // `EcdsaSigningKey` type doc in `oidc.rs` (H4). Do not reintroduce a literal.
     let signing_key = if let Some(key) = &config.signing_key_pem {
-        EcdsaSigningKey::from_pem(key, Some(JsonWebKeyId::new("key1".to_string())))
-            .expect("Failed to load signing key from PEM")
+        let key = EcdsaSigningKey::from_pem(key).expect("Failed to load signing key from PEM");
+        info!(
+            kid = %key.kid(),
+            "Loaded durable ES256 signing key from SIWEOIDC_SIGNING_KEY_PEM. \
+             DID assertions will be minted under this kid."
+        );
+        key
     } else {
         info!("Generating ephemeral ES256 signing key...");
-        let key = EcdsaSigningKey::generate(Some(JsonWebKeyId::new("key1".to_string())));
+        let key = EcdsaSigningKey::generate();
         // SECURITY: never log private key material. Log only a non-sensitive
         // fingerprint of the *public* key so operators can correlate the live
         // key without exposing the secret. This key rotates on every restart
         // (sessions break on restart) — set SIWEOIDC_SIGNING_KEY_PEM to persist.
-        info!(
-            kid = "key1",
+        //
+        // Emitted at `warn!`, not `info!`: this is a degraded-mode announcement
+        // with a second, quieter consequence that an operator MUST see, namely
+        // that provider-attested DID assertions are suppressed entirely while
+        // the key is ephemeral (`did_assertion::mint_did_assertion` returns
+        // `None`). A profile that carries `{"did": …}` with no `"proof"` key is
+        // explained by this line and by nothing else.
+        warn!(
+            kid = %key.kid(),
             pubkey_fp = %key.public_key_fingerprint(),
             "Generated ephemeral ES256 signing key (NOT persisted). \
+             Tokens stop verifying on restart AND provider-attested DID \
+             assertions will NOT be minted (no `proof` is written to user \
+             profiles) for as long as this key is ephemeral. \
              Set SIWEOIDC_SIGNING_KEY_PEM to use a stable key in production."
         );
         key

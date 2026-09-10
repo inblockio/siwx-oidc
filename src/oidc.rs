@@ -80,33 +80,144 @@ type DBClientType = dyn DBClient + Sync;
 
 // -- ES256 key wrapper implementing openidconnect's PrivateSigningKey ------
 
+/// The provider's ES256 signing key, carrying the two facts that anything
+/// *durable* signed by it needs to know: **which** key it is (`kid`), and
+/// whether it will still exist after the next restart (`ephemeral`).
+///
+/// # `kid` identifies the KEY, not the slot
+///
+/// This wrapper used to take a caller-supplied `kid`, and both construction
+/// sites in `axum_lib::main` passed the literal `"key1"` — the operator's
+/// configured key and the randomly generated fallback were stamped with the
+/// SAME identifier. `"key1"` is a *slot* name, not a *key* name, and the
+/// distinction stops being cosmetic the moment we sign something that outlives
+/// the process.
+///
+/// DID assertions (`crate::did_assertion`) are written into a user's Synapse
+/// profile and stay there indefinitely. Under a constant `kid`, a restart that
+/// mints a fresh ephemeral key yields **a different key under the same `kid`**,
+/// so every previously stored assertion fails verification as
+/// `bad signature` — the single worst diagnostic available, because to a
+/// verifier "bad signature" reads as *forgery*, and to an operator it offers
+/// nothing to grep for. Deriving `kid` from the public key turns exactly that
+/// event into `kid "3f2a…" is not present in the JWKS`: honest, self-describing,
+/// and immediately actionable ("the key rotated; set SIWEOIDC_SIGNING_KEY_PEM").
+///
+/// See `docs/superpowers/plans/2026-09-10-immutable-attested-did.md`
+/// §"`kid` must identify the key, not the slot" (hypothesis H4), pinned by
+/// `oidc::tests::h4_two_generated_keys_get_different_kids` and
+/// `oidc::tests::h4_the_same_pem_yields_the_same_kid_across_constructions`.
+///
+/// **Do not reintroduce a caller-supplied `kid`.** The constructors deliberately
+/// accept no `kid` argument, so a slot name cannot be stamped onto a key again;
+/// that absence IS the fix. Likewise, do not "simplify" `kid` back to an
+/// `Option<JsonWebKeyId>`: a JWKS entry without a `kid` forces every verifier to
+/// trial-verify against every key, which erases the unknown-kid diagnostic this
+/// type exists to produce.
 #[derive(Clone)]
 pub struct EcdsaSigningKey {
     key: SigningKey,
-    kid: Option<JsonWebKeyId>,
+    /// Always present and always derived from `key` — never configured.
+    /// See the type-level doc.
+    kid: JsonWebKeyId,
+    /// `true` when the key was generated at startup and therefore dies with the
+    /// process. Read by `did_assertion::mint_did_assertion`, which refuses to
+    /// mint a durable, off-server artifact with a key it knows is temporary.
+    ephemeral: bool,
 }
 
 impl EcdsaSigningKey {
-    pub fn from_pem(pem: &str, kid: Option<JsonWebKeyId>) -> Result<Self> {
+    /// Load the operator's durable key (`SIWEOIDC_SIGNING_KEY_PEM`).
+    ///
+    /// The resulting key is marked NON-ephemeral, which is what unlocks DID
+    /// assertion minting. That marking is a claim about *operator intent*
+    /// (a PEM was configured, so the same key is expected across restarts), not
+    /// a proof — nothing here can verify the operator will keep passing the same
+    /// PEM. The key-derived `kid` is the safety net for when they do not.
+    pub fn from_pem(pem: &str) -> Result<Self> {
         let key = SigningKey::from_pkcs8_pem(pem)
             .map_err(|e| anyhow!("Invalid ECDSA private key PEM: {}", e))?;
-        Ok(Self { key, kid })
+        Ok(Self::with_derived_kid(key, false))
     }
 
-    pub fn generate(kid: Option<JsonWebKeyId>) -> Self {
-        let key = SigningKey::random(&mut rand::thread_rng());
-        Self { key, kid }
+    /// Generate a throwaway key for a deployment with no configured PEM.
+    ///
+    /// Marked ephemeral: tokens signed by it stop verifying at the next restart
+    /// (which is merely annoying — clients re-authenticate), and DID assertions
+    /// are suppressed entirely (which is the point — see `did_assertion`).
+    pub fn generate() -> Self {
+        Self::with_derived_kid(SigningKey::random(&mut rand::thread_rng()), true)
+    }
+
+    /// The single place a `kid` is computed. Both constructors funnel through
+    /// here precisely so the "derive it, never accept it" rule cannot be
+    /// violated by adding a third constructor that forgets.
+    fn with_derived_kid(key: SigningKey, ephemeral: bool) -> Self {
+        let kid = JsonWebKeyId::new(Self::fingerprint_of(&key));
+        Self {
+            key,
+            kid,
+            ephemeral,
+        }
+    }
+
+    /// First 16 hex chars of SHA-256 over the SEC1 **uncompressed** public key.
+    ///
+    /// 64 bits of a cryptographic hash: not collision-resistant in the
+    /// adversarial sense, and it does not need to be. `kid` is a *lookup hint*
+    /// into a JWKS this provider publishes — a collision would only ever pick
+    /// the wrong key of our own, and the signature check then fails. It is not a
+    /// security boundary; the signature is.
+    fn fingerprint_of(key: &SigningKey) -> String {
+        use sha2::{Digest, Sha256};
+        let pubkey = key.verifying_key().to_encoded_point(false);
+        let digest = Sha256::digest(pubkey.as_bytes());
+        let hex = hex::encode(digest);
+        hex[..16].to_string()
     }
 
     /// Non-sensitive identifier for the signing key: the first 16 hex chars of a
     /// SHA-256 over the SEC1-encoded *public* key. Safe to log — it reveals no
     /// private material but lets operators correlate which ephemeral key is live.
+    ///
+    /// Identical by construction to `kid()`; kept as a distinct name because the
+    /// startup log lines read as "fingerprint" and the JWS header reads as
+    /// "kid", and conflating the two names in either place would obscure one of
+    /// them.
     pub fn public_key_fingerprint(&self) -> String {
-        use sha2::{Digest, Sha256};
-        let pubkey = self.key.verifying_key().to_encoded_point(false);
-        let digest = Sha256::digest(pubkey.as_bytes());
-        let hex = hex::encode(digest);
-        hex[..16].to_string()
+        Self::fingerprint_of(&self.key)
+    }
+
+    /// The `kid` published in the JWKS and stamped into every JWS header this
+    /// key produces. Derived from the public key; see the type-level doc.
+    pub fn kid(&self) -> &str {
+        self.kid.as_str()
+    }
+
+    /// `true` when this key was generated at startup and will not survive the
+    /// process.
+    ///
+    /// The one caller that matters is `did_assertion::mint_did_assertion`:
+    /// writing a durable assertion into a user's Synapse profile with a key we
+    /// KNOW is about to disappear is writing garbage into someone else's
+    /// database. Invariant 5 of the plan: never write a durable assertion with
+    /// an ephemeral key.
+    pub fn is_ephemeral(&self) -> bool {
+        self.ephemeral
+    }
+
+    /// Raw ES256 signature over `message`: **r‖s, exactly 64 bytes, never DER**.
+    ///
+    /// RFC 7515 §3.1 / RFC 7518 §3.4 mandate the fixed-width concatenation; the
+    /// `ecdsa` crate's `Signature::to_bytes()` is already that encoding, while
+    /// its `to_der()` is the 70–72 byte X.509 form that every JWS verifier
+    /// rejects. Do not "helpfully" switch to DER: the failure is silent at mint
+    /// time and only surfaces as an unverifiable proof in a stranger's profile.
+    /// `did_assertion::tests::signature_is_64_raw_bytes_never_der` asserts the
+    /// length explicitly for exactly this reason.
+    pub fn sign_es256(&self, message: &[u8]) -> Vec<u8> {
+        let sig: Signature = self.key.sign(message);
+        sig.to_bytes().to_vec()
     }
 }
 
@@ -118,9 +229,10 @@ impl PrivateSigningKey for EcdsaSigningKey {
         _signature_alg: &<CoreJsonWebKey as openidconnect::JsonWebKey>::SigningAlgorithm,
         message: &[u8],
     ) -> Result<Vec<u8>, SigningError> {
-        let sig: Signature = self.key.sign(message);
         // JWS ES256 requires the raw r||s encoding (64 bytes), not DER.
-        Ok(sig.to_bytes().to_vec())
+        // Delegated so the ID-token path and the DID-assertion path can never
+        // drift onto different signature encodings.
+        Ok(self.sign_es256(message))
     }
 
     fn as_verification_key(&self) -> CoreJsonWebKey {
@@ -137,9 +249,11 @@ impl PrivateSigningKey for EcdsaSigningKey {
             "use": "sig",
             "alg": "ES256",
         });
-        if let Some(kid) = &self.kid {
-            jwk_value["kid"] = serde_json::Value::String(kid.as_str().to_string());
-        }
+        // Always present: a JWKS entry with no `kid` forces verifiers to
+        // trial-verify against every published key, which destroys the
+        // "unknown kid" diagnostic that the key-derived `kid` exists to give
+        // (see the `EcdsaSigningKey` doc, H4).
+        jwk_value["kid"] = serde_json::Value::String(self.kid.as_str().to_string());
         serde_json::from_value(jwk_value).expect("Failed to construct EC JWK")
     }
 }
@@ -2175,6 +2289,92 @@ mod tests {
     use sha3::{Digest, Keccak256};
     use test_log::test;
 
+    // -- Signing key identity (H4/H5) -------------------------------------
+    //
+    // These pin the property the whole DID-assertion feature rests on: a `kid`
+    // names a KEY, so a key swap is diagnosable. See the `EcdsaSigningKey` doc
+    // and `docs/superpowers/plans/2026-09-10-immutable-attested-did.md`.
+
+    /// H4: two independently generated keys must NOT share a `kid`.
+    ///
+    /// The regression this catches is the old behaviour verbatim — both
+    /// constructors were handed the literal `"key1"`, so a restart produced a
+    /// different key under an identical `kid` and every durably-stored
+    /// assertion started failing as "bad signature" (indistinguishable from
+    /// forgery) instead of "unknown kid" (obviously a key rotation).
+    #[test]
+    fn h4_two_generated_keys_get_different_kids() {
+        let a = EcdsaSigningKey::generate();
+        let b = EcdsaSigningKey::generate();
+        assert_ne!(
+            a.kid(),
+            b.kid(),
+            "independently generated keys must not share a kid"
+        );
+        assert_eq!(a.kid(), a.public_key_fingerprint());
+        assert_eq!(
+            a.kid().len(),
+            16,
+            "kid is the first 16 hex chars of SHA-256 over the SEC1 public key"
+        );
+        assert!(a.kid().chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// H4, the other half: the `kid` is a pure function of the key, so the SAME
+    /// PEM yields the SAME `kid` across constructions — which is what makes a
+    /// restart with a configured key a no-op for previously issued assertions.
+    #[test]
+    fn h4_the_same_pem_yields_the_same_kid_across_constructions() {
+        let pem = crate::did_assertion::test_p256_pem();
+        let first = EcdsaSigningKey::from_pem(&pem).expect("test PEM must load");
+        let second = EcdsaSigningKey::from_pem(&pem).expect("test PEM must load");
+        assert_eq!(
+            first.kid(),
+            second.kid(),
+            "the same PEM must always produce the same kid"
+        );
+
+        // And it really is key-derived, not a constant: a different PEM differs.
+        let other = EcdsaSigningKey::from_pem(&crate::did_assertion::test_p256_pem())
+            .expect("test PEM must load");
+        assert_ne!(first.kid(), other.kid());
+    }
+
+    /// H5 at the key layer: provenance is recorded, and it is the PEM (operator
+    /// intent to persist) that marks a key durable.
+    #[test]
+    fn h5_generated_keys_are_ephemeral_and_pem_keys_are_durable() {
+        assert!(
+            EcdsaSigningKey::generate().is_ephemeral(),
+            "a generated key dies with the process and must say so"
+        );
+        assert!(
+            !EcdsaSigningKey::from_pem(&crate::did_assertion::test_p256_pem())
+                .expect("test PEM must load")
+                .is_ephemeral(),
+            "a configured PEM is the operator asserting the key persists"
+        );
+    }
+
+    /// The JWKS a relying party fetches must always carry a `kid`; without one,
+    /// a verifier has to trial-verify against every published key and the
+    /// "unknown kid" diagnostic disappears.
+    #[test]
+    fn published_jwk_always_carries_the_derived_kid() {
+        use openidconnect::JsonWebKey;
+        for key in [
+            EcdsaSigningKey::generate(),
+            EcdsaSigningKey::from_pem(&crate::did_assertion::test_p256_pem()).unwrap(),
+        ] {
+            let jwk = key.as_verification_key();
+            assert_eq!(
+                jwk.key_id().map(|k| k.as_str().to_string()),
+                Some(key.kid().to_string()),
+                "every published JWK must carry the key-derived kid"
+            );
+        }
+    }
+
     async fn default_config() -> (Config, RedisClient) {
         let config = Config::default();
         let db_client = RedisClient::new(&config.redis_url).await.unwrap();
@@ -2344,8 +2544,7 @@ mod tests {
         );
         let signin_params: SignInQueryParams =
             serde_urlencoded::from_str(redirect_url.query().unwrap()).unwrap();
-        let oidc_signing_key =
-            EcdsaSigningKey::generate(Some(JsonWebKeyId::new("key1".to_string())));
+        let oidc_signing_key = EcdsaSigningKey::generate();
         let _ = userinfo(
             &config,
             &oidc_signing_key,
