@@ -8,16 +8,14 @@ mod axum_lib;
 mod compat;
 mod config;
 mod device_auth;
-// Provider-attested DID assertions (the `proof` half of the `io.inblock.did`
-// profile object).
+// Provider-attested DID assertions: the field name, the `{did, proof}` value
+// builder, and the ES256 minter behind the `io.inblock.did` profile object.
 //
-// W1a ships the minter and its wire-format contract; the write channel that
-// calls it lives in `oidc::provision_synapse_device` and lands in the following
-// task. Until then nothing in the binary calls into this module, so it is dead
-// code by construction. The allow sits HERE, on the declaration, so it is a
-// single line to delete when the write channel lands — rather than a scatter of
-// per-item allows that would quietly outlive their reason.
-#[allow(dead_code)]
+// The write channel that calls it is `oidc::provision_synapse_device` ->
+// `synapse_client::publish_did_field`, reached from BOTH sign-in paths. The
+// `#[allow(dead_code)]` that sat here while only the minter existed is gone;
+// if it ever needs to come back, that means the publication call site was
+// deleted and users stopped getting an attested DID.
 mod did_assertion;
 mod introspect;
 mod localpart;

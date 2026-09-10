@@ -77,6 +77,20 @@ bs58 = "0.5"
 webauthn-rs-proto = "=0.6.1-dev"
 
 [dev-dependencies]
+# The SHIPPED CONSUMER, linked into the test build only.
+#
+# The minter (`src/did_assertion.rs`) and the verifier
+# (`siwx-oidc-auth/src/did_assertion.rs`) were written independently against one
+# written wire-format spec. Nothing but an actual mint-then-verify across the
+# crate boundary can prove they agree byte for byte — plan hypothesis H8 — so
+# the test that does it needs both in one process. This is acyclic:
+# `siwx-oidc-auth` does not depend on `siwx-oidc`, and this edge is
+# `[dev-dependencies]`, so the shipped binary and the published Docker image
+# link none of it.
+#
+# It also pins the `DID_PROFILE_FIELD` wire contract from both sides at compile
+# time (`publish_uses_the_shared_field_constant`).
+siwx-oidc-auth = { path = "siwx-oidc-auth" }
 base64 = "0.22"
 chrono = "0.4"
 ed25519-dalek = "2"

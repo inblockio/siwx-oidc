@@ -39,6 +39,7 @@ use super::admin_token;
 use super::compat;
 use super::config;
 use super::device_auth;
+use super::did_assertion::DidPublication;
 use super::introspect;
 use super::oidc::{self, CustomError, EcdsaSigningKey};
 use super::synapse_client::SynapseClient;
@@ -255,6 +256,18 @@ async fn sign_in(
     // surfacing the resolved DID (covers BOTH passkey and wallet, and runs only
     // after the browser confirmed the new-user gate). Error/early returns short-
     // circuit via `?` so the cookie is never set on a failed login.
+    //
+    // The DID-publication context is built HERE rather than inside `oidc`
+    // because this handler is the single place that holds both halves: the
+    // process-wide signing key (`AppState::signing_key`) and the advertised
+    // issuer (`config.base_url`). `issuer` must be the value OIDC discovery
+    // reports, because the shipped verifier compares the assertion's `iss` to
+    // the discovery document and rejects a mismatch as "minted by a different
+    // provider".
+    let publication = DidPublication {
+        key: &state.signing_key,
+        issuer: state.config.base_url.as_str(),
+    };
     let (url, did) = oidc::sign_in(
         &state.config.base_url,
         &state.config.supported_did_methods,
@@ -264,6 +277,7 @@ async fn sign_in(
         &state.redis_client,
         state.synapse_client.as_deref(),
         state.config.matrix_server_name.as_deref(),
+        Some(&publication),
     )
     .await?;
 

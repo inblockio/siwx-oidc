@@ -38,7 +38,8 @@ use aqua_auth::find_did_method;
 use siwx_oidc::db::*;
 use subtle::ConstantTimeEq;
 
-use crate::synapse_client::SynapseClient;
+use crate::did_assertion::DidPublication;
+use crate::synapse_client::{PublishOutcome, SynapseClient};
 
 use crate::introspect::generate_opaque_token;
 
@@ -881,6 +882,15 @@ async fn token_device_code(
             // (never modern — see resolve_identity_or_legacy's fail-safe
             // direction), matching the pre-existing degraded-provisioning path.
             let resolved = crate::localpart::resolve_identity_or_legacy(&did, synapse_client).await;
+            // Same DID publication as the wallet/passkey login path: the QR
+            // flow provisions a real session for a real identity, so it must
+            // publish (and re-assert) the same attested field. Both call sites
+            // route through the ONE `provision_synapse_device`, so there is no
+            // third place this could be forgotten.
+            let publication = DidPublication {
+                key: signing_key,
+                issuer: config.base_url.as_str(),
+            };
             provision_synapse_device(
                 &did,
                 &resolved.localpart,
@@ -888,6 +898,7 @@ async fn token_device_code(
                 "Element X",
                 Some(&dev_id),
                 config.matrix_server_name.as_deref(),
+                Some(&publication),
             )
             .await;
 
@@ -1755,6 +1766,27 @@ fn resolve_device_id(proposed_device_id: Option<&str>) -> String {
 /// localpart from `did` itself. The `is_localpart_available` probe below is
 /// therefore an idempotent re-confirmation of a decision already made by the
 /// caller, not a fresh decision.
+///
+/// # The three identity tiers, and why they are separated here
+///
+/// | Tier | Value | Owner | Mutable | Where |
+/// |---|---|---|---|---|
+/// | alias | a display name | the **user** | yes, freely | Synapse `displayname` |
+/// | MXID | `@{base36(sha256(did)[..10])}:{server}` | derived | no (no rename API) | Synapse `users` row |
+/// | DID | `did:key:…` / `did:pkh:…` + provider signature | the **provider** | no | profile field `io.inblock.did` |
+///
+/// Until 2026-09-10 tiers 1 and 3 were **conflated**: `provision_user` was
+/// called with `did` as its displayname argument, so a user's only published
+/// DID lived in a field the user can rewrite at will (verified live — the ACL
+/// probe's leg 5: `displayname` routes through `set_field` → `set_displayname`
+/// and never reaches the guard that protects `io.inblock.did`). A consumer
+/// reading displayname-as-a-DID could therefore be handed *somebody else's*
+/// DID. Splitting the tiers is the security fix; the assertion below is what
+/// makes the split checkable off-server. See
+/// `docs/superpowers/plans/2026-09-10-immutable-attested-did.md`.
+///
+/// `did_publication` carries the signing key and issuer for that third tier;
+/// `None` disables publication entirely.
 pub async fn provision_synapse_device(
     did: &str,
     localpart: &str,
@@ -1762,6 +1794,7 @@ pub async fn provision_synapse_device(
     display_name: &str,
     proposed_device_id: Option<&str>,
     server_name: Option<&str>,
+    did_publication: Option<&DidPublication<'_>>,
 ) -> Option<String> {
     let synapse = synapse_client?;
     let dev_id = resolve_device_id(proposed_device_id);
@@ -1769,7 +1802,20 @@ pub async fn provision_synapse_device(
 
     match synapse.is_localpart_available(localpart).await {
         Ok(true) => {
-            if let Err(e) = synapse.provision_user(localpart, did).await {
+            // ALIAS TIER SEED — deliberately the localpart, NEVER the DID.
+            //
+            // `provision_user`'s second argument is the user's *displayname*, a
+            // user-writable field. Seeding it with the DID published a
+            // provider-looking assertion into a surface any user can rewrite
+            // (see the three-tier table above). The localpart is the honest
+            // replacement: it is a valid non-empty string, so Synapse still
+            // creates the `profiles` row (which is what keeps #19702 at bay for
+            // new accounts), and it is exactly what Element renders for a user
+            // whose displayname is unset anyway — so nothing regresses
+            // visually. A friendlier generated name is an explicit non-goal
+            // (plan exclusions): it is a product decision, and this change is a
+            // security one.
+            if let Err(e) = synapse.provision_user(localpart, localpart).await {
                 error!(
                     did = %did,
                     error = %e,
@@ -1808,9 +1854,9 @@ pub async fn provision_synapse_device(
             // `SynapseClient::deactivate_user(.., erase: true)`) as "truly
             // absent" by the same M_UNKNOWN discriminator. If an erased
             // account ever completed sign-in again, this would resurrect a
-            // bare profile row (displayname = DID) — accepted, since that
-            // reveals nothing beyond the mxid the caller already presented to
-            // authenticate.
+            // bare profile row (displayname = the localpart, since 2026-09-10)
+            // — accepted, since that reveals nothing beyond the mxid the caller
+            // already presented to authenticate.
             if let Some(server_name) = server_name {
                 match synapse.has_profile_row(localpart, server_name).await {
                     Ok(true) => {}
@@ -1819,7 +1865,9 @@ pub async fn provision_synapse_device(
                             did = %did,
                             "existing account has no profile row — re-running provisioning (self-heal)"
                         );
-                        if let Err(e) = synapse.provision_user(localpart, did).await {
+                        // Same alias-tier seed as the first-sign-in branch
+                        // above: the localpart, never the DID.
+                        if let Err(e) = synapse.provision_user(localpart, localpart).await {
                             error!(
                                 did = %did,
                                 error = %e,
@@ -1838,6 +1886,73 @@ pub async fn provision_synapse_device(
             }
         }
         Err(e) => warn!("is_localpart_available check failed: {}", e),
+    }
+
+    // DID TIER — publish the provider-attested DID into the ACL-protected
+    // profile field, on EVERY sign-in.
+    //
+    // # Why re-assert every time instead of only at provisioning
+    //
+    // This is the self-heal, and it is load-bearing rather than defensive. The
+    // Synapse write-ACL we carry (a backport of element-hq/synapse#19980; see
+    // `docs/audits/2026-09-10-msc4133-acl-probe.md`) is **prospective only**:
+    // it refuses new user writes to this field but neither validates nor
+    // migrates a value that was written BEFORE the denylist was applied.
+    // Upstream has the identical gap, acknowledged in the PR's review thread
+    // `r3783167037`. Re-asserting on every login closes it from the other side,
+    // with no janitor process and no migration script: any account whose field
+    // a user clobbered while the server was unprotected is corrected the next
+    // time that user signs in. The write is idempotent, so the steady-state
+    // cost is one PUT per login.
+    //
+    // # Best-effort, exactly like its neighbours
+    //
+    // Plan invariant 1: sign-in NEVER fails because of this feature. Every
+    // outcome — including a 500 from a row-less account (#19702) — is logged
+    // and dropped, the same contract `upsert_device` and
+    // `allow_cross_signing_reset` have immediately below.
+    //
+    // # No `server_name`, no publication
+    //
+    // The assertion binds an `mxid`, which cannot be built without the server
+    // name, and an assertion binding a guessed mxid would be worse than none
+    // (it would verify for nobody, or — far worse — for the wrong account on a
+    // homeserver that later adopts that name). A standalone deployment with no
+    // `SIWEOIDC_MATRIX_SERVER_NAME` therefore skips this entirely, exactly like
+    // the self-heal branch above: degrade, never 500.
+    if let (Some(publication), Some(server_name)) = (did_publication, server_name) {
+        let mxid = crate::synapse_client::matrix_user_id(localpart, server_name);
+        let value = crate::did_assertion::did_profile_value(
+            publication.key,
+            publication.issuer,
+            did,
+            &mxid,
+            Utc::now().timestamp(),
+        );
+        match synapse
+            .publish_did_field(localpart, server_name, &value)
+            .await
+        {
+            Ok(PublishOutcome::Written) => info!(
+                did = %did,
+                %mxid,
+                "published the attested DID profile field"
+            ),
+            // NOT `error!`: a known, bounded condition of a known-buggy
+            // dependency (see SynapseClient::publish_did_field). It resolves by
+            // itself once the pinned Synapse image is bumped past #19702.
+            Ok(PublishOutcome::RowLessAccount) => warn!(
+                did = %did,
+                %mxid,
+                "attested DID field not written: this account has no profile row                  (element-hq/synapse#19702). Retried automatically at the next sign-in"
+            ),
+            Err(e) => warn!(
+                did = %did,
+                %mxid,
+                error = %e,
+                "publishing the attested DID profile field failed (non-fatal)"
+            ),
+        }
     }
 
     if let Err(e) = synapse
@@ -1864,6 +1979,11 @@ pub async fn provision_synapse_device(
     Some(dev_id)
 }
 
+/// `did_publication` carries the provider's signing key + issuer for the
+/// attested `io.inblock.did` profile field (see
+/// [`provision_synapse_device`]). It is built by the axum handler, which is the
+/// one place that holds both `AppState::signing_key` and `config.base_url`;
+/// `None` disables publication.
 #[allow(clippy::too_many_arguments)]
 pub async fn sign_in(
     _base_url: &Url,
@@ -1874,6 +1994,7 @@ pub async fn sign_in(
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
     server_name: Option<&str>,
+    did_publication: Option<&DidPublication<'_>>,
 ) -> Result<(Url, String), CustomError> {
     let session_id = if let Some(c) = cookies.get(SESSION_COOKIE_NAME) {
         c
@@ -2043,6 +2164,7 @@ pub async fn sign_in(
         "Element Web",
         proposed_device_id.as_deref(),
         server_name,
+        did_publication,
     )
     .await;
 
@@ -2534,6 +2656,7 @@ mod tests {
             &db_client,
             None, // no synapse_client in tests
             None, // no matrix_server_name in tests
+            None, // DID publication is off: no Synapse to publish into
         )
         .await
         .unwrap();
@@ -2635,6 +2758,7 @@ mod tests {
             params,
             cookie,
             &db_client,
+            None,
             None,
             None,
         )
@@ -3005,5 +3129,447 @@ mod tests {
             enforce_login_expiration(&msg, now).is_ok(),
             "a future Expiration Time must be accepted"
         );
+    }
+}
+
+/// **H11** — the alias tier and the DID tier stay separated.
+///
+/// # What is being pinned, and why it is a security test
+///
+/// `SynapseClient::provision_user`'s second argument is the account's
+/// **displayname**, and displayname is user-writable: it routes through
+/// Synapse's `set_field` -> `set_displayname` and never reaches the
+/// profile-field guard the `io.inblock.did` denylist installs. That was not
+/// inferred, it was measured — `docs/audits/2026-09-10-msc4133-acl-probe.md`
+/// leg 5, where a plain user's PUT to `displayname` answered **200** on the
+/// very image where the same user's PUT to `io.inblock.did` answered 403.
+///
+/// So passing the DID there published a provider-looking DID into a field any
+/// user can rewrite, and a consumer reading displayname-as-a-DID could be
+/// handed somebody else's. The fix is one argument; the test is here because
+/// nothing else about the system changes if it regresses — provisioning still
+/// succeeds, sign-in still works, and every other test stays green.
+///
+/// # The mock
+///
+/// Extends `localpart.rs`'s `spawn_mock_synapse` pattern (in-process axum on an
+/// ephemeral port, built only from crates already in `[dependencies]`) to the
+/// four MAS endpoints `provision_synapse_device` touches, recording every
+/// request body. `did_publication` is `None` throughout: these tests are about
+/// the alias tier, and `None` keeps them free of the Redis-backed admin mint
+/// that the DID tier needs.
+#[cfg(test)]
+mod provision_synapse_device_tests {
+    use super::*;
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+
+    /// Mixed case ON PURPOSE: a `did:key` payload is case-sensitive, and the
+    /// legacy localpart derived from it is lowercased. A test using an
+    /// all-lowercase DID could not tell "displayname is the localpart" apart
+    /// from "displayname is the DID, lowercased".
+    const DID: &str = "did:key:zDnaeUKTWUXc1mxSoRrEfV6wPWmQyHrKuTHLZgAkyUKfSbeMB";
+    const LOCALPART: &str = "k3f9x2q7ab4d8m1p";
+    const SERVER_NAME: &str = "inblock.io";
+
+    #[derive(Clone)]
+    struct MockState {
+        /// Request bodies, keyed by the MAS endpoint's last path segment.
+        calls: Arc<Mutex<HashMap<String, Vec<serde_json::Value>>>>,
+        /// True when `is_localpart_available` should answer "free" (a brand-new
+        /// account), false when it should answer "taken" (a returning one).
+        localpart_free: bool,
+        /// Body served by `GET /_matrix/client/v3/profile/{mxid}`, as a
+        /// `(status, json)` pair. `M_UNKNOWN` at 404 is the ONLY shape
+        /// `has_profile_row` reads as "truly absent" (see its table).
+        profile_reply: (axum::http::StatusCode, serde_json::Value),
+    }
+
+    async fn record(
+        state: &MockState,
+        endpoint: &str,
+        body: serde_json::Value,
+    ) -> axum::response::Response {
+        state
+            .calls
+            .lock()
+            .unwrap()
+            .entry(endpoint.to_string())
+            .or_default()
+            .push(body);
+        (axum::http::StatusCode::OK, Json(serde_json::json!({}))).into_response()
+    }
+
+    async fn spawn(
+        localpart_free: bool,
+        profile_reply: (axum::http::StatusCode, serde_json::Value),
+    ) -> (
+        SynapseClient,
+        Arc<Mutex<HashMap<String, Vec<serde_json::Value>>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let calls: Arc<Mutex<HashMap<String, Vec<serde_json::Value>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let state = MockState {
+            calls: calls.clone(),
+            localpart_free,
+            profile_reply,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral mock-synapse port");
+        let addr = listener.local_addr().expect("mock-synapse local_addr");
+
+        let app = Router::new()
+            .route(
+                "/_synapse/mas/is_localpart_available",
+                get(|State(s): State<MockState>| async move {
+                    if s.localpart_free {
+                        (
+                            axum::http::StatusCode::OK,
+                            Json(serde_json::json!({"available": true})),
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"errcode": "M_USER_IN_USE"})),
+                        )
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/_synapse/mas/provision_user",
+                post(
+                    |State(s): State<MockState>, Json(b): Json<serde_json::Value>| async move {
+                        record(&s, "provision_user", b).await
+                    },
+                ),
+            )
+            .route(
+                "/_synapse/mas/upsert_device",
+                post(
+                    |State(s): State<MockState>, Json(b): Json<serde_json::Value>| async move {
+                        record(&s, "upsert_device", b).await
+                    },
+                ),
+            )
+            .route(
+                "/_synapse/mas/allow_cross_signing_reset",
+                post(
+                    |State(s): State<MockState>, Json(b): Json<serde_json::Value>| async move {
+                        record(&s, "allow_cross_signing_reset", b).await
+                    },
+                ),
+            )
+            .route(
+                "/_matrix/client/v3/profile/{mxid}",
+                get(|State(s): State<MockState>| async move {
+                    (s.profile_reply.0, Json(s.profile_reply.1.clone())).into_response()
+                }),
+            )
+            .route(
+                "/_matrix/client/v3/profile/{mxid}/{field}",
+                axum::routing::put(
+                    |State(s): State<MockState>, Json(b): Json<serde_json::Value>| async move {
+                        record(&s, "publish_did_field", b).await
+                    },
+                ),
+            )
+            // Anything the routes above do not claim is recorded under
+            // `unmatched`, so a test can assert that a request was NOT made.
+            // Without this, "no profile write happened" would be a vacuous
+            // assertion about a key the mock never writes under any
+            // circumstances — the exact shape of a test that passes while
+            // proving nothing.
+            .fallback(
+                |State(s): State<MockState>, req: axum::extract::Request| async move {
+                    let seen = serde_json::json!({
+                        "method": req.method().to_string(),
+                        "path": req.uri().path().to_string(),
+                    });
+                    record(&s, "unmatched", seen).await
+                },
+            )
+            .with_state(state);
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock-synapse");
+        });
+        let client = SynapseClient::new(&format!("http://{addr}"), "shared-secret");
+        (client, calls, handle)
+    }
+
+    /// Every `provision_user` body recorded by the mock.
+    fn provision_bodies(
+        calls: &Arc<Mutex<HashMap<String, Vec<serde_json::Value>>>>,
+    ) -> Vec<serde_json::Value> {
+        calls
+            .lock()
+            .unwrap()
+            .get("provision_user")
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Assert a recorded `provision_user` body seeds the displayname with the
+    /// localpart and NOT with the DID, in any spelling.
+    fn assert_alias_is_not_the_did(body: &serde_json::Value) {
+        let display = body["set_displayname"]
+            .as_str()
+            .expect("provision_user must send set_displayname");
+        assert_eq!(
+            body["localpart"].as_str().unwrap(),
+            LOCALPART,
+            "the localpart must be the one the caller resolved, not one re-derived here"
+        );
+        assert_eq!(
+            display, LOCALPART,
+            "the displayname seed must be the localpart (ACL probe leg 5: displayname is \
+             USER-WRITABLE, so a DID published there is not provider-owned)"
+        );
+        assert_ne!(display, DID, "the DID must never be the displayname");
+        // Case-insensitively too: `legacy_localpart` lowercases, so a
+        // regression that passed a lowercased DID would still be a DID in a
+        // user-writable field.
+        assert!(
+            !display.to_ascii_lowercase().contains("did:"),
+            "no DID in any spelling may reach the alias tier: {display}"
+        );
+    }
+
+    /// H11, first sign-in: a brand-new account is provisioned with the
+    /// localpart as its displayname.
+    #[tokio::test]
+    async fn h11_first_signin_seeds_displayname_with_the_localpart_never_the_did() {
+        let (synapse, calls, handle) = spawn(
+            /* localpart_free */ true,
+            (axum::http::StatusCode::OK, serde_json::json!({})),
+        )
+        .await;
+
+        let device_id = provision_synapse_device(
+            DID,
+            LOCALPART,
+            Some(&synapse),
+            "Element Web",
+            Some("SIWX_test"),
+            Some(SERVER_NAME),
+            None, // DID publication off: this test is about the alias tier
+        )
+        .await;
+        assert_eq!(device_id.as_deref(), Some("SIWX_test"));
+
+        let bodies = provision_bodies(&calls);
+        assert_eq!(
+            bodies.len(),
+            1,
+            "a new account is provisioned exactly once: {bodies:?}"
+        );
+        assert_alias_is_not_the_did(&bodies[0]);
+        handle.abort();
+    }
+
+    /// H11, self-heal: the row-absent repair path uses the same seed.
+    ///
+    /// This is the second (and only other) `provision_user` call site. A fix
+    /// applied to just the first one would leave the DID leaking into
+    /// displayname for exactly the accounts that are already damaged.
+    #[tokio::test]
+    async fn h11_self_heal_seeds_displayname_with_the_localpart_never_the_did() {
+        let (synapse, calls, handle) = spawn(
+            /* localpart_free */ false,
+            // The one 404 shape `has_profile_row` reads as truly absent.
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                serde_json::json!({"errcode": "M_UNKNOWN", "error": "No row found"}),
+            ),
+        )
+        .await;
+
+        provision_synapse_device(
+            DID,
+            LOCALPART,
+            Some(&synapse),
+            "Element Web",
+            Some("SIWX_test"),
+            Some(SERVER_NAME),
+            None,
+        )
+        .await;
+
+        let bodies = provision_bodies(&calls);
+        assert_eq!(
+            bodies.len(),
+            1,
+            "the self-heal must re-run provisioning exactly once: {bodies:?}"
+        );
+        assert_alias_is_not_the_did(&bodies[0]);
+        handle.abort();
+    }
+
+    /// GRANDFATHERING: a returning account with a profile row is never
+    /// re-provisioned, so a displayname the user chose is never clobbered.
+    ///
+    /// This is the claim that makes the seed change safe to ship without a
+    /// migration. It is asserted rather than assumed because it is a claim
+    /// about a code path (`Ok(false)` + `has_profile_row == true` -> no call),
+    /// not about intent, and the same argument is what protects the deliberate
+    /// clearing of a displayname that the 2026-08-02 discriminator fix was
+    /// written for.
+    #[tokio::test]
+    async fn existing_account_with_a_profile_row_is_never_reprovisioned() {
+        let (synapse, calls, handle) = spawn(
+            /* localpart_free */ false,
+            (
+                axum::http::StatusCode::OK,
+                serde_json::json!({"displayname": "A Name The User Chose"}),
+            ),
+        )
+        .await;
+
+        provision_synapse_device(
+            DID,
+            LOCALPART,
+            Some(&synapse),
+            "Element Web",
+            Some("SIWX_test"),
+            Some(SERVER_NAME),
+            None,
+        )
+        .await;
+
+        assert!(
+            provision_bodies(&calls).is_empty(),
+            "a returning account with a profile row must NOT be re-provisioned; \
+             doing so would overwrite the user's own displayname"
+        );
+        // The rest of the login-time provisioning still ran.
+        let calls = calls.lock().unwrap();
+        assert!(calls.contains_key("upsert_device"));
+        assert!(calls.contains_key("allow_cross_signing_reset"));
+        handle.abort();
+    }
+
+    /// The POSITIVE wiring test: with a `server_name` and a publication
+    /// context, `provision_synapse_device` really does write the attested DID
+    /// field.
+    ///
+    /// The `no_server_name_…` test below proves the feature can be turned off;
+    /// on its own that is also what a deleted call site looks like. This one
+    /// proves the call site exists and is reached from the function BOTH
+    /// sign-in paths route through — which is the single insertion point the
+    /// whole design depends on.
+    ///
+    /// Needs Redis, because publication goes through the admin mint (see
+    /// `synapse_client`'s publish tests for the same constraint and the pure
+    /// classifier that keeps the classification covered when this skips).
+    #[tokio::test]
+    async fn publication_is_wired_into_the_shared_signin_path() {
+        let (synapse, calls, handle) = spawn(
+            /* localpart_free */ false,
+            (axum::http::StatusCode::OK, serde_json::json!({})),
+        )
+        .await;
+        let Ok(redis) =
+            siwx_oidc::db::RedisClient::new(&url::Url::parse("redis://localhost").unwrap()).await
+        else {
+            eprintln!(
+                "SKIP publication_is_wired_into_the_shared_signin_path: no Redis on localhost"
+            );
+            handle.abort();
+            return;
+        };
+        let synapse = synapse.with_admin_mint(redis, "siwx-admin".to_string(), 300);
+
+        let key = EcdsaSigningKey::from_pem(&crate::did_assertion::test_p256_pem())
+            .expect("test PEM must load");
+        let publication = DidPublication {
+            key: &key,
+            issuer: "https://issuer.example",
+        };
+
+        provision_synapse_device(
+            DID,
+            LOCALPART,
+            Some(&synapse),
+            "Element Web",
+            Some("SIWX_test"),
+            Some(SERVER_NAME),
+            Some(&publication),
+        )
+        .await;
+
+        let calls = calls.lock().unwrap();
+        let published = calls
+            .get("publish_did_field")
+            .expect("the DID field must be published on every sign-in");
+        assert_eq!(published.len(), 1, "exactly one write per sign-in");
+        let value = &published[0][crate::did_assertion::DID_PROFILE_FIELD];
+        assert_eq!(
+            value["did"].as_str(),
+            Some(DID),
+            "the exact-case DID must be what lands in the profile: {:?}",
+            published[0]
+        );
+        assert!(
+            value["proof"]
+                .as_str()
+                .is_some_and(|p| p.split('.').count() == 3),
+            "a durable key must publish a three-part compact JWS: {:?}",
+            published[0]
+        );
+        handle.abort();
+    }
+
+    /// With no `server_name`, nothing is published and nothing 500s.
+    ///
+    /// A standalone deployment (no `SIWEOIDC_MATRIX_SERVER_NAME`) cannot build
+    /// an mxid, and an assertion binding a guessed mxid would be worse than
+    /// none. The DID tier is skipped entirely; the rest of provisioning is
+    /// unaffected. Plan invariant: degrade, never 500.
+    #[tokio::test]
+    async fn no_server_name_skips_publication_without_disturbing_provisioning() {
+        let (synapse, calls, handle) = spawn(
+            /* localpart_free */ true,
+            (axum::http::StatusCode::OK, serde_json::json!({})),
+        )
+        .await;
+
+        let key = EcdsaSigningKey::from_pem(&crate::did_assertion::test_p256_pem())
+            .expect("test PEM must load");
+        let publication = DidPublication {
+            key: &key,
+            issuer: "https://issuer.example",
+        };
+
+        let device_id = provision_synapse_device(
+            DID,
+            LOCALPART,
+            Some(&synapse),
+            "Element Web",
+            Some("SIWX_test"),
+            None, // no SIWEOIDC_MATRIX_SERVER_NAME
+            Some(&publication),
+        )
+        .await;
+
+        assert_eq!(device_id.as_deref(), Some("SIWX_test"));
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.get("unmatched"),
+            None,
+            "no request may be made outside the four MAS endpoints — in particular no              PUT to the profile route — when there is no server_name to build an mxid from"
+        );
+        assert!(calls.contains_key("provision_user"));
+        assert!(calls.contains_key("upsert_device"));
+        handle.abort();
     }
 }

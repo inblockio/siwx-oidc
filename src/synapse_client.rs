@@ -11,7 +11,7 @@
 //! | Surface | Auth | Calls |
 //! |---|---|---|
 //! | `/_synapse/mas/*` | `Authorization: Bearer {shared_secret}`, compared for **exact string equality** against `matrix_authentication_service.secret` | `provision_user`, `upsert_device`, `allow_cross_signing_reset`, `is_localpart_available`, `query_user`, `delete_device`, `deactivate_user`, `reactivate_user` |
-//! | `/_synapse/admin/*` and the authenticated C-S API | a **minted, admin-scoped access token** ([`crate::admin_token`]) | `list_devices`, `get_device`, `has_cross_signing_keys` |
+//! | `/_synapse/admin/*` and the authenticated C-S API | a **minted, admin-scoped access token** ([`crate::admin_token`]) | `list_devices`, `get_device`, `has_cross_signing_keys`, `publish_did_field` |
 //!
 //! Presenting the shared secret on the second surface answers **401
 //! `M_UNKNOWN_TOKEN`** on 1.159 — it is not a token at all there, it is a
@@ -37,6 +37,7 @@ use tracing::{debug, info, warn};
 use siwx_oidc::db::{DBClient, RedisClient};
 
 use crate::admin_token::{admin_token_metadata, ADMIN_DISPLAY_NAME, ADMIN_TOKEN_PREFIX};
+use crate::did_assertion::DID_PROFILE_FIELD;
 use crate::introspect::generate_opaque_token;
 
 /// A user's account status as reported by the MAS query endpoint.
@@ -79,7 +80,13 @@ pub struct DeviceInfo {
 }
 
 /// Build a fully-qualified Matrix user id (`@localpart:server_name`).
-fn matrix_user_id(localpart: &str, server_name: &str) -> String {
+///
+/// `pub(crate)` so `oidc::provision_synapse_device` can build the `mxid` claim
+/// of a DID assertion with the SAME function that builds the URL the assertion
+/// is published to. A second `format!("@{localpart}:{server_name}")` elsewhere
+/// would be a second definition of the binding this whole feature is about, and
+/// the two could drift without any test noticing.
+pub(crate) fn matrix_user_id(localpart: &str, server_name: &str) -> String {
     format!("@{}:{}", localpart, server_name)
 }
 
@@ -804,6 +811,181 @@ impl SynapseClient {
         }
         Ok(())
     }
+
+    /// Publish the provider-attested DID object into the user's Matrix profile:
+    /// `PUT /_matrix/client/v3/profile/{mxid}/io.inblock.did`, body
+    /// `{"io.inblock.did": <value>}`.
+    ///
+    /// # Why this uses a MINTED ADMIN TOKEN and not the shared secret
+    ///
+    /// This is a `/_matrix/client/*` route, not `/_synapse/mas/*`. The shared
+    /// secret is honoured on exactly one surface (see the module docs) and
+    /// answers **401 `M_UNKNOWN_TOKEN`** here on 1.157+ — it is not a token at
+    /// all on the client API. It also has to be an *admin* token specifically:
+    /// `handlers/profile.py:700-704` on v1.159.0 reads
+    /// `if not by_admin and target_user != requester.user: raise AuthError(403)`,
+    /// and under MAS `by_admin` is literally
+    /// `"urn:synapse:admin:*" in requester.scope` (`api/auth/mas.py:274-275`) —
+    /// which is the scope [`crate::admin_token`] mints. Writing another user's
+    /// profile is only possible through that exemption.
+    ///
+    /// The same `by_admin` exemption is what lets the provider keep writing a
+    /// field the *user* is forbidden to touch. That was verified live, not
+    /// inferred: `docs/audits/2026-09-10-msc4133-acl-probe.md` leg 1 (admin PUT
+    /// → 200) against legs 2 and 3 (user PUT / DELETE → 403) on one image, with
+    /// the `msc4133_key_denylist` config as the only variable.
+    ///
+    /// # A 500 here means "row-less account", NOT "error"
+    ///
+    /// [element-hq/synapse#19702](https://github.com/element-hq/synapse/issues/19702)
+    /// is still present in **1.159.0**, on reads *and* writes: both
+    /// `_check_profile_size` and `get_profile_field` subscript an unguarded
+    /// `txn.fetchone()`, so an account with a `users` row but **no `profiles`
+    /// row** raises an uncaught `TypeError` and Synapse answers a bare 500 —
+    /// where a healthy account answers 404. 3 of 102 accounts on the dev
+    /// homeserver are in that state (erasure artifacts). It is therefore a
+    /// KNOWN CONDITION of a known-buggy dependency, reported as
+    /// [`PublishOutcome::RowLessAccount`] and logged at `warn!`, not `error!`:
+    /// nothing is broken here, the write simply could not be attempted and the
+    /// field's state is **unknown** (not "absent" — the route cannot tell us).
+    ///
+    /// Do not "simplify" this back into a plain `Err`. Sign-in calls this
+    /// best-effort, so an `Err` is swallowed by the caller either way — the
+    /// distinction exists so an operator reading logs (and the live test) can
+    /// tell a systemic breakage apart from three known-bad accounts, and so
+    /// this stops being special automatically once the pinned Synapse image is
+    /// bumped past the upstream fix.
+    ///
+    /// Every other non-2xx **is** a genuine `Err`, including 404: unlike the
+    /// GET twin, a 404 on this PUT does not mean "no such field". The stable v3
+    /// profile route is registered unconditionally on 1.159.0
+    /// (`rest/client/profile.py:100-103`), so a 404 means the mxid is unknown
+    /// to this homeserver or the homeserver predates MSC4133 — both of which an
+    /// operator needs to see.
+    ///
+    /// # Everything written here is world-readable
+    ///
+    /// The GET twin authenticates only when `require_auth_for_profile_requests`
+    /// is set, which defaults to **False** (`config/server.py:561`), and custom
+    /// fields federate via `on_profile_query`. See
+    /// [`crate::did_assertion::did_profile_value`] — nothing private may ever
+    /// enter this value.
+    pub async fn publish_did_field(
+        &self,
+        localpart: &str,
+        server_name: &str,
+        value: &serde_json::Value,
+    ) -> Result<PublishOutcome> {
+        let user_id = matrix_user_id(localpart, server_name);
+        // The mxid is a PATH SEGMENT here (unlike the localpart-scoped MAS
+        // bodies), so it must be percent-encoded: `@` and `:` are both
+        // sub-delims that a bare interpolation would leave raw.
+        let url = format!(
+            "{}/_matrix/client/v3/profile/{}/{}",
+            self.endpoint,
+            urlencoding::encode(&user_id),
+            DID_PROFILE_FIELD
+        );
+
+        // MSC4133's PUT body echoes the field name as its single key. Built as
+        // a Map rather than with `json!` so the key is unambiguously the
+        // shared constant and can never drift into a hard-coded literal that
+        // still compiles.
+        let mut body = serde_json::Map::new();
+        body.insert(DID_PROFILE_FIELD.to_string(), value.clone());
+        let body = serde_json::Value::Object(body);
+
+        let resp = self
+            .admin_request(|http, token| http.put(&url).bearer_auth(token).json(&body))
+            .await
+            .context("publish_did_field: request failed")?;
+
+        let status = resp.status();
+        match classify_publish_status(status) {
+            Some(PublishOutcome::Written) => {
+                debug!(%user_id, "publish_did_field: wrote the attested DID object");
+                Ok(PublishOutcome::Written)
+            }
+            Some(PublishOutcome::RowLessAccount) => {
+                let body = resp.text().await.unwrap_or_default();
+                warn!(
+                    %user_id, %body,
+                    "publish_did_field: Synapse answered 500 — this account has a `users` row but \
+                     no `profiles` row (element-hq/synapse#19702, unfixed in 1.159.0). The DID \
+                     field's state is UNKNOWN for this account; it will be re-attempted at the \
+                     user's next sign-in and resolves once the pinned Synapse image is bumped"
+                );
+                Ok(PublishOutcome::RowLessAccount)
+            }
+            None => {
+                let body = resp.text().await.unwrap_or_default();
+                warn!(%status, %body, %user_id, "publish_did_field failed");
+                anyhow::bail!(
+                    "publish_did_field: HTTP {status}{}",
+                    publish_status_hint(status)
+                );
+            }
+        }
+    }
+}
+
+/// What a [`SynapseClient::publish_did_field`] call actually achieved.
+///
+/// A bare `Ok(())` would collapse "the DID is now published" into the same
+/// answer as "Synapse crashed on a row-less account and we have no idea what
+/// the field holds". Both are non-failures the caller must not abort on, and
+/// they are not the same fact — the live test asserts a readback after the
+/// first and cannot after the second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// Synapse accepted the write (2xx). The field now holds the value sent.
+    Written,
+    /// Synapse answered 500 because the target account has a `users` row but no
+    /// `profiles` row — element-hq/synapse#19702, still unfixed in 1.159.0.
+    /// **The field's state is unknown**, not absent: the request never reached
+    /// the storage layer, and the same bug makes the GET twin 500 as well.
+    RowLessAccount,
+}
+
+/// Map a `PUT …/profile/{mxid}/{field}` status to its outcome, or `None` when
+/// it is a genuine error.
+///
+/// Pure and separate from the request for the same reason
+/// [`profile_404_means_row_absent`] is: the interesting decision here is a
+/// three-way classification of a status code, and it must be testable without
+/// a live homeserver, a Redis instance to mint a token into, or an HTTP mock.
+/// The full-path tests below exercise it through a real request as well; this
+/// function is what keeps that coverage non-vacuous when they skip.
+fn classify_publish_status(status: reqwest::StatusCode) -> Option<PublishOutcome> {
+    if status.is_success() {
+        return Some(PublishOutcome::Written);
+    }
+    // Deliberately exactly 500, not `is_server_error()`. #19702 surfaces as an
+    // uncaught `TypeError` → Twisted's generic 500. A 502/503/504 is a proxy or
+    // a homeserver that is down, which is a genuine failure an operator must
+    // see, and swallowing those as "known condition" would hide a total outage
+    // of the publication path behind a `warn!`.
+    if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR {
+        return Some(PublishOutcome::RowLessAccount);
+    }
+    None
+}
+
+/// A human hint appended to a failed profile-field write.
+///
+/// Split from [`admin_status_hint`] because this route has a second confusable
+/// failure the admin API does not: a 404 that an operator will read as "the
+/// field does not exist yet" when it actually means the *user* does not exist,
+/// or that this homeserver has no MSC4133 profile route at all.
+fn publish_status_hint(status: reqwest::StatusCode) -> &'static str {
+    match status {
+        reqwest::StatusCode::NOT_FOUND => {
+            " — the stable v3 profile route is registered unconditionally on Synapse 1.159.0, so \
+             a 404 means this homeserver has never heard of that user (or predates MSC4133), NOT \
+             that the field is merely unset"
+        }
+        _ => admin_status_hint(status),
+    }
 }
 
 /// A human hint for a failed `/_synapse/mas/*` call.
@@ -1107,5 +1289,363 @@ mod tests {
                 .unwrap();
         let ids: Vec<&str> = body.devices.iter().map(|d| d.device_id.as_str()).collect();
         assert_eq!(ids, vec!["A", "B"]);
+    }
+
+    // -- publish_did_field: the status classifier (pure) --------------------
+    //
+    // Same discipline as `profile_404_means_row_absent` above: the interesting
+    // decision is a three-way classification of a status code, so it is a pure
+    // function with its own tests. These run with no Redis, no mock and no
+    // network, which is what keeps H2 covered even when the full-path tests
+    // below skip.
+
+    /// H1 (classifier half): a 2xx is a real write.
+    #[test]
+    fn publish_status_2xx_is_written() {
+        for code in [200u16, 201, 204] {
+            assert_eq!(
+                classify_publish_status(reqwest::StatusCode::from_u16(code).unwrap()),
+                Some(PublishOutcome::Written),
+                "HTTP {code} must count as a completed write"
+            );
+        }
+    }
+
+    /// H2 (classifier half): a 500 is the known row-less-account condition
+    /// (element-hq/synapse#19702), NOT an error.
+    #[test]
+    fn publish_status_500_is_the_rowless_account_condition() {
+        assert_eq!(
+            classify_publish_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            Some(PublishOutcome::RowLessAccount)
+        );
+    }
+
+    /// The other 5xx codes must NOT be swallowed as "known condition".
+    ///
+    /// #19702 surfaces as an uncaught `TypeError` -> Twisted's generic 500. A
+    /// 502/503/504 is a dead homeserver or a proxy in front of it, and
+    /// classifying those as benign would hide a total outage of the
+    /// publication path behind a `warn!` on every single login. This is the
+    /// exact reason the classifier compares to 500 rather than calling
+    /// `is_server_error()`.
+    #[test]
+    fn publish_status_other_5xx_is_a_genuine_error() {
+        for code in [502u16, 503, 504] {
+            assert_eq!(
+                classify_publish_status(reqwest::StatusCode::from_u16(code).unwrap()),
+                None,
+                "HTTP {code} is a dead upstream, not a row-less account"
+            );
+        }
+    }
+
+    /// A 404 on the PUT is a genuine error, and its hint must say why.
+    ///
+    /// This is the one status an operator is most likely to misread: on the GET
+    /// twin a 404 means "the field is unset", which is normal. On the PUT it
+    /// means the *user* is unknown (or the homeserver has no MSC4133 route at
+    /// all), because the stable v3 profile route is registered unconditionally
+    /// on 1.159.0.
+    #[test]
+    fn publish_status_404_is_an_error_with_a_disambiguating_hint() {
+        assert_eq!(
+            classify_publish_status(reqwest::StatusCode::NOT_FOUND),
+            None
+        );
+        let hint = publish_status_hint(reqwest::StatusCode::NOT_FOUND);
+        assert!(
+            hint.contains("never heard of that user"),
+            "a 404 hint must rule out the 'field merely unset' reading: {hint}"
+        );
+    }
+
+    /// 401/403 keep the shared admin hint, so an auth failure on this route is
+    /// diagnosed identically to one on `/_synapse/admin/*`.
+    #[test]
+    fn publish_status_hint_falls_through_to_the_admin_hint_for_auth_failures() {
+        assert_eq!(
+            publish_status_hint(reqwest::StatusCode::UNAUTHORIZED),
+            admin_status_hint(reqwest::StatusCode::UNAUTHORIZED)
+        );
+        assert!(!publish_status_hint(reqwest::StatusCode::UNAUTHORIZED).is_empty());
+    }
+
+    // -- publish_did_field: the full admin path, against a mock Synapse ------
+    //
+    // Extends the in-process mock pattern from `localpart.rs`'s
+    // `spawn_mock_synapse` (axum on an ephemeral port, built only from crates
+    // already in `[dependencies]`).
+    //
+    // Unlike that one, these need a REAL `RedisClient`: `publish_did_field`
+    // goes through `admin_request` -> `admin_bearer`, which mints a token by
+    // writing it to the token store, and `AdminMint.db` is the concrete
+    // `RedisClient` type rather than a `dyn DBClient`. So these follow the
+    // repo's established "skip cleanly when Redis is unavailable" pattern
+    // (`db/redis.rs`, `webauthn.rs`). CI provides one; the pure classifier
+    // tests above are what keep the classification itself covered when they
+    // skip.
+
+    /// What the mock actually received. One PUT is expected, but the whole log
+    /// is captured so an unexpected extra request shows up as a failed length
+    /// assertion rather than being silently ignored.
+    #[derive(Clone, Debug)]
+    struct RecordedRequest {
+        method: String,
+        /// The RAW path, still percent-encoded — asserted verbatim, because
+        /// getting the encoding of `@` and `:` wrong is precisely the bug an
+        /// axum `Path` extractor would hide by decoding it for us.
+        path: String,
+        authorization: Option<String>,
+        body: serde_json::Value,
+    }
+
+    /// Spin up a mock Synapse that answers `is_localpart_available` with
+    /// "taken" (so the admin mint performs no `provision_user`) and records
+    /// every other request, answering it with `reply_status`.
+    async fn spawn_publish_mock(
+        reply_status: axum::http::StatusCode,
+    ) -> (
+        SynapseClient,
+        std::sync::Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::body::Bytes;
+        use axum::extract::{Request, State};
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        use axum::Router;
+        use std::sync::{Arc, Mutex};
+
+        let log: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+
+        #[derive(Clone)]
+        struct MockState {
+            log: std::sync::Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
+            reply_status: axum::http::StatusCode,
+        }
+
+        async fn record(State(state): State<MockState>, req: Request) -> axum::response::Response {
+            let method = req.method().to_string();
+            let path = req.uri().path().to_string();
+            let authorization = req
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let bytes: Bytes = axum::body::to_bytes(req.into_body(), 64 * 1024)
+                .await
+                .unwrap_or_default();
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            state.log.lock().unwrap().push(RecordedRequest {
+                method,
+                path,
+                authorization,
+                body,
+            });
+            (state.reply_status, "{}").into_response()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral mock-synapse port");
+        let addr = listener.local_addr().expect("mock-synapse local_addr");
+        let app = Router::new()
+            // 400 M_USER_IN_USE == "taken", which `is_localpart_available` maps
+            // to Ok(false), so `admin_bearer` skips provisioning the service
+            // user and goes straight to minting.
+            .route(
+                "/_synapse/mas/is_localpart_available",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(json!({"errcode": "M_USER_IN_USE", "error": "in use"})),
+                    )
+                }),
+            )
+            .fallback(record)
+            .with_state(MockState {
+                log: log.clone(),
+                reply_status,
+            });
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock-synapse");
+        });
+        let client = SynapseClient::new(&format!("http://{addr}"), "shared-secret");
+        (client, log, handle)
+    }
+
+    /// Attach a real token store, or return `None` when Redis is unavailable.
+    async fn with_redis_mint(client: SynapseClient) -> Option<SynapseClient> {
+        let redis = RedisClient::new(&url::Url::parse("redis://localhost").unwrap())
+            .await
+            .ok()?;
+        Some(client.with_admin_mint(redis, "siwx-admin".to_string(), 300))
+    }
+
+    fn sample_value() -> serde_json::Value {
+        json!({"did": "did:key:zDnaeUKTWUXc1mxSoRrEfV6wPWmQyHrKuTHLZgAkyUKfSbeMB", "proof": "eyJ0ZXN0Ijoi"})
+    }
+
+    /// **H1** — the wire shape, asserted field by field.
+    ///
+    /// Method, raw (percent-encoded) path, `Authorization: Bearer <minted
+    /// token>` and the exact `{field: value}` body envelope. Each of these has
+    /// its own way of failing silently: a POST would 404, an unencoded `@`/`:`
+    /// would address a different (or no) user, the shared secret instead of a
+    /// minted token would 401, and a body keyed by anything but the field name
+    /// is rejected by Synapse's MSC4133 servlet.
+    ///
+    /// The expected path is the one that round-tripped live —
+    /// `docs/audits/2026-09-10-msc4133-acl-probe.md` leg 1.
+    #[tokio::test]
+    async fn h1_publish_did_field_wire_shape() {
+        let (client, log, handle) = spawn_publish_mock(axum::http::StatusCode::OK).await;
+        let Some(client) = with_redis_mint(client).await else {
+            eprintln!("SKIP h1_publish_did_field_wire_shape: no Redis on localhost");
+            handle.abort();
+            return;
+        };
+
+        let value = sample_value();
+        let outcome = client
+            .publish_did_field("k3f9x2q7ab4d8m1p", "inblock.io", &value)
+            .await
+            .expect("a 200 from Synapse must be Ok");
+        assert_eq!(outcome, PublishOutcome::Written);
+
+        let recorded = log.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "exactly one request must reach the profile route, got {recorded:?}"
+        );
+        let req = &recorded[0];
+
+        assert_eq!(req.method, "PUT", "MSC4133 sets a profile field with PUT");
+        assert_eq!(
+            req.path, "/_matrix/client/v3/profile/%40k3f9x2q7ab4d8m1p%3Ainblock.io/io.inblock.did",
+            "the mxid is a path segment and MUST be percent-encoded (@ -> %40, : -> %3A)"
+        );
+
+        let auth = req
+            .authorization
+            .as_deref()
+            .expect("the request must carry an Authorization header");
+        let token = auth
+            .strip_prefix("Bearer ")
+            .expect("admin-scoped calls use a bearer token");
+        assert!(
+            token.starts_with(ADMIN_TOKEN_PREFIX),
+            "must present a MINTED admin token ({ADMIN_TOKEN_PREFIX}…), not the shared secret: \
+             the shared secret answers 401 M_UNKNOWN_TOKEN on /_matrix/client/* since 1.157"
+        );
+        assert_ne!(
+            token, "shared-secret",
+            "the shared secret must never be presented on the client API"
+        );
+
+        assert_eq!(
+            req.body,
+            json!({ "io.inblock.did": value }),
+            "the body is the field name mapped to the value, nothing else"
+        );
+
+        handle.abort();
+    }
+
+    /// **H2** — a 500 is `Ok(RowLessAccount)`, never `Err`.
+    ///
+    /// element-hq/synapse#19702 is unfixed in 1.159.0 and makes a `users`-row-
+    /// without-`profiles`-row account 500 on this route. 3 of 102 dev accounts
+    /// are in that state. Returning `Err` here would be *technically* harmless
+    /// (the caller is best-effort) but it would report a known dependency bug
+    /// as a failure of ours, on every login of those accounts, forever.
+    #[tokio::test]
+    async fn h2_publish_did_field_500_is_a_rowless_account_not_an_error() {
+        let (client, _log, handle) =
+            spawn_publish_mock(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+        let Some(client) = with_redis_mint(client).await else {
+            eprintln!(
+                "SKIP h2_publish_did_field_500_is_a_rowless_account_not_an_error: no Redis on localhost"
+            );
+            handle.abort();
+            return;
+        };
+
+        let outcome = client
+            .publish_did_field("k3f9x2q7ab4d8m1p", "inblock.io", &sample_value())
+            .await
+            .expect("a 500 is a KNOWN condition, not an Err");
+        assert_eq!(outcome, PublishOutcome::RowLessAccount);
+        handle.abort();
+    }
+
+    /// A 404 is a genuine `Err`, carrying the hint that disambiguates it from
+    /// the GET twin's benign "field is unset" 404.
+    #[tokio::test]
+    async fn publish_did_field_404_is_an_error() {
+        let (client, _log, handle) = spawn_publish_mock(axum::http::StatusCode::NOT_FOUND).await;
+        let Some(client) = with_redis_mint(client).await else {
+            eprintln!("SKIP publish_did_field_404_is_an_error: no Redis on localhost");
+            handle.abort();
+            return;
+        };
+
+        let err = client
+            .publish_did_field("k3f9x2q7ab4d8m1p", "inblock.io", &sample_value())
+            .await
+            .expect_err("a 404 on the PUT is not a success")
+            .to_string();
+        assert!(
+            err.contains("404"),
+            "the status must be in the message: {err}"
+        );
+        assert!(
+            err.contains("never heard of that user"),
+            "the 404 hint must be attached: {err}"
+        );
+        handle.abort();
+    }
+
+    /// A real upstream failure (503) is a genuine `Err`.
+    #[tokio::test]
+    async fn publish_did_field_503_is_an_error() {
+        let (client, _log, handle) =
+            spawn_publish_mock(axum::http::StatusCode::SERVICE_UNAVAILABLE).await;
+        let Some(client) = with_redis_mint(client).await else {
+            eprintln!("SKIP publish_did_field_503_is_an_error: no Redis on localhost");
+            handle.abort();
+            return;
+        };
+
+        let err = client
+            .publish_did_field("k3f9x2q7ab4d8m1p", "inblock.io", &sample_value())
+            .await
+            .expect_err("a dead homeserver must not be reported as a benign known condition")
+            .to_string();
+        assert!(
+            err.contains("503"),
+            "the status must be in the message: {err}"
+        );
+        handle.abort();
+    }
+
+    /// The field name is the SHARED constant, not a local literal.
+    ///
+    /// Guards the three-sided wire contract documented on
+    /// [`crate::did_assertion::DID_PROFILE_FIELD`]: the URL segment and the
+    /// body key must both move if the constant ever moves, and the client
+    /// crate's constant of the same name must move with them.
+    #[test]
+    fn publish_uses_the_shared_field_constant() {
+        assert_eq!(DID_PROFILE_FIELD, "io.inblock.did");
+        assert_eq!(
+            DID_PROFILE_FIELD,
+            siwx_oidc_auth::did_assertion::DID_PROFILE_FIELD,
+            "the provider and the shipped consumer must name the SAME profile field; \
+             a divergence here means every consumer reads 'no published DID'"
+        );
     }
 }

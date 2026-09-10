@@ -103,14 +103,46 @@
 //!
 //! Reference: `docs/superpowers/plans/2026-09-10-immutable-attested-did.md`.
 
-use anyhow::{anyhow, bail, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+// Only [`verify_with_key`] needs these, and that helper is `#[cfg(test)]` —
+// see its doc comment for why it must never be reachable from production code.
+#[cfg(test)]
+use anyhow::{anyhow, bail, Result};
+#[cfg(test)]
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::sync::Once;
 use tracing::{debug, warn};
 
 use crate::oidc::EcdsaSigningKey;
+
+/// The MSC4133 custom profile field that carries the provider-attested DID.
+///
+/// # This is a THREE-SIDED wire contract, not a string constant
+///
+/// The same literal has to be identical in three independently-deployed places,
+/// and they do not fail together — they fail *apart*, silently:
+///
+/// | Side | Where | What it does with the name |
+/// |---|---|---|
+/// | provider (this crate) | [`crate::synapse_client::SynapseClient::publish_did_field`] | `PUT /_matrix/client/v3/profile/{mxid}/{field}`, body keyed by the field |
+/// | consumer | `siwx-oidc-auth`'s own `DID_PROFILE_FIELD` (`siwx-oidc-auth/src/did_assertion.rs`) | reads the field and the `{field: value}` envelope Synapse echoes back |
+/// | homeserver | `experimental_features.msc4133_key_denylist` in `../siwx-oidc-matrix-server/entrypoints/matrix_server.sh` | refuses a *user's* write/delete of exactly this name |
+///
+/// Renaming it is therefore a **migration, not an edit**. All three sides must
+/// move together, and for at least one full upgrade cycle the consumer has to
+/// **dual-read** the old and new names — otherwise every account that has not
+/// signed in since the rename reads as "no published DID". Worse, the
+/// homeserver side fails *open*: a denylist entry that still names the old key
+/// leaves the new field user-writable, which is precisely the vulnerability
+/// this whole feature exists to close (see
+/// `docs/audits/2026-09-10-msc4133-acl-probe.md`, legs 2 and 3).
+///
+/// The name satisfies Synapse's Common Namespaced Identifier Grammar,
+/// `^[a-z][a-z0-9_.-]{0,254}$` (v1.159.0 `util/stringutils.py:53`) — which is
+/// also why a DID can never be a field *name*: that grammar forbids uppercase
+/// and colons.
+pub const DID_PROFILE_FIELD: &str = "io.inblock.did";
 
 /// The only signature algorithm this module mints or accepts.
 ///
@@ -265,6 +297,98 @@ pub fn mint_did_assertion(
     ))
 }
 
+/// Everything the DID-publication side effect needs, bundled so a sign-in path
+/// carries **one** extra parameter instead of two.
+///
+/// # Why a struct for two fields
+///
+/// [`crate::oidc::provision_synapse_device`] already took six arguments, four of
+/// which are `&str`/`Option<&str>`. Adding a seventh and eighth positional
+/// string is how call sites start passing `issuer` where `did` belongs — the
+/// compiler cannot tell two `&str`s apart, and both call sites are on the
+/// login path where a mix-up is a silently wrong assertion in a user's profile,
+/// not a crash. A named struct makes the mistake a type error at construction.
+///
+/// # Why it is `Option`al at the call site
+///
+/// One `None` turns the whole feature off in one place. That is the shape a
+/// deployment without this feature needs, and it is also the shape a unit test
+/// of `provision_synapse_device` needs when it is asserting something else
+/// entirely (see `provision_user_display_name_is_the_localpart_never_the_did`).
+///
+/// Note that `None` is NOT how the ephemeral-key case is expressed: an
+/// ephemeral key still publishes `{"did": …}` (without a `proof`), because the
+/// DID itself is true and worth publishing. See [`did_profile_value`].
+pub struct DidPublication<'a> {
+    /// The provider's ES256 signing key. Whether it is durable enough to mint a
+    /// `proof` is decided inside [`mint_did_assertion`], never here.
+    pub key: &'a EcdsaSigningKey,
+    /// The OIDC issuer URL (`config.base_url`), written verbatim into `iss`.
+    ///
+    /// It must be the value a consumer's OIDC discovery document reports as
+    /// `issuer`, because the shipped verifier compares the two
+    /// (trailing-slash-insensitively) and rejects a mismatch as "minted by a
+    /// different provider".
+    pub issuer: &'a str,
+}
+
+/// Build the exact JSON value published at [`DID_PROFILE_FIELD`].
+///
+/// ```json
+/// { "did": "did:key:zDn…", "proof": "<compact ES256 JWS>" }
+/// ```
+///
+/// # The `proof` member is absent, not empty, when the key is ephemeral
+///
+/// [`mint_did_assertion`] returns `None` for an ephemeral key (plan invariant 5
+/// — never write a durable assertion with a key that dies at restart), and this
+/// function then omits the `proof` key **entirely**. That is the honest state,
+/// not a failure: the DID is still true and still worth publishing, it simply
+/// carries no provider signature. The shipped consumer distinguishes the two
+/// cases by discriminator — `DidAssertionError::ProofAbsent` versus a
+/// verification error — so an operator can tell "this deployment has no
+/// configured signing key" apart from "this proof is bad" without reading logs.
+///
+/// Do not "improve" this by emitting `"proof": null` or `"proof": ""`: the
+/// consumer filters an empty string back out (`siwx-oidc-auth`'s
+/// `.filter(|s| !s.is_empty())`), so both spellings would land in the same
+/// bucket while making the stored JSON claim something exists that does not.
+///
+/// # Why an object rather than two profile fields
+///
+/// One `PUT` is one canonical-JSON blob, so the DID and its proof cannot drift
+/// apart (one write landing while the other fails), and the homeserver-side
+/// denylist that protects this value is **one** entry rather than two — a
+/// smaller Synapse patch to forward-port on every version bump. See the plan's
+/// "Why one field and not two".
+///
+/// # Nothing private may ever be added here
+///
+/// `GET /_matrix/client/v3/profile/{user}/{field}` is unauthenticated by
+/// default (`require_auth_for_profile_requests`, Synapse v1.159.0
+/// `config/server.py:561`) and custom fields federate. Anything this function
+/// returns is world-readable, forever. Plan invariant 4.
+pub fn did_profile_value(
+    key: &EcdsaSigningKey,
+    issuer: &str,
+    did: &str,
+    mxid: &str,
+    now: i64,
+) -> serde_json::Value {
+    let mut value = serde_json::Map::new();
+    // Exact case. A `did:key` multibase payload carries meaning in its case and
+    // is NOT recoverable from the (lowercased) Matrix localpart — MEMORY.md
+    // "MXID to DID is not invertible", filed as siwx-oidc#17.
+    value.insert(
+        "did".to_string(),
+        serde_json::Value::String(did.to_string()),
+    );
+    if let Some(proof) = mint_did_assertion(key, issuer, did, mxid, now) {
+        value.insert("proof".to_string(), serde_json::Value::String(proof));
+    }
+    serde_json::Value::Object(value)
+}
+
 /// Verify a DID assertion against a public key that the caller has ALREADY
 /// established is the right one, and return its claims.
 ///
@@ -291,6 +415,17 @@ pub fn mint_did_assertion(
 /// r‖s bytes, and a signature valid over the received `signing_input` bytes —
 /// the received bytes, never a re-serialization, so field-order or whitespace
 /// drift in a future minter cannot cause a spurious failure.
+///
+/// # `#[cfg(test)]` is the enforcement of the warning above
+///
+/// While the whole module was `#[allow(dead_code)]` (it was, until the write
+/// channel landed), "do not use it as one" was a doc comment and nothing more.
+/// Gating it on `cfg(test)` makes that warning a compile error instead: a
+/// future production call site cannot reach an unbound verifier by accident,
+/// which is the mistake that turns a signature check into a replay primitive.
+/// The consumer-facing verifier lives in `siwx-oidc-auth` and takes the
+/// expected MXID as a required argument.
+#[cfg(test)]
 pub fn verify_with_key(jws: &str, key: &VerifyingKey) -> Result<DidAssertionClaims> {
     let mut parts = jws.split('.');
     let (header_b64, payload_b64, signature_b64) =
@@ -668,5 +803,255 @@ mod tests {
         let two_parts: String = jws.rsplit_once('.').unwrap().0.to_string();
         assert!(verify_with_key(&two_parts, &vk).is_err());
         assert!(verify_with_key(&format!("{jws}.extra"), &vk).is_err());
+    }
+
+    // -- did_profile_value: the object that actually lands in the profile ----
+
+    /// **H1** (value half) — the published object is exactly `{did, proof}`,
+    /// with the DID reproduced byte-for-byte.
+    ///
+    /// Asserted on the RAW key set, not just on the two members being present,
+    /// so that a future addition to this object has to be a deliberate edit
+    /// here. Everything in it is world-readable and federates (plan invariant
+    /// 4), which makes "one more harmless field" the exact mistake to make hard.
+    #[test]
+    fn h1_did_profile_value_is_did_plus_proof() {
+        let (key, vk) = durable_key();
+        let value = did_profile_value(&key, ISSUER, DID, MXID, IAT);
+        let obj = value.as_object().expect("the field value is a JSON object");
+
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["did", "proof"],
+            "nothing but the DID and its proof may be published: {value}"
+        );
+        assert_eq!(
+            obj["did"].as_str().unwrap(),
+            DID,
+            "the DID must be exact-case; a lowercased did:key is a DIFFERENT key \
+             (MEMORY.md 'MXID to DID is not invertible', siwx-oidc#17)"
+        );
+
+        // The `proof` member must be the real thing, not merely a string.
+        let claims = verify_with_key(obj["proof"].as_str().unwrap(), &vk)
+            .expect("the published proof must verify under the publishing key");
+        assert_eq!(claims.sub, DID);
+        assert_eq!(claims.mxid, MXID);
+        assert_eq!(claims.iss, ISSUER);
+        assert_eq!(claims.iat, IAT);
+    }
+
+    /// **H5** (value half) — an ephemeral key publishes the DID with **no
+    /// `proof` key at all**.
+    ///
+    /// Not `"proof": null`, not `"proof": ""`. The consumer filters an empty
+    /// string back out, so both spellings would land in the same bucket while
+    /// making the stored JSON assert that something exists which does not. The
+    /// key-set assertion below is what forbids them.
+    #[test]
+    fn h5_ephemeral_key_publishes_a_did_with_no_proof_key() {
+        let key = EcdsaSigningKey::generate();
+        assert!(key.is_ephemeral());
+        let value = did_profile_value(&key, ISSUER, DID, MXID, IAT);
+        let obj = value.as_object().expect("the field value is a JSON object");
+
+        let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec!["did"],
+            "an ephemeral key must publish the DID alone — absent, not null, not empty: {value}"
+        );
+        assert_eq!(obj["did"].as_str().unwrap(), DID);
+    }
+
+    /// The `mxid` a value is built for really is the one bound inside the
+    /// proof. If `did_profile_value` ever passed its arguments to
+    /// `mint_did_assertion` in the wrong order (four `&str`s in a row), the
+    /// object would still look perfectly well-formed and every consumer would
+    /// reject it as a replay.
+    #[test]
+    fn did_profile_value_binds_the_mxid_it_was_given() {
+        let (key, vk) = durable_key();
+        let other_mxid = "@zzzzzzzzzzzzzzzz:inblock.io";
+        let value = did_profile_value(&key, ISSUER, DID, other_mxid, IAT);
+        let claims =
+            verify_with_key(value["proof"].as_str().unwrap(), &vk).expect("proof must verify");
+        assert_eq!(claims.mxid, other_mxid);
+        assert_eq!(claims.sub, DID, "sub is the DID, mxid is the Matrix ID");
+    }
+}
+
+/// **H8** — the server's minter and the shipped client verifier interoperate.
+///
+/// # Why this test is the one that matters
+///
+/// The minter (this module) and the verifier
+/// (`siwx-oidc-auth/src/did_assertion.rs`) were written independently, by
+/// different agents, against a written wire-format spec. Both sides have
+/// thorough unit tests; both sides pass them; neither proves the other can read
+/// what it wrote. A single disagreement — DER instead of raw r‖s, padded
+/// base64, a re-serialized signing input, a `kid` that is not the JWKS `kid` —
+/// produces two internally-consistent implementations that never verify a
+/// single real assertion between them, and every other test in this change
+/// would still be green. So this runs the real minter against the real
+/// verifier, over real HTTP, through the real `oidc::jwks` document.
+///
+/// # Why it lives here and not in `tests/`
+///
+/// `tests/*.rs` integration tests link against the `siwx_oidc` **library**
+/// crate (`src/lib.rs`), and both the minter and `EcdsaSigningKey` live in the
+/// **binary** crate's module tree (`src/main.rs`). A file under `tests/`
+/// literally cannot name `mint_did_assertion`. A `#[cfg(test)]` module in the
+/// binary can, and `[dev-dependencies]` are linked for it — which is what makes
+/// the cross-crate call possible at all. (The same reasoning is already
+/// recorded in `localpart.rs`'s `resolve_identity_tests` module doc.)
+#[cfg(test)]
+mod interop_with_the_shipped_verifier {
+    use super::*;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use siwx_oidc_auth::did_assertion::{verify_did_assertion, DidAssertionError};
+    use tokio::net::TcpListener;
+
+    const DID: &str = "did:key:zDnaeUKTWUXc1mxSoRrEfV6wPWmQyHrKuTHLZgAkyUKfSbeMB";
+    const MXID: &str = "@k3f9x2q7ab4d8m1p:inblock.io";
+    const OTHER_MXID: &str = "@w9q2h4t6y8u0i1o3:inblock.io";
+    const IAT: i64 = 1_757_500_000;
+
+    /// Serve the two documents a consumer actually fetches: OIDC discovery and
+    /// the JWKS. Both come from the SAME production code paths the real server
+    /// uses (`oidc::jwks`), so a change to the published JWK shape breaks this
+    /// test rather than silently breaking every deployed consumer.
+    ///
+    /// Returns the issuer base URL and the server task handle.
+    async fn spawn_issuer(key: &EcdsaSigningKey) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral issuer port");
+        let addr = listener.local_addr().expect("issuer local_addr");
+        let issuer = format!("http://{addr}");
+
+        let jwks_json = serde_json::to_value(
+            crate::oidc::jwks(key).expect("the production JWKS builder must succeed"),
+        )
+        .expect("a JWKS always serializes");
+        let discovery = serde_json::json!({
+            "issuer": issuer,
+            "jwks_uri": format!("{issuer}/jwk"),
+        });
+
+        let app = Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get(move || async move { Json(discovery) }),
+            )
+            .route("/jwk", get(move || async move { Json(jwks_json) }));
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("issuer server");
+        });
+        (issuer, handle)
+    }
+
+    /// H8: mint here, verify there. The `proof` is taken out of the exact
+    /// object [`did_profile_value`] publishes, not from a hand-built JWS, so
+    /// this covers the envelope as well as the signature.
+    #[tokio::test]
+    async fn h8_server_minted_assertion_verifies_in_the_client_crate() {
+        let key = EcdsaSigningKey::from_pem(&test_p256_pem()).expect("test PEM must load");
+        let (issuer, handle) = spawn_issuer(&key).await;
+
+        let value = did_profile_value(&key, &issuer, DID, MXID, IAT);
+        let proof = value["proof"]
+            .as_str()
+            .expect("a durable key must publish a proof");
+
+        let verified = verify_did_assertion(&issuer, proof, MXID)
+            .await
+            .expect("the shipped verifier must accept a genuinely minted assertion");
+
+        assert_eq!(
+            verified.did, DID,
+            "the DID must survive the round trip byte for byte"
+        );
+        assert_eq!(verified.mxid, MXID);
+        assert_eq!(verified.issued_at, IAT);
+        // Trailing-slash-insensitive on the verifier's side; assert the exact
+        // string here because our issuer never grows one.
+        assert_eq!(verified.issuer, issuer);
+
+        handle.abort();
+    }
+
+    /// H6/H8: the replay guard holds across the crate boundary too.
+    ///
+    /// This is the whole security property of the `mxid` claim: user B copies
+    /// A's perfectly valid, correctly-signed proof into B's own profile. The
+    /// signature verifies — it is genuine — and the assertion must still be
+    /// rejected. Asserted HERE, against the real verifier, rather than only in
+    /// the client crate's own tests, because a minter that forgot to set `mxid`
+    /// (or set it to the localpart, or to the DID) would pass every test on the
+    /// client side and produce universally-replayable proofs.
+    #[tokio::test]
+    async fn h8_replayed_assertion_is_rejected_across_the_crate_boundary() {
+        let key = EcdsaSigningKey::from_pem(&test_p256_pem()).expect("test PEM must load");
+        let (issuer, handle) = spawn_issuer(&key).await;
+
+        let value = did_profile_value(&key, &issuer, DID, MXID, IAT);
+        let proof = value["proof"].as_str().unwrap();
+
+        // Control leg: the same proof DOES verify for the account it names, so
+        // the rejection below cannot be an artifact of a broken fixture.
+        assert!(
+            verify_did_assertion(&issuer, proof, MXID).await.is_ok(),
+            "control: the proof must verify for its own mxid"
+        );
+
+        let err = verify_did_assertion(&issuer, proof, OTHER_MXID)
+            .await
+            .expect_err("a proof presented for another account must be rejected")
+            .to_string();
+        assert!(
+            err.contains("REPLAYED ASSERTION"),
+            "the rejection must be the mxid binding check, not an incidental \
+             signature failure: {err}"
+        );
+
+        handle.abort();
+    }
+
+    /// H5/H8: an ephemeral key's proof-less object is reported by the consumer
+    /// as the typed, downcastable `ProofAbsent`, not as a verification failure.
+    ///
+    /// The two must not be confused: `ProofAbsent` means "this deployment has
+    /// no configured signing key", which an operator fixes with
+    /// `SIWEOIDC_SIGNING_KEY_PEM`; a verification failure means "this proof is
+    /// not acceptable", which they investigate. This asserts the server's
+    /// omission lands in the consumer's intended bucket.
+    #[test]
+    fn h5_proofless_object_maps_to_the_consumers_proof_absent_discriminator() {
+        let key = EcdsaSigningKey::generate();
+        let value = did_profile_value(&key, "https://issuer.example", DID, MXID, IAT);
+        assert!(
+            value.get("proof").is_none(),
+            "precondition: an ephemeral key publishes no proof"
+        );
+
+        // Reproduce the branch `fetch_and_verify_did` takes on this exact
+        // object: an object whose `proof` member is absent.
+        let proof = value
+            .get("proof")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        assert!(proof.is_none());
+        let e = DidAssertionError::ProofAbsent {
+            mxid: MXID.to_string(),
+            did: DID.to_string(),
+        };
+        assert!(
+            e.to_string().contains("UNVERIFIABLE"),
+            "the consumer must call a proof-less DID unverifiable, not usable: {e}"
+        );
     }
 }

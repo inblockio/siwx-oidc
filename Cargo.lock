@@ -4621,6 +4621,7 @@ dependencies = [
  "serde_urlencoded",
  "sha2 0.10.6",
  "sha3",
+ "siwx-oidc-auth",
  "subtle",
  "test-log",
  "thiserror 2.0.18",
