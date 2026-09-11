@@ -20,6 +20,9 @@ mod did_assertion;
 mod introspect;
 mod localpart;
 mod oidc;
+// GET /resolve: the public DID <-> MXID directory lookup. Read-only, and a
+// discovery hint only — see the module doc's "never an authorization source".
+mod resolve;
 mod synapse_client;
 mod webauthn;
 

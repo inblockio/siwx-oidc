@@ -32,9 +32,15 @@ src/                                ← Axum OIDC server (binary)
                                      is_localpart_available, delete_device, deactivate_user, reactivate_user)
                                      and a MINTED admin token on /_synapse/admin/* + the authenticated
                                      C-S API (list_devices, get_device, has_cross_signing_keys,
-                                     publish_did_field -> PUT …/profile/{mxid}/io.inblock.did).
+                                     publish_did_field -> PUT …/profile/{mxid}/io.inblock.did, and its
+                                     read twin read_did_field; Err there means "state UNKNOWN", never
+                                     "no DID published").
   did_assertion.rs                   DID tier: DID_PROFILE_FIELD, mint_did_assertion (compact ES256 JWS),
                                      did_profile_value ({did, proof}), DidPublication. See "Identity model".
+  resolve.rs                         GET /resolve: the public DID <-> MXID lookup. Unauthenticated,
+                                     read-only, 4-field answer {did, mxid, exists, attested}. Uses the
+                                     FALLIBLE localpart::resolve_identity (a lookup must not guess) and
+                                     synapse_client::read_did_field. A DISCOVERY HINT, never authorization.
   alias.rs (lib)                     Tier 1: alias_for(did) -> "Firstname Surname", the pseudonym a new
                                      account is seeded with. Pure sha2; shares mxid::canonicalize
   localpart.rs                       Grandfathering POLICY (binary crate, needs SynapseClient):
@@ -375,6 +381,83 @@ Live coverage (`--ignored`, against the local e2e harness):
 `tests/e2e_did_field_live.rs` — `did_field_is_published_verifiable_and_public_live`,
 `did_field_user_write_is_forbidden_live`,
 `clobbered_did_field_is_restored_at_next_signin_live`.
+
+### Looking up an identity (`GET /resolve`) — 2026-09-12
+
+The directory lookup for the table above: which Matrix account belongs to a DID,
+and which DID a Matrix account publishes. `src/resolve.rs`, one route, read-only,
+provisions nothing.
+
+```bash
+curl -s "$OIDC/resolve?did=did:key:zDnaeUKTWU…"
+curl -s "$OIDC/resolve?mxid=@k3f9x2q7ab4d8m1p:inblock.io"
+# { "did": "did:key:zDnaeUKTWU…"|null, "mxid": "@…:inblock.io"|null,
+#   "exists": true, "attested": true }
+```
+
+**Exactly one** of `did` / `mxid`; zero or both is a 400 (they are two different
+questions, and `did`/`mxid` mean different things in each direction). An `mxid`
+for a foreign homeserver is a 400 too — read a foreign user's DID from that
+homeserver's own (unauthenticated, federated) profile route.
+
+- **A result is a discovery hint, NEVER an authorization source** — the same rule
+  and the same words as the `io.inblock.did` field above. Authorization resolves
+  the DID from an OIDC `sub` this provider issued, or from a fresh signature by
+  the DID key.
+- **`attested` = the profile field is present AND binds to this identity**,
+  compared under `mxid::canonicalize` (did:pkh case-folded, did:key byte-for-byte)
+  on the `?did=` path, and by re-deriving the localpart (either scheme — a
+  grandfathered account keeps its legacy shape) on the `?mxid=` path. **No
+  signature is verified**: the verifier lives in `siwx-oidc-auth`, a
+  dev-dependency the shipped binary does not link. A caller needing crypto runs
+  `siwx-oidc-auth --verify-did`.
+- **Unauthenticated on purpose, and not a privacy regression.** The DID → localpart
+  direction is a pure `sha2` function of the DID (`mxid::localpart_for` /
+  `legacy_localpart`, public library crate) that anyone can compute offline; the
+  MXID → DID direction reads a Synapse profile field that is unauthenticated by
+  default and federates; `exists` is the registration-availability answer any
+  client can already get. Gating it would buy **rate-limiting, not secrecy** — put
+  that in Caddy, not in-process. This is also why the response must stay at four
+  fields: the moment it carries something the caller could not compute or fetch
+  themselves, that argument stops holding.
+- **The `?did=` path uses the FALLIBLE `localpart::resolve_identity`, never
+  `resolve_identity_or_legacy`.** The fail-safe "guess legacy" rule exists so a
+  sign-in does not sever an existing user from their account; a read-only lookup
+  has no account to sever, so a wrong answer is strictly worse than an honest
+  error. A probe failure is a **502** carrying whatever mxid was already resolved,
+  never a guessed one.
+- **Degrade, never 500.** No `SIWEOIDC_MATRIX_SERVER_NAME` or no Synapse client
+  (standalone) is a **503** naming what is missing. `ResolveError` renders itself
+  (400/502/503) rather than going through `CustomError`, whose only non-4xx
+  variant is a 500.
+
+### The `io.inblock.mxid` userinfo claim — 2026-09-12
+
+`/userinfo` carries the caller's Matrix ID alongside the DID:
+
+```json
+{ "iss": "…", "aud": ["…"], "sub": "did:key:zDn…",
+  "preferred_username": "did:key:zDn…", "io.inblock.mxid": "@k3f9…:inblock.io" }
+```
+
+- Namespaced because there is no registered `mxid` claim, and matched to
+  `io.inblock.did` so the two provider-specific identity surfaces read as one
+  family. The wire name is a serde `rename` literal (serde cannot interpolate a
+  constant); the literal is re-spelled by hand in
+  `userinfo_mxid_claim_tests::the_claim_name_on_the_wire_is_io_inblock_mxid` so a
+  rename fails the suite.
+- Source is `TokenMetadata.username` (already the resolved localpart) +
+  `matrix_server_name`. **No Synapse round trip** — and no re-derivation, which
+  could contradict the grandfathering decision already recorded at sign-in.
+- **Omitted, never `null`**, when there is no `matrix_server_name`, or on the
+  legacy `CodeEntry` fallback path when that entry records no localpart
+  (pre-migration entries). An omitted claim degrades a consumer to the
+  `GET /resolve?did=…` lookup it would have done anyway; a derived one could name
+  a different account.
+- `sub` and `preferred_username` are **unchanged** (both still the DID). The claim
+  is additive; it is in BOTH the plain-JSON and the signed-JWT
+  (`userinfo_signed_response_alg`) variants, so a relying party never sees a
+  different identity depending on a registration setting.
 
 ## Admin-scoped token mint (`POST /oauth2/admin_token`)
 

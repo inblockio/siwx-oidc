@@ -9,18 +9,18 @@ use openidconnect::{
         CoreAuthErrorResponseType, CoreAuthPrompt, CoreClaimName, CoreClientAuthMethod,
         CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType, CoreGenderClaim,
         CoreGrantType, CoreIdToken, CoreIdTokenClaims, CoreIdTokenFields, CoreJsonWebKey,
-        CoreJsonWebKeySet, CoreJwsSigningAlgorithm, CoreProviderMetadata,
-        CoreRegisterErrorResponseType, CoreResponseType, CoreSubjectIdentifierType,
-        CoreTokenResponse, CoreTokenType, CoreUserInfoClaims, CoreUserInfoJsonWebToken,
+        CoreJsonWebKeySet, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm,
+        CoreProviderMetadata, CoreRegisterErrorResponseType, CoreResponseType,
+        CoreSubjectIdentifierType, CoreTokenResponse, CoreTokenType,
     },
     registration::{EmptyAdditionalClientMetadata, EmptyAdditionalClientRegistrationResponse},
     url::Url,
-    AccessToken, Audience, AuthUrl, ClientConfigUrl, ClientId, ClientSecret, EmptyAdditionalClaims,
-    EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserName, EndUserUsername,
-    IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl, LocalizedClaim, Nonce, OpPolicyUrl, OpTosUrl,
-    PrivateSigningKey, RedirectUrl, RefreshToken, RegistrationAccessToken, RegistrationUrl,
-    RequestUrl, ResponseTypes, Scope, SigningError, StandardClaims, SubjectIdentifier, TokenUrl,
-    UserInfoUrl,
+    AccessToken, AdditionalClaims, Audience, AuthUrl, ClientConfigUrl, ClientId, ClientSecret,
+    EmptyAdditionalClaims, EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserName,
+    EndUserUsername, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl, LocalizedClaim, Nonce, OpPolicyUrl,
+    OpTosUrl, PrivateSigningKey, RedirectUrl, RefreshToken, RegistrationAccessToken,
+    RegistrationUrl, RequestUrl, ResponseTypes, Scope, SigningError, StandardClaims,
+    SubjectIdentifier, TokenUrl, UserInfoClaims, UserInfoJsonWebToken, UserInfoUrl,
 };
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
@@ -2610,11 +2610,136 @@ pub struct UserInfoPayload {
     pub access_token: Option<String>,
 }
 
-pub enum UserInfoResponse {
-    Json(CoreUserInfoClaims),
-    Jwt(CoreUserInfoJsonWebToken),
+/// The provider-specific claims siwx-oidc adds to the standard OIDC userinfo
+/// set: today, exactly one — the caller's Matrix ID, on the wire as
+/// `io.inblock.mxid`.
+///
+/// # Why the claim is namespaced, and why it is not called `mxid`
+///
+/// There is no registered OIDC claim for a Matrix ID (IANA's "JSON Web Token
+/// Claims" registry has none, and MSC3861 defines none either), so an
+/// unqualified `mxid` would be this provider squatting a bare name in a shared
+/// namespace — the collision hazard OIDC Core §5.1.2 tells extensions to avoid
+/// with a collision-resistant name. It also matches the profile field the same
+/// value can be looked up against
+/// ([`crate::did_assertion::DID_PROFILE_FIELD`] = `io.inblock.did`), so the two
+/// provider-specific identity surfaces read as one family rather than two
+/// conventions.
+///
+/// The name below is spelled out as a literal rather than referencing a
+/// constant because `#[serde(rename = …)]` takes a string literal and cannot
+/// interpolate one. There is therefore exactly ONE place the wire name is
+/// written, and
+/// `userinfo_mxid_claim_tests::the_claim_name_on_the_wire_is_io_inblock_mxid`
+/// asserts that literal against a serialized response so a rename shows up as a
+/// failing test rather than as a silently-renamed claim.
+///
+/// # The claim is OMITTED, never null, when there is no Matrix ID
+///
+/// `skip_serializing_if` rather than a serialized `null`, for the same reason
+/// `did_assertion::did_profile_value` omits an absent `proof`: a present key
+/// asserts that the thing exists. A standalone deployment (no
+/// `SIWEOIDC_MATRIX_SERVER_NAME`) has no Matrix ID to report, and saying
+/// `"io.inblock.mxid": null` would make a consumer's `if "io.inblock.mxid" in
+/// claims` branch take the wrong turn while looking correct.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SiwxAdditionalClaims {
+    /// The caller's fully-qualified Matrix ID, `@localpart:server_name`.
+    #[serde(
+        rename = "io.inblock.mxid",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mxid: Option<String>,
 }
 
+impl AdditionalClaims for SiwxAdditionalClaims {}
+
+/// This provider's userinfo claim set: the OIDC Core standard claims plus
+/// [`SiwxAdditionalClaims`].
+///
+/// Replaces `CoreUserInfoClaims` (which pins `EmptyAdditionalClaims`)
+/// everywhere `/userinfo` is built or rendered. The standard claims —
+/// `iss`, `aud`, `sub`, `preferred_username` — are produced by exactly the same
+/// [`resolve_claims`] call as before and are byte-identical; see the note on
+/// [`userinfo`].
+pub type SiwxUserInfoClaims = UserInfoClaims<SiwxAdditionalClaims, CoreGenderClaim>;
+
+/// The signed-JWT twin of [`SiwxUserInfoClaims`], for clients registered with a
+/// `userinfo_signed_response_alg`.
+///
+/// The claim has to appear in BOTH response variants or a relying party would
+/// see a different identity depending on a registration setting it did not
+/// think was about identity at all. `openidconnect` 4.0.1 makes
+/// `UserInfoJsonWebToken` generic over the additional-claims type (it is a
+/// `JsonWebToken<…, UserInfoClaimsImpl<AC, GC>, …>` internally), so the JWT
+/// variant needs no special handling beyond naming the same `AC` — only the two
+/// JOSE parameters that `CoreUserInfoJsonWebToken` was pinning for us have to be
+/// restated here.
+pub type SiwxUserInfoJsonWebToken = UserInfoJsonWebToken<
+    SiwxAdditionalClaims,
+    CoreGenderClaim,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJwsSigningAlgorithm,
+>;
+
+pub enum UserInfoResponse {
+    Json(SiwxUserInfoClaims),
+    Jwt(SiwxUserInfoJsonWebToken),
+}
+
+/// Build the `io.inblock.mxid` claim from a localpart this request ALREADY has
+/// in hand.
+///
+/// # No Synapse round trip, on purpose
+///
+/// `TokenMetadata.username` is the localpart `localpart::resolve_identity`
+/// resolved at sign-in — the grandfathering decision has already been made and
+/// recorded. Re-deriving it here would risk contradicting it (a grandfathered
+/// legacy account would be handed the modern shape), and probing Synapse would
+/// put a network call on a hot, read-only endpoint to recompute a value the
+/// struct already carries.
+///
+/// # Both `None` cases mean "omit", and both are honest
+///
+/// - `server_name = None` — a standalone deployment. There is no homeserver, so
+///   there is no Matrix ID; a guessed one would name an account on a server that
+///   does not exist.
+/// - `localpart = None` — the legacy `CodeEntry` fallback path, for an entry
+///   written before `CodeEntry.localpart` existed. That field's own doc blesses
+///   `legacy_localpart(did)` as the fallback for PROVISIONING continuity, where
+///   the alternative is severing a user from their account. This is not that:
+///   a userinfo claim is a statement of fact to a relying party, and the honest
+///   answer to "which localpart did we resolve for this session" is "this entry
+///   does not record one". An omitted claim degrades a consumer to the lookup it
+///   would have done anyway (`GET /resolve?did=…`, see [`crate::resolve`]); a
+///   derived one could quietly name the wrong account.
+fn mxid_claim(config: &crate::config::Config, localpart: Option<&str>) -> SiwxAdditionalClaims {
+    let mxid = match (config.matrix_server_name.as_deref(), localpart) {
+        // An empty localpart is treated as absent rather than rendered as
+        // `@:server`. Deviceless/admin-minted tokens are the shape that can
+        // carry one, and `@:server` is not a Matrix ID, it is a parse error
+        // waiting at the consumer.
+        (Some(server_name), Some(localpart)) if !localpart.is_empty() => Some(
+            crate::synapse_client::matrix_user_id(localpart, server_name),
+        ),
+        _ => None,
+    };
+    SiwxAdditionalClaims { mxid }
+}
+
+/// `GET|POST /userinfo`.
+///
+/// # `sub` and `preferred_username` are UNCHANGED
+///
+/// Both still come from [`resolve_claims`] and both are still the DID. The
+/// `io.inblock.mxid` claim is purely ADDITIVE: anything already reading `sub` (the
+/// only authorization-bearing claim here) or `preferred_username` is
+/// byte-for-byte unaffected, and nothing in this function may ever be
+/// "simplified" into replacing one of them with the Matrix ID — the three-tier
+/// identity model (see `CLAUDE.md`) exists precisely because a consumer that
+/// reads a Matrix identifier where it expected a DID, or the reverse, resolves
+/// the wrong account.
 pub async fn userinfo(
     config: &crate::config::Config,
     signing_key: &EcdsaSigningKey,
@@ -2639,16 +2764,17 @@ pub async fn userinfo(
             .get_client(metadata.client_id.clone())
             .await?
             .ok_or_else(|| CustomError::BadRequest("Unknown client.".to_string()))?;
-        let response = CoreUserInfoClaims::new(
-            resolve_claims(config, &metadata.did).await,
-            EmptyAdditionalClaims::default(),
-        )
-        .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
-        .set_audiences(Some(vec![Audience::new(metadata.client_id)]));
+        // `metadata.username` IS the localpart (see `TokenMetadata::username`),
+        // already resolved through the grandfathering rule at sign-in.
+        let additional = mxid_claim(config, Some(metadata.username.as_str()));
+        let response =
+            SiwxUserInfoClaims::new(resolve_claims(config, &metadata.did).await, additional)
+                .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
+                .set_audiences(Some(vec![Audience::new(metadata.client_id)]));
         return match client_entry.metadata.userinfo_signed_response_alg() {
             None => Ok(UserInfoResponse::Json(response)),
             Some(alg) => Ok(UserInfoResponse::Jwt(
-                CoreUserInfoJsonWebToken::new(response, signing_key, alg.clone())
+                SiwxUserInfoJsonWebToken::new(response, signing_key, alg.clone())
                     .map_err(|_| anyhow!("Error signing response."))?,
             )),
         };
@@ -2667,16 +2793,19 @@ pub async fn userinfo(
         return Err(CustomError::BadRequest("Unknown client.".to_string()));
     };
 
-    let response = CoreUserInfoClaims::new(
-        resolve_claims(config, &code_entry.did).await,
-        EmptyAdditionalClaims::default(),
-    )
-    .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
-    .set_audiences(Some(vec![Audience::new(code_entry.client_id)]));
+    // The legacy path's localpart is an `Option`: a `CodeEntry` written before
+    // that field existed carries `None`, and `mxid_claim` then OMITS the claim
+    // rather than deriving one — see its doc for why a derivation would be a
+    // worse answer than silence here.
+    let additional = mxid_claim(config, code_entry.localpart.as_deref());
+    let response =
+        SiwxUserInfoClaims::new(resolve_claims(config, &code_entry.did).await, additional)
+            .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
+            .set_audiences(Some(vec![Audience::new(code_entry.client_id)]));
     match client_entry.metadata.userinfo_signed_response_alg() {
         None => Ok(UserInfoResponse::Json(response)),
         Some(alg) => Ok(UserInfoResponse::Jwt(
-            CoreUserInfoJsonWebToken::new(response, signing_key, alg.clone())
+            SiwxUserInfoJsonWebToken::new(response, signing_key, alg.clone())
                 .map_err(|_| anyhow!("Error signing response."))?,
         )),
     }
@@ -4286,5 +4415,296 @@ mod provision_synapse_device_tests {
         assert!(calls.contains_key("provision_user"));
         assert!(calls.contains_key("upsert_device"));
         handle.abort();
+    }
+}
+
+/// Tests for the `io.inblock.mxid` userinfo claim (`SiwxAdditionalClaims`).
+///
+/// # What these pin, and why each one exists
+///
+/// The claim is a wire contract with three independent ways to regress, so each
+/// gets its own test rather than one happy-path assertion:
+///
+/// 1. **The name.** `#[serde(rename = …)]` takes a literal, so the name lives in
+///    exactly one place in the source — and a literal is exactly the kind of
+///    thing a rename refactor silently changes. The literal is therefore spelled
+///    out again HERE, by hand, rather than referenced from the struct: a test
+///    that read the name out of the code under test would agree with any rename.
+/// 2. **Absence is absence.** `skip_serializing_if` must OMIT the key, not emit
+///    `null` — a consumer branching on key presence takes the wrong turn on a
+///    null. Asserted with `.get(…).is_none()` on the raw JSON map, which is the
+///    only way to tell the two apart.
+/// 3. **Both variants carry it.** A client with a `userinfo_signed_response_alg`
+///    gets a signed JWT instead of JSON; if the claim only made it into one of
+///    them, a relying party would see a different identity depending on a
+///    registration setting that has nothing to do with identity.
+///
+/// And, in every case, that `sub` and `preferred_username` are still the DID:
+/// the claim is additive, and `sub` is the only authorization-bearing value here
+/// (see [`userinfo`]'s doc).
+///
+/// Redis-backed, like the rest of this file's token tests: `userinfo` resolves
+/// its caller through `get_token`/`get_code`, and stubbing that out would test a
+/// different function than the one that ships.
+#[cfg(test)]
+mod userinfo_mxid_claim_tests {
+    use super::*;
+    use crate::config::Config;
+
+    /// A `did:key`, not a `did:pkh`: `resolve_claims` performs an ENS lookup for
+    /// `did:pkh:eip155:` subjects, and a unit test must not depend on the
+    /// network. Mixed case on purpose — `sub` must come back byte-identical.
+    const DID: &str = "did:key:zDnaeUKTWUXc1mxSoRrEfV6wPWmQyHrKuTHLZgAkyUKfSbeMB";
+    const LOCALPART: &str = "k3f9x2q7ab4d8m1p";
+    const SERVER_NAME: &str = "inblock.io";
+    /// Spelled out by hand. See this module's doc, point 1.
+    const CLAIM: &str = "io.inblock.mxid";
+
+    fn nonce() -> u128 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        (base << 20) | u128::from(COUNTER.fetch_add(1, Ordering::Relaxed) & 0xF_FFFF)
+    }
+
+    /// Config with (or without) a Matrix homeserver configured. ENS is disabled
+    /// so nothing here can reach the network.
+    fn config_with_server_name(server_name: Option<&str>) -> Config {
+        Config {
+            ens_api_url: None,
+            eth_provider: None,
+            matrix_server_name: server_name.map(str::to_string),
+            ..Config::default()
+        }
+    }
+
+    /// Register a client, optionally one that wants a SIGNED userinfo response.
+    async fn seed_client(db: &RedisClient, client_id: &str, signed: bool) -> anyhow::Result<()> {
+        let mut metadata = CoreClientMetadata::new(
+            vec![RedirectUrl::new("https://example.com".into()).unwrap()],
+            EmptyAdditionalClientMetadata {},
+        );
+        if signed {
+            metadata = metadata
+                .set_userinfo_signed_response_alg(Some(CoreJwsSigningAlgorithm::EcdsaP256Sha256));
+        }
+        db.set_client(
+            client_id.to_string(),
+            ClientEntry {
+                secret: "secret".into(),
+                metadata,
+                access_token: None,
+            },
+        )
+        .await
+    }
+
+    fn token_meta(client_id: &str, username: &str) -> TokenMetadata {
+        TokenMetadata {
+            username: username.to_string(),
+            device_id: "SIWX_test".to_string(),
+            scope: "openid".to_string(),
+            client_id: client_id.to_string(),
+            iat: 0,
+            exp: i64::MAX,
+            did: DID.to_string(),
+            name: "n".to_string(),
+        }
+    }
+
+    async fn db() -> RedisClient {
+        RedisClient::new(&Config::default().redis_url)
+            .await
+            .expect("these tests need Redis on localhost:6379")
+    }
+
+    /// Drive the real `userinfo` and return the JSON body a client would see.
+    async fn userinfo_json(config: &Config, db: &RedisClient, token: &str) -> serde_json::Value {
+        let key = EcdsaSigningKey::generate();
+        match userinfo(
+            config,
+            &key,
+            None,
+            UserInfoPayload {
+                access_token: Some(token.to_string()),
+            },
+            db,
+        )
+        .await
+        .expect("userinfo must succeed for a live token")
+        {
+            UserInfoResponse::Json(claims) => serde_json::to_value(claims).unwrap(),
+            UserInfoResponse::Jwt(_) => panic!("this client did not request a signed response"),
+        }
+    }
+
+    /// The happy path, and the only place the claim NAME is asserted.
+    #[tokio::test]
+    async fn the_claim_name_on_the_wire_is_io_inblock_mxid() {
+        let db = db().await;
+        let client_id = format!("mxid-claim-{}", nonce());
+        seed_client(&db, &client_id, false).await.unwrap();
+        let token = format!("tok_{}", nonce());
+        db.set_token(&token, &token_meta(&client_id, LOCALPART), 120)
+            .await
+            .unwrap();
+
+        let body = userinfo_json(&config_with_server_name(Some(SERVER_NAME)), &db, &token).await;
+
+        assert_eq!(
+            body.get(CLAIM).and_then(|v| v.as_str()),
+            Some(format!("@{LOCALPART}:{SERVER_NAME}").as_str()),
+            "the Matrix ID must be published under exactly `{CLAIM}`: {body}"
+        );
+        // Additive, not a replacement: both DID-bearing claims are untouched.
+        assert_eq!(
+            body.get("sub").and_then(|v| v.as_str()),
+            Some(DID),
+            "`sub` must still be the exact-case DID"
+        );
+        assert_eq!(
+            body.get("preferred_username").and_then(|v| v.as_str()),
+            Some(DID),
+            "`preferred_username` must still be the DID"
+        );
+    }
+
+    /// A standalone deployment has no homeserver, so there is no Matrix ID —
+    /// and the key must be ABSENT, not `null`. See this module's doc, point 2.
+    #[tokio::test]
+    async fn without_a_matrix_server_name_the_claim_is_omitted_not_null() {
+        let db = db().await;
+        let client_id = format!("mxid-claim-standalone-{}", nonce());
+        seed_client(&db, &client_id, false).await.unwrap();
+        let token = format!("tok_{}", nonce());
+        db.set_token(&token, &token_meta(&client_id, LOCALPART), 120)
+            .await
+            .unwrap();
+
+        let body = userinfo_json(&config_with_server_name(None), &db, &token).await;
+
+        assert!(
+            body.get(CLAIM).is_none(),
+            "with no SIWEOIDC_MATRIX_SERVER_NAME the claim must not appear at all \
+             (a `null` would make a consumer's `if CLAIM in claims` branch take the \
+             wrong turn): {body}"
+        );
+        assert_eq!(
+            body.get("sub").and_then(|v| v.as_str()),
+            Some(DID),
+            "a standalone deployment still gets the full standard claim set"
+        );
+    }
+
+    /// The legacy `CodeEntry` fallback path (`get_code`, pre-refresh-token
+    /// deployments) carries an `Option<String>` localpart. Both spellings are
+    /// pinned here because the `None` arm is the one that must NOT derive a
+    /// localpart from the DID — see `mxid_claim`'s doc.
+    #[tokio::test]
+    async fn legacy_code_entry_path_reports_a_recorded_localpart_and_omits_an_absent_one() {
+        let db = db().await;
+        let client_id = format!("mxid-claim-legacy-{}", nonce());
+        seed_client(&db, &client_id, false).await.unwrap();
+        let config = config_with_server_name(Some(SERVER_NAME));
+
+        let entry = |localpart: Option<&str>| CodeEntry {
+            exchange_count: 0,
+            did: DID.to_string(),
+            nonce: None,
+            client_id: client_id.clone(),
+            auth_time: Utc::now(),
+            code_challenge: None,
+            code_challenge_method: None,
+            device_id: None,
+            localpart: localpart.map(str::to_string),
+        };
+
+        let with_localpart = format!("code_{}", nonce());
+        db.set_code(with_localpart.clone(), entry(Some(LOCALPART)))
+            .await
+            .unwrap();
+        let body = userinfo_json(&config, &db, &with_localpart).await;
+        assert_eq!(
+            body.get(CLAIM).and_then(|v| v.as_str()),
+            Some(format!("@{LOCALPART}:{SERVER_NAME}").as_str()),
+            "a CodeEntry that RECORDS a localpart reports it: {body}"
+        );
+
+        let without_localpart = format!("code_{}", nonce());
+        db.set_code(without_localpart.clone(), entry(None))
+            .await
+            .unwrap();
+        let body = userinfo_json(&config, &db, &without_localpart).await;
+        assert!(
+            body.get(CLAIM).is_none(),
+            "a pre-migration CodeEntry records no localpart, and userinfo must say \
+             nothing rather than DERIVE one — a derived value could name a different \
+             account than the one this session was provisioned under: {body}"
+        );
+    }
+
+    /// The signed-JWT variant must carry the same claim. See this module's doc,
+    /// point 3.
+    #[tokio::test]
+    async fn the_signed_jwt_variant_carries_the_claim_too() {
+        let db = db().await;
+        let client_id = format!("mxid-claim-jwt-{}", nonce());
+        seed_client(&db, &client_id, true).await.unwrap();
+        let token = format!("tok_{}", nonce());
+        db.set_token(&token, &token_meta(&client_id, LOCALPART), 120)
+            .await
+            .unwrap();
+
+        let key = EcdsaSigningKey::generate();
+        let response = userinfo(
+            &config_with_server_name(Some(SERVER_NAME)),
+            &key,
+            None,
+            UserInfoPayload {
+                access_token: Some(token.clone()),
+            },
+            &db,
+        )
+        .await
+        .expect("userinfo must succeed for a live token");
+
+        let jwt = match response {
+            UserInfoResponse::Jwt(jwt) => serde_json::to_value(jwt)
+                .unwrap()
+                .as_str()
+                .expect("a signed userinfo response serializes as the compact JWT string")
+                .to_string(),
+            UserInfoResponse::Json(_) => {
+                panic!("a client with userinfo_signed_response_alg must get the JWT variant")
+            }
+        };
+
+        // Decode the payload of the compact JWS the client actually receives —
+        // not a re-serialization of the claims object, which would prove only
+        // that serde works.
+        let payload = jwt
+            .split('.')
+            .nth(1)
+            .expect("a compact JWS has three parts");
+        let payload: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .expect("the JWS payload is base64url-unpadded"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            payload.get(CLAIM).and_then(|v| v.as_str()),
+            Some(format!("@{LOCALPART}:{SERVER_NAME}").as_str()),
+            "the signed variant must carry the same Matrix ID as the JSON one: {payload}"
+        );
+        assert_eq!(
+            payload.get("sub").and_then(|v| v.as_str()),
+            Some(DID),
+            "`sub` is unchanged in the signed variant too"
+        );
     }
 }

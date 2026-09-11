@@ -1197,6 +1197,142 @@ impl SynapseClient {
             }
         }
     }
+
+    /// Read the DID currently published at [`DID_PROFILE_FIELD`] for one
+    /// account, exact case.
+    ///
+    /// The read twin of [`publish_did_field`](Self::publish_did_field), and the
+    /// only reader inside this crate. It backs [`crate::resolve`]'s `attested`
+    /// verdict.
+    ///
+    /// # Return shape
+    ///
+    /// - `Ok(Some(did))` — the field holds a DID. Returned **verbatim**: a
+    ///   `did:key` multibase payload carries meaning in its case and is not
+    ///   recoverable from the (lowercased) localpart, so normalising here would
+    ///   destroy the one thing this read exists to fetch (MEMORY.md "MXID to DID
+    ///   is not invertible" / siwx-oidc#17).
+    /// - `Ok(None)` — nothing usable is published: the field is unset (404), or
+    ///   it holds JSON with no readable `did` member. Those two collapse on
+    ///   purpose — every caller's next move is identical ("this account has no
+    ///   published DID"), and a caller that could act on the difference would be
+    ///   acting on a value a homeserver operator could have written by hand.
+    /// - `Err` — the state is UNKNOWN. Never conflated with `Ok(None)`: an
+    ///   unreachable or broken homeserver must not be reported as "this user has
+    ///   no DID", which is a claim about the user.
+    ///
+    /// # A 500 is a known upstream condition, and still an error here
+    ///
+    /// element-hq/synapse#19702 (unfixed in 1.159.0) makes an account with a
+    /// `users` row but no `profiles` row answer **500** on this route where a
+    /// healthy account answers 404 — `get_profile_field` subscripts an unguarded
+    /// `txn.fetchone()`. The message says so, so an operator is not left
+    /// guessing, but the outcome stays `Err`: the field's state genuinely is
+    /// unknown, and the reassuring reading ("absent") is the one that would put
+    /// a wrong answer in front of a caller. This is the same discipline
+    /// `publish_did_field` applies from the other side — there, a 500 is only
+    /// *excused* after a confirming probe.
+    ///
+    /// # Parsing mirrors the shipped consumer, and verifies nothing
+    ///
+    /// The object shape (`{did, proof}`) and the pre-object bare-string shape
+    /// are both accepted, exactly as `siwx-oidc-auth`'s `fetch_and_verify_did`
+    /// accepts them. The `proof` is deliberately **not** checked: verification
+    /// lives in `siwx-oidc-auth`, which is a **dev-dependency only** so the
+    /// shipped binary links none of it (see `CLAUDE.md`, "Verifying a published
+    /// DID"). A caller that needs cryptographic assurance runs that verifier;
+    /// what this returns is a discovery hint.
+    pub async fn read_did_field(
+        &self,
+        localpart: &str,
+        server_name: &str,
+    ) -> Result<Option<String>> {
+        let user_id = matrix_user_id(localpart, server_name);
+        // Percent-encoded path segment, for the same reason as the PUT twin:
+        // `@` and `:` are sub-delims a bare interpolation would leave raw.
+        let url = format!(
+            "{}/_matrix/client/v3/profile/{}/{}",
+            self.endpoint,
+            urlencoding::encode(&user_id),
+            DID_PROFILE_FIELD
+        );
+
+        // Unauthenticated unless an admin token happens to be available — the
+        // same best-effort rule as `read_profile`, and for the same reason: the
+        // route authenticates only when `require_auth_for_profile_requests` is
+        // set (Synapse 1.159.0 `config/server.py:561` defaults it to False), so
+        // a mint failure must degrade to the request that works today rather
+        // than fail the read.
+        let mut req = self.http.get(&url);
+        if self.admin.is_some() {
+            match self.admin_bearer().await {
+                Ok(token) => req = req.bearer_auth(token),
+                Err(e) => debug!(
+                    error = %e,
+                    "read_did_field: no admin token available; sending unauthenticated \
+                     (fine unless require_auth_for_profile_requests is set)"
+                ),
+            }
+        }
+        let resp = req.send().await.context("read_did_field: request failed")?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(%status, %body, %user_id, "read_did_field: unexpected response");
+            anyhow::bail!(
+                "read_did_field: HTTP {status}. (A 500 on this route can mean the account has a \
+                 `users` row but no `profiles` row — element-hq/synapse#19702, unfixed in \
+                 1.159.0 — so the field state is UNKNOWN, not absent.)"
+            );
+        }
+
+        // MSC4133 echoes the field name back as the single key of the object.
+        // Built from the shared constant, never a literal, so the read and the
+        // write cannot drift onto different names.
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("read_did_field: response was not JSON")?;
+        Ok(did_from_profile_field(body.get(DID_PROFILE_FIELD)))
+    }
+}
+
+/// Extract the published DID from the value of the [`DID_PROFILE_FIELD`] member
+/// of a profile-field response, if it carries one.
+///
+/// Split out from [`SynapseClient::read_did_field`] so the shape-handling can be
+/// exercised against literal JSON — the interesting cases (a hand-written bare
+/// string, an object with no `did`, an explicit `null`) are all cheap to write
+/// down and expensive to provoke through a mock homeserver.
+///
+/// Accepts exactly what the shipped consumer accepts:
+///
+/// - an **object** with a `did` string member — the shape
+///   [`crate::did_assertion::did_profile_value`] writes;
+/// - a bare **string** — the pre-object legacy shape, which is also what a user
+///   could write by hand on a homeserver where the MSC4133 denylist is not
+///   deployed. It carries no proof by construction, and it is returned here for
+///   the same reason the consumer accepts it: this function reports what is
+///   published, and the caller decides what that is worth.
+///
+/// Everything else — absent, `null`, a number, an object without a readable
+/// `did` — is `None`: nothing usable is published.
+fn did_from_profile_field(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(map) => map
+            .get("did")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+    // Exact case throughout: no `to_lowercase`, deliberately. See
+    // `read_did_field`.
+    .filter(|did| !did.is_empty())
 }
 
 /// What a [`SynapseClient::publish_did_field`] call actually achieved.
@@ -2364,6 +2500,58 @@ mod tests {
             siwx_oidc_auth::did_assertion::DID_PROFILE_FIELD,
             "the provider and the shipped consumer must name the SAME profile field; \
              a divergence here means every consumer reads 'no published DID'"
+        );
+    }
+
+    // -- did_from_profile_field ----------------------------------------------
+    //
+    // The shape-handling half of `read_did_field`, exercised against literal
+    // JSON. Each case here is a shape a real homeserver can serve: the object we
+    // write, the bare string a user could have written by hand where the MSC4133
+    // denylist is not deployed, and the several ways a field can carry nothing
+    // usable. All of the latter collapse to `None` on purpose — see the
+    // function's doc.
+
+    #[test]
+    fn the_object_shape_yields_the_did_in_exact_case() {
+        let did = "did:key:zDnaeUKTWUXc1mxSoRrEfV6wPWmQyHrKuTHLZgAkyUKfSbeMB";
+        let value = serde_json::json!({ "did": did, "proof": "eyJ…" });
+        assert_eq!(
+            did_from_profile_field(Some(&value)).as_deref(),
+            Some(did),
+            "mixed case must survive: a did:key payload's case is key material"
+        );
+    }
+
+    #[test]
+    fn a_bare_string_is_the_legacy_shape_and_is_still_read() {
+        let did = "did:pkh:eip155:1:0x7a760ea15d76f935c8646b449af488c2b0021734";
+        let value = serde_json::Value::String(did.to_string());
+        assert_eq!(did_from_profile_field(Some(&value)).as_deref(), Some(did));
+    }
+
+    #[test]
+    fn nothing_usable_reads_as_absent() {
+        assert_eq!(did_from_profile_field(None), None, "field not present");
+        assert_eq!(
+            did_from_profile_field(Some(&serde_json::Value::Null)),
+            None,
+            "an explicit null publishes nothing"
+        );
+        assert_eq!(
+            did_from_profile_field(Some(&serde_json::json!({ "proof": "eyJ…" }))),
+            None,
+            "an object with no `did` member publishes nothing"
+        );
+        assert_eq!(
+            did_from_profile_field(Some(&serde_json::json!({ "did": "" }))),
+            None,
+            "an empty string is not a DID"
+        );
+        assert_eq!(
+            did_from_profile_field(Some(&serde_json::json!(42))),
+            None,
+            "a field of the wrong JSON type publishes nothing — and must not panic"
         );
     }
 }

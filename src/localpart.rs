@@ -257,8 +257,13 @@ pub(crate) async fn resolve_identity_or_legacy(
 /// that endpoint. It is built entirely from crates already in
 /// `[dependencies]` (axum, tokio) — no new test dependency, and no docker/live
 /// stack required.
+///
+/// `pub(crate)` so `resolve.rs`'s tests can drive the SAME mock rather than
+/// standing up a second one: two hand-written mocks of one homeserver drift,
+/// and the drift surfaces as a test that passes against a server that does not
+/// exist.
 #[cfg(test)]
-mod resolve_identity_tests {
+pub(crate) mod resolve_identity_tests {
     use super::*;
     use crate::synapse_client::SynapseClient;
     use axum::extract::{Query, State};
@@ -269,12 +274,28 @@ mod resolve_identity_tests {
     use std::sync::Arc;
     use tokio::net::TcpListener;
 
+    /// The `io.inblock.did` profile field as this mock serves it: the value
+    /// stored per **fully-qualified mxid**, because that is the key the real
+    /// route is addressed by (`GET /_matrix/client/v3/profile/{mxid}/{field}`)
+    /// and keying the mock by localpart instead would hide a missing or wrong
+    /// server name in the URL the client builds.
+    type DidFields = HashMap<String, serde_json::Value>;
+
+    #[derive(Clone)]
+    struct MockState {
+        /// Localparts that read as "already taken" (existing accounts).
+        existing: Arc<HashSet<String>>,
+        /// Published `io.inblock.did` values, by mxid. An mxid with no entry
+        /// answers 404, exactly as Synapse does for an unset custom field.
+        did_fields: Arc<DidFields>,
+    }
+
     async fn is_localpart_available_handler(
-        State(existing): State<Arc<HashSet<String>>>,
+        State(state): State<MockState>,
         Query(params): Query<HashMap<String, String>>,
     ) -> axum::response::Response {
         let localpart = params.get("localpart").cloned().unwrap_or_default();
-        if existing.contains(&localpart) {
+        if state.existing.contains(&localpart) {
             (
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"errcode": "M_USER_IN_USE", "error": "in use"})),
@@ -289,6 +310,27 @@ mod resolve_identity_tests {
         }
     }
 
+    /// `GET /_matrix/client/v3/profile/{mxid}/{field}` — MSC4133's custom
+    /// profile field read. Answers `{ "<field>": <value> }` on a hit and a 404
+    /// with Synapse's `M_NOT_FOUND` shape on a miss.
+    async fn profile_field_handler(
+        State(state): State<MockState>,
+        axum::extract::Path((mxid, field)): axum::extract::Path<(String, String)>,
+    ) -> axum::response::Response {
+        match state.did_fields.get(&mxid) {
+            Some(value) => (
+                axum::http::StatusCode::OK,
+                Json(serde_json::json!({ field: value })),
+            )
+                .into_response(),
+            None => (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"errcode": "M_NOT_FOUND", "error": "no such field"})),
+            )
+                .into_response(),
+        }
+    }
+
     /// Spin up an in-process mock of `GET /_synapse/mas/is_localpart_available`
     /// on an ephemeral localhost port, pre-seeded with the set of localparts
     /// that should read as "already taken" (existing accounts). Returns a
@@ -297,6 +339,16 @@ mod resolve_identity_tests {
     /// process).
     async fn spawn_mock_synapse(
         existing: HashSet<String>,
+    ) -> (SynapseClient, tokio::task::JoinHandle<()>) {
+        spawn_mock_synapse_with_did_fields(existing, HashMap::new()).await
+    }
+
+    /// [`spawn_mock_synapse`] plus the MSC4133 profile-field read, for the
+    /// `/resolve` tests: the same homeserver, answering the one extra route that
+    /// endpoint touches.
+    pub(crate) async fn spawn_mock_synapse_with_did_fields(
+        existing: HashSet<String>,
+        did_fields: DidFields,
     ) -> (SynapseClient, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -307,7 +359,14 @@ mod resolve_identity_tests {
                 "/_synapse/mas/is_localpart_available",
                 get(is_localpart_available_handler),
             )
-            .with_state(Arc::new(existing));
+            .route(
+                "/_matrix/client/v3/profile/{mxid}/{field}",
+                get(profile_field_handler),
+            )
+            .with_state(MockState {
+                existing: Arc::new(existing),
+                did_fields: Arc::new(did_fields),
+            });
         let handle = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await

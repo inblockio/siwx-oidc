@@ -19,7 +19,6 @@ use figment::{
 use headers::Header;
 use openidconnect::core::{
     CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType, CoreJsonWebKeySet,
-    CoreUserInfoClaims, CoreUserInfoJsonWebToken,
 };
 use std::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
@@ -42,6 +41,7 @@ use super::device_auth;
 use super::did_assertion::DidPublication;
 use super::introspect;
 use super::oidc::{self, CustomError, EcdsaSigningKey};
+use super::resolve;
 use super::synapse_client::SynapseClient;
 use super::webauthn as wa;
 use aqua_auth::{all_cipher_suites, all_did_methods};
@@ -310,7 +310,13 @@ async fn register(
     Ok((StatusCode::CREATED, registration.into()))
 }
 
-struct UserInfoResponseJWT(Json<CoreUserInfoJsonWebToken>);
+/// The signed-JWT userinfo variant.
+///
+/// Carries [`oidc::SiwxUserInfoJsonWebToken`], not `CoreUserInfoJsonWebToken`:
+/// the provider-specific `io.inblock.mxid` claim has to be inside the SIGNED
+/// document too, or a client registered with a `userinfo_signed_response_alg`
+/// would silently see a smaller identity than an unsigned one.
+struct UserInfoResponseJWT(Json<oidc::SiwxUserInfoJsonWebToken>);
 
 impl IntoResponse for UserInfoResponseJWT {
     fn into_response(self) -> Response {
@@ -325,7 +331,7 @@ impl IntoResponse for UserInfoResponseJWT {
 }
 
 enum UserInfoResponse {
-    Json(Json<CoreUserInfoClaims>),
+    Json(Json<oidc::SiwxUserInfoClaims>),
     Jwt(UserInfoResponseJWT),
 }
 
@@ -989,6 +995,20 @@ async fn authed_action_response(
     Ok((headers, Json(response)))
 }
 
+/// `GET /resolve?did=…` | `?mxid=…` — the public DID <-> MXID lookup.
+///
+/// Unauthenticated by design (everything it returns is already publicly
+/// computable or publicly readable — see [`resolve`]'s module doc), and its
+/// errors render themselves rather than going through [`CustomError`], because
+/// none of them may become a 500.
+async fn resolve_handler(
+    State(state): State<AppState>,
+    Query(query): Query<resolve::ResolveQuery>,
+) -> Result<Json<resolve::ResolveResponse>, resolve::ResolveError> {
+    let synapse = state.synapse_client.as_deref();
+    Ok(Json(resolve::resolve(&state.config, synapse, query).await?))
+}
+
 async fn account_page_handler(
     State(state): State<AppState>,
     cookies: Option<TypedHeader<headers::Cookie>>,
@@ -1378,6 +1398,7 @@ pub async fn main() {
             post(device_passkey_finish_handler),
         )
         // MSC4191/MSC4312: account management + cross-signing reset
+        .route("/resolve", get(resolve_handler))
         .route("/account", get(account_page_handler))
         .route("/account/nonce", get(account_nonce_handler))
         .route("/account/wallet", post(account_wallet_handler))
