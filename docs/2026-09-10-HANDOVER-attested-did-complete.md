@@ -220,6 +220,33 @@ harness, or from inside the compose network — never by opening the edge.
 pass.** The first dev run reported 3/3; with `E2E_STRICT_SKIPS=1` the same run is
 2 passed, 1 failed. Always set it for a verification run.
 
+### 2026-09-11, later: the alias tier is decided, and the DID is visible in Element
+
+Tim settled the open product question (§2 item 5) in the opposite direction from the
+interim fix, and added two deliverables:
+
+1. **The alias is a generated pseudonym**, `Firstname Surname`, seeded deterministically
+   from the DID (`src/alias.rs`). It keeps the security property that split the tiers —
+   it carries no DID and no key material, so it cannot be read as an identifier — while
+   being a name a human can say. Written once at first sign-in; never re-asserted.
+   Accounts still carrying a string WE wrote (the raw DID, or the interim bare localpart)
+   are migrated at their next sign-in on a byte-equality test; a user-chosen name, and in
+   particular a deliberately cleared one, is never touched.
+2. **Element Web now shows it.** `patches/element-web/show-attested-did.patch` (registry
+   entry 7) renders the DID under the MXID in the member-info panel with a copy button,
+   and labels an unsigned one as such. Verified by building the image: the patch applies,
+   the app compiles, and the built bundle carries the class, the field name and the
+   strings. It reaches dev on the next element-web image promotion.
+3. **Agent-side identity is filed, not built**:
+   [inblockio/aqua-agents#25](https://github.com/inblockio/aqua-agents/issues/25) — an
+   identity tool call (agent DID, model card, owner DID plus the alias the agent uses for
+   them, trust chain on request) and attribution over Matrix.
+
+Also fixed while verifying: `e2e/up.sh` announced "stack up" on siwx-oidc's health alone,
+so a suite launched in the same command raced the Synapse mock's bind — 5 of 6
+account-management tests failed in 0.03s and all 6 passed on a warm retry. It now gates on
+the mock too.
+
 ### Promotion to prod is a TWO-STEP, and the order is load-bearing
 
 dev got the safe order by accident, not by design: both image refs there float on
