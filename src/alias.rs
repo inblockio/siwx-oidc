@@ -55,26 +55,10 @@
 //! function stops being safe and the alias must be seeded from something other
 //! than the DID.
 //!
-//! # It is a confirmation oracle, and that is deliberate rather than accidental
-//!
-//! The alias is a *deterministic public function of the DID*, so anyone holding
-//! a candidate DID can compute its alias and compare. A match is roughly
-//! 82,926:1 evidence (271 given names x 306 surnames, measured) — strong, not
-//! weak. That is harmless under this system's own threat model, because the
-//! DID↔account binding is something we **publish on purpose**: `io.inblock.did`
-//! states it outright, world-readable and federating, and the whole point of
-//! the DID tier is that a relying party can look it up.
-//!
-//! The case worth naming is the window where the alias is the ONLY public
-//! trace. An account with no published field — a row-less account
-//! (element-hq/synapse#19702), or a provider running an ephemeral signing key,
-//! which publishes no `proof` and may have failed to publish at all — still has
-//! its alias set at provisioning. In that window a DID guess can be confirmed
-//! against an account whose `io.inblock.did` is absent. Still not a leak by our
-//! model (same binding, weaker channel), but do not "fix" it by making the
-//! alias random: a random alias would have to be stored and reconciled, and it
-//! would lose the property that the same person is the same name on any
-//! deployment. Identified in review, 2026-09-11.
+//! Do NOT pre-empt that by making the alias random. A random alias has to be
+//! stored and reconciled (it is no longer a function of anything), and it loses
+//! the property that one person is one name on every deployment — paying a real
+//! cost for a threat this system does not have.
 //!
 //! # Canonicalisation is shared with the MXID, deliberately
 //!
