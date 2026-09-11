@@ -351,10 +351,15 @@ async fn resolve_did(
         // Echoing the caller's spelling instead would mean a `did:pkh` queried
         // in one case comes back in that case, and a byte-for-byte comparison
         // against the published value would then fail for no reason.
-        did: Some(if attested {
-            published.expect("attested implies a published DID")
-        } else {
-            did.to_string()
+        did: Some(match published {
+            // `attested` is derived from `published` three lines up, so the
+            // Some-arm is the only reachable one when it is true. Matched rather
+            // than `expect`-ed anyway: this is an unauthenticated endpoint, and
+            // a panic here would be a 500 on a route whose whole contract is
+            // that it never emits one. A later edit that breaks the local
+            // invariant should degrade, not crash.
+            Some(published) if attested => published,
+            _ => did.to_string(),
         }),
         mxid: Some(mxid),
         exists: true,

@@ -1397,8 +1397,9 @@ pub async fn main() {
             "/device/passkey/finish",
             post(device_passkey_finish_handler),
         )
-        // MSC4191/MSC4312: account management + cross-signing reset
+        // Public DID <-> MXID lookup (see the `resolve` module doc).
         .route("/resolve", get(resolve_handler))
+        // MSC4191/MSC4312: account management + cross-signing reset
         .route("/account", get(account_page_handler))
         .route("/account/nonce", get(account_nonce_handler))
         .route("/account/wallet", post(account_wallet_handler))
