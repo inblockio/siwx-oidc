@@ -16,18 +16,49 @@ credential, so there are two auth surfaces and this mock models both:
     POST   /_synapse/mas/delete_user      (deactivate; `erase` is the GDPR flag)
     POST   /_synapse/mas/reactivate_user
 
-  `Bearer msa_...` -- a minted, admin-scoped access token (src/admin_token.rs):
+  `Bearer msa_...` -- a minted, admin-scoped access token (src/admin_token.rs),
+  validated by INTROSPECTING it back against siwx-oidc:
     GET    /_synapse/admin/v2/users/{user_id}/devices
     GET    /_synapse/admin/v2/users/{user_id}/devices/{device_id}
     POST   /_matrix/client/v3/keys/query
 
-Presenting the shared secret on the admin surface answers 401 M_UNKNOWN_TOKEN,
-exactly as 1.159 does -- there it is a shared secret, not a token. The two
-credentials fail INDEPENDENTLY, so there are two levers: __set_secret breaks the
-MAS surface, __set_admin_token_valid breaks the admin surface. A test that wants
-"Synapse rejected the admin token" must use the latter; breaking the secret
-instead fails earlier, on the MAS deactivation probe, and never reaches an admin
-call at all.
+Admin-surface auth is NOT a prefix check. The mock POSTs the presented bearer to
+`${SIWEOIDC_BASE_URL}/oauth2/introspect` (RFC 7662; form body `token=...`,
+authenticated with the MAS shared secret) and requires all four of the conditions
+`src/admin_token.rs` documents, which were read off Synapse 1.159's
+`MasDelegatedAuth.get_user_by_access_token` (synapse/api/auth/mas.py):
+
+  1. `active: true`, and `exp`/`expires_in` not elapsed.
+  2. `scope` carries BOTH the Matrix C-S API scope `urn:matrix:client:api:*` (or
+     its MSC2967 unstable twin) AND `urn:synapse:admin:*`. Synapse checks the
+     C-S scope FIRST, so an admin-only scope string is rejected outright.
+  3. `username` is present and resolves to an existing user (EXISTING_USERS
+     here, `store.get_user_by_id` there).
+  4. `device_id` is absent/null, or names a device that exists. An empty string
+     is NOT "absent": Synapse reads it as a zero-length device id and raises
+     AuthError(500, "Invalid device ID in introspection result"). This mock
+     answers that same HTTP 500 -- deliberately NOT a 401 -- because that branch
+     is the regression guard for `render_device_id` in src/introspect.rs, which
+     renders a deviceless token's `device_id` as JSON `null`.
+
+Introspection FAILS CLOSED: a timeout (INTROSPECT_TIMEOUT_SECS), a connection
+error, a non-2xx, or an undecodable body all reject. Results are never cached --
+Synapse's own 2-minute introspection cache is a Synapse behaviour, and caching
+it here would hide the revocation timing this mock exists to expose. Only the
+Python stdlib is used; the mock has no third-party dependencies and must keep
+none.
+
+The introspection credential is the mock's CURRENT STATE["secret"], because in
+production Synapse and MAS share ONE secret -- so __set_secret now breaks BOTH
+surfaces, which is faithful. Presenting that shared secret as a bearer on the
+admin surface still answers 401 M_UNKNOWN_TOKEN, exactly as 1.159 does: it is a
+secret, not a token, so it introspects to `{"active": false}`.
+__set_admin_token_valid remains the independent lever, a short-circuit checked
+BEFORE introspection, and is still the only way to express "Synapse rejected the
+admin token while /_synapse/mas/* keeps working". A test that wants that must
+use it; breaking the secret instead fails earlier, on the MAS deactivation probe
+the login path runs before any admin call, and never reaches an admin call at
+all.
 
 The legacy admin routes (POST /_synapse/admin/v1/deactivate/{user_id},
 DELETE /_synapse/admin/v2/users/{user_id}/devices/{device_id},
@@ -50,16 +81,30 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlparse, parse_qs
+from urllib.parse import unquote, urlencode, urlparse, parse_qs
+from urllib.request import Request, urlopen
 
 SECRET = os.environ.get("SYNAPSE_MOCK_SECRET", "testsecret")
 PORT = int(os.environ.get("SYNAPSE_MOCK_PORT", "8090"))
 SERVER_NAME = os.environ.get("SYNAPSE_MOCK_SERVER_NAME", "matrix.test")
-# Prefix of a minted admin token (`ADMIN_TOKEN_PREFIX` in src/admin_token.rs).
-# Real Synapse validates such a token by introspecting it against siwx-oidc and
-# checking the returned scope; the mock cannot introspect, so it accepts any
-# token carrying the prefix and uses __set_admin_token_valid as the reject lever.
-ADMIN_TOKEN_PREFIX = "msa_"
+# Where the mock introspects admin-surface bearers: siwx-oidc itself. Both CI
+# jobs and e2e/up.sh export SIWEOIDC_BASE_URL; the default matches e2e/env.sh.
+# There is deliberately NO admin-token prefix constant any more: real Synapse
+# does not look at the prefix, it introspects, and so does this mock.
+SIWEOIDC_BASE_URL = os.environ.get("SIWEOIDC_BASE_URL", "http://localhost:18080")
+# Timeout for the introspection round trip. Short on purpose: the mock sits in
+# the request path of every admin call, so a hang here would be indistinguishable
+# from a siwx-oidc hang. Every failure mode rejects (fail closed), so a short
+# timeout can only ever produce a 401 -- never a false accept.
+INTROSPECT_TIMEOUT_SECS = 2.0
+# The scope `MasDelegatedAuth.is_server_admin` tests for (1.159).
+SYNAPSE_ADMIN_SCOPE = "urn:synapse:admin:*"
+# The Matrix C-S API scope, stable spelling first, MSC2967 unstable twin second.
+# Synapse accepts either, and checks this BEFORE it looks at the admin scope.
+MATRIX_API_SCOPES = (
+    "urn:matrix:client:api:*",
+    "urn:matrix:org.matrix.msc2967.client:api:*",
+)
 
 LOCK = threading.Lock()
 # user_id ("@lp:server") -> list[device dict]
@@ -160,20 +205,134 @@ class Handler(BaseHTTPRequestHandler):
         """/_synapse/mas/*: exact string equality against the MAS shared secret."""
         return self._bearer() == STATE["secret"]
 
-    def _admin_authed(self):
-        """/_synapse/admin/* and the authenticated C-S API: a minted access token.
+    def _introspect(self, token):
+        """POST `token` to siwx-oidc's RFC 7662 endpoint, as Synapse 1.159 does.
+
+        Returns the decoded introspection response, or None on ANY failure --
+        timeout, connection refused, non-2xx, undecodable body. The caller FAILS
+        CLOSED on None. Never cached.
+
+        The credential is the mock's CURRENT shared secret, not the boot-time
+        one: production Synapse and MAS share a single secret, so breaking it
+        must break admin auth too. The lock is released before the request --
+        never hold it across network I/O.
+        """
+        with LOCK:
+            secret = STATE["secret"]
+        req = Request(
+            SIWEOIDC_BASE_URL.rstrip("/") + "/oauth2/introspect",
+            data=urlencode({"token": token}).encode(),
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Authorization": "Bearer " + secret,
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=INTROSPECT_TIMEOUT_SECS) as resp:
+                if not 200 <= resp.status < 300:
+                    return None
+                return json.loads(resp.read() or b"{}")
+        except Exception as e:
+            sys.stderr.write(f"[synapse-mock] introspection failed: {e!r}\n")
+            return None
+
+    def _admin_auth_error(self):
+        """Validate an admin-surface bearer the way Synapse 1.159 does.
+
+        Returns None when the token authorizes the call, else the
+        `(http_status, body)` this surface must answer with. See the module
+        docstring for the four conditions and where each comes from.
 
         The shared secret is NOT accepted here -- that is the whole point of the
-        1.157 change. Real Synapse validates the token by introspecting it against
-        siwx-oidc and requiring both `urn:matrix:client:api:*` and
-        `urn:synapse:admin:*` in the returned scope; the mock cannot introspect, so
-        it accepts the token prefix and offers __set_admin_token_valid as the
-        reject lever.
+        1.157 change -- but nothing special-cases it: it simply introspects to
+        `{"active": false}`.
         """
         tok = self._bearer()
-        if tok is None or not tok.startswith(ADMIN_TOKEN_PREFIX):
-            return False
-        return bool(STATE["admin_token_valid"])
+        if tok is None:
+            return (401, {"errcode": "M_MISSING_TOKEN", "error": "no access token"})
+
+        # Short-circuit test lever, checked BEFORE introspection so a test can
+        # force "Synapse rejected the admin token" without forging a token.
+        with LOCK:
+            if not STATE["admin_token_valid"]:
+                return (401, {"errcode": "M_UNKNOWN_TOKEN", "error": "bad admin token"})
+
+        data = self._introspect(tok)
+        if data is None:
+            # Fail closed: introspection unreachable, slow or broken.
+            return (401, {"errcode": "M_UNKNOWN_TOKEN",
+                          "error": "introspection failed"})
+
+        # (1) active, and not expired.
+        if not data.get("active"):
+            return (401, {"errcode": "M_UNKNOWN_TOKEN", "error": "token is not active"})
+        exp = data.get("exp")
+        if isinstance(exp, (int, float)) and exp <= time.time():
+            return (401, {"errcode": "M_UNKNOWN_TOKEN", "error": "token has expired"})
+        expires_in = data.get("expires_in")
+        if isinstance(expires_in, (int, float)) and expires_in <= 0:
+            return (401, {"errcode": "M_UNKNOWN_TOKEN", "error": "token has expired"})
+
+        # (2) scope. The C-S API scope is checked FIRST, exactly as 1.159 does:
+        # an admin-only scope string is rejected here, before is_server_admin is
+        # ever consulted.
+        scopes = set((data.get("scope") or "").split())
+        if not scopes.intersection(MATRIX_API_SCOPES):
+            return (401, {"errcode": "M_UNKNOWN_TOKEN",
+                          "error": "Token doesn't grant access to the Matrix C-S API"})
+        if SYNAPSE_ADMIN_SCOPE not in scopes:
+            return (403, {"errcode": "M_FORBIDDEN", "error": "You are not a server admin"})
+
+        # (3) username present, and resolving to a user that exists here.
+        username = data.get("username")
+        if not isinstance(username, str) or not username:
+            return (500, {"errcode": "M_UNKNOWN",
+                          "error": "No username in introspection result"})
+        localpart = _localpart_of(username)
+        with LOCK:
+            known = localpart in EXISTING_USERS
+        if not known:
+            # DEVIATION, deliberate: real Synapse raises AuthError(500, "User not
+            # found") here. This mock answers 401 because /__reset wipes
+            # EXISTING_USERS out from under a still-cached admin token, and
+            # `SynapseClient::admin_request` re-mints (which re-provisions the
+            # service user) only on 401/403 -- a 500 would make every first admin
+            # call after a reset fail, testing the harness rather than siwx-oidc.
+            # The check still bites: the call is refused, and the error names it.
+            return (401, {"errcode": "M_UNKNOWN_TOKEN",
+                          "error": f"introspected username {username!r} resolves to no "
+                                   f"user (real Synapse: AuthError(500, 'User not found'))"})
+
+        # (4) device_id absent/null, or naming a device that exists. An empty
+        # string is NOT absent -- Synapse reads it as a zero-length device id --
+        # and this 500 is the regression guard for `render_device_id` in
+        # src/introspect.rs. It must NOT be softened into a 401.
+        device_id = data.get("device_id")
+        if device_id is not None:
+            if not isinstance(device_id, str) or device_id == "":
+                return (500, {"errcode": "M_UNKNOWN",
+                              "error": "Invalid device ID in introspection result"})
+            with LOCK:
+                devs = DEVICES.get(_user_id(localpart), [])
+                exists = any(d["device_id"] == device_id for d in devs)
+            if not exists:
+                return (401, {"errcode": "M_UNKNOWN_TOKEN",
+                              "error": f"Unknown device {device_id} in introspection result"})
+
+        return None
+
+    def _require_admin(self):
+        """Gate an admin-surface request. On refusal it SENDS the response
+        itself (401, 403 or 500 -- the status is part of the contract) and
+        returns False, so callers read `if not self._require_admin(): return`.
+        """
+        err = self._admin_auth_error()
+        if err is None:
+            return True
+        code, body = err
+        self._send(code, body)
+        return False
 
     def _deny(self):
         return self._send(401, {"errcode": "M_UNKNOWN_TOKEN", "error": "bad admin token"})
@@ -259,8 +418,8 @@ class Handler(BaseHTTPRequestHandler):
                     })
             return self._send(404, {"errcode": "M_NOT_FOUND", "error": path})
         # --- admin surface: a minted admin token, never the shared secret ---
-        if not self._admin_authed():
-            return self._deny()
+        if not self._require_admin():
+            return
         self._log("GET", path)
         # GET /_synapse/admin/v2/users/{user_id}/devices  (list_devices)
         m = re.match(r"^/_synapse/admin/v2/users/([^/]+)/devices$", path)
@@ -407,8 +566,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {})
             return self._send(404, {"errcode": "M_NOT_FOUND", "error": path})
         # --- admin surface: a minted admin token, never the shared secret ---
-        if not self._admin_authed():
-            return self._deny()
+        if not self._require_admin():
+            return
         self._log("POST", path)
         if path == "/_matrix/client/v3/keys/query":
             # report no master cross-signing key (keeps pre-flight warnings off)
@@ -432,8 +591,8 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(p.path)
         # Legacy admin surface: siwx-oidc now deletes devices via
         # POST /_synapse/mas/delete_device. Kept so a live-suite probe still works.
-        if not self._admin_authed():
-            return self._deny()
+        if not self._require_admin():
+            return
         self._log("DELETE", path)
         # DELETE /_synapse/admin/v2/users/{user_id}/devices/{device_id}
         m = re.match(r"^/_synapse/admin/v2/users/(.+)/devices/(.+)$", path)
@@ -459,8 +618,8 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body()
         # Legacy admin surface: reactivation now goes through
         # POST /_synapse/mas/reactivate_user.
-        if not self._admin_authed():
-            return self._deny()
+        if not self._require_admin():
+            return
         self._log("PUT", path)
         # PUT /_synapse/admin/v2/users/{user_id}
         m = re.match(r"^/_synapse/admin/v2/users/(.+)$", path)

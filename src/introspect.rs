@@ -135,19 +135,7 @@ fn render_introspection(
 
     match metadata {
         Some(m) if m.exp > now => {
-            // An EMPTY device_id must be rendered as JSON `null`, not `""`.
-            // Synapse 1.159 (`synapse/api/auth/mas.py`) treats a present-but-empty
-            // `device_id` as a zero-length device id and raises
-            // `AuthError(500, "Invalid device ID in introspection result")`; only
-            // `null`/absent means "this token has no device". Deviceless tokens
-            // are the admin tokens minted by `crate::admin_token` and the
-            // standalone-mode tokens (which no Synapse introspects, but which
-            // would otherwise be a latent 500 the day one does).
-            let device_id = if m.device_id.is_empty() {
-                serde_json::Value::Null
-            } else {
-                serde_json::Value::String(m.device_id.clone())
-            };
+            let device_id = render_device_id(&m.device_id);
             Ok(Json(serde_json::json!({
             "active": true,
             "username": m.username,
@@ -165,6 +153,27 @@ fn render_introspection(
         // A genuinely absent or expired token IS inactive. This is the only path
         // allowed to produce `active:false`.
         _ => Ok(Json(serde_json::json!({"active": false}))),
+    }
+}
+
+/// Render a token's `device_id` for the introspection response.
+///
+/// An EMPTY device id must go on the wire as JSON `null`, **never** as `""`.
+/// Synapse 1.159 (`synapse/api/auth/mas.py`) treats a present-but-empty
+/// `device_id` as a zero-length device id and raises
+/// `AuthError(500, "Invalid device ID in introspection result")`; only
+/// `null`/absent means "this token has no device". Deviceless tokens are the
+/// admin tokens minted by [`crate::admin_token`] (see requirement 4 of that
+/// module's docs) and the standalone-mode tokens — which no Synapse introspects
+/// today, but which would otherwise be a latent 500 the day one does.
+///
+/// Factored out of the handler purely so this mapping can be unit-tested; the
+/// handler calls it, so the tested seam is the real code path.
+fn render_device_id(device_id: &str) -> serde_json::Value {
+    if device_id.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(device_id.to_string())
     }
 }
 
@@ -250,5 +259,61 @@ mod tests {
         let out = render_introspection(Ok(Some(meta(2_000))), 1_000).expect("live token is a 200");
         assert_eq!(out.0["active"], serde_json::json!(true));
         assert_eq!(out.0["expires_in"], serde_json::json!(1_000));
+    }
+
+    // -- Guard: an empty device_id goes on the wire as `null`, never `""` ------
+    // Synapse 1.159 (`synapse/api/auth/mas.py`) sanity-checks the introspected
+    // device_id before use: `null`/absent means "this token carries no device",
+    // but a present, zero-length string is an INVALID device id and raises
+    // `AuthError(500, "Invalid device ID in introspection result")`. The admin
+    // tokens minted by `crate::admin_token` deliberately carry no device, so
+    // rendering their empty `device_id` as `""` would make every
+    // `/_synapse/admin/*` call 500 — not 401, so it would not even trip
+    // `SynapseClient::admin_request`'s re-mint-and-retry self-heal. `null` is
+    // correct; do NOT "simplify" these two tests, or the function, back to `""`.
+
+    #[test]
+    fn empty_device_id_renders_as_json_null() {
+        let rendered = render_device_id("");
+        assert!(
+            rendered.is_null(),
+            "an empty device_id must render as JSON null, got {rendered:?}"
+        );
+        assert_ne!(
+            rendered,
+            serde_json::Value::String(String::new()),
+            "an empty device_id must NOT render as the empty string — Synapse \
+             1.159 answers AuthError(500, \"Invalid device ID in introspection \
+             result\") to that"
+        );
+    }
+
+    #[test]
+    fn non_empty_device_id_renders_as_that_exact_string() {
+        let rendered = render_device_id("SIWX_abc123");
+        assert_eq!(rendered, serde_json::json!("SIWX_abc123"));
+        assert_eq!(rendered.as_str(), Some("SIWX_abc123"));
+    }
+
+    /// The whole point of factoring `render_device_id` out is that the handler
+    /// uses it, so pin the rendered BODY too — a future edit that inlines a
+    /// different mapping back into `render_introspection` fails here.
+    #[test]
+    fn deviceless_token_body_carries_device_id_null() {
+        let mut m = meta(2_000);
+        m.device_id = String::new();
+        let out = render_introspection(Ok(Some(m)), 1_000).expect("live token is a 200");
+        assert!(
+            out.0["device_id"].is_null(),
+            "introspection body must carry device_id: null for a deviceless token, \
+             got {:?}",
+            out.0["device_id"]
+        );
+    }
+
+    #[test]
+    fn device_bound_token_body_carries_the_device_id() {
+        let out = render_introspection(Ok(Some(meta(2_000))), 1_000).expect("live token is a 200");
+        assert_eq!(out.0["device_id"], serde_json::json!("SIWX_test"));
     }
 }
