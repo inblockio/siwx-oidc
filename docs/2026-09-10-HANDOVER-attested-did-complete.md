@@ -120,3 +120,69 @@ that turned out to be wrong*, not merely missing code:
    dev → repeat the A/V agent test → only then prod. This work rides that gate; it does
    not jump it.
 4. **Before any Synapse bump**, run the patch dry-run procedure.
+
+---
+
+## 2026-09-11 follow-up — merged to `dev`, and what the merge cost
+
+**Both repos are pushed.** `siwx-oidc-matrix-server` main (`9105a33` `a351300`
+`9736d59`) is on origin and its CI published the patched Synapse image, which is the
+proof the vendored patch still applies. `siwx-oidc`'s branch is pushed and
+fast-forwarded onto `origin/dev` at `375e8a9`, so the dev-aquafire converge now carries
+both halves — the publisher and the homeserver-side denylist. `aqua-auth` needed no
+action: `dev` had already pinned it to tag `v0.7.0`, and the merge brought that along.
+
+### The merge conflicted in three files, all of it duplicate work
+
+`dev` and this branch independently modernised the e2e Synapse mock for the Synapse
+1.157+ two-surface auth split. Every conflict resolved onto this branch's version,
+which is a superset (it also serves the profile routes the DID work needs); the one
+thing `dev` had that this branch did not was a differently-spelled admin-rejection
+lever (`__set_admin_token_valid` vs `__reject_admin_token`), and one spelling is kept.
+No coverage was dropped: `dev` retargeted the admin-rejection test onto the admin
+lever, and this branch had already done that AND kept the MAS-secret half alive as its
+own test.
+
+### Two failures the merge exposed, both fixed here
+
+- **The mock could not introspect on CI.** `SYNAPSE_MOCK_OIDC_BASE` has no default on
+  purpose, and only `e2e/up.sh` exports it; the CI jobs export `SIWEOIDC_BASE_URL`. So
+  on CI the mock authorised no admin call at all and
+  `wallet_single_reauth_covers_list_delete_profile` failed with a 400 on `devices_list`
+  that reads exactly like a product bug. `SIWEOIDC_BASE_URL` is now a fallback (the
+  stack's own spelling of the same value, not a guessed port); unset-both still fails
+  closed.
+- **The browser suite was still deriving the LEGACY localpart.** Six call sites across
+  four specs; since `c2cab99` a new identity gets `mxid::localpart_for`, so every
+  seeded device and every `detected_mxid` assertion named an account that does not
+  exist — eight specs failed while provisioning worked correctly.
+  `e2e/browser/mxid-helper.mjs` is now the suite's single derivation, mirroring
+  `src/mxid.rs` (method-aware canonicalisation included) and pinned to the same four
+  vectors. The Playwright container pin was also bumped to match the npm pin the
+  1.62.1 bump moved alone, which killed all 27 specs locally at launch while CI, which
+  installs its own browsers, stayed green.
+
+### Verified
+
+| Check | Result |
+|---|---|
+| `cargo test --workspace` (Redis up) | 283 passed, 0 failed |
+| `clippy --workspace --all-targets -D warnings`, `fmt --check` | clean |
+| `e2e_account_management -- --ignored --test-threads=1` | 6/6 |
+| `e2e_race_teardown -- --ignored --test-threads=1` | 14/14, incl. `did_field_is_published_at_signin_…` |
+| `e2e/browser/run.sh` | 27/27 |
+| GitHub CI on the branch tip | build + rust-e2e-mock + browser-e2e all green |
+
+### Still open
+
+- **The real-stack harness run did not happen.** `e2e-harness/run.sh full` needs host
+  ports 18080+18081 for its Caddy edge, and another session on this machine is holding
+  18081 with its own `target/debug/siwx-oidc`. The three `siwx-oidc.did_field.*` checks
+  are therefore still unrun since the merge — they DID pass before it, and the
+  mock-stack twin of the publication path (`did_field_is_published_at_signin_…`) is
+  green, but the live legs (public read, user write forbidden, clobber self-heal) want
+  the real Synapse.
+- Everything under §4 above that was not touched today still stands: the `run.sh full`
+  connector guard, the `MATRIX_HOST` port mismatch in `e2e_account_lifecycle_live`, the
+  missing per-login deadline, and the un-filed upstream comment.
+- **Prod is still gated** by memory `prod-promotion-gate`. Nothing here jumps it.
