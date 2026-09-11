@@ -1816,7 +1816,7 @@ pub fn verify_siwx_cookie(
         .map_err(|e| CustomError::BadRequest(format!("Bad signature: {}", e)))?;
 
     let did_method = find_did_method(&siwx_cookie.did)
-        .ok_or_else(|| CustomError::BadRequest(format!("Unsupported DID: {}", &siwx_cookie.did)))?;
+        .ok_or_else(|| CustomError::BadRequest(format!("Unsupported DID: {}", siwx_cookie.did)))?;
 
     if !allowed_did_methods
         .iter()
@@ -2293,7 +2293,7 @@ pub async fn sign_in(
             .map_err(|e| CustomError::BadRequest(format!("Bad signature: {}", e)))?;
 
         let did_method = find_did_method(&siwx_cookie.did).ok_or_else(|| {
-            CustomError::BadRequest(format!("Unsupported DID: {}", &siwx_cookie.did))
+            CustomError::BadRequest(format!("Unsupported DID: {}", siwx_cookie.did))
         })?;
 
         if !allowed_did_methods
