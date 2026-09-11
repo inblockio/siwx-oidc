@@ -1,20 +1,40 @@
 #!/usr/bin/env python3
 """Faithful in-memory mock of the Synapse endpoints siwx-oidc calls.
 
-Mirrors the exact contract in src/synapse_client.rs:
-  POST   /_synapse/mas/provision_user
-  POST   /_synapse/mas/upsert_device
-  POST   /_synapse/mas/allow_cross_signing_reset
-  GET    /_synapse/mas/is_localpart_available
-  POST   /_matrix/client/v3/keys/query
-  GET    /_synapse/admin/v2/users/{user_id}/devices
-  DELETE /_synapse/admin/v2/users/{user_id}/devices/{device_id}
-  POST   /_synapse/admin/v1/deactivate/{user_id}
-  PUT    /_synapse/admin/v2/users/{user_id}
+Mirrors the exact contract in src/synapse_client.rs. Synapse 1.157 DELETED the
+`admin_token` shim that let the MAS shared secret stand in for a server-admin
+credential, so there are two auth surfaces and this mock models both:
 
-All require `Authorization: Bearer <SECRET>` (set via SYNAPSE_MOCK_SECRET, default
-"testsecret"); a wrong/missing token yields 401 so the admin-auth-failure path can be
-exercised. State is in-memory; test-only helpers live under /__.
+  `Bearer <SECRET>` -- the MAS shared secret (SYNAPSE_MOCK_SECRET, default
+  "testsecret"), honoured ONLY on /_synapse/mas/*:
+    GET    /_synapse/mas/is_localpart_available
+    GET    /_synapse/mas/query_user
+    POST   /_synapse/mas/provision_user
+    POST   /_synapse/mas/upsert_device
+    POST   /_synapse/mas/allow_cross_signing_reset
+    POST   /_synapse/mas/delete_device
+    POST   /_synapse/mas/delete_user      (deactivate; `erase` is the GDPR flag)
+    POST   /_synapse/mas/reactivate_user
+
+  `Bearer msa_...` -- a minted, admin-scoped access token (src/admin_token.rs):
+    GET    /_synapse/admin/v2/users/{user_id}/devices
+    GET    /_synapse/admin/v2/users/{user_id}/devices/{device_id}
+    POST   /_matrix/client/v3/keys/query
+
+Presenting the shared secret on the admin surface answers 401 M_UNKNOWN_TOKEN,
+exactly as 1.159 does -- there it is a shared secret, not a token. The two
+credentials fail INDEPENDENTLY, so there are two levers: __set_secret breaks the
+MAS surface, __set_admin_token_valid breaks the admin surface. A test that wants
+"Synapse rejected the admin token" must use the latter; breaking the secret
+instead fails earlier, on the MAS deactivation probe, and never reaches an admin
+call at all.
+
+The legacy admin routes (POST /_synapse/admin/v1/deactivate/{user_id},
+DELETE /_synapse/admin/v2/users/{user_id}/devices/{device_id},
+PUT /_synapse/admin/v2/users/{user_id}) are kept on the admin surface but are no
+longer called by siwx-oidc; they were ported to /_synapse/mas/* in b9c1af6.
+
+State is in-memory; test-only helpers live under /__.
 
 `is_localpart_available` models EXISTING vs NEW accounts: a localpart that has been
 provisioned (provision_user / upsert_device), has a seeded device (__seed_device), or
@@ -34,6 +54,12 @@ from urllib.parse import unquote, urlparse, parse_qs
 
 SECRET = os.environ.get("SYNAPSE_MOCK_SECRET", "testsecret")
 PORT = int(os.environ.get("SYNAPSE_MOCK_PORT", "8090"))
+SERVER_NAME = os.environ.get("SYNAPSE_MOCK_SERVER_NAME", "matrix.test")
+# Prefix of a minted admin token (`ADMIN_TOKEN_PREFIX` in src/admin_token.rs).
+# Real Synapse validates such a token by introspecting it against siwx-oidc and
+# checking the returned scope; the mock cannot introspect, so it accepts any
+# token carrying the prefix and uses __set_admin_token_valid as the reject lever.
+ADMIN_TOKEN_PREFIX = "msa_"
 
 LOCK = threading.Lock()
 # user_id ("@lp:server") -> list[device dict]
@@ -54,7 +80,7 @@ EXISTING_USERS = set()
 LIFECYCLE = {}
 CALL_LOG = []  # list of "METHOD path"
 # Mutable expected secret (so a test can flip it to force 401s).
-STATE = {"secret": SECRET}
+STATE = {"secret": SECRET, "admin_token_valid": True}
 # Per-logical-endpoint fault injection (H14). Maps a logical endpoint name to a
 # mode string: "500" returns HTTP 500, "timeout" sleeps long enough that the
 # siwx-oidc reqwest client times out. Cleared by /__reset.
@@ -78,6 +104,18 @@ def _localpart_of(user_id):
         return user_id
     s = user_id[1:] if user_id.startswith("@") else user_id
     return s.split(":", 1)[0]
+
+
+def _user_id(localpart):
+    """Render a localpart as an mxid on this mock's server.
+
+    The /_synapse/mas/* wire format is localpart-scoped (no server in the body),
+    but DEVICES/LIFECYCLE are keyed by mxid because the admin API and the test
+    helpers both speak mxids. This is the one conversion point.
+    """
+    if not localpart:
+        return localpart
+    return localpart if localpart.startswith("@") else f"@{localpart}:{SERVER_NAME}"
 
 
 def _device(device_id, display_name=None, last_seen_ip=None, last_seen_ts=None):
@@ -114,8 +152,31 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _authed(self):
-        return self.headers.get("Authorization", "") == f"Bearer {STATE['secret']}"
+    def _bearer(self):
+        v = self.headers.get("Authorization", "")
+        return v[len("Bearer "):] if v.startswith("Bearer ") else None
+
+    def _mas_authed(self):
+        """/_synapse/mas/*: exact string equality against the MAS shared secret."""
+        return self._bearer() == STATE["secret"]
+
+    def _admin_authed(self):
+        """/_synapse/admin/* and the authenticated C-S API: a minted access token.
+
+        The shared secret is NOT accepted here -- that is the whole point of the
+        1.157 change. Real Synapse validates the token by introspecting it against
+        siwx-oidc and requiring both `urn:matrix:client:api:*` and
+        `urn:synapse:admin:*` in the returned scope; the mock cannot introspect, so
+        it accepts the token prefix and offers __set_admin_token_valid as the
+        reject lever.
+        """
+        tok = self._bearer()
+        if tok is None or not tok.startswith(ADMIN_TOKEN_PREFIX):
+            return False
+        return bool(STATE["admin_token_valid"])
+
+    def _deny(self):
+        return self._send(401, {"errcode": "M_UNKNOWN_TOKEN", "error": "bad admin token"})
 
     def _log(self, method, path):
         with LOCK:
@@ -161,20 +222,46 @@ class Handler(BaseHTTPRequestHandler):
                 })
         if path == "/health":
             return self._send(200, {"ok": True})
-        if not self._authed():
-            return self._send(401, {"errcode": "M_UNKNOWN_TOKEN", "error": "bad admin token"})
+        # --- MAS surface: the shared secret ---
+        if p.path.startswith("/_synapse/mas/"):
+            if not self._mas_authed():
+                return self._deny()
+            self._log("GET", path)
+            # GET /_synapse/mas/is_localpart_available
+            if p.path.startswith("/_synapse/mas/is_localpart_available"):
+                qs = parse_qs(p.query)
+                localpart = (qs.get("localpart") or [""])[0]
+                with LOCK:
+                    exists = localpart in EXISTING_USERS
+                if exists:
+                    # Taken: the siwx-oidc client treats any 4xx as "not available"
+                    # (an EXISTING account), so the new-identity gate does NOT reject.
+                    return self._send(400, {"errcode": "M_USER_IN_USE", "error": "in use"})
+                return self._send(200, {"available": True})
+            # GET /_synapse/mas/query_user -- the deactivation probe the login
+            # path runs before admitting a session. 404 means "no such user",
+            # which siwx-oidc reads as None (a brand-new identity), so an
+            # unknown localpart must NOT be an error here.
+            if p.path.startswith("/_synapse/mas/query_user"):
+                qs = parse_qs(p.query)
+                localpart = (qs.get("localpart") or [""])[0]
+                uid = _user_id(localpart)
+                with LOCK:
+                    if localpart not in EXISTING_USERS:
+                        return self._send(404, {"errcode": "M_NOT_FOUND", "error": "user"})
+                    life = LIFECYCLE.get(uid, {"deactivated": False, "erased": False})
+                    return self._send(200, {
+                        "user_id": uid,
+                        "display_name": None,
+                        "avatar_url": None,
+                        "is_suspended": False,
+                        "is_deactivated": bool(life.get("deactivated", False)),
+                    })
+            return self._send(404, {"errcode": "M_NOT_FOUND", "error": path})
+        # --- admin surface: a minted admin token, never the shared secret ---
+        if not self._admin_authed():
+            return self._deny()
         self._log("GET", path)
-        # GET /_synapse/mas/is_localpart_available
-        if p.path.startswith("/_synapse/mas/is_localpart_available"):
-            qs = parse_qs(p.query)
-            localpart = (qs.get("localpart") or [""])[0]
-            with LOCK:
-                exists = localpart in EXISTING_USERS
-            if exists:
-                # Taken: the siwx-oidc client treats any 4xx as "not available"
-                # (an EXISTING account), so the new-identity gate does NOT reject.
-                return self._send(400, {"errcode": "M_USER_IN_USE", "error": "in use"})
-            return self._send(200, {"available": True})
         # GET /_synapse/admin/v2/users/{user_id}/devices  (list_devices)
         m = re.match(r"^/_synapse/admin/v2/users/([^/]+)/devices$", path)
         if m:
@@ -228,11 +315,23 @@ class Handler(BaseHTTPRequestHandler):
                 FAIL.clear(); EFFECTIVE_DELETES.clear()
                 EXISTING_USERS.clear()
                 STATE["secret"] = SECRET
+                STATE["admin_token_valid"] = True
             return self._send(200, {"ok": True})
         if path == "/__set_secret":
             with LOCK:
                 STATE["secret"] = body.get("secret", SECRET)
             return self._send(200, {"ok": True})
+        # Accept or reject the MINTED ADMIN TOKEN, independently of the shared
+        # secret. Models Synapse refusing the token (introspection failed, the
+        # scope lacked urn:synapse:admin:*, or `username` resolved to no user)
+        # while /_synapse/mas/* keeps working -- the only way to exercise the
+        # admin-auth failure path on 1.157+, where the two credentials are
+        # separate. Cleared by /__reset.
+        #   POST /__set_admin_token_valid {"valid": false}
+        if path == "/__set_admin_token_valid":
+            with LOCK:
+                STATE["admin_token_valid"] = bool(body.get("valid", True))
+            return self._send(200, {"ok": True, "admin_token_valid": STATE["admin_token_valid"]})
         # Arm/disarm a fault on a logical endpoint (H14). mode "off"/absent clears.
         if path == "/__fail":
             endpoint = body.get("endpoint", "")
@@ -243,31 +342,78 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     FAIL[endpoint] = mode
             return self._send(200, {"ok": True, "fail": dict(FAIL)})
-        # authed synapse endpoints ----------------------------------------
-        if not self._authed():
-            return self._send(401, {"errcode": "M_UNKNOWN_TOKEN", "error": "bad admin token"})
-        self._log("POST", path)
-        if path == "/_synapse/mas/provision_user":
-            lp = body.get("localpart")
-            if lp:
+        # --- MAS surface: the shared secret -------------------------------
+        if path.startswith("/_synapse/mas/"):
+            if not self._mas_authed():
+                return self._deny()
+            self._log("POST", path)
+            if path == "/_synapse/mas/provision_user":
+                lp = body.get("localpart")
+                if lp:
+                    with LOCK:
+                        EXISTING_USERS.add(lp)
+                return self._send(200, {})
+            if path == "/_synapse/mas/upsert_device":
+                uid = _user_id(body["localpart"])
                 with LOCK:
-                    EXISTING_USERS.add(lp)
-            return self._send(200, {})
-        if path == "/_synapse/mas/upsert_device":
-            uid = f"@{body['localpart']}:matrix.test"
-            with LOCK:
-                # Provisioning a device for a user implies the user EXISTS.
-                EXISTING_USERS.add(body["localpart"])
-                devs = DEVICES.setdefault(uid, [])
-                if not any(d["device_id"] == body["device_id"] for d in devs):
-                    devs.append(_device(body["device_id"], body.get("display_name")))
-            return self._send(200, {})
-        if path == "/_synapse/mas/allow_cross_signing_reset":
-            return self._send(200, {})
+                    # Provisioning a device for a user implies the user EXISTS.
+                    EXISTING_USERS.add(body["localpart"])
+                    devs = DEVICES.setdefault(uid, [])
+                    if not any(d["device_id"] == body["device_id"] for d in devs):
+                        devs.append(_device(body["device_id"], body.get("display_name")))
+                return self._send(200, {})
+            if path == "/_synapse/mas/allow_cross_signing_reset":
+                return self._send(200, {})
+            # POST /_synapse/mas/delete_device {localpart, device_id}
+            # Ported from DELETE /_synapse/admin/v2/users/{mxid}/devices/{id}.
+            # Keeps that route's fault injection and EFFECTIVE_DELETES counting:
+            # the race suite asserts at most one STATE-MUTATING delete per
+            # (mxid, device_id), so the counter must live wherever the real
+            # deletion happens.
+            if path == "/_synapse/mas/delete_device":
+                if self._maybe_fail("delete_device"):
+                    return
+                uid = _user_id(body.get("localpart", ""))
+                device_id = body.get("device_id", "")
+                with LOCK:
+                    devs = DEVICES.get(uid, [])
+                    existed = any(d["device_id"] == device_id for d in devs)
+                    DEVICES[uid] = [d for d in devs if d["device_id"] != device_id]
+                    if existed:
+                        key = f"{uid}/{device_id}"
+                        EFFECTIVE_DELETES[key] = EFFECTIVE_DELETES.get(key, 0) + 1
+                return self._send(200, {})
+            # POST /_synapse/mas/delete_user {localpart, erase}
+            # Despite the name this is DEACTIVATION, not deletion: Synapse routes
+            # it to the same deactivate_account(user_id, erase_data=erase) handler
+            # the old admin route used. `erase` is the GDPR selector.
+            if path == "/_synapse/mas/delete_user":
+                if self._maybe_fail("deactivate"):
+                    return
+                uid = _user_id(body.get("localpart", ""))
+                erase = bool(body.get("erase", False))
+                with LOCK:
+                    LIFECYCLE[uid] = {"deactivated": True, "erased": erase}
+                    # deactivation drops the account's devices
+                    DEVICES[uid] = []
+                return self._send(200, {})
+            # POST /_synapse/mas/reactivate_user {localpart}
+            if path == "/_synapse/mas/reactivate_user":
+                uid = _user_id(body.get("localpart", ""))
+                with LOCK:
+                    cur = LIFECYCLE.get(uid, {"deactivated": False, "erased": False})
+                    cur["deactivated"] = False
+                    LIFECYCLE[uid] = cur
+                return self._send(200, {})
+            return self._send(404, {"errcode": "M_NOT_FOUND", "error": path})
+        # --- admin surface: a minted admin token, never the shared secret ---
+        if not self._admin_authed():
+            return self._deny()
+        self._log("POST", path)
         if path == "/_matrix/client/v3/keys/query":
             # report no master cross-signing key (keeps pre-flight warnings off)
             return self._send(200, {"master_keys": {}})
-        # POST /_synapse/admin/v1/deactivate/{user_id}
+        # POST /_synapse/admin/v1/deactivate/{user_id}  (legacy, no longer called)
         m = re.match(r"^/_synapse/admin/v1/deactivate/(.+)$", path)
         if m:
             if self._maybe_fail("deactivate"):
@@ -284,8 +430,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         p = urlparse(self.path)
         path = unquote(p.path)
-        if not self._authed():
-            return self._send(401, {"errcode": "M_UNKNOWN_TOKEN", "error": "bad admin token"})
+        # Legacy admin surface: siwx-oidc now deletes devices via
+        # POST /_synapse/mas/delete_device. Kept so a live-suite probe still works.
+        if not self._admin_authed():
+            return self._deny()
         self._log("DELETE", path)
         # DELETE /_synapse/admin/v2/users/{user_id}/devices/{device_id}
         m = re.match(r"^/_synapse/admin/v2/users/(.+)/devices/(.+)$", path)
@@ -309,8 +457,10 @@ class Handler(BaseHTTPRequestHandler):
         p = urlparse(self.path)
         path = unquote(p.path)
         body = self._body()
-        if not self._authed():
-            return self._send(401, {"errcode": "M_UNKNOWN_TOKEN", "error": "bad admin token"})
+        # Legacy admin surface: reactivation now goes through
+        # POST /_synapse/mas/reactivate_user.
+        if not self._admin_authed():
+            return self._deny()
         self._log("PUT", path)
         # PUT /_synapse/admin/v2/users/{user_id}
         m = re.match(r"^/_synapse/admin/v2/users/(.+)$", path)

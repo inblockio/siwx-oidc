@@ -605,6 +605,19 @@ fn count_calls(state: &Value, needle: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Count the device-deletion calls the mock saw, by OPERATION not HTTP method.
+///
+/// siwx-oidc deletes a device with `POST /_synapse/mas/delete_device`; before the
+/// Synapse 1.157+ port (b9c1af6) it used
+/// `DELETE /_synapse/admin/v2/users/{mxid}/devices/{id}`, which answers 401 now.
+/// The H1 guard below counts these to prove revoke does NOT delete a device, so
+/// matching on the literal method `"DELETE "` made it pass VACUOUSLY after the
+/// port -- nothing issues a DELETE any more, and a revoke that wrongly deleted
+/// the device would have gone unnoticed. Match the operation instead.
+fn device_delete_calls(state: &Value) -> usize {
+    count_calls(state, "/_synapse/mas/delete_device")
+}
+
 /// How many *effective* (state-mutating) DELETEs the mock recorded for a device.
 fn effective_deletes(state: &Value, mxid: &str, device_id: &str) -> i64 {
     let key = format!("{mxid}/{device_id}");
@@ -712,9 +725,9 @@ async fn h1_revoke_does_not_delete_device_but_logout_does() {
 
     let state = mock_state(&c).await;
     assert_eq!(
-        count_calls(&state, "DELETE "),
+        device_delete_calls(&state),
         0,
-        "REVOKE MUST NOT issue any Synapse DELETE /devices (H1 incident guard)"
+        "REVOKE MUST NOT issue any Synapse device deletion (H1 incident guard)"
     );
     assert!(
         device_ids(&state, &w.mxid).contains(&login.device_id),
@@ -743,8 +756,8 @@ async fn h1_revoke_does_not_delete_device_but_logout_does() {
 
     let state = mock_state(&c).await;
     assert!(
-        count_calls(&state, "DELETE ") >= 1,
-        "logout (explicit sign-out) MUST issue a Synapse DELETE /devices"
+        device_delete_calls(&state) >= 1,
+        "logout (explicit sign-out) MUST issue a Synapse device deletion"
     );
     assert!(
         !device_ids(&state, &w2.mxid).contains(&login2.device_id),

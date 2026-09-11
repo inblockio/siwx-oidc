@@ -157,9 +157,29 @@ async fn mock_state(c: &Client) -> Value {
         .await
         .unwrap()
 }
+/// Break (or restore) the MAS shared secret, which authenticates `/_synapse/mas/*`.
+///
+/// Currently unexercised: since the 1.157+ port every login runs a MAS
+/// deactivation probe first, so a wrong secret fails there and never reaches an
+/// admin call. Kept because it is the only lever for the MAS surface, and the
+/// misconfiguration it models is real.
+#[allow(dead_code)]
 async fn mock_set_secret(c: &Client, secret: &str) {
     c.post(format!("{}/__set_secret", mock()))
         .json(&json!({ "secret": secret }))
+        .send()
+        .await
+        .unwrap();
+}
+/// Make the mock accept or reject siwx-oidc's MINTED ADMIN TOKEN, which
+/// authenticates `/_synapse/admin/*` and the C-S API.
+///
+/// Distinct from [`mock_set_secret`] on purpose: Synapse 1.157 deleted the shim
+/// that let the shared secret serve as an admin credential, so the two are now
+/// separate credentials with separate failure modes.
+async fn mock_set_admin_token_valid(c: &Client, valid: bool) {
+    c.post(format!("{}/__set_admin_token_valid", mock()))
+        .json(&json!({ "valid": valid }))
         .send()
         .await
         .unwrap();
@@ -371,9 +391,18 @@ async fn admin_token_rejection_is_legible_not_a_500_or_notfound() {
     let c = Client::builder().build().unwrap();
     let base = oidc();
     mock_reset(&c).await;
-    mock_set_secret(&c, "WRONG-SECRET").await; // siwx's admin calls now 401
+    // Reject the minted admin token, NOT the shared secret. Breaking the secret
+    // instead fails earlier -- on the MAS deactivation probe the login path runs
+    // before any admin call -- so it never exercises admin-auth rejection at all.
+    mock_set_admin_token_valid(&c, false).await;
 
     let w = new_wallet();
+    // The wallet must be a RETURNING identity, or `reject_if_new_identity` 400s
+    // first and the admin call is never attempted. Previously this fell out of
+    // the broken secret: `is_localpart_available` answered 401, which the client
+    // reads as "taken". With only the admin token broken it answers 200
+    // ("available" = brand new), so the identity has to be seeded explicitly.
+    mock_seed_device(&c, &w.mxid, "SIWX_dev_admintok").await;
     let (message, signature) = sign_account_message(&c, &w, &base, "org.matrix.devices_list").await;
     let resp = c
         .post(format!("{base}/account/wallet"))
@@ -386,8 +415,8 @@ async fn admin_token_rejection_is_legible_not_a_500_or_notfound() {
         .unwrap();
     let status = resp.status();
     let text = resp.text().await.unwrap();
-    // Restore the secret for any later tests regardless of assertions.
-    mock_set_secret(&c, "testsecret").await;
+    // Restore the admin surface for any later tests regardless of assertions.
+    mock_set_admin_token_valid(&c, true).await;
 
     assert_eq!(
         status, 400,
