@@ -614,7 +614,15 @@ async fn did_field_is_published_verifiable_and_public_live() {
         !displayname.to_ascii_lowercase().contains("did:"),
         "no DID in any spelling may sit in the user-writable alias tier: {profile}"
     );
-    eprintln!("[e2e:did-field] displayname={displayname:?} (must not be the DID)");
+    // And it is the generated pseudonym, not the raw localpart: this is the
+    // live counterpart of `alias::tests::vectors_are_pinned`, proving the seed
+    // that reached a REAL Synapse is the one this build derives.
+    assert_eq!(
+        displayname,
+        siwx_oidc::alias::alias_for(&did),
+        "a brand-new account must be seeded with the generated alias: {profile}"
+    );
+    eprintln!("[e2e:did-field] displayname={displayname:?} (the generated alias)");
 }
 
 // ---------------------------------------------------------------------------

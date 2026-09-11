@@ -36,6 +36,21 @@ use tracing::{debug, info, warn};
 
 use siwx_oidc::db::{DBClient, RedisClient};
 
+/// What a profile read found.
+///
+/// `row_present` is the self-heal discriminator (see [`SynapseClient::read_profile`]);
+/// `displayname` is the tier-1 alias as it stands right now, `None` when the
+/// row has none, when the user cleared it, or when the read could not see one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileState {
+    /// Whether Synapse has a `profiles` row for this user. Fail-safe: any
+    /// ambiguous answer reads as `true`, because healing is the destructive
+    /// direction.
+    pub row_present: bool,
+    /// The current displayname, if the read actually returned a non-empty one.
+    pub displayname: Option<String>,
+}
+
 use crate::admin_token::{admin_token_metadata, ADMIN_DISPLAY_NAME, ADMIN_TOKEN_PREFIX};
 use crate::did_assertion::DID_PROFILE_FIELD;
 use crate::introspect::generate_opaque_token;
@@ -636,6 +651,24 @@ impl SynapseClient {
     /// only for a discriminator-confirmed absent row, `Err` for any non-404 error
     /// response or transport failure.
     pub async fn has_profile_row(&self, localpart: &str, server_name: &str) -> Result<bool> {
+        Ok(self.read_profile(localpart, server_name).await?.row_present)
+    }
+
+    /// The same read as [`Self::has_profile_row`], returning the displayname it
+    /// already fetched alongside the presence verdict.
+    ///
+    /// Split out for the alias-tier migration (`oidc::provision_synapse_device`):
+    /// deciding whether a displayname was written by US or chosen by the USER
+    /// requires seeing its value, and doing that with a second GET would double
+    /// the login-path probe count for a value this request already has in hand.
+    ///
+    /// `displayname` is `Some` only when Synapse returned a 200 carrying a
+    /// non-null `displayname`. A present-but-empty profile, a 404 of either
+    /// shape, and a row whose displayname the user deliberately CLEARED all
+    /// yield `None` — and `None` must never be treated as "safe to overwrite",
+    /// because clearing is exactly what the 2026-08-02 live falsification was
+    /// about.
+    pub async fn read_profile(&self, localpart: &str, server_name: &str) -> Result<ProfileState> {
         let user_id = matrix_user_id(localpart, server_name);
         let url = format!(
             "{}/_matrix/client/v3/profile/{}",
@@ -672,7 +705,19 @@ impl SynapseClient {
             .context("has_profile_row: request failed")?;
 
         if resp.status().is_success() {
-            return Ok(true);
+            // A malformed or unreadable 200 body still proves the row exists —
+            // degrade to "present, displayname unknown" rather than turning a
+            // successful probe into an error that would skip the heal.
+            let displayname = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("displayname")?.as_str().map(str::to_string))
+                .filter(|d| !d.is_empty());
+            return Ok(ProfileState {
+                row_present: true,
+                displayname,
+            });
         }
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             let body = resp.text().await.unwrap_or_default();
@@ -680,16 +725,19 @@ impl SynapseClient {
             if !row_absent {
                 debug!(
                     %body,
-                    "has_profile_row: 404 read as a present-but-empty (or unrecognized) profile shape — treating as present, skipping heal"
+                    "read_profile: 404 read as a present-but-empty (or unrecognized) profile shape — treating as present, skipping heal"
                 );
             }
-            return Ok(!row_absent);
+            return Ok(ProfileState {
+                row_present: !row_absent,
+                displayname: None,
+            });
         }
 
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        warn!(%status, %body, "has_profile_row: unexpected response");
-        anyhow::bail!("has_profile_row: HTTP {status}");
+        warn!(%status, %body, "read_profile: unexpected response");
+        anyhow::bail!("read_profile: HTTP {status}");
     }
 
     /// List a user's devices via the Synapse admin API

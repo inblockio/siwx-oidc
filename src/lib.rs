@@ -8,6 +8,12 @@ pub mod db;
 /// binary's `src/localpart.rs`.
 pub mod mxid;
 
+/// Tier 1 of the identity model: the human-readable alias a new account is
+/// seeded with, derived deterministically from the DID. Pure (`sha2` only),
+/// and in the library crate for the same reason as `mxid` — `tests/*.rs` link
+/// this crate, and a hand-copied derivation is a derivation that drifts.
+pub mod alias;
+
 /// The link-aware rule for which identity a stored passkey authenticates. Shared
 /// by the login path and the credential-store backfill.
 pub mod credential_identity;

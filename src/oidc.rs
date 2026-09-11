@@ -1898,6 +1898,21 @@ fn resolve_device_id(proposed_device_id: Option<&str>) -> String {
     }
 }
 
+/// Was this displayname written by US, or chosen by the USER?
+///
+/// `true` only for the two strings provisioning has ever seeded: the raw DID
+/// (until 2026-09-10) and the bare localpart (2026-09-10 to 2026-09-11).
+/// Byte-equality, deliberately — see the call site for why a fuzzier match is
+/// the wrong direction, and `alias_migration_*` for the cases this pins.
+///
+/// A cleared or absent displayname is NOT this function's business: the caller
+/// only reaches it with a value Synapse actually returned, because "the user
+/// deliberately emptied their name" is precisely the state the 2026-08-02
+/// live falsification caught this code clobbering.
+fn provider_written_displayname(current: &str, did: &str, localpart: &str) -> bool {
+    current == did || current == localpart
+}
+
 /// Provision a Synapse user+device for a DID. Best-effort: failures are logged
 /// but never fail the auth flow. Idempotent: re-provisioning the same device_id
 /// is a plain upsert that preserves the device's E2EE keys. Never deletes an
@@ -1992,24 +2007,31 @@ pub async fn provision_synapse_device(
     let synapse = synapse_client?;
     let localpart = identity.localpart.as_str();
     let dev_id = resolve_device_id(proposed_device_id);
+    // Tier 1. Derived here once and used by all three write paths below (first
+    // sign-in, row-absent self-heal, provider-written migration) so they cannot
+    // seed three different names for one account.
+    let alias = siwx_oidc::alias::alias_for(did);
     debug!("provisioning device_id={} for did={}", dev_id, did);
 
     match synapse.is_localpart_available(localpart).await {
         Ok(true) => {
-            // ALIAS TIER SEED — deliberately the localpart, NEVER the DID.
+            // ALIAS TIER SEED — a generated pseudonym, NEVER the DID.
             //
             // `provision_user`'s second argument is the user's *displayname*, a
             // user-writable field. Seeding it with the DID published a
             // provider-looking assertion into a surface any user can rewrite
-            // (see the three-tier table above). The localpart is the honest
-            // replacement: it is a valid non-empty string, so Synapse still
-            // creates the `profiles` row (which is what keeps #19702 at bay for
-            // new accounts), and it is exactly what Element renders for a user
-            // whose displayname is unset anyway — so nothing regresses
-            // visually. A friendlier generated name is an explicit non-goal
-            // (plan exclusions): it is a product decision, and this change is a
-            // security one.
-            if let Err(e) = synapse.provision_user(localpart, localpart).await {
+            // (see the three-tier table above), so a consumer reading
+            // displayname-as-identity could be handed someone else's DID. The
+            // interim fix seeded the localpart, which was honest but
+            // unreadable; `alias::alias_for` keeps the security property (the
+            // string carries no DID and no key material, so it cannot be
+            // mistaken for an identifier) and restores a name a human can say
+            // out loud. It is deterministic in the DID, so the same person gets
+            // the same name on any deployment, and non-empty, so Synapse still
+            // creates the `profiles` row that keeps #19702 away from new
+            // accounts. The user owns it from this moment on: it is written
+            // ONCE, here, and never re-asserted.
+            if let Err(e) = synapse.provision_user(localpart, &alias).await {
                 error!(
                     did = %did,
                     error = %e,
@@ -2052,16 +2074,53 @@ pub async fn provision_synapse_device(
             // — accepted, since that reveals nothing beyond the mxid the caller
             // already presented to authenticate.
             if let Some(server_name) = server_name {
-                match synapse.has_profile_row(localpart, server_name).await {
-                    Ok(true) => {}
-                    Ok(false) => {
+                match synapse.read_profile(localpart, server_name).await {
+                    Ok(profile) if profile.row_present => {
+                        // ALIAS-TIER MIGRATION. Rewrite the displayname only
+                        // when it is byte-equal to a string WE wrote — the raw
+                        // DID (pre-2026-09-10) or the bare localpart
+                        // (2026-09-10..2026-09-11). Anything else, including an
+                        // absent or cleared one, is the user's and is left
+                        // alone.
+                        //
+                        // Byte-equal, never prefix or case-folded: the point of
+                        // the test is "nothing but our own provisioning could
+                        // have produced this exact string". A fuzzier match
+                        // would eventually overwrite something a user chose,
+                        // which is the failure the 2026-08-02 discriminator fix
+                        // exists to prevent, and a missed migration costs only
+                        // a stale name until the user edits it themselves.
+                        //
+                        // Migrating the DID case is the point: leaving it there
+                        // does not create a new forgery path (a user could
+                        // always set any displayname to any string) but it
+                        // perpetuates the convention that displayname carries
+                        // the DID, and that convention is what makes a naive
+                        // consumer read it as an identity source at all.
+                        if let Some(current) = profile.displayname.as_deref() {
+                            if provider_written_displayname(current, did, localpart) {
+                                info!(
+                                    did = %did,
+                                    "migrating a provider-written displayname to the generated alias"
+                                );
+                                if let Err(e) = synapse.provision_user(localpart, &alias).await {
+                                    warn!(
+                                        did = %did,
+                                        error = %e,
+                                        "alias migration failed — the old displayname stands; will retry at next login"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {
                         warn!(
                             did = %did,
                             "existing account has no profile row — re-running provisioning (self-heal)"
                         );
                         // Same alias-tier seed as the first-sign-in branch
-                        // above: the localpart, never the DID.
-                        if let Err(e) = synapse.provision_user(localpart, localpart).await {
+                        // above: the generated pseudonym, never the DID.
+                        if let Err(e) = synapse.provision_user(localpart, &alias).await {
                             error!(
                                 did = %did,
                                 error = %e,
@@ -2073,7 +2132,7 @@ pub async fn provision_synapse_device(
                         warn!(
                             did = %did,
                             error = %e,
-                            "has_profile_row check failed — skipping self-heal this login"
+                            "profile read failed — skipping self-heal and alias migration this login"
                         );
                     }
                 }
@@ -3748,7 +3807,7 @@ mod provision_synapse_device_tests {
     }
 
     /// Assert a recorded `provision_user` body seeds the displayname with the
-    /// localpart and NOT with the DID, in any spelling.
+    /// generated alias and NOT with the DID, in any spelling.
     fn assert_alias_is_not_the_did(body: &serde_json::Value) {
         let display = body["set_displayname"]
             .as_str()
@@ -3759,11 +3818,17 @@ mod provision_synapse_device_tests {
             "the localpart must be the one the caller resolved, not one re-derived here"
         );
         assert_eq!(
-            display, LOCALPART,
-            "the displayname seed must be the localpart (ACL probe leg 5: displayname is \
-             USER-WRITABLE, so a DID published there is not provider-owned)"
+            display,
+            siwx_oidc::alias::alias_for(DID),
+            "the displayname seed must be the generated alias (ACL probe leg 5: displayname \
+             is USER-WRITABLE, so a DID published there is not provider-owned — and the \
+             localpart, the interim seed, is unreadable)"
         );
         assert_ne!(display, DID, "the DID must never be the displayname");
+        assert_ne!(
+            display, LOCALPART,
+            "the interim localpart seed is superseded by the alias"
+        );
         // Case-insensitively too: `legacy_localpart` lowercases, so a
         // regression that passed a lowercased DID would still be a DID in a
         // user-writable field.
@@ -3774,9 +3839,9 @@ mod provision_synapse_device_tests {
     }
 
     /// H11, first sign-in: a brand-new account is provisioned with the
-    /// localpart as its displayname.
+    /// generated alias as its displayname.
     #[tokio::test]
-    async fn h11_first_signin_seeds_displayname_with_the_localpart_never_the_did() {
+    async fn h11_first_signin_seeds_displayname_with_the_alias_never_the_did() {
         let (synapse, calls, handle) = spawn(
             /* localpart_free */ true,
             (axum::http::StatusCode::OK, serde_json::json!({})),
@@ -3811,7 +3876,7 @@ mod provision_synapse_device_tests {
     /// applied to just the first one would leave the DID leaking into
     /// displayname for exactly the accounts that are already damaged.
     #[tokio::test]
-    async fn h11_self_heal_seeds_displayname_with_the_localpart_never_the_did() {
+    async fn h11_self_heal_seeds_displayname_with_the_alias_never_the_did() {
         let (synapse, calls, handle) = spawn(
             /* localpart_free */ false,
             // The one 404 shape `has_profile_row` reads as truly absent.
@@ -3840,6 +3905,151 @@ mod provision_synapse_device_tests {
             "the self-heal must re-run provisioning exactly once: {bodies:?}"
         );
         assert_alias_is_not_the_did(&bodies[0]);
+        handle.abort();
+    }
+
+    /// Pure discriminator: only the two strings provisioning ever seeded are
+    /// "ours". Unit-tested separately from the async path because it is the
+    /// whole safety argument for rewriting someone's profile.
+    #[test]
+    fn provider_written_displayname_matches_only_our_own_seeds() {
+        assert!(
+            provider_written_displayname(DID, DID, LOCALPART),
+            "the raw DID was our seed until 2026-09-10"
+        );
+        assert!(
+            provider_written_displayname(LOCALPART, DID, LOCALPART),
+            "the bare localpart was our seed until 2026-09-11"
+        );
+        assert!(
+            !provider_written_displayname("Ayla Tikhonov", DID, LOCALPART),
+            "a generated alias is the user's the moment it is written"
+        );
+        assert!(!provider_written_displayname(
+            "A Name The User Chose",
+            DID,
+            LOCALPART
+        ));
+        assert!(
+            !provider_written_displayname("", DID, LOCALPART),
+            "an empty name is not a seed we wrote"
+        );
+        // Byte-equality, not prefix and not case-folded: all three of these are
+        // strings a USER could plausibly set, and rewriting them would be the
+        // clobber this discriminator exists to prevent.
+        assert!(!provider_written_displayname(
+            &DID.to_uppercase(),
+            DID,
+            LOCALPART
+        ));
+        assert!(!provider_written_displayname(
+            &format!("{DID} (me)"),
+            DID,
+            LOCALPART
+        ));
+        assert!(!provider_written_displayname(
+            &LOCALPART[..8],
+            DID,
+            LOCALPART
+        ));
+    }
+
+    /// MIGRATION, the case that motivated it: an account still carrying the raw
+    /// DID as its displayname — every account provisioned before 2026-09-10 —
+    /// is rewritten to the alias at its next sign-in.
+    ///
+    /// Leaving it does not open a forgery path (anyone can set any
+    /// displayname), but it perpetuates the convention that displayname carries
+    /// the DID, which is what makes a consumer read it as identity at all.
+    #[tokio::test]
+    async fn alias_migration_rewrites_a_displayname_that_is_the_raw_did() {
+        let (synapse, calls, handle) = spawn(
+            /* localpart_free */ false,
+            (
+                axum::http::StatusCode::OK,
+                serde_json::json!({ "displayname": DID }),
+            ),
+        )
+        .await;
+
+        provision_synapse_device(
+            DID,
+            &resolved_identity(),
+            Some(&synapse),
+            "Element Web",
+            Some("SIWX_test"),
+            Some(SERVER_NAME),
+            None,
+        )
+        .await;
+
+        let bodies = provision_bodies(&calls);
+        assert_eq!(bodies.len(), 1, "exactly one rewrite: {bodies:?}");
+        assert_alias_is_not_the_did(&bodies[0]);
+        handle.abort();
+    }
+
+    /// MIGRATION: the interim seed (the bare opaque localpart) is also ours to
+    /// replace. It is honest but unreadable, and it was only ever a stopgap.
+    #[tokio::test]
+    async fn alias_migration_rewrites_a_displayname_that_is_the_bare_localpart() {
+        let (synapse, calls, handle) = spawn(
+            /* localpart_free */ false,
+            (
+                axum::http::StatusCode::OK,
+                serde_json::json!({ "displayname": LOCALPART }),
+            ),
+        )
+        .await;
+
+        provision_synapse_device(
+            DID,
+            &resolved_identity(),
+            Some(&synapse),
+            "Element Web",
+            Some("SIWX_test"),
+            Some(SERVER_NAME),
+            None,
+        )
+        .await;
+
+        let bodies = provision_bodies(&calls);
+        assert_eq!(bodies.len(), 1, "exactly one rewrite: {bodies:?}");
+        assert_alias_is_not_the_did(&bodies[0]);
+        handle.abort();
+    }
+
+    /// MIGRATION, the case that must NOT fire: a displayname the user
+    /// deliberately CLEARED.
+    ///
+    /// Synapse answers 200 with no `displayname` key for that state, and an
+    /// empty name is not a string we ever wrote. Re-seeding it would be the
+    /// exact regression the 2026-08-02 discriminator fix was written for, in a
+    /// new place — a user who wants no name would have it restored at every
+    /// single login.
+    #[tokio::test]
+    async fn alias_migration_leaves_a_cleared_displayname_alone() {
+        let (synapse, calls, handle) = spawn(
+            /* localpart_free */ false,
+            (axum::http::StatusCode::OK, serde_json::json!({})),
+        )
+        .await;
+
+        provision_synapse_device(
+            DID,
+            &resolved_identity(),
+            Some(&synapse),
+            "Element Web",
+            Some("SIWX_test"),
+            Some(SERVER_NAME),
+            None,
+        )
+        .await;
+
+        assert!(
+            provision_bodies(&calls).is_empty(),
+            "a cleared displayname is the user's choice and must survive every login"
+        );
         handle.abort();
     }
 

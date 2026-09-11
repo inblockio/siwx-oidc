@@ -35,6 +35,8 @@ src/                                ← Axum OIDC server (binary)
                                      publish_did_field -> PUT …/profile/{mxid}/io.inblock.did).
   did_assertion.rs                   DID tier: DID_PROFILE_FIELD, mint_did_assertion (compact ES256 JWS),
                                      did_profile_value ({did, proof}), DidPublication. See "Identity model".
+  alias.rs (lib)                     Tier 1: alias_for(did) -> "Firstname Surname", the pseudonym a new
+                                     account is seeded with. Pure sha2; shares mxid::canonicalize
   localpart.rs                       Grandfathering POLICY (binary crate, needs SynapseClient):
                                      resolve_identity / resolve_identity_or_legacy. Fail-safe direction
                                      on error is LEGACY, never modern.
@@ -117,7 +119,7 @@ Conflating any two of them is the bug class this section exists to prevent.
 
 | Tier | Value | Owner | Mutable | Where it lives |
 |---|---|---|---|---|
-| **Alias** | a human display name | **the user** | yes, freely | Synapse `displayname` |
+| **Alias** | a generated pseudonym, `Firstname Surname` (`alias::alias_for`) | **the user** | yes, freely | Synapse `displayname` |
 | **MXID** | `@{base36(sha256(did)[..10])}:{server}` — 16 lowercase base36 chars, one alphanumeric run (`mxid::localpart_for`) | derived | **no** — Synapse has no user-rename API | Synapse `users` row |
 | **DID** | `did:key:…` / `did:pkh:…` + the provider's signature | **the provider** | **no** | Synapse profile field `io.inblock.did` |
 
@@ -706,20 +708,52 @@ fires unconditionally on sign-in. Since 2026-09-10 the same function also
 publishes the attested DID (`io.inblock.did`) on every sign-in — see "Identity
 model — three tiers".
 
-**The displayname seed is the LOCALPART, never the DID (2026-09-10).**
-`provision_user`'s second argument is the user's *displayname*, and it used to be
-the raw DID. That was a security problem, not an aesthetic one: `displayname`
+**The displayname seed is a GENERATED PSEUDONYM, never the DID (2026-09-11).**
+`provision_user`'s second argument is the user's *displayname*. It used to be the
+raw DID, which was a security problem rather than an aesthetic one: `displayname`
 routes through `set_field` → `set_displayname` and never reaches the guarded
 `set_profile_field`, so it is user-writable (probe leg 5) — publishing a
 provider-asserted-looking DID there means a consumer reading displayname-as-DID
-can be handed **someone else's** DID. The localpart is a valid non-empty string,
-so the `profiles` row is still created (which is what keeps #19702 away from new
-accounts), and it is exactly what Element renders when displayname is unset.
-Existing users are unaffected: `provision_user` runs only at first sign-in and on
-a confirmed-absent-row self-heal. Pinned by
-`h11_first_signin_seeds_displayname_with_the_localpart_never_the_did` and its
-`h11_self_heal_…` twin. A friendlier generated alias is a deliberate non-goal
-(product decision, not a security one).
+can be handed **someone else's** DID. The interim fix (2026-09-10) seeded the
+bare localpart: honest, but `@2wjyn3jhbh7savin` is not a name.
+
+`alias::alias_for(did)` now derives `"Firstname Surname"` from the DID
+(`src/alias.rs`, library crate, pure `sha2`):
+
+- **Seed** = `SHA-256("siwx-oidc/alias/v1\0" || mxid::canonicalize(did))`, the
+  same method-aware canonicalisation the MXID uses — so a mixed-case `did:pkh`
+  and its lowercase twin, which are ONE account, are also ONE name. The domain
+  prefix keeps it from being a second projection of the MXID's digest.
+- **Words** come from two ~256-entry ASCII lists, indexed by disjoint 4-byte
+  windows. Extend the lists by APPENDING only; an index is `digest mod len`, so
+  reordering renames future accounts (existing ones keep what is stored).
+- **Collisions are expected and fine.** The alias is decoration, never an
+  identifier: clients disambiguate duplicate display names by MXID, the MXID
+  carries 80 bits of hash, and the attested DID is published separately. Never
+  key anything on it.
+- It carries no DID and no key material, so it cannot be mistaken for an
+  identity source — which is the property the whole tier split exists for.
+
+Written **once**, at first sign-in (and on the row-absent self-heal). It is the
+user's from that moment: it is never re-asserted, so a name the user chooses
+survives every login. Pinned by `alias::tests::*` (incl. exact vectors),
+`h11_first_signin_seeds_displayname_with_the_alias_never_the_did`, its
+`h11_self_heal_…` twin, and live by `did_field_is_published_verifiable_and_public_live`.
+
+**Migration of provider-written names (2026-09-11).** An account whose
+displayname is **byte-equal** to a string *we* seeded — the raw DID, or the bare
+localpart — is rewritten to the alias at its next sign-in
+(`provider_written_displayname`, fed by `SynapseClient::read_profile`, which
+returns the displayname alongside the row-present verdict so the login path
+gains no extra probe). Byte-equal, never prefix or case-folded: the claim being
+tested is "nothing but our own provisioning could have produced this exact
+string". Anything else — including a displayname the user **cleared**, which
+Synapse reports as a 200 with no `displayname` — is left alone, because
+clobbering a deliberately-cleared name is the exact regression the 2026-08-02
+discriminator fix was written for. Leaving a legacy DID there would not open a
+new forgery path (any user can set any displayname), but it would perpetuate the
+convention that displayname carries the DID, and that convention is what makes a
+naive consumer read it as identity at all. Pinned by `alias_migration_*`.
 
 **`provision_user` failure logging + self-heal (2026-08-01, discriminator fixed
 2026-08-02):** A `provision_user` failure at first sign-in (new account) is

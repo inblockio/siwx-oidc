@@ -159,7 +159,13 @@ pub fn localpart_for(did: &str) -> String {
 /// checksum (fold it), `did:key`/`did:peer` case is key material (preserve
 /// it). Anything else is passed through unchanged, which preserves case by
 /// default — the safer default per the module doc.
-fn canonicalize(did: &str) -> String {
+///
+/// Public because [`crate::alias`] derives the tier-1 display name from the
+/// same canonical string. That sharing is the point, not convenience: a
+/// mixed-case `did:pkh` and its lowercase twin are ONE Matrix account, so they
+/// must also be one alias, and a second copy of this rule is a second place
+/// for it to drift.
+pub fn canonicalize(did: &str) -> String {
     if did.starts_with("did:pkh:") {
         did.to_lowercase()
     } else {
