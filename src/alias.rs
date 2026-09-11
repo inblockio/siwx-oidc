@@ -26,13 +26,55 @@
 //!
 //! # Collisions are expected, and are not a defect
 //!
-//! With `FIRST_NAMES.len() * SURNAMES.len()` combinations the birthday bound
-//! puts the first expected collision in the low hundreds of accounts, and two
+//! With `FIRST_NAMES.len() * SURNAMES.len()` = 271 x 306 = 82,926 combinations,
+//! expected collisions are `n^2 / 2N`, so the first one is due around n = 288
+//! accounts (measured, 2026-09-11). Two
 //! users sharing "Ingrid Moreau" is fine: Matrix clients disambiguate
 //! duplicate display names within a room by showing the MXID, the MXID itself
 //! is derived from 80 bits of hash ([`crate::mxid`]), and the attested DID is
 //! published separately. Never treat this string as unique, never key anything
 //! on it, and never compare it.
+//!
+//! # The alias is a confirmation oracle, and that is fine
+//!
+//! `alias_for` is a deterministic public function of the DID, so anyone holding
+//! a CANDIDATE DID can compute its alias and compare. A match is roughly
+//! 82,926:1 evidence, which is strong, not weak. This is not a leak under our
+//! own threat model: the DID-to-account binding is published on purpose in
+//! `io.inblock.did`, so the oracle only confirms what that field states
+//! outright.
+//!
+//! The one case worth knowing is the window where the field is ABSENT while the
+//! alias is present, because provisioning sets the displayname even when
+//! publication fails: a row-less account (element-hq/synapse#19702) or an
+//! ephemeral signing key. There the alias is the only public trace of the DID,
+//! and a guess can still be confirmed. Still acceptable for the same reason.
+//!
+//! Written down so it is not rediscovered later and mistaken for a defect. If
+//! the DID binding ever becomes something we intend to keep private, this
+//! function stops being safe and the alias must be seeded from something other
+//! than the DID.
+//!
+//! # It is a confirmation oracle, and that is deliberate rather than accidental
+//!
+//! The alias is a *deterministic public function of the DID*, so anyone holding
+//! a candidate DID can compute its alias and compare. A match is roughly
+//! 82,926:1 evidence (271 given names x 306 surnames, measured) — strong, not
+//! weak. That is harmless under this system's own threat model, because the
+//! DID↔account binding is something we **publish on purpose**: `io.inblock.did`
+//! states it outright, world-readable and federating, and the whole point of
+//! the DID tier is that a relying party can look it up.
+//!
+//! The case worth naming is the window where the alias is the ONLY public
+//! trace. An account with no published field — a row-less account
+//! (element-hq/synapse#19702), or a provider running an ephemeral signing key,
+//! which publishes no `proof` and may have failed to publish at all — still has
+//! its alias set at provisioning. In that window a DID guess can be confirmed
+//! against an account whose `io.inblock.did` is absent. Still not a leak by our
+//! model (same binding, weaker channel), but do not "fix" it by making the
+//! alias random: a random alias would have to be stored and reconciled, and it
+//! would lose the property that the same person is the same name on any
+//! deployment. Identified in review, 2026-09-11.
 //!
 //! # Canonicalisation is shared with the MXID, deliberately
 //!
