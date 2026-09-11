@@ -113,10 +113,21 @@ PORT = int(os.environ.get("SYNAPSE_MOCK_PORT", "8090"))
 # DEVICES / LIFECYCLE / PROFILES are keyed on (and that the tests assert against).
 SERVER_NAME = os.environ.get("SYNAPSE_MOCK_SERVER_NAME", "matrix.test")
 # Base URL of the siwx-oidc under test, used to introspect admin tokens exactly
-# as Synapse does. Intentionally has NO default: guessing a port would let the
-# admin surface fail closed for a config reason while looking like a product
-# failure. Unset => every admin call answers 401 naming this variable.
-OIDC_BASE = os.environ.get("SYNAPSE_MOCK_OIDC_BASE", "").rstrip("/")
+# as Synapse does. Intentionally has NO GUESSED default: inventing a port would
+# let the admin surface fail closed for a config reason while looking like a
+# product failure. Unset => every admin call answers 401 naming this variable.
+#
+# `SIWEOIDC_BASE_URL` is accepted as a fallback because it is the stack's own
+# authoritative spelling of the same value -- e2e/env.sh, e2e/up.sh and the CI
+# job all export it -- so reading it is not a guess. Without this, a harness
+# that sets only the standard variable (the `rust-e2e-mock` CI job does) gets a
+# mock that cannot authorise ANY admin call, which surfaces as a 400 on
+# `devices_list` and reads exactly like a product bug.
+OIDC_BASE = (
+    os.environ.get("SYNAPSE_MOCK_OIDC_BASE")
+    or os.environ.get("SIWEOIDC_BASE_URL")
+    or ""
+).rstrip("/")
 INTROSPECT_TIMEOUT = float(os.environ.get("SYNAPSE_MOCK_INTROSPECT_TIMEOUT", "5"))
 
 # Scopes from `src/admin_token.rs::ADMIN_SCOPE`. Both halves are load-bearing;
@@ -257,8 +268,9 @@ def _introspect(token):
     """
     if not OIDC_BASE:
         return None, (
-            "SYNAPSE_MOCK_OIDC_BASE is not set, so this mock cannot introspect "
-            "admin tokens; set it to the siwx-oidc base URL (see e2e/up.sh)"
+            "neither SYNAPSE_MOCK_OIDC_BASE nor SIWEOIDC_BASE_URL is set, so "
+            "this mock cannot introspect admin tokens; set one to the siwx-oidc "
+            "base URL (see e2e/up.sh)"
         )
     data = urlencode({"token": token, "token_type_hint": "access_token"}).encode()
     req = Request(f"{OIDC_BASE}/oauth2/introspect", data=data, method="POST")
