@@ -18,6 +18,7 @@
 // (`bash e2e/up.sh` rebuilds + restarts it). Then: `bash e2e/browser/run.sh`.
 
 import { test, expect } from '@playwright/test';
+import { localpartFor } from './mxid-helper.mjs';
 import net from 'node:net';
 import { addVirtualAuthenticator, registerPasskey } from './webauthn-helper.mjs';
 
@@ -34,7 +35,7 @@ async function mockSeedUser(did) {
   await fetch(`${MOCK}/__seed_user`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ localpart: did.replaceAll(':', '-').toLowerCase() }),
+    body: JSON.stringify({ localpart: localpartFor(did) }),
   });
 }
 

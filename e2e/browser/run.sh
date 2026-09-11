@@ -6,7 +6,12 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck disable=SC1091
 source "$DIR/../env.sh"
-IMG=mcr.microsoft.com/playwright:v1.50.1-noble
+# MUST match `@playwright/test` in package.json: the image ships only the browser
+# build its own Playwright expects, so a newer npm pin launches nothing at all
+# ("Executable doesn't exist at /ms-playwright/chromium_headless_shell-…"). The
+# 1.62.1 npm bump landed without this line, which failed all 27 specs locally
+# while CI (which installs its own browsers) stayed green.
+IMG=mcr.microsoft.com/playwright:v1.62.1-noble
 
 exec podman run --rm --network host --userns=keep-id \
   -v "$DIR:/work:z" -w /work \

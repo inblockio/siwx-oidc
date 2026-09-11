@@ -13,6 +13,7 @@
 import { test, expect } from '@playwright/test';
 import { makeWallet, DEFAULT_PRIV, injectMockWallet } from './wallet-helper.mjs';
 import { countCeremonies, registerPasskeyInPage } from './webauthn-helper.mjs';
+import { didToMxid } from './mxid-helper.mjs';
 
 const BASE = process.env.SIWEOIDC_HOST || 'http://localhost:18080';
 const MOCK = process.env.SYNAPSE_MOCK || 'http://localhost:8090';
@@ -178,7 +179,7 @@ test('passkey: one ceremony covers list + sign-out (virtual authenticator)', asy
   // Register a passkey and discover its did:key, then seed devices for it.
   const did = await page.evaluate(registerPasskeyInPage);
   expect(did).toMatch(/^did:key:zDn/);
-  const pkMxid = `@${did.replaceAll(':', '-').toLowerCase()}:matrix.test`;
+  const pkMxid = didToMxid(did);
   await mockSeed(pkMxid, 'SIWX_pk_a');
   await mockSeed(pkMxid, 'SIWX_pk_b');
 

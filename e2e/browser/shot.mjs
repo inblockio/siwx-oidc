@@ -2,12 +2,13 @@
 // screenshot the card, to eyeball the View / Sign out button styling.
 import { chromium } from '@playwright/test';
 import { Wallet } from 'ethers';
+import { didToMxid } from './mxid-helper.mjs';
 
 const BASE = process.env.SIWEOIDC_HOST || 'http://localhost:18080';
 const MOCK = process.env.SYNAPSE_MOCK || 'http://localhost:8090';
 const wallet = new Wallet('0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d');
 const ADDRESS = wallet.address;
-const MXID = `@${`did:pkh:eip155:1:${ADDRESS}`.replaceAll(':', '-').toLowerCase()}:matrix.test`;
+const MXID = didToMxid(`did:pkh:eip155:1:${ADDRESS}`);
 
 await fetch(`${MOCK}/__reset`, { method: 'POST' });
 for (const [id, name] of [['SIWX_phone', 'Element X (iPhone)'], ['SIWX_laptop', 'Element Web (Firefox)']]) {

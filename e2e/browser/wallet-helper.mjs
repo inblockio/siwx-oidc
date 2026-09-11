@@ -7,6 +7,7 @@
 // real MetaMask would (only the provider plumbing is mocked, not the crypto).
 
 import { Wallet, getBytes } from 'ethers';
+import { didToMxid } from './mxid-helper.mjs';
 
 // A fixed throwaway test key — never used anywhere real. Kept here so callers
 // that want the *default* shared identity can import it; tests that need a fresh
@@ -14,11 +15,14 @@ import { Wallet, getBytes } from 'ethers';
 export const DEFAULT_PRIV =
   '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
 
-// Derive the Matrix MXID for a did:pkh wallet DID, mirroring did_to_localpart
-// (replace ':' with '-', lowercase) and the e2e server_name (matrix.test).
+// Derive the Matrix MXID for a did:pkh wallet DID, mirroring `mxid::localpart_for`
+// (see ./mxid-helper.mjs) and the e2e server_name (matrix.test).
+//
+// Every wallet this helper builds is a FRESH random key, so it is always a new
+// identity, and a new identity always gets the modern opaque localpart — the
+// legacy shape here would name an account that does not exist.
 export function walletMxid(address, serverName = 'matrix.test') {
-  const did = `did:pkh:eip155:1:${address}`;
-  return `@${did.replaceAll(':', '-').toLowerCase()}:${serverName}`;
+  return didToMxid(`did:pkh:eip155:1:${address}`, serverName);
 }
 
 // Build a wallet bundle: { wallet, address, did, mxid }. Pass a private key to

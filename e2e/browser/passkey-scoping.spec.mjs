@@ -23,6 +23,7 @@ import { test, expect } from '@playwright/test';
 import net from 'node:net';
 import { addVirtualAuthenticator, registerPasskey } from './webauthn-helper.mjs';
 import { makeWallet, injectMockWallet } from './wallet-helper.mjs';
+import { localpartFor } from './mxid-helper.mjs';
 
 const BASE = process.env.SIWEOIDC_HOST || 'http://localhost:18080';
 const MOCK = process.env.SYNAPSE_MOCK || 'http://localhost:8090';
@@ -126,7 +127,7 @@ async function mockSeedDevice(mxid, deviceId) {
 }
 
 function didToLocalpart(did) {
-  return did.replaceAll(':', '-').toLowerCase();
+  return localpartFor(did);
 }
 function didToMxid(did) {
   return `@${didToLocalpart(did)}:${SERVER_NAME}`;

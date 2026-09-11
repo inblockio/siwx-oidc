@@ -15,6 +15,7 @@
 
 import { test, expect } from '@playwright/test';
 import net from 'node:net';
+import { localpartFor, didToMxid } from './mxid-helper.mjs';
 import {
   makeWallet, injectMockWallet, countSignatures,
 } from './wallet-helper.mjs';
@@ -47,7 +48,7 @@ async function mockSeed(mxid, deviceId, displayName = 'Element') {
 // new account, which those flows reject). These lifecycle tests operate on
 // accounts that already exist.
 function localpartOfDid(did) {
-  return did.replaceAll(':', '-').toLowerCase();
+  return localpartFor(did);
 }
 async function mockSeedUser(did) {
   await fetch(`${MOCK}/__seed_user`, {
@@ -306,7 +307,7 @@ test('R-C1/R-C2/R-C3: passkey register -> login -> token (same DID)', async ({ p
   expect(tok.access_token.startsWith('mat_')).toBe(true);
 
   // R-C3: the login resolved to the SAME did:key the registration derived.
-  const pkMxid = `@${did.replaceAll(':', '-').toLowerCase()}:matrix.test`;
+  const pkMxid = didToMxid(did);
   const ids = await mockDevices(pkMxid);
   expect(ids.some((d) => d.startsWith('SIWX_'))).toBe(true);
 
@@ -431,7 +432,7 @@ test('R-G6 + H13: account_erase deactivates(erase=true) AND purges WebAuthn cred
   const newKeys = after.filter((k) => !before.includes(k));
   expect(newKeys.length).toBeGreaterThanOrEqual(1);
 
-  const eraseMxid = `@${did.replaceAll(':', '-').toLowerCase()}:matrix.test`;
+  const eraseMxid = didToMxid(did);
   await mockSeed(eraseMxid, 'SIWX_erase_dev');
 
   // Erase via the page using the passkey (the re-auth proves the DID, then erase
