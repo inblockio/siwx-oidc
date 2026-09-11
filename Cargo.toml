@@ -11,7 +11,7 @@ repository = "https://github.com/inblockio/siwx-oidc/"
 description = "CAIP-122 to OpenID Connect bridge — Sign-In With X for any DID method."
 
 [dependencies]
-# PINNED and on the `ssh://` spelling, both deliberately.
+# PINNED to a release tag and on the `https://` spelling, both deliberately.
 #
 # It was unpinned, floating on the default branch: a bare `cargo update` could
 # move this crate onto a new aqua-auth without anyone asking for it. And it was
@@ -26,20 +26,18 @@ description = "CAIP-122 to OpenID Connect bridge — Sign-In With X for any DID 
 # cannot authenticate and the image build fails -- which, because dev-staging
 # floats on the `:dev` tag, silently leaves it running the PREVIOUS image. The
 # repository is anonymously readable over HTTPS, so this resolves unauthenticated
-# everywhere. The rev pin below, which is the part that actually matters, is
-# unchanged.
+# everywhere. The pin below, which is the part that actually matters, is
+# unaffected by the spelling.
 #
-# TODO(aqua-auth 0.7.0): move this to the 0.7.0 tag once it is cut. The rev below
-# is the tip of aqua-auth's `refactor/async-credential-store` -- 0.7.0, the async
-# credential store this crate's source actually targets. It is pinned to a rev
-# that EXISTS ON THE REMOTE so a clean checkout (CI, the :dev image build,
-# dev-staging) compiles without the machine-local `[patch]` the migration was
-# developed under. The previous pin was aqua-auth `main` (0.6.0, the SYNC trait):
-# resolvable, but it could not build this source at all off the one dev box.
-# Until the tag is cut this is a branch rev, not a release; aqua-node,
-# aquafier-rs and aqua-state-viewer still resolve 0.6.0 and move in one batch
-# when it is. See CONSUMERS.md in aqua-auth.
-aqua-auth = { git = "https://github.com/inblockio/aqua-rs-auth", rev = "1edee34622889a71098cec9b593ddcec794f5f88", features = ["webauthn", "ceremony", "redis"] }
+# `v0.7.0` is the async credential store this crate's source targets. It replaces
+# the `refactor/async-credential-store` branch rev this tracked while no tag
+# existed; the tagged tree differs from that rev by documentation only, so this
+# is a re-pin, not an upgrade. A release tag rather than a branch rev so a clean
+# checkout -- CI, the `:dev` image build, dev-staging -- resolves without the
+# machine-local `[patch]` the migration was developed under. aqua-node,
+# aquafier-rs and aqua-state-viewer still resolve 0.6.0 and move to this tag in
+# one batch. See CONSUMERS.md in aqua-auth.
+aqua-auth = { git = "https://github.com/inblockio/aqua-rs-auth", tag = "v0.7.0", features = ["webauthn", "ceremony", "redis"] }
 alloy-primitives = { version = "1", features = ["serde"] }
 alloy = { version = "1", features = ["providers", "transport-http", "contract", "sol-types", "ens"] }
 anyhow = "1"
