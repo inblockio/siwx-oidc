@@ -314,7 +314,7 @@ pub fn mint_did_assertion(
 /// One `None` turns the whole feature off in one place. That is the shape a
 /// deployment without this feature needs, and it is also the shape a unit test
 /// of `provision_synapse_device` needs when it is asserting something else
-/// entirely (see `provision_user_display_name_is_the_localpart_never_the_did`).
+/// entirely (see `h11_first_signin_seeds_displayname_with_the_alias_never_the_did`).
 ///
 /// Note that `None` is NOT how the ephemeral-key case is expressed: an
 /// ephemeral key still publishes `{"did": …}` (without a `proof`), because the

@@ -51,6 +51,29 @@ podman run -d --name siwx-e2e-mock --network host \
   -e SYNAPSE_MOCK_OIDC_BASE="$SYNAPSE_MOCK_OIDC_BASE" \
   docker.io/library/python:3-alpine python /app/synapse_mock.py >/dev/null
 
+# Gate on the MOCK answering before siwx-oidc starts against it.
+#
+# up.sh used to gate only on siwx-oidc's own /health at the bottom, which says
+# nothing about the mock: the python container needs a moment to bind, so a
+# suite launched in the same command as `up.sh` hit a mock that was not
+# listening yet and reported 5 of 6 account-management tests FAILED in 0.03s,
+# every one of them green on a warm retry a minute later. A harness whose
+# verdict depends on how fast the next command runs is worse than a slow one --
+# and the same readiness argument already applies to Redis just above.
+mock_ready=false
+for i in $(seq 1 60); do
+  if curl -sf "http://localhost:${SYNAPSE_MOCK_PORT}/health" >/dev/null 2>&1; then
+    mock_ready=true
+    break
+  fi
+  sleep 0.5
+done
+if [ "$mock_ready" != "true" ]; then
+  echo "synapse mock did not become ready on :${SYNAPSE_MOCK_PORT}" >&2
+  podman logs siwx-e2e-mock | tail -20 >&2
+  exit 1
+fi
+
 podman run -d --name siwx-e2e-oidc --network host -w /app -v "$REPO:/app:z" \
   -e SIWEOIDC_ADDRESS="$SIWEOIDC_ADDRESS" -e SIWEOIDC_PORT="$SIWEOIDC_PORT" \
   -e SIWEOIDC_BASE_URL="$SIWEOIDC_BASE_URL" \
