@@ -187,6 +187,39 @@ own test.
   missing per-login deadline, and the un-filed upstream comment.
 - **Prod is still gated** by memory `prod-promotion-gate`. Nothing here jumps it.
 
+### Live on dev-aquafire, 2026-09-11 — verified, with one leg structurally unrunnable
+
+The converge landed the homeserver half FIRST (`matrix_synapse` on
+`ghcr…/synapse:main`, live `/data/homeserver.yaml` carrying
+`msc4133_key_denylist: [io.inblock.did]`), then the publisher. `/jwk` is the honest
+liveness signal for the publisher: it served `kid: "key1"` before and
+`kid: "01797b65f97f018b"` after, with an unchanged public key — so the configured
+signing key survived the upgrade and assertions minted now verify.
+
+`cargo test --test e2e_did_field_live -- --ignored` with `SIWEOIDC_HOST=https://dev.siwx.inblock.io`
+and `MATRIX_HOST=https://dev.matrix.inblock.io`:
+
+| Check | Result |
+|---|---|
+| `did_field_is_published_verifiable_and_public_live` | **pass** — published, ES256-verified through the shipped verifier, readable unauthenticated |
+| `did_field_user_write_is_forbidden_live` | **pass** — the user's own token gets 403 on PUT *and* DELETE, and the displayname is not the DID |
+| `clobbered_did_field_is_restored_at_next_signin_live` | **not runnable from outside the edge** — see below |
+
+A live account from the run: `@2wjyn3jhbh7savin:dev.matrix.inblock.io` — the opaque
+16-character localpart working end to end against a real Synapse.
+
+**The self-heal leg cannot run against dev from outside, and that is correct
+behaviour, not a defect.** It plants a pre-denylist clobber by minting an admin token,
+and dev's Caddy deliberately answers `404` to `/oauth2/admin_token` (plan D22,
+2026-08-30: the endpoint that vends Synapse admin authority must not sit on the public
+internet as a guessing oracle against one static secret; both real callers are
+in-network). So the test's 404 is the edge doing its job. Cover that leg on the local
+harness, or from inside the compose network — never by opening the edge.
+
+**Run it WITHOUT `E2E_STRICT_SKIPS=1` and a missing `MAS_SHARED_SECRET` reads as a
+pass.** The first dev run reported 3/3; with `E2E_STRICT_SKIPS=1` the same run is
+2 passed, 1 failed. Always set it for a verification run.
+
 ### Promotion to prod is a TWO-STEP, and the order is load-bearing
 
 dev got the safe order by accident, not by design: both image refs there float on
