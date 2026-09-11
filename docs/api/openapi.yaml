@@ -1,0 +1,812 @@
+# OpenAPI description of the siwx-oidc HTTP surface.
+#
+# THIS FILE IS ENFORCED, NOT DECORATIVE. `tests/openapi_covers_every_route.rs`
+# reads the router in `src/axum_lib.rs` and fails the build if a route exists
+# there and not here, so a new endpoint cannot ship undocumented. When that test
+# fails, add the path — do not add it to the test's ignore list unless the route
+# is genuinely not part of the API (static files, for example).
+#
+# Schemas are described where a caller has to construct or parse a body. The
+# WebAuthn ceremony endpoints pass W3C credential objects through essentially
+# verbatim; those are typed as free-form objects on purpose, because pinning a
+# partial copy of the WebAuthn schema here would go stale against the browser
+# API without anyone noticing.
+openapi: 3.1.0
+info:
+  title: siwx-oidc
+  version: 0.2.0
+  summary: A CAIP-122 → OpenID Connect bridge, and the OIDC provider for a Matrix homeserver.
+  description: |
+    siwx-oidc turns a wallet signature or a passkey into standard OIDC tokens.
+    Any relying party can use it; the primary deployment target is Matrix
+    Synapse, where it **replaces MAS entirely** via MSC3861.
+
+    # Identity model
+
+    Every user carries three identifiers with three different owners, and
+    conflating any two of them is a bug class rather than a style question:
+
+    | Tier | Value | Owner | Mutable |
+    |---|---|---|---|
+    | Alias | a generated `Firstname Surname` pseudonym | the user | yes |
+    | MXID | `@{base36(sha256(did)[..10])}:{server}` | derived | no — Synapse has no rename API |
+    | DID | `did:key:…` / `did:pkh:…` plus the provider's signature | the provider | no |
+
+    # Authentication schemes in this document
+
+    Four different credentials appear below, and they are not interchangeable:
+
+    * **bearerToken** — an access token this provider issued, presented by the
+      end user's client.
+    * **masSharedSecret** — the MSC3861 shared secret. Server-to-server only;
+      the homeserver holds it. It must never traverse the public internet.
+    * **registrationAccessToken** — returned by dynamic client registration and
+      scoped to that one client record.
+    * **sessionCookie** — the browser ceremony cookies (`siwx`, `siwx_user`,
+      `acct_session`). These are interactive flows, not an API.
+
+    Endpoints with no `security` block are deliberately unauthenticated.
+
+    # What a DID from this API proves
+
+    Nothing about who you are talking to. A DID returned by `/resolve`, or read
+    out of a profile, is a **discovery hint**: it tells a consumer what to look
+    up, never what to permit. Authorization MUST resolve the DID from the `sub`
+    claim of a token this provider issued, or from a fresh signature by the
+    DID's own key.
+  license:
+    name: Apache-2.0
+  contact:
+    name: inblock.io
+    url: https://github.com/inblockio/siwx-oidc
+
+servers:
+  - url: https://dev.siwx.inblock.io
+    description: dev-staging
+  - url: http://localhost:8000
+    description: local default (SIWEOIDC_ADDRESS / SIWEOIDC_PORT)
+
+tags:
+  - name: OIDC
+    description: The standard OpenID Connect surface (discovery, tokens, userinfo, registration).
+  - name: Identity
+    description: DID ↔ MXID lookup. Read-only, and a discovery hint only.
+  - name: Sign-in ceremonies
+    description: Browser flows that produce a verified DID — CAIP-122 wallet and WebAuthn passkey.
+  - name: Device grant
+    description: RFC 8628 device authorization, used by Element X QR login.
+  - name: Account management
+    description: MSC4191 / MSC4312 account and device management.
+  - name: Homeserver
+    description: Server-to-server endpoints a Synapse homeserver calls. Not for end users.
+  - name: Matrix compatibility
+    description: Client-Server API paths served here when the deployment proxies them.
+  - name: Operations
+    description: Health and static assets.
+
+paths:
+  /.well-known/openid-configuration:
+    get:
+      tags: [OIDC]
+      operationId: discovery
+      summary: OpenID Provider metadata
+      description: |
+        The authoritative description of this provider's capabilities. Two
+        fields exist specifically for the Matrix stack and must not be dropped:
+        `prompt_values_supported` (`["login","create"]`) and
+        `account_management_uri`. Removing either silently breaks Element X
+        cross-signing bootstrap — the matrix-rust-sdk swallows the error.
+      responses:
+        "200":
+          description: Provider metadata.
+          content:
+            application/json:
+              schema: { type: object }
+
+  /jwk:
+    get:
+      tags: [OIDC]
+      operationId: jwks
+      summary: JSON Web Key Set
+      description: |
+        The public half of the ES256 signing key, plus any retired keys listed
+        in `SIWEOIDC_RETIRED_SIGNING_KEYS_PEM`. Each entry's `kid` is derived
+        from the key material (first 16 hex of SHA-256 over the SEC1
+        uncompressed public key), never a constant, so a rotated key fails as an
+        honest "kid not present in JWKS" instead of a silent bad signature.
+
+        This is the only verification anchor for published DID assertions, which
+        deliberately carry no `exp`. Rotating the signing key without listing
+        the old public key here makes every already-written proof permanently
+        unverifiable.
+      responses:
+        "200":
+          description: The key set.
+          content:
+            application/json:
+              schema: { type: object }
+
+  /authorize:
+    get:
+      tags: [OIDC]
+      operationId: authorize
+      summary: Begin an authorization-code flow
+      description: |
+        Standard OIDC authorization request. Issues the `siwx` session cookie
+        and the CAIP-122 nonce the client signs, then renders the login page.
+      parameters:
+        - { name: client_id, in: query, required: true, schema: { type: string } }
+        - { name: redirect_uri, in: query, required: true, schema: { type: string, format: uri } }
+        - { name: response_type, in: query, required: true, schema: { type: string } }
+        - { name: scope, in: query, required: false, schema: { type: string } }
+        - { name: state, in: query, required: false, schema: { type: string } }
+        - { name: nonce, in: query, required: false, schema: { type: string } }
+      responses:
+        "200": { description: The login page. }
+        "302": { description: Redirect back to the relying party. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /sign_in:
+    get:
+      tags: [Sign-in ceremonies]
+      operationId: signIn
+      summary: Complete a ceremony and mint an authorization code
+      description: |
+        Reads the verified DID — from the `siwx` cookie's CAIP-122 signature, or
+        from the server-side session a WebAuthn ceremony wrote — and redirects
+        to the relying party with an authorization code.
+
+        This is also the single point where a Matrix account is provisioned: the
+        localpart is resolved (honouring grandfathering), the alias is seeded on
+        first sign-in only, the Synapse device is upserted, and the attested DID
+        is re-published. Every one of those is best-effort and never fails the
+        sign-in.
+      security:
+        - sessionCookie: []
+      responses:
+        "302": { description: Redirect to `redirect_uri` with `code` and `state`. }
+        "401": { description: The account is deactivated, or the ceremony did not verify. }
+
+  /token:
+    post:
+      tags: [OIDC]
+      operationId: token
+      summary: Exchange a code, refresh token, or device code for tokens
+      description: |
+        Supports `authorization_code`, `refresh_token` and
+        `urn:ietf:params:oauth:grant-type:device_code`.
+
+        Refresh rotates both tokens. A bounded grace pointer (60s) lets a client
+        that LOST the rotation response — common on mobile — replay the old
+        refresh token once instead of being signed out.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [grant_type]
+              properties:
+                grant_type: { type: string, enum: [authorization_code, refresh_token, "urn:ietf:params:oauth:grant-type:device_code"] }
+                code: { type: string }
+                refresh_token: { type: string }
+                device_code: { type: string }
+                redirect_uri: { type: string, format: uri }
+                client_id: { type: string }
+                client_secret: { type: string }
+      responses:
+        "200":
+          description: Tokens.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+        "400":
+          description: |
+            OAuth error. `authorization_pending` and `slow_down` are the normal
+            polling answers on the device-code grant, not failures.
+
+  /userinfo:
+    get:
+      tags: [OIDC]
+      operationId: userinfo
+      summary: Claims about the authenticated user
+      security: [{ bearerToken: [] }]
+      responses:
+        "200":
+          description: Claims.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserInfo" }
+            application/jwt:
+              schema: { type: string, description: Returned when the client registered a `userinfo_signed_response_alg`. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+    post:
+      tags: [OIDC]
+      operationId: userinfoPost
+      summary: Claims about the authenticated user (form-encoded token)
+      security: [{ bearerToken: [] }]
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties: { access_token: { type: string } }
+      responses:
+        "200":
+          description: Claims.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserInfo" }
+
+  /register:
+    post:
+      tags: [OIDC]
+      operationId: registerClient
+      summary: Dynamic client registration (RFC 7591)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [redirect_uris]
+              properties:
+                redirect_uris: { type: array, items: { type: string, format: uri } }
+                client_name: { type: string }
+      responses:
+        "201":
+          description: The registered client, with its secret and registration access token.
+          content:
+            application/json:
+              schema: { type: object }
+        "400": { description: "Invalid metadata — a `redirect_uri` carrying a fragment is rejected." }
+
+  /client/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [OIDC]
+      operationId: getClient
+      summary: Read a registered client
+      security: [{ registrationAccessToken: [] }]
+      responses:
+        "200": { description: Client metadata., content: { application/json: { schema: { type: object } } } }
+    post:
+      tags: [OIDC]
+      operationId: updateClient
+      summary: Update a registered client
+      security: [{ registrationAccessToken: [] }]
+      responses:
+        "200": { description: Updated client metadata. }
+    delete:
+      tags: [OIDC]
+      operationId: deleteClient
+      summary: Delete a registered client
+      security: [{ registrationAccessToken: [] }]
+      responses:
+        "204": { description: Deleted. }
+
+  /resolve:
+    get:
+      tags: [Identity]
+      operationId: resolve
+      summary: Look up the Matrix account for a DID, or the DID for a Matrix account
+      description: |
+        Pass **exactly one** of `did` or `mxid`. Both, or neither, is a 400:
+        the two directions answer different questions and the response's
+        `did`/`mxid` fields mean different things in each.
+
+        **Unauthenticated on purpose.** The DID → localpart direction is a pure
+        function of the DID, and the MXID → DID direction reads a profile field
+        Synapse serves without authentication and federates. Everything here is
+        already publicly computable, so authentication would buy rate-limiting,
+        not secrecy — put that at the reverse proxy.
+
+        `attested: true` means the account's profile field currently carries a
+        DID that binds to it. It does **not** verify the assertion's signature
+        (the verifier lives in `siwx-oidc-auth`), and it authorizes nothing.
+      parameters:
+        - { name: did, in: query, required: false, schema: { type: string }, example: "did:key:z6Mkkx9jzu1iAVtjwHU2Vz8SLu3ZxuHZwPdAYReV7PrpWQwU" }
+        - { name: mxid, in: query, required: false, schema: { type: string }, example: "@1vo8g4vofiha69ua:dev.matrix.inblock.io" }
+      responses:
+        "200":
+          description: |
+            The lookup result. All four keys are always present, `null` where
+            unknown — a stable shape, so a caller never has to write both a
+            key-presence branch and a null branch.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ResolveResponse" }
+              examples:
+                attested:
+                  summary: A DID with an account that publishes it
+                  value: { did: "did:key:z6Mkkx9jzu1iAVtjwHU2Vz8SLu3ZxuHZwPdAYReV7PrpWQwU", mxid: "@1vo8g4vofiha69ua:dev.matrix.inblock.io", exists: true, attested: true }
+                unknown:
+                  summary: A well-formed DID that has never signed in here
+                  value: { did: "did:key:z6MkpFemPtmjvPZ1gFYM6d68tuwxxrcec4H2Ck23FRchU9ue", mxid: "@04gen9jsoj657dc0:dev.matrix.inblock.io", exists: false, attested: false }
+        "400":
+          description: Not exactly one selector, or an mxid belonging to another homeserver.
+          content: { application/json: { schema: { $ref: "#/components/schemas/ResolveError" } } }
+        "502":
+          description: The homeserver could not be asked. Never a guessed answer.
+          content: { application/json: { schema: { $ref: "#/components/schemas/ResolveError" } } }
+        "503":
+          description: This deployment has no homeserver configured and cannot answer.
+          content: { application/json: { schema: { $ref: "#/components/schemas/ResolveError" } } }
+
+  /oauth2/introspect:
+    post:
+      tags: [Homeserver]
+      operationId: introspect
+      summary: Token introspection (RFC 7662) — MSC3861
+      description: |
+        Called by Synapse on every authenticated request. The response's `scope`
+        is what Synapse's `is_server_admin()` reads, so it is also how an
+        admin-scoped token gets its privilege.
+
+        `device_id` is rendered as JSON `null`, never `""`: Synapse 1.159
+        rejects a present-but-empty device id with a 500.
+      security: [{ masSharedSecret: [] }]
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [token]
+              properties: { token: { type: string } }
+      responses:
+        "200":
+          description: |
+            Token metadata, or `{"active": false}`. An UNKNOWN token is
+            `{"active": false}` with HTTP 200 — never a 4xx.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Introspection" }
+        "404": { description: Introspection is unavailable — no `mas_shared_secret` is configured. }
+
+  /oauth2/admin_token:
+    post:
+      tags: [Homeserver]
+      operationId: adminToken
+      summary: Mint a short-lived Synapse-admin-scoped token
+      description: |
+        Synapse 1.157 deleted the `admin_token` shim, so `/_synapse/admin/*` is
+        reachable only with a token whose introspected scope carries
+        `urn:synapse:admin:*`. This mints one.
+
+        TTL is clamped **in code** to 30..=900s so a large
+        `SIWEOIDC_ADMIN_TOKEN_TTL_SECS` cannot promote it into a standing admin
+        key. Minting idempotently provisions `SIWEOIDC_ADMIN_TOKEN_LOCALPART`,
+        which creates a real Matrix account.
+      security: [{ masSharedSecret: [] }]
+      responses:
+        "200":
+          description: The minted token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminToken" }
+        "401": { description: Wrong or missing shared secret. }
+
+  /oauth2/revoke:
+    post:
+      tags: [Matrix compatibility]
+      operationId: revoke
+      summary: Revoke a token (RFC 7009)
+      description: |
+        Token hygiene only. It revokes the access token and its paired refresh
+        token and **never deletes the Synapse device** — clients fire this on
+        rotation and on dialog dismissals, and deleting the device there raced
+        in-flight key uploads and wedged users' cross-signing identity.
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [token]
+              properties: { token: { type: string } }
+      responses:
+        "200": { description: Always 200, per RFC 7009 — revoking an unknown token is not an error. }
+
+  /device_authorization:
+    post:
+      tags: [Device grant]
+      operationId: deviceAuthorization
+      summary: Begin an RFC 8628 device grant
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties: { client_id: { type: string }, scope: { type: string } }
+      responses:
+        "200":
+          description: Device and user codes.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceAuthorization" }
+
+  /device:
+    get:
+      tags: [Device grant]
+      operationId: devicePage
+      summary: The approval page a user opens with their user code
+      parameters: [{ name: user_code, in: query, required: false, schema: { type: string } }]
+      responses: { "200": { description: The approval page. } }
+    post:
+      tags: [Device grant]
+      operationId: deviceApprove
+      summary: Approve a device login with a wallet signature
+      responses:
+        "200": { description: Approval outcome. }
+        "400": { description: "Rejected — including a new identity, which may only be created at the login screen." }
+
+  /device/verify:
+    get:
+      tags: [Device grant]
+      operationId: deviceVerify
+      summary: Check whether a user code is valid and still pending
+      parameters: [{ name: user_code, in: query, required: true, schema: { type: string } }]
+      responses: { "200": { description: Validity of the code. } }
+
+  /device/nonce:
+    get:
+      tags: [Device grant]
+      operationId: deviceNonce
+      summary: A CAIP-122 nonce for the device approval signature
+      responses: { "200": { description: The nonce. } }
+
+  /device/passkey/start:
+    post:
+      tags: [Device grant]
+      operationId: devicePasskeyStart
+      summary: Begin passkey authentication for device approval
+      responses: { "200": { description: A WebAuthn request challenge. } }
+
+  /device/passkey/finish:
+    post:
+      tags: [Device grant]
+      operationId: devicePasskeyFinish
+      summary: Finish passkey authentication and approve the device
+      responses:
+        "200": { description: Approved. }
+        "400": { description: "Rejected — a new identity cannot be created here." }
+        "401": { $ref: "#/components/responses/UnknownCredential" }
+
+  /webauthn/register/start:
+    post:
+      tags: [Sign-in ceremonies]
+      operationId: webauthnRegisterStart
+      summary: Begin passkey registration
+      responses: { "200": { description: A W3C `CreationChallengeResponse`. } }
+
+  /webauthn/register/finish:
+    post:
+      tags: [Sign-in ceremonies]
+      operationId: webauthnRegisterFinish
+      summary: Finish passkey registration
+      description: The resulting P-256 public key derives the user's `did:key:zDn…`.
+      responses: { "200": { description: The derived DID. } }
+
+  /webauthn/authenticate/start:
+    post:
+      tags: [Sign-in ceremonies]
+      operationId: webauthnAuthenticateStart
+      summary: Begin passkey authentication
+      description: |
+        Scoped by the opaque `siwx_user` cookie when present, so a returning
+        user's picker shows only their own credentials. A forged or expired
+        cookie is a cache miss and falls back to usernameless, leaking zero
+        credential ids. Send `{"all": true}` (or `?all=1`) to force usernameless.
+      responses:
+        "200":
+          description: |
+            A W3C `RequestChallengeResponse` with the `publicKey` fields
+            flattened at the top level, plus `detected_mxid` — present only when
+            the request was scoped.
+          content: { application/json: { schema: { type: object } } }
+
+  /webauthn/authenticate/finish:
+    post:
+      tags: [Sign-in ceremonies]
+      operationId: webauthnAuthenticateFinish
+      summary: Finish passkey authentication
+      description: |
+        Stores the verified DID server-side and reports the new-account gate.
+        `new_user: true` means nothing has been provisioned yet — the browser
+        must confirm before `/sign_in` creates the account.
+      responses:
+        "200": { description: "`{ok, did, new_user, mxid}`." }
+        "401": { $ref: "#/components/responses/UnknownCredential" }
+
+  /link/webauthn/start:
+    post:
+      tags: [Sign-in ceremonies]
+      operationId: linkWebauthnStart
+      summary: Begin linking a passkey to the signed-in wallet DID
+      description: Verifies the `siwx` cookie's CAIP-122 signature first, to prove DID ownership.
+      security: [{ sessionCookie: [] }]
+      responses: { "200": { description: A W3C `CreationChallengeResponse`. } }
+
+  /link/webauthn/finish:
+    post:
+      tags: [Sign-in ceremonies]
+      operationId: linkWebauthnFinish
+      summary: Finish linking a passkey
+      description: Afterwards, authenticating with that passkey yields the wallet DID rather than a new `did:key`.
+      security: [{ sessionCookie: [] }]
+      responses: { "200": { description: Linked. } }
+
+  /account:
+    get:
+      tags: [Account management]
+      operationId: accountPage
+      summary: MSC4191 account management
+      description: |
+        With no `action`, renders the account-home menu — required because
+        Element Web's "Manage account" opens the bare URI. With an `action`, the
+        page re-authenticates (wallet or passkey) and then performs it.
+      parameters:
+        - name: action
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - profile
+              - devices_list
+              - sessions_list
+              - device_view
+              - session_view
+              - device_delete
+              - session_end
+              - org.matrix.cross_signing_reset
+              - org.matrix.account_deactivate
+              - org.matrix.account_erase
+              - org.matrix.account_reactivate
+        - { name: device_id, in: query, required: false, schema: { type: string } }
+      responses: { "200": { description: The account page. } }
+
+  /account/nonce:
+    get:
+      tags: [Account management]
+      operationId: accountNonce
+      summary: A CAIP-122 nonce for account re-authentication
+      responses: { "200": { description: The nonce. } }
+
+  /account/wallet:
+    post:
+      tags: [Account management]
+      operationId: accountWallet
+      summary: Re-authenticate for an account action with a wallet signature
+      responses:
+        "200": { description: Authenticated. }
+        "400": { description: "Rejected — a new identity cannot be created here." }
+
+  /account/action:
+    post:
+      tags: [Account management]
+      operationId: accountAction
+      summary: Perform the re-authenticated account action
+      description: |
+        Returns a `kind`-tagged outcome the page renders. `profile` is the one
+        that answers "who am I": `{kind: "profile", did, user_id}` — the surface
+        a Matrix client without custom-profile-field support deep-links to.
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200":
+          description: The action outcome.
+          content: { application/json: { schema: { $ref: "#/components/schemas/ActionOutcome" } } }
+        "400": { description: Missing, unknown, or unavailable action. }
+
+  /account/passkey/start:
+    post:
+      tags: [Account management]
+      operationId: accountPasskeyStart
+      summary: Begin passkey re-authentication for an account action
+      responses: { "200": { description: A WebAuthn request challenge. } }
+
+  /account/passkey/finish:
+    post:
+      tags: [Account management]
+      operationId: accountPasskeyFinish
+      summary: Finish passkey re-authentication for an account action
+      responses:
+        "200": { description: Authenticated. }
+        "400": { description: "Rejected — a new identity cannot be created here." }
+        "401": { $ref: "#/components/responses/UnknownCredential" }
+
+  /_matrix/client/v3/login:
+    get:
+      tags: [Matrix compatibility]
+      operationId: loginFlows
+      summary: Advertise the supported Matrix login flows
+      responses: { "200": { description: The flow list. } }
+
+  /_matrix/client/v3/refresh:
+    post:
+      tags: [Matrix compatibility]
+      operationId: matrixRefresh
+      summary: Matrix-shaped refresh, with the same rotation grace window as `/token`
+      responses: { "200": { description: New tokens. } }
+
+  /_matrix/client/v3/logout:
+    post:
+      tags: [Matrix compatibility]
+      operationId: matrixLogout
+      summary: End this session
+      description: Revokes the session's tokens **and** deletes its Synapse device — explicit intent, unlike `/oauth2/revoke`.
+      security: [{ bearerToken: [] }]
+      responses: { "200": { description: Best-effort, idempotent, never 500. } }
+
+  /_matrix/client/v3/logout/all:
+    post:
+      tags: [Matrix compatibility]
+      operationId: matrixLogoutAll
+      summary: End every session
+      description: Session invalidation, NOT deactivation — the account stays active and can sign in again.
+      security: [{ bearerToken: [] }]
+      responses: { "200": { description: Best-effort, idempotent, never 500. } }
+
+  /_matrix/client/v3/devices/{device_id}:
+    delete:
+      tags: [Matrix compatibility]
+      operationId: matrixDeleteDevice
+      summary: Sign out one device
+      security: [{ bearerToken: [] }]
+      parameters: [{ name: device_id, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: Deleted. } }
+
+  /_matrix/client/v3/delete_devices:
+    post:
+      tags: [Matrix compatibility]
+      operationId: matrixDeleteDevices
+      summary: Sign out several devices
+      security: [{ bearerToken: [] }]
+      responses: { "200": { description: Deleted. } }
+
+  /health:
+    get:
+      tags: [Operations]
+      operationId: health
+      summary: Liveness probe
+      responses: { "200": { description: The service is up. } }
+
+components:
+  securitySchemes:
+    bearerToken:
+      type: http
+      scheme: bearer
+      description: An access token issued by this provider (`mat_…` in MSC3861 mode).
+    masSharedSecret:
+      type: http
+      scheme: bearer
+      description: |
+        The MSC3861 shared secret, compared for exact string equality.
+        Server-to-server only — the homeserver holds it. Never expose these
+        routes to the public internet.
+    registrationAccessToken:
+      type: http
+      scheme: bearer
+      description: The registration access token returned by `/register`, scoped to that client.
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: siwx
+      description: |
+        A browser ceremony cookie. `siwx` carries the CAIP-122 proof,
+        `siwx_user` is an opaque passkey-picker scope hint, and `acct_session`
+        scopes the account page. These are interactive flows, not an API.
+
+  responses:
+    BadRequest:
+      description: Malformed request.
+      content: { application/json: { schema: { type: object } } }
+    UnknownCredential:
+      description: |
+        The presented passkey is not one this server stores. A machine-readable
+        discriminator, so a client can prune the stale key from the platform
+        picker via `signalUnknownCredential`.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string, const: unknown_credential }
+              credential_id: { type: string }
+              message: { type: string }
+
+  schemas:
+    TokenResponse:
+      type: object
+      properties:
+        access_token: { type: string }
+        token_type: { type: string }
+        expires_in: { type: integer, description: 300 seconds. }
+        refresh_token: { type: string, description: 90-day TTL, rotated on every use. }
+        id_token: { type: string, description: "ES256 JWT. `sub` is the DID." }
+        scope: { type: string, description: "Carries `urn:matrix:client:device:{id}` so a client can discover its provisioned device." }
+
+    UserInfo:
+      type: object
+      properties:
+        iss: { type: string, format: uri }
+        aud: { type: array, items: { type: string } }
+        sub: { type: string, description: "The DID, exact case.", example: "did:key:z6Mkkx9jzu1iAVtjwHU2Vz8SLu3ZxuHZwPdAYReV7PrpWQwU" }
+        preferred_username: { type: string, description: The DID. Unchanged for backwards compatibility. }
+        io.inblock.mxid:
+          type: string
+          description: |
+            The caller's Matrix ID. **Omitted entirely — never null** — on a
+            standalone deployment with no `SIWEOIDC_MATRIX_SERVER_NAME`, because
+            a present key asserts that the thing exists. Namespaced because no
+            registered OIDC claim for a Matrix ID exists.
+          example: "@1vo8g4vofiha69ua:dev.matrix.inblock.io"
+
+    ResolveResponse:
+      type: object
+      required: [did, mxid, exists, attested]
+      properties:
+        did:
+          type: [string, "null"]
+          description: The DID, exact case, never normalised. On the `?did=` path the published spelling wins when the account publishes the same DID.
+        mxid:
+          type: [string, "null"]
+          description: The fully-qualified Matrix ID, honouring the grandfathering rule — a pre-2026-09 account keeps its legacy localpart.
+        exists: { type: boolean, description: Whether an account exists on THIS homeserver. Says nothing about any other. }
+        attested:
+          type: boolean
+          description: |
+            The profile field is present AND binds to this account. **No
+            signature is verified** — use `siwx-oidc-auth --verify-did` for that.
+
+    ResolveError:
+      type: object
+      required: [error, message]
+      properties:
+        error: { type: string, enum: [invalid_request, unavailable, upstream_error] }
+        message: { type: string }
+        mxid: { type: [string, "null"], description: Present when an mxid was resolved before the upstream failure. }
+
+    Introspection:
+      type: object
+      properties:
+        active: { type: boolean }
+        username: { type: string, description: The Matrix localpart. }
+        device_id: { type: [string, "null"], description: "`null`, never `\"\"` — an empty string is a 500 at Synapse." }
+        scope: { type: string }
+        sub: { type: string, description: The DID. }
+
+    AdminToken:
+      type: object
+      properties:
+        access_token: { type: string }
+        token_type: { type: string }
+        expires_in: { type: integer, description: Clamped in code to 30..=900. }
+        scope: { type: string, description: "Must carry BOTH `urn:matrix:client:api:*` and `urn:synapse:admin:*`." }
+        user_id: { type: string }
+
+    DeviceAuthorization:
+      type: object
+      properties:
+        device_code: { type: string }
+        user_code: { type: string }
+        verification_uri: { type: string, format: uri }
+        verification_uri_complete: { type: string, format: uri }
+        expires_in: { type: integer }
+        interval: { type: integer }
+
+    ActionOutcome:
+      type: object
+      required: [kind]
+      description: A tagged union; `kind` selects the variant.
+      properties:
+        kind:
+          type: string
+          enum: [profile, devices, device, deleted, deactivated, erased, reactivated, reset, reset_unconfirmed]
+        did: { type: string }
+        user_id: { type: string }
+        devices: { type: array, items: { type: object } }
+        device: { type: object }
+        device_id: { type: string }
+        guidance: { type: string }

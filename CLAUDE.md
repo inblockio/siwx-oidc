@@ -569,6 +569,24 @@ Existing sessions via the legacy `get_code` path still work as a fallback.
 | `did:peer` | variant 0, variant 2 | `aqua-auth` (peer module) | No (opt-in) |
 | `did:web` | — | Not implemented | Needs async resolver |
 
+## API documentation
+
+`docs/api/openapi.yaml` describes every route this service serves, and
+`docs/api/README.md` is the human-readable companion (which credential each
+endpoint wants, the common flows, the error conventions that look like bugs and
+are not).
+
+**The document is enforced, not decorative.**
+`tests/openapi_covers_every_route.rs` parses the router out of `axum_lib.rs` —
+resolving the `*_PATH` constants from `oidc.rs`, so a renamed constant moves the
+expectation with it — and fails when a route exists there and not in the
+document. Adding an endpoint without documenting it fails the build. It checks
+only that direction on purpose: "every documented path is a route" would fight
+paths served by the reverse proxy, and a test that cries wolf grows an ignore
+list until it protects nothing. The `NOT_AN_API` exemption list is itself
+guarded by a second test that fails when an exemption stops being a route, so it
+cannot quietly become a way to skip real endpoints.
+
 ## Building and testing
 
 ```bash
