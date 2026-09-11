@@ -186,3 +186,27 @@ own test.
   connector guard, the `MATRIX_HOST` port mismatch in `e2e_account_lifecycle_live`, the
   missing per-login deadline, and the un-filed upstream comment.
 - **Prod is still gated** by memory `prod-promotion-gate`. Nothing here jumps it.
+
+### Promotion to prod is a TWO-STEP, and the order is load-bearing
+
+dev got the safe order by accident, not by design: both image refs there float on
+tags (`.env` on dev-aquafire pins only redis and lk-jwt by digest), the Synapse image
+build simply finished first, and the pull-model converge picked it up — `matrix_synapse`
+was already running the patched image with `msc4133_key_denylist: [io.inblock.did]` in
+its live `/data/homeserver.yaml` before the publisher half landed.
+
+Prod does not float. It runs digest-pinned images and promotion is "digests,
+dev-validated", so on prod the order is whatever a human writes into `.env` — and the
+reverse order opens a real window: siwx-oidc starts publishing `io.inblock.did` while
+Synapse is still unpatched, so every sign-in in that window writes a provider-asserted
+field that any user can then overwrite. Re-assertion repairs it at the next sign-in,
+but only after someone has had the opportunity to tamper.
+
+So promote in two steps, never one `compose up`:
+
+1. Bump the **Synapse** digest, converge, and confirm in the RUNNING container that
+   `/data/homeserver.yaml` carries `msc4133_key_denylist: [io.inblock.did]`.
+2. Only then bump the **siwx-oidc** digest.
+
+`/jwk` is the honest liveness signal for step 2: the old binary serves `kid: "key1"`,
+the new one serves a 16-hex-character key-derived kid.
