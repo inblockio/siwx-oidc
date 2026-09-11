@@ -78,6 +78,42 @@ fn matrix_host() -> String {
     std::env::var("MATRIX_HOST").unwrap_or_else(|_| "http://localhost:8448".to_string())
 }
 
+/// Pure predicate behind [`skip_or_fail`]'s strictness, split out so the
+/// default can be TESTED rather than reasoned about.
+///
+/// Only the exact string `"0"` opts out. Unset means strict, which is the whole
+/// point: the lenient default is what let a live dev run report 3/3 green while
+/// verifying one leg of three.
+fn strict_skips_opted_out(var: Option<&str>) -> bool {
+    var == Some("0")
+}
+
+/// Regression guard on the default. If this ever reads `true` for `None`, a
+/// missing precondition silently becomes a passing test again.
+#[test]
+fn an_absent_strict_skips_variable_means_strict() {
+    assert!(
+        !strict_skips_opted_out(None),
+        "unset E2E_STRICT_SKIPS must mean STRICT; a lenient default turns an unverified leg into a reported pass"
+    );
+    assert!(
+        !strict_skips_opted_out(Some("1")),
+        "E2E_STRICT_SKIPS=1 must mean strict"
+    );
+    assert!(
+        !strict_skips_opted_out(Some("")),
+        "an empty value is not an opt-out"
+    );
+    assert!(
+        !strict_skips_opted_out(Some("false")),
+        "only the exact string 0 opts out"
+    );
+    assert!(
+        strict_skips_opted_out(Some("0")),
+        "E2E_STRICT_SKIPS=0 is the documented opt-out and must actually work (the previous implementation used .is_ok(), so 0 panicked too)"
+    );
+}
+
 /// Emit the harness's skip marker and either skip or hard-fail.
 ///
 /// Mirrors `e2e_account_lifecycle_live.rs`: a skip is never silent, and
@@ -85,8 +121,29 @@ fn matrix_host() -> String {
 /// masquerade as a pass in a verification run.
 fn skip_or_fail(what: &str, why: &str) {
     eprintln!("E2E_SKIP: {what} — {why}");
-    if std::env::var("E2E_STRICT_SKIPS").is_ok() {
-        panic!("E2E_STRICT_SKIPS=1: refusing to skip {what} — {why}");
+    // STRICT BY DEFAULT. Opt out only with an explicit `E2E_STRICT_SKIPS=0`.
+    //
+    // This was the other way round, and it produced exactly the failure this
+    // whole suite exists to prevent: run these tests with a required secret
+    // unset and libtest reports every leg as PASSED, because a Rust test that
+    // returns early is indistinguishable from one that verified something. A
+    // live dev run on 2026-09-11 reported 3/3 green while having checked one
+    // leg of three. The `E2E_SKIP:` line above is not a defence — nobody greps
+    // stdout of a green run.
+    //
+    // The old form was also broken on its own terms: it used `.is_ok()`, so
+    // `E2E_STRICT_SKIPS=0` — the documented way to opt out — panicked too. Any
+    // value at all meant strict.
+    //
+    // Lenient-by-default with strictness bolted on by whatever harness
+    // remembers to set the variable has the safety backwards, and `run.sh`
+    // already defaults it to 1 for the same reason. Do not invert this again.
+    if !strict_skips_opted_out(std::env::var("E2E_STRICT_SKIPS").ok().as_deref()) {
+        panic!(
+            "cannot verify {what}: {why}. This is a FAILURE, not a skip, because a \
+             silently-skipped leg reports as a pass. Supply what is missing, or set \
+             E2E_STRICT_SKIPS=0 to accept an explicitly unverified run."
+        );
     }
 }
 
