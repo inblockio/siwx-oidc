@@ -98,6 +98,58 @@ pub(crate) fn matrix_user_id(localpart: &str, server_name: &str) -> String {
 /// `admin_token`") is deliberately gone: on 1.157+ there IS no `admin_token`
 /// setting to check, and pointing an operator at it sent them looking for a
 /// config key that no longer exists.
+/// A buffered admin-scoped response: status plus the body, already read.
+///
+/// Buffered rather than a live [`reqwest::Response`] because the retry decision
+/// in [`SynapseClient::admin_request`] has to inspect the body — the one failure
+/// a re-mint can repair arrives as a 500 whose body is the only thing setting it
+/// apart from an unrelated server error.
+struct AdminResponse {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl AdminResponse {
+    async fn read(resp: reqwest::Response) -> Self {
+        let status = resp.status();
+        // An unreadable body is not itself a failure: the status still decides,
+        // and an empty body simply never matches the retry marker.
+        let body = resp.text().await.unwrap_or_default();
+        Self { status, body }
+    }
+}
+
+/// Synapse's error text when the introspected `username` resolves to no user row
+/// (`AuthError(500, "User not found")` in `synapse/api/auth/mas.py`, 1.159).
+///
+/// Matching on prose is unlovely, but it is the discriminator actually available.
+/// Verified live against 1.159.0: the response is
+/// `500 {"errcode":"M_FORBIDDEN","error":"User not found"}` — an errcode that
+/// normally accompanies a 403, carried here under a 500, and not one this crate
+/// can assume is unique to this cause. The status alone certainly is not: the
+/// sibling "Invalid device ID in introspection result" is also a 500. If a future
+/// Synapse reworded the text the retry would silently stop firing, which is
+/// exactly why [`admin_retry_warranted`] is unit-tested against this string AND
+/// against the 500 that must not retry.
+const MAS_USER_NOT_FOUND: &str = "User not found";
+
+/// Whether an admin-scoped failure is worth exactly one re-mint.
+///
+/// `true` for 401/403 (a stale or flushed token), and for the narrow 500 above,
+/// where the admin service user's row is gone and
+/// [`SynapseClient::admin_bearer`] re-provisions it on the next mint.
+///
+/// Deliberately `false` for the sibling 500, "Invalid device ID in introspection
+/// result": that one is OUR bug — an empty `device_id` serialised as `""`
+/// instead of `null` (see `crate::introspect::render_device_id`) — and a second
+/// attempt would reproduce it identically while doubling the load.
+fn admin_retry_warranted(status: reqwest::StatusCode, body: &str) -> bool {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return true;
+    }
+    status == reqwest::StatusCode::INTERNAL_SERVER_ERROR && body.contains(MAS_USER_NOT_FOUND)
+}
+
 fn admin_status_hint(status: reqwest::StatusCode) -> &'static str {
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         " — Synapse rejected the minted admin token (its scope must carry both \
@@ -331,35 +383,50 @@ impl SynapseClient {
         }
     }
 
-    /// Send an admin-scoped request, re-minting **once** on 401/403.
+    /// Send an admin-scoped request, re-minting **once** when the failure is one
+    /// a fresh mint can actually repair.
     ///
-    /// The retry is not defensive padding: a cached token can be rejected for
-    /// reasons that a fresh mint genuinely fixes — the token store was flushed
-    /// out from under us, or the admin service user was deleted (the re-mint
-    /// re-provisions it). Retrying once converts those into a self-heal instead
-    /// of a user-visible failure, and a second 401 is surfaced honestly.
+    /// The retry is not defensive padding. A cached token can be rejected for
+    /// reasons a fresh mint genuinely fixes — the token store was flushed out
+    /// from under us (401), or the admin service user's row is gone, which
+    /// [`admin_bearer`](Self::admin_bearer) heals by re-provisioning it before
+    /// minting.
+    ///
+    /// That second case arrives as a **500**, not a 401: Synapse 1.159 resolves
+    /// the introspected `username` against its own `users` table and raises
+    /// `AuthError(500, "User not found")`. Retrying on 401/403 alone therefore
+    /// never reached it, though this doc comment claimed it did — the self-heal
+    /// was unreachable in production. [`admin_retry_warranted`] draws the line,
+    /// and is unit-tested on both sides of it.
+    ///
+    /// The response is buffered because that decision has to read the body.
+    ///
+    /// Retrying is safe for every current caller: `list_devices` and
+    /// `has_cross_signing_keys` are reads, and `publish_did_field` is an
+    /// idempotent PUT of a fixed body, so a second attempt cannot duplicate a
+    /// side effect. A future non-idempotent admin call would need its own
+    /// opt-out.
     ///
     /// `build` is called once per attempt because a `RequestBuilder` is consumed
     /// by `send()`.
-    async fn admin_request<F>(&self, build: F) -> Result<reqwest::Response>
+    async fn admin_request<F>(&self, build: F) -> Result<AdminResponse>
     where
         F: Fn(&Client, &str) -> reqwest::RequestBuilder,
     {
         let token = self.admin_bearer().await?;
-        let resp = build(&self.http, &token).send().await?;
+        let first = AdminResponse::read(build(&self.http, &token).send().await?).await;
 
-        let status = resp.status();
-        if status != reqwest::StatusCode::UNAUTHORIZED && status != reqwest::StatusCode::FORBIDDEN {
-            return Ok(resp);
+        if !admin_retry_warranted(first.status, &first.body) {
+            return Ok(first);
         }
 
         warn!(
-            %status,
-            "synapse_client: admin token rejected; re-minting and retrying once"
+            status = %first.status,
+            "synapse_client: admin credential rejected; re-minting and retrying once"
         );
         self.invalidate_admin_token().await;
         let token = self.admin_bearer().await?;
-        Ok(build(&self.http, &token).send().await?)
+        Ok(AdminResponse::read(build(&self.http, &token).send().await?).await)
     }
 
     /// Provision (register) a user in Synapse.
@@ -487,20 +554,17 @@ impl SynapseClient {
             .await
             .context("has_cross_signing_keys: request failed")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            warn!(%status, %body, "has_cross_signing_keys: query failed");
+        if !resp.status.is_success() {
+            let status = resp.status;
+            warn!(%status, body = %resp.body, "has_cross_signing_keys: query failed");
             anyhow::bail!(
                 "has_cross_signing_keys: HTTP {status}{}",
                 admin_status_hint(status)
             );
         }
 
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .context("has_cross_signing_keys: invalid JSON")?;
+        let body: serde_json::Value =
+            serde_json::from_str(&resp.body).context("has_cross_signing_keys: invalid JSON")?;
 
         let has_master = body
             .get("master_keys")
@@ -721,10 +785,9 @@ impl SynapseClient {
             .await
             .context("list_devices: request failed")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            warn!(%status, %body, "list_devices failed");
+        if !resp.status.is_success() {
+            let status = resp.status;
+            warn!(%status, body = %resp.body, "list_devices failed");
             anyhow::bail!("list_devices: HTTP {status}{}", admin_status_hint(status));
         }
 
@@ -733,7 +796,8 @@ impl SynapseClient {
             #[serde(default)]
             devices: Vec<DeviceInfo>,
         }
-        let body: DevicesResponse = resp.json().await.context("list_devices: invalid JSON")?;
+        let body: DevicesResponse =
+            serde_json::from_str(&resp.body).context("list_devices: invalid JSON")?;
         Ok(body.devices)
     }
 
@@ -1014,7 +1078,7 @@ impl SynapseClient {
             .await
             .context("publish_did_field: request failed")?;
 
-        let status = resp.status();
+        let status = resp.status;
         match classify_publish_status(status) {
             PublishStatusClass::Written => {
                 debug!(%user_id, "publish_did_field: wrote the attested DID object");
@@ -1025,7 +1089,7 @@ impl SynapseClient {
             // section on this method for why this probe is mandatory and why it
             // fails LOUD rather than fail-safe.
             PublishStatusClass::MaybeRowLess => {
-                let body = resp.text().await.unwrap_or_default();
+                let body = &resp.body;
                 match self.has_profile_row(localpart, server_name).await {
                     // Confirmed: the profile row really is absent. This is
                     // #19702 and nothing else.
@@ -1076,7 +1140,7 @@ impl SynapseClient {
                 }
             }
             PublishStatusClass::Failed => {
-                let body = resp.text().await.unwrap_or_default();
+                let body = &resp.body;
                 warn!(%status, %body, %user_id, "publish_did_field failed");
                 anyhow::bail!(
                     "publish_did_field: HTTP {status}{}",
@@ -1270,6 +1334,61 @@ mod tests {
         assert_eq!(encoded, "%40alice%3Aexample.com");
         assert!(!encoded.contains('@'));
         assert!(!encoded.contains(':'));
+    }
+
+    // -- admin_retry_warranted ------------------------------------------------
+    //
+    // This predicate decides whether siwx-oidc re-mints its admin credential and
+    // tries again. It exists because the failure that a re-mint actually repairs
+    // -- the admin service user's row having vanished -- is reported by Synapse
+    // 1.159 as `AuthError(500, "User not found")`, NOT as a 401. The previous
+    // guard tested `status != 401 && status != 403`, so the self-heal its own
+    // doc comment advertised could never fire in production.
+    //
+    // Both directions matter, so both are pinned: the narrow 500 must retry, and
+    // the sibling 500 must not.
+
+    fn code(n: u16) -> reqwest::StatusCode {
+        reqwest::StatusCode::from_u16(n).unwrap()
+    }
+
+    #[test]
+    fn stale_token_statuses_warrant_a_remint() {
+        assert!(admin_retry_warranted(code(401), ""));
+        assert!(admin_retry_warranted(code(403), ""));
+    }
+
+    #[test]
+    fn missing_service_user_500_warrants_a_remint() {
+        // The whole point of the fix: `admin_bearer` re-provisions the service
+        // user before minting, so this IS self-healable -- but only if a 500
+        // carrying this text is allowed to reach the retry.
+        let body = r#"{"errcode":"M_UNKNOWN","error":"User not found"}"#;
+        assert!(admin_retry_warranted(code(500), body));
+    }
+
+    #[test]
+    fn invalid_device_id_500_must_not_retry() {
+        // Our own bug (an empty `device_id` rendered as "" instead of null).
+        // Retrying reproduces it exactly and doubles the load, so this 500 is
+        // deliberately excluded even though it shares the status code above.
+        let body = r#"{"errcode":"M_UNKNOWN","error":"Invalid device ID in introspection result"}"#;
+        assert!(!admin_retry_warranted(code(500), body));
+    }
+
+    #[test]
+    fn unrelated_500_must_not_retry() {
+        assert!(!admin_retry_warranted(code(500), "database is on fire"));
+        assert!(!admin_retry_warranted(code(500), ""));
+    }
+
+    #[test]
+    fn success_and_other_failures_do_not_retry() {
+        // A 404 body could mention "User not found" without being the auth case;
+        // the status is what confines the text match to the 500 branch.
+        assert!(!admin_retry_warranted(code(200), "User not found"));
+        assert!(!admin_retry_warranted(code(404), "User not found"));
+        assert!(!admin_retry_warranted(code(502), "User not found"));
     }
 
     #[test]
