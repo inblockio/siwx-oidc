@@ -455,10 +455,10 @@ fn payload_force_all(payload: &serde_json::Value) -> bool {
 /// when `force_all` (the `{"all":true}` escape hatch wins) or the cookie is absent.
 /// Pure (no Redis) so the escape-hatch + absent-cookie branches are unit-testable; the
 /// resolve-to-DID step is [`user_session_scope_did`].
-fn user_session_token<'a>(
-    cookies: &'a Option<TypedHeader<headers::Cookie>>,
+fn user_session_token(
+    cookies: &Option<TypedHeader<headers::Cookie>>,
     force_all: bool,
-) -> Option<&'a str> {
+) -> Option<&str> {
     if force_all {
         return None;
     }
