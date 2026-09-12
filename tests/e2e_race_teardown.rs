@@ -1284,9 +1284,12 @@ async fn h14_synapse_delete_failure_is_surfaced_not_500() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn h3_concurrent_same_device_delete_revokes_all_tokens() {
+    const ROUNDS: usize = 6;
+    let mut total_minted = 0usize;
+    let mut rounds_with_mints = 0usize;
     let base = oidc();
     let c = Client::new();
-    for round in 0..6 {
+    for round in 0..ROUNDS {
         mock_reset(&c).await;
         let w = new_wallet();
         let login = wallet_login(&c, &base, &w).await;
@@ -1392,26 +1395,99 @@ async fn h3_concurrent_same_device_delete_revokes_all_tokens() {
             "round {round}: {survivors} of {} refreshed tokens survived the device delete (resurrection)",
             minted.len()
         );
+
+        total_minted += minted.len();
+        if !minted.is_empty() {
+            rounds_with_mints += 1;
+        }
     }
+
+    eprintln!(
+        "[h3] totals across {ROUNDS} rounds: minted={total_minted} in \
+         {rounds_with_mints} round(s)"
+    );
+
+    // ANTI-VACUITY — the guard h6 grew and this test, its twin, never had.
+    //
+    // `survivors == 0` is trivially true over an EMPTY `minted`, so a run where
+    // the pump never lands a refresh inside the delete window reports a
+    // confident green while proving nothing about resurrection. h6 sat in
+    // exactly that state undetected (measured: zero pump mints in all six
+    // rounds, twice, a remediation apart). Nothing structural protected h3 from
+    // the same fate — it merely happened to be winning its race — so the
+    // absence of this check was a silent dependency on timing, not a design.
+    //
+    // Unlike h6's, this window is real and the pump does win it: measured
+    // 2026-09-13, `minted=1` in 6 of 6 rounds. It is not wide, though — the
+    // refresh answers in ~11ms and the device-revoked tombstone lands after the
+    // Synapse `delete_device` round trip, so a slower runner can lose a round.
+    // Hence an aggregate rather than a per-round requirement: a single lost
+    // round is timing, all six lost is a test that no longer tests anything.
+    // The per-round `[h3]` lines above show the distribution, so a decay from
+    // 6/6 toward 1/6 is visible in the log BEFORE it becomes a failure here.
+    //
+    // If this fires, the fix is to widen the window or redesign the pump, NOT to
+    // delete the check: deleting it restores a test that can only ever pass.
+    assert!(
+        total_minted > 0,
+        "VACUOUS RUN: the refresh pump minted 0 tokens inside the delete window \
+         across all {ROUNDS} rounds, so `survivors == 0` proved nothing. The \
+         resurrection scenario was never exercised — see the comment above \
+         before touching this assertion."
+    );
 }
 
-// --- H6 / S3-4: account_deactivate (revoke ALL) racing an in-flight refresh -
-// Desired: NO token survives — deactivate revokes ALL of the user's tokens, so a
-// refresh that races (or follows) the sweep must not yield an active token. The
-// confirmed bug: the deactivate sweep is a non-atomic one-shot, so a refresh
-// chain keeps minting usable tokens (resurrection). A refresh pump exposes it
-// deterministically (same shape as H3).
+// --- H6 / S3-4: account_deactivate (revoke ALL) vs. a refresh pump ----------
 // REGRESSION GUARD (was repro S3-4 / H6): account_deactivate's non-atomic sweep let
 // an in-flight refresh resurrect access. Fixed by planting a per-user deactivation
 // tombstone BEFORE the sweep (checked + check-mint-rechecked by the refresh paths).
-// See fix commit for S3-4/H6. Now runs unconditionally, asserting survivors == 0.
+//
+// WHAT THIS TEST ACTUALLY PROVES — AND WHAT IT DOES NOT.
+//
+// It was called `h6_deactivate_racing_refresh_no_resurrection` and it does not
+// race. Instrumented 2026-09-13, six rounds, six identical results:
+//
+//     seeded=1  post_barrier=0  first_status=401  ("M_UNKNOWN_TOKEN",
+//                                                  "Session has been revoked")
+//     first post-barrier refresh answered in ~11ms; deactivate took ~77ms
+//
+// The post-barrier loop body NEVER RUNS. Every token this test checks is the
+// pre-barrier seed, so the property it establishes is the SEQUENTIAL one — "a
+// token minted before the deactivate is revoked by it, and every later refresh
+// is refused" — not the concurrent one its old name claimed. The 2026-09-10
+// remediation that added the seed and the `total_minted > 0` guard fixed the
+// silent-zero, but the guard it added is satisfied ENTIRELY by that seed, so the
+// concurrent half stayed unexercised and unreported.
+//
+// The deactivate wins because it is BUILT to win: `account.rs` plants the
+// deactivation tombstone as the first thing the handler does, before the Synapse
+// call and before the sweep ("Plant the deactivation tombstone FIRST (S3-4/H6)").
+// That is one cheap Redis SET after session validation, while a refresh is a
+// multi-step read-mint-write. A client cannot reliably get its tombstone check in
+// first, and the resurrection window it would then need — check before the plant,
+// WRITE after the sweep ~70ms later — is closed a second time by the
+// check-mint-recheck rollback. So the race is not merely hard to hit here: the
+// fix is what makes it unhittable, and a test that demanded a post-barrier mint
+// would be permanently red against correct code.
+//
+// The barrier is therefore KEPT and the post-barrier outcome is now ASSERTED
+// rather than ignored. If a future change moves the tombstone later — the exact
+// regression that would reopen S3-4 — post-barrier refreshes start succeeding,
+// this test starts exercising the concurrent path for real, and `survivors == 0`
+// becomes a live question again. Until then the assertion below pins the reason
+// the loop does not run: the refusal must be the DEACTIVATION tombstone
+// (401 M_UNKNOWN_TOKEN), never some unrelated breakage in the pump. That is the
+// difference between "the race did not happen" and "the test did not work", and
+// telling those two apart is the whole point of this rewrite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
-async fn h6_deactivate_racing_refresh_no_resurrection() {
-    let mut total_minted = 0usize;
+async fn h6_deactivate_revokes_every_minted_token_and_the_tombstone_wins() {
+    const ROUNDS: usize = 6;
+    let mut total_seeded = 0usize;
+    let mut total_post_barrier = 0usize;
     let base = oidc();
     let c = Client::new();
-    for round in 0..6 {
+    for round in 0..ROUNDS {
         mock_reset(&c).await;
         let w = new_wallet();
         let login = wallet_login(&c, &base, &w).await;
@@ -1436,9 +1512,13 @@ async fn h6_deactivate_racing_refresh_no_resurrection() {
             .await
             .status()
         });
-        // Pump chained refreshes throughout the deactivate window.
+        // Pump chained refreshes throughout the deactivate window. It reports
+        // the two halves SEPARATELY: conflating them is what let the old
+        // `total_minted > 0` guard be satisfied by the seed alone.
         let pump = tokio::spawn(async move {
-            let mut minted: Vec<String> = Vec::new();
+            let mut seeded: Vec<String> = Vec::new();
+            let mut post_barrier: Vec<String> = Vec::new();
+            let mut first_post_refusal: Option<(StatusCode, String)> = None;
             let mut rt = first_refresh;
 
             // SEED ONE REFRESH *BEFORE* THE BARRIER.
@@ -1450,11 +1530,11 @@ async fn h6_deactivate_racing_refresh_no_resurrection() {
             // while checking an EMPTY set — a test that could only ever pass.
             //
             // Seeding guarantees at least one refreshed token exists when the
-            // deactivate sweep runs, which is precisely the resurrection risk
-            // this test is named for. The barrier race below is deliberately
-            // KEPT, so any refresh that does land inside the window still
-            // exercises the concurrent path: this widens the test, it does not
-            // replace it. Do not "simplify" the seed away.
+            // deactivate sweep runs. Measured again 2026-09-13: it is also the
+            // ONLY token this test ever checks, because the post-barrier loop
+            // below still never runs (see the header comment). Do not
+            // "simplify" the seed away, and do not let it stand in for the
+            // post-barrier half — they are counted separately on purpose.
             let seed = cp
                 .post(format!("{basep}/_matrix/client/v3/refresh"))
                 .json(&json!({ "refresh_token": rt }))
@@ -1464,7 +1544,7 @@ async fn h6_deactivate_racing_refresh_no_resurrection() {
             if seed.status() == StatusCode::OK {
                 let j: Value = seed.json().await.unwrap();
                 if let Some(at) = j["access_token"].as_str() {
-                    minted.push(at.to_string());
+                    seeded.push(at.to_string());
                 }
                 if let Some(next) = j["refresh_token"].as_str() {
                     rt = next.to_string();
@@ -1480,23 +1560,47 @@ async fn h6_deactivate_racing_refresh_no_resurrection() {
                     .await
                     .unwrap();
                 if r.status() != StatusCode::OK {
+                    // Record WHY the chain stopped. "The race was lost" and "the
+                    // pump was broken" both produce zero post-barrier mints and
+                    // must not look alike.
+                    let st = r.status();
+                    let body: Value = r.json().await.unwrap_or(Value::Null);
+                    first_post_refusal = Some((
+                        st,
+                        body["errcode"]
+                            .as_str()
+                            .unwrap_or("<no errcode>")
+                            .to_string(),
+                    ));
                     break;
                 }
                 let j: Value = r.json().await.unwrap();
                 if let Some(at) = j["access_token"].as_str() {
-                    minted.push(at.to_string());
+                    post_barrier.push(at.to_string());
                 }
                 match j["refresh_token"].as_str() {
                     Some(next) => rt = next.to_string(),
                     None => break,
                 }
             }
-            minted
+            (seeded, post_barrier, first_post_refusal)
         });
 
         let st = deact.await.unwrap();
-        let minted = pump.await.unwrap();
+        let (seeded, post_barrier, first_post_refusal) = pump.await.unwrap();
         assert_eq!(st, 200, "round {round}: deactivate must 200");
+
+        // ANTI-VACUITY, PART 1: the seed must exist. It is the token the sweep is
+        // judged on, so a round without it asserts nothing whatsoever. The old
+        // aggregate guard could be satisfied by a single lucky round; this is
+        // per-round and cannot.
+        assert_eq!(
+            seeded.len(),
+            1,
+            "round {round}: the pre-barrier seed refresh must mint exactly one \
+             token — without it `survivors == 0` below is checked against an \
+             EMPTY set and proves nothing (see the header comment)"
+        );
 
         // The original token is gone.
         assert!(
@@ -1505,6 +1609,7 @@ async fn h6_deactivate_racing_refresh_no_resurrection() {
         );
         // No refreshed token may survive: deactivate revokes ALL the user's tokens.
         // THE BUG: the non-atomic sweep lets refreshed tokens survive (resurrection).
+        let minted: Vec<&String> = seeded.iter().chain(post_barrier.iter()).collect();
         let mut survivors = 0;
         for t in &minted {
             if token_active(&c, t).await {
@@ -1512,53 +1617,118 @@ async fn h6_deactivate_racing_refresh_no_resurrection() {
             }
         }
         eprintln!(
-            "[h6] round {round}: minted={} survivors={survivors}",
-            minted.len()
+            "[h6] round {round}: seeded={} post_barrier={} survivors={survivors} \
+             first_post_refusal={first_post_refusal:?}",
+            seeded.len(),
+            post_barrier.len()
         );
         assert_eq!(
             survivors, 0,
             "round {round}: {survivors} of {} refreshed tokens survived account_deactivate (resurrection)",
             minted.len()
         );
-        total_minted += minted.len();
+
+        // ANTI-VACUITY, PART 2: the post-barrier half must have a LEGIBLE
+        // outcome. Either the refresh won the race and minted (checked for
+        // survival just above), or it was refused BY THE DEACTIVATION TOMBSTONE
+        // — 401 M_UNKNOWN_TOKEN, from either `compat::refresh`'s pre-check or
+        // its check-mint-recheck rollback. Any other answer means the pump broke
+        // for a reason unrelated to deactivation, which is precisely the state
+        // this test spent two remediations silently sitting in.
+        match (post_barrier.len(), &first_post_refusal) {
+            (0, None) => panic!(
+                "round {round}: the post-barrier pump neither minted nor was \
+                 refused — it did not run at all"
+            ),
+            (0, Some((status, errcode))) => {
+                assert_eq!(
+                    *status,
+                    StatusCode::UNAUTHORIZED,
+                    "round {round}: a refresh after account_deactivate must be \
+                     refused with 401, got {status} ({errcode})"
+                );
+                assert_eq!(
+                    errcode, "M_UNKNOWN_TOKEN",
+                    "round {round}: the refusal must be the DEACTIVATION \
+                     tombstone, not an unrelated pump failure"
+                );
+            }
+            _ => {
+                // The race was won: post-barrier tokens exist and were just
+                // proven dead. This is the concurrent path the test is for, and
+                // reaching it is a strictly better outcome than the branch above.
+            }
+        }
+
+        total_seeded += seeded.len();
+        total_post_barrier += post_barrier.len();
     }
 
-    // THE ASSERTION ABOVE IS VACUOUS WHEN THE PUMP MINTS NOTHING.
-    //
-    // `survivors == 0` is trivially true if `minted` is empty, so a run where the
-    // refresh pump never won a single round would report a confident green while
-    // proving nothing about resurrection at all. That is not hypothetical: it was
-    // measured on 2026-09-10 against the modernised mock, where all six rounds
-    // minted zero tokens and this test still passed. (h3's identical pump minted
-    // one per round on the same stack, so the mechanism is sound — it is the race
-    // window that is timing-sensitive.)
-    //
-    // So the vacuity is now a FAILURE rather than a footnote in a report nobody
-    // will read. If this fires, the test did not run the scenario it is named
-    // for; the fix is to widen the race window (or redesign the pump), NOT to
-    // delete this check. Deleting it restores a test that can only ever pass.
-    assert!(
-        total_minted > 0,
-        "VACUOUS RUN: the refresh pump minted 0 tokens across all rounds, so \
-         `survivors == 0` proved nothing. The resurrection scenario was never \
-         exercised — see the comment above before touching this assertion."
+    eprintln!(
+        "[h6] totals across {ROUNDS} rounds: seeded={total_seeded} \
+         post_barrier={total_post_barrier}"
+    );
+
+    // The aggregate guard counts ONLY the pre-barrier seeds, because that is the
+    // only thing this test can honestly require. The previous version summed both
+    // halves into one `total_minted > 0`, which read like a guarantee that the
+    // race had been exercised and was in fact satisfied by the seed alone in
+    // every round ever measured. `total_post_barrier` is REPORTED, never
+    // required: demanding it would make this test permanently red against
+    // correct code (the header comment explains why the tombstone always wins).
+    // If it is ever non-zero, the concurrent path ran — read the header before
+    // concluding that is good news, because it may mean the tombstone moved.
+    assert_eq!(
+        total_seeded, ROUNDS,
+        "VACUOUS RUN: only {total_seeded} of {ROUNDS} rounds seeded a token \
+         before the barrier, so those rounds checked `survivors == 0` against an \
+         empty set and proved nothing."
     );
 }
 
 // --- H9 / S3-1: device-code Approved branch is double-redeemable ------------
-// Desired: two concurrent token polls for one approved device_code mint at most
-// one token pair. The bug: delete-after-issuance with no atomic claim, so both
-// polls can mint tokens.
+// Desired: two concurrent token polls for one APPROVED device_code mint EXACTLY
+// one token pair — one winner, one loser refused with an RFC 8628 error. The
+// bug: delete-after-issuance with no atomic claim, so both polls could mint.
 // REGRESSION GUARD (was repro S3-1 / H9): the device-code Approved branch deleted the
 // code only AFTER token issuance, so two concurrent polls each minted a token pair.
 // Fixed by an atomic SETNX claim (try_claim_device_code) before issuing. See fix
-// commit for S3-1/H9. Now runs unconditionally, asserting at most one token minted.
+// commit for S3-1/H9. Now runs unconditionally.
+//
+// THE ASSERTION USED TO BE `minted.len() <= 1` — AND ZERO SATISFIES THAT.
+//
+// "At most one" is half the invariant. The half it omits is the half that says
+// the grant WORKS, and omitting it made this test blind to a device-code grant
+// that issues nothing to anybody. Measured 2026-09-13: an auditor patched the
+// Approved branch so the claim never succeeded — a totally broken RFC 8628
+// grant — rebuilt, and ran every suite CI runs. `e2e_account_management` 6/6,
+// `e2e_oauth_binding` 11/11, `e2e_race_teardown` 14/14 (this test included),
+// `e2e_resolve_http` 12/12 and 259 unit tests all stayed GREEN. The one test
+// that went red, `e2e_device_code::device_code_grant_end_to_end`, was `#[ignore]`d
+// and ran in no CI job at all (it is promoted now — see the `rust-e2e-mock` job
+// in `.github/workflows/ci.yml`). This test was the only CI-visible guard on the
+// whole grant, and a grant minting zero tokens passed it.
+//
+// So it now asserts the invariant end to end: EXACTLY one poll is served, the
+// token it got is really usable (introspection says active — a 200 carrying a
+// junk string is not a redemption), and the other poll is refused with a
+// legitimate RFC 8628 error rather than a 500.
+//
+// There is no legitimate way for a round to mint zero, which is why `== 1` is
+// assertable and not merely hoped for: the code is APPROVED before the polls
+// start (asserted above), `try_claim_device_code` is a SETNX on a key nothing
+// else can hold, and the branch behind that claim has no best-effort exit that
+// swallows a failure — the Synapse work inside it is logged, never fatal. A
+// round that mints zero means the grant is broken. Do not weaken this back to
+// `<= 1` to get a green run; `<= 1` is what a broken grant already passes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn h9_device_code_approved_no_double_redemption() {
+    const ROUNDS: usize = 8;
+    let mut total_minted = 0usize;
     let base = oidc();
     let c = Client::new();
-    for round in 0..8 {
+    for round in 0..ROUNDS {
         mock_reset(&c).await;
         let w = new_wallet();
         // AFTER the reset (which clears the existing-user set): this test is about
@@ -1619,27 +1789,88 @@ async fn h9_device_code_approved_no_double_redemption() {
                     .send()
                     .await
                     .unwrap();
-                if r.status() == StatusCode::OK {
-                    let j: Value = r.json().await.unwrap();
-                    j["access_token"].as_str().map(|s| s.to_string())
-                } else {
-                    None
-                }
+                // Keep the REFUSAL, not just the absence of a token: "nobody was
+                // served" and "one poll was served" are only distinguishable if
+                // the loser's answer is recorded too.
+                let status = r.status();
+                let body: Value = r.json().await.unwrap_or(Value::Null);
+                (status, body)
             }));
         }
-        let mut minted = Vec::new();
+        let mut outcomes: Vec<(StatusCode, Value)> = Vec::new();
         for t in tasks {
-            if let Some(tok) = t.await.unwrap() {
-                minted.push(tok);
-            }
+            outcomes.push(t.await.unwrap());
         }
-        // DESIRED: at most one token pair minted (no double redemption).
-        assert!(
-            minted.len() <= 1,
-            "round {round}: device_code must be redeemable at most once, minted {} tokens",
+        let minted: Vec<String> = outcomes
+            .iter()
+            .filter(|(st, _)| *st == StatusCode::OK)
+            .filter_map(|(_, b)| b["access_token"].as_str().map(|s| s.to_string()))
+            .collect();
+        let refused: Vec<(StatusCode, String)> = outcomes
+            .iter()
+            .filter(|(st, _)| *st != StatusCode::OK)
+            .map(|(st, b)| {
+                (
+                    *st,
+                    b["error"]
+                        .as_str()
+                        .unwrap_or("<no error member>")
+                        .to_string(),
+                )
+            })
+            .collect();
+        eprintln!(
+            "[h9] round {round}: minted={} refused={refused:?}",
             minted.len()
         );
+
+        // DESIRED: EXACTLY one token pair minted. `> 1` is the double-redemption
+        // bug this test is named for; `== 0` is a device-code grant that serves
+        // nobody, which the former `<= 1` assertion accepted as a pass.
+        assert_eq!(
+            minted.len(),
+            1,
+            "round {round}: an APPROVED device_code must be redeemed EXACTLY once \
+             by two concurrent polls, minted {} (refused: {refused:?}). More than \
+             one is double redemption; ZERO is a broken grant, and zero is what \
+             the old `<= 1` assertion could not see.",
+            minted.len()
+        );
+
+        // A 200 is not a redemption unless the thing it carried is a token. This
+        // is what makes the "at least one" half real rather than a status check.
+        assert!(
+            token_active(&c, &minted[0]).await,
+            "round {round}: the winning poll's access token must be a real, \
+             introspectable, ACTIVE token"
+        );
+
+        // And the loser is refused legibly: RFC 8628 `authorization_pending`
+        // while the winner holds the claim, or `expired_token` if it arrives
+        // after the winner deleted the code. Never a 500, never a silent 200.
+        for (status, error) in &refused {
+            assert_eq!(
+                *status,
+                StatusCode::BAD_REQUEST,
+                "round {round}: the losing poll must be refused with 400, got {status} ({error})"
+            );
+            assert!(
+                matches!(error.as_str(), "authorization_pending" | "expired_token"),
+                "round {round}: the losing poll must get an RFC 8628 error, got {error:?}"
+            );
+        }
+
+        total_minted += minted.len();
     }
+
+    // Aggregate anti-vacuity: one token per round, every round. A suite-wide
+    // regression that silently stops serving the grant shows up here even if a
+    // single round's `== 1` were ever relaxed.
+    assert_eq!(
+        total_minted, ROUNDS,
+        "{total_minted} tokens minted across {ROUNDS} approved device codes: \
+         each approved code must be redeemed exactly once"
+    );
 }
 
 // ===========================================================================

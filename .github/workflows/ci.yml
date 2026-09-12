@@ -24,9 +24,17 @@ jobs:
         run: cargo fmt -- --check
 
       # Runs the unit tests only. Every tests/*.rs integration test is #[ignore]d
-      # and stays that way: all 43 of them need a live siwx-oidc HTTP listener,
+      # and stays that way: all 63 of them need a live siwx-oidc HTTP listener,
       # which this job does not have (Redis alone is not enough). The promotable
       # subset runs in the `rust-e2e-mock` job below.
+      #
+      # This does NOT run the 4 `#[ignore]`d UNIT tests in the binary crate, and
+      # no job does: `device_auth::tests::write_previews` (an opt-in HTML dumper),
+      # `synapse_client::tests::d1_live_*` (2, need a real Synapse), and
+      # `synapse_client::tests::d5_a_blackholed_synapse_gives_up_in_about_the_connect_timeout`.
+      # d5 needs NOTHING — it dials a TEST-NET-1 (RFC 5737) address and asserts the
+      # connect timeout is honoured, and passes here in ~2s — so it is promotable
+      # and should be promoted the next time `src/synapse_client.rs` is touched.
       - name: Test
         run: cargo test
 
@@ -36,11 +44,36 @@ jobs:
   # ran NOWHERE automatically, so every protocol-level assertion about session
   # teardown, OAuth binding and account management was an unguarded manual claim.
   #
-  # This job promotes the 28 of them that need nothing beyond the self-contained
+  # This job promotes the 51 of them that need nothing beyond the self-contained
   # mock stack (Redis + synapse_mock.py + siwx-oidc) -- the same infrastructure
-  # browser-e2e already stands up. The remaining 15 are NOT promotable: they need
+  # browser-e2e already stands up. The remaining 12 are NOT promotable: they need
   # a REAL Synapse (they call /_matrix/client/v3/... Client-Server endpoints that
-  # synapse_mock.py does not implement and 404s).
+  # synapse_mock.py does not implement and 404s, or read Synapse's own
+  # /_matrix/client/v1/auth_metadata forwarding).
+  #
+  # The 2026-09-13 test-vacuity audit re-counted this and found the tally had
+  # rotted: the job ran 43, not the 28 claimed here, while 24 `#[ignore]`d tests
+  # ran NOWHERE. Nine of those were verified green against a plain mock stack and
+  # are promoted below. The one that mattered most was
+  # `e2e_device_code::device_code_grant_end_to_end`: it was the ONLY test in the
+  # repo that fails when the RFC 8628 grant is broken, and it ran in no job, so a
+  # device-code grant patched to issue nothing to anybody passed every CI suite
+  # green (see the h9 comment in tests/e2e_race_teardown.rs for the evidence).
+  # Not promotable, and why:
+  #   e2e_account_lifecycle_live  (2) real Synapse: whoami/admin round trip
+  #   e2e_did_field_live          (3) real PATCHED Synapse: MSC4133 write ACL
+  #   e2e_msc4191_live            (5) real Synapse: cross-signing key upload
+  #   e2e_msc3861::msc4191_metadata_advertised_and_forwarded
+  #                               (1) real Synapse: it asserts SYNAPSE forwards
+  #                                   our account_management_actions_supported
+  #   e2e_messaging::two_client_messaging
+  #                               (1) real Synapse -- and it PASSES without one by
+  #                                   printing "skipping messaging test" and
+  #                                   returning ok. It is NOT promoted: a step
+  #                                   that can only ever be green is worse than no
+  #                                   step. It needs the E2E_STRICT_SKIPS gate the
+  #                                   other live suites use before it is worth a
+  #                                   CI line.
   #
   # Three of the 28 were initially RED and were briefly skipped by name. They were
   # not weakened -- they were WRONG, and are now fixed (see finding F-1): each
@@ -131,10 +164,14 @@ jobs:
       - name: E2E OAuth binding
         run: cargo test --test e2e_oauth_binding -- --ignored --test-threads=1
 
-      # Race/teardown hazard register H1..H14 (12/12 promoted).
-      # h9 -- "at most one token per device_code across 8 concurrent rounds" -- is
-      # the double-redemption guard, and is the single most consequential assertion
-      # in this job. It must never be skipped to obtain a green run.
+      # Race/teardown hazard register H1..H14 (14/14 promoted -- this said 12/12
+      # for two suites' worth of growth; the count is now checked, not recited).
+      # h9 -- "EXACTLY one token per device_code across 8 concurrent rounds" -- is
+      # the double-redemption guard and the most consequential assertion here. It
+      # must never be skipped to obtain a green run. It asserted "at MOST one"
+      # until 2026-09-13, which zero also satisfies, so it passed against a
+      # device-code grant that issued nothing at all; the "at least one" half is
+      # now asserted too, and `e2e_device_code` below is its independent twin.
       - name: E2E race and teardown
         run: cargo test --test e2e_race_teardown -- --ignored --test-threads=1
 
@@ -146,6 +183,46 @@ jobs:
       # headers and the JSON key set, which is what its third-party consumers see.
       - name: E2E resolve HTTP contract
         run: cargo test --test e2e_resolve_http -- --ignored --test-threads=1
+
+      # -------------------------------------------------------------------
+      # Promoted 2026-09-13 by the test-vacuity audit. Each of these ran in no
+      # job at all before, despite passing against exactly this mock stack.
+      # -------------------------------------------------------------------
+
+      # THE RFC 8628 device-code grant, end to end (1/1 promoted). Guards that an
+      # approved device code actually yields working tokens -- the one invariant
+      # no other CI test can see fail. A grant broken so it never issues anything
+      # left every other suite green.
+      - name: E2E device code grant
+        run: cargo test --test e2e_device_code -- --ignored --test-threads=1
+
+      # MSC3861 delegated-auth lifecycle (3/4 promoted). Guards the Synapse
+      # provisioning contract: sign-in -> device -> introspection -> refresh, and
+      # that a returning user gets a NEW device rather than a recycled one.
+      # `msc4191_metadata_advertised_and_forwarded` is skipped by name because it
+      # asserts a REAL Synapse re-serves our account-management actions on
+      # /_matrix/client/v1/auth_metadata, which the mock does not model.
+      - name: E2E MSC3861 lifecycle
+        run: |
+          cargo test --test e2e_msc3861 -- --ignored --test-threads=1 \
+            --skip msc4191_metadata_advertised_and_forwarded
+
+      # `compat::TeardownPolicy` (3/3 promoted): the fix for the 2026-06-12 login
+      # incident. Guards that /oauth2/revoke deletes NO Synapse device (token
+      # hygiene raced in-flight key uploads and wedged cross-signing), that an
+      # explicit /logout deletes exactly the ending one, and that /logout/all
+      # invalidates every session WITHOUT deactivating the account.
+      - name: E2E session teardown policy
+        run: cargo test --test e2e_session_teardown -- --ignored --test-threads=1
+
+      # MSC4191 account-management PAGES (1/6 promoted). Guards the bare-action
+      # landing menu, which is the only route an Element Web user has to
+      # deactivation. The other five in this suite drive a real Synapse's
+      # cross-signing key upload and cannot run here.
+      - name: E2E MSC4191 account menu
+        run: |
+          cargo test --test e2e_msc4191_live \
+            msc4191_account_menu_and_deactivate_page_live -- --ignored --test-threads=1
 
       - name: Collect service logs
         if: failure()
