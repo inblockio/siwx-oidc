@@ -987,6 +987,58 @@ mod tests {
         assert_eq!(status_of(err), axum::http::StatusCode::BAD_REQUEST);
     }
 
+    /// An INDETERMINATE probe answer is a 502, not the 400 that a refused
+    /// localpart gets. The two look alike on the wire and mean opposite things.
+    ///
+    /// A `400 M_INVALID_USERNAME` is Synapse telling us this name can never hold
+    /// an account — a fact about the REQUEST, so a 400 (pinned by
+    /// `an_mxid_the_homeserver_refuses_is_a_400_never_a_502_or_a_phantom_account`).
+    /// A proxy `404`, a `429`, or a non-JSON error body tells us nothing about
+    /// the localpart at all — a fact about the UPSTREAM, so a 502.
+    ///
+    /// Before the 2026-09-13 errcode allowlist (see
+    /// `docs/audits/2026-09-12-localpart-availability-conflation.md`) every
+    /// non-`M_USER_IN_USE` 4xx became `Unusable` and this answered 400, telling
+    /// the caller their mxid was malformed when in fact a proxy was in the way.
+    /// Sending whoever is holding the pager to the caller instead of to the
+    /// homeserver is the whole cost of conflating these.
+    #[tokio::test]
+    async fn an_indeterminate_probe_is_a_502_not_the_400_a_refused_localpart_gets() {
+        let localpart = "someone";
+        let mxid = format!("@{localpart}:{SERVER_NAME}");
+
+        let (synapse, handle) = spawn_mock_synapse_configured(
+            crate::localpart::resolve_identity_tests::MockSynapseConfig {
+                // A reverse proxy in front of Synapse answering for a route it
+                // does not know: a 4xx carrying no Matrix errcode at all.
+                probe_faults: std::collections::HashMap::from([(
+                    localpart.to_string(),
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        "<html>404 Not Found</html>".to_string(),
+                    ),
+                )]),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let err = resolve(
+            &config(Some(SERVER_NAME)),
+            Some(&synapse),
+            query(None, Some(&mxid)),
+        )
+        .await
+        .expect_err("an indeterminate probe cannot answer the question");
+
+        assert!(
+            matches!(err, ResolveError::Upstream { .. }),
+            "an upstream fault must not be reported as a bad request: {err:?}"
+        );
+        assert_eq!(status_of(err), axum::http::StatusCode::BAD_GATEWAY);
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn a_malformed_mxid_is_rejected_before_any_probe() {
         // TEST-NET-1 (RFC 5737): guaranteed non-routable. If parsing did NOT

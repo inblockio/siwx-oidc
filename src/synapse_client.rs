@@ -616,6 +616,7 @@ impl SynapseClient {
     /// | all-numeric (reserved for guests) | 400 | `M_INVALID_USERNAME` | [`LocalpartStatus::Unusable`] |
     /// | appservice-exclusive namespace | 400 | `M_EXCLUSIVE` | [`LocalpartStatus::Unusable`] |
     /// | **bad MAS shared secret** | **403** | — | **`Err`** |
+    /// | **anything else 4xx** (unknown or absent `errcode`, a non-JSON body, a proxy `404 M_NOT_FOUND`, `429 M_LIMIT_EXCEEDED`) | 4xx | any | **`Err`** |
     ///
     /// **401/403 is an `Err`, and must never be allowed to become a verdict.**
     /// `assert_request_is_from_mas` rejects a wrong or rotated shared secret
@@ -627,21 +628,49 @@ impl SynapseClient {
     /// silent failure of new-account detection, presented as fact. This is the
     /// load-bearing branch of this function.
     ///
-    /// **A missing or unparseable `errcode` resolves to `Unusable`, never
-    /// `InUse`.** The two wrong answers are not symmetric: reporting
-    /// "unusable" for an account that exists costs one honest error on a path
-    /// that already has to handle errors, while reporting "in use" for a
-    /// localpart no account can occupy invents an account — and callers such
-    /// as [`crate::localpart::resolve_identity`] read exactly that as "this
-    /// user is pre-existing, grandfather them". Fail toward the cheap mistake.
+    /// **The `errcode` is an ALLOWLIST in both directions; every other 4xx is
+    /// an `Err`.** `M_USER_IN_USE` is the only errcode that may produce
+    /// [`LocalpartStatus::InUse`], and `M_INVALID_USERNAME` / `M_EXCLUSIVE`
+    /// are the only two that may produce [`LocalpartStatus::Unusable`] — the
+    /// only two answers in which Synapse has actually told us it will not
+    /// allow an account under this name. Anything else (an unknown errcode, a
+    /// body with no `errcode`, a body that is not JSON, a `404` from a proxy
+    /// that does not serve this route, a `429 M_LIMIT_EXCEEDED`) is an `Err`
+    /// saying the answer is **indeterminate**, because none of those responses
+    /// carry information about the localpart at all.
     ///
-    /// Known imprecision: a 404 from a homeserver that does not serve this
-    /// route at all (wrong endpoint, a proxy in the way) also lands in
-    /// `Unusable` rather than an error, because nothing in the response
-    /// distinguishes it from a refusal. The safety property still holds — the
-    /// caller is told "not an account", not "an account" — but the variant
-    /// name overstates what was learned. Diagnose from the `errcode`/`message`
-    /// it carries.
+    /// **What changed on 2026-09-13, and why the old rule was wrong.** This
+    /// function used to return `Unusable` for every non-`M_USER_IN_USE` 4xx,
+    /// arguing that "not an account" is the cheap mistake and "an account
+    /// exists" the damaging one. That argument holds only for the errcodes
+    /// that actually *prove* refusal. [`crate::localpart::resolve_identity`]
+    /// reads `Unusable` as "no account can exist here, so fall through to the
+    /// modern localpart" — so an indeterminate 4xx made a **grandfathered**
+    /// user, whose legacy account genuinely exists, fall through to a
+    /// brand-new empty modern account, under which
+    /// `oidc::provision_synapse_device` then published a second,
+    /// independently-verifying `io.inblock.did` assertion. Two provider-signed
+    /// assertions for one DID, with no way for a consumer to tell which is
+    /// canonical, and Synapse has no rename API to undo it: finding **D4** of
+    /// the 2026-09-10 audit, *"a signed lie is strictly worse than no
+    /// signature"*, reproduced end-to-end against a scriptable mock. The
+    /// `degraded` guard written for D4 could not fire, because the
+    /// fall-through returned `Ok { degraded: false }` rather than `Err`.
+    ///
+    /// An `Err` routes into that guard instead:
+    /// [`crate::localpart::resolve_identity_or_legacy`] falls back to the
+    /// LEGACY localpart with `degraded: true`, the user keeps their account,
+    /// and nothing durable is published from a guess. The fail direction is
+    /// therefore no longer "toward the cheap mistake" but "toward the honest
+    /// one": a response that proves nothing yields no verdict at all. Note the
+    /// old rule was *worse than its predecessor* for this class — the
+    /// pre-2026-09-12 any-4xx-is-taken mapping at least kept the user on their
+    /// own account.
+    ///
+    /// **Do not widen the `Unusable` allowlist** without re-reading
+    /// [`crate::localpart::resolve_identity`]'s fall-through arm: every
+    /// errcode added there becomes a new way for a transient upstream fault to
+    /// masquerade as proof that a user's account cannot exist.
     pub async fn localpart_status(&self, localpart: &str) -> Result<LocalpartStatus> {
         let url = format!(
             "{}/_synapse/mas/is_localpart_available?localpart={}",
@@ -677,14 +706,35 @@ impl SynapseClient {
 
         if status.is_client_error() {
             let body = resp.text().await.unwrap_or_default();
-            let verdict = classify_localpart_refusal(&body);
-            if let LocalpartStatus::Unusable { errcode, message } = &verdict {
-                debug!(
-                    %status, %errcode, %message, %localpart,
-                    "localpart_status: Synapse refuses this localpart outright — NOT an existing account"
-                );
+            match classify_localpart_refusal(&body) {
+                Some(verdict) => {
+                    if let LocalpartStatus::Unusable { errcode, message } = &verdict {
+                        debug!(
+                            %status, %errcode, %message, %localpart,
+                            "localpart_status: Synapse refuses this localpart outright — NOT an existing account"
+                        );
+                    }
+                    return Ok(verdict);
+                }
+                // Off both allowlists, so this response says nothing about the
+                // localpart. An `Err` — never a verdict, and in particular
+                // never `Unusable`, which `resolve_identity` reads as licence
+                // to abandon a grandfathered account. See the doc above.
+                None => {
+                    let (errcode, message) = refusal_diagnosis(&body);
+                    warn!(
+                        %status, %errcode, %message, %localpart,
+                        "localpart_status: 4xx this client cannot classify — INDETERMINATE, not a verdict"
+                    );
+                    anyhow::bail!(
+                        "localpart_status: HTTP {status} with errcode `{errcode}` ({message}) \
+                         — the status of `{localpart}` is INDETERMINATE. This is NOT a verdict: \
+                         it says neither that an account exists there nor that Synapse refuses \
+                         the name. Only `M_USER_IN_USE` (in use), `M_INVALID_USERNAME` and \
+                         `M_EXCLUSIVE` (refused) are answers; everything else is this error."
+                    );
+                }
             }
-            return Ok(verdict);
         }
 
         // 5xx or other unexpected status is a real error.
@@ -700,7 +750,9 @@ impl SynapseClient {
     /// [`LocalpartStatus::Unusable`] has **no** honest `bool` to map to, so it
     /// is an `Err` naming the errcode — not a silent `Ok(false)`, which is what
     /// this wrapper used to return and which is the bug the enum was introduced
-    /// to make unrepresentable. Callers here mostly hand in a *derived*
+    /// to make unrepresentable. An INDETERMINATE 4xx (an errcode off the
+    /// allowlist, an unreadable body) never reaches this wrapper at all: it is
+    /// already an `Err` from [`Self::localpart_status`]. Callers here mostly hand in a *derived*
     /// localpart ([`crate::mxid::localpart_for`] /
     /// [`crate::mxid::legacy_localpart`]) and so rarely see it; the ones that
     /// do (an over-long legacy localpart from a long DID, a caller-supplied
@@ -1448,6 +1500,12 @@ fn did_from_profile_field(value: Option<&serde_json::Value>) -> Option<String> {
 /// exceeds Synapse's 255-char `MAX_USERID_LENGTH`; `M_INVALID_USERNAME` came
 /// back and the identity read as pre-existing.
 ///
+/// There is a FOURTH outcome, and it is deliberately not a variant here:
+/// *indeterminate*. A 4xx carrying an errcode this client cannot act on is an
+/// `Err` from [`SynapseClient::localpart_status`], not a `LocalpartStatus`,
+/// because every variant of this enum is a claim about the localpart and such a
+/// response supports none of them (2026-09-13; see that method's doc).
+///
 /// Not `Copy` (unlike [`PublishOutcome`]) only because the diagnosis
 /// `Unusable` carries is a pair of owned strings; the intent is the same.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1456,13 +1514,22 @@ pub enum LocalpartStatus {
     Available,
     /// `400 M_USER_IN_USE` — an account already holds it.
     InUse,
-    /// Synapse refuses this localpart outright (`M_INVALID_USERNAME`,
-    /// `M_EXCLUSIVE`, or any other non-`M_USER_IN_USE` 4xx). This is NOT
-    /// "taken": no account can exist under it, so a caller deciding whether an
-    /// identity is pre-existing must NOT read this as evidence that it is.
+    /// Synapse refuses this localpart outright: `M_INVALID_USERNAME` or
+    /// `M_EXCLUSIVE`, and **nothing else**. This is NOT "taken": no account we
+    /// could provision can exist under it, so a caller deciding whether an
+    /// identity is pre-existing must NOT read this as evidence that it is —
+    /// and [`crate::localpart::resolve_identity`] relies on exactly that when
+    /// it falls through to the modern localpart.
+    ///
+    /// **The two-errcode allowlist is what makes that fall-through safe.** A
+    /// 4xx that merely *failed* — a proxy `404`, a `429`, an unparseable body,
+    /// an errcode this client has never heard of — is an `Err` from
+    /// [`SynapseClient::localpart_status`], never this variant. Widening the
+    /// allowlist re-opens the 2026-09-13 severing bug; see that method's doc.
     Unusable {
-        /// The `errcode` Synapse returned, or [`NO_ERRCODE`] when the body
-        /// carried none (or was not JSON at all).
+        /// The `errcode` Synapse returned. Always one of the two allowlisted
+        /// refusals — never [`NO_ERRCODE`], which since 2026-09-13 only ever
+        /// reaches an error message.
         errcode: String,
         /// Synapse's human-readable `error`, or the raw body when there was no
         /// `error` member. Diagnostic only: Synapse's message strings are under
@@ -1472,11 +1539,15 @@ pub enum LocalpartStatus {
     },
 }
 
-/// Stand-in `errcode` for a refusal whose body carried none, or was not JSON.
+/// Stand-in `errcode` for a 4xx whose body carried none, or was not JSON.
 ///
 /// A sentinel rather than an empty string so an error message reads
-/// `(<no errcode>: …)` instead of `(: …)`, and so a grep for the literal finds
-/// every place this case is handled.
+/// `` errcode `<no errcode>` `` instead of `` errcode `` `` , and so a grep for
+/// the literal finds every place this case is handled.
+///
+/// It reaches only the INDETERMINATE error of [`SynapseClient::localpart_status`]
+/// — never a [`LocalpartStatus`], because a body we cannot read is not a verdict
+/// (2026-09-13; it used to become an `Unusable`).
 pub const NO_ERRCODE: &str = "<no errcode>";
 
 /// Longest raw body kept as the `message` of an [`LocalpartStatus::Unusable`]
@@ -1484,29 +1555,21 @@ pub const NO_ERRCODE: &str = "<no errcode>";
 /// from a misrouted proxy, short enough not to paste one into a log line.
 const MAX_RAW_REFUSAL_MESSAGE: usize = 200;
 
-/// Decide which refusal a non-auth 4xx from
-/// `GET /_synapse/mas/is_localpart_available` actually is.
+/// Read the `errcode` and human-readable diagnosis out of a 4xx body, whatever
+/// shape it is in.
 ///
-/// Pure and separate from the request for the same reason
-/// [`profile_404_means_row_absent`] and [`classify_publish_status`] are: the
-/// interesting decision is a classification of a response body, and it must be
-/// testable without a live homeserver.
-///
-/// `errcode` is the only signal, exactly as in
-/// [`profile_404_means_row_absent`]. **`M_USER_IN_USE` is an allowlist of one**
-/// — the ONLY errcode that may produce [`LocalpartStatus::InUse`] — and every
-/// other shape, including a body with no `errcode` and a body that is not JSON,
-/// falls to [`LocalpartStatus::Unusable`]. That direction is deliberate and is
-/// the inverse of `profile_404_means_row_absent`'s fail-safe: there, the
-/// destructive answer was "heal"; here, the destructive answer is "an account
-/// exists", because it silently grandfathers an identity that has none.
-fn classify_localpart_refusal(body: &str) -> LocalpartStatus {
+/// Split out from [`classify_localpart_refusal`] because the INDETERMINATE path
+/// needs the same two strings the classifier does: an error that cannot name
+/// the errcode it refused to act on is an error nobody can diagnose.
+/// [`NO_ERRCODE`] stands in when the body has no `errcode` member, or is not
+/// JSON at all; the raw body (truncated) stands in for a missing `error`.
+fn refusal_diagnosis(body: &str) -> (String, String) {
     let parsed = serde_json::from_str::<serde_json::Value>(body).unwrap_or(serde_json::Value::Null);
-    let errcode = parsed.get("errcode").and_then(|v| v.as_str());
-
-    if errcode == Some("M_USER_IN_USE") {
-        return LocalpartStatus::InUse;
-    }
+    let errcode = parsed
+        .get("errcode")
+        .and_then(|v| v.as_str())
+        .unwrap_or(NO_ERRCODE)
+        .to_string();
 
     let message = match parsed.get("error").and_then(|v| v.as_str()) {
         Some(error) => error.to_string(),
@@ -1519,9 +1582,50 @@ fn classify_localpart_refusal(body: &str) -> LocalpartStatus {
         }
     };
 
-    LocalpartStatus::Unusable {
-        errcode: errcode.unwrap_or(NO_ERRCODE).to_string(),
-        message,
+    (errcode, message)
+}
+
+/// Decide which refusal a non-auth 4xx from
+/// `GET /_synapse/mas/is_localpart_available` actually is — or `None` when it
+/// is not a refusal this client can act on.
+///
+/// Pure and separate from the request for the same reason
+/// [`profile_404_means_row_absent`] and [`classify_publish_status`] are: the
+/// interesting decision is a classification of a response body, and it must be
+/// testable without a live homeserver.
+///
+/// `errcode` is the only signal, exactly as in
+/// [`profile_404_means_row_absent`], and it is an **allowlist in both
+/// directions**:
+///
+/// | `errcode` | Answer | What Synapse actually told us |
+/// |---|---|---|
+/// | `M_USER_IN_USE` | `Some(`[`LocalpartStatus::InUse`]`)` | an account already holds this name |
+/// | `M_INVALID_USERNAME` | `Some(`[`LocalpartStatus::Unusable`]`)` | it will not allow this name (charset, length, guest-numeric, …) |
+/// | `M_EXCLUSIVE` | `Some(`[`LocalpartStatus::Unusable`]`)` | the name is in an appservice-reserved namespace |
+/// | anything else, absent, or unparseable | `None` | **nothing** |
+///
+/// `None` means *indeterminate*, and the caller turns it into an `Err` —
+/// deliberately NOT into `Unusable`. Before 2026-09-13 everything but
+/// `M_USER_IN_USE` fell to `Unusable` on the argument that "not an account" is
+/// the cheap mistake; but [`crate::localpart::resolve_identity`] treats
+/// `Unusable` as proof that no account can exist and abandons the legacy
+/// localpart on it, so a proxy `404`, a `429` or a truncated body was enough to
+/// sever a grandfathered user onto a brand-new account and publish a second
+/// signed DID assertion under it (2026-09-10 audit, **D4**). A body we cannot
+/// read is not evidence of anything, and this function now says so.
+fn classify_localpart_refusal(body: &str) -> Option<LocalpartStatus> {
+    let (errcode, message) = refusal_diagnosis(body);
+
+    match errcode.as_str() {
+        "M_USER_IN_USE" => Some(LocalpartStatus::InUse),
+        // The ONLY two errcodes that prove Synapse will not allow an account
+        // under this name. Adding a third is a change to the safety of
+        // `resolve_identity`'s fall-through, not a widening of a lookup table.
+        "M_INVALID_USERNAME" | "M_EXCLUSIVE" => {
+            Some(LocalpartStatus::Unusable { errcode, message })
+        }
+        _ => None,
     }
 }
 
@@ -2985,34 +3089,47 @@ mod tests {
         handle.abort();
     }
 
-    /// A refusal we cannot read — no `errcode` member, or a body that is not
-    /// JSON at all — falls to `Unusable`, NEVER to `InUse`.
+    /// A 400 whose body carries no `errcode`, and a 400 whose body is not JSON
+    /// at all, are both INDETERMINATE: an `Err`, never `InUse` and (since
+    /// 2026-09-13) never `Unusable` either.
     ///
-    /// Pins the fail direction, which is the inverse of
-    /// [`profile_404_means_row_absent`]'s: there the destructive answer was
-    /// "heal", so an unrecognised shape means "do not"; here the destructive
-    /// answer is "an account exists", so an unrecognised shape means "not an
-    /// account".
+    /// **Retargeted, not weakened.** This test used to assert `Unusable` for
+    /// both shapes. The invariant it was written to protect — *a refusal we
+    /// cannot read must never become "an account exists"* — is unchanged and is
+    /// still asserted explicitly below; what changed is that `Unusable` is no
+    /// longer an acceptable place to put an unreadable answer, because
+    /// [`crate::localpart::resolve_identity`] acts on `Unusable` by abandoning
+    /// the user's legacy localpart. A body we cannot read is evidence of
+    /// nothing, and must produce no verdict at all.
     #[tokio::test]
-    async fn a_refusal_we_cannot_parse_falls_to_unusable_never_in_use() {
+    async fn a_refusal_we_cannot_parse_is_indeterminate_never_in_use_and_never_unusable() {
         // (a) valid JSON, no `errcode`.
         let (client, handle) = spawn_localpart_mock((
             axum::http::StatusCode::BAD_REQUEST,
             json!({"error": "something went wrong"}).to_string(),
         ))
         .await;
-        let status = client.localpart_status("whoever").await.unwrap();
-        assert_eq!(
-            status,
-            LocalpartStatus::Unusable {
-                errcode: NO_ERRCODE.to_string(),
-                message: "something went wrong".to_string(),
-            }
-        );
+        let status = client.localpart_status("whoever").await;
         assert_ne!(
-            status,
-            LocalpartStatus::InUse,
-            "a body with no errcode proves nothing"
+            status.as_ref().ok(),
+            Some(&LocalpartStatus::InUse),
+            "a body with no errcode proves nothing — above all not that an account exists"
+        );
+        assert!(
+            !matches!(status.as_ref().ok(), Some(LocalpartStatus::Unusable { .. })),
+            "nor that Synapse refuses the name: `Unusable` is an errcode allowlist, and \
+             `resolve_identity` abandons the legacy localpart on it"
+        );
+        let err = status
+            .expect_err("an unreadable 4xx is indeterminate, not a verdict")
+            .to_string();
+        assert!(
+            err.contains(NO_ERRCODE),
+            "the error must name the MISSING errcode, not omit it: {err}"
+        );
+        assert!(
+            err.contains("INDETERMINATE"),
+            "and must say it is not a verdict, in as many words: {err}"
         );
         assert!(client.is_localpart_available("whoever").await.is_err());
         handle.abort();
@@ -3023,15 +3140,161 @@ mod tests {
             "<html><body>400 Bad Request</body></html>".to_string(),
         ))
         .await;
-        let status = client.localpart_status("whoever").await.unwrap();
+        let status = client.localpart_status("whoever").await;
+        assert_ne!(status.as_ref().ok(), Some(&LocalpartStatus::InUse));
+        assert!(!matches!(
+            status.as_ref().ok(),
+            Some(LocalpartStatus::Unusable { .. })
+        ));
+        let err = status
+            .expect_err("a non-JSON body is indeterminate too")
+            .to_string();
         assert!(
-            matches!(&status, LocalpartStatus::Unusable { errcode, message }
-                if errcode == NO_ERRCODE && message.contains("400 Bad Request")),
-            "a non-JSON body must still be Unusable, keeping the raw body as diagnosis: {status:?}"
+            err.contains("400 Bad Request"),
+            "the raw body must survive into the error as the only diagnosis there is: {err}"
         );
-        assert_ne!(status, LocalpartStatus::InUse);
         assert!(client.is_localpart_available("whoever").await.is_err());
         handle.abort();
+    }
+
+    /// **The 2026-09-13 regression, at the client layer.** A `404 M_NOT_FOUND`
+    /// — what a reverse proxy answers for a route it does not serve, and what
+    /// Synapse answers for an unrecognised request — is an `Err`, NOT
+    /// [`LocalpartStatus::Unusable`].
+    ///
+    /// It is the difference between "this homeserver will not allow an account
+    /// under this name" and "we never reached the homeserver". Classifying it
+    /// as `Unusable` let [`crate::localpart::resolve_identity`] fall through to
+    /// the modern localpart for a user whose legacy account genuinely exists —
+    /// severing them permanently (Synapse has no rename API) and publishing a
+    /// second signed `io.inblock.did` assertion under the new account
+    /// (2026-09-10 audit, **D4**). The end-to-end proof is
+    /// `crate::localpart::resolve_identity_tests::a_proxy_404_never_severs_a_grandfathered_account_onto_the_modern_localpart`.
+    #[tokio::test]
+    async fn a_proxy_404_is_indeterminate_never_unusable_and_never_in_use() {
+        let (client, handle) = spawn_localpart_mock((
+            axum::http::StatusCode::NOT_FOUND,
+            json!({"errcode": "M_NOT_FOUND", "error": "Unrecognized request"}).to_string(),
+        ))
+        .await;
+
+        let status = client.localpart_status("k3f9x2q7ab4d8m1p").await;
+        assert!(
+            !matches!(status.as_ref().ok(), Some(LocalpartStatus::Unusable { .. })),
+            "a 404 says the ROUTE is missing, not that the NAME is refused — and \
+             `resolve_identity` abandons a grandfathered account on `Unusable`"
+        );
+        assert_ne!(status.as_ref().ok(), Some(&LocalpartStatus::InUse));
+
+        let err = status
+            .expect_err("a 404 from in front of Synapse is indeterminate")
+            .to_string();
+        assert!(
+            err.contains("404"),
+            "the status must be in the message: {err}"
+        );
+        assert!(
+            err.contains("M_NOT_FOUND"),
+            "and so must the errcode it refused to act on: {err}"
+        );
+        assert!(
+            err.contains("INDETERMINATE"),
+            "and it must say the answer is not a verdict: {err}"
+        );
+        assert!(client
+            .is_localpart_available("k3f9x2q7ab4d8m1p")
+            .await
+            .is_err());
+        handle.abort();
+    }
+
+    /// A `429 M_LIMIT_EXCEEDED` is INDETERMINATE: being rate-limited is a fact
+    /// about the caller, never a fact about the localpart.
+    ///
+    /// The damaging misreading is `Unusable`, because that is the one a caller
+    /// acts on destructively — and rate limiting is the most ordinary transient
+    /// fault a homeserver produces, so it would fire on healthy accounts under
+    /// load rather than in some exotic misconfiguration.
+    #[tokio::test]
+    async fn a_rate_limited_probe_is_indeterminate_never_a_verdict_about_the_localpart() {
+        let (client, handle) = spawn_localpart_mock((
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            json!({"errcode": "M_LIMIT_EXCEEDED", "error": "Too Many Requests",
+                   "retry_after_ms": 2000})
+            .to_string(),
+        ))
+        .await;
+
+        let status = client.localpart_status("k3f9x2q7ab4d8m1p").await;
+        assert!(!matches!(
+            status.as_ref().ok(),
+            Some(LocalpartStatus::Unusable { .. })
+        ));
+        assert_ne!(status.as_ref().ok(), Some(&LocalpartStatus::InUse));
+        let err = status
+            .expect_err("a rate limit is not an answer about the name")
+            .to_string();
+        assert!(
+            err.contains("M_LIMIT_EXCEEDED") && err.contains("429"),
+            "the error must carry both the errcode and the status: {err}"
+        );
+        assert!(client
+            .is_localpart_available("k3f9x2q7ab4d8m1p")
+            .await
+            .is_err());
+        handle.abort();
+    }
+
+    /// The allowlist itself, stated once as a table: exactly three errcodes
+    /// produce a verdict, and every other shape produces none.
+    ///
+    /// Drives [`classify_localpart_refusal`] directly, so the rule is pinned
+    /// independently of any HTTP plumbing — and so a future edit that adds a
+    /// fourth errcode has to change a test that spells out what the allowlist
+    /// is for, rather than one that merely happens to fail.
+    #[test]
+    fn exactly_three_errcodes_produce_a_verdict_and_every_other_shape_produces_none() {
+        let verdict = |errcode: &str| {
+            classify_localpart_refusal(&json!({"errcode": errcode, "error": "…"}).to_string())
+        };
+
+        assert_eq!(
+            verdict("M_USER_IN_USE"),
+            Some(LocalpartStatus::InUse),
+            "the only errcode that means an account is there"
+        );
+        for refused in ["M_INVALID_USERNAME", "M_EXCLUSIVE"] {
+            assert!(
+                matches!(verdict(refused), Some(LocalpartStatus::Unusable { ref errcode, .. })
+                    if errcode == refused),
+                "{refused} is a PROVEN refusal and must stay `Unusable` — it is what makes \
+                 `resolve_identity`'s fall-through safe"
+            );
+        }
+
+        // Everything else proves nothing. `M_FORBIDDEN` is here for the record
+        // only: 401/403 never reach this function, because `localpart_status`
+        // bails on them before the 4xx branch.
+        for indeterminate in [
+            "M_NOT_FOUND",
+            "M_LIMIT_EXCEEDED",
+            "M_UNKNOWN",
+            "M_FORBIDDEN",
+            "M_MISSING_PARAM",
+            "M_SOMETHING_WE_HAVE_NEVER_SEEN",
+        ] {
+            assert_eq!(
+                verdict(indeterminate),
+                None,
+                "{indeterminate} tells us nothing about the localpart, so it must produce \
+                 no verdict at all — above all not `Unusable`"
+            );
+        }
+
+        // The unreadable shapes, for completeness: no errcode, and no JSON.
+        assert_eq!(classify_localpart_refusal(r#"{"error":"eh"}"#), None);
+        assert_eq!(classify_localpart_refusal("<html>502</html>"), None);
+        assert_eq!(classify_localpart_refusal(""), None);
     }
 
     /// **A rejected MAS shared secret is an `Err`, and must never become a

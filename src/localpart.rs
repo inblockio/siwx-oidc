@@ -134,12 +134,45 @@ pub(crate) struct ResolvedIdentity {
 ///
 /// # Why an UNUSABLE legacy localpart falls through instead of grandfathering
 ///
-/// `Unusable` means Synapse **refuses** the localpart outright
-/// (`M_INVALID_USERNAME`, `M_EXCLUSIVE`, …). That is the opposite of "taken":
-/// no account can exist under a localpart Synapse will not allow, so there is
-/// nothing to grandfather and falling through severs **nobody**. The grandfather
-/// rule protects accounts that exist; this is the one case where it is
-/// provably impossible for one to exist.
+/// `Unusable` means Synapse **refuses** the localpart outright. That is the
+/// opposite of "taken": no account we could provision can exist under a
+/// localpart Synapse will not allow, so there is nothing to grandfather and
+/// falling through severs **nobody**. The grandfather rule protects accounts
+/// that exist; this is the one case where it is provably impossible for one to
+/// exist.
+///
+/// ## That rests ENTIRELY on `Unusable` being an errcode ALLOWLIST
+///
+/// It means `M_INVALID_USERNAME` or `M_EXCLUSIVE` and **nothing else** — the
+/// two answers in which Synapse actually told us it will not allow an account
+/// under this name. Every other 4xx from the probe (a proxy `404 M_NOT_FOUND`,
+/// a `429 M_LIMIT_EXCEEDED`, a body that is not JSON, a missing `errcode`, an
+/// errcode this client has never seen) is an `Err` from
+/// [`crate::synapse_client::SynapseClient::localpart_status`], NOT an
+/// `Unusable`, and so never reaches this arm at all.
+///
+/// **Until 2026-09-13 it was not an allowlist, and this arm was therefore
+/// wrong.** `classify_localpart_refusal` returned `Unusable` for every
+/// non-`M_USER_IN_USE` 4xx, so a GRANDFATHERED user — whose legacy account
+/// genuinely exists — could hit one transient upstream fault, fall through
+/// here, be provisioned a brand-new empty modern account, and have a second,
+/// independently-verifying `io.inblock.did` assertion published under it. Both
+/// assertions verify with the shipped `siwx-oidc-auth` verifier and no consumer
+/// can tell which is canonical: finding **D4** of the 2026-09-10 audit, *"a
+/// signed lie is strictly worse than no signature"*. Synapse has no rename API,
+/// so the severing is permanent, and [`ResolvedIdentity::degraded`] could not
+/// suppress the publication because this path returns
+/// `Ok { degraded: false }`, not `Err`. See
+/// `docs/audits/2026-09-12-localpart-availability-conflation.md`.
+///
+/// Note the fix is not a return to the pre-`156b1f9` behaviour: any-4xx-is-taken
+/// was safe for *this* class (the user kept their account) and wrong for the
+/// long-`did:peer` class below. Putting the precision in the errcode is what
+/// makes both classes right at once.
+///
+/// **So do not widen `Unusable` without re-reading this arm.** Every errcode
+/// added to that allowlist becomes a new way for a transient upstream fault to
+/// masquerade as proof that a user's account cannot exist.
 ///
 /// **The old claim here was falsified — do not reinstate it.** This doc used to
 /// state that `is_localpart_available`'s any-4xx-to-`Ok(false)` mapping "cannot
@@ -213,6 +246,11 @@ pub(crate) async fn resolve_identity(
         // nobody, and hands the identity the 16-char base36 localpart that was
         // always within Synapse's limits. Reading this as "taken" is the
         // defect this match arm exists to close.
+        //
+        // Safe ONLY because `Unusable` is the two-errcode allowlist
+        // `M_INVALID_USERNAME` / `M_EXCLUSIVE`; an upstream fault that merely
+        // FAILED to answer is an `Err` from the probe above and never lands
+        // here. See the doc's "that rests entirely on ... ALLOWLIST".
         LocalpartStatus::Unusable { errcode, message } => {
             info!(
                 did = %did,
@@ -413,6 +451,29 @@ pub(crate) mod resolve_identity_tests {
         /// secret. Scoped to the MAS route on purpose: the profile read is
         /// reached with an admin token, a different credential entirely.
         pub(crate) reject_secret: bool,
+        /// A fault in FRONT of Synapse, **per localpart**: a probe for one of
+        /// these localparts answers the given `(status, raw body)` verbatim,
+        /// with no registration logic running at all — a reverse proxy
+        /// answering `404 M_NOT_FOUND` for a route it does not serve, a
+        /// `429 M_LIMIT_EXCEEDED`, an HTML error page. Every other localpart is
+        /// answered normally.
+        ///
+        /// This is the lever the 2026-09-13 fix exists for, and it is keyed by
+        /// localpart for a reason the first draft of these tests got WRONG: a
+        /// fault applied to *every* probe makes the modern probe fail too, so
+        /// [`resolve_identity`] bails on the modern arm and the severing is
+        /// invisible. The dangerous production shape is a **transient** fault —
+        /// the legacy probe fails, the modern probe answers `Available`
+        /// perfectly normally, and the user is provisioned onto a brand-new
+        /// empty account. Only a per-localpart fault can express it, and a
+        /// global one silently passes under the very mutation it is meant to
+        /// catch (observed, 2026-09-13).
+        ///
+        /// Checked BEFORE every other lever, `reject_secret` included: something
+        /// in front of the homeserver answers before Synapse sees the request.
+        /// A raw `String` value so a non-JSON fault is expressible; build a JSON
+        /// one with `serde_json::json!(…).to_string()`.
+        pub(crate) probe_faults: HashMap<String, (axum::http::StatusCode, String)>,
     }
 
     #[derive(Clone)]
@@ -424,6 +485,13 @@ pub(crate) mod resolve_identity_tests {
         State(state): State<MockState>,
         Query(params): Query<HashMap<String, String>>,
     ) -> axum::response::Response {
+        let localpart = params.get("localpart").cloned().unwrap_or_default();
+        // First of all: a fault in front of the homeserver answers before
+        // Synapse — or its credential check — ever sees the request. Reading
+        // the query parameter is only addressing, not a lookup.
+        if let Some((status, body)) = state.cfg.probe_faults.get(&localpart) {
+            return (*status, body.clone()).into_response();
+        }
         // Before anything is looked up: a rejected credential says NOTHING
         // about the localpart, and Synapse never reaches `check_username`.
         if state.cfg.reject_secret {
@@ -436,7 +504,6 @@ pub(crate) mod resolve_identity_tests {
             )
                 .into_response();
         }
-        let localpart = params.get("localpart").cloned().unwrap_or_default();
         if state.cfg.unusable.contains(&localpart) {
             // The live dev shape: a legacy localpart from a long DID whose
             // user ID exceeds Synapse's MAX_USERID_LENGTH (255).
@@ -915,6 +982,134 @@ OmV4YW1wbGU6c29tZW1lZGlhdG9yI3NvbWVrZXkiXSwiYSI6WyJkaWRjb21tL3YyIl19";
         assert!(
             degraded.degraded,
             "and it must announce the guess, so nothing durable is published under it"
+        );
+        handle.abort();
+    }
+
+    /// **THE 2026-09-13 regression, end to end: a transient upstream fault must
+    /// never sever a grandfathered user onto the modern localpart.**
+    ///
+    /// The setup is an ordinary returning user — their LEGACY account genuinely
+    /// exists — plus one thing going wrong that has nothing to do with them: for
+    /// the duration of one probe, something in front of the homeserver answers
+    /// `404 M_NOT_FOUND` (the shape a route-not-served answer takes). The
+    /// homeserver is otherwise healthy, and that is the point: the modern probe
+    /// that follows answers `Available` perfectly normally.
+    ///
+    /// Before the fix, `classify_localpart_refusal` mapped every
+    /// non-`M_USER_IN_USE` 4xx to
+    /// [`crate::synapse_client::LocalpartStatus::Unusable`], and
+    /// [`resolve_identity`]'s fall-through reads `Unusable` as "no account can
+    /// exist here" — so this user was handed [`localpart_for`], provisioned a
+    /// brand-new empty Matrix account, and had a second, independently-verifying
+    /// `io.inblock.did` assertion published under it. Two provider-signed
+    /// assertions for one DID, both passing the shipped `siwx-oidc-auth`
+    /// verifier, and Synapse has no rename API to undo it: finding **D4** of
+    /// `docs/audits/2026-09-10-attested-did-audit.md`, *"a signed lie is
+    /// strictly worse than no signature"*. The `degraded` guard written for D4
+    /// could not fire, because the fall-through returned `Ok { degraded: false }`
+    /// rather than `Err`.
+    ///
+    /// See `docs/audits/2026-09-12-localpart-availability-conflation.md` for the
+    /// conflation this grew out of. What this test pins is the ROUTE the answer
+    /// takes: `Err` out of [`resolve_identity`], and therefore the already-tested
+    /// fail-safe legacy fallback with `degraded: true` out of
+    /// [`resolve_identity_or_legacy`] — the user keeps their account, and nothing
+    /// durable is published from a guess.
+    ///
+    /// **The fault is scoped to the LEGACY probe on purpose.** A fault on every
+    /// probe makes the modern arm bail too, so `resolve_identity` errors for the
+    /// wrong reason and the test passes even with the defect reinstated —
+    /// verified by mutation, and the reason [`MockSynapseConfig::probe_faults`]
+    /// is a map rather than a flag.
+    #[tokio::test]
+    async fn a_proxy_404_never_severs_a_grandfathered_account_onto_the_modern_localpart() {
+        let did = "did:pkh:eip155:1:0x7a760ea15d76f935c8646b449af488c2b0021734";
+        let legacy = legacy_localpart(did);
+        let modern = localpart_for(did);
+
+        // Control: with nothing wrong, this user is found exactly where they
+        // live. Without this, a later change could make the assertions below
+        // hold for an account that was never there in the first place.
+        let (healthy, handle) = spawn_mock_synapse(HashSet::from([legacy.clone()])).await;
+        let control = resolve_identity(did, Some(&healthy))
+            .await
+            .expect("premise: a healthy probe resolves this grandfathered account");
+        assert_eq!(control.localpart, legacy);
+        assert!(!control.is_new, "premise: the account already exists");
+        handle.abort();
+
+        // Now the same user, same homeserver, one faulted probe.
+        let (synapse, handle) = spawn_mock_synapse_configured(MockSynapseConfig {
+            // The grandfathered account really is there...
+            existing: HashSet::from([legacy.clone()]),
+            // ...and this one probe cannot see it, because something in front
+            // of Synapse answers first. Note this is NOT a refusal of the name.
+            // The MODERN probe is deliberately left healthy, so it will answer
+            // `Available` — which is exactly what turns a misclassification here
+            // into a brand-new account.
+            probe_faults: HashMap::from([(
+                legacy.clone(),
+                (
+                    axum::http::StatusCode::NOT_FOUND,
+                    serde_json::json!({"errcode": "M_NOT_FOUND", "error": "Unrecognized request"})
+                        .to_string(),
+                ),
+            )]),
+            ..MockSynapseConfig::default()
+        })
+        .await;
+
+        // Not `expect_err`: `ResolvedIdentity` carries no `Debug`, and the
+        // interesting thing to print on failure is the localpart it wrongly
+        // returned.
+        let err = match resolve_identity(did, Some(&synapse)).await {
+            Err(e) => e,
+            Ok(resolved) => panic!(
+                "a 404 from in front of Synapse proves nothing about `{legacy}`, so there is \
+                 no resolution to return — but got `{}`{}",
+                resolved.localpart,
+                if resolved.localpart == modern {
+                    ". That is the MODERN shape: this user has just been severed from the \
+                     account their rooms, DMs and keys live in, permanently (Synapse has no \
+                     rename API), and a second fully-verifying `io.inblock.did` assertion \
+                     will be published under the new one — 2026-09-10 audit, D4"
+                } else {
+                    ""
+                }
+            ),
+        };
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("M_NOT_FOUND"),
+            "the error must name the errcode it refused to act on: {rendered}"
+        );
+        assert!(
+            rendered.contains(&legacy),
+            "and the localpart whose status is unknown, which is the LEGACY one — an error \
+             naming the modern localpart would mean the fall-through already happened: \
+             {rendered}"
+        );
+
+        // And the infallible wrapper takes the D4 suppression path.
+        let resolved = resolve_identity_or_legacy(did, Some(&synapse)).await;
+        assert_eq!(
+            resolved.localpart, legacy,
+            "the user must KEEP the legacy localpart their account lives under"
+        );
+        assert_ne!(
+            resolved.localpart, modern,
+            "it must NEVER be the modern shape: Synapse has no rename API, so provisioning \
+             the user onto it severs them from their rooms, DMs and keys permanently"
+        );
+        assert!(
+            resolved.degraded,
+            "and the guess must ANNOUNCE itself, or `provision_synapse_device` will publish \
+             a second, fully-verifying `io.inblock.did` assertion under it (D4)"
+        );
+        assert!(
+            !resolved.is_new,
+            "a fallback must never claim to know an account is new"
         );
         handle.abort();
     }
