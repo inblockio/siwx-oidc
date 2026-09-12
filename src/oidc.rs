@@ -315,6 +315,33 @@ pub enum CustomError {
     NotFound,
     #[error("{0:?}")]
     Redirect(String),
+    /// A dependency this request could not proceed without — Synapse — was
+    /// unreachable or refused our credentials, so a check that must not be
+    /// skipped could not be completed. Renders as **503**.
+    ///
+    /// # Why not a 4xx, and why not a 500
+    ///
+    /// Not a 4xx: the caller did nothing wrong, and a 4xx tells them to change a
+    /// request that was already correct. That is not a cosmetic distinction —
+    /// the first user of this variant
+    /// ([`crate::webauthn::reject_if_new_identity`]) spent its 400 telling a
+    /// legitimate user to create an account they may well already have.
+    ///
+    /// Not [`CustomError::Other`]'s 500 either: this is a KNOWN, classified,
+    /// handled, fail-closed condition, and the flows that raise it are
+    /// documented to degrade rather than 500. A 500 would claim an unhandled
+    /// internal error and would put a diagnosed fault in the same bucket as an
+    /// undiagnosed one, which is precisely the signal an operator needs kept
+    /// separate.
+    ///
+    /// 503 is the honest answer — server-side, transient, retryable — and it is
+    /// the one that stays legible in a proxy access log, where nobody is reading
+    /// the message body.
+    ///
+    /// The payload is the USER-FACING message only. The underlying cause is
+    /// logged at the point of failure and must never be put on the wire.
+    #[error("{0}")]
+    ServiceUnavailable(String),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

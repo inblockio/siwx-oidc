@@ -72,6 +72,52 @@ pub const NEW_IDENTITY_REJECT_MSG: &str =
     "This passkey/wallet is not linked to an existing account. \
      Create an account at sign-in first.";
 
+/// The error message returned when the new-account check could not be
+/// **completed** — as distinct from completing and finding no account.
+///
+/// # Why this is a second message and not the same one
+///
+/// [`reject_if_new_identity`] fails closed on both facts, and it must keep doing
+/// so: nothing is provisioned either way, and sign-in is equally broken, so no
+/// duplicate account can be created down either path. But the two facts are not
+/// the same fact, and until this constant existed they shared
+/// [`NEW_IDENTITY_REJECT_MSG`] — so a server-side misconfiguration told the user
+/// to go and create an account. That is a safe answer and a misleading
+/// diagnosis: the user cannot fix it, the advice cannot even be *followed*
+/// (sign-in is down too), and the real cause is invisible to the only person who
+/// could act on it. The two real causes are an unreachable Synapse and a
+/// rejected MAS shared secret — the latter an `Err` rather than a silent "the
+/// localpart is taken" only since the availability-conflation fix
+/// (`docs/audits/2026-09-12-localpart-availability-conflation.md`), which is
+/// what made this message worth separating out.
+///
+/// # What it may and may not say
+///
+/// It names the server as the faulty party, says the condition is worth
+/// retrying, and points at an administrator if it persists. It deliberately
+/// leaks **nothing** operational: no Synapse endpoint, no HTTP status, no
+/// errcode, and above all no hint that a shared secret is involved — this body
+/// is rendered verbatim by the account and device-approval pages to a caller who
+/// has proven a DID but is otherwise a stranger. Everything diagnostic goes to
+/// the `warn!` beside the reject, which is the surface an operator reads and a
+/// caller does not. Pinned by
+/// `the_detection_failure_message_leaks_no_server_internals`.
+///
+/// # Why the asymmetry with [`reject_if_deactivated`] is correct
+///
+/// That gate deliberately does NOT distinguish "deactivated" from "could not
+/// tell", because doing so would let an unauthenticated prober learn account
+/// state. Distinguishing the two cases **here** leaks nothing, because the fact
+/// being distinguished is already public: `GET /resolve?did=…` answers
+/// `exists: false` for exactly this condition, and the DID → localpart
+/// derivation is a pure `sha2` function ([`crate::localpart`] over
+/// `mxid::localpart_for`) that anyone can compute offline. So the two gates are
+/// asymmetric on purpose. Do not "harmonise" them in either direction.
+pub const IDENTITY_CHECK_UNAVAILABLE_MSG: &str =
+    "The server could not complete a required account check right now. \
+     Nothing has been changed. Please try again in a moment, and contact a \
+     server administrator if this keeps happening.";
+
 /// Server-enforced reject for the account + QR/device flows: if a Synapse client
 /// is configured AND the authenticated `did` resolves to a NON-existent account
 /// under EITHER localpart scheme (`resolve_identity(..).is_new == true` — see
@@ -85,6 +131,22 @@ pub const NEW_IDENTITY_REJECT_MSG: &str =
 /// `server_name` guards already `BadRequest` for the actions that need Synapse).
 /// Returning the existing-identity path unchanged keeps `is_new == false`
 /// a strict no-op.
+///
+/// # Two rejects, two different facts
+///
+/// Both reject and both fail closed — that part is the security property and
+/// must not change — but they are reported differently, because they are
+/// different answers to the user:
+///
+/// | Outcome | Error | Status | Meaning |
+/// |---|---|---|---|
+/// | `Ok(is_new == true)` | `BadRequest(`[`NEW_IDENTITY_REJECT_MSG`]`)` | 400 | the check RAN: there is no such account, and this flow may not create one |
+/// | `Err(_)` | `ServiceUnavailable(`[`IDENTITY_CHECK_UNAVAILABLE_MSG`]`)` | 503 | the check could not run at all; we say nothing about whether the account exists |
+///
+/// Collapsing the second into the first is safe but misleading, and was the
+/// behaviour until this split — see [`IDENTITY_CHECK_UNAVAILABLE_MSG`] for the
+/// full argument and for why the analogous split would be WRONG in
+/// [`reject_if_deactivated`].
 pub async fn reject_if_new_identity(
     synapse: Option<&crate::synapse_client::SynapseClient>,
     did: &str,
@@ -101,12 +163,20 @@ pub async fn reject_if_new_identity(
             ))
         }
         Ok(_) => Ok(()),
-        // A detection failure (Synapse unreachable) must not silently create an
-        // account: fail closed with the same clear message rather than provisioning.
+        // A detection failure must not silently create an account: this still
+        // fails CLOSED, and that is not negotiable. What changed is only the
+        // diagnosis — "we could not check" is a server fault, not "you have no
+        // account here" (see IDENTITY_CHECK_UNAVAILABLE_MSG). The underlying
+        // error stays here in the log, where an operator can act on it, and
+        // never goes on the wire to the caller.
         Err(e) => {
-            warn!(did = %did, "new-identity detection failed, rejecting to avoid silent creation: {}", e);
-            Err(crate::oidc::CustomError::BadRequest(
-                NEW_IDENTITY_REJECT_MSG.to_string(),
+            warn!(
+                did = %did,
+                error = %e,
+                "new-identity detection failed, rejecting to avoid silent creation"
+            );
+            Err(crate::oidc::CustomError::ServiceUnavailable(
+                IDENTITY_CHECK_UNAVAILABLE_MSG.to_string(),
             ))
         }
     }
@@ -937,9 +1007,14 @@ mod tests {
     }
 
     /// H5 (fail-closed): a Synapse client that is present but UNREACHABLE is a
-    /// detection failure. We must NOT fall through and provision a new account; we
-    /// reject with the same clear `BadRequest` message. Points at an unroutable
-    /// endpoint so the request fails fast without a live Synapse.
+    /// detection failure. We must NOT fall through and provision a new account.
+    ///
+    /// It rejects — and it rejects as a **server fault**, with
+    /// `IDENTITY_CHECK_UNAVAILABLE_MSG`, not with the new-identity message. That
+    /// separation is the whole point: a user whose sign-in is broken by a
+    /// server-side problem must not be told to go and create an account. Points
+    /// at an unroutable endpoint so the request fails fast without a live
+    /// Synapse.
     #[tokio::test]
     async fn reject_if_new_identity_fails_closed_on_synapse_error() {
         // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): guaranteed non-routable.
@@ -948,11 +1023,141 @@ mod tests {
             .await
             .expect_err("detection failure must reject, not silently create");
         match err {
+            crate::oidc::CustomError::ServiceUnavailable(msg) => {
+                assert_eq!(msg, IDENTITY_CHECK_UNAVAILABLE_MSG);
+                // Asserted EXPLICITLY, not merely implied by the line above: the
+                // two messages being distinguishable is the fix, so a future
+                // "simplification" back onto one string has to fail here rather
+                // than quietly restore the misleading diagnosis.
+                assert_ne!(
+                    msg, NEW_IDENTITY_REJECT_MSG,
+                    "a detection failure must never be reported as 'no such account'"
+                );
+            }
+            other => panic!("expected ServiceUnavailable, got {:?}", other),
+        }
+    }
+
+    /// The other half of the separation, and the reason the pair cannot collapse
+    /// back into one: an identity the probe SUCCESSFULLY determined to be new
+    /// still gets `NEW_IDENTITY_REJECT_MSG` and a `BadRequest`. Without this, the
+    /// new-identity arm could drift onto the unavailable message and the sibling
+    /// test above would still pass.
+    ///
+    /// Drives `localpart.rs`'s in-process mock homeserver (no live stack, no
+    /// network) with an EMPTY set of existing localparts, so both the legacy and
+    /// the modern shape read as free and `resolve_identity` reports
+    /// `is_new == true`.
+    #[tokio::test]
+    async fn a_genuinely_new_identity_still_gets_the_new_identity_message() {
+        use crate::localpart::resolve_identity_tests::spawn_mock_synapse_with_did_fields;
+        use std::collections::{HashMap, HashSet};
+
+        let (synapse, handle) =
+            spawn_mock_synapse_with_did_fields(HashSet::new(), HashMap::new()).await;
+        let err = reject_if_new_identity(Some(&synapse), "did:key:zDnBRANDNEW")
+            .await
+            .expect_err("a new identity must be rejected outside the login flow");
+        match err {
             crate::oidc::CustomError::BadRequest(msg) => {
                 assert_eq!(msg, NEW_IDENTITY_REJECT_MSG);
+                assert_ne!(
+                    msg, IDENTITY_CHECK_UNAVAILABLE_MSG,
+                    "a determinate 'no such account' must not be dressed up as a server fault"
+                );
             }
             other => panic!("expected BadRequest, got {:?}", other),
         }
+        handle.abort();
+    }
+
+    /// The case that actually motivated the split, at the level the e2e test
+    /// `wrong_mas_shared_secret_fails_closed_not_open` exercises end to end: a
+    /// REACHABLE Synapse that answers `403` on `/_synapse/mas/*` because the
+    /// shared secret is wrong or rotated.
+    ///
+    /// This became reachable only with the availability-conflation fix
+    /// (`docs/audits/2026-09-12-localpart-availability-conflation.md`): before
+    /// it, a rejected credential was folded into "the localpart is taken", so
+    /// every user on the homeserver looked like a normal returning account and
+    /// this gate never fired at all. Worth its own test rather than leaning on
+    /// the unreachable-host case above, because "reachable but refusing us" is
+    /// the failure an operator will actually hit.
+    #[tokio::test]
+    async fn a_rejected_mas_shared_secret_is_a_detection_failure_not_a_new_identity() {
+        use crate::localpart::resolve_identity_tests::{
+            spawn_mock_synapse_configured, MockSynapseConfig,
+        };
+
+        let (synapse, handle) = spawn_mock_synapse_configured(MockSynapseConfig {
+            reject_secret: true,
+            ..MockSynapseConfig::default()
+        })
+        .await;
+        let err = reject_if_new_identity(Some(&synapse), "did:key:zDnWRONGSECRET")
+            .await
+            .expect_err("a rejected credential must reject, not silently create");
+        match err {
+            crate::oidc::CustomError::ServiceUnavailable(msg) => {
+                assert_eq!(msg, IDENTITY_CHECK_UNAVAILABLE_MSG);
+                assert_ne!(
+                    msg, NEW_IDENTITY_REJECT_MSG,
+                    "our own misconfigured credential is not the user's missing account"
+                );
+            }
+            other => panic!("expected ServiceUnavailable, got {:?}", other),
+        }
+        handle.abort();
+    }
+
+    /// The detection-failure message is rendered VERBATIM to the caller: both the
+    /// account page and the device-approval page show the response body for any
+    /// non-2xx (`showStatus(await r.text())`). The caller has proven a DID and
+    /// nothing else, so the message must carry no operational detail — a leaked
+    /// "403 from /_synapse/mas" would hand a stranger a map of our internals and
+    /// tell them our shared secret is the thing that is wrong.
+    ///
+    /// Everything diagnostic belongs in the `warn!` beside the reject instead,
+    /// which only an operator reads. This test pins both directions: what the
+    /// message must NOT say, and the two things the wording is REQUIRED to
+    /// convey (retry, then escalate).
+    #[test]
+    fn the_detection_failure_message_leaks_no_server_internals() {
+        let lower = IDENTITY_CHECK_UNAVAILABLE_MSG.to_lowercase();
+        for forbidden in [
+            "secret",
+            "synapse",
+            "403",
+            "401",
+            "errcode",
+            "m_",
+            "token",
+            "http",
+            "localpart",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "the detection-failure message must not mention {forbidden:?}: \
+                 {IDENTITY_CHECK_UNAVAILABLE_MSG}"
+            );
+        }
+        // And it must not hand out the one piece of advice that is actively
+        // wrong here, which is the entire reason this constant exists.
+        assert!(
+            !lower.contains("create an account"),
+            "a server fault must not be reported as 'you have no account': \
+             {IDENTITY_CHECK_UNAVAILABLE_MSG}"
+        );
+        assert!(
+            lower.contains("try again"),
+            "the condition is transient, so the message must invite a retry: \
+             {IDENTITY_CHECK_UNAVAILABLE_MSG}"
+        );
+        assert!(
+            lower.contains("administrator"),
+            "a persisting server fault needs an escalation path: \
+             {IDENTITY_CHECK_UNAVAILABLE_MSG}"
+        );
     }
 
     /// Graceful degradation, mirroring `reject_if_new_identity_is_noop_without_synapse`:

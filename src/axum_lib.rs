@@ -134,6 +134,13 @@ impl IntoResponse for CustomError {
                 // Expected user condition (stale/revoked passkey), NOT a server fault.
                 warn!(credential_id = %cred_id, "unknown_credential");
             }
+            // A server-side fault we have already CLASSIFIED, unlike
+            // `internal_error`. Logged under its own name so an operator can
+            // tell "a dependency is down and we failed closed on purpose" from
+            // "something unhandled blew up" without reading either message.
+            CustomError::ServiceUnavailable(msg) => {
+                warn!(error = %msg, "service_unavailable");
+            }
             CustomError::Other(e) => {
                 warn!(error = %e, "internal_error");
             }
@@ -168,6 +175,9 @@ impl IntoResponse for CustomError {
                 .into_response(),
             CustomError::NotFound => (StatusCode::NOT_FOUND, self.to_string()).into_response(),
             CustomError::Redirect(uri) => Redirect::to(&uri).into_response(),
+            CustomError::ServiceUnavailable(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, self.to_string()).into_response()
+            }
             CustomError::Other(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()).into_response()
             }

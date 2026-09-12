@@ -181,9 +181,48 @@ because the wrong secret made the identity look like an existing account, so
 fixed, the first Synapse-dependent guard is the one that fails — by its own
 documented "detection failed → reject" rule.
 
-**Open wart:** that 400 carries `NEW_IDENTITY_REJECT_MSG`, which tells the user to
-create an account when the real cause is a server credential misconfiguration.
-Safe (nothing is provisioned, and sign-in is equally broken) but a misleading
-diagnosis. Giving `reject_if_new_identity` a distinct error for "detection
-failed" is the recommended follow-up; it was not done here because it changes a
-user-visible message beyond the scope of this fix.
+### Follow-up, done — the two rejects are now two facts
+
+That 400 carried `NEW_IDENTITY_REJECT_MSG`, telling the user to create an account
+when the real cause was a server credential misconfiguration. Safe, but a
+misleading diagnosis over a fault the user cannot fix and advice they cannot even
+follow (sign-in is equally broken). `reject_if_new_identity` now reports the two
+outcomes separately:
+
+| Outcome | Error | Status |
+|---|---|---|
+| the check RAN, no account exists | `BadRequest(NEW_IDENTITY_REJECT_MSG)` | 400 |
+| the check could not RUN | `ServiceUnavailable(IDENTITY_CHECK_UNAVAILABLE_MSG)` | 503 |
+
+Both still reject, nothing is provisioned either way, and that is unchanged and
+not negotiable — only the diagnosis differs.
+
+**503 required a new `CustomError::ServiceUnavailable`, and the status was chosen
+on evidence rather than taste.** A 4xx tells a caller to change a request that was
+already correct; `Other`'s 500 would claim an unhandled fault and put a diagnosed
+condition in the same operator bucket as an undiagnosed one. It is only safe to
+return 503 because every one of the four call sites' page JS renders the body for
+*any* non-2xx — checked at `account.rs:1694`/`1741` and `device_auth.rs:595`/`636`;
+the only status-specific branch in either page is `accountAction`'s `401`, and
+that route is not a call site. Confirmed on the wire: `WARN service_unavailable`,
+`response status=503`, and zero occurrences of the new-identity message.
+
+The message names the server as the faulty party, says it is worth retrying, and
+points at an administrator. It leaks nothing operational — no endpoint, no status,
+no errcode, and no hint that a shared secret is involved — because the body is
+rendered verbatim to a caller who has proven a DID but is otherwise a stranger.
+Pinned by `the_detection_failure_message_leaks_no_server_internals`.
+
+**The analogous split would be WRONG in `reject_if_deactivated`**, which
+deliberately does not distinguish "deactivated" from "could not tell": that WOULD
+let an unauthenticated prober learn account state. Distinguishing here leaks
+nothing, because the fact is already public — `GET /resolve?did=…` answers
+`exists: false` for exactly this condition and the derivation is a pure `sha2`
+function anyone can compute offline. The asymmetry is intentional; do not
+harmonise the two gates in either direction.
+
+`e2e_account_management::wrong_mas_shared_secret_fails_closed_not_open` moves
+400 → 503, and its companion assertion is restated from "a 4xx" to "an error,
+never a 2xx and never a redirect" — deliberately not narrowed to `is_server_error`,
+since what is being pinned is fail-closed, not a particular status.
+`cargo test --workspace`: **345 passed, 0 failed.** e2e suites: 43/43.

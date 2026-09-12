@@ -123,7 +123,7 @@ jobs:
           cat /tmp/siwx-oidc.log >&2
           exit 1
 
-      # MSC4191 account-management protocol flows (5/5 promoted).
+      # MSC4191 account-management protocol flows (6/6 promoted).
       - name: E2E account management
         run: cargo test --test e2e_account_management -- --ignored --test-threads=1
 

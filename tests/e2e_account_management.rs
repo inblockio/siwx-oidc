@@ -484,19 +484,32 @@ async fn admin_token_rejection_is_legible_not_a_500_or_notfound() {
 /// A rejected credential is now an `Err`, not a verdict, so the FIRST guard that
 /// needs Synapse is the one that fails, and it fails closed by its own
 /// documented rule ("detection failed → reject rather than risk silent
-/// creation"). The status is therefore **400**.
+/// creation").
 ///
-/// What this test pins is the invariant, not the incidental code: an unreachable
-/// MAS surface must be rejected, must not mint a session, and must never be a
-/// 2xx or a 5xx. Do not "restore" the 401 by reordering the guards — that would
-/// be preserving an accident.
+/// What this test pins is the invariant, not the incidental code: a rejected MAS
+/// credential must be rejected, must not mint a session, and must never be a
+/// 2xx. Do not "restore" the 401 by reordering the guards — that would be
+/// preserving an accident.
 ///
-/// **Known wart, deliberately not fixed here:** the 400 body is
-/// `NEW_IDENTITY_REJECT_MSG`, which tells the user to create an account when the
-/// real cause is a server-side credential misconfiguration. It is safe (nothing
-/// is provisioned, and sign-in is equally broken so no duplicate can be created)
-/// but it is a misleading diagnosis. Giving `reject_if_new_identity` a distinct
-/// error for "detection failed" is the right follow-up.
+/// # The status is now 503, and that is the fix, not a regression
+///
+/// This asserted **400** with a body of `NEW_IDENTITY_REJECT_MSG` — which told
+/// the user to create an account when the real cause was a server-side
+/// credential misconfiguration. The doc here named that as a known wart and the
+/// distinct "detection failed" error as the right follow-up; that follow-up has
+/// been done. `webauthn::reject_if_new_identity` now separates the two facts it
+/// used to conflate: `Ok(is_new)` still yields `400 NEW_IDENTITY_REJECT_MSG`,
+/// while `Err(_)` — this test's case — yields
+/// `503 IDENTITY_CHECK_UNAVAILABLE_MSG`, a message that blames the server,
+/// invites a retry, points at an administrator, and leaks nothing about which
+/// credential failed.
+///
+/// The old companion assertion `status.is_client_error()` is therefore GONE, and
+/// deliberately not replaced with `is_server_error()`: it was never really about
+/// the 4xx class, it was standing in for "did not succeed, minted nothing". That
+/// invariant is restated below in those terms instead of being weakened — a
+/// fail-closed path is one the caller does not get through, not one the caller
+/// gets blamed for.
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn wrong_mas_shared_secret_fails_closed_not_open() {
@@ -523,20 +536,31 @@ async fn wrong_mas_shared_secret_fails_closed_not_open() {
     mock_set_secret(&c, "testsecret").await;
 
     assert_eq!(
-        status, 400,
-        "an unreachable MAS surface must fail CLOSED via the first Synapse-dependent \
-         guard — see this test's doc for why this is 400 and not the historical 401: {text}"
+        status, 503,
+        "a rejected MAS credential must fail CLOSED via the first Synapse-dependent \
+         guard, and diagnose itself honestly: the check could not be COMPLETED, which \
+         is a server fault — see this test's doc for why this is 503 and neither the \
+         historical 401 nor the 400 it replaced: {text}"
     );
-    // The invariant the status code is only a proxy for. Asserted separately so
-    // that a future change of WHICH guard rejects cannot quietly turn this into
-    // a success or a server error.
+    // The invariant the status code is only a proxy for, restated rather than
+    // weakened (see the doc above): a fail-closed path is one the caller does
+    // not get through. Asserted separately so a future change of WHICH guard
+    // rejects cannot quietly turn this into a success or a redirect.
     assert!(
-        status.is_client_error(),
-        "fail-closed means a 4xx rejection, never a 2xx and never a 5xx: {status} {text}"
+        status.is_client_error() || status.is_server_error(),
+        "fail-closed means an error response, never a 2xx and never a redirect: {status} {text}"
     );
     // And it must not have handed out an account session on the way through.
     assert!(
         !text.contains("csrf"),
         "a fail-closed re-auth must not mint an account session: {text}"
+    );
+    // The diagnosis must be the honest one. Telling the user to go and create an
+    // account when the SERVER's own credential is wrong is safe but misleading,
+    // and it is advice they cannot act on — sign-in is broken by the same fault.
+    assert!(
+        !text.to_lowercase().contains("create an account"),
+        "a server-side credential failure must not be reported as 'you have no \
+         account': {text}"
     );
 }

@@ -1049,13 +1049,22 @@ QR/device flows hard-REJECT it:
 | Flow | New identity (`is_localpart_available == true`) |
 |------|--------------------------------------------------|
 | Login (`/webauthn/authenticate/finish`, wallet `/sign_in`) | **GATE:** `finish` returns `{ok, did, new_user:true, mxid}` and does NOT provision. The browser shows a confirm/cancel gate; provisioning happens only at `/sign_in` AFTER confirm. Cancel = no `/sign_in` = zero Synapse state. |
-| Account re-auth (`/account/passkey/finish`, `/account/wallet`) | **REJECT:** `reject_if_new_identity` -> `400` with `NEW_IDENTITY_REJECT_MSG` ("not linked to an existing account. Create an account at sign-in first."). Nothing provisioned. |
+| Account re-auth (`/account/passkey/finish`, `/account/wallet`) | **REJECT:** `reject_if_new_identity` -> `400` with `NEW_IDENTITY_REJECT_MSG` ("not linked to an existing account. Create an account at sign-in first."), or `503` with `IDENTITY_CHECK_UNAVAILABLE_MSG` when the check could not RUN. Nothing provisioned either way. |
 | QR / device approval (`/device/passkey/finish`, `/device` wallet) | **REJECT:** same `400`, BEFORE `entry.did` is set, so the token grant never provisions. |
 
-`reject_if_new_identity` fails **closed**: if detection itself fails (Synapse
-unreachable) it rejects with the same message rather than risk a silent creation. It
-is a strict no-op when no Synapse client is configured (standalone deployments
-degrade, never 500). `login_finish` only reports `new_user`/`mxid` when a Synapse
+`reject_if_new_identity` fails **closed**, and reports the two outcomes as two
+different facts (2026-09-12). The check RUNNING and finding no account is a `400`
+with `NEW_IDENTITY_REJECT_MSG`; the check being UNABLE TO RUN — Synapse unreachable,
+or a rejected MAS shared secret — is a `503` with `IDENTITY_CHECK_UNAVAILABLE_MSG`,
+which names the server as the faulty party and leaks nothing operational. Both
+reject and nothing is provisioned either way; only the diagnosis differs. Collapsing
+them (the behaviour until 2026-09-12) told a legitimate user to create an account
+they may already have, over a fault they cannot fix. **The analogous split would be
+WRONG in `reject_if_deactivated`**, which deliberately does not distinguish
+"deactivated" from "could not tell" because that WOULD leak account state; the
+asymmetry is intentional — "this DID has no account here" is already public via
+`GET /resolve?did=…`. It is a strict no-op when no Synapse client is configured
+(standalone deployments degrade, never 500). `login_finish` only reports `new_user`/`mxid` when a Synapse
 client + `server_name` are configured (else `new_user:false`, behaves as before).
 
 ## Troubleshooting
