@@ -69,6 +69,19 @@ use siwx_oidc::mxid::{canonicalize, legacy_localpart, localpart_for};
 use crate::localpart::resolve_identity;
 use crate::synapse_client::{matrix_user_id, LocalpartStatus, SynapseClient};
 
+/// Largest `did` this endpoint will consider, in bytes.
+///
+/// Chosen to be unreachable by any real DID rather than to be tight: see the
+/// reasoning at the check in [`resolve`]. Far above Synapse's 255-byte user-ID
+/// limit on purpose — a DID longer than that is legitimate and simply has no
+/// legacy localpart.
+const MAX_DID_LEN: usize = 2048;
+
+/// Largest `mxid` this endpoint will consider, in bytes — the Matrix spec's own
+/// `MAX_USERID_LENGTH`. Anything longer cannot name an account on any
+/// homeserver, so this rejects rather than asking one.
+const MAX_MXID_LEN: usize = 255;
+
 /// Query string of `GET /resolve`: **exactly one** of `did` or `mxid`.
 ///
 /// Both or neither is a 400. There is no "resolve whatever you can find" mode
@@ -249,6 +262,52 @@ pub async fn resolve(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    // Bound the inputs before anything is done with them.
+    //
+    // This is input validation, NOT the in-process rate limiter the module doc
+    // refuses — that refusal stands, and the edge is still where request RATE
+    // belongs. What is bounded here is the size of a SINGLE request, which the
+    // edge should not have to know the semantics of.
+    //
+    // Both values are reflected in the response and both become outbound query
+    // parameters to Synapse, so without a cap an unauthenticated caller chooses
+    // how much work and how much response body one request costs. The HTTP
+    // layer does not do it for us: a 20 000-character `did` was answered with a
+    // 200 that echoed the whole thing back (`e2e_resolve_http`'s hostile
+    // corpus).
+    //
+    // The limits are deliberately far above anything real, because rejecting a
+    // legitimate DID is the worse failure:
+    //
+    // - A DID has no length limit in the W3C syntax. `did:pkh` and `did:key`
+    //   sit near 60 characters; a `did:peer:2` carrying service endpoints is the
+    //   only common shape that runs long, and even a pathological one stays
+    //   under 2 KiB. Note the cap MUST stay well above Synapse's 255-character
+    //   user-ID limit: a DID longer than that is perfectly legitimate — it
+    //   simply cannot have a LEGACY localpart, which is exactly the case
+    //   `localpart::resolve_identity` now falls through to the modern shape for.
+    // - An MXID is bounded by the Matrix spec itself at 255 bytes
+    //   (`MAX_USERID_LENGTH`), so anything longer cannot name a real account on
+    //   any homeserver. Rejecting it here costs the caller nothing and saves a
+    //   round trip that could only ever come back `M_INVALID_USERNAME`.
+    if let Some(did) = did {
+        if did.len() > MAX_DID_LEN {
+            return Err(ResolveError::BadRequest(format!(
+                "`did` is {} bytes; the maximum accepted here is {MAX_DID_LEN}.",
+                did.len()
+            )));
+        }
+    }
+    if let Some(mxid) = mxid {
+        if mxid.len() > MAX_MXID_LEN {
+            return Err(ResolveError::BadRequest(format!(
+                "`mxid` is {} bytes; a Matrix user ID cannot exceed {MAX_MXID_LEN} \
+                 (Synapse `MAX_USERID_LENGTH`), so no account can have this ID.",
+                mxid.len()
+            )));
+        }
+    }
+
     let selector = match (did, mxid) {
         (Some(did), None) => Selector::Did(did),
         (None, Some(mxid)) => Selector::Mxid(mxid),
@@ -808,14 +867,19 @@ mod tests {
     /// the pager to the wrong system.
     #[tokio::test]
     async fn an_mxid_the_homeserver_refuses_is_a_400_never_a_502_or_a_phantom_account() {
-        // ASCII-graphic throughout, so it clears `split_mxid`'s syntactic guard
-        // and actually reaches the availability probe — the point of the test.
-        let over_long = "z".repeat(250);
-        let mxid = format!("@{over_long}:{SERVER_NAME}");
+        // A SHORT localpart that Synapse nevertheless refuses: an all-numeric
+        // one is reserved for guests and answers `M_INVALID_USERNAME`
+        // (`check_username`, 1.159.0). Short ON PURPOSE — an over-long localpart
+        // is now caught by `MAX_MXID_LEN` before any probe, which is correct but
+        // would leave this test measuring the cap instead of the errcode path it
+        // exists for. ASCII-graphic, so it clears `split_mxid`'s syntactic guard
+        // and actually reaches the availability probe.
+        let refused = "12345";
+        let mxid = format!("@{refused}:{SERVER_NAME}");
 
         let (synapse, handle) = spawn_mock_synapse_configured(
             crate::localpart::resolve_identity_tests::MockSynapseConfig {
-                unusable: HashSet::from([over_long.clone()]),
+                unusable: HashSet::from([refused.to_string()]),
                 ..Default::default()
             },
         )
@@ -838,6 +902,89 @@ mod tests {
         );
         assert_eq!(status_of(err), axum::http::StatusCode::BAD_REQUEST);
         handle.abort();
+    }
+
+    /// An oversized `did` is refused without asking the homeserver anything.
+    ///
+    /// The value is REFLECTED in the response and also becomes an outbound query
+    /// parameter to Synapse, so without a cap an unauthenticated caller picks how
+    /// much work and how much response body one request costs. Pinned against a
+    /// dead port so that "before any probe" is proven by the test hanging or
+    /// failing if the order ever changes, not merely asserted.
+    #[tokio::test]
+    async fn an_oversized_did_is_rejected_before_any_probe() {
+        // TEST-NET-1 (RFC 5737): guaranteed non-routable.
+        let synapse = SynapseClient::new("http://192.0.2.1:1", "secret");
+        let huge = format!("did:key:z{}", "x".repeat(MAX_DID_LEN));
+
+        let err = resolve(
+            &config(Some(SERVER_NAME)),
+            Some(&synapse),
+            query(Some(&huge), None),
+        )
+        .await
+        .expect_err("an oversized did must be refused");
+
+        assert!(matches!(err, ResolveError::BadRequest(_)), "got {err:?}");
+        assert_eq!(status_of(err), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// The cap must not reject a DID that is merely LONG but legitimate.
+    ///
+    /// This is the failure that would actually hurt: a `did:peer:2` carrying
+    /// service endpoints runs to several hundred characters, is perfectly valid,
+    /// and is exactly the shape whose LEGACY localpart exceeds Synapse's
+    /// 255-byte user-ID limit — the case `localpart::resolve_identity` falls
+    /// through to the modern shape for. A cap tight enough to catch it would
+    /// re-break what the 2026-09-12 conflation fix repaired.
+    #[tokio::test]
+    async fn a_long_but_legitimate_did_is_not_rejected_by_the_cap() {
+        let long_peer = format!(
+            "did:peer:2.Ez6LS{}.Vz6Mk{}",
+            "a".repeat(200),
+            "b".repeat(200)
+        );
+        assert!(
+            long_peer.len() > 255,
+            "vector must exceed the Matrix user-ID limit"
+        );
+
+        let (synapse, handle) =
+            spawn_mock_synapse_with_did_fields(HashSet::new(), HashMap::new()).await;
+        let resp = resolve(
+            &config(Some(SERVER_NAME)),
+            Some(&synapse),
+            query(Some(&long_peer), None),
+        )
+        .await
+        .expect("a long did:peer is legitimate and must resolve, not 400");
+
+        assert!(!resp.exists, "no account exists for this DID in the mock");
+        assert_eq!(
+            resp.mxid.as_deref(),
+            Some(format!("@{}:{SERVER_NAME}", localpart_for(&long_peer)).as_str()),
+            "it must resolve to the MODERN 16-char localpart"
+        );
+        handle.abort();
+    }
+
+    /// An `mxid` longer than the Matrix spec's own limit cannot name an account
+    /// on any homeserver, so it is refused here rather than asked about.
+    #[tokio::test]
+    async fn an_mxid_longer_than_the_matrix_limit_is_rejected_before_any_probe() {
+        let synapse = SynapseClient::new("http://192.0.2.1:1", "secret");
+        let huge = format!("@{}:{SERVER_NAME}", "z".repeat(MAX_MXID_LEN));
+
+        let err = resolve(
+            &config(Some(SERVER_NAME)),
+            Some(&synapse),
+            query(None, Some(&huge)),
+        )
+        .await
+        .expect_err("an over-long mxid must be refused");
+
+        assert!(matches!(err, ResolveError::BadRequest(_)), "got {err:?}");
+        assert_eq!(status_of(err), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
