@@ -38,8 +38,8 @@
 //!   via `handlers/profile.py::on_profile_query`. The live probe read it back
 //!   with no `Authorization` header at all.
 //! - The one thing this server adds is `exists`, which is
-//!   `is_localpart_available` — the same answer any client gets from Matrix
-//!   registration availability.
+//!   `SynapseClient::localpart_status` — the same answer any client gets from
+//!   Matrix registration availability.
 //!
 //! So authentication would buy **rate-limiting, not secrecy**, and it is not
 //! implemented here: a rate limiter belongs at the reverse proxy that already
@@ -67,7 +67,7 @@ use tracing::warn;
 use siwx_oidc::mxid::{canonicalize, legacy_localpart, localpart_for};
 
 use crate::localpart::resolve_identity;
-use crate::synapse_client::{matrix_user_id, SynapseClient};
+use crate::synapse_client::{matrix_user_id, LocalpartStatus, SynapseClient};
 
 /// Query string of `GET /resolve`: **exactly one** of `did` or `mxid`.
 ///
@@ -389,13 +389,32 @@ async fn resolve_mxid(
         )));
     }
 
-    let exists = !synapse
-        .is_localpart_available(localpart)
-        .await
-        .map_err(|e| ResolveError::Upstream {
-            mxid: Some(mxid.to_string()),
-            message: format!("could not ask the homeserver whether {mxid} exists: {e}"),
-        })?;
+    // `localpart_status`, not the two-valued `is_localpart_available` wrapper.
+    //
+    // Every OTHER caller hands Synapse a *derived* localpart; this one hands it
+    // whatever the caller typed. So this is the one place where "Synapse refuses
+    // this localpart outright" is a routine, expected answer rather than an
+    // anomaly — and it is a property of the REQUEST, not a failure of the
+    // upstream. Reporting it as a 502 would blame the homeserver for a caller's
+    // typo, and reporting it as `exists: false` would quietly claim we checked
+    // something we could not check. It is a 400.
+    let exists =
+        match synapse
+            .localpart_status(localpart)
+            .await
+            .map_err(|e| ResolveError::Upstream {
+                mxid: Some(mxid.to_string()),
+                message: format!("could not ask the homeserver whether {mxid} exists: {e}"),
+            })? {
+            LocalpartStatus::InUse => true,
+            LocalpartStatus::Available => false,
+            LocalpartStatus::Unusable { errcode, message } => {
+                return Err(ResolveError::BadRequest(format!(
+                    "`{mxid}` is not a localpart this homeserver will accept ({errcode}: \
+                 {message}), so no account can exist under it."
+                )))
+            }
+        };
 
     if !exists {
         return Ok(ResolveResponse {
@@ -466,16 +485,21 @@ fn split_mxid(mxid: &str) -> Result<(&str, &str), ResolveError> {
     }
     // A deliberately narrow syntactic guard, NOT the Matrix localpart grammar.
     //
-    // `SynapseClient::is_localpart_available` maps ANY 4xx to `Ok(false)` =
-    // "taken", which is correct for the derived localparts every other caller
-    // hands it but not for a caller-supplied one: a localpart Synapse rejects as
-    // `M_INVALID_USERNAME` would then be reported as an existing account. The
-    // historical grammar is permissive enough (old accounts carry uppercase and
-    // other now-deprecated characters) that enforcing the modern spec here would
-    // make real accounts unresolvable, so this rejects only what cannot be a
-    // Matrix localpart under any reading — whitespace, control characters and
-    // non-ASCII — and the residual ambiguity is documented rather than papered
-    // over.
+    // This USED TO BE the only thing standing between a caller-supplied
+    // localpart and a fabricated account: `is_localpart_available` mapped ANY
+    // 4xx to "taken", so a localpart Synapse refuses as `M_INVALID_USERNAME`
+    // came back as an existing account. That is fixed at the source — the probe
+    // now returns `LocalpartStatus::Unusable` and the call site above turns it
+    // into a 400 — so this guard is no longer load-bearing for correctness. It
+    // is kept as a cheap pre-filter that answers the obviously-impossible cases
+    // without spending a homeserver round trip on them.
+    //
+    // It stays narrow for the original reason: the historical grammar is
+    // permissive enough (old accounts carry uppercase and other now-deprecated
+    // characters) that enforcing the modern spec here would make real accounts
+    // unresolvable. So it rejects only what cannot be a Matrix localpart under
+    // any reading — whitespace, control characters and non-ASCII — and leaves
+    // every remaining judgement to Synapse, which is the authority on it.
     if !localpart.chars().all(|c| c.is_ascii_graphic()) {
         return Err(ResolveError::BadRequest(format!(
             "`{mxid}` is not a Matrix ID: the localpart contains whitespace, control \
@@ -506,7 +530,9 @@ fn binds_to_localpart(did: &str, localpart: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::localpart::resolve_identity_tests::spawn_mock_synapse_with_did_fields;
+    use crate::localpart::resolve_identity_tests::{
+        spawn_mock_synapse_configured, spawn_mock_synapse_with_did_fields,
+    };
     use crate::synapse_client::SynapseClient;
     use std::collections::{HashMap, HashSet};
 
@@ -760,6 +786,55 @@ mod tests {
         assert!(
             msg.contains("matrix.org") && msg.contains(SERVER_NAME),
             "the message must name BOTH servers so the caller can see the mismatch: {msg}"
+        );
+        assert_eq!(status_of(err), axum::http::StatusCode::BAD_REQUEST);
+        handle.abort();
+    }
+
+    /// A localpart the homeserver REFUSES is a 400 — never a 502, and never a
+    /// `200 {"exists": true}`.
+    ///
+    /// This is the `/resolve` half of the 2026-09-12 conflation defect (see
+    /// `docs/audits/2026-09-12-localpart-availability-conflation.md`). The old
+    /// probe mapped every 4xx to "taken", so an mxid Synapse rejects as
+    /// `M_INVALID_USERNAME` — an over-length one, say — was reported as an
+    /// existing account and the endpoint went on to read a profile field for a
+    /// user that cannot exist.
+    ///
+    /// 400 rather than 502 is the deliberate part: this is the ONE call site
+    /// handed a caller-supplied localpart rather than a derived one, so the
+    /// refusal is a property of the request, not a failure of the upstream.
+    /// Blaming the homeserver for a caller's typo would send whoever is holding
+    /// the pager to the wrong system.
+    #[tokio::test]
+    async fn an_mxid_the_homeserver_refuses_is_a_400_never_a_502_or_a_phantom_account() {
+        // ASCII-graphic throughout, so it clears `split_mxid`'s syntactic guard
+        // and actually reaches the availability probe — the point of the test.
+        let over_long = "z".repeat(250);
+        let mxid = format!("@{over_long}:{SERVER_NAME}");
+
+        let (synapse, handle) = spawn_mock_synapse_configured(
+            crate::localpart::resolve_identity_tests::MockSynapseConfig {
+                unusable: HashSet::from([over_long.clone()]),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let err = resolve(
+            &config(Some(SERVER_NAME)),
+            Some(&synapse),
+            query(None, Some(&mxid)),
+        )
+        .await
+        .expect_err("a localpart the homeserver refuses has no account to report");
+
+        let ResolveError::BadRequest(ref msg) = err else {
+            panic!("a refused localpart is a bad REQUEST, not an upstream failure: {err:?}");
+        };
+        assert!(
+            msg.contains("M_INVALID_USERNAME"),
+            "the message must carry Synapse's own errcode so the caller can see WHY: {msg}"
         );
         assert_eq!(status_of(err), axum::http::StatusCode::BAD_REQUEST);
         handle.abort();

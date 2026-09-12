@@ -43,8 +43,9 @@
 //! rule and the "why 80 bits of hash" rationale — both apply unchanged here,
 //! just documented alongside the code that implements them.
 
+use crate::synapse_client::LocalpartStatus;
 pub(crate) use siwx_oidc::mxid::{legacy_localpart, localpart_for};
-use tracing::warn;
+use tracing::{info, warn};
 
 // -- Grandfathering policy ---------------------------------------------------
 
@@ -110,25 +111,74 @@ pub(crate) struct ResolvedIdentity {
 ///    Redis. This also preserves the historical contract of the old
 ///    `is_new_identity` helper ("no Synapse client -> cannot detect; behave as
 ///    today").
-/// 2. `is_localpart_available(legacy) == Ok(false)` (taken) ->
-///    `{ legacy, is_new: false }` — a pre-existing, grandfathered account.
-/// 3. Else, `is_localpart_available(modern) == Ok(false)` (taken) ->
-///    `{ modern, is_new: false }` — already migrated, or created under the new
-///    scheme by a previous sign-in.
-/// 4. Else -> `{ modern, is_new: true }` — genuinely new; neither shape is
-///    taken.
+/// 2. `localpart_status(legacy) == InUse` -> `{ legacy, is_new: false }` — a
+///    pre-existing, grandfathered account.
+/// 3. `localpart_status(legacy) == Unusable` -> **fall through to the modern
+///    probe**, exactly as if the legacy shape had been free. See the section
+///    below; this arm is the one that is easy to get wrong.
+/// 4. Else (legacy `Available`, or fell through from `Unusable`):
+///    `localpart_status(modern) == InUse` -> `{ modern, is_new: false }` —
+///    already migrated, or created under the new scheme by a previous sign-in.
+/// 5. `localpart_status(modern) == Available` -> `{ modern, is_new: true }` —
+///    genuinely new; no account exists under either shape.
+/// 6. `localpart_status(modern) == Unusable` -> `Err`, loudly. See below.
 ///
 /// Any `Err` from a probe is propagated, not papered over: a caller that needs
 /// a localpart anyway despite the error MUST fall back to [`legacy_localpart`]
 /// (never [`localpart_for`]) — see [`resolve_identity_or_legacy`] and the
-/// module doc's note on the fail-safe direction.
+/// module doc's note on the fail-safe direction. In particular a **rejected MAS
+/// shared secret** (401/403) is an `Err` from
+/// [`crate::synapse_client::SynapseClient::localpart_status`] and never a
+/// verdict, so a rotated secret cannot make every localpart on the homeserver
+/// read as taken.
 ///
-/// Note: [`crate::synapse_client::SynapseClient::is_localpart_available`] maps
-/// ANY 4xx response to `Ok(false)` ("taken"), which also covers
-/// `M_INVALID_USERNAME`. That cannot misfire here because both
-/// [`legacy_localpart`] and [`localpart_for`] always produce a syntactically
-/// valid Matrix localpart (`[a-z0-9._=/-]`), so a 4xx on either probe can only
-/// mean "already in use", never "malformed".
+/// # Why an UNUSABLE legacy localpart falls through instead of grandfathering
+///
+/// `Unusable` means Synapse **refuses** the localpart outright
+/// (`M_INVALID_USERNAME`, `M_EXCLUSIVE`, …). That is the opposite of "taken":
+/// no account can exist under a localpart Synapse will not allow, so there is
+/// nothing to grandfather and falling through severs **nobody**. The grandfather
+/// rule protects accounts that exist; this is the one case where it is
+/// provably impossible for one to exist.
+///
+/// **The old claim here was falsified — do not reinstate it.** This doc used to
+/// state that `is_localpart_available`'s any-4xx-to-`Ok(false)` mapping "cannot
+/// misfire here because both `legacy_localpart` and `localpart_for` always
+/// produce a syntactically valid Matrix localpart (`[a-z0-9._=/-]`)". That
+/// reasoning covered the **character class** only and never considered
+/// Synapse's `MAX_USERID_LENGTH` (255). Confirmed live on dev (Synapse 1.159.0):
+/// a 252-character `did:peer:2` yields a 252-character legacy localpart, whose
+/// user ID is 264 characters, which `check_username` refuses with
+/// `M_INVALID_USERNAME` — and the old code read that refusal as "an account
+/// exists here" and returned `{ localpart: legacy, is_new: false }`,
+/// grandfathering an identity that had no account at all.
+///
+/// That was not merely a wrong lookup. `is_new` is the input to the
+/// new-account gates: `webauthn::reject_if_new_identity` matches
+/// `Ok(resolved) if resolved.is_new` -> reject, `Ok(_)` -> **pass**, `Err` ->
+/// reject (fail closed). A wrongly-`Ok(false)` legacy probe therefore made the
+/// gate **PASS** for a brand-new identity on the QR/device-approval and
+/// account-re-auth paths, which are documented to hard-REJECT it.
+///
+/// The fix is also the proof that the opaque scheme already solved the long-DID
+/// problem: [`localpart_for`] is **always** exactly 16 lowercase base36
+/// characters, so it is always inside both the length and the charset limits,
+/// for every DID of every length. The legacy probe's misreading was *masking*
+/// that solution — the identity had a perfectly usable modern localpart waiting
+/// the whole time.
+///
+/// # Why an UNUSABLE modern localpart is a hard `Err`
+///
+/// It should be unreachable: 16 characters of `[0-9a-z]` cannot violate the
+/// charset rule, and cannot approach `MAX_USERID_LENGTH` for any plausible
+/// server name. The one theoretical route is Synapse's guest-reserved
+/// all-numeric rule — a digest whose base36 encoding happens to be 16 digits,
+/// probability ≈ `(10/36)^16` ≈ 3e-9. So an `Err` here is an honest "something
+/// is very wrong" (a homeserver with an appservice namespace swallowing the
+/// space, a proxy answering for the route, a wildly misconfigured server name),
+/// not a case to paper over with a fallback. Failing loudly also fails
+/// **closed** at every new-account gate, which is the right direction for a
+/// condition nobody has an explanation for.
 pub(crate) async fn resolve_identity(
     did: &str,
     synapse: Option<&crate::synapse_client::SynapseClient>,
@@ -144,31 +194,60 @@ pub(crate) async fn resolve_identity(
         }
     };
 
+    // The THREE-valued probe, never the two-valued `is_localpart_available`
+    // wrapper: telling `InUse` ("an account holds this") apart from `Unusable`
+    // ("Synapse will not allow an account here") is the entire decision being
+    // made, and the wrapper cannot express it — see the doc above.
     let legacy = legacy_localpart(did);
-    let legacy_available = synapse.is_localpart_available(&legacy).await?;
-    if !legacy_available {
-        return Ok(ResolvedIdentity {
-            localpart: legacy,
-            is_new: false,
-            degraded: false,
-        });
+    match synapse.localpart_status(&legacy).await? {
+        LocalpartStatus::InUse => {
+            return Ok(ResolvedIdentity {
+                localpart: legacy,
+                is_new: false,
+                degraded: false,
+            });
+        }
+        // NOT an account: Synapse refuses this localpart, so no account can
+        // exist under it and there is nothing to grandfather. Fall through to
+        // the modern probe exactly as if it had been free — which severs
+        // nobody, and hands the identity the 16-char base36 localpart that was
+        // always within Synapse's limits. Reading this as "taken" is the
+        // defect this match arm exists to close.
+        LocalpartStatus::Unusable { errcode, message } => {
+            info!(
+                did = %did,
+                %errcode,
+                %message,
+                "legacy localpart is UNUSABLE (not taken) — no account can exist under it, \
+                 so there is nothing to grandfather; resolving to the modern shape"
+            );
+        }
+        LocalpartStatus::Available => {}
     }
 
     let modern = localpart_for(did);
-    let modern_available = synapse.is_localpart_available(&modern).await?;
-    if !modern_available {
-        return Ok(ResolvedIdentity {
+    match synapse.localpart_status(&modern).await? {
+        LocalpartStatus::InUse => Ok(ResolvedIdentity {
             localpart: modern,
             is_new: false,
             degraded: false,
-        });
+        }),
+        LocalpartStatus::Available => Ok(ResolvedIdentity {
+            localpart: modern,
+            is_new: true,
+            degraded: false,
+        }),
+        // Should be unreachable — 16 chars of [0-9a-z] break no Synapse rule.
+        // Loud, not papered over: see the doc's "why an UNUSABLE modern
+        // localpart is a hard Err".
+        LocalpartStatus::Unusable { errcode, message } => anyhow::bail!(
+            "resolve_identity: Synapse refuses the MODERN localpart `{modern}` for `{did}` \
+             ({errcode}: {message}). That should be impossible — `localpart_for` is always \
+             16 lowercase base36 characters — so this is a homeserver-side condition \
+             (appservice namespace, misrouted route, guest-reserved all-numeric localpart), \
+             not something to fall back from."
+        ),
     }
-
-    Ok(ResolvedIdentity {
-        localpart: modern,
-        is_new: true,
-        degraded: false,
-    })
 }
 
 /// [`resolve_identity`], but infallible: on any probe error, fall back to
@@ -207,6 +286,23 @@ pub(crate) async fn resolve_identity(
 /// accounts are modern": no. A wrong-but-working account is recoverable by a
 /// later correct sign-in; a severed account is not recoverable at all, at any
 /// population ratio.
+///
+/// ## The fallback can produce an UNUSABLE localpart, and that is the trade
+///
+/// For a DID whose legacy form is over-length (the 252-character `did:peer:2`
+/// case in [`resolve_identity`]'s doc), this fallback hands back a localpart
+/// Synapse will **refuse** — `provision_user` then fails with
+/// `M_INVALID_USERNAME` instead of quietly creating an account. That is the
+/// intended outcome, not a second bug to route around: the fail-safe direction
+/// above is decided by the asymmetry between "badly-shaped new account" and
+/// "existing user severed from their rooms forever", and that asymmetry does
+/// not change just because the bad shape is bad enough to be rejected. The
+/// difference is only *where* the failure surfaces — loudly at provisioning,
+/// where it can be diagnosed, rather than silently as a wrong identity. Do NOT
+/// "fix" this by falling back to [`localpart_for`] when the legacy shape looks
+/// too long: that is the severing guess, wearing a length check as a disguise.
+/// The real fix is for Synapse to be reachable, so [`resolve_identity`] can
+/// answer instead of this function guessing.
 ///
 /// Use this only where the caller must produce SOME localpart and cannot fail
 /// the whole request over a transient Synapse hiccup (sign-in provisioning,
@@ -279,23 +375,80 @@ pub(crate) mod resolve_identity_tests {
     /// route is addressed by (`GET /_matrix/client/v3/profile/{mxid}/{field}`)
     /// and keying the mock by localpart instead would hide a missing or wrong
     /// server name in the URL the client builds.
-    type DidFields = HashMap<String, serde_json::Value>;
+    pub(crate) type DidFields = HashMap<String, serde_json::Value>;
+
+    /// Everything this mock homeserver can be told to do, in one place.
+    ///
+    /// The original harness modelled only the TWO answers
+    /// `is_localpart_available` used to have (200 free / 400 `M_USER_IN_USE`),
+    /// which is precisely the blind spot that let the
+    /// `Unusable`-read-as-`InUse` defect ship: a mock that cannot produce
+    /// `M_INVALID_USERNAME` cannot fail a test about it. The extra levers below
+    /// exist so the three-valued
+    /// [`crate::synapse_client::LocalpartStatus`] contract — and the credential
+    /// failure that must never become a verdict — are all reachable here.
+    ///
+    /// `pub(crate)` for the same reason [`spawn_mock_synapse_with_did_fields`]
+    /// is: `crate::resolve`'s tests need the `unusable` lever to pin that a
+    /// localpart the homeserver refuses becomes a 400 there, and a second copy
+    /// of this mock would be a second place for the homeserver's behaviour to
+    /// drift away from the real one.
+    #[derive(Clone, Default)]
+    pub(crate) struct MockSynapseConfig {
+        /// Localparts that read as "already taken" (existing accounts):
+        /// `400 M_USER_IN_USE` -> [`LocalpartStatus::InUse`].
+        pub(crate) existing: HashSet<String>,
+        /// Published `io.inblock.did` values, by mxid. An mxid with no entry
+        /// answers 404, exactly as Synapse does for an unset custom field.
+        pub(crate) did_fields: DidFields,
+        /// Localparts Synapse REFUSES outright: `400 M_INVALID_USERNAME` ->
+        /// [`LocalpartStatus::Unusable`]. Checked BEFORE `existing`, because a
+        /// localpart Synapse will not allow cannot simultaneously be an
+        /// account — putting one in both sets is a test bug, and this ordering
+        /// makes the refusal win rather than silently modelling an impossible
+        /// homeserver.
+        pub(crate) unusable: HashSet<String>,
+        /// Answer every `/_synapse/mas/*` call `403`, as Synapse's
+        /// `assert_request_is_from_mas` does for a wrong or rotated shared
+        /// secret. Scoped to the MAS route on purpose: the profile read is
+        /// reached with an admin token, a different credential entirely.
+        pub(crate) reject_secret: bool,
+    }
 
     #[derive(Clone)]
     struct MockState {
-        /// Localparts that read as "already taken" (existing accounts).
-        existing: Arc<HashSet<String>>,
-        /// Published `io.inblock.did` values, by mxid. An mxid with no entry
-        /// answers 404, exactly as Synapse does for an unset custom field.
-        did_fields: Arc<DidFields>,
+        cfg: Arc<MockSynapseConfig>,
     }
 
     async fn is_localpart_available_handler(
         State(state): State<MockState>,
         Query(params): Query<HashMap<String, String>>,
     ) -> axum::response::Response {
+        // Before anything is looked up: a rejected credential says NOTHING
+        // about the localpart, and Synapse never reaches `check_username`.
+        if state.cfg.reject_secret {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "errcode": "M_FORBIDDEN",
+                    "error": "This endpoint must only be called by MAS",
+                })),
+            )
+                .into_response();
+        }
         let localpart = params.get("localpart").cloned().unwrap_or_default();
-        if state.existing.contains(&localpart) {
+        if state.cfg.unusable.contains(&localpart) {
+            // The live dev shape: a legacy localpart from a long DID whose
+            // user ID exceeds Synapse's MAX_USERID_LENGTH (255).
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "errcode": "M_INVALID_USERNAME",
+                    "error": "User ID may not be longer than 255 characters",
+                })),
+            )
+                .into_response()
+        } else if state.cfg.existing.contains(&localpart) {
             (
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"errcode": "M_USER_IN_USE", "error": "in use"})),
@@ -317,7 +470,7 @@ pub(crate) mod resolve_identity_tests {
         State(state): State<MockState>,
         axum::extract::Path((mxid, field)): axum::extract::Path<(String, String)>,
     ) -> axum::response::Response {
-        match state.did_fields.get(&mxid) {
+        match state.cfg.did_fields.get(&mxid) {
             Some(value) => (
                 axum::http::StatusCode::OK,
                 Json(serde_json::json!({ field: value })),
@@ -346,9 +499,32 @@ pub(crate) mod resolve_identity_tests {
     /// [`spawn_mock_synapse`] plus the MSC4133 profile-field read, for the
     /// `/resolve` tests: the same homeserver, answering the one extra route that
     /// endpoint touches.
+    ///
+    /// **Keep this signature.** It is `pub(crate)` and called from
+    /// `resolve.rs`'s tests; richer scenarios go through
+    /// [`spawn_mock_synapse_configured`] instead of widening it, so a mock
+    /// feature added for one module cannot force an edit in another.
     pub(crate) async fn spawn_mock_synapse_with_did_fields(
         existing: HashSet<String>,
         did_fields: DidFields,
+    ) -> (SynapseClient, tokio::task::JoinHandle<()>) {
+        spawn_mock_synapse_configured(MockSynapseConfig {
+            existing,
+            did_fields,
+            ..MockSynapseConfig::default()
+        })
+        .await
+    }
+
+    /// The one real constructor: every other spawn helper above is a
+    /// convenience wrapper that fills in a [`MockSynapseConfig`].
+    ///
+    /// Spins the mock up on an ephemeral localhost port and returns a
+    /// `SynapseClient` pointed at it plus the server task's handle (abort it
+    /// when the test is done so the port doesn't linger for the rest of the
+    /// process).
+    pub(crate) async fn spawn_mock_synapse_configured(
+        cfg: MockSynapseConfig,
     ) -> (SynapseClient, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -363,10 +539,7 @@ pub(crate) mod resolve_identity_tests {
                 "/_matrix/client/v3/profile/{mxid}/{field}",
                 get(profile_field_handler),
             )
-            .with_state(MockState {
-                existing: Arc::new(existing),
-                did_fields: Arc::new(did_fields),
-            });
+            .with_state(MockState { cfg: Arc::new(cfg) });
         let handle = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
@@ -569,5 +742,215 @@ pub(crate) mod resolve_identity_tests {
             "a standalone deployment is not degraded — it has no Matrix account to \
              resolve, which is a different fact from a probe that failed"
         );
+    }
+
+    // -- UNUSABLE is not TAKEN (2026-09-12) -------------------------------------
+
+    /// A real-shaped `did:peer:2` (numalgo 2: an `.E` key agreement key, a `.V`
+    /// authentication key and an `.S` base64url service block), 252 characters
+    /// long. Its legacy localpart is 252 characters, making a 264-character user
+    /// ID — past Synapse's `MAX_USERID_LENGTH` of 255. This is the shape that
+    /// falsified the old "a 4xx can only mean already-in-use" claim on dev, and
+    /// it is written out in full rather than generated so the test data is the
+    /// same kind of thing a user actually presents.
+    const LONG_PEER_DID: &str = "did:peer:2\
+        .Ez6LSbysY2xFMRpGMhb7tFTLMpeuPRaqaWM7p43Y4rHzY7bLm\
+        .Vz6MkqRYqQiSgvZQdnBytw86Qbs2ZWUkGv22od935YF4s8M7V\
+        .SeyJ0IjoiZG0iLCJzIjoiaHR0cHM6Ly9leGFtcGxlLmNvbS9lbmRwb2ludCIsInIiOlsiZGlk\
+OmV4YW1wbGU6c29tZW1lZGlhdG9yI3NvbWVrZXkiXSwiYSI6WyJkaWRjb21tL3YyIl19";
+
+    /// THE headline regression. A DID whose LEGACY localpart is too long for
+    /// Synapse to accept at all must resolve to the MODERN localpart and be
+    /// reported as NEW — because a localpart Synapse refuses cannot have an
+    /// account under it, so there is nothing to grandfather.
+    ///
+    /// Pre-fix, `is_localpart_available` mapped that `M_INVALID_USERNAME` to
+    /// `Ok(false)` = "taken" and this returned `{ legacy, is_new: false }`:
+    /// an identity with no account anywhere, reported as a pre-existing one,
+    /// under a localpart no account can ever occupy.
+    ///
+    /// It also pins the positive half of the story: the opaque scheme ALREADY
+    /// solved the long-DID problem — `localpart_for` is 16 base36 characters for
+    /// a 252-character DID exactly as for a 40-character one — and the legacy
+    /// probe's misreading was merely masking that solution.
+    #[tokio::test]
+    async fn a_did_whose_legacy_localpart_is_over_length_resolves_to_the_modern_one_and_is_new() {
+        let legacy = legacy_localpart(LONG_PEER_DID);
+        assert!(
+            format!("@{legacy}:inblock.io").len() > 255,
+            "test premise: this DID's legacy user ID must exceed MAX_USERID_LENGTH \
+             (got {} characters)",
+            format!("@{legacy}:inblock.io").len()
+        );
+
+        let (synapse, handle) = spawn_mock_synapse_configured(MockSynapseConfig {
+            unusable: HashSet::from([legacy.clone()]),
+            ..MockSynapseConfig::default()
+        })
+        .await;
+
+        let resolved = resolve_identity(LONG_PEER_DID, Some(&synapse))
+            .await
+            .expect("an unusable legacy localpart is a fall-through, never an error");
+
+        assert_eq!(
+            resolved.localpart,
+            localpart_for(LONG_PEER_DID),
+            "the identity must get the modern 16-char base36 shape"
+        );
+        assert_ne!(
+            resolved.localpart, legacy,
+            "it must NOT be grandfathered onto the localpart Synapse refuses"
+        );
+        assert_eq!(
+            resolved.localpart.len(),
+            16,
+            "sanity: the modern shape is a fixed 16 characters however long the DID is"
+        );
+        assert!(
+            resolved.is_new,
+            "no account exists under EITHER shape — one of them cannot even hold an account"
+        );
+        assert!(!resolved.degraded, "this was RESOLVED, not guessed");
+        handle.abort();
+    }
+
+    /// The security consequence, stated on its own: an `Unusable` legacy probe
+    /// must never be read as an existing account, because `is_new` is the input
+    /// to the new-account gates.
+    ///
+    /// `webauthn::reject_if_new_identity` matches `Ok(resolved) if
+    /// resolved.is_new` -> reject, `Ok(_)` -> **pass**, `Err` -> reject (fail
+    /// closed). So a wrongly-`is_new: false` resolution makes that gate PASS for
+    /// a brand-new identity on the QR/device-approval and account-re-auth paths,
+    /// which are documented to hard-REJECT it. Asserting `is_new == true` here
+    /// is asserting that the gate REJECTS.
+    #[tokio::test]
+    async fn an_unusable_legacy_localpart_is_never_read_as_an_existing_account() {
+        let did = "did:pkh:eip155:1:0x7a760ea15d76f935c8646b449af488c2b0021734";
+        let (synapse, handle) = spawn_mock_synapse_configured(MockSynapseConfig {
+            unusable: HashSet::from([legacy_localpart(did)]),
+            ..MockSynapseConfig::default()
+        })
+        .await;
+
+        let resolved = resolve_identity(did, Some(&synapse))
+            .await
+            .expect("reachable mock");
+
+        assert!(
+            resolved.is_new,
+            "a localpart Synapse REFUSES holds no account, so the identity is new and \
+             every new-account gate must reject it"
+        );
+        assert_eq!(resolved.localpart, localpart_for(did));
+        handle.abort();
+    }
+
+    /// The fall-through is a fall-through, not a shortcut to "new": when the
+    /// legacy shape is unusable but an account ALREADY exists under the modern
+    /// shape (the user signed in once before, after the opaque scheme shipped),
+    /// the answer is that returning account — modern localpart, `is_new: false`.
+    ///
+    /// Without this, a second sign-in by a long-DID user would read as a first
+    /// sign-in, and `oidc::provision_synapse_device` would treat an established
+    /// account as brand-new (re-seeding the displayname alias over a name the
+    /// user chose).
+    #[tokio::test]
+    async fn an_unusable_legacy_localpart_still_yields_the_modern_one_when_that_account_already_exists(
+    ) {
+        let modern = localpart_for(LONG_PEER_DID);
+        let (synapse, handle) = spawn_mock_synapse_configured(MockSynapseConfig {
+            unusable: HashSet::from([legacy_localpart(LONG_PEER_DID)]),
+            existing: HashSet::from([modern.clone()]),
+            ..MockSynapseConfig::default()
+        })
+        .await;
+
+        let resolved = resolve_identity(LONG_PEER_DID, Some(&synapse))
+            .await
+            .expect("reachable mock");
+
+        assert_eq!(resolved.localpart, modern);
+        assert!(
+            !resolved.is_new,
+            "an account that already exists under the modern shape is RETURNING, and a \
+             refused legacy probe says nothing to the contrary"
+        );
+        assert!(!resolved.degraded);
+        handle.abort();
+    }
+
+    /// A rejected MAS shared secret (403) is a CREDENTIAL failure: it never
+    /// reaches `check_username`, so it carries no information about the
+    /// localpart and must not become a verdict about it. `resolve_identity` must
+    /// therefore `Err` — which makes every new-account gate fail CLOSED — and
+    /// `resolve_identity_or_legacy` must degrade to the legacy shape with
+    /// `degraded: true`, suppressing DID publication (2026-09-10 audit, D4).
+    ///
+    /// Folding 403 into the 4xx branch would make every localpart on the
+    /// homeserver read as taken the moment the secret drifted: a total, silent
+    /// failure of new-account detection, presented as fact.
+    #[tokio::test]
+    async fn a_rejected_mas_secret_is_an_error_never_a_resolution() {
+        let did = "did:key:z6MkmWziJJ2k3ckqVqnmMGVKefMhDSe4ZxrfvqksxDMGBa4v";
+        let (synapse, handle) = spawn_mock_synapse_configured(MockSynapseConfig {
+            reject_secret: true,
+            ..MockSynapseConfig::default()
+        })
+        .await;
+
+        assert!(
+            resolve_identity(did, Some(&synapse)).await.is_err(),
+            "a rejected credential must propagate as Err so the new-account gates fail \
+             closed — it is not evidence that the localpart is free OR taken"
+        );
+
+        let degraded = resolve_identity_or_legacy(did, Some(&synapse)).await;
+        assert_eq!(
+            degraded.localpart,
+            legacy_localpart(did),
+            "the infallible wrapper still falls back to LEGACY, never modern"
+        );
+        assert!(
+            degraded.degraded,
+            "and it must announce the guess, so nothing durable is published under it"
+        );
+        handle.abort();
+    }
+
+    /// An `Unusable` MODERN localpart is a hard error, never a fallback.
+    ///
+    /// It should be unreachable — 16 characters of `[0-9a-z]` break no Synapse
+    /// rule, and the only theoretical route is the guest-reserved all-numeric
+    /// case at probability ≈ `(10/36)^16` ≈ 3e-9. So reaching it means something
+    /// is wrong with the homeserver, not with the DID, and the honest answer is
+    /// a loud failure (which also fails closed at every gate) rather than a
+    /// guess dressed up as a resolution.
+    #[tokio::test]
+    async fn an_unusable_modern_localpart_is_a_hard_error() {
+        let did = "did:key:z6MkmWziJJ2k3ckqVqnmMGVKefMhDSe4ZxrfvqksxDMGBa4v";
+        let (synapse, handle) = spawn_mock_synapse_configured(MockSynapseConfig {
+            unusable: HashSet::from([legacy_localpart(did), localpart_for(did)]),
+            ..MockSynapseConfig::default()
+        })
+        .await;
+
+        // Not `expect_err`: `ResolvedIdentity` deliberately carries no `Debug`,
+        // and the interesting thing to print on failure is the localpart that
+        // was wrongly returned anyway.
+        let err = match resolve_identity(did, Some(&synapse)).await {
+            Err(e) => e,
+            Ok(resolved) => panic!(
+                "both shapes refused leaves no localpart to return, but got `{}`",
+                resolved.localpart
+            ),
+        };
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains(&localpart_for(did)),
+            "the error must name the localpart that was refused, so it is diagnosable: {rendered}"
+        );
+        handle.abort();
     }
 }

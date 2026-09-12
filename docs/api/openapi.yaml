@@ -292,9 +292,16 @@ paths:
       operationId: resolve
       summary: Look up the Matrix account for a DID, or the DID for a Matrix account
       description: |
-        Pass **exactly one** of `did` or `mxid`. Both, or neither, is a 400:
-        the two directions answer different questions and the response's
-        `did`/`mxid` fields mean different things in each.
+        Pass **exactly one** of `did` or `mxid`, each at most once. Both, or
+        neither, is a 400: the two directions answer different questions and the
+        response's `did`/`mxid` fields mean different things in each.
+
+        "Exactly one" counts **non-empty** values. `?did=X&mxid=` is one
+        selector, not two — an empty parameter is what a client emits when it
+        did not fill one in, and "you passed both" would be a worse diagnosis
+        than answering the question it did ask. Repeating a parameter
+        (`?did=a&did=b`) is a 400 in the same `error`/`message` envelope as
+        every other error on this route.
 
         **Unauthenticated on purpose.** The DID → localpart direction is a pure
         function of the DID, and the MXID → DID direction reads a profile field

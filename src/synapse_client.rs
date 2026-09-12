@@ -10,13 +10,20 @@
 //!
 //! | Surface | Auth | Calls |
 //! |---|---|---|
-//! | `/_synapse/mas/*` | `Authorization: Bearer {shared_secret}`, compared for **exact string equality** against `matrix_authentication_service.secret` | `provision_user`, `upsert_device`, `allow_cross_signing_reset`, `is_localpart_available`, `query_user`, `delete_device`, `deactivate_user`, `reactivate_user` |
+//! | `/_synapse/mas/*` | `Authorization: Bearer {shared_secret}`, compared for **exact string equality** against `matrix_authentication_service.secret` | `provision_user`, `upsert_device`, `allow_cross_signing_reset`, `localpart_status` (and its two-valued wrapper `is_localpart_available`), `query_user`, `delete_device`, `deactivate_user`, `reactivate_user` |
 //! | `/_synapse/admin/*` and the authenticated C-S API | a **minted, admin-scoped access token** ([`crate::admin_token`]) | `list_devices`, `get_device`, `has_cross_signing_keys`, `publish_did_field` |
 //!
 //! Presenting the shared secret on the second surface answers **401
 //! `M_UNKNOWN_TOKEN`** on 1.159 — it is not a token at all there, it is a
 //! shared secret. That is why this client can mint itself a real access token;
 //! see [`SynapseClient::with_admin_mint`].
+//!
+//! And in the other direction: a wrong or rotated shared secret on the FIRST
+//! surface answers **403** ("This endpoint must only be called by MAS",
+//! `assert_request_is_from_mas`), which is a *client* error. Any call here that
+//! classifies 4xx responses must therefore separate 401/403 out BEFORE reading
+//! the rest as an answer — see [`SynapseClient::localpart_status`], where
+//! folding them together made every localpart on the homeserver read as taken.
 //!
 //! # The MAS wire format is localpart-scoped
 //!
@@ -589,12 +596,53 @@ impl SynapseClient {
         Ok(has_master)
     }
 
-    /// Check whether a localpart is available for registration.
+    /// Ask Synapse what it would do with this localpart — the **primary**
+    /// answer, three-valued on purpose.
     ///
-    /// Returns `true` if the localpart is free, `false` if it is already taken.
-    /// A 4xx response with errcode `M_USER_IN_USE` is treated as "not available"
-    /// rather than an error.
-    pub async fn is_localpart_available(&self, localpart: &str) -> Result<bool> {
+    /// `GET /_synapse/mas/is_localpart_available?localpart=…` does no work of
+    /// its own: `MasIsLocalpartAvailableResource` delegates entirely to
+    /// `RegistrationHandler.check_username`, which refuses a localpart for
+    /// several distinct reasons and tells them apart by `errcode`. Read
+    /// against the 1.159.0 source in the running container:
+    ///
+    /// | Cause | HTTP | `errcode` | Answer |
+    /// |---|---|---|---|
+    /// | free to register | 200 | — | [`LocalpartStatus::Available`] |
+    /// | already registered | 400 | `M_USER_IN_USE` | [`LocalpartStatus::InUse`] |
+    /// | invalid characters | 400 | `M_INVALID_USERNAME` | [`LocalpartStatus::Unusable`] |
+    /// | empty localpart | 400 | `M_INVALID_USERNAME` | [`LocalpartStatus::Unusable`] |
+    /// | leading `_` (unless allowed) | 400 | `M_INVALID_USERNAME` | [`LocalpartStatus::Unusable`] |
+    /// | user id longer than `MAX_USERID_LENGTH` (255) | 400 | `M_INVALID_USERNAME` | [`LocalpartStatus::Unusable`] |
+    /// | all-numeric (reserved for guests) | 400 | `M_INVALID_USERNAME` | [`LocalpartStatus::Unusable`] |
+    /// | appservice-exclusive namespace | 400 | `M_EXCLUSIVE` | [`LocalpartStatus::Unusable`] |
+    /// | **bad MAS shared secret** | **403** | — | **`Err`** |
+    ///
+    /// **401/403 is an `Err`, and must never be allowed to become a verdict.**
+    /// `assert_request_is_from_mas` rejects a wrong or rotated shared secret
+    /// with 403 ("This endpoint must only be called by MAS") before
+    /// `check_username` is reached, so the response carries no information
+    /// about the localpart at all. Folding it into the 4xx branch — which the
+    /// pre-2026-09-12 implementation did — made **every localpart on the
+    /// homeserver read as taken** the moment the secret drifted: a total,
+    /// silent failure of new-account detection, presented as fact. This is the
+    /// load-bearing branch of this function.
+    ///
+    /// **A missing or unparseable `errcode` resolves to `Unusable`, never
+    /// `InUse`.** The two wrong answers are not symmetric: reporting
+    /// "unusable" for an account that exists costs one honest error on a path
+    /// that already has to handle errors, while reporting "in use" for a
+    /// localpart no account can occupy invents an account — and callers such
+    /// as [`crate::localpart::resolve_identity`] read exactly that as "this
+    /// user is pre-existing, grandfather them". Fail toward the cheap mistake.
+    ///
+    /// Known imprecision: a 404 from a homeserver that does not serve this
+    /// route at all (wrong endpoint, a proxy in the way) also lands in
+    /// `Unusable` rather than an error, because nothing in the response
+    /// distinguishes it from a refusal. The safety property still holds — the
+    /// caller is told "not an account", not "an account" — but the variant
+    /// name overstates what was learned. Diagnose from the `errcode`/`message`
+    /// it carries.
+    pub async fn localpart_status(&self, localpart: &str) -> Result<LocalpartStatus> {
         let url = format!(
             "{}/_synapse/mas/is_localpart_available?localpart={}",
             self.endpoint,
@@ -606,22 +654,75 @@ impl SynapseClient {
             .bearer_auth(&self.shared_secret)
             .send()
             .await
-            .context("is_localpart_available: request failed")?;
+            .context("localpart_status: request failed")?;
 
-        if resp.status().is_success() {
-            return Ok(true);
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(LocalpartStatus::Available);
         }
 
-        // 4xx means the localpart is taken (M_USER_IN_USE or similar).
-        if resp.status().is_client_error() {
-            return Ok(false);
+        // The credential was rejected, so nothing downstream of it ran. Bail
+        // BEFORE the 4xx branch: 403 is a client error, and letting it fall
+        // through is the entire defect this ordering exists to prevent.
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            let body = resp.text().await.unwrap_or_default();
+            warn!(%status, %body, "localpart_status: Synapse rejected the MAS shared secret");
+            anyhow::bail!(
+                "localpart_status: HTTP {status} — authentication failed{}. This is a \
+                 credential failure and says NOTHING about whether `{localpart}` is \
+                 registered; it must never be read as a verdict about the localpart.",
+                mas_status_hint(status)
+            );
+        }
+
+        if status.is_client_error() {
+            let body = resp.text().await.unwrap_or_default();
+            let verdict = classify_localpart_refusal(&body);
+            if let LocalpartStatus::Unusable { errcode, message } = &verdict {
+                debug!(
+                    %status, %errcode, %message, %localpart,
+                    "localpart_status: Synapse refuses this localpart outright — NOT an existing account"
+                );
+            }
+            return Ok(verdict);
         }
 
         // 5xx or other unexpected status is a real error.
-        let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        warn!(%status, %body, "is_localpart_available: unexpected response");
-        anyhow::bail!("is_localpart_available: HTTP {status}");
+        warn!(%status, %body, "localpart_status: unexpected response");
+        anyhow::bail!("localpart_status: HTTP {status}");
+    }
+
+    /// The deliberately TWO-VALUED view of [`Self::localpart_status`]:
+    /// `Ok(true)` = free to register, `Ok(false)` = an account already holds
+    /// it.
+    ///
+    /// [`LocalpartStatus::Unusable`] has **no** honest `bool` to map to, so it
+    /// is an `Err` naming the errcode — not a silent `Ok(false)`, which is what
+    /// this wrapper used to return and which is the bug the enum was introduced
+    /// to make unrepresentable. Callers here mostly hand in a *derived*
+    /// localpart ([`crate::mxid::localpart_for`] /
+    /// [`crate::mxid::legacy_localpart`]) and so rarely see it; the ones that
+    /// do (an over-long legacy localpart from a long DID, a caller-supplied
+    /// mxid on `GET /resolve`) get a loud failure instead of a fabricated
+    /// account.
+    ///
+    /// **This wrapper existing is not an invitation to collapse the enum back.**
+    /// It is a convenience for the callers whose question genuinely is binary;
+    /// anything that needs to tell "Synapse will not allow an account here"
+    /// apart from "an account is already here" must call
+    /// [`Self::localpart_status`] and match on it.
+    pub async fn is_localpart_available(&self, localpart: &str) -> Result<bool> {
+        match self.localpart_status(localpart).await? {
+            LocalpartStatus::Available => Ok(true),
+            LocalpartStatus::InUse => Ok(false),
+            LocalpartStatus::Unusable { errcode, message } => anyhow::bail!(
+                "is_localpart_available: Synapse refuses the localpart `{localpart}` outright \
+                 ({errcode}: {message}). That is NOT an existing account — no account can exist \
+                 under it — so there is no true/false answer to give. Call `localpart_status` if \
+                 you need to tell 'unusable' apart from 'in use'."
+            ),
+        }
     }
 
     /// A user's account status from the MAS query endpoint
@@ -1335,6 +1436,95 @@ fn did_from_profile_field(value: Option<&serde_json::Value>) -> Option<String> {
     .filter(|did| !did.is_empty())
 }
 
+/// What [`SynapseClient::localpart_status`] learned about one localpart.
+///
+/// Three variants because `RegistrationHandler.check_username` gives three
+/// answers, and the middle one is not the interesting distinction: "an account
+/// already holds this" and "Synapse will not allow an account here" are
+/// opposite facts that both arrive as `400`. The pre-2026-09-12 client mapped
+/// every 4xx to `Ok(false)` = taken, so a localpart Synapse had *refused* was
+/// reported to callers as an account that exists. Live on dev, a 287-char
+/// `did:peer:2` produced the legacy localpart `did-peer-2.ez6lsp…`, whose mxid
+/// exceeds Synapse's 255-char `MAX_USERID_LENGTH`; `M_INVALID_USERNAME` came
+/// back and the identity read as pre-existing.
+///
+/// Not `Copy` (unlike [`PublishOutcome`]) only because the diagnosis
+/// `Unusable` carries is a pair of owned strings; the intent is the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalpartStatus {
+    /// `200` — free to register.
+    Available,
+    /// `400 M_USER_IN_USE` — an account already holds it.
+    InUse,
+    /// Synapse refuses this localpart outright (`M_INVALID_USERNAME`,
+    /// `M_EXCLUSIVE`, or any other non-`M_USER_IN_USE` 4xx). This is NOT
+    /// "taken": no account can exist under it, so a caller deciding whether an
+    /// identity is pre-existing must NOT read this as evidence that it is.
+    Unusable {
+        /// The `errcode` Synapse returned, or [`NO_ERRCODE`] when the body
+        /// carried none (or was not JSON at all).
+        errcode: String,
+        /// Synapse's human-readable `error`, or the raw body when there was no
+        /// `error` member. Diagnostic only: Synapse's message strings are under
+        /// no stability contract, so never branch on this — branch on
+        /// `errcode`, as [`profile_404_means_row_absent`] does.
+        message: String,
+    },
+}
+
+/// Stand-in `errcode` for a refusal whose body carried none, or was not JSON.
+///
+/// A sentinel rather than an empty string so an error message reads
+/// `(<no errcode>: …)` instead of `(: …)`, and so a grep for the literal finds
+/// every place this case is handled.
+pub const NO_ERRCODE: &str = "<no errcode>";
+
+/// Longest raw body kept as the `message` of an [`LocalpartStatus::Unusable`]
+/// whose response had no `error` member. Enough to recognise an HTML error page
+/// from a misrouted proxy, short enough not to paste one into a log line.
+const MAX_RAW_REFUSAL_MESSAGE: usize = 200;
+
+/// Decide which refusal a non-auth 4xx from
+/// `GET /_synapse/mas/is_localpart_available` actually is.
+///
+/// Pure and separate from the request for the same reason
+/// [`profile_404_means_row_absent`] and [`classify_publish_status`] are: the
+/// interesting decision is a classification of a response body, and it must be
+/// testable without a live homeserver.
+///
+/// `errcode` is the only signal, exactly as in
+/// [`profile_404_means_row_absent`]. **`M_USER_IN_USE` is an allowlist of one**
+/// — the ONLY errcode that may produce [`LocalpartStatus::InUse`] — and every
+/// other shape, including a body with no `errcode` and a body that is not JSON,
+/// falls to [`LocalpartStatus::Unusable`]. That direction is deliberate and is
+/// the inverse of `profile_404_means_row_absent`'s fail-safe: there, the
+/// destructive answer was "heal"; here, the destructive answer is "an account
+/// exists", because it silently grandfathers an identity that has none.
+fn classify_localpart_refusal(body: &str) -> LocalpartStatus {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).unwrap_or(serde_json::Value::Null);
+    let errcode = parsed.get("errcode").and_then(|v| v.as_str());
+
+    if errcode == Some("M_USER_IN_USE") {
+        return LocalpartStatus::InUse;
+    }
+
+    let message = match parsed.get("error").and_then(|v| v.as_str()) {
+        Some(error) => error.to_string(),
+        None => {
+            let raw = body.trim();
+            match raw.char_indices().nth(MAX_RAW_REFUSAL_MESSAGE) {
+                Some((cut, _)) => format!("{}…", &raw[..cut]),
+                None => raw.to_string(),
+            }
+        }
+    };
+
+    LocalpartStatus::Unusable {
+        errcode: errcode.unwrap_or(NO_ERRCODE).to_string(),
+        message,
+    }
+}
+
 /// What a [`SynapseClient::publish_did_field`] call actually achieved.
 ///
 /// A bare `Ok(())` would collapse "the DID is now published" into the same
@@ -1927,6 +2117,69 @@ mod tests {
         )
     }
 
+    /// Everything the one in-file mock Synapse can be told to answer.
+    ///
+    /// A config struct rather than a growing positional argument list, and
+    /// rather than a SECOND mock: `localpart_status` and `publish_did_field`
+    /// exercise the same server (the admin mint calls
+    /// `is_localpart_available` on its way to minting a token for the PUT), so
+    /// two mocks would be two places for the wire shape to drift.
+    #[derive(Clone)]
+    struct MockReplies {
+        /// Status for every request that is not one of the two specially
+        /// handled routes below — in practice the profile PUT and the MAS
+        /// endpoints other than `is_localpart_available`.
+        reply_status: axum::http::StatusCode,
+        /// Body served with `reply_status`. `"{}"` is the historical default
+        /// and is all `publish_did_field` ever needed; `query_user` needs a
+        /// real payload.
+        reply_body: String,
+        /// What the WHOLE-profile `GET …/profile/{mxid}` answers — the D1
+        /// confirmation probe.
+        profile_reply: (axum::http::StatusCode, serde_json::Value),
+        /// What `GET /_synapse/mas/is_localpart_available` answers.
+        ///
+        /// A raw `String` body, not a `serde_json::Value`, because one of the
+        /// cases under test is a body that is **not JSON at all** — which is
+        /// exactly the shape a `Json` reply could not produce.
+        localpart_reply: (axum::http::StatusCode, String),
+    }
+
+    impl MockReplies {
+        /// The historical defaults: everything unhandled answers
+        /// `reply_status` with `{}`, the profile row reads as absent, and
+        /// `is_localpart_available` says "taken" so `admin_bearer` skips
+        /// `provision_user` and goes straight to minting.
+        fn new(reply_status: axum::http::StatusCode) -> Self {
+            Self {
+                reply_status,
+                reply_body: "{}".to_string(),
+                profile_reply: profile_row_absent(),
+                localpart_reply: (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    json!({"errcode": "M_USER_IN_USE", "error": "User ID already taken."})
+                        .to_string(),
+                ),
+            }
+        }
+
+        fn profile(mut self, reply: (axum::http::StatusCode, serde_json::Value)) -> Self {
+            self.profile_reply = reply;
+            self
+        }
+
+        fn body(mut self, body: serde_json::Value) -> Self {
+            self.reply_body = body.to_string();
+            self
+        }
+
+        /// Answer `is_localpart_available` with this status and RAW body.
+        fn localpart(mut self, status: axum::http::StatusCode, body: &str) -> Self {
+            self.localpart_reply = (status, body.to_string());
+            self
+        }
+    }
+
     /// Spin up a mock Synapse that answers `is_localpart_available` with
     /// "taken" (so the admin mint performs no `provision_user`) and records
     /// every other request, answering it with `reply_status`.
@@ -1941,7 +2194,7 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
         tokio::task::JoinHandle<()>,
     ) {
-        spawn_publish_mock_with_profile(reply_status, profile_row_absent()).await
+        spawn_mock_synapse(MockReplies::new(reply_status)).await
     }
 
     /// [`spawn_publish_mock`], with control over what the whole-profile GET
@@ -1959,6 +2212,24 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
         tokio::task::JoinHandle<()>,
     ) {
+        spawn_mock_synapse(MockReplies::new(reply_status).profile(profile_reply)).await
+    }
+
+    /// The mock itself: an axum server on an ephemeral port, answering
+    /// according to [`MockReplies`].
+    ///
+    /// `is_localpart_available` is served by its own route and is deliberately
+    /// **not** recorded, so the `recorded.len() == 1` assertions in the
+    /// `publish_did_field` tests keep meaning "exactly one request reached the
+    /// profile route" and do not silently absorb the admin mint's existence
+    /// probe.
+    async fn spawn_mock_synapse(
+        replies: MockReplies,
+    ) -> (
+        SynapseClient,
+        std::sync::Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use axum::body::Bytes;
         use axum::extract::{Request, State};
         use axum::response::IntoResponse;
@@ -1971,8 +2242,7 @@ mod tests {
         #[derive(Clone)]
         struct MockState {
             log: std::sync::Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
-            reply_status: axum::http::StatusCode,
-            profile_reply: (axum::http::StatusCode, serde_json::Value),
+            replies: MockReplies,
         }
 
         /// True for the WHOLE-profile GET (`…/profile/{mxid}`) and false for
@@ -2009,10 +2279,15 @@ mod tests {
                 body,
             });
             if whole_profile_get {
-                let (status, body) = state.profile_reply.clone();
+                let (status, body) = state.replies.profile_reply.clone();
                 return (status, axum::Json(body)).into_response();
             }
-            (state.reply_status, "{}").into_response()
+            (state.replies.reply_status, state.replies.reply_body.clone()).into_response()
+        }
+
+        async fn localpart_available(State(state): State<MockState>) -> axum::response::Response {
+            let (status, body) = state.replies.localpart_reply.clone();
+            (status, body).into_response()
         }
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2020,23 +2295,14 @@ mod tests {
             .expect("bind ephemeral mock-synapse port");
         let addr = listener.local_addr().expect("mock-synapse local_addr");
         let app = Router::new()
-            // 400 M_USER_IN_USE == "taken", which `is_localpart_available` maps
-            // to Ok(false), so `admin_bearer` skips provisioning the service
-            // user and goes straight to minting.
             .route(
                 "/_synapse/mas/is_localpart_available",
-                get(|| async {
-                    (
-                        axum::http::StatusCode::BAD_REQUEST,
-                        axum::Json(json!({"errcode": "M_USER_IN_USE", "error": "in use"})),
-                    )
-                }),
+                get(localpart_available),
             )
             .fallback(record)
             .with_state(MockState {
                 log: log.clone(),
-                reply_status,
-                profile_reply,
+                replies,
             });
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("mock-synapse");
@@ -2553,5 +2819,350 @@ mod tests {
             None,
             "a field of the wrong JSON type publishes nothing — and must not panic"
         );
+    }
+
+    // -- localpart_status: the three answers, against the mock Synapse -------
+    //
+    // `localpart_status` presents the shared secret directly on
+    // `/_synapse/mas/*` and mints nothing, so unlike the `publish_did_field`
+    // tests above these need NO Redis and never skip.
+    //
+    // Until 2026-09-12 this function had no test at all and mapped every 4xx
+    // to `Ok(false)` = taken. These pin the two things that mapping got wrong:
+    // a localpart Synapse REFUSES is not an account, and a rejected credential
+    // is not a verdict.
+
+    /// A 200 body from `is_localpart_available`, for readability at call sites.
+    fn localpart_free() -> (axum::http::StatusCode, String) {
+        (
+            axum::http::StatusCode::OK,
+            json!({"available": true}).to_string(),
+        )
+    }
+
+    /// A 400 refusal, as Synapse renders one
+    /// (`SynapseError` → `{"errcode": …, "error": …}`).
+    fn localpart_refused(errcode: &str, error: &str) -> (axum::http::StatusCode, String) {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            json!({"errcode": errcode, "error": error}).to_string(),
+        )
+    }
+
+    /// Spawn a mock whose ONLY configured behaviour is what
+    /// `is_localpart_available` answers.
+    async fn spawn_localpart_mock(
+        reply: (axum::http::StatusCode, String),
+    ) -> (SynapseClient, tokio::task::JoinHandle<()>) {
+        let (client, _log, handle) = spawn_mock_synapse(
+            MockReplies::new(axum::http::StatusCode::OK).localpart(reply.0, &reply.1),
+        )
+        .await;
+        (client, handle)
+    }
+
+    /// 200 → `Available`, and the two-valued wrapper agrees.
+    #[tokio::test]
+    async fn an_available_localpart_is_available_and_the_wrapper_says_true() {
+        let (client, handle) = spawn_localpart_mock(localpart_free()).await;
+
+        assert_eq!(
+            client.localpart_status("k3f9x2q7ab4d8m1p").await.unwrap(),
+            LocalpartStatus::Available
+        );
+        assert!(
+            client
+                .is_localpart_available("k3f9x2q7ab4d8m1p")
+                .await
+                .unwrap(),
+            "a 200 is the only shape that means 'free to register'"
+        );
+        handle.abort();
+    }
+
+    /// `400 M_USER_IN_USE` — the ONE refusal that really does mean an account
+    /// exists — is `InUse`, and the wrapper's `Ok(false)`.
+    #[tokio::test]
+    async fn a_localpart_already_registered_is_in_use_and_the_wrapper_says_false() {
+        let (client, handle) =
+            spawn_localpart_mock(localpart_refused("M_USER_IN_USE", "User ID already taken."))
+                .await;
+
+        assert_eq!(
+            client.localpart_status("k3f9x2q7ab4d8m1p").await.unwrap(),
+            LocalpartStatus::InUse
+        );
+        assert!(
+            !client
+                .is_localpart_available("k3f9x2q7ab4d8m1p")
+                .await
+                .unwrap(),
+            "M_USER_IN_USE is the only errcode that may become Ok(false)"
+        );
+        handle.abort();
+    }
+
+    /// **The central invariant.** A localpart Synapse refuses as unusable must
+    /// never be reported as an existing account — not as
+    /// [`LocalpartStatus::InUse`], and not as the wrapper's `Ok(false)`.
+    ///
+    /// The real-world trigger, confirmed live on dev: a long DID —
+    /// `did:peer:2` runs to ~287 characters — derives a LEGACY localpart
+    /// (`did-peer-2.ez6lsp…`) whose `@localpart:server` form is past Synapse's
+    /// `MAX_USERID_LENGTH` of 255. `RegistrationHandler.check_username` then
+    /// raises `400 M_INVALID_USERNAME`, and under the old any-4xx-is-taken
+    /// mapping `localpart::resolve_identity` read that as "a grandfathered
+    /// account already lives here" and stopped looking — for an account that
+    /// cannot exist, because Synapse will not let it.
+    ///
+    /// A **plain `assert!(matches!(…))`** on the enum is not enough on its own;
+    /// the wrapper is where callers actually read the answer, so the `Err`
+    /// assertion below is the one that has to hold.
+    #[tokio::test]
+    async fn an_unusable_localpart_is_never_reported_as_taken() {
+        let (client, handle) = spawn_localpart_mock(localpart_refused(
+            "M_INVALID_USERNAME",
+            "User ID may not be longer than 255 characters",
+        ))
+        .await;
+
+        let status = client.localpart_status("did-peer-2.ez6lsp…").await.unwrap();
+        assert_eq!(
+            status,
+            LocalpartStatus::Unusable {
+                errcode: "M_INVALID_USERNAME".to_string(),
+                message: "User ID may not be longer than 255 characters".to_string(),
+            }
+        );
+        assert_ne!(
+            status,
+            LocalpartStatus::InUse,
+            "an over-long localpart is refused, NOT occupied"
+        );
+
+        let err = client
+            .is_localpart_available("did-peer-2.ez6lsp…")
+            .await
+            .expect_err(
+                "the wrapper has no honest bool for `Unusable` — it MUST be an Err, never the \
+                 Ok(false) that invents an account",
+            )
+            .to_string();
+        assert!(
+            err.contains("M_INVALID_USERNAME"),
+            "the error must name the errcode so the cause is diagnosable: {err}"
+        );
+        assert!(
+            err.contains("NOT an existing account"),
+            "the error must say what it is not, since the old answer said the opposite: {err}"
+        );
+        handle.abort();
+    }
+
+    /// `M_EXCLUSIVE` (an appservice-reserved namespace) is another refusal, and
+    /// lands in the same variant. No account exists there either.
+    #[tokio::test]
+    async fn an_appservice_reserved_localpart_is_unusable_not_in_use() {
+        let (client, handle) = spawn_localpart_mock(localpart_refused(
+            "M_EXCLUSIVE",
+            "This user ID is reserved by an application service.",
+        ))
+        .await;
+
+        let status = client.localpart_status("_bridge_alice").await.unwrap();
+        assert!(
+            matches!(&status, LocalpartStatus::Unusable { errcode, .. } if errcode == "M_EXCLUSIVE"),
+            "expected Unusable{{M_EXCLUSIVE}}, got {status:?}"
+        );
+        assert_ne!(status, LocalpartStatus::InUse);
+        assert!(
+            client
+                .is_localpart_available("_bridge_alice")
+                .await
+                .is_err(),
+            "an appservice namespace is not an account the wrapper may report as taken"
+        );
+        handle.abort();
+    }
+
+    /// A refusal we cannot read — no `errcode` member, or a body that is not
+    /// JSON at all — falls to `Unusable`, NEVER to `InUse`.
+    ///
+    /// Pins the fail direction, which is the inverse of
+    /// [`profile_404_means_row_absent`]'s: there the destructive answer was
+    /// "heal", so an unrecognised shape means "do not"; here the destructive
+    /// answer is "an account exists", so an unrecognised shape means "not an
+    /// account".
+    #[tokio::test]
+    async fn a_refusal_we_cannot_parse_falls_to_unusable_never_in_use() {
+        // (a) valid JSON, no `errcode`.
+        let (client, handle) = spawn_localpart_mock((
+            axum::http::StatusCode::BAD_REQUEST,
+            json!({"error": "something went wrong"}).to_string(),
+        ))
+        .await;
+        let status = client.localpart_status("whoever").await.unwrap();
+        assert_eq!(
+            status,
+            LocalpartStatus::Unusable {
+                errcode: NO_ERRCODE.to_string(),
+                message: "something went wrong".to_string(),
+            }
+        );
+        assert_ne!(
+            status,
+            LocalpartStatus::InUse,
+            "a body with no errcode proves nothing"
+        );
+        assert!(client.is_localpart_available("whoever").await.is_err());
+        handle.abort();
+
+        // (b) not JSON at all — an HTML error page from a proxy in the way.
+        let (client, handle) = spawn_localpart_mock((
+            axum::http::StatusCode::BAD_REQUEST,
+            "<html><body>400 Bad Request</body></html>".to_string(),
+        ))
+        .await;
+        let status = client.localpart_status("whoever").await.unwrap();
+        assert!(
+            matches!(&status, LocalpartStatus::Unusable { errcode, message }
+                if errcode == NO_ERRCODE && message.contains("400 Bad Request")),
+            "a non-JSON body must still be Unusable, keeping the raw body as diagnosis: {status:?}"
+        );
+        assert_ne!(status, LocalpartStatus::InUse);
+        assert!(client.is_localpart_available("whoever").await.is_err());
+        handle.abort();
+    }
+
+    /// **A rejected MAS shared secret is an `Err`, and must never become a
+    /// verdict about the localpart.**
+    ///
+    /// `assert_request_is_from_mas` raises **403** ("This endpoint must only be
+    /// called by MAS") before `check_username` runs, so the response carries no
+    /// information about the localpart whatsoever. 403 is a client error, and
+    /// the pre-2026-09-12 `is_localpart_available` returned `Ok(false)` for
+    /// every client error — which meant a rotated or mistyped secret silently
+    /// reported **every localpart on the homeserver as taken**, turning off
+    /// new-account detection with no error anywhere.
+    #[tokio::test]
+    async fn a_rejected_mas_secret_is_an_error_never_a_verdict_about_the_localpart() {
+        for status in [
+            axum::http::StatusCode::FORBIDDEN,
+            axum::http::StatusCode::UNAUTHORIZED,
+        ] {
+            let (client, handle) = spawn_localpart_mock((
+                status,
+                json!({"errcode": "M_FORBIDDEN", "error": "This endpoint must only be called by MAS"})
+                    .to_string(),
+            ))
+            .await;
+
+            let err = client
+                .localpart_status("k3f9x2q7ab4d8m1p")
+                .await
+                .expect_err("a rejected credential is not an answer about the localpart")
+                .to_string();
+            assert!(
+                err.contains("authentication failed"),
+                "the message must name this as an AUTH failure, not a localpart verdict: {err}"
+            );
+            assert!(
+                err.contains("MAS shared secret"),
+                "and must point the operator at the credential to fix: {err}"
+            );
+            assert!(
+                err.contains("says NOTHING about whether"),
+                "and must explicitly disclaim the verdict reading: {err}"
+            );
+            assert!(
+                client
+                    .is_localpart_available("k3f9x2q7ab4d8m1p")
+                    .await
+                    .is_err(),
+                "the wrapper must propagate the auth failure, never degrade it to Ok(false) \
+                 (= InUse), which is exactly what the old any-4xx mapping did"
+            );
+            handle.abort();
+        }
+    }
+
+    /// A 5xx stays a hard error — unchanged from before the three-way split.
+    #[tokio::test]
+    async fn a_server_error_from_the_availability_probe_stays_an_error() {
+        let (client, handle) = spawn_localpart_mock((
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"errcode": "M_UNKNOWN", "error": "Internal server error"}).to_string(),
+        ))
+        .await;
+
+        let err = client
+            .localpart_status("k3f9x2q7ab4d8m1p")
+            .await
+            .expect_err("a 500 is not a verdict either")
+            .to_string();
+        assert!(
+            err.contains("500"),
+            "the status must be in the message: {err}"
+        );
+        assert!(client
+            .is_localpart_available("k3f9x2q7ab4d8m1p")
+            .await
+            .is_err());
+        handle.abort();
+    }
+
+    // -- query_user ---------------------------------------------------------
+
+    /// `404 "User not found"` is `Ok(None)` — the new-identity case — and not
+    /// an error.
+    ///
+    /// The distinction matters because `Ok(None)` and `Err` route to opposite
+    /// decisions in [`crate::webauthn::reject_if_deactivated`]: absent means
+    /// "nothing to gate", an error means "could not check".
+    #[tokio::test]
+    async fn query_user_reports_an_absent_account_as_ok_none_not_an_error() {
+        let (client, _log, handle) = spawn_mock_synapse(
+            MockReplies::new(axum::http::StatusCode::NOT_FOUND)
+                .body(json!({"errcode": "M_NOT_FOUND", "error": "User not found"})),
+        )
+        .await;
+
+        assert!(
+            client.query_user("nobody").await.unwrap().is_none(),
+            "a 404 from query_user is the absent-account case, not a failure"
+        );
+        handle.abort();
+    }
+
+    /// A 200 parses into [`MasUserInfo`], including the `is_deactivated` flag
+    /// the sign-in gate keys on.
+    #[tokio::test]
+    async fn query_user_parses_the_mas_payload_including_is_deactivated() {
+        let (client, _log, handle) =
+            spawn_mock_synapse(MockReplies::new(axum::http::StatusCode::OK).body(json!({
+                "user_id": "@k3f9x2q7ab4d8m1p:inblock.io",
+                "display_name": "Quiet Meadow",
+                "avatar_url": null,
+                "is_suspended": false,
+                "is_deactivated": true,
+            })))
+            .await;
+
+        let info = client
+            .query_user("k3f9x2q7ab4d8m1p")
+            .await
+            .unwrap()
+            .expect("a 200 must parse into Some(MasUserInfo)");
+        assert_eq!(info.user_id, "@k3f9x2q7ab4d8m1p:inblock.io");
+        assert_eq!(info.display_name.as_deref(), Some("Quiet Meadow"));
+        assert!(
+            info.is_deactivated,
+            "the deactivation gate reads this field; a default-false parse would open it"
+        );
+        assert!(
+            !info.is_suspended,
+            "suspension is parsed but is not a login gate"
+        );
+        handle.abort();
     }
 }

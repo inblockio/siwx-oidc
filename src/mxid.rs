@@ -212,6 +212,16 @@ mod tests {
     const KEY_LOWER: &str = "did:key:z6mkmwzijj2k3ckqvqnmmgvkefmhdse4zxrfvqksxdmgba4v";
     const KEY_LOWER_EXPECTED: &str = "4qhlwf2qqvk7sqfw";
 
+    /// `did:peer` variant 2. Its case is key material for exactly the same
+    /// reason `did:key`'s is — the payload after `2.` is a multibase-encoded
+    /// public key — and the module doc names BOTH methods in the
+    /// case-preserving branch, so these vectors pin the half of that claim no
+    /// test covered.
+    const PEER_MIXED: &str = "did:peer:2.Ez6LSbysY2xFMRpGMhb7tFTLMpeuPRUqZAsvhgSfvY9ZBLM";
+    const PEER_MIXED_EXPECTED: &str = "0umi2bxe3biv6d95";
+    const PEER_LOWER: &str = "did:peer:2.ez6lsbysy2xfmrpgmhb7tftlmpeupruqzasvhgsfvy9zblm";
+    const PEER_LOWER_EXPECTED: &str = "52kbzku4jf2oj2nl";
+
     #[test]
     fn vector_pkh_lower() {
         assert_eq!(localpart_for(PKH_LOWER), PKH_EXPECTED);
@@ -260,6 +270,27 @@ mod tests {
             localpart_for(KEY_UPPER),
             localpart_for(KEY_LOWER),
             "did:key case must NOT be folded — case is identity, not a checksum"
+        );
+    }
+
+    /// The same rule as `key_case_is_preserved_not_folded`, for the OTHER
+    /// method the module doc promises it for.
+    ///
+    /// It needs a vector of its own precisely BECAUSE `canonicalize` has no
+    /// `did:peer` branch: the case is preserved by the pass-through arm, not by
+    /// a rule naming the method. A future edit that folded case for "everything
+    /// except `did:key`" would leave `key_case_is_preserved_not_folded` green
+    /// while silently reassigning every `did:peer` account to a different
+    /// Matrix localpart — the siwx-oidc#17 failure, one method over.
+    #[test]
+    fn peer_case_is_preserved_not_folded() {
+        assert_eq!(localpart_for(PEER_MIXED), PEER_MIXED_EXPECTED);
+        assert_eq!(localpart_for(PEER_LOWER), PEER_LOWER_EXPECTED);
+        assert_ne!(
+            localpart_for(PEER_MIXED),
+            localpart_for(PEER_LOWER),
+            "did:peer case must NOT be folded — the multibase payload after `2.` is \
+             encoded key material, not a checksum"
         );
     }
 

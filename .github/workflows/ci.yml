@@ -138,6 +138,15 @@ jobs:
       - name: E2E race and teardown
         run: cargo test --test e2e_race_teardown -- --ignored --test-threads=1
 
+      # GET /resolve is a PUBLIC, unauthenticated route, and its 15 unit tests all
+      # call `resolve::resolve()` with a hand-built `ResolveQuery` -- so the Axum
+      # wiring around it (the `Query` extractor, the method routing, and
+      # `ResolveError`'s `IntoResponse`) was exercised by nothing at all. This
+      # suite drives the real HTTP surface and asserts on raw bytes, status,
+      # headers and the JSON key set, which is what its third-party consumers see.
+      - name: E2E resolve HTTP contract
+        run: cargo test --test e2e_resolve_http -- --ignored --test-threads=1
+
       - name: Collect service logs
         if: failure()
         run: |

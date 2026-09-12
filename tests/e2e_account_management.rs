@@ -459,8 +459,8 @@ async fn admin_token_rejection_is_legible_not_a_500_or_notfound() {
 }
 
 /// The OTHER half of the two-credential split: when the **MAS shared secret**
-/// is wrong, the account re-auth fails CLOSED with a 401 — it does not fall
-/// through to the admin path, and it does not silently succeed.
+/// is wrong, the account re-auth fails CLOSED — it does not fall through to the
+/// admin path, and it does not silently succeed.
 ///
 /// This test exists because the behaviour used to be covered by accident.
 /// `admin_token_rejection_is_legible_not_a_500_or_notfound` flipped the shared
@@ -470,11 +470,33 @@ async fn admin_token_rejection_is_legible_not_a_500_or_notfound() {
 /// 400. Rather than delete the coverage along with the stale set-up, the two
 /// halves are now two tests.
 ///
-/// 401 (not 400) is correct and deliberate: with `query_user` unreachable,
-/// `webauthn::reject_if_deactivated` cannot rule out a deactivated account, and
-/// it must not revive one on a probe failure. The message intentionally does not
-/// distinguish "deactivated" from "we could not tell" — see
-/// `DEACTIVATED_REJECT_MSG`.
+/// # Which guard fires changed on 2026-09-12, and the reason is the point
+///
+/// This asserted **401** until the `is_localpart_available` conflation was fixed
+/// (`docs/audits/2026-09-12-localpart-availability-conflation.md`), and it got
+/// that 401 the same way the sibling test got its set-up: **by accident.** A
+/// wrong shared secret makes Synapse answer `403`, the old probe mapped every
+/// 4xx to "the localpart is taken", so the identity looked like a normal
+/// returning user, `reject_if_new_identity` passed, and the request travelled on
+/// to `reject_if_deactivated`, whose own `query_user` probe was equally broken —
+/// and THAT produced the 401.
+///
+/// A rejected credential is now an `Err`, not a verdict, so the FIRST guard that
+/// needs Synapse is the one that fails, and it fails closed by its own
+/// documented rule ("detection failed → reject rather than risk silent
+/// creation"). The status is therefore **400**.
+///
+/// What this test pins is the invariant, not the incidental code: an unreachable
+/// MAS surface must be rejected, must not mint a session, and must never be a
+/// 2xx or a 5xx. Do not "restore" the 401 by reordering the guards — that would
+/// be preserving an accident.
+///
+/// **Known wart, deliberately not fixed here:** the 400 body is
+/// `NEW_IDENTITY_REJECT_MSG`, which tells the user to create an account when the
+/// real cause is a server-side credential misconfiguration. It is safe (nothing
+/// is provisioned, and sign-in is equally broken so no duplicate can be created)
+/// but it is a misleading diagnosis. Giving `reject_if_new_identity` a distinct
+/// error for "detection failed" is the right follow-up.
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn wrong_mas_shared_secret_fails_closed_not_open() {
@@ -501,8 +523,16 @@ async fn wrong_mas_shared_secret_fails_closed_not_open() {
     mock_set_secret(&c, "testsecret").await;
 
     assert_eq!(
-        status, 401,
-        "an unreachable MAS surface must fail CLOSED, never open: {text}"
+        status, 400,
+        "an unreachable MAS surface must fail CLOSED via the first Synapse-dependent \
+         guard — see this test's doc for why this is 400 and not the historical 401: {text}"
+    );
+    // The invariant the status code is only a proxy for. Asserted separately so
+    // that a future change of WHICH guard rejects cannot quietly turn this into
+    // a success or a server error.
+    assert!(
+        status.is_client_error(),
+        "fail-closed means a 4xx rejection, never a 2xx and never a 5xx: {status} {text}"
     );
     // And it must not have handed out an account session on the way through.
     assert!(

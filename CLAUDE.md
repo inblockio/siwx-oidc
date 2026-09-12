@@ -29,12 +29,22 @@ src/                                ← Axum OIDC server (binary)
                                      /_synapse/admin/* on Synapse 1.157+ (the `admin_token` shim is gone)
   synapse_client.rs                  Synapse client, TWO credentials: MAS shared secret on /_synapse/mas/*
                                      (provision_user, upsert_device, allow_cross_signing_reset,
-                                     is_localpart_available, delete_device, deactivate_user, reactivate_user)
+                                     localpart_status/is_localpart_available, delete_device,
+                                     deactivate_user, reactivate_user)
                                      and a MINTED admin token on /_synapse/admin/* + the authenticated
                                      C-S API (list_devices, get_device, has_cross_signing_keys,
                                      publish_did_field -> PUT …/profile/{mxid}/io.inblock.did, and its
                                      read twin read_did_field; Err there means "state UNKNOWN", never
                                      "no DID published").
+                                     localpart_status is the THREE-valued availability probe:
+                                     Available / InUse / Unusable. A 4xx that is not `M_USER_IN_USE`
+                                     means Synapse REFUSES that localpart (over-length, bad charset,
+                                     appservice-reserved) — NEVER that an account holds it — and a
+                                     rejected MAS secret (401/403) is an Err, never a verdict about
+                                     the localpart. is_localpart_available is the two-valued wrapper
+                                     and turns Unusable into an Err. Conflating these disarmed the
+                                     new-account gate; see
+                                     docs/audits/2026-09-12-localpart-availability-conflation.md.
   did_assertion.rs                   DID tier: DID_PROFILE_FIELD, mint_did_assertion (compact ES256 JWS),
                                      did_profile_value ({did, proof}), DidPublication. See "Identity model".
   resolve.rs                         GET /resolve: the public DID <-> MXID lookup. Unauthenticated,
@@ -395,7 +405,11 @@ curl -s "$OIDC/resolve?mxid=@k3f9x2q7ab4d8m1p:inblock.io"
 #   "exists": true, "attested": true }
 ```
 
-**Exactly one** of `did` / `mxid`; zero or both is a 400 (they are two different
+**Exactly one** of `did` / `mxid`, each at most once; zero or both is a 400
+(an EMPTY value counts as absent, so `?did=X&mxid=` is one selector — and a
+REPEATED parameter is a 400 rendered in the normal error envelope, which it was
+not until 2026-09-12: the `Query` extractor rejected it before the handler ran
+and axum's plain-text body escaped the contract) (they are two different
 questions, and `did`/`mxid` mean different things in each direction). An `mxid`
 for a foreign homeserver is a 400 too — read a foreign user's DID from that
 homeserver's own (unauthenticated, federated) profile route.

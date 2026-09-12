@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Form, Json, Path, Query, State},
+    extract::{rejection::QueryRejection, Form, Json, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::{delete, get, post},
@@ -1001,10 +1001,38 @@ async fn authed_action_response(
 /// computable or publicly readable — see [`resolve`]'s module doc), and its
 /// errors render themselves rather than going through [`CustomError`], because
 /// none of them may become a 500.
+///
+/// # The query is extracted FALLIBLY, and that is the contract, not a style choice
+///
+/// Taking `Query<ResolveQuery>` directly means a query string serde cannot
+/// deserialize is rejected by the extractor **before this handler runs**, so
+/// [`resolve::ResolveError::into_response`] never executes and the caller gets
+/// axum's own `text/plain` body instead of the documented
+/// `{"error", "message"}` envelope. That was live on dev: `?did=a&did=b`
+/// answered `400 Failed to deserialize query string: .: duplicate field ` did` `
+/// as plain text, contradicting `docs/api/openapi.yaml`, where `ResolveError`
+/// is `required: [error, message]`.
+///
+/// Every documented error on this route is a `ResolveError`, so the rejection
+/// has to be converted into one rather than escaping around it. Taking
+/// `Result<Query<_>, QueryRejection>` keeps the extractor's parsing and moves
+/// its failure back under our renderer.
+///
+/// Pinned by `tests/e2e_resolve_http.rs::`
+/// `a_repeated_query_parameter_is_rejected_with_the_documented_error_envelope`,
+/// which asserts the envelope over real HTTP — the unit tests in
+/// [`resolve`] cannot see this, because they build a `ResolveQuery` by hand and
+/// never cross the extractor at all.
 async fn resolve_handler(
     State(state): State<AppState>,
-    Query(query): Query<resolve::ResolveQuery>,
+    query: Result<Query<resolve::ResolveQuery>, QueryRejection>,
 ) -> Result<Json<resolve::ResolveResponse>, resolve::ResolveError> {
+    let Query(query) = query.map_err(|rejection| {
+        resolve::ResolveError::BadRequest(format!(
+            "could not read the query string ({rejection}). Pass exactly one of \
+             `did=<did>` or `mxid=@localpart:server`, and pass it only once."
+        ))
+    })?;
     let synapse = state.synapse_client.as_deref();
     Ok(Json(resolve::resolve(&state.config, synapse, query).await?))
 }
