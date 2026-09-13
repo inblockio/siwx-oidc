@@ -38,8 +38,17 @@
 //!   via `handlers/profile.py::on_profile_query`. The live probe read it back
 //!   with no `Authorization` header at all.
 //! - The one thing this server adds is `exists`, which is
-//!   `SynapseClient::localpart_status` — the same answer any client gets from
-//!   Matrix registration availability.
+//!   `SynapseClient::localpart_status` — whether a localpart is taken. That is
+//!   already observable without this server through the same unauthenticated,
+//!   federated profile route the bullet above describes: an account that does
+//!   not exist cannot answer it.
+//!
+//!   (This used to cite `GET /_matrix/client/v3/register/available` as "the
+//!   same answer any client gets". That route does not exist on this
+//!   deployment — registration is delegated via MSC3861, and the live probe
+//!   answers `404 M_UNRECOGNIZED`. The conclusion survives by the profile
+//!   route; the mechanism originally cited did not, and citing a mechanism
+//!   that is not there is how a privacy argument quietly stops being true.)
 //!
 //! So authentication would buy **rate-limiting, not secrecy**, and it is not
 //! implemented here: a rate limiter belongs at the reverse proxy that already
@@ -58,6 +67,16 @@
 //! all (standalone mode), cannot answer this question — and says so with a 503
 //! naming the missing configuration, never a 500 and never a guess. See
 //! [`ResolveError`].
+//!
+//! # Bounded, never open-ended
+//!
+//! Every answer arrives within [`RESOLVE_DEADLINE`], including the failures.
+//! A public route whose duration is chosen by the upstream is a public route
+//! whose connection count is chosen by the upstream; overrunning the deadline
+//! is a 504 in the same `{"error", "message"}` envelope as every other error
+//! here.
+
+use std::time::Duration;
 
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -76,6 +95,46 @@ use crate::synapse_client::{matrix_user_id, LocalpartStatus, SynapseClient};
 /// limit on purpose — a DID longer than that is legitimate and simply has no
 /// legacy localpart.
 const MAX_DID_LEN: usize = 2048;
+
+/// Wall-clock ceiling on ONE `GET /resolve`, enforced in [`resolve`].
+///
+/// # Why a per-request deadline exists at all
+///
+/// `synapse_client::SYNAPSE_REQUEST_TIMEOUT` (8s) bounds each *call*, not the
+/// request, and this endpoint makes up to four of them in sequence: the legacy
+/// availability probe, the modern one, the profile-field read, and — on a
+/// homeserver that demands authentication — one authenticated retry of that
+/// read. Against an upstream answering in 7.5s the 2026-09-13 audit measured
+/// **22.55s for a single `GET /resolve`**, with a worst case near **4 × 8s =
+/// 32s**. On a public, unauthenticated route that is not a slow answer, it is a
+/// free way to pin a connection per request.
+///
+/// # Why ten seconds
+///
+/// It has to sit strictly between two measured numbers, or it accomplishes
+/// nothing:
+///
+/// - **A healthy request is milliseconds.** Against the in-process mock one
+///   full `?did=` lookup — two probes plus the field read — completes in
+///   ~1-3ms, and the test
+///   `a_healthy_lookup_finishes_far_inside_the_deadline` pins that it stays
+///   under a second. Ten seconds is three orders of magnitude of headroom, so
+///   this can only fire on a genuinely sick upstream.
+/// - **The worst case it is bounding is ~32s.** Ten seconds cuts that to under
+///   a third, and turns an unbounded-feeling stall into one honest status code.
+///
+/// The lower bound is sharper than "comfortably above healthy", though: it is
+/// deliberately **above `SYNAPSE_REQUEST_TIMEOUT` (8s)**, so a single slow call
+/// is still reported by that call's own timeout — a 502 naming what failed —
+/// rather than being cut short by this and reported as a deadline. This fires
+/// only when calls CHAIN, which is the shape the finding is about. Dropping it
+/// below 8s would start converting ordinary one-call upstream slowness into
+/// 504s, which is a worse diagnosis, not a faster one.
+///
+/// A constant, not a config knob, for the same reason
+/// `SYNAPSE_REQUEST_TIMEOUT` is: a timeout nobody sets is a timeout nobody
+/// tunes correctly under pressure.
+const RESOLVE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Largest `mxid` this endpoint will consider, in bytes — the Matrix spec's own
 /// `MAX_USERID_LENGTH`. Anything longer cannot name an account on any
@@ -183,6 +242,20 @@ pub enum ResolveError {
         mxid: Option<String>,
         message: String,
     },
+    /// The whole request outran [`RESOLVE_DEADLINE`]. `504`.
+    ///
+    /// **Not a 502 and certainly not a 500.** A 502 says the homeserver gave a
+    /// bad answer; here it gave *no* answer in time, and the difference is the
+    /// one an operator needs — a 504 on this route means the chain of Synapse
+    /// calls is slow, not that any one of them failed. A 500 would claim the
+    /// bug is ours, and this route's contract is that it never emits one.
+    ///
+    /// Rendered as a `ResolveError` rather than by a `tower` `TimeoutLayer`
+    /// on purpose: a layer answers with an EMPTY body, which breaks the
+    /// `{"error", "message"}` envelope `docs/api/openapi.yaml` declares
+    /// required and `tests/e2e_resolve_http.rs` pins on every other error.
+    /// (`tower-http` is also built here without its `timeout` feature.)
+    Deadline(Duration),
 }
 
 impl IntoResponse for ResolveError {
@@ -218,6 +291,20 @@ impl IntoResponse for ResolveError {
                     mxid,
                 )
             }
+            ResolveError::Deadline(waited) => {
+                warn!(deadline = ?waited, "resolve: deadline_exceeded");
+                (
+                    axum::http::StatusCode::GATEWAY_TIMEOUT,
+                    "upstream_timeout",
+                    format!(
+                        "The homeserver did not finish answering within {}s, so this lookup was \
+                         abandoned. Nothing is known about this identity — retry, and check the \
+                         homeserver's health.",
+                        waited.as_secs_f32()
+                    ),
+                    None,
+                )
+            }
         };
         let mut body = serde_json::json!({ "error": code, "message": message });
         if let Some(mxid) = mxid {
@@ -237,8 +324,68 @@ const NO_SYNAPSE: &str =
 /// Resolve a DID to its Matrix account, or a Matrix account to its published
 /// DID.
 ///
-/// Read-only: it never provisions, never writes, and never mints anything.
+/// # What it does to the homeserver
+///
+/// It answers from reads: up to two `is_localpart_available` probes and one
+/// `GET …/profile/{mxid}/io.inblock.did`. It creates no account, writes no
+/// profile, stores no session, and issues the caller nothing.
+///
+/// One honest caveat, because the previous wording here ("never provisions,
+/// never writes, and never mints anything") was measured FALSE and is audit
+/// finding F4: on a homeserver that sets `require_auth_for_profile_requests`,
+/// the profile read is refused anonymously and
+/// [`SynapseClient::read_did_field`] retries it with a minted admin token —
+/// and minting provisions the admin service user if its row is missing and
+/// writes a token to Redis. That is a side effect on the PROVIDER's own
+/// service account, never on the identity being looked up, it happens once per
+/// token TTL rather than once per request, and on a stock homeserver (the
+/// default, `require_auth_for_profile_requests: false`) it does not happen at
+/// all. Nothing here ever touches the queried account.
+///
+/// # It is bounded
+///
+/// The whole lookup runs under [`RESOLVE_DEADLINE`]; overrunning it is a 504,
+/// not a partial answer. See that constant for why per-call timeouts were not
+/// enough.
 pub async fn resolve(
+    config: &crate::config::Config,
+    synapse: Option<&SynapseClient>,
+    query: ResolveQuery,
+) -> Result<ResolveResponse, ResolveError> {
+    resolve_within(config, synapse, query, RESOLVE_DEADLINE).await
+}
+
+/// [`resolve`] with the deadline passed in.
+///
+/// Exists so the timeout can be TESTED. The alternative — a test that waits out
+/// the shipped ten seconds — is the kind of test that gets `#[ignore]`d within
+/// a month and then guards nothing, and the alternative to that (trusting the
+/// constant) is what finding F5 was.
+///
+/// The deadline wraps the ENTIRE body, validation included. Validation is
+/// microseconds and could not plausibly overrun, but excluding it would mean
+/// two code paths where one will do, and the cheap one is not the one worth
+/// optimising.
+async fn resolve_within(
+    config: &crate::config::Config,
+    synapse: Option<&SynapseClient>,
+    query: ResolveQuery,
+    deadline: Duration,
+) -> Result<ResolveResponse, ResolveError> {
+    match tokio::time::timeout(deadline, resolve_uncapped(config, synapse, query)).await {
+        Ok(answer) => answer,
+        // The in-flight Synapse request is dropped with the future, which
+        // closes the connection — the point of bounding the request rather
+        // than only answering the caller quickly.
+        Err(_elapsed) => Err(ResolveError::Deadline(deadline)),
+    }
+}
+
+/// The lookup itself, with no bound of its own.
+///
+/// Private, and called from exactly one place ([`resolve_within`]). Anything
+/// that calls this directly is an unbounded public route again.
+async fn resolve_uncapped(
     config: &crate::config::Config,
     synapse: Option<&SynapseClient>,
     query: ResolveQuery,
@@ -1150,6 +1297,144 @@ mod tests {
              legacy localpart the sign-in path would have fallen back to"
         );
         assert_eq!(status_of(err), axum::http::StatusCode::BAD_GATEWAY);
+    }
+
+    // -- The per-request deadline (audit finding F5) -----------------------
+
+    /// A homeserver that accepts the connection and then never answers.
+    ///
+    /// Deliberately NOT a second mock Synapse — it models no route and has no
+    /// wire shape to drift away from the real one (the reason the module doc
+    /// above reuses `localpart.rs`'s harness for everything else). It is a
+    /// socket that stays open and stays silent, which is the only upstream
+    /// behaviour these two tests care about, and it is what distinguishes this
+    /// from a dead port: a refused connection fails in microseconds and would
+    /// prove nothing about a deadline.
+    async fn spawn_black_hole() -> (SynapseClient, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral black-hole port");
+        let addr = listener.local_addr().expect("black-hole local_addr");
+        let handle = tokio::spawn(async move {
+            // Accepted connections are HELD, never read from and never written
+            // to. Dropping them would send a FIN and turn the stall into a
+            // prompt connection error.
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        (
+            SynapseClient::new(&format!("http://{addr}"), "secret"),
+            handle,
+        )
+    }
+
+    /// Render an error the way the HTTP layer will, so the envelope can be
+    /// asserted on rather than assumed.
+    async fn rendered(err: ResolveError) -> (axum::http::StatusCode, serde_json::Value) {
+        let resp = err.into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("an error body must be readable");
+        (
+            status,
+            serde_json::from_slice(&bytes).expect("an error body must be JSON"),
+        )
+    }
+
+    /// A homeserver that never answers produces a 504 in the documented error
+    /// envelope, well before the per-call timeout could have fired.
+    ///
+    /// This is audit finding F5. `SYNAPSE_REQUEST_TIMEOUT` (8s) bounds each
+    /// CALL, and a `?did=` lookup makes up to four in sequence, so one measured
+    /// request took **22.55s** against an upstream answering in 7.5s. The
+    /// deadline is injected here rather than waiting out the shipped ten
+    /// seconds — a twenty-second test is a test that gets `#[ignore]`d.
+    ///
+    /// The envelope matters as much as the status: the obvious fix, a `tower`
+    /// `TimeoutLayer`, answers with an EMPTY body and would silently break the
+    /// `{"error", "message"}` contract `tests/e2e_resolve_http.rs` pins on
+    /// every other error this route can produce.
+    #[tokio::test]
+    async fn a_homeserver_that_never_answers_becomes_a_504_in_the_documented_envelope() {
+        let (synapse, handle) = spawn_black_hole().await;
+        let deadline = std::time::Duration::from_millis(250);
+
+        let started = std::time::Instant::now();
+        let err = resolve_within(
+            &config(Some(SERVER_NAME)),
+            Some(&synapse),
+            query(Some(DID), None),
+            deadline,
+        )
+        .await
+        .expect_err("a homeserver that never answers cannot be answered for");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(err, ResolveError::Deadline(_)),
+            "a stalled upstream must be a deadline, not {err:?}"
+        );
+        let (status, body) = rendered(err).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            "no answer in time is a 504 — not the 502 a BAD answer gets, and never a 500"
+        );
+        assert_eq!(
+            body.get("error").and_then(|v| v.as_str()),
+            Some("upstream_timeout"),
+            "the envelope's `error` discriminator is required: {body}"
+        );
+        assert!(
+            body.get("message").and_then(|v| v.as_str()).is_some(),
+            "the envelope's `message` is required: {body}"
+        );
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "the DEADLINE must be what fired, not the 8s per-call timeout: took {elapsed:?}"
+        );
+        handle.abort();
+    }
+
+    /// A healthy lookup is unaffected by the deadline, and finishes three
+    /// orders of magnitude inside it.
+    ///
+    /// The other half of the bound: a deadline that fires on healthy traffic
+    /// is an outage. This runs the SHIPPED [`RESOLVE_DEADLINE`] — not an
+    /// injected one — over the full `?did=` path (two availability probes plus
+    /// the profile-field read), which is also where the "a healthy request is
+    /// milliseconds" number in that constant's doc comes from.
+    #[tokio::test]
+    async fn a_healthy_lookup_finishes_far_inside_the_deadline() {
+        let localpart = localpart_for(DID);
+        let (synapse, handle) = spawn_mock_synapse_with_did_fields(
+            HashSet::from([localpart.clone()]),
+            HashMap::from([(format!("@{localpart}:{SERVER_NAME}"), published(DID))]),
+        )
+        .await;
+
+        let started = std::time::Instant::now();
+        let out = resolve(
+            &config(Some(SERVER_NAME)),
+            Some(&synapse),
+            query(Some(DID), None),
+        )
+        .await
+        .expect("a healthy homeserver must be answered, deadline or no deadline");
+        let elapsed = started.elapsed();
+
+        assert!(out.exists && out.attested, "sanity: the lookup really ran");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "a healthy lookup must finish in a fraction of the {RESOLVE_DEADLINE:?} deadline, \
+             or the deadline is not comfortably above healthy traffic: took {elapsed:?}"
+        );
+        eprintln!("healthy ?did= lookup: {elapsed:?} (deadline {RESOLVE_DEADLINE:?})");
+        handle.abort();
     }
 
     // -- Pure helpers ------------------------------------------------------

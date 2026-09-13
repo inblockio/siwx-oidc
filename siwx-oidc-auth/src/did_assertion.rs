@@ -1565,6 +1565,128 @@ mod tests {
         );
     }
 
+    // -- T5: the claim-PRESENCE layer ---------------------------------------
+    //
+    // Every member of `AssertionClaims` is `Option<T>` with `#[serde(default)]`,
+    // so serde accepts a payload that OMITS any of them: the rejection is done
+    // entirely by the four `ok_or_else` calls at the end of
+    // `verify_did_assertion`. "Required" is therefore a property of four
+    // hand-written lines, not of the type — and swapping any one of them for a
+    // default is invisible to a suite that only ever mints COMPLETE payloads.
+    // These four tests mint incomplete ones.
+    //
+    // Each proof below is otherwise perfect: real key, published `kid`, intact
+    // signature, matching issuer. The only defect is the missing claim, so
+    // `Err` can come from nothing else.
+
+    /// A payload with one claim surgically removed.
+    ///
+    /// Panics when `claim` is not a member `payload_of` actually emits, so a
+    /// renamed claim turns these tests red instead of quietly making them
+    /// vacuous — removing a key that was never there is a silent no-op, and a
+    /// test that then verifies a COMPLETE payload passes for the wrong reason.
+    fn payload_omitting(iss: &str, claim: &str) -> serde_json::Value {
+        let mut payload = payload_of(iss, DID, ALICE);
+        payload
+            .as_object_mut()
+            .expect("payload_of builds a JSON object")
+            .remove(claim)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{claim}` is not a claim `payload_of` emits, so this omission test would \
+                     assert nothing"
+                )
+            });
+        payload
+    }
+
+    /// Mint a proof whose payload is complete except for `claim`, serve real
+    /// discovery + JWKS for it, and verify it through the real entry point.
+    async fn verify_a_proof_whose_payload_omits(claim: &str) -> Result<VerifiedDid> {
+        let key = SigningKey::random(&mut OsRng);
+        let jwks = json!({ "keys": [jwk_of(&key, KID)] });
+        let base = spawn_mock_http(move |b| discovery_and_jwks(b, b, jwks)).await;
+        let jws = mint(&key, &header_of(KID), &payload_omitting(&base, claim));
+        verify_did_assertion(&base, &jws, ALICE).await
+    }
+
+    /// Omitting `mxid` must NOT bypass the replay binding.
+    ///
+    /// The mxid binding is the whole security property of this module: without
+    /// it, user B copies A's genuinely signed proof into B's profile and it
+    /// verifies. A verifier that reads an ABSENT `mxid` as "binds whatever you
+    /// asked about" hands an attacker that same bypass more cheaply than
+    /// forging a signature — they need a proof that simply never named an
+    /// account. `h6_valid_assertion_replayed_for_another_user_is_rejected`
+    /// pins the WRONG-value case; this pins the NO-value case, and they are
+    /// different lines of code (`!=` versus `ok_or_else`).
+    #[tokio::test]
+    async fn h6_a_proof_that_omits_the_mxid_claim_binds_nothing_and_is_rejected() {
+        let err = verify_a_proof_whose_payload_omits("mxid").await.expect_err(
+            "a proof carrying no `mxid` claim binds no account at all; defaulting it to the mxid \
+             being asked about would make the replay guard bypassable BY OMISSION",
+        );
+        assert!(
+            format!("{err:#}").contains("mxid"),
+            "the error must name the missing claim: {err:#}"
+        );
+    }
+
+    /// Omitting `iss` must not let the proof inherit the issuer it is being
+    /// checked against.
+    ///
+    /// Defaulting `iss` to `discovery.issuer` turns step 9 into a comparison of
+    /// a value with itself: it can never fail, on a proof that never named an
+    /// issuer. The §4.3 pin above stops a server laundering somebody else's
+    /// NAME; this stops a proof acquiring one it never carried.
+    #[tokio::test]
+    async fn h7_a_proof_that_omits_the_iss_claim_is_rejected() {
+        let err = verify_a_proof_whose_payload_omits("iss").await.expect_err(
+            "a proof that names no issuer must not be credited to the issuer that happens to be \
+             verifying it",
+        );
+        assert!(
+            format!("{err:#}").contains("iss"),
+            "the error must name the missing claim: {err:#}"
+        );
+    }
+
+    /// Omitting `sub` must not produce a DID.
+    ///
+    /// `sub` IS the DID this module exists to deliver. Any default — including
+    /// an obviously-fake placeholder like `did:unknown`, which sails through the
+    /// `starts_with("did:")` sanity check — comes back out of
+    /// `VerifiedDid::did()` wearing a signature check that passed, which is the
+    /// one thing a caller is entitled to read that value as meaning.
+    #[tokio::test]
+    async fn h7_a_proof_that_omits_the_sub_claim_is_rejected() {
+        let err = verify_a_proof_whose_payload_omits("sub")
+            .await
+            .expect_err("a proof with no `sub` asserts no DID, so there is nothing to return");
+        assert!(
+            format!("{err:#}").contains("sub"),
+            "the error must name the missing claim: {err:#}"
+        );
+    }
+
+    /// Omitting `iat` must not produce an assertion dated to the epoch.
+    ///
+    /// `issued_at` is the one thing a verified assertion actually attests a
+    /// *time* for ("the provider asserted this binding at `iat`"), and there is
+    /// deliberately no `exp` to cross-check it against. Defaulting it to 0 does
+    /// not fail loudly anywhere — it silently dates every unstamped proof to
+    /// 1970 and leaves the claim reading as attested.
+    #[tokio::test]
+    async fn h7_a_proof_that_omits_the_iat_claim_is_rejected() {
+        let err = verify_a_proof_whose_payload_omits("iat")
+            .await
+            .expect_err("a proof with no `iat` attests no point in time");
+        assert!(
+            format!("{err:#}").contains("iat"),
+            "the error must name the missing claim: {err:#}"
+        );
+    }
+
     // -- D3: the trust anchor cannot be laundered ---------------------------
 
     #[tokio::test]
@@ -1969,6 +2091,219 @@ mod tests {
             "the SIGNED sub must win over the plain member"
         );
         assert_ne!(verified.did(), OTHER_DID);
+    }
+
+    // -- T5: the branches that DECIDE the typed discriminators --------------
+    //
+    // `FieldAbsent` and `ProofAbsent` are the contract a relying party is told
+    // to branch on, so which input yields which — and which inputs must yield
+    // NEITHER — is part of the wire contract, not an implementation detail.
+    // The rule these tests enforce:
+    //
+    //   FieldAbsent   the field is genuinely not there (404, key absent, null)
+    //   ProofAbsent   the field IS there but carries no usable proof
+    //   neither       we could not READ it (500 / 403 / 502). "We do not know"
+    //                 is not "they published nothing".
+    //
+    // Before these tests every one of those branches could be rewritten without
+    // a single failure: the suite minted well-formed inputs and asserted on the
+    // two happy discriminators, never on what must not receive them.
+
+    /// Serve `status`/`body` from the profile route of a mock that is otherwise
+    /// a fully working issuer, and run the real `fetch_and_verify_did`.
+    ///
+    /// Discovery and the JWKS are served for real, so a test that reaches
+    /// signature verification does so against a genuine key: an early return
+    /// below is never an artefact of a crippled mock.
+    async fn fetch_with_profile_body(status: u16, body: serde_json::Value) -> Result<VerifiedDid> {
+        let key = SigningKey::random(&mut OsRng);
+        let jwks = json!({ "keys": [jwk_of(&key, KID)] });
+        let base = spawn_mock_http(move |b| {
+            let mut routes = discovery_and_jwks(b, b, jwks);
+            routes.push(profile_route(ALICE, status, body.to_string()));
+            routes
+        })
+        .await;
+        fetch_and_verify_did(&base, ALICE, &base).await
+    }
+
+    /// A failed READ is not a published absence.
+    ///
+    /// A consumer that matches `FieldAbsent` goes on to treat the user as
+    /// having no DID, so folding every non-2xx into it converts a homeserver
+    /// outage into a silent, fleet-wide "nobody publishes a DID" — the worst
+    /// possible shape for this failure, because it looks exactly like the
+    /// healthy answer. 500 is not even exceptional here: element-hq/synapse
+    /// #19702 makes a row-less account (a `users` row with no `profiles` row)
+    /// 500 where a healthy account 404s, and that state is UNKNOWN, not absent.
+    #[tokio::test]
+    async fn a_failed_profile_read_is_never_reported_as_field_absent() {
+        for status in [500u16, 403, 502] {
+            let err = fetch_with_profile_body(status, json!({ "errcode": "M_UNKNOWN" }))
+                .await
+                .expect_err("a non-2xx profile read yields no DID");
+            assert!(
+                err.downcast_ref::<DidAssertionError>().is_none(),
+                "HTTP {status} must stay an UNTYPED transport error: it is neither of the two \
+                 EXPECTED publication outcomes, and giving it one of their discriminators tells \
+                 the caller a fact about the account that we never learned: {err:#}"
+            );
+            assert!(
+                format!("{err:#}").contains(&status.to_string()),
+                "the error must name the status an operator has to act on: {err:#}"
+            );
+        }
+    }
+
+    /// An explicit JSON `null` is an absent field, not a value.
+    ///
+    /// Both spellings must reach the same typed outcome, because a homeserver
+    /// is free to render "unset" either way and a consumer cannot be asked to
+    /// care which.
+    #[tokio::test]
+    async fn an_explicit_json_null_field_is_absent_not_a_value() {
+        for body in [json!({ DID_PROFILE_FIELD: null }), json!({})] {
+            let err = fetch_with_profile_body(200, body.clone())
+                .await
+                .expect_err("an unset field is not a DID");
+            assert_eq!(
+                err.downcast_ref::<DidAssertionError>(),
+                Some(&DidAssertionError::FieldAbsent {
+                    mxid: ALICE.to_string()
+                }),
+                "`{body}` must read as an absent field, not as a value to be parsed: {err:#}"
+            );
+        }
+    }
+
+    /// `null` and a missing key are indistinguishable by the time the match
+    /// runs, and this pins WHERE that happens.
+    ///
+    /// `ProfileFieldResponse::field` is `Option<serde_json::Value>`, and
+    /// serde's `Option` deserializer consumes a JSON `null` as `None` before
+    /// `serde_json::Value` is ever built. So the `Some(Value::Null)` arm in
+    /// `fetch_and_verify_did` is unreachable through this type: deleting it
+    /// changes no behaviour, and no end-to-end test can tell. Keeping it is
+    /// still right — it is one arm's worth of insurance against the field type
+    /// later becoming a plain `Value` — but the INVARIANT lives here, one layer
+    /// down, which is where a mutation to it would actually be detectable.
+    #[test]
+    fn an_absent_key_and_an_explicit_null_deserialize_to_the_same_absence() {
+        let explicit_null: ProfileFieldResponse =
+            serde_json::from_str(&json!({ DID_PROFILE_FIELD: null }).to_string()).unwrap();
+        let missing_key: ProfileFieldResponse = serde_json::from_str("{}").unwrap();
+        assert!(
+            explicit_null.field.is_none(),
+            "serde must collapse an explicit null to None; if this ever fails, the \
+             `Some(Value::Null)` arm in fetch_and_verify_did has become load-bearing and needs a \
+             behavioural test of its own"
+        );
+        assert!(missing_key.field.is_none());
+    }
+
+    /// The `""` spelling of "no proof" must reach `ProofAbsent`, not the
+    /// verifier.
+    ///
+    /// The minter writes NO `proof` key at all when its signing key is
+    /// ephemeral, but the consumer additionally filters `""` back out so both
+    /// spellings land in one bucket. Drop that filter and `""` stops being an
+    /// expected outcome: it becomes an untyped "malformed proof" error about a
+    /// profile that never claimed to have one, and a caller branching on
+    /// `ProofAbsent` silently stops recognising it.
+    #[tokio::test]
+    async fn an_empty_string_proof_is_proof_absent_never_a_proof() {
+        let err = fetch_with_profile_body(
+            200,
+            json!({ DID_PROFILE_FIELD: { "did": DID, "proof": "" } }),
+        )
+        .await
+        .expect_err("an empty proof proves nothing");
+        assert_eq!(
+            err.downcast_ref::<DidAssertionError>(),
+            Some(&DidAssertionError::ProofAbsent {
+                mxid: ALICE.to_string(),
+                unverified_did: DID.to_string(),
+            }),
+            "`\"\"` must map to the same typed outcome as a missing `proof` key: {err:#}"
+        );
+    }
+
+    /// A bare-string field value is the proofless legacy shape — never its own
+    /// proof.
+    ///
+    /// It is also what a user can write by hand wherever the MSC4133 denylist
+    /// is not deployed, which is what makes the second leg more than tidiness:
+    /// if the string were fed to the verifier, a user who pastes a genuine JWS
+    /// into their own profile gets it verified and returned as attested, out of
+    /// a field they control. Nothing signed the string *as a field value*, so
+    /// it is unverifiable by construction, whatever its contents happen to be.
+    #[tokio::test]
+    async fn a_bare_string_field_value_is_never_treated_as_its_own_proof() {
+        let err = fetch_with_profile_body(200, json!({ DID_PROFILE_FIELD: DID }))
+            .await
+            .expect_err("a bare string carries no proof");
+        assert_eq!(
+            err.downcast_ref::<DidAssertionError>(),
+            Some(&DidAssertionError::ProofAbsent {
+                mxid: ALICE.to_string(),
+                unverified_did: DID.to_string(),
+            }),
+            "a bare string is the proofless legacy shape: {err:#}"
+        );
+
+        // Leg 2: the string IS a genuine, correctly-bound, correctly-signed
+        // proof for this very mxid. It must STILL be ProofAbsent.
+        let key = SigningKey::random(&mut OsRng);
+        let jwks = json!({ "keys": [jwk_of(&key, KID)] });
+        let base = spawn_mock_http(move |b| {
+            let jws = mint(&key, &header_of(KID), &payload_of(b, DID, ALICE));
+            let mut routes = discovery_and_jwks(b, b, jwks);
+            routes.push(profile_route(
+                ALICE,
+                200,
+                json!({ DID_PROFILE_FIELD: jws }).to_string(),
+            ));
+            routes
+        })
+        .await;
+
+        let err = fetch_and_verify_did(&base, ALICE, &base)
+            .await
+            .expect_err("a JWS written where the OBJECT belongs is still not a published proof");
+        assert!(
+            matches!(
+                err.downcast_ref::<DidAssertionError>(),
+                Some(DidAssertionError::ProofAbsent { .. })
+            ),
+            "a string field must never be handed to the verifier, however valid its contents: \
+             {err:#}"
+        );
+    }
+
+    /// A field value that is neither an object nor a string is rejected
+    /// outright — it is not one of the two expected outcomes.
+    ///
+    /// Reporting a number, an array or a bool as `ProofAbsent` (or as
+    /// `FieldAbsent`) tells a consumer the account is healthy and simply
+    /// publishes nothing, when what actually happened is that the field holds
+    /// something no version of this contract has ever produced.
+    #[tokio::test]
+    async fn a_field_value_that_is_neither_object_nor_string_is_rejected_outright() {
+        for value in [json!(42), json!([DID]), json!(true)] {
+            let err = fetch_with_profile_body(200, json!({ DID_PROFILE_FIELD: value }))
+                .await
+                .expect_err("a non-object, non-string field is not a DID publication");
+            assert!(
+                err.downcast_ref::<DidAssertionError>().is_none(),
+                "a malformed field is neither EXPECTED outcome; giving it one of their \
+                 discriminators reads to a caller as a healthy account with nothing published: \
+                 {err:#}"
+            );
+            assert!(
+                format!("{err:#}").contains("neither an object nor a string"),
+                "the error must say what was wrong with the value: {err:#}"
+            );
+        }
     }
 
     #[test]

@@ -213,9 +213,10 @@ no errcode, and no hint that a shared secret is involved — because the body is
 rendered verbatim to a caller who has proven a DID but is otherwise a stranger.
 Pinned by `the_detection_failure_message_leaks_no_server_internals`.
 
-**The analogous split would be WRONG in `reject_if_deactivated`**, which
-deliberately does not distinguish "deactivated" from "could not tell": that WOULD
-let an unauthenticated prober learn account state. Distinguishing here leaks
+**Superseded 2026-09-13:** `reject_if_deactivated` was given the same split. The
+claim that it would be WRONG there assumed an unauthenticated prober; every call
+site in fact runs after proof of DID control, and on a healthy server the 401
+already identified deactivation uniquely. Distinguishing here leaks
 nothing, because the fact is already public — `GET /resolve?did=…` answers
 `exists: false` for exactly this condition and the derivation is a pure `sha2`
 function anyone can compute offline. The asymmetry is intentional; do not

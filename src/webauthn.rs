@@ -103,16 +103,29 @@ pub const NEW_IDENTITY_REJECT_MSG: &str =
 /// caller does not. Pinned by
 /// `the_detection_failure_message_leaks_no_server_internals`.
 ///
-/// # Why the asymmetry with [`reject_if_deactivated`] is correct
+/// # The asymmetry with [`reject_if_deactivated`] was WITHDRAWN (2026-09-13)
 ///
-/// That gate deliberately does NOT distinguish "deactivated" from "could not
-/// tell", because doing so would let an unauthenticated prober learn account
-/// state. Distinguishing the two cases **here** leaks nothing, because the fact
-/// being distinguished is already public: `GET /resolve?did=…` answers
-/// `exists: false` for exactly this condition, and the DID → localpart
-/// derivation is a pure `sha2` function ([`crate::localpart`] over
-/// `mxid::localpart_for`) that anyone can compute offline. So the two gates are
-/// asymmetric on purpose. Do not "harmonise" them in either direction.
+/// This paragraph used to say the analogous split would be wrong in that gate,
+/// because distinguishing "deactivated" from "could not tell" would let an
+/// **unauthenticated prober** learn account state. A follow-up audit falsified
+/// the premise: there is no unauthenticated prober at any of that gate's five
+/// call sites — every one runs after a verified CAIP-122 signature or a
+/// verified WebAuthn assertion for the very DID being asked about — and on a
+/// healthy server its 401 already identified deactivation uniquely, so the
+/// conflation blurred nothing an attacker could induce. It only told every user
+/// on an unhealthy homeserver that their account had been deactivated.
+///
+/// [`reject_if_deactivated`] therefore now splits its arms the same way this
+/// one does, and the two gates are **symmetric**. The full evidence — the
+/// call-site table and the healthy-server argument — lives at
+/// [`DEACTIVATION_CHECK_UNAVAILABLE_MSG`]. Do not restore either conflation.
+///
+/// Distinguishing the two cases here leaks nothing independently of that
+/// argument, because the fact being distinguished is already public:
+/// `GET /resolve?did=…` answers `exists: false` for exactly this condition, and
+/// the DID → localpart derivation is a pure `sha2` function
+/// ([`crate::localpart`] over `mxid::localpart_for`) that anyone can compute
+/// offline.
 pub const IDENTITY_CHECK_UNAVAILABLE_MSG: &str =
     "The server could not complete a required account check right now. \
      Nothing has been changed. Please try again in a moment, and contact a \
@@ -145,8 +158,9 @@ pub const IDENTITY_CHECK_UNAVAILABLE_MSG: &str =
 ///
 /// Collapsing the second into the first is safe but misleading, and was the
 /// behaviour until this split — see [`IDENTITY_CHECK_UNAVAILABLE_MSG`] for the
-/// full argument and for why the analogous split would be WRONG in
-/// [`reject_if_deactivated`].
+/// full argument. [`reject_if_deactivated`] now splits its arms the same way
+/// (2026-09-13); the asymmetry an earlier revision of these docs recorded
+/// between the two gates has been withdrawn.
 pub async fn reject_if_new_identity(
     synapse: Option<&crate::synapse_client::SynapseClient>,
     did: &str,
@@ -182,12 +196,112 @@ pub async fn reject_if_new_identity(
     }
 }
 
-/// The error message returned by every server-enforced deactivated-account
-/// reject. Deliberately does NOT distinguish "deactivated" from "erased" to the
+/// The error message returned when an account genuinely IS deactivated.
+///
+/// Deliberately does NOT distinguish "deactivated" from "erased" to the
 /// caller: both mean the same thing to the person at the keyboard, and Synapse
 /// reports them identically (`is_deactivated == true`) anyway.
+///
+/// It IS distinguished from [`DEACTIVATION_CHECK_UNAVAILABLE_MSG`] — the check
+/// having *failed* is a different fact from the check having *found* a
+/// deactivated account, and the two were conflated until 2026-09-13. See that
+/// constant for the argument.
 pub const DEACTIVATED_REJECT_MSG: &str = "This account has been deactivated and cannot sign in. \
      Contact a server administrator if you believe this is a mistake.";
+
+/// The error message returned when the deactivation check could not be
+/// **completed** — as distinct from completing and finding a deactivated
+/// account.
+///
+/// # Why this is a second message and not the same one
+///
+/// [`reject_if_deactivated`] fails closed on both facts, and it must keep doing
+/// so: a Synapse outage must never silently re-open access to a deactivated
+/// account. That is the security property and it is unchanged. What changed on
+/// 2026-09-13 is only the *diagnosis*. Until then both arms returned
+/// `Unauthorized(`[`DEACTIVATED_REJECT_MSG`]`)`, so a single unhealthy Synapse
+/// told **every user on the homeserver** that their account had been
+/// deactivated and that they should go and argue with an administrator about
+/// it. Observed in the wild as:
+///
+/// ```text
+/// WARN identity resolution failed, rejecting to avoid reviving a deactivated
+///      account: localpart_status: HTTP 500 Internal Server Error
+/// WARN unauthorized error=This account has been deactivated and cannot sign in…
+/// response status=401
+/// ```
+///
+/// That is the same defect [`reject_if_new_identity`] was cured of in the
+/// sibling fix: **a check that could not RUN is not a check that found
+/// something.** The claim is not merely misleading, it is *false* — and it is
+/// false in the one direction a user cannot investigate, because the only
+/// person who could act on the real cause never sees it.
+///
+/// # The recorded objection, and why it does not hold
+///
+/// This gate's documentation used to argue the conflation was deliberate:
+/// distinguishing the two answers "WOULD let an unauthenticated prober learn
+/// account state". Two independent reasons that does not survive contact with
+/// the code.
+///
+/// **1. There is no unauthenticated prober.** Every one of the five call sites
+/// runs *after* the caller has proven control of the DID being asked about:
+///
+/// | Call site | Proof already established |
+/// |---|---|
+/// | `oidc::sign_in` | a verified CAIP-122 signature (Path B) or a WebAuthn assertion the ceremony endpoint verified and stored as `session.verified_did` (Path A) |
+/// | `account::account_wallet` | `DIDMethod::verify` on the CAIP-122 message, plus a consumed single-use action-bound nonce |
+/// | `account::account_passkey_finish` | `webauthn::verify_credential` |
+/// | `device_auth::device_approve` | `DIDMethod::verify`, plus a consumed single-use nonce bound to this `user_code` |
+/// | `device_auth::device_approve_passkey` | `webauthn::verify_credential`, in the route handler that calls it |
+///
+/// A "prober" here is therefore someone holding the account's own key, asking
+/// about their own account. Telling them their account is deactivated is not a
+/// leak, it is the answer they are entitled to — and it is the message's entire
+/// purpose.
+///
+/// **2. On a healthy server the state was never hidden anyway.** With Synapse
+/// up, an active account returns `Ok(())`, an absent one returns `Ok(())`, and
+/// a deactivated one returns 401 — so the 401 already identifies deactivation
+/// uniquely. The conflation only blurred the answer during a fault the caller
+/// cannot induce and does not control. It bought ambiguity on exactly the
+/// occasions when nobody was enumerating and everybody was locked out: it
+/// protected nothing and misinformed everyone.
+///
+/// (Account *existence* is separately public regardless — `GET /resolve?did=…`
+/// answers `exists`, and the DID → localpart derivation is a pure `sha2`
+/// function anyone can compute offline. So the two gates are now symmetric, and
+/// the asymmetry the sibling fix recorded between them is **withdrawn**.)
+///
+/// # What it may and may not say
+///
+/// It names the server as the faulty party, says the condition is worth
+/// retrying, and points at an administrator if it persists. It leaks **nothing**
+/// operational: no Synapse endpoint, no HTTP status, no errcode, no localpart.
+/// Everything diagnostic goes to the `warn!` beside the reject, which is the
+/// surface an operator reads and a caller does not. Pinned by
+/// `the_deactivation_failure_message_leaks_no_server_internals`.
+///
+/// # Why it is byte-identical to [`IDENTITY_CHECK_UNAVAILABLE_MSG`]
+///
+/// On the account and device-approval paths [`reject_if_new_identity`] runs
+/// immediately before this gate, so two *distinguishable* "could not check"
+/// messages would tell the caller **which** gate they got past — i.e. that an
+/// account exists for their DID. That fact is already public via `/resolve`, so
+/// this is a small thing; but it is free to close and there is no
+/// corresponding benefit to distinguishing them, since a user cannot act on
+/// which internal probe failed and an operator reads the log, not the body.
+///
+/// They are nonetheless two constants, not one alias, because they belong to
+/// two gates with two different `warn!` lines and two different owners; either
+/// may need to be reworded for its own gate. Pinned equal by
+/// `the_two_unavailable_messages_are_deliberately_indistinguishable`, which is
+/// the place to record the decision if a future change makes them diverge on
+/// purpose.
+pub const DEACTIVATION_CHECK_UNAVAILABLE_MSG: &str =
+    "The server could not complete a required account check right now. \
+     Nothing has been changed. Please try again in a moment, and contact a \
+     server administrator if this keeps happening.";
 
 /// Server-enforced reject for a **deactivated** account.
 ///
@@ -218,16 +332,42 @@ pub const DEACTIVATED_REJECT_MSG: &str = "This account has been deactivated and 
 ///   new-identity case and belongs to [`reject_if_new_identity`]; conflating the
 ///   two here would break first-time sign-in, which is legitimate at the login
 ///   screen.
-/// * probe failed — **fails closed** with the same message, matching
-///   [`reject_if_new_identity`]. A Synapse outage must not silently re-open
-///   access to deactivated accounts.
+/// * probe failed — **fails closed**, as a `ServiceUnavailable`. A Synapse
+///   outage must not silently re-open access to deactivated accounts.
+///
+/// # Two rejects, two different facts (2026-09-13)
+///
+/// Both reject and both fail closed — that part is the security property and
+/// must not change — but they are reported differently, because they are
+/// different answers to the user:
+///
+/// | Outcome | Error | Status | Meaning |
+/// |---|---|---|---|
+/// | `query_user` → `Ok(Some(info))` with `info.is_deactivated` | `Unauthorized(`[`DEACTIVATED_REJECT_MSG`]`)` | 401 | the check RAN: this account is deactivated |
+/// | either probe → `Err(_)` | `ServiceUnavailable(`[`DEACTIVATION_CHECK_UNAVAILABLE_MSG`]`)` | 503 | the check could not run at all; we say nothing about the account |
+///
+/// This matches [`reject_if_new_identity`] exactly, and that symmetry is now
+/// the point. An earlier revision of these docs claimed the split would be
+/// WRONG here because it leaks account state to an unauthenticated prober;
+/// that objection is **withdrawn** — see
+/// [`DEACTIVATION_CHECK_UNAVAILABLE_MSG`] for the evidence (there is no
+/// unauthenticated prober at any of the five call sites, and on a healthy
+/// server the 401 already identified deactivation uniquely). Do not
+/// re-conflate the arms.
 ///
 /// **Grandfathering-aware (2026-09):** which localpart to query is itself
 /// resolved via [`crate::localpart::resolve_identity`] (grandfathered legacy
 /// first, then modern) rather than a single fixed derivation — querying the
 /// wrong scheme for a migrated/modern-only account would silently read back
 /// "no account" and treat a deactivated user as new-identity-safe. A
-/// resolution failure fails closed exactly like a `query_user` failure below.
+/// resolution failure fails closed exactly like a `query_user` failure below,
+/// and for the same reason: **the FALLIBLE `resolve_identity`, never
+/// `resolve_identity_or_legacy`.** The fail-safe legacy guess would hand this
+/// gate a localpart that may not be the user's, and `query_user` on the wrong
+/// localpart answers `Ok(None)` — which this function reads as "no account,
+/// nothing to reject". That is a live deactivation bypass, not a degradation,
+/// which is why the guess is refused here and the whole request fails instead.
+/// See the ordering note at this gate's `oidc::sign_in` call site.
 pub async fn reject_if_deactivated(
     synapse: Option<&crate::synapse_client::SynapseClient>,
     did: &str,
@@ -237,13 +377,22 @@ pub async fn reject_if_deactivated(
         None => return Ok(()),
     };
     let localpart = match crate::localpart::resolve_identity(did, Some(synapse)).await {
-        Ok(resolved) => resolved.localpart,
+        // Still fails CLOSED — not negotiable. Only the diagnosis changed: "we
+        // could not check" is a server fault, not "your account was
+        // deactivated" (see DEACTIVATION_CHECK_UNAVAILABLE_MSG). The underlying
+        // error stays here in the log, where an operator can act on it, and
+        // never goes on the wire to the caller.
         Err(e) => {
-            warn!(did = %did, "identity resolution failed, rejecting to avoid reviving a deactivated account: {}", e);
-            return Err(crate::oidc::CustomError::Unauthorized(
-                DEACTIVATED_REJECT_MSG.to_string(),
+            warn!(
+                did = %did,
+                error = %e,
+                "identity resolution failed, rejecting to avoid reviving a deactivated account"
+            );
+            return Err(crate::oidc::CustomError::ServiceUnavailable(
+                DEACTIVATION_CHECK_UNAVAILABLE_MSG.to_string(),
             ));
         }
+        Ok(resolved) => resolved.localpart,
     };
     match synapse.query_user(&localpart).await {
         Ok(Some(info)) if info.is_deactivated => {
@@ -254,10 +403,19 @@ pub async fn reject_if_deactivated(
         }
         // Active account, or no account at all (the new-identity case).
         Ok(_) => Ok(()),
+        // The second half of the same fail-closed-but-honest rule as the
+        // resolution arm above: reachable on its own whenever
+        // `is_localpart_available` answers but `query_user` does not (a partial
+        // Synapse outage, a proxy serving one MAS route and not the other, a
+        // rotated shared secret racing a restart).
         Err(e) => {
-            warn!(did = %did, "deactivation probe failed, rejecting to avoid reviving a deactivated account: {}", e);
-            Err(crate::oidc::CustomError::Unauthorized(
-                DEACTIVATED_REJECT_MSG.to_string(),
+            warn!(
+                did = %did,
+                error = %e,
+                "deactivation probe failed, rejecting to avoid reviving a deactivated account"
+            );
+            Err(crate::oidc::CustomError::ServiceUnavailable(
+                DEACTIVATION_CHECK_UNAVAILABLE_MSG.to_string(),
             ))
         }
     }
@@ -869,6 +1027,9 @@ pub fn build_webauthn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use siwx_oidc::mxid::legacy_localpart;
+    use std::collections::{HashMap, HashSet};
+    use tokio::task::JoinHandle;
 
     /// `derive_did_from_credential_json` is the resolver `RedisClient::purge_identity`
     /// uses for its best-effort standalone-credential pass (pass b). It MUST fail
@@ -1051,7 +1212,6 @@ mod tests {
     #[tokio::test]
     async fn a_genuinely_new_identity_still_gets_the_new_identity_message() {
         use crate::localpart::resolve_identity_tests::spawn_mock_synapse_with_did_fields;
-        use std::collections::{HashMap, HashSet};
 
         let (synapse, handle) =
             spawn_mock_synapse_with_did_fields(HashSet::new(), HashMap::new()).await;
@@ -1173,11 +1333,19 @@ mod tests {
         );
     }
 
-    /// Fail-closed: a present-but-UNREACHABLE Synapse is a detection failure. It
-    /// must NOT fall through to a working session — that is exactly the bypass
-    /// this gate exists to close, and a Synapse outage is the moment it would
-    /// matter most. Unlike the new-identity gate this surfaces `Unauthorized`,
-    /// because the semantic is "you may not sign in", not "your request was bad".
+    /// Fail-closed AND honestly diagnosed: a present-but-UNREACHABLE Synapse is a
+    /// detection failure. It must NOT fall through to a working session — that is
+    /// exactly the bypass this gate exists to close, and a Synapse outage is the
+    /// moment it would matter most.
+    ///
+    /// It rejects — and since 2026-09-13 it rejects as a **server fault**, with
+    /// `DEACTIVATION_CHECK_UNAVAILABLE_MSG`, not by claiming the account was
+    /// deactivated. That separation is the whole point: a single unhealthy
+    /// homeserver used to tell every user on it that their account had been
+    /// deactivated and that they should go and argue with an administrator.
+    /// Points at an unroutable endpoint so the request fails fast without a live
+    /// Synapse; this is the `resolve_identity` half of the two `Err` arms (the
+    /// `query_user` half has its own test below).
     #[tokio::test]
     async fn reject_if_deactivated_fails_closed_on_synapse_error() {
         // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): guaranteed non-routable.
@@ -1186,13 +1354,321 @@ mod tests {
             .await
             .expect_err("probe failure must reject, not revive a deactivated account");
         match err {
-            crate::oidc::CustomError::Unauthorized(msg) => {
-                assert_eq!(msg, DEACTIVATED_REJECT_MSG);
+            crate::oidc::CustomError::ServiceUnavailable(msg) => {
+                assert_eq!(msg, DEACTIVATION_CHECK_UNAVAILABLE_MSG);
+                // Asserted EXPLICITLY, not merely implied by the line above: the
+                // two messages being distinguishable IS the fix, so a future
+                // "simplification" back onto one string has to fail here rather
+                // than quietly restore the false accusation.
+                assert_ne!(
+                    msg, DEACTIVATED_REJECT_MSG,
+                    "a probe failure must never be reported as 'your account was deactivated'"
+                );
             }
-            other => panic!("expected Unauthorized, got {:?}", other),
+            other => panic!("expected ServiceUnavailable, got {:?}", other),
         }
     }
 
+    /// The OTHER `Err` arm, which the unreachable-host test above cannot reach:
+    /// `is_localpart_available` answers normally (so `resolve_identity` succeeds
+    /// and hands back a localpart) and then `query_user` fails.
+    ///
+    /// This is not a contrived split. The two probes are different routes with
+    /// different handlers, so a proxy serving one and not the other, a partial
+    /// Synapse outage, or a shared secret rotated between the two calls all land
+    /// here and nowhere else. Before this test the arm was entirely unguarded —
+    /// the audit found it had no coverage at all.
+    #[tokio::test]
+    async fn a_query_user_failure_is_a_probe_failure_not_a_deactivation() {
+        let (synapse, handle) = spawn_mas_mock(MasMock {
+            // The account EXISTS under the legacy shape, so `resolve_identity`
+            // grandfathers it and returns without ever consulting `query_user`.
+            existing: HashSet::from([legacy_localpart(DEACTIVATION_TEST_DID)]),
+            // …and then the deactivation probe itself is the thing that breaks.
+            query_user_status: Some(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+            ..MasMock::default()
+        })
+        .await;
+        let err = reject_if_deactivated(Some(&synapse), DEACTIVATION_TEST_DID)
+            .await
+            .expect_err("a failed deactivation probe must reject, not let the user through");
+        match err {
+            crate::oidc::CustomError::ServiceUnavailable(msg) => {
+                assert_eq!(msg, DEACTIVATION_CHECK_UNAVAILABLE_MSG);
+                assert_ne!(
+                    msg, DEACTIVATED_REJECT_MSG,
+                    "our own broken probe is not the user's deactivated account"
+                );
+            }
+            other => panic!("expected ServiceUnavailable, got {:?}", other),
+        }
+        handle.abort();
+    }
+
+    /// **The positive case, which had NO test at all until 2026-09-13.** The
+    /// audit disabled the `is_deactivated` arm outright and the entire suite
+    /// stayed green: every "deactivation" assertion in the file was actually
+    /// being satisfied by a *probe failure* returning the same message, so the
+    /// gate's whole reason for existing was unverified.
+    ///
+    /// A genuinely deactivated account — Synapse healthy, `query_user` answering
+    /// `is_deactivated: true` — must get `Unauthorized(DEACTIVATED_REJECT_MSG)`,
+    /// and must NOT get the server-fault message. Together with the two `Err`
+    /// tests above this is what stops the arms collapsing back into one.
+    ///
+    /// The mock models production exactly: Synapse reports a deactivated user's
+    /// localpart as *taken*, which is precisely why the new-identity gate does
+    /// not catch these users and this gate had to exist.
+    #[tokio::test]
+    async fn a_genuinely_deactivated_account_still_gets_the_deactivated_message() {
+        let legacy = legacy_localpart(DEACTIVATION_TEST_DID);
+        let (synapse, handle) = spawn_mas_mock(MasMock {
+            existing: HashSet::from([legacy.clone()]),
+            users: HashMap::from([(legacy, true)]),
+            ..MasMock::default()
+        })
+        .await;
+        let err = reject_if_deactivated(Some(&synapse), DEACTIVATION_TEST_DID)
+            .await
+            .expect_err("a deactivated account must not be able to sign back in");
+        match err {
+            crate::oidc::CustomError::Unauthorized(msg) => {
+                assert_eq!(msg, DEACTIVATED_REJECT_MSG);
+                assert_ne!(
+                    msg, DEACTIVATION_CHECK_UNAVAILABLE_MSG,
+                    "a determinate 'this account is deactivated' must not be dressed up \
+                     as a transient server fault the user should retry"
+                );
+            }
+            other => panic!("expected Unauthorized, got {:?}", other),
+        }
+        handle.abort();
+    }
+
+    /// The two `Ok` arms, pinned so the gate cannot become a blanket reject the
+    /// moment someone hardens it. An ACTIVE account passes, and an ABSENT one
+    /// passes too — the absent case belongs to `reject_if_new_identity`, and
+    /// conflating it here would break legitimate first-time sign-in at the login
+    /// screen, which is the one place account creation is allowed.
+    #[tokio::test]
+    async fn an_active_or_absent_account_passes_the_deactivation_gate() {
+        let legacy = legacy_localpart(DEACTIVATION_TEST_DID);
+        let (synapse, handle) = spawn_mas_mock(MasMock {
+            existing: HashSet::from([legacy.clone()]),
+            users: HashMap::from([(legacy, false)]),
+            ..MasMock::default()
+        })
+        .await;
+        assert!(
+            reject_if_deactivated(Some(&synapse), DEACTIVATION_TEST_DID)
+                .await
+                .is_ok(),
+            "an ACTIVE account must pass the deactivation gate"
+        );
+        handle.abort();
+
+        // A genuinely unknown identity: BOTH localpart shapes read as free, so
+        // `resolve_identity` reports `is_new` and hands back the modern shape,
+        // and the mock has no `users` entry for it -> 404 -> `Ok(None)`.
+        let (synapse, handle) = spawn_mas_mock(MasMock::default()).await;
+        assert!(
+            reject_if_deactivated(Some(&synapse), DEACTIVATION_TEST_DID)
+                .await
+                .is_ok(),
+            "an ABSENT account is the new-identity case and belongs to \
+             reject_if_new_identity, not to this gate — rejecting it here would \
+             break first-time sign-in at the login screen"
+        );
+        handle.abort();
+    }
+
+    /// The deactivation-failure message is rendered VERBATIM to the caller: the
+    /// account and device-approval pages show the response body for any non-2xx,
+    /// and `/sign_in` is a full-page navigation whose body the browser paints as
+    /// plain text. The caller has proven a DID and nothing else, so the message
+    /// must carry no operational detail — a leaked "500 from /_synapse/mas" would
+    /// hand a stranger a map of our internals.
+    ///
+    /// Everything diagnostic belongs in the `warn!` beside the reject instead,
+    /// which only an operator reads. This pins both directions: what the message
+    /// must NOT say, and the two things the wording is REQUIRED to convey (retry,
+    /// then escalate). It also pins the one claim that must be absent — that the
+    /// account was deactivated — which is the entire reason the constant exists.
+    #[test]
+    fn the_deactivation_failure_message_leaks_no_server_internals() {
+        let lower = DEACTIVATION_CHECK_UNAVAILABLE_MSG.to_lowercase();
+        for forbidden in [
+            "secret",
+            "synapse",
+            "500",
+            "503",
+            "403",
+            "401",
+            "errcode",
+            "m_",
+            "token",
+            "http",
+            "localpart",
+            "mxid",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "the deactivation-failure message must not mention {forbidden:?}: \
+                 {DEACTIVATION_CHECK_UNAVAILABLE_MSG}"
+            );
+        }
+        // And it must not make the one claim that is actively FALSE here, which
+        // is the entire reason this constant exists.
+        assert!(
+            !lower.contains("deactivat"),
+            "a probe failure must not be reported as 'your account was deactivated': \
+             {DEACTIVATION_CHECK_UNAVAILABLE_MSG}"
+        );
+        assert!(
+            lower.contains("try again"),
+            "the condition is transient, so the message must invite a retry: \
+             {DEACTIVATION_CHECK_UNAVAILABLE_MSG}"
+        );
+        assert!(
+            lower.contains("administrator"),
+            "a persisting server fault needs an escalation path: \
+             {DEACTIVATION_CHECK_UNAVAILABLE_MSG}"
+        );
+    }
+
+    /// The two "could not check" messages are byte-equal ON PURPOSE, and this
+    /// test is where that decision is recorded.
+    ///
+    /// On the account and device-approval paths `reject_if_new_identity` runs
+    /// immediately before `reject_if_deactivated`. If the two 503 bodies differed,
+    /// a caller could tell WHICH gate they reached — i.e. that they got past the
+    /// new-identity check, i.e. that an account exists for their DID. That fact is
+    /// already public via `GET /resolve?did=…`, so this is a small thing; but it
+    /// costs nothing to close and there is no compensating benefit, because a user
+    /// cannot act on which internal probe failed and an operator reads the two
+    /// distinct `warn!` lines rather than the body.
+    ///
+    /// They remain two constants rather than one alias because they belong to two
+    /// gates with two different owners. If a future change makes them diverge
+    /// deliberately, delete this test *and say why here* — do not weaken it to an
+    /// `assert_ne!`, and do not merge the constants either.
+    #[test]
+    fn the_two_unavailable_messages_are_deliberately_indistinguishable() {
+        assert_eq!(
+            DEACTIVATION_CHECK_UNAVAILABLE_MSG, IDENTITY_CHECK_UNAVAILABLE_MSG,
+            "two distinguishable 'could not check' bodies would tell the caller which \
+             gate they reached, and so whether an account exists — see this test's doc"
+        );
+        // The pair being equal must not be allowed to make the OTHER pair equal:
+        // "we could not check" and "you are deactivated" are the split this whole
+        // fix is about.
+        assert_ne!(DEACTIVATION_CHECK_UNAVAILABLE_MSG, DEACTIVATED_REJECT_MSG);
+        assert_ne!(IDENTITY_CHECK_UNAVAILABLE_MSG, NEW_IDENTITY_REJECT_MSG);
+    }
+
+    // -- MAS mock for the deactivation gate ----------------------------------
+    //
+    // `localpart::resolve_identity_tests`'s mock serves `is_localpart_available`
+    // but NOT `query_user`, so it cannot express any of the states this gate
+    // actually decides on. Rather than widen a helper another module owns, the
+    // deactivation tests carry their own two-route mock — which is also the only
+    // way to fault ONE of the two routes while the other answers normally, the
+    // exact shape `a_query_user_failure_is_a_probe_failure_not_a_deactivation`
+    // needs.
+
+    /// A `did:key` whose legacy localpart is short enough to be a valid Synapse
+    /// user id, so `resolve_identity` grandfathers it instead of taking the
+    /// `Unusable` branch. Shared by the deactivation tests so the mock's
+    /// `existing`/`users` keys always name the same account.
+    const DEACTIVATION_TEST_DID: &str = "did:key:zDnDEACTIVATIONGATE";
+
+    #[derive(Default)]
+    struct MasMock {
+        /// Localparts that read as "already taken": `400 M_USER_IN_USE`. A
+        /// deactivated user's localpart IS taken as far as Synapse is concerned,
+        /// which is exactly why this gate had to exist.
+        existing: HashSet<String>,
+        /// localpart -> `is_deactivated`. A localpart with no entry answers 404,
+        /// which `query_user` maps to `Ok(None)` (no such account).
+        users: HashMap<String, bool>,
+        /// When set, `query_user` answers this status with no body instead of
+        /// doing anything — the lever for faulting ONE of the two routes.
+        query_user_status: Option<axum::http::StatusCode>,
+    }
+
+    async fn spawn_mas_mock(
+        cfg: MasMock,
+    ) -> (crate::synapse_client::SynapseClient, JoinHandle<()>) {
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::sync::Arc;
+
+        async fn available(
+            State(cfg): State<Arc<MasMock>>,
+            Query(params): Query<HashMap<String, String>>,
+        ) -> axum::response::Response {
+            let localpart = params.get("localpart").cloned().unwrap_or_default();
+            if cfg.existing.contains(&localpart) {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"errcode": "M_USER_IN_USE", "error": "in use"})),
+                )
+                    .into_response()
+            } else {
+                (
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::json!({"available": true})),
+                )
+                    .into_response()
+            }
+        }
+
+        async fn query_user(
+            State(cfg): State<Arc<MasMock>>,
+            Query(params): Query<HashMap<String, String>>,
+        ) -> axum::response::Response {
+            if let Some(status) = cfg.query_user_status {
+                return (status, "").into_response();
+            }
+            let localpart = params.get("localpart").cloned().unwrap_or_default();
+            match cfg.users.get(&localpart) {
+                Some(is_deactivated) => (
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::json!({
+                        "user_id": format!("@{localpart}:example.org"),
+                        "display_name": null,
+                        "avatar_url": null,
+                        "is_suspended": false,
+                        "is_deactivated": is_deactivated,
+                    })),
+                )
+                    .into_response(),
+                // Synapse's own "no such user" shape, which `query_user` reads as
+                // `Ok(None)` — the new-identity case, not a failure.
+                None => (
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"errcode": "M_NOT_FOUND", "error": "User not found"})),
+                )
+                    .into_response(),
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral mas-mock port");
+        let addr = listener.local_addr().expect("mas-mock local_addr");
+        let app = Router::new()
+            .route("/_synapse/mas/is_localpart_available", get(available))
+            .route("/_synapse/mas/query_user", get(query_user))
+            .with_state(Arc::new(cfg));
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mas-mock server");
+        });
+        let client = crate::synapse_client::SynapseClient::new(&format!("http://{addr}"), "secret");
+        (client, handle)
+    }
     /// The gate reads exactly one field off the MAS wire, so pin the shape of
     /// `MasQueryUserResource.Response` (synapse 1.159.0). Two properties matter:
     /// an ACTIVE user must parse to `is_deactivated == false` (a parse that

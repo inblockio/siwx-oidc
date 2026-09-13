@@ -485,7 +485,13 @@ class Handler(BaseHTTPRequestHandler):
                 with LOCK:
                     exists = localpart in EXISTING_USERS
                 if exists:
-                    # Taken: the siwx-oidc client treats any 4xx as "not available"
+                    # Taken. NOTE the errcode is load-bearing: since 2026-09-12
+                    # the client reads ONLY `M_USER_IN_USE` as "taken"
+                    # (`classify_localpart_refusal`). `M_INVALID_USERNAME` /
+                    # `M_EXCLUSIVE` mean "Synapse refuses this name", and every
+                    # other 4xx is INDETERMINATE and becomes an Err. The old
+                    # "any 4xx = not available" behaviour this comment used to
+                    # describe was the defect, not the contract.
                     # (an EXISTING account), so the new-identity gate does NOT reject.
                     return self._send(400, {"errcode": "M_USER_IN_USE", "error": "in use"})
                 return self._send(200, {"available": True})
@@ -556,7 +562,10 @@ class Handler(BaseHTTPRequestHandler):
     def _profile_field_get(self, raw_user_id, field):
         """GET /_matrix/client/v3/profile/{mxid}/{field} (MSC4133).
 
-        siwx-oidc does not call this; tests do, to read back what
+        siwx-oidc DOES call this in production: since `/resolve` shipped it is
+        that endpoint's read path (`synapse_client::read_did_field`), which since
+        2026-09-13 reads ANONYMOUSLY first and only mints a token if the
+        homeserver answers 401/403. Tests also call it, to read back what
         `publish_did_field` wrote. A row-less account 500s here rather than
         404ing because element-hq/synapse#19702 bites on READS too:
         `get_profile_field` subscripts an unguarded `txn.fetchone()`.

@@ -325,7 +325,10 @@ pub enum CustomError {
     /// request that was already correct. That is not a cosmetic distinction —
     /// the first user of this variant
     /// ([`crate::webauthn::reject_if_new_identity`]) spent its 400 telling a
-    /// legitimate user to create an account they may well already have.
+    /// legitimate user to create an account they may well already have, and the
+    /// second ([`crate::webauthn::reject_if_deactivated`]) spent its **401**
+    /// telling every user on an unhealthy homeserver that their account had been
+    /// deactivated. Both were safe and both were false.
     ///
     /// Not [`CustomError::Other`]'s 500 either: this is a KNOWN, classified,
     /// handled, fail-closed condition, and the flows that raise it are
@@ -2444,6 +2447,41 @@ pub async fn sign_in(
     // erased account signed straight back in and got a full session. Placed
     // after the DID is proven but BEFORE `provision_synapse_device`, so a
     // rejected sign-in leaves no Synapse state behind.
+    //
+    // # This runs BEFORE `resolve_identity_or_legacy` below, DELIBERATELY
+    //
+    // The 2026-09-13 audit observed that because this gate fails closed on a
+    // probe error, a PERSISTENT Synapse fault can never reach the
+    // `resolve_identity_or_legacy` call ~20 lines down, and therefore never
+    // reaches the `degraded` guard that suppresses DID publication (2026-09-10
+    // audit, D4) — making that guard look like near-dead code on the login path.
+    // The observation is correct and the ordering is still right. Do not swap
+    // them to "make the guard reachable".
+    //
+    // Swapping them would not trade coverage for safety, it would build a live
+    // deactivation BYPASS. `resolve_identity_or_legacy` is infallible by
+    // construction: on a probe error it returns the fail-safe LEGACY localpart
+    // with `degraded: true`. Feed that guess to the gate and, for a modern-only
+    // account, `query_user(legacy_localpart)` answers 404 — which the gate reads
+    // as `Ok(None)`, "no such account, nothing to reject" — and the deactivated
+    // user signs in. That is not hypothetical: the two MAS probes are separate
+    // routes, so a partial fault where `is_localpart_available` fails and
+    // `query_user` answers is exactly the shape
+    // `webauthn::tests::a_query_user_failure_is_a_probe_failure_not_a_deactivation`
+    // models. This is why `reject_if_deactivated` calls the FALLIBLE
+    // `resolve_identity` and refuses the guess — the same rule `resolve.rs`
+    // follows, for the same reason.
+    //
+    // `degraded` is narrowed on this path, not dead. It still fires here when
+    // the fault arrives BETWEEN the gate's probe and the resolution below (two
+    // independent round trips — a flaky or mid-restart Synapse), which is
+    // precisely the residual window a fail-closed gate cannot cover. And it is
+    // fully exercised on the paths that have no gate in front of it: the
+    // device-code grant in `token` (this file, `resolve_identity_or_legacy`
+    // under `grant_type=device_code` — the deactivation gate for that flow ran
+    // at APPROVAL time, in a different request, possibly minutes earlier), and
+    // the cosmetic `detected_mxid` / `new_user` displays in
+    // `axum_lib::detected_mxid_for` and `webauthn_authenticate_finish`.
     crate::webauthn::reject_if_deactivated(synapse_client, &did).await?;
 
     // C2 Step 3: re-validate the request redirect_uri against the client's
@@ -2466,6 +2504,14 @@ pub async fn sign_in(
     // must not fail sign-in, so an error degrades to the legacy localpart
     // (never the modern one — see resolve_identity_or_legacy's fail-safe
     // direction) exactly like the pre-existing degraded-provisioning path.
+    //
+    // ORDERING (2026-09-13 audit): `reject_if_deactivated` above has already
+    // failed closed on a persistent probe error, so on THIS path the `degraded`
+    // fallback covers only the residual window — a fault arriving between that
+    // gate's probe and this one. That is deliberate and must not be "fixed" by
+    // reordering: the full argument, including the deactivation bypass a swap
+    // would open and the paths that do exercise `degraded` freely, is at the
+    // gate's call site above.
     let resolved = crate::localpart::resolve_identity_or_legacy(&did, synapse_client).await;
     let device_id = provision_synapse_device(
         &did,

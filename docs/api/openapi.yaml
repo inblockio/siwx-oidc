@@ -70,7 +70,7 @@ tags:
   - name: OIDC
     description: The standard OpenID Connect surface (discovery, tokens, userinfo, registration).
   - name: Identity
-    description: DID ↔ MXID lookup. Read-only, and a discovery hint only.
+    description: DID ↔ MXID lookup, and a discovery hint only. Reads no caller credential and provisions nothing on a stock homeserver; on one setting `require_auth_for_profile_requests` it mints a service token (and provisions its service user) once per token lifetime to read the profile field.
   - name: Sign-in ceremonies
     description: Browser flows that produce a verified DID — CAIP-122 wallet and WebAuthn passkey.
   - name: Device grant
@@ -336,6 +336,13 @@ paths:
           content: { application/json: { schema: { $ref: "#/components/schemas/ResolveError" } } }
         "502":
           description: The homeserver could not be asked. Never a guessed answer.
+        '504':
+          $ref: '#/components/responses/ResolveError'
+          description: |
+            The whole lookup exceeded its deadline. Distinct from 502: a 502 is
+            an answer we could not use, a 504 is calls that CHAINED past the
+            budget. The per-call timeout is lower, so a single slow call still
+            reports as a 502 naming what failed.
           content: { application/json: { schema: { $ref: "#/components/schemas/ResolveError" } } }
         "503":
           description: This deployment has no homeserver configured and cannot answer.

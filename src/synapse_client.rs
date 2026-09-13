@@ -1395,6 +1395,20 @@ impl SynapseClient {
     /// shipped binary links none of it (see `CLAUDE.md`, "Verifying a published
     /// DID"). A caller that needs cryptographic assurance runs that verifier;
     /// what this returns is a discovery hint.
+    ///
+    /// # It reads ANONYMOUSLY, and mints a credential only if refused
+    ///
+    /// The request goes out with no `Authorization` header. A minted admin
+    /// token is attached only on a **retry**, and only when the homeserver
+    /// answered 401/403 — i.e. only on a deployment that sets
+    /// `require_auth_for_profile_requests: true`.
+    ///
+    /// That ordering is a security property of `GET /resolve`, not a
+    /// performance tweak: minting is not free, it **provisions the admin
+    /// service user** when that row is missing and writes a token to Redis, so
+    /// an eager mint made one anonymous public GET create a Matrix account (F4
+    /// of `docs/audits/2026-09-13-post-resolve-slice-adversarial-audit.md`). Do
+    /// not "simplify" this back into a single authenticated request.
     pub async fn read_did_field(
         &self,
         localpart: &str,
@@ -1410,24 +1424,76 @@ impl SynapseClient {
             DID_PROFILE_FIELD
         );
 
-        // Unauthenticated unless an admin token happens to be available — the
-        // same best-effort rule as `read_profile`, and for the same reason: the
-        // route authenticates only when `require_auth_for_profile_requests` is
-        // set (Synapse 1.159.0 `config/server.py:561` defaults it to False), so
-        // a mint failure must degrade to the request that works today rather
-        // than fail the read.
-        let mut req = self.http.get(&url);
-        if self.admin.is_some() {
-            match self.admin_bearer().await {
-                Ok(token) => req = req.bearer_auth(token),
-                Err(e) => debug!(
-                    error = %e,
-                    "read_did_field: no admin token available; sending unauthenticated \
-                     (fine unless require_auth_for_profile_requests is set)"
-                ),
+        // ANONYMOUS FIRST. A credential is minted only if the homeserver
+        // actually asks for one.
+        //
+        // This route authenticates only when `require_auth_for_profile_requests`
+        // is set (Synapse 1.159.0 `config/server.py:561` defaults it to False),
+        // so on a stock homeserver the anonymous GET is the request that works,
+        // and it is the only request this read needs.
+        //
+        // The order is load-bearing, not a micro-optimisation, because this is
+        // the read `crate::resolve` performs and `GET /resolve` is PUBLIC and
+        // UNAUTHENTICATED. `admin_bearer` is not a credential lookup: on a cold
+        // cache it probes `is_localpart_available`, **provisions the admin
+        // service user when that row is missing**, and writes a token into
+        // Redis. Minting up front therefore made one anonymous `GET /resolve`
+        // create a Matrix account and mint an admin credential — measured, and
+        // filed as F4 of `docs/audits/2026-09-13-post-resolve-slice-adversarial-audit.md`
+        // — on a route whose entire contract is that it reads.
+        //
+        // The admin path is RETRIED, not deleted: a deployment that does set
+        // `require_auth_for_profile_requests: true` answers 401 here, and for
+        // that deployment the minted token is the only way to read the field at
+        // all. Lazy keeps both deployments working and gives the side effect to
+        // only the one that cannot avoid it.
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("read_did_field: request failed")?;
+
+        // 401/403 is the homeserver saying this route needs a credential, and
+        // it is the ONLY condition a mint can repair. Every other status is
+        // answered as it stands: a 404 is an unset field and a 500 is
+        // element-hq/synapse#19702 — a token changes neither, and asking for one
+        // would buy the provisioning side effect above for nothing.
+        let resp = match (resp.status(), self.admin.is_some()) {
+            (reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN, true) => {
+                match self.admin_bearer().await {
+                    Ok(token) => {
+                        debug!(
+                            %user_id,
+                            "read_did_field: the homeserver requires authentication on the \
+                             profile route; retrying once with a minted admin token"
+                        );
+                        self.http
+                            .get(&url)
+                            .bearer_auth(token)
+                            .send()
+                            .await
+                            .context("read_did_field: authenticated retry failed")?
+                    }
+                    // No degradation is available here: the anonymous attempt
+                    // has ALREADY been refused, so the 401/403 is carried
+                    // forward and reported as the error it is. Reporting it as
+                    // `Ok(None)` would turn "we could not look" into "this user
+                    // has no DID", which is the one conflation this function's
+                    // return shape exists to prevent.
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            %user_id,
+                            "read_did_field: the profile route demands authentication and no \
+                             admin token could be minted"
+                        );
+                        resp
+                    }
+                }
             }
-        }
-        let resp = req.send().await.context("read_did_field: request failed")?;
+            _ => resp,
+        };
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -2247,6 +2313,15 @@ mod tests {
         /// cases under test is a body that is **not JSON at all** — which is
         /// exactly the shape a `Json` reply could not produce.
         localpart_reply: (axum::http::StatusCode, String),
+        /// Model a homeserver configured with
+        /// `require_auth_for_profile_requests: true`: a FIELD-scoped profile
+        /// GET carrying no `Authorization` header is answered
+        /// `401 M_MISSING_TOKEN`, exactly as Synapse's `ProfileRestServlet`
+        /// does, and the same request with one is answered normally.
+        ///
+        /// Default `false`, which is stock Synapse (`config/server.py:561`) and
+        /// what every other test in this module assumes.
+        require_auth_on_profile_field: bool,
     }
 
     impl MockReplies {
@@ -2264,6 +2339,7 @@ mod tests {
                     json!({"errcode": "M_USER_IN_USE", "error": "User ID already taken."})
                         .to_string(),
                 ),
+                require_auth_on_profile_field: false,
             }
         }
 
@@ -2280,6 +2356,13 @@ mod tests {
         /// Answer `is_localpart_available` with this status and RAW body.
         fn localpart(mut self, status: axum::http::StatusCode, body: &str) -> Self {
             self.localpart_reply = (status, body.to_string());
+            self
+        }
+
+        /// Demand an `Authorization` header on the field-scoped profile GET —
+        /// see [`MockReplies::require_auth_on_profile_field`].
+        fn require_auth_on_profile_field(mut self) -> Self {
+            self.require_auth_on_profile_field = true;
             self
         }
     }
@@ -2362,6 +2445,16 @@ mod tests {
                 && !path.ends_with(DID_PROFILE_FIELD)
         }
 
+        /// True for the FIELD-scoped profile GET
+        /// (`…/profile/{mxid}/io.inblock.did`) — the read
+        /// [`SynapseClient::read_did_field`] performs, and the exact complement
+        /// of [`is_whole_profile_get`].
+        fn is_profile_field_get(method: &str, path: &str) -> bool {
+            method == "GET"
+                && path.starts_with("/_matrix/client/v3/profile/")
+                && path.ends_with(DID_PROFILE_FIELD)
+        }
+
         async fn record(State(state): State<MockState>, req: Request) -> axum::response::Response {
             let method = req.method().to_string();
             let path = req.uri().path().to_string();
@@ -2376,12 +2469,29 @@ mod tests {
             let body: serde_json::Value =
                 serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
             let whole_profile_get = is_whole_profile_get(&method, &path);
+            let unauthenticated_field_get = state.replies.require_auth_on_profile_field
+                && is_profile_field_get(&method, &path)
+                && authorization.is_none();
             state.log.lock().unwrap().push(RecordedRequest {
                 method,
                 path,
                 authorization,
                 body,
             });
+            // Refuse AFTER recording: a mock that drops the requests it rejects
+            // cannot prove the anonymous attempt was made at all, and "was the
+            // anonymous attempt made first" is the whole assertion of the
+            // lazy-mint tests.
+            if unauthenticated_field_get {
+                return (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    axum::Json(json!({
+                        "errcode": "M_MISSING_TOKEN",
+                        "error": "Missing access token",
+                    })),
+                )
+                    .into_response();
+            }
             if whole_profile_get {
                 let (status, body) = state.replies.profile_reply.clone();
                 return (status, axum::Json(body)).into_response();
@@ -2923,6 +3033,145 @@ mod tests {
             None,
             "a field of the wrong JSON type publishes nothing — and must not panic"
         );
+    }
+
+    // -- read_did_field: the lazy mint (audit finding F4) --------------------
+    //
+    // `read_did_field` is the one Synapse call `GET /resolve` makes on behalf
+    // of an ANONYMOUS caller, and `admin_bearer` is not a credential lookup: on
+    // a cold cache it probes `is_localpart_available`, provisions the admin
+    // service user when that row is missing, and writes a token into Redis. So
+    // "does this read mint" is a question about what an unauthenticated public
+    // GET is allowed to do to the homeserver, not about latency.
+    //
+    // Both tests need a real `RedisClient` for the same reason the
+    // `publish_did_field` tests do (`AdminMint.db` is the concrete type), and
+    // follow the same skip-when-Redis-is-absent pattern. A client with NO mint
+    // configured could not fail these at all — the mint is exactly what is
+    // under test — so the mint is attached deliberately and the tests assert it
+    // stays unused.
+
+    /// The DID these two publish. Mixed case on purpose: `did:key` case is key
+    /// material (siwx-oidc#17), so a lowercase vector could not tell "returned
+    /// verbatim" apart from "lowercased and happened to match".
+    const LAZY_MINT_DID: &str = "did:key:zDnaeUKTWUXc1mxSoRrEfV6wPWmQyHrKuTHLZgAkyUKfSbeMB";
+
+    /// A mock that serves the published field as a stock, unauthenticated
+    /// Synapse does, and answers `is_localpart_available` with **available** —
+    /// so that an eager mint is forced to reveal itself by provisioning the
+    /// admin service user.
+    fn unauthenticated_profile_mock() -> MockReplies {
+        MockReplies::new(axum::http::StatusCode::OK)
+            .body(json!({ DID_PROFILE_FIELD: { "did": LAZY_MINT_DID } }))
+            .localpart(
+                axum::http::StatusCode::OK,
+                &json!({"available": true}).to_string(),
+            )
+    }
+
+    /// Reading a published DID from a homeserver that does not ask for
+    /// authentication provisions nobody and mints nothing.
+    ///
+    /// This is audit finding F4 in one assertion. Before the lazy mint, one
+    /// anonymous `GET /resolve` ran `is_localpart_available(siwx-admin)` ->
+    /// `provision_user(siwx-admin)` -> `set_token`, i.e. an unauthenticated
+    /// public read CREATED a Matrix account, on a route documented as
+    /// read-only.
+    ///
+    /// The mock answers `is_localpart_available` with **available** precisely so
+    /// that an eager mint cannot pass quietly: it would have to provision, and
+    /// the provisioning POST lands in the recorded log.
+    #[tokio::test]
+    async fn an_unauthenticated_profile_read_provisions_nobody_and_mints_nothing() {
+        let (client, log, handle) = spawn_mock_synapse(unauthenticated_profile_mock()).await;
+        let Some(client) = with_redis_mint(client).await else {
+            eprintln!("skipping: no Redis on localhost");
+            handle.abort();
+            return;
+        };
+
+        let published = client
+            .read_did_field("someone", "matrix.test")
+            .await
+            .expect("a reachable homeserver serving the field must answer");
+        assert_eq!(
+            published.as_deref(),
+            Some(LAZY_MINT_DID),
+            "the read itself must still work, verbatim"
+        );
+
+        let recorded = log.lock().unwrap().clone();
+        assert!(
+            !recorded
+                .iter()
+                .any(|r| r.path.ends_with("/_synapse/mas/provision_user")),
+            "an anonymous read must not create a Matrix account: {recorded:?}"
+        );
+        assert_eq!(
+            recorded.len(),
+            1,
+            "exactly one request — the profile GET — belongs on this path: {recorded:?}"
+        );
+        assert_eq!(
+            recorded[0].authorization, None,
+            "the read must go out with no credential at all, so nothing is minted to \
+             build one: {recorded:?}"
+        );
+        handle.abort();
+    }
+
+    /// A homeserver that DOES demand authentication on the profile route gets a
+    /// minted admin token on the retry, and the read still succeeds.
+    ///
+    /// The other half of the F4 fix: lazy must not mean "gone". A deployment
+    /// with `require_auth_for_profile_requests: true` is the one case where the
+    /// mint is the only way to read the field, and deleting the admin path
+    /// instead of deferring it would have broken exactly that deployment.
+    #[tokio::test]
+    async fn a_homeserver_demanding_auth_gets_a_minted_token_on_the_retry() {
+        let (client, log, handle) =
+            spawn_mock_synapse(unauthenticated_profile_mock().require_auth_on_profile_field())
+                .await;
+        let Some(client) = with_redis_mint(client).await else {
+            eprintln!("skipping: no Redis on localhost");
+            handle.abort();
+            return;
+        };
+
+        let published = client
+            .read_did_field("someone", "matrix.test")
+            .await
+            .expect("the authenticated retry must succeed");
+        assert_eq!(
+            published.as_deref(),
+            Some(LAZY_MINT_DID),
+            "the retry must return the field, not swallow it"
+        );
+
+        let recorded = log.lock().unwrap().clone();
+        let field_gets: Vec<&RecordedRequest> = recorded
+            .iter()
+            .filter(|r| r.method == "GET" && r.path.ends_with(DID_PROFILE_FIELD))
+            .collect();
+        assert_eq!(
+            field_gets.len(),
+            2,
+            "anonymous first, then exactly one authenticated retry: {recorded:?}"
+        );
+        assert_eq!(
+            field_gets[0].authorization, None,
+            "the FIRST attempt must be anonymous, or the lazy mint is not lazy"
+        );
+        let retry = field_gets[1]
+            .authorization
+            .as_deref()
+            .expect("the retry must carry a credential");
+        assert!(
+            retry.starts_with(&format!("Bearer {ADMIN_TOKEN_PREFIX}")),
+            "the retry must present a MINTED admin token, not the MAS shared secret \
+             (which answers 401 on this route since Synapse 1.157): {retry}"
+        );
+        handle.abort();
     }
 
     // -- localpart_status: the three answers, against the mock Synapse -------

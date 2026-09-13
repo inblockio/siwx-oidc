@@ -1059,11 +1059,17 @@ or a rejected MAS shared secret — is a `503` with `IDENTITY_CHECK_UNAVAILABLE_
 which names the server as the faulty party and leaks nothing operational. Both
 reject and nothing is provisioned either way; only the diagnosis differs. Collapsing
 them (the behaviour until 2026-09-12) told a legitimate user to create an account
-they may already have, over a fault they cannot fix. **The analogous split would be
-WRONG in `reject_if_deactivated`**, which deliberately does not distinguish
-"deactivated" from "could not tell" because that WOULD leak account state; the
-asymmetry is intentional — "this DID has no account here" is already public via
-`GET /resolve?did=…`. It is a strict no-op when no Synapse client is configured
+they may already have, over a fault they cannot fix. **`reject_if_deactivated` was given the same split on
+2026-09-13** (`DEACTIVATION_CHECK_UNAVAILABLE_MSG`, 503). The earlier claim that
+it would be WRONG there is WITHDRAWN: the leak argument assumed an
+unauthenticated prober, but all five call sites run after a CAIP-122 signature or
+a verified WebAuthn assertion — and on a healthy server the 401 already
+identified deactivation uniquely, so the conflation only blurred the answer
+during a fault the prober cannot induce. It protected nothing and misinformed
+everyone. **Do not reorder that gate to sit after `resolve_identity_or_legacy`**:
+that fallback is infallible and guesses the LEGACY localpart, so for a
+modern-only account `query_user(legacy)` answers 404 and a deactivated user signs
+in. It is a strict no-op when no Synapse client is configured
 (standalone deployments degrade, never 500). `login_finish` only reports `new_user`/`mxid` when a Synapse
 client + `server_name` are configured (else `new_user:false`, behaves as before).
 
