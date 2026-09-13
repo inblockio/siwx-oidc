@@ -29,3 +29,10 @@ export SYNAPSE_MOCK_SERVER_NAME="${SYNAPSE_MOCK_SERVER_NAME:-$SIWEOIDC_MATRIX_SE
 # MasDelegatedAuth does. Without this the mock cannot authorise ANY admin call
 # (deliberately: it refuses rather than rubber-stamping). See e2e/synapse_mock.py.
 export SYNAPSE_MOCK_OIDC_BASE="${SYNAPSE_MOCK_OIDC_BASE:-$SIWEOIDC_BASE_URL}"
+# `matrix_host()` in tests/e2e_device_code.rs, tests/e2e_msc3861.rs and
+# tests/e2e_session_teardown.rs. Its built-in default is :8448 -- a REAL Synapse
+# -- which the mock stack does not run, so those suites died on a refused
+# connection inside a bare `.unwrap()`. The mock serves the two C-S routes they
+# drive (GET account/whoami, GET devices) through a real introspection against
+# siwx-oidc. Overridable, because a real-stack run must still point at Synapse.
+export MATRIX_HOST="${MATRIX_HOST:-http://localhost:${SYNAPSE_MOCK_PORT}}"

@@ -543,7 +543,15 @@ async fn device_code_grant_end_to_end() {
         .bearer_auth(&access_token)
         .send()
         .await
-        .unwrap();
+        .unwrap_or_else(|e| {
+            // NOT softened to a skip. An unreachable homeserver is a broken
+            // harness, and this leg is the only place the Synapse->siwx-oidc
+            // introspection path is asserted; swallowing it would recreate the
+            // vacuity this suite was promoted to close. Name MATRIX_HOST,
+            // because the default (:8448) is a REAL Synapse and the CI mock
+            // stack serves :8090 -- which is exactly how this failed once.
+            panic!("MATRIX_HOST={matrix} is unreachable: {e}")
+        });
     let dev_status = dev_resp.status();
     eprintln!("[e2e] GET /_matrix/client/v3/devices -> {dev_status}");
     if dev_status == StatusCode::SERVICE_UNAVAILABLE {

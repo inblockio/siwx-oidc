@@ -26,6 +26,7 @@ shared secret, which is now a hard 401 in production and used to be fine).
 |---|---|---|
 | `/_synapse/mas/*` | `Authorization: Bearer <SECRET>`, exact string equality | provision_user, upsert_device, allow_cross_signing_reset, is_localpart_available, query_user, delete_device, delete_user, reactivate_user |
 | `/_synapse/admin/*` + the AUTHENTICATED C-S API | a **minted admin token** (`src/admin_token.rs`, `msa_` prefix), validated by REAL introspection against siwx-oidc | list_devices (get_device is list+filter), keys/query, PUT profile field |
+| the AUTHENTICATED C-S API, as the USER | the caller's OWN access token (`mat_` / standalone), validated by the SAME real introspection | account/whoami, GET devices |
 | the UNauthenticated C-S API | none | GET profile, GET profile field |
 
 The admin surface is NOT a rubber stamp: `_admin_auth` introspects the presented
@@ -66,6 +67,13 @@ nondeterministic, so every admin request introspects.
   GET    /_synapse/admin/v2/users/{mxid}/devices  synapse_client::list_devices (and get_device)
   POST   /_matrix/client/v3/keys/query            synapse_client::has_cross_signing_keys
   PUT    /_matrix/client/v3/profile/{mxid}/{field} synapse_client::publish_did_field
+
+  -- authenticated C-S API, as the USER (the caller's own access token) ------
+  GET    /_matrix/client/v3/account/whoami        tests/e2e_msc3861.rs,
+                                                  tests/e2e_session_teardown.rs
+  GET    /_matrix/client/v3/devices               tests/e2e_device_code.rs
+         siwx-oidc itself calls NEITHER: these are the Synapse->siwx-oidc
+         introspection leg, driven by the e2e suites as the user would.
 
   -- unauthenticated C-S API -------------------------------------------------
   GET    /_matrix/client/v3/profile/{mxid}        synapse_client::has_profile_row
@@ -220,6 +228,32 @@ def _device(device_id, display_name=None, last_seen_ip=None, last_seen_ts=None):
     }
 
 
+def _cs_device_view(d):
+    """A device as the C-S API renders it.
+
+    `user_id` is an ADMIN-only field (`GET /_synapse/admin/v2/users/{id}/devices`)
+    and must not appear here, or a test could come to assert against a key real
+    Synapse never sends on this route.
+    """
+    return {k: d.get(k) for k in ("device_id", "display_name", "last_seen_ip", "last_seen_ts")}
+
+
+def _whoami(introspection):
+    """`GET /_matrix/client/v3/account/whoami` built from an introspection response.
+
+    `device_id` is OMITTED, not null, when the token carries none. Synapse's
+    `WhoamiRestServlet` only inserts the key when the requester HAS a device, and
+    siwx-oidc deliberately renders an empty device_id as JSON `null` (see the
+    token-model section of CLAUDE.md) — so a deviceless token must read as "no
+    key", never as a device literally named `None`.
+    """
+    body = {"user_id": _mxid(introspection.get("username") or ""), "is_guest": False}
+    device_id = introspection.get("device_id")
+    if device_id:
+        body["device_id"] = device_id
+    return body
+
+
 def _mark_existing(localpart):
     """Record a `users` row, and NOTHING else. Caller must hold LOCK.
 
@@ -371,6 +405,55 @@ class Handler(BaseHTTPRequestHandler):
             }
         return None
 
+    def _cs_api_auth(self):
+        """C-S API auth for a USER's own access token. Returns
+        `(introspection, None)` when authorised, else `(None, (code, body))`.
+
+        This is `_admin_auth` minus the `is_server_admin` step, and it is a
+        SEPARATE method on purpose: the admin surface and the user surface are
+        two different credentials (see the module docstring), and one helper
+        answering for both would let an admin-scope regression pass unseen here.
+
+        An introspection call that FAILS is a **503**, not a 401. Synapse raises
+        `SynapseError(503, "Unable to introspect the access token")` when it
+        cannot reach the provider, and the e2e suites key their degradation on
+        exactly that status (`matrix_introspection_healthy` in
+        tests/e2e_msc3861.rs). Collapsing it into 401 would report "the stack is
+        broken" as "your token is bad" and turn a real outage into a green run.
+        """
+        token = self._bearer()
+        if not token:
+            return None, (401, {"errcode": "M_MISSING_TOKEN", "error": "no access token"})
+        if token == STATE["secret"]:
+            # 1.157 deleted the admin_token shim for EVERY route, not just the
+            # admin surface: the MAS shared secret is not an access token here
+            # either. Same regression, same answer as _admin_auth.
+            return None, (
+                401,
+                {
+                    "errcode": "M_UNKNOWN_TOKEN",
+                    "error": "the MAS shared secret is not an access token on the C-S API",
+                },
+            )
+        introspection, err = _introspect(token)
+        if err:
+            return None, (
+                503,
+                {"errcode": "M_UNKNOWN", "error": f"Unable to introspect the access token: {err}"},
+            )
+        if not introspection.get("active"):
+            return None, (401, {"errcode": "M_UNKNOWN_TOKEN", "error": "token is not active"})
+        scope = (introspection.get("scope") or "").split()
+        if MATRIX_API_SCOPE not in scope and MATRIX_API_SCOPE_UNSTABLE not in scope:
+            return None, (
+                401,
+                {
+                    "errcode": "M_UNKNOWN_TOKEN",
+                    "error": "Token doesn't grant access to the Matrix C-S API",
+                },
+            )
+        return introspection, None
+
     def _log(self, method, path):
         with LOCK:
             CALL_LOG.append(f"{method} {path}")
@@ -439,6 +522,30 @@ class Handler(BaseHTTPRequestHandler):
         # requests is a debugging trap: the 1.157 port's symptom was a stream of
         # 401s, and the old mock's call log showed nothing at all.
         self._log("GET", path)
+
+        # -- authenticated C-S API, as the USER -----------------------------
+        # siwx-oidc calls NEITHER of these; the e2e suites do, as the user, to
+        # exercise the Synapse -> siwx-oidc introspection leg end to end. Before
+        # they existed the suites aimed at a real Synapse on :8448 and died on a
+        # refused connection inside a bare .unwrap() -- which is how a promoted
+        # suite failed CI rather than the code it guards.
+        if path == "/_matrix/client/v3/account/whoami":
+            introspection, denied = self._cs_api_auth()
+            if denied:
+                return self._send(*denied)
+            return self._send(200, _whoami(introspection))
+        # GET /_matrix/client/v3/devices -- the caller's OWN devices. Scoped by
+        # the INTROSPECTED username, never by anything the caller sends: that
+        # scoping is the property the route exists to demonstrate.
+        if path == "/_matrix/client/v3/devices":
+            introspection, denied = self._cs_api_auth()
+            if denied:
+                return self._send(*denied)
+            user_id = _mxid(introspection.get("username") or "")
+            with LOCK:
+                devs = [_cs_device_view(d) for d in DEVICES.get(user_id, [])]
+            # No `total`: that key belongs to the admin v2 route, not this one.
+            return self._send(200, {"devices": devs})
 
         # -- unauthenticated C-S API ---------------------------------------
         # GET /_matrix/client/v3/profile/{mxid}/{field}  (read-back for tests)

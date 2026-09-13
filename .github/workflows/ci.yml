@@ -117,6 +117,14 @@ jobs:
       # What the tests themselves read (tests/e2e_*.rs `oidc()` / `mock()`).
       SIWEOIDC_HOST: http://localhost:18080
       SYNAPSE_MOCK: http://localhost:8090
+      # `matrix_host()` in e2e_device_code / e2e_msc3861 / e2e_session_teardown.
+      # It defaults to :8448 -- a REAL Synapse -- which nothing serves in this
+      # job, so the three suites promoted on 2026-09-13 panicked on a refused
+      # connection inside a bare `.unwrap()`. The mock answers the two C-S
+      # routes they drive (account/whoami, GET devices) through a real
+      # introspection against siwx-oidc, so pointing them here makes that leg
+      # ASSERT rather than skip.
+      MATRIX_HOST: http://localhost:8090
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
