@@ -44,6 +44,24 @@ pub struct Config {
     pub rp_id: Option<String>,
     /// WebAuthn expected origin. Defaults to `base_url` (scheme + host + port).
     pub rp_origin: Option<String>,
+    /// Additional exact WebAuthn origins, comma-separated (no wildcards).
+    /// Every origin's host must equal `rp_id` or be a subdomain of it; startup
+    /// fails otherwise. Empty/unset means `rp_origin` is the only origin.
+    /// Env: `SIWEOIDC_RP_EXTRA_ORIGINS`
+    pub rp_extra_origins: Option<String>,
+    /// The RP ID that passkeys registered BEFORE per-credential RP-ID storage
+    /// existed are bound to. A stored credential with no recorded RP ID is
+    /// verified against this value, never against `rp_id`.
+    ///
+    /// Defaults to the hostname of `base_url`, which is what `rp_id` defaulted
+    /// to when those credentials were created. When it equals `rp_id` the
+    /// legacy path is inert (single-RP deployment, behaviour unchanged).
+    ///
+    /// Shared-RP-ID transition (2026-09-27): `rp_id = "inblock.io"` with this
+    /// left at its default (`siwx-oidc.inblock.io`) keeps every existing
+    /// passkey working while new registrations use the shared RP ID.
+    /// Env: `SIWEOIDC_LEGACY_RP_ID`
+    pub legacy_rp_id: Option<String>,
     /// Shared secret for MSC3861 token introspection (Synapse delegates auth).
     /// When set, the token endpoint issues opaque tokens stored in Redis instead
     /// of JWTs, and the `/oauth2/introspect` endpoint becomes active.
@@ -102,6 +120,8 @@ impl Default for Config {
             ],
             rp_id: None,
             rp_origin: None,
+            rp_extra_origins: None,
+            legacy_rp_id: None,
             mas_shared_secret: None,
             synapse_endpoint: None,
             log_format: "pretty".to_string(),

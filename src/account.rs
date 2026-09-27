@@ -877,8 +877,7 @@ pub async fn account_wallet(
 pub async fn account_passkey_finish(
     db_client: &RedisClient,
     session_id: &str,
-    rp_id: &str,
-    rp_origin: &str,
+    rp: &wa::RpPolicy,
     req: AccountPasskeyFinishRequest,
     synapse_client: Option<&SynapseClient>,
     server_name: Option<&str>,
@@ -889,7 +888,7 @@ pub async fn account_passkey_finish(
         serde_json::from_value(req.credential)
             .map_err(|e| CustomError::BadRequest(format!("Invalid credential: {}", e)))?;
 
-    let resp = wa::verify_credential(db_client, session_id, rp_id, rp_origin, &auth_response)
+    let resp = wa::verify_credential(db_client, session_id, rp, &auth_response)
         .await
         // Route the stale-passkey case to the structured 401 discriminator; keep every
         // other verification failure as the existing 400 BadRequest for this flow.
@@ -1711,7 +1710,13 @@ async function authWallet() {
   }
 }
 
-async function authPasskey(forceAll) {
+// Shared-RP-ID transition: the legacy RP ID reported by the start endpoint when
+// passkeys created before the switch to the shared inblock.io RP ID are still
+// accepted. One ceremony can use only one rpId, so an old passkey needs its own
+// ceremony ({"legacy": true}).
+let legacyRpId = null;
+
+async function authPasskey(forceAll, legacy) {
   hideStatus();
   setBusy('btn-passkey', true, 'Authenticating...');
   try {
@@ -1720,13 +1725,14 @@ async function authPasskey(forceAll) {
       headers: { 'Content-Type': 'application/json' },
       // `all:true` is the escape hatch: re-run usernameless (offer every key) even
       // when the siwx_user cookie scoped this picker to one account.
-      body: JSON.stringify({ action: ACTION, all: !!forceAll })
+      body: JSON.stringify({ action: ACTION, all: !!forceAll, legacy: !!legacy })
     });
     if (!startR.ok) { showStatus('Failed to start passkey authentication.'); return; }
     const startData = await startR.json();
     // Identity-scoped picker: when the server recognises this browser's account it
     // returns `detected_mxid` and an allowCredentials limited to that account's keys.
     // Surface "use a different passkey" so another account is never locked out.
+    legacyRpId = startData.legacy_rp_id || null;
     renderPasskeyScope(forceAll ? null : startData.detected_mxid);
     const sessionId = startData.session_id;
     const options = startData;
@@ -1782,6 +1788,7 @@ async function authPasskey(forceAll) {
     // than a raw error string.
     if (e && (e.name === 'NotAllowedError' || e.name === 'AbortError')) {
       showStatus('No passkey was used. Try "Use a different passkey" above, approve on another device, or sign with your wallet.');
+      if (legacyRpId && !legacy) renderLegacyOffer();
     } else {
       showStatus('Passkey error: ' + (e.message || e));
     }
@@ -1794,6 +1801,20 @@ async function authPasskey(forceAll) {
 // picker is identity-scoped (detected_mxid present), or hide it (usernameless). The
 // mxid is set via textContent (never innerHTML) so it can never inject markup, and
 // the link is styled inline so it does not depend on a page-specific CSS class.
+function renderLegacyOffer() {
+  const el = $('passkey-scope');
+  if (!el || $('passkey-legacy')) return;
+  el.appendChild(document.createTextNode(' Created your passkey before the switch to inblock.io? '));
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.id = 'passkey-legacy';
+  btn.textContent = 'Use an older passkey';
+  btn.style.cssText = 'background:none;border:none;padding:0;font:inherit;color:inherit;text-decoration:underline;cursor:pointer;';
+  btn.onclick = () => authPasskey(false, true);
+  el.appendChild(btn);
+  el.classList.remove('hidden');
+}
+
 function renderPasskeyScope(mxid) {
   const el = $('passkey-scope');
   if (!el) return;

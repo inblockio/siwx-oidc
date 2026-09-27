@@ -512,12 +512,20 @@ paths:
         user's picker shows only their own credentials. A forged or expired
         cookie is a cache miss and falls back to usernameless, leaking zero
         credential ids. Send `{"all": true}` (or `?all=1`) to force usernameless.
+
+        Shared RP ID (2026-09-27): the ceremony runs under `SIWEOIDC_RP_ID`
+        (`publicKey.rpId`). Send `{"legacy": true}` to run it under the legacy RP
+        ID instead, for passkeys created before the switch. A cookie-scoped
+        request whose DID has only legacy passkeys is dispatched to the legacy
+        RP ID automatically. `/device/passkey/start` and `/account/passkey/start`
+        accept the same `legacy` flag.
       responses:
         "200":
           description: |
             A W3C `RequestChallengeResponse` with the `publicKey` fields
             flattened at the top level, plus `detected_mxid` — present only when
-            the request was scoped.
+            the request was scoped — and `legacy_rp_id`, present only while the
+            server still accepts passkeys under a legacy RP ID.
           content: { application/json: { schema: { type: object } } }
 
   /webauthn/authenticate/finish:

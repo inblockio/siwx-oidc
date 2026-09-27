@@ -62,6 +62,15 @@ pub const KV_WEBAUTHN_CREDENTIAL_PREFIX: &str = "webauthn:credential";
 /// owning. See [`crate::credential_migration`].
 pub const KV_WEBAUTHN_LINK_PREFIX: &str = "webauthn:link";
 
+/// Redis key prefix for a credential's registration RP ID:
+/// `webauthn:rp_id/{cred_id_b64}` -> e.g. `inblock.io`. Written (before the
+/// credential blob) by `register_finish`/`link_finish` since the shared-RP-ID
+/// change; ABSENT for every earlier credential, which the verifier then binds to
+/// the configured legacy RP ID. Deleted alongside the credential by
+/// `purge_identity`. Deliberately not under `webauthn:credential/`, which is
+/// enumerated as passkey blobs.
+pub const KV_WEBAUTHN_RP_ID_PREFIX: &str = "webauthn:rp_id";
+
 /// Redis key prefix for the opaque login user-session: `user:session/{token}` ->
 /// DID. The token is the identity hint that scopes the passkey picker's
 /// `allowCredentials` on a returning login. It is an OPAQUE random token (never a

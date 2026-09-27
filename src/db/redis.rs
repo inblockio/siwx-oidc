@@ -378,6 +378,12 @@ impl RedisClient {
                     cred_id, e
                 );
             }
+            // The credential's recorded RP ID goes with it (inert on its own,
+            // but erasure should leave nothing keyed by this credential).
+            let rp_key = format!("{}/{}", super::KV_WEBAUTHN_RP_ID_PREFIX, cred_id);
+            if let Err(e) = self.del_raw(&rp_key).await {
+                debug!("purge_identity: del rp_id {} failed: {}", rp_key, e);
+            }
             // Delete-through: without this, an erased identity's passkey would
             // survive in aqua-auth's namespace the moment the dual-write flag is
             // on, and erasure would be incomplete. No-op when the flag is off.
@@ -412,6 +418,10 @@ impl RedisClient {
                         "purge_identity: index_remove_passkey {} failed: {}",
                         cred_id, e
                     );
+                }
+                let rp_key = format!("{}/{}", super::KV_WEBAUTHN_RP_ID_PREFIX, cred_id);
+                if let Err(e) = self.del_raw(&rp_key).await {
+                    debug!("purge_identity: del rp_id {} failed: {}", rp_key, e);
                 }
                 // Delete-through, as in pass (a).
                 crate::credential_store::mirror_delete(did, cred_id).await;

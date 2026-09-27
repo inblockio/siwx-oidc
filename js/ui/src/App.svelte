@@ -37,6 +37,16 @@
 	// a brand-new account, so we gate instead of auto-redirecting. Holds the mxid to
 	// show. null = no gate.
 	let newUserGate: { mxid: string } | null = null;
+	// Shared-RP-ID transition: set from authenticate/start's `legacy_rp_id` when the
+	// server still accepts passkeys created under the old per-host RP ID. New
+	// passkeys live under the shared RP ID, and one WebAuthn ceremony can only use
+	// ONE rpId, so an old passkey needs its own ceremony: the "Use an older
+	// passkey" link re-runs start with {"legacy": true}. Returning users with a
+	// siwx_user cookie never need it (the server dispatches their rpId).
+	let legacyRpId: string | null = null;
+	// Emphasise the older-passkey link after a ceremony under the shared RP ID
+	// ended without a credential (cancelled / nothing found).
+	let offerLegacy = false;
 
 	const config = createConfig({
 		chains: [mainnet],
@@ -241,7 +251,7 @@
 	// Measured on the served bundle 2026-07-26; present since edff2b2, i.e. this
 	// one-step flow has never completed. The guard still protects every real user
 	// entry point (all of which pass `chained = false`).
-	async function handlePasskeySignIn(forceAll = false, chained = false) {
+	async function handlePasskeySignIn(forceAll = false, chained = false, legacy = false) {
 		if (passkeyLoading && !chained) return;
 		passkeyLoading = true;
 		error = null;
@@ -253,12 +263,13 @@
 			const startResp = await fetch('/webauthn/authenticate/start', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: forceAll ? JSON.stringify({ all: true }) : '{}',
+				body: forceAll || legacy ? JSON.stringify({ all: forceAll, legacy }) : '{}',
 			});
 			if (!startResp.ok) {
 				throw new Error(await startResp.text());
 			}
 			const options = await startResp.json();
+			legacyRpId = options.legacy_rp_id ?? null;
 
 			// Detected-account affordance: present ONLY when the server scoped this
 			// request (valid cookie, not the escape hatch). When unscoped this is
@@ -338,7 +349,12 @@
 			window.location.replace(buildSignInUrl());
 		} catch (e: any) {
 			if (e.name === 'NotAllowedError') {
-				error = 'Passkey authentication was cancelled.';
+				if (legacyRpId && !legacy) {
+					offerLegacy = true;
+					error = 'No passkey was used. If you created your passkey before the switch to a shared inblock.io passkey, choose "Use an older passkey" below.';
+				} else {
+					error = 'Passkey authentication was cancelled.';
+				}
 			} else {
 				error = e.message || 'Passkey authentication failed';
 			}
@@ -565,6 +581,22 @@
 								on:click={() => handlePasskeySignIn(true)}
 							>
 								Use a different passkey
+							</button>
+						</p>
+					{/if}
+
+					{#if legacyRpId}
+						<!-- Shared-RP-ID transition: passkeys created before the switch are
+						     bound to the old RP ID and need a ceremony of their own. -->
+						<p class="register-hint" class:legacy-offer={offerLegacy}>
+							Created your passkey before the switch to inblock.io?
+							<button
+								class="link-btn"
+								data-testid="use-older-passkey"
+								disabled={passkeyLoading}
+								on:click={() => handlePasskeySignIn(false, false, true)}
+							>
+								Use an older passkey
 							</button>
 						</p>
 					{/if}
@@ -961,6 +993,10 @@
 	}
 
 	/* ---- Register hint ---- */
+
+	.legacy-offer {
+		font-weight: 600;
+	}
 
 	.register-hint {
 		text-align: center;
