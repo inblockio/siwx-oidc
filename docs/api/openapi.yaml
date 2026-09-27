@@ -127,6 +127,15 @@ paths:
         deliberately carry no `exp`. Rotating the signing key without listing
         the old public key here makes every already-written proof permanently
         unverifiable.
+
+        Browsers read it too: Element Web's `resolve-did-search` patch verifies
+        a DID search hit's proof client-side, fetching this key set through the
+        discovery document's `jwks_uri` of the issuer the candidate's homeserver
+        advertises. For that to work from any Element origin, the deployment's
+        edge should serve this path and `/.well-known/openid-configuration`
+        with `Access-Control-Allow-Origin: *` (public key material, no
+        credentials); a CORS refusal degrades the result to "unverified", never
+        to "verified".
       responses:
         "200":
           description: The key set.

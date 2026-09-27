@@ -96,6 +96,34 @@ that account, with **no signature checked**. The verifier lives in
 link), which is why `--verify-did` above is a separate step rather than
 something the endpoint does for you.
 
+**How to verify a proof correctly** (the wire contract is the header comment of
+`src/did_assertion.rs`). Two verifiers implement this today:
+`siwx-oidc-auth` (`verify_did_assertion` / `fetch_and_verify_did`) and, in the
+browser, Element Web's `resolve-did-search` patch (siwx-oidc-matrix-server,
+`patches/element-web/`, 2026-09-28). Both:
+
+- check `alg` is ES256 (and refuse `crit`) before fetching any key;
+- require `mxid` to be byte-equal to the profile the proof was read from. This
+  is mandatory, not advice: without it a genuine proof copied into another
+  profile verifies;
+- require `sub` to be the DID being looked for, exact case (`did:pkh` compared
+  under the same case-folding the MXID derivation uses);
+- **pin the issuer** instead of trusting the token's `iss`: the CLI takes it as
+  `--server`, Element takes the issuer the candidate MXID's own homeserver
+  advertises in `/_matrix/client/v1/auth_metadata`. `iss` must equal it;
+- take keys from that issuer's discovery `jwks_uri` and select by `kid` with no
+  fallback. `/jwk` lists retired keys, so proofs minted before a key rotation
+  keep verifying;
+- verify the raw 64-byte r||s signature over the received signing input.
+
+**What a verified proof cannot tell you.** It proves that the issuer the
+homeserver advertises attested the binding. That removes any dependence on the
+homeserver's profile write ACL, but a **malicious homeserver operator controls
+the issuer it advertises** and can sign any DID-to-MXID binding it likes. For a
+federated peer, a verified result is therefore exactly as trustworthy as that
+peer's operator; only a signature by the DID's own key could do better, and the
+assertion format carries none.
+
 ## Errors
 
 Most routes return an OAuth-shaped body (`{"error": …}`) with a 4xx. Three
