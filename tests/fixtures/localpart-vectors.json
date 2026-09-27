@@ -1,0 +1,41 @@
+{
+  "_comment": "Golden vectors for siwx_oidc::mxid (canonicalize, localpart_for, legacy_localpart). The source of truth for every hand-copied mirror of the derivation (Element Web resolve-did-search patch, e2e/browser/mxid-helper.mjs). Enforced by tests/localpart_vectors.rs. APPEND ONLY: a changed value means the derivation changed, which reassigns Matrix accounts.",
+  "vectors": [
+    {
+      "did": "did:pkh:eip155:1:0x7a760ea15d76f935c8646b449af488c2b0021734",
+      "canonical": "did:pkh:eip155:1:0x7a760ea15d76f935c8646b449af488c2b0021734",
+      "localpart": "37rb2h7bdij3o1qm",
+      "legacy_localpart": "did-pkh-eip155-1-0x7a760ea15d76f935c8646b449af488c2b0021734"
+    },
+    {
+      "did": "did:pkh:eip155:1:0x7A760ea15d76F935c8646b449AF488c2B0021734",
+      "canonical": "did:pkh:eip155:1:0x7a760ea15d76f935c8646b449af488c2b0021734",
+      "localpart": "37rb2h7bdij3o1qm",
+      "legacy_localpart": "did-pkh-eip155-1-0x7a760ea15d76f935c8646b449af488c2b0021734"
+    },
+    {
+      "did": "did:key:z6MkmWziJJ2k3ckqVqnmMGVKefMhDSe4ZxrfvqksxDMGBa4v",
+      "canonical": "did:key:z6MkmWziJJ2k3ckqVqnmMGVKefMhDSe4ZxrfvqksxDMGBa4v",
+      "localpart": "0f2g2c0d3vclsu3i",
+      "legacy_localpart": "did-key-z6mkmwzijj2k3ckqvqnmmgvkefmhdse4zxrfvqksxdmgba4v"
+    },
+    {
+      "did": "did:key:z6mkmwzijj2k3ckqvqnmmgvkefmhdse4zxrfvqksxdmgba4v",
+      "canonical": "did:key:z6mkmwzijj2k3ckqvqnmmgvkefmhdse4zxrfvqksxdmgba4v",
+      "localpart": "4qhlwf2qqvk7sqfw",
+      "legacy_localpart": "did-key-z6mkmwzijj2k3ckqvqnmmgvkefmhdse4zxrfvqksxdmgba4v"
+    },
+    {
+      "did": "did:peer:2.Ez6LSbysY2xFMRpGMhb7tFTLMpeuPRUqZAsvhgSfvY9ZBLM",
+      "canonical": "did:peer:2.Ez6LSbysY2xFMRpGMhb7tFTLMpeuPRUqZAsvhgSfvY9ZBLM",
+      "localpart": "0umi2bxe3biv6d95",
+      "legacy_localpart": "did-peer-2.ez6lsbysy2xfmrpgmhb7tftlmpeupruqzasvhgsfvy9zblm"
+    },
+    {
+      "did": "did:peer:2.ez6lsbysy2xfmrpgmhb7tftlmpeupruqzasvhgsfvy9zblm",
+      "canonical": "did:peer:2.ez6lsbysy2xfmrpgmhb7tftlmpeupruqzasvhgsfvy9zblm",
+      "localpart": "52kbzku4jf2oj2nl",
+      "legacy_localpart": "did-peer-2.ez6lsbysy2xfmrpgmhb7tftlmpeupruqzasvhgsfvy9zblm"
+    }
+  ]
+}

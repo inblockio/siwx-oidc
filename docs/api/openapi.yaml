@@ -96,6 +96,14 @@ paths:
         `prompt_values_supported` (`["login","create"]`) and
         `account_management_uri`. Removing either silently breaks Element X
         cross-signing bootstrap — the matrix-rust-sdk swallows the error.
+
+        `io.inblock.resolve_endpoint` (`{issuer}/resolve`) advertises
+        `GET /resolve`, and is present **only** when this deployment can
+        answer it (a Matrix server name and a Synapse client are configured).
+        Synapse forwards this document, unknown keys included, as
+        `/_matrix/client/v1/auth_metadata`, which is how a client finds a
+        homeserver's DID resolver — its own or a federated peer's. The Element
+        Web `resolve-did-search` patch reads this exact key.
       responses:
         "200":
           description: Provider metadata.

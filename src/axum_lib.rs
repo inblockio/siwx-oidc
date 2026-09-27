@@ -198,8 +198,17 @@ async fn provider_metadata(
     let value = oidc::provider_metadata_value(
         state.config.base_url.clone(),
         state.config.account_management_uri.as_ref(),
+        resolve_endpoint_advertised(&state),
     )?;
     Ok(value.into())
+}
+
+/// Whether `GET /resolve` can answer on this deployment, and so may be
+/// advertised in discovery. Mirrors the two 503 conditions in
+/// [`resolve::ResolveError`]: no `SIWEOIDC_MATRIX_SERVER_NAME`, or no Synapse
+/// client (standalone mode).
+fn resolve_endpoint_advertised(state: &AppState) -> bool {
+    state.config.matrix_server_name.is_some() && state.synapse_client.is_some()
 }
 
 async fn token(
