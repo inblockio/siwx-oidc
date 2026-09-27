@@ -59,8 +59,7 @@ struct AppState {
     config: config::Config,
     redis_client: RedisClient,
     webauthn: Arc<Webauthn>,
-    rp_id: String,
-    rp_origin: String,
+    rp: Arc<wa::RpPolicy>,
     synapse_client: Option<Arc<SynapseClient>>,
 }
 
@@ -484,6 +483,16 @@ fn payload_force_all(payload: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// `{"legacy": true}`: run the assertion ceremony under the legacy RP ID (the
+/// "use an older passkey" affordance of the shared-RP-ID transition). Literal
+/// `true` only, like [`payload_force_all`]. A no-op on a single-RP deployment.
+fn payload_legacy(payload: &serde_json::Value) -> bool {
+    payload
+        .get("legacy")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// Extract the opaque `siwx_user` cookie token to scope a passkey picker, or `None`
 /// when `force_all` (the `{"all":true}` escape hatch wins) or the cookie is absent.
 /// Pure (no Redis) so the escape-hatch + absent-cookie branches are unit-testable; the
@@ -558,9 +567,11 @@ async fn device_passkey_start_handler(
         user_session_scope_did(&state.redis_client, &cookies, payload_force_all(&payload)).await;
     let rcr = wa::authenticate_start(
         &state.webauthn,
+        &state.rp,
         &state.redis_client,
         &session_id,
         scope_did.as_deref(),
+        payload_legacy(&payload),
     )
     .await?;
     let detected_mxid = detected_mxid_for(
@@ -572,6 +583,7 @@ async fn device_passkey_start_handler(
     Ok(Json(AuthenticateStartResponse {
         challenge: rcr,
         detected_mxid,
+        legacy_rp_id: state.rp.legacy_rp_id().map(str::to_string),
     }))
 }
 
@@ -590,8 +602,7 @@ async fn device_passkey_finish_handler(
     let resp = wa::verify_credential(
         &state.redis_client,
         &session_id,
-        &state.rp_id,
-        &state.rp_origin,
+        &state.rp,
         &auth_response,
     )
     .await
@@ -644,6 +655,7 @@ async fn webauthn_register_finish(
         .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
     let resp = wa::register_finish(
         &state.webauthn,
+        &state.rp,
         &state.redis_client,
         session_id,
         reg_response,
@@ -662,6 +674,9 @@ async fn webauthn_register_finish(
 struct AuthenticateStartBody {
     #[serde(default)]
     all: bool,
+    /// Run the ceremony under the legacy RP ID ("use an older passkey").
+    #[serde(default)]
+    legacy: bool,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -693,6 +708,11 @@ struct AuthenticateStartResponse {
     challenge: RequestChallengeResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     detected_mxid: Option<String>,
+    /// The legacy RP ID when this deployment still accepts passkeys created
+    /// before the shared-RP-ID change, else absent. The page shows its "use an
+    /// older passkey" affordance only when this is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_rp_id: Option<String>,
 }
 
 async fn webauthn_authenticate_start(
@@ -707,7 +727,8 @@ async fn webauthn_authenticate_start(
 
     // Escape hatch: `?all=1` OR JSON `{"all": true}` forces usernameless even with
     // a cookie ("use a different passkey").
-    let force_all = body.map(|Json(b)| b.all).unwrap_or(false)
+    let (body_all, legacy) = body.map(|Json(b)| (b.all, b.legacy)).unwrap_or((false, false));
+    let force_all = body_all
         || query
             .all
             .as_deref()
@@ -733,9 +754,11 @@ async fn webauthn_authenticate_start(
 
     let challenge = wa::authenticate_start(
         &state.webauthn,
+        &state.rp,
         &state.redis_client,
         session_id,
         scope_did.as_deref(),
+        legacy,
     )
     .await?;
 
@@ -755,6 +778,7 @@ async fn webauthn_authenticate_start(
     Ok(Json(AuthenticateStartResponse {
         challenge,
         detected_mxid,
+        legacy_rp_id: state.rp.legacy_rp_id().map(str::to_string),
     }))
 }
 
@@ -792,8 +816,7 @@ async fn webauthn_authenticate_finish(
     let resp = wa::authenticate_finish(
         &state.redis_client,
         session_id,
-        &state.rp_id,
-        &state.rp_origin,
+        &state.rp,
         auth_response,
     )
     .await?;
@@ -873,6 +896,7 @@ async fn webauthn_link_finish(
         .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
     let resp = wa::link_finish(
         &state.webauthn,
+        &state.rp,
         &state.redis_client,
         session_id,
         reg_response,
@@ -1140,14 +1164,19 @@ async fn account_passkey_start_handler(
         user_session_scope_did(&state.redis_client, &cookies, payload_force_all(&payload)).await;
     let rcr = wa::authenticate_start(
         &state.webauthn,
+        &state.rp,
         &state.redis_client,
         &session_id,
         scope_did.as_deref(),
+        payload_legacy(&payload),
     )
     .await?;
     let mut value = serde_json::to_value(&rcr)
         .map_err(|e| anyhow::anyhow!("Failed to serialize challenge: {}", e))?;
     value["session_id"] = serde_json::json!(session_id);
+    if let Some(legacy) = state.rp.legacy_rp_id() {
+        value["legacy_rp_id"] = serde_json::json!(legacy);
+    }
     if let Some(mxid) = detected_mxid_for(
         state.synapse_client.as_deref(),
         state.config.matrix_server_name.as_deref(),
@@ -1189,8 +1218,7 @@ async fn account_passkey_finish_handler(
     let authed = account::account_passkey_finish(
         &state.redis_client,
         session_id,
-        &state.rp_id,
-        &state.rp_origin,
+        &state.rp,
         req,
         synapse,
         state.config.matrix_server_name.as_deref(),
@@ -1347,8 +1375,10 @@ pub async fn main() {
         &config.base_url,
         config.rp_id.as_deref(),
         config.rp_origin.as_deref(),
+        config.rp_extra_origins.as_deref(),
+        config.legacy_rp_id.as_deref(),
     )
-    .expect("Failed to initialize WebAuthn — check SIWEOIDC_BASE_URL, SIWEOIDC_RP_ID, SIWEOIDC_RP_ORIGIN");
+    .expect("Failed to initialize WebAuthn — check SIWEOIDC_BASE_URL, SIWEOIDC_RP_ID, SIWEOIDC_RP_ORIGIN, SIWEOIDC_RP_EXTRA_ORIGINS, SIWEOIDC_LEGACY_RP_ID");
 
     // Initialize Synapse client for MSC3861 device lifecycle (optional).
     //
@@ -1379,8 +1409,7 @@ pub async fn main() {
         config: config.clone(),
         redis_client,
         webauthn: Arc::new(wa_config.webauthn),
-        rp_id: wa_config.rp_id,
-        rp_origin: wa_config.rp_origin,
+        rp: Arc::new(wa_config.rp),
         synapse_client,
     };
 
@@ -1641,6 +1670,7 @@ mod unknown_credential_response_tests {
         let scoped = serde_json::to_value(AuthenticateStartResponse {
             challenge: rcr.clone(),
             detected_mxid: Some("@did-key-zdn:matrix.example.com".to_string()),
+            legacy_rp_id: None,
         })
         .unwrap();
         assert_eq!(scoped["publicKey"]["challenge"], "AAECAwQFBgcICQ");
@@ -1652,6 +1682,7 @@ mod unknown_credential_response_tests {
         let unscoped = serde_json::to_value(AuthenticateStartResponse {
             challenge: rcr,
             detected_mxid: None,
+            legacy_rp_id: None,
         })
         .unwrap();
         assert_eq!(unscoped["publicKey"]["challenge"], "AAECAwQFBgcICQ");

@@ -29,6 +29,11 @@ const CREDENTIAL_PREFIX: &str = siwx_oidc::db::KV_WEBAUTHN_CREDENTIAL_PREFIX;
 // writer.
 const LINK_PREFIX: &str = siwx_oidc::db::KV_WEBAUTHN_LINK_PREFIX;
 const LINK_CHALLENGE_PREFIX: &str = "webauthn:link_challenge";
+// `webauthn:rp_id/{cred_id}` -> the RP ID the credential was registered under.
+// Absent for every credential registered before the shared-RP-ID change; those
+// are verified against `RpPolicy::legacy_rp_id`. Deliberately NOT under the
+// `webauthn:credential/` prefix, which purge/scan code enumerates as blobs.
+const RP_ID_PREFIX: &str = siwx_oidc::db::KV_WEBAUTHN_RP_ID_PREFIX;
 const CHALLENGE_TTL: u64 = 120; // 2 min
 
 // -- DID derivation from P-256 public key --
@@ -434,7 +439,7 @@ pub struct RegisterFinishResponse {
     pub credential_id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct AuthenticateFinishResponse {
     pub ok: bool,
     pub did: String,
@@ -503,6 +508,221 @@ fn require_resident_key(ccr: &mut CreationChallengeResponse) {
     sel.require_resident_key = true;
 }
 
+
+// -- Relying-party policy (shared RP ID + legacy transition) ----------------
+
+/// Which RP IDs and origins this server accepts, and which RP ID each stored
+/// credential must be verified against.
+///
+/// # Why there are two RP IDs
+///
+/// A passkey is bound to the RP ID it was created under, and its assertions
+/// carry `SHA-256(rp_id)` in `authenticatorData[0..32]`. Moving to a shared RP ID
+/// (`inblock.io`, so one passkey yields one did:key across siwx-oidc and
+/// aqua-node) cannot rebind existing credentials: they stay bound to the old
+/// per-host RP ID (`siwx-oidc.inblock.io`) forever. So:
+///
+/// * **new** registrations use [`RpPolicy::rp_id`], and record it per credential
+///   (`webauthn:rp_id/{cred_id}`);
+/// * a stored credential with **no** recorded RP ID predates this change and is
+///   verified against [`RpPolicy::legacy_rp_id`];
+/// * a recorded RP ID that is neither of the two is refused (config drift must
+///   fail closed, never fall through to "try the other one").
+///
+/// Each assertion is checked against the RP ID of the credential that produced
+/// it, never against "whichever configured RP ID happens to match": a credential
+/// is not allowed to change RP ID after the fact.
+///
+/// # Origins
+///
+/// Exact string match against a fixed list (no wildcards, no subdomain rule),
+/// and every listed origin's host must be the RP ID or a subdomain of it,
+/// checked at startup. The origin a browser reports is additionally checked to
+/// be within the RP ID of the credential being verified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RpPolicy {
+    rp_id: String,
+    legacy_rp_id: Option<String>,
+    origins: Vec<String>,
+}
+
+/// `host` equals `rp_id` or is a subdomain of it (label-boundary aware, so
+/// `evilinblock.io` is NOT within `inblock.io`).
+pub fn host_within_rp_id(host: &str, rp_id: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let rp_id = rp_id.trim_end_matches('.').to_ascii_lowercase();
+    host == rp_id || host.ends_with(&format!(".{rp_id}"))
+}
+
+/// Normalise and validate one configured origin: `scheme://host[:port]`, no
+/// path/query/fragment, https (or http only for `localhost` / `*.localhost`).
+fn normalise_origin(raw: &str) -> Result<(String, String)> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let url = Url::parse(trimmed).map_err(|e| anyhow!("invalid WebAuthn origin {trimmed:?}: {e}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("WebAuthn origin {trimmed:?} has no host"))?
+        .to_ascii_lowercase();
+    if url.path() != "/" && !url.path().is_empty() || url.query().is_some() || url.fragment().is_some() {
+        return Err(anyhow!("WebAuthn origin {trimmed:?} must be scheme://host[:port] only"));
+    }
+    // No wildcards or other non-hostname characters: an origin is one exact
+    // host. (`Url` accepts `*` in a domain, so this is not redundant.)
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return Err(anyhow!("WebAuthn origin {trimmed:?}: host must be a plain hostname (no wildcards)"));
+    }
+    let local = host == "localhost" || host.ends_with(".localhost");
+    match url.scheme() {
+        "https" => {}
+        "http" if local => {}
+        other => return Err(anyhow!("WebAuthn origin {trimmed:?}: scheme {other} not allowed (https, or http on localhost)")),
+    }
+    // `Url` serialises an origin with a trailing "/"; the browser's
+    // clientDataJSON.origin has none. Compare in the browser's form.
+    let origin = url.origin().ascii_serialization();
+    Ok((origin, host))
+}
+
+/// An RP ID is a bare domain: no scheme, port, path, IP literal, or wildcard.
+fn validate_rp_id(rp_id: &str) -> Result<String> {
+    let r = rp_id.trim().trim_end_matches('.').to_ascii_lowercase();
+    if r.is_empty()
+        || r.contains(['/', ':', '*', ' ', '@'])
+        || r.starts_with('.')
+        || r.split('.').any(|l| l.is_empty())
+    {
+        return Err(anyhow!("invalid WebAuthn RP ID {rp_id:?}: must be a bare domain"));
+    }
+    if r.parse::<std::net::IpAddr>().is_ok() {
+        return Err(anyhow!("invalid WebAuthn RP ID {rp_id:?}: IP literals are not allowed"));
+    }
+    // A single label is only meaningful for localhost; anything else would be a
+    // TLD-wide RP ID that the browser rejects anyway.
+    if !r.contains('.') && r != "localhost" {
+        return Err(anyhow!("invalid WebAuthn RP ID {rp_id:?}: single-label RP IDs other than localhost are refused"));
+    }
+    Ok(r)
+}
+
+impl RpPolicy {
+    /// Build and validate. `origins[0]` is the primary origin. `legacy_rp_id`
+    /// equal to `rp_id` (or `None`) disables the legacy path.
+    pub fn new(rp_id: &str, legacy_rp_id: Option<&str>, origins: &[String]) -> Result<Self> {
+        let rp_id = validate_rp_id(rp_id)?;
+        let legacy_rp_id = match legacy_rp_id {
+            None => None,
+            Some(l) => {
+                let l = validate_rp_id(l)?;
+                (l != rp_id).then_some(l)
+            }
+        };
+        if origins.is_empty() {
+            return Err(anyhow!("at least one WebAuthn origin is required"));
+        }
+        let mut normalised: Vec<String> = Vec::new();
+        let mut hosts: Vec<String> = Vec::new();
+        for o in origins {
+            let (origin, host) = normalise_origin(o)?;
+            if !host_within_rp_id(&host, &rp_id) {
+                return Err(anyhow!(
+                    "WebAuthn origin {origin} is not within RP ID {rp_id}: its host must equal the RP ID or be a subdomain of it"
+                ));
+            }
+            if !normalised.contains(&origin) {
+                normalised.push(origin);
+                hosts.push(host);
+            }
+        }
+        if let Some(legacy) = &legacy_rp_id {
+            // Legacy credentials can only be exercised from a page whose host is
+            // within the legacy RP ID. If none of our origins is, keeping the
+            // legacy path would advertise a ceremony no browser can perform.
+            if !hosts.iter().any(|h| host_within_rp_id(h, legacy)) {
+                return Err(anyhow!(
+                    "legacy WebAuthn RP ID {legacy} is unusable: no configured origin is within it"
+                ));
+            }
+        }
+        Ok(Self {
+            rp_id,
+            legacy_rp_id,
+            origins: normalised,
+        })
+    }
+
+    /// The RP ID new registrations are created under.
+    pub fn rp_id(&self) -> &str {
+        &self.rp_id
+    }
+
+    /// The RP ID of credentials with no recorded RP ID, or `None` when the
+    /// deployment has a single RP ID.
+    pub fn legacy_rp_id(&self) -> Option<&str> {
+        self.legacy_rp_id.as_deref()
+    }
+
+    /// The primary origin (the first configured one).
+    pub fn primary_origin(&self) -> &str {
+        &self.origins[0]
+    }
+
+    pub fn origins(&self) -> &[String] {
+        &self.origins
+    }
+
+    /// The RP ID a stored credential must be verified against, given what was
+    /// recorded for it at registration (`None` = pre-change credential).
+    pub fn rp_id_for_stored(&self, stored: Option<&str>) -> Result<&str> {
+        match stored {
+            None => Ok(self.legacy_rp_id.as_deref().unwrap_or(&self.rp_id)),
+            Some(s) if s == self.rp_id => Ok(&self.rp_id),
+            Some(s) if Some(s) == self.legacy_rp_id.as_deref() => {
+                Ok(self.legacy_rp_id.as_deref().unwrap_or(&self.rp_id))
+            }
+            Some(s) => Err(anyhow!(
+                "credential is bound to RP ID {s:?}, which this server no longer accepts"
+            )),
+        }
+    }
+
+    /// The configured origin exactly equal to the browser-reported `origin`,
+    /// provided its host is within `rp_id`. Exact match only.
+    pub fn accept_origin(&self, origin: &str, rp_id: &str) -> Result<&str> {
+        let hit = self
+            .origins
+            .iter()
+            .find(|o| o.as_str() == origin)
+            .ok_or_else(|| anyhow!("origin {origin:?} is not an allowed WebAuthn origin"))?;
+        let host = Url::parse(hit)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_default();
+        if !host_within_rp_id(&host, rp_id) {
+            return Err(anyhow!("origin {origin:?} is not within RP ID {rp_id:?}"));
+        }
+        Ok(hit)
+    }
+}
+
+/// Read the recorded RP ID of a stored credential (`None` = pre-change).
+async fn stored_rp_id(redis: &RedisClient, cred_id_b64: &str) -> Result<Option<String>> {
+    redis
+        .get_raw(&format!("{}/{}", RP_ID_PREFIX, cred_id_b64))
+        .await
+}
+
+/// Record the RP ID a credential was registered under. NOT best-effort: a
+/// credential stored without its RP ID would later be verified as a legacy one
+/// and never authenticate, so a failure here fails the registration.
+async fn record_rp_id(redis: &RedisClient, cred_id_b64: &str, rp_id: &str) -> Result<()> {
+    redis
+        .set_raw(&format!("{}/{}", RP_ID_PREFIX, cred_id_b64), rp_id)
+        .await
+}
+
 // -- Registration ceremony --
 
 pub async fn register_start(
@@ -536,6 +756,7 @@ pub async fn register_start(
 
 pub async fn register_finish(
     webauthn: &Webauthn,
+    rp: &RpPolicy,
     redis: &RedisClient,
     session_id: &str,
     reg_response: RegisterPublicKeyCredential,
@@ -557,6 +778,13 @@ pub async fn register_finish(
 
     let did = did_from_passkey(&passkey)?;
     let cred_id_b64 = URL_SAFE_NO_PAD.encode(passkey.cred_id());
+
+    // Record the RP ID BEFORE the credential: `webauthn` was built for
+    // `rp.rp_id()`, which `finish_passkey_registration` just enforced against
+    // the attestation's rpIdHash. Written first so a credential can never exist
+    // without it (an orphan RP-ID key is inert; an RP-less credential would be
+    // verified as legacy and never authenticate).
+    record_rp_id(redis, &cred_id_b64, rp.rp_id()).await?;
 
     // Store the credential persistently (no TTL).
     let cred_json = serde_json::to_string(&passkey)
@@ -629,15 +857,40 @@ pub async fn register_finish(
 /// scoped path we obtain a `RequestChallengeResponse` exactly as the usernameless
 /// path does and set `allow_credentials` directly (the shape the pre-discoverable
 /// code used). The stored challenge and `verify_credential` are unchanged.
+///
+/// # Which RP ID the ceremony runs under (shared-RP-ID transition)
+///
+/// One `navigator.credentials.get` call can only use one rpId, so the ceremony
+/// picks one and sets `publicKey.rpId` accordingly:
+///
+/// * default: [`RpPolicy::rp_id`] (the shared RP ID new passkeys live under);
+/// * `legacy == true` (the "use an older passkey" affordance): the legacy RP ID;
+/// * scoped (`Some(did)`): **dispatched by the DID's stored credentials** -- the
+///   primary RP ID if the DID has any credential under it, else the legacy RP ID
+///   if it has legacy ones. A returning user with only an old passkey therefore
+///   gets the right rpId with no extra click. `allow_credentials` is filtered to
+///   the credentials under the chosen RP ID (a credential listed under the wrong
+///   rpId can never be exercised).
+///
+/// Nothing here is a security decision: `verify_credential` checks every
+/// assertion against the RP ID recorded for its own credential.
 pub async fn authenticate_start(
     webauthn: &Webauthn,
+    rp: &RpPolicy,
     redis: &RedisClient,
     session_id: &str,
     scope_did: Option<&str>,
+    legacy: bool,
 ) -> Result<RequestChallengeResponse> {
     let (mut rcr, _auth_state) = webauthn
         .start_discoverable_authentication()
         .map_err(|e| anyhow!("WebAuthn auth start failed: {:?}", e))?;
+
+    let legacy_rp = rp.legacy_rp_id();
+    let mut ceremony_rp: &str = match (legacy, legacy_rp) {
+        (true, Some(l)) => l,
+        _ => rp.rp_id(),
+    };
 
     if let Some(did) = scope_did {
         // The UNION of the legacy webauthn:by_did index (with its scan
@@ -653,6 +906,28 @@ pub async fn authenticate_start(
             derive_did_from_credential_json,
         )
         .await?;
+        // Partition by the RP ID each credential must be exercised under.
+        let mut primary_ids: Vec<String> = Vec::new();
+        let mut legacy_ids: Vec<String> = Vec::new();
+        for id in cred_ids {
+            let stored = stored_rp_id(redis, &id).await?;
+            match rp.rp_id_for_stored(stored.as_deref()) {
+                Ok(r) if r == rp.rp_id() => primary_ids.push(id),
+                Ok(_) => legacy_ids.push(id),
+                Err(e) => warn!(cred = %id, "authenticate_start: skipping credential: {}", e),
+            }
+        }
+        let cred_ids = if legacy && legacy_rp.is_some() {
+            legacy_ids
+        } else if !primary_ids.is_empty() || legacy_rp.is_none() {
+            primary_ids
+        } else if !legacy_ids.is_empty() {
+            // Only old passkeys: dispatch the whole ceremony to the legacy RP ID.
+            ceremony_rp = legacy_rp.unwrap_or(rp.rp_id());
+            legacy_ids
+        } else {
+            Vec::new()
+        };
         // Empty set -> fall back to discoverable (leave allow_credentials empty) so a
         // wallet-only DID does not produce a broken empty picker that blocks all keys.
         if !cred_ids.is_empty() {
@@ -686,6 +961,8 @@ pub async fn authenticate_start(
         }
     }
 
+    rcr.public_key.rp_id = ceremony_rp.to_string();
+
     let challenge_b64 = URL_SAFE_NO_PAD.encode(&*rcr.public_key.challenge);
     redis
         .set_ex_raw(
@@ -695,8 +972,23 @@ pub async fn authenticate_start(
         )
         .await?;
 
-    info!("webauthn authenticate_start: session={}", session_id);
+    info!(
+        "webauthn authenticate_start: session={} rp_id={}",
+        session_id, ceremony_rp
+    );
     Ok(rcr)
+}
+
+/// The `origin` member of a clientDataJSON. The value is re-checked by
+/// `verify_webauthn_assertion` against the origin we pass it; reading it here
+/// only selects WHICH allowed origin to pass.
+fn client_data_origin(client_data_json: &[u8]) -> Result<String> {
+    let v: serde_json::Value = serde_json::from_slice(client_data_json)
+        .map_err(|e| anyhow!("invalid clientDataJSON: {}", e))?;
+    v.get("origin")
+        .and_then(|o| o.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("clientDataJSON has no origin"))
 }
 
 /// Core WebAuthn assertion verification: challenge retrieval, credential lookup,
@@ -705,8 +997,7 @@ pub async fn authenticate_start(
 pub async fn verify_credential(
     redis: &RedisClient,
     session_id: &str,
-    rp_id: &str,
-    rp_origin: &str,
+    rp: &RpPolicy,
     auth_response: &PublicKeyCredential,
 ) -> Result<AuthenticateFinishResponse, VerifyError> {
     let challenge_key = format!("{}/{}", CHALLENGE_PREFIX, session_id);
@@ -739,6 +1030,15 @@ pub async fn verify_credential(
         .map_err(|e| anyhow!("Failed to deserialize credential: {}", e))?;
 
     let compressed_pubkey = compressed_pubkey_from_passkey(&passkey)?;
+
+    // The RP ID THIS credential was registered under (absent = legacy), never
+    // "whichever configured RP ID matches the rpIdHash".
+    let stored_rp = stored_rp_id(redis, &cred_id_b64).await?;
+    let rp_id = rp.rp_id_for_stored(stored_rp.as_deref())?;
+    // Exact-match the browser-reported origin against the allow-list, and
+    // require it to sit within this credential's RP ID.
+    let reported_origin = client_data_origin(&auth_response.response.client_data_json)?;
+    let rp_origin = rp.accept_origin(&reported_origin, rp_id)?;
 
     let der_sig = &*auth_response.response.signature;
     let sig = Signature::from_der(der_sig)
@@ -820,8 +1120,8 @@ pub async fn verify_credential(
     }
 
     info!(
-        "webauthn verify_credential: did={} cred={}",
-        did, cred_id_b64
+        "webauthn verify_credential: did={} cred={} rp_id={}",
+        did, cred_id_b64, rp_id
     );
     Ok(AuthenticateFinishResponse { ok: true, did })
 }
@@ -831,11 +1131,10 @@ pub async fn verify_credential(
 pub async fn authenticate_finish(
     redis: &RedisClient,
     session_id: &str,
-    rp_id: &str,
-    rp_origin: &str,
+    rp: &RpPolicy,
     auth_response: PublicKeyCredential,
 ) -> Result<AuthenticateFinishResponse, VerifyError> {
-    let resp = verify_credential(redis, session_id, rp_id, rp_origin, &auth_response).await?;
+    let resp = verify_credential(redis, session_id, rp, &auth_response).await?;
 
     let session_key = format!("sessions/{}", session_id);
     let session_json = redis
@@ -901,6 +1200,7 @@ pub async fn link_start(
 
 pub async fn link_finish(
     webauthn: &Webauthn,
+    rp: &RpPolicy,
     redis: &RedisClient,
     session_id: &str,
     reg_response: RegisterPublicKeyCredential,
@@ -923,6 +1223,9 @@ pub async fn link_finish(
         .map_err(|e| anyhow!("WebAuthn registration verification failed: {:?}", e))?;
 
     let cred_id_b64 = URL_SAFE_NO_PAD.encode(passkey.cred_id());
+
+    // Same ordering and reason as register_finish.
+    record_rp_id(redis, &cred_id_b64, rp.rp_id()).await?;
 
     // Store the credential persistently (same as register_finish).
     let cred_json = serde_json::to_string(&passkey)
@@ -981,47 +1284,71 @@ pub async fn link_finish(
 
 pub struct WebauthnConfig {
     pub webauthn: Webauthn,
-    pub rp_id: String,
-    pub rp_origin: String,
+    pub rp: RpPolicy,
 }
 
-/// Build the Webauthn instance from config.
+/// Parse the comma-separated `rp_extra_origins` setting.
+pub fn parse_extra_origins(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Build the Webauthn instance (used for REGISTRATION only; assertions are
+/// verified by `verify_credential` under [`RpPolicy`]) and the RP policy.
 pub fn build_webauthn(
     base_url: &Url,
     rp_id: Option<&str>,
     rp_origin: Option<&str>,
+    extra_origins: Option<&str>,
+    legacy_rp_id: Option<&str>,
 ) -> Result<WebauthnConfig> {
-    let default_rp_id = base_url
+    let base_host = base_url
         .host_str()
         .ok_or_else(|| anyhow!("SIWEOIDC_BASE_URL has no host — cannot derive WebAuthn RP ID"))?
         .to_string();
-    let resolved_rp_id = rp_id.unwrap_or(&default_rp_id).to_string();
+    let resolved_rp_id = rp_id.unwrap_or(&base_host).to_string();
+    // Credentials with no recorded RP ID were created while `rp_id` defaulted
+    // to the base_url host (the only value prod ever ran with).
+    let resolved_legacy = legacy_rp_id.unwrap_or(&base_host).to_string();
 
     let default_origin = base_url.as_str().trim_end_matches('/').to_string();
-    let resolved_rp_origin = rp_origin
+    let mut origins = vec![rp_origin
         .unwrap_or(&default_origin)
         .trim_end_matches('/')
-        .to_string();
-    let rp_origin_url = Url::parse(&resolved_rp_origin)
-        .map_err(|e| anyhow!("Invalid SIWEOIDC_RP_ORIGIN: {}", e))?;
+        .to_string()];
+    origins.extend(parse_extra_origins(extra_origins));
 
-    let webauthn = WebauthnBuilder::new(&resolved_rp_id, &rp_origin_url)
-        .map_err(|e| {
-            anyhow!(
-                "WebauthnBuilder::new failed (rp_id={}, origin={}): {:?}",
-                resolved_rp_id,
-                rp_origin_url,
-                e
-            )
-        })?
+    let rp = RpPolicy::new(&resolved_rp_id, Some(&resolved_legacy), &origins)?;
+
+    let primary = Url::parse(rp.primary_origin())
+        .map_err(|e| anyhow!("Invalid SIWEOIDC_RP_ORIGIN: {}", e))?;
+    let mut builder = WebauthnBuilder::new(rp.rp_id(), &primary).map_err(|e| {
+        anyhow!(
+            "WebauthnBuilder::new failed (rp_id={}, origin={}): {:?}",
+            rp.rp_id(),
+            primary,
+            e
+        )
+    })?;
+    for o in rp.origins().iter().skip(1) {
+        let u = Url::parse(o).map_err(|e| anyhow!("Invalid extra origin {o}: {e}"))?;
+        builder = builder.append_allowed_origin(&u);
+    }
+    let webauthn = builder
         .build()
         .map_err(|e| anyhow!("Webauthn::build failed: {:?}", e))?;
 
-    Ok(WebauthnConfig {
-        webauthn,
-        rp_id: resolved_rp_id,
-        rp_origin: resolved_rp_origin,
-    })
+    info!(
+        rp_id = %rp.rp_id(),
+        legacy_rp_id = ?rp.legacy_rp_id(),
+        origins = ?rp.origins(),
+        "WebAuthn relying party configured"
+    );
+    Ok(WebauthnConfig { webauthn, rp })
 }
 
 #[cfg(test)]
@@ -1716,7 +2043,7 @@ mod tests {
         // A localhost RP is valid for WebauthnBuilder (origin must be https OR
         // localhost); this lets the test build a real Webauthn without TLS.
         let base = Url::parse("http://localhost:8000").unwrap();
-        let cfg = build_webauthn(&base, None, None).expect("build webauthn");
+        let cfg = build_webauthn(&base, None, None, None, None).expect("build webauthn");
 
         // A forged/guessed token that was never minted -> lookup must miss -> None.
         let nonce = Uuid::new_v4().simple().to_string();
@@ -1732,7 +2059,7 @@ mod tests {
 
         // Drive authenticate_start with the resolved (None) scope: usernameless.
         let session_id = format!("forgedsess{nonce}");
-        let rcr = authenticate_start(&cfg.webauthn, &redis, &session_id, scope_did.as_deref())
+        let rcr = authenticate_start(&cfg.webauthn, &cfg.rp, &redis, &session_id, scope_did.as_deref(), false)
             .await
             .expect("authenticate_start must succeed");
         assert!(
@@ -1754,7 +2081,7 @@ mod tests {
             Err(_) => return, // no Redis: skip (CI provides one)
         };
         let base = Url::parse("http://localhost:8000").unwrap();
-        let cfg = build_webauthn(&base, None, None).expect("build webauthn");
+        let cfg = build_webauthn(&base, None, None, None, None).expect("build webauthn");
 
         let nonce = Uuid::new_v4().simple().to_string();
         let did_a = format!("did:key:zDnA{nonce}");
@@ -1779,7 +2106,7 @@ mod tests {
         assert_eq!(scope_did.as_deref(), Some(did_a.as_str()));
 
         let session_id = format!("scopesess{nonce}");
-        let rcr = authenticate_start(&cfg.webauthn, &redis, &session_id, scope_did.as_deref())
+        let rcr = authenticate_start(&cfg.webauthn, &cfg.rp, &redis, &session_id, scope_did.as_deref(), false)
             .await
             .expect("authenticate_start");
 
@@ -1804,4 +2131,358 @@ mod tests {
         redis.index_remove_passkey(&did_b, &cred_b).await.ok();
         redis.destroy_user_session(&token).await.ok();
     }
+
+    // -- Shared-RP-ID transition: RpPolicy (pure) ------------------------------
+
+    fn origins(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn rp_policy_accepts_subdomain_origins_under_the_shared_rp_id() {
+        let p = RpPolicy::new(
+            "inblock.io",
+            Some("siwx-oidc.inblock.io"),
+            &origins(&["https://siwx-oidc.inblock.io/", "https://aquafire.inblock.io"]),
+        )
+        .expect("valid policy");
+        assert_eq!(p.rp_id(), "inblock.io");
+        assert_eq!(p.legacy_rp_id(), Some("siwx-oidc.inblock.io"));
+        // Trailing slash normalised away: the browser reports no slash.
+        assert_eq!(p.primary_origin(), "https://siwx-oidc.inblock.io");
+    }
+
+    #[test]
+    fn rp_policy_rejects_an_origin_outside_the_rp_id() {
+        for bad in [
+            "https://evil.example.com",
+            "https://evilinblock.io",       // suffix without a label boundary
+            "https://inblock.io.evil.com",  // RP ID as a left-hand label
+        ] {
+            let err = RpPolicy::new("inblock.io", None, &origins(&[bad]))
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("not within RP ID"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn rp_policy_rejects_wildcards_paths_ips_and_plain_http() {
+        assert!(RpPolicy::new("*.inblock.io", None, &origins(&["https://a.inblock.io"])).is_err());
+        assert!(RpPolicy::new("inblock.io", None, &origins(&["https://*.inblock.io"])).is_err());
+        assert!(RpPolicy::new("inblock.io", None, &origins(&["https://a.inblock.io/login"])).is_err());
+        assert!(RpPolicy::new("inblock.io", None, &origins(&["http://a.inblock.io"])).is_err());
+        assert!(RpPolicy::new("127.0.0.1", None, &origins(&["http://127.0.0.1:8000"])).is_err());
+        assert!(RpPolicy::new("io", None, &origins(&["https://inblock.io"])).is_err());
+        assert!(RpPolicy::new("https://inblock.io", None, &origins(&["https://inblock.io"])).is_err());
+        // http is allowed on the localhost family only (local e2e harness).
+        RpPolicy::new(
+            "inblock.localhost",
+            Some("siwx.inblock.localhost"),
+            &origins(&["http://siwx.inblock.localhost:18200"]),
+        )
+        .expect("localhost family over http is allowed");
+    }
+
+    #[test]
+    fn rp_policy_refuses_a_legacy_rp_id_no_origin_can_reach() {
+        let err = RpPolicy::new(
+            "inblock.io",
+            Some("siwx-oidc.inblock.io"),
+            &origins(&["https://aquafire.inblock.io"]),
+        )
+        .expect_err("legacy RP ID unreachable from every origin")
+        .to_string();
+        assert!(err.contains("unusable"), "{err}");
+    }
+
+    #[test]
+    fn rp_policy_legacy_equal_to_primary_is_single_rp() {
+        let p = RpPolicy::new(
+            "siwx-oidc.inblock.io",
+            Some("siwx-oidc.inblock.io"),
+            &origins(&["https://siwx-oidc.inblock.io"]),
+        )
+        .unwrap();
+        assert_eq!(p.legacy_rp_id(), None);
+        assert_eq!(p.rp_id_for_stored(None).unwrap(), "siwx-oidc.inblock.io");
+    }
+
+    #[test]
+    fn rp_policy_binds_each_credential_to_its_own_rp_id() {
+        let p = RpPolicy::new(
+            "inblock.io",
+            Some("siwx-oidc.inblock.io"),
+            &origins(&["https://siwx-oidc.inblock.io"]),
+        )
+        .unwrap();
+        // Pre-change credential (nothing recorded) -> legacy, NEVER the shared one.
+        assert_eq!(p.rp_id_for_stored(None).unwrap(), "siwx-oidc.inblock.io");
+        assert_eq!(p.rp_id_for_stored(Some("inblock.io")).unwrap(), "inblock.io");
+        assert_eq!(
+            p.rp_id_for_stored(Some("siwx-oidc.inblock.io")).unwrap(),
+            "siwx-oidc.inblock.io"
+        );
+        // An RP ID the server no longer accepts fails closed.
+        assert!(p.rp_id_for_stored(Some("aquafire.inblock.io")).is_err());
+    }
+
+    #[test]
+    fn rp_policy_origin_match_is_exact() {
+        let p = RpPolicy::new(
+            "inblock.io",
+            Some("siwx-oidc.inblock.io"),
+            &origins(&["https://siwx-oidc.inblock.io", "https://aquafire.inblock.io"]),
+        )
+        .unwrap();
+        assert!(p.accept_origin("https://siwx-oidc.inblock.io", "inblock.io").is_ok());
+        assert!(p.accept_origin("https://siwx-oidc.inblock.io/", "inblock.io").is_err());
+        assert!(p.accept_origin("https://siwx-oidc.inblock.io:443", "inblock.io").is_err());
+        assert!(p.accept_origin("http://siwx-oidc.inblock.io", "inblock.io").is_err());
+        assert!(p.accept_origin("https://x.siwx-oidc.inblock.io", "inblock.io").is_err());
+        // A configured origin is still refused for a credential whose RP ID it
+        // is not within (aquafire is not under the legacy siwx-oidc RP ID).
+        assert!(p
+            .accept_origin("https://aquafire.inblock.io", "siwx-oidc.inblock.io")
+            .is_err());
+    }
+
+    #[test]
+    fn build_webauthn_default_config_is_unchanged_single_rp() {
+        let base = Url::parse("https://siwx-oidc.inblock.io").unwrap();
+        let cfg = build_webauthn(&base, None, None, None, None).unwrap();
+        assert_eq!(cfg.rp.rp_id(), "siwx-oidc.inblock.io");
+        assert_eq!(cfg.rp.legacy_rp_id(), None, "no config change => no legacy path");
+        // The shared-RP-ID deployment: only SIWEOIDC_RP_ID changes.
+        let cfg = build_webauthn(&base, Some("inblock.io"), None, None, None).unwrap();
+        assert_eq!(cfg.rp.rp_id(), "inblock.io");
+        assert_eq!(cfg.rp.legacy_rp_id(), Some("siwx-oidc.inblock.io"));
+        assert_eq!(cfg.rp.origins(), &["https://siwx-oidc.inblock.io".to_string()]);
+        assert_eq!(parse_extra_origins(Some(" https://a.inblock.io, ,https://b.inblock.io,")),
+            vec!["https://a.inblock.io".to_string(), "https://b.inblock.io".to_string()]);
+    }
+
+    // -- Shared-RP-ID transition: per-credential verification (needs Redis) ---
+
+    /// A software P-256 "authenticator": a stored-credential blob in the exact
+    /// webauthn-rs shape (the fixture with our own key substituted) plus an
+    /// assertion builder. Lets `verify_credential` run hermetically.
+    struct SoftKey {
+        sk: p256::ecdsa::SigningKey,
+        cred_id: Vec<u8>,
+    }
+
+    impl SoftKey {
+        fn new() -> Self {
+            let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+            let cred_id = Uuid::new_v4().as_bytes().to_vec();
+            Self { sk, cred_id }
+        }
+        fn cred_id_b64(&self) -> String {
+            URL_SAFE_NO_PAD.encode(&self.cred_id)
+        }
+        fn blob(&self) -> String {
+            const BLOB: &str =
+                include_str!("../tests/fixtures/passkey_webauthn_rs_0_6_0_dev.json");
+            let point = self.sk.verifying_key().to_encoded_point(false);
+            let mut v: serde_json::Value = serde_json::from_str(BLOB).unwrap();
+            v["cred"]["cred_id"] = serde_json::json!(self.cred_id_b64());
+            v["cred"]["cred"]["key"]["EC_EC2"]["x"] =
+                serde_json::json!(URL_SAFE_NO_PAD.encode(point.x().unwrap()));
+            v["cred"]["cred"]["key"]["EC_EC2"]["y"] =
+                serde_json::json!(URL_SAFE_NO_PAD.encode(point.y().unwrap()));
+            v.to_string()
+        }
+        fn did(&self) -> String {
+            derive_did_from_credential_json(&self.blob()).unwrap()
+        }
+        fn assert(&self, rp_id: &str, origin: &str, challenge: &[u8], counter: u32) -> PublicKeyCredential {
+            use p256::ecdsa::signature::Signer;
+            use sha2::{Digest, Sha256};
+            let mut auth_data = Sha256::digest(rp_id.as_bytes()).to_vec();
+            auth_data.push(0x05); // UP | UV
+            auth_data.extend_from_slice(&counter.to_be_bytes());
+            let cdj = serde_json::json!({
+                "type": "webauthn.get",
+                "challenge": URL_SAFE_NO_PAD.encode(challenge),
+                "origin": origin,
+                "crossOrigin": false,
+            })
+            .to_string();
+            let mut msg = auth_data.clone();
+            msg.extend_from_slice(&Sha256::digest(cdj.as_bytes()));
+            let sig: p256::ecdsa::Signature = self.sk.sign(&msg);
+            serde_json::from_value(serde_json::json!({
+                "id": self.cred_id_b64(),
+                "rawId": self.cred_id_b64(),
+                "type": "public-key",
+                "extensions": {},
+                "response": {
+                    "authenticatorData": URL_SAFE_NO_PAD.encode(&auth_data),
+                    "clientDataJSON": URL_SAFE_NO_PAD.encode(cdj.as_bytes()),
+                    "signature": URL_SAFE_NO_PAD.encode(sig.to_der().as_bytes()),
+                    "userHandle": null,
+                },
+            }))
+            .expect("PublicKeyCredential shape")
+        }
+    }
+
+    async fn redis_or_skip() -> Option<RedisClient> {
+        RedisClient::new(&Url::parse("redis://localhost").unwrap()).await.ok()
+    }
+
+    fn shared_policy() -> RpPolicy {
+        RpPolicy::new(
+            "inblock.io",
+            Some("siwx-oidc.inblock.io"),
+            &origins(&["https://siwx-oidc.inblock.io"]),
+        )
+        .unwrap()
+    }
+
+    /// Store `key` as a credential (optionally recording an RP ID), arm a
+    /// challenge for a fresh session, and run `verify_credential`.
+    async fn verify_with(
+        redis: &RedisClient,
+        rp: &RpPolicy,
+        key: &SoftKey,
+        recorded_rp: Option<&str>,
+        assert_rp: &str,
+        origin: &str,
+    ) -> Result<AuthenticateFinishResponse, VerifyError> {
+        let id = key.cred_id_b64();
+        redis
+            .set_raw(&format!("{}/{}", CREDENTIAL_PREFIX, id), &key.blob())
+            .await
+            .unwrap();
+        if let Some(r) = recorded_rp {
+            record_rp_id(redis, &id, r).await.unwrap();
+        }
+        let session = format!("rpt{}", Uuid::new_v4().simple());
+        let challenge = Uuid::new_v4().as_bytes().to_vec();
+        redis
+            .set_ex_raw(
+                &format!("{}/{}", CHALLENGE_PREFIX, session),
+                &URL_SAFE_NO_PAD.encode(&challenge),
+                CHALLENGE_TTL,
+            )
+            .await
+            .unwrap();
+        let cred = key.assert(assert_rp, origin, &challenge, 1);
+        verify_credential(redis, &session, rp, &cred).await
+    }
+
+    async fn cleanup(redis: &RedisClient, key: &SoftKey) {
+        let id = key.cred_id_b64();
+        let _ = redis.del_raw(&format!("{}/{}", CREDENTIAL_PREFIX, id)).await;
+        let _ = redis.del_raw(&format!("{}/{}", RP_ID_PREFIX, id)).await;
+    }
+
+    #[tokio::test]
+    async fn new_credential_verifies_under_the_shared_rp_id_only() {
+        let Some(redis) = redis_or_skip().await else { return };
+        let rp = shared_policy();
+        let key = SoftKey::new();
+        let ok = verify_with(&redis, &rp, &key, Some("inblock.io"), "inblock.io", "https://siwx-oidc.inblock.io")
+            .await
+            .expect("shared-RP credential verifies");
+        assert_eq!(ok.did, key.did());
+        // The same credential presenting a LEGACY rpIdHash is refused: a
+        // credential is never verified against "the other" RP ID.
+        let err = verify_with(&redis, &rp, &key, Some("inblock.io"), "siwx-oidc.inblock.io", "https://siwx-oidc.inblock.io")
+            .await
+            .expect_err("wrong rpIdHash for this credential");
+        assert!(err.to_string().contains("rpIdHash"), "{err}");
+        cleanup(&redis, &key).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_credential_without_recorded_rp_id_still_logs_in() {
+        let Some(redis) = redis_or_skip().await else { return };
+        let rp = shared_policy();
+        let key = SoftKey::new();
+        // A pre-change row: blob only, no webauthn:rp_id key.
+        let ok = verify_with(&redis, &rp, &key, None, "siwx-oidc.inblock.io", "https://siwx-oidc.inblock.io")
+            .await
+            .expect("legacy credential verifies under the legacy RP ID");
+        assert_eq!(ok.did, key.did());
+        // ...and is NOT accepted under the shared RP ID (it cannot be: a real
+        // authenticator would never produce that hash for this credential).
+        let err = verify_with(&redis, &rp, &key, None, "inblock.io", "https://siwx-oidc.inblock.io")
+            .await
+            .expect_err("legacy credential asserting the shared rpIdHash");
+        assert!(err.to_string().contains("rpIdHash"), "{err}");
+        cleanup(&redis, &key).await;
+    }
+
+    #[tokio::test]
+    async fn assertion_from_an_unlisted_origin_is_refused() {
+        let Some(redis) = redis_or_skip().await else { return };
+        let rp = shared_policy();
+        let key = SoftKey::new();
+        // A valid shared-RP assertion obtained on ANOTHER inblock.io page (the
+        // browser allows any *.inblock.io page to use RP ID inblock.io) is not
+        // a siwx-oidc login.
+        let err = verify_with(&redis, &rp, &key, Some("inblock.io"), "inblock.io", "https://draw.inblock.io")
+            .await
+            .expect_err("foreign origin");
+        assert!(err.to_string().contains("not an allowed WebAuthn origin"), "{err}");
+        cleanup(&redis, &key).await;
+    }
+
+    #[tokio::test]
+    async fn a_recorded_rp_id_the_server_no_longer_accepts_fails_closed() {
+        let Some(redis) = redis_or_skip().await else { return };
+        let rp = shared_policy();
+        let key = SoftKey::new();
+        let err = verify_with(&redis, &rp, &key, Some("old.example.com"), "old.example.com", "https://siwx-oidc.inblock.io")
+            .await
+            .expect_err("unknown recorded RP ID");
+        assert!(err.to_string().contains("no longer accepts"), "{err}");
+        cleanup(&redis, &key).await;
+    }
+
+    #[tokio::test]
+    async fn scoped_start_dispatches_a_legacy_only_user_to_the_legacy_rp_id() {
+        let Some(redis) = redis_or_skip().await else { return };
+        let base = Url::parse("https://siwx-oidc.inblock.io").unwrap();
+        let cfg = build_webauthn(&base, Some("inblock.io"), None, None, None).unwrap();
+        let legacy = SoftKey::new();
+        let modern = SoftKey::new();
+        for k in [&legacy, &modern] {
+            redis
+                .set_raw(&format!("{}/{}", CREDENTIAL_PREFIX, k.cred_id_b64()), &k.blob())
+                .await
+                .unwrap();
+        }
+        record_rp_id(&redis, &modern.cred_id_b64(), "inblock.io").await.unwrap();
+
+        let sess = || format!("rps{}", Uuid::new_v4().simple());
+        // Legacy-only DID: the ceremony itself moves to the legacy RP ID.
+        let rcr = authenticate_start(&cfg.webauthn, &cfg.rp, &redis, &sess(), Some(&legacy.did()), false)
+            .await
+            .unwrap();
+        assert_eq!(rcr.public_key.rp_id, "siwx-oidc.inblock.io");
+        assert_eq!(rcr.public_key.allow_credentials.len(), 1);
+        assert_eq!(rcr.public_key.allow_credentials[0].id, legacy.cred_id);
+        // Modern DID: shared RP ID.
+        let rcr = authenticate_start(&cfg.webauthn, &cfg.rp, &redis, &sess(), Some(&modern.did()), false)
+            .await
+            .unwrap();
+        assert_eq!(rcr.public_key.rp_id, "inblock.io");
+        assert_eq!(rcr.public_key.allow_credentials[0].id, modern.cred_id);
+        // Unscoped: shared RP ID by default, legacy on request.
+        let rcr = authenticate_start(&cfg.webauthn, &cfg.rp, &redis, &sess(), None, false).await.unwrap();
+        assert_eq!(rcr.public_key.rp_id, "inblock.io");
+        assert!(rcr.public_key.allow_credentials.is_empty());
+        let rcr = authenticate_start(&cfg.webauthn, &cfg.rp, &redis, &sess(), None, true).await.unwrap();
+        assert_eq!(rcr.public_key.rp_id, "siwx-oidc.inblock.io");
+
+        for k in [&legacy, &modern] {
+            cleanup(&redis, k).await;
+            let _ = redis.index_remove_passkey(&k.did(), &k.cred_id_b64()).await;
+        }
+    }
+
 }

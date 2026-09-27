@@ -608,7 +608,13 @@ async function approveWallet() {
   }
 }
 
-async function approvePasskey(forceAll) {
+// Shared-RP-ID transition: the legacy RP ID reported by the start endpoint when
+// passkeys created before the switch to the shared inblock.io RP ID are still
+// accepted. One ceremony can use only one rpId, so an old passkey needs its own
+// ceremony ({"legacy": true}).
+let legacyRpId = null;
+
+async function approvePasskey(forceAll, legacy) {
   hideStatus();
   setBusy('btn-passkey', true, 'Authenticating...');
   try {
@@ -617,13 +623,14 @@ async function approvePasskey(forceAll) {
       headers: { 'Content-Type': 'application/json' },
       // `all:true` is the escape hatch: re-run usernameless (offer every key) even
       // when the siwx_user cookie scoped this picker to the approver's account.
-      body: JSON.stringify({ user_code: currentUserCode, all: !!forceAll })
+      body: JSON.stringify({ user_code: currentUserCode, all: !!forceAll, legacy: !!legacy })
     });
     if (!startR.ok) { showStatus('Failed to start passkey authentication.', true); return; }
     const options = await startR.json();
     // Identity-scoped picker: when the server recognises the approver's account it
     // returns `detected_mxid` and an allowCredentials limited to that account's keys.
     // Surface "use a different passkey" so approving as another account is possible.
+    legacyRpId = options.legacy_rp_id || null;
     renderPasskeyScope(forceAll ? null : options.detected_mxid);
     options.publicKey.challenge = base64ToBuffer(options.publicKey.challenge);
     // The server may return a scoped allowCredentials (the approver's keys) or an
@@ -674,6 +681,7 @@ async function approvePasskey(forceAll) {
     // than a raw error string.
     if (e && (e.name === 'NotAllowedError' || e.name === 'AbortError')) {
       showStatus('No passkey was used. Try "Use a different passkey" above, approve on another device, or sign with your wallet.', true);
+      if (legacyRpId && !legacy) renderLegacyOffer();
     } else {
       showStatus('Passkey error: ' + (e.message || e), true);
     }
@@ -686,6 +694,20 @@ async function approvePasskey(forceAll) {
 // picker is identity-scoped (detected_mxid present), or hide it (usernameless). The
 // mxid is set via textContent (never innerHTML), and the link is styled inline so it
 // does not depend on a page-specific CSS class.
+function renderLegacyOffer() {
+  const el = $('passkey-scope');
+  if (!el || $('passkey-legacy')) return;
+  el.appendChild(document.createTextNode(' Created your passkey before the switch to inblock.io? '));
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.id = 'passkey-legacy';
+  btn.textContent = 'Use an older passkey';
+  btn.style.cssText = 'background:none;border:none;padding:0;font:inherit;color:inherit;text-decoration:underline;cursor:pointer;';
+  btn.onclick = () => approvePasskey(false, true);
+  el.appendChild(btn);
+  el.classList.remove('hidden');
+}
+
 function renderPasskeyScope(mxid) {
   const el = $('passkey-scope');
   if (!el) return;

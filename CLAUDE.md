@@ -713,7 +713,9 @@ Prefix: `SIWEOIDC_` (via Figment: `siwe-oidc.toml` or env vars)
 | `SIWEOIDC_SUPPORTED_DID_METHODS` | DID methods accepted at sign-in | `["pkh"]` |
 | `SIWEOIDC_SUPPORTED_PKH_NAMESPACES` | did:pkh namespaces accepted | `["eip155","ed25519","p256"]` |
 | `SIWEOIDC_RP_ID` | WebAuthn Relying Party ID (domain) | hostname of `BASE_URL` |
-| `SIWEOIDC_RP_ORIGIN` | WebAuthn expected origin URL | `BASE_URL` |
+| `SIWEOIDC_RP_ORIGIN` | WebAuthn expected origin URL (the primary origin) | `BASE_URL` |
+| `SIWEOIDC_RP_EXTRA_ORIGINS` | Extra exact WebAuthn origins, comma-separated. No wildcards; each host must equal `RP_ID` or be a subdomain of it (startup fails otherwise) | (none) |
+| `SIWEOIDC_LEGACY_RP_ID` | RP ID that credentials with NO recorded RP ID (all pre-2026-09-27 passkeys) are verified against. Equal to `RP_ID` = legacy path off | hostname of `BASE_URL` |
 | `SIWEOIDC_LOG_FORMAT` | Log output format | `pretty` (or `json`) |
 | `SIWEOIDC_MATRIX_SERVER_NAME` | Matrix server_name for cross-signing checks, device actions, and `io.inblock.did` publication (no server_name → no `mxid` → publication skipped) | (none) |
 | `SIWEOIDC_ACCOUNT_MANAGEMENT_URI` | MSC4191 account management URL (override) | `{base_url}/account` |
@@ -943,6 +945,7 @@ webauthn:credential/{cred_id_b64}      no TTL    — stored Passkey (JSON-serial
 webauthn:link/{cred_id_b64}            no TTL    — { primary_did, label } (account linking)
 webauthn:link_challenge/{session_id}   TTL 120s  — link ceremony state (reg_state + primary_did)
 webauthn:by_did/{did}                  no TTL    — SET of cred_id_b64 for this DID (reverse index)
+webauthn:rp_id/{cred_id_b64}           no TTL    — RP ID the credential was registered under (absent = legacy)
 user:session/{token}                   TTL 30d   — opaque login user-session: token -> DID
 device_codes/{device_code}             TTL 1800s — DeviceCodeEntry (RFC 8628)
 user_codes/{user_code}                 TTL 1800s — reverse lookup to device_code
@@ -991,6 +994,38 @@ After linking, authenticating with that passkey produces the wallet's DID (not a
 The `/link/webauthn/start` endpoint verifies the `siwx` cookie's CAIP-122 signature to prove
 DID ownership before creating the link. `authenticate_finish` checks `webauthn:link/{cred_id}`
 and substitutes `primary_did` if a mapping exists.
+
+### Shared RP ID `inblock.io` + legacy transition — 2026-09-27
+
+Goal: one passkey (hence one `did:key`) across every inblock.io service
+(siwx-oidc, aqua-node/aquafier, aqua-suite). Deployment = `SIWEOIDC_RP_ID=inblock.io`
+and nothing else; each app stays on its own subdomain (WebAuthn L3 §5.1 lets a page
+on `siwx-oidc.inblock.io` use its registrable suffix `inblock.io` as rpId, and
+`inblock.io` is not on the Public Suffix List). No apex hosting, no
+`/.well-known/webauthn` (Related Origin Requests are only for a DIFFERENT
+registrable domain).
+
+- **Per-credential RP ID.** New registrations record `webauthn:rp_id/{cred}` =
+  `RP_ID` (written BEFORE the blob, and a write failure fails the registration).
+  A credential with no record is a pre-change one and is verified against
+  `SIWEOIDC_LEGACY_RP_ID` (default: base_url host = `siwx-oidc.inblock.io`). A
+  recorded RP ID that is neither is refused. `verify_credential` never tries "the
+  other" RP ID (`RpPolicy::rp_id_for_stored`).
+- **Origins:** exact match against `RP_ORIGIN` + `RP_EXTRA_ORIGINS`, and the
+  reported origin must also be within the credential's RP ID. With a shared RP ID
+  ANY `*.inblock.io` page can run a ceremony, so the exact origin check is what
+  keeps an assertion obtained on e.g. `draw.inblock.io` from being a siwx-oidc
+  login.
+- **One rpId per ceremony**, so old passkeys need their own ceremony:
+  `authenticate/start` (and `/device/passkey/start`, `/account/passkey/start`)
+  accept `{"legacy": true}` and report `legacy_rp_id` while the legacy path is on.
+  A cookie-scoped (`siwx_user`) start DISPATCHES automatically: a DID whose
+  credentials are all legacy gets a legacy-rpId ceremony with no extra click.
+  Unscoped users get the shared rpId first; on a cancelled/empty ceremony the
+  pages offer "Use an older passkey".
+- Retiring the legacy path later = set `SIWEOIDC_LEGACY_RP_ID` equal to
+  `SIWEOIDC_RP_ID`; unrecorded credentials then verify against the shared RP ID
+  and fail (their rpIdHash is the old host's), i.e. old passkeys stop working.
 
 ### Passkey-picker scoping (`siwx_user` cookie) — 2026-06-18
 
