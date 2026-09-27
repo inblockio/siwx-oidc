@@ -599,19 +599,14 @@ async fn device_passkey_finish_handler(
     let auth_response: PublicKeyCredential = serde_json::from_value(payload.clone())
         .map_err(|e| CustomError::BadRequest(format!("Invalid credential: {}", e)))?;
     let session_id = format!("device_passkey_{}", user_code);
-    let resp = wa::verify_credential(
-        &state.redis_client,
-        &session_id,
-        &state.rp,
-        &auth_response,
-    )
-    .await
-    // Route the stale-passkey case to the structured 401 discriminator; keep every
-    // other verification failure as the existing 400 BadRequest for this flow.
-    .map_err(|e| match e {
-        wa::VerifyError::UnknownCredential(id) => CustomError::UnknownCredential(id),
-        wa::VerifyError::Other(inner) => CustomError::BadRequest(inner.to_string()),
-    })?;
+    let resp = wa::verify_credential(&state.redis_client, &session_id, &state.rp, &auth_response)
+        .await
+        // Route the stale-passkey case to the structured 401 discriminator; keep every
+        // other verification failure as the existing 400 BadRequest for this flow.
+        .map_err(|e| match e {
+            wa::VerifyError::UnknownCredential(id) => CustomError::UnknownCredential(id),
+            wa::VerifyError::Other(inner) => CustomError::BadRequest(inner.to_string()),
+        })?;
     let synapse = state.synapse_client.as_deref();
     let server_name = state.config.matrix_server_name.as_deref();
     let result = device_auth::device_approve_passkey(
@@ -727,7 +722,9 @@ async fn webauthn_authenticate_start(
 
     // Escape hatch: `?all=1` OR JSON `{"all": true}` forces usernameless even with
     // a cookie ("use a different passkey").
-    let (body_all, legacy) = body.map(|Json(b)| (b.all, b.legacy)).unwrap_or((false, false));
+    let (body_all, legacy) = body
+        .map(|Json(b)| (b.all, b.legacy))
+        .unwrap_or((false, false));
     let force_all = body_all
         || query
             .all
@@ -813,13 +810,8 @@ async fn webauthn_authenticate_finish(
     let session_id = cookies
         .get(SESSION_COOKIE_NAME)
         .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
-    let resp = wa::authenticate_finish(
-        &state.redis_client,
-        session_id,
-        &state.rp,
-        auth_response,
-    )
-    .await?;
+    let resp =
+        wa::authenticate_finish(&state.redis_client, session_id, &state.rp, auth_response).await?;
 
     // Detection only (no blocking, no change to provisioning). The verified DID
     // is already stored in the session by authenticate_finish; the new-user gate
