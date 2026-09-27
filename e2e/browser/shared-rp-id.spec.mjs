@@ -15,7 +15,7 @@
 // Both services share the aqua-auth credential store (AQUA_WEBAUTHN_REDIS_URL),
 // which is what lets aquafier verify a credential siwx-oidc registered.
 //
-// Stack: ~/.cache/shared-rp-id/stack.sh (not part of e2e/up.sh). Run with
+// Stack: e2e/shared-rp-id-stack.sh (+ a Redis on :6379; not part of e2e/up.sh). Run with
 //   bash e2e/browser/run.sh shared-rp-id.spec.mjs
 import { test, expect } from '@playwright/test';
 import net from 'node:net';
@@ -217,7 +217,7 @@ test('shared RP ID: one passkey, one did:key across siwx-oidc and aquafier; lega
 });
 
 // aquafier's own legacy path (Postgres credential store). Stack:
-// ~/.cache/shared-rp-id/stack-aqf-legacy.sh — A1 = pre-change config on :3292
+// e2e/shared-rp-id-stack-aqf-legacy.sh (+ the test-only NULL-rp_id trigger it documents) — A1 = pre-change config on :3292
 // (RP ID = aquafire.inblock.localhost), A2 = AQUAFIER_WEBAUTHN_RP_ID=inblock.localhost
 // on :3293 with the default legacy RP ID, one shared Postgres. A1's rows are
 // stored with rp_id NULL (a test trigger), exactly like pre-migration-037 rows.
