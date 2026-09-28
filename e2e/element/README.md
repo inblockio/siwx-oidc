@@ -33,6 +33,7 @@ bash e2e/element/stack-down.sh
 | `ew-passkey.spec.mjs` | EW-P1–P3 passkey OIDC login: new-user gate, returning-user scoped picker + multi-device, synced passkey in a second context |
 | `ew-clickpath.spec.mjs` | EW-C1–C3 REAL Element DOM: SSO click-login through the siwx UI + Secure Backup wizard, Settings→Sessions sign-out (teardown policy), Manage-account deep-link |
 | `ew-verify-sas.spec.mjs` | EW-V1 R4/AC4 proof: a second session is cross-signed by SAS/emoji driven from a live first session (Settings→Sessions→"Verify session"), with a positive tripwire asserting **no recovery phrase** was typed and no 4S entry surface appeared during the SAS leg |
+| `ew-sw-media-auth.spec.mjs` | SW-1..3: Element's service worker keeps authenticated media working when its `/versions` check hits an expired token (401, anonymous retry), a transient 5xx (never cached), or a media 401 while the app refreshes (one bounded retry). Covers siwx-oidc-matrix-server `patches/element-web` entries 9 and 10. `EW_SW_OVERRIDE=<stock sw.js>` serves the unpatched worker through `helpers/stock-sw-proxy.mjs`; every leg must then fail. |
 
 ## Helpers
 
