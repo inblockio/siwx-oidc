@@ -1,6 +1,6 @@
 # cargo-about: the third-party license texts shipped in the container image
 # (/usr/share/licenses/siwx-oidc/THIRD-PARTY-LICENSES-rust.txt), generated in
-# the Dockerfile's builder stage with `cargo about generate --locked --fail`.
+# the Dockerfile's builder stage by scripts/third-party-notices.sh.
 #
 # Scope is the root package, whose two binaries (siwx-oidc, migrate-credentials)
 # are what the image ships: dev- and build-dependencies are left out, and so is
@@ -31,8 +31,9 @@ ignore-dev-dependencies = true
 # copyright lines the MIT and BSD licenses require us to reproduce (and, for
 # curve25519-dalek, the Go Authors notice for the code it derives from). Each
 # file is pinned by SHA-256. When a dependency bump changes the file,
-# cargo-about only warns and falls back to the bare text; the Dockerfile turns
-# that warning into a build failure, so the clarification gets re-reviewed.
+# cargo-about only warns and falls back to the bare text;
+# scripts/third-party-notices.sh turns that warning into a build failure, so the
+# clarification gets re-reviewed.
 
 [curve25519-dalek.clarify]
 license = "BSD-3-Clause"

@@ -48,19 +48,15 @@ COPY --from=dep_cacher $CARGO_HOME $CARGO_HOME
 COPY --from=dep_planner /siwx-oidc/ ./
 RUN cargo build --release --locked
 # License texts of every crate linked into the two binaries (scope and the
-# accepted-license allowlist: about.toml). `--fail` makes an unaccepted license
-# fail the build. A clarification whose checksum no longer matches is only a
-# cargo-about warning, after which it silently falls back to the bare SPDX text
-# and drops the crate's copyright lines, so any warning fails the build too.
+# accepted-license allowlist: about.toml). The script fails the build on an
+# unaccepted license AND on any cargo-about warning, such as a clarification
+# whose checksum no longer matches; it says why cargo-about's exit status alone
+# is not enough.
 COPY --from=about $CARGO_HOME/bin/cargo-about $CARGO_HOME/bin/
 COPY about.toml about.hbs ./
-# Written for both shells this RUN may get: podman's OCI format ignores the base
-# image's SHELL (/bin/sh), Docker honours it (bash -eux -o pipefail).
-RUN if cargo about --color never generate --locked --fail about.hbs \
-            -o THIRD-PARTY-LICENSES-rust.txt 2> about.log; \
-    then status=0; else status=$?; fi; \
-    cat about.log >&2; \
-    test "$status" -eq 0 && ! grep -qE '\[(WARN|ERROR)\]' about.log
+COPY scripts/third-party-notices.sh ./scripts/
+RUN ./scripts/third-party-notices.sh THIRD-PARTY-LICENSES-rust.txt
+
 
 FROM docker.io/library/alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 # A fixed unprivileged UID/GID, so file ownership on mounted volumes and
