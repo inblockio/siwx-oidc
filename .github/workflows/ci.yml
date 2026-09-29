@@ -261,10 +261,13 @@ jobs:
             --skip msc4191_metadata_advertised_and_forwarded
 
       # `compat::TeardownPolicy` (3/3 promoted): the fix for the 2026-06-12 login
-      # incident. Guards that /oauth2/revoke deletes NO Synapse device (token
-      # hygiene raced in-flight key uploads and wedged cross-signing), that an
-      # explicit /logout deletes exactly the ending one, and that /logout/all
-      # invalidates every session WITHOUT deactivating the account.
+      # incident. Guards that /oauth2/revoke and an explicit /logout each end
+      # the session (its token stops authenticating at whoami), and that
+      # /logout/all invalidates every session WITHOUT deactivating the account.
+      # These observe tokens, not devices: that revoke keeps the Synapse device
+      # (token hygiene deleting it raced in-flight key uploads and wedged
+      # cross-signing) is pinned by the unit test
+      # `compat::tests::teardown_policy_only_deletes_device_on_explicit_signout`.
       - name: E2E session teardown policy
         run: cargo test --test e2e_session_teardown -- --ignored --test-threads=1
 
