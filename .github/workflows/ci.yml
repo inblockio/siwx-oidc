@@ -1,6 +1,20 @@
 name: ci
 
-on: push
+# Pushes to main, and every pull request, fork PRs included. Branch pushes
+# without a PR do not run, so a PR branch is not built twice.
+#
+# A `pull_request` run gets a read-only token and, from a fork, no secrets.
+# Nothing in this workflow reads a secret (SIWEOIDC_MAS_SHARED_SECRET below is
+# a literal test value), so a fork PR runs every job in full. Keep it that
+# way: a step that needs a secret must skip visibly when it is absent, in a
+# named step that says why, and never fail or pass without running.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
