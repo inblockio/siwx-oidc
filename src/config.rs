@@ -105,6 +105,22 @@ fn has_prefix(key: &str, prefix: &str) -> bool {
         && key.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
+/// Deserializes an optional URL, treating an empty (or all-whitespace) string
+/// as `None`. Environment variables cannot express "unset" once a default
+/// exists, so an empty value is how an operator switches an optional URL off.
+fn empty_string_as_none<'de, D>(deserializer: D) -> Result<Option<Url>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<String>::deserialize(deserializer)? {
+        Some(raw) if raw.trim().is_empty() => Ok(None),
+        Some(raw) => Url::parse(raw.trim())
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub address: IpAddr,
@@ -131,8 +147,11 @@ pub struct Config {
     pub id_token_ttl_secs: u64,
     pub eth_provider: Option<Url>,
     /// ENS reverse-lookup API URL. Appended with `/{address}` and must return
-    /// JSON with an `ens_primary` field. Default: `https://api.ensdata.net`.
-    /// Set to empty string to disable ENS resolution entirely.
+    /// JSON with an `ens_primary` field. Default: `https://api.ensdata.net`,
+    /// which receives the Ethereum address of every `did:pkh:eip155` sign-in.
+    /// Set to an empty string (`SIWXOIDC_ENS_API_URL=`) to disable the HTTP
+    /// lookup entirely.
+    #[serde(default, deserialize_with = "empty_string_as_none")]
     pub ens_api_url: Option<Url>,
     /// DID method names accepted at sign-in (e.g. ["pkh"]).
     /// Must be a subset of the methods registered in aqua-auth.
@@ -427,6 +446,36 @@ mod tests {
             jail.set_env("SIWXOIDC_PORT", 4109);
             jail.create_file(CONFIG_FILE, "[default]\nport = 4110\n")?;
             assert!(LegacyNames::detect(&figment()).is_empty());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn empty_ens_api_url_disables_the_lookup() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWXOIDC_ENS_API_URL", "");
+            let config: Config = figment().extract()?;
+            assert!(config.ens_api_url.is_none());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn ens_api_url_keeps_its_default_and_accepts_a_replacement() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            let config: Config = figment().extract()?;
+            assert_eq!(
+                config.ens_api_url.as_ref().map(Url::as_str),
+                Some("https://api.ensdata.net/")
+            );
+            jail.set_env("SIWXOIDC_ENS_API_URL", "https://ens.example.org");
+            let config: Config = figment().extract()?;
+            assert_eq!(
+                config.ens_api_url.as_ref().map(Url::as_str),
+                Some("https://ens.example.org/")
+            );
             Ok(())
         });
     }

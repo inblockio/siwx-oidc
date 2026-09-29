@@ -9,9 +9,8 @@ specific to Claude Code; keep project rules in `AGENTS.md` so every agent sees t
 
 The task guides in `skills/` are exposed as slash commands through symlinks in
 `.claude/commands/`: `/add-did-method`, `/add-cipher-suite`, `/add-auth-ceremony`,
-`/authenticate-siwe-matrix`, `/debug-oidc`, `/deploy-check`, `/docker-build`.
-`skills/cross-signing-bootstrap-and-debug.md` and `skills/element-x-qr-code-specialist.md`
-have no symlink; read them directly, or add a symlink in `.claude/commands/` to invoke them.
+`/authenticate-siwe-matrix`, `/debug-oidc`, `/deploy-check`, `/docker-build`,
+`/cross-signing-bootstrap-and-debug`, `/element-x-qr-code-specialist`.
 
 ## Private notes
 

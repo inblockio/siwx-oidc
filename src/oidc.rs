@@ -401,8 +401,8 @@ const PUBLIC_PEM_END: &str = "-----END PUBLIC KEY-----";
 /// motivating case is a key that was **compromised**. The lazy path for an
 /// operator holding a compromised private PEM is to paste it straight into the
 /// retired list, where it would live on indefinitely in the process
-/// environment; that is precisely how the 2026-09-09 dev exposure happened
-/// (`SIWEOIDC_SIGNING_KEY_PEM` read out of a bare `printenv`). A config that
+/// environment, where a bare `printenv` in the container prints it whole
+/// (multiline PEM values included). A config that
 /// makes "keep the compromised secret around forever" the path of least
 /// resistance is a bad config. So a private PEM is a hard error with the
 /// one-line fix in the message:
@@ -674,11 +674,11 @@ pub const RESOLVE_ENDPOINT_METADATA_KEY: &str = "io.inblock.resolve_endpoint";
 
 // -- ENS resolution -------------------------------------------------------
 //
-// Primary strategy: HTTP API (handles CCIP Read / NameWrapper / offchain
-// names server-side). Default: api.ensdata.net. Override via ens_api_url.
-//
-// Fallback: on-chain via alloy's legacy ENS registry (eth_provider).
-// Does not support NameWrapper but handles classic reverse records.
+// Order: when eth_provider is set, the on-chain legacy ENS registry is asked
+// first (classic reverse records only; no NameWrapper). The HTTP API
+// (ens_api_url, default api.ensdata.net; handles CCIP Read / NameWrapper /
+// offchain names server-side) is used when there is no eth_provider or the
+// on-chain lookup finds nothing. An empty ens_api_url disables the HTTP API.
 
 /// Resolve ENS primary name via HTTP API.
 /// API must accept GET /{address} and return JSON with `ens_primary` field.
@@ -3155,8 +3155,8 @@ mod tests {
     /// Not fussiness: a retired key never signs, so the private half grants a
     /// capability nothing needs, and the motivating case is a key that was
     /// COMPROMISED. Accepting it would make "keep the compromised secret in the
-    /// environment forever" the path of least resistance — which is exactly how
-    /// the 2026-09-09 dev exposure happened (read out of a bare `printenv`).
+    /// environment forever" the path of least resistance, where any bare
+    /// `printenv` in the container prints it whole.
     #[test]
     fn a_private_key_is_refused_with_the_openssl_fix() {
         let err = parse_retired_verification_keys(&crate::did_assertion::test_p256_pem())

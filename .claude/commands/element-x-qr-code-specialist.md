@@ -1,0 +1,1 @@
+../../skills/element-x-qr-code-specialist.md

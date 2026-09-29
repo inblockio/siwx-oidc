@@ -132,11 +132,11 @@ my-app = '{"secret":"change-me","metadata":{"redirect_uris":["https://app.exampl
 When an ID token is issued, and on every userinfo request, for a `did:pkh:eip155` subject,
 siwx-oidc looks up the address's ENS primary name and, if found, puts it in the `name` claim.
 **With the defaults this sends every Ethereum user's address to api.ensdata.net, a third
-party.** There is currently no switch that disables the lookup: an empty `ens_api_url` is a
-startup error (the field's code comment says otherwise, and is wrong). To keep addresses
-in-house, point `ens_api_url` at an ENS API you operate, or at an address where nothing
-listens (e.g. `http://127.0.0.1:9`); the lookup then fails quietly (logged at `debug`) and
-`name` is omitted. Passkey and `did:key` sign-ins never trigger a lookup.
+party.** To switch the HTTP lookup off, set `ens_api_url` to an empty string
+(`SIWXOIDC_ENS_API_URL=`); with `eth_provider` also unset, no lookup happens and `name` is
+omitted. To keep ENS names without the third party, point `ens_api_url` at an ENS API you
+operate, or use `eth_provider` together with an empty `ens_api_url` (with both set, a name
+not found on-chain falls back to the HTTP API). Passkey and `did:key` sign-ins never trigger a lookup.
 
 ### Matrix
 
