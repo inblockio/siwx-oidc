@@ -85,7 +85,7 @@ test('wallet: erase runs end-to-end after one signature', async ({ page }) => {
   await instrumentCeremonyCounters(page);
   await injectWallet(page);
 
-  await page.goto('/account?action=org.matrix.account_erase');
+  await page.goto('/account?action=io.inblock.account_erase');
   // Erase is gated by a confirm checkbox; then ONE signature erases.
   await page.locator('#confirm-erase').check();
   await page.click('#btn-wallet');
