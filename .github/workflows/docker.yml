@@ -20,7 +20,8 @@ env:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    # Pinned so the OS changes on purpose: `ubuntu-latest` becomes 26.04 from 2026-10-19.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -87,7 +88,8 @@ jobs:
     name: Deploy to dev-staging
     needs: build-and-push
     if: ${{ github.repository == 'inblockio/siwx-oidc' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch') }}
-    runs-on: ubuntu-latest
+    # Pinned so the OS changes on purpose: `ubuntu-latest` becomes 26.04 from 2026-10-19.
+    runs-on: ubuntu-24.04
     # The target values are secrets so that Actions masks them in the public
     # logs; a repository variable bound to a step is printed in that step's log
     # header. They are still bound only to the steps that need them (which run

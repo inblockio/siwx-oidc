@@ -22,7 +22,8 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned so the OS changes on purpose: `ubuntu-latest` becomes 26.04 from 2026-10-19.
+    runs-on: ubuntu-24.04
     # Redis for the unit tests that need it, started the same way as in the two
     # e2e jobs below. It used to come from test/docker-compose.yml, a siwe-oidc
     # leftover whose other services (the upstream image, Keycloak) nothing ran.
@@ -115,7 +116,8 @@ jobs:
   # concurrently makes them clobber each other's state.
   # ---------------------------------------------------------------------------
   rust-e2e-mock:
-    runs-on: ubuntu-latest
+    # Pinned so the OS changes on purpose: `ubuntu-latest` becomes 26.04 from 2026-10-19.
+    runs-on: ubuntu-24.04
     services:
       redis:
         image: redis:7-alpine
@@ -286,7 +288,8 @@ jobs:
   # tracked separately; do not read this job's green as covering Element.
   # ---------------------------------------------------------------------------
   browser-e2e:
-    runs-on: ubuntu-latest
+    # Pinned so the OS changes on purpose: `ubuntu-latest` becomes 26.04 from 2026-10-19.
+    runs-on: ubuntu-24.04
     services:
       redis:
         image: redis:7-alpine
