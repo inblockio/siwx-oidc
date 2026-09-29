@@ -89,6 +89,41 @@ jobs:
         run: cargo test --workspace
 
   # ---------------------------------------------------------------------------
+  # The container image, built and never pushed, so a pull request meets every
+  # gate the Dockerfile holds before docker.yml publishes from main: the Rust
+  # license gate (scripts/third-party-notices.sh, cargo-about), the npm license
+  # allowlist (js/ui/third-party-licenses.js), the check that every Alpine
+  # package's license has its text in the image, and the lockfile checks
+  # (`cargo build --locked`, `npm ci`).
+  #
+  # Least privilege: only the workflow's read-only token, no registry login and
+  # no secrets, so fork PRs run it in full. The GitHub Actions cache (type=gha)
+  # needs no token permission. A PR's cache entries are visible to that PR
+  # only, and every PR can read main's, which is why this job also runs on
+  # pushes to main. mode=max caches the intermediate stages too (the cargo-chef
+  # dependency build, the cargo-about install); mode=min would cache only the
+  # final image. A failed cache export must not fail the gate, hence
+  # ignore-error.
+  # ---------------------------------------------------------------------------
+  image:
+    # Pinned so the OS changes on purpose: `ubuntu-latest` becomes 26.04 from 2026-10-19.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      # The gha cache needs a BuildKit builder with the docker-container
+      # driver; the runner's default docker driver cannot export to it.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the image (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max,ignore-error=true
+
+  # ---------------------------------------------------------------------------
   # Rust integration E2E against the MOCK stack. Added 2026-07-26 to close the
   # remaining half of audit finding C-0: all 43 `#[ignore]` tests in tests/*.rs
   # ran NOWHERE automatically, so every protocol-level assertion about session

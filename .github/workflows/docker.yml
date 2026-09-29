@@ -16,7 +16,8 @@ on:
 
 # No `pull_request` trigger, on purpose: every run pushes to GHCR
 # (`packages: write`) and the deploy job reads secrets, and a fork PR gets
-# neither. ci.yml builds and tests pull requests; it does not build this image.
+# neither. ci.yml builds and tests pull requests, and its `image` job builds
+# this Dockerfile without pushing, so the gates inside it run before a merge.
 #
 # Read-only by default; each job grants only what it uses. Every action is
 # pinned by full commit SHA; the comment names the release tag the SHA was

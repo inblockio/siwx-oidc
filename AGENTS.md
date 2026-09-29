@@ -117,10 +117,13 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 - **Running the server locally** needs `SIWXOIDC_BASE_URL` with a hostname
   (`http://localhost:8000`): the default `http://127.0.0.1:8000` makes WebAuthn refuse the IP
   literal as RP ID and startup panics. See [docs/configuration.md](docs/configuration.md).
-- CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on every pull request, forks
-  included; it reads no secrets. Job `build` runs clippy on all targets and
+- CI (`.github/workflows/ci.yml`) runs on pushes to `main` and `fork-stable` and on every pull
+  request, forks included; it reads no secrets. Job `build` runs clippy on all targets and
   `cargo test --workspace` against two Redis services with `SIWX_TEST_REQUIRE_REDIS=1`; job
-  `rust-e2e-mock` runs the promotable mock-stack suites; job `browser-e2e` runs `e2e/browser`.
+  `image` builds the container image without pushing it, which runs the license gates
+  (`scripts/third-party-notices.sh`, `js/ui/third-party-licenses.js`, the Alpine license
+  check); job `rust-e2e-mock` runs the promotable mock-stack suites; job `browser-e2e` runs
+  `e2e/browser`. Actions are pinned by commit SHA.
 
 **Route documentation is enforced.** `tests/openapi_covers_every_route.rs`
 (`every_route_is_described_in_the_openapi_document`) parses the router in `axum_lib.rs` and
