@@ -60,11 +60,12 @@ everything else exists only in the binary crate.
 | `did_assertion.rs` | The shipped verifier: `fetch_and_verify_did`, `verify_did_assertion`, `VerifiedDid`, `DidAssertionError`, `DID_PROFILE_FIELD`. |
 | `main.rs` | CLI: `--key-file`, `--print-did`, `--server`, `--refresh-token`, `--device-flow`, `--verify-did <MXID> --homeserver <url>`. |
 
-Other paths: `tests/` (integration suites, all `#[ignore]`d), `e2e/` (mock stack, Playwright
-suites, Element Web suites), `js/ui/` (Svelte login page, built into `static/build`),
-`static/` (served pages and assets), `docs/api/` (OpenAPI document), `docs/audits/` and
-`docs/design/` (evidence and design records), `security/` plus `.cargo/audit.toml` (advisory
-exceptions, VEX), `scripts/` (live checks against a deployment), `skills/` (agent skills).
+Other paths: `tests/` (integration suites, mostly `#[ignore]`d; see below), `e2e/` (mock
+stack, Playwright suites, Element Web suites), `js/ui/` (Svelte login page, built into
+`static/build`), `static/` (served pages and assets), `docs/api/` (OpenAPI document),
+`docs/audits/` and `docs/design/` (evidence and design records), `security/` plus
+`.cargo/audit.toml` (advisory exceptions, VEX), `scripts/` (live checks against a deployment),
+`skills/` (agent skills).
 
 ## Architecture in brief
 
@@ -81,14 +82,18 @@ lineage: [docs/architecture.md](docs/architecture.md).
 cargo build --workspace
 cargo fmt -- --check && cargo clippy          # CI builds with RUSTFLAGS=-Dwarnings
 docker run -d --rm --name siwx-redis -p 6379:6379 redis:7-alpine   # Redis on localhost:6379
-cargo test                                    # unit tests; several need that Redis
+cargo test                                    # unit tests + non-ignored tests/; several need Redis
 cargo run                                     # the server (needs Redis; see below)
 cargo run -p siwx-oidc-auth -- --help         # the headless client
 ```
 
-- **Every `tests/*.rs` test is `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
-  mock). Plain `cargo test` runs only unit tests. Run a suite explicitly:
-  `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
+- **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
+  mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
+  Plain `cargo test` runs the unit tests plus 12 tests in five files: `openapi_covers_every_route`
+  (2) and `localpart_vectors` (1), which need nothing; `account_linking_dual_write` (6), which
+  needs Redis on localhost; `credential_migration_live` (2), which returns early unless
+  `MIGRATION_TEST_REDIS_URL` names a disposable Redis; and
+  `e2e_account_lifecycle_live::an_absent_strict_skips_variable_means_strict` (1), a pure check.
 - **Mock stack:** `e2e/up.sh` / `e2e/down.sh` start Redis, `e2e/synapse_mock.py` and siwx-oidc
   in podman; `bash e2e/run-all.sh` runs everything. See [e2e/README.md](e2e/README.md).
   `--test-threads=1` is required: the suites share one stack and reset the mock.
