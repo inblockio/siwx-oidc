@@ -26,7 +26,7 @@
 //! it upserts a fresh `SIWX_{uuid}`, so the explicit-logout delete is safe
 //! precisely because the id is not reused. Apart from the Matrix-shaped
 //! `refresh`, none of this code touches sign-in or token issuance (`oidc.rs`);
-//! see CLAUDE.md "MSC3861 device lifecycle".
+//! see `docs/matrix-integration.md`, "Accounts and devices".
 
 use std::sync::Arc;
 

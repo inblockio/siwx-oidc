@@ -68,8 +68,9 @@
 //!
 //! ## `sub` is the DID, deliberately
 //!
-//! The same claim name the ID token already uses (CLAUDE.md breaking change #1:
-//! `sub` became `did:pkh:eip155:1:0xAddr`). A consumer can compare an
+//! The same claim name the ID token already uses (breaking change #1 against
+//! siwe-oidc in `docs/architecture.md`, "Lineage": `sub` became
+//! `did:pkh:eip155:1:0xAddr`). A consumer can compare an
 //! assertion's `sub` to an ID token's `sub` with zero translation — and, per the
 //! siwx-oidc#17 note above, translation is exactly where DID identity goes wrong.
 //!
@@ -89,7 +90,7 @@
 //! ## There is no `exp`, on purpose
 //!
 //! The binding is permanent. Localparts are never recycled (see the no-recycling
-//! rule in CLAUDE.md's MSC3861 device lifecycle section, which is about device
+//! rule in `docs/matrix-integration.md`, "No device recycling", which is about device
 //! ids but reflects the same discipline), and a DID does not stop being that
 //! user's DID. An expiry would convert a statement that stays **true** into a
 //! credential that goes **stale**, and would require re-minting for accounts

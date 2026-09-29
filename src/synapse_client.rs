@@ -1392,8 +1392,8 @@ impl SynapseClient {
     /// are both accepted, exactly as `siwx-oidc-auth`'s `fetch_and_verify_did`
     /// accepts them. The `proof` is deliberately **not** checked: verification
     /// lives in `siwx-oidc-auth`, which is a **dev-dependency only** so the
-    /// shipped binary links none of it (see `CLAUDE.md`, "Verifying a published
-    /// DID"). A caller that needs cryptographic assurance runs that verifier;
+    /// shipped binary links none of it (see `docs/identity-model.md`, "Verifying a
+    /// published DID"). A caller that needs cryptographic assurance runs that verifier;
     /// what this returns is a discovery hint.
     ///
     /// # It reads ANONYMOUSLY, and mints a credential only if refused

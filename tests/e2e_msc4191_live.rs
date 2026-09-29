@@ -775,7 +775,7 @@ async fn msc4191_device_management_live() {
 
     // Synapse caches introspection results for 2 minutes (documented MSC3861
     // deployment behavior: see siwx-oidc-matrix-server design doc step 16, and
-    // CLAUDE.md "Synapse caches introspection results for 2 minutes"). The
+    // docs/matrix-integration.md, "What Synapse calls"). The
     // siwx-oidc layer has already revoked the session (token deleted from Redis;
     // the device vanished from devices_list above), so the Matrix-layer 401 only
     // appears once that cache expires. Poll a little past the 2-minute window.

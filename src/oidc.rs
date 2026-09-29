@@ -2849,7 +2849,7 @@ fn mxid_claim(config: &crate::config::Config, localpart: Option<&str>) -> SiwxAd
 /// only authorization-bearing claim here) or `preferred_username` is
 /// byte-for-byte unaffected, and nothing in this function may ever be
 /// "simplified" into replacing one of them with the Matrix ID — the three-tier
-/// identity model (see `CLAUDE.md`) exists precisely because a consumer that
+/// identity model (see `docs/identity-model.md`) exists precisely because a consumer that
 /// reads a Matrix identifier where it expected a DID, or the reverse, resolves
 /// the wrong account.
 pub async fn userinfo(
