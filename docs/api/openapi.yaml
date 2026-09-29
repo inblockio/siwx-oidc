@@ -707,6 +707,11 @@ paths:
       tags: [Matrix compatibility]
       operationId: loginFlows
       summary: Advertise the supported Matrix login flows
+      description: |
+        Advertises `m.login.sso` only, for discovery. There is no
+        `POST /_matrix/client/v3/login`: legacy password, token and SSO login
+        are not supported, so a client that does not implement the Matrix
+        OAuth 2.0 API cannot sign in.
       responses: { "200": { description: The flow list. } }
 
   /_matrix/client/v3/refresh:
