@@ -207,8 +207,8 @@ A complete Docker Compose deployment (Synapse, Element Web, siwx-oidc, Redis, Ca
   cannot sign in.
 - Only Synapse is tested. Tuwunel, Dendrite and Conduit are untested and unsupported.
 - `/account` advertises two actions that are **not in the Matrix spec**,
-  `org.matrix.account_erase` and `org.matrix.account_reactivate`. They are project-specific
-  despite their prefix.
+  `io.inblock.account_erase` and `io.inblock.account_reactivate`. They are project-specific,
+  hence the project namespace; their former `org.matrix.` names are still accepted as aliases.
 
 ## Why not MAS?
 

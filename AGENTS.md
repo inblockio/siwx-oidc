@@ -39,7 +39,7 @@ everything else exists only in the binary crate.
 | `admin_token.rs` | `POST /oauth2/admin_token`: short-TTL token whose scope carries `urn:synapse:admin:*`. |
 | `compat.rs` | `POST /oauth2/revoke` (RFC 7009) and the Matrix client-server endpoints siwx-oidc answers (login flows, logout, logout/all, refresh, device deletion); `TeardownPolicy`. |
 | `device_auth.rs` | RFC 8628 device authorization: `/device_authorization`, the `/device` approval page (wallet and passkey), server-issued CAIP-122 nonces. |
-| `account.rs` | MSC4191 `/account` page and actions, MSC4312 cross-signing reset. `SUPPORTED_ACTIONS` is the single source of truth for discovery and dispatch; `canonical_action` maps `session_*` aliases to `device_*`. |
+| `account.rs` | MSC4191 `/account` page and actions, MSC4312 cross-signing reset, and the two non-spec actions `io.inblock.account_erase` / `io.inblock.account_reactivate`. `SUPPORTED_ACTIONS` is the single source of truth for discovery and dispatch; `canonical_action` maps `session_*` aliases to `device_*` and the legacy `org.matrix.account_erase` / `org.matrix.account_reactivate` names to the new ones. |
 | `webauthn.rs` | Passkey ceremonies (register, authenticate, link), the new-identity and deactivation gates (`reject_if_new_identity`, `reject_if_deactivated`), picker scoping. |
 | `synapse_client.rs` | Synapse client with two credentials: the MAS shared secret on `/_synapse/mas/*` (`provision_user`, `upsert_device`, `allow_cross_signing_reset`, `localpart_status`, `delete_device`, `deactivate_user`, `reactivate_user`) and a minted admin-scoped token (`admin_request`) on `/_synapse/admin/*` and the client-server API (`list_devices`, `get_device`, `has_cross_signing_keys`, `read_profile`, `publish_did_field`, `read_did_field`). |
 | `did_assertion.rs` | `DID_PROFILE_FIELD`, `mint_did_assertion` (compact ES256 JWS), `did_profile_value`, `DidPublication`. |
@@ -329,6 +329,11 @@ doc; read it before changing the code the rule covers.
   `ttl_clamp_caps_a_long_lived_request`, `ttl_clamp_raises_an_unusably_short_request`.
 - **`account::SUPPORTED_ACTIONS` is the one list** behind discovery and dispatch. Pin:
   `supported_actions_cover_acceptance_criteria`, `canonical_action_collapses_session_aliases`.
+- **Actions outside the Matrix spec use the `io.inblock.` namespace, never `org.matrix.`**
+  (which belongs to matrix.org). The pre-rename `org.matrix.account_erase` /
+  `org.matrix.account_reactivate` stay accepted aliases for one upgrade cycle and are never
+  advertised. Pin: `non_spec_actions_are_advertised_only_under_the_io_inblock_namespace`,
+  `legacy_erase_and_reactivate_names_are_accepted_as_aliases`.
 
 ### Structure
 

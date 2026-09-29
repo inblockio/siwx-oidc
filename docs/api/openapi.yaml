@@ -625,6 +625,11 @@ paths:
         With no `action`, renders the account-home menu — required because
         Element Web's "Manage account" opens the bare URI. With an `action`, the
         page re-authenticates (wallet or passkey) and then performs it.
+
+        `io.inblock.account_erase` and `io.inblock.account_reactivate` are not
+        in the Matrix spec. Their former names, `org.matrix.account_erase` and
+        `org.matrix.account_reactivate`, are still accepted as aliases for one
+        upgrade cycle but no longer advertised in discovery.
       parameters:
         - name: action
           in: query
@@ -632,15 +637,17 @@ paths:
           schema:
             type: string
             enum:
-              - profile
-              - devices_list
-              - sessions_list
-              - device_view
-              - session_view
-              - device_delete
-              - session_end
+              - org.matrix.profile
+              - org.matrix.devices_list
+              - org.matrix.sessions_list
+              - org.matrix.device_view
+              - org.matrix.session_view
+              - org.matrix.device_delete
+              - org.matrix.session_end
               - org.matrix.cross_signing_reset
               - org.matrix.account_deactivate
+              - io.inblock.account_erase
+              - io.inblock.account_reactivate
               - org.matrix.account_erase
               - org.matrix.account_reactivate
         - { name: device_id, in: query, required: false, schema: { type: string } }

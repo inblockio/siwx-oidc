@@ -2256,7 +2256,7 @@ pub async fn provision_synapse_device(
             //
             // Erasure note: `has_profile_row` also reads a GDPR-erased
             // account's purged row (see account::execute_action's
-            // `org.matrix.account_erase`, which calls
+            // `io.inblock.account_erase`, which calls
             // `SynapseClient::deactivate_user(.., erase: true)`) as "truly
             // absent" by the same M_UNKNOWN discriminator. If an erased
             // account ever completed sign-in again, this would resurrect a
@@ -3776,8 +3776,8 @@ mod tests {
             "org.matrix.device_delete",
             "org.matrix.cross_signing_reset",
             "org.matrix.account_deactivate",
-            "org.matrix.account_erase",
-            "org.matrix.account_reactivate",
+            "io.inblock.account_erase",
+            "io.inblock.account_reactivate",
             "org.matrix.sessions_list",
             "org.matrix.session_view",
             "org.matrix.session_end",

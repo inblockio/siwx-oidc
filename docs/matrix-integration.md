@@ -469,15 +469,19 @@ override with `SIWXOIDC_ACCOUNT_MANAGEMENT_URI`) and
 | `org.matrix.device_delete` | `org.matrix.session_end` | sign one device out (needs `device_id`) |
 | `org.matrix.cross_signing_reset` | | allow a cross-signing reset (MSC4312) |
 | `org.matrix.account_deactivate` | | deactivate the account (`delete_user` with `erase: false`) and revoke all tokens |
-| `org.matrix.account_erase` | | **not in the spec.** Erase the account (`delete_user` with `erase: true`: profile, media and room memberships), revoke all tokens, and delete the DID's passkey credentials and links |
-| `org.matrix.account_reactivate` | | **not in the spec.** Reactivate an account deactivated with `erase: false` (`reactivate_user`) |
+| `io.inblock.account_erase` | `org.matrix.account_erase` | **not in the spec.** Erase the account (`delete_user` with `erase: true`: profile, media and room memberships), revoke all tokens, and delete the DID's passkey credentials and links |
+| `io.inblock.account_reactivate` | `org.matrix.account_reactivate` | **not in the spec.** Reactivate an account deactivated with `erase: false` (`reactivate_user`) |
 
-`org.matrix.account_erase` and `org.matrix.account_reactivate` are
-project-specific. They use the `org.matrix.` prefix although Matrix does not
-define them; do not rely on other servers or clients supporting them. The
-`session_*` names are the older aliases, accepted for clients that still send
-them. The list lives in one place, `account::SUPPORTED_ACTIONS`, which drives
-both discovery and dispatch.
+`io.inblock.account_erase` and `io.inblock.account_reactivate` are
+project-specific: Matrix does not define them, so they carry this project's
+namespace rather than `org.matrix.`, and other servers and clients will not
+support them. Until 2026-09 they were advertised as `org.matrix.account_erase`
+and `org.matrix.account_reactivate`; those names are still accepted as
+aliases for one upgrade cycle but are no longer advertised. The `session_*`
+names are the older aliases, accepted for clients that still send them. The
+advertised list lives in one place, `account::SUPPORTED_ACTIONS`, which drives
+discovery; `account::canonical_action` maps every accepted name, aliases
+included, to the action it dispatches.
 
 ### How the page works
 
