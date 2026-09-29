@@ -4,7 +4,8 @@
 // cross-signing reset, GDPR erase + credential purge), CSRF enforcement, and the
 // WebAuthn challenge-replay guard.
 //
-// Spec: docs/audits/2026-06-14-siwx-oidc-requirement-map.md (R-* / H-*).
+// Spec: docs/audits/2026-06-14-siwx-oidc-requirement-map.md (R-* / H-*), on the
+// `audit/siwx-oidc-functional-harness` branch (not on main).
 // Pattern source: account.spec.mjs (kept green). Helpers:
 //   ./wallet-helper.mjs   — injectMockWallet, makeWallet, countSignatures
 //   ./webauthn-helper.mjs — addVirtualAuthenticator, registerPasskey,

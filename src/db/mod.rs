@@ -74,9 +74,9 @@ pub const KV_USER_SESSION_PREFIX: &str = "user:session";
 /// not scope forever. 30 days mirrors a typical "remember this device" horizon.
 pub const USER_SESSION_LIFETIME: u64 = 30 * 24 * 3600; // 30 days
 
-/// TTL for opaque access tokens (MSC3861 mode).
+/// TTL for opaque access tokens (both modes).
 pub const ACCESS_TOKEN_TTL: u64 = 300; // 5 minutes
-/// TTL for opaque refresh tokens (MSC3861 mode).
+/// TTL for opaque refresh tokens (both modes).
 pub const REFRESH_TOKEN_TTL: u64 = 7_776_000; // 90 days
 
 /// Prefix for the short-lived refresh-token rotation grace pointer:
@@ -284,7 +284,8 @@ pub struct CodeEntry {
     /// PKCE code_challenge (S256-hashed verifier, base64url-encoded).
     #[serde(default)]
     pub code_challenge: Option<String>,
-    /// PKCE code_challenge_method ("S256" or "plain").
+    /// PKCE code_challenge_method. Only "S256" is accepted: /authorize rejects
+    /// "plain", and /token refuses any stored method other than "S256".
     #[serde(default)]
     pub code_challenge_method: Option<String>,
     /// Device ID generated during Synapse provisioning (MSC3861).
@@ -360,7 +361,10 @@ pub struct TokenMetadata {
     /// instead, because matrix.org's policy server refuses the long,
     /// hyphen-heavy legacy shape (see `localpart` module doc).
     pub username: String,
-    /// Device ID assigned by this provider (deterministic from token).
+    /// The Synapse device this token is bound to: the client-proposed id from
+    /// the scope, or a fresh `SIWX_{uuid}` minted at provisioning. Empty for
+    /// deviceless tokens (standalone mode, minted admin tokens, failed
+    /// provisioning), which introspection renders as JSON `null`.
     pub device_id: String,
     /// Space-separated OAuth2 scopes granted.
     pub scope: String,
@@ -372,7 +376,9 @@ pub struct TokenMetadata {
     pub exp: i64,
     /// The original DID (used as OIDC `sub` claim for consistency with ID token).
     pub did: String,
-    /// Display name (ENS name or DID) for Synapse display name updates.
+    /// Display name (for a user token: the ENS name, else the DID). Echoed as
+    /// `name` by introspection; Synapse does not read it, and the Matrix
+    /// displayname is the alias seeded at first sign-in.
     pub name: String,
 }
 

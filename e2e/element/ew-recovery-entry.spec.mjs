@@ -1,9 +1,9 @@
 /**
  * EW-R1: "Enter recovery phrase" must be AVAILABLE in every context that needs it.
  *
- * Requirement (docs/superpowers/plans/2026-07-25-session-durability-no-forced-logins.md,
- * R5/R6): when no other verified session exists, the recovery phrase must not merely be
- * DEMANDED — it must be ENTERABLE. A recorded P0 finding (F16) says the verify gate offers
+ * Requirement (R5/R6 of the 2026-07-25 session-durability plan): when no other
+ * verified session exists, the recovery phrase must not merely be DEMANDED — it
+ * must be ENTERABLE. A recorded P0 finding (F16) says the verify gate offers
  * only "Use another device" or a destructive identity RESET.
  *
  * WHAT GATES THE AFFORDANCE (verified against element-web v1.12.20 + the shipped bundle):

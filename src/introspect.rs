@@ -1,8 +1,11 @@
 //! MSC3861 token introspection endpoint (RFC 7662).
 //!
-//! When `mas_shared_secret` is configured, this module provides:
+//! This module provides:
 //! - `POST /oauth2/introspect` for Synapse to validate opaque access tokens
-//! - `generate_opaque_token` for issuing `mat_`/`mcr_`-prefixed tokens
+//!   (active only when `mas_shared_secret` is configured; a 404 otherwise)
+//! - `generate_opaque_token`, used for every opaque token this provider issues
+//!   (`mat_`/`mcr_` in MSC3861 mode, unprefixed in standalone mode, `msa_` for
+//!   minted admin tokens)
 
 use axum::{
     extract::{Form, State},
@@ -111,8 +114,9 @@ pub async fn introspect(
 ///
 /// **Load-bearing invariant: a store ERROR must never render as
 /// `{"active": false}`.** Synapse caches a *negative* introspection result for
-/// two minutes with no invalidation path (`msc3861_delegated.py`, `ResponseCache`
-/// with a 2-minute timeout), and under MSC3861 an inactive token is a HARD logout
+/// two minutes with no invalidation path (`MasDelegatedAuth` in
+/// `synapse/api/auth/mas.py`, a `ResponseCache` with a 2-minute timeout; before
+/// 1.157, `msc3861_delegated.py`), and under MSC3861 an inactive token is a HARD logout
 /// — `InvalidClientTokenError` is raised with `soft_logout` left at its default
 /// `false`, so the client wipes its crypto store and the user loses their
 /// cryptographic identity. One transient Redis error rendered as `active:false`

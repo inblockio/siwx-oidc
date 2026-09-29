@@ -122,11 +122,12 @@ pub const ADMIN_DISPLAY_NAME: &str = "siwx-oidc service admin";
 ///
 /// This is the SINGLE definition of the admin credential's claims. It is shared
 /// by the HTTP mint endpoint ([`admin_token`], used by shell callers such as
-/// `scripts/matrix-storage-controller.sh`) and by the in-process mint that
-/// [`crate::synapse_client::SynapseClient`] performs for its own admin-API
-/// calls. Sharing it is load-bearing: the four Synapse-1.159 acceptance
-/// conditions in the module docs above are properties of THESE FIELDS, so two
-/// independent constructions would be two independent chances to drop one.
+/// siwx-oidc-matrix-server's `scripts/matrix-storage-controller.sh`) and by the
+/// in-process mint that [`crate::synapse_client::SynapseClient`] performs for
+/// its own admin-API calls. Sharing it is load-bearing: the four Synapse-1.159
+/// acceptance conditions in the module docs above are properties of THESE
+/// FIELDS, so two independent constructions would be two independent chances to
+/// drop one.
 ///
 /// In particular `device_id` is the empty string, which `introspect` renders as
 /// JSON `null` — see requirement 4. Do not set it to a placeholder.
@@ -201,7 +202,8 @@ async fn ensure_service_user(synapse: &SynapseClient, localpart: &str) -> anyhow
 /// Authentication: `Authorization: Bearer {mas_shared_secret}`, compared in
 /// constant time (same secret and same comparison as `/oauth2/introspect`).
 /// There is no request body: the interface is deliberately plain so a bash
-/// caller — `scripts/matrix-storage-controller.sh` — is a single `curl`.
+/// caller — siwx-oidc-matrix-server's `scripts/matrix-storage-controller.sh` —
+/// is a single `curl`.
 ///
 /// Returns an RFC 6749 §5.1-shaped token response:
 /// `{ "access_token", "token_type", "expires_in", "scope", "user_id"? }`.

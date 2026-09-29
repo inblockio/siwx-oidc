@@ -89,8 +89,8 @@
 			import strip_upstream_cors
 		}
 	}
-	# Legacy CS-API single-device delete (DELETE /devices/{id}) — in-client
-	# device manager sign-out of a specific device.
+	# Legacy CS-API bulk device delete (POST /delete_devices) — in-client
+	# device manager sign-out of several devices.
 	handle /_matrix/client/v3/delete_devices {
 		import public_cors
 		reverse_proxy siwx-real-oidc:8081 {

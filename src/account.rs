@@ -2,7 +2,9 @@
 //!
 //! Provides:
 //! - `GET /account` — renders the account management page
+//! - `GET /account/nonce` — server-issued single-use CAIP-122 nonce for a re-auth
 //! - `POST /account/wallet` — wallet (CAIP-122) re-auth + action execution
+//! - `POST /account/action` — action execution on an existing account session
 //! - `POST /account/passkey/start` — start passkey authentication
 //! - `POST /account/passkey/finish` — finish passkey auth + action execution
 
@@ -592,7 +594,7 @@ async fn execute_action(
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
             // Confirm the device belongs to the authenticated user before deleting
-            // (defence in depth; the admin call is already mxid-scoped).
+            // (defence in depth; the MAS delete is already scoped to the localpart).
             let owned = synapse
                 .get_device(&localpart, device_id, server)
                 .await
@@ -717,7 +719,10 @@ async fn execute_action(
                 .map_err(|e| {
                     warn!(error = %e, "reactivate_user failed during account action");
                     // Reactivation is verified working under MSC3861 (live probe
-                    // 2026-06-10), so this branch is a genuine error path (e.g.
+                    // 2026-06-10 on the pre-1.157 admin route; the current
+                    // `/_synapse/mas/reactivate_user` path is exercised live by
+                    // tests/e2e_account_lifecycle_live.rs), so this branch is a
+                    // genuine error path (e.g.
                     // erased account, Synapse unreachable). Keep the honest
                     // fallback: a server admin can always reactivate directly.
                     CustomError::BadRequest(

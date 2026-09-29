@@ -823,16 +823,15 @@ impl SynapseClient {
     }
 
     /// Check whether a user's Synapse **profile row** exists
-    /// (`GET /_matrix/client/v3/profile/{mxid}`, the unauthenticated client API —
-    /// still sent with the shared secret bearer token for consistency with the
-    /// rest of this client, though Synapse does not require it for this route).
+    /// (`GET /_matrix/client/v3/profile/{mxid}`, the client API, which Synapse
+    /// serves unauthenticated by default — sent with a minted admin token when
+    /// one is available, otherwise with no credential; see [`Self::read_profile`]).
     ///
     /// This is the half-provisioning discriminator behind the self-heal in
     /// [`crate::oidc::provision_synapse_device`]: the 2026-08-01 dev incident
     /// found an account with a Synapse `users` row but no `profiles` row (because
     /// `provision_user` failed transiently at first sign-in), which then silently
-    /// failed every subsequent displayname write. See
-    /// `docs/superpowers/plans/2026-08-01-provision-retry-hardening.md`.
+    /// failed every subsequent displayname write.
     ///
     /// **Discriminator corrected 2026-08-02 (live-falsified on Synapse 1.154.0):**
     /// the original "any 404 means the row is absent" premise was wrong — Synapse
@@ -857,10 +856,11 @@ impl SynapseClient {
     /// (below) for the pure decision function and its unit tests.
     ///
     /// **Erasure interplay:** a GDPR-erased account (`account::execute_action`'s
-    /// `org.matrix.account_erase`, which purges the profile via Synapse admin
-    /// `deactivate(erase: true)`) also 404s as "truly absent" by this same
-    /// discriminator. If an erased account ever completed sign-in again this
-    /// heal would resurrect a bare profile row (`displayname = DID`) — accepted,
+    /// `org.matrix.account_erase`, which purges the profile via the MAS
+    /// `delete_user` call with `erase: true`) also 404s as "truly absent" by this
+    /// same discriminator. If an erased account ever completed sign-in again this
+    /// heal would resurrect a bare profile row (displayname = the generated
+    /// alias) — accepted,
     /// since that reveals nothing beyond the mxid the caller already presented.
     ///
     /// Returns `Ok(true)` when the row is present (200, or a 404 the
@@ -1363,8 +1363,8 @@ impl SynapseClient {
     /// - `Ok(Some(did))` — the field holds a DID. Returned **verbatim**: a
     ///   `did:key` multibase payload carries meaning in its case and is not
     ///   recoverable from the (lowercased) localpart, so normalising here would
-    ///   destroy the one thing this read exists to fetch (MEMORY.md "MXID to DID
-    ///   is not invertible" / siwx-oidc#17).
+    ///   destroy the one thing this read exists to fetch ("MXID to DID is not
+    ///   invertible", siwx-oidc#17).
     /// - `Ok(None)` — nothing usable is published: the field is unset (404), or
     ///   it holds JSON with no readable `did` member. Those two collapse on
     ///   purpose — every caller's next move is identical ("this account has no
