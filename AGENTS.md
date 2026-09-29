@@ -93,7 +93,7 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
   `cargo test --workspace` runs the unit tests of both crates plus 13 tests in six files:
   `openapi_covers_every_route` (2) and `localpart_vectors` (1), which need nothing;
-  `account_linking_dual_write` (6), which needs Redis on localhost; `credential_migration_live`
+  `account_linking_dual_write` (6), which needs the test Redis; `credential_migration_live`
   (2), which needs its own disposable, empty Redis named by `MIGRATION_TEST_REDIS_URL`; and the
   pure check `an_absent_strict_skips_variable_means_strict` in `e2e_account_lifecycle_live` and
   in `e2e_did_field_live` (1 each).
@@ -135,11 +135,8 @@ endpoint, update `e2e/synapse_mock.py` in the same change (drift check in
 **A test must be able to fail.** A bound such as `n <= 1` is satisfied by zero, and a test
 that prints "skipping" and returns ok is green forever. Assert the positive case, and make
 skips loud and switchable into failures (`SIWX_TEST_REQUIRE_REDIS`, `E2E_STRICT_SKIPS`).
-Known gaps: `account_linking_dual_write` still builds its own client on `redis://localhost`
-rather than through `test_support`, so it ignores `SIWX_TEST_REDIS_URL` and, without Redis,
-fails after the 30-second timeout instead of skipping. `e2e_msc3861` and `e2e_messaging` skip
-their Matrix-side assertions with a plain `eprintln!` when whoami is unavailable, with no
-`E2E_STRICT_SKIPS` gate.
+Known gap: `e2e_msc3861` and `e2e_messaging` skip their Matrix-side assertions with a plain
+`eprintln!` when whoami is unavailable, with no `E2E_STRICT_SKIPS` gate.
 
 ## Invariants: do not "simplify" these
 
