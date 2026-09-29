@@ -16,6 +16,11 @@ FROM docker.io/clux/muslrust:stable@sha256:fb4bd163dc90d308e1071d728f63306f624aa
 WORKDIR /siwx-oidc
 RUN cargo install cargo-chef --version 0.1.78 --locked
 
+# A stage of its own, so bumping cargo-about does not invalidate the dependency
+# cache below. The `cli` feature is what builds the binary.
+FROM chef AS about
+RUN cargo install cargo-about --version 0.9.2 --locked --features cli
+
 FROM chef AS dep_planner
 COPY ./src/ ./src/
 COPY ./siwx-oidc-auth/ ./siwx-oidc-auth/
@@ -33,6 +38,8 @@ ADD --chown=node:node ./js/ui /siwx-oidc/js/ui
 WORKDIR /siwx-oidc/js/ui
 # Installs exactly package-lock.json and fails if package.json disagrees with it.
 RUN npm ci
+# Also writes static/build/third-party-licenses.txt, and fails on a bundled
+# package whose license is not accepted (js/ui/third-party-licenses.js).
 RUN npm run build
 
 FROM chef AS builder
@@ -40,6 +47,20 @@ COPY --from=dep_cacher /siwx-oidc/target/ ./target/
 COPY --from=dep_cacher $CARGO_HOME $CARGO_HOME
 COPY --from=dep_planner /siwx-oidc/ ./
 RUN cargo build --release --locked
+# License texts of every crate linked into the two binaries (scope and the
+# accepted-license allowlist: about.toml). `--fail` makes an unaccepted license
+# fail the build. A clarification whose checksum no longer matches is only a
+# cargo-about warning, after which it silently falls back to the bare SPDX text
+# and drops the crate's copyright lines, so any warning fails the build too.
+COPY --from=about $CARGO_HOME/bin/cargo-about $CARGO_HOME/bin/
+COPY about.toml about.hbs ./
+# Written for both shells this RUN may get: podman's OCI format ignores the base
+# image's SHELL (/bin/sh), Docker honours it (bash -eux -o pipefail).
+RUN if cargo about --color never generate --locked --fail about.hbs \
+            -o THIRD-PARTY-LICENSES-rust.txt 2> about.log; \
+    then status=0; else status=$?; fi; \
+    cat about.log >&2; \
+    test "$status" -eq 0 && ! grep -qE '\[(WARN|ERROR)\]' about.log
 
 FROM docker.io/library/alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 COPY --from=builder /siwx-oidc/target/x86_64-unknown-linux-musl/release/siwx-oidc /usr/local/bin/
@@ -55,6 +76,10 @@ COPY --from=node_builder /siwx-oidc/static/ ./static/
 # carries the license and the NOTICE. Copied straight from the build context,
 # which .dockerignore does not filter, so no build stage has to carry them.
 COPY LICENSE NOTICE /usr/share/licenses/siwx-oidc/
+# The third-party notices the MIT, BSD and Apache licenses of the linked crates
+# and the bundled npm packages require in binary distributions (see NOTICE).
+COPY --from=builder /siwx-oidc/THIRD-PARTY-LICENSES-rust.txt /usr/share/licenses/siwx-oidc/
+COPY --from=node_builder /siwx-oidc/static/build/third-party-licenses.txt /usr/share/licenses/siwx-oidc/THIRD-PARTY-LICENSES-js.txt
 # No config file ships in the image: every setting has a default or comes from
 # SIWXOIDC_* env (see config::figment). This one only makes the listener
 # reachable from outside the container. The new prefix outranks the legacy

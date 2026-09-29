@@ -22,14 +22,15 @@ Third-party components
 
 Binary distributions of siwx-oidc, including the container image, statically
 link third-party Rust crates, each under its own license. The exact versions
-are recorded in Cargo.lock.
+are recorded in Cargo.lock. The container image carries their license texts
+in /usr/share/licenses/siwx-oidc/THIRD-PARTY-LICENSES-rust.txt, generated at
+build time (see about.toml).
 
 The following crates are licensed under the Mozilla Public License 2.0. They
 are used unmodified, and the source code of each is available at
 https://crates.io/crates/<name>:
 
     crypto-glue
-    fastrlp
     webauthn-attestation-ca
     webauthn-rs
     webauthn-rs-core
@@ -37,3 +38,10 @@ https://crates.io/crates/<name>:
 
 The web frontend in the container image is built from npm packages, each under
 its own license. The exact versions are recorded in js/ui/package-lock.json.
+The license texts of the packages bundled into it are served with it at
+/build/third-party-licenses.txt and carried in the container image in
+/usr/share/licenses/siwx-oidc/THIRD-PARTY-LICENSES-js.txt.
+
+The container image is built on Alpine Linux. The packages of that base image
+carry their own licenses; they are listed, with each package's license, in
+/lib/apk/db/installed.

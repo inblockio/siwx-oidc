@@ -1,0 +1,11 @@
+Third-party Rust crates linked into the siwx-oidc binaries (siwx-oidc and
+migrate-credentials), with the license texts they ship. Generated at build time
+by cargo-about from Cargo.lock; scope and accepted licenses are in about.toml.
+{{#each licenses}}
+================================================================================
+{{name}} ({{id}})
+{{#each used_by}}  {{crate.name}} {{crate.version}}
+{{/each}}--------------------------------------------------------------------------------
+
+{{{text}}}
+{{/each}}
