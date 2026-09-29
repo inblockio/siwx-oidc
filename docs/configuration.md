@@ -132,10 +132,12 @@ my-app = '{"secret":"change-me","metadata":{"redirect_uris":["https://app.exampl
 
 Each value must be an absolute `http` or `https` URL; anything else stops the server at startup
 with an error naming the key. Unset or empty, the field is left out of discovery. There is no
-default, because the documents are the operator's own. The server also serves the files in
+default, because the documents are the operator's own. The footers of the login page, the
+device-approval page and the account page link the same two values (the login page reads them
+from discovery) and show no legal links when neither is set. The server also serves the files in
 `static/legal/` at `/legal/terms-of-use.html` and `/legal/privacy-policy.html`: they are the
-maintainers' documents for their own deployment, not templates, and nothing advertises them
-unless a key points at them.
+maintainers' documents for their own deployment, not templates, and nothing links or advertises
+them unless a key points at them.
 
 ### ENS names (Ethereum sign-ins)
 

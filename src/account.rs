@@ -1253,17 +1253,21 @@ fn auth_section_html(
 /// entry, and the signature used by the page-rendering unit tests).
 #[allow(dead_code)]
 pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
-    account_page_inner(query, base_url, None)
+    account_page_inner(query, base_url, None, "")
 }
 
 /// Render the account page. `authed_csrf` is `Some(csrf)` when the request
 /// carried a live account session, which switches the page into "already
 /// authenticated" mode: no fresh signature, and subsequent actions are driven
 /// in-page against `POST /account/action` carrying `csrf`.
+///
+/// `legal_footer` is [`crate::oidc::legal_footer_html`] for this deployment
+/// (empty when no terms or privacy policy are configured).
 pub fn account_page_inner(
     query: AccountPageQuery,
     base_url: &str,
     authed_csrf: Option<&str>,
+    legal_footer: &str,
 ) -> Html<String> {
     let action = query
         .action
@@ -1324,7 +1328,7 @@ pub fn account_page_inner(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} · inblock.io</title>
+<title>{page_title}</title>
 <link rel="icon" type="image/png" href="/favicon.png">
 <link href="https://api.fontshare.com/css?f[]=satoshi@300,400,500,700,900&display=swap" rel="stylesheet">
 <style>{css}</style>
@@ -1366,12 +1370,7 @@ pub fn account_page_inner(
         <span id="status-text"></span>
       </div>
 
-      <div class="footer">
-        <p>By continuing you agree to the
-          <a href="/legal/terms-of-use.html">Terms of Use</a> and
-          <a href="/legal/privacy-policy.html">Privacy Policy</a>.
-        </p>
-      </div>
+      {legal_footer}
     </div>
   </div>
 </div>
@@ -1380,6 +1379,8 @@ pub fn account_page_inner(
 </html>"##,
         css = ACCOUNT_PAGE_CSS,
         js = ACCOUNT_PAGE_JS,
+        page_title = crate::oidc::page_title(title, base_url),
+        legal_footer = legal_footer,
         title = title,
         subtitle = subtitle,
         action = action,
@@ -2175,6 +2176,29 @@ mod tests {
         );
     }
 
+    /// The account page carries the operator's legal links and no others, and
+    /// its title names the issuer host rather than a brand.
+    #[test]
+    fn account_page_footer_and_title_follow_the_deployment() {
+        let query = || AccountPageQuery {
+            action: None,
+            device_id: None,
+            id_token_hint: None,
+        };
+        let bare = account_page_inner(query(), "https://id.example.org", None, "").0;
+        assert!(!bare.contains("/legal/"), "no default legal links");
+        assert!(
+            !bare.contains(r#"class="footer""#),
+            "no footer without legal links"
+        );
+        assert!(bare.contains("<title>Account · id.example.org</title>"));
+
+        let tos = url::Url::parse("https://legal.example.org/terms").unwrap();
+        let footer = crate::oidc::legal_footer_html(Some(&tos), None);
+        let linked = account_page_inner(query(), "https://id.example.org", None, &footer).0;
+        assert!(linked.contains(r#"<a href="https://legal.example.org/terms">Terms of Use</a>"#));
+    }
+
     #[test]
     fn account_page_deactivate_shows_confirmation() {
         let html = account_page(
@@ -2779,6 +2803,7 @@ mod tests {
             },
             "https://siwx.example.com",
             Some("csrf"),
+            "",
         )
         .0;
         assert!(

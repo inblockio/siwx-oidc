@@ -118,9 +118,10 @@ paths:
         `urn:ietf:params:oauth:grant-type:device_code` grant type are present
         only when a MAS shared secret is configured (delegated-auth mode);
         without one, introspection answers 404 and both `/device_authorization`
-        and the device-code grant at `/token` are refused. `op_tos_uri` and `op_policy_uri` are present only when the
-        operator configured them (`SIWXOIDC_OP_TOS_URI`,
-        `SIWXOIDC_OP_POLICY_URI`); there is no default.
+        and the device-code grant at `/token` are refused. `op_tos_uri` and
+        `op_policy_uri` are present only when the operator configured them
+        (`SIWXOIDC_OP_TOS_URI`, `SIWXOIDC_OP_POLICY_URI`); there is no
+        default. The login page reads them here for its footer.
       responses:
         "200":
           description: Provider metadata.

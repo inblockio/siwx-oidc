@@ -435,6 +435,12 @@ async fn client_delete(
 
 async fn healthcheck() {}
 
+/// The legal footer for the server-rendered pages, from the same two settings
+/// discovery advertises.
+fn legal_footer(config: &config::Config) -> String {
+    oidc::legal_footer_html(config.op_tos_uri.as_ref(), config.op_policy_uri.as_ref())
+}
+
 // -- RFC 8628 device authorization handlers ---------------------------------
 
 async fn device_authorization_handler(
@@ -449,7 +455,11 @@ async fn device_page_handler(
     State(state): State<AppState>,
     Query(query): Query<device_auth::DevicePageQuery>,
 ) -> axum::response::Html<String> {
-    device_auth::device_page(query, state.config.base_url.as_str())
+    device_auth::device_page(
+        query,
+        state.config.base_url.as_str(),
+        &legal_footer(&state.config),
+    )
 }
 
 async fn device_verify_handler(
@@ -1066,7 +1076,12 @@ async fn account_page_handler(
             .map(|s| s.csrf),
         None => None,
     };
-    account::account_page_inner(query, state.config.base_url.as_str(), csrf.as_deref())
+    account::account_page_inner(
+        query,
+        state.config.base_url.as_str(),
+        csrf.as_deref(),
+        &legal_footer(&state.config),
+    )
 }
 
 async fn account_nonce_handler(

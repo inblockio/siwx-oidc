@@ -591,6 +591,52 @@ pub fn metadata(config: &crate::config::Config) -> Result<CoreProviderMetadata, 
     Ok(pm)
 }
 
+// -- Shared bits of the server-rendered pages (/account, /device) ----------
+
+/// Escape a value for an HTML text node or a double-quoted attribute.
+fn escape_html(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// The `<title>` of a server-rendered page: `{title} · {issuer host}`, or
+/// `title` alone when the base URL has no host. Never a fixed brand: the page
+/// belongs to whoever runs this deployment.
+pub fn page_title(title: &str, base_url: &str) -> String {
+    match Url::parse(base_url).ok().as_ref().and_then(Url::host_str) {
+        Some(host) => escape_html(&format!("{title} · {host}")),
+        None => escape_html(title),
+    }
+}
+
+/// The legal footer of the server-rendered pages, linking exactly the terms
+/// and privacy policy the operator configured (`op_tos_uri`, `op_policy_uri`,
+/// the values discovery advertises). Empty when neither is set: a deployment
+/// must not point its users at documents it did not write. The login page
+/// (`js/ui/src/App.svelte`) builds the same footer from discovery.
+pub fn legal_footer_html(tos: Option<&Url>, policy: Option<&Url>) -> String {
+    let links: Vec<String> = [(tos, "Terms of Use"), (policy, "Privacy Policy")]
+        .into_iter()
+        .filter_map(|(url, label)| {
+            url.map(|u| format!(r#"<a href="{}">{label}</a>"#, escape_html(u.as_str())))
+        })
+        .collect();
+    if links.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<div class="footer">
+        <p>By continuing you agree to the
+          {}.
+        </p>
+      </div>"#,
+        links.join(" and\n          ")
+    )
+}
+
 /// Whether this deployment runs in delegated-auth mode: a MAS shared secret is
 /// configured, so Synapse can delegate authentication to this provider.
 ///
@@ -3852,6 +3898,40 @@ mod tests {
         let set = provider_metadata_value(&config, false).unwrap();
         assert_eq!(set["op_tos_uri"], "https://legal.example.org/terms");
         assert_eq!(set["op_policy_uri"], "https://legal.example.org/privacy");
+    }
+
+    /// The footer of the server-rendered pages links exactly what discovery
+    /// advertises: nothing when nothing is configured, and each document only
+    /// when it is.
+    #[test]
+    fn the_legal_footer_links_only_configured_documents() {
+        let tos = Url::parse("https://legal.example.org/terms?v=1&lang=en").unwrap();
+        let policy = Url::parse("https://legal.example.org/privacy").unwrap();
+
+        assert_eq!(legal_footer_html(None, None), "", "no terms, no footer");
+
+        let both = legal_footer_html(Some(&tos), Some(&policy));
+        assert!(both.contains(
+            r#"<a href="https://legal.example.org/terms?v=1&amp;lang=en">Terms of Use</a>"#
+        ));
+        assert!(both.contains(r#"<a href="https://legal.example.org/privacy">Privacy Policy</a>"#));
+        assert!(!both.contains("/legal/"), "{both}");
+
+        let tos_only = legal_footer_html(Some(&tos), None);
+        assert!(tos_only.contains("Terms of Use") && !tos_only.contains("Privacy Policy"));
+        let policy_only = legal_footer_html(None, Some(&policy));
+        assert!(policy_only.contains("Privacy Policy") && !policy_only.contains("Terms of Use"));
+    }
+
+    /// A page title names the deployment it came from, never a fixed brand.
+    #[test]
+    fn a_page_title_names_the_issuer_host_not_a_brand() {
+        assert_eq!(
+            page_title("Account", "https://id.example.org/"),
+            "Account · id.example.org"
+        );
+        assert_eq!(page_title("Account", "not a url"), "Account");
+        assert!(!page_title("Account", "https://id.example.org").contains("inblock"));
     }
 
     /// Standalone discovery lists only what a standalone deployment serves.
