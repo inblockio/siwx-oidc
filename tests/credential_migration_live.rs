@@ -39,7 +39,7 @@ const FIXTURE_DID: &str = "did:key:zDnaebVfjz61NuRbnMfF2gA6NZM6DRWTeauDnFH1DhG2M
 /// [`FIXTURE_DID`]: the whole point of the link table is that it overrides the
 /// derived identity, so a test where the two coincide proves nothing.
 const LINKED_DID: &str = "did:pkh:eip155:1:0x1111111111111111111111111111111111111111";
-const LINK_LABEL: &str = "Tim's hardware wallet";
+const LINK_LABEL: &str = "Hardware wallet";
 
 /// Both tests share one Redis namespace and the first asserts it starts empty,
 /// so they must not overlap. Same test binary, so a process-wide lock is enough.

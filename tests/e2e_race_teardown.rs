@@ -733,7 +733,7 @@ async fn account_action(
 }
 
 // ===========================================================================
-// GRANDFATHER (2026-09-09, Tim): an account that already exists under the
+// GRANDFATHER (2026-09-09, the maintainer): an account that already exists under the
 // LEGACY localpart (`did.replace(':', "-").to_lowercase()`) keeps it forever
 // on real sign-in — Synapse has no user-rename API, so `resolve_identity`
 // checks the legacy shape FIRST and, if it is already taken, never considers

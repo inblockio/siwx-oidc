@@ -1237,7 +1237,7 @@ impl SynapseClient {
     /// `_check_profile_size` and `get_profile_field` subscript an unguarded
     /// `txn.fetchone()`, so an account with a `users` row but **no `profiles`
     /// row** raises an uncaught `TypeError` and Synapse answers a bare 500 —
-    /// where a healthy account answers 404. 3 of 102 accounts on the dev
+    /// where a healthy account answers 404. A few accounts on the dev
     /// homeserver are in that state (erasure artifacts). That is a KNOWN
     /// CONDITION of a known-buggy dependency, reported as
     /// [`PublishOutcome::RowLessAccount`] and logged at `warn!`, not `error!`:
@@ -2661,7 +2661,7 @@ mod tests {
     /// **H2** — a 500 is `Ok(RowLessAccount)`, never `Err`.
     ///
     /// element-hq/synapse#19702 is unfixed in 1.159.0 and makes a `users`-row-
-    /// without-`profiles`-row account 500 on this route. 3 of 102 dev accounts
+    /// without-`profiles`-row account 500 on this route. A few dev accounts
     /// are in that state. Returning `Err` here would be *technically* harmless
     /// (the caller is best-effort) but it would report a known dependency bug
     /// as a failure of ours, on every login of those accounts, forever.
