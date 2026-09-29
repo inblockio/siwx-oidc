@@ -14,7 +14,6 @@ registration token or application service is involved.
 - [When a human should own the session: the device flow](#when-a-human-should-own-the-session-the-device-flow)
 - [Verifying other parties](#verifying-other-parties)
 - [Operational notes](#operational-notes)
-- [Known quirks](#known-quirks)
 - [How bots usually get Matrix identities](#how-bots-usually-get-matrix-identities)
 - [Industry context (as of September 2026)](#industry-context-as-of-september-2026)
 
@@ -88,7 +87,8 @@ Key input, highest priority first: `--key-file`, the `SIWX_KEY_FILE`
 environment variable, `--key-hex` (a 32-byte seed; for testing only, since it
 appears in the process list and shell history), and finally a freshly generated
 **ephemeral** key. When the client generates a key it prints the PEM to stderr.
-An ephemeral key is a new identity every time it runs.
+An ephemeral key is a new identity every time it runs. `--refresh-token` never
+generates one, since a refresh needs no key.
 
 ## Signing in from the command line
 
@@ -134,12 +134,13 @@ To rotate tokens without signing again:
 
 ```bash
 siwx-oidc-auth --server https://auth.example.org --client-id "$CLIENT_ID" \
-  --refresh-token "$REFRESH_TOKEN" --key-file agent-key.pem
+  --refresh-token "$REFRESH_TOKEN"
 ```
 
-The refresh itself does not use the key. The CLI still loads it to report the
-`did` in its output, so pass the same `--key-file`; without one it would
-generate an ephemeral key and report that key's DID.
+No key is needed: the refresh request carries no signature. The refresh
+response has no ID token, so the output has no `did` unless you pass key input
+(`--key-file`, `SIWX_KEY_FILE` or `--key-hex`), whose DID then fills it. Pass
+the key that signed in; the server does not check it.
 
 ## Signing in from Rust
 
@@ -314,14 +315,6 @@ issuer their homeserver uses. Full details:
   cannot be reached for that check, it answers 503; retry later.
 - **Common errors** at sign-in, with fixes, are in
   [troubleshooting.md](troubleshooting.md#headless-sign-in-siwx-oidc-auth).
-
-## Known quirks
-
-- **`--refresh-token` without `--key-file` reports the wrong DID.** With no key
-  given, the CLI generates an ephemeral key (`load_key` in
-  `siwx-oidc-auth/src/main.rs`) and prints that key's DID in its output; the
-  refresh itself does not use the key. Always pass `--key-file` (or set
-  `SIWX_KEY_FILE`).
 
 ## How bots usually get Matrix identities
 

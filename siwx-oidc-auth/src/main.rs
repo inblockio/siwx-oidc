@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 use clap::{Parser, ValueEnum};
 use siwx_oidc_auth::{
-    authenticate_device_flow, authenticate_with_device, fetch_and_verify_did, refresh, SiwxKey,
+    authenticate_device_flow, authenticate_with_device, fetch_and_verify_did, refresh, AuthTokens,
+    SiwxKey,
 };
 
 /// Headless OIDC client for siwx-oidc.
@@ -88,6 +89,9 @@ struct Cli {
 
     /// Refresh token from a previous authentication. When provided, exchanges
     /// it for new tokens instead of performing a full auth flow.
+    ///
+    /// Needs no key: the refresh request carries no signature. Key input, when
+    /// given, only fills the output's `did`; without it `did` is left out.
     #[arg(long)]
     refresh_token: Option<String>,
 }
@@ -123,6 +127,34 @@ fn load_key(cli: &Cli) -> Result<SiwxKey> {
         key.to_pem()?,
     );
     Ok(key)
+}
+
+/// The key for `--refresh-token`: the one the caller supplied, or none. Never
+/// a generated one.
+///
+/// The refresh grant sends `grant_type`, `client_id` and `refresh_token` and
+/// nothing signed (`siwx_oidc_auth::refresh`), so the server never sees a key.
+/// A supplied key only labels the output's `did`. Generating one, as
+/// [`load_key`] does for sign-in, would report a random DID that has nothing
+/// to do with the session, and print a private key nobody asked for.
+fn refresh_key(cli: &Cli) -> Result<Option<SiwxKey>> {
+    if cli.key_file.is_none() && cli.key_hex.is_none() {
+        return Ok(None);
+    }
+    load_key(cli).map(Some)
+}
+
+/// The JSON printed for a refresh. The refresh response has no ID token, so
+/// the session's DID is known only from a supplied key; without one the `did`
+/// member is left out rather than filled with a guess.
+fn refresh_output(tokens: &AuthTokens, did_known: bool) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(tokens)?;
+    if !did_known {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("did");
+        }
+    }
+    Ok(value)
 }
 
 #[tokio::main]
@@ -163,27 +195,100 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(rt) = &cli.refresh_token {
+        let key = refresh_key(&cli)?;
+        let did = key.as_ref().map(SiwxKey::did);
+        if let Some(did) = &did {
+            eprintln!("DID: {did}");
+        }
+        let tokens = refresh(server, client_id, rt, did.as_deref().unwrap_or_default()).await?;
+        let output = refresh_output(&tokens, did.is_some())?;
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
     let key = load_key(&cli)?;
     eprintln!("DID: {}", key.did());
 
-    let tokens = if let Some(rt) = &cli.refresh_token {
-        refresh(server, client_id, rt, &key.did()).await?
-    } else {
-        let redirect_uri = cli.redirect_uri.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("--redirect-uri is required for initial authentication")
-        })?;
-        if redirect_uri.is_empty() {
-            bail!("--redirect-uri must not be empty");
-        }
-        authenticate_with_device(
-            server,
-            client_id,
-            redirect_uri,
-            &key,
-            cli.device_id.as_deref(),
-        )
-        .await?
-    };
+    let redirect_uri = cli
+        .redirect_uri
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--redirect-uri is required for initial authentication"))?;
+    if redirect_uri.is_empty() {
+        bail!("--redirect-uri must not be empty");
+    }
+    let tokens = authenticate_with_device(
+        server,
+        client_id,
+        redirect_uri,
+        &key,
+        cli.device_id.as_deref(),
+    )
+    .await?;
     println!("{}", serde_json::to_string_pretty(&tokens)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HEX_SEED: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+
+    fn parse(args: &[&str]) -> Cli {
+        // `--key-file` also reads SIWX_KEY_FILE; these tests are about the
+        // flags alone.
+        std::env::remove_var("SIWX_KEY_FILE");
+        let mut argv = vec![
+            "siwx-oidc-auth",
+            "--server",
+            "https://id.example.org",
+            "--client-id",
+            "agent",
+            "--refresh-token",
+            "mcr_example",
+        ];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).expect("valid arguments")
+    }
+
+    fn tokens(did: &str) -> AuthTokens {
+        AuthTokens {
+            access_token: "mat_example".to_string(),
+            token_type: "bearer".to_string(),
+            id_token: None,
+            expires_in: Some(300),
+            refresh_token: Some("mcr_next".to_string()),
+            did: did.to_string(),
+        }
+    }
+
+    /// The refresh request carries no signature, so without key input the CLI
+    /// must not invent a key (and with it a DID for the output).
+    #[test]
+    fn refresh_without_key_input_generates_no_key() {
+        assert!(refresh_key(&parse(&[])).unwrap().is_none());
+    }
+
+    #[test]
+    fn refresh_uses_a_supplied_key_to_label_the_did() {
+        let key = refresh_key(&parse(&["--key-hex", HEX_SEED]))
+            .unwrap()
+            .expect("a supplied key is used");
+        assert_eq!(
+            key.did(),
+            SiwxKey::ed25519_from_hex(HEX_SEED).unwrap().did()
+        );
+    }
+
+    #[test]
+    fn refresh_output_leaves_out_a_did_it_does_not_know() {
+        let without = refresh_output(&tokens(""), false).unwrap();
+        assert!(without.get("did").is_none(), "{without}");
+        assert_eq!(without["access_token"], "mat_example");
+        assert_eq!(without["refresh_token"], "mcr_next");
+
+        let with = refresh_output(&tokens("did:key:z6MkExample"), true).unwrap();
+        assert_eq!(with["did"], "did:key:z6MkExample");
+    }
 }
