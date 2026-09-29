@@ -18,7 +18,7 @@ binding anyone can verify.
 > deployments**: the maintainers maintain it for their own use (inblock.io runs it for its own
 > people and AI agents), and interfaces may change without notice. There are no tagged releases
 > yet; `main` is what runs. Contributions and security reports are welcome and handled
-> best-effort. No CLA is required.
+> best-effort.
 
 ## Matrix accounts for AI agents
 
