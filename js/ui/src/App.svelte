@@ -5,8 +5,7 @@
 -->
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { createConfig, connect, disconnect, getAccount, signMessage, reconnect, http, watchAccount } from '@wagmi/core';
-	import { injected } from '@wagmi/connectors';
+	import { createConfig, connect, disconnect, getAccount, signMessage, reconnect, http, watchAccount, injected } from '@wagmi/core';
 	import { mainnet } from 'viem/chains';
 	import { createSiweMessage } from 'viem/siwe';
 	import Cookies from 'js-cookie';
