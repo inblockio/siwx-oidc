@@ -63,13 +63,15 @@ jobs:
   # whatever `main` currently resolves to on GHCR — it never overrides that pin.
   #
   # The deploy target is configuration, not code: it comes from repository
-  # variables, and the key from a repository secret.
+  # secrets, like the key. The target values are secrets rather than variables
+  # because Actions masks secret values in logs and does not mask variables,
+  # and this repository's logs are public.
   #
-  #   vars.DEV_DEPLOY_HOST          host name or address of the dev-staging host
-  #   vars.DEV_DEPLOY_PORT          its SSH port
-  #   vars.DEV_DEPLOY_USER          the SSH user the deploy key is installed for
-  #   vars.DEV_DEPLOY_KNOWN_HOSTS   the pinned known_hosts line(s) for that host
-  #   secrets.DEV_STAGING_DEPLOY_KEY  the deploy private key
+  #   secrets.DEV_DEPLOY_HOST          host name or address of the dev-staging host
+  #   secrets.DEV_DEPLOY_PORT          its SSH port
+  #   secrets.DEV_DEPLOY_USER          the SSH user the deploy key is installed for
+  #   secrets.DEV_DEPLOY_KNOWN_HOSTS   the pinned known_hosts line(s) for that host
+  #   secrets.DEV_STAGING_DEPLOY_KEY   the deploy private key
   #
   # The SSH key is a dedicated, restricted deploy key: the host's
   # authorized_keys pins it to a forced command (a single deploy script) with
@@ -86,11 +88,11 @@ jobs:
     needs: build-and-push
     if: ${{ github.repository == 'inblockio/siwx-oidc' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
-    # Repository variables are NOT masked: any step that binds one prints its
-    # value in the step's log header, and this repository's logs are public.
-    # So the values are bound only to the steps that need them (which run only
-    # once the deploy key exists), and the guard below inspects them through
-    # expressions that yield variable NAMES, never values.
+    # The target values are secrets so that Actions masks them in the public
+    # logs; a repository variable bound to a step is printed in that step's log
+    # header. They are still bound only to the steps that need them (which run
+    # only once the deploy key exists), and the guard below inspects them
+    # through expressions that yield secret NAMES, never values.
     steps:
       # Secret-presence guard: while DEV_STAGING_DEPLOY_KEY is not set, the
       # push-model deploy is dormant by design. The host's own pull-model
@@ -101,23 +103,24 @@ jobs:
         id: check-secret
         run: echo "ok=${{ secrets.DEV_STAGING_DEPLOY_KEY != '' }}" >> "$GITHUB_OUTPUT"
 
-      # Variable guard: once the deploy key exists, FAILS the job, loudly, when
+      # Target guard: once the deploy key exists, FAILS the job, loudly, when
       # the deploy target is not fully configured. It does not run while the key
-      # is absent: the deploy is dormant then, and failing on variables nothing
-      # reads would turn every push to `main` red. Deliberately not a skip: a silently skipped deploy
-      # leaves dev-staging on the previous image while the run shows green.
-      - name: Require deploy target variables
+      # is absent: the deploy is dormant then, and failing on secrets nothing
+      # reads would turn every push to `main` red. Deliberately not a skip: a
+      # silently skipped deploy leaves dev-staging on the previous image while
+      # the run shows green.
+      - name: Require deploy target secrets
         if: steps.check-secret.outputs.ok == 'true'
         env:
           MISSING: >-
-            ${{ vars.DEV_DEPLOY_HOST == '' && 'DEV_DEPLOY_HOST' || '' }}
-            ${{ vars.DEV_DEPLOY_PORT == '' && 'DEV_DEPLOY_PORT' || '' }}
-            ${{ vars.DEV_DEPLOY_USER == '' && 'DEV_DEPLOY_USER' || '' }}
-            ${{ vars.DEV_DEPLOY_KNOWN_HOSTS == '' && 'DEV_DEPLOY_KNOWN_HOSTS' || '' }}
+            ${{ secrets.DEV_DEPLOY_HOST == '' && 'DEV_DEPLOY_HOST' || '' }}
+            ${{ secrets.DEV_DEPLOY_PORT == '' && 'DEV_DEPLOY_PORT' || '' }}
+            ${{ secrets.DEV_DEPLOY_USER == '' && 'DEV_DEPLOY_USER' || '' }}
+            ${{ secrets.DEV_DEPLOY_KNOWN_HOSTS == '' && 'DEV_DEPLOY_KNOWN_HOSTS' || '' }}
         run: |
           missing=$(echo $MISSING)
           if [ -n "$missing" ]; then
-            echo "::error title=Dev-staging deploy target not configured::Repository variable(s) empty: ${missing}. Set them under Settings > Secrets and variables > Actions > Variables (gh variable set NAME -R ${GITHUB_REPOSITORY}). Refusing to skip silently: dev-staging would stay on the previous image."
+            echo "::error title=Dev-staging deploy target not configured::Repository secret(s) empty: ${missing}. Set them under Settings > Secrets and variables > Actions > Secrets (gh secret set NAME -R ${GITHUB_REPOSITORY}). Refusing to skip silently: dev-staging would stay on the previous image."
             exit 1
           fi
 
@@ -132,7 +135,7 @@ jobs:
       - name: Pin dev-staging host key
         if: steps.check-secret.outputs.ok == 'true'
         env:
-          DEV_DEPLOY_KNOWN_HOSTS: ${{ vars.DEV_DEPLOY_KNOWN_HOSTS }}
+          DEV_DEPLOY_KNOWN_HOSTS: ${{ secrets.DEV_DEPLOY_KNOWN_HOSTS }}
         run: |
           install -m 700 -d ~/.ssh
           umask 077
@@ -141,9 +144,9 @@ jobs:
       - name: Deploy to dev-staging (forced command runs the deploy script)
         if: steps.check-secret.outputs.ok == 'true'
         env:
-          DEV_DEPLOY_HOST: ${{ vars.DEV_DEPLOY_HOST }}
-          DEV_DEPLOY_PORT: ${{ vars.DEV_DEPLOY_PORT }}
-          DEV_DEPLOY_USER: ${{ vars.DEV_DEPLOY_USER }}
+          DEV_DEPLOY_HOST: ${{ secrets.DEV_DEPLOY_HOST }}
+          DEV_DEPLOY_PORT: ${{ secrets.DEV_DEPLOY_PORT }}
+          DEV_DEPLOY_USER: ${{ secrets.DEV_DEPLOY_USER }}
         run: |
           case "$DEV_DEPLOY_PORT" in
             ''|*[!0-9]*)

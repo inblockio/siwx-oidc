@@ -6,7 +6,7 @@ builds should only be used for testing, never for production deployment.
 ## Steps
 
 1. Run the checks CI runs first (catches Rust issues early; `cargo test` needs Redis on
-   localhost:6379, e.g. `docker compose -f test/docker-compose.yml up -d redis`):
+   localhost:6379, e.g. `docker run -d --rm --name siwx-redis -p 6379:6379 redis:7-alpine`):
 ```bash
 cargo fmt -- --check
 cargo clippy --workspace -- -D warnings

@@ -174,9 +174,9 @@ pub struct VerifiedDid {
 impl VerifiedDid {
     /// The DID, exact case, from the `sub` claim.
     ///
-    /// This is deliberately the same claim the ID token carries (CLAUDE.md
-    /// breaking change #1: `sub` is `did:pkh:eip155:1:0x…`, not a bare
-    /// address), so a consumer can compare an assertion's `sub` to an ID
+    /// This is deliberately the same claim the ID token carries (breaking change
+    /// #1 in `docs/architecture.md`, "Lineage": `sub` is `did:pkh:eip155:1:0x…`,
+    /// not a bare address), so a consumer can compare an assertion's `sub` to an ID
     /// token's `sub` with no translation step in between.
     pub fn did(&self) -> &str {
         &self.did

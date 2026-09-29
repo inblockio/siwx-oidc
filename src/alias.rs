@@ -1,7 +1,7 @@
 //! Tier 1 of the identity model: a human-readable **alias**, deterministically
 //! seeded from the DID.
 //!
-//! See the three-tier table in `CLAUDE.md`. The alias is the tier the USER
+//! See the three-tier table in `docs/identity-model.md`. The alias is the tier the USER
 //! owns: Synapse's `displayname`, freely rewritable by its owner at any time
 //! ([the ACL probe's leg 5][probe] measured a plain user's `PUT` to
 //! `displayname` as **200** on the same image where their `PUT` to

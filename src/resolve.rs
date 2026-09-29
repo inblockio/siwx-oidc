@@ -196,8 +196,8 @@ pub struct ResolveResponse {
     /// **What this does not mean.** No signature is verified. The published
     /// object's `proof` (a compact ES256 JWS) is not checked here, because the
     /// verifier lives in `siwx-oidc-auth`, which is a **dev-dependency only** so
-    /// the shipped binary links none of it (`CLAUDE.md`, "Verifying a published
-    /// DID"). A caller who needs cryptographic assurance runs
+    /// the shipped binary links none of it (`docs/identity-model.md`, "Verifying a
+    /// published DID"). A caller who needs cryptographic assurance runs
     /// `siwx-oidc-auth --verify-did`, which also re-checks the `mxid` binding
     /// and the issuer. A deployment with an ephemeral signing key publishes a
     /// DID with no `proof` at all, and that account still reports
@@ -261,7 +261,7 @@ pub enum ResolveError {
 impl IntoResponse for ResolveError {
     fn into_response(self) -> Response {
         // This module bypasses `CustomError`, so it logs its own errors — see
-        // CLAUDE.md's logging conventions ("modules that bypass CustomError must
+        // AGENTS.md's logging conventions ("Modules that bypass `CustomError` …
         // log their own errors").
         let (status, code, message, mxid) = match self {
             ResolveError::BadRequest(m) => {

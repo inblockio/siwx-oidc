@@ -22,15 +22,18 @@ The repository's [`skills/`](../skills/) directory has longer checklists:
 [`element-x-qr-code-specialist`](../skills/element-x-qr-code-specialist.md),
 [`authenticate-siwe-matrix`](../skills/authenticate-siwe-matrix.md) for the
 end-to-end Element Web flow, and [`deploy-check`](../skills/deploy-check.md)
-before a deployment.
+after a deployment.
 
 ## Where to look first
 
 - **Logs.** The default filter is `siwx_oidc=info,tower_http=info,warn`;
   override it with `RUST_LOG`. `SIWXOIDC_LOG_FORMAT=json` gives structured
-  output. Every error response is logged with a discriminator: `bad_request`,
+  output. Error responses are logged with a discriminator: `bad_request`,
   `unauthorized`, `unknown_credential`, `service_unavailable` (a dependency is
   down and the server refused on purpose) and `internal_error` (unexpected).
+  A 404 and an error redirect (for example `/authorize` sending an unregistered
+  `redirect_uri` to `/error?message=unregistered_redirect_uri`) get no such
+  line; only the per-request `response` line shows their status (404 or 303).
 - **Discovery.** `GET /.well-known/openid-configuration` and `GET /jwk` describe
   the running server: issuer, endpoints, grant types, account-management
   actions, and the signing keys.
@@ -43,7 +46,7 @@ before a deployment.
 | Error printed by the client | Cause | Fix |
 |---|---|---|
 | `/authorize returned 401 Unauthorized instead of 303` | the `client_id` is not registered | register a client ([agents.md](agents.md#prerequisites)) |
-| `failed to parse authorize redirect query params` | the `redirect_uri` is not registered for that client; the server redirected to `/error?message=unregistered_redirect_uri` | pass exactly a registered redirect URI (query strings are ignored in the comparison) |
+| `/authorize response missing session cookie` | the `redirect_uri` is not registered for that client; the server answered with a 303 to `/error?message=unregistered_redirect_uri`, which sets no session cookie | pass exactly a registered redirect URI (query strings are ignored in the comparison) |
 | `/sign_in returned 400 …: DID method 'key' is not enabled on this server` | `supported_did_methods` does not contain `"key"` | add it (it is in the default) |
 | `/sign_in returned 401 …: Signature verification failed` | the signature does not match the DID in the message | check the key file; do not edit the generated message |
 | `/sign_in returned 401 …: This account has been deactivated …` | the account was deactivated | a deactivated account cannot sign in |
@@ -228,9 +231,10 @@ MAS deployment before looking anywhere else.
 - **`/resolve` answers 503**: the deployment has no server name or no Synapse
   client. **502**: Synapse could not be asked; the body says what failed. **504**:
   the lookup took more than 10 seconds.
-- **A 500 from Synapse on a profile read or write for one account** (Synapse
-  1.159 and earlier): that account has no profile row
-  (element-hq/synapse#19702). See
+- **A 500 from Synapse on a profile read or write for one account**: that
+  account has no profile row (element-hq/synapse#19702; affected: Synapse 1.160
+  and earlier; 1.161 fixes some of the paths (#20149, #20172); #19702 remains
+  open upstream; not re-verified against this deployment). See
   [identity-model.md](identity-model.md#row-less-accounts-and-the-exact-500-rule).
 
 ## Inspecting Redis

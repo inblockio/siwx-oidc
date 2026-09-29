@@ -18,7 +18,7 @@ binding anyone can verify.
 > deployments**: the maintainers maintain it for their own use (inblock.io runs it for its own
 > people and AI agents), and interfaces may change without notice. There are no tagged releases
 > yet; `main` is what runs. Contributions and security reports are welcome and handled
-> best-effort.
+> best-effort. No CLA is required.
 
 ## Matrix accounts for AI agents
 
@@ -61,7 +61,7 @@ curl -s -X POST https://siwx.example.com/register -H 'Content-Type: application/
 # Sign in, pinning a stable Matrix device ID
 siwx-oidc-auth --server https://siwx.example.com --client-id "$CLIENT_ID" \
   --redirect-uri http://localhost/callback --key-file agent.pem --device-id my-agent
-# prints JSON: access_token, refresh_token, id_token, expires_in, did
+# prints JSON: access_token, token_type ("bearer"), id_token, expires_in, refresh_token, did
 
 # Later: new tokens without signing again; the device stays the same
 siwx-oidc-auth --server https://siwx.example.com --client-id "$CLIENT_ID" \
@@ -120,8 +120,10 @@ People sign in on the login page, or approve a sign-in for another device.
 | Wallet (CAIP-122 / Sign-In with Ethereum) | `did:pkh:eip155:1:0x…` | Browser wallets through EIP-1193 (for example MetaMask). |
 | Device code / QR (RFC 8628) | the approving person's DID | Used by Element X's QR login and by `siwx-oidc-auth --device-flow` on machines without a browser. |
 
-For people, a new account is created only at the login screen, after an explicit confirmation;
-the account page and the device approval page refuse identities that have no account yet.
+New accounts are created only through the login flow, at the first sign-in. A passkey sign-in
+on the login page asks the user to confirm first (the page enforces this, not the server); a
+wallet sign-in and an agent's headless sign-in create the account directly, with no confirmation
+step. The account page and the device approval page refuse identities that have no account yet.
 Accepted DID methods are configurable (`supported_did_methods`, default `["pkh","key"]`;
 `did:peer` is available opt-in). Besides `eip155`, `did:pkh` accepts `ed25519` and `p256`
 namespaces, which are aqua-auth extensions, not registered CAIP namespaces. See
@@ -176,9 +178,10 @@ A complete Docker Compose deployment (Synapse, Element Web, siwx-oidc, Redis, Ca
 
 ### What it depends on
 
-- **Synapse.** The code targets Synapse 1.157 and later and is tested with 1.161.0, the version
-  the bundled deployment runs. The stable `matrix_authentication_service` block exists since
-  1.136.0; 1.157.0 removed the experimental `experimental_features.msc3861` mode.
+- **Synapse.** Tested with Synapse 1.159 and 1.161. The integration uses Synapse's stable
+  `matrix_authentication_service` block (available since 1.136); versions before 1.157 are
+  untested. The bundled deployment runs 1.161.0. 1.157.0 removed the experimental
+  `experimental_features.msc3861` mode.
 - **An internal Synapse API.** Synapse's side of this integration (`/_synapse/mas/*`) is an
   internal API designed for MAS (Synapse 1.135.0 changelog), not a public, stable interface.
   siwx-oidc tracks it per Synapse release, so every Synapse upgrade is a compatibility check.
@@ -276,6 +279,9 @@ docker run --rm --network siwx -p 8000:8000 \
   -e SIWXOIDC_REDIS_URL=redis://redis:6379 \
   ghcr.io/inblockio/siwx-oidc:latest
 ```
+
+The `SIWXOIDC_` names need an image built with the `SIWXOIDC_` rename or later; older images
+read only `SIWEOIDC_`, which remains accepted either way.
 
 ### Agent client
 

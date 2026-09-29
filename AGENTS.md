@@ -16,7 +16,7 @@ binding in the profile field `io.inblock.did`.
 
 **Status:** siwx-oidc is a pathfinder project for agent identity on Matrix, run by inblock.io
 assets GmbH on a non-commercial basis. It is provided as is, without warranty (Apache-2.0
-§7–8). There is no support offering, no SLA, and no commitment to maintain it for third-party
+§§7–8). There is no support offering, no SLA, and no commitment to maintain it for third-party
 deployments; the maintainers maintain it for their own use, and interfaces may change without
 notice. There are no tagged releases yet; `main` is what runs.
 
@@ -60,36 +60,43 @@ everything else exists only in the binary crate.
 | `did_assertion.rs` | The shipped verifier: `fetch_and_verify_did`, `verify_did_assertion`, `VerifiedDid`, `DidAssertionError`, `DID_PROFILE_FIELD`. |
 | `main.rs` | CLI: `--key-file`, `--print-did`, `--server`, `--refresh-token`, `--device-flow`, `--verify-did <MXID> --homeserver <url>`. |
 
-Other paths: `tests/` (integration suites, all `#[ignore]`d), `e2e/` (mock stack, Playwright
-suites, Element Web suites), `js/ui/` (Svelte login page, built into `static/build`),
-`static/` (served pages and assets), `docs/api/` (OpenAPI document), `docs/audits/` and
-`docs/design/` (evidence and design records), `security/` plus `.cargo/audit.toml` (advisory
-exceptions, VEX), `scripts/` (live checks against a deployment), `skills/` (agent skills),
-`example/demo/` (a demo relying party), `test/docker-compose.yml` (Redis for local tests).
+Other paths: `tests/` (integration suites, mostly `#[ignore]`d; see below), `e2e/` (mock
+stack, Playwright suites, Element Web suites), `js/ui/` (Svelte login page, built into
+`static/build`), `static/` (served pages and assets), `docs/api/` (OpenAPI document),
+`docs/audits/` and `docs/design/` (evidence and design records), `security/` plus
+`.cargo/audit.toml` (advisory exceptions, VEX), `scripts/` (live checks against a deployment),
+`skills/` (agent skills).
 
 ## Architecture in brief
 
 Three layers. **aqua-auth** verifies CAIP-122 proofs through the `DIDMethod` trait (and, inside
 `did:pkh`, `CipherSuite`). **Ceremony modules** in `src/` (WebAuthn, the RFC 8628 approval page)
 verify other proofs server-side and store a verified DID in the Redis session. **`oidc.rs`**
-issues tokens; `sign_in` and the device-code grant are the only places codes and tokens come
-from. Ceremonies never extend `DIDMethod`. Full picture, sign-in flows, Redis keyspace and
-lineage: [docs/architecture.md](docs/architecture.md).
+issues codes and tokens: authorization codes only in `sign_in`, tokens at `POST /token`
+(authorization-code, refresh and device-code grants). Two more endpoints mint tokens:
+`POST /_matrix/client/v3/refresh` (`compat.rs`) and `POST /oauth2/admin_token`
+(`admin_token.rs`). Ceremonies never issue either and never extend `DIDMethod`. Full picture,
+sign-in flows, Redis keyspace and lineage: [docs/architecture.md](docs/architecture.md).
 
 ## Build and test
 
 ```bash
 cargo build --workspace
 cargo fmt -- --check && cargo clippy          # CI builds with RUSTFLAGS=-Dwarnings
-docker compose -f test/docker-compose.yml up -d redis   # Redis on localhost:6379
-cargo test                                    # unit tests; several need that Redis
+docker run -d --rm --name siwx-redis -p 6379:6379 redis:7-alpine   # Redis on localhost:6379
+cargo test                                    # unit tests + non-ignored tests/; several need Redis
 cargo run                                     # the server (needs Redis; see below)
 cargo run -p siwx-oidc-auth -- --help         # the headless client
 ```
 
-- **Every `tests/*.rs` test is `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
-  mock). Plain `cargo test` runs only unit tests. Run a suite explicitly:
-  `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
+- **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
+  mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
+  Plain `cargo test` runs the unit tests plus 13 tests in six files: `openapi_covers_every_route`
+  (2) and `localpart_vectors` (1), which need nothing; `account_linking_dual_write` (6), which
+  needs Redis on localhost; `credential_migration_live` (2), which returns early unless
+  `MIGRATION_TEST_REDIS_URL` names a disposable Redis; and the pure check
+  `an_absent_strict_skips_variable_means_strict` in `e2e_account_lifecycle_live` and in
+  `e2e_did_field_live` (1 each).
 - **Mock stack:** `e2e/up.sh` / `e2e/down.sh` start Redis, `e2e/synapse_mock.py` and siwx-oidc
   in podman; `bash e2e/run-all.sh` runs everything. See [e2e/README.md](e2e/README.md).
   `--test-threads=1` is required: the suites share one stack and reset the mock.
@@ -118,7 +125,11 @@ endpoint, update `e2e/synapse_mock.py` in the same change (drift check in
 
 **A test must be able to fail.** A bound such as `n <= 1` is satisfied by zero, and a test
 that prints "skipping" and returns ok is green forever. Assert the positive case, and make
-skips loud (`E2E_STRICT_SKIPS`).
+skips loud (`E2E_STRICT_SKIPS`). Known gap: several Redis-backed tests still return early
+without Redis (e.g. `forged_user_cookie_yields_usernameless_empty_allow_credentials`, the
+`d1_500_…` tests in `synapse_client.rs`, most of `account_linking_dual_write`), and
+`backfill_is_additive_link_aware_counter_preserving_and_idempotent` runs only when
+`MIGRATION_TEST_REDIS_URL` is set, which no CI job sets.
 
 ## Invariants: do not "simplify" these
 
@@ -159,8 +170,10 @@ doc; read it before changing the code the rule covers.
   `h4_the_same_pem_yields_the_same_kid_across_constructions`,
   `published_jwk_always_carries_the_derived_kid`.
 - **No `exp` in a DID assertion.** The binding is permanent. Pin: `payload_has_no_exp_claim`.
-- **ES256 signatures are raw `r‖s`, 64 bytes, never DER**, and ID tokens use the same
-  `sign_es256`. Pin: `signature_is_64_raw_bytes_never_der`.
+- **ES256 signatures are raw `r‖s`, 64 bytes, never DER.** Pin:
+  `signature_is_64_raw_bytes_never_der`, which covers the DID-assertion signature only. ID
+  tokens share `sign_es256` by construction (`PrivateSigningKey::sign` delegates to it); no
+  separate test pins that.
 - **Claim and header order is struct declaration order**; those bytes are signed. Pin:
   `minted_jws_has_exactly_three_parts_and_the_exact_header`.
 - **An ephemeral key mints no assertion at all.** `mint_did_assertion` returns `None`.
@@ -230,24 +243,29 @@ doc; read it before changing the code the rule covers.
 
 ### Sign-in gates ([docs/passkeys.md](docs/passkeys.md))
 
-- **New accounts are created only at the login screen.** Account re-auth and device approval
-  reject an unknown identity via `reject_if_new_identity`.
+- **New accounts are created only through the login flow (`/sign_in`).** Only the browser
+  passkey login asks for confirmation, and the frontend enforces it; wallet and headless
+  sign-ins create the account directly. Account re-auth and device approval reject an unknown
+  identity via `reject_if_new_identity`.
 - **Both gates fail closed and report two different facts**: the check ran and said no (400 /
   401) versus the check could not run (503). Pin:
   `reject_if_new_identity_fails_closed_on_synapse_error`,
   `a_rejected_mas_shared_secret_is_a_detection_failure_not_a_new_identity`,
   `reject_if_deactivated_fails_closed_on_synapse_error`.
-- **`reject_if_deactivated` runs before `resolve_identity_or_legacy` in `sign_in`.** Swapping them
-  lets a deactivated modern-only account sign in via the legacy guess. Pin:
-  `a_query_user_failure_is_a_probe_failure_not_a_deactivation`; rationale at the call site.
+- **`reject_if_deactivated` runs before `resolve_identity_or_legacy` in `sign_in`.** Feeding the
+  gate that resolver's legacy guess lets a deactivated modern-only account sign in. Pin:
+  `sign_in_refuses_a_deactivated_account_before_resolving_or_provisioning`,
+  `a_partial_probe_fault_fails_sign_in_closed_before_any_legacy_guess` (they drive `sign_in`
+  against a recording homeserver); rationale at the call site.
 - **Standalone deployments degrade, never 500.** No Synapse client means the gates are no-ops.
 
 ### Tokens, sessions and devices ([docs/matrix-integration.md](docs/matrix-integration.md))
 
 - **An empty `device_id` is JSON `null` on the wire, never `""`.** Synapse rejects `""`. Pin:
   `empty_device_id_renders_as_json_null`, `deviceless_token_body_carries_device_id_null`.
-- **Refresh rotation keeps a 60 s grace pointer** so a client that lost the response can replay
-  once. Pin: `refresh_grace_window_tolerates_replay` (mock stack).
+- **Refresh rotation keeps a 60 s grace pointer**: any replay of the old refresh token within
+  60 s returns the same successor pair, so a client that lost the response recovers. Pin:
+  `refresh_grace_window_tolerates_replay` (mock stack).
 - **Never infer token validity from Synapse**: it caches introspection for two minutes. Our
   introspection answer is the authority.
 - **No device-id recycling.** Sign-in upserts a fresh `SIWX_…` id and never deletes. Pin:
@@ -310,7 +328,8 @@ doc; read it before changing the code the rule covers.
 - **aqua-auth has no logging** and no knowledge of ceremonies.
 - **Credential store: dual-write, not cut-over.** The legacy `webauthn:credential/*` namespace
   stays authoritative; mirror writes are best-effort; the backfill is additive and idempotent.
-  Pin: `backfill_is_additive_link_aware_counter_preserving_and_idempotent` (live Redis).
+  Pin: `backfill_is_additive_link_aware_counter_preserving_and_idempotent` (runs only with
+  `MIGRATION_TEST_REDIS_URL`; see the known gap under Build and test).
 
 ## Logging conventions
 

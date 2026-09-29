@@ -2494,7 +2494,8 @@ pub async fn sign_in(
     // reaches the `degraded` guard that suppresses DID publication (2026-09-10
     // audit, D4) — making that guard look like near-dead code on the login path.
     // The observation is correct and the ordering is still right. Do not swap
-    // them to "make the guard reachable".
+    // them to "make the guard reachable". `sign_in_deactivation_order_tests`
+    // (end of this file) fails if the gate moves anywhere later in `sign_in`.
     //
     // Swapping them would not trade coverage for safety, it would build a live
     // deactivation BYPASS. `resolve_identity_or_legacy` is infallible by
@@ -2848,7 +2849,7 @@ fn mxid_claim(config: &crate::config::Config, localpart: Option<&str>) -> SiwxAd
 /// only authorization-bearing claim here) or `preferred_username` is
 /// byte-for-byte unaffected, and nothing in this function may ever be
 /// "simplified" into replacing one of them with the Matrix ID — the three-tier
-/// identity model (see `CLAUDE.md`) exists precisely because a consumer that
+/// identity model (see `docs/identity-model.md`) exists precisely because a consumer that
 /// reads a Matrix identifier where it expected a DID, or the reverse, resolves
 /// the wrong account.
 pub async fn userinfo(
@@ -4836,6 +4837,290 @@ mod userinfo_mxid_claim_tests {
             payload.get("sub").and_then(|v| v.as_str()),
             Some(DID),
             "`sub` is unchanged in the signed variant too"
+        );
+    }
+}
+
+/// `sign_in` decides deactivation BEFORE it resolves the login localpart.
+///
+/// The ordering rule is argued at the gate's call site in [`sign_in`]: the
+/// deactivation gate must run before `resolve_identity_or_legacy`, because that
+/// resolver is infallible and answers a probe error with a GUESSED legacy
+/// localpart. A gate that consumed the guess would ask `query_user` about the
+/// wrong account, read the 404 as "no account, nothing to reject", and let a
+/// deactivated modern-only account sign straight back in.
+///
+/// The `webauthn` tests pin the gate in isolation; nothing there can see where
+/// `sign_in` calls it. These tests drive `sign_in` itself, with a server-verified
+/// DID in the Redis session (the passkey path) and an in-process homeserver that
+/// records every request it receives, and pin two things:
+///
+/// - **the outcome**: a deactivated account is refused, and a probe fault fails
+///   closed, before anything is provisioned;
+/// - **the order**: the gate's own probes are the ONLY requests `sign_in` makes
+///   on those paths. Resolving the localpart first shows up as extra
+///   `is_localpart_available` probes ahead of `query_user`, and provisioning
+///   first shows up as MAS writes, so moving the gate anywhere later in
+///   `sign_in` fails these tests even when the outcome alone would not change.
+///
+/// Redis-backed like the rest of this file's `sign_in` tests (`e2e_flow`): the
+/// session is read and marked signed-in through the real `DBClient`.
+#[cfg(test)]
+mod sign_in_deactivation_order_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::localpart::{legacy_localpart, localpart_for};
+    use axum::extract::{Query, State};
+    use axum::http::{Method, StatusCode, Uri};
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use headers::{HeaderMap, HeaderMapExt, HeaderValue};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+
+    /// Synthetic; `find_did_method` checks only the `did:key:` prefix, and the
+    /// gate never parses the key.
+    const DID: &str = "did:key:zDnSIGNINDEACTIVATIONORDER";
+    const SERVER_NAME: &str = "example.org";
+    const REDIRECT: &str = "https://example.com/callback";
+
+    /// What the homeserver answers, per localpart, and what it was asked.
+    #[derive(Default)]
+    struct Homeserver {
+        /// `is_localpart_available` answers 500: a fault on ONE route, the
+        /// partial-outage shape the ordering note describes.
+        faulted: HashSet<String>,
+        /// `is_localpart_available` answers `400 M_USER_IN_USE`. A deactivated
+        /// account's localpart is taken as far as Synapse is concerned.
+        taken: HashSet<String>,
+        /// `query_user` answers `is_deactivated: true`; any other localpart is
+        /// a 404, which `query_user` reads as "no such account".
+        deactivated: HashSet<String>,
+        /// Every request, in arrival order.
+        log: Mutex<Vec<String>>,
+    }
+
+    async fn is_localpart_available(
+        State(hs): State<Arc<Homeserver>>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> axum::response::Response {
+        let lp = q.get("localpart").cloned().unwrap_or_default();
+        hs.log
+            .lock()
+            .unwrap()
+            .push(format!("is_localpart_available {lp}"));
+        if hs.faulted.contains(&lp) {
+            (StatusCode::INTERNAL_SERVER_ERROR, "").into_response()
+        } else if hs.taken.contains(&lp) {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"errcode": "M_USER_IN_USE", "error": "in use"})),
+            )
+                .into_response()
+        } else {
+            (StatusCode::OK, Json(serde_json::json!({"available": true}))).into_response()
+        }
+    }
+
+    async fn query_user(
+        State(hs): State<Arc<Homeserver>>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> axum::response::Response {
+        let lp = q.get("localpart").cloned().unwrap_or_default();
+        hs.log.lock().unwrap().push(format!("query_user {lp}"));
+        if hs.deactivated.contains(&lp) {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "user_id": format!("@{lp}:{SERVER_NAME}"),
+                    "display_name": null,
+                    "avatar_url": null,
+                    "is_suspended": false,
+                    "is_deactivated": true,
+                })),
+            )
+                .into_response()
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"errcode": "M_NOT_FOUND", "error": "User not found"})),
+            )
+                .into_response()
+        }
+    }
+
+    /// Anything else `sign_in` might send (provisioning, profile reads) is
+    /// recorded and answered with an empty 200, so a gate moved past
+    /// provisioning shows up in the log instead of as an unrelated error.
+    async fn anything_else(
+        State(hs): State<Arc<Homeserver>>,
+        method: Method,
+        uri: Uri,
+    ) -> axum::response::Response {
+        hs.log
+            .lock()
+            .unwrap()
+            .push(format!("{method} {}", uri.path()));
+        (StatusCode::OK, Json(serde_json::json!({}))).into_response()
+    }
+
+    /// Run one passkey-path `sign_in` for [`DID`] against `hs`; return the
+    /// outcome and the homeserver's request log.
+    async fn sign_in_against(hs: Homeserver) -> (Result<(Url, String), CustomError>, Vec<String>) {
+        let hs = Arc::new(hs);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral homeserver port");
+        let addr = listener.local_addr().expect("homeserver local_addr");
+        let app = Router::new()
+            .route(
+                "/_synapse/mas/is_localpart_available",
+                get(is_localpart_available),
+            )
+            .route("/_synapse/mas/query_user", get(query_user))
+            .fallback(anything_else)
+            .with_state(hs.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("homeserver");
+        });
+        let synapse = SynapseClient::new(&format!("http://{addr}"), "secret");
+
+        let db = RedisClient::new(&Config::default().redis_url)
+            .await
+            .expect("these tests need Redis on localhost:6379, as CI provides");
+        let nonce = Uuid::new_v4().simple().to_string();
+        let client_id = format!("deactivation-order-{nonce}");
+        db.set_client(
+            client_id.clone(),
+            ClientEntry {
+                secret: "secret".into(),
+                metadata: CoreClientMetadata::new(
+                    vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
+                    EmptyAdditionalClientMetadata {},
+                ),
+                access_token: None,
+            },
+        )
+        .await
+        .unwrap();
+        // The passkey path: the ceremony already verified the DID and stored it
+        // in the session, so `sign_in` needs no CAIP-122 cookie.
+        let session_id = format!("deactivation-order-{nonce}");
+        db.set_session(
+            session_id.clone(),
+            SessionEntry {
+                siwe_nonce: nonce.clone(),
+                oidc_nonce: None,
+                secret: "secret".into(),
+                signin_count: 0,
+                verified_did: Some(DID.to_string()),
+                scope: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
+        );
+        let cookies = headers.typed_get::<headers::Cookie>().unwrap();
+        let params = SignInParams {
+            redirect_uri: RedirectUrl::new(REDIRECT.into()).unwrap(),
+            state: "state".into(),
+            oidc_nonce: None,
+            client_id,
+            code_challenge: None,
+            code_challenge_method: None,
+            response_mode: None,
+        };
+
+        let result = sign_in(
+            &Url::parse("https://example.com").unwrap(),
+            &["key".to_string()],
+            &[],
+            params,
+            cookies,
+            &db,
+            Some(&synapse),
+            Some(SERVER_NAME),
+            None,
+        )
+        .await;
+        server.abort();
+        let log = hs.log.lock().unwrap().clone();
+        (result, log)
+    }
+
+    /// A healthy homeserver and a genuinely deactivated account that exists only
+    /// under the MODERN localpart. `sign_in` refuses it with the deactivation
+    /// message, and the only requests it made are the gate's own three probes:
+    /// legacy is free, modern is taken, and the modern account is deactivated.
+    #[tokio::test]
+    async fn sign_in_refuses_a_deactivated_account_before_resolving_or_provisioning() {
+        let legacy = legacy_localpart(DID);
+        let modern = localpart_for(DID);
+        let (result, log) = sign_in_against(Homeserver {
+            taken: HashSet::from([modern.clone()]),
+            deactivated: HashSet::from([modern.clone()]),
+            ..Homeserver::default()
+        })
+        .await;
+
+        match result {
+            Err(CustomError::Unauthorized(msg)) => {
+                assert_eq!(msg, crate::webauthn::DEACTIVATED_REJECT_MSG);
+            }
+            other => panic!("a deactivated account must not sign in, got {other:?}"),
+        }
+        assert_eq!(
+            log,
+            vec![
+                format!("is_localpart_available {legacy}"),
+                format!("is_localpart_available {modern}"),
+                format!("query_user {modern}"),
+            ],
+            "the deactivation gate must be the first and only thing sign_in asks the \
+             homeserver on this path: extra availability probes before `query_user` mean \
+             the login localpart was resolved first, and anything after it means \
+             provisioning ran for an account that is being refused"
+        );
+    }
+
+    /// The bypass shape from the ordering note: the legacy availability probe
+    /// fails while `query_user` would answer, and the deactivated account lives
+    /// under the MODERN localpart. `resolve_identity_or_legacy` would answer this
+    /// fault with the legacy guess, and `query_user` on that guess is a 404. The
+    /// gate must instead fail closed with the "could not check" 503, having sent
+    /// nothing but the one failed probe.
+    #[tokio::test]
+    async fn a_partial_probe_fault_fails_sign_in_closed_before_any_legacy_guess() {
+        let legacy = legacy_localpart(DID);
+        let modern = localpart_for(DID);
+        let (result, log) = sign_in_against(Homeserver {
+            faulted: HashSet::from([legacy.clone()]),
+            taken: HashSet::from([modern.clone()]),
+            deactivated: HashSet::from([modern.clone()]),
+            ..Homeserver::default()
+        })
+        .await;
+
+        match result {
+            Err(CustomError::ServiceUnavailable(msg)) => {
+                assert_eq!(msg, crate::webauthn::DEACTIVATION_CHECK_UNAVAILABLE_MSG);
+            }
+            other => panic!(
+                "a probe fault must fail sign-in closed, never fall back to the legacy \
+                 guess and let a deactivated modern-only account in; got {other:?}"
+            ),
+        }
+        assert_eq!(
+            log,
+            vec![format!("is_localpart_available {legacy}")],
+            "the gate's failed probe must be the only request: a second probe means the \
+             login localpart was resolved (and guessed) before the gate decided"
         );
     }
 }

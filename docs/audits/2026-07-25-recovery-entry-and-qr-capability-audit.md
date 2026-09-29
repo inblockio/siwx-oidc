@@ -3,7 +3,7 @@
 > **Unpublished references.** Session plans and handovers cited below by file name (e.g. `2026-07-25-session-onboarding-state-machine-map.md`) are the maintainers' internal working documents and are not part of this repository; the findings here stand on their own evidence.
 
 **Date:** 2026-07-25
-**Worktree:** `/home/waldknoten-01/wt/siwx-durability`, branch `feat/session-durability-marathon`, base `main` @ `d21329e`
+**Worktree:** `<worktree>`, branch `feat/session-durability-marathon`, base `main` @ `d21329e`
 **Method:** `/logic-model` (CONTEXT → GOAL → INPUTS → ACTIVITIES/OUTPUTS → BOUNDARY CONDITIONS)
 **Scope:** evaluation + test authoring. **No container was started, stopped, restarted or removed.**
 All live evidence is read-only HTTP `GET` against a lab a sibling agent owns.
@@ -49,14 +49,14 @@ pedantry — it is currently FALSE (F16)*.
 ### 1.2 What changed since F16 was recorded
 
 The reload verify-gate was root-caused to this deployment's **own vendored Element patch**, and
-two fixes are merged to `main` of `/home/waldknoten-01/siwx-oidc-matrix-server`:
+two fixes are merged to `main` of `<siwx-oidc-matrix-server>`:
 
 | Commit | Change | Status |
 |---|---|---|
 | `9ec414d` | `shouldForceVerification` widened: `!crossSigningReady \|\| !(secretStorageReady \|\| hasServer4S)`, with `hasServer4S = client.secretStorage.hasKey()` | superseded |
 | `b7e594f` | its own assumption A1 falsified — `hasKey()` reads the **local** cache, as cold as `isSecretStorageReady()`. Replaced with a direct server fetch: `getAccountDataFromServer("m.secret_storage.default_key")` | **current** |
 
-Patch file: `/home/waldknoten-01/siwx-oidc-matrix-server/patches/element-web/force-first-device-recovery.patch`
+Patch file: `<siwx-oidc-matrix-server>/patches/element-web/force-first-device-recovery.patch`
 (VERIFIED, read in full). Two hunks against `apps/web/src/components/structures/MatrixChat.tsx`
 at pristine `v1.12.20`, plus two `en_EN.json` strings.
 
@@ -365,7 +365,7 @@ paths deliberately have no recovery-phrase entry. R5/R6 stay negative requiremen
 the phrase is **demanded** *and* **enterable**, never that it can be skipped.
 
 **Exclusions.** No container lifecycle operations. No modification of
-`/home/waldknoten-01/siwx-oidc` or of `e2e/element/helpers/*`. No fix applied to the vendored
+`<repo>` or of `e2e/element/helpers/*`. No fix applied to the vendored
 patch (that repo is out of this worktree's scope; §7.2 is a routed recommendation). No Element
 upgrade. No prod probe.
 

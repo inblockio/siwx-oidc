@@ -17,7 +17,8 @@
 #
 # Source of truth for the route split:
 #   - which /_matrix/... paths siwx-oidc owns: src/axum_lib.rs route table
-#   - the prod edge that productizes them: ~/siwx-oidc-matrix-server/Caddyfile.production
+#   - the prod edge that productizes them: ../siwx-oidc-matrix-server/Caddyfile.production
+#     (relative to this repository's root)
 #     (login/logout/refresh) PLUS the legacy CS-API device-management paths that
 #     siwx-oidc also registers (devices/{id}, delete_devices, logout/all) and that
 #     the deployed account-management edge route already forwards on prod.

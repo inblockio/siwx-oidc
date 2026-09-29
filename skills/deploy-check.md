@@ -1,4 +1,4 @@
-Pre-deployment checklist for siwx-oidc with Matrix Synapse.
+Post-deployment checklist for siwx-oidc with Matrix Synapse.
 
 Run through this checklist after deploying siwx-oidc in front of a Synapse
 homeserver (siwx-oidc as the auth service in Synapse's `matrix_authentication_service`

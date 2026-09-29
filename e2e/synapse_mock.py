@@ -245,7 +245,7 @@ def _whoami(introspection):
     `device_id` is OMITTED, not null, when the token carries none. Synapse's
     `WhoamiRestServlet` only inserts the key when the requester HAS a device, and
     siwx-oidc deliberately renders an empty device_id as JSON `null` (see the
-    token-model section of CLAUDE.md) — so a deviceless token must read as "no
+    token-model section of docs/matrix-integration.md) — so a deviceless token must read as "no
     key", never as a device literally named `None`.
     """
     body = {"user_id": _mxid(introspection.get("username") or ""), "is_guest": False}

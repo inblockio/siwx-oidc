@@ -14,8 +14,9 @@ Settings come from a TOML file and from environment variables, loaded with
 - **Environment prefix `SIWXOIDC_`**, e.g. `SIWXOIDC_BASE_URL`. The legacy prefix `SIWEOIDC_`
   (from the upstream siwe-oidc) is still accepted, with no removal scheduled. When both set the
   same key, `SIWXOIDC_` wins, and a startup warning names the legacy variables in use.
-- **Config file `siwx-oidc.toml`** in the working directory. The legacy `siwe-oidc.toml` is
-  still read.
+- **Config file `siwx-oidc.toml`** in the working directory, or else in the nearest parent
+  directory that has one (Figment searches upwards). The legacy `siwe-oidc.toml` is still read,
+  found the same way.
 - **Precedence, lowest to highest:** defaults < `siwe-oidc.toml` < `siwx-oidc.toml` <
   `SIWEOIDC_*` < `SIWXOIDC_*`.
 - **Keys go under a `[default]` table** in the file: the file's top-level tables are Figment
@@ -178,7 +179,7 @@ a generated key, a public-key fingerprint).
 ## Running locally
 
 ```bash
-docker compose -f test/docker-compose.yml up -d redis          # Redis on localhost:6379
+docker run -d --rm --name siwx-redis -p 6379:6379 redis:7-alpine  # Redis on localhost:6379
 (cd js/ui && npm install --legacy-peer-deps && npm run build)  # login page into static/build
 SIWXOIDC_BASE_URL=http://localhost:8000 cargo run
 ```
@@ -187,8 +188,11 @@ Run from the repository root: static assets are served from `./static`.
 
 ## Docker
 
-CI publishes `ghcr.io/inblockio/siwx-oidc` on pushes to `main` that change more than docs
-(tags `main`, `latest` and `sha-…`). There are no release tags yet. The image contains the `siwx-oidc` server, the
+CI (`.github/workflows/docker.yml`) publishes `ghcr.io/inblockio/siwx-oidc`. A push to `main`
+is tagged `main`, `latest` and `sha-<short commit>`; a push to the `fork-stable` branch is
+tagged `fork-stable` and `sha-…` (pushes that change only docs are not built); a published
+GitHub release with a semver tag `vX.Y.Z` is tagged `X.Y.Z`, `X.Y` and `sha-…`. There are no
+releases yet, so no semver tags exist. The image contains the `siwx-oidc` server, the
 `migrate-credentials` tool and the built login page; it sets `SIWXOIDC_ADDRESS=0.0.0.0` and
 exposes port 8000. Because `SIWXOIDC_` outranks `SIWEOIDC_`, a legacy `SIWEOIDC_ADDRESS` cannot
 override that image default: use `SIWXOIDC_ADDRESS`. A config file goes in the working
@@ -204,6 +208,9 @@ docker run -d --name siwx-oidc --network siwx -p 8000:8000 \
   -e SIWXOIDC_SIGNING_KEY_PEM="$(cat signing-key.pem)" \
   ghcr.io/inblockio/siwx-oidc:main
 ```
+
+The `SIWXOIDC_` names need an image built with the `SIWXOIDC_` rename or later;
+older images read only `SIWEOIDC_`, which remains accepted either way.
 
 For a Matrix deployment add `SIWXOIDC_MAS_SHARED_SECRET`, `SIWXOIDC_SYNAPSE_ENDPOINT` and
 `SIWXOIDC_MATRIX_SERVER_NAME`, and configure Synapse as described in

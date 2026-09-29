@@ -41,12 +41,17 @@ Older text in this repository, and some error messages and code comments, call
 the delegated-auth mode "MSC3861 mode". It means the same thing: the shared
 secret is configured.
 
+Known inconsistency: in standalone mode, discovery still advertises
+`introspection_endpoint`, the device-code grant type and
+`device_authorization_endpoint`, although introspection answers 404 and the
+grant is refused.
+
 ## How Synapse is wired
 
 ### Synapse configuration
 
 ```yaml
-# homeserver.yaml (Synapse 1.136 or later)
+# homeserver.yaml (tested with Synapse 1.159 and 1.161; versions before 1.157 are untested)
 matrix_authentication_service:
   enabled: true
   # Where Synapse reaches siwx-oidc. An internal address is fine and preferred.
@@ -85,7 +90,10 @@ Synapse uses fixed paths under `endpoint`, not paths from discovery:
 
 Introspection returns `active`, `username` (the Matrix localpart), `device_id`,
 `scope` (containing `urn:matrix:client:api:*`), `sub` (the DID) and expiry.
-Synapse caches an introspection result for two minutes with no invalidation.
+Synapse caches an introspection result for up to two minutes. It drops the
+cached result when the token's device no longer exists, so a sign-out that
+deletes the device takes effect at once; a token revoked without deleting its
+device can keep working at Synapse for up to two minutes.
 siwx-oidc also accepts the secret as `client_secret` in the form body.
 
 Synapse serves `GET /_matrix/client/v1/auth_metadata` (MSC2965) by forwarding
@@ -136,18 +144,21 @@ Timeouts: 2 s to connect and 8 s per request to Synapse.
   documented for MAS. It is not a published, stable interface. siwx-oidc tracks
   it per Synapse release, and it changed materially between 1.135 and 1.157.
   **Treat every Synapse upgrade as a compatibility check.**
-- **Tested version.** The deployment this project maintains
-  ([siwx-oidc-matrix-server](https://github.com/inblockio/siwx-oidc-matrix-server))
-  runs Synapse 1.161.0 with one patch (below). Source-level claims in the code
-  comments were checked against 1.159.0. The stable integration needs at least
-  1.136.0; 1.157.0 and later require it.
-- **Known upstream bug, historical.** On Synapse 1.159 and earlier, an account
-  with a `users` row but no `profiles` row (element-hq/synapse#19702) answered
-  500 on profile reads and writes, and displayname writes for it failed. Upstream
-  fixes in 1.161.0 (#20149, #20172) appear to address it; this has not yet been
-  re-verified live against this deployment. The handling described in
+- **Tested versions.** Tested with Synapse 1.159 and 1.161. The integration uses
+  Synapse's stable `matrix_authentication_service` block (available since
+  1.136); versions before 1.157 are untested. The deployment this project
+  maintains ([siwx-oidc-matrix-server](https://github.com/inblockio/siwx-oidc-matrix-server))
+  runs Synapse 1.161.0 with one patch (below); source-level claims in the code
+  comments were checked against 1.159.0.
+- **Known upstream bug.** An account with a `users` row but no `profiles` row
+  (element-hq/synapse#19702) answers 500 on profile reads and writes, and
+  displayname writes for it fail (affected: Synapse 1.160 and earlier; 1.161
+  fixes some of the paths (#20149, #20172); #19702 remains open upstream; not
+  re-verified against this deployment). #20149 and #20172 cover custom-field
+  reads and admin writes, which may not include the displayname write the
+  self-heal depends on. The handling described in
   [identity-model.md](identity-model.md#row-less-accounts-and-the-exact-500-rule)
-  stays for older homeservers.
+  stays in place.
 - **Element Web patches.** The Element Web build used with this deployment
   carries patches, listed with evidence and retirement conditions in the
   [Element Web patch registry](https://github.com/inblockio/siwx-oidc-matrix-server/blob/main/patches/element-web/README.md).
@@ -352,9 +363,10 @@ default 300) is clamped in code to 30–900 s (`clamp_admin_token_ttl`), so
 configuration cannot turn it into a standing admin key. Do not keep a
 long-lived admin credential in the environment.
 
-**Caching caveat.** Synapse caches introspection for two minutes, so a token can
-keep working at Synapse after it expires. siwx-oidc's introspection response is
-the authority.
+**Caching caveat.** Synapse caches introspection for up to two minutes and drops
+a cached result only when the token's device is gone. An admin token has no
+device, so if siwx-oidc stops accepting one, it can keep working at Synapse for
+up to two minutes. siwx-oidc's introspection response is the authority.
 
 **Errors** carry `{"error", "error_description"}`: 404 `not_configured` (no
 shared secret), 401 `unauthorized`, 503 `synapse_unavailable` or
@@ -499,7 +511,8 @@ both discovery and dispatch.
   standalone passkeys whose key derives to that `did:key`, so the DID cannot be
   signed into again from a leftover passkey.
 
-Live check against the local stack:
+Live check, which needs a real Synapse (the Synapse mock does not model
+`auth_metadata`, and CI skips this test by name):
 `cargo test --test e2e_msc3861 msc4191_metadata -- --ignored`.
 
 ## Device-code and QR login

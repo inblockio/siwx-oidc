@@ -14,7 +14,7 @@ started, stopped, or removed. This file is the only artifact written.
 > one is in the assumptions register (§9) with the test that would settle it.
 
 > **Snapshot pin — the tree moved under this audit.** Analysis is pinned to
-> `/home/waldknoten-01/wt/siwx-durability` @ **`dd34e3f`** (branch
+> `<worktree>` @ **`dd34e3f`** (branch
 > `feat/session-durability-marathon`). At task start it was `d21329e`; a parallel agent committed
 > `dd34e3f` ("fix(refresh): distinguish infrastructure failure from revocation") mid-audit. §5's M2
 > rows reflect `dd34e3f`. Element-client claims are pinned to element-web **v1.12.20** +
@@ -78,7 +78,7 @@ the gap list is ordered by reachability × severity with the ranking justified.
 | Code (siwx) | `src/{oidc,account,device_auth,compat,introspect,webauthn}.rs`, `src/db/{mod,redis}.rs` | all |
 | Code (Element v1.12.20) | `SetupEncryptionStore.ts`, `SetupEncryptionBody.tsx`, `useOwnDevices.ts`, `LoginWithQRSection.tsx` | M4, M5, §7.1, §7.2 |
 | Patch | `siwx-oidc-matrix-server/patches/element-web/force-first-device-recovery.patch` @ `b7e594f` | §7.1 |
-| Branch (read-only) | `fix/finding3-fragment-response-mode` @ `3018ffe` in `/home/waldknoten-01/siwx-oidc` | §7.3 |
+| Branch (read-only) | `fix/finding3-fragment-response-mode` @ `3018ffe` in `<repo>` | §7.3 |
 | Tests | `tests/*.rs` (8), `e2e/browser/*.spec.mjs` (4), `e2e/element/*.spec.mjs` (6) | §5 |
 
 ---
@@ -447,7 +447,7 @@ is **U8**, and it is the same silent-dead-end class as the auth_metadata finding
 references to the field, so Element 1.12.20 is unaffected today.
 
 **Fix in flight (read-only, NOT modified).** `fix/finding3-fragment-response-mode` @ `3018ffe` in
-`/home/waldknoten-01/siwx-oidc`, `+223` lines in `src/oidc.rs`. It does the two things the finding
+`<repo>`, `+223` lines in `src/oidc.rs`. It does the two things the finding
 doc says must ship together:
 
 * advertises `value["response_modes_supported"] = ["query","fragment"]` — with a code comment
@@ -524,7 +524,7 @@ in §5 marked "Covered" is guarded by nothing automated.
 ## 10. BOUNDARY CONDITIONS
 
 **Respected during this audit:** read-only; no container touched; nothing in
-`/home/waldknoten-01/siwx-oidc` or `/home/waldknoten-01/siwx-oidc-matrix-server` modified; exactly
+`<repo>` or `<siwx-oidc-matrix-server>` modified; exactly
 one new file written; no commit; no sub-subagents.
 
 **Invariants this matrix must not be used to weaken:**

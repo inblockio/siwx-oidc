@@ -76,10 +76,10 @@ localpart = base36( first 10 bytes of SHA-256( canonicalize(did) ) )
   collisions. `36^16 ≈ 2^82.7`, so the 80-bit value always fits without
   truncation.
 - **Why it is short.** The older derivation (below) produced MXIDs of 80+
-  characters made of five hyphen-separated words. In a controlled A/B test on
-  2026-09-09, the MSC4284 policy server that matrix.org operates refused to sign
-  events from that long shape and accepted a short single-run localpart on the
-  same homeserver.
+  characters made of five hyphen-separated words. In an A/B test we ran on
+  2026-09-09 (see the comment in `src/mxid.rs`), matrix.org's policy server
+  refused long DID-derived MXIDs and accepted the 16-character form. This is
+  our own observation, not documented matrix.org behaviour.
 
 ### Canonicalisation is method-aware
 
@@ -168,8 +168,9 @@ from the DID. It is the displayname a new account starts with.
 - **Words**: the first name is indexed by digest bytes 0..4, the surname by
   bytes 4..8, each `mod` its list length. The lists hold 271 first names and 306
   surnames (82,926 combinations).
-- **Collisions are expected.** The first one is due around 288 accounts. The
-  alias is decoration: Matrix clients disambiguate duplicate display names by
+- **Collisions are expected.** With 82,926 names, two accounts share one with
+  about 50% probability by ~339 accounts, and the expected first collision
+  comes at ~361 accounts. The alias is decoration: Matrix clients disambiguate duplicate display names by
   MXID, and the DID is published separately. Never key anything on it.
 - **It carries no DID and no key material**, so it cannot be mistaken for an
   identifier.
@@ -355,13 +356,15 @@ leave every stored assertion failing as a silent "bad signature"; with a derived
 
 ### Row-less accounts and the exact-500 rule
 
-On Synapse 1.159 and earlier, an account with a `users` row but no `profiles`
-row (element-hq/synapse#19702) answered **500** on profile reads and writes
-where a healthy account answered 404. Upstream fixes in Synapse 1.161.0
-(#20149, #20172) appear to address this; that has not yet been re-verified live
-against this project's deployment.
+An account with a `users` row but no `profiles` row
+(element-hq/synapse#19702) answers **500** on profile reads and writes where a
+healthy account answers 404 (affected: Synapse 1.160 and earlier; 1.161 fixes
+some of the paths (#20149, #20172); #19702 remains open upstream; not
+re-verified against this deployment). #20149 and #20172 cover custom-field
+reads and admin writes, which may not include the displayname write the
+self-heal depends on.
 
-The handling stays in place for older homeservers:
+The handling stays in place:
 
 - `classify_publish_status` treats **exactly** 500 as "possibly row-less", and
   deliberately not `is_server_error()`: 502/503/504 stay hard errors, so an

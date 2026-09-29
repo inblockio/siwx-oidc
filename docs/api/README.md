@@ -154,5 +154,5 @@ should code to them:
   deployment has no homeserver. A present key asserts the thing exists — the
   same rule the `io.inblock.did` profile field follows with its `proof`.
 
-Breaking changes against the `siwe-oidc` predecessor are listed in the root
-`CLAUDE.md` under "Breaking changes vs siwe-oidc".
+Breaking changes against the `siwe-oidc` predecessor are listed in
+[architecture.md, "Lineage"](../architecture.md#lineage).

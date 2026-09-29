@@ -121,10 +121,12 @@ registration.
 siwx-oidc also write credentials to aqua-auth's credential store at that Redis
 (dual-write) and read from it first, falling back to the keys above. The keys
 above stay authoritative, so turning it off loses nothing. Link entries are
-never mirrored. The library module `credential_migration` implements an
-additive, idempotent backfill (dry run unless told to apply); this repository
-has no command-line entry point for it. If the variable names a Redis that
-cannot be opened, the server refuses to start.
+never mirrored. Existing passkeys are backfilled by the `migrate-credentials`
+tool (`src/bin/migrate-credentials.rs`, shipped in the image next to the
+server): `migrate-credentials [--apply] [--source-redis URL] [--target-redis URL]`.
+It is a dry run unless given `--apply`, only adds keys, and can be re-run; the
+logic is the library module `credential_migration`. If the variable names a
+Redis that cannot be opened, the server refuses to start.
 
 ## Scoping the passkey picker
 

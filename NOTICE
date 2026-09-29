@@ -8,8 +8,9 @@ siwx-oidc began as a fork of siwe-oidc (https://github.com/spruceid/siwe-oidc),
 developed by Spruce Systems, Inc. and contributors. siwe-oidc is offered under
 "MIT OR Apache-2.0"; siwx-oidc uses it under the Apache License, Version 2.0.
 Files that still contain siwe-oidc code and were modified here carry a notice
-at the top saying so. Short build and configuration files whose remaining
-siwe-oidc lines are boilerplate are covered by this NOTICE instead.
+at the top saying so. Files whose remaining siwe-oidc lines are trivial
+(module declarations, blank lines, build and configuration boilerplate) are
+covered by this NOTICE instead.
 
 siwe-oidc's LICENSE-MIT contained the following notice, retained here verbatim:
 

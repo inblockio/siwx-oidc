@@ -19,13 +19,12 @@
 # both the container exiting between phases 1 and 4 AND the stack restart.
 set -euo pipefail
 
-# Overridable like stack-up.sh's MATRIX_SERVER_REPO, but defaulting to the
-# real path (NOT a sibling-relative guess): this script is authored to run
-# from inside a worktree (e.g. /home/waldknoten-01/wt/siwx-durability), where
-# "../siwx-oidc-matrix-server" would resolve next to the WORKTREE instead of
-# the real matrix-server checkout.
-MS_REPO="${MATRIX_SERVER_REPO:-/home/waldknoten-01/siwx-oidc-matrix-server}"
 SIWX_REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"   # e2e/element -> repo root
+# Overridable like stack-up.sh's MATRIX_SERVER_REPO, with the same default: a
+# siwx-oidc-matrix-server checkout next to this repository. When running from a
+# git worktree that lives elsewhere, set MATRIX_SERVER_REPO to the real
+# matrix-server checkout, since the sibling path resolves next to the worktree.
+MS_REPO="${MATRIX_SERVER_REPO:-$SIWX_REPO_DIR/../siwx-oidc-matrix-server}"
 ELEMENT_DIR="$SIWX_REPO_DIR/e2e/element"
 
 SIWX_URL="${SIWX_URL:-http://localhost:28081}"
