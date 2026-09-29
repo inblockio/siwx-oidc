@@ -19,7 +19,9 @@ info:
   description: |
     siwx-oidc turns a wallet signature or a passkey into standard OIDC tokens.
     Any relying party can use it; the primary deployment target is Matrix
-    Synapse, where it **replaces MAS entirely** via MSC3861.
+    Synapse, where it is the auth service in Synapse's
+    `matrix_authentication_service` integration (the Matrix OAuth 2.0 API,
+    MSC3861).
 
     # Identity model
 
@@ -38,7 +40,8 @@ info:
 
     * **bearerToken** — an access token this provider issued, presented by the
       end user's client.
-    * **masSharedSecret** — the MSC3861 shared secret. Server-to-server only;
+    * **masSharedSecret** — the shared secret of Synapse's
+      `matrix_authentication_service` integration. Server-to-server only;
       the homeserver holds it. It must never traverse the public internet.
     * **registrationAccessToken** — returned by dynamic client registration and
       scoped to that one client record.
@@ -61,10 +64,10 @@ info:
     url: https://github.com/inblockio/siwx-oidc
 
 servers:
-  - url: https://dev.siwx.inblock.io
-    description: dev-staging
+  - url: https://siwx-oidc.example.org
+    description: a deployment (its SIWXOIDC_BASE_URL; the legacy SIWEOIDC_ prefix is also read)
   - url: http://localhost:8000
-    description: local default (SIWEOIDC_ADDRESS / SIWEOIDC_PORT)
+    description: local default (SIWXOIDC_ADDRESS / SIWXOIDC_PORT)
 
 tags:
   - name: OIDC
@@ -118,7 +121,7 @@ paths:
       summary: JSON Web Key Set
       description: |
         The public half of the ES256 signing key, plus any retired keys listed
-        in `SIWEOIDC_RETIRED_SIGNING_KEYS_PEM`. Each entry's `kid` is derived
+        in `SIWXOIDC_RETIRED_SIGNING_KEYS_PEM`. Each entry's `kid` is derived
         from the key material (first 16 hex of SHA-256 over the SEC1
         uncompressed public key), never a constant, so a rotated key fails as an
         honest "kid not present in JWKS" instead of a silent bad signature.
@@ -342,7 +345,7 @@ paths:
         (the verifier lives in `siwx-oidc-auth`), and it authorizes nothing.
       parameters:
         - { name: did, in: query, required: false, schema: { type: string }, example: "did:key:z6Mkkx9jzu1iAVtjwHU2Vz8SLu3ZxuHZwPdAYReV7PrpWQwU" }
-        - { name: mxid, in: query, required: false, schema: { type: string }, example: "@1vo8g4vofiha69ua:dev.matrix.inblock.io" }
+        - { name: mxid, in: query, required: false, schema: { type: string }, example: "@1vo8g4vofiha69ua:matrix.example.org" }
       responses:
         "200":
           description: |
@@ -355,10 +358,10 @@ paths:
               examples:
                 attested:
                   summary: A DID with an account that publishes it
-                  value: { did: "did:key:z6Mkkx9jzu1iAVtjwHU2Vz8SLu3ZxuHZwPdAYReV7PrpWQwU", mxid: "@1vo8g4vofiha69ua:dev.matrix.inblock.io", exists: true, attested: true }
+                  value: { did: "did:key:z6Mkkx9jzu1iAVtjwHU2Vz8SLu3ZxuHZwPdAYReV7PrpWQwU", mxid: "@1vo8g4vofiha69ua:matrix.example.org", exists: true, attested: true }
                 unknown:
                   summary: A well-formed DID that has never signed in here
-                  value: { did: "did:key:z6MkpFemPtmjvPZ1gFYM6d68tuwxxrcec4H2Ck23FRchU9ue", mxid: "@04gen9jsoj657dc0:dev.matrix.inblock.io", exists: false, attested: false }
+                  value: { did: "did:key:z6MkpFemPtmjvPZ1gFYM6d68tuwxxrcec4H2Ck23FRchU9ue", mxid: "@04gen9jsoj657dc0:matrix.example.org", exists: false, attested: false }
         "400":
           description: |
             Not exactly one selector; a `did` that is not a DID any sign-in here
@@ -399,9 +402,11 @@ paths:
       operationId: introspect
       summary: Token introspection (RFC 7662) — MSC3861
       description: |
-        Called by Synapse on every authenticated request. The response's `scope`
-        is what Synapse's `is_server_admin()` reads, so it is also how an
-        admin-scoped token gets its privilege.
+        Called by Synapse to validate the access token on authenticated
+        requests (Synapse caches a successful answer, `active: false` included,
+        for two minutes). The response's `scope` is what Synapse's
+        `is_server_admin()` reads, so it is also how an admin-scoped token gets
+        its privilege.
 
         `device_id` is rendered as JSON `null`, never `""`: Synapse 1.159
         rejects a present-but-empty device id with a 500.
@@ -435,8 +440,8 @@ paths:
         `urn:synapse:admin:*`. This mints one.
 
         TTL is clamped **in code** to 30..=900s so a large
-        `SIWEOIDC_ADMIN_TOKEN_TTL_SECS` cannot promote it into a standing admin
-        key. Minting idempotently provisions `SIWEOIDC_ADMIN_TOKEN_LOCALPART`,
+        `SIWXOIDC_ADMIN_TOKEN_TTL_SECS` cannot promote it into a standing admin
+        key. Minting idempotently provisions `SIWXOIDC_ADMIN_TOKEN_LOCALPART`,
         which creates a real Matrix account.
       security: [{ masSharedSecret: [] }]
       responses:
@@ -736,12 +741,13 @@ components:
     bearerToken:
       type: http
       scheme: bearer
-      description: An access token issued by this provider (`mat_…` in MSC3861 mode).
+      description: An access token issued by this provider (`mat_…` in delegated-auth mode).
     masSharedSecret:
       type: http
       scheme: bearer
       description: |
-        The MSC3861 shared secret, compared for exact string equality.
+        The `matrix_authentication_service` shared secret, compared for exact
+        string equality.
         Server-to-server only — the homeserver holds it. Never expose these
         routes to the public internet.
     registrationAccessToken:
@@ -797,10 +803,10 @@ components:
           type: string
           description: |
             The caller's Matrix ID. **Omitted entirely — never null** — on a
-            standalone deployment with no `SIWEOIDC_MATRIX_SERVER_NAME`, because
+            standalone deployment with no `SIWXOIDC_MATRIX_SERVER_NAME`, because
             a present key asserts that the thing exists. Namespaced because no
             registered OIDC claim for a Matrix ID exists.
-          example: "@1vo8g4vofiha69ua:dev.matrix.inblock.io"
+          example: "@1vo8g4vofiha69ua:matrix.example.org"
 
     ResolveResponse:
       type: object
@@ -862,7 +868,7 @@ components:
       properties:
         kind:
           type: string
-          enum: [profile, devices, device, deleted, deactivated, erased, reactivated, reset, reset_unconfirmed]
+          enum: [profile, devices, device, deleted, deactivated, erased, reactivated, completed, reset_unconfirmed]
         did: { type: string }
         user_id: { type: string }
         devices: { type: array, items: { type: object } }

@@ -1,8 +1,10 @@
 # Audit — the provider-attested DID identity attribute
 
+> **Unpublished references.** Session plans and handovers cited below by file name (e.g. `2026-07-25-session-onboarding-state-machine-map.md`) are the maintainers' internal working documents and are not part of this repository; the findings here stand on their own evidence.
+
 **Date:** 2026-09-10. **Branch:** `feat/opaque-mxid-localpart`.
 **Under audit:** siwx-oidc `42b78fa..01d37f6`; siwx-oidc-matrix-server `9105a33`, `a351300`, `9736d59`.
-**Plan + hypothesis register:** `docs/superpowers/plans/2026-09-10-immutable-attested-did.md`.
+**Plan + hypothesis register:** `2026-09-10-immutable-attested-did.md`.
 **Method:** an independent adversarial pass, briefed to find what is wrong or unproven and
 told not to be agreeable. Every "Confirmed" below cites a check the auditor ran or read
 themselves, not the implementers' report.

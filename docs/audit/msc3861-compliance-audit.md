@@ -1,5 +1,10 @@
 # siwx-oidc MSC3861 Compliance Audit
 
+> **Historical (2026-05-19).** This audit describes Synapse's experimental
+> `experimental_features.msc3861` mode, which Synapse 1.157.0 removed. Its wording
+> ("replaces MAS entirely") predates the current description. For the current
+> wiring, see [docs/matrix-integration.md](../matrix-integration.md).
+
 ## Executive Summary
 
 siwx-oidc implements MSC3861 and **replaces Matrix Authentication Service (MAS) entirely**. Synapse delegates all authentication to siwx-oidc via a shared secret. There is no MAS instance in the deployment.

@@ -1,6 +1,8 @@
 {
-	"name": "svelte-app",
+	"name": "siwx-oidc-ui",
 	"version": "1.0.0",
+	"private": true,
+	"license": "Apache-2.0",
 	"devDependencies": {
 		"@types/node": "^22.0.0",
 		"autoprefixer": "^10.4.0",
@@ -40,7 +42,6 @@
 		"validate": "svelte-check"
 	},
 	"dependencies": {
-		"@wagmi/connectors": "^5.7.0",
 		"@wagmi/core": "^2.21.2",
 		"js-cookie": "^3.0.5",
 		"viem": "^2.47.0"

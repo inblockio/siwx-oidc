@@ -4,12 +4,12 @@ Add a new authentication method (e.g. WebAuthn/passkeys, SSH keys, PGP) to siwx-
 
 ## Architecture — Three-Layer Ceremony Model
 
-Authentication ceremonies live in the **server layer** (`src/`), not in `siwx-core`.
+Authentication ceremonies live in the **server layer** (`src/`), not in aqua-auth.
 The `DIDMethod` trait handles CAIP-122 verification only. New proof ceremonies are
 separate server-side modules that produce a verified DID.
 
 ```
-Layer 1: siwx-core        — Pure crypto. DIDMethod::verify() = CAIP-122 only. DO NOT MODIFY.
+Layer 1: aqua-auth        — DIDMethod::verify() = CAIP-122 only. Not extended for ceremonies.
 Layer 2: src/{ceremony}.rs — Ceremony verification (this skill). Verify proof → store DID in session.
 Layer 3: src/oidc.rs       — sign_in reads verified DID from session → issues OIDC auth code.
 ```
@@ -19,14 +19,14 @@ The normalized output of every ceremony is a verified DID string stored in the R
 
 ## Checklist
 
-### 1. DID derivation — confirm siwx-core support
+### 1. DID derivation — confirm aqua-auth support
 
 Before writing any server code, confirm the DID type your ceremony produces is already
-supported in siwx-core:
+supported in aqua-auth (https://github.com/inblockio/aqua-rs-auth):
 
-- `did:key:zDn…` (P-256) — for WebAuthn/passkeys. Already in `siwx-core/src/key/mod.rs`.
-- `did:key:z6Mk…` (Ed25519) — for SSH Ed25519 keys. Already in `siwx-core/src/key/mod.rs`.
-- `did:pkh:eip155:…` — for Ethereum wallets. Already in `siwx-core/src/pkh/`.
+- `did:key:zDn…` (P-256) — for WebAuthn/passkeys. aqua-auth `src/key/`.
+- `did:key:z6Mk…` (Ed25519) — for SSH Ed25519 keys. aqua-auth `src/key/`.
+- `did:pkh:eip155:…` — for Ethereum wallets. aqua-auth `src/pkh/`.
 
 If the key type is new, use `/add-did-method` or `/add-cipher-suite` first.
 
@@ -76,9 +76,9 @@ pub struct SessionEntry {
     pub verified_did: Option<String>,  // ← NEW: set by ceremony, read by sign_in
 }
 
-// Ceremony-specific keys (e.g. credential storage)
-// webauthn:credential:{cred_id}  no TTL  → { did, pubkey, sign_count }
-// webauthn:challenge:{session}   TTL 60s → challenge state
+// Ceremony-specific keys (as WebAuthn does it; see docs/architecture.md "Redis keyspace")
+// webauthn:credential/{cred_id_b64}  no TTL   → serialized webauthn_rs::Passkey
+// webauthn:challenge/{session_id}    TTL 120s → ceremony state
 ```
 
 ### 4. Register routes — `src/axum_lib.rs`
@@ -121,7 +121,8 @@ Add a button/section for the new ceremony. For WebAuthn:
 
 ### 7. Update config — `src/config.rs`
 
-Add any ceremony-specific config (e.g. `SIWEOIDC_RP_ID` for WebAuthn RP ID).
+Add any ceremony-specific config (e.g. `rp_id` / `SIWXOIDC_RP_ID` for the WebAuthn RP ID)
+and document it in `docs/configuration.md`.
 
 ### 8. Test
 
@@ -138,7 +139,7 @@ cargo test --bin siwx-oidc  # Server tests (needs Redis)
 | Server-side trust | Verified DID stored in Redis session, never in a client-side cookie. |
 | Fail closed | If Redis or ceremony library fails, reject login. Never silently skip checks. |
 | DID allowlist | `sign_in` enforces `supported_did_methods` for ALL paths, including server-verified. |
-| No ceremony in siwx-core | Ceremony logic stays in `src/`. The `DIDMethod` trait is not extended. |
+| No ceremony in aqua-auth's `DIDMethod` | Ceremony logic stays in `src/`. The `DIDMethod` trait is not extended. |
 
 ## Production checklist
 
@@ -148,10 +149,10 @@ Before shipping a new ceremony:
 - [ ] Input validation: credential IDs, session IDs validated for non-empty before use in Redis keys
 - [ ] Server-verified path in `sign_in` enforces both `allowed_did_methods` AND `allowed_pkh_namespaces`
 - [ ] Challenge TTLs are set (default 120s) and challenges are consumed (deleted) after use
-- [ ] `SIWEOIDC_SUPPORTED_DID_METHODS` includes the DID method the ceremony produces (e.g. `"key"` for passkeys)
+- [ ] `supported_did_methods` (`SIWXOIDC_SUPPORTED_DID_METHODS`) includes the DID method the ceremony produces (e.g. `"key"` for passkeys; the default `["pkh", "key"]` already does)
 - [ ] Redis key prefixes are unique and don't collide with existing prefixes (sessions/, codes/, clients/)
 - [ ] Frontend `buildSignInUrl()` passes PKCE params through to `/sign_in`
-- [ ] `CLAUDE.md` troubleshooting section updated with ceremony-specific error messages
+- [ ] `docs/troubleshooting.md` updated with ceremony-specific error messages, and the new routes added to `docs/api/openapi.yaml` (`tests/openapi_covers_every_route.rs` fails otherwise)
 
 ## References
 

@@ -1,3 +1,7 @@
+// Portions of this file are derived from siwe-oidc (https://github.com/spruceid/siwe-oidc),
+// Copyright Spruce Systems, Inc. and contributors, used under the Apache License 2.0.
+// Modified by inblock.io assets GmbH. See NOTICE.
+
 use axum::{
     extract::{rejection::QueryRejection, Form, Json, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
@@ -11,10 +15,6 @@ use axum_extra::{
         Authorization, ContentType,
     },
     TypedHeader,
-};
-use figment::{
-    providers::{Env, Format, Serialized, Toml},
-    Figment,
 };
 use headers::Header;
 use openidconnect::core::{
@@ -1211,10 +1211,11 @@ async fn account_passkey_finish_handler(
 // -- Application entry point -----------------------------------------------
 
 pub async fn main() {
-    let config = Figment::from(Serialized::defaults(config::Config::default()))
-        .merge(Toml::file("siwe-oidc.toml").nested())
-        .merge(Env::prefixed("SIWEOIDC_").split("__").global());
-    let config = config.extract::<config::Config>().unwrap();
+    // Precedence and the naming contract (SIWXOIDC_ / siwx-oidc.toml, with the
+    // legacy SIWEOIDC_ / siwe-oidc.toml still read) live in `config::figment`.
+    let figment = config::figment();
+    let config = figment.extract::<config::Config>().unwrap();
+    let legacy_names = config::LegacyNames::detect(&figment);
 
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("siwx_oidc=info,tower_http=info,warn"));
@@ -1230,6 +1231,26 @@ pub async fn main() {
         _ => {
             fmt().with_env_filter(env_filter).with_target(true).init();
         }
+    }
+
+    // Tracing exists only now, so the legacy-name check made above is reported
+    // here. Names only: several of these variables hold secrets.
+    if !legacy_names.is_empty() {
+        warn!(
+            legacy_env_vars = %legacy_names.env_vars.join(","),
+            legacy_config_file = %legacy_names
+                .file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            "deprecated configuration names in use: the {} environment prefix is now {} \
+             and {} is now {}. The legacy names are still read and no removal is \
+             scheduled; where a key is set under both, the new name wins.",
+            config::LEGACY_ENV_PREFIX,
+            config::ENV_PREFIX,
+            config::LEGACY_CONFIG_FILE,
+            config::CONFIG_FILE,
+        );
     }
 
     // Fail fast when the dual-write flag names a Redis we cannot open. Lazy
@@ -1288,7 +1309,7 @@ pub async fn main() {
         let key = EcdsaSigningKey::from_pem(key).expect("Failed to load signing key from PEM");
         info!(
             kid = %key.kid(),
-            "Loaded durable ES256 signing key from SIWEOIDC_SIGNING_KEY_PEM. \
+            "Loaded durable ES256 signing key from SIWXOIDC_SIGNING_KEY_PEM. \
              DID assertions will be minted under this kid."
         );
         key
@@ -1298,7 +1319,9 @@ pub async fn main() {
         // SECURITY: never log private key material. Log only a non-sensitive
         // fingerprint of the *public* key so operators can correlate the live
         // key without exposing the secret. This key rotates on every restart
-        // (sessions break on restart) — set SIWEOIDC_SIGNING_KEY_PEM to persist.
+        // (ID tokens and signed userinfo issued before it stop verifying; the
+        // opaque access/refresh tokens live in Redis and are unaffected) — set
+        // SIWEOIDC_SIGNING_KEY_PEM to persist.
         //
         // Emitted at `warn!`, not `info!`: this is a degraded-mode announcement
         // with a second, quieter consequence that an operator MUST see, namely
@@ -1313,7 +1336,7 @@ pub async fn main() {
              Tokens stop verifying on restart AND provider-attested DID \
              assertions will NOT be minted (no `proof` is written to user \
              profiles) for as long as this key is ephemeral. \
-             Set SIWEOIDC_SIGNING_KEY_PEM to use a stable key in production."
+             Set SIWXOIDC_SIGNING_KEY_PEM to use a stable key in production."
         );
         key
     };
@@ -1330,7 +1353,7 @@ pub async fn main() {
     let retired_verification_keys = match &config.retired_signing_keys_pem {
         Some(pem) => {
             let keys = oidc::parse_retired_verification_keys(pem)
-                .expect("Failed to parse SIWEOIDC_RETIRED_SIGNING_KEYS_PEM");
+                .expect("Failed to parse SIWXOIDC_RETIRED_SIGNING_KEYS_PEM");
             // Log only the derived kids — public, non-sensitive, and exactly
             // the strings an operator needs to match against the `kid` in a
             // stored proof they are debugging.
@@ -1357,7 +1380,7 @@ pub async fn main() {
         config.rp_id.as_deref(),
         config.rp_origin.as_deref(),
     )
-    .expect("Failed to initialize WebAuthn — check SIWEOIDC_BASE_URL, SIWEOIDC_RP_ID, SIWEOIDC_RP_ORIGIN");
+    .expect("Failed to initialize WebAuthn — check SIWXOIDC_BASE_URL, SIWXOIDC_RP_ID, SIWXOIDC_RP_ORIGIN");
 
     // Initialize Synapse client for MSC3861 device lifecycle (optional).
     //

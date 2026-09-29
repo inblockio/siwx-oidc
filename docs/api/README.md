@@ -130,8 +130,10 @@ Most routes return an OAuth-shaped body (`{"error": …}`) with a 4xx. Three
 conventions are worth knowing because they look like bugs and are not:
 
 - **`/oauth2/introspect` answers `200 {"active": false}` for an unknown token**,
-  never a 4xx. Synapse caches a *negative* introspection result, so a 4xx here
-  would be cached as a hard failure.
+  never a 4xx. That is the RFC 7662 answer, and it is the only one Synapse turns
+  into `M_UNKNOWN_TOKEN` for the client (and caches for two minutes). Synapse
+  treats any non-2xx here as "unable to introspect" and answers the client 503
+  instead, so a 4xx would leave a dead token retrying rather than signed out.
 - **`authorization_pending` and `slow_down` on `/token`** are the normal answers
   while a device grant is still awaiting approval.
 - **`/resolve` never returns 500.** A homeserver it cannot reach is a 502 naming
@@ -156,5 +158,5 @@ should code to them:
   deployment has no homeserver. A present key asserts the thing exists — the
   same rule the `io.inblock.did` profile field follows with its `proof`.
 
-Breaking changes against the `siwe-oidc` predecessor are listed in the root
-`CLAUDE.md` under "Breaking changes vs siwe-oidc".
+Breaking changes against the `siwe-oidc` predecessor are listed in
+[architecture.md, "Lineage"](../architecture.md#lineage).

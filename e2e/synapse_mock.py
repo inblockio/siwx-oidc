@@ -77,8 +77,8 @@ nondeterministic, so every admin request introspects.
 
   -- unauthenticated C-S API -------------------------------------------------
   GET    /_matrix/client/v3/profile/{mxid}        synapse_client::has_profile_row
-  GET    /_matrix/client/v3/profile/{mxid}/{field} (read-back for tests; the GET
-         twin of publish_did_field, which siwx-oidc itself does not call)
+  GET    /_matrix/client/v3/profile/{mxid}/{field} synapse_client::read_did_field
+         (the GET twin of publish_did_field; tests also use it to read back)
 
   -- test-only control plane (never authenticated, never call-logged) --------
   GET    /__state                 whole in-memory state
@@ -206,8 +206,9 @@ GENERIC_500 = {"errcode": "M_UNKNOWN", "error": "Internal server error"}
 
 def _localpart_of(user_id):
     """Extract the localpart from an mxid `@localpart:server` (or pass through a
-    bare localpart). Mirrors how siwx-oidc queries is_localpart_available with the
-    `did_to_localpart` value, so the seeded mxid and the queried localpart match."""
+    bare localpart). Mirrors how siwx-oidc queries is_localpart_available with a
+    bare localpart (`mxid::localpart_for`, or `legacy_localpart` for grandfathered
+    accounts), so the seeded mxid and the queried localpart match."""
     if not user_id:
         return user_id
     s = user_id[1:] if user_id.startswith("@") else user_id
@@ -244,7 +245,7 @@ def _whoami(introspection):
     `device_id` is OMITTED, not null, when the token carries none. Synapse's
     `WhoamiRestServlet` only inserts the key when the requester HAS a device, and
     siwx-oidc deliberately renders an empty device_id as JSON `null` (see the
-    token-model section of CLAUDE.md) — so a deviceless token must read as "no
+    token-model section of docs/matrix-integration.md) — so a deviceless token must read as "no
     key", never as a device literally named `None`.
     """
     body = {"user_id": _mxid(introspection.get("username") or ""), "is_guest": False}
@@ -348,9 +349,11 @@ class Handler(BaseHTTPRequestHandler):
     def _mas_authed(self):
         """MAS surface auth: exact string equality against the shared secret.
 
-        `synapse/rest/synapse/mas/__init__.py` compares the bearer to
+        Synapse (`MasBaseResource.assert_request_is_from_mas` in
+        `synapse/rest/synapse/mas/_base.py`) compares the bearer to
         `matrix_authentication_service.secret` verbatim. There is no token
-        lookup and no scope — presenting anything else is a 401.
+        lookup and no scope. Real Synapse answers anything else with 403
+        ("This endpoint must only be called by MAS"); this mock answers 401.
         """
         return self._bearer() == STATE["secret"]
 
@@ -548,7 +551,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"devices": devs})
 
         # -- unauthenticated C-S API ---------------------------------------
-        # GET /_matrix/client/v3/profile/{mxid}/{field}  (read-back for tests)
+        # GET /_matrix/client/v3/profile/{mxid}/{field}  (read_did_field; test read-back)
         m = re.match(r"^/_matrix/client/v3/profile/([^/]+)/(.+)$", path)
         if m:
             return self._profile_field_get(m.group(1), m.group(2))

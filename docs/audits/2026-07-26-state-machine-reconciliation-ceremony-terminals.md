@@ -1,5 +1,7 @@
 # State-machine reconciliation: the ceremony-view terminals were never named
 
+> **Unpublished references.** Session plans and handovers cited below by file name (e.g. `2026-07-25-session-onboarding-state-machine-map.md`) are the maintainers' internal working documents and are not part of this repository; the findings here stand on their own evidence.
+
 **Date:** 2026-07-26
 **Trigger:** EW-R1-2, the last open defect, turned out to be a harness gap. Reconciling that
 result against the state-machine definitions explains *why it took a session to find*, and

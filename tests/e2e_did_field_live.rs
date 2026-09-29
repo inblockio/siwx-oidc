@@ -584,7 +584,7 @@ async fn did_field_is_published_verifiable_and_public_live() {
         value["did"].as_str(),
         Some(did.as_str()),
         "the published DID must be byte-identical to the one that signed in, mixed case \
-         included (MEMORY.md 'MXID to DID is not invertible'): {body}"
+         included (siwx-oidc#17: an MXID is not invertible to a DID): {body}"
     );
 
     // -- LEG 2 (H8 live): the SHIPPED verifier, end to end -------------------

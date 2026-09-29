@@ -5,6 +5,8 @@
 //! - `GET /_matrix/client/v3/login` (login flows discovery)
 //! - `POST /_matrix/client/v3/logout` (single-session logout)
 //! - `POST /_matrix/client/v3/logout/all` (bulk sign-out, all sessions)
+//! - `DELETE /_matrix/client/v3/devices/{device_id}` and
+//!   `POST /_matrix/client/v3/delete_devices` (legacy in-client device sign-out)
 //! - `POST /_matrix/client/v3/refresh` (token refresh)
 //!
 //! ## Session teardown vs. account deactivation
@@ -22,8 +24,9 @@
 //! `e2e_cross_signing_signatures` rows, and the signature-upload handler then
 //! skips fresh uploads. Sign-in therefore never deletes-then-reuses a device id;
 //! it upserts a fresh `SIWX_{uuid}`, so the explicit-logout delete is safe
-//! precisely because the id is not reused. None of this code touches sign-in or
-//! token issuance (`oidc.rs`); see CLAUDE.md "MSC3861 device lifecycle".
+//! precisely because the id is not reused. Apart from the Matrix-shaped
+//! `refresh`, none of this code touches sign-in or token issuance (`oidc.rs`);
+//! see `docs/matrix-integration.md`, "Accounts and devices".
 
 use std::sync::Arc;
 
@@ -44,8 +47,9 @@ use tracing::{debug, info, warn};
 use crate::introspect::generate_opaque_token;
 // Use the binary crate's own `synapse_client` module (the same one `axum_lib`
 // and `account` use) so `CompatState.synapse_client` is type-compatible with
-// `AppState.synapse_client`. The lib crate re-exposes the same file as
-// `siwx_oidc::synapse_client`, which is a *distinct* type here.
+// `AppState.synapse_client`. The lib crate used to re-expose the same file as
+// `siwx_oidc::synapse_client`, which was a *distinct* type here; it no longer
+// does (see the note in `src/lib.rs`).
 use crate::synapse_client::SynapseClient;
 use siwx_oidc::db::{
     DBClient, RedisClient, RevocationState, RotatedToken, TokenMetadata, ACCESS_TOKEN_TTL,
@@ -335,9 +339,10 @@ pub async fn logout_all(
 // NOT the MSC4191 account-page deep link. Under MSC3861 the homeserver delegates
 // auth, so — when the deployment proxies these specific paths to siwx-oidc — we
 // service them here: resolve the user from their bearer token, delete the target
-// Synapse device via the admin API, and revoke that device's OAuth tokens. This
-// is the same safe "delete an ending device" teardown as logout/revoke (the id is
-// never reused), just initiated by the client's session manager.
+// Synapse device via the MAS API (`/_synapse/mas/delete_device`), and revoke that
+// device's OAuth tokens. This is the same safe "delete an ending device" teardown
+// as logout (the id is never reused), just initiated by the client's session
+// manager.
 //
 // We accept the bearer as sufficient authorization (no UIA challenge): auth is
 // delegated to us, so a valid access token already proves the caller, mirroring
@@ -366,7 +371,7 @@ async fn username_from_bearer(
         .map(|m| m.username)
 }
 
-/// Delete one of `username`'s Synapse devices (admin API) and revoke its tokens.
+/// Delete one of `username`'s Synapse devices (MAS API) and revoke its tokens.
 /// Best-effort, idempotent, never fails the caller — same teardown as logout.
 async fn teardown_device(state: &CompatState, username: &str, device_id: &str, ctx: &str) {
     if device_id.is_empty() {
@@ -411,7 +416,7 @@ fn unknown_token_response() -> (StatusCode, Json<serde_json::Value>) {
 
 /// `DELETE /_matrix/client/v3/devices/{device_id}` — sign out a single device
 /// from the in-client session manager. Scoped to the bearer's user (a foreign
-/// device id is a no-op, since the admin delete is mxid-scoped).
+/// device id is a no-op, since the MAS delete is scoped to the user's localpart).
 pub async fn delete_device(
     State(state): State<CompatState>,
     Path(device_id): Path<String>,

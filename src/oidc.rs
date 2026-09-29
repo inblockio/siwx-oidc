@@ -1,3 +1,7 @@
+// Portions of this file are derived from siwe-oidc (https://github.com/spruceid/siwe-oidc),
+// Copyright Spruce Systems, Inc. and contributors, used under the Apache License 2.0.
+// Modified by inblock.io assets GmbH. See NOTICE.
+
 use alloy_primitives::Address;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -49,7 +53,9 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// ES256 signing key (replaces RSA — eliminates RUSTSEC-2023-0071 Marvin attack)
+// ES256 signing key (replaces RSA signing, so this provider performs no RSA
+// private-key operation — the surface of the RUSTSEC-2023-0071 Marvin attack;
+// see security/vex/siwx-oidc.openvex.json)
 // ---------------------------------------------------------------------------
 
 lazy_static::lazy_static! {
@@ -104,8 +110,8 @@ type DBClientType = dyn DBClient + Sync;
 /// event into `kid "3f2a…" is not present in the JWKS`: honest, self-describing,
 /// and immediately actionable ("the key rotated; set SIWEOIDC_SIGNING_KEY_PEM").
 ///
-/// See `docs/superpowers/plans/2026-09-10-immutable-attested-did.md`
-/// §"`kid` must identify the key, not the slot" (hypothesis H4), pinned by
+/// This is hypothesis H4 of the attested-DID design ("`kid` must identify the
+/// key, not the slot"), pinned by
 /// `oidc::tests::h4_two_generated_keys_get_different_kids` and
 /// `oidc::tests::h4_the_same_pem_yields_the_same_kid_across_constructions`.
 ///
@@ -395,8 +401,8 @@ const PUBLIC_PEM_END: &str = "-----END PUBLIC KEY-----";
 /// motivating case is a key that was **compromised**. The lazy path for an
 /// operator holding a compromised private PEM is to paste it straight into the
 /// retired list, where it would live on indefinitely in the process
-/// environment; that is precisely how the 2026-09-09 dev exposure happened
-/// (`SIWEOIDC_SIGNING_KEY_PEM` read out of a bare `printenv`). A config that
+/// environment, where a bare `printenv` in the container prints it whole
+/// (multiline PEM values included). A config that
 /// makes "keep the compromised secret around forever" the path of least
 /// resistance is a bad config. So a private PEM is a hard error with the
 /// one-line fix in the message:
@@ -425,7 +431,7 @@ pub fn parse_retired_verification_keys(pem_bundle: &str) -> Result<Vec<CoreJsonW
 
     if pem_bundle.contains("PRIVATE KEY") {
         return Err(anyhow!(
-            "SIWEOIDC_RETIRED_SIGNING_KEYS_PEM contains a PRIVATE key. Retired keys are              published for VERIFICATION only and must be the public half — a retired key never              signs anything, and keeping a rotated-out (often compromised) private key in the              process environment is exactly the exposure that motivates rotation. Convert it              with: openssl pkey -in <old-key>.pem -pubout"
+            "SIWXOIDC_RETIRED_SIGNING_KEYS_PEM contains a PRIVATE key. Retired keys are published for VERIFICATION only and must be the public half — a retired key never signs anything, and keeping a rotated-out (often compromised) private key in the process environment is exactly the exposure that motivates rotation. Convert it with: openssl pkey -in <old-key>.pem -pubout"
         ));
     }
 
@@ -435,14 +441,14 @@ pub fn parse_retired_verification_keys(pem_bundle: &str) -> Result<Vec<CoreJsonW
         let after_begin = &rest[begin..];
         let end = after_begin.find(PUBLIC_PEM_END).ok_or_else(|| {
             anyhow!(
-                "SIWEOIDC_RETIRED_SIGNING_KEYS_PEM has a '{PUBLIC_PEM_BEGIN}' with no matching                  '{PUBLIC_PEM_END}' — the PEM block is truncated"
+                "SIWXOIDC_RETIRED_SIGNING_KEYS_PEM has a '{PUBLIC_PEM_BEGIN}' with no matching '{PUBLIC_PEM_END}' — the PEM block is truncated"
             )
         })? + PUBLIC_PEM_END.len();
         let block = &after_begin[..end];
 
         let public_key = p256::PublicKey::from_public_key_pem(block).map_err(|e| {
             anyhow!(
-                "SIWEOIDC_RETIRED_SIGNING_KEYS_PEM entry {} is not a valid P-256 SPKI public                  key: {e}. ES256 is the only algorithm this provider has ever signed with, so a                  retired key of any other curve could not have produced a proof to verify.",
+                "SIWXOIDC_RETIRED_SIGNING_KEYS_PEM entry {} is not a valid P-256 SPKI public key: {e}. ES256 is the only algorithm this provider has ever signed with, so a retired key of any other curve could not have produced a proof to verify.",
                 keys.len() + 1
             )
         })?;
@@ -455,7 +461,7 @@ pub fn parse_retired_verification_keys(pem_bundle: &str) -> Result<Vec<CoreJsonW
 
     if keys.is_empty() {
         return Err(anyhow!(
-            "SIWEOIDC_RETIRED_SIGNING_KEYS_PEM is set but contains no '{PUBLIC_PEM_BEGIN}' block.              Unset it, or supply the public half of each retired signing key              (openssl pkey -in <old-key>.pem -pubout)."
+            "SIWXOIDC_RETIRED_SIGNING_KEYS_PEM is set but contains no '{PUBLIC_PEM_BEGIN}' block. Unset it, or supply the public half of each retired signing key (openssl pkey -in <old-key>.pem -pubout)."
         ));
     }
     Ok(keys)
@@ -668,11 +674,11 @@ pub const RESOLVE_ENDPOINT_METADATA_KEY: &str = "io.inblock.resolve_endpoint";
 
 // -- ENS resolution -------------------------------------------------------
 //
-// Primary strategy: HTTP API (handles CCIP Read / NameWrapper / offchain
-// names server-side). Default: api.ensdata.net. Override via ens_api_url.
-//
-// Fallback: on-chain via alloy's legacy ENS registry (eth_provider).
-// Does not support NameWrapper but handles classic reverse records.
+// Order: when eth_provider is set, the on-chain legacy ENS registry is asked
+// first (classic reverse records only; no NameWrapper). The HTTP API
+// (ens_api_url, default api.ensdata.net; handles CCIP Read / NameWrapper /
+// offchain names server-side) is used when there is no eth_provider or the
+// on-chain lookup finds nothing. An empty ens_api_url disables the HTTP API.
 
 /// Resolve ENS primary name via HTTP API.
 /// API must accept GET /{address} and return JSON with `ens_primary` field.
@@ -780,8 +786,10 @@ async fn resolve_claims(
         None
     };
 
-    // preferred_username is ALWAYS the full DID (used as Matrix username).
-    // name is the ENS name when available (used as Matrix display name).
+    // preferred_username is ALWAYS the full DID (the Matrix localpart travels in
+    // introspection's `username`, never here). name is the ENS name when
+    // available (an OIDC claim only; the Matrix displayname is the alias seeded
+    // at first sign-in).
     let mut claims = StandardClaims::new(SubjectIdentifier::new(subject))
         .set_preferred_username(Some(EndUserUsername::new(did.to_string())));
     if let Some(name) = ens_name {
@@ -1457,7 +1465,8 @@ pub struct AuthorizeParams {
     pub request: Option<String>,
     /// PKCE code_challenge.
     pub code_challenge: Option<String>,
-    /// PKCE code_challenge_method ("S256" or "plain").
+    /// PKCE code_challenge_method. Only "S256" is accepted; "plain" is
+    /// rejected at /authorize.
     pub code_challenge_method: Option<String>,
     /// OAuth response_mode ("query" or "fragment"). matrix-js-sdk v42
     /// (Element Web >= 1.12.24) sends `fragment` and reads the authorization
@@ -1711,8 +1720,8 @@ fn extract_expiration_time(message: &str) -> Option<&str> {
 /// (past, beyond the skew). The replay window for an omitted exp is bounded
 /// elsewhere by the single-use nonce / session lifetime.
 ///
-/// Out of scope: the device-approval and account paths (their builders do not set
-/// an expiration yet — those are the breaking C1 parts handled in a follow-up).
+/// Not used by the device-approval and account paths: those make `Expiration
+/// Time` MANDATORY instead (see [`validate_caip122_envelope`]).
 const CAIP122_EXPIRY_SKEW_SECS: i64 = 120;
 
 fn enforce_login_expiration(message: &str, now: chrono::DateTime<Utc>) -> Result<(), CustomError> {
@@ -1929,7 +1938,8 @@ pub struct SignInParams {
     pub client_id: String,
     /// PKCE code_challenge (passed through from /authorize).
     pub code_challenge: Option<String>,
-    /// PKCE code_challenge_method ("S256" or "plain").
+    /// PKCE code_challenge_method. Only "S256" is accepted; "plain" is
+    /// rejected at /authorize.
     pub code_challenge_method: Option<String>,
     /// OAuth response_mode (passed through from /authorize; validated there).
     pub response_mode: Option<String>,
@@ -2010,8 +2020,7 @@ fn provider_written_displayname(current: &str, did: &str, localpart: &str) -> bo
 /// it self-activates once the deployment's Synapse image is bumped past that
 /// fix — see the comment on the heal branch below. `server_name: None` (no
 /// `SIWEOIDC_MATRIX_SERVER_NAME` configured) skips the check entirely,
-/// preserving prior behavior for standalone deployments. See
-/// `docs/superpowers/plans/2026-08-01-provision-retry-hardening.md`.
+/// preserving prior behavior for standalone deployments.
 ///
 /// `localpart` is the value already decided by
 /// [`crate::localpart::resolve_identity`] for this sign-in (grandfathered
@@ -2036,8 +2045,7 @@ fn provider_written_displayname(current: &str, did: &str, localpart: &str) -> bo
 /// and never reaches the guard that protects `io.inblock.did`). A consumer
 /// reading displayname-as-a-DID could therefore be handed *somebody else's*
 /// DID. Splitting the tiers is the security fix; the assertion below is what
-/// makes the split checkable off-server. See
-/// `docs/superpowers/plans/2026-09-10-immutable-attested-did.md`.
+/// makes the split checkable off-server.
 ///
 /// `did_publication` carries the signing key and issuer for that third tier;
 /// `None` disables publication entirely.
@@ -2130,7 +2138,7 @@ pub async fn provision_synapse_device(
             // `SynapseClient::deactivate_user(.., erase: true)`) as "truly
             // absent" by the same M_UNKNOWN discriminator. If an erased
             // account ever completed sign-in again, this would resurrect a
-            // bare profile row (displayname = the localpart, since 2026-09-10)
+            // bare profile row (displayname = the generated alias, since 2026-09-11)
             // — accepted, since that reveals nothing beyond the mxid the caller
             // already presented to authenticate.
             if let Some(server_name) = server_name {
@@ -2486,7 +2494,8 @@ pub async fn sign_in(
     // reaches the `degraded` guard that suppresses DID publication (2026-09-10
     // audit, D4) — making that guard look like near-dead code on the login path.
     // The observation is correct and the ordering is still right. Do not swap
-    // them to "make the guard reachable".
+    // them to "make the guard reachable". `sign_in_deactivation_order_tests`
+    // (end of this file) fails if the gate moves anywhere later in `sign_in`.
     //
     // Swapping them would not trade coverage for safety, it would build a live
     // deactivation BYPASS. `resolve_identity_or_legacy` is infallible by
@@ -2840,7 +2849,7 @@ fn mxid_claim(config: &crate::config::Config, localpart: Option<&str>) -> SiwxAd
 /// only authorization-bearing claim here) or `preferred_username` is
 /// byte-for-byte unaffected, and nothing in this function may ever be
 /// "simplified" into replacing one of them with the Matrix ID — the three-tier
-/// identity model (see `CLAUDE.md`) exists precisely because a consumer that
+/// identity model (see `docs/identity-model.md`) exists precisely because a consumer that
 /// reads a Matrix identifier where it expected a DID, or the reverse, resolves
 /// the wrong account.
 pub async fn userinfo(
@@ -2929,8 +2938,7 @@ mod tests {
     // -- Signing key identity (H4/H5) -------------------------------------
     //
     // These pin the property the whole DID-assertion feature rests on: a `kid`
-    // names a KEY, so a key swap is diagnosable. See the `EcdsaSigningKey` doc
-    // and `docs/superpowers/plans/2026-09-10-immutable-attested-did.md`.
+    // names a KEY, so a key swap is diagnosable. See the `EcdsaSigningKey` doc.
 
     /// H4: two independently generated keys must NOT share a `kid`.
     ///
@@ -3148,8 +3156,8 @@ mod tests {
     /// Not fussiness: a retired key never signs, so the private half grants a
     /// capability nothing needs, and the motivating case is a key that was
     /// COMPROMISED. Accepting it would make "keep the compromised secret in the
-    /// environment forever" the path of least resistance — which is exactly how
-    /// the 2026-09-09 dev exposure happened (read out of a bare `printenv`).
+    /// environment forever" the path of least resistance, where any bare
+    /// `printenv` in the container prints it whole.
     #[test]
     fn a_private_key_is_refused_with_the_openssl_fix() {
         let err = parse_retired_verification_keys(&crate::did_assertion::test_p256_pem())
@@ -4712,7 +4720,7 @@ mod userinfo_mxid_claim_tests {
 
         assert!(
             body.get(CLAIM).is_none(),
-            "with no SIWEOIDC_MATRIX_SERVER_NAME the claim must not appear at all \
+            "with no SIWXOIDC_MATRIX_SERVER_NAME the claim must not appear at all \
              (a `null` would make a consumer's `if CLAIM in claims` branch take the \
              wrong turn): {body}"
         );
@@ -4829,6 +4837,290 @@ mod userinfo_mxid_claim_tests {
             payload.get("sub").and_then(|v| v.as_str()),
             Some(DID),
             "`sub` is unchanged in the signed variant too"
+        );
+    }
+}
+
+/// `sign_in` decides deactivation BEFORE it resolves the login localpart.
+///
+/// The ordering rule is argued at the gate's call site in [`sign_in`]: the
+/// deactivation gate must run before `resolve_identity_or_legacy`, because that
+/// resolver is infallible and answers a probe error with a GUESSED legacy
+/// localpart. A gate that consumed the guess would ask `query_user` about the
+/// wrong account, read the 404 as "no account, nothing to reject", and let a
+/// deactivated modern-only account sign straight back in.
+///
+/// The `webauthn` tests pin the gate in isolation; nothing there can see where
+/// `sign_in` calls it. These tests drive `sign_in` itself, with a server-verified
+/// DID in the Redis session (the passkey path) and an in-process homeserver that
+/// records every request it receives, and pin two things:
+///
+/// - **the outcome**: a deactivated account is refused, and a probe fault fails
+///   closed, before anything is provisioned;
+/// - **the order**: the gate's own probes are the ONLY requests `sign_in` makes
+///   on those paths. Resolving the localpart first shows up as extra
+///   `is_localpart_available` probes ahead of `query_user`, and provisioning
+///   first shows up as MAS writes, so moving the gate anywhere later in
+///   `sign_in` fails these tests even when the outcome alone would not change.
+///
+/// Redis-backed like the rest of this file's `sign_in` tests (`e2e_flow`): the
+/// session is read and marked signed-in through the real `DBClient`.
+#[cfg(test)]
+mod sign_in_deactivation_order_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::localpart::{legacy_localpart, localpart_for};
+    use axum::extract::{Query, State};
+    use axum::http::{Method, StatusCode, Uri};
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use headers::{HeaderMap, HeaderMapExt, HeaderValue};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+
+    /// Synthetic; `find_did_method` checks only the `did:key:` prefix, and the
+    /// gate never parses the key.
+    const DID: &str = "did:key:zDnSIGNINDEACTIVATIONORDER";
+    const SERVER_NAME: &str = "example.org";
+    const REDIRECT: &str = "https://example.com/callback";
+
+    /// What the homeserver answers, per localpart, and what it was asked.
+    #[derive(Default)]
+    struct Homeserver {
+        /// `is_localpart_available` answers 500: a fault on ONE route, the
+        /// partial-outage shape the ordering note describes.
+        faulted: HashSet<String>,
+        /// `is_localpart_available` answers `400 M_USER_IN_USE`. A deactivated
+        /// account's localpart is taken as far as Synapse is concerned.
+        taken: HashSet<String>,
+        /// `query_user` answers `is_deactivated: true`; any other localpart is
+        /// a 404, which `query_user` reads as "no such account".
+        deactivated: HashSet<String>,
+        /// Every request, in arrival order.
+        log: Mutex<Vec<String>>,
+    }
+
+    async fn is_localpart_available(
+        State(hs): State<Arc<Homeserver>>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> axum::response::Response {
+        let lp = q.get("localpart").cloned().unwrap_or_default();
+        hs.log
+            .lock()
+            .unwrap()
+            .push(format!("is_localpart_available {lp}"));
+        if hs.faulted.contains(&lp) {
+            (StatusCode::INTERNAL_SERVER_ERROR, "").into_response()
+        } else if hs.taken.contains(&lp) {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"errcode": "M_USER_IN_USE", "error": "in use"})),
+            )
+                .into_response()
+        } else {
+            (StatusCode::OK, Json(serde_json::json!({"available": true}))).into_response()
+        }
+    }
+
+    async fn query_user(
+        State(hs): State<Arc<Homeserver>>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> axum::response::Response {
+        let lp = q.get("localpart").cloned().unwrap_or_default();
+        hs.log.lock().unwrap().push(format!("query_user {lp}"));
+        if hs.deactivated.contains(&lp) {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "user_id": format!("@{lp}:{SERVER_NAME}"),
+                    "display_name": null,
+                    "avatar_url": null,
+                    "is_suspended": false,
+                    "is_deactivated": true,
+                })),
+            )
+                .into_response()
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"errcode": "M_NOT_FOUND", "error": "User not found"})),
+            )
+                .into_response()
+        }
+    }
+
+    /// Anything else `sign_in` might send (provisioning, profile reads) is
+    /// recorded and answered with an empty 200, so a gate moved past
+    /// provisioning shows up in the log instead of as an unrelated error.
+    async fn anything_else(
+        State(hs): State<Arc<Homeserver>>,
+        method: Method,
+        uri: Uri,
+    ) -> axum::response::Response {
+        hs.log
+            .lock()
+            .unwrap()
+            .push(format!("{method} {}", uri.path()));
+        (StatusCode::OK, Json(serde_json::json!({}))).into_response()
+    }
+
+    /// Run one passkey-path `sign_in` for [`DID`] against `hs`; return the
+    /// outcome and the homeserver's request log.
+    async fn sign_in_against(hs: Homeserver) -> (Result<(Url, String), CustomError>, Vec<String>) {
+        let hs = Arc::new(hs);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral homeserver port");
+        let addr = listener.local_addr().expect("homeserver local_addr");
+        let app = Router::new()
+            .route(
+                "/_synapse/mas/is_localpart_available",
+                get(is_localpart_available),
+            )
+            .route("/_synapse/mas/query_user", get(query_user))
+            .fallback(anything_else)
+            .with_state(hs.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("homeserver");
+        });
+        let synapse = SynapseClient::new(&format!("http://{addr}"), "secret");
+
+        let db = RedisClient::new(&Config::default().redis_url)
+            .await
+            .expect("these tests need Redis on localhost:6379, as CI provides");
+        let nonce = Uuid::new_v4().simple().to_string();
+        let client_id = format!("deactivation-order-{nonce}");
+        db.set_client(
+            client_id.clone(),
+            ClientEntry {
+                secret: "secret".into(),
+                metadata: CoreClientMetadata::new(
+                    vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
+                    EmptyAdditionalClientMetadata {},
+                ),
+                access_token: None,
+            },
+        )
+        .await
+        .unwrap();
+        // The passkey path: the ceremony already verified the DID and stored it
+        // in the session, so `sign_in` needs no CAIP-122 cookie.
+        let session_id = format!("deactivation-order-{nonce}");
+        db.set_session(
+            session_id.clone(),
+            SessionEntry {
+                siwe_nonce: nonce.clone(),
+                oidc_nonce: None,
+                secret: "secret".into(),
+                signin_count: 0,
+                verified_did: Some(DID.to_string()),
+                scope: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
+        );
+        let cookies = headers.typed_get::<headers::Cookie>().unwrap();
+        let params = SignInParams {
+            redirect_uri: RedirectUrl::new(REDIRECT.into()).unwrap(),
+            state: "state".into(),
+            oidc_nonce: None,
+            client_id,
+            code_challenge: None,
+            code_challenge_method: None,
+            response_mode: None,
+        };
+
+        let result = sign_in(
+            &Url::parse("https://example.com").unwrap(),
+            &["key".to_string()],
+            &[],
+            params,
+            cookies,
+            &db,
+            Some(&synapse),
+            Some(SERVER_NAME),
+            None,
+        )
+        .await;
+        server.abort();
+        let log = hs.log.lock().unwrap().clone();
+        (result, log)
+    }
+
+    /// A healthy homeserver and a genuinely deactivated account that exists only
+    /// under the MODERN localpart. `sign_in` refuses it with the deactivation
+    /// message, and the only requests it made are the gate's own three probes:
+    /// legacy is free, modern is taken, and the modern account is deactivated.
+    #[tokio::test]
+    async fn sign_in_refuses_a_deactivated_account_before_resolving_or_provisioning() {
+        let legacy = legacy_localpart(DID);
+        let modern = localpart_for(DID);
+        let (result, log) = sign_in_against(Homeserver {
+            taken: HashSet::from([modern.clone()]),
+            deactivated: HashSet::from([modern.clone()]),
+            ..Homeserver::default()
+        })
+        .await;
+
+        match result {
+            Err(CustomError::Unauthorized(msg)) => {
+                assert_eq!(msg, crate::webauthn::DEACTIVATED_REJECT_MSG);
+            }
+            other => panic!("a deactivated account must not sign in, got {other:?}"),
+        }
+        assert_eq!(
+            log,
+            vec![
+                format!("is_localpart_available {legacy}"),
+                format!("is_localpart_available {modern}"),
+                format!("query_user {modern}"),
+            ],
+            "the deactivation gate must be the first and only thing sign_in asks the \
+             homeserver on this path: extra availability probes before `query_user` mean \
+             the login localpart was resolved first, and anything after it means \
+             provisioning ran for an account that is being refused"
+        );
+    }
+
+    /// The bypass shape from the ordering note: the legacy availability probe
+    /// fails while `query_user` would answer, and the deactivated account lives
+    /// under the MODERN localpart. `resolve_identity_or_legacy` would answer this
+    /// fault with the legacy guess, and `query_user` on that guess is a 404. The
+    /// gate must instead fail closed with the "could not check" 503, having sent
+    /// nothing but the one failed probe.
+    #[tokio::test]
+    async fn a_partial_probe_fault_fails_sign_in_closed_before_any_legacy_guess() {
+        let legacy = legacy_localpart(DID);
+        let modern = localpart_for(DID);
+        let (result, log) = sign_in_against(Homeserver {
+            faulted: HashSet::from([legacy.clone()]),
+            taken: HashSet::from([modern.clone()]),
+            deactivated: HashSet::from([modern.clone()]),
+            ..Homeserver::default()
+        })
+        .await;
+
+        match result {
+            Err(CustomError::ServiceUnavailable(msg)) => {
+                assert_eq!(msg, crate::webauthn::DEACTIVATION_CHECK_UNAVAILABLE_MSG);
+            }
+            other => panic!(
+                "a probe fault must fail sign-in closed, never fall back to the legacy \
+                 guess and let a deactivated modern-only account in; got {other:?}"
+            ),
+        }
+        assert_eq!(
+            log,
+            vec![format!("is_localpart_available {legacy}")],
+            "the gate's failed probe must be the only request: a second probe means the \
+             login localpart was resolved (and guessed) before the gate decided"
         );
     }
 }

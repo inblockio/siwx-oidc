@@ -1,10 +1,12 @@
 # Session & Onboarding — State-Machine Coverage Matrix
 
+> **Unpublished references.** Session plans and handovers cited below by file name (e.g. `2026-07-25-session-onboarding-state-machine-map.md`) are the maintainers' internal working documents and are not part of this repository; the findings here stand on their own evidence.
+
 **Date:** 2026-07-25
 **Method:** `/logic-model` (CONTEXT → GOAL → INPUTS → ACTIVITIES/OUTPUTS → BOUNDARY CONDITIONS)
 **Mode:** Read-only analysis. No source, config, or container was modified. No container was
 started, stopped, or removed. This file is the only artifact written.
-**Authority document:** `docs/superpowers/plans/2026-07-25-session-onboarding-state-machine-map.md`
+**Authority document:** `2026-07-25-session-onboarding-state-machine-map.md`
 (machines M0–M5, undefined states U1–U4, QR terminals Q1–Q5).
 
 > **Labelling contract.** **VERIFIED** = backed by a `file:line` in a tree named below, or a
@@ -12,7 +14,7 @@ started, stopped, or removed. This file is the only artifact written.
 > one is in the assumptions register (§9) with the test that would settle it.
 
 > **Snapshot pin — the tree moved under this audit.** Analysis is pinned to
-> `/home/waldknoten-01/wt/siwx-durability` @ **`dd34e3f`** (branch
+> `<worktree>` @ **`dd34e3f`** (branch
 > `feat/session-durability-marathon`). At task start it was `d21329e`; a parallel agent committed
 > `dd34e3f` ("fix(refresh): distinguish infrastructure failure from revocation") mid-audit. §5's M2
 > rows reflect `dd34e3f`. Element-client claims are pinned to element-web **v1.12.20** +
@@ -76,7 +78,7 @@ the gap list is ordered by reachability × severity with the ranking justified.
 | Code (siwx) | `src/{oidc,account,device_auth,compat,introspect,webauthn}.rs`, `src/db/{mod,redis}.rs` | all |
 | Code (Element v1.12.20) | `SetupEncryptionStore.ts`, `SetupEncryptionBody.tsx`, `useOwnDevices.ts`, `LoginWithQRSection.tsx` | M4, M5, §7.1, §7.2 |
 | Patch | `siwx-oidc-matrix-server/patches/element-web/force-first-device-recovery.patch` @ `b7e594f` | §7.1 |
-| Branch (read-only) | `fix/finding3-fragment-response-mode` @ `3018ffe` in `/home/waldknoten-01/siwx-oidc` | §7.3 |
+| Branch (read-only) | `fix/finding3-fragment-response-mode` @ `3018ffe` in `<repo>` | §7.3 |
 | Tests | `tests/*.rs` (8), `e2e/browser/*.spec.mjs` (4), `e2e/element/*.spec.mjs` (6) | §5 |
 
 ---
@@ -445,7 +447,7 @@ is **U8**, and it is the same silent-dead-end class as the auth_metadata finding
 references to the field, so Element 1.12.20 is unaffected today.
 
 **Fix in flight (read-only, NOT modified).** `fix/finding3-fragment-response-mode` @ `3018ffe` in
-`/home/waldknoten-01/siwx-oidc`, `+223` lines in `src/oidc.rs`. It does the two things the finding
+`<repo>`, `+223` lines in `src/oidc.rs`. It does the two things the finding
 doc says must ship together:
 
 * advertises `value["response_modes_supported"] = ["query","fragment"]` — with a code comment
@@ -514,7 +516,7 @@ in §5 marked "Covered" is guarded by nothing automated.
 | **B7** | The `e2e/browser` Synapse mock faithfully models the real admin/MAS API for the paths it stands in for | **ASSUMED** | Cross-run the same assertions against the Element lab (real Synapse) |
 | **B8** | matrix-js-sdk v42 hard-requires `response_modes_supported` | **REPO-SOURCED** (`2026-07-25-element-jssdk-v42-oauth-compat-finding.md`), reproduced via client-side shims; v42 sources not re-derived here | Read `matrix-js-sdk@42.0.0/src/oauth/discover.ts` from npm |
 | **B9** | `hasDevicesToVerifyAgainst` counts the current device, so "Use another device" can render with no peer | **Source-VERIFIED** (`SetupEncryptionStore.ts:104-119` has no self-exclusion); consequence **INFERRED** | Single-device lab session: reload, click it, observe whether any peer responds. **EW-L1b asserts this button visible on a single-device account — consistent with the inference** |
-| **B10** | Prod is still `sha-db79e75` | **ASSUMED** — carried from the map; not re-probed (no prod access used in this audit) | `grep SIWX_OIDC_TAG /home/deploy/matrix/stack/.env` |
+| **B10** | Prod is still `sha-db79e75` | **ASSUMED** — carried from the map; not re-probed (no prod access used in this audit) | `grep SIWX_OIDC_TAG <prod-stack-dir>/.env` on `<prod-host>` |
 | **B11** | No test clicks the new-user confirm/cancel gate | **VERIFIED by absence** across `e2e/browser` + `e2e/element` | — |
 
 ---
@@ -522,7 +524,7 @@ in §5 marked "Covered" is guarded by nothing automated.
 ## 10. BOUNDARY CONDITIONS
 
 **Respected during this audit:** read-only; no container touched; nothing in
-`/home/waldknoten-01/siwx-oidc` or `/home/waldknoten-01/siwx-oidc-matrix-server` modified; exactly
+`<repo>` or `<siwx-oidc-matrix-server>` modified; exactly
 one new file written; no commit; no sub-subagents.
 
 **Invariants this matrix must not be used to weaken:**

@@ -17,10 +17,11 @@
 //! `proof` is deliberately **optional**: when the issuer's signing key is
 //! ephemeral (no `SIWEOIDC_SIGNING_KEY_PEM`) the server refuses to mint one,
 //! because writing a durable assertion signed by a key that dies at the next
-//! restart is writing garbage into someone's profile. See
-//! `docs/superpowers/plans/2026-09-10-immutable-attested-did.md` H5 (line 136)
-//! and the "Never write a durable assertion with an ephemeral key" invariant
-//! (line 170). This module surfaces that case as the typed, distinguishable
+//! restart is writing garbage into someone's profile (hypothesis H5 of the
+//! attested-DID design, and its "never write a durable assertion with an
+//! ephemeral key" invariant; pinned server-side by
+//! `did_assertion::tests::h5_ephemeral_key_publishes_a_did_with_no_proof_key`).
+//! This module surfaces that case as the typed, distinguishable
 //! [`DidAssertionError::ProofAbsent`] — never a panic, and never a silent pass.
 //!
 //! # THE TRUST MODEL — read before you use any of this
@@ -41,7 +42,8 @@
 //! otherwise read a DID out of `displayname` — a field the **user** can rewrite
 //! at will, so a consumer treating displayname-as-DID can be handed someone
 //! else's DID. Separating the provider-owned DID from the user-owned alias is
-//! the security fix; see the three-tier table in the plan (lines 17-27).
+//! the security fix; see the three-tier identity table on the server's
+//! `oidc::provision_synapse_device`.
 //!
 //! # The field is world-readable and it federates
 //!
@@ -49,7 +51,7 @@
 //! `require_auth_for_profile_requests` is set, and that defaults to **False**
 //! (Synapse v1.159.0 `config/server.py:561`); custom fields also federate via
 //! `on_profile_query`. Everything in this object is public. **Nothing private
-//! may ever be added to it** (plan invariant 4, line 169).
+//! may ever be added to it** (design invariant 4).
 //!
 //! # Wire contract (must match the server's minter byte for byte)
 //!
@@ -77,8 +79,8 @@
 //!   stamped `kid = "key1"` on both the configured and the generated key, so a
 //!   restart with an ephemeral key would leave every stored assertion failing
 //!   as "bad signature" — indistinguishable from an attack. Deriving `kid` from
-//!   the public key (`EcdsaSigningKey::public_key_fingerprint`,
-//!   `src/oidc.rs:188-190`) turns
+//!   the public key (`EcdsaSigningKey::public_key_fingerprint` in
+//!   `src/oidc.rs`) turns
 //!   that into an honest, diagnosable "kid not present in JWKS", which is
 //!   exactly why [`verify_did_assertion`] treats a missing `kid` match as a
 //!   **hard error** and never falls back to trying every key in the set.
@@ -86,7 +88,7 @@
 //! There is deliberately **no `exp`** claim. The binding is permanent —
 //! localparts are never recycled and a DID never stops being that user's DID —
 //! so a stale assertion stays *true* rather than decaying into a stale
-//! credential (plan lines 83-85). Nothing in this module rejects on age; do not
+//! credential. Nothing in this module rejects on age; do not
 //! add an age check "for hygiene", it would make correct old assertions fail.
 
 use std::fmt;
@@ -172,9 +174,9 @@ pub struct VerifiedDid {
 impl VerifiedDid {
     /// The DID, exact case, from the `sub` claim.
     ///
-    /// This is deliberately the same claim the ID token carries (CLAUDE.md
-    /// breaking change #1: `sub` is `did:pkh:eip155:1:0x…`, not a bare
-    /// address), so a consumer can compare an assertion's `sub` to an ID
+    /// This is deliberately the same claim the ID token carries (breaking change
+    /// #1 in `docs/architecture.md`, "Lineage": `sub` is `did:pkh:eip155:1:0x…`,
+    /// not a bare address), so a consumer can compare an assertion's `sub` to an ID
     /// token's `sub` with no translation step in between.
     pub fn did(&self) -> &str {
         &self.did

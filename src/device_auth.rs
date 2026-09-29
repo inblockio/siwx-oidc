@@ -31,7 +31,7 @@ const USER_CODE_LEN: usize = 6;
 ///
 /// 6 consonants from a 20-character alphabet give log2(20^6) ≈ 25.9 bits of
 /// entropy, which is comfortably above the ~20-bit minimum recommended by
-/// RFC 8628 §6.1 for the lifetime of a device code (600s).
+/// RFC 8628 §6.1 for the lifetime of a device code (`DEVICE_CODE_LIFETIME`, 1800s).
 ///
 /// The shorter format ensures the code fits in narrow client display widgets
 /// (notably the Element X mobile verification screen).

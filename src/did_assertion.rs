@@ -25,7 +25,7 @@
 //! profile and it verifies in isolation. The binding claim is the only thing
 //! that stops that, and checking it is the *consumer's* job.
 //!
-//! (Related, and load-bearing: `MEMORY.md` → "MXID to DID is not invertible".
+//! (Related, and load-bearing: MXID to DID is not invertible.
 //! A `did:key` rebuilt from a Matrix localpart is a DIFFERENT key — 17 of 48
 //! base58 chars differed in the 2026-09-09 incident, filed as siwx-oidc#17.
 //! Resolve DIDs from `sub` or from this field, never from a localpart, and
@@ -68,10 +68,11 @@
 //!
 //! ## `sub` is the DID, deliberately
 //!
-//! The same claim name the ID token already uses (CLAUDE.md breaking change #1:
-//! `sub` became `did:pkh:eip155:1:0xAddr`). A consumer can compare an
+//! The same claim name the ID token already uses (breaking change #1 against
+//! siwe-oidc in `docs/architecture.md`, "Lineage": `sub` became
+//! `did:pkh:eip155:1:0xAddr`). A consumer can compare an
 //! assertion's `sub` to an ID token's `sub` with zero translation — and, per the
-//! memory note above, translation is exactly where DID identity goes wrong.
+//! siwx-oidc#17 note above, translation is exactly where DID identity goes wrong.
 //!
 //! DIDs are **case-sensitive**: `did:key` multibase-base58btc payloads carry
 //! meaning in their case. `sub` is written verbatim, never normalised, never
@@ -89,7 +90,7 @@
 //! ## There is no `exp`, on purpose
 //!
 //! The binding is permanent. Localparts are never recycled (see the no-recycling
-//! rule in CLAUDE.md's MSC3861 device lifecycle section, which is about device
+//! rule in `docs/matrix-integration.md`, "No device recycling", which is about device
 //! ids but reflects the same discipline), and a DID does not stop being that
 //! user's DID. An expiry would convert a statement that stays **true** into a
 //! credential that goes **stale**, and would require re-minting for accounts
@@ -100,8 +101,6 @@
 //! ## Nothing is minted with an ephemeral key
 //!
 //! Plan invariant 5. See [`mint_did_assertion`].
-//!
-//! Reference: `docs/superpowers/plans/2026-09-10-immutable-attested-did.md`.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 // Only [`verify_with_key`] needs these, and that helper is `#[cfg(test)]` —
@@ -246,7 +245,7 @@ pub fn mint_did_assertion(
                 kid = %key.kid(),
                 "signing key is ephemeral: provider-attested DID assertions are \
                  NOT being minted, and user profiles will carry a `did` with no \
-                 `proof`. Set SIWEOIDC_SIGNING_KEY_PEM to a durable key. \
+                 `proof`. Set SIWXOIDC_SIGNING_KEY_PEM to a durable key. \
                  (Logged once per process; per-call detail is at debug level.)"
             );
         });
@@ -377,8 +376,8 @@ pub fn did_profile_value(
 ) -> serde_json::Value {
     let mut value = serde_json::Map::new();
     // Exact case. A `did:key` multibase payload carries meaning in its case and
-    // is NOT recoverable from the (lowercased) Matrix localpart — MEMORY.md
-    // "MXID to DID is not invertible", filed as siwx-oidc#17.
+    // is NOT recoverable from the (lowercased) Matrix localpart — "MXID to DID
+    // is not invertible", filed as siwx-oidc#17.
     value.insert(
         "did".to_string(),
         serde_json::Value::String(did.to_string()),
@@ -517,7 +516,7 @@ mod tests {
     const ISSUER: &str = "https://siwx-oidc.inblock.io";
     /// Mixed case ON PURPOSE. `did:key` multibase payloads are case-sensitive;
     /// a minter that lowercased `sub` would produce a proof for a DIFFERENT key
-    /// (MEMORY.md "MXID to DID is not invertible" / siwx-oidc#17).
+    /// ("MXID to DID is not invertible", siwx-oidc#17).
     const DID: &str = "did:key:zDnaeUKTWUXc1mxSoRrEfV6wPWmQyHrKuTHLZgAkyUKfSbeMB";
     const MXID: &str = "@k3f9x2q7ab4d8m1p:inblock.io";
     const IAT: i64 = 1_757_500_000;
@@ -831,7 +830,7 @@ mod tests {
             obj["did"].as_str().unwrap(),
             DID,
             "the DID must be exact-case; a lowercased did:key is a DIFFERENT key \
-             (MEMORY.md 'MXID to DID is not invertible', siwx-oidc#17)"
+             (siwx-oidc#17: an MXID is not invertible to a DID)"
         );
 
         // The `proof` member must be the real thing, not merely a string.

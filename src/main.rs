@@ -1,7 +1,7 @@
-// Harmless content marker (S5 branch-based CI deploys, 2026-07-31): proves a
-// push to `dev` produces a genuinely new, distinct :dev image on GHCR and
-// that dev-staging's pull-model timer converges onto it. See
-// siwx-oidc-matrix-server's docs/2026-07-30-dev-staging-dev-aquafire.md §9.
+// Harmless content marker left by the S5 branch-based CI deploy test
+// (2026-07-31), which proved a push to `dev` produced a distinct :dev image on
+// GHCR. Historical: CI stopped building a `dev` branch image on 2026-09-29
+// (#20).
 mod account;
 mod admin_token;
 mod axum_lib;

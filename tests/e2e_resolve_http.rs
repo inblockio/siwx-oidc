@@ -3,13 +3,14 @@
 //!
 //! # The gap this closes
 //!
-//! `src/resolve.rs` carries 15 unit tests and every one of them builds a
-//! `ResolveQuery` **struct** and calls `resolve::resolve(…)` directly. That is
+//! `src/resolve.rs`'s unit tests build a `ResolveQuery` **struct** and call
+//! `resolve::resolve(…)` directly (the rest test pure helpers). That is
 //! the right shape for the resolution *logic*, and it is structurally blind to
 //! everything between a socket and that function:
 //!
 //! - the `Query<ResolveQuery>` extractor, which rejects malformed query strings
-//!   **before** the handler runs and therefore before `ResolveError` gets a say;
+//!   **before** the handler body runs (the handler converts that rejection into
+//!   a `ResolveError`; only a request over real HTTP can prove it does);
 //! - the method routing (`get(resolve_handler)` vs an accidental `any()`);
 //! - `ResolveError`'s `IntoResponse` — the unit tests reach it only through a
 //!   `status_of` helper that throws the body and the headers away.
@@ -28,15 +29,15 @@
 //! `docs/api/README.md` ("`/resolve` always returns all four keys", "`/resolve`
 //! never returns 500").
 //!
-//! # One test here is EXPECTED RED
+//! # One test here was written RED
 //!
 //! [`a_repeated_query_parameter_is_rejected_with_the_documented_error_envelope`]
-//! fails against the code as it stands, on purpose. A repeated selector
-//! (`?did=a&did=b`) is rejected by serde's `Query` extractor, which answers a
-//! **`text/plain`** 400 that never reaches `ResolveError::into_response` — so
-//! the documented JSON envelope is not what a caller gets. It is written to the
-//! contract and must not be weakened to the observed behaviour; see that test's
-//! own doc comment for the exact body and the shape of the fix.
+//! was written against the contract while the code violated it: a repeated
+//! selector (`?did=a&did=b`) was rejected by serde's `Query` extractor with a
+//! **`text/plain`** 400 that never reached `ResolveError::into_response`. The
+//! handler now takes `Result<Query<_>, QueryRejection>` and renders the
+//! rejection as `ResolveError::BadRequest` (156b1f9, 2026-09-12), so the test
+//! is a regression guard. It must not be weakened; see its own doc comment.
 //!
 //! # Running
 //!
@@ -316,15 +317,16 @@ fn mxid_for(did: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// The known deviation
+// The repeated-selector deviation (fixed in 156b1f9)
 // ---------------------------------------------------------------------------
 
-/// **EXPECTED RED against the current code — do not weaken this to match it.**
+/// **Written RED against the code of its day — do not weaken this to match
+/// any future regression.**
 ///
 /// A repeated selector is a caller error like any other, and every caller error
 /// this endpoint reports is documented to arrive as
 /// `{"error": …, "message": …}` with `Content-Type: application/json`
-/// (`docs/api/openapi.yaml` `ResolveError`). What actually arrives is
+/// (`docs/api/openapi.yaml` `ResolveError`). What used to arrive was
 ///
 /// ```text
 /// HTTP/1.1 400 Bad Request
@@ -333,9 +335,9 @@ fn mxid_for(did: &str) -> String {
 /// Failed to deserialize query string: .: duplicate field `did`
 /// ```
 ///
-/// because `ResolveQuery` is pulled out by `Query<T>`, whose serde rejection is
-/// turned into a response by **Axum**, not by `ResolveError::into_response`.
-/// Nothing in `src/resolve.rs` runs. The unit tests cannot see this: they
+/// because `ResolveQuery` was pulled out by `Query<T>`, whose serde rejection
+/// was turned into a response by **Axum**, not by `ResolveError::into_response`.
+/// Nothing in `src/resolve.rs` ran. The unit tests cannot see this: they
 /// construct the struct that the extractor failed to build.
 ///
 /// It matters more here than on an authenticated route. `/resolve` exists for
@@ -344,11 +346,11 @@ fn mxid_for(did: &str) -> String {
 /// a plain typo in a URL is also the one that hands them a body their parser
 /// rejects, with no discriminator to branch on.
 ///
-/// The fix is at the wiring, not in the handler: give the extractor a rejection
-/// that renders as `ResolveError::BadRequest` (a `FromRequestParts` wrapper
-/// around `Query`, or `WithRejection`), so that *every* 400 on this path leaves
-/// through the one `IntoResponse` that already exists. Both selectors are
-/// asserted because the extractor rejects each by name.
+/// The fix (156b1f9) is at the wiring: `resolve_handler` takes
+/// `Result<Query<_>, QueryRejection>` and maps the rejection to
+/// `ResolveError::BadRequest`, so *every* 400 on this path leaves through the
+/// one `IntoResponse` that already exists. Both selectors are asserted because
+/// the extractor rejects each by name.
 #[tokio::test]
 #[ignore]
 async fn a_repeated_query_parameter_is_rejected_with_the_documented_error_envelope() {
@@ -376,10 +378,11 @@ async fn a_repeated_query_parameter_is_rejected_with_the_documented_error_envelo
 /// envelope — the sweep that says the shape is a property of the route and not
 /// of one lucky branch.
 ///
-/// Scoped to errors that reach `resolve_handler`. Rejections raised *before* it
-/// (the repeated parameter above; the 405 and 404 below) are a separate,
-/// deliberately separate, finding: bundling them in here would make one red
-/// test stand for four different causes.
+/// Scoped to errors that reach `resolve_handler`. Rejections Axum answers
+/// *before* it (the 405 and 404 below; the repeated parameter above, until
+/// 156b1f9 routed it through `ResolveError`) are a separate, deliberately
+/// separate, finding: bundling them in here would make one red test stand for
+/// four different causes.
 #[tokio::test]
 #[ignore]
 async fn every_error_the_handler_produces_carries_the_documented_json_envelope() {

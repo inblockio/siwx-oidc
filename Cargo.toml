@@ -6,9 +6,9 @@ resolver = "2"
 name = "siwx-oidc"
 version = "0.2.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/inblockio/siwx-oidc/"
-description = "CAIP-122 to OpenID Connect bridge — Sign-In With X for any DID method."
+description = "Key-first OpenID Connect provider and Matrix auth service: agents and people sign in with their own key, no passwords."
 
 [dependencies]
 # PINNED to a release tag and on the `https://` spelling, both deliberately.
@@ -69,12 +69,18 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
 url = { version = "2", features = ["serde"] }
 urlencoding = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
-# WebAuthn/passkey ceremony (safe API only — see PLAN_webauthn.md)
+# WebAuthn/passkey ceremony (safe API only — see docs/design/webauthn-plan.md)
 webauthn-rs = { version = "=0.6.1-dev", features = ["danger-allow-state-serialisation", "conditional-ui"] }
 bs58 = "0.5"
 webauthn-rs-proto = "=0.6.1-dev"
 
 [dev-dependencies]
+# `figment::Jail` for the config-loading tests in src/config.rs: a temporary
+# working directory plus env vars that are restored when the jail drops, so
+# the file and env-prefix precedence can be proven hermetically. Dev-only;
+# resolver 2 keeps the `test` feature (tempfile, parking_lot) out of the
+# shipped binary.
+figment = { version = "0.10", features = ["toml", "env", "test"] }
 # The SHIPPED CONSUMER, linked into the test build only.
 #
 # The minter (`src/did_assertion.rs`) and the verifier

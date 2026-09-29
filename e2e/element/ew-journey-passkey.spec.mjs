@@ -187,7 +187,8 @@ async function walkFirstDeviceWizard(page, prefix) {
  * independent OIDC session + WebAuthn assertion with the SAME resident passkey
  * and reads the server's own new-identity verdict:
  *
- *     new_user == is_localpart_available(did_to_localpart(did))   [CLAUDE.md]
+ *     new_user == resolve_identity_or_legacy(did).is_new   [src/axum_lib.rs]
+ *     (true only when neither the legacy nor the modern localpart is taken)
  *
  * `authenticate/finish` never provisions — only `/sign_in` does, and this never
  * calls it — so the probe is read-only with respect to account creation.
@@ -359,7 +360,7 @@ test('EW-JP1: first-time passkey → new-user gate → session — every screen 
     (gate.headings || []).join(' '),
     `JP1 never reached the new-user gate. Screen was headings=${JSON.stringify(gate.headings)} ` +
       `controls=${JSON.stringify(gate.controls)}. An unrecognised passkey MUST be gated before ` +
-      `provisioning (CLAUDE.md, new-account creation policy), and the user must see it.`,
+      `provisioning (docs/passkeys.md, new-account creation policy), and the user must see it.`,
   ).toMatch(GATE_HEADING);
 
   // The gate's exit must be a REAL one: enabled, not a greyed-out Continue.
@@ -413,7 +414,7 @@ test('EW-JP1: first-time passkey → new-user gate → session — every screen 
 //   1. Does declining strand the user?  ("Try another passkey" is the only
 //      non-committal control; where does it lead, and can they act there?)
 //   2. Does reaching the gate leave Synapse state?  The policy claims
-//      "Cancel = no /sign_in = zero Synapse state" (CLAUDE.md). That is a claim
+//      "Cancel = no /sign_in = zero Synapse state" (docs/passkeys.md). That is a claim
 //      about the server, so it is measured on the server, not read off the UI.
 // ---------------------------------------------------------------------------
 test('EW-JP2: declining the new-user gate strands nobody and provisions nothing', async ({ page }) => {
@@ -481,7 +482,7 @@ test('EW-JP2: declining the new-user gate strands nobody and provisions nothing'
     `ZERO-STATE VIOLATED — after reaching the gate and declining, the server no longer reports ` +
       `${gateMxid} as a new identity (new_user=${probe.new_user}). Something provisioned the ` +
       `account without the user ever confirming, which is exactly what the login-only gate ` +
-      `exists to prevent (CLAUDE.md: "Cancel = no /sign_in = zero Synapse state").`,
+      `exists to prevent (docs/passkeys.md: cancelling leaves no Synapse state).`,
   ).toBe(true);
   expect(probe.mxid, 'JP2 probe resolved a different identity than the gate named').toBe(gateMxid);
 });
@@ -587,14 +588,14 @@ test('EW-JP3: returning passkey login lands in a session — every screen offers
   expect(
     second.device_id,
     'JP3 returning login reused the first device id — sign-in must provision a fresh device ' +
-      '(CLAUDE.md: no recycling).',
+      '(docs/matrix-integration.md: no device recycling).',
   ).not.toBe(first.device_id);
 });
 
 // ---------------------------------------------------------------------------
 // JP4 — a credential the server does not know (stale / revoked / flushed).
 //
-// The contract (CLAUDE.md + src/axum_lib.rs:120-130): HTTP 401 with
+// The contract (docs/passkeys.md "Unknown credentials" + src/axum_lib.rs): HTTP 401 with
 // {error:"unknown_credential", ...}, NOT a 500, and the user gets an actionable
 // message rather than a dead end.
 // ---------------------------------------------------------------------------

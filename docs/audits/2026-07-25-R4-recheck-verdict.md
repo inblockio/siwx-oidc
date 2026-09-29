@@ -1,5 +1,7 @@
 # R4 adversarial re-check — ADOPT / DISREGARD verdict
 
+> **Unpublished references.** Session plans and handovers cited below by file name (e.g. `2026-07-25-session-onboarding-state-machine-map.md`) are the maintainers' internal working documents and are not part of this repository; the findings here stand on their own evidence.
+
 **Date:** 2026-07-25
 **Branch:** `phase2/session-onboarding-lab`
 **Method:** `/logic-model` (CONTEXT → GOAL → INPUTS → ACTIVITIES/OUTPUTS → BOUNDARY CONDITIONS)
@@ -66,7 +68,7 @@ QR half**. R4 is roughly 90% proof-debt and 10% engineering.
 | Vendored patch | `force-first-device-recovery.patch`; **main** has the buggy restore gate, **`fix/finding2-restore-gate`** has the fix | `git show main:patches/…` vs working tree; `git log` |
 | siwx-oidc | CAIP-122 → OIDC bridge; owns the RFC 8628 half of QR only | `src/oidc.rs`, `src/device_auth.rs` |
 
-**R4 as written** (`docs/superpowers/plans/2026-07-25-session-durability-no-forced-logins.md:102`):
+**R4 as written** (`2026-07-25-session-durability-no-forced-logins.md:102`):
 
 > *"User adds a phone, desktop still signed in." Today: recovery phrase. Required: QR / emoji
 > verify from the desktop, **no phrase typed**.*

@@ -1,7 +1,7 @@
 //! Tier 1 of the identity model: a human-readable **alias**, deterministically
 //! seeded from the DID.
 //!
-//! See the three-tier table in `CLAUDE.md`. The alias is the tier the USER
+//! See the three-tier table in `docs/identity-model.md`. The alias is the tier the USER
 //! owns: Synapse's `displayname`, freely rewritable by its owner at any time
 //! ([the ACL probe's leg 5][probe] measured a plain user's `PUT` to
 //! `displayname` as **200** on the same image where their `PUT` to
@@ -27,8 +27,10 @@
 //! # Collisions are expected, and are not a defect
 //!
 //! With `FIRST_NAMES.len() * SURNAMES.len()` = 271 x 306 = 82,926 combinations,
-//! expected collisions are `n^2 / 2N`, so the first one is due around n = 288
-//! accounts (measured, 2026-09-11). Two
+//! the expected number of colliding pairs is about `n^2 / 2N`: a collision is
+//! more likely than not by n ~ 339 accounts, and the expected first one is at
+//! n ~ 361 (`sqrt(pi * N / 2)`). A 2026-09-11 run hit its first at n = 288,
+//! well within that spread. Two
 //! users sharing "Ingrid Moreau" is fine: Matrix clients disambiguate
 //! duplicate display names within a room by showing the MXID, the MXID itself
 //! is derived from 80 bits of hash ([`crate::mxid`]), and the attested DID is
