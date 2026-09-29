@@ -2,7 +2,7 @@ name: Publish Docker
 
 on:
   push:
-    branches: [main, fork-stable, dev]
+    branches: [main, fork-stable]
     # Doc-only commits were rebuilding+moving the :main digest with no code
     # change (observed 2026-07-31) — that breaks digest-based promotion
     # tracking. Skip the build when a push touches only docs/markdown.
