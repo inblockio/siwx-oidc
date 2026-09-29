@@ -895,8 +895,12 @@ async fn msc4191_account_menu_and_deactivate_page_live() {
         .await
         .unwrap();
     assert!(
-        gate.contains("permanently") && gate.contains("cannot be undone"),
-        "deactivate page must warn it is permanent and cannot be undone"
+        gate.contains("permanently") && gate.contains("You cannot undo this yourself."),
+        "deactivate page must warn it is permanent and that the user cannot undo it"
+    );
+    assert!(
+        !gate.contains("cannot be undone"),
+        "an admin can reactivate the account, so deactivation must not be called irreversible"
     );
     assert!(
         gate.contains(r#"id="confirm-deactivate""#),

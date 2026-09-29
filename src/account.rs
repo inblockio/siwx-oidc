@@ -1099,6 +1099,12 @@ fn danger_gate_authed_html(
     )
 }
 
+/// The deactivate confirmation, shared by both page states. It does not say
+/// "cannot be undone": an `erase: false` deactivation can be reversed (by a
+/// server admin), unlike an erasure, whose warning keeps that phrase.
+const DEACTIVATE_WARNING: &str = "This permanently deactivates your Matrix account and signs \
+     you out of every session. You cannot undo this yourself.";
+
 /// The account-home menu of links (shown for the empty/landing action).
 fn menu_html(base: &str) -> String {
     format!(
@@ -1136,7 +1142,7 @@ fn auth_section_html(
         return match action_opt {
             Some(Action::AccountDeactivate) => danger_gate_html(
                 "confirm-deactivate",
-                "This permanently deactivates your Matrix account and signs you out of every session. This cannot be undone.",
+                DEACTIVATE_WARNING,
                 "I understand this is permanent",
             ),
             Some(Action::AccountErase) => danger_gate_html(
@@ -1152,7 +1158,7 @@ fn auth_section_html(
     match action_opt {
         Some(Action::AccountDeactivate) => danger_gate_authed_html(
             "confirm-deactivate",
-            "This permanently deactivates your Matrix account and signs you out of every session. This cannot be undone.",
+            DEACTIVATE_WARNING,
             "I understand this is permanent",
             "Deactivate my account",
         ),
@@ -2108,8 +2114,8 @@ mod tests {
             "deactivate gate must warn it is permanent"
         );
         assert!(
-            html.contains("cannot be undone"),
-            "deactivate gate must warn it cannot be undone"
+            html.contains("You cannot undo this yourself."),
+            "deactivate gate must warn the user cannot undo it"
         );
         assert!(
             html.contains(r#"id="confirm-deactivate""#),
@@ -2127,6 +2133,42 @@ mod tests {
             html.contains(r#"onclick="authWallet()""#),
             "deactivate gate still has the (gated) auth buttons"
         );
+    }
+
+    /// Deactivation (`erase: false`) can be reversed by a server admin, so its
+    /// warning must not call it irreversible; erasure cannot, so its warning
+    /// keeps "cannot be undone". Both page states: before re-authentication
+    /// and with a live account session.
+    #[test]
+    fn only_erasure_is_described_as_impossible_to_undo() {
+        for authed in [false, true] {
+            let deactivate = auth_section_html(
+                Some(Action::AccountDeactivate),
+                false,
+                "https://siwx.example.com",
+                authed,
+            );
+            assert!(
+                deactivate.contains("You cannot undo this yourself."),
+                "authed={authed}: {deactivate}"
+            );
+            assert!(
+                !deactivate.contains("cannot be undone"),
+                "authed={authed}: a deactivation can be reversed by an admin, so it must \
+                 not be called irreversible: {deactivate}"
+            );
+
+            let erase = auth_section_html(
+                Some(Action::AccountErase),
+                false,
+                "https://siwx.example.com",
+                authed,
+            );
+            assert!(
+                erase.contains("This cannot be undone."),
+                "authed={authed}: erasure is irreversible and must say so: {erase}"
+            );
+        }
     }
 
     #[test]
