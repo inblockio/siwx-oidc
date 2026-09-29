@@ -280,6 +280,9 @@ docker run --rm --network siwx -p 8000:8000 \
   ghcr.io/inblockio/siwx-oidc:latest
 ```
 
+The `SIWXOIDC_` names need an image built with the `SIWXOIDC_` rename or later; older images
+read only `SIWEOIDC_`, which remains accepted either way.
+
 ### Agent client
 
 See [Matrix accounts for AI agents](#matrix-accounts-for-ai-agents) above and

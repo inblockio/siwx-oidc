@@ -205,6 +205,9 @@ docker run -d --name siwx-oidc --network siwx -p 8000:8000 \
   ghcr.io/inblockio/siwx-oidc:main
 ```
 
+The `SIWXOIDC_` names need an image built with the `SIWXOIDC_` rename or later;
+older images read only `SIWEOIDC_`, which remains accepted either way.
+
 For a Matrix deployment add `SIWXOIDC_MAS_SHARED_SECRET`, `SIWXOIDC_SYNAPSE_ENDPOINT` and
 `SIWXOIDC_MATRIX_SERVER_NAME`, and configure Synapse as described in
 [matrix-integration.md](matrix-integration.md). A complete Synapse + Element Web + siwx-oidc
