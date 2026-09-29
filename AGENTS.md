@@ -332,6 +332,9 @@ doc; read it before changing the code the rule covers.
 - **Registries are plain functions** (`all_did_methods`, `all_cipher_suites`), no `inventory`
   crate (not WASM-safe). New DID methods and namespaces are opt-in through config.
 - **aqua-auth has no logging** and no knowledge of ceremonies.
+- **SIGTERM shuts the server down gracefully.** In the image it is PID 1, which ignores a
+  signal it has no handler for, so without `shutdown_signal` `docker stop` waits 10 s and
+  SIGKILLs. Pin: `sigterm_finishes_and_exits_zero_with_an_idle_connection_open`.
 - **Credential store: dual-write, not cut-over.** The legacy `webauthn:credential/*` namespace
   stays authoritative; mirror writes are best-effort; the backfill is additive and idempotent.
   Pin: `backfill_is_additive_link_aware_counter_preserving_and_idempotent` (runs only with
