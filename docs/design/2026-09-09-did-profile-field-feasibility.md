@@ -342,7 +342,7 @@ GET /_matrix/client/v3/profile/{active user}/org.aqua-protocol.did   (field neve
 → 404 {"errcode":"M_NOT_FOUND","error":"Profile was not found"}      ← works correctly once a row exists
 
 GET /_matrix/client/v3/profile/{active user}/displayname
-→ 200 {"displayname":"did:key:z6MknwPR8neFZcaoPu8pJLeicmyVnFvPh6wyBAVPu2suG8rV"}
+→ 200 {"displayname":"did:key:z6Mk<redacted>"}
 ```
 (This last one is a nice incidental confirmation that `provision_user`'s
 displayname-as-DID convention, documented in `CLAUDE.md`, is live and working on
