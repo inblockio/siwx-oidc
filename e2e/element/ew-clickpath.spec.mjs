@@ -15,11 +15,15 @@
  *   EW-C3  "Manage account" in Element settings opens the siwx /account page
  *          (MSC4191 account_management_uri) in a new tab.
  *
- * PRE-REQ (lab): Synapse msc3861.issuer_metadata must be the OP's FULL
- * metadata with only introspection_endpoint internal — an endpoints-only
- * dict fails matrix-js-sdk issuer validation and Element falls back to the
- * legacy /login/sso/redirect, which 404s under MSC3861. See
- * siwx-oidc-matrix-server entrypoints/matrix_server.sh.
+ * PRE-REQ (lab): the auth_metadata Synapse serves must be the OP's FULL,
+ * browser-resolvable metadata. Since Synapse 1.157 it is fetched from
+ * `matrix_authentication_service.endpoint` + /.well-known/openid-configuration
+ * (the old `msc3861.issuer_metadata` override, whose endpoints-only dict once
+ * broke this, is gone), so its URLs come from siwx-oidc's SIWEOIDC_BASE_URL.
+ * Metadata that fails matrix-js-sdk issuer validation makes Element fall back
+ * to the legacy /login/sso/redirect, which 404s under MSC3861. Check with
+ * scripts/check-auth-metadata.sh; see siwx-oidc-matrix-server
+ * entrypoints/matrix_server.sh (apply_mas_config).
  *
  * Element loads are slow (~60-90s to the wizard); each test budgets generously.
  */

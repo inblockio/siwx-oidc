@@ -53,7 +53,9 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// ES256 signing key (replaces RSA — eliminates RUSTSEC-2023-0071 Marvin attack)
+// ES256 signing key (replaces RSA signing, so this provider performs no RSA
+// private-key operation — the surface of the RUSTSEC-2023-0071 Marvin attack;
+// see security/vex/siwx-oidc.openvex.json)
 // ---------------------------------------------------------------------------
 
 lazy_static::lazy_static! {
@@ -108,8 +110,8 @@ type DBClientType = dyn DBClient + Sync;
 /// event into `kid "3f2a…" is not present in the JWKS`: honest, self-describing,
 /// and immediately actionable ("the key rotated; set SIWEOIDC_SIGNING_KEY_PEM").
 ///
-/// See `docs/superpowers/plans/2026-09-10-immutable-attested-did.md`
-/// §"`kid` must identify the key, not the slot" (hypothesis H4), pinned by
+/// This is hypothesis H4 of the attested-DID design ("`kid` must identify the
+/// key, not the slot"), pinned by
 /// `oidc::tests::h4_two_generated_keys_get_different_kids` and
 /// `oidc::tests::h4_the_same_pem_yields_the_same_kid_across_constructions`.
 ///
@@ -784,8 +786,10 @@ async fn resolve_claims(
         None
     };
 
-    // preferred_username is ALWAYS the full DID (used as Matrix username).
-    // name is the ENS name when available (used as Matrix display name).
+    // preferred_username is ALWAYS the full DID (the Matrix localpart travels in
+    // introspection's `username`, never here). name is the ENS name when
+    // available (an OIDC claim only; the Matrix displayname is the alias seeded
+    // at first sign-in).
     let mut claims = StandardClaims::new(SubjectIdentifier::new(subject))
         .set_preferred_username(Some(EndUserUsername::new(did.to_string())));
     if let Some(name) = ens_name {
@@ -1461,7 +1465,8 @@ pub struct AuthorizeParams {
     pub request: Option<String>,
     /// PKCE code_challenge.
     pub code_challenge: Option<String>,
-    /// PKCE code_challenge_method ("S256" or "plain").
+    /// PKCE code_challenge_method. Only "S256" is accepted; "plain" is
+    /// rejected at /authorize.
     pub code_challenge_method: Option<String>,
     /// OAuth response_mode ("query" or "fragment"). matrix-js-sdk v42
     /// (Element Web >= 1.12.24) sends `fragment` and reads the authorization
@@ -1715,8 +1720,8 @@ fn extract_expiration_time(message: &str) -> Option<&str> {
 /// (past, beyond the skew). The replay window for an omitted exp is bounded
 /// elsewhere by the single-use nonce / session lifetime.
 ///
-/// Out of scope: the device-approval and account paths (their builders do not set
-/// an expiration yet — those are the breaking C1 parts handled in a follow-up).
+/// Not used by the device-approval and account paths: those make `Expiration
+/// Time` MANDATORY instead (see [`validate_caip122_envelope`]).
 const CAIP122_EXPIRY_SKEW_SECS: i64 = 120;
 
 fn enforce_login_expiration(message: &str, now: chrono::DateTime<Utc>) -> Result<(), CustomError> {
@@ -1933,7 +1938,8 @@ pub struct SignInParams {
     pub client_id: String,
     /// PKCE code_challenge (passed through from /authorize).
     pub code_challenge: Option<String>,
-    /// PKCE code_challenge_method ("S256" or "plain").
+    /// PKCE code_challenge_method. Only "S256" is accepted; "plain" is
+    /// rejected at /authorize.
     pub code_challenge_method: Option<String>,
     /// OAuth response_mode (passed through from /authorize; validated there).
     pub response_mode: Option<String>,
@@ -2014,8 +2020,7 @@ fn provider_written_displayname(current: &str, did: &str, localpart: &str) -> bo
 /// it self-activates once the deployment's Synapse image is bumped past that
 /// fix — see the comment on the heal branch below. `server_name: None` (no
 /// `SIWEOIDC_MATRIX_SERVER_NAME` configured) skips the check entirely,
-/// preserving prior behavior for standalone deployments. See
-/// `docs/superpowers/plans/2026-08-01-provision-retry-hardening.md`.
+/// preserving prior behavior for standalone deployments.
 ///
 /// `localpart` is the value already decided by
 /// [`crate::localpart::resolve_identity`] for this sign-in (grandfathered
@@ -2040,8 +2045,7 @@ fn provider_written_displayname(current: &str, did: &str, localpart: &str) -> bo
 /// and never reaches the guard that protects `io.inblock.did`). A consumer
 /// reading displayname-as-a-DID could therefore be handed *somebody else's*
 /// DID. Splitting the tiers is the security fix; the assertion below is what
-/// makes the split checkable off-server. See
-/// `docs/superpowers/plans/2026-09-10-immutable-attested-did.md`.
+/// makes the split checkable off-server.
 ///
 /// `did_publication` carries the signing key and issuer for that third tier;
 /// `None` disables publication entirely.
@@ -2134,7 +2138,7 @@ pub async fn provision_synapse_device(
             // `SynapseClient::deactivate_user(.., erase: true)`) as "truly
             // absent" by the same M_UNKNOWN discriminator. If an erased
             // account ever completed sign-in again, this would resurrect a
-            // bare profile row (displayname = the localpart, since 2026-09-10)
+            // bare profile row (displayname = the generated alias, since 2026-09-11)
             // — accepted, since that reveals nothing beyond the mxid the caller
             // already presented to authenticate.
             if let Some(server_name) = server_name {
@@ -2933,8 +2937,7 @@ mod tests {
     // -- Signing key identity (H4/H5) -------------------------------------
     //
     // These pin the property the whole DID-assertion feature rests on: a `kid`
-    // names a KEY, so a key swap is diagnosable. See the `EcdsaSigningKey` doc
-    // and `docs/superpowers/plans/2026-09-10-immutable-attested-did.md`.
+    // names a KEY, so a key swap is diagnosable. See the `EcdsaSigningKey` doc.
 
     /// H4: two independently generated keys must NOT share a `kid`.
     ///

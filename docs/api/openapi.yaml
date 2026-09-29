@@ -371,9 +371,11 @@ paths:
       operationId: introspect
       summary: Token introspection (RFC 7662) — MSC3861
       description: |
-        Called by Synapse on every authenticated request. The response's `scope`
-        is what Synapse's `is_server_admin()` reads, so it is also how an
-        admin-scoped token gets its privilege.
+        Called by Synapse to validate the access token on authenticated
+        requests (Synapse caches a successful answer, `active: false` included,
+        for two minutes). The response's `scope` is what Synapse's
+        `is_server_admin()` reads, so it is also how an admin-scoped token gets
+        its privilege.
 
         `device_id` is rendered as JSON `null`, never `""`: Synapse 1.159
         rejects a present-but-empty device id with a 500.
@@ -834,7 +836,7 @@ components:
       properties:
         kind:
           type: string
-          enum: [profile, devices, device, deleted, deactivated, erased, reactivated, reset, reset_unconfirmed]
+          enum: [profile, devices, device, deleted, deactivated, erased, reactivated, completed, reset_unconfirmed]
         did: { type: string }
         user_id: { type: string }
         devices: { type: array, items: { type: object } }

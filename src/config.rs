@@ -144,9 +144,12 @@ pub struct Config {
     pub rp_id: Option<String>,
     /// WebAuthn expected origin. Defaults to `base_url` (scheme + host + port).
     pub rp_origin: Option<String>,
-    /// Shared secret for MSC3861 token introspection (Synapse delegates auth).
-    /// When set, the token endpoint issues opaque tokens stored in Redis instead
-    /// of JWTs, and the `/oauth2/introspect` endpoint becomes active.
+    /// The MAS shared secret (MSC3861 mode); must equal Synapse's
+    /// `matrix_authentication_service.secret`. It authenticates Synapse to
+    /// `/oauth2/introspect` and `/oauth2/admin_token`, and this provider to
+    /// Synapse's `/_synapse/mas/*`. When set, issued tokens carry the Matrix
+    /// `mat_`/`mcr_` prefixes and scopes (tokens are opaque and stored in Redis
+    /// in both modes) and those two endpoints become active.
     /// Env: `SIWEOIDC_MAS_SHARED_SECRET`
     pub mas_shared_secret: Option<String>,
     /// Synapse homeserver endpoint for provisioning calls (MSC3861 Agent C).
@@ -157,7 +160,9 @@ pub struct Config {
     /// Env: `SIWEOIDC_LOG_FORMAT`
     pub log_format: String,
     /// Matrix homeserver server_name (e.g. `matrix.inblock.io`).
-    /// Used for cross-signing pre-flight checks during device approval.
+    /// Needed wherever a full mxid is built: account and device actions,
+    /// session teardown, `io.inblock.did` publication, the `io.inblock.mxid`
+    /// userinfo claim and `GET /resolve`. Without it those degrade or are skipped.
     /// Env: `SIWEOIDC_MATRIX_SERVER_NAME`
     pub matrix_server_name: Option<String>,
     /// MSC4191: Account management URI advertised in OIDC discovery.

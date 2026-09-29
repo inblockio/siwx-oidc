@@ -968,17 +968,21 @@ async fn returning_user_new_device() {
 ///   MATRIX_HOST=https://matrix.inblock.io SIWEOIDC_HOST=https://siwx-oidc.inblock.io \
 ///     cargo test --test e2e_msc3861 msc4191_metadata -- --ignored --nocapture
 ///
-/// KNOWN SYNAPSE-VERSION/ENV LIMITATION (not a siwx-oidc bug): step 2 fails on
-/// the e2e-harness stack (Synapse 1.154.0). siwx-oidc's OWN OIDC discovery
-/// (`/.well-known/openid-configuration`) advertises all 11 actions correctly
-/// (step 1 passes), but Synapse 1.154 re-exports
-/// `/_matrix/client/v1/auth_metadata` WITHOUT the
-/// `account_management_actions_supported` array — it forwards
-/// `account_management_uri` only — so `assert_actions(&auth_meta, ...)` panics
+/// KNOWN SYNAPSE-VERSION/ENV LIMITATION (not a siwx-oidc bug), recorded while
+/// the e2e-harness stack pinned Synapse 1.154.0: step 2 failed there.
+/// siwx-oidc's OWN OIDC discovery (`/.well-known/openid-configuration`)
+/// advertises all 11 actions correctly (step 1 passes), but Synapse 1.154
+/// re-exported `/_matrix/client/v1/auth_metadata` WITHOUT the
+/// `account_management_actions_supported` array — it forwarded
+/// `account_management_uri` only — so `assert_actions(&auth_meta, ...)` panicked
 /// with "actions array missing". The verbatim forwarding this test asserts was
-/// observed on the older production Synapse; the current pinned harness version
-/// no longer re-exports that field. This is a Synapse behavior/version gap, not
+/// observed on the older production Synapse; the then-pinned harness version
+/// did not re-export that field. This is a Synapse behavior/version gap, not
 /// a regression in siwx-oidc (whose advertised set is unchanged and correct).
+/// Since 1.157, Synapse builds `auth_metadata` from the provider's discovery
+/// document with unknown keys kept (`ServerMetadata`, `extra="allow"`, in
+/// `synapse/api/auth/mas.py`), and the harness now builds the deployed image,
+/// so this note may no longer hold; re-run before relying on it either way.
 /// Left honestly red rather than weakened: do NOT relax step 2 to make it pass.
 #[tokio::test]
 #[ignore]

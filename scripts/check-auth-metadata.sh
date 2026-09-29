@@ -4,9 +4,13 @@
 #
 # Deploy-time guard against MSC3861 auth_metadata regressions.
 #
-# Synapse forwards experimental_features.msc3861.issuer_metadata VERBATIM to
-# browsers via GET /_matrix/client/v1/auth_metadata. If that metadata is
-# incomplete (missing response_types_supported / grant_types_supported /
+# Synapse forwards the OP's metadata to browsers via
+# GET /_matrix/client/v1/auth_metadata. Since Synapse 1.157 that is siwx-oidc's
+# own /.well-known/openid-configuration, fetched from
+# matrix_authentication_service.endpoint and forwarded with unknown keys kept;
+# before 1.157 an experimental_features.msc3861.issuer_metadata override, when
+# set, was forwarded VERBATIM instead. If that metadata is incomplete (missing
+# response_types_supported / grant_types_supported /
 # code_challenge_methods_supported) or contains non-public (docker-internal)
 # endpoint URLs, matrix-js-sdk rejects the issuer ("Issuer configuration not
 # valid"), Element Web silently falls back to the legacy /login/sso/redirect
@@ -102,9 +106,10 @@ contains("code_challenge_methods_supported", "S256")
 
 # js-sdk v42 (Element Web >= 1.12.24) additionally hard-requires
 # response_modes_supported with BOTH "query" and "fragment", and delivers the
-# auth response via fragment. siwx-oidc does not implement fragment response
-# mode yet, so this is a WARNING until that ships — flip to a violation once
-# it does. See docs/audits/2026-07-25-element-jssdk-v42-oauth-compat-finding.md.
+# auth response via fragment. siwx-oidc has advertised and honoured both since
+# 3018ffe (2026-07-25); this check is still a WARNING because it has not been
+# flipped to a violation yet. See
+# docs/audits/2026-07-25-element-jssdk-v42-oauth-compat-finding.md.
 rms = meta.get("response_modes_supported")
 if not (isinstance(rms, list) and "query" in rms and "fragment" in rms):
     print(

@@ -1,7 +1,10 @@
 //! WebAuthn/passkey ceremony — server-layer authentication (Layer 2).
 //!
-//! This module handles the full WebAuthn ceremony using the `webauthn-rs` safe API.
-//! It does NOT extend `DIDMethod` — see PLAN_webauthn.md for rationale.
+//! This module handles the full WebAuthn ceremony. Registration and challenge
+//! issuance use the `webauthn-rs` safe API; assertions are verified by
+//! `aqua_auth::verify_webauthn_assertion` against the challenge stored in Redis
+//! (see `verify_credential`).
+//! It does NOT extend `DIDMethod` — see docs/design/webauthn-plan.md for rationale.
 //!
 //! After successful authentication, the verified DID is stored in the Redis session.
 //! `sign_in` reads it from there (server-side, trusted).

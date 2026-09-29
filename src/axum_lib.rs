@@ -1319,7 +1319,9 @@ pub async fn main() {
         // SECURITY: never log private key material. Log only a non-sensitive
         // fingerprint of the *public* key so operators can correlate the live
         // key without exposing the secret. This key rotates on every restart
-        // (sessions break on restart) — set SIWEOIDC_SIGNING_KEY_PEM to persist.
+        // (ID tokens and signed userinfo issued before it stop verifying; the
+        // opaque access/refresh tokens live in Redis and are unaffected) — set
+        // SIWEOIDC_SIGNING_KEY_PEM to persist.
         //
         // Emitted at `warn!`, not `info!`: this is a degraded-mode announcement
         // with a second, quieter consequence that an operator MUST see, namely

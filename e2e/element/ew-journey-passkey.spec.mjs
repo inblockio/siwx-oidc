@@ -187,7 +187,8 @@ async function walkFirstDeviceWizard(page, prefix) {
  * independent OIDC session + WebAuthn assertion with the SAME resident passkey
  * and reads the server's own new-identity verdict:
  *
- *     new_user == is_localpart_available(did_to_localpart(did))   [CLAUDE.md]
+ *     new_user == resolve_identity_or_legacy(did).is_new   [src/axum_lib.rs]
+ *     (true only when neither the legacy nor the modern localpart is taken)
  *
  * `authenticate/finish` never provisions — only `/sign_in` does, and this never
  * calls it — so the probe is read-only with respect to account creation.

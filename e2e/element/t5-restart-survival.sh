@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # T5 (H-D1): restart-survival e2e leg — host driver.
 #
-# Plan: 2026-07-25-session-durability-no-forced-logins.md
-# (maintainers' internal session plan, not published)
-# H-D1: "If session state survives a full stack restart (durable AOF, named
-# volume, verified replay), then a client holding a valid refresh token stays
-# logged in with the SAME device_id; zero new device provisions."
+# H-D1 of the 2026-07-25 session-durability plan: "If session state survives a
+# full stack restart (durable AOF, named volume, verified replay), then a client
+# holding a valid refresh token stays logged in with the SAME device_id; zero new
+# device provisions."
 #
 # Four phases, run from the HOST (not inside the Playwright container, unlike
 # the specs themselves):

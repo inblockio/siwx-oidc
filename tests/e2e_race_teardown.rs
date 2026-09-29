@@ -1,6 +1,7 @@
 //! Deterministic HTTP E2E suite guarding the device-removal / session-cleanup
 //! RACE and TEARDOWN hazards of siwx-oidc (hazard register H1..H14 in
-//! `docs/audits/2026-06-14-siwx-oidc-requirement-map.md`).
+//! `docs/audits/2026-06-14-siwx-oidc-requirement-map.md`, which lives on the
+//! `audit/siwx-oidc-functional-harness` branch, not on main).
 //!
 //! Targets the MOCK stack brought up by `e2e/up.sh`:
 //!   - siwx-oidc on :8080  (SIWEOIDC_HOST)

@@ -8,11 +8,13 @@
 # (tests/e2e_session_teardown.rs, tests/e2e_msc3861.rs).
 #
 # Features under test:
-#   F1  logout / revoke delete the Synapse device (not just the Redis token)
+#   F1  logout deletes the Synapse device (not just the Redis token); revoke
+#       deliberately does not (token hygiene only, since the 2026-06-12 incident)
 #   F2  POST /_matrix/client/v3/logout/all (revoke all tokens + delete all devices,
 #       never deactivate)
 #   F3  account_erase (erase:true + token revoke + WebAuthn identity purge) and
-#       account_reactivate (admin PUT deactivated:false; MSC3861 feasibility UNKNOWN)
+#       account_reactivate (probed here via the admin PUT deactivated:false, found
+#       working 2026-06-10; siwx-oidc now calls POST /_synapse/mas/reactivate_user)
 #
 # WHAT RUNS WHEN:
 #   * Sections 1-2 (read-only) always run: discovery/metadata advertising + route wiring.
@@ -20,18 +22,27 @@
 #     throwaway user and only run with CONFIRM_DESTRUCTIVE=1 + TEST_LOCALPART set.
 #   * Section 4 (end-to-end logout teardown) runs only if you supply USER_TOKEN.
 #
-# SECRETS: the Synapse admin token (== the MAS shared secret) is read from $ADMIN_TOKEN
-# and is NEVER printed. Run this on the server (or a host that already holds the secret).
+# SECRETS: a Synapse admin-scoped access token is read from $ADMIN_TOKEN and is
+# NEVER printed. Before Synapse 1.157 this was the MAS shared secret itself; on
+# 1.157+ the shared secret answers 401 on /_synapse/admin/*, so mint a short-lived
+# token from siwx-oidc (POST /oauth2/admin_token, TTL <= 900 s) as shown below.
+# Run this on the server (or a host that already holds the secret).
 #
 # USAGE (run on the server, where the admin secret lives):
 #   export ISSUER=https://siwx-oidc.example.org   # required
 #   export MATRIX=https://matrix.example.org      # required
 #   export SERVER_NAME=example.org                # the Matrix server_name (mxid domain)
-#   export ADMIN_TOKEN="$(grep -oP 'shared_secret:\s*\K\S+' /path/to/mas/config)"  # do not echo it
+#   # An edge proxy should refuse /oauth2/admin_token and /_synapse/admin/* from
+#   # the internet, so mint from siwx-oidc's INTERNAL address, and point MATRIX at
+#   # Synapse's internal address for the admin-API sections (3-5):
+#   export ADMIN_TOKEN="$(curl -sS -X POST -H "Authorization: Bearer $MAS_SHARED_SECRET" \
+#     "$SIWX_INTERNAL_URL/oauth2/admin_token" | jq -r .access_token)"   # do not echo it
 #   # read-only checks:
 #   ./verify-lifecycle-live.sh
 #   # + the reactivation feasibility probe + erasure on a THROWAWAY user:
-#   export TEST_LOCALPART=did-pkh-eip155-1-0xdeadbeef...   # a disposable account localpart
+#   # a disposable account localpart (new accounts: 16 base36 chars; legacy
+#   # accounts: did-pkh-…):
+#   export TEST_LOCALPART=k3f9x2q7ab4d8m1p
 #   CONFIRM_DESTRUCTIVE=1 ./verify-lifecycle-live.sh
 #   # + end-to-end OIDC-layer logout teardown (paste a real access token, e.g. from
 #   #   Element devtools, that belongs to TEST_LOCALPART):
@@ -94,8 +105,10 @@ route_probe POST /_matrix/client/v3/logout/all  "logout/all"
 route_probe POST /oauth2/revoke                 "revoke"   # form endpoint; non-404 = wired
 
 # --- 3. REACTIVATION feasibility probe under MSC3861 (DESTRUCTIVE) ---------
-# This is the key unverified assumption: does Synapse admin reactivation
-# (PUT users {deactivated:false}) actually work when MAS owns auth?
+# Historical probe of the pre-1.157 path: does Synapse admin reactivation
+# (PUT users {deactivated:false}) work when MAS owns auth? Found working
+# 2026-06-10. account_reactivate now calls POST /_synapse/mas/reactivate_user,
+# which tests/e2e_account_lifecycle_live.rs exercises live.
 hdr "3. Reactivation feasibility under MSC3861 (DESTRUCTIVE, throwaway user)"
 if [ "$CONFIRM_DESTRUCTIVE" != 1 ] || [ -z "$ADMIN_TOKEN" ] || [ -z "$SERVER_NAME" ] || [ -z "$TEST_LOCALPART" ]; then
   skip "reactivation probe (needs CONFIRM_DESTRUCTIVE=1 + ADMIN_TOKEN + SERVER_NAME + TEST_LOCALPART)"

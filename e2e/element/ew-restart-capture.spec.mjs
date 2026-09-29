@@ -1,10 +1,9 @@
 /**
  * EW-T5-1: T5 phase 1 — capture pre-restart session state (H-D1).
  *
- * Plan: 2026-07-25-session-durability-no-forced-logins.md
- * (maintainers' internal session plan, not published)
- * Task T5 / Hypothesis H-D1: "If session state survives a full stack restart
- * (durable AOF, named volume, verified replay), then a client holding a valid
+ * Task T5 / Hypothesis H-D1 of the 2026-07-25 session-durability plan: "If
+ * session state survives a full stack restart (durable AOF, named volume,
+ * verified replay), then a client holding a valid
  * refresh token stays logged in with the SAME device_id; zero new device
  * provisions." This spec is the FIRST of two legs. It logs in, proves the
  * session is genuinely live, and writes everything the second leg needs to
