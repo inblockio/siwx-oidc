@@ -63,6 +63,11 @@ RUN if cargo about --color never generate --locked --fail about.hbs \
     test "$status" -eq 0 && ! grep -qE '\[(WARN|ERROR)\]' about.log
 
 FROM docker.io/library/alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+# A fixed unprivileged UID/GID, so file ownership on mounted volumes and
+# `runAsUser` policies can name it. Nothing is written at runtime (state lives
+# in Redis); the binaries and static/ stay root-owned and world-readable.
+RUN addgroup -S -g 10001 siwx-oidc \
+    && adduser -S -D -H -u 10001 -G siwx-oidc -s /sbin/nologin siwx-oidc
 COPY --from=builder /siwx-oidc/target/x86_64-unknown-linux-musl/release/siwx-oidc /usr/local/bin/
 # The credential backfill operator tool. `cargo build --release` above already
 # produces it, so shipping it costs nothing but is REQUIRED: the aqua-auth 0.7.0
@@ -87,6 +92,9 @@ COPY --from=node_builder /siwx-oidc/static/build/third-party-licenses.txt /usr/s
 # SIWXOIDC_ADDRESS; a legacy SIWEOIDC_ADDRESS cannot override this line.
 ENV SIWXOIDC_ADDRESS="0.0.0.0"
 EXPOSE 8000
+# Numeric, so a runtime that enforces runAsNonRoot can verify it without
+# reading /etc/passwd.
+USER 10001:10001
 ENTRYPOINT ["siwx-oidc"]
 LABEL org.opencontainers.image.source="https://github.com/inblockio/siwx-oidc"
 LABEL org.opencontainers.image.description="Key-first OpenID Connect provider and Matrix auth service: agents and people sign in with their own key, no passwords."
