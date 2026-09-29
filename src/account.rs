@@ -251,8 +251,8 @@ pub enum Action {
     DeviceDelete,
     /// `org.matrix.cross_signing_reset` (MSC4312).
     CrossSigningReset,
-    /// `org.matrix.account_deactivate`: permanently deactivate the account
-    /// (keeps profile/media; reversible via [`Action::Reactivate`]).
+    /// `org.matrix.account_deactivate`: deactivate the account until the user
+    /// reactivates it (keeps profile/media; reversible via [`Action::Reactivate`]).
     AccountDeactivate,
     /// `io.inblock.account_erase` (legacy alias `org.matrix.account_erase`):
     /// irreversibly erase the account (GDPR `erase:true` + Redis identity purge).
@@ -1115,10 +1115,17 @@ fn danger_gate_authed_html(
 }
 
 /// The deactivate confirmation, shared by both page states. It does not say
-/// "cannot be undone": an `erase: false` deactivation can be reversed (by a
-/// server admin), unlike an erasure, whose warning keeps that phrase.
-const DEACTIVATE_WARNING: &str = "This permanently deactivates your Matrix account and signs \
-     you out of every session. You cannot undo this yourself.";
+/// "permanent" or "cannot be undone": the user can reverse an `erase: false`
+/// deactivation themselves with [`Action::Reactivate`], which is deliberately
+/// exempt from `reject_if_deactivated`. Only an erasure is irreversible, and
+/// only its warning says so.
+const DEACTIVATE_WARNING: &str = "This deactivates your Matrix account and signs you out of \
+     every session. Your account stays deactivated until you reactivate it from this page. \
+     To delete your data permanently, use Erase instead.";
+
+/// The deactivate checkbox label: what the user actually confirms.
+const DEACTIVATE_CONFIRM_LABEL: &str =
+    "I understand my account will be deactivated until I reactivate it";
 
 /// The account-home menu of links (shown for the empty/landing action).
 fn menu_html(base: &str) -> String {
@@ -1160,7 +1167,7 @@ fn auth_section_html(
             Some(Action::AccountDeactivate) => danger_gate_html(
                 "confirm-deactivate",
                 DEACTIVATE_WARNING,
-                "I understand this is permanent",
+                DEACTIVATE_CONFIRM_LABEL,
             ),
             Some(Action::AccountErase) => danger_gate_html(
                 "confirm-erase",
@@ -1176,7 +1183,7 @@ fn auth_section_html(
         Some(Action::AccountDeactivate) => danger_gate_authed_html(
             "confirm-deactivate",
             DEACTIVATE_WARNING,
-            "I understand this is permanent",
+            DEACTIVATE_CONFIRM_LABEL,
             "Deactivate my account",
         ),
         Some(Action::AccountErase) => danger_gate_authed_html(
@@ -1234,10 +1241,9 @@ pub fn account_page_inner(
         ),
         Some(Action::DeviceView) => ("Session details", "Authenticate to view this device."),
         Some(Action::DeviceDelete) => ("Sign out device", "Authenticate to sign this device out."),
-        Some(Action::AccountDeactivate) => (
-            "Deactivate account",
-            "Confirm to permanently deactivate your account.",
-        ),
+        Some(Action::AccountDeactivate) => {
+            ("Deactivate account", "Confirm to deactivate your account.")
+        }
         Some(Action::AccountErase) => (
             "Erase account",
             "Confirm to irreversibly erase your account and all of its data.",
@@ -2128,12 +2134,15 @@ mod tests {
         )
         .0;
         assert!(
-            html.contains("permanently"),
-            "deactivate gate must warn it is permanent"
+            html.contains(
+                "Your account stays deactivated until you reactivate it from this page. \
+                 To delete your data permanently, use Erase instead."
+            ),
+            "deactivate gate must say how long it lasts and point to Erase"
         );
         assert!(
-            html.contains("You cannot undo this yourself."),
-            "deactivate gate must warn the user cannot undo it"
+            html.contains("I understand my account will be deactivated until I reactivate it"),
+            "the checkbox must name what the user confirms"
         );
         assert!(
             html.contains(r#"id="confirm-deactivate""#),
@@ -2153,12 +2162,13 @@ mod tests {
         );
     }
 
-    /// Deactivation (`erase: false`) can be reversed by a server admin, so its
-    /// warning must not call it irreversible; erasure cannot, so its warning
-    /// keeps "cannot be undone". Both page states: before re-authentication
-    /// and with a live account session.
+    /// The user can reverse a deactivation (`erase: false`) themselves with the
+    /// reactivate action, so its page must say exactly that and must not call
+    /// the deactivation permanent; an erasure cannot be reversed, so its warning
+    /// keeps "cannot be undone". Both page states: before re-authentication and
+    /// with a live account session.
     #[test]
-    fn only_erasure_is_described_as_impossible_to_undo() {
+    fn deactivation_is_described_as_reversible_and_only_erasure_as_final() {
         for authed in [false, true] {
             let deactivate = auth_section_html(
                 Some(Action::AccountDeactivate),
@@ -2167,14 +2177,30 @@ mod tests {
                 authed,
             );
             assert!(
-                deactivate.contains("You cannot undo this yourself."),
+                deactivate.contains(
+                    "Your account stays deactivated until you reactivate it from this page. \
+                     To delete your data permanently, use Erase instead."
+                ),
                 "authed={authed}: {deactivate}"
             );
             assert!(
-                !deactivate.contains("cannot be undone"),
-                "authed={authed}: a deactivation can be reversed by an admin, so it must \
-                 not be called irreversible: {deactivate}"
+                deactivate
+                    .contains("I understand my account will be deactivated until I reactivate it"),
+                "authed={authed}: {deactivate}"
             );
+            for claim in [
+                "cannot be undone",
+                "cannot undo",
+                "permanently deactivat",
+                "this is permanent",
+                "irreversible",
+            ] {
+                assert!(
+                    !deactivate.to_lowercase().contains(claim),
+                    "authed={authed}: the user can reactivate, so a deactivation must not \
+                     be described as final ({claim:?}): {deactivate}"
+                );
+            }
 
             let erase = auth_section_html(
                 Some(Action::AccountErase),

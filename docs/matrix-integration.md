@@ -502,10 +502,12 @@ included, to the action it dispatches.
   (400 `Missing action`) from an unknown one (400 `Unsupported action: …`).
 - **Destructive actions.** Deactivate and erase show a warning and a checkbox
   before the authentication buttons. The checkbox is friction only; the
-  signature is the authorization. The deactivation warning says "You cannot
-  undo this yourself.", because an `erase: false` deactivation can be
-  reversed by a server admin (and with `account_reactivate`). Only the erase
-  warning says "This cannot be undone.": an erased account cannot be restored.
+  signature is the authorization. The deactivation warning says "Your account
+  stays deactivated until you reactivate it from this page. To delete your data
+  permanently, use Erase instead.", because the user can reverse an
+  `erase: false` deactivation with `io.inblock.account_reactivate`, which is
+  exempt from the deactivation gate. Only the erase warning says "This cannot
+  be undone."
 - **Devices come from Synapse.** Listing and viewing use the Synapse admin API
   with a minted token, because the MAS API has no device-listing route (its
   device routes are write-only). `device_delete` deletes the Synapse device and
