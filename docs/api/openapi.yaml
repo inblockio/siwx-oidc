@@ -19,7 +19,9 @@ info:
   description: |
     siwx-oidc turns a wallet signature or a passkey into standard OIDC tokens.
     Any relying party can use it; the primary deployment target is Matrix
-    Synapse, where it **replaces MAS entirely** via MSC3861.
+    Synapse, where it is the auth service in Synapse's
+    `matrix_authentication_service` integration (the Matrix OAuth 2.0 API,
+    MSC3861).
 
     # Identity model
 
@@ -38,7 +40,8 @@ info:
 
     * **bearerToken** — an access token this provider issued, presented by the
       end user's client.
-    * **masSharedSecret** — the MSC3861 shared secret. Server-to-server only;
+    * **masSharedSecret** — the shared secret of Synapse's
+      `matrix_authentication_service` integration. Server-to-server only;
       the homeserver holds it. It must never traverse the public internet.
     * **registrationAccessToken** — returned by dynamic client registration and
       scoped to that one client record.
@@ -62,9 +65,9 @@ info:
 
 servers:
   - url: https://siwx-oidc.example.org
-    description: a deployment (its SIWEOIDC_BASE_URL)
+    description: a deployment (its SIWXOIDC_BASE_URL; the legacy SIWEOIDC_ prefix is also read)
   - url: http://localhost:8000
-    description: local default (SIWEOIDC_ADDRESS / SIWEOIDC_PORT)
+    description: local default (SIWXOIDC_ADDRESS / SIWXOIDC_PORT)
 
 tags:
   - name: OIDC
@@ -118,7 +121,7 @@ paths:
       summary: JSON Web Key Set
       description: |
         The public half of the ES256 signing key, plus any retired keys listed
-        in `SIWEOIDC_RETIRED_SIGNING_KEYS_PEM`. Each entry's `kid` is derived
+        in `SIWXOIDC_RETIRED_SIGNING_KEYS_PEM`. Each entry's `kid` is derived
         from the key material (first 16 hex of SHA-256 over the SEC1
         uncompressed public key), never a constant, so a rotated key fails as an
         honest "kid not present in JWKS" instead of a silent bad signature.
@@ -409,8 +412,8 @@ paths:
         `urn:synapse:admin:*`. This mints one.
 
         TTL is clamped **in code** to 30..=900s so a large
-        `SIWEOIDC_ADMIN_TOKEN_TTL_SECS` cannot promote it into a standing admin
-        key. Minting idempotently provisions `SIWEOIDC_ADMIN_TOKEN_LOCALPART`,
+        `SIWXOIDC_ADMIN_TOKEN_TTL_SECS` cannot promote it into a standing admin
+        key. Minting idempotently provisions `SIWXOIDC_ADMIN_TOKEN_LOCALPART`,
         which creates a real Matrix account.
       security: [{ masSharedSecret: [] }]
       responses:
@@ -710,12 +713,13 @@ components:
     bearerToken:
       type: http
       scheme: bearer
-      description: An access token issued by this provider (`mat_…` in MSC3861 mode).
+      description: An access token issued by this provider (`mat_…` in delegated-auth mode).
     masSharedSecret:
       type: http
       scheme: bearer
       description: |
-        The MSC3861 shared secret, compared for exact string equality.
+        The `matrix_authentication_service` shared secret, compared for exact
+        string equality.
         Server-to-server only — the homeserver holds it. Never expose these
         routes to the public internet.
     registrationAccessToken:
@@ -771,7 +775,7 @@ components:
           type: string
           description: |
             The caller's Matrix ID. **Omitted entirely — never null** — on a
-            standalone deployment with no `SIWEOIDC_MATRIX_SERVER_NAME`, because
+            standalone deployment with no `SIWXOIDC_MATRIX_SERVER_NAME`, because
             a present key asserts that the thing exists. Namespaced because no
             registered OIDC claim for a Matrix ID exists.
           example: "@1vo8g4vofiha69ua:matrix.example.org"
