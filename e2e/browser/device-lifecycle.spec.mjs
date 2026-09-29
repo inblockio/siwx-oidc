@@ -438,7 +438,7 @@ test('R-G6 + H13: account_erase deactivates(erase=true) AND purges WebAuthn cred
 
   // Erase via the page using the passkey (the re-auth proves the DID, then erase
   // runs deactivate(erase=true) + purge_identity for that DID).
-  await page.goto('/account?action=org.matrix.account_erase');
+  await page.goto('/account?action=io.inblock.account_erase');
   await page.locator('#confirm-erase').check();
   await page.click('#btn-passkey');
   await expect(page.getByText('Account erased')).toBeVisible();

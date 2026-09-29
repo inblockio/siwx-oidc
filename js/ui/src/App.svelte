@@ -29,6 +29,11 @@
 	let linkSuccess = false;
 	let client_metadata: any = {};
 	let mounted = false;
+	// The operator's terms and privacy policy, read from discovery
+	// (`op_tos_uri`, `op_policy_uri`), the same values the server-rendered
+	// pages link. Unset means none was configured, and the footer links nothing.
+	let tosUri: string | null = null;
+	let policyUri: string | null = null;
 
 	// --- Passkey scoping + new-user gate (Task 5) ---
 	// When /webauthn/authenticate/start is scoped by a valid siwx_user cookie the
@@ -84,6 +89,17 @@
 			window.location.replace(`/account${window.location.search}`);
 			return;
 		}
+
+		// Not awaited: the footer must never hold up sign-in. The server accepts
+		// only absolute http(s) URLs for both; anything else is ignored here too.
+		const httpUrl = (v: unknown) => (typeof v === 'string' && /^https?:\/\//i.test(v) ? v : null);
+		fetch(`${window.location.origin}/.well-known/openid-configuration`)
+			.then((resp) => (resp.ok ? resp.json() : {}))
+			.then((meta: Record<string, unknown>) => {
+				tosUri = httpUrl(meta.op_tos_uri);
+				policyUri = httpUrl(meta.op_policy_uri);
+			})
+			.catch((e) => console.error(e));
 
 		// Only fetch client metadata when a real client_id is present. A bare-root
 		// visit carries no client_id; fetching /client/null (or /client/undefined)
@@ -652,11 +668,12 @@
 
 			<!-- Footer -->
 			<div class="footer">
-				<p>
-					By continuing you agree to the
-					<a href="/legal/terms-of-use.html">Terms of Use</a> and
-					<a href="/legal/privacy-policy.html">Privacy Policy</a>.
-				</p>
+				{#if tosUri || policyUri}
+					<p>
+						By continuing you agree to the
+						{#if tosUri}<a href={tosUri}>Terms of Use</a>{/if}{#if tosUri && policyUri}{' and '}{/if}{#if policyUri}<a href={policyUri}>Privacy Policy</a>{/if}.
+					</p>
+				{/if}
 				{#if client_metadata.client_uri}
 					<p class="client-uri">Requested by {client_metadata.client_uri}</p>
 				{/if}

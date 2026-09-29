@@ -41,7 +41,7 @@ everything else exists only in the binary crate.
 | `device_auth.rs` | RFC 8628 device authorization: `/device_authorization`, the `/device` approval page (wallet and passkey), server-issued CAIP-122 nonces. |
 | `account.rs` | MSC4191 `/account` page and actions, MSC4312 cross-signing reset, and the two non-spec actions `io.inblock.account_erase` / `io.inblock.account_reactivate`. `SUPPORTED_ACTIONS` is the single source of truth for discovery and dispatch; `canonical_action` maps `session_*` aliases to `device_*` and the legacy `org.matrix.account_erase` / `org.matrix.account_reactivate` names to the new ones. |
 | `webauthn.rs` | Passkey ceremonies (register, authenticate, link), the new-identity and deactivation gates (`reject_if_new_identity`, `reject_if_deactivated`), picker scoping. |
-| `synapse_client.rs` | Synapse client with two credentials: the MAS shared secret on `/_synapse/mas/*` (`provision_user`, `upsert_device`, `allow_cross_signing_reset`, `localpart_status`, `delete_device`, `deactivate_user`, `reactivate_user`) and a minted admin-scoped token (`admin_request`) on `/_synapse/admin/*` and the client-server API (`list_devices`, `get_device`, `has_cross_signing_keys`, `read_profile`, `publish_did_field`, `read_did_field`). |
+| `synapse_client.rs` | Synapse client with two credentials: the MAS shared secret on `/_synapse/mas/*` (`provision_user`, `upsert_device`, `update_device_display_name`, `allow_cross_signing_reset`, `localpart_status`, `delete_device`, `deactivate_user`, `reactivate_user`) and a minted admin-scoped token (`admin_request`) on `/_synapse/admin/*` and the client-server API (`list_devices`, `get_device`, `has_cross_signing_keys`, `read_profile`, `publish_did_field`, `read_did_field`). |
 | `did_assertion.rs` | `DID_PROFILE_FIELD`, `mint_did_assertion` (compact ES256 JWS), `did_profile_value`, `DidPublication`. |
 | `resolve.rs` | `GET /resolve`, the public DID↔MXID lookup. |
 | `localpart.rs` | Grandfathering policy: `resolve_identity` (fallible) and `resolve_identity_or_legacy` (fail-safe to legacy). |
@@ -91,9 +91,9 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 14 tests in seven files:
-  `openapi_covers_every_route` (2), `localpart_vectors` (1) and `graceful_shutdown` (1), which
-  need nothing; `account_linking_dual_write` (6), which needs Redis on localhost;
+  `cargo test --workspace` runs the unit tests of both crates plus 16 tests in seven files:
+  `openapi_covers_every_route` (2), `localpart_vectors` (1) and `graceful_shutdown` (3), which
+  need nothing; `account_linking_dual_write` (6), which needs the test Redis;
   `credential_migration_live` (2), which needs its own disposable, empty Redis named by
   `MIGRATION_TEST_REDIS_URL`; and the pure check `an_absent_strict_skips_variable_means_strict`
   in `e2e_account_lifecycle_live` and in `e2e_did_field_live` (1 each).
@@ -138,11 +138,8 @@ endpoint, update `e2e/synapse_mock.py` in the same change (drift check in
 **A test must be able to fail.** A bound such as `n <= 1` is satisfied by zero, and a test
 that prints "skipping" and returns ok is green forever. Assert the positive case, and make
 skips loud and switchable into failures (`SIWX_TEST_REQUIRE_REDIS`, `E2E_STRICT_SKIPS`).
-Known gaps: `account_linking_dual_write` still builds its own client on `redis://localhost`
-rather than through `test_support`, so it ignores `SIWX_TEST_REDIS_URL` and, without Redis,
-fails after the 30-second timeout instead of skipping. `e2e_msc3861` and `e2e_messaging` skip
-their Matrix-side assertions with a plain `eprintln!` when whoami is unavailable, with no
-`E2E_STRICT_SKIPS` gate.
+Known gap: `e2e_msc3861` and `e2e_messaging` skip their Matrix-side assertions with a plain
+`eprintln!` when whoami is unavailable, with no `E2E_STRICT_SKIPS` gate.
 
 ## Invariants: do not "simplify" these
 
@@ -285,8 +282,9 @@ doc; read it before changing the code the rule covers.
   `h2_sequential_signins_mint_distinct_device_ids` (mock stack).
 - **A device is named only when a sign-in creates it**, after the OAuth client
   (`client_name`, else `client_id`), never a fixed brand. Synapse's `upsert_device`
-  overwrites an existing device's name whenever one is sent, so a client-supplied id is
-  named only when Synapse confirms the device is new. Pin:
+  overwrites an existing device's name whenever one is sent, so the upsert never carries
+  a name, and only a device it created (201) is then named via
+  `update_device_display_name`. Pin:
   `upsert_names_only_a_device_this_sign_in_creates`,
   `a_client_supplied_device_that_exists_keeps_its_name`,
   `sign_in_names_a_new_device_after_the_registered_client`.
@@ -336,7 +334,11 @@ doc; read it before changing the code the rule covers.
   `without_a_matrix_server_name_the_claim_is_omitted_not_null`,
   `the_claim_name_on_the_wire_is_io_inblock_mxid`, `the_signed_jwt_variant_carries_the_claim_too`.
 - **`io.inblock.resolve_endpoint` in discovery is read by an Element Web patch**; it is advertised
-  only when `/resolve` can answer. Pin: `provider_metadata_advertises_resolve_only_when_it_can_answer`.
+  only when `/resolve` can answer; account management likewise, and the device grant only in
+  delegated-auth mode, where `/device_authorization` is also the only place it is served. Pin:
+  `provider_metadata_advertises_resolve_only_when_it_can_answer`,
+  `account_management_is_advertised_only_when_the_actions_can_run`,
+  `device_authorization_is_refused_outside_delegated_auth_mode`.
 - **Admin tokens: both scopes, `device_id` null, TTL clamped in code to 30–900 s.** Never put a
   long-lived admin credential in configuration. Pin: `admin_scope_carries_both_required_scopes`,
   `ttl_clamp_caps_a_long_lived_request`, `ttl_clamp_raises_an_unusably_short_request`.
@@ -357,9 +359,12 @@ doc; read it before changing the code the rule covers.
 - **Registries are plain functions** (`all_did_methods`, `all_cipher_suites`), no `inventory`
   crate (not WASM-safe). New DID methods and namespaces are opt-in through config.
 - **aqua-auth has no logging** and no knowledge of ceremonies.
-- **SIGTERM shuts the server down gracefully.** In the image it is PID 1, which ignores a
-  signal it has no handler for, so without `shutdown_signal` `docker stop` waits 10 s and
-  SIGKILLs. Pin: `sigterm_finishes_and_exits_zero_with_an_idle_connection_open`.
+- **SIGTERM and SIGINT shut the server down gracefully**, answering requests already in flight.
+  In the image it is PID 1, which ignores a signal it has no handler for, so without
+  `shutdown_signal` `docker stop` waits 10 s and SIGKILLs. Pin:
+  `sigterm_finishes_and_exits_zero_with_an_idle_connection_open`,
+  `sigint_finishes_and_exits_zero_with_an_idle_connection_open`,
+  `a_request_in_flight_when_sigterm_arrives_is_still_answered`.
 - **Credential store: dual-write, not cut-over.** The legacy `webauthn:credential/*` namespace
   stays authoritative; mirror writes are best-effort; the backfill is additive and idempotent.
   Pin: `backfill_is_additive_link_aware_counter_preserving_and_idempotent` (needs its own

@@ -157,6 +157,28 @@ fn refresh_output(tokens: &AuthTokens, did_known: bool) -> Result<serde_json::Va
     Ok(value)
 }
 
+/// `--refresh-token`: exchange the refresh token for new tokens and build the
+/// JSON to print.
+///
+/// Split out of `main` so the rule is tested where it is applied: without key
+/// input no key is loaded or generated, the exchange is given no DID, and the
+/// output leaves `did` out. `exchange` performs the refresh request, given the
+/// DID to label the tokens with (empty when unknown); `main` passes
+/// [`refresh`].
+async fn refresh_command<F, Fut>(cli: &Cli, exchange: F) -> Result<serde_json::Value>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<AuthTokens>>,
+{
+    let key = refresh_key(cli)?;
+    let did = key.as_ref().map(SiwxKey::did);
+    if let Some(did) = &did {
+        eprintln!("DID: {did}");
+    }
+    let tokens = exchange(did.clone().unwrap_or_default()).await?;
+    refresh_output(&tokens, did.is_some())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -196,13 +218,10 @@ async fn main() -> Result<()> {
     }
 
     if let Some(rt) = &cli.refresh_token {
-        let key = refresh_key(&cli)?;
-        let did = key.as_ref().map(SiwxKey::did);
-        if let Some(did) = &did {
-            eprintln!("DID: {did}");
-        }
-        let tokens = refresh(server, client_id, rt, did.as_deref().unwrap_or_default()).await?;
-        let output = refresh_output(&tokens, did.is_some())?;
+        let output = refresh_command(&cli, |did| async move {
+            refresh(server, client_id, rt, &did).await
+        })
+        .await?;
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
     }
@@ -279,6 +298,41 @@ mod tests {
             key.did(),
             SiwxKey::ed25519_from_hex(HEX_SEED).unwrap().did()
         );
+    }
+
+    /// The whole refresh command, not just its helpers: with no key input the
+    /// exchange is given no DID and the printed JSON carries none. Generating
+    /// a key here would label the session with a random DID.
+    #[tokio::test]
+    async fn the_refresh_command_without_key_input_sends_and_prints_no_did() {
+        let seen = std::sync::Mutex::new(None);
+        let output = refresh_command(&parse(&[]), |did| {
+            *seen.lock().unwrap() = Some(did.clone());
+            async move { Ok(tokens(&did)) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some(""),
+            "no DID may be sent"
+        );
+        assert!(
+            output.get("did").is_none(),
+            "no DID may be printed: {output}"
+        );
+        assert_eq!(output["access_token"], "mat_example");
+    }
+
+    #[tokio::test]
+    async fn the_refresh_command_labels_the_tokens_with_a_supplied_key() {
+        let expected = SiwxKey::ed25519_from_hex(HEX_SEED).unwrap().did();
+        let output = refresh_command(&parse(&["--key-hex", HEX_SEED]), |did| async move {
+            Ok(tokens(&did))
+        })
+        .await
+        .unwrap();
+        assert_eq!(output["did"], expected.as_str());
     }
 
     #[test]

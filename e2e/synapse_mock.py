@@ -24,7 +24,7 @@ shared secret, which is now a hard 401 in production and used to be fine).
 
 | Surface | Credential | Routes |
 |---|---|---|
-| `/_synapse/mas/*` | `Authorization: Bearer <SECRET>`, exact string equality | provision_user, upsert_device, allow_cross_signing_reset, is_localpart_available, query_user, delete_device, delete_user, reactivate_user |
+| `/_synapse/mas/*` | `Authorization: Bearer <SECRET>`, exact string equality | provision_user, upsert_device, update_device_display_name, allow_cross_signing_reset, is_localpart_available, query_user, delete_device, delete_user, reactivate_user |
 | `/_synapse/admin/*` + the AUTHENTICATED C-S API | a **minted admin token** (`src/admin_token.rs`, `msa_` prefix), validated by REAL introspection against siwx-oidc | list_devices (get_device is list+filter), keys/query, PUT profile field |
 | the AUTHENTICATED C-S API, as the USER | the caller's OWN access token (`mat_` / standalone), validated by the SAME real introspection | account/whoami, GET devices |
 | the UNauthenticated C-S API | none | GET profile, GET profile field |
@@ -56,6 +56,7 @@ nondeterministic, so every admin request introspects.
   -- MAS surface (shared secret) ---------------------------------------------
   POST   /_synapse/mas/provision_user             synapse_client::provision_user
   POST   /_synapse/mas/upsert_device              synapse_client::upsert_device
+  POST   /_synapse/mas/update_device_display_name synapse_client::update_device_display_name
   POST   /_synapse/mas/allow_cross_signing_reset  synapse_client::allow_cross_signing_reset
   GET    /_synapse/mas/is_localpart_available     synapse_client::is_localpart_available
   GET    /_synapse/mas/query_user                 synapse_client::query_user
@@ -125,14 +126,16 @@ SERVER_NAME = os.environ.get("SYNAPSE_MOCK_SERVER_NAME", "matrix.test")
 # let the admin surface fail closed for a config reason while looking like a
 # product failure. Unset => every admin call answers 401 naming this variable.
 #
-# `SIWEOIDC_BASE_URL` is accepted as a fallback because it is the stack's own
-# authoritative spelling of the same value -- e2e/env.sh, e2e/up.sh and the CI
-# job all export it -- so reading it is not a guess. Without this, a harness
-# that sets only the standard variable (the `rust-e2e-mock` CI job does) gets a
-# mock that cannot authorise ANY admin call, which surfaces as a 400 on
-# `devices_list` and reads exactly like a product bug.
+# `SIWXOIDC_BASE_URL` (and its legacy spelling `SIWEOIDC_BASE_URL`, which the
+# server also still reads) is accepted as a fallback because it is the stack's
+# own authoritative spelling of the same value -- e2e/env.sh and e2e/up.sh export
+# it -- so reading it is not a guess. Without this, a harness that sets only the
+# server's variable gets a mock that cannot authorise ANY admin call, which
+# surfaces as a 400 on `devices_list` and reads exactly like a product bug. The
+# new name wins, as it does in the server.
 OIDC_BASE = (
     os.environ.get("SYNAPSE_MOCK_OIDC_BASE")
+    or os.environ.get("SIWXOIDC_BASE_URL")
     or os.environ.get("SIWEOIDC_BASE_URL")
     or ""
 ).rstrip("/")
@@ -303,7 +306,7 @@ def _introspect(token):
     """
     if not OIDC_BASE:
         return None, (
-            "neither SYNAPSE_MOCK_OIDC_BASE nor SIWEOIDC_BASE_URL is set, so "
+            "none of SYNAPSE_MOCK_OIDC_BASE, SIWXOIDC_BASE_URL or SIWEOIDC_BASE_URL is set, so "
             "this mock cannot introspect admin tokens; set one to the siwx-oidc "
             "base URL (see e2e/up.sh)"
         )
@@ -818,6 +821,14 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 _mark_profile(lp, body.get("set_displayname"))
             return self._send(200, {})
+        # POST /_synapse/mas/upsert_device {localpart, device_id, display_name?}
+        #
+        # Synapse 1.161.0 answers 201 when it inserted the device and 200 when it
+        # already existed, and OVERWRITES an existing device's name whenever one
+        # is sent (`DeviceHandler.upsert_device` -> `store.update_device`). Both
+        # are modelled: siwx-oidc must read the 201 to know a device is new, and
+        # a name it wrongly sent to an existing device must show up here the way
+        # it would on Synapse. This mock used to keep the old name, which hid it.
         if path == "/_synapse/mas/upsert_device":
             uid = _mxid(body["localpart"])
             with LOCK:
@@ -827,8 +838,30 @@ class Handler(BaseHTTPRequestHandler):
                 # repair every row-less account.
                 _mark_existing(body["localpart"])
                 devs = DEVICES.setdefault(uid, [])
-                if not any(d["device_id"] == body["device_id"] for d in devs):
+                existing = next((d for d in devs if d["device_id"] == body["device_id"]), None)
+                if existing is None:
                     devs.append(_device(body["device_id"], body.get("display_name")))
+                elif body.get("display_name") is not None:
+                    existing["display_name"] = body["display_name"]
+            return self._send(201 if existing is None else 200, {})
+        # POST /_synapse/mas/update_device_display_name {localpart, device_id, display_name}
+        #
+        # `display_name` is a required StrictStr; an unknown device is a 404
+        # (`update_device` raises NotFoundError on the store's 404).
+        if path == "/_synapse/mas/update_device_display_name":
+            name = body.get("display_name")
+            if not isinstance(name, str):
+                return self._send(400, {
+                    "errcode": "M_BAD_JSON",
+                    "error": "`display_name` is required and must be a string",
+                })
+            uid = _mxid(body.get("localpart", ""))
+            with LOCK:
+                dev = next((d for d in DEVICES.get(uid, [])
+                            if d["device_id"] == body.get("device_id")), None)
+                if dev is None:
+                    return self._send(404, {"errcode": "M_NOT_FOUND", "error": "Not found"})
+                dev["display_name"] = name
             return self._send(200, {})
         if path == "/_synapse/mas/allow_cross_signing_reset":
             return self._send(200, {})
@@ -888,18 +921,17 @@ class Handler(BaseHTTPRequestHandler):
                     PROFILE_FIELDS.pop(uid, None)
             return self._send(200, {})
         # POST /_synapse/mas/reactivate_user {localpart}
+        #
+        # Synapse 1.161.0 (`activate_account`) reactivates ANY deactivated
+        # account, erased or not: it calls `mark_user_not_erased`, recreates a
+        # blank profile row (`create_profile`) and clears the deactivated flag.
+        # This mock used to refuse an erased account, which Synapse does not do,
+        # and that hid a real hole: only siwx-oidc keeps an erasure final.
         if path == "/_synapse/mas/reactivate_user":
             uid = _mxid(body.get("localpart", ""))
             with LOCK:
-                cur = LIFECYCLE.get(uid, {"deactivated": False, "erased": False})
-                if cur.get("erased"):
-                    # Only an erase=false deactivation can be restored.
-                    return self._send(400, {
-                        "errcode": "M_UNKNOWN",
-                        "error": "cannot reactivate an erased account",
-                    })
-                cur["deactivated"] = False
-                LIFECYCLE[uid] = cur
+                LIFECYCLE[uid] = {"deactivated": False, "erased": False}
+                PROFILES.setdefault(uid, {"displayname": None, "avatar_url": None})
             return self._send(200, {})
         return self._send(404, {"errcode": "M_NOT_FOUND", "error": path})
 

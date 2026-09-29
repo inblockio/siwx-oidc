@@ -10,7 +10,7 @@
 //!
 //! | Surface | Auth | Calls |
 //! |---|---|---|
-//! | `/_synapse/mas/*` | `Authorization: Bearer {shared_secret}`, compared for **exact string equality** against `matrix_authentication_service.secret` | `provision_user`, `upsert_device`, `allow_cross_signing_reset`, `localpart_status` (and its two-valued wrapper `is_localpart_available`), `query_user`, `delete_device`, `deactivate_user`, `reactivate_user` |
+//! | `/_synapse/mas/*` | `Authorization: Bearer {shared_secret}`, compared for **exact string equality** against `matrix_authentication_service.secret` | `provision_user`, `upsert_device`, `update_device_display_name`, `allow_cross_signing_reset`, `localpart_status` (and its two-valued wrapper `is_localpart_available`), `query_user`, `delete_device`, `deactivate_user`, `reactivate_user` |
 //! | `/_synapse/admin/*` and the authenticated C-S API | a **minted, admin-scoped access token** ([`crate::admin_token`]) | `list_devices`, `get_device`, `has_cross_signing_keys`, `publish_did_field` |
 //!
 //! Presenting the shared secret on the second surface answers **401
@@ -83,6 +83,17 @@ pub struct MasUserInfo {
     pub is_suspended: bool,
     #[serde(default)]
     pub is_deactivated: bool,
+}
+
+/// What `upsert_device` did, read from Synapse's status: 201 is
+/// [`Created`](DeviceUpsert::Created), any other 2xx
+/// [`AlreadyExisted`](DeviceUpsert::AlreadyExisted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceUpsert {
+    /// This call inserted the device, so it has no name yet and is ours to name.
+    Created,
+    /// The device was already there; its name belongs to whoever set it.
+    AlreadyExisted,
 }
 
 /// A user's device/session as reported by Synapse's admin API.
@@ -477,23 +488,23 @@ impl SynapseClient {
         Ok(())
     }
 
-    /// Create or update a device for a user.
+    /// Create a device for a user, or confirm that it exists, WITHOUT a
+    /// display name (`POST /_synapse/mas/upsert_device`).
     ///
-    /// If the device already exists its display name is updated.
-    pub async fn upsert_device(
-        &self,
-        localpart: &str,
-        device_id: &str,
-        display_name: Option<&str>,
-    ) -> Result<()> {
+    /// Never sends a name, because Synapse OVERWRITES an existing device's name
+    /// whenever one is sent (1.161.0: `DeviceHandler.upsert_device` calls
+    /// `store.update_device(new_display_name=…)` when the device existed), and
+    /// only the caller that created the device may name it. Synapse answers 201
+    /// when it inserted the device and 200 when it already existed
+    /// (`rest/synapse/mas/devices.py`); only a 201 reads as
+    /// [`DeviceUpsert::Created`], so an unexpected 2xx names nothing. Name a
+    /// created device with [`update_device_display_name`](Self::update_device_display_name).
+    pub async fn upsert_device(&self, localpart: &str, device_id: &str) -> Result<DeviceUpsert> {
         let url = format!("{}/_synapse/mas/upsert_device", self.endpoint);
-        let mut body = json!({
+        let body = json!({
             "localpart": localpart,
             "device_id": device_id,
         });
-        if let Some(name) = display_name {
-            body["display_name"] = json!(name);
-        }
 
         let resp = self
             .http
@@ -504,11 +515,50 @@ impl SynapseClient {
             .await
             .context("upsert_device: request failed")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let status = resp.status();
+        if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
             warn!(%status, body = %body_text, "upsert_device failed");
             anyhow::bail!("upsert_device: HTTP {status}");
+        }
+        Ok(if status == reqwest::StatusCode::CREATED {
+            DeviceUpsert::Created
+        } else {
+            DeviceUpsert::AlreadyExisted
+        })
+    }
+
+    /// Set a device's display name
+    /// (`POST /_synapse/mas/update_device_display_name`). Overwrites the
+    /// current name, so call it only for a device this caller just created.
+    pub async fn update_device_display_name(
+        &self,
+        localpart: &str,
+        device_id: &str,
+        display_name: &str,
+    ) -> Result<()> {
+        let url = format!("{}/_synapse/mas/update_device_display_name", self.endpoint);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.shared_secret)
+            .json(&json!({
+                "localpart": localpart,
+                "device_id": device_id,
+                "display_name": display_name,
+            }))
+            .send()
+            .await
+            .context("update_device_display_name: request failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            warn!(%status, body = %body_text, "update_device_display_name failed");
+            anyhow::bail!(
+                "update_device_display_name: HTTP {status}{}",
+                mas_status_hint(status)
+            );
         }
         Ok(())
     }
@@ -856,7 +906,7 @@ impl SynapseClient {
     /// (below) for the pure decision function and its unit tests.
     ///
     /// **Erasure interplay:** a GDPR-erased account (`account::execute_action`'s
-    /// `org.matrix.account_erase`, which purges the profile via the MAS
+    /// `io.inblock.account_erase`, which purges the profile via the MAS
     /// `delete_user` call with `erase: true`) also 404s as "truly absent" by this
     /// same discriminator. If an erased account ever completed sign-in again this
     /// heal would resurrect a bare profile row (displayname = the generated
@@ -1082,8 +1132,11 @@ impl SynapseClient {
     ///   the account is restorable via [`reactivate_user`](Self::reactivate_user).
     ///   This backs `/account?action=org.matrix.account_deactivate`.
     /// * `erase = true` → the same deactivation **plus** GDPR erasure of the
-    ///   user's data. Irreversible. This backs
-    ///   `/account?action=org.matrix.account_erase`.
+    ///   user's data. This backs `/account?action=io.inblock.account_erase`.
+    ///   The deleted data does not come back, but Synapse does not make the
+    ///   erasure final: [`reactivate_user`](Self::reactivate_user) would
+    ///   reactivate the account. siwx-oidc refuses that itself, from a marker
+    ///   written before this call (`account::reactivation_gate`).
     ///
     /// `erase` is a **required** `StrictBool` in the MAS request model (no
     /// default, and no coercion from `"true"` or `1`), so it must be sent as a
@@ -1115,14 +1168,17 @@ impl SynapseClient {
         Ok(())
     }
 
-    /// Reactivate a previously (non-erased) deactivated account via the MAS API
+    /// Reactivate a deactivated account via the MAS API
     /// (`POST /_synapse/mas/reactivate_user`, body `{localpart}`).
     ///
     /// Ported from `PUT /_synapse/admin/v2/users/{mxid}` with
     /// `{"deactivated": false}`, which answers 401 on 1.157+. The MAS resource
     /// calls `deactivate_account_handler.activate_account(user_id)` — the same
-    /// handler the admin PUT reached — so the semantics carry over, including
-    /// the constraint that only an `erase = false` deactivation can be restored.
+    /// handler the admin PUT reached — so the semantics carry over. That
+    /// handler reactivates ANY deactivated account, an erased one included: it
+    /// clears the erased flag and recreates the profile row (1.161.0). Callers
+    /// must refuse an erased account BEFORE calling this; the account action
+    /// does, in `account::reactivation_gate`.
     ///
     /// The historical worry that reactivation demands a local password does not
     /// apply here at all: the MAS body carries only the localpart, so there is
@@ -1181,7 +1237,7 @@ impl SynapseClient {
     /// `_check_profile_size` and `get_profile_field` subscript an unguarded
     /// `txn.fetchone()`, so an account with a `users` row but **no `profiles`
     /// row** raises an uncaught `TypeError` and Synapse answers a bare 500 —
-    /// where a healthy account answers 404. 3 of 102 accounts on the dev
+    /// where a healthy account answers 404. A few accounts on the dev
     /// homeserver are in that state (erasure artifacts). That is a KNOWN
     /// CONDITION of a known-buggy dependency, reported as
     /// [`PublishOutcome::RowLessAccount`] and logged at `warn!`, not `error!`:
@@ -2605,7 +2661,7 @@ mod tests {
     /// **H2** — a 500 is `Ok(RowLessAccount)`, never `Err`.
     ///
     /// element-hq/synapse#19702 is unfixed in 1.159.0 and makes a `users`-row-
-    /// without-`profiles`-row account 500 on this route. 3 of 102 dev accounts
+    /// without-`profiles`-row account 500 on this route. A few dev accounts
     /// are in that state. Returning `Err` here would be *technically* harmless
     /// (the caller is best-effort) but it would report a known dependency bug
     /// as a failure of ours, on every login of those accounts, forever.

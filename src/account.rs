@@ -223,6 +223,16 @@ const ACTION_CROSS_SIGNING_RESET: &str = "org.matrix.cross_signing_reset";
 /// The two actions this project adds to MSC4191's set. They are not in the
 /// Matrix spec, so they carry this project's namespace, not `org.matrix.`,
 /// which belongs to matrix.org.
+/// Refusal for reactivating an erased account (see `Action::Reactivate`).
+const ERASED_NOT_REACTIVATABLE_MSG: &str =
+    "This account was erased. An erased account cannot be reactivated.";
+/// 503 when the erasure marker cannot be read, so reactivation is refused.
+const ERASURE_CHECK_UNAVAILABLE_MSG: &str =
+    "The server could not check this account right now. Please try again later.";
+/// 503 when the erasure cannot be recorded, so nothing is erased.
+const ERASURE_NOT_RECORDED_MSG: &str =
+    "The server could not erase this account right now. It was not erased; please try again later.";
+
 const ACTION_ACCOUNT_ERASE: &str = "io.inblock.account_erase";
 const ACTION_ACCOUNT_REACTIVATE: &str = "io.inblock.account_reactivate";
 
@@ -251,14 +261,15 @@ pub enum Action {
     DeviceDelete,
     /// `org.matrix.cross_signing_reset` (MSC4312).
     CrossSigningReset,
-    /// `org.matrix.account_deactivate`: permanently deactivate the account
-    /// (keeps profile/media; reversible via [`Action::Reactivate`]).
+    /// `org.matrix.account_deactivate`: deactivate the account until the user
+    /// reactivates it (keeps profile/media; reversible via [`Action::Reactivate`]).
     AccountDeactivate,
     /// `io.inblock.account_erase` (legacy alias `org.matrix.account_erase`):
     /// irreversibly erase the account (GDPR `erase:true` + Redis identity purge).
     AccountErase,
     /// `io.inblock.account_reactivate` (legacy alias
-    /// `org.matrix.account_reactivate`): restore an `erase:false`-deactivated account.
+    /// `org.matrix.account_reactivate`): restore an `erase:false`-deactivated
+    /// account. Refused for an erased one (the durable marker, not Synapse).
     Reactivate,
 }
 
@@ -680,8 +691,23 @@ async fn execute_action(
         Action::AccountErase => {
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
-            // Plant the deactivation tombstone FIRST (S3-4 / H6) so a concurrent
-            // refresh/mint cannot resurrect access during the erase sweep.
+            // Record the erasure BEFORE anything changes, and do not erase what
+            // cannot be recorded. Synapse would let the account come back: its
+            // `reactivate_user` (1.161.0) clears the erased flag and recreates the
+            // profile row, and `query_user` does not report erasure. This marker
+            // is what `Action::Reactivate` checks. If the erasure below then
+            // fails, the marker stays: it can only refuse a later reactivation,
+            // never allow one.
+            db_client
+                .mark_account_erased(&localpart, did)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "could not record the erasure; nothing was erased");
+                    CustomError::ServiceUnavailable(ERASURE_NOT_RECORDED_MSG.to_string())
+                })?;
+            // Then plant the deactivation tombstone (S3-4 / H6), still before
+            // Synapse, so a concurrent refresh/mint cannot resurrect access
+            // during the erase sweep.
             if let Err(e) = db_client.mark_user_deactivated(&localpart).await {
                 warn!(error = %e, "mark_user_deactivated failed (pre-erase)");
             }
@@ -725,30 +751,53 @@ async fn execute_action(
         Action::Reactivate => {
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
-            // Valid only for accounts deactivated with erase:false; an erased
-            // account cannot be restored. Self-service reactivation is verified
-            // working under MSC3861 (see SynapseClient::reactivate_user).
+            // Only an `erase: false` deactivation comes back. Synapse does not
+            // enforce that (see `reactivation_gate`), so ask the marker written
+            // at erase time BEFORE Synapse is asked to reactivate.
+            reactivation_gate(did, db_client.is_account_erased(&localpart, did).await)?;
             synapse
                 .reactivate_user(&localpart, server)
                 .await
                 .map_err(|e| {
                     warn!(error = %e, "reactivate_user failed during account action");
-                    // Reactivation is verified working under MSC3861 (live probe
-                    // 2026-06-10 on the pre-1.157 admin route; the current
-                    // `/_synapse/mas/reactivate_user` path is exercised live by
-                    // tests/e2e_account_lifecycle_live.rs), so this branch is a
-                    // genuine error path (e.g.
-                    // erased account, Synapse unreachable). Keep the honest
-                    // fallback: a server admin can always reactivate directly.
+                    // A genuine error (Synapse unreachable, a rejected shared
+                    // secret, an unknown user): the endpoint itself reactivates
+                    // any deactivated account. A server admin can still
+                    // reactivate directly.
                     CustomError::BadRequest(
-                        "Reactivation failed. Under delegated auth (MSC3861) the homeserver \
-                         may not support self-service reactivation; ask a server admin to \
+                        "Reactivation failed. Try again later, or ask a server admin to \
                          reactivate the account."
                             .to_string(),
                     )
                 })?;
             info!(did = %did, "account reactivated via account management");
             Ok(ActionOutcome::Reactivated)
+        }
+    }
+}
+
+/// Whether an account may be reactivated, given its erasure marker.
+///
+/// Synapse keeps nothing final: its `reactivate_user` (1.161.0) calls
+/// `activate_account`, which clears the erased flag and recreates the profile
+/// row, and `query_user` does not report erasure. So the marker written by
+/// `Action::AccountErase` decides. A marker that cannot be read refuses with a
+/// 503, never allows: an erasure the user was told cannot be undone must not
+/// be undone because Redis could not answer.
+fn reactivation_gate(did: &str, erased: anyhow::Result<bool>) -> Result<(), CustomError> {
+    match erased {
+        Ok(false) => Ok(()),
+        Ok(true) => {
+            info!(did = %did, "reactivation refused: the account was erased");
+            Err(CustomError::BadRequest(
+                ERASED_NOT_REACTIVATABLE_MSG.to_string(),
+            ))
+        }
+        Err(e) => {
+            warn!(did = %did, error = %e, "could not read the erasure marker; refusing reactivation");
+            Err(CustomError::ServiceUnavailable(
+                ERASURE_CHECK_UNAVAILABLE_MSG.to_string(),
+            ))
         }
     }
 }
@@ -864,8 +913,9 @@ pub async fn account_wallet(
     // therefore applies here too, or the sign-in fix would just move rather than
     // close. ONE deliberate exemption: `Reactivate` is the documented, auditable
     // way back from an `erase:false` deactivation, and gating it would make
-    // self-service reactivation impossible. An erased account cannot be restored
-    // regardless: Synapse refuses, and `reactivate_user` surfaces that.
+    // self-service reactivation impossible. An erased account stays erased even
+    // so: Synapse itself would restore it, so `execute_action` refuses
+    // Reactivate for an account carrying the marker written at erase time.
     if !matches!(action, Action::Reactivate) {
         wa::reject_if_deactivated(synapse_client, &req.did).await?;
     }
@@ -928,8 +978,9 @@ pub async fn account_passkey_finish(
     // therefore applies here too, or the sign-in fix would just move rather than
     // close. ONE deliberate exemption: `Reactivate` is the documented, auditable
     // way back from an `erase:false` deactivation, and gating it would make
-    // self-service reactivation impossible. An erased account cannot be restored
-    // regardless: Synapse refuses, and `reactivate_user` surfaces that.
+    // self-service reactivation impossible. An erased account stays erased even
+    // so: Synapse itself would restore it, so `execute_action` refuses
+    // Reactivate for an account carrying the marker written at erase time.
     if !matches!(action, Action::Reactivate) {
         wa::reject_if_deactivated(synapse_client, &resp.did).await?;
     }
@@ -1115,10 +1166,17 @@ fn danger_gate_authed_html(
 }
 
 /// The deactivate confirmation, shared by both page states. It does not say
-/// "cannot be undone": an `erase: false` deactivation can be reversed (by a
-/// server admin), unlike an erasure, whose warning keeps that phrase.
-const DEACTIVATE_WARNING: &str = "This permanently deactivates your Matrix account and signs \
-     you out of every session. You cannot undo this yourself.";
+/// "permanent" or "cannot be undone": the user can reverse an `erase: false`
+/// deactivation themselves with [`Action::Reactivate`], which is deliberately
+/// exempt from `reject_if_deactivated`. Only an erasure is irreversible, and
+/// only its warning says so.
+const DEACTIVATE_WARNING: &str = "This deactivates your Matrix account and signs you out of \
+     every session. Your account stays deactivated until you reactivate it from this page. \
+     To delete your data permanently, use Erase instead.";
+
+/// The deactivate checkbox label: what the user actually confirms.
+const DEACTIVATE_CONFIRM_LABEL: &str =
+    "I understand my account will be deactivated until I reactivate it";
 
 /// The account-home menu of links (shown for the empty/landing action).
 fn menu_html(base: &str) -> String {
@@ -1160,7 +1218,7 @@ fn auth_section_html(
             Some(Action::AccountDeactivate) => danger_gate_html(
                 "confirm-deactivate",
                 DEACTIVATE_WARNING,
-                "I understand this is permanent",
+                DEACTIVATE_CONFIRM_LABEL,
             ),
             Some(Action::AccountErase) => danger_gate_html(
                 "confirm-erase",
@@ -1176,7 +1234,7 @@ fn auth_section_html(
         Some(Action::AccountDeactivate) => danger_gate_authed_html(
             "confirm-deactivate",
             DEACTIVATE_WARNING,
-            "I understand this is permanent",
+            DEACTIVATE_CONFIRM_LABEL,
             "Deactivate my account",
         ),
         Some(Action::AccountErase) => danger_gate_authed_html(
@@ -1195,17 +1253,21 @@ fn auth_section_html(
 /// entry, and the signature used by the page-rendering unit tests).
 #[allow(dead_code)]
 pub fn account_page(query: AccountPageQuery, base_url: &str) -> Html<String> {
-    account_page_inner(query, base_url, None)
+    account_page_inner(query, base_url, None, "")
 }
 
 /// Render the account page. `authed_csrf` is `Some(csrf)` when the request
 /// carried a live account session, which switches the page into "already
 /// authenticated" mode: no fresh signature, and subsequent actions are driven
 /// in-page against `POST /account/action` carrying `csrf`.
+///
+/// `legal_footer` is [`crate::oidc::legal_footer_html`] for this deployment
+/// (empty when no terms or privacy policy are configured).
 pub fn account_page_inner(
     query: AccountPageQuery,
     base_url: &str,
     authed_csrf: Option<&str>,
+    legal_footer: &str,
 ) -> Html<String> {
     let action = query
         .action
@@ -1234,10 +1296,9 @@ pub fn account_page_inner(
         ),
         Some(Action::DeviceView) => ("Session details", "Authenticate to view this device."),
         Some(Action::DeviceDelete) => ("Sign out device", "Authenticate to sign this device out."),
-        Some(Action::AccountDeactivate) => (
-            "Deactivate account",
-            "Confirm to permanently deactivate your account.",
-        ),
+        Some(Action::AccountDeactivate) => {
+            ("Deactivate account", "Confirm to deactivate your account.")
+        }
         Some(Action::AccountErase) => (
             "Erase account",
             "Confirm to irreversibly erase your account and all of its data.",
@@ -1267,7 +1328,7 @@ pub fn account_page_inner(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} · inblock.io</title>
+<title>{page_title}</title>
 <link rel="icon" type="image/png" href="/favicon.png">
 <link href="https://api.fontshare.com/css?f[]=satoshi@300,400,500,700,900&display=swap" rel="stylesheet">
 <style>{css}</style>
@@ -1309,12 +1370,7 @@ pub fn account_page_inner(
         <span id="status-text"></span>
       </div>
 
-      <div class="footer">
-        <p>By continuing you agree to the
-          <a href="/legal/terms-of-use.html">Terms of Use</a> and
-          <a href="/legal/privacy-policy.html">Privacy Policy</a>.
-        </p>
-      </div>
+      {legal_footer}
     </div>
   </div>
 </div>
@@ -1323,6 +1379,8 @@ pub fn account_page_inner(
 </html>"##,
         css = ACCOUNT_PAGE_CSS,
         js = ACCOUNT_PAGE_JS,
+        page_title = crate::oidc::page_title(title, base_url),
+        legal_footer = legal_footer,
         title = title,
         subtitle = subtitle,
         action = action,
@@ -2047,6 +2105,8 @@ document.addEventListener('click', (ev) => {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn account_page_renders_cross_signing_reset() {
@@ -2116,6 +2176,29 @@ mod tests {
         );
     }
 
+    /// The account page carries the operator's legal links and no others, and
+    /// its title names the issuer host rather than a brand.
+    #[test]
+    fn account_page_footer_and_title_follow_the_deployment() {
+        let query = || AccountPageQuery {
+            action: None,
+            device_id: None,
+            id_token_hint: None,
+        };
+        let bare = account_page_inner(query(), "https://id.example.org", None, "").0;
+        assert!(!bare.contains("/legal/"), "no default legal links");
+        assert!(
+            !bare.contains(r#"class="footer""#),
+            "no footer without legal links"
+        );
+        assert!(bare.contains("<title>Account · id.example.org</title>"));
+
+        let tos = url::Url::parse("https://legal.example.org/terms").unwrap();
+        let footer = crate::oidc::legal_footer_html(Some(&tos), None);
+        let linked = account_page_inner(query(), "https://id.example.org", None, &footer).0;
+        assert!(linked.contains(r#"<a href="https://legal.example.org/terms">Terms of Use</a>"#));
+    }
+
     #[test]
     fn account_page_deactivate_shows_confirmation() {
         let html = account_page(
@@ -2128,12 +2211,15 @@ mod tests {
         )
         .0;
         assert!(
-            html.contains("permanently"),
-            "deactivate gate must warn it is permanent"
+            html.contains(
+                "Your account stays deactivated until you reactivate it from this page. \
+                 To delete your data permanently, use Erase instead."
+            ),
+            "deactivate gate must say how long it lasts and point to Erase"
         );
         assert!(
-            html.contains("You cannot undo this yourself."),
-            "deactivate gate must warn the user cannot undo it"
+            html.contains("I understand my account will be deactivated until I reactivate it"),
+            "the checkbox must name what the user confirms"
         );
         assert!(
             html.contains(r#"id="confirm-deactivate""#),
@@ -2153,12 +2239,13 @@ mod tests {
         );
     }
 
-    /// Deactivation (`erase: false`) can be reversed by a server admin, so its
-    /// warning must not call it irreversible; erasure cannot, so its warning
-    /// keeps "cannot be undone". Both page states: before re-authentication
-    /// and with a live account session.
+    /// The user can reverse a deactivation (`erase: false`) themselves with the
+    /// reactivate action, so its page must say exactly that and must not call
+    /// the deactivation permanent; an erasure cannot be reversed, so its warning
+    /// keeps "cannot be undone". Both page states: before re-authentication and
+    /// with a live account session.
     #[test]
-    fn only_erasure_is_described_as_impossible_to_undo() {
+    fn deactivation_is_described_as_reversible_and_only_erasure_as_final() {
         for authed in [false, true] {
             let deactivate = auth_section_html(
                 Some(Action::AccountDeactivate),
@@ -2167,14 +2254,30 @@ mod tests {
                 authed,
             );
             assert!(
-                deactivate.contains("You cannot undo this yourself."),
+                deactivate.contains(
+                    "Your account stays deactivated until you reactivate it from this page. \
+                     To delete your data permanently, use Erase instead."
+                ),
                 "authed={authed}: {deactivate}"
             );
             assert!(
-                !deactivate.contains("cannot be undone"),
-                "authed={authed}: a deactivation can be reversed by an admin, so it must \
-                 not be called irreversible: {deactivate}"
+                deactivate
+                    .contains("I understand my account will be deactivated until I reactivate it"),
+                "authed={authed}: {deactivate}"
             );
+            for claim in [
+                "cannot be undone",
+                "cannot undo",
+                "permanently deactivat",
+                "this is permanent",
+                "irreversible",
+            ] {
+                assert!(
+                    !deactivate.to_lowercase().contains(claim),
+                    "authed={authed}: the user can reactivate, so a deactivation must not \
+                     be described as final ({claim:?}): {deactivate}"
+                );
+            }
 
             let erase = auth_section_html(
                 Some(Action::AccountErase),
@@ -2700,6 +2803,7 @@ mod tests {
             },
             "https://siwx.example.com",
             Some("csrf"),
+            "",
         )
         .0;
         assert!(
@@ -3127,6 +3231,247 @@ mod tests {
         )
         .await;
         assert!(err.is_err(), "device_view requires server_name");
+    }
+
+    // -- Erasure is final (A2) ---------------------------------------------------
+    //
+    // Synapse 1.161.0 does not keep an erasure final: `reactivate_user` calls
+    // `activate_account`, which clears the erased flag and recreates the profile
+    // row. The homeserver below models exactly that, so a refusal can only come
+    // from siwx-oidc. The marker lives in Redis, so these skip loudly without it.
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    struct Lifecycle {
+        deactivated: bool,
+        erased: bool,
+    }
+
+    #[derive(Clone, Default)]
+    struct Homeserver {
+        users: Arc<Mutex<HashMap<String, Lifecycle>>>,
+        calls: Arc<Mutex<Vec<String>>>,
+        fail_delete_user: bool,
+    }
+
+    impl Homeserver {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn lifecycle(&self, localpart: &str) -> Lifecycle {
+            self.users.lock().unwrap()[localpart]
+        }
+    }
+
+    /// A homeserver holding one existing account, `localpart`, with Synapse
+    /// 1.161.0's MAS semantics for the three routes these actions use.
+    async fn spawn_homeserver(
+        localpart: &str,
+        fail_delete_user: bool,
+    ) -> (SynapseClient, Homeserver) {
+        use axum::extract::{Query, State};
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+
+        async fn available(
+            State(hs): State<Homeserver>,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> axum::response::Response {
+            if hs.users.lock().unwrap().contains_key(&q["localpart"]) {
+                let body = serde_json::json!({"errcode": "M_USER_IN_USE", "error": "in use"});
+                (StatusCode::BAD_REQUEST, Json(body)).into_response()
+            } else {
+                (StatusCode::OK, Json(serde_json::json!({}))).into_response()
+            }
+        }
+        async fn delete_user(
+            State(hs): State<Homeserver>,
+            Json(body): Json<serde_json::Value>,
+        ) -> StatusCode {
+            hs.calls.lock().unwrap().push("delete_user".to_string());
+            if hs.fail_delete_user {
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
+            let lp = body["localpart"].as_str().unwrap().to_string();
+            let erase = body["erase"].as_bool().unwrap();
+            hs.users.lock().unwrap().insert(
+                lp,
+                Lifecycle {
+                    deactivated: true,
+                    erased: erase,
+                },
+            );
+            StatusCode::OK
+        }
+        // `activate_account`: mark_user_not_erased + set_user_deactivated_status(False).
+        async fn reactivate_user(
+            State(hs): State<Homeserver>,
+            Json(body): Json<serde_json::Value>,
+        ) -> StatusCode {
+            hs.calls.lock().unwrap().push("reactivate_user".to_string());
+            let lp = body["localpart"].as_str().unwrap().to_string();
+            hs.users.lock().unwrap().insert(lp, Lifecycle::default());
+            StatusCode::OK
+        }
+
+        let hs = Homeserver {
+            fail_delete_user,
+            ..Default::default()
+        };
+        hs.users
+            .lock()
+            .unwrap()
+            .insert(localpart.to_string(), Lifecycle::default());
+        let app = Router::new()
+            .route("/_synapse/mas/is_localpart_available", get(available))
+            .route("/_synapse/mas/delete_user", post(delete_user))
+            .route("/_synapse/mas/reactivate_user", post(reactivate_user))
+            .with_state(hs.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (SynapseClient::new(&format!("http://{addr}"), "secret"), hs)
+    }
+
+    /// A fresh wallet DID in mixed case, and the modern localpart its account
+    /// is held under.
+    fn fresh_account() -> (String, String) {
+        let hex = format!(
+            "{}{}",
+            Uuid::new_v4().simple(),
+            &Uuid::new_v4().simple().to_string()[..8]
+        );
+        let did = format!("did:pkh:eip155:1:0xAb{}", &hex[2..]);
+        let localpart = siwx_oidc::mxid::localpart_for(&did);
+        (did, localpart)
+    }
+
+    #[tokio::test]
+    async fn an_erased_account_cannot_be_reactivated_although_synapse_would_allow_it() {
+        let Some(redis) = test_redis().await else {
+            return;
+        };
+        let (did, localpart) = fresh_account();
+        let (client, hs) = spawn_homeserver(&localpart, false).await;
+        let server = Some("matrix.test");
+
+        let erased = execute_action(
+            Action::AccountErase,
+            None,
+            &did,
+            Some(&client),
+            &redis,
+            server,
+        )
+        .await
+        .expect("erase must succeed");
+        assert_eq!(erased, ActionOutcome::Erased);
+
+        // The same wallet in another case is the same account.
+        for spelling in [did.clone(), did.to_lowercase()] {
+            let refused = execute_action(
+                Action::Reactivate,
+                None,
+                &spelling,
+                Some(&client),
+                &redis,
+                server,
+            )
+            .await;
+            assert!(
+                matches!(&refused, Err(CustomError::BadRequest(m)) if m == ERASED_NOT_REACTIVATABLE_MSG),
+                "{spelling}: an erased account must not come back, got {refused:?}"
+            );
+        }
+        assert!(
+            !hs.calls().contains(&"reactivate_user".to_string()),
+            "Synapse would reactivate an erased account, so it must never be asked: {:?}",
+            hs.calls()
+        );
+        assert_eq!(
+            hs.lifecycle(&localpart),
+            Lifecycle {
+                deactivated: true,
+                erased: true
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deactivated_account_can_still_be_reactivated() {
+        let Some(redis) = test_redis().await else {
+            return;
+        };
+        let (did, localpart) = fresh_account();
+        let (client, hs) = spawn_homeserver(&localpart, false).await;
+        let server = Some("matrix.test");
+
+        let deactivated = execute_action(
+            Action::AccountDeactivate,
+            None,
+            &did,
+            Some(&client),
+            &redis,
+            server,
+        )
+        .await
+        .expect("deactivate must succeed");
+        assert_eq!(deactivated, ActionOutcome::Deactivated);
+        let reactivated = execute_action(
+            Action::Reactivate,
+            None,
+            &did,
+            Some(&client),
+            &redis,
+            server,
+        )
+        .await
+        .expect("an erase:false deactivation must be reversible");
+        assert_eq!(reactivated, ActionOutcome::Reactivated);
+        assert_eq!(hs.lifecycle(&localpart), Lifecycle::default());
+    }
+
+    /// The marker is written BEFORE Synapse is asked to erase, so an erasure
+    /// whose outcome is unknown (here a 500, which may still have run) can only
+    /// refuse a later reactivation, never allow one.
+    #[tokio::test]
+    async fn the_erasure_marker_is_written_before_synapse_is_asked() {
+        let Some(redis) = test_redis().await else {
+            return;
+        };
+        let (did, localpart) = fresh_account();
+        let (client, hs) = spawn_homeserver(&localpart, true).await;
+        let server = Some("matrix.test");
+
+        let failed = execute_action(
+            Action::AccountErase,
+            None,
+            &did,
+            Some(&client),
+            &redis,
+            server,
+        )
+        .await;
+        assert!(failed.is_err(), "a failed erasure must not report success");
+        assert_eq!(hs.calls(), vec!["delete_user".to_string()]);
+        assert!(
+            redis.is_account_erased(&localpart, &did).await.unwrap(),
+            "the marker must already be in place when Synapse is asked"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_erasure_marker_refuses_reactivation_with_503() {
+        assert!(reactivation_gate("did:x", Ok(false)).is_ok());
+        assert!(matches!(
+            reactivation_gate("did:x", Ok(true)),
+            Err(CustomError::BadRequest(m)) if m == ERASED_NOT_REACTIVATABLE_MSG
+        ));
+        assert!(matches!(
+            reactivation_gate("did:x", Err(anyhow::anyhow!("Redis pool: timed out"))),
+            Err(CustomError::ServiceUnavailable(m)) if m == ERASURE_CHECK_UNAVAILABLE_MSG
+        ));
     }
 
     // -- Account session + session-backed action (Fix C) ----------------------

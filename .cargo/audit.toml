@@ -19,7 +19,7 @@ ignore = [
   # public-key verify of passkey assertions/attestations). Public-key verification is
   # not the vulnerable operation.
   # Evidence + VEX: security/EXCEPTIONS.md, security/vex/siwx-oidc.openvex.json
-  # Decided: Tim Bansemer, 2026-09-29.
+  # Decided: the maintainer, 2026-09-29.
   # Review trigger (first of): an rsa release that fixes Marvin (0.10 line), siwx-oidc
   # starting to hold RSA private keys (e.g. an RS256 signing option), or 2027-03-29.
   "RUSTSEC-2023-0071",

@@ -82,8 +82,12 @@ hdr "1. New actions advertised (OIDC discovery + Synapse auth_metadata)"
 check_actions() { # url label
   local doc; doc="$(curl -sS "$1" 2>/dev/null)" || { red "$2 unreachable ($1)"; return; }
   local acts; acts="$(jq -r '.account_management_actions_supported // [] | join(",")' <<<"$doc" 2>/dev/null)"
-  for want in org.matrix.account_erase org.matrix.account_reactivate org.matrix.account_deactivate; do
+  for want in io.inblock.account_erase io.inblock.account_reactivate org.matrix.account_deactivate; do
     if grep -q "$want" <<<"$acts"; then green "$2 advertises $want"; else red "$2 MISSING $want (got: $acts)"; fi
+  done
+  # The pre-rename names are accepted as aliases but never advertised.
+  for legacy in org.matrix.account_erase org.matrix.account_reactivate; do
+    if grep -q "$legacy" <<<"$acts"; then red "$2 still advertises legacy $legacy"; else green "$2 does not advertise legacy $legacy"; fi
   done
 }
 check_actions "${ISSUER}/.well-known/openid-configuration" "OIDC discovery"
@@ -130,7 +134,7 @@ else
   echo "  reactivate PUT -> HTTP $rea_code; body: $(head -c 300 <<<"$rea_body")"
   after_re="$(admin_curl GET "/_synapse/admin/v2/users/$(jq -rn --arg s "$ID" '$s|@uri')")"
   if [ "$(jq -r '.deactivated' <<<"${after_re%$'\n'*}" 2>/dev/null)" = false ]; then
-    green "REACTIVATION SUPPORTED under MSC3861 (keep org.matrix.account_reactivate advertised)"
+    green "REACTIVATION SUPPORTED under MSC3861 (keep io.inblock.account_reactivate advertised)"
   else
     red  "REACTIVATION BLOCKED under MSC3861 (HTTP $rea_code) -> drop account_reactivate from SUPPORTED_ACTIONS or keep ask-admin message; user '$ID' is left DEACTIVATED"
   fi

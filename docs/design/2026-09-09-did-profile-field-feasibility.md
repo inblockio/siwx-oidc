@@ -425,7 +425,7 @@ and to the eventual `org.aqua-protocol.did` implementation's own docs.
    field doesn't change it, it only fixes the *display/discovery* half.
 3. **Handle the row-less-account edge case defensively.** Both the write (`PUT`)
    and — newly discovered here — the **read** (`GET`) of a custom field 500 on an
-   account with a `users` row but no `profiles` row (currently 3/102 accounts on
+   account with a `users` row but no `profiles` row (currently a few accounts on
    dev, all erasure artifacts). Wrap both the write-after-provision call and any
    future read-back of `org.aqua-protocol.did` to treat a 500 from this specific
    endpoint as "unknown," not as an error worth surfacing loudly — this is a

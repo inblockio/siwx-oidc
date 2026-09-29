@@ -34,8 +34,8 @@ spelling is still accepted; see [configuration.md](configuration.md).
 | Synapse calls | none | also needs `SIWXOIDC_SYNAPSE_ENDPOINT` |
 | Relying parties | any OIDC client | any OIDC client, plus Synapse and Matrix clients |
 | Token introspection (`/oauth2/introspect`) | 404 | active |
-| Device-code grant | refused | active |
-| DID publication, `/resolve` | off | also needs `SIWXOIDC_MATRIX_SERVER_NAME` |
+| Device-code grant (`/device_authorization`, `/token`) | refused | active |
+| DID publication, `/resolve`, account actions | off | also needs `SIWXOIDC_MATRIX_SERVER_NAME` |
 
 Older text in this repository, and some error messages and code comments, call
 the delegated-auth mode "MSC3861 mode". It means the same thing: the shared
@@ -45,7 +45,13 @@ Discovery follows the mode. `introspection_endpoint`,
 `introspection_endpoint_auth_methods_supported`,
 `device_authorization_endpoint` and the device-code grant type in
 `grant_types_supported` appear only in delegated-auth mode; a standalone
-deployment advertises `authorization_code` and `refresh_token` only.
+deployment advertises `authorization_code` and `refresh_token` only, and
+refuses `/device_authorization` and the device-code grant with
+`unsupported_grant_type`. `account_management_uri`,
+`account_management_actions_supported` and `io.inblock.resolve_endpoint`
+appear only when a Synapse client and `SIWXOIDC_MATRIX_SERVER_NAME` are both
+configured, since without them `/resolve` answers 503 and every account action
+400.
 
 ## How Synapse is wired
 
@@ -109,7 +115,7 @@ interchangeable:
 
 | Surface | Credential | Calls |
 |---|---|---|
-| `/_synapse/mas/*` | the shared secret | `provision_user`, `is_localpart_available`, `query_user`, `upsert_device`, `delete_device`, `allow_cross_signing_reset`, `delete_user` (deactivate/erase), `reactivate_user` |
+| `/_synapse/mas/*` | the shared secret | `provision_user`, `is_localpart_available`, `query_user`, `upsert_device`, `update_device_display_name`, `delete_device`, `allow_cross_signing_reset`, `delete_user` (deactivate/erase), `reactivate_user` |
 | `/_synapse/admin/*` and the client-server API | a **minted admin-scoped token** ([below](#admin-scoped-token-mint)) | `GET /_synapse/admin/v2/users/{mxid}/devices` (list, view), `POST /_matrix/client/v3/keys/query` (cross-signing readback), `PUT`/`GET /_matrix/client/v3/profile/{mxid}/io.inblock.did` |
 
 The shared secret answers 401 `M_UNKNOWN_TOKEN` on the second surface. A wrong
@@ -394,16 +400,17 @@ logged and never fails the sign-in.
    overwritten.
 3. **DID field.** `io.inblock.did` is published (see
    [identity-model.md](identity-model.md#publication)).
-4. **Device.** `upsert_device` creates or updates the device. The device ID is
-   the one the client requested in its scope (`urn:matrix:client:device:{id}`
-   or the MSC2967 unstable form); otherwise `SIWX_` + 8 hex characters. A
-   device this sign-in creates is named after the OAuth client: its registered
-   `client_name`, else its client ID, cut to Synapse's 100-character limit.
-   An existing device keeps its name. Synapse's `upsert_device` overwrites the
-   name of an existing device whenever one is sent, so for a client-requested
-   ID siwx-oidc first lists the user's devices (admin API) and sends a name
-   only when the device is new; when it cannot tell (no
-   `SIWXOIDC_MATRIX_SERVER_NAME`, or the read failed), it sends none.
+4. **Device.** `upsert_device` creates the device, or confirms it exists. The
+   device ID is the one the client requested in its scope
+   (`urn:matrix:client:device:{id}` or the MSC2967 unstable form); otherwise
+   `SIWX_` + 8 hex characters. A device this sign-in creates is named after
+   the OAuth client: its registered `client_name` (the untagged one, else the
+   one with the smallest language tag), else its client ID, cut to Synapse's
+   100-character limit. An existing device keeps its name. Synapse's
+   `upsert_device` overwrites the name of an existing device whenever one is
+   sent, so siwx-oidc upserts without a name and, only when Synapse answers
+   201 (created), sets the name with `update_device_display_name`. Any other
+   success status leaves the device unnamed.
 5. **Cross-signing reset window.** `allow_cross_signing_reset` is called on
    every sign-in, so a client that is halfway through a key reset can publish
    replacement keys (see [Cross-signing](#cross-signing)).
@@ -470,7 +477,7 @@ override with `SIWXOIDC_ACCOUNT_MANAGEMENT_URI`) and
 | `org.matrix.cross_signing_reset` | | allow a cross-signing reset (MSC4312) |
 | `org.matrix.account_deactivate` | | deactivate the account (`delete_user` with `erase: false`) and revoke all tokens |
 | `io.inblock.account_erase` | `org.matrix.account_erase` | **not in the spec.** Erase the account (`delete_user` with `erase: true`: profile, media and room memberships), revoke all tokens, and delete the DID's passkey credentials and links |
-| `io.inblock.account_reactivate` | `org.matrix.account_reactivate` | **not in the spec.** Reactivate an account deactivated with `erase: false` (`reactivate_user`) |
+| `io.inblock.account_reactivate` | `org.matrix.account_reactivate` | **not in the spec.** Reactivate an account deactivated with `erase: false` (`reactivate_user`). An erased account is refused, see below |
 
 `io.inblock.account_erase` and `io.inblock.account_reactivate` are
 project-specific: Matrix does not define them, so they carry this project's
@@ -502,10 +509,23 @@ included, to the action it dispatches.
   (400 `Missing action`) from an unknown one (400 `Unsupported action: …`).
 - **Destructive actions.** Deactivate and erase show a warning and a checkbox
   before the authentication buttons. The checkbox is friction only; the
-  signature is the authorization. The deactivation warning says "You cannot
-  undo this yourself.", because an `erase: false` deactivation can be
-  reversed by a server admin (and with `account_reactivate`). Only the erase
-  warning says "This cannot be undone.": an erased account cannot be restored.
+  signature is the authorization. The deactivation warning says "Your account
+  stays deactivated until you reactivate it from this page. To delete your data
+  permanently, use Erase instead.", because the user can reverse an
+  `erase: false` deactivation with `io.inblock.account_reactivate`, which is
+  exempt from the deactivation gate. Only the erase warning says "This cannot
+  be undone."
+- **Erasure is final because siwx-oidc makes it so, not Synapse.** Synapse's
+  `reactivate_user` reactivates any deactivated account: it clears the erased
+  flag and recreates a blank profile row (1.161.0, `activate_account`), and
+  `query_user` does not report erasure. So erase first writes a marker to Redis
+  with no expiry (`erased:user/{localpart}` and `erased:did/{sha256 of the
+  canonical DID}`) and refuses to erase if it cannot; reactivate refuses an
+  account carrying either marker with a 400, before Synapse is asked, and a
+  marker it cannot read with a 503. The erased data itself (profile, media,
+  room memberships, passkeys) is gone either way. A server admin can still
+  reactivate the account in Synapse directly, and flushing Redis removes the
+  markers.
 - **Devices come from Synapse.** Listing and viewing use the Synapse admin API
   with a minted token, because the MAS API has no device-listing route (its
   device routes are write-only). `device_delete` deletes the Synapse device and
@@ -682,9 +702,11 @@ symbol in the code.
 - **Revoke never deletes a device.** Device deletion belongs to explicit
   sign-out paths only (`compat::TeardownPolicy`).
 - **Never delete and then reuse a device ID.** Sign-in only upserts.
-- **Name a device only when this sign-in creates it**
-  (`oidc::upsert_display_name`). A name sent with `upsert_device` overwrites
-  the one the user chose.
+- **Name a device only when this sign-in creates it.** `upsert_device` never
+  carries a name, because a name sent with it overwrites the one the user
+  chose; a device the upsert created (Synapse answers 201) is then named with
+  `update_device_display_name`. The 201 is race-free, unlike a separate
+  existence check.
 - **`logout/all` never deactivates the account.**
 - **Deny-list, never allow-list,** in the Synapse patch configuration.
 - **Run the deactivation gate before `resolve_identity_or_legacy`** at sign-in,
