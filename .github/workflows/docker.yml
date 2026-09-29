@@ -86,30 +86,28 @@ jobs:
     needs: build-and-push
     if: ${{ github.repository == 'inblockio/siwx-oidc' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
-    env:
-      DEV_DEPLOY_HOST: ${{ vars.DEV_DEPLOY_HOST }}
-      DEV_DEPLOY_PORT: ${{ vars.DEV_DEPLOY_PORT }}
-      DEV_DEPLOY_USER: ${{ vars.DEV_DEPLOY_USER }}
-      DEV_DEPLOY_KNOWN_HOSTS: ${{ vars.DEV_DEPLOY_KNOWN_HOSTS }}
+    # Repository variables are NOT masked: any step that binds one prints its
+    # value in the step's log header, and this repository's logs are public.
+    # So the values are bound only to the steps that need them (which run only
+    # once the deploy key exists), and the guard below inspects them through
+    # expressions that yield variable NAMES, never values.
     steps:
       # Variable guard: FAILS the job, loudly, when the deploy target is not
       # fully configured. Deliberately not a skip: a silently skipped deploy
       # leaves dev-staging on the previous image while the run shows green.
       - name: Require deploy target variables
+        env:
+          MISSING: >-
+            ${{ vars.DEV_DEPLOY_HOST == '' && 'DEV_DEPLOY_HOST' || '' }}
+            ${{ vars.DEV_DEPLOY_PORT == '' && 'DEV_DEPLOY_PORT' || '' }}
+            ${{ vars.DEV_DEPLOY_USER == '' && 'DEV_DEPLOY_USER' || '' }}
+            ${{ vars.DEV_DEPLOY_KNOWN_HOSTS == '' && 'DEV_DEPLOY_KNOWN_HOSTS' || '' }}
         run: |
-          missing=()
-          for name in DEV_DEPLOY_HOST DEV_DEPLOY_PORT DEV_DEPLOY_USER DEV_DEPLOY_KNOWN_HOSTS; do
-            if [ -z "${!name}" ]; then missing+=("$name"); fi
-          done
-          if [ "${#missing[@]}" -gt 0 ]; then
-            echo "::error title=Dev-staging deploy target not configured::Repository variable(s) empty: ${missing[*]}. Set them under Settings > Secrets and variables > Actions > Variables (gh variable set NAME -R ${GITHUB_REPOSITORY}). Refusing to skip silently: dev-staging would stay on the previous image."
+          missing=$(echo $MISSING)
+          if [ -n "$missing" ]; then
+            echo "::error title=Dev-staging deploy target not configured::Repository variable(s) empty: ${missing}. Set them under Settings > Secrets and variables > Actions > Variables (gh variable set NAME -R ${GITHUB_REPOSITORY}). Refusing to skip silently: dev-staging would stay on the previous image."
             exit 1
           fi
-          case "$DEV_DEPLOY_PORT" in
-            ''|*[!0-9]*)
-              echo "::error title=Invalid DEV_DEPLOY_PORT::DEV_DEPLOY_PORT must be a port number."
-              exit 1 ;;
-          esac
 
       # Secret-presence guard: while DEV_STAGING_DEPLOY_KEY is not set, the
       # push-model deploy is dormant by design. The host's own pull-model
@@ -130,6 +128,8 @@ jobs:
 
       - name: Pin dev-staging host key
         if: steps.check-secret.outputs.ok == 'true'
+        env:
+          DEV_DEPLOY_KNOWN_HOSTS: ${{ vars.DEV_DEPLOY_KNOWN_HOSTS }}
         run: |
           install -m 700 -d ~/.ssh
           umask 077
@@ -137,7 +137,16 @@ jobs:
 
       - name: Deploy to dev-staging (forced command runs the deploy script)
         if: steps.check-secret.outputs.ok == 'true'
+        env:
+          DEV_DEPLOY_HOST: ${{ vars.DEV_DEPLOY_HOST }}
+          DEV_DEPLOY_PORT: ${{ vars.DEV_DEPLOY_PORT }}
+          DEV_DEPLOY_USER: ${{ vars.DEV_DEPLOY_USER }}
         run: |
+          case "$DEV_DEPLOY_PORT" in
+            ''|*[!0-9]*)
+              echo "::error title=Invalid DEV_DEPLOY_PORT::DEV_DEPLOY_PORT must be a port number."
+              exit 1 ;;
+          esac
           ssh -p "$DEV_DEPLOY_PORT" \
             -i ~/.ssh/dev_staging_deploy_key \
             -o UserKnownHostsFile=~/.ssh/dev_staging_known_hosts \
