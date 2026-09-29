@@ -334,7 +334,11 @@ doc; read it before changing the code the rule covers.
   `without_a_matrix_server_name_the_claim_is_omitted_not_null`,
   `the_claim_name_on_the_wire_is_io_inblock_mxid`, `the_signed_jwt_variant_carries_the_claim_too`.
 - **`io.inblock.resolve_endpoint` in discovery is read by an Element Web patch**; it is advertised
-  only when `/resolve` can answer. Pin: `provider_metadata_advertises_resolve_only_when_it_can_answer`.
+  only when `/resolve` can answer; account management likewise, and the device grant only in
+  delegated-auth mode, where `/device_authorization` is also the only place it is served. Pin:
+  `provider_metadata_advertises_resolve_only_when_it_can_answer`,
+  `account_management_is_advertised_only_when_the_actions_can_run`,
+  `device_authorization_is_refused_outside_delegated_auth_mode`.
 - **Admin tokens: both scopes, `device_id` null, TTL clamped in code to 30–900 s.** Never put a
   long-lived admin credential in configuration. Pin: `admin_scope_carries_both_required_scopes`,
   `ttl_clamp_caps_a_long_lived_request`, `ttl_clamp_raises_an_unusably_short_request`.

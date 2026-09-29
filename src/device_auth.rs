@@ -66,11 +66,19 @@ pub struct DeviceAuthResponse {
 ///
 /// Validates the client, generates a device code and user code, stores both in
 /// Redis, and returns the URIs the device should display to the user.
+///
+/// Outside delegated-auth mode it refuses before anything is stored, with the
+/// same `unsupported_grant_type` the token endpoint gives the grant: a code
+/// issued there could be approved by the user but never redeemed.
 pub async fn device_authorization(
     config: &Config,
     db_client: &(dyn DBClient + Sync),
     form: DeviceAuthRequest,
 ) -> Result<DeviceAuthResponse, CustomError> {
+    if !crate::oidc::delegated_auth_enabled(config) {
+        return Err(crate::oidc::device_grant_unsupported());
+    }
+
     // 1. Validate client_id
     let _client = db_client
         .get_client(form.client_id.clone())
@@ -1089,6 +1097,60 @@ pub async fn device_approve_passkey(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A standalone deployment cannot redeem a device code (the token endpoint
+    /// refuses the grant), so a code issued there would let a user approve a
+    /// login that never completes. The endpoint refuses first, with the token
+    /// endpoint's own answer; with a MAS shared secret the same request is
+    /// served. Needs Redis for the served half.
+    #[tokio::test]
+    async fn device_authorization_is_refused_outside_delegated_auth_mode() {
+        use openidconnect::core::{CoreClientMetadata, CoreErrorResponseType};
+        use openidconnect::registration::EmptyAdditionalClientMetadata;
+        use openidconnect::RedirectUrl;
+
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = format!("device-auth-{}", uuid::Uuid::new_v4().simple());
+        db.set_client(
+            client_id.clone(),
+            ClientEntry {
+                secret: "secret".into(),
+                metadata: CoreClientMetadata::new(
+                    vec![RedirectUrl::new("https://example.com".into()).unwrap()],
+                    EmptyAdditionalClientMetadata {},
+                ),
+                access_token: None,
+            },
+        )
+        .await
+        .unwrap();
+        let form = || DeviceAuthRequest {
+            client_id: client_id.clone(),
+            scope: None,
+        };
+
+        let refused = device_authorization(&Config::default(), &db, form()).await;
+        match refused {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error, CoreErrorResponseType::UnsupportedGrantType)
+            }
+            other => panic!(
+                "standalone must refuse with unsupported_grant_type, got {:?}",
+                other.map(|r| r.user_code)
+            ),
+        }
+
+        let delegated = Config {
+            mas_shared_secret: Some("shared-secret".to_string()),
+            ..Config::default()
+        };
+        let issued = device_authorization(&delegated, &db, form())
+            .await
+            .unwrap_or_else(|e| panic!("delegated-auth mode must issue a code: {e:?}"));
+        assert!(issued.device_code.starts_with("dvc_"));
+    }
 
     #[test]
     fn device_page_renders_landing_page_brand() {

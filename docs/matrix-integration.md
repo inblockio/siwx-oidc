@@ -34,8 +34,8 @@ spelling is still accepted; see [configuration.md](configuration.md).
 | Synapse calls | none | also needs `SIWXOIDC_SYNAPSE_ENDPOINT` |
 | Relying parties | any OIDC client | any OIDC client, plus Synapse and Matrix clients |
 | Token introspection (`/oauth2/introspect`) | 404 | active |
-| Device-code grant | refused | active |
-| DID publication, `/resolve` | off | also needs `SIWXOIDC_MATRIX_SERVER_NAME` |
+| Device-code grant (`/device_authorization`, `/token`) | refused | active |
+| DID publication, `/resolve`, account actions | off | also needs `SIWXOIDC_MATRIX_SERVER_NAME` |
 
 Older text in this repository, and some error messages and code comments, call
 the delegated-auth mode "MSC3861 mode". It means the same thing: the shared
@@ -45,7 +45,13 @@ Discovery follows the mode. `introspection_endpoint`,
 `introspection_endpoint_auth_methods_supported`,
 `device_authorization_endpoint` and the device-code grant type in
 `grant_types_supported` appear only in delegated-auth mode; a standalone
-deployment advertises `authorization_code` and `refresh_token` only.
+deployment advertises `authorization_code` and `refresh_token` only, and
+refuses `/device_authorization` and the device-code grant with
+`unsupported_grant_type`. `account_management_uri`,
+`account_management_actions_supported` and `io.inblock.resolve_endpoint`
+appear only when a Synapse client and `SIWXOIDC_MATRIX_SERVER_NAME` are both
+configured, since without them `/resolve` answers 503 and every account action
+400.
 
 ## How Synapse is wired
 

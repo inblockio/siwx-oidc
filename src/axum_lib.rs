@@ -195,15 +195,16 @@ async fn jwk_set(State(state): State<AppState>) -> Result<Json<CoreJsonWebKeySet
 async fn provider_metadata(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, CustomError> {
-    let value = oidc::provider_metadata_value(&state.config, resolve_endpoint_advertised(&state))?;
+    let value = oidc::provider_metadata_value(&state.config, matrix_ready(&state))?;
     Ok(value.into())
 }
 
-/// Whether `GET /resolve` can answer on this deployment, and so may be
-/// advertised in discovery. Mirrors the two 503 conditions in
-/// [`resolve::ResolveError`]: no `SIWEOIDC_MATRIX_SERVER_NAME`, or no Synapse
-/// client (standalone mode).
-fn resolve_endpoint_advertised(state: &AppState) -> bool {
+/// Whether the Matrix-backed features can answer on this deployment, and so
+/// may be advertised in discovery: `GET /resolve` and the MSC4191 account
+/// actions. Mirrors the two 503 conditions in [`resolve::ResolveError`] and the
+/// account actions' 400: no `SIWXOIDC_MATRIX_SERVER_NAME`, or no Synapse client
+/// (standalone mode).
+fn matrix_ready(state: &AppState) -> bool {
     state.config.matrix_server_name.is_some() && state.synapse_client.is_some()
 }
 

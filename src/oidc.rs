@@ -595,12 +595,24 @@ pub fn metadata(config: &crate::config::Config) -> Result<CoreProviderMetadata, 
 /// configured, so Synapse can delegate authentication to this provider.
 ///
 /// Token introspection and the RFC 8628 device-code grant work only in this
-/// mode: `introspect::introspect` answers 404 without the secret, and
-/// [`token_device_code`] refuses the grant. Discovery reads the same predicate
+/// mode: `introspect::introspect` answers 404 without the secret, and both
+/// `/device_authorization` and [`token_device_code`] refuse the grant with
+/// [`device_grant_unsupported`]. Discovery reads the same predicate
 /// ([`provider_metadata_value`]), so it never advertises an endpoint or grant
 /// this deployment would refuse.
 pub fn delegated_auth_enabled(config: &crate::config::Config) -> bool {
     config.mas_shared_secret.is_some()
+}
+
+/// The refusal of the RFC 8628 device-code grant outside delegated-auth mode:
+/// a 400 with an RFC 6749 §5.2 body, `unsupported_grant_type`, which RFC 8628
+/// §3.2 prescribes for `/device_authorization` errors as well. One value for
+/// both endpoints, so a client sees the same answer at either.
+pub fn device_grant_unsupported() -> CustomError {
+    CustomError::BadRequestToken(TokenError {
+        error: CoreErrorResponseType::UnsupportedGrantType,
+        error_description: "device_code grant requires MSC3861 mode.".to_string(),
+    })
 }
 
 /// Build the full OIDC provider-metadata document served at [`METADATA_PATH`],
@@ -610,8 +622,10 @@ pub fn delegated_auth_enabled(config: &crate::config::Config) -> bool {
 ///
 /// It advertises only what this deployment serves. Introspection and the
 /// device-code grant (with its `device_authorization_endpoint`) appear only in
-/// delegated-auth mode ([`delegated_auth_enabled`]); `advertise_resolve` gates
-/// `GET /resolve` the same way.
+/// delegated-auth mode ([`delegated_auth_enabled`]). `matrix_ready` says a
+/// Synapse client AND a Matrix server name are configured; without both,
+/// `GET /resolve` answers 503 and every account action a 400, so neither
+/// `io.inblock.resolve_endpoint` nor MSC4191 account management is advertised.
 ///
 /// `config.account_management_uri` is the MSC4191 account-management URL; when
 /// `None` it defaults to `{base_url}/account`. The advertised
@@ -619,7 +633,7 @@ pub fn delegated_auth_enabled(config: &crate::config::Config) -> bool {
 /// [`crate::account::SUPPORTED_ACTIONS`] so discovery and dispatch never drift.
 pub fn provider_metadata_value(
     config: &crate::config::Config,
-    advertise_resolve: bool,
+    matrix_ready: bool,
 ) -> Result<serde_json::Value, CustomError> {
     let base_url = &config.base_url;
     let pm = metadata(config)?;
@@ -649,20 +663,20 @@ pub fn provider_metadata_value(
     value["token_endpoint_auth_methods_supported"] =
         serde_json::json!(["client_secret_post", "none"]);
     value["prompt_values_supported"] = serde_json::json!(["login", "create"]);
-    // MSC4191: account management discovery (stable v1.18).
-    let account_uri = config
-        .account_management_uri
-        .as_ref()
-        .map(|u| u.as_str().to_string())
-        .unwrap_or_else(|| format!("{}/account", base));
-    value["account_management_uri"] = serde_json::json!(account_uri);
-    value["account_management_actions_supported"] =
-        serde_json::json!(crate::account::SUPPORTED_ACTIONS);
-    // Advertised ONLY when this deployment can answer it (see
-    // `resolve_endpoint_advertised`): a client that finds the key will call
-    // the route, and advertising a route that answers 503 turns discovery
-    // into a guaranteed failed request per lookup.
-    if advertise_resolve {
+    // Both advertised ONLY when this deployment can answer them: a client that
+    // finds a key will use it, and a route that answers 503 (`/resolve`) or an
+    // account page whose every action answers 400 turns discovery into a
+    // guaranteed failed request.
+    if matrix_ready {
+        // MSC4191: account management discovery (stable v1.18).
+        let account_uri = config
+            .account_management_uri
+            .as_ref()
+            .map(|u| u.as_str().to_string())
+            .unwrap_or_else(|| format!("{}/account", base));
+        value["account_management_uri"] = serde_json::json!(account_uri);
+        value["account_management_actions_supported"] =
+            serde_json::json!(crate::account::SUPPORTED_ACTIONS);
         value[RESOLVE_ENDPOINT_METADATA_KEY] = serde_json::json!(format!("{}/resolve", base));
     }
     Ok(value)
@@ -1039,10 +1053,7 @@ async fn token_device_code(
     synapse_client: Option<&SynapseClient>,
 ) -> Result<CoreTokenResponse, CustomError> {
     if !delegated_auth_enabled(config) {
-        return Err(CustomError::BadRequestToken(TokenError {
-            error: CoreErrorResponseType::UnsupportedGrantType,
-            error_description: "device_code grant requires MSC3861 mode.".to_string(),
-        }));
+        return Err(device_grant_unsupported());
     }
 
     let dc = form.device_code.ok_or_else(|| {
@@ -3733,7 +3744,7 @@ mod tests {
         // account_management_actions_supported array containing the four real
         // actions plus their session_* aliases. Synapse forwards this document
         // verbatim to /_matrix/client/v1/auth_metadata (verified live).
-        let value = provider_metadata_value(&discovery_config(), false).unwrap();
+        let value = provider_metadata_value(&discovery_config(), true).unwrap();
 
         assert_eq!(
             value["account_management_uri"], "https://siwx-oidc.example.com/account",
@@ -3788,11 +3799,34 @@ mod tests {
             account_management_uri: Some(Url::parse("https://account.example.com/manage").unwrap()),
             ..discovery_config()
         };
-        let value = provider_metadata_value(&config, false).unwrap();
+        let value = provider_metadata_value(&config, true).unwrap();
         assert_eq!(
             value["account_management_uri"],
             "https://account.example.com/manage"
         );
+    }
+
+    /// Without a Synapse client or a Matrix server name every account action
+    /// answers 400, so neither the account page nor its actions may be
+    /// advertised, even when the operator configured the page's URL.
+    #[test]
+    fn account_management_is_advertised_only_when_the_actions_can_run() {
+        let config = Config {
+            account_management_uri: Some(Url::parse("https://account.example.com/manage").unwrap()),
+            ..discovery_config()
+        };
+        let standalone = provider_metadata_value(&config, false).unwrap();
+        for key in [
+            "account_management_uri",
+            "account_management_actions_supported",
+        ] {
+            assert!(
+                standalone.get(key).is_none(),
+                "{key} must not be advertised without Synapse and a server name: {standalone}"
+            );
+        }
+        let ready = provider_metadata_value(&config, true).unwrap();
+        assert!(ready["account_management_actions_supported"].is_array());
     }
 
     /// The terms of service and privacy policy are the deployment's own, so
@@ -3878,6 +3912,69 @@ mod tests {
             delegated["revocation_endpoint"],
             "https://siwx-oidc.example.com/oauth2/revoke"
         );
+    }
+
+    /// The token endpoint refuses the device-code grant outside delegated-auth
+    /// mode, even for a code a user already approved, and leaves the code as
+    /// it was: nothing is redeemed, nothing is issued.
+    #[tokio::test]
+    async fn the_device_code_grant_is_refused_outside_delegated_auth_mode() {
+        let Some((config, db)) = default_config().await else {
+            return;
+        };
+        assert!(
+            !delegated_auth_enabled(&config),
+            "Config::default() is standalone"
+        );
+        let device_code = format!("dvc_standalone-{}", Uuid::new_v4().simple());
+        db.set_device_code(
+            &device_code,
+            &DeviceCodeEntry {
+                user_code: format!("SA-{}", Uuid::new_v4().simple()),
+                client_id: "client".to_string(),
+                scope: "openid".to_string(),
+                status: DeviceCodeStatus::Approved,
+                did: Some("did:key:zDnSTANDALONEDEVICECODE".to_string()),
+                device_id: None,
+                last_poll: None,
+                created_at: Utc::now().timestamp(),
+            },
+            DEVICE_CODE_LIFETIME,
+        )
+        .await
+        .unwrap();
+
+        let refused = token(
+            TokenForm {
+                code: None,
+                client_id: Some("client".to_string()),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code.clone()),
+            },
+            None,
+            &EcdsaSigningKey::generate(),
+            &config,
+            &db,
+            None,
+        )
+        .await;
+        match refused {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error, CoreErrorResponseType::UnsupportedGrantType)
+            }
+            Err(other) => panic!("expected unsupported_grant_type, got {other:?}"),
+            Ok(_) => panic!("a standalone deployment must not redeem a device code"),
+        }
+        let entry = db
+            .get_device_code(&device_code)
+            .await
+            .unwrap()
+            .expect("the refused code must be left in place");
+        assert_eq!(entry.status, DeviceCodeStatus::Approved);
+        db.delete_device_code(&device_code).await.ok();
     }
 
     #[tokio::test]

@@ -99,6 +99,10 @@ paths:
         `prompt_values_supported` (`["login","create"]`) and
         `account_management_uri`. Removing either silently breaks Element X
         cross-signing bootstrap — the matrix-rust-sdk swallows the error.
+        `account_management_uri` and `account_management_actions_supported`
+        are present only when the account actions can run (a Matrix server
+        name and a Synapse client are configured); without them every action
+        answers 400.
 
         `io.inblock.resolve_endpoint` (`{issuer}/resolve`) advertises
         `GET /resolve`, and is present **only** when this deployment can
@@ -113,8 +117,8 @@ paths:
         `device_authorization_endpoint` and the
         `urn:ietf:params:oauth:grant-type:device_code` grant type are present
         only when a MAS shared secret is configured (delegated-auth mode);
-        without one, introspection answers 404 and the device-code grant is
-        refused. `op_tos_uri` and `op_policy_uri` are present only when the
+        without one, introspection answers 404 and both `/device_authorization`
+        and the device-code grant at `/token` are refused. `op_tos_uri` and `op_policy_uri` are present only when the
         operator configured them (`SIWXOIDC_OP_TOS_URI`,
         `SIWXOIDC_OP_POLICY_URI`); there is no default.
       responses:
@@ -489,9 +493,12 @@ paths:
       operationId: deviceAuthorization
       summary: Begin an RFC 8628 device grant
       description: |
-        Advertised in discovery only in delegated-auth mode (a MAS shared
-        secret is configured), the only mode in which `POST /token` redeems
-        the device code.
+        Served and advertised in discovery only in delegated-auth mode (a MAS
+        shared secret is configured), the only mode in which `POST /token`
+        redeems the device code. Without it the request is refused before
+        anything is stored, with the same RFC 6749 §5.2 error the token
+        endpoint gives the grant (RFC 8628 §3.2), so no code is issued that a
+        user could approve but a client never redeem.
       requestBody:
         content:
           application/x-www-form-urlencoded:
@@ -504,6 +511,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DeviceAuthorization" }
+        "400":
+          description: |
+            `{"error": "unsupported_grant_type", "error_description": …}` when
+            the deployment is not in delegated-auth mode; a plain 400 for an
+            unknown `client_id`.
 
   /device:
     get:
