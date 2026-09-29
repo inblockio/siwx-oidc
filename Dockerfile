@@ -1,4 +1,8 @@
 # syntax=docker/dockerfile:1
+# Portions of this file are derived from siwe-oidc (https://github.com/spruceid/siwe-oidc),
+# Copyright Spruce Systems, Inc. and contributors, used under the Apache License 2.0.
+# Modified by inblock.io assets GmbH. See NOTICE.
+
 FROM clux/muslrust:stable AS chef
 WORKDIR /siwx-oidc
 RUN cargo install cargo-chef
@@ -8,7 +12,6 @@ COPY ./src/ ./src/
 COPY ./siwx-oidc-auth/ ./siwx-oidc-auth/
 COPY ./Cargo.lock ./
 COPY ./Cargo.toml ./
-COPY ./siwe-oidc.toml ./
 RUN cargo chef prepare  --recipe-path recipe.json
 
 FROM chef AS dep_cacher
@@ -38,10 +41,18 @@ COPY --from=builder /siwx-oidc/target/x86_64-unknown-linux-musl/release/migrate-
 WORKDIR /siwx-oidc
 RUN mkdir -p ./static
 COPY --from=node_builder /siwx-oidc/static/ ./static/
-COPY --from=builder /siwx-oidc/siwe-oidc.toml ./
-ENV SIWEOIDC_ADDRESS="0.0.0.0"
+# Apache-2.0 section 4(a) and (d): every copy of the Work, the image included,
+# carries the license and the NOTICE. Copied straight from the build context,
+# which .dockerignore does not filter, so no build stage has to carry them.
+COPY LICENSE NOTICE /usr/share/licenses/siwx-oidc/
+# No config file ships in the image: every setting has a default or comes from
+# SIWXOIDC_* env (see config::figment). This one only makes the listener
+# reachable from outside the container. The new prefix outranks the legacy
+# SIWEOIDC_ one, so a deployment that needs a DIFFERENT bind address must set
+# SIWXOIDC_ADDRESS; a legacy SIWEOIDC_ADDRESS cannot override this line.
+ENV SIWXOIDC_ADDRESS="0.0.0.0"
 EXPOSE 8000
 ENTRYPOINT ["siwx-oidc"]
 LABEL org.opencontainers.image.source="https://github.com/inblockio/siwx-oidc"
-LABEL org.opencontainers.image.description="CAIP-122 to OpenID Connect bridge — Sign-In With X for any DID method"
-LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
+LABEL org.opencontainers.image.description="Key-first OpenID Connect provider and Matrix auth service: agents and people sign in with their own key, no passwords."
+LABEL org.opencontainers.image.licenses="Apache-2.0"

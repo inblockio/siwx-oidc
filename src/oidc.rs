@@ -1,3 +1,7 @@
+// Portions of this file are derived from siwe-oidc (https://github.com/spruceid/siwe-oidc),
+// Copyright Spruce Systems, Inc. and contributors, used under the Apache License 2.0.
+// Modified by inblock.io assets GmbH. See NOTICE.
+
 use alloy_primitives::Address;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -425,7 +429,7 @@ pub fn parse_retired_verification_keys(pem_bundle: &str) -> Result<Vec<CoreJsonW
 
     if pem_bundle.contains("PRIVATE KEY") {
         return Err(anyhow!(
-            "SIWEOIDC_RETIRED_SIGNING_KEYS_PEM contains a PRIVATE key. Retired keys are              published for VERIFICATION only and must be the public half — a retired key never              signs anything, and keeping a rotated-out (often compromised) private key in the              process environment is exactly the exposure that motivates rotation. Convert it              with: openssl pkey -in <old-key>.pem -pubout"
+            "SIWXOIDC_RETIRED_SIGNING_KEYS_PEM contains a PRIVATE key. Retired keys are              published for VERIFICATION only and must be the public half — a retired key never              signs anything, and keeping a rotated-out (often compromised) private key in the              process environment is exactly the exposure that motivates rotation. Convert it              with: openssl pkey -in <old-key>.pem -pubout"
         ));
     }
 
@@ -435,14 +439,14 @@ pub fn parse_retired_verification_keys(pem_bundle: &str) -> Result<Vec<CoreJsonW
         let after_begin = &rest[begin..];
         let end = after_begin.find(PUBLIC_PEM_END).ok_or_else(|| {
             anyhow!(
-                "SIWEOIDC_RETIRED_SIGNING_KEYS_PEM has a '{PUBLIC_PEM_BEGIN}' with no matching                  '{PUBLIC_PEM_END}' — the PEM block is truncated"
+                "SIWXOIDC_RETIRED_SIGNING_KEYS_PEM has a '{PUBLIC_PEM_BEGIN}' with no matching                  '{PUBLIC_PEM_END}' — the PEM block is truncated"
             )
         })? + PUBLIC_PEM_END.len();
         let block = &after_begin[..end];
 
         let public_key = p256::PublicKey::from_public_key_pem(block).map_err(|e| {
             anyhow!(
-                "SIWEOIDC_RETIRED_SIGNING_KEYS_PEM entry {} is not a valid P-256 SPKI public                  key: {e}. ES256 is the only algorithm this provider has ever signed with, so a                  retired key of any other curve could not have produced a proof to verify.",
+                "SIWXOIDC_RETIRED_SIGNING_KEYS_PEM entry {} is not a valid P-256 SPKI public                  key: {e}. ES256 is the only algorithm this provider has ever signed with, so a                  retired key of any other curve could not have produced a proof to verify.",
                 keys.len() + 1
             )
         })?;
@@ -455,7 +459,7 @@ pub fn parse_retired_verification_keys(pem_bundle: &str) -> Result<Vec<CoreJsonW
 
     if keys.is_empty() {
         return Err(anyhow!(
-            "SIWEOIDC_RETIRED_SIGNING_KEYS_PEM is set but contains no '{PUBLIC_PEM_BEGIN}' block.              Unset it, or supply the public half of each retired signing key              (openssl pkey -in <old-key>.pem -pubout)."
+            "SIWXOIDC_RETIRED_SIGNING_KEYS_PEM is set but contains no '{PUBLIC_PEM_BEGIN}' block.              Unset it, or supply the public half of each retired signing key              (openssl pkey -in <old-key>.pem -pubout)."
         ));
     }
     Ok(keys)
@@ -4712,7 +4716,7 @@ mod userinfo_mxid_claim_tests {
 
         assert!(
             body.get(CLAIM).is_none(),
-            "with no SIWEOIDC_MATRIX_SERVER_NAME the claim must not appear at all \
+            "with no SIWXOIDC_MATRIX_SERVER_NAME the claim must not appear at all \
              (a `null` would make a consumer's `if CLAIM in claims` branch take the \
              wrong turn): {body}"
         );

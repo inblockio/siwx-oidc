@@ -56,6 +56,6 @@ No cloud dependencies (no WalletConnect/Reown, no PROJECT_ID).
 
 - siwx-core has no async — all verification is pure crypto
 - Errors use `SiwxError` enum in siwx-core, `CustomError` in the server
-- Config uses Figment (TOML + env vars with `SIWEOIDC_` prefix)
+- Config uses Figment (`siwx-oidc.toml` + env vars with `SIWXOIDC_` prefix; the legacy `siwe-oidc.toml` and `SIWEOIDC_` are still read, at lower precedence)
 - `sub` claim is the full DID string (e.g., `did:pkh:eip155:1:0x...`)
 - Cookie name is `siwx`, payload is `{ did, message, signature }`
