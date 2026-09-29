@@ -3,7 +3,10 @@
 //! the session's token must stop authenticating at `account/whoami`, and
 //! `/_matrix/client/v3/logout/all` must be a registered route that leaves the
 //! account active. A rejected token proves the session ended; it does not by
-//! itself prove a Synapse device was deleted.
+//! itself prove a Synapse device was deleted, so the logout test also reads the
+//! device list, from the Synapse mock (`SYNAPSE_MOCK`, as in CI). Against a
+//! real Synapse that list needs an admin token this suite does not have, and
+//! the device half is a loud skip (a failure under `E2E_STRICT_SKIPS=1`).
 //!
 //! Self-contained: copies the auth-flow helpers from `e2e_msc3861.rs` (the same
 //! pattern `e2e_msc4191_live.rs` uses) so this file runs on its own and never
@@ -336,6 +339,47 @@ async fn poll_whoami_rejected(token: &str) -> StatusCode {
     last
 }
 
+/// The Matrix ID a token authenticates as, read from `whoami`.
+async fn whoami_user_id(token: &str) -> Option<String> {
+    let resp = Client::new()
+        .get(format!(
+            "{}/_matrix/client/v3/account/whoami",
+            matrix_host()
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .ok()?;
+    let body: Value = resp.json().await.ok()?;
+    body["user_id"].as_str().map(str::to_string)
+}
+
+/// The device ids the Synapse mock holds for `mxid`, or `None` when this run
+/// is not against the mock (`SYNAPSE_MOCK` unset, or no `/__state` there).
+async fn mock_device_ids(mxid: &str) -> Option<Vec<String>> {
+    let base = std::env::var("SYNAPSE_MOCK").ok()?;
+    let state: Value = Client::new()
+        .get(format!("{base}/__state"))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    Some(
+        state["devices"]
+            .get(mxid)
+            .and_then(Value::as_array)
+            .map(|devices| {
+                devices
+                    .iter()
+                    .filter_map(|d| d["device_id"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // H1: logout tears down the ending session's Synapse device + tokens
 // ---------------------------------------------------------------------------
@@ -374,9 +418,10 @@ fn skip_or_fail(test: &str, whoami_status: StatusCode) {
 }
 
 /// After `POST /_matrix/client/v3/logout` with the session's bearer token, the
-/// token must no longer authenticate against Matrix (the Synapse device for the
-/// ending session was deleted and the OAuth tokens revoked). One-time deletion
-/// of the *ending* session is the safe teardown; no device id is recycled.
+/// token must no longer authenticate against Matrix, and the ending session's
+/// Synapse device must be gone from the user's device list (read from the
+/// Synapse mock; see the module docs for a real Synapse). One-time deletion of
+/// the *ending* session is the safe teardown; no device id is recycled.
 #[tokio::test]
 #[ignore]
 async fn logout_deletes_ending_session_device() {
@@ -387,15 +432,25 @@ async fn logout_deletes_ending_session_device() {
     let (token, device_id, whoami_st) = login_with_key(&key, &address, &did).await;
     eprintln!("[e2e] logged in: device={:?}", device_id);
 
-    if device_id.is_none() {
+    let Some(device_id) = device_id else {
         skip_or_fail("logout_deletes_ending_session_device", whoami_st);
         return;
-    }
+    };
     assert_eq!(
         whoami_status(&token).await,
         StatusCode::OK,
         "fresh token must work before logout"
     );
+    let mxid = whoami_user_id(&token)
+        .await
+        .expect("whoami answered 200, so it names the user");
+    let before = mock_device_ids(&mxid).await;
+    if let Some(before) = &before {
+        assert!(
+            before.contains(&device_id),
+            "sign-in must have created the session's device: {before:?}"
+        );
+    }
 
     let logout_resp = http
         .post(format!("{}/_matrix/client/v3/logout", oidc))
@@ -412,8 +467,25 @@ async fn logout_deletes_ending_session_device() {
     assert_eq!(
         poll_whoami_rejected(&token).await,
         StatusCode::UNAUTHORIZED,
-        "after logout the session token must be rejected (device deleted + tokens revoked)"
+        "after logout the session token must be rejected"
     );
+
+    match mock_device_ids(&mxid).await {
+        Some(after) => assert!(
+            !after.contains(&device_id),
+            "logout must delete the ending session's Synapse device: {after:?}"
+        ),
+        None => {
+            let marker = "E2E_SKIP: logout_deletes_ending_session_device: no Synapse mock \
+                          (SYNAPSE_MOCK) to read the device list from; the device-deletion \
+                          half is NOT exercised";
+            assert!(
+                std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+                "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+            );
+            eprintln!("{marker}");
+        }
+    }
     eprintln!("[e2e] logout tore down the ending session's device + tokens");
 }
 
@@ -427,7 +499,10 @@ async fn logout_deletes_ending_session_device() {
 /// Revoke is token hygiene (`TeardownPolicy::TokensOnly`) and must NOT delete
 /// the Synapse device; deleting it there wedged cross-signing in the 2026-06-12
 /// login incident. This test does not observe the device. The keep-the-device
-/// half is pinned by the unit test
+/// half is pinned at the handler's call site by
+/// `e2e_race_teardown::h1_revoke_does_not_delete_device_but_logout_does` (it
+/// counts the mock's `delete_device` calls, and fails if `compat::revoke`
+/// passes `DeleteDevice`), and the policy itself by the unit test
 /// `compat::tests::teardown_policy_only_deletes_device_on_explicit_signout`.
 #[tokio::test]
 #[ignore]
