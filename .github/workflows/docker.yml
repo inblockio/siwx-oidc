@@ -130,7 +130,9 @@ jobs:
             ${{ secrets.DEV_DEPLOY_USER == '' && 'DEV_DEPLOY_USER' || '' }}
             ${{ secrets.DEV_DEPLOY_KNOWN_HOSTS == '' && 'DEV_DEPLOY_KNOWN_HOSTS' || '' }}
         run: |
-          missing=$(echo $MISSING)
+          # Collapse the folded scalar's blanks into "NAME NAME" (or nothing).
+          read -r -a names <<< "$MISSING"
+          missing="${names[*]}"
           if [ -n "$missing" ]; then
             echo "::error title=Dev-staging deploy target not configured::Repository secret(s) empty: ${missing}. Set them under Settings > Secrets and variables > Actions > Secrets (gh secret set NAME -R ${GITHUB_REPOSITORY}). Refusing to skip silently: dev-staging would stay on the previous image."
             exit 1

@@ -186,7 +186,7 @@ jobs:
       - name: Start Synapse mock
         run: |
           nohup python3 e2e/synapse_mock.py > /tmp/synapse-mock.log 2>&1 &
-          for i in $(seq 1 40); do
+          for _ in $(seq 1 40); do
             if curl -sf "http://localhost:${SYNAPSE_MOCK_PORT}/health" >/dev/null 2>&1; then
               echo "synapse mock healthy"; exit 0
             fi
@@ -199,7 +199,7 @@ jobs:
       - name: Start siwx-oidc
         run: |
           nohup ./target/debug/siwx-oidc > /tmp/siwx-oidc.log 2>&1 &
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if curl -sf "${SIWEOIDC_BASE_URL}/health" >/dev/null 2>&1; then
               echo "siwx-oidc healthy"; exit 0
             fi
@@ -358,7 +358,7 @@ jobs:
       - name: Start Synapse mock
         run: |
           nohup python3 e2e/synapse_mock.py > /tmp/synapse-mock.log 2>&1 &
-          for i in $(seq 1 40); do
+          for _ in $(seq 1 40); do
             if curl -sf "http://localhost:${SYNAPSE_MOCK_PORT}/health" >/dev/null 2>&1; then
               echo "synapse mock healthy"; exit 0
             fi
@@ -371,7 +371,7 @@ jobs:
       - name: Start siwx-oidc
         run: |
           nohup ./target/debug/siwx-oidc > /tmp/siwx-oidc.log 2>&1 &
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if curl -sf "${SIWEOIDC_BASE_URL}/health" >/dev/null 2>&1; then
               echo "siwx-oidc healthy"; exit 0
             fi
