@@ -12,7 +12,6 @@ COPY ./src/ ./src/
 COPY ./siwx-oidc-auth/ ./siwx-oidc-auth/
 COPY ./Cargo.lock ./
 COPY ./Cargo.toml ./
-COPY ./siwe-oidc.toml ./
 RUN cargo chef prepare  --recipe-path recipe.json
 
 FROM chef AS dep_cacher
@@ -42,12 +41,16 @@ COPY --from=builder /siwx-oidc/target/x86_64-unknown-linux-musl/release/migrate-
 WORKDIR /siwx-oidc
 RUN mkdir -p ./static
 COPY --from=node_builder /siwx-oidc/static/ ./static/
-COPY --from=builder /siwx-oidc/siwe-oidc.toml ./
 # Apache-2.0 section 4(a) and (d): every copy of the Work, the image included,
 # carries the license and the NOTICE. Copied straight from the build context,
 # which .dockerignore does not filter, so no build stage has to carry them.
 COPY LICENSE NOTICE /usr/share/licenses/siwx-oidc/
-ENV SIWEOIDC_ADDRESS="0.0.0.0"
+# No config file ships in the image: every setting has a default or comes from
+# SIWXOIDC_* env (see config::figment). This one only makes the listener
+# reachable from outside the container. The new prefix outranks the legacy
+# SIWEOIDC_ one, so a deployment that needs a DIFFERENT bind address must set
+# SIWXOIDC_ADDRESS; a legacy SIWEOIDC_ADDRESS cannot override this line.
+ENV SIWXOIDC_ADDRESS="0.0.0.0"
 EXPOSE 8000
 ENTRYPOINT ["siwx-oidc"]
 LABEL org.opencontainers.image.source="https://github.com/inblockio/siwx-oidc"

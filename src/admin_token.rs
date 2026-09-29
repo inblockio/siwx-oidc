@@ -220,7 +220,7 @@ pub async fn admin_token(
             return Err(fail(
                 StatusCode::NOT_FOUND,
                 "not_configured",
-                "admin token minting requires SIWEOIDC_MAS_SHARED_SECRET",
+                "admin token minting requires SIWXOIDC_MAS_SHARED_SECRET",
             ));
         }
     };
@@ -248,7 +248,7 @@ pub async fn admin_token(
 
     let synapse = state.synapse_client.as_deref().ok_or_else(|| {
         error!(
-            "admin_token: no Synapse client configured (SIWEOIDC_SYNAPSE_ENDPOINT); refusing to mint"
+            "admin_token: no Synapse client configured (SIWXOIDC_SYNAPSE_ENDPOINT); refusing to mint"
         );
         fail(
             StatusCode::SERVICE_UNAVAILABLE,

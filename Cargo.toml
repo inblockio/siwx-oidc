@@ -75,6 +75,12 @@ bs58 = "0.5"
 webauthn-rs-proto = "=0.6.1-dev"
 
 [dev-dependencies]
+# `figment::Jail` for the config-loading tests in src/config.rs: a temporary
+# working directory plus env vars that are restored when the jail drops, so
+# the file and env-prefix precedence can be proven hermetically. Dev-only;
+# resolver 2 keeps the `test` feature (tempfile, parking_lot) out of the
+# shipped binary.
+figment = { version = "0.10", features = ["toml", "env", "test"] }
 # The SHIPPED CONSUMER, linked into the test build only.
 #
 # The minter (`src/did_assertion.rs`) and the verifier

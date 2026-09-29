@@ -2,12 +2,108 @@
 // Copyright Spruce Systems, Inc. and contributors, used under the Apache License 2.0.
 // Modified by inblock.io assets GmbH. See NOTICE.
 
+use figment::{
+    providers::{Env, Format, Serialized, Toml},
+    Figment,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr},
+    path::PathBuf,
 };
 use url::Url;
+
+/// The documented environment prefix: `SIWXOIDC_PORT`, `SIWXOIDC_BASE_URL`, …
+pub const ENV_PREFIX: &str = "SIWXOIDC_";
+/// The prefix inherited from siwe-oidc. Still read, with no removal scheduled,
+/// because live deployments set it. It ranks below [`ENV_PREFIX`].
+pub const LEGACY_ENV_PREFIX: &str = "SIWEOIDC_";
+/// The documented config file, looked up in the working directory and then in
+/// each parent directory (figment's `Toml::file` search).
+pub const CONFIG_FILE: &str = "siwx-oidc.toml";
+/// The config file name inherited from siwe-oidc. Still read, below
+/// [`CONFIG_FILE`].
+pub const LEGACY_CONFIG_FILE: &str = "siwe-oidc.toml";
+
+/// The layered configuration source. Precedence, lowest to highest:
+///
+/// 1. [`Config::default`]
+/// 2. [`LEGACY_CONFIG_FILE`] (`siwe-oidc.toml`)
+/// 3. [`CONFIG_FILE`] (`siwx-oidc.toml`)
+/// 4. [`LEGACY_ENV_PREFIX`] variables (`SIWEOIDC_*`)
+/// 5. [`ENV_PREFIX`] variables (`SIWXOIDC_*`)
+///
+/// So a key set under both names takes the new name's value, and a deployment
+/// that sets only the legacy names keeps working unchanged. Every layer is
+/// optional: a missing file contributes nothing, which is how the container
+/// image runs (it ships no config file).
+///
+/// The files are `nested()`: their top-level tables are figment profiles
+/// (`[default]`, `[global]`). Both env prefixes are `global()` and split on
+/// `__`, so `SIWXOIDC_DEFAULT_CLIENTS__MYCLIENT=…` sets
+/// `default_clients.myclient`. Prefix matching is case-insensitive, as in
+/// figment itself.
+///
+/// Figment ranks profiles before merge order: anything in the `global`
+/// profile beats anything in `default`. The ladder above therefore holds
+/// between layers that write the same profile, and a file's `[default]`
+/// table always ranks below the environment.
+pub fn figment() -> Figment {
+    Figment::from(Serialized::defaults(Config::default()))
+        .merge(Toml::file(LEGACY_CONFIG_FILE).nested())
+        .merge(Toml::file(CONFIG_FILE).nested())
+        .merge(Env::prefixed(LEGACY_ENV_PREFIX).split("__").global())
+        .merge(Env::prefixed(ENV_PREFIX).split("__").global())
+}
+
+/// The legacy configuration names a figment actually draws on, for the startup
+/// deprecation warning. It holds variable NAMES and a file path only, never a
+/// value: several of these variables carry secrets (`…_SIGNING_KEY_PEM`,
+/// `…_MAS_SHARED_SECRET`).
+#[derive(Debug, Default, PartialEq)]
+pub struct LegacyNames {
+    /// `SIWEOIDC_*` variables present in the process environment, sorted.
+    pub env_vars: Vec<String>,
+    /// The `siwe-oidc.toml` the figment found and read, if any.
+    pub file: Option<PathBuf>,
+}
+
+impl LegacyNames {
+    /// Inspects the process environment and the files `figment` resolved.
+    pub fn detect(figment: &Figment) -> Self {
+        LegacyNames {
+            env_vars: legacy_env_var_names(std::env::vars_os().map(|(key, _)| key)),
+            file: figment.metadata().find_map(|md| {
+                let path = md.source.as_ref()?.file_path()?;
+                (path.file_name()? == LEGACY_CONFIG_FILE).then(|| path.to_path_buf())
+            }),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.env_vars.is_empty() && self.file.is_none()
+    }
+}
+
+/// The keys among `keys` that the legacy env provider would read, sorted.
+/// Takes the keys alone, so no value can reach the caller.
+fn legacy_env_var_names(keys: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<String> {
+    let mut names: Vec<String> = keys
+        .into_iter()
+        .map(|key| key.to_string_lossy().into_owned())
+        .filter(|key| has_prefix(key, LEGACY_ENV_PREFIX))
+        .collect();
+    names.sort();
+    names
+}
+
+/// ASCII case-insensitive prefix test, matching how figment's
+/// `Env::prefixed` selects variables.
+fn has_prefix(key: &str, prefix: &str) -> bool {
+    key.len() >= prefix.len()
+        && key.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -114,5 +210,216 @@ impl Default for Config {
             admin_token_ttl_secs: 300,
             admin_token_localpart: "siwx-admin".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The naming contract for configuration sources. Each test runs in a
+    //! `figment::Jail`: a fresh temporary working directory (so no real
+    //! `siwe-oidc.toml` / `siwx-oidc.toml` is in reach) and env vars that are
+    //! restored when the jail drops.
+
+    use super::*;
+    use figment::Jail;
+
+    /// Removes every `SIWXOIDC_*` / `SIWEOIDC_*` variable the ambient
+    /// environment carries (a shell that sourced `e2e/env.sh` has a dozen),
+    /// so each test sees only the layers it sets up. Each variable is first
+    /// registered with the jail, which records the original value and
+    /// restores it on drop.
+    fn scrub_config_env(jail: &mut Jail) {
+        let ambient: Vec<String> = std::env::vars_os()
+            .filter_map(|(key, _)| key.into_string().ok())
+            .filter(|key| has_prefix(key, ENV_PREFIX) || has_prefix(key, LEGACY_ENV_PREFIX))
+            .collect();
+        for key in ambient {
+            jail.set_env(&key, "");
+            std::env::remove_var(&key);
+        }
+    }
+
+    #[test]
+    fn new_env_prefix_is_read() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWXOIDC_PORT", 4101);
+            assert_eq!(figment().extract::<Config>()?.port, 4101);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn legacy_env_prefix_is_still_read() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWEOIDC_PORT", 4102);
+            assert_eq!(figment().extract::<Config>()?.port, 4102);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn new_env_prefix_beats_legacy_when_both_are_set() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWEOIDC_PORT", 4103);
+            jail.set_env("SIWXOIDC_PORT", 4104);
+            assert_eq!(figment().extract::<Config>()?.port, 4104);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn both_env_prefixes_keep_the_double_underscore_split() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWEOIDC_DEFAULT_CLIENTS__ALPHA", "from-legacy");
+            jail.set_env("SIWXOIDC_DEFAULT_CLIENTS__BETA", "from-new");
+            let clients = figment().extract::<Config>()?.default_clients;
+            assert_eq!(
+                clients.get("alpha").map(String::as_str),
+                Some("from-legacy")
+            );
+            assert_eq!(clients.get("beta").map(String::as_str), Some("from-new"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn legacy_file_is_still_read() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.create_file(LEGACY_CONFIG_FILE, "[default]\nport = 4105\n")?;
+            assert_eq!(figment().extract::<Config>()?.port, 4105);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn new_file_overrides_legacy_file() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.create_file(LEGACY_CONFIG_FILE, "[default]\nport = 4106\n")?;
+            jail.create_file(CONFIG_FILE, "[default]\nport = 4107\n")?;
+            assert_eq!(figment().extract::<Config>()?.port, 4107);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn missing_config_files_are_fine() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            let figment = figment();
+            let config = figment.extract::<Config>()?;
+            assert_eq!(config.port, Config::default().port);
+            assert!(
+                figment.metadata().all(|md| md
+                    .source
+                    .as_ref()
+                    .and_then(|s| s.file_path())
+                    .is_none()),
+                "no provider may report a file source when no file exists"
+            );
+            Ok(())
+        });
+    }
+
+    /// All five layers at once. Key `k` is written by every layer up to and
+    /// including the one it is named for, so its value can only come from that
+    /// layer if the order is exactly defaults < legacy file < new file <
+    /// legacy env < new env.
+    #[test]
+    fn full_precedence_ladder() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.create_file(
+                LEGACY_CONFIG_FILE,
+                "[default]\nport = 1001\nid_token_ttl_secs = 1001\n\
+                 admin_token_ttl_secs = 1001\nadmin_token_localpart = \"legacy-file\"\n",
+            )?;
+            jail.create_file(
+                CONFIG_FILE,
+                "[default]\nid_token_ttl_secs = 2002\n\
+                 admin_token_ttl_secs = 2002\nadmin_token_localpart = \"new-file\"\n",
+            )?;
+            jail.set_env("SIWEOIDC_ADMIN_TOKEN_TTL_SECS", 3003);
+            jail.set_env("SIWEOIDC_ADMIN_TOKEN_LOCALPART", "legacy-env");
+            jail.set_env("SIWXOIDC_ADMIN_TOKEN_LOCALPART", "new-env");
+
+            let config = figment().extract::<Config>()?;
+            assert_eq!(
+                config.log_format, "pretty",
+                "untouched key keeps its default"
+            );
+            assert_eq!(config.port, 1001, "legacy file beats defaults");
+            assert_eq!(config.id_token_ttl_secs, 2002, "new file beats legacy file");
+            assert_eq!(
+                config.admin_token_ttl_secs, 3003,
+                "legacy env beats new file"
+            );
+            assert_eq!(
+                config.admin_token_localpart, "new-env",
+                "new env beats legacy env"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn client_key_file_var_is_not_server_config() {
+        // `siwx-oidc-auth` reads `SIWX_KEY_FILE`. The server prefix is
+        // `SIWXOIDC_`, so the two must never meet.
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWX_KEY_FILE", "/nonexistent/identity.pem");
+            assert_eq!(Env::prefixed(ENV_PREFIX).iter().count(), 0);
+            assert_eq!(Env::prefixed(LEGACY_ENV_PREFIX).iter().count(), 0);
+            figment().extract::<Config>()?;
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn legacy_env_names_are_matched_like_figment_and_reported_by_name() {
+        let keys = [
+            "SIWXOIDC_PORT",
+            "SIWEOIDC_SIGNING_KEY_PEM",
+            "PATH",
+            "siweoidc_base_url",
+            "SIWX_KEY_FILE",
+            "SIWEOIDC",
+        ]
+        .map(std::ffi::OsString::from);
+        assert_eq!(
+            legacy_env_var_names(keys),
+            vec!["SIWEOIDC_SIGNING_KEY_PEM", "siweoidc_base_url"]
+        );
+    }
+
+    #[test]
+    fn deprecation_reports_legacy_env_and_file() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWEOIDC_PORT", 4108);
+            jail.create_file(LEGACY_CONFIG_FILE, "")?;
+            let legacy = LegacyNames::detect(&figment());
+            assert_eq!(legacy.env_vars, vec!["SIWEOIDC_PORT"]);
+            let file = legacy.file.expect("the legacy file must be reported");
+            assert_eq!(file.file_name().unwrap(), LEGACY_CONFIG_FILE);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn deprecation_is_silent_when_only_new_names_are_used() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWXOIDC_PORT", 4109);
+            jail.create_file(CONFIG_FILE, "[default]\nport = 4110\n")?;
+            assert!(LegacyNames::detect(&figment()).is_empty());
+            Ok(())
+        });
     }
 }

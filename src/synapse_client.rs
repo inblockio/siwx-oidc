@@ -347,8 +347,8 @@ impl SynapseClient {
     async fn admin_bearer(&self) -> Result<String> {
         let admin = self.admin.as_ref().context(
             "admin-scoped Synapse call attempted without a token store; \
-             siwx-oidc must be configured with SIWEOIDC_REDIS_URL, \
-             SIWEOIDC_SYNAPSE_ENDPOINT and SIWEOIDC_MAS_SHARED_SECRET",
+             siwx-oidc must be configured with SIWXOIDC_REDIS_URL, \
+             SIWXOIDC_SYNAPSE_ENDPOINT and SIWXOIDC_MAS_SHARED_SECRET",
         )?;
 
         let mut cached = admin.cached.lock().await;

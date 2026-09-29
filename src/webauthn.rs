@@ -993,7 +993,7 @@ pub fn build_webauthn(
 ) -> Result<WebauthnConfig> {
     let default_rp_id = base_url
         .host_str()
-        .ok_or_else(|| anyhow!("SIWEOIDC_BASE_URL has no host — cannot derive WebAuthn RP ID"))?
+        .ok_or_else(|| anyhow!("SIWXOIDC_BASE_URL has no host — cannot derive WebAuthn RP ID"))?
         .to_string();
     let resolved_rp_id = rp_id.unwrap_or(&default_rp_id).to_string();
 
@@ -1003,7 +1003,7 @@ pub fn build_webauthn(
         .trim_end_matches('/')
         .to_string();
     let rp_origin_url = Url::parse(&resolved_rp_origin)
-        .map_err(|e| anyhow!("Invalid SIWEOIDC_RP_ORIGIN: {}", e))?;
+        .map_err(|e| anyhow!("Invalid SIWXOIDC_RP_ORIGIN: {}", e))?;
 
     let webauthn = WebauthnBuilder::new(&resolved_rp_id, &rp_origin_url)
         .map_err(|e| {

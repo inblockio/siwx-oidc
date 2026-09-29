@@ -316,7 +316,7 @@ impl IntoResponse for ResolveError {
 
 /// Message for a deployment that has no Matrix server name configured.
 const NO_SERVER_NAME: &str =
-    "This deployment cannot resolve Matrix identities: SIWEOIDC_MATRIX_SERVER_NAME is not set.";
+    "This deployment cannot resolve Matrix identities: SIWXOIDC_MATRIX_SERVER_NAME is not set.";
 /// Message for a deployment running without a Synapse client (standalone mode).
 const NO_SYNAPSE: &str =
     "This deployment cannot resolve Matrix identities: no Synapse homeserver is configured.";

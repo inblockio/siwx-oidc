@@ -246,7 +246,7 @@ pub fn mint_did_assertion(
                 kid = %key.kid(),
                 "signing key is ephemeral: provider-attested DID assertions are \
                  NOT being minted, and user profiles will carry a `did` with no \
-                 `proof`. Set SIWEOIDC_SIGNING_KEY_PEM to a durable key. \
+                 `proof`. Set SIWXOIDC_SIGNING_KEY_PEM to a durable key. \
                  (Logged once per process; per-call detail is at debug level.)"
             );
         });
