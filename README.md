@@ -61,7 +61,7 @@ curl -s -X POST https://siwx.example.com/register -H 'Content-Type: application/
 # Sign in, pinning a stable Matrix device ID
 siwx-oidc-auth --server https://siwx.example.com --client-id "$CLIENT_ID" \
   --redirect-uri http://localhost/callback --key-file agent.pem --device-id my-agent
-# prints JSON: access_token, refresh_token, id_token, expires_in, did
+# prints JSON: access_token, token_type ("bearer"), id_token, expires_in, refresh_token, did
 
 # Later: new tokens without signing again; the device stays the same
 siwx-oidc-auth --server https://siwx.example.com --client-id "$CLIENT_ID" \

@@ -14,6 +14,7 @@ registration token or application service is involved.
 - [When a human should own the session: the device flow](#when-a-human-should-own-the-session-the-device-flow)
 - [Verifying other parties](#verifying-other-parties)
 - [Operational notes](#operational-notes)
+- [Known quirks](#known-quirks)
 - [How bots usually get Matrix identities](#how-bots-usually-get-matrix-identities)
 - [Industry context (as of September 2026)](#industry-context-as-of-september-2026)
 
@@ -37,8 +38,17 @@ registration token or application service is involved.
 
 - A siwx-oidc server with `"key"` in `supported_did_methods` (the default is
   `["pkh", "key"]`).
-- For Matrix: the server runs in delegated-auth mode in front of Synapse, with
-  `SIWXOIDC_MATRIX_SERVER_NAME` set. See [matrix-integration.md](matrix-integration.md).
+- For Matrix: the server runs in delegated-auth mode in front of Synapse.
+  Creating the agent's account needs both `SIWXOIDC_MAS_SHARED_SECRET` and
+  `SIWXOIDC_SYNAPSE_ENDPOINT` (together they enable the Synapse client).
+  `SIWXOIDC_MATRIX_SERVER_NAME` is needed for the published `io.inblock.did`
+  field, the `io.inblock.mxid` claim and `/resolve`, but not for creating the
+  account. See [matrix-integration.md](matrix-integration.md).
+- **Account creation is best-effort.** If `provision_user` fails at the first
+  sign-in, the server still issues tokens, but the homeserver rejects them until
+  a later sign-in (not a refresh) retries the provisioning. After signing in,
+  check `GET /_matrix/client/v3/account/whoami` on the homeserver before relying
+  on the account.
 - **A registered OIDC client for the agent, as a public client.** The client
   does not send a client secret, and the server requires one unless the client
   was registered with `token_endpoint_auth_method: "none"`. Register one with
@@ -90,7 +100,7 @@ siwx-oidc-auth --server https://auth.example.org \
 It prints the tokens as JSON on stdout (diagnostics go to stderr):
 
 ```json
-{ "access_token": "mat_…", "token_type": "Bearer", "id_token": "eyJ…",
+{ "access_token": "mat_…", "token_type": "bearer", "id_token": "eyJ…",
   "expires_in": 300, "refresh_token": "mcr_…", "did": "did:key:z6Mk…" }
 ```
 
@@ -292,12 +302,23 @@ issuer their homeserver uses. Full details:
   admin tool for it, so deactivation has to be arranged with the homeserver's
   operator. Move the agent to a new key (and so a new account) afterwards.
 - **Display name.** A new account's display name is a generated `Firstname
-  Surname` alias. The Matrix device's display name is set to `Element Web` on
-  every sign-in through `/sign_in`, whatever the client.
+  Surname` alias.
 - **A deactivated account cannot sign in**: `/sign_in` answers 401. If Synapse
   cannot be reached for that check, it answers 503; retry later.
 - **Common errors** at sign-in, with fixes, are in
   [troubleshooting.md](troubleshooting.md#headless-sign-in-siwx-oidc-auth).
+
+## Known quirks
+
+- **Every device created through `/sign_in` is named `Element Web`**, whatever
+  the client: `sign_in` passes that fixed display name to
+  `provision_synapse_device` (`src/oidc.rs`), which sends it with
+  `upsert_device` at every sign-in.
+- **`--refresh-token` without `--key-file` reports the wrong DID.** With no key
+  given, the CLI generates an ephemeral key (`load_key` in
+  `siwx-oidc-auth/src/main.rs`) and prints that key's DID in its output; the
+  refresh itself does not use the key. Always pass `--key-file` (or set
+  `SIWX_KEY_FILE`).
 
 ## How bots usually get Matrix identities
 
@@ -328,8 +349,9 @@ Identifying automated clients by their own signing key, rather than by a shared
 secret or an IP address, is being standardised on the web:
 
 - **RFC 9421** "HTTP Message Signatures" (Proposed Standard, February 2024).
-- **Cloudflare Web Bot Auth** (May 2025) signs agent HTTP requests with RFC 9421
-  and publishes keys in a directory. Adopters with public documentation include
+- **Cloudflare Web Bot Auth** (May 2025): agents sign their HTTP requests with
+  RFC 9421 and publish their keys in a directory, and Cloudflare (among others)
+  verifies the signatures. Adopters with public documentation include
   OpenAI's ChatGPT agent, Visa's Trusted Agent Protocol (October 2025),
   Mastercard Agent Pay, Amazon Bedrock AgentCore Browser (preview, October
   2025), Akamai (verification at its edge, November 2025), and Google
