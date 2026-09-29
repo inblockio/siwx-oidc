@@ -212,6 +212,24 @@ exposes port 8000. Because `SIWXOIDC_` outranks `SIWEOIDC_`, a legacy `SIWEOIDC_
 override that image default: use `SIWXOIDC_ADDRESS`. A config file goes in the working
 directory, `/siwx-oidc`. `GET /health` answers when the server is up.
 
+- **Unprivileged user.** The server runs as UID/GID 10001, not root. It writes nothing to
+  disk (all state is in Redis), so it needs no writable volume; a mounted config file only
+  has to be readable by UID 10001. Keep the port at 1024 or above (the default 8000 is):
+  an unprivileged process cannot bind a lower one unless the runtime allows it.
+- **Stopping.** SIGTERM (`docker stop`) and SIGINT stop the server gracefully: it stops
+  accepting connections, finishes open requests and exits with status 0, logging one
+  `shutting down` line. A stop takes well under a second, not the 10 s grace period.
+- **License notices.** `/usr/share/licenses/siwx-oidc/` holds `LICENSE`, `NOTICE` and the
+  third-party license texts generated during the build: `THIRD-PARTY-LICENSES-rust.txt` for
+  the crates linked into the binaries (cargo-about, configured in `about.toml`) and
+  `THIRD-PARTY-LICENSES-js.txt` for the npm packages bundled into the login page. The Alpine
+  base packages list their licenses in `/lib/apk/db/installed`.
+- **Building it yourself.** The base images are pinned by digest and the build uses
+  `Cargo.lock` and `package-lock.json` as they are (`--locked`, `npm ci`). The build fails
+  when a dependency brings a license outside the accepted lists in `about.toml` and
+  `js/ui/third-party-licenses.js`; review the license, then add it. How to bump a base image
+  is described at the top of the `Dockerfile`.
+
 ```bash
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out signing-key.pem
 docker network create siwx

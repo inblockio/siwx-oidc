@@ -1561,9 +1561,55 @@ pub async fn main() {
         );
 
     let addr = SocketAddr::from((config.address, config.port));
+    // Before the bind: from the moment the port accepts, a SIGTERM is handled.
+    let shutdown = shutdown_signal();
     info!("Listening on {}", addr);
     let listener = TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .unwrap();
+}
+
+/// Resolves on SIGTERM (`docker stop`, Kubernetes) or SIGINT (Ctrl-C); the
+/// server then stops accepting, finishes open requests and `main` returns.
+///
+/// In a container the server is PID 1, and the kernel drops a signal that PID 1
+/// has no handler for instead of terminating it. Without this handler
+/// `docker stop` waits out its grace period (10 s) and then SIGKILLs, cutting
+/// off whatever is in flight. Pinned by `tests/graceful_shutdown.rs`.
+///
+/// The handlers are installed when this is called, not when the future is
+/// first polled, so there is no window in which a signal takes the default
+/// action.
+#[cfg(unix)]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut terminate = signal(SignalKind::terminate()).expect("install the SIGTERM handler");
+    let mut interrupt = signal(SignalKind::interrupt()).expect("install the SIGINT handler");
+    async move {
+        let received = tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+        };
+        info!(
+            signal = received,
+            "shutting down: no new connections, finishing open requests"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install the Ctrl-C handler");
+        info!(
+            signal = "ctrl_c",
+            "shutting down: no new connections, finishing open requests"
+        );
+    }
 }
 
 #[cfg(test)]

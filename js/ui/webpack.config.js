@@ -6,6 +6,7 @@ const MiniCssExtractPlugin = require('mini-css-extract-plugin');
 const path = require('path');
 const sveltePreprocess = require('svelte-preprocess');
 const webpack = require('webpack');
+const { ThirdPartyLicensesPlugin } = require('./third-party-licenses');
 
 const mode = process.env.NODE_ENV || 'development';
 const prod = mode === 'production';
@@ -107,6 +108,7 @@ module.exports = {
 		new MiniCssExtractPlugin({
 			filename: '[name].css'
 		}),
+		new ThirdPartyLicensesPlugin({ filename: 'third-party-licenses.txt' }),
 	],
 	devtool: prod ? false : 'source-map',
 	devServer: {

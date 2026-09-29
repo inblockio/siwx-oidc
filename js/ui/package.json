@@ -42,8 +42,8 @@
 		"validate": "svelte-check"
 	},
 	"dependencies": {
-		"@wagmi/core": "^2.21.2",
-		"js-cookie": "^3.0.5",
-		"viem": "^2.47.0"
+		"@wagmi/core": "^2.22.1",
+		"js-cookie": "^3.0.8",
+		"viem": "^2.57.1"
 	}
 }

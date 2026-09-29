@@ -1,2 +1,11 @@
 .github
 target
+# Host installs and build output. The image runs npm ci and webpack itself, and
+# webpack does not clean static/build, so stale files from a local build would
+# otherwise ship next to the fresh ones.
+**/node_modules
+static/build
+.git
+# Maintainer-local material never belongs in a build context.
+internal
+CLAUDE.local.md
