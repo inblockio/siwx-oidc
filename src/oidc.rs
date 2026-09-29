@@ -601,6 +601,7 @@ pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
 pub fn provider_metadata_value(
     base_url: Url,
     account_management_uri: Option<&Url>,
+    advertise_resolve: bool,
 ) -> Result<serde_json::Value, CustomError> {
     let pm = metadata(base_url.clone())?;
     let mut value =
@@ -633,8 +634,37 @@ pub fn provider_metadata_value(
     value["account_management_uri"] = serde_json::json!(account_uri);
     value["account_management_actions_supported"] =
         serde_json::json!(crate::account::SUPPORTED_ACTIONS);
+    // Advertised ONLY when this deployment can answer it (see
+    // `resolve_endpoint_advertised`): a client that finds the key will call
+    // the route, and advertising a route that answers 503 turns discovery
+    // into a guaranteed failed request per lookup.
+    if advertise_resolve {
+        value[RESOLVE_ENDPOINT_METADATA_KEY] = serde_json::json!(format!("{}/resolve", base));
+    }
     Ok(value)
 }
+
+/// The provider-metadata key advertising `GET /resolve` (see `resolve.rs`).
+///
+/// # Why in the OIDC discovery document
+///
+/// A client that wants to resolve a DID on some homeserver needs to find THAT
+/// homeserver's resolver, and the one document every OAuth-aware Matrix client
+/// already fetches for a homeserver is `/_matrix/client/v1/auth_metadata` —
+/// which Synapse (MAS-mode delegation) serves by forwarding this document with
+/// unknown keys intact (`synapse/api/auth/mas.py::ServerMetadata`,
+/// `extra="allow"`; `account_management_uri` reaches clients the same way,
+/// verified live). So advertising it here needs no Synapse, well-known or
+/// Caddy change, and it works for any homeserver delegating auth to a
+/// siwx-oidc that sets this, including a federated peer's.
+///
+/// RFC 8414 §2 permits additional metadata parameters; the reverse-DNS name
+/// keeps it out of any registered namespace. It is a DISCOVERY HINT like the
+/// endpoint it names: a consumer still verifies the account it is pointed at
+/// (the published `io.inblock.did` field), and nothing is authorized by it.
+///
+/// Contract: the Element Web `resolve-did-search` patch reads this exact key.
+pub const RESOLVE_ENDPOINT_METADATA_KEY: &str = "io.inblock.resolve_endpoint";
 
 // -- ENS resolution -------------------------------------------------------
 //
@@ -3503,7 +3533,7 @@ mod tests {
     fn provider_metadata_advertises_response_modes() {
         // js-sdk v42 `isValidAuthMetadata` hard-requires both modes.
         let base = Url::parse("https://siwx-oidc.example.com/").unwrap();
-        let value = provider_metadata_value(base, None).unwrap();
+        let value = provider_metadata_value(base, None, false).unwrap();
         assert_eq!(
             value["response_modes_supported"],
             serde_json::json!(["query", "fragment"])
@@ -3583,7 +3613,7 @@ mod tests {
         // actions plus their session_* aliases. Synapse forwards this document
         // verbatim to /_matrix/client/v1/auth_metadata (verified live).
         let base = Url::parse("https://siwx-oidc.example.com/").unwrap();
-        let value = provider_metadata_value(base, None).unwrap();
+        let value = provider_metadata_value(base, None, false).unwrap();
 
         assert_eq!(
             value["account_management_uri"], "https://siwx-oidc.example.com/account",
@@ -3614,10 +3644,31 @@ mod tests {
     }
 
     #[test]
+    fn provider_metadata_advertises_resolve_only_when_it_can_answer() {
+        let base = Url::parse("https://siwx-oidc.example.com/").unwrap();
+
+        let on = provider_metadata_value(base.clone(), None, true).unwrap();
+        assert_eq!(
+            on[RESOLVE_ENDPOINT_METADATA_KEY], "https://siwx-oidc.example.com/resolve",
+            "the advertised endpoint must be {{base}}/resolve, the route axum serves"
+        );
+        assert_eq!(
+            RESOLVE_ENDPOINT_METADATA_KEY, "io.inblock.resolve_endpoint",
+            "the Element Web resolve-did-search patch reads this exact key"
+        );
+
+        let off = provider_metadata_value(base, None, false).unwrap();
+        assert!(
+            off.get(RESOLVE_ENDPOINT_METADATA_KEY).is_none(),
+            "a deployment that would answer 503 must not advertise the route"
+        );
+    }
+
+    #[test]
     fn provider_metadata_honours_account_management_uri_override() {
         let base = Url::parse("https://siwx-oidc.example.com/").unwrap();
         let override_uri = Url::parse("https://account.example.com/manage").unwrap();
-        let value = provider_metadata_value(base, Some(&override_uri)).unwrap();
+        let value = provider_metadata_value(base, Some(&override_uri), false).unwrap();
         assert_eq!(
             value["account_management_uri"],
             "https://account.example.com/manage"
