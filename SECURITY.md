@@ -1,8 +1,9 @@
 # Security policy
 
 siwx-oidc is a pathfinder project run by inblock.io assets GmbH on a non-commercial basis and
-provided as is, without warranty (Apache-2.0 §§7–8). Security reports are welcome and handled
-best-effort.
+provided as is, without warranty (Apache-2.0 §§7–8). There is no support offering, no SLA, and
+no commitment to maintain it for third-party deployments. Security reports are welcome and
+handled best-effort.
 
 ## Supported versions
 

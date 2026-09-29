@@ -16,7 +16,7 @@ binding in the profile field `io.inblock.did`.
 
 **Status:** siwx-oidc is a pathfinder project for agent identity on Matrix, run by inblock.io
 assets GmbH on a non-commercial basis. It is provided as is, without warranty (Apache-2.0
-§7–8). There is no support offering, no SLA, and no commitment to maintain it for third-party
+§§7–8). There is no support offering, no SLA, and no commitment to maintain it for third-party
 deployments; the maintainers maintain it for their own use, and interfaces may change without
 notice. There are no tagged releases yet; `main` is what runs.
 
