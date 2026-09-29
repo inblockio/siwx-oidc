@@ -123,6 +123,20 @@ metadata (at least `redirect_uris`). Clients can also register themselves throug
 my-app = '{"secret":"change-me","metadata":{"redirect_uris":["https://app.example.org/callback"]}}'
 ```
 
+### Legal documents
+
+| Key | Environment | Default | Meaning |
+|---|---|---|---|
+| `op_tos_uri` | `SIWXOIDC_OP_TOS_URI` | none | Your terms of service, advertised as `op_tos_uri` in discovery. |
+| `op_policy_uri` | `SIWXOIDC_OP_POLICY_URI` | none | Your privacy policy, advertised as `op_policy_uri` in discovery. |
+
+Each value must be an absolute `http` or `https` URL; anything else stops the server at startup
+with an error naming the key. Unset or empty, the field is left out of discovery. There is no
+default, because the documents are the operator's own. The server also serves the files in
+`static/legal/` at `/legal/terms-of-use.html` and `/legal/privacy-policy.html`: they are the
+maintainers' documents for their own deployment, not templates, and nothing advertises them
+unless a key points at them.
+
 ### ENS names (Ethereum sign-ins)
 
 | Key | Environment | Default | Meaning |

@@ -82,8 +82,6 @@ pub const SIGNIN_PATH: &str = "/sign_in";
 pub const SIWX_COOKIE_KEY: &str = "siwx";
 /// RFC 8628 grant type of the device-code grant (`POST /token`).
 pub const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
-pub const TOU_PATH: &str = "/legal/terms-of-use.html";
-pub const PP_PATH: &str = "/legal/privacy-policy.html";
 
 type DBClientType = dyn DBClient + Sync;
 
@@ -530,7 +528,8 @@ pub fn jwks(
     Ok(CoreJsonWebKeySet::new(keys))
 }
 
-pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
+pub fn metadata(config: &crate::config::Config) -> Result<CoreProviderMetadata, CustomError> {
+    let base_url = &config.base_url;
     let pm = CoreProviderMetadata::new(
         IssuerUrl::from_url(base_url.clone()),
         AuthUrl::from_url(
@@ -583,16 +582,11 @@ pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
         CoreClientAuthMethod::ClientSecretBasic,
         CoreClientAuthMethod::ClientSecretPost,
     ]))
-    .set_op_policy_uri(Some(OpPolicyUrl::from_url(
-        base_url
-            .join(PP_PATH)
-            .map_err(|e| anyhow!("Unable to join URL: {}", e))?,
-    )))
-    .set_op_tos_uri(Some(OpTosUrl::from_url(
-        base_url
-            .join(TOU_PATH)
-            .map_err(|e| anyhow!("Unable to join URL: {}", e))?,
-    )));
+    // Only what the operator configured. The terms and privacy policy are the
+    // deployment's own documents, so there is no default to fall back to, and
+    // an unset key omits the field (openidconnect skips `None`).
+    .set_op_policy_uri(config.op_policy_uri.clone().map(OpPolicyUrl::from_url))
+    .set_op_tos_uri(config.op_tos_uri.clone().map(OpTosUrl::from_url));
 
     Ok(pm)
 }
@@ -628,7 +622,7 @@ pub fn provider_metadata_value(
     advertise_resolve: bool,
 ) -> Result<serde_json::Value, CustomError> {
     let base_url = &config.base_url;
-    let pm = metadata(base_url.clone())?;
+    let pm = metadata(config)?;
     let mut value =
         serde_json::to_value(pm).map_err(|e| anyhow!("Failed to serialize metadata: {}", e))?;
     let base = base_url.as_str().trim_end_matches('/');
@@ -3613,8 +3607,7 @@ mod tests {
 
     #[test]
     fn discovery_metadata_contains_matrix_scopes() {
-        let base = Url::parse("https://siwx-oidc.example.com").unwrap();
-        let pm = metadata(base).unwrap();
+        let pm = metadata(&discovery_config()).unwrap();
         let json = serde_json::to_value(&pm).unwrap();
         let scopes = json["scopes_supported"]
             .as_array()
@@ -3712,6 +3705,31 @@ mod tests {
             value["account_management_uri"],
             "https://account.example.com/manage"
         );
+    }
+
+    /// The terms of service and privacy policy are the deployment's own, so
+    /// discovery carries exactly what the operator configured and omits an
+    /// unset field rather than pointing at a default document.
+    #[test]
+    fn discovery_advertises_legal_uris_only_when_configured() {
+        let unset = provider_metadata_value(&discovery_config(), false).unwrap();
+        assert!(
+            unset.get("op_tos_uri").is_none(),
+            "no default terms of service may be advertised: {unset}"
+        );
+        assert!(
+            unset.get("op_policy_uri").is_none(),
+            "no default privacy policy may be advertised: {unset}"
+        );
+
+        let config = Config {
+            op_tos_uri: Some(Url::parse("https://legal.example.org/terms").unwrap()),
+            op_policy_uri: Some(Url::parse("https://legal.example.org/privacy").unwrap()),
+            ..discovery_config()
+        };
+        let set = provider_metadata_value(&config, false).unwrap();
+        assert_eq!(set["op_tos_uri"], "https://legal.example.org/terms");
+        assert_eq!(set["op_policy_uri"], "https://legal.example.org/privacy");
     }
 
     /// Standalone discovery lists only what a standalone deployment serves.

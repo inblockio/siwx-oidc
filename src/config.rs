@@ -121,6 +121,25 @@ where
     }
 }
 
+/// Deserializes an optional absolute `http`/`https` URL, treating an empty
+/// string as `None` like [`empty_string_as_none`]. Anything else, a relative
+/// path or another scheme, is an error, so a bad value stops the server at
+/// startup instead of being published in discovery.
+fn http_url_or_none<'de, D>(deserializer: D) -> Result<Option<Url>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(url) = empty_string_as_none(deserializer)? else {
+        return Ok(None);
+    };
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(serde::de::Error::custom(format!(
+            "expected an absolute http(s) URL, got {url}"
+        )));
+    }
+    Ok(Some(url))
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub address: IpAddr,
@@ -184,6 +203,18 @@ pub struct Config {
     /// userinfo claim and `GET /resolve`. Without it those degrade or are skipped.
     /// Env: `SIWEOIDC_MATRIX_SERVER_NAME`
     pub matrix_server_name: Option<String>,
+    /// This deployment's terms of service, advertised as `op_tos_uri` in
+    /// discovery. Unset or empty (the default): the field is omitted, because
+    /// no deployment should advertise terms it did not write. An absolute
+    /// http(s) URL, checked at startup.
+    /// Env: `SIWXOIDC_OP_TOS_URI`
+    #[serde(default, deserialize_with = "http_url_or_none")]
+    pub op_tos_uri: Option<Url>,
+    /// This deployment's privacy policy, advertised as `op_policy_uri` in
+    /// discovery. Same rules as [`Config::op_tos_uri`].
+    /// Env: `SIWXOIDC_OP_POLICY_URI`
+    #[serde(default, deserialize_with = "http_url_or_none")]
+    pub op_policy_uri: Option<Url>,
     /// MSC4191: Account management URI advertised in OIDC discovery.
     /// When absent, defaults to `{base_url}/account`.
     /// Env: `SIWEOIDC_ACCOUNT_MANAGEMENT_URI`
@@ -230,6 +261,8 @@ impl Default for Config {
             synapse_endpoint: None,
             log_format: "pretty".to_string(),
             matrix_server_name: None,
+            op_tos_uri: None,
+            op_policy_uri: None,
             account_management_uri: None,
             admin_token_ttl_secs: 300,
             admin_token_localpart: "siwx-admin".to_string(),
@@ -448,6 +481,78 @@ mod tests {
             assert!(LegacyNames::detect(&figment()).is_empty());
             Ok(())
         });
+    }
+
+    #[test]
+    fn legal_uris_are_unset_by_default() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            let config: Config = figment().extract()?;
+            assert!(config.op_tos_uri.is_none());
+            assert!(config.op_policy_uri.is_none());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn legal_uris_are_read_under_both_prefixes_and_from_the_file() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWXOIDC_OP_TOS_URI", "https://id.example.org/terms");
+            jail.set_env("SIWEOIDC_OP_POLICY_URI", "https://id.example.org/privacy");
+            let config: Config = figment().extract()?;
+            assert_eq!(
+                config.op_tos_uri.as_ref().map(Url::as_str),
+                Some("https://id.example.org/terms")
+            );
+            assert_eq!(
+                config.op_policy_uri.as_ref().map(Url::as_str),
+                Some("https://id.example.org/privacy")
+            );
+
+            scrub_config_env(jail);
+            jail.create_file(
+                CONFIG_FILE,
+                "[default]\nop_tos_uri = \"https://id.example.org/file-terms\"\n",
+            )?;
+            let config: Config = figment().extract()?;
+            assert_eq!(
+                config.op_tos_uri.as_ref().map(Url::as_str),
+                Some("https://id.example.org/file-terms")
+            );
+            // An empty value unsets it again, as for every optional URL.
+            jail.set_env("SIWXOIDC_OP_TOS_URI", "");
+            let config: Config = figment().extract()?;
+            assert!(config.op_tos_uri.is_none());
+            Ok(())
+        });
+    }
+
+    /// A value that is not an absolute http(s) URL fails extraction, which is
+    /// the startup `unwrap` in `axum_lib::main`: the server refuses to start
+    /// rather than advertise it. The error names the key.
+    #[test]
+    fn a_legal_uri_that_is_not_an_absolute_http_url_fails_startup() {
+        for bad in [
+            "/legal/terms-of-use.html",
+            "javascript:alert(1)",
+            "mailto:legal@example.org",
+            "not a url",
+        ] {
+            Jail::expect_with(|jail| {
+                scrub_config_env(jail);
+                jail.set_env("SIWXOIDC_OP_POLICY_URI", bad);
+                let err = match figment().extract::<Config>() {
+                    Ok(_) => panic!("{bad:?} must be refused"),
+                    Err(e) => e.to_string(),
+                };
+                assert!(
+                    err.to_ascii_lowercase().contains("op_policy_uri"),
+                    "the error must name the key, got: {err}"
+                );
+                Ok(())
+            });
+        }
     }
 
     #[test]
