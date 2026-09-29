@@ -24,13 +24,23 @@ jobs:
   build:
     # Pinned so the OS changes on purpose: `ubuntu-latest` becomes 26.04 from 2026-10-19.
     runs-on: ubuntu-24.04
-    # Redis for the unit tests that need it, started the same way as in the two
-    # e2e jobs below. It used to come from test/docker-compose.yml, a siwe-oidc
-    # leftover whose other services (the upstream image, Keycloak) nothing ran.
+    # Two Redis services, started the same way as in the e2e jobs below.
+    # `redis` serves every Redis-backed unit test (src/test_support.rs).
+    # `migration-redis` is the disposable instance
+    # tests/credential_migration_live.rs requires: it asserts the credential
+    # namespace starts EMPTY, so it cannot share the first one.
     services:
       redis:
         image: redis:7-alpine
         ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      migration-redis:
+        image: redis:7-alpine
+        ports: ["6398:6379"]
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s
@@ -42,16 +52,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build
+        run: cargo build --workspace
       - name: Clippy
-        run: cargo clippy
+        run: cargo clippy --workspace --all-targets
       - name: Fmt
-        run: cargo fmt -- --check
+        run: cargo fmt --all -- --check
 
-      # Runs the unit tests only. Every tests/*.rs integration test is #[ignore]d
-      # and stays that way: all 63 of them need a live siwx-oidc HTTP listener,
-      # which this job does not have (Redis alone is not enough). The promotable
+      # The unit tests of both crates, siwx-oidc-auth's doc test, and the 13
+      # tests in tests/*.rs that are not #[ignore]d. The other 65 need a live
+      # siwx-oidc HTTP listener (Redis alone is not enough); the promotable
       # subset runs in the `rust-e2e-mock` job below.
+      #
+      # SIWX_TEST_REQUIRE_REDIS=1 makes an unreachable Redis FAIL a
+      # Redis-backed test instead of skipping it, and an unset
+      # MIGRATION_TEST_REDIS_URL fail the migration suite, so a green run means
+      # every one of them ran.
       #
       # This does NOT run the 4 `#[ignore]`d UNIT tests in the binary crate, and
       # no job does: `device_auth::tests::write_previews` (an opt-in HTML dumper),
@@ -61,7 +76,11 @@ jobs:
       # connect timeout is honoured, and passes here in ~2s — so it is promotable
       # and should be promoted the next time `src/synapse_client.rs` is touched.
       - name: Test
-        run: cargo test
+        env:
+          SIWX_TEST_REDIS_URL: redis://localhost:6379
+          SIWX_TEST_REQUIRE_REDIS: "1"
+          MIGRATION_TEST_REDIS_URL: redis://localhost:6398
+        run: cargo test --workspace
 
   # ---------------------------------------------------------------------------
   # Rust integration E2E against the MOCK stack. Added 2026-07-26 to close the
@@ -69,7 +88,7 @@ jobs:
   # ran NOWHERE automatically, so every protocol-level assertion about session
   # teardown, OAuth binding and account management was an unguarded manual claim.
   #
-  # This job promotes the 51 of them that need nothing beyond the self-contained
+  # This job promotes the 53 of them that need nothing beyond the self-contained
   # mock stack (Redis + synapse_mock.py + siwx-oidc) -- the same infrastructure
   # browser-e2e already stands up. The remaining 12 are NOT promotable: they need
   # a REAL Synapse (they call /_matrix/client/v3/... Client-Server endpoints that
