@@ -188,8 +188,11 @@ Run from the repository root: static assets are served from `./static`.
 
 ## Docker
 
-CI publishes `ghcr.io/inblockio/siwx-oidc` on pushes to `main` that change more than docs
-(tags `main`, `latest` and `sha-…`). There are no release tags yet. The image contains the `siwx-oidc` server, the
+CI (`.github/workflows/docker.yml`) publishes `ghcr.io/inblockio/siwx-oidc`. A push to `main`
+is tagged `main`, `latest` and `sha-<short commit>`; a push to the `fork-stable` branch is
+tagged `fork-stable` and `sha-…` (pushes that change only docs are not built); a published
+GitHub release with a semver tag `vX.Y.Z` is tagged `X.Y.Z`, `X.Y` and `sha-…`. There are no
+releases yet, so no semver tags exist. The image contains the `siwx-oidc` server, the
 `migrate-credentials` tool and the built login page; it sets `SIWXOIDC_ADDRESS=0.0.0.0` and
 exposes port 8000. Because `SIWXOIDC_` outranks `SIWEOIDC_`, a legacy `SIWEOIDC_ADDRESS` cannot
 override that image default: use `SIWXOIDC_ADDRESS`. A config file goes in the working
