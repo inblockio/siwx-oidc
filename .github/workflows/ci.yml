@@ -4,7 +4,7 @@ name: ci
 # without a PR do not run, so a PR branch is not built twice.
 #
 # A `pull_request` run gets a read-only token and, from a fork, no secrets.
-# Nothing in this workflow reads a secret (SIWEOIDC_MAS_SHARED_SECRET below is
+# Nothing in this workflow reads a secret (SIWXOIDC_MAS_SHARED_SECRET below is
 # a literal test value), so a fork PR runs every job in full. Keep it that
 # way: a step that needs a secret must skip visibly when it is absent, in a
 # named step that says why, and never fail or pass without running.
@@ -152,19 +152,25 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      SIWEOIDC_ADDRESS: 127.0.0.1
-      SIWEOIDC_PORT: "18080"
-      SIWEOIDC_BASE_URL: http://localhost:18080
-      SIWEOIDC_REDIS_URL: redis://localhost:6379
-      SIWEOIDC_MAS_SHARED_SECRET: testsecret
-      SIWEOIDC_SYNAPSE_ENDPOINT: http://localhost:8090
-      SIWEOIDC_MATRIX_SERVER_NAME: matrix.test
-      SIWEOIDC_REQUIRE_SECRET: "false"
-      SIWEOIDC_LOG_FORMAT: pretty
+      SIWXOIDC_ADDRESS: 127.0.0.1
+      SIWXOIDC_PORT: "18080"
+      SIWXOIDC_BASE_URL: http://localhost:18080
+      SIWXOIDC_REDIS_URL: redis://localhost:6379
+      SIWXOIDC_MAS_SHARED_SECRET: testsecret
+      SIWXOIDC_SYNAPSE_ENDPOINT: http://localhost:8090
+      SIWXOIDC_MATRIX_SERVER_NAME: matrix.test
+      SIWXOIDC_REQUIRE_SECRET: "false"
+      SIWXOIDC_LOG_FORMAT: pretty
       RUST_LOG: siwx_oidc=info,tower_http=warn,warn
       SYNAPSE_MOCK_SECRET: testsecret
       SYNAPSE_MOCK_PORT: "8090"
+      # The issuer the mock introspects admin tokens against. Set explicitly:
+      # its fallback reads the legacy SIWEOIDC_BASE_URL, which this job no
+      # longer sets, and without either every admin call answers 401.
+      SYNAPSE_MOCK_OIDC_BASE: http://localhost:18080
       # What the tests themselves read (tests/e2e_*.rs `oidc()` / `mock()`).
+      # SIWEOIDC_HOST is the suites' own variable, not a server setting; the
+      # server is started without it so its legacy-name warning stays quiet.
       SIWEOIDC_HOST: http://localhost:18080
       SYNAPSE_MOCK: http://localhost:8090
       # `matrix_host()` in e2e_device_code / e2e_msc3861 / e2e_session_teardown.
@@ -205,14 +211,14 @@ jobs:
 
       - name: Start siwx-oidc
         run: |
-          nohup ./target/debug/siwx-oidc > /tmp/siwx-oidc.log 2>&1 &
+          nohup env -u SIWEOIDC_HOST ./target/debug/siwx-oidc > /tmp/siwx-oidc.log 2>&1 &
           for _ in $(seq 1 60); do
-            if curl -sf "${SIWEOIDC_BASE_URL}/health" >/dev/null 2>&1; then
+            if curl -sf "${SIWXOIDC_BASE_URL}/health" >/dev/null 2>&1; then
               echo "siwx-oidc healthy"; exit 0
             fi
             sleep 0.5
           done
-          echo "siwx-oidc did not become healthy on ${SIWEOIDC_BASE_URL}" >&2
+          echo "siwx-oidc did not become healthy on ${SIWXOIDC_BASE_URL}" >&2
           cat /tmp/siwx-oidc.log >&2
           exit 1
 
@@ -329,18 +335,23 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      SIWEOIDC_ADDRESS: 127.0.0.1
-      SIWEOIDC_PORT: "18080"
-      SIWEOIDC_BASE_URL: http://localhost:18080
-      SIWEOIDC_REDIS_URL: redis://localhost:6379
-      SIWEOIDC_MAS_SHARED_SECRET: testsecret
-      SIWEOIDC_SYNAPSE_ENDPOINT: http://localhost:8090
-      SIWEOIDC_MATRIX_SERVER_NAME: matrix.test
-      SIWEOIDC_REQUIRE_SECRET: "false"
-      SIWEOIDC_LOG_FORMAT: pretty
+      SIWXOIDC_ADDRESS: 127.0.0.1
+      SIWXOIDC_PORT: "18080"
+      SIWXOIDC_BASE_URL: http://localhost:18080
+      SIWXOIDC_REDIS_URL: redis://localhost:6379
+      SIWXOIDC_MAS_SHARED_SECRET: testsecret
+      SIWXOIDC_SYNAPSE_ENDPOINT: http://localhost:8090
+      SIWXOIDC_MATRIX_SERVER_NAME: matrix.test
+      SIWXOIDC_REQUIRE_SECRET: "false"
+      SIWXOIDC_LOG_FORMAT: pretty
       RUST_LOG: siwx_oidc=info,tower_http=warn,warn
       SYNAPSE_MOCK_SECRET: testsecret
       SYNAPSE_MOCK_PORT: "8090"
+      # The issuer the mock introspects admin tokens against. Set explicitly:
+      # its fallback reads the legacy SIWEOIDC_BASE_URL, which this job no
+      # longer sets, and without either every admin call answers 401.
+      SYNAPSE_MOCK_OIDC_BASE: http://localhost:18080
+      # The suites' own variable, not a server setting (see rust-e2e-mock).
       SIWEOIDC_HOST: http://localhost:18080
       SYNAPSE_MOCK: http://localhost:8090
     steps:
@@ -379,14 +390,14 @@ jobs:
 
       - name: Start siwx-oidc
         run: |
-          nohup ./target/debug/siwx-oidc > /tmp/siwx-oidc.log 2>&1 &
+          nohup env -u SIWEOIDC_HOST ./target/debug/siwx-oidc > /tmp/siwx-oidc.log 2>&1 &
           for _ in $(seq 1 60); do
-            if curl -sf "${SIWEOIDC_BASE_URL}/health" >/dev/null 2>&1; then
+            if curl -sf "${SIWXOIDC_BASE_URL}/health" >/dev/null 2>&1; then
               echo "siwx-oidc healthy"; exit 0
             fi
             sleep 0.5
           done
-          echo "siwx-oidc did not become healthy on ${SIWEOIDC_BASE_URL}" >&2
+          echo "siwx-oidc did not become healthy on ${SIWXOIDC_BASE_URL}" >&2
           cat /tmp/siwx-oidc.log >&2
           exit 1
 
