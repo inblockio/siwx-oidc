@@ -1,5 +1,7 @@
 # Recovery-phrase entry & QR second-device login — capability audit
 
+> **Unpublished references.** Session plans and handovers cited below by file name (e.g. `2026-07-25-session-onboarding-state-machine-map.md`) are the maintainers' internal working documents and are not part of this repository; the findings here stand on their own evidence.
+
 **Date:** 2026-07-25
 **Worktree:** `/home/waldknoten-01/wt/siwx-durability`, branch `feat/session-durability-marathon`, base `main` @ `d21329e`
 **Method:** `/logic-model` (CONTEXT → GOAL → INPUTS → ACTIVITIES/OUTPUTS → BOUNDARY CONDITIONS)
@@ -35,7 +37,7 @@ the merged patch fixes only one of them.
 
 ### 1.1 The requirement
 
-`docs/superpowers/plans/2026-07-25-session-durability-no-forced-logins.md:105-106` (**R5**, **R6**):
+`2026-07-25-session-durability-no-forced-logins.md:105-106` (**R5**, **R6**):
 
 > R5 — User adds a phone, **nothing else signed in** → Recovery phrase — **must remain, and must be enterable**
 > R6 — User lost every device → Recovery phrase — **must remain, and must be enterable**
