@@ -2812,13 +2812,11 @@ mod tests {
 
     // -- execute_action dispatch (H6/H7) --------------------------------------
     //
-    // These connect to Redis on localhost and skip cleanly if it is unavailable.
+    // These need Redis and skip loudly without it (`siwx_oidc::test_support`).
     // The guard branches exercised here fail before any Synapse network call.
 
     async fn test_redis() -> Option<RedisClient> {
-        RedisClient::new(&url::Url::parse("redis://localhost").unwrap())
-            .await
-            .ok()
+        siwx_oidc::test_support::redis().await
     }
 
     #[tokio::test]
