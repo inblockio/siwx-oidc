@@ -1,241 +1,328 @@
 # siwx-oidc
 
-OpenID Connect identity provider that authenticates users via wallet signatures (CAIP-122) and WebAuthn passkeys. Users sign a challenge with their existing wallet or tap a biometric; siwx-oidc issues standard OIDC tokens with the user's DID as the subject claim.
+**Key-first OpenID Connect provider and Matrix auth service: agents and people sign in with
+their own key, no passwords.**
 
-Any OIDC relying party can consume these tokens. The primary deployment target is Matrix Synapse, where siwx-oidc **replaces MAS entirely** via MSC3861, handling token introspection, device provisioning, cross-signing management, and the full device lifecycle including QR code login.
+**siwx-oidc** is an OpenID Connect provider where the account *is* a key. People sign in with a
+passkey or a wallet; software agents sign in with their own Ed25519/P-256 key, no browser and no
+password. Every identity is a DID, carried as the OIDC `sub`. For Matrix it takes the place of
+the Matrix Authentication Service (MAS) as Synapse's auth service, so giving an AI agent a full
+end-to-end-encrypted Matrix account takes one key pair — and it publishes a signed DID↔MXID
+binding anyone can verify.
 
-Single Rust binary (~18MB Alpine Docker image). Redis as the only dependency.
+> [!IMPORTANT]
+> **Status: pathfinder project, non-commercial, provided as is.**
+> siwx-oidc is a pathfinder project for agent identity on Matrix, run by inblock.io assets GmbH
+> on a non-commercial basis. It is provided **as is**, without warranty (Apache-2.0 §§7–8).
+> There is **no support offering, no SLA, and no commitment to maintain it for third-party
+> deployments**: the maintainers maintain it for their own use (inblock.io runs it for its own
+> people and AI agents), and interfaces may change without notice. There are no tagged releases
+> yet; `main` is what runs. Contributions and security reports are welcome and handled
+> best-effort.
 
-## What makes this different
+## Matrix accounts for AI agents
 
-No other open-source project combines these three things:
+An agent's key is its account. With `siwx-oidc-auth` (CLI and Rust library in this repository),
+a software agent signs in headlessly with its own Ed25519 or P-256 key:
 
-1. **Wallet signature as primary OIDC identity.** The DID derived from the wallet or passkey is the canonical identity. No username, no password, no email. General IAM platforms (Keycloak, authentik) treat wallet login as peripheral "social login" bound to a traditional account.
+- **No password, registration token or appservice.** The agent's DID (`did:key:z6Mk…` for
+  Ed25519, `did:key:zDn…` for P-256) is derived from its public key, and its Matrix ID is derived
+  from the DID. The first sign-in creates the account.
+- **No browser.** The client runs the OIDC authorization-code flow with PKCE and signs a
+  CAIP-122 challenge locally.
+- **A full Matrix user account.** It is an ordinary Synapse user, not a bridge or an appservice
+  puppet, so the agent's Matrix client can join rooms and use end-to-end encryption like any
+  other client.
+- **A stable device.** Refreshing tokens keeps the Matrix device ID, so the agent's E2EE crypto
+  store stays valid. `--device-id` pins one device across full re-authentications as well.
+  Access tokens live 5 minutes; refresh tokens live 90 days and rotate on every use.
+- **A verifiable binding.** siwx-oidc publishes a provider-signed `io.inblock.did` field in the
+  agent's profile. With it, `GET /resolve` and `siwx-oidc-auth --verify-did` let others check
+  which key stands behind an MXID (see [Identity model](#identity-model)).
 
-2. **Full MSC3861 compliance.** Token introspection, device provisioning via Synapse admin API, cross-signing reset (MSC4312), account management discovery (MSC4191). MAS implements this protocol but accepts no wallet auth.
+### Example
 
-3. **Multi-ceremony, multi-chain, single identity.** CAIP-122 (any chain), WebAuthn passkeys, and RFC 8628 device codes all converge into one DID-based identity. A user can authenticate with MetaMask on desktop, Face ID on mobile, or a QR code on a headless device, and all sessions resolve to the same account.
+```bash
+# Build the client (from a checkout of this repository)
+cargo install --path siwx-oidc-auth
 
-The upstream predecessor ([spruceid/siwe-oidc](https://github.com/nickreynolds/siwe-oidc)) was Ethereum-only, had no passkeys, no refresh tokens, no MSC3861 support, and was abandoned in mid-2024.
+# The key is the account: generate it once and keep it safe
+openssl genpkey -algorithm Ed25519 -out agent.pem
+siwx-oidc-auth --print-did --key-file agent.pem
+# did:key:z6Mk…
 
-## Authentication methods
+# Register an OAuth client once. A public client: the agent holds no client secret.
+# The redirect URI is never visited, but it must be registered and passed below.
+curl -s -X POST https://siwx.example.com/register -H 'Content-Type: application/json' \
+  -d '{"redirect_uris":["http://localhost/callback"],"token_endpoint_auth_method":"none",
+       "grant_types":["authorization_code","refresh_token"],"response_types":["code"]}'
+# {"client_id":"…", …}
 
-| Method | Flow | Identity | Use case |
-|--------|------|----------|----------|
-| Wallet (CAIP-122) | Browser sign + cookie | `did:pkh:eip155:1:0x...` | Primary login (desktop) |
-| WebAuthn passkey | Biometric prompt | `did:key:zDn...` (P-256) | Passwordless mobile/desktop |
-| Linked passkey | Biometric prompt | Wallet DID (linked) | Same identity, no wallet needed |
-| Device code (RFC 8628) | QR code / user code | Approver's DID | Element X QR login, CI, headless |
-| Headless client | Local PEM key | `did:key:z6Mk...` (Ed25519) | Service accounts, bots |
+# Sign in, pinning a stable Matrix device ID
+siwx-oidc-auth --server https://siwx.example.com --client-id "$CLIENT_ID" \
+  --redirect-uri http://localhost/callback --key-file agent.pem --device-id my-agent
+# prints JSON: access_token, refresh_token, id_token, expires_in, did
 
-Users can link a passkey to their wallet DID, so future biometric logins produce the same identity as wallet logins.
+# Later: new tokens without signing again; the device stays the same
+siwx-oidc-auth --server https://siwx.example.com --client-id "$CLIENT_ID" \
+  --refresh-token "$REFRESH_TOKEN" --key-file agent.pem
+```
 
-## Supported DID methods
+The `access_token` is the agent's Matrix access token; `GET /_matrix/client/v3/account/whoami`
+on the homeserver returns its MXID and device ID. The same flow as a library call:
 
-| DID Method | Key types | Default |
-|-----------|-----------|---------|
-| `did:pkh` | eip155 (Ethereum), ed25519, p256 | Yes |
-| `did:key` | Ed25519 (`z6Mk...`), P-256 (`zDn...`) | Opt-in |
-| `did:peer` | Variant 0, Variant 2 (V-key) | Opt-in |
+```rust
+use siwx_oidc_auth::{authenticate_with_device, refresh, SiwxKey};
+
+let key = SiwxKey::from_pem_file("agent.pem".as_ref())?;
+let tokens = authenticate_with_device(
+    "https://siwx.example.com", &client_id, "http://localhost/callback",
+    &key, Some("my-agent"),
+).await?;
+// ...later, when the access token expires:
+let tokens = refresh(
+    "https://siwx.example.com", &client_id,
+    tokens.refresh_token.as_deref().expect("refresh token"), &key.did(),
+).await?;
+```
+
+The full agent guide, including the device-code flow for a human approving a headless machine,
+is [docs/agents.md](docs/agents.md).
+
+### Key-first agent identity on the web
+
+Identifying an agent by a key it holds is also how AI agents are starting to identify themselves
+to websites. Cloudflare introduced [Web Bot Auth](https://blog.cloudflare.com/web-bot-auth/) in
+May 2025, built on [RFC 9421](https://www.rfc-editor.org/rfc/rfc9421) (HTTP Message Signatures).
+OpenAI's ChatGPT agent was in the first cohort of Cloudflare's
+[signed agents](https://blog.cloudflare.com/signed-agents/) (August 2025);
+[Visa's Trusted Agent Protocol](https://usa.visa.com/about-visa/newsroom/press-releases.releaseId.21716.html)
+(October 2025) builds on the same standard; Amazon Bedrock AgentCore Browser
+[signs requests in preview](https://aws.amazon.com/about-aws/whats-new/2025/10/amazon-bedrock-agentcore-browser-web-bot-auth-preview)
+(October 2025), and [Google](https://developers.google.com/crawling/docs/crawlers-fetchers/web-bot-auth)
+signs some agent requests experimentally. The IETF chartered the
+[`webbotauth` working group](https://datatracker.ietf.org/wg/webbotauth/about/) on 2025-10-23;
+its first working-group draft appeared on 2026-09-01.
+
+siwx-oidc itself does **not** implement RFC 9421 or Web Bot Auth. Its agent path is CAIP-122
+over the OIDC authorization-code flow. The same key can also sign HTTP requests through the
+*experimental* `http-sig` feature of [aqua-auth](https://github.com/inblockio/aqua-rs-auth), the
+crate siwx-oidc builds on; siwx-oidc does not use that feature, and nothing here has been tested
+against third-party verifiers.
+
+## People
+
+People sign in on the login page, or approve a sign-in for another device.
+
+| Method | Identity | Notes |
+|---|---|---|
+| Passkey (WebAuthn) | `did:key:zDn…` (P-256) | Register on the login page. A passkey can be linked to a wallet; it then signs in as the wallet's DID. |
+| Wallet (CAIP-122 / Sign-In with Ethereum) | `did:pkh:eip155:1:0x…` | Browser wallets through EIP-1193 (for example MetaMask). |
+| Device code / QR (RFC 8628) | the approving person's DID | Used by Element X's QR login and by `siwx-oidc-auth --device-flow` on machines without a browser. |
+
+For people, a new account is created only at the login screen, after an explicit confirmation;
+the account page and the device approval page refuse identities that have no account yet.
+Accepted DID methods are configurable (`supported_did_methods`, default `["pkh","key"]`;
+`did:peer` is available opt-in). Besides `eip155`, `did:pkh` accepts `ed25519` and `p256`
+namespaces, which are aqua-auth extensions, not registered CAIP namespaces. See
+[docs/passkeys.md](docs/passkeys.md).
+
+## Identity model
+
+Every user carries three identifiers with three different owners:
+
+| Tier | Example | Owner | Mutable | Where it lives |
+|---|---|---|---|---|
+| Alias | `Firstname Surname`, generated from the DID | the user | yes | Synapse `displayname` |
+| MXID | `@k3f9x2q7ab4d8m1p:example.org` (16 base36 characters from SHA-256 of the DID) | derived | no | Synapse user |
+| DID | `did:key:z6Mk…`, `did:pkh:eip155:1:0x…` | the provider (signed binding) | no | OIDC `sub`; Synapse profile field `io.inblock.did` |
+
+On every sign-in, siwx-oidc writes `io.inblock.did` into the user's Matrix profile: the exact DID
+plus a compact ES256 JWS that binds it to that one MXID, signed with the provider's key (there is
+no proof when the provider runs with an ephemeral key). The field is world-readable and federates,
+so it never carries anything private. It is a **discovery hint, never an authorization source**:
+authorize from the `sub` of a token this provider issued, or from a fresh signature by the DID's
+key. `GET /resolve?did=…` or `?mxid=…` answers the lookup in either direction without
+authentication and checks no signature; `siwx-oidc-auth --verify-did` checks the signature, the
+issuer and the MXID binding. When a Matrix server name is configured, `/userinfo` also returns
+the caller's MXID as the `io.inblock.mxid` claim. Accounts created before the current MXID
+scheme keep their older localpart. The wire contract is in
+[docs/identity-model.md](docs/identity-model.md).
+
+## Matrix integration
+
+siwx-oidc implements the Matrix OAuth 2.0 authentication API (Matrix spec v1.15 and later:
+MSC3861 and its sub-proposals) and acts as the auth service in Synapse's
+`matrix_authentication_service` integration:
+
+```yaml
+# homeserver.yaml
+matrix_authentication_service:
+  enabled: true
+  endpoint: http://siwx-oidc:8000/   # where Synapse reaches siwx-oidc
+  secret: "<shared secret>"          # the same value as SIWXOIDC_MAS_SHARED_SECRET
+```
+
+On the siwx-oidc side, `SIWXOIDC_MAS_SHARED_SECRET`, `SIWXOIDC_SYNAPSE_ENDPOINT` and
+`SIWXOIDC_MATRIX_SERVER_NAME` turn the Matrix role on. In that role siwx-oidc answers Synapse's
+token introspection, creates users and devices through Synapse's `/_synapse/mas/*` API at sign-in
+(a fresh device per login unless the client pins one; device IDs are never recycled), serves the
+device authorization grant (RFC 8628), account-management deep links (MSC4191) including
+cross-signing reset (MSC4312), and token revocation, and mints short-lived admin-scoped tokens for
+its own calls to Synapse's admin API. Details:
+[docs/matrix-integration.md](docs/matrix-integration.md).
+A complete Docker Compose deployment (Synapse, Element Web, siwx-oidc, Redis, Caddy) is
+[siwx-oidc-matrix-server](https://github.com/inblockio/siwx-oidc-matrix-server).
+
+### What it depends on
+
+- **Synapse.** The code targets Synapse 1.157 and later and is tested with 1.161.0, the version
+  the bundled deployment runs. The stable `matrix_authentication_service` block exists since
+  1.136.0; 1.157.0 removed the experimental `experimental_features.msc3861` mode.
+- **An internal Synapse API.** Synapse's side of this integration (`/_synapse/mas/*`) is an
+  internal API designed for MAS (Synapse 1.135.0 changelog), not a public, stable interface.
+  siwx-oidc tracks it per Synapse release, so every Synapse upgrade is a compatibility check.
+- **A patched Synapse, for write protection of `io.inblock.did`.** Stock Synapse lets users
+  write any custom profile field, including this one. The bundled image carries a backport of
+  [element-hq/synapse#19980](https://github.com/element-hq/synapse/pull/19980) (open) that denies
+  users writes to it. Without the patch the field is still published and signed; a verifier
+  rejects a tampered or copied value, and the user's next sign-in writes it back. Registry:
+  [patches/synapse](https://github.com/inblockio/siwx-oidc-matrix-server/blob/main/patches/synapse/README.md).
+  The bundled Element Web build also carries patches:
+  [patches/element-web](https://github.com/inblockio/siwx-oidc-matrix-server/blob/main/patches/element-web/README.md).
+- **Redis** holds all server state: clients, sessions, tokens and passkey credentials.
+- **aqua-auth**, the external crate that parses DIDs and verifies CAIP-122 signatures and
+  passkey assertions, pinned to tag `v0.7.0` of
+  [inblockio/aqua-rs-auth](https://github.com/inblockio/aqua-rs-auth).
+
+### What it does not do
+
+- No password login and no password registration.
+- No upstream identity providers ("sign in with Google/Keycloak").
+- No admin REST API or admin UI, and no client-credentials grant.
+- No legacy `POST /_matrix/client/v3/login`. Clients that do not speak the Matrix OAuth 2.0 API
+  cannot sign in.
+- Only Synapse is tested. Tuwunel, Dendrite and Conduit are untested and unsupported.
+- `/account` advertises two actions that are **not in the Matrix spec**,
+  `org.matrix.account_erase` and `org.matrix.account_reactivate`. They are project-specific
+  despite their prefix.
+
+## Why not MAS?
+
+[MAS](https://github.com/element-hq/matrix-authentication-service) (Matrix Authentication
+Service) is Element's authentication service for Synapse, licensed AGPL-3.0-or-later or under a
+commercial license. The two overlap on the Matrix OAuth plumbing and differ on the identity
+model. MAS is a full account system; siwx-oidc makes a key the account and lacks most of MAS's
+operator surface.
+
+| | MAS | siwx-oidc |
+|---|---|---|
+| Headless sign-in with the agent's own key | No: bots use operator-issued personal access tokens, compatibility tokens or passwords | Yes (`siwx-oidc-auth`) |
+| DID as the account identity | No | Yes: `sub` is the DID, the MXID is derived from it |
+| Passkeys, wallets | Not natively (passkeys are an open draft PR) | Yes |
+| Password login, registration controls, upstream IdPs | Yes | No |
+| Legacy `/login` for non-OAuth clients | Yes (compatibility layer) | No |
+| Admin API and UI, policy engine | Yes | No |
+| Scale and support | Runs matrix.org; commercial support from Element | One organisation's deployment; no support offering |
+
+The other way round is also possible in principle: MAS stays Synapse's auth service and uses
+siwx-oidc as an upstream OIDC provider. This topology is untested. People would keep signing in
+with passkeys and wallets, through MAS's login page. Headless agent sign-in with the agent's own
+key would break, because MAS's upstream login is an interactive browser redirect; the DID would
+stop being the account and become a linked upstream identity; and `io.inblock.did` publication
+would break as built, because Synapse would introspect tokens at MAS. Sources and the full
+analysis: [docs/comparison.md](docs/comparison.md).
+
+## Quick start
+
+### Server
+
+```bash
+docker run -d --name siwx-redis -p 6379:6379 redis   # or any Redis on localhost:6379
+SIWXOIDC_BASE_URL=http://localhost:8000 cargo run --bin siwx-oidc
+curl -s http://localhost:8000/.well-known/openid-configuration
+```
+
+Set the base URL to a host name: WebAuthn does not accept an IP literal such as the default
+`http://127.0.0.1:8000` as its relying-party ID, and the server panics at startup with it. The
+browser sign-in page (passkey, wallet) needs the frontend built once:
+`cd js/ui && npm install && npm run build`. Agents do not need it.
+
+Configuration comes from `siwx-oidc.toml` or `SIWXOIDC_*` environment variables. Key settings:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SIWXOIDC_BASE_URL` | `http://127.0.0.1:8000` | Issuer URL; also the WebAuthn relying party |
+| `SIWXOIDC_REDIS_URL` | `redis://localhost` | Redis connection |
+| `SIWXOIDC_SIGNING_KEY_PEM` | generated at startup | ES256 signing key (PKCS#8 PEM). Set it in production: without it the key changes on every restart and no `io.inblock.did` proof is minted |
+| `SIWXOIDC_SUPPORTED_DID_METHODS` | `["pkh","key"]` | DID methods accepted at sign-in |
+| `SIWXOIDC_MATRIX_SERVER_NAME` | none | Matrix `server_name`; needed for MXIDs and DID publication |
+| `SIWXOIDC_MAS_SHARED_SECRET` | none | Shared secret with Synapse; turns on introspection |
+
+The legacy `SIWEOIDC_*` prefix and `siwe-oidc.toml` inherited from siwe-oidc are still read, with
+no removal scheduled; when both prefixes set the same key, `SIWXOIDC_*` wins, and a startup
+warning names the legacy variables in use. Full reference:
+[docs/configuration.md](docs/configuration.md).
+
+### Docker
+
+`ghcr.io/inblockio/siwx-oidc:latest` is published from `main` (also tagged `main` and by commit).
+
+```bash
+docker network create siwx
+docker run -d --name redis --network siwx redis
+docker run --rm --network siwx -p 8000:8000 \
+  -e SIWXOIDC_BASE_URL=http://localhost:8000 \
+  -e SIWXOIDC_REDIS_URL=redis://redis:6379 \
+  ghcr.io/inblockio/siwx-oidc:latest
+```
+
+### Agent client
+
+See [Matrix accounts for AI agents](#matrix-accounts-for-ai-agents) above and
+[docs/agents.md](docs/agents.md). `siwx-oidc-auth --help` lists every flag.
+
+## Documentation
+
+| Page | Content |
+|---|---|
+| [docs/README.md](docs/README.md) | Index of all documentation |
+| [docs/agents.md](docs/agents.md) | Agent guide: `siwx-oidc-auth` CLI and library, device stability, refresh, verifying DIDs |
+| [docs/identity-model.md](docs/identity-model.md) | The three tiers, the `io.inblock.did` wire contract, trust model, `/resolve`, `io.inblock.mxid` |
+| [docs/matrix-integration.md](docs/matrix-integration.md) | Synapse wiring, dependencies, token model, device lifecycle, account management, QR login |
+| [docs/passkeys.md](docs/passkeys.md) | WebAuthn architecture, passkey linking, picker scoping, new-account gate |
+| [docs/configuration.md](docs/configuration.md) | Every setting, legacy names, key rotation, reverse proxy and CORS, Docker |
+| [docs/architecture.md](docs/architecture.md) | Layers, code map, DID methods, frontend, Redis keyspace, lineage |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Passkey, QR, wallet and OIDC failures |
+| [docs/comparison.md](docs/comparison.md) | MAS comparison and the MAS-first option, with sources |
+| [docs/api/](docs/api/) | HTTP API: [openapi.yaml](docs/api/openapi.yaml) (enforced against the router) and a [guide](docs/api/README.md) |
+| [docs/design/](docs/design/) | Design notes |
+| [docs/audits/](docs/audits/) | Dated audits and live probes |
+| [security/](security/) | Accepted advisory exceptions and VEX statements |
+| [AGENTS.md](AGENTS.md) | Code rules and invariants for human and AI contributors |
 
 ## Workspace
 
-| Crate | Description |
-|-------|-------------|
-| **siwx-oidc** (root) | Axum server with Redis backend |
-| **siwx-oidc-auth** | Headless OIDC client (library + CLI) |
+| Crate | Contents |
+|---|---|
+| `siwx-oidc` (root) | The server (`siwx-oidc` binary, Axum + Redis) and `migrate-credentials`, a one-shot operator tool for the passkey credential store |
+| `siwx-oidc-auth` | Headless client: Rust library and CLI (sign-in, refresh, device flow, DID verification) |
 
-Crypto verification lives in the external [aqua-auth](https://github.com/inblockio/aqua-auth) crate (DIDMethod/CipherSuite traits, pure library, no async).
+The browser sign-in page is a Svelte app in `js/ui/`, built into `static/`. CAIP-122 verification
+and DID parsing live in the external aqua-auth crate.
 
-## Quick start (server)
+## Lineage
 
-### Dependencies
+siwx-oidc began as a fork of [siwe-oidc](https://github.com/spruceid/siwe-oidc) by Spruce
+Systems, an OpenID Connect provider for Sign-In with Ethereum. Upstream has had no commits since
+July 2024. siwx-oidc generalised it from Ethereum addresses to DIDs (`sub` is now a DID) and added
+passkeys, the device authorization grant, refresh tokens, the headless client, the Matrix auth
+service role and DID publication. The breaking changes against siwe-oidc are listed in
+[docs/architecture.md](docs/architecture.md).
 
-- Redis (or Redis-compatible store)
-- Rust 1.75+
+## Contributing, security, license
 
-### Running
+Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities
+privately as described in [SECURITY.md](SECURITY.md), not in public issues.
 
-```bash
-redis-server &
-cargo run
-```
-
-Discovery endpoint: `http://127.0.0.1:8000/.well-known/openid-configuration`
-
-### Configuration
-
-Configure via `siwe-oidc.toml` or environment variables (prefix `SIWEOIDC_`):
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `SIWEOIDC_ADDRESS` | Bind address | `127.0.0.1` |
-| `SIWEOIDC_PORT` | Port | `8000` |
-| `SIWEOIDC_BASE_URL` | Advertised OIDC issuer URL | `http://127.0.0.1:8000` |
-| `SIWEOIDC_REDIS_URL` | Redis connection URL | `redis://localhost` |
-| `SIWEOIDC_SIGNING_KEY_PEM` | PKCS#8 PEM for ES256 signing key | auto-generated |
-| `SIWEOIDC_SUPPORTED_DID_METHODS` | DID methods accepted | `["pkh"]` |
-| `SIWEOIDC_SUPPORTED_PKH_NAMESPACES` | did:pkh namespaces | `["eip155","ed25519","p256"]` |
-| `SIWEOIDC_RP_ID` | WebAuthn Relying Party ID (domain) | hostname of BASE_URL |
-| `SIWEOIDC_RP_ORIGIN` | WebAuthn expected origin | BASE_URL |
-| `SIWEOIDC_MATRIX_SERVER_NAME` | Matrix server_name for cross-signing | (none) |
-
-To enable passkey login and the headless client, add `"key"` to supported methods:
-```toml
-# siwe-oidc.toml
-[supported_did_methods]
-0 = "pkh"
-1 = "key"
-```
-
-## Headless client (siwx-oidc-auth)
-
-Authenticate without a browser, using a local key or device authorization grant.
-
-### Authorization code flow (machine identity)
-
-```bash
-# Generate a persistent Ed25519 identity
-openssl genpkey -algorithm Ed25519 -out identity.pem
-
-# Print the DID
-cargo run -p siwx-oidc-auth -- --print-did --key-file identity.pem
-
-# Authenticate
-cargo run -p siwx-oidc-auth -- \
-  --server https://siwx.example.com \
-  --client-id my-service \
-  --redirect-uri https://myapp.example.com/callback \
-  --key-file identity.pem
-
-# Refresh without re-authenticating
-cargo run -p siwx-oidc-auth -- \
-  --server https://siwx.example.com \
-  --client-id my-service \
-  --refresh-token "<token>" \
-  --key-file identity.pem
-```
-
-### Device flow (human identity on headless machine)
-
-```bash
-# Prints user code + verification URL, polls until approved
-cargo run -p siwx-oidc-auth -- --device-flow \
-  --server https://siwx.example.com \
-  --client-id my-service
-```
-
-The approving user's DID (wallet or passkey) becomes the session identity.
-
-### Library usage
-
-```rust
-use siwx_oidc_auth::{SiwxKey, authenticate, refresh};
-
-let key = SiwxKey::from_pem_file("identity.pem".as_ref())?;
-let tokens = authenticate(
-    "https://siwx.example.com",
-    "my-client-id",
-    "https://app.example.com/callback",
-    &key,
-).await?;
-
-// Later: refresh without re-signing
-let new_tokens = refresh(
-    "https://siwx.example.com",
-    "my-client-id",
-    &tokens.refresh_token.unwrap(),
-).await?;
-```
-
-### Key input priority
-
-1. `--key-file <path>` - PKCS#8 PEM (auto-detects Ed25519 vs P-256)
-2. `SIWX_KEY_FILE` env var
-3. `--key-hex <hex>` - 32-byte hex seed (requires `--key-type`)
-4. (none) - generates ephemeral key, prints PEM to stderr
-
-## Frontend
-
-The Svelte frontend (`js/ui/`) provides browser-based sign-in with two methods:
-
-- **Sign-In with Ethereum** - direct browser wallet detection (MetaMask, Brave, Coinbase) via EIP-1193
-- **Sign-In with Passkey** - WebAuthn biometric prompt, with registration flow for new users
-- **Link Passkey to Wallet** - after wallet login, optionally link a passkey for future biometric logins
-
-```bash
-cd js/ui && npm install && npm run build
-```
-
-Build output goes to `static/` which the server serves automatically.
-
-## Matrix integration (MSC3861)
-
-siwx-oidc implements the full MSC3861 surface required by Synapse delegated auth:
-
-| Endpoint | Purpose |
-|----------|---------|
-| `POST /oauth2/introspect` | Token introspection (Synapse validates access tokens) |
-| `POST /oauth2/revoke` | Token revocation |
-| `GET /account` | Account management page (MSC4191) |
-| `POST /device_authorization` | RFC 8628 device code grant (Element X QR login) |
-| Device provisioning | Synapse MAS API: idempotent upsert of a fresh device per login (never delete/recycle) |
-| Cross-signing reset | `allow_cross_signing_reset` on every login (MSC4312) |
-
-Token model: access tokens (5min TTL, `mat_` prefix), refresh tokens (90d TTL, `mcr_` prefix), rotation on refresh.
-
-## Architecture
-
-Three-layer model:
-
-```
-Layer 1: aqua-auth (external)     - Crypto: DIDMethod trait, CipherSuite trait, registries
-Layer 2: src/{ceremony}.rs        - Auth ceremonies: CAIP-122, WebAuthn, RFC 8628
-Layer 3: src/oidc.rs              - OIDC token issuance (all ceremonies converge here)
-```
-
-Key boundary: aqua-auth handles CAIP-122 proof verification only. Non-CAIP-122 ceremonies (WebAuthn, device code) are server-layer modules that produce a verified DID. The `DIDMethod` trait is not extended for these.
-
-Extensibility:
-- New DID method = one file + one line in `all_did_methods()`
-- New cipher suite = one file + one line in `all_cipher_suites()`
-- New auth ceremony = one server module + integration with sign_in
-
-## Deployment
-
-Docker image published to GHCR on push to `main` via GitHub Actions.
-
-```bash
-# Pull and run
-docker pull ghcr.io/inblockio/siwx-oidc:latest
-docker run -e SIWEOIDC_REDIS_URL=redis://redis:6379 ghcr.io/inblockio/siwx-oidc
-```
-
-For Matrix Synapse deployment (docker-compose with Synapse, Redis, Element Web, Caddy), see [siwx-oidc-matrix-server](https://github.com/inblockio/siwx-oidc-matrix-server).
-
-## Building and testing
-
-```bash
-# Build the full workspace
-cargo build --workspace
-
-# Run server tests (needs Redis on localhost:6379)
-cargo test --bin siwx-oidc
-
-# Run the server
-cargo run
-
-# Run the headless client
-cargo run -p siwx-oidc-auth -- --help
-```
-
-## Breaking changes vs siwe-oidc
-
-1. **`sub` claim**: `eip155:1:0xAddr` -> `did:pkh:eip155:1:0xAddr`
-2. **Sign-in cookie**: `siwe` -> `siwx`; payload `{ did, message, signature }`
-3. **CodeEntry**: `address: Address` -> `did: String` (flush Redis on upgrade)
-4. **Config**: adds `supported_did_methods`, `supported_pkh_namespaces`, WebAuthn settings
-
-## License
-
-MIT OR Apache-2.0
+Licensed under Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
