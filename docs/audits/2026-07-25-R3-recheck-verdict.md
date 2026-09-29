@@ -162,12 +162,14 @@ This is the sharpest single finding for D1. **VERIFIED** on all three legs:
 
 **(a) It is routed — including in production.** Not dead by configuration:
 - Registered: `src/axum_lib.rs:1278-1281` → `post(compat::refresh)`.
-- Prod edge: `../siwx-oidc-matrix-server/deploy.sh:126-128` —
-  `handle /_matrix/client/v3/refresh { reverse_proxy siwx-oidc:8081 }`, appended to the
-  external `<prod-edge-caddy>` Caddyfile. Also reachable via the `siwx-oidc.inblock.io`
-  catch-all vhost (`deploy.sh:142-145`).
-- Same split in `Caddyfile.production:47-52`, `e2e/real-stack/Caddyfile:111-117`,
-  `Caddyfile.local:82-87`, `Caddyfile.e2e:89-94`.
+- Prod edge: the production deployment script appends
+  `handle /_matrix/client/v3/refresh { reverse_proxy siwx-oidc:8081 }` to the external
+  `<prod-edge-caddy>` Caddyfile, and the route is also reachable via the
+  `siwx-oidc.inblock.io` catch-all vhost. (That script and the production Caddyfile have
+  since moved out of the public repositories; the line references this audit cited are
+  no longer public.)
+- Same split in `e2e/real-stack/Caddyfile:111-117` and siwx-oidc-matrix-server's
+  `Caddyfile.local:82-87` and `Caddyfile.e2e:89-94`.
 
 **(b) Synapse would not serve it anyway**, so the split is correct, not redundant:
 `synapse/rest/client/login.py:730-732` returns early from `register_servlets` when
