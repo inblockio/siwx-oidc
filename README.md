@@ -120,8 +120,10 @@ People sign in on the login page, or approve a sign-in for another device.
 | Wallet (CAIP-122 / Sign-In with Ethereum) | `did:pkh:eip155:1:0x…` | Browser wallets through EIP-1193 (for example MetaMask). |
 | Device code / QR (RFC 8628) | the approving person's DID | Used by Element X's QR login and by `siwx-oidc-auth --device-flow` on machines without a browser. |
 
-For people, a new account is created only at the login screen, after an explicit confirmation;
-the account page and the device approval page refuse identities that have no account yet.
+New accounts are created only through the login flow, at the first sign-in. A passkey sign-in
+on the login page asks the user to confirm first (the page enforces this, not the server); a
+wallet sign-in and an agent's headless sign-in create the account directly, with no confirmation
+step. The account page and the device approval page refuse identities that have no account yet.
 Accepted DID methods are configurable (`supported_did_methods`, default `["pkh","key"]`;
 `did:peer` is available opt-in). Besides `eip155`, `did:pkh` accepts `ed25519` and `p256`
 namespaces, which are aqua-auth extensions, not registered CAIP namespaces. See

@@ -74,7 +74,7 @@ third-party implementations of it, either way.
 | Wallets (CAIP-122 / Sign-In with Ethereum) | No native support | Yes (`did:pkh`) |
 | Device authorization grant (RFC 8628) | Yes, on by default | Yes ([`device_auth.rs`](../src/device_auth.rs)) |
 | Account management deep links (MSC4191) | Yes | Yes, plus two actions that are not in the spec: `org.matrix.account_erase`, `org.matrix.account_reactivate` ([`account.rs`](../src/account.rs)) |
-| Local password login and registration | Yes (password registration off by default; email, registration tokens, CAPTCHA) ([configuration](https://element-hq.github.io/matrix-authentication-service/reference/configuration.html)) | No passwords. An account is created at first sign-in, behind a confirmation on the login page |
+| Local password login and registration | Yes (password registration off by default; email, registration tokens, CAPTCHA) ([configuration](https://element-hq.github.io/matrix-authentication-service/reference/configuration.html)) | No passwords. An account is created at first sign-in; only the browser passkey login asks for a confirmation first (enforced by the login page), while wallet and headless sign-ins create it directly |
 | Upstream OIDC identity providers | Yes, several, with claim mapping ([SSO setup](https://element-hq.github.io/matrix-authentication-service/setup/sso.html)) | No |
 | Legacy `/login` for non-OAuth clients | Yes, compatibility layer (`m.login.password`, `m.login.sso`, `m.login.token`) | No. `GET /_matrix/client/v3/login` answers for discovery, but there is no `POST /login`; legacy clients cannot sign in ([`compat.rs`](../src/compat.rs)) |
 | Client-credentials grant | Yes (useful for MAS's admin API; Synapse requires a user on the session) | No |

@@ -229,8 +229,10 @@ doc; read it before changing the code the rule covers.
 
 ### Sign-in gates ([docs/passkeys.md](docs/passkeys.md))
 
-- **New accounts are created only at the login screen.** Account re-auth and device approval
-  reject an unknown identity via `reject_if_new_identity`.
+- **New accounts are created only through the login flow (`/sign_in`).** Only the browser
+  passkey login asks for confirmation, and the frontend enforces it; wallet and headless
+  sign-ins create the account directly. Account re-auth and device approval reject an unknown
+  identity via `reject_if_new_identity`.
 - **Both gates fail closed and report two different facts**: the check ran and said no (400 /
   401) versus the check could not run (503). Pin:
   `reject_if_new_identity_fails_closed_on_synapse_error`,
