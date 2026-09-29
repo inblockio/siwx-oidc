@@ -92,10 +92,22 @@ jobs:
     # once the deploy key exists), and the guard below inspects them through
     # expressions that yield variable NAMES, never values.
     steps:
-      # Variable guard: FAILS the job, loudly, when the deploy target is not
-      # fully configured. Deliberately not a skip: a silently skipped deploy
+      # Secret-presence guard: while DEV_STAGING_DEPLOY_KEY is not set, the
+      # push-model deploy is dormant by design. The host's own pull-model
+      # timer is the primary auto-deploy mechanism in the meantime, so a
+      # missing key is expected steady state, not a failure: the steps below
+      # are skipped and a notice says so.
+      - name: Check deploy key configured
+        id: check-secret
+        run: echo "ok=${{ secrets.DEV_STAGING_DEPLOY_KEY != '' }}" >> "$GITHUB_OUTPUT"
+
+      # Variable guard: once the deploy key exists, FAILS the job, loudly, when
+      # the deploy target is not fully configured. It does not run while the key
+      # is absent: the deploy is dormant then, and failing on variables nothing
+      # reads would turn every push to `main` red. Deliberately not a skip: a silently skipped deploy
       # leaves dev-staging on the previous image while the run shows green.
       - name: Require deploy target variables
+        if: steps.check-secret.outputs.ok == 'true'
         env:
           MISSING: >-
             ${{ vars.DEV_DEPLOY_HOST == '' && 'DEV_DEPLOY_HOST' || '' }}
@@ -108,15 +120,6 @@ jobs:
             echo "::error title=Dev-staging deploy target not configured::Repository variable(s) empty: ${missing}. Set them under Settings > Secrets and variables > Actions > Variables (gh variable set NAME -R ${GITHUB_REPOSITORY}). Refusing to skip silently: dev-staging would stay on the previous image."
             exit 1
           fi
-
-      # Secret-presence guard: while DEV_STAGING_DEPLOY_KEY is not set, the
-      # push-model deploy is dormant by design. The host's own pull-model
-      # timer is the primary auto-deploy mechanism in the meantime, so a
-      # missing key is expected steady state, not a failure: the steps below
-      # are skipped and a notice says so.
-      - name: Check deploy key configured
-        id: check-secret
-        run: echo "ok=${{ secrets.DEV_STAGING_DEPLOY_KEY != '' }}" >> "$GITHUB_OUTPUT"
 
       - name: Install deploy key
         if: steps.check-secret.outputs.ok == 'true'
