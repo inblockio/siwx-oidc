@@ -37,3 +37,9 @@ pub mod credential_store;
 // mints its own admin-scoped credential and therefore depends on
 // `crate::admin_token` and `crate::introspect`, which exist only in the binary
 // crate. The binary's `mod synapse_client;` is the single definition.
+
+/// Redis for the Redis-backed tests: whether each one runs, skips loudly, or
+/// fails (`SIWX_TEST_REDIS_URL`, `SIWX_TEST_REQUIRE_REDIS`). Test-only, but not
+/// `#[cfg(test)]`; the module doc says why.
+#[doc(hidden)]
+pub mod test_support;

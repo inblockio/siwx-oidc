@@ -195,19 +195,16 @@ async fn jwk_set(State(state): State<AppState>) -> Result<Json<CoreJsonWebKeySet
 async fn provider_metadata(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, CustomError> {
-    let value = oidc::provider_metadata_value(
-        state.config.base_url.clone(),
-        state.config.account_management_uri.as_ref(),
-        resolve_endpoint_advertised(&state),
-    )?;
+    let value = oidc::provider_metadata_value(&state.config, matrix_ready(&state))?;
     Ok(value.into())
 }
 
-/// Whether `GET /resolve` can answer on this deployment, and so may be
-/// advertised in discovery. Mirrors the two 503 conditions in
-/// [`resolve::ResolveError`]: no `SIWEOIDC_MATRIX_SERVER_NAME`, or no Synapse
-/// client (standalone mode).
-fn resolve_endpoint_advertised(state: &AppState) -> bool {
+/// Whether the Matrix-backed features can answer on this deployment, and so
+/// may be advertised in discovery: `GET /resolve` and the MSC4191 account
+/// actions. Mirrors the two 503 conditions in [`resolve::ResolveError`] and the
+/// account actions' 400: no `SIWXOIDC_MATRIX_SERVER_NAME`, or no Synapse client
+/// (standalone mode).
+fn matrix_ready(state: &AppState) -> bool {
     state.config.matrix_server_name.is_some() && state.synapse_client.is_some()
 }
 
@@ -438,6 +435,12 @@ async fn client_delete(
 
 async fn healthcheck() {}
 
+/// The legal footer for the server-rendered pages, from the same two settings
+/// discovery advertises.
+fn legal_footer(config: &config::Config) -> String {
+    oidc::legal_footer_html(config.op_tos_uri.as_ref(), config.op_policy_uri.as_ref())
+}
+
 // -- RFC 8628 device authorization handlers ---------------------------------
 
 async fn device_authorization_handler(
@@ -452,7 +455,11 @@ async fn device_page_handler(
     State(state): State<AppState>,
     Query(query): Query<device_auth::DevicePageQuery>,
 ) -> axum::response::Html<String> {
-    device_auth::device_page(query, state.config.base_url.as_str())
+    device_auth::device_page(
+        query,
+        state.config.base_url.as_str(),
+        &legal_footer(&state.config),
+    )
 }
 
 async fn device_verify_handler(
@@ -1069,7 +1076,12 @@ async fn account_page_handler(
             .map(|s| s.csrf),
         None => None,
     };
-    account::account_page_inner(query, state.config.base_url.as_str(), csrf.as_deref())
+    account::account_page_inner(
+        query,
+        state.config.base_url.as_str(),
+        csrf.as_deref(),
+        &legal_footer(&state.config),
+    )
 }
 
 async fn account_nonce_handler(
@@ -1565,9 +1577,55 @@ pub async fn main() {
         );
 
     let addr = SocketAddr::from((config.address, config.port));
+    // Before the bind: from the moment the port accepts, a SIGTERM is handled.
+    let shutdown = shutdown_signal();
     info!("Listening on {}", addr);
     let listener = TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .unwrap();
+}
+
+/// Resolves on SIGTERM (`docker stop`, Kubernetes) or SIGINT (Ctrl-C); the
+/// server then stops accepting, finishes open requests and `main` returns.
+///
+/// In a container the server is PID 1, and the kernel drops a signal that PID 1
+/// has no handler for instead of terminating it. Without this handler
+/// `docker stop` waits out its grace period (10 s) and then SIGKILLs, cutting
+/// off whatever is in flight. Pinned by `tests/graceful_shutdown.rs`.
+///
+/// The handlers are installed when this is called, not when the future is
+/// first polled, so there is no window in which a signal takes the default
+/// action.
+#[cfg(unix)]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut terminate = signal(SignalKind::terminate()).expect("install the SIGTERM handler");
+    let mut interrupt = signal(SignalKind::interrupt()).expect("install the SIGINT handler");
+    async move {
+        let received = tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+        };
+        info!(
+            signal = received,
+            "shutting down: no new connections, finishing open requests"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install the Ctrl-C handler");
+        info!(
+            signal = "ctrl_c",
+            "shutting down: no new connections, finishing open requests"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1769,12 +1827,11 @@ mod unknown_credential_response_tests {
     /// refactor to `?` would break this invariant while every miss-path test stayed
     /// green — so pin the error path here. We force a real, fast `WRONGTYPE` error by
     /// storing the `user:session/{token}` key as a SET, so the `GET` in
-    /// `lookup_user_session` errors. Requires Redis on localhost; skips if absent.
+    /// `lookup_user_session` errors. Needs Redis (`siwx_oidc::test_support::redis`).
     #[tokio::test]
     async fn user_session_scope_did_degrades_open_on_redis_error() {
-        let redis = match RedisClient::new(&url::Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return, // no Redis: skip (CI provides one)
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
         };
         let token = format!("wrongtype{}", uuid::Uuid::new_v4().simple());
         // KV_USER_SESSION_PREFIX is in scope via `use siwx_oidc::db::*` at the top.

@@ -66,11 +66,19 @@ pub struct DeviceAuthResponse {
 ///
 /// Validates the client, generates a device code and user code, stores both in
 /// Redis, and returns the URIs the device should display to the user.
+///
+/// Outside delegated-auth mode it refuses before anything is stored, with the
+/// same `unsupported_grant_type` the token endpoint gives the grant: a code
+/// issued there could be approved by the user but never redeemed.
 pub async fn device_authorization(
     config: &Config,
     db_client: &(dyn DBClient + Sync),
     form: DeviceAuthRequest,
 ) -> Result<DeviceAuthResponse, CustomError> {
+    if !crate::oidc::delegated_auth_enabled(config) {
+        return Err(crate::oidc::device_grant_unsupported());
+    }
+
     // 1. Validate client_id
     let _client = db_client
         .get_client(form.client_id.clone())
@@ -150,7 +158,10 @@ fn sanitize_user_code(raw: &str) -> String {
 /// Visual language mirrors the siwx-oidc landing page (`js/ui/src/App.svelte`):
 /// Satoshi from fontshare, `#f5f5f5` background with an ambient orange glow,
 /// white card on top, orange gradient primary button, ghost-styled "Deny".
-pub fn device_page(query: DevicePageQuery, base_url: &str) -> Html<String> {
+///
+/// `legal_footer` is [`crate::oidc::legal_footer_html`] for this deployment
+/// (empty when no terms or privacy policy are configured).
+pub fn device_page(query: DevicePageQuery, base_url: &str, legal_footer: &str) -> Html<String> {
     let user_code = sanitize_user_code(query.user_code.as_deref().unwrap_or(""));
     let base = base_url.trim_end_matches('/');
     let html = format!(
@@ -159,7 +170,7 @@ pub fn device_page(query: DevicePageQuery, base_url: &str) -> Html<String> {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Approve device · inblock.io</title>
+<title>{title}</title>
 <link rel="icon" type="image/png" href="/favicon.png">
 <link href="https://api.fontshare.com/css?f[]=satoshi@300,400,500,700,900&display=swap" rel="stylesheet">
 <style>{css}</style>
@@ -239,22 +250,19 @@ pub fn device_page(query: DevicePageQuery, base_url: &str) -> Html<String> {
         <span id="status-text"></span>
       </div>
 
-      <div class="footer">
-        <p>By continuing you agree to the
-          <a href="/legal/terms-of-use.html">Terms of Use</a> and
-          <a href="/legal/privacy-policy.html">Privacy Policy</a>.
-        </p>
-      </div>
+      {legal_footer}
     </div>
   </div>
 </div>
 <script>{js}</script>
 </body>
 </html>"##,
+        title = crate::oidc::page_title("Approve device", base_url),
         css = DEVICE_PAGE_CSS,
         js = DEVICE_PAGE_JS,
         user_code = user_code,
         base = base,
+        legal_footer = legal_footer,
     );
     Html(html)
 }
@@ -1090,6 +1098,83 @@ pub async fn device_approve_passkey(
 mod tests {
     use super::*;
 
+    /// The device page carries the operator's legal links and no others, and
+    /// its title names the issuer host rather than a brand.
+    #[test]
+    fn device_page_footer_and_title_follow_the_deployment() {
+        let query = || DevicePageQuery {
+            user_code: Some("JKQ-WZL".to_string()),
+        };
+        let bare = device_page(query(), "https://id.example.org", "").0;
+        assert!(!bare.contains("/legal/"), "no default legal links");
+        assert!(
+            !bare.contains(r#"class="footer""#),
+            "no footer without legal links"
+        );
+        assert!(bare.contains("<title>Approve device · id.example.org</title>"));
+
+        let policy = url::Url::parse("https://legal.example.org/privacy").unwrap();
+        let footer = crate::oidc::legal_footer_html(None, Some(&policy));
+        let linked = device_page(query(), "https://id.example.org", &footer).0;
+        assert!(
+            linked.contains(r#"<a href="https://legal.example.org/privacy">Privacy Policy</a>"#)
+        );
+    }
+
+    /// A standalone deployment cannot redeem a device code (the token endpoint
+    /// refuses the grant), so a code issued there would let a user approve a
+    /// login that never completes. The endpoint refuses first, with the token
+    /// endpoint's own answer; with a MAS shared secret the same request is
+    /// served. Needs Redis for the served half.
+    #[tokio::test]
+    async fn device_authorization_is_refused_outside_delegated_auth_mode() {
+        use openidconnect::core::{CoreClientMetadata, CoreErrorResponseType};
+        use openidconnect::registration::EmptyAdditionalClientMetadata;
+        use openidconnect::RedirectUrl;
+
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = format!("device-auth-{}", uuid::Uuid::new_v4().simple());
+        db.set_client(
+            client_id.clone(),
+            ClientEntry {
+                secret: "secret".into(),
+                metadata: CoreClientMetadata::new(
+                    vec![RedirectUrl::new("https://example.com".into()).unwrap()],
+                    EmptyAdditionalClientMetadata {},
+                ),
+                access_token: None,
+            },
+        )
+        .await
+        .unwrap();
+        let form = || DeviceAuthRequest {
+            client_id: client_id.clone(),
+            scope: None,
+        };
+
+        let refused = device_authorization(&Config::default(), &db, form()).await;
+        match refused {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error, CoreErrorResponseType::UnsupportedGrantType)
+            }
+            other => panic!(
+                "standalone must refuse with unsupported_grant_type, got {:?}",
+                other.map(|r| r.user_code)
+            ),
+        }
+
+        let delegated = Config {
+            mas_shared_secret: Some("shared-secret".to_string()),
+            ..Config::default()
+        };
+        let issued = device_authorization(&delegated, &db, form())
+            .await
+            .unwrap_or_else(|e| panic!("delegated-auth mode must issue a code: {e:?}"));
+        assert!(issued.device_code.starts_with("dvc_"));
+    }
+
     #[test]
     fn device_page_renders_landing_page_brand() {
         let html = device_page(
@@ -1097,6 +1182,7 @@ mod tests {
                 user_code: Some("JKQ-WZL".to_string()),
             },
             "https://siwx-oidc.example.com",
+            "",
         )
         .0;
         // Brand markers from the landing page (App.svelte).
@@ -1131,6 +1217,7 @@ mod tests {
                 user_code: Some("\"><script>alert(1)</script>".to_string()),
             },
             "https://siwx-oidc.example.com",
+            "",
         )
         .0;
         // Raw script tag must not appear in the rendered HTML.
@@ -1156,6 +1243,7 @@ mod tests {
             let html = device_page(
                 DevicePageQuery { user_code: code },
                 "https://siwx-oidc.example.com",
+                "",
             )
             .0;
             let path = format!("/tmp/device-{name}.html");

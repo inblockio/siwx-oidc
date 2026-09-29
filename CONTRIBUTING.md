@@ -27,10 +27,13 @@ You need recent stable Rust and a Redis on `localhost:6379`:
 docker run -d --name siwx-redis -p 6379:6379 redis
 
 cargo build --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets        # CI sets RUSTFLAGS=-Dwarnings
 cargo test --workspace                        # unit and integration tests; needs Redis
-cargo clippy
-cargo fmt -- --check
 ```
+
+CI (`.github/workflows/ci.yml`) runs the same commands on every pull request, plus the
+mock-stack and browser end-to-end suites and a build of the container image.
 
 - `cargo test --test openapi_covers_every_route` fails when a route exists in the router
   (`src/axum_lib.rs`) but not in [docs/api/openapi.yaml](docs/api/openapi.yaml). Adding an
@@ -41,7 +44,7 @@ cargo fmt -- --check
   `cargo test --test <name> -- --ignored --test-threads=1`. The other files in `tests/` run by
   default; `account_linking_dual_write` needs the Redis above, and `credential_migration_live`
   runs only when `MIGRATION_TEST_REDIS_URL` points at a disposable Redis.
-- The sign-in frontend lives in `js/ui/`: `npm install && npm run build` writes to `static/`.
+- The sign-in frontend lives in `js/ui/`: `npm ci && npm run build` writes to `static/build/`.
 - CAIP-122 and DID verification live in the external aqua-auth crate
   ([inblockio/aqua-rs-auth](https://github.com/inblockio/aqua-rs-auth)), with its own tests.
 

@@ -399,7 +399,7 @@ async fn device_code_grant_end_to_end() {
     //    device_id (urn:matrix:client:device:<id>), so the provisioned Synapse
     //    device id is deterministic and assertable.
     let rc = register_client(&c, &base).await;
-    let device_id = format!("DEVCODE_{}", &uuid_like());
+    let device_id = format!("DEVCODE_{}", uuid_like());
     let scope = format!("openid urn:matrix:client:device:{device_id}");
     let da: Value = c
         .post(format!("{base}/device_authorization"))

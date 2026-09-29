@@ -94,9 +94,17 @@ category-(b) files contain **zero** `matrix_host` / `MATRIX_HOST` references.
 | 38 | `cross_signing_reset_leg_a_roundtrip_completed_live` | `e2e_msc4191_live.rs` | same |
 | 39 | `cross_signing_reset_stale_window_wedge_live` | `e2e_msc4191_live.rs` | same |
 | 40 | `cross_signing_reset_no_master_completed_live` | `e2e_msc4191_live.rs` | same |
-| 41 | `logout_deletes_ending_session_device` | `e2e_session_teardown.rs` | Synapse-side device deletion, verified via `{matrix}/_matrix/client/v3/devices` |
-| 42 | `revoke_deletes_session_device` | `e2e_session_teardown.rs` | same |
-| 43 | `logout_all_invalidates_all_sessions_without_deactivating` | `e2e_session_teardown.rs` | same |
+| 41 | `logout_deletes_ending_session_device` | `e2e_session_teardown.rs` | `whoami` rejected after logout (see correction below) |
+| 42 | `revoke_invalidates_session_token` | `e2e_session_teardown.rs` | `whoami` rejected after revoke (see correction below) |
+| 43 | `logout_all_invalidates_all_sessions_without_deactivating` | `e2e_session_teardown.rs` | `whoami` rejected for both sessions after logout/all (see correction below) |
+
+Correction (2026-09-29): rows 41 to 43 said "Synapse-side device deletion,
+verified via `{matrix}/_matrix/client/v3/devices`" and "same". None of the three
+read `/devices`; each observes only `whoami`. Row 42 was also wrong about the
+behaviour: revoke must NOT delete the device (the 2026-06-12 incident), and that is
+pinned at the handler by row 17 (`h1_revoke_does_not_delete_device_but_logout_does`,
+which counts the mock's `delete_device` calls). Since 2026-09-29 row 41 also checks
+that the device is gone from the Synapse mock's device list.
 
 Note on #34: step 1 (siwx-oidc's own discovery doc) *would* run against the mock
 stack, but step 2 asserts Synapse forwards the action list verbatim to

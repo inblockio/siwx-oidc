@@ -99,6 +99,10 @@ paths:
         `prompt_values_supported` (`["login","create"]`) and
         `account_management_uri`. Removing either silently breaks Element X
         cross-signing bootstrap — the matrix-rust-sdk swallows the error.
+        `account_management_uri` and `account_management_actions_supported`
+        are present only when the account actions can run (a Matrix server
+        name and a Synapse client are configured); without them every action
+        answers 400.
 
         `io.inblock.resolve_endpoint` (`{issuer}/resolve`) advertises
         `GET /resolve`, and is present **only** when this deployment can
@@ -107,6 +111,17 @@ paths:
         `/_matrix/client/v1/auth_metadata`, which is how a client finds a
         homeserver's DID resolver — its own or a federated peer's. The Element
         Web `resolve-did-search` patch reads this exact key.
+
+        The document lists only what this deployment serves.
+        `introspection_endpoint`, `introspection_endpoint_auth_methods_supported`,
+        `device_authorization_endpoint` and the
+        `urn:ietf:params:oauth:grant-type:device_code` grant type are present
+        only when a MAS shared secret is configured (delegated-auth mode);
+        without one, introspection answers 404 and both `/device_authorization`
+        and the device-code grant at `/token` are refused. `op_tos_uri` and
+        `op_policy_uri` are present only when the operator configured them
+        (`SIWXOIDC_OP_TOS_URI`, `SIWXOIDC_OP_POLICY_URI`); there is no
+        default. The login page reads them here for its footer.
       responses:
         "200":
           description: Provider metadata.
@@ -178,8 +193,9 @@ paths:
 
         This is also the single point where a Matrix account is provisioned: the
         localpart is resolved (honouring grandfathering), the alias is seeded on
-        first sign-in only, the Synapse device is upserted, and the attested DID
-        is re-published. Every one of those is best-effort and never fails the
+        first sign-in only, the Synapse device is upserted (a new device is
+        named after the OAuth client's `client_name`, else its `client_id`; an
+        existing one keeps its name), and the attested DID is re-published. Every one of those is best-effort and never fails the
         sign-in.
       security:
         - sessionCookie: []
@@ -477,6 +493,13 @@ paths:
       tags: [Device grant]
       operationId: deviceAuthorization
       summary: Begin an RFC 8628 device grant
+      description: |
+        Served and advertised in discovery only in delegated-auth mode (a MAS
+        shared secret is configured), the only mode in which `POST /token`
+        redeems the device code. Without it the request is refused before
+        anything is stored, with the same RFC 6749 §5.2 error the token
+        endpoint gives the grant (RFC 8628 §3.2), so no code is issued that a
+        user could approve but a client never redeem.
       requestBody:
         content:
           application/x-www-form-urlencoded:
@@ -489,6 +512,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DeviceAuthorization" }
+        "400":
+          description: |
+            `{"error": "unsupported_grant_type", "error_description": …}` when
+            the deployment is not in delegated-auth mode; a plain 400 for an
+            unknown `client_id`.
 
   /device:
     get:
@@ -610,6 +638,11 @@ paths:
         With no `action`, renders the account-home menu — required because
         Element Web's "Manage account" opens the bare URI. With an `action`, the
         page re-authenticates (wallet or passkey) and then performs it.
+
+        `io.inblock.account_erase` and `io.inblock.account_reactivate` are not
+        in the Matrix spec. Their former names, `org.matrix.account_erase` and
+        `org.matrix.account_reactivate`, are still accepted as aliases for one
+        upgrade cycle but no longer advertised in discovery.
       parameters:
         - name: action
           in: query
@@ -617,15 +650,17 @@ paths:
           schema:
             type: string
             enum:
-              - profile
-              - devices_list
-              - sessions_list
-              - device_view
-              - session_view
-              - device_delete
-              - session_end
+              - org.matrix.profile
+              - org.matrix.devices_list
+              - org.matrix.sessions_list
+              - org.matrix.device_view
+              - org.matrix.session_view
+              - org.matrix.device_delete
+              - org.matrix.session_end
               - org.matrix.cross_signing_reset
               - org.matrix.account_deactivate
+              - io.inblock.account_erase
+              - io.inblock.account_reactivate
               - org.matrix.account_erase
               - org.matrix.account_reactivate
         - { name: device_id, in: query, required: false, schema: { type: string } }
@@ -645,7 +680,8 @@ paths:
       summary: Re-authenticate for an account action with a wallet signature
       responses:
         "200": { description: Authenticated. }
-        "400": { description: "Rejected — a new identity cannot be created here." }
+        "400": { description: "Rejected — a new identity cannot be created here, or reactivation of an erased account." }
+        "503": { description: "A required check (Synapse, or the erasure marker) could not run; nothing was changed." }
 
   /account/action:
     post:
@@ -661,7 +697,8 @@ paths:
         "200":
           description: The action outcome.
           content: { application/json: { schema: { $ref: "#/components/schemas/ActionOutcome" } } }
-        "400": { description: Missing, unknown, or unavailable action. }
+        "400": { description: "Missing, unknown, or unavailable action, or reactivation of an erased account." }
+        "503": { description: "A required check (Synapse, or the erasure marker) could not run; nothing was changed." }
 
   /account/passkey/start:
     post:
@@ -677,7 +714,8 @@ paths:
       summary: Finish passkey re-authentication for an account action
       responses:
         "200": { description: Authenticated. }
-        "400": { description: "Rejected — a new identity cannot be created here." }
+        "400": { description: "Rejected — a new identity cannot be created here, or reactivation of an erased account." }
+        "503": { description: "A required check (Synapse, or the erasure marker) could not run; nothing was changed." }
         "401": { $ref: "#/components/responses/UnknownCredential" }
 
   /_matrix/client/v3/login:
@@ -685,6 +723,11 @@ paths:
       tags: [Matrix compatibility]
       operationId: loginFlows
       summary: Advertise the supported Matrix login flows
+      description: |
+        Advertises `m.login.sso` only, for discovery. There is no
+        `POST /_matrix/client/v3/login`: legacy password, token and SSO login
+        are not supported, so a client that does not implement the Matrix
+        OAuth 2.0 API cannot sign in.
       responses: { "200": { description: The flow list. } }
 
   /_matrix/client/v3/refresh:

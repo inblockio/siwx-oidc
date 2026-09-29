@@ -733,7 +733,7 @@ async fn account_action(
 }
 
 // ===========================================================================
-// GRANDFATHER (2026-09-09, Tim): an account that already exists under the
+// GRANDFATHER (2026-09-09, the maintainer): an account that already exists under the
 // LEGACY localpart (`did.replace(':', "-").to_lowercase()`) keeps it forever
 // on real sign-in — Synapse has no user-rename API, so `resolve_identity`
 // checks the legacy shape FIRST and, if it is already taken, never considers
@@ -1847,8 +1847,14 @@ async fn h9_device_code_approved_no_double_redemption() {
         );
 
         // And the loser is refused legibly: RFC 8628 `authorization_pending`
-        // while the winner holds the claim, or `expired_token` if it arrives
-        // after the winner deleted the code. Never a 500, never a silent 200.
+        // while the winner holds the claim, `expired_token` if it arrives after
+        // the winner deleted the code, or `slow_down`. The poll-rate check reads
+        // and writes `last_poll` without a lock, so the second of two
+        // simultaneous polls can see the first one's timestamp and be told to
+        // back off; RFC 8628 §3.5 makes `slow_down` a legitimate answer to a
+        // poll that came too soon. The first reader always reaches the claim,
+        // so this cannot excuse a round that mints nothing: `== 1` above is the
+        // property. Never a 500, never a silent 200.
         for (status, error) in &refused {
             assert_eq!(
                 *status,
@@ -1856,7 +1862,10 @@ async fn h9_device_code_approved_no_double_redemption() {
                 "round {round}: the losing poll must be refused with 400, got {status} ({error})"
             );
             assert!(
-                matches!(error.as_str(), "authorization_pending" | "expired_token"),
+                matches!(
+                    error.as_str(),
+                    "authorization_pending" | "expired_token" | "slow_down"
+                ),
                 "round {round}: the losing poll must get an RFC 8628 error, got {error:?}"
             );
         }

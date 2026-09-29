@@ -43,7 +43,7 @@ use siwx_oidc::db::*;
 use subtle::ConstantTimeEq;
 
 use crate::did_assertion::DidPublication;
-use crate::synapse_client::{PublishOutcome, SynapseClient};
+use crate::synapse_client::{DeviceUpsert, PublishOutcome, SynapseClient};
 
 use crate::introspect::generate_opaque_token;
 
@@ -80,8 +80,8 @@ pub const CLIENT_PATH: &str = "/client";
 pub const USERINFO_PATH: &str = "/userinfo";
 pub const SIGNIN_PATH: &str = "/sign_in";
 pub const SIWX_COOKIE_KEY: &str = "siwx";
-pub const TOU_PATH: &str = "/legal/terms-of-use.html";
-pub const PP_PATH: &str = "/legal/privacy-policy.html";
+/// RFC 8628 grant type of the device-code grant (`POST /token`).
+pub const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 type DBClientType = dyn DBClient + Sync;
 
@@ -528,7 +528,8 @@ pub fn jwks(
     Ok(CoreJsonWebKeySet::new(keys))
 }
 
-pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
+pub fn metadata(config: &crate::config::Config) -> Result<CoreProviderMetadata, CustomError> {
+    let base_url = &config.base_url;
     let pm = CoreProviderMetadata::new(
         IssuerUrl::from_url(base_url.clone()),
         AuthUrl::from_url(
@@ -581,18 +582,83 @@ pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
         CoreClientAuthMethod::ClientSecretBasic,
         CoreClientAuthMethod::ClientSecretPost,
     ]))
-    .set_op_policy_uri(Some(OpPolicyUrl::from_url(
-        base_url
-            .join(PP_PATH)
-            .map_err(|e| anyhow!("Unable to join URL: {}", e))?,
-    )))
-    .set_op_tos_uri(Some(OpTosUrl::from_url(
-        base_url
-            .join(TOU_PATH)
-            .map_err(|e| anyhow!("Unable to join URL: {}", e))?,
-    )));
+    // Only what the operator configured. The terms and privacy policy are the
+    // deployment's own documents, so there is no default to fall back to, and
+    // an unset key omits the field (openidconnect skips `None`).
+    .set_op_policy_uri(config.op_policy_uri.clone().map(OpPolicyUrl::from_url))
+    .set_op_tos_uri(config.op_tos_uri.clone().map(OpTosUrl::from_url));
 
     Ok(pm)
+}
+
+// -- Shared bits of the server-rendered pages (/account, /device) ----------
+
+/// Escape a value for an HTML text node or a double-quoted attribute.
+fn escape_html(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// The `<title>` of a server-rendered page: `{title} · {issuer host}`, or
+/// `title` alone when the base URL has no host. Never a fixed brand: the page
+/// belongs to whoever runs this deployment.
+pub fn page_title(title: &str, base_url: &str) -> String {
+    match Url::parse(base_url).ok().as_ref().and_then(Url::host_str) {
+        Some(host) => escape_html(&format!("{title} · {host}")),
+        None => escape_html(title),
+    }
+}
+
+/// The legal footer of the server-rendered pages, linking exactly the terms
+/// and privacy policy the operator configured (`op_tos_uri`, `op_policy_uri`,
+/// the values discovery advertises). Empty when neither is set: a deployment
+/// must not point its users at documents it did not write. The login page
+/// (`js/ui/src/App.svelte`) builds the same footer from discovery.
+pub fn legal_footer_html(tos: Option<&Url>, policy: Option<&Url>) -> String {
+    let links: Vec<String> = [(tos, "Terms of Use"), (policy, "Privacy Policy")]
+        .into_iter()
+        .filter_map(|(url, label)| {
+            url.map(|u| format!(r#"<a href="{}">{label}</a>"#, escape_html(u.as_str())))
+        })
+        .collect();
+    if links.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<div class="footer">
+        <p>By continuing you agree to the
+          {}.
+        </p>
+      </div>"#,
+        links.join(" and\n          ")
+    )
+}
+
+/// Whether this deployment runs in delegated-auth mode: a MAS shared secret is
+/// configured, so Synapse can delegate authentication to this provider.
+///
+/// Token introspection and the RFC 8628 device-code grant work only in this
+/// mode: `introspect::introspect` answers 404 without the secret, and both
+/// `/device_authorization` and [`token_device_code`] refuse the grant with
+/// [`device_grant_unsupported`]. Discovery reads the same predicate
+/// ([`provider_metadata_value`]), so it never advertises an endpoint or grant
+/// this deployment would refuse.
+pub fn delegated_auth_enabled(config: &crate::config::Config) -> bool {
+    config.mas_shared_secret.is_some()
+}
+
+/// The refusal of the RFC 8628 device-code grant outside delegated-auth mode:
+/// a 400 with an RFC 6749 §5.2 body, `unsupported_grant_type`, which RFC 8628
+/// §3.2 prescribes for `/device_authorization` errors as well. One value for
+/// both endpoints, so a client sees the same answer at either.
+pub fn device_grant_unsupported() -> CustomError {
+    CustomError::BadRequestToken(TokenError {
+        error: CoreErrorResponseType::UnsupportedGrantType,
+        error_description: "device_code grant requires MSC3861 mode.".to_string(),
+    })
 }
 
 /// Build the full OIDC provider-metadata document served at [`METADATA_PATH`],
@@ -600,16 +666,23 @@ pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
 /// crate cannot represent natively (introspection, device authorization,
 /// revocation, prompt values, and MSC4191 account management).
 ///
-/// `account_management_uri` is the MSC4191 account-management URL; when `None`
-/// it defaults to `{base_url}/account`. The advertised
+/// It advertises only what this deployment serves. Introspection and the
+/// device-code grant (with its `device_authorization_endpoint`) appear only in
+/// delegated-auth mode ([`delegated_auth_enabled`]). `matrix_ready` says a
+/// Synapse client AND a Matrix server name are configured; without both,
+/// `GET /resolve` answers 503 and every account action a 400, so neither
+/// `io.inblock.resolve_endpoint` nor MSC4191 account management is advertised.
+///
+/// `config.account_management_uri` is the MSC4191 account-management URL; when
+/// `None` it defaults to `{base_url}/account`. The advertised
 /// `account_management_actions_supported` list is sourced from
 /// [`crate::account::SUPPORTED_ACTIONS`] so discovery and dispatch never drift.
 pub fn provider_metadata_value(
-    base_url: Url,
-    account_management_uri: Option<&Url>,
-    advertise_resolve: bool,
+    config: &crate::config::Config,
+    matrix_ready: bool,
 ) -> Result<serde_json::Value, CustomError> {
-    let pm = metadata(base_url.clone())?;
+    let base_url = &config.base_url;
+    let pm = metadata(config)?;
     let mut value =
         serde_json::to_value(pm).map_err(|e| anyhow!("Failed to serialize metadata: {}", e))?;
     let base = base_url.as_str().trim_end_matches('/');
@@ -619,32 +692,37 @@ pub fn provider_metadata_value(
     // (404 under MSC3861). Only advertised because /sign_in honors fragment —
     // advertising without honoring would be strictly worse for v42 clients.
     value["response_modes_supported"] = serde_json::json!(["query", "fragment"]);
-    value["introspection_endpoint"] = serde_json::json!(format!("{}/oauth2/introspect", base));
-    value["introspection_endpoint_auth_methods_supported"] =
-        serde_json::json!(["client_secret_post", "bearer"]);
-    value["grant_types_supported"] = serde_json::json!([
-        "authorization_code",
-        "refresh_token",
-        "urn:ietf:params:oauth:grant-type:device_code"
-    ]);
-    value["device_authorization_endpoint"] =
-        serde_json::json!(format!("{}/device_authorization", base));
+    let mut grant_types = vec!["authorization_code", "refresh_token"];
+    // A standalone deployment would answer these with a 404 (introspection) or
+    // `unsupported_grant_type` (the device-code poll), after the user had
+    // already approved the device. Not advertising them is the honest answer.
+    if delegated_auth_enabled(config) {
+        value["introspection_endpoint"] = serde_json::json!(format!("{}/oauth2/introspect", base));
+        value["introspection_endpoint_auth_methods_supported"] =
+            serde_json::json!(["client_secret_post", "bearer"]);
+        grant_types.push(DEVICE_CODE_GRANT_TYPE);
+        value["device_authorization_endpoint"] =
+            serde_json::json!(format!("{}/device_authorization", base));
+    }
+    value["grant_types_supported"] = serde_json::json!(grant_types);
     value["revocation_endpoint"] = serde_json::json!(format!("{}/oauth2/revoke", base));
     value["token_endpoint_auth_methods_supported"] =
         serde_json::json!(["client_secret_post", "none"]);
     value["prompt_values_supported"] = serde_json::json!(["login", "create"]);
-    // MSC4191: account management discovery (stable v1.18).
-    let account_uri = account_management_uri
-        .map(|u| u.as_str().to_string())
-        .unwrap_or_else(|| format!("{}/account", base));
-    value["account_management_uri"] = serde_json::json!(account_uri);
-    value["account_management_actions_supported"] =
-        serde_json::json!(crate::account::SUPPORTED_ACTIONS);
-    // Advertised ONLY when this deployment can answer it (see
-    // `resolve_endpoint_advertised`): a client that finds the key will call
-    // the route, and advertising a route that answers 503 turns discovery
-    // into a guaranteed failed request per lookup.
-    if advertise_resolve {
+    // Both advertised ONLY when this deployment can answer them: a client that
+    // finds a key will use it, and a route that answers 503 (`/resolve`) or an
+    // account page whose every action answers 400 turns discovery into a
+    // guaranteed failed request.
+    if matrix_ready {
+        // MSC4191: account management discovery (stable v1.18).
+        let account_uri = config
+            .account_management_uri
+            .as_ref()
+            .map(|u| u.as_str().to_string())
+            .unwrap_or_else(|| format!("{}/account", base));
+        value["account_management_uri"] = serde_json::json!(account_uri);
+        value["account_management_actions_supported"] =
+            serde_json::json!(crate::account::SUPPORTED_ACTIONS);
         value[RESOLVE_ENDPOINT_METADATA_KEY] = serde_json::json!(format!("{}/resolve", base));
     }
     Ok(value)
@@ -674,11 +752,14 @@ pub const RESOLVE_ENDPOINT_METADATA_KEY: &str = "io.inblock.resolve_endpoint";
 
 // -- ENS resolution -------------------------------------------------------
 //
+// Opt-in: with neither eth_provider nor ens_api_url configured (the default)
+// no lookup happens and no address leaves the server.
+//
 // Order: when eth_provider is set, the on-chain legacy ENS registry is asked
 // first (classic reverse records only; no NameWrapper). The HTTP API
-// (ens_api_url, default api.ensdata.net; handles CCIP Read / NameWrapper /
+// (ens_api_url, e.g. api.ensdata.net; handles CCIP Read / NameWrapper /
 // offchain names server-side) is used when there is no eth_provider or the
-// on-chain lookup finds nothing. An empty ens_api_url disables the HTTP API.
+// on-chain lookup finds nothing.
 
 /// Resolve ENS primary name via HTTP API.
 /// API must accept GET /{address} and return JSON with `ens_primary` field.
@@ -746,7 +827,7 @@ async fn resolve_name(
         }
     }
 
-    // Default: HTTP API (handles CCIP Read / NameWrapper / offchain names).
+    // HTTP API, when configured (handles CCIP Read / NameWrapper / offchain names).
     if let Some(api_url) = ens_api_url {
         if let Some(name) = resolve_name_http(api_url, &address_string).await {
             return Some(name);
@@ -1017,11 +1098,8 @@ async fn token_device_code(
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
 ) -> Result<CoreTokenResponse, CustomError> {
-    if config.mas_shared_secret.is_none() {
-        return Err(CustomError::BadRequestToken(TokenError {
-            error: CoreErrorResponseType::UnsupportedGrantType,
-            error_description: "device_code grant requires MSC3861 mode.".to_string(),
-        }));
+    if !delegated_auth_enabled(config) {
+        return Err(device_grant_unsupported());
     }
 
     let dc = form.device_code.ok_or_else(|| {
@@ -1110,18 +1188,15 @@ async fn token_device_code(
                 "device_code grant: scope extraction"
             );
 
-            let dev_id = if let Some(ref proposed) = proposed_device_id {
-                info!(proposed_device_id = %proposed, "using client-proposed device_id from scope");
-                proposed.clone()
-            } else {
-                let generated = format!("SIWX_{}", &Uuid::new_v4().to_string()[..8]);
-                warn!(
+            match proposed_device_id {
+                Some(ref proposed) => {
+                    info!(proposed_device_id = %proposed, "using client-proposed device_id from scope")
+                }
+                None => warn!(
                     scope = %entry.scope,
-                    generated_device_id = %generated,
                     "no device_id found in scope, generating one"
-                );
-                generated
-            };
+                ),
+            }
 
             // Resolve ONCE (grandfathering decision) and reuse it for both
             // provisioning and TokenMetadata.username, exactly like sign_in.
@@ -1138,16 +1213,33 @@ async fn token_device_code(
                 key: signing_key,
                 issuer: config.base_url.as_str(),
             };
-            provision_synapse_device(
+            // Named after the client that started the grant, like sign_in.
+            // The name is cosmetic, so a failed client read falls back to the
+            // client id instead of failing a grant the user already approved.
+            let client = db_client
+                .get_client(client_id.clone())
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "device_code grant: client read failed; naming the device after its client id");
+                    None
+                });
+            let device_name = device_display_name(&client_id, client.as_ref());
+            // The client's proposal goes in as is, so provisioning mints the id
+            // when there is none and can tell a minted id (new, so it is named)
+            // from a client-supplied one (maybe renamed by the user, so named
+            // only when confirmed new). Without a Synapse client nothing is
+            // provisioned and the id is minted here, for the token scope alone.
+            let dev_id = provision_synapse_device(
                 &did,
                 &resolved,
                 synapse_client,
-                "Element X",
-                Some(&dev_id),
+                &device_name,
+                proposed_device_id.as_deref(),
                 config.matrix_server_name.as_deref(),
                 Some(&publication),
             )
-            .await;
+            .await
+            .unwrap_or_else(|| resolve_device_id(proposed_device_id.as_deref()));
 
             let now = Utc::now();
             let iat = now.timestamp();
@@ -1828,11 +1920,13 @@ pub fn validate_caip122_envelope(
 /// match). Used by `sign_in` so a code is never appended to an unregistered (e.g.
 /// attacker-controlled) redirect_uri — closing the open-redirect on BOTH the
 /// wallet (Path B) and WebAuthn (Path A) login paths.
+/// Returns the client's entry, so the caller can use its registration (the
+/// device name in `sign_in`) without a second read.
 async fn validate_registered_redirect_uri(
     client_id: &str,
     redirect_uri: &RedirectUrl,
     db_client: &DBClientType,
-) -> Result<(), CustomError> {
+) -> Result<ClientEntry, CustomError> {
     let client_entry = db_client
         .get_client(client_id.to_string())
         .await
@@ -1854,7 +1948,7 @@ async fn validate_registered_redirect_uri(
             "redirect_uri is not registered for this client.".to_string(),
         ));
     }
-    Ok(())
+    Ok(client_entry)
 }
 
 /// Verify the `siwx` cookie's CAIP-122 signature and nonce against the session.
@@ -1968,6 +2062,44 @@ fn resolve_device_id(proposed_device_id: Option<&str>) -> String {
     }
 }
 
+/// Synapse's limit on a device display name (`MAX_DEVICE_DISPLAY_NAME_LEN` in
+/// `synapse/handlers/device.py`, 1.161.0, counted in code points). A longer
+/// name makes `update_device_display_name` answer 400 `M_TOO_LARGE` and the
+/// new device would stay unnamed, so the name is cut to fit.
+const MAX_DEVICE_DISPLAY_NAME_CHARS: usize = 100;
+
+/// The display name for a Synapse device created by a sign-in through
+/// `client_id`: the client's registered `client_name` (RFC 7591), else the
+/// client id itself.
+///
+/// Never a fixed brand. Every client used to get "Element Web" (or "Element
+/// X" on the device-code path), so an agent's or any other client's session
+/// showed up in the user's device list under a client it was not. The
+/// untagged `client_name` wins; a client that registered only language-tagged
+/// names (`client_name#de`) gets the one with the lexicographically smallest
+/// tag. The tagged names sit in a `HashMap`, so "the first one" would change
+/// from one sign-in to the next.
+fn device_display_name(client_id: &str, client: Option<&ClientEntry>) -> String {
+    let registered = client
+        .and_then(|c| c.metadata.client_name())
+        .and_then(|names| {
+            names.get(None).or_else(|| {
+                names
+                    .iter()
+                    .filter_map(|(tag, name)| Some((tag?.as_ref(), name)))
+                    .min_by_key(|(tag, _)| *tag)
+                    .map(|(_, name)| name)
+            })
+        })
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty());
+    registered
+        .unwrap_or(client_id)
+        .chars()
+        .take(MAX_DEVICE_DISPLAY_NAME_CHARS)
+        .collect()
+}
+
 /// Was this displayname written by US, or chosen by the USER?
 ///
 /// `true` only for the two strings provisioning has ever seeded: the raw DID
@@ -1999,6 +2131,11 @@ fn provider_written_displayname(current: &str, did: &str, localpart: &str) -> bo
 /// `proposed_device_id`: the client-supplied device_id from the OAuth scope
 /// (stable for Element Web and Element X). When `None`, a fresh `SIWX_{uuid}`
 /// is minted.
+///
+/// `display_name` is the name a device CREATED by this sign-in gets
+/// ([`device_display_name`]). An existing device keeps its name: the device is
+/// upserted without one and named only when Synapse reports it created it (see
+/// the upsert below).
 ///
 /// **Loud failure + self-heal (2026-08-01 incident, discriminator corrected
 /// 2026-08-02):** a `provision_user` failure at first sign-in used to be
@@ -2134,7 +2271,7 @@ pub async fn provision_synapse_device(
             //
             // Erasure note: `has_profile_row` also reads a GDPR-erased
             // account's purged row (see account::execute_action's
-            // `org.matrix.account_erase`, which calls
+            // `io.inblock.account_erase`, which calls
             // `SynapseClient::deactivate_user(.., erase: true)`) as "truly
             // absent" by the same M_UNKNOWN discriminator. If an erased
             // account ever completed sign-in again, this would resurrect a
@@ -2306,11 +2443,23 @@ pub async fn provision_synapse_device(
         }
     }
 
-    if let Err(e) = synapse
-        .upsert_device(localpart, &dev_id, Some(display_name))
-        .await
-    {
-        warn!("upsert_device failed: {}", e);
+    // Upsert WITHOUT a name, then name the device only if this upsert created
+    // it. Synapse overwrites an existing device's name whenever one is sent,
+    // and a client may re-authenticate with its own device id for a device
+    // the user renamed. Synapse's 201 is the one race-free signal that the
+    // device is new: a separate "does it exist?" read could be overtaken by a
+    // concurrent sign-in. Failing to name a new device is cosmetic.
+    match synapse.upsert_device(localpart, &dev_id).await {
+        Ok(DeviceUpsert::Created) => {
+            if let Err(e) = synapse
+                .update_device_display_name(localpart, &dev_id, display_name)
+                .await
+            {
+                warn!(device_id = %dev_id, error = %e, "naming the new device failed (non-fatal)");
+            }
+        }
+        Ok(DeviceUpsert::AlreadyExisted) => {}
+        Err(e) => warn!("upsert_device failed: {}", e),
     }
 
     // 3B: arm reset window after every successful login provision (best-effort).
@@ -2530,7 +2679,10 @@ pub async fn sign_in(
     // redirect on BOTH the wallet (Path B) and WebAuthn (Path A) paths. Path B
     // additionally binds the redirect via the signed `Resources:` list above;
     // this is the only redirect binding Path A has.
-    validate_registered_redirect_uri(&params.client_id, &params.redirect_uri, db_client).await?;
+    let client =
+        validate_registered_redirect_uri(&params.client_id, &params.redirect_uri, db_client)
+            .await?;
+    let device_name = device_display_name(&params.client_id, Some(&client));
 
     // Extract client-proposed device_id from the session's stored scope (if any).
     let proposed_device_id = session_entry
@@ -2556,7 +2708,7 @@ pub async fn sign_in(
         &did,
         &resolved,
         synapse_client,
-        "Element Web",
+        &device_name,
         proposed_device_id.as_deref(),
         server_name,
         did_publication,
@@ -3199,9 +3351,10 @@ mod tests {
         assert!(err.contains("truncated"), "{err}");
     }
 
-    async fn default_config() -> (Config, RedisClient) {
+    /// `None` after a loud skip when Redis is unavailable (`siwx_oidc::test_support`).
+    async fn default_config() -> Option<(Config, RedisClient)> {
         let config = Config::default();
-        let db_client = RedisClient::new(&config.redis_url).await.unwrap();
+        let db_client = siwx_oidc::test_support::redis().await?;
         db_client
             .set_client(
                 "client".into(),
@@ -3216,7 +3369,7 @@ mod tests {
             )
             .await
             .unwrap();
-        (config, db_client)
+        Some((config, db_client))
     }
 
     fn config_no_ens() -> Config {
@@ -3281,7 +3434,9 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_flow() {
-        let (config, db_client) = default_config().await;
+        let Some((config, db_client)) = default_config().await else {
+            return;
+        };
 
         // Generate an eip155 keypair (same approach as Eip155Suite tests).
         let secret = k256::SecretKey::random(&mut rand::thread_rng());
@@ -3388,7 +3543,9 @@ mod tests {
     /// residue (v42 reads the authorization response ONLY from the fragment).
     #[tokio::test]
     async fn e2e_flow_fragment_response_mode() {
-        let (_config, db_client) = default_config().await;
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
 
         let secret = k256::SecretKey::random(&mut rand::thread_rng());
         let signing_key = k256::ecdsa::SigningKey::from(&secret);
@@ -3485,7 +3642,9 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_rejects_unsupported_response_mode() {
-        let (_config, db_client) = default_config().await;
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
         let params = AuthorizeParams {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(Url::parse("https://example.com").unwrap()),
@@ -3515,7 +3674,9 @@ mod tests {
     async fn authorize_accepts_query_response_mode_without_forwarding() {
         // Explicit "query" is valid but default: the SPA URL stays byte-identical
         // to the absent-param case (nothing forwarded).
-        let (_config, db_client) = default_config().await;
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
         let params = AuthorizeParams {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(Url::parse("https://example.com").unwrap()),
@@ -3537,11 +3698,19 @@ mod tests {
         );
     }
 
+    /// A config whose issuer is `https://siwx-oidc.example.com/`; everything
+    /// else keeps its default (standalone mode, no legal URIs).
+    fn discovery_config() -> Config {
+        Config {
+            base_url: Url::parse("https://siwx-oidc.example.com/").unwrap(),
+            ..Config::default()
+        }
+    }
+
     #[test]
     fn provider_metadata_advertises_response_modes() {
         // js-sdk v42 `isValidAuthMetadata` hard-requires both modes.
-        let base = Url::parse("https://siwx-oidc.example.com/").unwrap();
-        let value = provider_metadata_value(base, None, false).unwrap();
+        let value = provider_metadata_value(&discovery_config(), false).unwrap();
         assert_eq!(
             value["response_modes_supported"],
             serde_json::json!(["query", "fragment"])
@@ -3550,7 +3719,9 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_accepts_matrix_scopes() {
-        let (_config, db_client) = default_config().await;
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
         let params = AuthorizeParams {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(
@@ -3581,8 +3752,7 @@ mod tests {
 
     #[test]
     fn discovery_metadata_contains_matrix_scopes() {
-        let base = Url::parse("https://siwx-oidc.example.com").unwrap();
-        let pm = metadata(base).unwrap();
+        let pm = metadata(&discovery_config()).unwrap();
         let json = serde_json::to_value(&pm).unwrap();
         let scopes = json["scopes_supported"]
             .as_array()
@@ -3620,8 +3790,7 @@ mod tests {
         // account_management_actions_supported array containing the four real
         // actions plus their session_* aliases. Synapse forwards this document
         // verbatim to /_matrix/client/v1/auth_metadata (verified live).
-        let base = Url::parse("https://siwx-oidc.example.com/").unwrap();
-        let value = provider_metadata_value(base, None, false).unwrap();
+        let value = provider_metadata_value(&discovery_config(), true).unwrap();
 
         assert_eq!(
             value["account_management_uri"], "https://siwx-oidc.example.com/account",
@@ -3641,8 +3810,8 @@ mod tests {
             "org.matrix.device_delete",
             "org.matrix.cross_signing_reset",
             "org.matrix.account_deactivate",
-            "org.matrix.account_erase",
-            "org.matrix.account_reactivate",
+            "io.inblock.account_erase",
+            "io.inblock.account_reactivate",
             "org.matrix.sessions_list",
             "org.matrix.session_view",
             "org.matrix.session_end",
@@ -3653,9 +3822,7 @@ mod tests {
 
     #[test]
     fn provider_metadata_advertises_resolve_only_when_it_can_answer() {
-        let base = Url::parse("https://siwx-oidc.example.com/").unwrap();
-
-        let on = provider_metadata_value(base.clone(), None, true).unwrap();
+        let on = provider_metadata_value(&discovery_config(), true).unwrap();
         assert_eq!(
             on[RESOLVE_ENDPOINT_METADATA_KEY], "https://siwx-oidc.example.com/resolve",
             "the advertised endpoint must be {{base}}/resolve, the route axum serves"
@@ -3665,7 +3832,7 @@ mod tests {
             "the Element Web resolve-did-search patch reads this exact key"
         );
 
-        let off = provider_metadata_value(base, None, false).unwrap();
+        let off = provider_metadata_value(&discovery_config(), false).unwrap();
         assert!(
             off.get(RESOLVE_ENDPOINT_METADATA_KEY).is_none(),
             "a deployment that would answer 503 must not advertise the route"
@@ -3674,18 +3841,227 @@ mod tests {
 
     #[test]
     fn provider_metadata_honours_account_management_uri_override() {
-        let base = Url::parse("https://siwx-oidc.example.com/").unwrap();
-        let override_uri = Url::parse("https://account.example.com/manage").unwrap();
-        let value = provider_metadata_value(base, Some(&override_uri), false).unwrap();
+        let config = Config {
+            account_management_uri: Some(Url::parse("https://account.example.com/manage").unwrap()),
+            ..discovery_config()
+        };
+        let value = provider_metadata_value(&config, true).unwrap();
         assert_eq!(
             value["account_management_uri"],
             "https://account.example.com/manage"
         );
     }
 
+    /// Without a Synapse client or a Matrix server name every account action
+    /// answers 400, so neither the account page nor its actions may be
+    /// advertised, even when the operator configured the page's URL.
+    #[test]
+    fn account_management_is_advertised_only_when_the_actions_can_run() {
+        let config = Config {
+            account_management_uri: Some(Url::parse("https://account.example.com/manage").unwrap()),
+            ..discovery_config()
+        };
+        let standalone = provider_metadata_value(&config, false).unwrap();
+        for key in [
+            "account_management_uri",
+            "account_management_actions_supported",
+        ] {
+            assert!(
+                standalone.get(key).is_none(),
+                "{key} must not be advertised without Synapse and a server name: {standalone}"
+            );
+        }
+        let ready = provider_metadata_value(&config, true).unwrap();
+        assert!(ready["account_management_actions_supported"].is_array());
+    }
+
+    /// The terms of service and privacy policy are the deployment's own, so
+    /// discovery carries exactly what the operator configured and omits an
+    /// unset field rather than pointing at a default document.
+    #[test]
+    fn discovery_advertises_legal_uris_only_when_configured() {
+        let unset = provider_metadata_value(&discovery_config(), false).unwrap();
+        assert!(
+            unset.get("op_tos_uri").is_none(),
+            "no default terms of service may be advertised: {unset}"
+        );
+        assert!(
+            unset.get("op_policy_uri").is_none(),
+            "no default privacy policy may be advertised: {unset}"
+        );
+
+        let config = Config {
+            op_tos_uri: Some(Url::parse("https://legal.example.org/terms").unwrap()),
+            op_policy_uri: Some(Url::parse("https://legal.example.org/privacy").unwrap()),
+            ..discovery_config()
+        };
+        let set = provider_metadata_value(&config, false).unwrap();
+        assert_eq!(set["op_tos_uri"], "https://legal.example.org/terms");
+        assert_eq!(set["op_policy_uri"], "https://legal.example.org/privacy");
+    }
+
+    /// The footer of the server-rendered pages links exactly what discovery
+    /// advertises: nothing when nothing is configured, and each document only
+    /// when it is.
+    #[test]
+    fn the_legal_footer_links_only_configured_documents() {
+        let tos = Url::parse("https://legal.example.org/terms?v=1&lang=en").unwrap();
+        let policy = Url::parse("https://legal.example.org/privacy").unwrap();
+
+        assert_eq!(legal_footer_html(None, None), "", "no terms, no footer");
+
+        let both = legal_footer_html(Some(&tos), Some(&policy));
+        assert!(both.contains(
+            r#"<a href="https://legal.example.org/terms?v=1&amp;lang=en">Terms of Use</a>"#
+        ));
+        assert!(both.contains(r#"<a href="https://legal.example.org/privacy">Privacy Policy</a>"#));
+        assert!(!both.contains("/legal/"), "{both}");
+
+        let tos_only = legal_footer_html(Some(&tos), None);
+        assert!(tos_only.contains("Terms of Use") && !tos_only.contains("Privacy Policy"));
+        let policy_only = legal_footer_html(None, Some(&policy));
+        assert!(policy_only.contains("Privacy Policy") && !policy_only.contains("Terms of Use"));
+    }
+
+    /// A page title names the deployment it came from, never a fixed brand.
+    #[test]
+    fn a_page_title_names_the_issuer_host_not_a_brand() {
+        assert_eq!(
+            page_title("Account", "https://id.example.org/"),
+            "Account · id.example.org"
+        );
+        assert_eq!(page_title("Account", "not a url"), "Account");
+        assert!(!page_title("Account", "https://id.example.org").contains("inblock"));
+    }
+
+    /// Standalone discovery lists only what a standalone deployment serves.
+    /// Introspection answers 404 there and the device-code poll is refused, so
+    /// neither the endpoints nor the grant type may be advertised; revocation
+    /// works in both modes and stays.
+    #[test]
+    fn discovery_advertises_introspection_and_the_device_grant_only_in_delegated_auth_mode() {
+        let standalone = provider_metadata_value(&discovery_config(), false).unwrap();
+        for key in [
+            "introspection_endpoint",
+            "introspection_endpoint_auth_methods_supported",
+            "device_authorization_endpoint",
+        ] {
+            assert!(
+                standalone.get(key).is_none(),
+                "standalone discovery must not advertise {key}: {standalone}"
+            );
+        }
+        assert_eq!(
+            standalone["grant_types_supported"],
+            serde_json::json!(["authorization_code", "refresh_token"])
+        );
+        assert_eq!(
+            standalone["revocation_endpoint"],
+            "https://siwx-oidc.example.com/oauth2/revoke"
+        );
+
+        let delegated = provider_metadata_value(
+            &Config {
+                mas_shared_secret: Some("shared-secret".to_string()),
+                ..discovery_config()
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            delegated["introspection_endpoint"],
+            "https://siwx-oidc.example.com/oauth2/introspect"
+        );
+        assert_eq!(
+            delegated["introspection_endpoint_auth_methods_supported"],
+            serde_json::json!(["client_secret_post", "bearer"])
+        );
+        assert_eq!(
+            delegated["device_authorization_endpoint"],
+            "https://siwx-oidc.example.com/device_authorization"
+        );
+        assert_eq!(
+            delegated["grant_types_supported"],
+            serde_json::json!([
+                "authorization_code",
+                "refresh_token",
+                DEVICE_CODE_GRANT_TYPE
+            ])
+        );
+        assert_eq!(
+            delegated["revocation_endpoint"],
+            "https://siwx-oidc.example.com/oauth2/revoke"
+        );
+    }
+
+    /// The token endpoint refuses the device-code grant outside delegated-auth
+    /// mode, even for a code a user already approved, and leaves the code as
+    /// it was: nothing is redeemed, nothing is issued.
+    #[tokio::test]
+    async fn the_device_code_grant_is_refused_outside_delegated_auth_mode() {
+        let Some((config, db)) = default_config().await else {
+            return;
+        };
+        assert!(
+            !delegated_auth_enabled(&config),
+            "Config::default() is standalone"
+        );
+        let device_code = format!("dvc_standalone-{}", Uuid::new_v4().simple());
+        db.set_device_code(
+            &device_code,
+            &DeviceCodeEntry {
+                user_code: format!("SA-{}", Uuid::new_v4().simple()),
+                client_id: "client".to_string(),
+                scope: "openid".to_string(),
+                status: DeviceCodeStatus::Approved,
+                did: Some("did:key:zDnSTANDALONEDEVICECODE".to_string()),
+                device_id: None,
+                last_poll: None,
+                created_at: Utc::now().timestamp(),
+            },
+            DEVICE_CODE_LIFETIME,
+        )
+        .await
+        .unwrap();
+
+        let refused = token(
+            TokenForm {
+                code: None,
+                client_id: Some("client".to_string()),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code.clone()),
+            },
+            None,
+            &EcdsaSigningKey::generate(),
+            &config,
+            &db,
+            None,
+        )
+        .await;
+        match refused {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error, CoreErrorResponseType::UnsupportedGrantType)
+            }
+            Err(other) => panic!("expected unsupported_grant_type, got {other:?}"),
+            Ok(_) => panic!("a standalone deployment must not redeem a device code"),
+        }
+        let entry = db
+            .get_device_code(&device_code)
+            .await
+            .unwrap()
+            .expect("the refused code must be left in place");
+        assert_eq!(entry.status, DeviceCodeStatus::Approved);
+        db.delete_device_code(&device_code).await.ok();
+    }
+
     #[tokio::test]
     async fn authorize_accepts_matrix_only_scopes_without_openid() {
-        let (_config, db_client) = default_config().await;
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
         let params = AuthorizeParams {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(
@@ -3716,7 +4092,9 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_rejects_invalid_scope() {
-        let (_config, db_client) = default_config().await;
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
         let params = AuthorizeParams {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(Url::parse("https://example.com").unwrap()),
@@ -4377,12 +4755,7 @@ mod provision_synapse_device_tests {
             (axum::http::StatusCode::OK, serde_json::json!({})),
         )
         .await;
-        let Ok(redis) =
-            siwx_oidc::db::RedisClient::new(&url::Url::parse("redis://localhost").unwrap()).await
-        else {
-            eprintln!(
-                "SKIP publication_is_wired_into_the_shared_signin_path: no Redis on localhost"
-            );
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
             handle.abort();
             return;
         };
@@ -4455,12 +4828,7 @@ mod provision_synapse_device_tests {
             (axum::http::StatusCode::OK, serde_json::json!({})),
         )
         .await;
-        let Ok(redis) =
-            siwx_oidc::db::RedisClient::new(&url::Url::parse("redis://localhost").unwrap()).await
-        else {
-            eprintln!(
-                "SKIP a_degraded_identity_provisions_but_never_publishes_an_assertion: no Redis on localhost"
-            );
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
             handle.abort();
             return;
         };
@@ -4647,10 +5015,9 @@ mod userinfo_mxid_claim_tests {
         }
     }
 
-    async fn db() -> RedisClient {
-        RedisClient::new(&Config::default().redis_url)
-            .await
-            .expect("these tests need Redis on localhost:6379")
+    /// `None` after a loud skip when Redis is unavailable (`siwx_oidc::test_support`).
+    async fn db() -> Option<RedisClient> {
+        siwx_oidc::test_support::redis().await
     }
 
     /// Drive the real `userinfo` and return the JSON body a client would see.
@@ -4676,7 +5043,9 @@ mod userinfo_mxid_claim_tests {
     /// The happy path, and the only place the claim NAME is asserted.
     #[tokio::test]
     async fn the_claim_name_on_the_wire_is_io_inblock_mxid() {
-        let db = db().await;
+        let Some(db) = db().await else {
+            return;
+        };
         let client_id = format!("mxid-claim-{}", nonce());
         seed_client(&db, &client_id, false).await.unwrap();
         let token = format!("tok_{}", nonce());
@@ -4708,7 +5077,9 @@ mod userinfo_mxid_claim_tests {
     /// and the key must be ABSENT, not `null`. See this module's doc, point 2.
     #[tokio::test]
     async fn without_a_matrix_server_name_the_claim_is_omitted_not_null() {
-        let db = db().await;
+        let Some(db) = db().await else {
+            return;
+        };
         let client_id = format!("mxid-claim-standalone-{}", nonce());
         seed_client(&db, &client_id, false).await.unwrap();
         let token = format!("tok_{}", nonce());
@@ -4737,7 +5108,9 @@ mod userinfo_mxid_claim_tests {
     /// localpart from the DID — see `mxid_claim`'s doc.
     #[tokio::test]
     async fn legacy_code_entry_path_reports_a_recorded_localpart_and_omits_an_absent_one() {
-        let db = db().await;
+        let Some(db) = db().await else {
+            return;
+        };
         let client_id = format!("mxid-claim-legacy-{}", nonce());
         seed_client(&db, &client_id, false).await.unwrap();
         let config = config_with_server_name(Some(SERVER_NAME));
@@ -4782,7 +5155,9 @@ mod userinfo_mxid_claim_tests {
     /// point 3.
     #[tokio::test]
     async fn the_signed_jwt_variant_carries_the_claim_too() {
-        let db = db().await;
+        let Some(db) = db().await else {
+            return;
+        };
         let client_id = format!("mxid-claim-jwt-{}", nonce());
         seed_client(&db, &client_id, true).await.unwrap();
         let token = format!("tok_{}", nonce());
@@ -4868,7 +5243,6 @@ mod userinfo_mxid_claim_tests {
 #[cfg(test)]
 mod sign_in_deactivation_order_tests {
     use super::*;
-    use crate::config::Config;
     use crate::localpart::{legacy_localpart, localpart_for};
     use axum::extract::{Query, State};
     use axum::http::{Method, StatusCode, Uri};
@@ -4967,8 +5341,11 @@ mod sign_in_deactivation_order_tests {
     }
 
     /// Run one passkey-path `sign_in` for [`DID`] against `hs`; return the
-    /// outcome and the homeserver's request log.
-    async fn sign_in_against(hs: Homeserver) -> (Result<(Url, String), CustomError>, Vec<String>) {
+    /// outcome and the homeserver's request log, or `None` after a loud skip
+    /// when Redis is unavailable (`siwx_oidc::test_support`).
+    async fn sign_in_against(
+        hs: Homeserver,
+    ) -> Option<(Result<(Url, String), CustomError>, Vec<String>)> {
         let hs = Arc::new(hs);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -4987,9 +5364,10 @@ mod sign_in_deactivation_order_tests {
         });
         let synapse = SynapseClient::new(&format!("http://{addr}"), "secret");
 
-        let db = RedisClient::new(&Config::default().redis_url)
-            .await
-            .expect("these tests need Redis on localhost:6379, as CI provides");
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            server.abort();
+            return None;
+        };
         let nonce = Uuid::new_v4().simple().to_string();
         let client_id = format!("deactivation-order-{nonce}");
         db.set_client(
@@ -5051,7 +5429,7 @@ mod sign_in_deactivation_order_tests {
         .await;
         server.abort();
         let log = hs.log.lock().unwrap().clone();
-        (result, log)
+        Some((result, log))
     }
 
     /// A healthy homeserver and a genuinely deactivated account that exists only
@@ -5062,12 +5440,15 @@ mod sign_in_deactivation_order_tests {
     async fn sign_in_refuses_a_deactivated_account_before_resolving_or_provisioning() {
         let legacy = legacy_localpart(DID);
         let modern = localpart_for(DID);
-        let (result, log) = sign_in_against(Homeserver {
+        let Some((result, log)) = sign_in_against(Homeserver {
             taken: HashSet::from([modern.clone()]),
             deactivated: HashSet::from([modern.clone()]),
             ..Homeserver::default()
         })
-        .await;
+        .await
+        else {
+            return;
+        };
 
         match result {
             Err(CustomError::Unauthorized(msg)) => {
@@ -5099,13 +5480,16 @@ mod sign_in_deactivation_order_tests {
     async fn a_partial_probe_fault_fails_sign_in_closed_before_any_legacy_guess() {
         let legacy = legacy_localpart(DID);
         let modern = localpart_for(DID);
-        let (result, log) = sign_in_against(Homeserver {
+        let Some((result, log)) = sign_in_against(Homeserver {
             faulted: HashSet::from([legacy.clone()]),
             taken: HashSet::from([modern.clone()]),
             deactivated: HashSet::from([modern.clone()]),
             ..Homeserver::default()
         })
-        .await;
+        .await
+        else {
+            return;
+        };
 
         match result {
             Err(CustomError::ServiceUnavailable(msg)) => {
@@ -5121,6 +5505,497 @@ mod sign_in_deactivation_order_tests {
             vec![format!("is_localpart_available {legacy}")],
             "the gate's failed probe must be the only request: a second probe means the \
              login localpart was resolved (and guessed) before the gate decided"
+        );
+    }
+}
+
+#[cfg(test)]
+mod device_display_name_tests {
+    //! The Synapse device a sign-in creates is named after the OAuth client
+    //! (its registered `client_name`, else its client id), never after a fixed
+    //! brand, and an existing device's name is never overwritten.
+    use super::*;
+    use crate::config::Config;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use headers::{HeaderMap, HeaderMapExt, HeaderValue};
+    use openidconnect::{ClientName, LanguageTag};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+
+    /// Synthetic; `find_did_method` checks only the `did:key:` prefix.
+    const DID: &str = "did:key:zDnDEVICEDISPLAYNAMETEST";
+    const SERVER_NAME: &str = "example.org";
+    const REDIRECT: &str = "https://example.com/callback";
+    const USERS_NAME: &str = "Chosen by the user";
+
+    /// A homeserver on which every localpart is taken (an existing, active
+    /// account, so nothing is provisioned and no gate refuses), with Synapse
+    /// 1.161.0's device semantics: `upsert_device` answers 201 for a device it
+    /// inserts and 200 for one it already has, and OVERWRITES an existing
+    /// device's name whenever one is sent; `update_device_display_name` sets
+    /// the name of a device that exists. `always_200` models a homeserver or
+    /// proxy that never says 201.
+    struct Homeserver {
+        /// device id -> display name
+        devices: Mutex<HashMap<String, Option<String>>>,
+        upserts: Mutex<Vec<serde_json::Value>>,
+        renames: Mutex<Vec<serde_json::Value>>,
+        always_200: bool,
+    }
+
+    async fn spawn(
+        devices: &[&str],
+    ) -> (SynapseClient, Arc<Homeserver>, tokio::task::JoinHandle<()>) {
+        spawn_with(devices, false).await
+    }
+
+    async fn spawn_with(
+        devices: &[&str],
+        always_200: bool,
+    ) -> (SynapseClient, Arc<Homeserver>, tokio::task::JoinHandle<()>) {
+        let hs = Arc::new(Homeserver {
+            devices: Mutex::new(
+                devices
+                    .iter()
+                    .map(|d| (d.to_string(), Some(USERS_NAME.to_string())))
+                    .collect(),
+            ),
+            upserts: Mutex::new(Vec::new()),
+            renames: Mutex::new(Vec::new()),
+            always_200,
+        });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral homeserver port");
+        let addr = listener.local_addr().expect("homeserver local_addr");
+        let app = Router::new()
+            .route(
+                "/_synapse/mas/is_localpart_available",
+                get(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"errcode": "M_USER_IN_USE", "error": "in use"})),
+                    )
+                }),
+            )
+            .route(
+                "/_synapse/mas/query_user",
+                get(|| async {
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"errcode": "M_NOT_FOUND", "error": "User not found"})),
+                    )
+                }),
+            )
+            .route(
+                "/_synapse/mas/upsert_device",
+                post(
+                    |State(hs): State<Arc<Homeserver>>, Json(body): Json<serde_json::Value>| async move {
+                        hs.upserts.lock().unwrap().push(body.clone());
+                        let id = body["device_id"].as_str().unwrap().to_string();
+                        let name = body["display_name"].as_str().map(str::to_string);
+                        let mut devices = hs.devices.lock().unwrap();
+                        let created = match devices.get_mut(&id) {
+                            None => {
+                                devices.insert(id, name);
+                                true
+                            }
+                            Some(existing) => {
+                                if name.is_some() {
+                                    *existing = name;
+                                }
+                                false
+                            }
+                        };
+                        let status = if created && !hs.always_200 {
+                            StatusCode::CREATED
+                        } else {
+                            StatusCode::OK
+                        };
+                        (status, Json(serde_json::json!({})))
+                    },
+                ),
+            )
+            .route(
+                "/_synapse/mas/update_device_display_name",
+                post(
+                    |State(hs): State<Arc<Homeserver>>, Json(body): Json<serde_json::Value>| async move {
+                        hs.renames.lock().unwrap().push(body.clone());
+                        let id = body["device_id"].as_str().unwrap();
+                        let name = body["display_name"].as_str().unwrap().to_string();
+                        match hs.devices.lock().unwrap().get_mut(id) {
+                            Some(existing) => {
+                                *existing = Some(name);
+                                StatusCode::OK
+                            }
+                            None => StatusCode::NOT_FOUND,
+                        }
+                    },
+                ),
+            )
+            // Profile reads, cross-signing reset and anything else: an empty 200.
+            .fallback(|| async { (StatusCode::OK, Json(serde_json::json!({}))).into_response() })
+            .with_state(hs.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("homeserver");
+        });
+        (
+            SynapseClient::new(&format!("http://{addr}"), "secret"),
+            hs,
+            server,
+        )
+    }
+
+    fn client_entry(client_name: Option<&str>) -> ClientEntry {
+        let mut metadata = CoreClientMetadata::new(
+            vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
+            EmptyAdditionalClientMetadata {},
+        );
+        if let Some(name) = client_name {
+            let mut names = LocalizedClaim::new();
+            names.insert(None, ClientName::new(name.to_string()));
+            metadata = metadata.set_client_name(Some(names));
+        }
+        ClientEntry {
+            secret: "secret".into(),
+            metadata,
+            access_token: None,
+        }
+    }
+
+    /// Asserts that exactly one device was upserted, that the upsert carried
+    /// no name, and that the device was then named `expected` (`None`: not
+    /// named at all). Returns the device id.
+    fn the_one_device(hs: &Homeserver, expected: Option<&str>) -> String {
+        let upserts = hs.upserts.lock().unwrap().clone();
+        assert_eq!(upserts.len(), 1, "exactly one device upsert: {upserts:?}");
+        assert!(
+            upserts[0].get("display_name").is_none(),
+            "an upsert must never carry a name: Synapse would overwrite an existing \
+             device's: {}",
+            upserts[0]
+        );
+        let device_id = upserts[0]["device_id"].as_str().unwrap().to_string();
+        let renames = hs.renames.lock().unwrap().clone();
+        match expected {
+            Some(name) => {
+                assert_eq!(renames.len(), 1, "exactly one rename: {renames:?}");
+                assert_eq!(renames[0]["device_id"], device_id.as_str());
+                assert_eq!(renames[0]["display_name"], name);
+            }
+            None => assert!(
+                renames.is_empty(),
+                "a device this sign-in did not create must not be renamed: {renames:?}"
+            ),
+        }
+        device_id
+    }
+
+    /// Run one passkey-path `sign_in` for [`DID`] through a client registered
+    /// with `client_name`, with no device id in the session scope. `None` when
+    /// Redis is unavailable (the test then skips, see `test_support`).
+    async fn sign_in_through(client_name: Option<&str>) -> Option<(String, Arc<Homeserver>)> {
+        let db = siwx_oidc::test_support::redis().await?;
+        let (synapse, hs, server) = spawn(&[]).await;
+        let nonce = Uuid::new_v4().simple().to_string();
+        let client_id = format!("device-name-{nonce}");
+        db.set_client(client_id.clone(), client_entry(client_name))
+            .await
+            .unwrap();
+        let session_id = format!("device-name-{nonce}");
+        db.set_session(
+            session_id.clone(),
+            SessionEntry {
+                siwe_nonce: nonce.clone(),
+                oidc_nonce: None,
+                secret: "secret".into(),
+                signin_count: 0,
+                verified_did: Some(DID.to_string()),
+                scope: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
+        );
+        let params = SignInParams {
+            redirect_uri: RedirectUrl::new(REDIRECT.into()).unwrap(),
+            state: "state".into(),
+            oidc_nonce: None,
+            client_id: client_id.clone(),
+            code_challenge: None,
+            code_challenge_method: None,
+            response_mode: None,
+        };
+        sign_in(
+            &Url::parse("https://example.com").unwrap(),
+            &["key".to_string()],
+            &[],
+            params,
+            headers.typed_get::<headers::Cookie>().unwrap(),
+            &db,
+            Some(&synapse),
+            Some(SERVER_NAME),
+            None,
+        )
+        .await
+        .expect("sign_in must succeed against a healthy homeserver");
+        server.abort();
+        Some((client_id, hs))
+    }
+
+    #[test]
+    fn the_device_is_named_after_the_registered_client_name() {
+        assert_eq!(
+            device_display_name("cid", Some(&client_entry(Some("Aqua Agent")))),
+            "Aqua Agent"
+        );
+        assert_eq!(
+            device_display_name("cid", Some(&client_entry(Some("  Aqua Agent\n")))),
+            "Aqua Agent",
+            "surrounding whitespace is not part of a name"
+        );
+    }
+
+    #[test]
+    fn without_a_registered_name_the_device_is_named_after_the_client_id() {
+        assert_eq!(device_display_name("my-agent", None), "my-agent");
+        assert_eq!(
+            device_display_name("my-agent", Some(&client_entry(None))),
+            "my-agent"
+        );
+        assert_eq!(
+            device_display_name("my-agent", Some(&client_entry(Some("   ")))),
+            "my-agent",
+            "a blank client_name names nothing"
+        );
+    }
+
+    #[test]
+    fn a_language_tagged_name_is_used_when_there_is_no_default_one() {
+        let mut entry = client_entry(None);
+        let mut names = LocalizedClaim::new();
+        names.insert(
+            Some(LanguageTag::new("de".to_string())),
+            ClientName::new("Mein Agent".to_string()),
+        );
+        entry.metadata = entry.metadata.set_client_name(Some(names));
+        assert_eq!(device_display_name("cid", Some(&entry)), "Mein Agent");
+    }
+
+    /// The untagged name wins over every tagged one; without it the smallest
+    /// tag wins, on every call, although the tagged names sit in a `HashMap`
+    /// whose iteration order differs from one instance to the next.
+    #[test]
+    fn a_language_tagged_name_is_chosen_deterministically() {
+        let tagged = [
+            ("fr", "Mon Agent"),
+            ("nl", "Mijn Agent"),
+            ("de", "Mein Agent"),
+            ("en-GB", "My Agent"),
+        ];
+        for default in [None, Some("Agent")] {
+            for _ in 0..64 {
+                let mut entry = client_entry(None);
+                let mut names = LocalizedClaim::new();
+                if let Some(name) = default {
+                    names.insert(None, ClientName::new(name.to_string()));
+                }
+                for (tag, name) in tagged {
+                    names.insert(
+                        Some(LanguageTag::new(tag.to_string())),
+                        ClientName::new(name.to_string()),
+                    );
+                }
+                entry.metadata = entry.metadata.set_client_name(Some(names));
+                assert_eq!(
+                    device_display_name("cid", Some(&entry)),
+                    default.unwrap_or("Mein Agent")
+                );
+            }
+        }
+    }
+
+    /// Synapse answers `update_device_display_name` with 400 `M_TOO_LARGE` for
+    /// a name over 100 code points, and the device would then stay unnamed.
+    #[test]
+    fn a_long_client_name_is_cut_to_synapses_limit() {
+        let long = "é".repeat(150);
+        let name = device_display_name("cid", Some(&client_entry(Some(&long))));
+        assert_eq!(name.chars().count(), MAX_DEVICE_DISPLAY_NAME_CHARS);
+        assert_eq!(MAX_DEVICE_DISPLAY_NAME_CHARS, 100);
+        assert_eq!(
+            device_display_name(&"c".repeat(150), None).chars().count(),
+            100
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_in_names_a_new_device_after_the_registered_client() {
+        let Some((_, hs)) = sign_in_through(Some("Aqua Agent")).await else {
+            return;
+        };
+        let device_id = the_one_device(&hs, Some("Aqua Agent"));
+        assert!(device_id.starts_with("SIWX_"), "{device_id}");
+    }
+
+    #[tokio::test]
+    async fn sign_in_names_a_new_device_after_the_client_id_without_a_client_name() {
+        let Some((client_id, hs)) = sign_in_through(None).await else {
+            return;
+        };
+        the_one_device(&hs, Some(&client_id));
+    }
+
+    fn identity() -> crate::localpart::ResolvedIdentity {
+        crate::localpart::ResolvedIdentity {
+            localpart: crate::localpart::localpart_for(DID),
+            is_new: false,
+            degraded: false,
+        }
+    }
+
+    async fn provision(
+        synapse: &SynapseClient,
+        device: Option<&str>,
+        server_name: Option<&str>,
+    ) -> Option<String> {
+        provision_synapse_device(
+            DID,
+            &identity(),
+            Some(synapse),
+            "Aqua Agent",
+            device,
+            server_name,
+            None,
+        )
+        .await
+    }
+
+    /// A client re-authenticating with its own device id, for a device the
+    /// user renamed: the name stays the user's.
+    #[tokio::test]
+    async fn a_client_supplied_device_that_exists_keeps_its_name() {
+        let (synapse, hs, server) = spawn(&["CLIENTDEVICE"]).await;
+        let device_id = provision(&synapse, Some("CLIENTDEVICE"), Some(SERVER_NAME)).await;
+        server.abort();
+        assert_eq!(device_id.as_deref(), Some("CLIENTDEVICE"));
+        the_one_device(&hs, None);
+        assert_eq!(
+            hs.devices.lock().unwrap()["CLIENTDEVICE"].as_deref(),
+            Some(USERS_NAME)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_supplied_device_that_is_new_gets_the_client_name() {
+        let (synapse, hs, server) = spawn(&["SOMEOTHERDEVICE"]).await;
+        provision(&synapse, Some("CLIENTDEVICE"), Some(SERVER_NAME)).await;
+        server.abort();
+        assert_eq!(the_one_device(&hs, Some("Aqua Agent")), "CLIENTDEVICE");
+        assert_eq!(
+            hs.devices.lock().unwrap()["CLIENTDEVICE"].as_deref(),
+            Some("Aqua Agent")
+        );
+    }
+
+    /// Naming reads nothing about the account, so it needs no MXID: a new
+    /// device is named without a server name too.
+    #[tokio::test]
+    async fn a_new_device_is_named_without_a_server_name() {
+        let (synapse, hs, server) = spawn(&[]).await;
+        provision(&synapse, Some("CLIENTDEVICE"), None).await;
+        server.abort();
+        the_one_device(&hs, Some("Aqua Agent"));
+    }
+
+    /// Only Synapse's 201 means "this upsert created the device". A homeserver
+    /// that answers 200 for everything leaves every device unnamed rather than
+    /// risk renaming one the user named.
+    #[tokio::test]
+    async fn upsert_names_only_a_device_this_sign_in_creates() {
+        let (synapse, hs, server) = spawn_with(&[], true).await;
+        provision(&synapse, Some("CLIENTDEVICE"), Some(SERVER_NAME)).await;
+        provision(&synapse, None, Some(SERVER_NAME)).await;
+        server.abort();
+        assert_eq!(hs.upserts.lock().unwrap().len(), 2);
+        assert!(
+            hs.renames.lock().unwrap().is_empty(),
+            "without a 201 nothing may be renamed"
+        );
+    }
+
+    /// The QR / device-code path used to name every device "Element X".
+    #[tokio::test]
+    async fn the_device_code_grant_names_the_device_after_its_client() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (synapse, hs, server) = spawn(&[]).await;
+        let nonce = Uuid::new_v4().simple().to_string();
+        let client_id = format!("device-name-dc-{nonce}");
+        db.set_client(client_id.clone(), client_entry(Some("Pocket Client")))
+            .await
+            .unwrap();
+        let device_code = format!("dvc_device-name-{nonce}");
+        db.set_device_code(
+            &device_code,
+            &DeviceCodeEntry {
+                user_code: format!("DN-{nonce}"),
+                client_id: client_id.clone(),
+                scope: "openid".to_string(),
+                status: DeviceCodeStatus::Approved,
+                did: Some(DID.to_string()),
+                device_id: None,
+                last_poll: None,
+                created_at: Utc::now().timestamp(),
+            },
+            DEVICE_CODE_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let config = Config {
+            mas_shared_secret: Some("secret".to_string()),
+            matrix_server_name: Some(SERVER_NAME.to_string()),
+            ..Config::default()
+        };
+        let response = token(
+            TokenForm {
+                code: None,
+                client_id: Some(client_id),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code),
+            },
+            None,
+            &EcdsaSigningKey::generate(),
+            &config,
+            &db,
+            Some(&synapse),
+        )
+        .await
+        .expect("an approved device code must be redeemed");
+        server.abort();
+        let device_id = the_one_device(&hs, Some("Pocket Client"));
+        assert!(device_id.starts_with("SIWX_"), "{device_id}");
+        let scopes: Vec<String> = openidconnect::OAuth2TokenResponse::scopes(&response)
+            .expect("the device-code response carries its scope")
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(
+            scopes.contains(&format!("urn:matrix:client:device:{device_id}")),
+            "the token must be scoped to the device that was provisioned: {scopes:?}"
         );
     }
 }

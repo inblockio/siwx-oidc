@@ -17,11 +17,10 @@
 #
 # Source of truth for the route split:
 #   - which /_matrix/... paths siwx-oidc owns: src/axum_lib.rs route table
-#   - the prod edge that productizes them: ../siwx-oidc-matrix-server/Caddyfile.production
-#     (relative to this repository's root)
-#     (login/logout/refresh) PLUS the legacy CS-API device-management paths that
-#     siwx-oidc also registers (devices/{id}, delete_devices, logout/all) and that
-#     the deployed account-management edge route already forwards on prod.
+#   - the production edge forwards the same set: login/logout/refresh PLUS the
+#     legacy CS-API device-management paths siwx-oidc also registers
+#     (DELETE devices/{id}, delete_devices, logout/all). This file mirrors that
+#     split; when the route table changes, change both.
 #
 # Topology (podman, network siwx-real-net):
 #   - upstream siwx-oidc : siwx-real-oidc:8081
@@ -98,11 +97,15 @@
 			import strip_upstream_cors
 		}
 	}
-	# Caddy `handle` matches a path prefix, so this also covers
-	# `DELETE /_matrix/client/v3/devices/{device_id}` (and the GET device list,
-	# which siwx-oidc does not own — but Synapse 404s the delete under MSC3861,
-	# so forwarding the whole subtree to siwx-oidc matches the owned method).
-	handle /_matrix/client/v3/devices/* {
+	# Single-device delete (DELETE /_matrix/client/v3/devices/{device_id}): the
+	# only method siwx-oidc serves under devices/ (src/axum_lib.rs), and one
+	# Synapse 404s under delegated auth. GET and PUT on a single device (read,
+	# rename) stay on Synapse: siwx-oidc would answer them 405.
+	@device_delete {
+		path /_matrix/client/v3/devices/*
+		method DELETE
+	}
+	handle @device_delete {
 		import public_cors
 		reverse_proxy siwx-real-oidc:8081 {
 			import strip_upstream_cors

@@ -70,8 +70,8 @@ established over the 256 non-ignored tests plus nine live suites the auditor ran
    checked against that URL.
 4. **The audit brief itself was wrong.** It told the auditor this stack held two row-less
    accounts. It did not — the harness had been recreated with `--fresh` in between, and
-   the auditor found 31 users / 31 profiles and had to manufacture one. The "3 of 102"
-   figure is about the dev deployment, not the local harness.
+   the auditor found 31 users / 31 profiles and had to manufacture one. The row-less
+   accounts (a few dev accounts) are on the dev deployment, not in the local harness.
 
 ## Remediation
 

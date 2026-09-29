@@ -27,6 +27,14 @@ const KV_DEVICE_TOMBSTONE_PREFIX: &str = "tombstone:device";
 /// concurrent refresh/mint refuses to issue tokens for a terminating user
 /// (S3-4 / H6 fix). Checked by the refresh/mint paths.
 const KV_USER_TOMBSTONE_PREFIX: &str = "tombstone:user";
+/// Durable erasure markers: `erased:user/{localpart}` and
+/// `erased:did/{hex(sha256(canonical DID))}`, written with NO TTL before an
+/// account is erased and checked before any reactivation. They are what makes
+/// an erasure final: Synapse's `reactivate_user` (1.161.0) clears its own erased
+/// flag and recreates the profile row, and `query_user` does not report erasure.
+/// The DID is stored as a hash so an erased account leaves no DID in cleartext.
+const KV_ERASED_USER_PREFIX: &str = "erased:user";
+const KV_ERASED_DID_PREFIX: &str = "erased:did";
 /// Prefix for server-issued, single-use CAIP-122 nonces (C1). Used by the
 /// device-approval and account CAIP-122 paths, which (unlike the login path) have
 /// no session to carry the nonce: it is minted on a dedicated GET and consumed on

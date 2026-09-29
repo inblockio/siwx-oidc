@@ -11,8 +11,9 @@
 //! AQUA_WEBAUTHN_REDIS_URL=redis://localhost cargo test --test account_linking_dual_write   # flag on
 //! ```
 //!
-//! Uses `redis://localhost` and unique nonces, the convention the other
-//! Redis-backed tests here already follow, and cleans up after itself.
+//! Gets its Redis from `siwx_oidc::test_support` (`SIWX_TEST_REDIS_URL`, a loud
+//! skip without it, a failure under `SIWX_TEST_REQUIRE_REDIS=1`), uses unique
+//! nonces, and cleans up after itself.
 //!
 //! What is deliberately NOT tested by calling it: `link_start`/`link_finish`
 //! live in the binary crate and need a real authenticator to drive. What is
@@ -23,7 +24,6 @@
 
 use aqua_auth::webauthn_store::{CredentialId, WebauthnCredentialBackend};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use url::Url;
 
 use siwx_oidc::credential_identity::resolve_credential_identity;
 use siwx_oidc::credential_migration::derive_did_from_passkey_blob;
@@ -66,9 +66,7 @@ fn shared_rt() -> &'static tokio::runtime::Runtime {
 }
 
 async fn redis() -> Option<RedisClient> {
-    RedisClient::new(&Url::parse("redis://localhost").unwrap())
-        .await
-        .ok()
+    siwx_oidc::test_support::redis().await
 }
 
 fn nonce() -> u128 {
@@ -96,7 +94,7 @@ fn cid(id: &str) -> CredentialId {
 /// The link entries for exactly these credential ids.
 ///
 /// Scoped rather than a whole-namespace snapshot on purpose: these tests share
-/// `redis://localhost` with the rest of the suite, so a global snapshot would
+/// their Redis with the rest of the suite, so a global snapshot would
 /// pick up other tests' keys appearing and disappearing and fail for reasons
 /// that have nothing to do with the mirror. Scoped is also the assertion that
 /// actually bites: `mirror_credential` could only ever write a link key for the

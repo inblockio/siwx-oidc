@@ -39,9 +39,9 @@ everything else exists only in the binary crate.
 | `admin_token.rs` | `POST /oauth2/admin_token`: short-TTL token whose scope carries `urn:synapse:admin:*`. |
 | `compat.rs` | `POST /oauth2/revoke` (RFC 7009) and the Matrix client-server endpoints siwx-oidc answers (login flows, logout, logout/all, refresh, device deletion); `TeardownPolicy`. |
 | `device_auth.rs` | RFC 8628 device authorization: `/device_authorization`, the `/device` approval page (wallet and passkey), server-issued CAIP-122 nonces. |
-| `account.rs` | MSC4191 `/account` page and actions, MSC4312 cross-signing reset. `SUPPORTED_ACTIONS` is the single source of truth for discovery and dispatch; `canonical_action` maps `session_*` aliases to `device_*`. |
+| `account.rs` | MSC4191 `/account` page and actions, MSC4312 cross-signing reset, and the two non-spec actions `io.inblock.account_erase` / `io.inblock.account_reactivate`. `SUPPORTED_ACTIONS` is the single source of truth for discovery and dispatch; `canonical_action` maps `session_*` aliases to `device_*` and the legacy `org.matrix.account_erase` / `org.matrix.account_reactivate` names to the new ones. |
 | `webauthn.rs` | Passkey ceremonies (register, authenticate, link), the new-identity and deactivation gates (`reject_if_new_identity`, `reject_if_deactivated`), picker scoping. |
-| `synapse_client.rs` | Synapse client with two credentials: the MAS shared secret on `/_synapse/mas/*` (`provision_user`, `upsert_device`, `allow_cross_signing_reset`, `localpart_status`, `delete_device`, `deactivate_user`, `reactivate_user`) and a minted admin-scoped token (`admin_request`) on `/_synapse/admin/*` and the client-server API (`list_devices`, `get_device`, `has_cross_signing_keys`, `read_profile`, `publish_did_field`, `read_did_field`). |
+| `synapse_client.rs` | Synapse client with two credentials: the MAS shared secret on `/_synapse/mas/*` (`provision_user`, `upsert_device`, `update_device_display_name`, `allow_cross_signing_reset`, `localpart_status`, `delete_device`, `deactivate_user`, `reactivate_user`) and a minted admin-scoped token (`admin_request`) on `/_synapse/admin/*` and the client-server API (`list_devices`, `get_device`, `has_cross_signing_keys`, `read_profile`, `publish_did_field`, `read_did_field`). |
 | `did_assertion.rs` | `DID_PROFILE_FIELD`, `mint_did_assertion` (compact ES256 JWS), `did_profile_value`, `DidPublication`. |
 | `resolve.rs` | `GET /resolve`, the public DID↔MXID lookup. |
 | `localpart.rs` | Grandfathering policy: `resolve_identity` (fallible) and `resolve_identity_or_legacy` (fail-safe to legacy). |
@@ -82,21 +82,28 @@ sign-in flows, Redis keyspace and lineage: [docs/architecture.md](docs/architect
 
 ```bash
 cargo build --workspace
-cargo fmt -- --check && cargo clippy          # CI builds with RUSTFLAGS=-Dwarnings
+cargo fmt --all -- --check && cargo clippy --workspace --all-targets   # CI: RUSTFLAGS=-Dwarnings
 docker run -d --rm --name siwx-redis -p 6379:6379 redis:7-alpine   # Redis on localhost:6379
-cargo test                                    # unit tests + non-ignored tests/; several need Redis
+cargo test --workspace                        # unit tests + non-ignored tests/; many need Redis
 cargo run                                     # the server (needs Redis; see below)
 cargo run -p siwx-oidc-auth -- --help         # the headless client
 ```
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  Plain `cargo test` runs the unit tests plus 13 tests in six files: `openapi_covers_every_route`
-  (2) and `localpart_vectors` (1), which need nothing; `account_linking_dual_write` (6), which
-  needs Redis on localhost; `credential_migration_live` (2), which returns early unless
-  `MIGRATION_TEST_REDIS_URL` names a disposable Redis; and the pure check
-  `an_absent_strict_skips_variable_means_strict` in `e2e_account_lifecycle_live` and in
-  `e2e_did_field_live` (1 each).
+  `cargo test --workspace` runs the unit tests of both crates plus 16 tests in seven files:
+  `openapi_covers_every_route` (2), `localpart_vectors` (1) and `graceful_shutdown` (3), which
+  need nothing; `account_linking_dual_write` (6), which needs the test Redis;
+  `credential_migration_live` (2), which needs its own disposable, empty Redis named by
+  `MIGRATION_TEST_REDIS_URL`; and the pure check `an_absent_strict_skips_variable_means_strict`
+  in `e2e_account_lifecycle_live` and in `e2e_did_field_live` (1 each).
+- **Redis-backed tests** get their Redis from `siwx_oidc::test_support` (`src/test_support.rs`):
+  `SIWX_TEST_REDIS_URL`, default `redis://localhost`. When it is unreachable each test prints
+  one `SKIP <test>: …` line to stderr and passes; with `SIWX_TEST_REQUIRE_REDIS=1` it fails
+  instead, and so does `credential_migration_live` when `MIGRATION_TEST_REDIS_URL` is unset.
+  CI sets both. Use the helper in any new Redis-backed test: `RedisClient::new` never connects
+  (bb8 builds the pool with `min_idle` 0), so a `RedisClient::new(..).ok()` guard never skips,
+  and without Redis the test fails after bb8's 30-second timeout.
 - **Mock stack:** `e2e/up.sh` / `e2e/down.sh` start Redis, `e2e/synapse_mock.py` and siwx-oidc
   in podman; `bash e2e/run-all.sh` runs everything. See [e2e/README.md](e2e/README.md).
   `--test-threads=1` is required: the suites share one stack and reset the mock.
@@ -110,8 +117,13 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 - **Running the server locally** needs `SIWXOIDC_BASE_URL` with a hostname
   (`http://localhost:8000`): the default `http://127.0.0.1:8000` makes WebAuthn refuse the IP
   literal as RP ID and startup panics. See [docs/configuration.md](docs/configuration.md).
-- CI (`.github/workflows/ci.yml`) runs the unit tests, the promotable mock-stack suites
-  (job `rust-e2e-mock`) and `e2e/browser` (job `browser-e2e`).
+- CI (`.github/workflows/ci.yml`) runs on pushes to `main` and `fork-stable` and on every pull
+  request, forks included; it reads no secrets. Job `build` runs clippy on all targets and
+  `cargo test --workspace` against two Redis services with `SIWX_TEST_REQUIRE_REDIS=1`; job
+  `image` builds the container image without pushing it, which runs the license gates
+  (`scripts/third-party-notices.sh`, `js/ui/third-party-licenses.js`, the Alpine license
+  check); job `rust-e2e-mock` runs the promotable mock-stack suites; job `browser-e2e` runs
+  `e2e/browser`. Actions are pinned by commit SHA.
 
 **Route documentation is enforced.** `tests/openapi_covers_every_route.rs`
 (`every_route_is_described_in_the_openapi_document`) parses the router in `axum_lib.rs` and
@@ -125,11 +137,9 @@ endpoint, update `e2e/synapse_mock.py` in the same change (drift check in
 
 **A test must be able to fail.** A bound such as `n <= 1` is satisfied by zero, and a test
 that prints "skipping" and returns ok is green forever. Assert the positive case, and make
-skips loud (`E2E_STRICT_SKIPS`). Known gap: several Redis-backed tests still return early
-without Redis (e.g. `forged_user_cookie_yields_usernameless_empty_allow_credentials`, the
-`d1_500_…` tests in `synapse_client.rs`, most of `account_linking_dual_write`), and
-`backfill_is_additive_link_aware_counter_preserving_and_idempotent` runs only when
-`MIGRATION_TEST_REDIS_URL` is set, which no CI job sets.
+skips loud and switchable into failures (`SIWX_TEST_REQUIRE_REDIS`, `E2E_STRICT_SKIPS`).
+Known gap: `e2e_msc3861` and `e2e_messaging` skip their Matrix-side assertions with a plain
+`eprintln!` when whoami is unavailable, with no `E2E_STRICT_SKIPS` gate.
 
 ## Invariants: do not "simplify" these
 
@@ -270,6 +280,14 @@ doc; read it before changing the code the rule covers.
   introspection answer is the authority.
 - **No device-id recycling.** Sign-in upserts a fresh `SIWX_…` id and never deletes. Pin:
   `h2_sequential_signins_mint_distinct_device_ids` (mock stack).
+- **A device is named only when a sign-in creates it**, after the OAuth client
+  (`client_name`, else `client_id`), never a fixed brand. Synapse's `upsert_device`
+  overwrites an existing device's name whenever one is sent, so the upsert never carries
+  a name, and only a device it created (201) is then named via
+  `update_device_display_name`. Pin:
+  `upsert_names_only_a_device_this_sign_in_creates`,
+  `a_client_supplied_device_that_exists_keeps_its_name`,
+  `sign_in_names_a_new_device_after_the_registered_client`.
 - **`/oauth2/revoke` never deletes a device.** Only explicit sign-out (`logout`, MSC4191
   `device_delete`) does; `logout/all` never deactivates the account. Pin:
   `teardown_policy_only_deletes_device_on_explicit_signout`,
@@ -316,12 +334,21 @@ doc; read it before changing the code the rule covers.
   `without_a_matrix_server_name_the_claim_is_omitted_not_null`,
   `the_claim_name_on_the_wire_is_io_inblock_mxid`, `the_signed_jwt_variant_carries_the_claim_too`.
 - **`io.inblock.resolve_endpoint` in discovery is read by an Element Web patch**; it is advertised
-  only when `/resolve` can answer. Pin: `provider_metadata_advertises_resolve_only_when_it_can_answer`.
+  only when `/resolve` can answer; account management likewise, and the device grant only in
+  delegated-auth mode, where `/device_authorization` is also the only place it is served. Pin:
+  `provider_metadata_advertises_resolve_only_when_it_can_answer`,
+  `account_management_is_advertised_only_when_the_actions_can_run`,
+  `device_authorization_is_refused_outside_delegated_auth_mode`.
 - **Admin tokens: both scopes, `device_id` null, TTL clamped in code to 30–900 s.** Never put a
   long-lived admin credential in configuration. Pin: `admin_scope_carries_both_required_scopes`,
   `ttl_clamp_caps_a_long_lived_request`, `ttl_clamp_raises_an_unusably_short_request`.
 - **`account::SUPPORTED_ACTIONS` is the one list** behind discovery and dispatch. Pin:
   `supported_actions_cover_acceptance_criteria`, `canonical_action_collapses_session_aliases`.
+- **Actions outside the Matrix spec use the `io.inblock.` namespace, never `org.matrix.`**
+  (which belongs to matrix.org). The pre-rename `org.matrix.account_erase` /
+  `org.matrix.account_reactivate` stay accepted aliases for one upgrade cycle and are never
+  advertised. Pin: `non_spec_actions_are_advertised_only_under_the_io_inblock_namespace`,
+  `legacy_erase_and_reactivate_names_are_accepted_as_aliases`.
 
 ### Structure
 
@@ -332,10 +359,16 @@ doc; read it before changing the code the rule covers.
 - **Registries are plain functions** (`all_did_methods`, `all_cipher_suites`), no `inventory`
   crate (not WASM-safe). New DID methods and namespaces are opt-in through config.
 - **aqua-auth has no logging** and no knowledge of ceremonies.
+- **SIGTERM and SIGINT shut the server down gracefully**, answering requests already in flight.
+  In the image it is PID 1, which ignores a signal it has no handler for, so without
+  `shutdown_signal` `docker stop` waits 10 s and SIGKILLs. Pin:
+  `sigterm_finishes_and_exits_zero_with_an_idle_connection_open`,
+  `sigint_finishes_and_exits_zero_with_an_idle_connection_open`,
+  `a_request_in_flight_when_sigterm_arrives_is_still_answered`.
 - **Credential store: dual-write, not cut-over.** The legacy `webauthn:credential/*` namespace
   stays authoritative; mirror writes are best-effort; the backfill is additive and idempotent.
-  Pin: `backfill_is_additive_link_aware_counter_preserving_and_idempotent` (runs only with
-  `MIGRATION_TEST_REDIS_URL`; see the known gap under Build and test).
+  Pin: `backfill_is_additive_link_aware_counter_preserving_and_idempotent` (needs its own
+  empty Redis, `MIGRATION_TEST_REDIS_URL`; CI provides one).
 
 ## Logging conventions
 
@@ -375,8 +408,9 @@ structured output.
 This repository is public. Never commit infrastructure access details (host names or IPs of
 maintainer machines, SSH users and ports, stack paths), personal data (real users' MXIDs,
 wallet addresses, IP addresses; use `example.org` and generated test identities), secrets or
-key material, or maintainer session plans and handovers. Maintainer-local material lives in
-the gitignored `internal/` directory and `CLAUDE.local.md`. Report vulnerabilities as described
+key material, or maintainer session plans and handovers. Maintainer operations material lives
+outside this repository, in a private operations repository and the gitignored
+`CLAUDE.local.md` (`/internal/` stays gitignored as a guard). Report vulnerabilities as described
 in [SECURITY.md](SECURITY.md).
 
 ## External repos

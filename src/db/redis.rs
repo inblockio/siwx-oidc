@@ -38,6 +38,20 @@ fn user_tombstone_key(username: &str) -> String {
     format!("{}/{}", KV_USER_TOMBSTONE_PREFIX, username)
 }
 
+/// Redis key for the durable erasure marker of a localpart.
+fn erased_user_key(localpart: &str) -> String {
+    format!("{}/{}", KV_ERASED_USER_PREFIX, localpart)
+}
+
+/// Redis key for the durable erasure marker of a DID: the SHA-256 of its
+/// canonical form (`mxid::canonicalize`), so the case variants of one `did:pkh`
+/// share a marker and the DID itself is not kept in cleartext.
+fn erased_did_key(did: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(crate::mxid::canonicalize(did).as_bytes());
+    format!("{}/{}", KV_ERASED_DID_PREFIX, hex::encode(digest))
+}
+
 /// Redis key for the short-lived refresh-token rotation grace pointer.
 fn rotated_token_key(old_refresh: &str) -> String {
     format!("{}/{}", KV_ROTATED_PREFIX, old_refresh)
@@ -293,6 +307,27 @@ impl RedisClient {
     pub async fn mark_user_deactivated(&self, username: &str) -> Result<()> {
         self.set_ex_raw(&user_tombstone_key(username), "1", TOMBSTONE_TTL_SECS)
             .await
+    }
+
+    /// Record, with no TTL, that the account `localpart` of `did` is being
+    /// erased. Written BEFORE Synapse is asked to erase, so an erasure that
+    /// succeeds always has a marker. Keyed twice, by the localpart Synapse
+    /// knows the account under and by the canonical DID the user signs with,
+    /// so a later change in how the DID resolves cannot slip past it.
+    pub async fn mark_account_erased(&self, localpart: &str, did: &str) -> Result<()> {
+        let at = chrono::Utc::now().to_rfc3339();
+        self.set_raw(&erased_user_key(localpart), &at).await?;
+        self.set_raw(&erased_did_key(did), &at).await
+    }
+
+    /// Whether the account `localpart` of `did` carries an erasure marker
+    /// (either key). An `Err` means "unknown", and a caller deciding whether an
+    /// account may come back must treat it as a refusal.
+    pub async fn is_account_erased(&self, localpart: &str, did: &str) -> Result<bool> {
+        if self.get_raw(&erased_user_key(localpart)).await?.is_some() {
+            return Ok(true);
+        }
+        Ok(self.get_raw(&erased_did_key(did)).await?.is_some())
     }
 
     /// Purge a user's WebAuthn identity artifacts so the DID cannot be silently
@@ -1090,10 +1125,9 @@ impl DBClient for RedisClient {
 
 #[cfg(test)]
 mod tests {
-    use super::RedisClient;
+    use super::{erased_did_key, erased_user_key};
     use crate::db::{DBClient, TokenMetadata};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use url::Url;
 
     /// A globally-unique nonce for test keys on the shared Redis. The nanosecond
     /// clock alone can collide across tests that start in the same instant on
@@ -1128,12 +1162,11 @@ mod tests {
 
     /// H5: device_delete must revoke ONLY the OAuth session(s) for the targeted
     /// (username, device_id), leaving other devices and other users untouched.
-    /// Requires Redis on localhost; skips cleanly if unavailable.
+    /// Needs Redis (`crate::test_support::redis`).
     #[tokio::test]
     async fn revoke_device_tokens_removes_only_matching_session() {
-        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return, // no Redis: skip (CI provides one)
+        let Some(client) = crate::test_support::redis().await else {
+            return;
         };
 
         // Unique per run so parallel tests / stale entries cannot interfere.
@@ -1183,12 +1216,11 @@ mod tests {
 
     /// MSC4191 account_deactivate must revoke EVERY OAuth session for the user
     /// (all devices), leaving other users untouched.
-    /// Requires Redis on localhost; skips cleanly if unavailable.
+    /// Needs Redis (`crate::test_support::redis`).
     #[tokio::test]
     async fn revoke_all_user_tokens_removes_all_user_sessions() {
-        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return, // no Redis: skip (CI provides one)
+        let Some(client) = crate::test_support::redis().await else {
+            return;
         };
 
         // Unique per run so parallel tests / stale entries cannot interfere.
@@ -1235,16 +1267,73 @@ mod tests {
         client.delete_token(&t3).await.ok();
     }
 
+    /// The erasure marker is durable (no TTL) and found by the localpart OR by
+    /// any spelling of the DID that canonicalises to the marked one, and only
+    /// for the account it was written for. Needs Redis
+    /// (`crate::test_support::redis`).
+    #[tokio::test]
+    async fn an_erasure_marker_is_durable_and_found_by_localpart_or_canonical_did() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let nonce = unique_nonce();
+        let localpart = format!("erased-{nonce}");
+        let did = format!("did:pkh:eip155:1:0xAbC{nonce}");
+        let other_did = format!("did:pkh:eip155:1:0xdef{nonce}");
+
+        assert!(!client.is_account_erased(&localpart, &did).await.unwrap());
+        client.mark_account_erased(&localpart, &did).await.unwrap();
+
+        assert!(client.is_account_erased(&localpart, &did).await.unwrap());
+        assert!(
+            client
+                .is_account_erased("some-other-localpart", &did.to_lowercase())
+                .await
+                .unwrap(),
+            "a did:pkh case variant is the same account and must find the marker"
+        );
+        assert!(
+            client
+                .is_account_erased(&localpart, &other_did)
+                .await
+                .unwrap(),
+            "the localpart alone must find the marker"
+        );
+        assert!(
+            !client
+                .is_account_erased(&format!("other-{nonce}"), &other_did)
+                .await
+                .unwrap(),
+            "an unrelated account must not read as erased"
+        );
+
+        let mut conn = client.pool.get().await.unwrap();
+        for key in [erased_user_key(&localpart), erased_did_key(&did)] {
+            let ttl: i64 = bb8_redis::redis::cmd("TTL")
+                .arg(&key)
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+            assert_eq!(ttl, -1, "{key} must never expire");
+        }
+        assert!(
+            !erased_did_key(&did).contains(&did.to_lowercase()[8..]),
+            "the DID must not be stored in cleartext"
+        );
+        drop(conn);
+        client.del_raw(&erased_user_key(&localpart)).await.ok();
+        client.del_raw(&erased_did_key(&did)).await.ok();
+    }
+
     /// H4 (part a, MUST): purge_identity must delete the `webauthn:link/*` entry
     /// whose `primary_did` matches the DID AND the credential that link points at,
     /// while leaving links/credentials for OTHER DIDs untouched. Uses a no-op
     /// credential resolver so part (b) does not interfere with the part-(a)
-    /// assertion. Requires Redis on localhost; skips cleanly if unavailable.
+    /// assertion. Needs Redis (`crate::test_support::redis`).
     #[tokio::test]
     async fn purge_identity_removes_linked_credential_for_did() {
-        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return, // no Redis: skip (CI provides one)
+        let Some(client) = crate::test_support::redis().await else {
+            return;
         };
 
         let nonce = unique_nonce();
@@ -1312,12 +1401,11 @@ mod tests {
     /// H4 (part b, BEST-EFFORT): a standalone credential (no link entry) whose
     /// stored passkey derives to the target did:key must also be purged, using
     /// the supplied derivation resolver. A credential deriving to a different
-    /// DID must survive. Requires Redis on localhost; skips cleanly if absent.
+    /// DID must survive. Needs Redis (`crate::test_support::redis`).
     #[tokio::test]
     async fn purge_identity_removes_standalone_credential_by_derived_did() {
-        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return,
+        let Some(client) = crate::test_support::redis().await else {
+            return;
         };
 
         let nonce = unique_nonce();
@@ -1368,13 +1456,12 @@ mod tests {
     /// the same set as the maintained index (warm), for a DID that has BOTH a
     /// wallet-linked passkey (`webauthn:link`, primary_did == did) AND a standalone
     /// credential that derives to that same DID. Unrelated link/credential entries
-    /// for OTHER DIDs must be excluded from both. Requires Redis on localhost;
-    /// skips cleanly if unavailable. Mirrors the `purge_identity_*` style/gating.
+    /// for OTHER DIDs must be excluded from both. Needs Redis
+    /// (`crate::test_support::redis`), like the `purge_identity_*` tests.
     #[tokio::test]
     async fn get_passkeys_for_did_scan_fallback_equals_index() {
-        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return, // no Redis: skip (CI provides one)
+        let Some(client) = crate::test_support::redis().await else {
+            return;
         };
 
         let nonce = unique_nonce();
@@ -1493,13 +1580,12 @@ mod tests {
     }
 
     /// Opaque login user-session: create -> lookup round-trips the DID; a
-    /// forged/guessed token is a miss (None). Requires Redis on localhost; skips
-    /// cleanly if unavailable.
+    /// forged/guessed token is a miss (None). Needs Redis
+    /// (`crate::test_support::redis`).
     #[tokio::test]
     async fn user_session_create_lookup_roundtrip_and_forged_miss() {
-        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return,
+        let Some(client) = crate::test_support::redis().await else {
+            return;
         };
 
         let nonce = unique_nonce();

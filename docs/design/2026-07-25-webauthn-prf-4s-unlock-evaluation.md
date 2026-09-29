@@ -67,7 +67,7 @@ the authentication provider's own origin.** This single fact drives the verdict.
 | # | Fact | Evidence |
 |---|---|---|
 | L6 | **Element Web is already built from source at pinned tag `v1.12.20` with a vendored patch**, in CI. The patch edits `MatrixChat.tsx` and calls `accessSecretStorage` / `cli.secretStorage.hasKey()`. | `../siwx-oidc-matrix-server/dockerfiles/Dockerfile.element`, `patches/element-web/force-first-device-recovery.patch`, `docs/element-web-source-build.md` |
-| L7 | Element X mobile authenticates through a **system browser** (Chrome Custom Tabs / `ASWebAuthenticationSession`) pointed at `siwx-oidc.inblock.io`. The native app performs no WebAuthn ceremony and is a stock app-store binary. | `../siwx-oidc-matrix-server/docs/2026-05-23-element-x-mobile-compatibility.md` steps 4-8 |
+| L7 | Element X mobile authenticates through a **system browser** (Chrome Custom Tabs / `ASWebAuthenticationSession`) pointed at `siwx-oidc.inblock.io`. The native app performs no WebAuthn ceremony and is a stock app-store binary. | The maintainers' 2026-05-23 Element X mobile compatibility walk-through, steps 4-8 (since moved out of the public repositories). The behaviour is Element X's standard OAuth 2.0 login: the app opens the issuer in the system browser. |
 | L8 | "Forking Element Web" is an explicit non-goal of the current phase plans. | `2026-07-25-session-onboarding-state-machine-map.md:146,479` |
 | L9 | The CDP virtual authenticator used by the e2e lab supports `hasPrf` and `hasHmacSecret`, so PRF *is* testable in the existing harness. | https://chromedevtools.github.io/devtools-protocol/tot/WebAuthn/ ; `e2e/element/ew-passkey.spec.mjs` |
 

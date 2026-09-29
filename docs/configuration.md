@@ -123,30 +123,46 @@ metadata (at least `redirect_uris`). Clients can also register themselves throug
 my-app = '{"secret":"change-me","metadata":{"redirect_uris":["https://app.example.org/callback"]}}'
 ```
 
+### Legal documents
+
+| Key | Environment | Default | Meaning |
+|---|---|---|---|
+| `op_tos_uri` | `SIWXOIDC_OP_TOS_URI` | none | Your terms of service, advertised as `op_tos_uri` in discovery. |
+| `op_policy_uri` | `SIWXOIDC_OP_POLICY_URI` | none | Your privacy policy, advertised as `op_policy_uri` in discovery. |
+
+Each value must be an absolute `http` or `https` URL; anything else stops the server at startup
+with an error naming the key. Unset or empty, the field is left out of discovery. There is no
+default, because the documents are the operator's own. The footers of the login page, the
+device-approval page and the account page link the same two values (the login page reads them
+from discovery) and show no legal links when neither is set. The server also serves the files in
+`static/legal/` at `/legal/terms-of-use.html` and `/legal/privacy-policy.html`: they are the
+maintainers' documents for their own deployment, not templates, and nothing links or advertises
+them unless a key points at them.
+
 ### ENS names (Ethereum sign-ins)
 
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
 | `eth_provider` | `SIWXOIDC_ETH_PROVIDER` | none | Ethereum JSON-RPC URL. When set, the ENS reverse record is looked up on-chain first (classic reverse records only). |
-| `ens_api_url` | `SIWXOIDC_ENS_API_URL` | `https://api.ensdata.net` | HTTP ENS API, called as `GET {ens_api_url}/{checksummed address}`; must return JSON with `ens_primary`. |
+| `ens_api_url` | `SIWXOIDC_ENS_API_URL` | none | HTTP ENS API, called as `GET {ens_api_url}/{checksummed address}`; must return JSON with `ens_primary`. An empty value disables it. |
 
-When an ID token is issued, and on every userinfo request, for a `did:pkh:eip155` subject,
-siwx-oidc looks up the address's ENS primary name and, if found, puts it in the `name` claim.
-**With the defaults this sends every Ethereum user's address to api.ensdata.net, a third
-party.** To switch the HTTP lookup off, set `ens_api_url` to an empty string
-(`SIWXOIDC_ENS_API_URL=`); with `eth_provider` also unset, no lookup happens and `name` is
-omitted. To keep ENS names without the third party, point `ens_api_url` at an ENS API you
-operate, or use `eth_provider` together with an empty `ens_api_url` (with both set, a name
-not found on-chain falls back to the HTTP API). Passkey and `did:key` sign-ins never trigger a lookup.
+ENS lookups are **opt-in**. With the defaults no lookup happens, no address leaves the server,
+and the `name` claim is omitted. When either key is set, siwx-oidc looks up the ENS primary name
+of a `did:pkh:eip155` subject when an ID token is issued and on every userinfo request, and puts
+it in the `name` claim. Setting `ens_api_url` sends every Ethereum user's address to that API:
+`https://api.ensdata.net` is a public one, operated by a third party. To avoid the third party,
+point `ens_api_url` at an ENS API you operate, or set only `eth_provider` (with both set, a name
+not found on-chain falls back to the HTTP API). Passkey and `did:key` sign-ins never trigger a
+lookup.
 
 ### Matrix
 
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
-| `mas_shared_secret` | `SIWXOIDC_MAS_SHARED_SECRET` | none | Secret shared with Synapse (its `matrix_authentication_service.secret`). Enables Matrix mode: `mat_`/`mcr_` token prefixes and Matrix scopes, `POST /oauth2/introspect`, `POST /oauth2/admin_token`, and the device-code grant. Without it those endpoints answer 404 and the grant is refused. |
+| `mas_shared_secret` | `SIWXOIDC_MAS_SHARED_SECRET` | none | Secret shared with Synapse (its `matrix_authentication_service.secret`). Enables Matrix mode: `mat_`/`mcr_` token prefixes and Matrix scopes, `POST /oauth2/introspect`, `POST /oauth2/admin_token`, and the device-code grant. Without it those endpoints answer 404, the grant is refused, and discovery advertises neither introspection nor the device-code grant. |
 | `synapse_endpoint` | `SIWXOIDC_SYNAPSE_ENDPOINT` | none | Synapse base URL as reachable from siwx-oidc (e.g. `http://synapse:8008`). With `mas_shared_secret` it enables the Synapse client: provisioning, devices, deactivation, DID publication, the sign-in gates. |
 | `matrix_server_name` | `SIWXOIDC_MATRIX_SERVER_NAME` | none | The homeserver's `server_name`. Needed to build MXIDs: DID publication, `GET /resolve`, the `io.inblock.mxid` userinfo claim, `/account` device actions and the passkey picker's account hint. Without it those degrade (skipped, omitted or 503), never 500. |
-| `account_management_uri` | `SIWXOIDC_ACCOUNT_MANAGEMENT_URI` | `{base_url}/account` | MSC4191 account-management URL advertised in discovery. |
+| `account_management_uri` | `SIWXOIDC_ACCOUNT_MANAGEMENT_URI` | `{base_url}/account` | MSC4191 account-management URL advertised in discovery; advertised only when a Synapse client and `matrix_server_name` are configured. |
 | `admin_token_ttl_secs` | `SIWXOIDC_ADMIN_TOKEN_TTL_SECS` | `300` | Lifetime of a minted admin-scoped token. Clamped in code to 30–900 s. |
 | `admin_token_localpart` | `SIWXOIDC_ADMIN_TOKEN_LOCALPART` | `siwx-admin` | Synapse user the admin token acts as. Created on first mint: this is a real Matrix account. |
 
@@ -180,7 +196,7 @@ a generated key, a public-key fingerprint).
 
 ```bash
 docker run -d --rm --name siwx-redis -p 6379:6379 redis:7-alpine  # Redis on localhost:6379
-(cd js/ui && npm install --legacy-peer-deps && npm run build)  # login page into static/build
+(cd js/ui && npm ci && npm run build)  # login page into static/build
 SIWXOIDC_BASE_URL=http://localhost:8000 cargo run
 ```
 
@@ -197,6 +213,32 @@ releases yet, so no semver tags exist. The image contains the `siwx-oidc` server
 exposes port 8000. Because `SIWXOIDC_` outranks `SIWEOIDC_`, a legacy `SIWEOIDC_ADDRESS` cannot
 override that image default: use `SIWXOIDC_ADDRESS`. A config file goes in the working
 directory, `/siwx-oidc`. `GET /health` answers when the server is up.
+
+- **Unprivileged user.** The server runs as UID/GID 10001, not root. It writes nothing to
+  disk (all state is in Redis), so it needs no writable volume; a mounted config file only
+  has to be readable by UID 10001. Keep the port at 1024 or above (the default 8000 is):
+  an unprivileged process cannot bind a lower one unless the runtime allows it.
+- **Stopping.** SIGTERM (`docker stop`) and SIGINT stop the server gracefully: it stops
+  accepting connections, answers the requests already in flight and exits with status 0,
+  logging one `shutting down` line naming the signal. With no request in flight a stop takes
+  well under a second, not the 10 s grace period; an open idle connection does not delay it
+  (`tests/graceful_shutdown.rs`).
+- **License notices.** `/usr/share/licenses/siwx-oidc/` holds `LICENSE`, `NOTICE` and the
+  third-party license texts generated during the build: `THIRD-PARTY-LICENSES-rust.txt` for
+  the crates linked into the binaries (cargo-about, configured in `about.toml`) and
+  `THIRD-PARTY-LICENSES-js.txt` for the npm packages bundled into the login page. The image
+  is built on Alpine Linux 3.24.2. Its packages declare their licenses in
+  `/lib/apk/db/installed`, and `/usr/share/licenses/alpine/` holds the text of every license
+  they declare (SPDX license-list-data, pinned by tag and checksum). `NOTICE` says where the
+  packages' source is: the aports tag `v3.24.2` and Alpine's `distfiles/v3.24/`.
+- **Building it yourself.** The base images are pinned by digest and the build uses
+  `Cargo.lock` and `package-lock.json` as they are (`--locked`, `npm ci`). The build fails
+  when a dependency brings a license outside the accepted lists in `about.toml` and
+  `js/ui/third-party-licenses.js` (review the license, then add it), when cargo-about warns,
+  for example about a stale clarification checksum (`scripts/third-party-notices.sh`), and
+  when an Alpine package declares a license with no text in the `alpine_licenses` stage or
+  `NOTICE` does not name the Alpine release. How to bump a base image is described at the
+  top of the `Dockerfile`.
 
 ```bash
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out signing-key.pem

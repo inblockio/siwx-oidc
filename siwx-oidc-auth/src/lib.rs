@@ -504,7 +504,9 @@ pub async fn authenticate_with_device(
 /// - `server_url`: Base URL of the siwx-oidc server.
 /// - `client_id`: OIDC client ID.
 /// - `refresh_token`: The refresh token from a previous `authenticate()` or `refresh()` call.
-/// - `did`: The DID associated with this session (carried forward for the caller).
+/// - `did`: The DID associated with this session, copied into the returned
+///   `AuthTokens::did` for the caller. It is not sent: the refresh request
+///   carries no signature and needs no key, and its response has no ID token.
 pub async fn refresh(
     server_url: &str,
     client_id: &str,

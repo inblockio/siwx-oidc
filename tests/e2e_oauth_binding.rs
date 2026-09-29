@@ -938,7 +938,7 @@ async fn account_action_without_server_nonce_is_rejected() {
     let resp = post_account_wallet(
         &c,
         &base,
-        "org.matrix.account_erase",
+        "io.inblock.account_erase",
         &w,
         &message,
         &signature,
@@ -1005,7 +1005,7 @@ async fn account_action_operation_binding_is_enforced() {
     let resp = post_account_wallet(
         &c,
         &base,
-        "org.matrix.account_erase",
+        "io.inblock.account_erase",
         &w,
         &message,
         &signature,

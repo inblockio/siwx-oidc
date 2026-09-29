@@ -94,7 +94,7 @@ pub(crate) struct ResolvedIdentity {
 }
 
 /// Decide which localpart a DID should use, honouring the GRANDFATHER rule
-/// (Tim, 2026-09-09): an account that already exists under [`legacy_localpart`]
+/// (the maintainer, 2026-09-09): an account that already exists under [`legacy_localpart`]
 /// keeps it forever, because Synapse has no user-rename API and switching it
 /// would silently give the user a brand-new, empty account. Only an identity
 /// with no existing account at all gets the new, policy-server-safe

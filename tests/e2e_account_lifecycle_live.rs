@@ -733,7 +733,7 @@ async fn account_lifecycle_round_trip_live() {
         &signing_key,
         &address,
         &did,
-        "org.matrix.account_reactivate",
+        "io.inblock.account_reactivate",
         None,
     )
     .await;
@@ -766,7 +766,7 @@ async fn account_lifecycle_round_trip_live() {
         &signing_key,
         &address,
         &did,
-        "org.matrix.account_erase",
+        "io.inblock.account_erase",
         None,
     )
     .await;
@@ -919,7 +919,7 @@ async fn device_delete_removes_the_device_from_synapse_live() {
         &signing_key,
         &address,
         &did,
-        "org.matrix.account_erase",
+        "io.inblock.account_erase",
         None,
     )
     .await;

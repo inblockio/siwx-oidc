@@ -317,11 +317,11 @@ async fn wallet_erase_runs_erasure_and_clears_session() {
     mock_seed_device(&c, &w.mxid, "SIWX_dev_erase").await;
 
     let (message, signature) =
-        sign_account_message(&c, &w, &base, "org.matrix.account_erase").await;
+        sign_account_message(&c, &w, &base, "io.inblock.account_erase").await;
     let resp = c
         .post(format!("{base}/account/wallet"))
         .json(&json!({
-            "action": "org.matrix.account_erase",
+            "action": "io.inblock.account_erase",
             "did": w.did, "message": message, "signature": signature, "device_id": null
         }))
         .send()
@@ -341,6 +341,91 @@ async fn wallet_erase_runs_erasure_and_clears_session() {
     assert_eq!(
         life["erased"], true,
         "erase MUST request GDPR erasure (erase=true)"
+    );
+}
+
+/// Re-authenticate with the wallet for `action` and run it (`POST /account/wallet`).
+async fn wallet_action(c: &Client, w: &Wallet, base: &str, action: &str) -> reqwest::Response {
+    let (message, signature) = sign_account_message(c, w, base, action).await;
+    c.post(format!("{base}/account/wallet"))
+        .json(&json!({
+            "action": action,
+            "did": w.did, "message": message, "signature": signature, "device_id": null
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A2: an erased account stays erased. The mock reactivates an erased account
+/// the way Synapse 1.161.0 does (`activate_account` clears the erased flag), so
+/// the refusal can only come from siwx-oidc, and it must come before Synapse
+/// is asked at all.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn wallet_reactivate_after_erase_is_refused_before_synapse_is_asked() {
+    let c = Client::builder().build().unwrap();
+    let base = oidc();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    mock_seed_device(&c, &w.mxid, "SIWX_dev_erase_back").await;
+
+    let resp = wallet_action(&c, &w, &base, "io.inblock.account_erase").await;
+    assert_eq!(resp.status(), 200, "erase re-auth must succeed");
+
+    let resp = wallet_action(&c, &w, &base, "io.inblock.account_reactivate").await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 400, "an erased account must not come back: {body}");
+    assert!(body.contains("erased"), "the refusal must say why: {body}");
+
+    let state = mock_state(&c).await;
+    let life = &state["lifecycle"][&w.mxid];
+    assert_eq!(life["erased"], true, "the account must still be erased");
+    assert_eq!(
+        life["deactivated"], true,
+        "the account must still be deactivated"
+    );
+    let asked = state["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c == "POST /_synapse/mas/reactivate_user");
+    assert!(
+        !asked,
+        "Synapse would reactivate an erased account, so it must never be asked"
+    );
+}
+
+/// A2's other half: an `erase: false` deactivation is still reversible by the
+/// user, through the same wallet re-auth.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn wallet_reactivate_after_deactivate_restores_the_account() {
+    let c = Client::builder().build().unwrap();
+    let base = oidc();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    mock_seed_device(&c, &w.mxid, "SIWX_dev_deact_back").await;
+
+    let resp = wallet_action(&c, &w, &base, "org.matrix.account_deactivate").await;
+    assert_eq!(resp.status(), 200, "deactivate re-auth must succeed");
+    let life = &mock_state(&c).await["lifecycle"][&w.mxid];
+    assert_eq!(life["deactivated"], true);
+    assert_eq!(life["erased"], false);
+
+    let resp = wallet_action(&c, &w, &base, "io.inblock.account_reactivate").await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "reactivation of a deactivated account must succeed"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["kind"], "reactivated");
+    let life = &mock_state(&c).await["lifecycle"][&w.mxid];
+    assert_eq!(
+        life["deactivated"], false,
+        "the account must be active again"
     );
 }
 

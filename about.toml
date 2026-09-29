@@ -1,0 +1,100 @@
+# cargo-about: the third-party license texts shipped in the container image
+# (/usr/share/licenses/siwx-oidc/THIRD-PARTY-LICENSES-rust.txt), generated in
+# the Dockerfile's builder stage by scripts/third-party-notices.sh.
+#
+# Scope is the root package, whose two binaries (siwx-oidc, migrate-credentials)
+# are what the image ships: dev- and build-dependencies are left out, and so is
+# siwx-oidc-auth, which the root package links only as a dev-dependency.
+#
+# `accepted` is a reviewed allowlist, in priority order: for "MIT OR Apache-2.0"
+# the first match wins. A dependency under any other license FAILS the image
+# build, on purpose: read the license, then add it here.
+
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "Zlib",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]
+targets = ["x86_64-unknown-linux-musl"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Clarifications for crates whose own license file cargo-about cannot match with
+# confidence. Without them it falls back to the bare SPDX text, which drops the
+# copyright lines the MIT and BSD licenses require us to reproduce (and, for
+# curve25519-dalek, the Go Authors notice for the code it derives from). Each
+# file is pinned by SHA-256. When a dependency bump changes the file,
+# cargo-about only warns and falls back to the bare text;
+# scripts/third-party-notices.sh turns that warning into a build failure, so the
+# clarification gets re-reviewed.
+
+[curve25519-dalek.clarify]
+license = "BSD-3-Clause"
+
+[[curve25519-dalek.clarify.files]]
+path = "LICENSE"
+checksum = "cca0bd3c4fcdba74145ef9d49c62337e2c9fbf9368288f11d0547f1b0273219f"
+
+[sha1_smol.clarify]
+license = "BSD-3-Clause"
+
+[[sha1_smol.clarify.files]]
+path = "LICENSE"
+checksum = "282a21b0710441c364025461a447362daf18f5798a7b72ae2f801a2aa536da51"
+
+[async-stream.clarify]
+license = "MIT"
+
+[[async-stream.clarify.files]]
+path = "LICENSE"
+checksum = "157d381f6304eba77459fc10dfb5b1b22fc0d04e384a32865f32d8e67a34c0eb"
+
+[async-stream-impl.clarify]
+license = "MIT"
+
+[[async-stream-impl.clarify.files]]
+path = "LICENSE"
+checksum = "157d381f6304eba77459fc10dfb5b1b22fc0d04e384a32865f32d8e67a34c0eb"
+
+[unicode-ident.clarify]
+license = "(MIT OR Apache-2.0) AND Unicode-DFS-2016"
+
+[[unicode-ident.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+
+[[unicode-ident.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+
+[[unicode-ident.clarify.files]]
+path = "LICENSE-UNICODE"
+license = "Unicode-DFS-2016"
+checksum = "68f5b9f5ea36881a0942ba02f558e9e1faf76cc09cb165ad801744c61b738844"
+
+# ruint and ruint-macro publish no license file at all. `git` reads LICENSE from
+# the upstream repository at the commit recorded in the crate's
+# .cargo_vcs_info.json, so this lookup needs network access during the build.
+
+[ruint.clarify]
+license = "MIT"
+
+[[ruint.clarify.git]]
+path = "LICENSE"
+checksum = "9de1e5b5b50b059e58009b7044705557dd07ec87555bca518bef8b5acc002908"
+
+[ruint-macro.clarify]
+license = "MIT"
+
+[[ruint-macro.clarify.git]]
+path = "LICENSE"
+checksum = "9de1e5b5b50b059e58009b7044705557dd07ec87555bca518bef8b5acc002908"

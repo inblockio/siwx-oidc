@@ -1,22 +1,24 @@
 Build, test, and optionally push the siwx-oidc Docker image.
 
-Docker images are built by GitHub Actions CI on push to main. Manual local
-builds should only be used for testing, never for production deployment.
+Docker images are published by GitHub Actions (`docker.yml`) on push to main; CI
+(`ci.yml`, job `image`) also builds the image, without pushing, on every pull
+request. Manual local builds should only be used for testing, never for
+production deployment.
 
 ## Steps
 
 1. Run the checks CI runs first (catches Rust issues early; `cargo test` needs Redis on
    localhost:6379, e.g. `docker run -d --rm --name siwx-redis -p 6379:6379 redis:7-alpine`):
 ```bash
-cargo fmt -- --check
-cargo clippy --workspace -- -D warnings
-cargo test
+cargo fmt --all -- --check
+RUSTFLAGS=-Dwarnings cargo clippy --workspace --all-targets
+cargo test --workspace
 ```
 aqua-auth is a pinned git dependency; its own tests run in its repository.
 
 2. Run the frontend build locally to catch webpack errors before Docker:
 ```bash
-cd js/ui && npm install --legacy-peer-deps && npm run build && cd ../..
+cd js/ui && npm ci && npm run build && cd ../..
 ```
 
 3. Build the Docker image:
@@ -26,7 +28,7 @@ docker build -t ghcr.io/inblockio/siwx-oidc:latest .
 
 4. Verify the image:
 ```bash
-# Check image size (should be ~18MB)
+# Check image size (about 24 MB)
 docker images ghcr.io/inblockio/siwx-oidc:latest
 
 # Verify both binaries are in the image (the server takes no CLI arguments;
@@ -53,6 +55,8 @@ configuration) before trusting it.
 ## Common issues
 
 - **webpack `fullySpecified` errors**: ESM modules in node_modules need `fullySpecified: false` rule in webpack.config.js
-- **clippy failures on CI but not locally**: CI uses latest stable Rust, check with `rustup update && cargo clippy`
-- **Docker build fails at npm step**: The node_builder stage is independent; check `npm run build` locally first
-- **Image too large**: Should be ~18MB. If much larger, check that the multi-stage build is working (final stage is `FROM alpine`, not the build stage)
+- **clippy failures on CI but not locally**: CI denies warnings (`RUSTFLAGS=-Dwarnings`) and lints all targets, so run the exact command from step 1. CI also uses the runner's current stable toolchain (no toolchain is pinned), which can be newer than yours and bring new lints; read the lint in the CI log and fix it
+- **Build fails in `third-party-notices.sh`**: a Rust dependency's license is not accepted in `about.toml`, or a clarified license file changed (checksum mismatch). Read the license, then update `about.toml`; the script's header explains the gate
+- **Build fails at the Alpine license check**: the base image now has a package whose license has no text in the Dockerfile's `alpine_licenses` stage, or NOTICE names a different Alpine release. Add the SPDX text (with its checksum) or update NOTICE
+- **Docker build fails at npm step**: The node_builder stage is independent; check `npm run build` locally first. It also fails when a bundled package's license is not in `ACCEPTED_LICENSES` (`js/ui/third-party-licenses.js`)
+- **Image too large**: Should be about 24 MB. If much larger, check that the multi-stage build is working (final stage is `FROM alpine`, not the build stage)
