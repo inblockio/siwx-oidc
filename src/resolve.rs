@@ -78,6 +78,7 @@
 
 use std::time::Duration;
 
+use aqua_auth::{all_did_methods, find_did_method, identifier_from_did};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -223,7 +224,8 @@ pub struct ResolveResponse {
 #[derive(Debug)]
 pub enum ResolveError {
     /// The request is wrong, and the caller can fix it: zero or two selectors, a
-    /// malformed mxid, or an mxid for a different homeserver. `400`.
+    /// `did` no sign-in here could accept (see `check_did`), a malformed mxid,
+    /// or an mxid for a different homeserver. `400`.
     BadRequest(String),
     /// This deployment cannot answer the question at all — no Matrix server name
     /// configured, or no Synapse client (standalone mode). `503`, because
@@ -456,7 +458,10 @@ async fn resolve_uncapped(
     }
 
     let selector = match (did, mxid) {
-        (Some(did), None) => Selector::Did(did),
+        (Some(did), None) => {
+            check_did(did)?;
+            Selector::Did(did)
+        }
         (None, Some(mxid)) => Selector::Mxid(mxid),
         (Some(_), Some(_)) => {
             return Err(ResolveError::BadRequest(
@@ -483,6 +488,102 @@ async fn resolve_uncapped(
         Selector::Did(did) => resolve_did(did, server_name, synapse).await,
         Selector::Mxid(mxid) => resolve_mxid(mxid, server_name, synapse).await,
     }
+}
+
+/// Refuse a `did` that no sign-in on this provider could ever have accepted
+/// (siwx-oidc#23).
+///
+/// # Why a 400 and not `exists: false`
+///
+/// `exists: false` is documented as "a well-formed DID that has never signed
+/// in here", and until #23 it was also what `kenn`, `did:` and
+/// `did:pkh:garbage` got, each with an mxid hashed from the input. A caller
+/// could not tell a real but unused DID from something that is not a DID at
+/// all, and every one of those answers cost two homeserver probes. This runs
+/// before the deployment check and before any probe, like `split_mxid` does
+/// for the other direction.
+///
+/// # The rule: the sign-in path's own parsers, minus the signature
+///
+/// Every sign-in path (`oidc::sign_in` for both the CAIP-122 cookie and the
+/// server-verified passkey DID, `oidc::verify_siwx_cookie`,
+/// `device_auth`, `account`) first resolves the DID through
+/// `aqua_auth::find_did_method` and refuses it when that is `None`, then (for
+/// CAIP-122) calls `DIDMethod::verify`, which parses the DID before it looks at
+/// a signature. So an account can only exist for a DID that passes those
+/// parsers, and this applies exactly them, reused rather than re-implemented:
+///
+/// 1. `find_did_method`: the method is one aqua-auth registers (`pkh`, `key`,
+///    and `peer` variants 0 and 2 at the pinned tag). Any other method,
+///    `did:web` included, can never have signed in here.
+/// 2. `DIDMethod::method_label`: for `did:key` and `did:peer` this decodes the
+///    base58btc multibase key and requires an Ed25519 or P-256 multicodec
+///    prefix, the same `decode_multibase_key` `verify` runs; for `did:pkh` it
+///    requires a namespace aqua-auth has a cipher suite for.
+/// 3. For `did:pkh` only, `aqua_auth::identifier_from_did`: it dispatches on
+///    the namespace to `address_from_did` (40 hex digits after `0x`),
+///    `pubkey_from_ed25519_did` or `pubkey_from_p256_did`, which are the very
+///    functions the eip155, ed25519 and p256 suites' `verify` start with.
+///    `method_label` does not reach them for `did:pkh`, hence the extra step.
+///
+/// Each step is a NECESSARY condition of the sign-in path, never a stricter
+/// one: rejecting a DID a sign-in accepts is the worse failure (see the length
+/// cap above). It is deliberately not narrowed to this deployment's
+/// `supported_did_methods` / `supported_pkh_namespaces`, because an account
+/// made while a method was enabled outlives the method being disabled.
+///
+/// No separate W3C grammar check is layered on top. For the registered
+/// methods it would add nothing the parsers do not already enforce, and for
+/// `did:peer:2`, whose elements aqua-auth does not all parse, it could reject a
+/// DID a sign-in accepts. It exists here only as the first question, to say
+/// "not a DID" rather than "not a method we sign in" when that is the truth.
+///
+/// # Case
+///
+/// The parsers run on [`canonicalize`]`(did)`, the same string the localpart
+/// is derived from: `did:pkh` is case-folded, so an EIP-55 mixed-case address
+/// and its lowercase twin (one account) are both accepted; `did:key` and
+/// `did:peer` stay byte-for-byte, so a `did:key` lowercased the way a Matrix
+/// localpart forces it (siwx-oidc#17) is refused, as it names a different and
+/// invalid key.
+fn check_did(did: &str) -> Result<(), ResolveError> {
+    let has_did_shape = did
+        .strip_prefix("did:")
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(method, id)| !method.is_empty() && !id.is_empty());
+    if !has_did_shape {
+        return Err(ResolveError::BadRequest(format!(
+            "`{did}` is not a DID: it must look like `did:<method>:<method-specific-id>`, \
+             for example `did:key:z6Mk…` or `did:pkh:eip155:1:0x…`."
+        )));
+    }
+
+    let canonical = canonicalize(did);
+    let Some(method) = find_did_method(&canonical) else {
+        let methods: Vec<String> = all_did_methods()
+            .iter()
+            .map(|m| format!("`did:{}`", m.method_name()))
+            .collect();
+        return Err(ResolveError::BadRequest(format!(
+            "`{did}` is not a DID this provider can sign in (supported methods: {}), so no \
+             account can exist for it.",
+            methods.join(", ")
+        )));
+    };
+
+    let parsed = method.method_label(&canonical).and_then(|_| {
+        if method.method_name() == "pkh" {
+            identifier_from_did(&canonical).map(|_| ())
+        } else {
+            Ok(())
+        }
+    });
+    parsed.map_err(|e| {
+        ResolveError::BadRequest(format!(
+            "`{did}` is not a valid `did:{}` DID ({e}), so no account can exist for it.",
+            method.method_name()
+        ))
+    })
 }
 
 /// Which of the two questions was asked. Exists so the "exactly one" check
