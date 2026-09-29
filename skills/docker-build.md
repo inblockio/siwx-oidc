@@ -55,7 +55,7 @@ configuration) before trusting it.
 ## Common issues
 
 - **webpack `fullySpecified` errors**: ESM modules in node_modules need `fullySpecified: false` rule in webpack.config.js
-- **clippy failures on CI but not locally**: CI denies warnings (`RUSTFLAGS=-Dwarnings`) and lints all targets; run the exact command from step 1
+- **clippy failures on CI but not locally**: CI denies warnings (`RUSTFLAGS=-Dwarnings`) and lints all targets, so run the exact command from step 1. CI also uses the runner's current stable toolchain (no toolchain is pinned), which can be newer than yours and bring new lints; read the lint in the CI log and fix it
 - **Build fails in `third-party-notices.sh`**: a Rust dependency's license is not accepted in `about.toml`, or a clarified license file changed (checksum mismatch). Read the license, then update `about.toml`; the script's header explains the gate
 - **Build fails at the Alpine license check**: the base image now has a package whose license has no text in the Dockerfile's `alpine_licenses` stage, or NOTICE names a different Alpine release. Add the SPDX text (with its checksum) or update NOTICE
 - **Docker build fails at npm step**: The node_builder stage is independent; check `npm run build` locally first. It also fails when a bundled package's license is not in `ACCEPTED_LICENSES` (`js/ui/third-party-licenses.js`)
