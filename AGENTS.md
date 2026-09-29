@@ -91,11 +91,12 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  Plain `cargo test` runs the unit tests plus 12 tests in five files: `openapi_covers_every_route`
+  Plain `cargo test` runs the unit tests plus 13 tests in six files: `openapi_covers_every_route`
   (2) and `localpart_vectors` (1), which need nothing; `account_linking_dual_write` (6), which
   needs Redis on localhost; `credential_migration_live` (2), which returns early unless
-  `MIGRATION_TEST_REDIS_URL` names a disposable Redis; and
-  `e2e_account_lifecycle_live::an_absent_strict_skips_variable_means_strict` (1), a pure check.
+  `MIGRATION_TEST_REDIS_URL` names a disposable Redis; and the pure check
+  `an_absent_strict_skips_variable_means_strict` in `e2e_account_lifecycle_live` and in
+  `e2e_did_field_live` (1 each).
 - **Mock stack:** `e2e/up.sh` / `e2e/down.sh` start Redis, `e2e/synapse_mock.py` and siwx-oidc
   in podman; `bash e2e/run-all.sh` runs everything. See [e2e/README.md](e2e/README.md).
   `--test-threads=1` is required: the suites share one stack and reset the mock.

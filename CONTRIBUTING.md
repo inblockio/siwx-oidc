@@ -35,8 +35,8 @@ cargo fmt -- --check
 - `cargo test --test openapi_covers_every_route` fails when a route exists in the router
   (`src/axum_lib.rs`) but not in [docs/api/openapi.yaml](docs/api/openapi.yaml). Adding an
   endpoint means documenting it in the same change.
-- The end-to-end suites (`tests/e2e_*.rs`) are `#[ignore]`d, apart from one pure check in
-  `e2e_account_lifecycle_live`. They need a running siwx-oidc, and some need a real homeserver;
+- The end-to-end suites (`tests/e2e_*.rs`) are `#[ignore]`d, apart from one pure check each in
+  `e2e_account_lifecycle_live` and `e2e_did_field_live`. They need a running siwx-oidc, and some need a real homeserver;
   CI runs the mock-stack suites against a Synapse mock. Run one with
   `cargo test --test <name> -- --ignored --test-threads=1`. The other files in `tests/` run by
   default; `account_linking_dual_write` needs the Redis above, and `credential_migration_live`
