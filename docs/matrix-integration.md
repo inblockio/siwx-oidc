@@ -398,8 +398,9 @@ logged and never fails the sign-in.
    device ID is the one the client requested in its scope
    (`urn:matrix:client:device:{id}` or the MSC2967 unstable form); otherwise
    `SIWX_` + 8 hex characters. A device this sign-in creates is named after
-   the OAuth client: its registered `client_name`, else its client ID, cut to
-   Synapse's 100-character limit. An existing device keeps its name. Synapse's
+   the OAuth client: its registered `client_name` (the untagged one, else the
+   one with the smallest language tag), else its client ID, cut to Synapse's
+   100-character limit. An existing device keeps its name. Synapse's
    `upsert_device` overwrites the name of an existing device whenever one is
    sent, so siwx-oidc upserts without a name and, only when Synapse answers
    201 (created), sets the name with `update_device_display_name`. Any other

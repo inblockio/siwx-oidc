@@ -2017,16 +2017,22 @@ const MAX_DEVICE_DISPLAY_NAME_CHARS: usize = 100;
 ///
 /// Never a fixed brand. Every client used to get "Element Web" (or "Element
 /// X" on the device-code path), so an agent's or any other client's session
-/// showed up in the user's device list under a client it was not. A client
-/// that registered only language-tagged names (`client_name#de`) gets the
-/// first of them.
+/// showed up in the user's device list under a client it was not. The
+/// untagged `client_name` wins; a client that registered only language-tagged
+/// names (`client_name#de`) gets the one with the lexicographically smallest
+/// tag. The tagged names sit in a `HashMap`, so "the first one" would change
+/// from one sign-in to the next.
 fn device_display_name(client_id: &str, client: Option<&ClientEntry>) -> String {
     let registered = client
         .and_then(|c| c.metadata.client_name())
         .and_then(|names| {
-            names
-                .get(None)
-                .or_else(|| names.iter().next().map(|(_, name)| name))
+            names.get(None).or_else(|| {
+                names
+                    .iter()
+                    .filter_map(|(tag, name)| Some((tag?.as_ref(), name)))
+                    .min_by_key(|(tag, _)| *tag)
+                    .map(|(_, name)| name)
+            })
         })
         .map(|name| name.trim())
         .filter(|name| !name.is_empty());
@@ -5606,6 +5612,39 @@ mod device_display_name_tests {
         );
         entry.metadata = entry.metadata.set_client_name(Some(names));
         assert_eq!(device_display_name("cid", Some(&entry)), "Mein Agent");
+    }
+
+    /// The untagged name wins over every tagged one; without it the smallest
+    /// tag wins, on every call, although the tagged names sit in a `HashMap`
+    /// whose iteration order differs from one instance to the next.
+    #[test]
+    fn a_language_tagged_name_is_chosen_deterministically() {
+        let tagged = [
+            ("fr", "Mon Agent"),
+            ("nl", "Mijn Agent"),
+            ("de", "Mein Agent"),
+            ("en-GB", "My Agent"),
+        ];
+        for default in [None, Some("Agent")] {
+            for _ in 0..64 {
+                let mut entry = client_entry(None);
+                let mut names = LocalizedClaim::new();
+                if let Some(name) = default {
+                    names.insert(None, ClientName::new(name.to_string()));
+                }
+                for (tag, name) in tagged {
+                    names.insert(
+                        Some(LanguageTag::new(tag.to_string())),
+                        ClientName::new(name.to_string()),
+                    );
+                }
+                entry.metadata = entry.metadata.set_client_name(Some(names));
+                assert_eq!(
+                    device_display_name("cid", Some(&entry)),
+                    default.unwrap_or("Mein Agent")
+                );
+            }
+        }
     }
 
     /// Synapse answers `update_device_display_name` with 400 `M_TOO_LARGE` for
