@@ -692,11 +692,14 @@ pub const RESOLVE_ENDPOINT_METADATA_KEY: &str = "io.inblock.resolve_endpoint";
 
 // -- ENS resolution -------------------------------------------------------
 //
+// Opt-in: with neither eth_provider nor ens_api_url configured (the default)
+// no lookup happens and no address leaves the server.
+//
 // Order: when eth_provider is set, the on-chain legacy ENS registry is asked
 // first (classic reverse records only; no NameWrapper). The HTTP API
-// (ens_api_url, default api.ensdata.net; handles CCIP Read / NameWrapper /
+// (ens_api_url, e.g. api.ensdata.net; handles CCIP Read / NameWrapper /
 // offchain names server-side) is used when there is no eth_provider or the
-// on-chain lookup finds nothing. An empty ens_api_url disables the HTTP API.
+// on-chain lookup finds nothing.
 
 /// Resolve ENS primary name via HTTP API.
 /// API must accept GET /{address} and return JSON with `ens_primary` field.
@@ -764,7 +767,7 @@ async fn resolve_name(
         }
     }
 
-    // Default: HTTP API (handles CCIP Read / NameWrapper / offchain names).
+    // HTTP API, when configured (handles CCIP Read / NameWrapper / offchain names).
     if let Some(api_url) = ens_api_url {
         if let Some(name) = resolve_name_http(api_url, &address_string).await {
             return Some(name);

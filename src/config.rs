@@ -166,10 +166,11 @@ pub struct Config {
     pub id_token_ttl_secs: u64,
     pub eth_provider: Option<Url>,
     /// ENS reverse-lookup API URL. Appended with `/{address}` and must return
-    /// JSON with an `ens_primary` field. Default: `https://api.ensdata.net`,
-    /// which receives the Ethereum address of every `did:pkh:eip155` sign-in.
-    /// Set to an empty string (`SIWXOIDC_ENS_API_URL=`) to disable the HTTP
-    /// lookup entirely.
+    /// JSON with an `ens_primary` field. Opt-in, no default: the API receives
+    /// the Ethereum address of every `did:pkh:eip155` sign-in, and a default
+    /// deployment must not send that to a third party. Setting it (for
+    /// example `https://api.ensdata.net`) enables the HTTP lookup; an empty
+    /// string (`SIWXOIDC_ENS_API_URL=`) disables it again.
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub ens_api_url: Option<Url>,
     /// DID method names accepted at sign-in (e.g. ["pkh"]).
@@ -248,7 +249,7 @@ impl Default for Config {
             require_secret: true,
             id_token_ttl_secs: 300,
             eth_provider: None,
-            ens_api_url: Some(Url::parse("https://api.ensdata.net").unwrap()),
+            ens_api_url: None,
             supported_did_methods: vec!["pkh".to_string(), "key".to_string()],
             supported_pkh_namespaces: vec![
                 "eip155".to_string(),
@@ -555,10 +556,17 @@ mod tests {
         }
     }
 
+    /// An empty value switches the lookup off even over a configured one, so
+    /// an operator can disable ENS from the environment without editing the
+    /// file.
     #[test]
     fn empty_ens_api_url_disables_the_lookup() {
         Jail::expect_with(|jail| {
             scrub_config_env(jail);
+            jail.create_file(
+                CONFIG_FILE,
+                "[default]\nens_api_url = \"https://ens.example.org\"\n",
+            )?;
             jail.set_env("SIWXOIDC_ENS_API_URL", "");
             let config: Config = figment().extract()?;
             assert!(config.ens_api_url.is_none());
@@ -566,10 +574,18 @@ mod tests {
         });
     }
 
+    /// ENS is opt-in: a default deployment sends no Ethereum address to a
+    /// third-party API. Setting the variable, under either prefix, enables it.
     #[test]
-    fn ens_api_url_keeps_its_default_and_accepts_a_replacement() {
+    fn ens_api_url_is_off_by_default_and_enabled_by_setting_it() {
         Jail::expect_with(|jail| {
             scrub_config_env(jail);
+            let config: Config = figment().extract()?;
+            assert!(
+                config.ens_api_url.is_none(),
+                "a default deployment must make no third-party ENS call"
+            );
+            jail.set_env("SIWEOIDC_ENS_API_URL", "https://api.ensdata.net");
             let config: Config = figment().extract()?;
             assert_eq!(
                 config.ens_api_url.as_ref().map(Url::as_str),

@@ -142,16 +142,16 @@ unless a key points at them.
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
 | `eth_provider` | `SIWXOIDC_ETH_PROVIDER` | none | Ethereum JSON-RPC URL. When set, the ENS reverse record is looked up on-chain first (classic reverse records only). |
-| `ens_api_url` | `SIWXOIDC_ENS_API_URL` | `https://api.ensdata.net` | HTTP ENS API, called as `GET {ens_api_url}/{checksummed address}`; must return JSON with `ens_primary`. |
+| `ens_api_url` | `SIWXOIDC_ENS_API_URL` | none | HTTP ENS API, called as `GET {ens_api_url}/{checksummed address}`; must return JSON with `ens_primary`. An empty value disables it. |
 
-When an ID token is issued, and on every userinfo request, for a `did:pkh:eip155` subject,
-siwx-oidc looks up the address's ENS primary name and, if found, puts it in the `name` claim.
-**With the defaults this sends every Ethereum user's address to api.ensdata.net, a third
-party.** To switch the HTTP lookup off, set `ens_api_url` to an empty string
-(`SIWXOIDC_ENS_API_URL=`); with `eth_provider` also unset, no lookup happens and `name` is
-omitted. To keep ENS names without the third party, point `ens_api_url` at an ENS API you
-operate, or use `eth_provider` together with an empty `ens_api_url` (with both set, a name
-not found on-chain falls back to the HTTP API). Passkey and `did:key` sign-ins never trigger a lookup.
+ENS lookups are **opt-in**. With the defaults no lookup happens, no address leaves the server,
+and the `name` claim is omitted. When either key is set, siwx-oidc looks up the ENS primary name
+of a `did:pkh:eip155` subject when an ID token is issued and on every userinfo request, and puts
+it in the `name` claim. Setting `ens_api_url` sends every Ethereum user's address to that API:
+`https://api.ensdata.net` is a public one, operated by a third party. To avoid the third party,
+point `ens_api_url` at an ENS API you operate, or set only `eth_provider` (with both set, a name
+not found on-chain falls back to the HTTP API). Passkey and `did:key` sign-ins never trigger a
+lookup.
 
 ### Matrix
 
