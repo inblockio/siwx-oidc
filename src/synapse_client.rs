@@ -2243,11 +2243,11 @@ mod tests {
     // Unlike that one, these need a REAL `RedisClient`: `publish_did_field`
     // goes through `admin_request` -> `admin_bearer`, which mints a token by
     // writing it to the token store, and `AdminMint.db` is the concrete
-    // `RedisClient` type rather than a `dyn DBClient`. So these follow the
-    // repo's established "skip cleanly when Redis is unavailable" pattern
-    // (`db/redis.rs`, `webauthn.rs`). CI provides one; the pure classifier
-    // tests above are what keep the classification itself covered when they
-    // skip.
+    // `RedisClient` type rather than a `dyn DBClient`. So these take their
+    // Redis from `siwx_oidc::test_support`, like every Redis-backed test: a
+    // loud skip without one, a failure under `SIWX_TEST_REQUIRE_REDIS=1` (as
+    // in CI). The pure classifier tests above keep the classification itself
+    // covered when they skip.
 
     /// What the mock actually received. One PUT is expected, but the whole log
     /// is captured so an unexpected extra request shows up as a failed length
@@ -2525,11 +2525,10 @@ mod tests {
         (client, log, handle)
     }
 
-    /// Attach a real token store, or return `None` when Redis is unavailable.
+    /// Attach a real token store, or return `None` after a loud skip when Redis
+    /// is unavailable (`siwx_oidc::test_support`).
     async fn with_redis_mint(client: SynapseClient) -> Option<SynapseClient> {
-        let redis = RedisClient::new(&url::Url::parse("redis://localhost").unwrap())
-            .await
-            .ok()?;
+        let redis = siwx_oidc::test_support::redis().await?;
         Some(client.with_admin_mint(redis, "siwx-admin".to_string(), 300))
     }
 
@@ -2552,7 +2551,6 @@ mod tests {
     async fn h1_publish_did_field_wire_shape() {
         let (client, log, handle) = spawn_publish_mock(axum::http::StatusCode::OK).await;
         let Some(client) = with_redis_mint(client).await else {
-            eprintln!("SKIP h1_publish_did_field_wire_shape: no Redis on localhost");
             handle.abort();
             return;
         };
@@ -2616,9 +2614,6 @@ mod tests {
         let (client, _log, handle) =
             spawn_publish_mock(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
         let Some(client) = with_redis_mint(client).await else {
-            eprintln!(
-                "SKIP h2_publish_did_field_500_is_a_rowless_account_not_an_error: no Redis on localhost"
-            );
             handle.abort();
             return;
         };
@@ -2657,9 +2652,6 @@ mod tests {
         )
         .await;
         let Some(client) = with_redis_mint(client).await else {
-            eprintln!(
-                "SKIP d1_500_with_a_confirmed_absent_row_is_still_a_rowless_account: no Redis on localhost"
-            );
             handle.abort();
             return;
         };
@@ -2693,9 +2685,6 @@ mod tests {
         )
         .await;
         let Some(client) = with_redis_mint(client).await else {
-            eprintln!(
-                "SKIP d1_500_with_a_present_profile_row_is_a_genuine_error: no Redis on localhost"
-            );
             handle.abort();
             return;
         };
@@ -2742,9 +2731,6 @@ mod tests {
         )
         .await;
         let Some(client) = with_redis_mint(client).await else {
-            eprintln!(
-                "SKIP d1_500_with_an_unconfirmable_row_is_a_genuine_error: no Redis on localhost"
-            );
             handle.abort();
             return;
         };
@@ -2922,7 +2908,6 @@ mod tests {
     async fn publish_did_field_404_is_an_error() {
         let (client, _log, handle) = spawn_publish_mock(axum::http::StatusCode::NOT_FOUND).await;
         let Some(client) = with_redis_mint(client).await else {
-            eprintln!("SKIP publish_did_field_404_is_an_error: no Redis on localhost");
             handle.abort();
             return;
         };
@@ -2949,7 +2934,6 @@ mod tests {
         let (client, _log, handle) =
             spawn_publish_mock(axum::http::StatusCode::SERVICE_UNAVAILABLE).await;
         let Some(client) = with_redis_mint(client).await else {
-            eprintln!("SKIP publish_did_field_503_is_an_error: no Redis on localhost");
             handle.abort();
             return;
         };
@@ -3085,7 +3069,6 @@ mod tests {
     async fn an_unauthenticated_profile_read_provisions_nobody_and_mints_nothing() {
         let (client, log, handle) = spawn_mock_synapse(unauthenticated_profile_mock()).await;
         let Some(client) = with_redis_mint(client).await else {
-            eprintln!("skipping: no Redis on localhost");
             handle.abort();
             return;
         };
@@ -3133,7 +3116,6 @@ mod tests {
             spawn_mock_synapse(unauthenticated_profile_mock().require_auth_on_profile_field())
                 .await;
         let Some(client) = with_redis_mint(client).await else {
-            eprintln!("skipping: no Redis on localhost");
             handle.abort();
             return;
         };

@@ -1,6 +1,20 @@
 name: ci
 
-on: push
+# Pushes to main, and every pull request, fork PRs included. Branch pushes
+# without a PR do not run, so a PR branch is not built twice.
+#
+# A `pull_request` run gets a read-only token and, from a fork, no secrets.
+# Nothing in this workflow reads a secret (SIWEOIDC_MAS_SHARED_SECRET below is
+# a literal test value), so a fork PR runs every job in full. Keep it that
+# way: a step that needs a secret must skip visibly when it is absent, in a
+# named step that says why, and never fail or pass without running.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -8,14 +22,25 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    # Redis for the unit tests that need it, started the same way as in the two
-    # e2e jobs below. It used to come from test/docker-compose.yml, a siwe-oidc
-    # leftover whose other services (the upstream image, Keycloak) nothing ran.
+    # Pinned so the OS changes on purpose: `ubuntu-latest` becomes 26.04 from 2026-10-19.
+    runs-on: ubuntu-24.04
+    # Two Redis services, started the same way as in the e2e jobs below.
+    # `redis` serves every Redis-backed unit test (src/test_support.rs).
+    # `migration-redis` is the disposable instance
+    # tests/credential_migration_live.rs requires: it asserts the credential
+    # namespace starts EMPTY, so it cannot share the first one.
     services:
       redis:
         image: redis:7-alpine
         ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      migration-redis:
+        image: redis:7-alpine
+        ports: ["6398:6379"]
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s
@@ -27,16 +52,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build
+        run: cargo build --workspace
       - name: Clippy
-        run: cargo clippy
+        run: cargo clippy --workspace --all-targets
       - name: Fmt
-        run: cargo fmt -- --check
+        run: cargo fmt --all -- --check
 
-      # Runs the unit tests only. Every tests/*.rs integration test is #[ignore]d
-      # and stays that way: all 63 of them need a live siwx-oidc HTTP listener,
-      # which this job does not have (Redis alone is not enough). The promotable
+      # The unit tests of both crates, siwx-oidc-auth's doc test, and the 13
+      # tests in tests/*.rs that are not #[ignore]d. The other 65 need a live
+      # siwx-oidc HTTP listener (Redis alone is not enough); the promotable
       # subset runs in the `rust-e2e-mock` job below.
+      #
+      # SIWX_TEST_REQUIRE_REDIS=1 makes an unreachable Redis FAIL a
+      # Redis-backed test instead of skipping it, and an unset
+      # MIGRATION_TEST_REDIS_URL fail the migration suite, so a green run means
+      # every one of them ran.
       #
       # This does NOT run the 4 `#[ignore]`d UNIT tests in the binary crate, and
       # no job does: `device_auth::tests::write_previews` (an opt-in HTML dumper),
@@ -46,7 +76,11 @@ jobs:
       # connect timeout is honoured, and passes here in ~2s — so it is promotable
       # and should be promoted the next time `src/synapse_client.rs` is touched.
       - name: Test
-        run: cargo test
+        env:
+          SIWX_TEST_REDIS_URL: redis://localhost:6379
+          SIWX_TEST_REQUIRE_REDIS: "1"
+          MIGRATION_TEST_REDIS_URL: redis://localhost:6398
+        run: cargo test --workspace
 
   # ---------------------------------------------------------------------------
   # Rust integration E2E against the MOCK stack. Added 2026-07-26 to close the
@@ -54,7 +88,7 @@ jobs:
   # ran NOWHERE automatically, so every protocol-level assertion about session
   # teardown, OAuth binding and account management was an unguarded manual claim.
   #
-  # This job promotes the 51 of them that need nothing beyond the self-contained
+  # This job promotes the 53 of them that need nothing beyond the self-contained
   # mock stack (Redis + synapse_mock.py + siwx-oidc) -- the same infrastructure
   # browser-e2e already stands up. The remaining 12 are NOT promotable: they need
   # a REAL Synapse (they call /_matrix/client/v3/... Client-Server endpoints that
@@ -101,7 +135,8 @@ jobs:
   # concurrently makes them clobber each other's state.
   # ---------------------------------------------------------------------------
   rust-e2e-mock:
-    runs-on: ubuntu-latest
+    # Pinned so the OS changes on purpose: `ubuntu-latest` becomes 26.04 from 2026-10-19.
+    runs-on: ubuntu-24.04
     services:
       redis:
         image: redis:7-alpine
@@ -138,7 +173,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
 
@@ -151,7 +186,7 @@ jobs:
       - name: Start Synapse mock
         run: |
           nohup python3 e2e/synapse_mock.py > /tmp/synapse-mock.log 2>&1 &
-          for i in $(seq 1 40); do
+          for _ in $(seq 1 40); do
             if curl -sf "http://localhost:${SYNAPSE_MOCK_PORT}/health" >/dev/null 2>&1; then
               echo "synapse mock healthy"; exit 0
             fi
@@ -164,7 +199,7 @@ jobs:
       - name: Start siwx-oidc
         run: |
           nohup ./target/debug/siwx-oidc > /tmp/siwx-oidc.log 2>&1 &
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if curl -sf "${SIWEOIDC_BASE_URL}/health" >/dev/null 2>&1; then
               echo "siwx-oidc healthy"; exit 0
             fi
@@ -226,10 +261,13 @@ jobs:
             --skip msc4191_metadata_advertised_and_forwarded
 
       # `compat::TeardownPolicy` (3/3 promoted): the fix for the 2026-06-12 login
-      # incident. Guards that /oauth2/revoke deletes NO Synapse device (token
-      # hygiene raced in-flight key uploads and wedged cross-signing), that an
-      # explicit /logout deletes exactly the ending one, and that /logout/all
-      # invalidates every session WITHOUT deactivating the account.
+      # incident. Guards that /oauth2/revoke and an explicit /logout each end
+      # the session (its token stops authenticating at whoami), and that
+      # /logout/all invalidates every session WITHOUT deactivating the account.
+      # These observe tokens, not devices: that revoke keeps the Synapse device
+      # (token hygiene deleting it raced in-flight key uploads and wedged
+      # cross-signing) is pinned by the unit test
+      # `compat::tests::teardown_policy_only_deletes_device_on_explicit_signout`.
       - name: E2E session teardown policy
         run: cargo test --test e2e_session_teardown -- --ignored --test-threads=1
 
@@ -250,7 +288,7 @@ jobs:
 
       - name: Upload failure artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rust-e2e-mock-logs
           path: |
@@ -272,7 +310,8 @@ jobs:
   # tracked separately; do not read this job's green as covering Element.
   # ---------------------------------------------------------------------------
   browser-e2e:
-    runs-on: ubuntu-latest
+    # Pinned so the OS changes on purpose: `ubuntu-latest` becomes 26.04 from 2026-10-19.
+    runs-on: ubuntu-24.04
     services:
       redis:
         image: redis:7-alpine
@@ -300,10 +339,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
 
@@ -319,7 +358,7 @@ jobs:
       - name: Start Synapse mock
         run: |
           nohup python3 e2e/synapse_mock.py > /tmp/synapse-mock.log 2>&1 &
-          for i in $(seq 1 40); do
+          for _ in $(seq 1 40); do
             if curl -sf "http://localhost:${SYNAPSE_MOCK_PORT}/health" >/dev/null 2>&1; then
               echo "synapse mock healthy"; exit 0
             fi
@@ -332,7 +371,7 @@ jobs:
       - name: Start siwx-oidc
         run: |
           nohup ./target/debug/siwx-oidc > /tmp/siwx-oidc.log 2>&1 &
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if curl -sf "${SIWEOIDC_BASE_URL}/health" >/dev/null 2>&1; then
               echo "siwx-oidc healthy"; exit 0
             fi
@@ -360,7 +399,7 @@ jobs:
 
       - name: Upload failure artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: browser-e2e-results
           path: |

@@ -14,13 +14,22 @@ on:
     types: [published]
   workflow_dispatch:
 
+# No `pull_request` trigger, on purpose: every run pushes to GHCR
+# (`packages: write`) and the deploy job reads secrets, and a fork PR gets
+# neither. ci.yml builds and tests pull requests; it does not build this image.
+#
+# Read-only by default; each job grants only what it uses.
+permissions:
+  contents: read
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    # Pinned so the OS changes on purpose: `ubuntu-latest` becomes 26.04 from 2026-10-19.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -87,7 +96,10 @@ jobs:
     name: Deploy to dev-staging
     needs: build-and-push
     if: ${{ github.repository == 'inblockio/siwx-oidc' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch') }}
-    runs-on: ubuntu-latest
+    # Pinned so the OS changes on purpose: `ubuntu-latest` becomes 26.04 from 2026-10-19.
+    runs-on: ubuntu-24.04
+    # No token scope at all: this job runs no checkout and calls no GitHub API.
+    permissions: {}
     # The target values are secrets so that Actions masks them in the public
     # logs; a repository variable bound to a step is printed in that step's log
     # header. They are still bound only to the steps that need them (which run
@@ -118,7 +130,9 @@ jobs:
             ${{ secrets.DEV_DEPLOY_USER == '' && 'DEV_DEPLOY_USER' || '' }}
             ${{ secrets.DEV_DEPLOY_KNOWN_HOSTS == '' && 'DEV_DEPLOY_KNOWN_HOSTS' || '' }}
         run: |
-          missing=$(echo $MISSING)
+          # Collapse the folded scalar's blanks into "NAME NAME" (or nothing).
+          read -r -a names <<< "$MISSING"
+          missing="${names[*]}"
           if [ -n "$missing" ]; then
             echo "::error title=Dev-staging deploy target not configured::Repository secret(s) empty: ${missing}. Set them under Settings > Secrets and variables > Actions > Secrets (gh secret set NAME -R ${GITHUB_REPOSITORY}). Refusing to skip silently: dev-staging would stay on the previous image."
             exit 1

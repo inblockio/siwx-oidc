@@ -95,7 +95,7 @@ category-(b) files contain **zero** `matrix_host` / `MATRIX_HOST` references.
 | 39 | `cross_signing_reset_stale_window_wedge_live` | `e2e_msc4191_live.rs` | same |
 | 40 | `cross_signing_reset_no_master_completed_live` | `e2e_msc4191_live.rs` | same |
 | 41 | `logout_deletes_ending_session_device` | `e2e_session_teardown.rs` | Synapse-side device deletion, verified via `{matrix}/_matrix/client/v3/devices` |
-| 42 | `revoke_deletes_session_device` | `e2e_session_teardown.rs` | same |
+| 42 | `revoke_invalidates_session_token` | `e2e_session_teardown.rs` | same |
 | 43 | `logout_all_invalidates_all_sessions_without_deactivating` | `e2e_session_teardown.rs` | same |
 
 Note on #34: step 1 (siwx-oidc's own discovery doc) *would* run against the mock

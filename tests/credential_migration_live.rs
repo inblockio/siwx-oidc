@@ -1,8 +1,10 @@
 //! Gate 3: the additive credential backfill, proved against a real Redis.
 //!
 //! Set `MIGRATION_TEST_REDIS_URL` to a **disposable, empty** Redis and this
-//! suite runs for real. Leave it unset and it skips, matching the convention of
-//! the other Redis-backed tests in this repo. If the variable IS set the suite
+//! suite runs for real. Leave it unset and each test skips loudly through
+//! `siwx_oidc::test_support`, like the other Redis-backed tests, unless
+//! `SIWX_TEST_REQUIRE_REDIS=1` is set: then an unset variable is a failure. CI
+//! sets both, on a second Redis service. If the variable IS set the suite
 //! refuses to skip for any reason, so a broken environment can never masquerade
 //! as a pass:
 //!
@@ -24,6 +26,7 @@ use url::Url;
 use siwx_oidc::credential_identity::resolve_credential_identity;
 use siwx_oidc::credential_migration::{derive_did_from_passkey_blob, CredentialMigration};
 use siwx_oidc::db::{RedisClient, KV_WEBAUTHN_CREDENTIAL_PREFIX, KV_WEBAUTHN_LINK_PREFIX};
+use siwx_oidc::test_support;
 
 /// A REAL serialized `Passkey`, the same fixture the webauthn-rs alignment test
 /// uses. Its `cred.counter` is 0; the non-zero-counter case is derived from it.
@@ -42,21 +45,29 @@ const LINK_LABEL: &str = "Tim's hardware wallet";
 /// so they must not overlap. Same test binary, so a process-wide lock is enough.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Resolve the test Redis, or `None` to skip.
+/// Resolve the test Redis, or `None` after a loud skip.
 ///
-/// Deliberately NOT falling back to `redis://localhost` the way the other
-/// Redis-backed tests here do. This suite asserts the credential namespace
-/// starts empty, so pointing it at a shared dev Redis would fail for
-/// environmental reasons rather than for a real defect. It runs only when an
-/// operator names a disposable instance, and once named, an unusable Redis is a
-/// FAILURE, never a silent skip.
+/// Deliberately NOT falling back to `SIWX_TEST_REDIS_URL` the way the other
+/// Redis-backed tests do. This suite asserts the credential namespace starts
+/// empty, so pointing it at a shared dev Redis would fail for environmental
+/// reasons rather than for a real defect. It runs only when an operator names a
+/// disposable instance, and once named, an unusable Redis is a FAILURE, never a
+/// skip. The probe matters: `RedisClient::new` does not connect, so without it
+/// a dead URL would surface only as a 30-second pool timeout mid-test.
 async fn test_redis() -> Option<(RedisClient, String)> {
-    let url = std::env::var("MIGRATION_TEST_REDIS_URL").ok()?;
+    let Ok(url) = std::env::var("MIGRATION_TEST_REDIS_URL") else {
+        return test_support::skip_or_fail(
+            "MIGRATION_TEST_REDIS_URL is unset (point it at a disposable, empty Redis to run this)",
+        );
+    };
     let parsed = Url::parse(&url).expect("MIGRATION_TEST_REDIS_URL must be a URL");
-    match RedisClient::new(&parsed).await {
-        Ok(c) => Some((c, url)),
-        Err(e) => panic!("MIGRATION_TEST_REDIS_URL={url} is set but unusable: {e:#}"),
+    if let Err(e) = test_support::probe(&parsed).await {
+        panic!("MIGRATION_TEST_REDIS_URL={url} is set but unusable: {e}");
     }
+    let client = RedisClient::new(&parsed)
+        .await
+        .unwrap_or_else(|e| panic!("MIGRATION_TEST_REDIS_URL={url} is set but unusable: {e:#}"));
+    Some((client, url))
 }
 
 fn b64(s: &str) -> String {
@@ -175,9 +186,6 @@ async fn snapshot_source(redis: &RedisClient) -> Vec<(String, String)> {
 #[tokio::test]
 async fn backfill_is_additive_link_aware_counter_preserving_and_idempotent() {
     let Some((redis, url)) = test_redis().await else {
-        eprintln!(
-            "skip: MIGRATION_TEST_REDIS_URL unset (point it at a disposable Redis to run this)"
-        );
         return;
     };
     let _serial = SERIAL.lock().await;
@@ -359,9 +367,6 @@ async fn backfill_is_additive_link_aware_counter_preserving_and_idempotent() {
 #[tokio::test]
 async fn a_rerun_never_regresses_a_counter_the_store_has_advanced() {
     let Some((redis, url)) = test_redis().await else {
-        eprintln!(
-            "skip: MIGRATION_TEST_REDIS_URL unset (point it at a disposable Redis to run this)"
-        );
         return;
     };
     let _serial = SERIAL.lock().await;

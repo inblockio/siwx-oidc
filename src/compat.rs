@@ -694,13 +694,10 @@ mod tests {
     use axum::extract::{Form, State};
     use axum::response::IntoResponse;
     use siwx_oidc::db::DBClient;
-    use url::Url;
 
-    /// Connect to the local Redis, or `None` if unavailable (CI provides one).
+    /// The test Redis, or `None` after a loud skip (`siwx_oidc::test_support`).
     async fn redis() -> Option<RedisClient> {
-        RedisClient::new(&Url::parse("redis://localhost").unwrap())
-            .await
-            .ok()
+        siwx_oidc::test_support::redis().await
     }
 
     /// A unique nonce so parallel tests / stale entries never collide on the

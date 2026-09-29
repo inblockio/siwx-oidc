@@ -1090,10 +1090,8 @@ impl DBClient for RedisClient {
 
 #[cfg(test)]
 mod tests {
-    use super::RedisClient;
     use crate::db::{DBClient, TokenMetadata};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use url::Url;
 
     /// A globally-unique nonce for test keys on the shared Redis. The nanosecond
     /// clock alone can collide across tests that start in the same instant on
@@ -1128,12 +1126,11 @@ mod tests {
 
     /// H5: device_delete must revoke ONLY the OAuth session(s) for the targeted
     /// (username, device_id), leaving other devices and other users untouched.
-    /// Requires Redis on localhost; skips cleanly if unavailable.
+    /// Needs Redis (`crate::test_support::redis`).
     #[tokio::test]
     async fn revoke_device_tokens_removes_only_matching_session() {
-        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return, // no Redis: skip (CI provides one)
+        let Some(client) = crate::test_support::redis().await else {
+            return;
         };
 
         // Unique per run so parallel tests / stale entries cannot interfere.
@@ -1183,12 +1180,11 @@ mod tests {
 
     /// MSC4191 account_deactivate must revoke EVERY OAuth session for the user
     /// (all devices), leaving other users untouched.
-    /// Requires Redis on localhost; skips cleanly if unavailable.
+    /// Needs Redis (`crate::test_support::redis`).
     #[tokio::test]
     async fn revoke_all_user_tokens_removes_all_user_sessions() {
-        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return, // no Redis: skip (CI provides one)
+        let Some(client) = crate::test_support::redis().await else {
+            return;
         };
 
         // Unique per run so parallel tests / stale entries cannot interfere.
@@ -1239,12 +1235,11 @@ mod tests {
     /// whose `primary_did` matches the DID AND the credential that link points at,
     /// while leaving links/credentials for OTHER DIDs untouched. Uses a no-op
     /// credential resolver so part (b) does not interfere with the part-(a)
-    /// assertion. Requires Redis on localhost; skips cleanly if unavailable.
+    /// assertion. Needs Redis (`crate::test_support::redis`).
     #[tokio::test]
     async fn purge_identity_removes_linked_credential_for_did() {
-        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return, // no Redis: skip (CI provides one)
+        let Some(client) = crate::test_support::redis().await else {
+            return;
         };
 
         let nonce = unique_nonce();
@@ -1312,12 +1307,11 @@ mod tests {
     /// H4 (part b, BEST-EFFORT): a standalone credential (no link entry) whose
     /// stored passkey derives to the target did:key must also be purged, using
     /// the supplied derivation resolver. A credential deriving to a different
-    /// DID must survive. Requires Redis on localhost; skips cleanly if absent.
+    /// DID must survive. Needs Redis (`crate::test_support::redis`).
     #[tokio::test]
     async fn purge_identity_removes_standalone_credential_by_derived_did() {
-        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return,
+        let Some(client) = crate::test_support::redis().await else {
+            return;
         };
 
         let nonce = unique_nonce();
@@ -1368,13 +1362,12 @@ mod tests {
     /// the same set as the maintained index (warm), for a DID that has BOTH a
     /// wallet-linked passkey (`webauthn:link`, primary_did == did) AND a standalone
     /// credential that derives to that same DID. Unrelated link/credential entries
-    /// for OTHER DIDs must be excluded from both. Requires Redis on localhost;
-    /// skips cleanly if unavailable. Mirrors the `purge_identity_*` style/gating.
+    /// for OTHER DIDs must be excluded from both. Needs Redis
+    /// (`crate::test_support::redis`), like the `purge_identity_*` tests.
     #[tokio::test]
     async fn get_passkeys_for_did_scan_fallback_equals_index() {
-        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return, // no Redis: skip (CI provides one)
+        let Some(client) = crate::test_support::redis().await else {
+            return;
         };
 
         let nonce = unique_nonce();
@@ -1493,13 +1486,12 @@ mod tests {
     }
 
     /// Opaque login user-session: create -> lookup round-trips the DID; a
-    /// forged/guessed token is a miss (None). Requires Redis on localhost; skips
-    /// cleanly if unavailable.
+    /// forged/guessed token is a miss (None). Needs Redis
+    /// (`crate::test_support::redis`).
     #[tokio::test]
     async fn user_session_create_lookup_roundtrip_and_forged_miss() {
-        let client = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return,
+        let Some(client) = crate::test_support::redis().await else {
+            return;
         };
 
         let nonce = unique_nonce();

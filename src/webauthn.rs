@@ -1708,12 +1708,11 @@ mod tests {
     /// usernameless (discoverable) path with an EMPTY `allowCredentials` — leaking
     /// zero credential ids. This exercises the exact seam the HTTP handler uses
     /// (`lookup_user_session` -> `authenticate_start(scope_did)`), end to end against
-    /// Redis. Requires Redis on localhost; skips cleanly when unavailable.
+    /// Redis. Needs Redis (`siwx_oidc::test_support::redis`).
     #[tokio::test]
     async fn forged_user_cookie_yields_usernameless_empty_allow_credentials() {
-        let redis = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return, // no Redis: skip (CI provides one)
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
         };
 
         // A localhost RP is valid for WebauthnBuilder (origin must be https OR
@@ -1749,12 +1748,11 @@ mod tests {
     /// other half of the forged-cookie test — it proves the scoped path is correct,
     /// not merely safe, and is the server-side twin of the browser two-credential
     /// case. Seeds the `by_did` index directly (the SMEMBERS fast path) so it needs no
-    /// real attestation. Requires Redis on localhost; skips cleanly when unavailable.
+    /// real attestation. Needs Redis (`siwx_oidc::test_support::redis`).
     #[tokio::test]
     async fn valid_user_session_scopes_allow_credentials_to_its_did_only() {
-        let redis = match RedisClient::new(&Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return, // no Redis: skip (CI provides one)
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
         };
         let base = Url::parse("http://localhost:8000").unwrap();
         let cfg = build_webauthn(&base, None, None).expect("build webauthn");

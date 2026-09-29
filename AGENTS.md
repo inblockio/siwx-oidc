@@ -82,21 +82,28 @@ sign-in flows, Redis keyspace and lineage: [docs/architecture.md](docs/architect
 
 ```bash
 cargo build --workspace
-cargo fmt -- --check && cargo clippy          # CI builds with RUSTFLAGS=-Dwarnings
+cargo fmt --all -- --check && cargo clippy --workspace --all-targets   # CI: RUSTFLAGS=-Dwarnings
 docker run -d --rm --name siwx-redis -p 6379:6379 redis:7-alpine   # Redis on localhost:6379
-cargo test                                    # unit tests + non-ignored tests/; several need Redis
+cargo test --workspace                        # unit tests + non-ignored tests/; many need Redis
 cargo run                                     # the server (needs Redis; see below)
 cargo run -p siwx-oidc-auth -- --help         # the headless client
 ```
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  Plain `cargo test` runs the unit tests plus 13 tests in six files: `openapi_covers_every_route`
-  (2) and `localpart_vectors` (1), which need nothing; `account_linking_dual_write` (6), which
-  needs Redis on localhost; `credential_migration_live` (2), which returns early unless
-  `MIGRATION_TEST_REDIS_URL` names a disposable Redis; and the pure check
-  `an_absent_strict_skips_variable_means_strict` in `e2e_account_lifecycle_live` and in
-  `e2e_did_field_live` (1 each).
+  `cargo test --workspace` runs the unit tests of both crates plus 13 tests in six files:
+  `openapi_covers_every_route` (2) and `localpart_vectors` (1), which need nothing;
+  `account_linking_dual_write` (6), which needs Redis on localhost; `credential_migration_live`
+  (2), which needs its own disposable, empty Redis named by `MIGRATION_TEST_REDIS_URL`; and the
+  pure check `an_absent_strict_skips_variable_means_strict` in `e2e_account_lifecycle_live` and
+  in `e2e_did_field_live` (1 each).
+- **Redis-backed tests** get their Redis from `siwx_oidc::test_support` (`src/test_support.rs`):
+  `SIWX_TEST_REDIS_URL`, default `redis://localhost`. When it is unreachable each test prints
+  one `SKIP <test>: …` line to stderr and passes; with `SIWX_TEST_REQUIRE_REDIS=1` it fails
+  instead, and so does `credential_migration_live` when `MIGRATION_TEST_REDIS_URL` is unset.
+  CI sets both. Use the helper in any new Redis-backed test: `RedisClient::new` never connects
+  (bb8 builds the pool with `min_idle` 0), so a `RedisClient::new(..).ok()` guard never skips,
+  and without Redis the test fails after bb8's 30-second timeout.
 - **Mock stack:** `e2e/up.sh` / `e2e/down.sh` start Redis, `e2e/synapse_mock.py` and siwx-oidc
   in podman; `bash e2e/run-all.sh` runs everything. See [e2e/README.md](e2e/README.md).
   `--test-threads=1` is required: the suites share one stack and reset the mock.
@@ -110,8 +117,10 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 - **Running the server locally** needs `SIWXOIDC_BASE_URL` with a hostname
   (`http://localhost:8000`): the default `http://127.0.0.1:8000` makes WebAuthn refuse the IP
   literal as RP ID and startup panics. See [docs/configuration.md](docs/configuration.md).
-- CI (`.github/workflows/ci.yml`) runs the unit tests, the promotable mock-stack suites
-  (job `rust-e2e-mock`) and `e2e/browser` (job `browser-e2e`).
+- CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on every pull request, forks
+  included; it reads no secrets. Job `build` runs clippy on all targets and
+  `cargo test --workspace` against two Redis services with `SIWX_TEST_REQUIRE_REDIS=1`; job
+  `rust-e2e-mock` runs the promotable mock-stack suites; job `browser-e2e` runs `e2e/browser`.
 
 **Route documentation is enforced.** `tests/openapi_covers_every_route.rs`
 (`every_route_is_described_in_the_openapi_document`) parses the router in `axum_lib.rs` and
@@ -125,11 +134,12 @@ endpoint, update `e2e/synapse_mock.py` in the same change (drift check in
 
 **A test must be able to fail.** A bound such as `n <= 1` is satisfied by zero, and a test
 that prints "skipping" and returns ok is green forever. Assert the positive case, and make
-skips loud (`E2E_STRICT_SKIPS`). Known gap: several Redis-backed tests still return early
-without Redis (e.g. `forged_user_cookie_yields_usernameless_empty_allow_credentials`, the
-`d1_500_…` tests in `synapse_client.rs`, most of `account_linking_dual_write`), and
-`backfill_is_additive_link_aware_counter_preserving_and_idempotent` runs only when
-`MIGRATION_TEST_REDIS_URL` is set, which no CI job sets.
+skips loud and switchable into failures (`SIWX_TEST_REQUIRE_REDIS`, `E2E_STRICT_SKIPS`).
+Known gaps: `account_linking_dual_write` still builds its own client on `redis://localhost`
+rather than through `test_support`, so it ignores `SIWX_TEST_REDIS_URL` and, without Redis,
+fails after the 30-second timeout instead of skipping. `e2e_msc3861` and `e2e_messaging` skip
+their Matrix-side assertions with a plain `eprintln!` when whoami is unavailable, with no
+`E2E_STRICT_SKIPS` gate.
 
 ## Invariants: do not "simplify" these
 
@@ -334,8 +344,8 @@ doc; read it before changing the code the rule covers.
 - **aqua-auth has no logging** and no knowledge of ceremonies.
 - **Credential store: dual-write, not cut-over.** The legacy `webauthn:credential/*` namespace
   stays authoritative; mirror writes are best-effort; the backfill is additive and idempotent.
-  Pin: `backfill_is_additive_link_aware_counter_preserving_and_idempotent` (runs only with
-  `MIGRATION_TEST_REDIS_URL`; see the known gap under Build and test).
+  Pin: `backfill_is_additive_link_aware_counter_preserving_and_idempotent` (needs its own
+  empty Redis, `MIGRATION_TEST_REDIS_URL`; CI provides one).
 
 ## Logging conventions
 

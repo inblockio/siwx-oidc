@@ -3199,9 +3199,10 @@ mod tests {
         assert!(err.contains("truncated"), "{err}");
     }
 
-    async fn default_config() -> (Config, RedisClient) {
+    /// `None` after a loud skip when Redis is unavailable (`siwx_oidc::test_support`).
+    async fn default_config() -> Option<(Config, RedisClient)> {
         let config = Config::default();
-        let db_client = RedisClient::new(&config.redis_url).await.unwrap();
+        let db_client = siwx_oidc::test_support::redis().await?;
         db_client
             .set_client(
                 "client".into(),
@@ -3216,7 +3217,7 @@ mod tests {
             )
             .await
             .unwrap();
-        (config, db_client)
+        Some((config, db_client))
     }
 
     fn config_no_ens() -> Config {
@@ -3281,7 +3282,9 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_flow() {
-        let (config, db_client) = default_config().await;
+        let Some((config, db_client)) = default_config().await else {
+            return;
+        };
 
         // Generate an eip155 keypair (same approach as Eip155Suite tests).
         let secret = k256::SecretKey::random(&mut rand::thread_rng());
@@ -3388,7 +3391,9 @@ mod tests {
     /// residue (v42 reads the authorization response ONLY from the fragment).
     #[tokio::test]
     async fn e2e_flow_fragment_response_mode() {
-        let (_config, db_client) = default_config().await;
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
 
         let secret = k256::SecretKey::random(&mut rand::thread_rng());
         let signing_key = k256::ecdsa::SigningKey::from(&secret);
@@ -3485,7 +3490,9 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_rejects_unsupported_response_mode() {
-        let (_config, db_client) = default_config().await;
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
         let params = AuthorizeParams {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(Url::parse("https://example.com").unwrap()),
@@ -3515,7 +3522,9 @@ mod tests {
     async fn authorize_accepts_query_response_mode_without_forwarding() {
         // Explicit "query" is valid but default: the SPA URL stays byte-identical
         // to the absent-param case (nothing forwarded).
-        let (_config, db_client) = default_config().await;
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
         let params = AuthorizeParams {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(Url::parse("https://example.com").unwrap()),
@@ -3550,7 +3559,9 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_accepts_matrix_scopes() {
-        let (_config, db_client) = default_config().await;
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
         let params = AuthorizeParams {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(
@@ -3685,7 +3696,9 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_accepts_matrix_only_scopes_without_openid() {
-        let (_config, db_client) = default_config().await;
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
         let params = AuthorizeParams {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(
@@ -3716,7 +3729,9 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_rejects_invalid_scope() {
-        let (_config, db_client) = default_config().await;
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
         let params = AuthorizeParams {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(Url::parse("https://example.com").unwrap()),
@@ -4377,12 +4392,7 @@ mod provision_synapse_device_tests {
             (axum::http::StatusCode::OK, serde_json::json!({})),
         )
         .await;
-        let Ok(redis) =
-            siwx_oidc::db::RedisClient::new(&url::Url::parse("redis://localhost").unwrap()).await
-        else {
-            eprintln!(
-                "SKIP publication_is_wired_into_the_shared_signin_path: no Redis on localhost"
-            );
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
             handle.abort();
             return;
         };
@@ -4455,12 +4465,7 @@ mod provision_synapse_device_tests {
             (axum::http::StatusCode::OK, serde_json::json!({})),
         )
         .await;
-        let Ok(redis) =
-            siwx_oidc::db::RedisClient::new(&url::Url::parse("redis://localhost").unwrap()).await
-        else {
-            eprintln!(
-                "SKIP a_degraded_identity_provisions_but_never_publishes_an_assertion: no Redis on localhost"
-            );
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
             handle.abort();
             return;
         };
@@ -4647,10 +4652,9 @@ mod userinfo_mxid_claim_tests {
         }
     }
 
-    async fn db() -> RedisClient {
-        RedisClient::new(&Config::default().redis_url)
-            .await
-            .expect("these tests need Redis on localhost:6379")
+    /// `None` after a loud skip when Redis is unavailable (`siwx_oidc::test_support`).
+    async fn db() -> Option<RedisClient> {
+        siwx_oidc::test_support::redis().await
     }
 
     /// Drive the real `userinfo` and return the JSON body a client would see.
@@ -4676,7 +4680,9 @@ mod userinfo_mxid_claim_tests {
     /// The happy path, and the only place the claim NAME is asserted.
     #[tokio::test]
     async fn the_claim_name_on_the_wire_is_io_inblock_mxid() {
-        let db = db().await;
+        let Some(db) = db().await else {
+            return;
+        };
         let client_id = format!("mxid-claim-{}", nonce());
         seed_client(&db, &client_id, false).await.unwrap();
         let token = format!("tok_{}", nonce());
@@ -4708,7 +4714,9 @@ mod userinfo_mxid_claim_tests {
     /// and the key must be ABSENT, not `null`. See this module's doc, point 2.
     #[tokio::test]
     async fn without_a_matrix_server_name_the_claim_is_omitted_not_null() {
-        let db = db().await;
+        let Some(db) = db().await else {
+            return;
+        };
         let client_id = format!("mxid-claim-standalone-{}", nonce());
         seed_client(&db, &client_id, false).await.unwrap();
         let token = format!("tok_{}", nonce());
@@ -4737,7 +4745,9 @@ mod userinfo_mxid_claim_tests {
     /// localpart from the DID — see `mxid_claim`'s doc.
     #[tokio::test]
     async fn legacy_code_entry_path_reports_a_recorded_localpart_and_omits_an_absent_one() {
-        let db = db().await;
+        let Some(db) = db().await else {
+            return;
+        };
         let client_id = format!("mxid-claim-legacy-{}", nonce());
         seed_client(&db, &client_id, false).await.unwrap();
         let config = config_with_server_name(Some(SERVER_NAME));
@@ -4782,7 +4792,9 @@ mod userinfo_mxid_claim_tests {
     /// point 3.
     #[tokio::test]
     async fn the_signed_jwt_variant_carries_the_claim_too() {
-        let db = db().await;
+        let Some(db) = db().await else {
+            return;
+        };
         let client_id = format!("mxid-claim-jwt-{}", nonce());
         seed_client(&db, &client_id, true).await.unwrap();
         let token = format!("tok_{}", nonce());
@@ -4868,7 +4880,6 @@ mod userinfo_mxid_claim_tests {
 #[cfg(test)]
 mod sign_in_deactivation_order_tests {
     use super::*;
-    use crate::config::Config;
     use crate::localpart::{legacy_localpart, localpart_for};
     use axum::extract::{Query, State};
     use axum::http::{Method, StatusCode, Uri};
@@ -4967,8 +4978,11 @@ mod sign_in_deactivation_order_tests {
     }
 
     /// Run one passkey-path `sign_in` for [`DID`] against `hs`; return the
-    /// outcome and the homeserver's request log.
-    async fn sign_in_against(hs: Homeserver) -> (Result<(Url, String), CustomError>, Vec<String>) {
+    /// outcome and the homeserver's request log, or `None` after a loud skip
+    /// when Redis is unavailable (`siwx_oidc::test_support`).
+    async fn sign_in_against(
+        hs: Homeserver,
+    ) -> Option<(Result<(Url, String), CustomError>, Vec<String>)> {
         let hs = Arc::new(hs);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -4987,9 +5001,10 @@ mod sign_in_deactivation_order_tests {
         });
         let synapse = SynapseClient::new(&format!("http://{addr}"), "secret");
 
-        let db = RedisClient::new(&Config::default().redis_url)
-            .await
-            .expect("these tests need Redis on localhost:6379, as CI provides");
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            server.abort();
+            return None;
+        };
         let nonce = Uuid::new_v4().simple().to_string();
         let client_id = format!("deactivation-order-{nonce}");
         db.set_client(
@@ -5051,7 +5066,7 @@ mod sign_in_deactivation_order_tests {
         .await;
         server.abort();
         let log = hs.log.lock().unwrap().clone();
-        (result, log)
+        Some((result, log))
     }
 
     /// A healthy homeserver and a genuinely deactivated account that exists only
@@ -5062,12 +5077,15 @@ mod sign_in_deactivation_order_tests {
     async fn sign_in_refuses_a_deactivated_account_before_resolving_or_provisioning() {
         let legacy = legacy_localpart(DID);
         let modern = localpart_for(DID);
-        let (result, log) = sign_in_against(Homeserver {
+        let Some((result, log)) = sign_in_against(Homeserver {
             taken: HashSet::from([modern.clone()]),
             deactivated: HashSet::from([modern.clone()]),
             ..Homeserver::default()
         })
-        .await;
+        .await
+        else {
+            return;
+        };
 
         match result {
             Err(CustomError::Unauthorized(msg)) => {
@@ -5099,13 +5117,16 @@ mod sign_in_deactivation_order_tests {
     async fn a_partial_probe_fault_fails_sign_in_closed_before_any_legacy_guess() {
         let legacy = legacy_localpart(DID);
         let modern = localpart_for(DID);
-        let (result, log) = sign_in_against(Homeserver {
+        let Some((result, log)) = sign_in_against(Homeserver {
             faulted: HashSet::from([legacy.clone()]),
             taken: HashSet::from([modern.clone()]),
             deactivated: HashSet::from([modern.clone()]),
             ..Homeserver::default()
         })
-        .await;
+        .await
+        else {
+            return;
+        };
 
         match result {
             Err(CustomError::ServiceUnavailable(msg)) => {

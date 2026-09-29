@@ -1,18 +1,19 @@
-//! Live end-to-end tests for Synapse-side session/device teardown on logout,
-//! revocation, and bulk sign-out (Feature 1/2). These assert the *Synapse* side
-//! effects that cannot be unit-tested without a live homeserver: that
-//! `/_matrix/client/v3/logout` deletes the ending session's Synapse device, that
-//! `/_matrix/client/v3/logout/all` deletes ALL of the user's devices, and that
-//! the new `/logout/all` route is actually registered.
+//! End-to-end tests for session teardown on logout, revocation, and bulk
+//! sign-out (Feature 1/2), observed from the Matrix side: after each teardown
+//! the session's token must stop authenticating at `account/whoami`, and
+//! `/_matrix/client/v3/logout/all` must be a registered route that leaves the
+//! account active. A rejected token proves the session ended; it does not by
+//! itself prove a Synapse device was deleted.
 //!
 //! Self-contained: copies the auth-flow helpers from `e2e_msc3861.rs` (the same
 //! pattern `e2e_msc4191_live.rs` uses) so this file runs on its own and never
 //! edits the existing test files.
 //!
-//! NOT runnable in CI here (no live Synapse). These mirror the repo's
-//! `#[ignore]` e2e convention and run in deployment:
+//! `#[ignore]`d, like the other e2e suites. CI runs it against the mock stack
+//! (job `rust-e2e-mock`, with `MATRIX_HOST` pointed at `e2e/synapse_mock.py`).
+//! Against a real deployment:
 //!
-//!   SIWEOIDC_HOST=https://siwx-oidc.inblock.io MATRIX_HOST=https://matrix.inblock.io \
+//!   SIWEOIDC_HOST=https://siwx.example.org MATRIX_HOST=https://matrix.example.org \
 //!     cargo test --test e2e_session_teardown -- --ignored --nocapture
 //!
 //! The pure teardown logic (graceful degradation, idempotency, logout_all
@@ -417,19 +418,27 @@ async fn logout_deletes_ending_session_device() {
 }
 
 // ---------------------------------------------------------------------------
-// H1: revoke (RFC 7009) tears down the session's device + tokens
+// H1: revoke (RFC 7009) ends the session's tokens and keeps its device
 // ---------------------------------------------------------------------------
 
+/// After `POST /oauth2/revoke`, the revoked access token must no longer
+/// authenticate against Matrix.
+///
+/// Revoke is token hygiene (`TeardownPolicy::TokensOnly`) and must NOT delete
+/// the Synapse device; deleting it there wedged cross-signing in the 2026-06-12
+/// login incident. This test does not observe the device. The keep-the-device
+/// half is pinned by the unit test
+/// `compat::tests::teardown_policy_only_deletes_device_on_explicit_signout`.
 #[tokio::test]
 #[ignore]
-async fn revoke_deletes_session_device() {
+async fn revoke_invalidates_session_token() {
     let oidc = siweoidc_host();
     let http = Client::new();
 
     let (key, address, did) = fresh_identity();
     let (token, device_id, whoami_st) = login_with_key(&key, &address, &did).await;
     if device_id.is_none() {
-        skip_or_fail("revoke_deletes_session_device", whoami_st);
+        skip_or_fail("revoke_invalidates_session_token", whoami_st);
         return;
     }
 

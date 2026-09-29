@@ -1769,12 +1769,11 @@ mod unknown_credential_response_tests {
     /// refactor to `?` would break this invariant while every miss-path test stayed
     /// green — so pin the error path here. We force a real, fast `WRONGTYPE` error by
     /// storing the `user:session/{token}` key as a SET, so the `GET` in
-    /// `lookup_user_session` errors. Requires Redis on localhost; skips if absent.
+    /// `lookup_user_session` errors. Needs Redis (`siwx_oidc::test_support::redis`).
     #[tokio::test]
     async fn user_session_scope_did_degrades_open_on_redis_error() {
-        let redis = match RedisClient::new(&url::Url::parse("redis://localhost").unwrap()).await {
-            Ok(c) => c,
-            Err(_) => return, // no Redis: skip (CI provides one)
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
         };
         let token = format!("wrongtype{}", uuid::Uuid::new_v4().simple());
         // KV_USER_SESSION_PREFIX is in scope via `use siwx_oidc::db::*` at the top.
