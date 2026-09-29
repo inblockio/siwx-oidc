@@ -178,7 +178,7 @@ a generated key, a public-key fingerprint).
 ## Running locally
 
 ```bash
-docker compose -f test/docker-compose.yml up -d redis          # Redis on localhost:6379
+docker run -d --rm --name siwx-redis -p 6379:6379 redis:7-alpine  # Redis on localhost:6379
 (cd js/ui && npm install --legacy-peer-deps && npm run build)  # login page into static/build
 SIWXOIDC_BASE_URL=http://localhost:8000 cargo run
 ```

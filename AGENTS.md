@@ -64,8 +64,7 @@ Other paths: `tests/` (integration suites, all `#[ignore]`d), `e2e/` (mock stack
 suites, Element Web suites), `js/ui/` (Svelte login page, built into `static/build`),
 `static/` (served pages and assets), `docs/api/` (OpenAPI document), `docs/audits/` and
 `docs/design/` (evidence and design records), `security/` plus `.cargo/audit.toml` (advisory
-exceptions, VEX), `scripts/` (live checks against a deployment), `skills/` (agent skills),
-`example/demo/` (a demo relying party), `test/docker-compose.yml` (Redis for local tests).
+exceptions, VEX), `scripts/` (live checks against a deployment), `skills/` (agent skills).
 
 ## Architecture in brief
 
@@ -81,7 +80,7 @@ lineage: [docs/architecture.md](docs/architecture.md).
 ```bash
 cargo build --workspace
 cargo fmt -- --check && cargo clippy          # CI builds with RUSTFLAGS=-Dwarnings
-docker compose -f test/docker-compose.yml up -d redis   # Redis on localhost:6379
+docker run -d --rm --name siwx-redis -p 6379:6379 redis:7-alpine   # Redis on localhost:6379
 cargo test                                    # unit tests; several need that Redis
 cargo run                                     # the server (needs Redis; see below)
 cargo run -p siwx-oidc-auth -- --help         # the headless client

@@ -179,8 +179,8 @@ Systems, Inc. and contributors, an Ethereum-only Sign-In with Ethereum OpenID Co
 (licensed "MIT OR Apache-2.0", used here under Apache-2.0; `NOTICE` keeps the upstream
 notices). Upstream has had no commits since July 2024. siwx-oidc generalised it from Ethereum
 addresses to DIDs, added passkeys, RFC 8628 and the Matrix integration, and removed the
-Cloudflare Workers target. `wrangler_example.toml` and `example/demo` are inherited from
-upstream and not maintained.
+Cloudflare Workers target. `wrangler_example.toml` and the `example/demo` relying party were
+upstream leftovers that nothing used, and have been removed.
 
 **Breaking changes relative to siwe-oidc:**
 
