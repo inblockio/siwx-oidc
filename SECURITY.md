@@ -14,9 +14,8 @@ and are not backported. The container image `ghcr.io/inblockio/siwx-oidc:latest`
 
 Please do **not** open a public issue, discussion or pull request for a vulnerability.
 
-- **Preferred:** GitHub private vulnerability reporting. Open the repository's **Security** tab
-  and choose **Report a vulnerability**.
-- **Fallback:** email **hello@inblock.io** with `SECURITY` in the subject line.
+Report privately through GitHub (the repository's **Security** tab → **Report a
+vulnerability**) or by email to **hello@inblock.io** with `SECURITY` in the subject.
 
 Please include:
 
