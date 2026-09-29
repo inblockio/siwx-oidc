@@ -46,7 +46,7 @@ secret is configured.
 ### Synapse configuration
 
 ```yaml
-# homeserver.yaml (Synapse 1.136 or later)
+# homeserver.yaml (tested with Synapse 1.159 and 1.161; versions before 1.157 are untested)
 matrix_authentication_service:
   enabled: true
   # Where Synapse reaches siwx-oidc. An internal address is fine and preferred.
@@ -136,18 +136,21 @@ Timeouts: 2 s to connect and 8 s per request to Synapse.
   documented for MAS. It is not a published, stable interface. siwx-oidc tracks
   it per Synapse release, and it changed materially between 1.135 and 1.157.
   **Treat every Synapse upgrade as a compatibility check.**
-- **Tested version.** The deployment this project maintains
-  ([siwx-oidc-matrix-server](https://github.com/inblockio/siwx-oidc-matrix-server))
-  runs Synapse 1.161.0 with one patch (below). Source-level claims in the code
-  comments were checked against 1.159.0. The stable integration needs at least
-  1.136.0; 1.157.0 and later require it.
-- **Known upstream bug, historical.** On Synapse 1.159 and earlier, an account
-  with a `users` row but no `profiles` row (element-hq/synapse#19702) answered
-  500 on profile reads and writes, and displayname writes for it failed. Upstream
-  fixes in 1.161.0 (#20149, #20172) appear to address it; this has not yet been
-  re-verified live against this deployment. The handling described in
+- **Tested versions.** Tested with Synapse 1.159 and 1.161. The integration uses
+  Synapse's stable `matrix_authentication_service` block (available since
+  1.136); versions before 1.157 are untested. The deployment this project
+  maintains ([siwx-oidc-matrix-server](https://github.com/inblockio/siwx-oidc-matrix-server))
+  runs Synapse 1.161.0 with one patch (below); source-level claims in the code
+  comments were checked against 1.159.0.
+- **Known upstream bug.** An account with a `users` row but no `profiles` row
+  (element-hq/synapse#19702) answers 500 on profile reads and writes, and
+  displayname writes for it fail (affected: Synapse 1.160 and earlier; 1.161
+  fixes some of the paths (#20149, #20172); #19702 remains open upstream; not
+  re-verified against this deployment). #20149 and #20172 cover custom-field
+  reads and admin writes, which may not include the displayname write the
+  self-heal depends on. The handling described in
   [identity-model.md](identity-model.md#row-less-accounts-and-the-exact-500-rule)
-  stays for older homeservers.
+  stays in place.
 - **Element Web patches.** The Element Web build used with this deployment
   carries patches, listed with evidence and retirement conditions in the
   [Element Web patch registry](https://github.com/inblockio/siwx-oidc-matrix-server/blob/main/patches/element-web/README.md).

@@ -80,7 +80,7 @@ third-party implementations of it, either way.
 | Client-credentials grant | Yes (useful for MAS's admin API; Synapse requires a user on the session) | No |
 | Admin tooling | Admin REST API (OpenAPI), Element Admin UI, `mas-cli`, policy engine, rate and session limits ([admin API](https://element-hq.github.io/matrix-authentication-service/topics/admin-api.html)) | None beyond a self-minted, short-lived (30–900 s) Synapse admin token for its own calls ([`admin_token.rs`](../src/admin_token.rs)) |
 | Storage | PostgreSQL | Redis |
-| Homeservers | Synapse ≥ 1.136.0 | Synapse (tested with 1.161.0); others untested |
+| Homeservers | Synapse ≥ 1.136.0 | Synapse (tested with 1.159 and 1.161; versions before 1.157 untested); other homeservers untested |
 | Maturity and support | v1.0 in 2025-08, v1.25.1 in 2026-09; runs matrix.org; commercial support from Element | Version 0.2.0, no releases; one organisation's deployment; no support offering |
 | License | AGPL-3.0-or-later or commercial | Apache-2.0 |
 

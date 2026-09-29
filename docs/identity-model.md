@@ -355,13 +355,15 @@ leave every stored assertion failing as a silent "bad signature"; with a derived
 
 ### Row-less accounts and the exact-500 rule
 
-On Synapse 1.159 and earlier, an account with a `users` row but no `profiles`
-row (element-hq/synapse#19702) answered **500** on profile reads and writes
-where a healthy account answered 404. Upstream fixes in Synapse 1.161.0
-(#20149, #20172) appear to address this; that has not yet been re-verified live
-against this project's deployment.
+An account with a `users` row but no `profiles` row
+(element-hq/synapse#19702) answers **500** on profile reads and writes where a
+healthy account answers 404 (affected: Synapse 1.160 and earlier; 1.161 fixes
+some of the paths (#20149, #20172); #19702 remains open upstream; not
+re-verified against this deployment). #20149 and #20172 cover custom-field
+reads and admin writes, which may not include the displayname write the
+self-heal depends on.
 
-The handling stays in place for older homeservers:
+The handling stays in place:
 
 - `classify_publish_status` treats **exactly** 500 as "possibly row-less", and
   deliberately not `is_server_error()`: 502/503/504 stay hard errors, so an

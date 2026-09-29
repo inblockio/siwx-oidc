@@ -178,9 +178,10 @@ A complete Docker Compose deployment (Synapse, Element Web, siwx-oidc, Redis, Ca
 
 ### What it depends on
 
-- **Synapse.** The code targets Synapse 1.157 and later and is tested with 1.161.0, the version
-  the bundled deployment runs. The stable `matrix_authentication_service` block exists since
-  1.136.0; 1.157.0 removed the experimental `experimental_features.msc3861` mode.
+- **Synapse.** Tested with Synapse 1.159 and 1.161. The integration uses Synapse's stable
+  `matrix_authentication_service` block (available since 1.136); versions before 1.157 are
+  untested. The bundled deployment runs 1.161.0. 1.157.0 removed the experimental
+  `experimental_features.msc3861` mode.
 - **An internal Synapse API.** Synapse's side of this integration (`/_synapse/mas/*`) is an
   internal API designed for MAS (Synapse 1.135.0 changelog), not a public, stable interface.
   siwx-oidc tracks it per Synapse release, so every Synapse upgrade is a compatibility check.

@@ -231,9 +231,10 @@ MAS deployment before looking anywhere else.
 - **`/resolve` answers 503**: the deployment has no server name or no Synapse
   client. **502**: Synapse could not be asked; the body says what failed. **504**:
   the lookup took more than 10 seconds.
-- **A 500 from Synapse on a profile read or write for one account** (Synapse
-  1.159 and earlier): that account has no profile row
-  (element-hq/synapse#19702). See
+- **A 500 from Synapse on a profile read or write for one account**: that
+  account has no profile row (element-hq/synapse#19702; affected: Synapse 1.160
+  and earlier; 1.161 fixes some of the paths (#20149, #20172); #19702 remains
+  open upstream; not re-verified against this deployment). See
   [identity-model.md](identity-model.md#row-less-accounts-and-the-exact-500-rule).
 
 ## Inspecting Redis
