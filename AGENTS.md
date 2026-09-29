@@ -238,9 +238,11 @@ doc; read it before changing the code the rule covers.
   `reject_if_new_identity_fails_closed_on_synapse_error`,
   `a_rejected_mas_shared_secret_is_a_detection_failure_not_a_new_identity`,
   `reject_if_deactivated_fails_closed_on_synapse_error`.
-- **`reject_if_deactivated` runs before `resolve_identity_or_legacy` in `sign_in`.** Swapping them
-  lets a deactivated modern-only account sign in via the legacy guess. Pin:
-  `a_query_user_failure_is_a_probe_failure_not_a_deactivation`; rationale at the call site.
+- **`reject_if_deactivated` runs before `resolve_identity_or_legacy` in `sign_in`.** Feeding the
+  gate that resolver's legacy guess lets a deactivated modern-only account sign in. Pin:
+  `sign_in_refuses_a_deactivated_account_before_resolving_or_provisioning`,
+  `a_partial_probe_fault_fails_sign_in_closed_before_any_legacy_guess` (they drive `sign_in`
+  against a recording homeserver); rationale at the call site.
 - **Standalone deployments degrade, never 500.** No Synapse client means the gates are no-ops.
 
 ### Tokens, sessions and devices ([docs/matrix-integration.md](docs/matrix-integration.md))
