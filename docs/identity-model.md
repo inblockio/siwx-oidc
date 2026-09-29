@@ -76,10 +76,10 @@ localpart = base36( first 10 bytes of SHA-256( canonicalize(did) ) )
   collisions. `36^16 ≈ 2^82.7`, so the 80-bit value always fits without
   truncation.
 - **Why it is short.** The older derivation (below) produced MXIDs of 80+
-  characters made of five hyphen-separated words. In a controlled A/B test on
-  2026-09-09, the MSC4284 policy server that matrix.org operates refused to sign
-  events from that long shape and accepted a short single-run localpart on the
-  same homeserver.
+  characters made of five hyphen-separated words. In an A/B test we ran on
+  2026-09-09 (see the comment in `src/mxid.rs`), matrix.org's policy server
+  refused long DID-derived MXIDs and accepted the 16-character form. This is
+  our own observation, not documented matrix.org behaviour.
 
 ### Canonicalisation is method-aware
 
