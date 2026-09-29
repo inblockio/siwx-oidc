@@ -314,9 +314,9 @@ Three accounts on dev currently have a `users` row with **no** matching `profile
 row (confirmed via read-only SQLite query on `/data/homeserver.db`):
 ```
 users: 102   profiles: 99   → 3 accounts with no profiles row, all deactivated=1
-  @did-key-zdnaeskrgk1qmczqwg6rvbskbq7bnh3nhra7gdpdbvmtuv87r:dev.matrix.inblock.io
-  @did-pkh-eip155-1-0x83477e7ba0b901dc8a3ae78ee50fe2cb67861b0d:dev.matrix.inblock.io
-  @did-pkh-eip155-1-0xa79bbdade22853874b6df6beb80f05a8a5577761:dev.matrix.inblock.io
+  @did-key-zdnae<redacted>:<dev-server>   (legacy did:key localpart)
+  @did-pkh-eip155-1-0x<redacted>:<dev-server>   (legacy did:pkh localpart)
+  @did-pkh-eip155-1-0x<redacted>:<dev-server>   (legacy did:pkh localpart)
 ```
 These are erased/deactivated accounts, not fresh-provisioning failures — Synapse's
 own erasure path (`ProfileHandler.delete_profile_upon_deactivation` →
