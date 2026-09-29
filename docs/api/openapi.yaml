@@ -329,6 +329,17 @@ paths:
         already publicly computable, so authentication would buy rate-limiting,
         not secrecy — put that at the reverse proxy.
 
+        A `did` is checked before the homeserver is asked anything. It must be
+        a DID some sign-in on this provider could accept: a method aqua-auth
+        registers (`did:pkh`, `did:key`, `did:peer` variants 0 and 2) whose
+        method-specific id parses the way sign-in parses it (a `did:pkh`
+        namespace with a cipher suite and a well-formed address or key, a
+        `did:key` / `did:peer` Ed25519 or P-256 multikey). Anything else is a
+        400, because no account can exist for it. This is not narrowed to the
+        methods this deployment currently enables. `did:pkh` is checked
+        case-folded (an EIP-55 address and its lowercase form are one
+        account); `did:key` is checked in exact case.
+
         `attested: true` means the account's profile field currently carries a
         DID that binds to it. It does **not** verify the assertion's signature
         (the verifier lives in `siwx-oidc-auth`), and it authorizes nothing.
@@ -352,8 +363,25 @@ paths:
                   summary: A well-formed DID that has never signed in here
                   value: { did: "did:key:z6MkpFemPtmjvPZ1gFYM6d68tuwxxrcec4H2Ck23FRchU9ue", mxid: "@04gen9jsoj657dc0:matrix.example.org", exists: false, attested: false }
         "400":
-          description: Not exactly one selector, or an mxid belonging to another homeserver.
-          content: { application/json: { schema: { $ref: "#/components/schemas/ResolveError" } } }
+          description: |
+            Not exactly one selector; a `did` that is not a DID any sign-in here
+            accepts (not `did:<method>:<id>`, a method this provider does not
+            sign in, or an id its method cannot parse); a malformed mxid; or an
+            mxid belonging to another homeserver. `error` is `invalid_request`
+            and `message` quotes the refused value.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ResolveError" }
+              examples:
+                notADid:
+                  summary: A value that is not a DID
+                  value: { error: invalid_request, message: "`kenn` is not a DID: it must look like `did:<method>:<method-specific-id>`, for example `did:key:z6Mk…` or `did:pkh:eip155:1:0x…`." }
+                malformedDid:
+                  summary: A DID its method cannot parse
+                  value: { error: invalid_request, message: "`did:pkh:eip155:1:0xZZZ` is not a valid `did:pkh` DID (invalid DID: eip155 address must be 40 hex chars, got 3), so no account can exist for it." }
+                unsupportedMethod:
+                  summary: A DID method this provider never signs in
+                  value: { error: invalid_request, message: "`did:web:example.com` is not a DID this provider can sign in (supported methods: `did:pkh`, `did:key`, `did:peer`), so no account can exist for it." }
         "502":
           description: The homeserver could not be asked. Never a guessed answer.
         '504':

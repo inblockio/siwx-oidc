@@ -58,7 +58,7 @@ use std::collections::BTreeSet;
 
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{json, Value};
-use siwx_oidc::mxid::localpart_for;
+use siwx_oidc::mxid::{legacy_localpart, localpart_for};
 use siwx_oidc_auth::did_assertion::DID_PROFILE_FIELD;
 
 fn oidc() -> String {
@@ -397,6 +397,8 @@ async fn every_error_the_handler_produces_carries_the_documented_json_envelope()
         "did",
         // two selectors: two different questions
         "did=did:key:zAaa&mxid=@alice:matrix.test",
+        // a value that is not a DID (siwx-oidc#23)
+        "did=kenn",
         // an mxid this provider cannot answer for
         "mxid=@alice:matrix.org",
         // and the four ways an mxid can fail to be one
@@ -491,6 +493,109 @@ async fn a_syntactically_impossible_mxid_is_rejected_without_asking_the_homeserv
         "a request that cannot be a Matrix ID must not reach the homeserver, but the mock \
          logged: {calls:?}"
     );
+}
+
+/// A `did` that no sign-in on this provider could ever have accepted is a 400
+/// in the documented envelope, and the homeserver is never asked
+/// (siwx-oidc#23).
+///
+/// The first five are the inputs the issue reproduced on production, where
+/// each came back **200** with an mxid hashed from the garbage and
+/// `exists: false`: indistinguishable from "a well-formed DID that has never
+/// signed in here". Two of them (`did:pkh:garbage`, `did:pkh:eip155:1:0xZZZ`)
+/// are valid under the generic W3C DID grammar, so they pin that the METHOD's
+/// parser runs, not just a shape check. This is the `did` counterpart of
+/// [`a_syntactically_impossible_mxid_is_rejected_without_asking_the_homeserver`].
+#[tokio::test]
+#[ignore]
+async fn a_value_that_is_not_a_did_is_rejected_without_asking_the_homeserver() {
+    let c = Client::new();
+    mock_reset(&c).await;
+
+    for did in [
+        "kenn",
+        "did:",
+        "did:pkh:garbage",
+        "did:key:notbase58!!",
+        "did:pkh:eip155:1:0xZZZ",
+        "did:key:",
+        "did:web:example.com",
+        "did:pkh:eip155:1:0x5305548520063b21cd9d19fbecb0b44ee6fde6f",
+        // siwx-oidc#17's lowercased did:key: a different, invalid key
+        "did:key:z6mkmwzijj2k3ckqvqnmmgvkefmhdse4zxrfvqksxdmgba4v",
+    ] {
+        let raw = format!("did={}", urlencoding::encode(did));
+        let answer = get_resolve(&c, &raw).await;
+        assert_documented_error_envelope(&answer, StatusCode::BAD_REQUEST, &format!("`?{raw}`"));
+        let body = answer.json();
+        assert_eq!(
+            body["error"].as_str(),
+            Some("invalid_request"),
+            "`?{raw}`: {body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("`{did}`")),
+            "`?{raw}`: the message must quote the value it refused: {body}"
+        );
+    }
+
+    let calls = mock_calls(&c).await;
+    assert!(
+        calls.is_empty(),
+        "a value that cannot be a DID must not reach the homeserver, but the mock logged:          {calls:?}"
+    );
+}
+
+/// Validation must not refuse a real DID in any spelling the lookup already
+/// honours: an EIP-55 mixed-case `did:pkh` and its lowercase twin are ONE
+/// (here grandfathered) account and both resolve to it; a `did:key` resolves
+/// in exact case. The mixed-case vector is the one #23 used as its "still
+/// works" control on production.
+#[tokio::test]
+#[ignore]
+async fn valid_dids_still_resolve_in_every_spelling_the_lookup_honours() {
+    const PKH_EIP55: &str = "did:pkh:eip155:1:0x5305548520063b21cd9d19fbECB0B44Ee6Fde6F7";
+    let c = Client::new();
+    mock_reset(&c).await;
+    let legacy = legacy_localpart(PKH_EIP55);
+    mock_seed_user(&c, &legacy).await;
+
+    for spelling in [PKH_EIP55.to_string(), PKH_EIP55.to_lowercase()] {
+        let raw = format!("did={spelling}");
+        let answer = get_resolve(&c, &raw).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::OK,
+            "`?{raw}` body={:?}",
+            answer.body
+        );
+        let body = answer.json();
+        assert_eq!(body["exists"], json!(true), "`?{raw}`: {body}");
+        assert_eq!(
+            body["mxid"].as_str(),
+            Some(format!("@{legacy}:{SERVER_NAME}").as_str()),
+            "`?{raw}`: both case spellings are one account: {body}"
+        );
+    }
+
+    for did in [
+        "did:pkh:eip155:1:0x254b0d7b63342fcb8955db82e95c21d72efdb6f7",
+        DID_UNKNOWN,
+    ] {
+        let answer = get_resolve(&c, &format!("did={did}")).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::OK,
+            "`{did}` body={:?}",
+            answer.body
+        );
+        let body = answer.json();
+        assert_eq!(body["did"].as_str(), Some(did), "`{did}`: exact case");
+        assert_eq!(body["exists"], json!(false), "`{did}`: {body}");
+    }
 }
 
 /// The 502 branch, on the wire: when the homeserver cannot be read, the answer
@@ -781,6 +886,12 @@ async fn no_query_string_this_endpoint_accepts_can_make_it_answer_500() {
         "mxid=@ :matrix.test".to_string(),
         "mxid=@alice:matrix.test:8448".to_string(),
         "mxid=@alice:matrix.org".to_string(),
+        // not DIDs at all, or not ones any sign-in accepts (siwx-oidc#23)
+        "did=kenn".to_string(),
+        "did=did:".to_string(),
+        "did=did:pkh:garbage".to_string(),
+        "did=did:key:notbase58!!".to_string(),
+        "did=did:pkh:eip155:1:0xZZZ".to_string(),
         // unknown parameters alongside a good one
         format!("did={DID_UNKNOWN}&foo=bar&foo=baz"),
     ];

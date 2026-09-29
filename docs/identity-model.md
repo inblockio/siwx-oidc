@@ -506,6 +506,13 @@ curl -s "https://auth.example.org/resolve?mxid=@k3f9x2q7ab4d8m1p:example.org"
   400 in the normal error envelope.
 - `did` is at most 2048 bytes; `mxid` at most 255 bytes (Matrix's user ID
   limit).
+- A `did` that no sign-in on this server could accept is a 400, before any probe
+  (`resolve::check_did`). It runs the sign-in path's own parsers minus the signature check:
+  the DID method must be registered (e.g. `did:web` is refused), the did:key / did:peer
+  multikey must decode, and a did:pkh namespace and address must parse. It runs on
+  `mxid::canonicalize(did)`, so EIP-55 case still folds and did:key keeps its exact case. It
+  is deliberately not narrowed to `supported_did_methods`: accounts outlive a method being
+  disabled, and a false reject would be the worse failure.
 - An `mxid` on a different homeserver is a 400. Read a foreign user's DID from
   that homeserver's own (public, federated) profile route and verify it against
   that homeserver's issuer.

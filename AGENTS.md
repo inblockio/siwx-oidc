@@ -305,6 +305,12 @@ doc; read it before changing the code the rule covers.
   `a_standalone_deployment_degrades_with_503_never_500`,
   `a_repeated_query_parameter_is_rejected_with_the_documented_error_envelope`.
   Rate limiting belongs in the reverse proxy, not in-process.
+- **`/resolve` refuses a `did` no sign-in could accept, with a 400 before any probe**
+  (`resolve::check_did`: the sign-in parsers minus the signature, run on `canonicalize(did)`).
+  Never stricter than sign-in and never narrowed to `supported_did_methods`; a false reject is
+  the worse failure. Pin: `a_value_that_is_not_a_did_is_rejected_before_any_probe`,
+  `a_value_that_is_not_a_did_is_rejected_without_asking_the_homeserver`,
+  `valid_dids_still_resolve_in_every_spelling_the_lookup_honours` (live).
 - **`io.inblock.mxid` in userinfo is omitted, never `null`**, is read from `TokenMetadata`
   (never re-derived), and appears in the JSON and signed-JWT variants alike. Pin:
   `without_a_matrix_server_name_the_claim_is_omitted_not_null`,
