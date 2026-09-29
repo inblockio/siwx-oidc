@@ -1,0 +1,26 @@
+# cargo-audit configuration for siwx-oidc.
+#
+# RULE: every id in `ignore` below MUST have
+#   1. a row in security/EXCEPTIONS.md (human register: why, evidence, who, when to review), and
+#   2. a statement in security/vex/siwx-oidc.openvex.json (machine-readable OpenVEX).
+# An ignore without both is a silenced alarm, not an exception. Remove the entry the
+# moment its review trigger fires.
+
+[advisories]
+ignore = [
+  # RUSTSEC-2023-0071 (CVE-2023-49092, GHSA-c38w-74pg-36hr): rsa 0.9.10 "Marvin"
+  # timing side channel on RSA PRIVATE-key operations (decrypt / sign). No fixed
+  # release exists (patched = []).
+  #
+  # Reason: NOT APPLICABLE. siwx-oidc signs ID tokens, userinfo and DID assertions
+  # with ES256 (P-256) only and never holds, loads or generates RSA private key
+  # material. `rsa` is linked only through openidconnect (RS256 public-key verify of
+  # JWKs) and webauthn-rs-core / webauthn-attestation-ca via crypto-glue (RS256
+  # public-key verify of passkey assertions/attestations). Public-key verification is
+  # not the vulnerable operation.
+  # Evidence + VEX: security/EXCEPTIONS.md, security/vex/siwx-oidc.openvex.json
+  # Decided: Tim Bansemer, 2026-09-29.
+  # Review trigger (first of): an rsa release that fixes Marvin (0.10 line), siwx-oidc
+  # starting to hold RSA private keys (e.g. an RS256 signing option), or 2027-03-29.
+  "RUSTSEC-2023-0071",
+]

@@ -1,0 +1,40 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://github.com/inblockio/siwx-oidc/blob/main/security/vex/siwx-oidc.openvex.json",
+  "author": "inblock.io",
+  "role": "Document Creator",
+  "timestamp": "2026-09-29T01:59:47Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {
+        "@id": "https://rustsec.org/advisories/RUSTSEC-2023-0071",
+        "name": "RUSTSEC-2023-0071",
+        "description": "Marvin Attack: potential key recovery through timing side channels in RSA private-key operations of the rsa crate",
+        "aliases": [
+          "CVE-2023-49092",
+          "GHSA-c38w-74pg-36hr",
+          "GHSA-4grx-2x9w-596c"
+        ]
+      },
+      "timestamp": "2026-09-29T01:59:47Z",
+      "products": [
+        {
+          "@id": "pkg:github/inblockio/siwx-oidc",
+          "subcomponents": [
+            { "@id": "pkg:cargo/rsa@0.9.10" }
+          ]
+        },
+        {
+          "@id": "pkg:oci/siwx-oidc?repository_url=ghcr.io/inblockio/siwx-oidc",
+          "subcomponents": [
+            { "@id": "pkg:cargo/rsa@0.9.10" }
+          ]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "The Marvin timing side channel affects RSA private-key operations (decryption and signing). siwx-oidc signs ID tokens, userinfo responses and DID assertions exclusively with ES256 (ECDSA P-256): its signing key type is p256::ecdsa::SigningKey, loaded from a PKCS#8 P-256 PEM or generated at startup, and retired keys are accepted only as P-256 public keys (a PEM containing any PRIVATE KEY is rejected). siwx-oidc never holds, loads or generates RSA private key material, and neither its own code nor aqua-auth references the rsa crate. rsa 0.9.10 is linked only through openidconnect 4.0.1 (RS256 public-key JWK verification) and webauthn-rs-core / webauthn-attestation-ca 0.6.1-dev via crypto-glue 0.1.16 (RS256 public-key verification of passkey assertions and attestation certificates). The deployed discovery documents (dev.siwx.inblock.io, siwx-oidc.inblock.io) advertise only ES256 for id_token and userinfo signing, no JWE algorithms, and their JWKS contain only EC P-256 keys. Verified 2026-09-29."
+    }
+  ]
+}
