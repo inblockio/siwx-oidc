@@ -57,7 +57,24 @@ COPY about.toml about.hbs ./
 COPY scripts/third-party-notices.sh ./scripts/
 RUN ./scripts/third-party-notices.sh THIRD-PARTY-LICENSES-rust.txt
 
+# The license texts of the Alpine packages in the runtime base below: the
+# canonical texts from SPDX license-list-data at a pinned tag, each checked
+# against its SHA-256 on download. Which licenses are needed is not decided
+# here: the final stage fails the build when an installed package declares a
+# license with no text in this set, so an Alpine bump that brings a new license
+# stops until its text is added. Docker gives a remote ADD mode 0600, hence --chmod.
+FROM scratch AS alpine_licenses
+ARG SPDX_TEXT=https://raw.githubusercontent.com/spdx/license-list-data/v3.29.0/text
+ADD --chmod=0644 --checksum=sha256:074e6e32c86a4c0ef8b3ed25b721ca23aca83df277cd88106ef7177c354615ff ${SPDX_TEXT}/Apache-2.0.txt /alpine/Apache-2.0.txt
+ADD --chmod=0644 --checksum=sha256:f32fb3b417a194167cfad068223fc975ba96c5960513a10f66a3c28720aec1df ${SPDX_TEXT}/BSD-2-Clause.txt /alpine/BSD-2-Clause.txt
+ADD --chmod=0644 --checksum=sha256:aaf135472f81c5b4a0dca9367e5bb5e9750032b5bebe5442b36e4c0a47430df3 ${SPDX_TEXT}/GPL-2.0-only.txt /alpine/GPL-2.0-only.txt
+ADD --chmod=0644 --checksum=sha256:aaf135472f81c5b4a0dca9367e5bb5e9750032b5bebe5442b36e4c0a47430df3 ${SPDX_TEXT}/GPL-2.0-or-later.txt /alpine/GPL-2.0-or-later.txt
+ADD --chmod=0644 --checksum=sha256:b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5 ${SPDX_TEXT}/MIT.txt /alpine/MIT.txt
+ADD --chmod=0644 --checksum=sha256:66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172 ${SPDX_TEXT}/MPL-2.0.txt /alpine/MPL-2.0.txt
+ADD --chmod=0644 --checksum=sha256:bfb1112d49db5b1daecdfef24bd7e2f3ea0bafb33aa67aa0ab51e2bf8407c03d ${SPDX_TEXT}/Zlib.txt /alpine/Zlib.txt
 
+# NOTICE names this Alpine release and where its source is; bump them together
+# (the license check at the end of this stage fails when they disagree).
 FROM docker.io/library/alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 # A fixed unprivileged UID/GID, so file ownership on mounted volumes and
 # `runAsUser` policies can name it. Nothing is written at runtime (state lives
@@ -83,6 +100,27 @@ COPY --chmod=0644 LICENSE NOTICE /usr/share/licenses/siwx-oidc/
 # and the bundled npm packages require in binary distributions (see NOTICE).
 COPY --from=builder --chmod=0644 /siwx-oidc/THIRD-PARTY-LICENSES-rust.txt /usr/share/licenses/siwx-oidc/
 COPY --from=node_builder --chmod=0644 /siwx-oidc/static/build/third-party-licenses.txt /usr/share/licenses/siwx-oidc/THIRD-PARTY-LICENSES-js.txt
+# The license texts of this base image's packages (stage alpine_licenses),
+# already 0644 from their ADD.
+COPY --from=alpine_licenses /alpine/ /usr/share/licenses/alpine/
+# Keeps what ships in step with what is installed. Fails the build when a
+# package's declared license (its L: line in the apk database, an SPDX
+# expression) has no text in /usr/share/licenses/alpine/, or when NOTICE does
+# not name this Alpine release and its source. Keep it after any `apk add`.
+RUN missing=$(awk '/^L:/ { sub(/^L:/, ""); gsub(/[()]/, " "); \
+            for (i = 1; i <= NF; i++) if ($i != "AND" && $i != "OR" && $i != "WITH") print $i }' \
+            /lib/apk/db/installed | sort -u | while read -r id; do \
+            [ -f "/usr/share/licenses/alpine/$id.txt" ] || echo "$id"; done); \
+    if [ -n "$missing" ]; then \
+        echo "No license text in /usr/share/licenses/alpine/ for:" $missing \
+             "- add it to the alpine_licenses stage." >&2; \
+        exit 1; \
+    fi; \
+    rel=$(cat /etc/alpine-release); \
+    for s in "Alpine Linux $rel" "aports/-/tree/v$rel" "distfiles/v${rel%.*}/"; do \
+        grep -qF "$s" /usr/share/licenses/siwx-oidc/NOTICE \
+            || { echo "NOTICE does not name '$s': update it for this base image." >&2; exit 1; }; \
+    done
 # No config file ships in the image: every setting has a default or comes from
 # SIWXOIDC_* env (see config::figment). This one only makes the listener
 # reachable from outside the container. The new prefix outranks the legacy
