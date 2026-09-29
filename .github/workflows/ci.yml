@@ -64,10 +64,10 @@ jobs:
       - name: Fmt
         run: cargo fmt --all -- --check
 
-      # The unit tests of both crates, siwx-oidc-auth's doc test, and the 13
-      # tests in tests/*.rs that are not #[ignore]d. The other 65 need a live
-      # siwx-oidc HTTP listener (Redis alone is not enough); the promotable
-      # subset runs in the `rust-e2e-mock` job below.
+      # The unit tests of both crates, siwx-oidc-auth's doc test, and the
+      # tests in tests/*.rs that are not #[ignore]d (AGENTS.md lists them). The
+      # #[ignore]d ones need a live siwx-oidc HTTP listener (Redis alone is not
+      # enough); the promotable subset runs in the `rust-e2e-mock` job below.
       #
       # SIWX_TEST_REQUIRE_REDIS=1 makes an unreachable Redis FAIL a
       # Redis-backed test instead of skipping it, and an unset

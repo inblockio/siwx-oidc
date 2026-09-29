@@ -91,12 +91,12 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 13 tests in six files:
-  `openapi_covers_every_route` (2) and `localpart_vectors` (1), which need nothing;
-  `account_linking_dual_write` (6), which needs Redis on localhost; `credential_migration_live`
-  (2), which needs its own disposable, empty Redis named by `MIGRATION_TEST_REDIS_URL`; and the
-  pure check `an_absent_strict_skips_variable_means_strict` in `e2e_account_lifecycle_live` and
-  in `e2e_did_field_live` (1 each).
+  `cargo test --workspace` runs the unit tests of both crates plus 14 tests in seven files:
+  `openapi_covers_every_route` (2), `localpart_vectors` (1) and `graceful_shutdown` (1), which
+  need nothing; `account_linking_dual_write` (6), which needs Redis on localhost;
+  `credential_migration_live` (2), which needs its own disposable, empty Redis named by
+  `MIGRATION_TEST_REDIS_URL`; and the pure check `an_absent_strict_skips_variable_means_strict`
+  in `e2e_account_lifecycle_live` and in `e2e_did_field_live` (1 each).
 - **Redis-backed tests** get their Redis from `siwx_oidc::test_support` (`src/test_support.rs`):
   `SIWX_TEST_REDIS_URL`, default `redis://localhost`. When it is unreachable each test prints
   one `SKIP <test>: …` line to stderr and passes; with `SIWX_TEST_REQUIRE_REDIS=1` it fails
