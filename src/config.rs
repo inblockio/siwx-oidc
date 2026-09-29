@@ -214,6 +214,9 @@ impl Default for Config {
 }
 
 #[cfg(test)]
+// `figment::Jail::expect_with` fixes the closure's return type to
+// `figment::Result<()>`; its error type is figment's, not ours to shrink.
+#[allow(clippy::result_large_err)]
 mod tests {
     //! The naming contract for configuration sources. Each test runs in a
     //! `figment::Jail`: a fresh temporary working directory (so no real
