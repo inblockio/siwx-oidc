@@ -80,6 +80,8 @@ pub const CLIENT_PATH: &str = "/client";
 pub const USERINFO_PATH: &str = "/userinfo";
 pub const SIGNIN_PATH: &str = "/sign_in";
 pub const SIWX_COOKIE_KEY: &str = "siwx";
+/// RFC 8628 grant type of the device-code grant (`POST /token`).
+pub const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 pub const TOU_PATH: &str = "/legal/terms-of-use.html";
 pub const PP_PATH: &str = "/legal/privacy-policy.html";
 
@@ -595,20 +597,37 @@ pub fn metadata(base_url: Url) -> Result<CoreProviderMetadata, CustomError> {
     Ok(pm)
 }
 
+/// Whether this deployment runs in delegated-auth mode: a MAS shared secret is
+/// configured, so Synapse can delegate authentication to this provider.
+///
+/// Token introspection and the RFC 8628 device-code grant work only in this
+/// mode: `introspect::introspect` answers 404 without the secret, and
+/// [`token_device_code`] refuses the grant. Discovery reads the same predicate
+/// ([`provider_metadata_value`]), so it never advertises an endpoint or grant
+/// this deployment would refuse.
+pub fn delegated_auth_enabled(config: &crate::config::Config) -> bool {
+    config.mas_shared_secret.is_some()
+}
+
 /// Build the full OIDC provider-metadata document served at [`METADATA_PATH`],
 /// including the non-standard Matrix/MSC extensions that the `openidconnect`
 /// crate cannot represent natively (introspection, device authorization,
 /// revocation, prompt values, and MSC4191 account management).
 ///
-/// `account_management_uri` is the MSC4191 account-management URL; when `None`
-/// it defaults to `{base_url}/account`. The advertised
+/// It advertises only what this deployment serves. Introspection and the
+/// device-code grant (with its `device_authorization_endpoint`) appear only in
+/// delegated-auth mode ([`delegated_auth_enabled`]); `advertise_resolve` gates
+/// `GET /resolve` the same way.
+///
+/// `config.account_management_uri` is the MSC4191 account-management URL; when
+/// `None` it defaults to `{base_url}/account`. The advertised
 /// `account_management_actions_supported` list is sourced from
 /// [`crate::account::SUPPORTED_ACTIONS`] so discovery and dispatch never drift.
 pub fn provider_metadata_value(
-    base_url: Url,
-    account_management_uri: Option<&Url>,
+    config: &crate::config::Config,
     advertise_resolve: bool,
 ) -> Result<serde_json::Value, CustomError> {
+    let base_url = &config.base_url;
     let pm = metadata(base_url.clone())?;
     let mut value =
         serde_json::to_value(pm).map_err(|e| anyhow!("Failed to serialize metadata: {}", e))?;
@@ -619,22 +638,27 @@ pub fn provider_metadata_value(
     // (404 under MSC3861). Only advertised because /sign_in honors fragment —
     // advertising without honoring would be strictly worse for v42 clients.
     value["response_modes_supported"] = serde_json::json!(["query", "fragment"]);
-    value["introspection_endpoint"] = serde_json::json!(format!("{}/oauth2/introspect", base));
-    value["introspection_endpoint_auth_methods_supported"] =
-        serde_json::json!(["client_secret_post", "bearer"]);
-    value["grant_types_supported"] = serde_json::json!([
-        "authorization_code",
-        "refresh_token",
-        "urn:ietf:params:oauth:grant-type:device_code"
-    ]);
-    value["device_authorization_endpoint"] =
-        serde_json::json!(format!("{}/device_authorization", base));
+    let mut grant_types = vec!["authorization_code", "refresh_token"];
+    // A standalone deployment would answer these with a 404 (introspection) or
+    // `unsupported_grant_type` (the device-code poll), after the user had
+    // already approved the device. Not advertising them is the honest answer.
+    if delegated_auth_enabled(config) {
+        value["introspection_endpoint"] = serde_json::json!(format!("{}/oauth2/introspect", base));
+        value["introspection_endpoint_auth_methods_supported"] =
+            serde_json::json!(["client_secret_post", "bearer"]);
+        grant_types.push(DEVICE_CODE_GRANT_TYPE);
+        value["device_authorization_endpoint"] =
+            serde_json::json!(format!("{}/device_authorization", base));
+    }
+    value["grant_types_supported"] = serde_json::json!(grant_types);
     value["revocation_endpoint"] = serde_json::json!(format!("{}/oauth2/revoke", base));
     value["token_endpoint_auth_methods_supported"] =
         serde_json::json!(["client_secret_post", "none"]);
     value["prompt_values_supported"] = serde_json::json!(["login", "create"]);
     // MSC4191: account management discovery (stable v1.18).
-    let account_uri = account_management_uri
+    let account_uri = config
+        .account_management_uri
+        .as_ref()
         .map(|u| u.as_str().to_string())
         .unwrap_or_else(|| format!("{}/account", base));
     value["account_management_uri"] = serde_json::json!(account_uri);
@@ -1017,7 +1041,7 @@ async fn token_device_code(
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
 ) -> Result<CoreTokenResponse, CustomError> {
-    if config.mas_shared_secret.is_none() {
+    if !delegated_auth_enabled(config) {
         return Err(CustomError::BadRequestToken(TokenError {
             error: CoreErrorResponseType::UnsupportedGrantType,
             error_description: "device_code grant requires MSC3861 mode.".to_string(),
@@ -3537,11 +3561,19 @@ mod tests {
         );
     }
 
+    /// A config whose issuer is `https://siwx-oidc.example.com/`; everything
+    /// else keeps its default (standalone mode, no legal URIs).
+    fn discovery_config() -> Config {
+        Config {
+            base_url: Url::parse("https://siwx-oidc.example.com/").unwrap(),
+            ..Config::default()
+        }
+    }
+
     #[test]
     fn provider_metadata_advertises_response_modes() {
         // js-sdk v42 `isValidAuthMetadata` hard-requires both modes.
-        let base = Url::parse("https://siwx-oidc.example.com/").unwrap();
-        let value = provider_metadata_value(base, None, false).unwrap();
+        let value = provider_metadata_value(&discovery_config(), false).unwrap();
         assert_eq!(
             value["response_modes_supported"],
             serde_json::json!(["query", "fragment"])
@@ -3620,8 +3652,7 @@ mod tests {
         // account_management_actions_supported array containing the four real
         // actions plus their session_* aliases. Synapse forwards this document
         // verbatim to /_matrix/client/v1/auth_metadata (verified live).
-        let base = Url::parse("https://siwx-oidc.example.com/").unwrap();
-        let value = provider_metadata_value(base, None, false).unwrap();
+        let value = provider_metadata_value(&discovery_config(), false).unwrap();
 
         assert_eq!(
             value["account_management_uri"], "https://siwx-oidc.example.com/account",
@@ -3653,9 +3684,7 @@ mod tests {
 
     #[test]
     fn provider_metadata_advertises_resolve_only_when_it_can_answer() {
-        let base = Url::parse("https://siwx-oidc.example.com/").unwrap();
-
-        let on = provider_metadata_value(base.clone(), None, true).unwrap();
+        let on = provider_metadata_value(&discovery_config(), true).unwrap();
         assert_eq!(
             on[RESOLVE_ENDPOINT_METADATA_KEY], "https://siwx-oidc.example.com/resolve",
             "the advertised endpoint must be {{base}}/resolve, the route axum serves"
@@ -3665,7 +3694,7 @@ mod tests {
             "the Element Web resolve-did-search patch reads this exact key"
         );
 
-        let off = provider_metadata_value(base, None, false).unwrap();
+        let off = provider_metadata_value(&discovery_config(), false).unwrap();
         assert!(
             off.get(RESOLVE_ENDPOINT_METADATA_KEY).is_none(),
             "a deployment that would answer 503 must not advertise the route"
@@ -3674,12 +3703,74 @@ mod tests {
 
     #[test]
     fn provider_metadata_honours_account_management_uri_override() {
-        let base = Url::parse("https://siwx-oidc.example.com/").unwrap();
-        let override_uri = Url::parse("https://account.example.com/manage").unwrap();
-        let value = provider_metadata_value(base, Some(&override_uri), false).unwrap();
+        let config = Config {
+            account_management_uri: Some(Url::parse("https://account.example.com/manage").unwrap()),
+            ..discovery_config()
+        };
+        let value = provider_metadata_value(&config, false).unwrap();
         assert_eq!(
             value["account_management_uri"],
             "https://account.example.com/manage"
+        );
+    }
+
+    /// Standalone discovery lists only what a standalone deployment serves.
+    /// Introspection answers 404 there and the device-code poll is refused, so
+    /// neither the endpoints nor the grant type may be advertised; revocation
+    /// works in both modes and stays.
+    #[test]
+    fn discovery_advertises_introspection_and_the_device_grant_only_in_delegated_auth_mode() {
+        let standalone = provider_metadata_value(&discovery_config(), false).unwrap();
+        for key in [
+            "introspection_endpoint",
+            "introspection_endpoint_auth_methods_supported",
+            "device_authorization_endpoint",
+        ] {
+            assert!(
+                standalone.get(key).is_none(),
+                "standalone discovery must not advertise {key}: {standalone}"
+            );
+        }
+        assert_eq!(
+            standalone["grant_types_supported"],
+            serde_json::json!(["authorization_code", "refresh_token"])
+        );
+        assert_eq!(
+            standalone["revocation_endpoint"],
+            "https://siwx-oidc.example.com/oauth2/revoke"
+        );
+
+        let delegated = provider_metadata_value(
+            &Config {
+                mas_shared_secret: Some("shared-secret".to_string()),
+                ..discovery_config()
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            delegated["introspection_endpoint"],
+            "https://siwx-oidc.example.com/oauth2/introspect"
+        );
+        assert_eq!(
+            delegated["introspection_endpoint_auth_methods_supported"],
+            serde_json::json!(["client_secret_post", "bearer"])
+        );
+        assert_eq!(
+            delegated["device_authorization_endpoint"],
+            "https://siwx-oidc.example.com/device_authorization"
+        );
+        assert_eq!(
+            delegated["grant_types_supported"],
+            serde_json::json!([
+                "authorization_code",
+                "refresh_token",
+                DEVICE_CODE_GRANT_TYPE
+            ])
+        );
+        assert_eq!(
+            delegated["revocation_endpoint"],
+            "https://siwx-oidc.example.com/oauth2/revoke"
         );
     }
 

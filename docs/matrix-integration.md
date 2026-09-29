@@ -41,10 +41,11 @@ Older text in this repository, and some error messages and code comments, call
 the delegated-auth mode "MSC3861 mode". It means the same thing: the shared
 secret is configured.
 
-Known inconsistency: in standalone mode, discovery still advertises
-`introspection_endpoint`, the device-code grant type and
-`device_authorization_endpoint`, although introspection answers 404 and the
-grant is refused.
+Discovery follows the mode. `introspection_endpoint`,
+`introspection_endpoint_auth_methods_supported`,
+`device_authorization_endpoint` and the device-code grant type in
+`grant_types_supported` appear only in delegated-auth mode; a standalone
+deployment advertises `authorization_code` and `refresh_token` only.
 
 ## How Synapse is wired
 

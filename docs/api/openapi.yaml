@@ -107,6 +107,14 @@ paths:
         `/_matrix/client/v1/auth_metadata`, which is how a client finds a
         homeserver's DID resolver — its own or a federated peer's. The Element
         Web `resolve-did-search` patch reads this exact key.
+
+        The document lists only what this deployment serves.
+        `introspection_endpoint`, `introspection_endpoint_auth_methods_supported`,
+        `device_authorization_endpoint` and the
+        `urn:ietf:params:oauth:grant-type:device_code` grant type are present
+        only when a MAS shared secret is configured (delegated-auth mode);
+        without one, introspection answers 404 and the device-code grant is
+        refused.
       responses:
         "200":
           description: Provider metadata.
@@ -477,6 +485,10 @@ paths:
       tags: [Device grant]
       operationId: deviceAuthorization
       summary: Begin an RFC 8628 device grant
+      description: |
+        Advertised in discovery only in delegated-auth mode (a MAS shared
+        secret is configured), the only mode in which `POST /token` redeems
+        the device code.
       requestBody:
         content:
           application/x-www-form-urlencoded:

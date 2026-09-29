@@ -195,11 +195,7 @@ async fn jwk_set(State(state): State<AppState>) -> Result<Json<CoreJsonWebKeySet
 async fn provider_metadata(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, CustomError> {
-    let value = oidc::provider_metadata_value(
-        state.config.base_url.clone(),
-        state.config.account_management_uri.as_ref(),
-        resolve_endpoint_advertised(&state),
-    )?;
+    let value = oidc::provider_metadata_value(&state.config, resolve_endpoint_advertised(&state))?;
     Ok(value.into())
 }
 
