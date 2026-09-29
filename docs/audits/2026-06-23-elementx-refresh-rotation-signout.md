@@ -154,6 +154,6 @@ grace path does not blanket-accept.
 ## Deployment note
 
 Code-only change. No Redis flush, no Synapse change, no Caddy change. Deploy is the standard
-manual step on `agentic.inblock.io`:
-`cd /home/deploy/matrix/stack && docker compose pull siwx-oidc && docker compose up -d siwx-oidc`.
+manual step on `<prod-host>`:
+`cd <prod-stack-dir> && docker compose pull siwx-oidc && docker compose up -d siwx-oidc`.
 Deploy is deliberately gated on owner approval and is NOT part of this change.

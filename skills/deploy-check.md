@@ -1,18 +1,23 @@
 Pre-deployment checklist for siwx-oidc with Matrix Synapse.
 
-Run through this checklist to verify everything is ready after deploying
-to the production server (`deploy@142.93.168.4`).
+Run through this checklist after deploying siwx-oidc in front of a Synapse
+homeserver (MSC3861 delegated auth). It is written for a Docker Compose
+deployment behind a Caddy reverse proxy, but the checks are HTTP-level and
+apply to any setup.
+
+Set these once for your deployment; every command below uses them:
+
+```bash
+MATRIX=https://matrix.example.org        # homeserver public base URL
+OIDC=https://siwx-oidc.example.org       # siwx-oidc issuer (SIWEOIDC_BASE_URL)
+ELEMENT=https://element.example.org      # Element Web origin (if you serve it)
+```
 
 ## Deploy model
 
-Code on dev machine, push to GitHub, CI builds Docker images to GHCR.
-**Deploys are MANUAL** (verified 2026-06-12): the watchtower container is scoped
-to `matrix` but nothing else carries that scope label, so it updates NOTHING.
-After CI publishes, someone must run on the server:
-`cd /home/deploy/matrix/stack && docker compose pull siwx-oidc && docker compose up -d siwx-oidc`.
-
-**No repos or builds on the server.** Server has only `docker-compose.yml` + `.env`
-at `/home/deploy/matrix/stack/`.
+Code on a dev machine, push to GitHub, CI builds Docker images to GHCR
+(`ghcr.io/inblockio/siwx-oidc`). Publishing an image deploys nothing by itself:
+after CI publishes, pull and recreate the container on your host (step 7).
 
 ## 1. CI status
 
@@ -27,28 +32,29 @@ gh run list -R inblockio/siwx-oidc-matrix-server --limit 3
 
 ## 2. Server container status
 
+On the deployment host, in the compose stack directory:
+
 ```bash
-ssh deploy@142.93.168.4 "cd /home/deploy/matrix/stack && docker compose ps"
+docker compose ps
 ```
 
-All 5 services should be healthy: matrix_synapse, siwx-oidc, redis, element-web, watchtower.
+Every service should be healthy — at minimum Synapse, siwx-oidc and Redis, plus
+Element Web if you serve it.
 
 ## 3. OIDC and Synapse verification
 
 ```bash
-ssh deploy@142.93.168.4 "
-  # OIDC discovery
-  curl -s https://siwx-oidc.inblock.io/.well-known/openid-configuration | python3 -m json.tool
+# OIDC discovery
+curl -s "$OIDC/.well-known/openid-configuration" | python3 -m json.tool
 
-  # Synapse reachable
-  curl -s https://matrix.inblock.io/_matrix/client/versions | python3 -m json.tool
+# Synapse reachable
+curl -s "$MATRIX/_matrix/client/versions" | python3 -m json.tool
 
-  # Login flows (should show m.login.sso only, no password)
-  curl -s https://matrix.inblock.io/_matrix/client/v3/login | python3 -m json.tool
+# Login flows (should show m.login.sso only, no password)
+curl -s "$MATRIX/_matrix/client/v3/login" | python3 -m json.tool
 
-  # MSC4108 QR code login enabled
-  curl -s https://matrix.inblock.io/_matrix/client/versions | python3 -c 'import json,sys; print(\"msc4108:\", json.load(sys.stdin)[\"unstable_features\"].get(\"org.matrix.msc4108\"))'
-"
+# MSC4108 QR code login enabled
+curl -s "$MATRIX/_matrix/client/versions" | python3 -c 'import json,sys; print("msc4108:", json.load(sys.stdin)["unstable_features"].get("org.matrix.msc4108"))'
 ```
 
 ## 4. auth_metadata guard
@@ -67,14 +73,14 @@ when the check fails:
 
 | Synapse | Source of `auth_metadata` |
 |---|---|
-| >= 1.157 (dev-staging 1.159.0) | **Fetched live over HTTP** from `matrix_authentication_service.endpoint`. `api/auth/mas.py::auth_metadata()` is `self._server_metadata.get()` -> `get_json(self._metadata_url)`. There is no `issuer_metadata` config key; grep of the 1.159.0 tree finds zero occurrences. Fix regressions in **siwx-oidc's `/.well-known/openid-configuration`**, then let Synapse's metadata cache expire. |
-| <= 1.156 (prod today 1.154.0) | Forwarded **verbatim** from the `experimental_features.msc3861.issuer_metadata` config blob, when set. Fix regressions in the **homeserver.yaml blob**. |
+| >= 1.157 | **Fetched live over HTTP** from `matrix_authentication_service.endpoint`. `api/auth/mas.py::auth_metadata()` is `self._server_metadata.get()` -> `get_json(self._metadata_url)`. There is no `issuer_metadata` config key; grep of the 1.159.0 tree finds zero occurrences. Fix regressions in **siwx-oidc's `/.well-known/openid-configuration`**, then let Synapse's metadata cache expire. |
+| <= 1.156 | Forwarded **verbatim** from the `experimental_features.msc3861.issuer_metadata` config blob, when set. Fix regressions in the **homeserver.yaml blob**. |
 
 Either way the guard script below asserts the same public contract, so it is valid
-against both deployments.
+against both.
 
 ```bash
-scripts/check-auth-metadata.sh https://matrix.inblock.io https://siwx-oidc.inblock.io/
+scripts/check-auth-metadata.sh "$MATRIX" "$OIDC/"
 ```
 
 Must end with `== PASS ... ==` (exit 0). The 404 WARNING for the legacy SSO
@@ -86,37 +92,41 @@ siwx-oidc's tower_http CorsLayer and Caddy both emit CORS headers. Caddy must
 strip siwx-oidc's headers to avoid dual Access-Control-Allow-Origin (browsers reject it).
 
 ```bash
-ssh deploy@142.93.168.4 "curl -sI https://siwx-oidc.inblock.io/.well-known/openid-configuration \
-  -H 'Origin: https://element.inblock.io' | grep -i access-control-allow-origin"
-# Must show exactly ONE line: Access-Control-Allow-Origin: https://element.inblock.io
+curl -sI "$OIDC/.well-known/openid-configuration" \
+  -H "Origin: $ELEMENT" | grep -i access-control-allow-origin
+# Must show exactly ONE line: Access-Control-Allow-Origin: <your Element origin>
 ```
 
-If two lines appear, update `/home/portal/portal/Caddyfile` to add `header_down
--Access-Control-Allow-Origin` in the siwx-oidc reverse_proxy block. See Caddyfile.local
-`(strip_upstream_cors)` snippet.
+If two lines appear, add `header_down -Access-Control-Allow-Origin` to the
+siwx-oidc `reverse_proxy` block of your Caddyfile. See the `(strip_upstream_cors)`
+snippet in `Caddyfile.local` (siwx-oidc-matrix-server).
 
 ## 6. DNS records
 
-Two domains needed:
-- **matrix.inblock.io** — Synapse homeserver
-- **siwx-oidc.inblock.io** — OIDC provider
-- **element.inblock.io** — Element Web client
+Three hostnames are needed (names are yours to choose):
+- **homeserver** (`$MATRIX`) — Synapse
+- **OIDC provider** (`$OIDC`) — siwx-oidc
+- **Element Web** (`$ELEMENT`) — the web client, if you serve it
 
-All point to `142.93.168.4`. Caddy handles TLS via Let's Encrypt.
+All point at the reverse proxy host. Caddy handles TLS via Let's Encrypt.
 
-## 7. Manual deploy (watchtower is a NO-OP)
+## 7. Roll out the new image
 
-Watchtower runs scoped to `com.centurylinklabs.watchtower.scope=matrix`, but the
-only container carrying that label is watchtower itself — it deploys nothing
-(verified 2026-06-12; see CLAUDE.md "Deployment"). Pull and restart manually:
+After CI publishes, pull and recreate siwx-oidc on the deployment host, in the
+compose stack directory:
 
 ```bash
-ssh deploy@142.93.168.4 "cd /home/deploy/matrix/stack && docker compose pull siwx-oidc && docker compose up -d siwx-oidc"
+docker compose pull siwx-oidc && docker compose up -d siwx-oidc
 ```
+
+If you run an auto-updater such as watchtower, verify it actually watches the
+siwx-oidc container before relying on it: a watchtower started with a scope
+(`com.centurylinklabs.watchtower.scope=…`) only updates containers carrying that
+same scope label, and updates nothing at all when only watchtower itself carries it.
 
 ## 8. Login test
 
-1. Open `https://element.inblock.io` in incognito (clear localStorage)
+1. Open `$ELEMENT` in incognito (clear localStorage)
 2. Should see "Connecting wallet..." splash (siwx-gate.js blocks Element)
 3. MetaMask prompts to sign CAIP-122 message
 4. After signing, redirected back with `?code=`, token exchange completes

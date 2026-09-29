@@ -39,8 +39,11 @@ git push origin main
 gh run list -R inblockio/siwx-oidc --limit 1  # watch CI
 ```
 
-Watchtower on the production server auto-pulls new images every 5 minutes.
-No manual deployment steps needed.
+Publishing to GHCR does not by itself deploy anything: roll the new image out
+on your host (`docker compose pull siwx-oidc && docker compose up -d siwx-oidc`)
+and verify with `/deploy-check`. If you rely on an auto-updater such as
+watchtower, confirm it actually watches the siwx-oidc container (scope/label
+configuration) before trusting it.
 
 ## Common issues
 

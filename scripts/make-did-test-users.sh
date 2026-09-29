@@ -14,14 +14,17 @@
 # second run also exercises the re-assertion path (siwx-oidc rewrites the DID
 # field on every sign-in), which is how a clobbered field self-heals.
 #
+#   export SIWX_SERVER=https://siwx.example.org       # siwx-oidc issuer (required)
+#   export SIWX_HOMESERVER=https://matrix.example.org # homeserver base URL (required)
 #   ./scripts/make-did-test-users.sh                 # alice + bob
 #   ./scripts/make-did-test-users.sh carol dave erin # any names you like
 #
-# Env overrides: SIWX_SERVER, SIWX_HOMESERVER, SIWX_KEYDIR.
+# Point it at a stack you own: it creates real accounts there.
+# Optional overrides: SIWX_KEYDIR, SIWX_REDIRECT_URI.
 set -euo pipefail
 
-SERVER=${SIWX_SERVER:-https://dev.siwx.inblock.io}
-HOMESERVER=${SIWX_HOMESERVER:-https://dev.matrix.inblock.io}
+SERVER=${SIWX_SERVER:?set SIWX_SERVER to the siwx-oidc issuer URL, e.g. https://siwx.example.org}
+HOMESERVER=${SIWX_HOMESERVER:?set SIWX_HOMESERVER to the homeserver base URL, e.g. https://matrix.example.org}
 KEYDIR=${SIWX_KEYDIR:-$HOME/.cache/siwx-did-test-users}
 REDIRECT_URI=${SIWX_REDIRECT_URI:-http://localhost:8999/callback}
 

@@ -6,7 +6,7 @@ exact-case DID as an MSC4133 extended profile field, `org.aqua-protocol.did`, so
 downstream agents stop trying to reconstruct it from the (lowercased, one-way)
 Matrix localpart.
 **Method:** read the installed Synapse 1.159.0 source inside the live dev container
-(`matrix-staging-matrix_synapse-1`, `ssh -p 8022 dev@207.154.209.103`), cross-checked
+(`<dev-synapse-container>` on `<dev-host>`), cross-checked
 against the running config (`/data/homeserver.yaml`) and the live SQLite DB
 (`/data/homeserver.db`, opened read-only), plus three safe, read-only `curl GET`
 probes against `https://dev.matrix.inblock.io`. No POST/PUT was sent to the
