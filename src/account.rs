@@ -220,6 +220,19 @@ pub enum ActionOutcome {
 
 const ACTION_CROSS_SIGNING_RESET: &str = "org.matrix.cross_signing_reset";
 
+/// The two actions this project adds to MSC4191's set. They are not in the
+/// Matrix spec, so they carry this project's namespace, not `org.matrix.`,
+/// which belongs to matrix.org.
+const ACTION_ACCOUNT_ERASE: &str = "io.inblock.account_erase";
+const ACTION_ACCOUNT_REACTIVATE: &str = "io.inblock.account_reactivate";
+
+/// The names those two actions were advertised under until 2026-09. Still
+/// accepted as aliases for one upgrade cycle, so a client or bookmarked link
+/// that learned them keeps working; no longer advertised. Remove after the
+/// next release.
+const LEGACY_ACTION_ACCOUNT_ERASE: &str = "org.matrix.account_erase";
+const LEGACY_ACTION_ACCOUNT_REACTIVATE: &str = "org.matrix.account_reactivate";
+
 /// A normalized MSC4191 account-management action.
 ///
 /// The wire protocol has two generations of action strings: the stable
@@ -241,10 +254,11 @@ pub enum Action {
     /// `org.matrix.account_deactivate`: permanently deactivate the account
     /// (keeps profile/media; reversible via [`Action::Reactivate`]).
     AccountDeactivate,
-    /// `org.matrix.account_erase`: irreversibly erase the account
-    /// (GDPR `erase:true` + Redis identity purge).
+    /// `io.inblock.account_erase` (legacy alias `org.matrix.account_erase`):
+    /// irreversibly erase the account (GDPR `erase:true` + Redis identity purge).
     AccountErase,
-    /// `org.matrix.account_reactivate`: restore an `erase:false`-deactivated account.
+    /// `io.inblock.account_reactivate` (legacy alias
+    /// `org.matrix.account_reactivate`): restore an `erase:false`-deactivated account.
     Reactivate,
 }
 
@@ -262,16 +276,17 @@ pub const SUPPORTED_ACTIONS: &[&str] = &[
     "org.matrix.device_delete",
     ACTION_CROSS_SIGNING_RESET,
     "org.matrix.account_deactivate",
-    "org.matrix.account_erase",
-    "org.matrix.account_reactivate",
+    ACTION_ACCOUNT_ERASE,
+    ACTION_ACCOUNT_REACTIVATE,
     // session_* aliases (older naming, accepted for compatibility):
     "org.matrix.sessions_list",
     "org.matrix.session_view",
     "org.matrix.session_end",
 ];
 
-/// Map an action string (stable `device_*` or legacy `session_*`) to its
-/// canonical [`Action`]. Returns `None` for unknown/unsupported actions.
+/// Map an action string (stable `device_*` or legacy `session_*`, and the
+/// legacy `org.matrix.` names of erase and reactivate) to its canonical
+/// [`Action`]. Returns `None` for unknown/unsupported actions.
 pub fn canonical_action(action: &str) -> Option<Action> {
     match action {
         "org.matrix.profile" => Some(Action::Profile),
@@ -280,8 +295,8 @@ pub fn canonical_action(action: &str) -> Option<Action> {
         "org.matrix.device_delete" | "org.matrix.session_end" => Some(Action::DeviceDelete),
         ACTION_CROSS_SIGNING_RESET => Some(Action::CrossSigningReset),
         "org.matrix.account_deactivate" => Some(Action::AccountDeactivate),
-        "org.matrix.account_erase" => Some(Action::AccountErase),
-        "org.matrix.account_reactivate" => Some(Action::Reactivate),
+        ACTION_ACCOUNT_ERASE | LEGACY_ACTION_ACCOUNT_ERASE => Some(Action::AccountErase),
+        ACTION_ACCOUNT_REACTIVATE | LEGACY_ACTION_ACCOUNT_REACTIVATE => Some(Action::Reactivate),
         _ => None,
     }
 }
@@ -1099,6 +1114,12 @@ fn danger_gate_authed_html(
     )
 }
 
+/// The deactivate confirmation, shared by both page states. It does not say
+/// "cannot be undone": an `erase: false` deactivation can be reversed (by a
+/// server admin), unlike an erasure, whose warning keeps that phrase.
+const DEACTIVATE_WARNING: &str = "This permanently deactivates your Matrix account and signs \
+     you out of every session. You cannot undo this yourself.";
+
 /// The account-home menu of links (shown for the empty/landing action).
 fn menu_html(base: &str) -> String {
     format!(
@@ -1106,10 +1127,12 @@ fn menu_html(base: &str) -> String {
           <a class="btn btn-secondary" href="{base}/account?action=org.matrix.profile">Your account</a>
           <a class="btn btn-secondary" href="{base}/account?action=org.matrix.devices_list">Your sessions</a>
           <a class="btn btn-danger" href="{base}/account?action=org.matrix.account_deactivate">Deactivate account</a>
-          <a class="btn btn-danger" href="{base}/account?action=org.matrix.account_erase">Erase account</a>
-          <a class="btn btn-secondary" href="{base}/account?action=org.matrix.account_reactivate">Reactivate account</a>
+          <a class="btn btn-danger" href="{base}/account?action={erase}">Erase account</a>
+          <a class="btn btn-secondary" href="{base}/account?action={reactivate}">Reactivate account</a>
         </div>"##,
-        base = base
+        base = base,
+        erase = ACTION_ACCOUNT_ERASE,
+        reactivate = ACTION_ACCOUNT_REACTIVATE,
     )
 }
 
@@ -1136,7 +1159,7 @@ fn auth_section_html(
         return match action_opt {
             Some(Action::AccountDeactivate) => danger_gate_html(
                 "confirm-deactivate",
-                "This permanently deactivates your Matrix account and signs you out of every session. This cannot be undone.",
+                DEACTIVATE_WARNING,
                 "I understand this is permanent",
             ),
             Some(Action::AccountErase) => danger_gate_html(
@@ -1152,7 +1175,7 @@ fn auth_section_html(
     match action_opt {
         Some(Action::AccountDeactivate) => danger_gate_authed_html(
             "confirm-deactivate",
-            "This permanently deactivates your Matrix account and signs you out of every session. This cannot be undone.",
+            DEACTIVATE_WARNING,
             "I understand this is permanent",
             "Deactivate my account",
         ),
@@ -2013,7 +2036,8 @@ document.addEventListener('click', (ev) => {
     'org.matrix.profile',
     'org.matrix.devices_list', 'org.matrix.sessions_list',
     'org.matrix.device_view', 'org.matrix.session_view',
-    'org.matrix.account_reactivate',
+    // The org.matrix. name is the legacy alias, accepted for one upgrade cycle.
+    'io.inblock.account_reactivate', 'org.matrix.account_reactivate',
     'org.matrix.cross_signing_reset'
   ];
   if (AUTO_RUN.indexOf(ACTION) !== -1) accountAction(ACTION, DEVICE_ID);
@@ -2108,8 +2132,8 @@ mod tests {
             "deactivate gate must warn it is permanent"
         );
         assert!(
-            html.contains("cannot be undone"),
-            "deactivate gate must warn it cannot be undone"
+            html.contains("You cannot undo this yourself."),
+            "deactivate gate must warn the user cannot undo it"
         );
         assert!(
             html.contains(r#"id="confirm-deactivate""#),
@@ -2129,6 +2153,42 @@ mod tests {
         );
     }
 
+    /// Deactivation (`erase: false`) can be reversed by a server admin, so its
+    /// warning must not call it irreversible; erasure cannot, so its warning
+    /// keeps "cannot be undone". Both page states: before re-authentication
+    /// and with a live account session.
+    #[test]
+    fn only_erasure_is_described_as_impossible_to_undo() {
+        for authed in [false, true] {
+            let deactivate = auth_section_html(
+                Some(Action::AccountDeactivate),
+                false,
+                "https://siwx.example.com",
+                authed,
+            );
+            assert!(
+                deactivate.contains("You cannot undo this yourself."),
+                "authed={authed}: {deactivate}"
+            );
+            assert!(
+                !deactivate.contains("cannot be undone"),
+                "authed={authed}: a deactivation can be reversed by an admin, so it must \
+                 not be called irreversible: {deactivate}"
+            );
+
+            let erase = auth_section_html(
+                Some(Action::AccountErase),
+                false,
+                "https://siwx.example.com",
+                authed,
+            );
+            assert!(
+                erase.contains("This cannot be undone."),
+                "authed={authed}: erasure is irreversible and must say so: {erase}"
+            );
+        }
+    }
+
     #[test]
     fn account_page_erase_shows_stronger_confirmation() {
         // AC3/AC5: erasure is irreversible and must gate the auth buttons behind
@@ -2137,7 +2197,7 @@ mod tests {
         // deleted, behind a #confirm-erase checkbox.
         let html = account_page(
             AccountPageQuery {
-                action: Some("org.matrix.account_erase".to_string()),
+                action: Some("io.inblock.account_erase".to_string()),
                 device_id: None,
                 id_token_hint: None,
             },
@@ -2183,42 +2243,52 @@ mod tests {
         )
         .0;
         assert!(
-            html.contains("action=org.matrix.account_erase"),
+            html.contains("action=io.inblock.account_erase"),
             "home menu must link to account_erase"
         );
         // It must be the danger-styled entry (stronger than deactivate's link).
         assert!(
-            html.contains(r#"class="btn btn-danger" href="https://siwx.example.com/account?action=org.matrix.account_erase""#),
+            html.contains(r#"class="btn btn-danger" href="https://siwx.example.com/account?action=io.inblock.account_erase""#),
             "erase menu entry must be danger-styled"
+        );
+        assert!(
+            html.contains("action=io.inblock.account_reactivate"),
+            "home menu must link to account_reactivate under its new name"
         );
     }
 
     #[test]
     fn account_page_reactivate_is_benign_no_scary_gate() {
         // Reactivation is benign: it keeps the plain auth buttons (no confirm
-        // gate, buttons NOT disabled) and renders its own title.
-        let html = account_page(
-            AccountPageQuery {
-                action: Some("org.matrix.account_reactivate".to_string()),
-                device_id: None,
-                id_token_hint: None,
-            },
-            "https://siwx.example.com",
-        )
-        .0;
-        assert!(
-            html.contains("Reactivate account"),
-            "reactivate page must have its own title"
-        );
-        assert!(
-            html.contains(r#"onclick="authWallet()""#)
-                && !html.contains(r#"onclick="authWallet()" disabled>"#),
-            "reactivate must keep the (enabled) auth buttons, no confirm gate"
-        );
-        assert!(
-            !html.contains(r#"id="confirm-erase""#),
-            "reactivate must not show the erase confirm gate"
-        );
+        // gate, buttons NOT disabled) and renders its own title. The legacy
+        // name renders the same page for as long as it is an alias.
+        for action in [
+            "io.inblock.account_reactivate",
+            "org.matrix.account_reactivate",
+        ] {
+            let html = account_page(
+                AccountPageQuery {
+                    action: Some(action.to_string()),
+                    device_id: None,
+                    id_token_hint: None,
+                },
+                "https://siwx.example.com",
+            )
+            .0;
+            assert!(
+                html.contains("Reactivate account"),
+                "{action}: reactivate page must have its own title"
+            );
+            assert!(
+                html.contains(r#"onclick="authWallet()""#)
+                    && !html.contains(r#"onclick="authWallet()" disabled>"#),
+                "{action}: reactivate must keep the (enabled) auth buttons, no confirm gate"
+            );
+            assert!(
+                !html.contains(r#"id="confirm-erase""#),
+                "{action}: reactivate must not show the erase confirm gate"
+            );
+        }
     }
 
     #[test]
@@ -2226,7 +2296,7 @@ mod tests {
         // The page JS must render the new outcomes and wire #confirm-erase.
         let html = account_page(
             AccountPageQuery {
-                action: Some("org.matrix.account_erase".to_string()),
+                action: Some("io.inblock.account_erase".to_string()),
                 device_id: None,
                 id_token_hint: None,
             },
@@ -2585,12 +2655,74 @@ mod tests {
     #[test]
     fn canonical_action_accepts_erase_and_reactivate() {
         assert_eq!(
-            canonical_action("org.matrix.account_erase"),
+            canonical_action("io.inblock.account_erase"),
             Some(Action::AccountErase)
         );
         assert_eq!(
-            canonical_action("org.matrix.account_reactivate"),
+            canonical_action("io.inblock.account_reactivate"),
             Some(Action::Reactivate)
+        );
+    }
+
+    /// The pre-rename `org.matrix.` names stay accepted, mapped to the same
+    /// action, and parse like any other name, so a client that learned them
+    /// keeps working for one upgrade cycle.
+    #[test]
+    fn legacy_erase_and_reactivate_names_are_accepted_as_aliases() {
+        assert_eq!(
+            canonical_action("org.matrix.account_erase"),
+            canonical_action("io.inblock.account_erase")
+        );
+        assert_eq!(
+            canonical_action("org.matrix.account_reactivate"),
+            canonical_action("io.inblock.account_reactivate")
+        );
+        assert_eq!(
+            parse_action("org.matrix.account_erase").unwrap(),
+            Action::AccountErase
+        );
+        assert_eq!(
+            parse_action("org.matrix.account_reactivate").unwrap(),
+            Action::Reactivate
+        );
+    }
+
+    /// With a live account session, reactivation runs on page load. The page
+    /// JS keys that on the raw action string, so it must list the new name and,
+    /// while it is accepted, the legacy alias.
+    #[test]
+    fn the_page_auto_runs_reactivation_under_both_names() {
+        let html = account_page_inner(
+            AccountPageQuery {
+                action: Some("io.inblock.account_reactivate".to_string()),
+                device_id: None,
+                id_token_hint: None,
+            },
+            "https://siwx.example.com",
+            Some("csrf"),
+        )
+        .0;
+        assert!(
+            html.contains("'io.inblock.account_reactivate', 'org.matrix.account_reactivate'"),
+            "AUTO_RUN must list both reactivate names"
+        );
+    }
+
+    /// The two actions outside the Matrix spec are advertised only under this
+    /// project's namespace; `org.matrix.` belongs to matrix.org.
+    #[test]
+    fn non_spec_actions_are_advertised_only_under_the_io_inblock_namespace() {
+        for legacy in ["org.matrix.account_erase", "org.matrix.account_reactivate"] {
+            assert!(
+                !SUPPORTED_ACTIONS.contains(&legacy),
+                "{legacy} is an alias only and must not be advertised"
+            );
+        }
+        let menu = menu_html("https://siwx.example.com");
+        assert!(
+            !menu.contains("org.matrix.account_erase")
+                && !menu.contains("org.matrix.account_reactivate"),
+            "the menu must link the new names: {menu}"
         );
     }
 
@@ -2599,11 +2731,11 @@ mod tests {
         // H6/AC5: both new lifecycle actions must be advertised (and so flow into
         // OIDC discovery), and every advertised action must be dispatchable.
         assert!(
-            SUPPORTED_ACTIONS.contains(&"org.matrix.account_erase"),
+            SUPPORTED_ACTIONS.contains(&"io.inblock.account_erase"),
             "SUPPORTED_ACTIONS must advertise account_erase"
         );
         assert!(
-            SUPPORTED_ACTIONS.contains(&"org.matrix.account_reactivate"),
+            SUPPORTED_ACTIONS.contains(&"io.inblock.account_reactivate"),
             "SUPPORTED_ACTIONS must advertise account_reactivate"
         );
         for action in SUPPORTED_ACTIONS {

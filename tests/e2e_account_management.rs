@@ -317,11 +317,11 @@ async fn wallet_erase_runs_erasure_and_clears_session() {
     mock_seed_device(&c, &w.mxid, "SIWX_dev_erase").await;
 
     let (message, signature) =
-        sign_account_message(&c, &w, &base, "org.matrix.account_erase").await;
+        sign_account_message(&c, &w, &base, "io.inblock.account_erase").await;
     let resp = c
         .post(format!("{base}/account/wallet"))
         .json(&json!({
-            "action": "org.matrix.account_erase",
+            "action": "io.inblock.account_erase",
             "did": w.did, "message": message, "signature": signature, "device_id": null
         }))
         .send()

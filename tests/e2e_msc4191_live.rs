@@ -894,9 +894,13 @@ async fn msc4191_account_menu_and_deactivate_page_live() {
         .text()
         .await
         .unwrap();
+    // The page script also carries the erase outcome text ("This cannot be
+    // undone."), so the absence of that phrase from the deactivate warning is
+    // pinned on the warning alone, by
+    // `account::tests::only_erasure_is_described_as_impossible_to_undo`.
     assert!(
-        gate.contains("permanently") && gate.contains("cannot be undone"),
-        "deactivate page must warn it is permanent and cannot be undone"
+        gate.contains("permanently") && gate.contains("You cannot undo this yourself."),
+        "deactivate page must warn it is permanent and that the user cannot undo it"
     );
     assert!(
         gate.contains(r#"id="confirm-deactivate""#),
