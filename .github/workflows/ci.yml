@@ -1,7 +1,8 @@
 name: ci
 
-# Pushes to main, and every pull request, fork PRs included. Branch pushes
-# without a PR do not run, so a PR branch is not built twice.
+# Pushes to the two branches docker.yml publishes (main, fork-stable), and
+# every pull request, fork PRs included. Other branch pushes without a PR do
+# not run, so a PR branch is not built twice.
 #
 # A `pull_request` run gets a read-only token and, from a fork, no secrets.
 # Nothing in this workflow reads a secret (SIWXOIDC_MAS_SHARED_SECRET below is
@@ -13,7 +14,7 @@ name: ci
 # the SHA was verified against. Bump both together.
 on:
   push:
-    branches: [main]
+    branches: [main, fork-stable]
   pull_request:
 
 permissions:
