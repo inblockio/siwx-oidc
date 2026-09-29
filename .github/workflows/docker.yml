@@ -14,6 +14,14 @@ on:
     types: [published]
   workflow_dispatch:
 
+# No `pull_request` trigger, on purpose: every run pushes to GHCR
+# (`packages: write`) and the deploy job reads secrets, and a fork PR gets
+# neither. ci.yml builds and tests pull requests; it does not build this image.
+#
+# Read-only by default; each job grants only what it uses.
+permissions:
+  contents: read
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
@@ -90,6 +98,8 @@ jobs:
     if: ${{ github.repository == 'inblockio/siwx-oidc' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch') }}
     # Pinned so the OS changes on purpose: `ubuntu-latest` becomes 26.04 from 2026-10-19.
     runs-on: ubuntu-24.04
+    # No token scope at all: this job runs no checkout and calls no GitHub API.
+    permissions: {}
     # The target values are secrets so that Actions masks them in the public
     # logs; a repository variable bound to a step is printed in that step's log
     # header. They are still bound only to the steps that need them (which run
