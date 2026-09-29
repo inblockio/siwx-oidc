@@ -408,8 +408,9 @@ structured output.
 This repository is public. Never commit infrastructure access details (host names or IPs of
 maintainer machines, SSH users and ports, stack paths), personal data (real users' MXIDs,
 wallet addresses, IP addresses; use `example.org` and generated test identities), secrets or
-key material, or maintainer session plans and handovers. Maintainer-local material lives in
-the gitignored `internal/` directory and `CLAUDE.local.md`. Report vulnerabilities as described
+key material, or maintainer session plans and handovers. Maintainer operations material lives
+outside this repository, in a private operations repository and the gitignored
+`CLAUDE.local.md` (`/internal/` stays gitignored as a guard). Report vulnerabilities as described
 in [SECURITY.md](SECURITY.md).
 
 ## External repos
