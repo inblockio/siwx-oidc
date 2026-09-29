@@ -78,6 +78,7 @@
 
 use std::time::Duration;
 
+use aqua_auth::{all_did_methods, find_did_method, identifier_from_did};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -223,7 +224,8 @@ pub struct ResolveResponse {
 #[derive(Debug)]
 pub enum ResolveError {
     /// The request is wrong, and the caller can fix it: zero or two selectors, a
-    /// malformed mxid, or an mxid for a different homeserver. `400`.
+    /// `did` no sign-in here could accept (see `check_did`), a malformed mxid,
+    /// or an mxid for a different homeserver. `400`.
     BadRequest(String),
     /// This deployment cannot answer the question at all — no Matrix server name
     /// configured, or no Synapse client (standalone mode). `503`, because
@@ -456,7 +458,10 @@ async fn resolve_uncapped(
     }
 
     let selector = match (did, mxid) {
-        (Some(did), None) => Selector::Did(did),
+        (Some(did), None) => {
+            check_did(did)?;
+            Selector::Did(did)
+        }
         (None, Some(mxid)) => Selector::Mxid(mxid),
         (Some(_), Some(_)) => {
             return Err(ResolveError::BadRequest(
@@ -483,6 +488,102 @@ async fn resolve_uncapped(
         Selector::Did(did) => resolve_did(did, server_name, synapse).await,
         Selector::Mxid(mxid) => resolve_mxid(mxid, server_name, synapse).await,
     }
+}
+
+/// Refuse a `did` that no sign-in on this provider could ever have accepted
+/// (siwx-oidc#23).
+///
+/// # Why a 400 and not `exists: false`
+///
+/// `exists: false` is documented as "a well-formed DID that has never signed
+/// in here", and until #23 it was also what `kenn`, `did:` and
+/// `did:pkh:garbage` got, each with an mxid hashed from the input. A caller
+/// could not tell a real but unused DID from something that is not a DID at
+/// all, and every one of those answers cost two homeserver probes. This runs
+/// before the deployment check and before any probe, like `split_mxid` does
+/// for the other direction.
+///
+/// # The rule: the sign-in path's own parsers, minus the signature
+///
+/// Every sign-in path (`oidc::sign_in` for both the CAIP-122 cookie and the
+/// server-verified passkey DID, `oidc::verify_siwx_cookie`,
+/// `device_auth`, `account`) first resolves the DID through
+/// `aqua_auth::find_did_method` and refuses it when that is `None`, then (for
+/// CAIP-122) calls `DIDMethod::verify`, which parses the DID before it looks at
+/// a signature. So an account can only exist for a DID that passes those
+/// parsers, and this applies exactly them, reused rather than re-implemented:
+///
+/// 1. `find_did_method`: the method is one aqua-auth registers (`pkh`, `key`,
+///    and `peer` variants 0 and 2 at the pinned tag). Any other method,
+///    `did:web` included, can never have signed in here.
+/// 2. `DIDMethod::method_label`: for `did:key` and `did:peer` this decodes the
+///    base58btc multibase key and requires an Ed25519 or P-256 multicodec
+///    prefix, the same `decode_multibase_key` `verify` runs; for `did:pkh` it
+///    requires a namespace aqua-auth has a cipher suite for.
+/// 3. For `did:pkh` only, `aqua_auth::identifier_from_did`: it dispatches on
+///    the namespace to `address_from_did` (40 hex digits after `0x`),
+///    `pubkey_from_ed25519_did` or `pubkey_from_p256_did`, which are the very
+///    functions the eip155, ed25519 and p256 suites' `verify` start with.
+///    `method_label` does not reach them for `did:pkh`, hence the extra step.
+///
+/// Each step is a NECESSARY condition of the sign-in path, never a stricter
+/// one: rejecting a DID a sign-in accepts is the worse failure (see the length
+/// cap above). It is deliberately not narrowed to this deployment's
+/// `supported_did_methods` / `supported_pkh_namespaces`, because an account
+/// made while a method was enabled outlives the method being disabled.
+///
+/// No separate W3C grammar check is layered on top. For the registered
+/// methods it would add nothing the parsers do not already enforce, and for
+/// `did:peer:2`, whose elements aqua-auth does not all parse, it could reject a
+/// DID a sign-in accepts. It exists here only as the first question, to say
+/// "not a DID" rather than "not a method we sign in" when that is the truth.
+///
+/// # Case
+///
+/// The parsers run on [`canonicalize`]`(did)`, the same string the localpart
+/// is derived from: `did:pkh` is case-folded, so an EIP-55 mixed-case address
+/// and its lowercase twin (one account) are both accepted; `did:key` and
+/// `did:peer` stay byte-for-byte, so a `did:key` lowercased the way a Matrix
+/// localpart forces it (siwx-oidc#17) is refused, as it names a different and
+/// invalid key.
+fn check_did(did: &str) -> Result<(), ResolveError> {
+    let has_did_shape = did
+        .strip_prefix("did:")
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(method, id)| !method.is_empty() && !id.is_empty());
+    if !has_did_shape {
+        return Err(ResolveError::BadRequest(format!(
+            "`{did}` is not a DID: it must look like `did:<method>:<method-specific-id>`, \
+             for example `did:key:z6Mk…` or `did:pkh:eip155:1:0x…`."
+        )));
+    }
+
+    let canonical = canonicalize(did);
+    let Some(method) = find_did_method(&canonical) else {
+        let methods: Vec<String> = all_did_methods()
+            .iter()
+            .map(|m| format!("`did:{}`", m.method_name()))
+            .collect();
+        return Err(ResolveError::BadRequest(format!(
+            "`{did}` is not a DID this provider can sign in (supported methods: {}), so no \
+             account can exist for it.",
+            methods.join(", ")
+        )));
+    };
+
+    let parsed = method.method_label(&canonical).and_then(|_| {
+        if method.method_name() == "pkh" {
+            identifier_from_did(&canonical).map(|_| ())
+        } else {
+            Ok(())
+        }
+    });
+    parsed.map_err(|e| {
+        ResolveError::BadRequest(format!(
+            "`{did}` is not a valid `did:{}` DID ({e}), so no account can exist for it.",
+            method.method_name()
+        ))
+    })
 }
 
 /// Which of the two questions was asked. Exists so the "exactly one" check
@@ -1086,11 +1187,7 @@ mod tests {
     /// re-break what the 2026-09-12 conflation fix repaired.
     #[tokio::test]
     async fn a_long_but_legitimate_did_is_not_rejected_by_the_cap() {
-        let long_peer = format!(
-            "did:peer:2.Ez6LS{}.Vz6Mk{}",
-            "a".repeat(200),
-            "b".repeat(200)
-        );
+        let long_peer = long_peer_did();
         assert!(
             long_peer.len() > 255,
             "vector must exceed the Matrix user-ID limit"
@@ -1112,6 +1209,174 @@ mod tests {
             Some(format!("@{}:{SERVER_NAME}", localpart_for(&long_peer)).as_str()),
             "it must resolve to the MODERN 16-char localpart"
         );
+        handle.abort();
+    }
+
+    /// A `did:peer:2` that runs well past Synapse's 255-byte user-ID limit and
+    /// is still a DID some sign-in here would accept.
+    ///
+    /// The shape is the did:peer spec's own example (an `E` key-agreement key,
+    /// a `V` verification key, both real multibase keys) plus an `S` service
+    /// element whose endpoint is long, which is how a real `did:peer:2` gets
+    /// long. The `V` key is what aqua-auth's `PeerMethod` decodes at login, so
+    /// it has to be a real Ed25519 multikey: a vector padded with filler
+    /// characters there would be a string no sign-in could ever produce, and
+    /// would prove nothing about a legitimate DID.
+    fn long_peer_did() -> String {
+        use base64::Engine as _;
+        let service = serde_json::json!({
+            "t": "dm",
+            "s": format!("https://mediator.example.com/{}", "segment/".repeat(40)),
+            "r": [],
+            "a": ["didcomm/v2"],
+        });
+        format!(
+            "did:peer:2.Ez6LSbysY2xFMRpGMhb7tFTLMpeuPRaqaWM1yECx2AtzE3KCc\
+             .Vz6MkqRYqQiSgvZQdnBytw86Qbs2ZWUkGv22od935YF4s8M7V.S{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(service.to_string())
+        )
+    }
+
+    /// A value that is not a DID any sign-in here could accept is a 400, and
+    /// it is refused before the homeserver is asked anything (siwx-oidc#23).
+    ///
+    /// Until #23 every one of these came back 200 with an mxid hashed from the
+    /// garbage and `exists: false`, which the API documents as "a well-formed
+    /// DID that has never signed in here". The first five are the exact inputs
+    /// the issue reproduced on production. Two of them (`did:pkh:garbage`,
+    /// `did:pkh:eip155:1:0xZZZ`) are VALID under the generic W3C DID grammar,
+    /// which is why a shape check alone cannot be the fix: the method's own
+    /// parser has to run.
+    ///
+    /// The upstream is a black hole under a short deadline, so "before any
+    /// probe" is observable: a single probe would stall and come back as a 504
+    /// instead of the 400 asserted here.
+    #[tokio::test]
+    async fn a_value_that_is_not_a_did_is_rejected_before_any_probe() {
+        let (synapse, handle) = spawn_black_hole().await;
+        let not_dids = [
+            // #23, verbatim
+            "kenn",
+            "did:",
+            "did:pkh:garbage",
+            "did:key:notbase58!!",
+            "did:pkh:eip155:1:0xZZZ",
+            // no method-specific id, no method
+            "did:key:",
+            "did::abc",
+            // a did:pkh namespace no cipher suite handles
+            "did:pkh:solana:4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZ:7S3P4HxJpyyigGzodYwHtCxZyUQe9JiBMHyRWXArAaKv",
+            // one hex digit short of an eip155 address
+            "did:pkh:eip155:1:0x5305548520063b21cd9d19fbecb0b44ee6fde6f",
+            // a did:pkh:ed25519 whose "key" is not 32 bytes of hex
+            "did:pkh:ed25519:0xnothex",
+            // a real secp256k1 did:key (the did:key spec's own example): a
+            // key type no sign-in here verifies
+            "did:key:zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCEJwekUDPQiYBme",
+            // a did:key lowercased the way a Matrix localpart forces it
+            // (siwx-oidc#17): a DIFFERENT, invalid key, not this identity
+            "did:key:z6mkmwzijj2k3ckqvqnmmgvkefmhdse4zxrfvqksxdmgba4v",
+            // a did:peer variant no sign-in accepts
+            "did:peer:1zQmZMygzYqNwU6Uhmewx5Xepf2VLp5S4HLSwwgf2aiKZuwa",
+            // a W3C-valid DID of a method this provider never signs in
+            "did:web:example.com",
+            // the method name is case-sensitive, and upper case is not it
+            "DID:KEY:z6MkmWziJJ2k3ckqVqnmMGVKefMhDSe4ZxrfvqksxDMGBa4v",
+        ];
+
+        for input in not_dids {
+            let err = match resolve_within(
+                &config(Some(SERVER_NAME)),
+                Some(&synapse),
+                query(Some(input), None),
+                std::time::Duration::from_millis(500),
+            )
+            .await
+            {
+                Ok(resp) => panic!("`{input}` must be refused, not resolved to {resp:?}"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err, ResolveError::BadRequest(_)),
+                "`{input}` must be a 400 decided without asking the homeserver, got {err:?}"
+            );
+            let (status, body) = rendered(err).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "`{input}`");
+            assert_eq!(
+                body["error"].as_str(),
+                Some("invalid_request"),
+                "`{input}`: the documented 400 discriminator: {body}"
+            );
+            let message = body["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(&format!("`{input}`")),
+                "`{input}`: the message must quote what it refused, as the mxid one does: \
+                 {message}"
+            );
+        }
+        handle.abort();
+    }
+
+    /// The other half of #23, and the failure that would actually hurt:
+    /// validation must not refuse a DID a sign-in here accepts, in any case
+    /// spelling the lookup already honours.
+    ///
+    /// - `did:pkh` is case-FOLDED (`mxid::canonicalize`): an EIP-55 mixed-case
+    ///   address and its lowercase twin are one account, so both spellings
+    ///   must resolve, and to the same (here grandfathered, legacy) mxid.
+    /// - `did:key` is compared in EXACT case, and its real mixed-case spelling
+    ///   must resolve.
+    /// - `did:peer` variant 0 and a long variant 2 must resolve too: `peer` is
+    ///   registered in aqua-auth and can be enabled for sign-in by config.
+    #[tokio::test]
+    async fn every_did_shape_a_sign_in_accepts_still_resolves() {
+        const PKH_EIP55: &str = "did:pkh:eip155:1:0x5305548520063b21cd9d19fbECB0B44Ee6Fde6F7";
+        let pkh_lower = PKH_EIP55.to_lowercase();
+        let legacy = legacy_localpart(PKH_EIP55);
+        let (synapse, handle) =
+            spawn_mock_synapse_with_did_fields(HashSet::from([legacy.clone()]), HashMap::new())
+                .await;
+
+        for spelling in [PKH_EIP55, pkh_lower.as_str()] {
+            let resp = resolve(
+                &config(Some(SERVER_NAME)),
+                Some(&synapse),
+                query(Some(spelling), None),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("`{spelling}` is a valid did:pkh and must resolve: {e:?}"));
+            assert!(resp.exists, "`{spelling}`: the legacy account exists");
+            assert_eq!(
+                resp.mxid.as_deref(),
+                Some(format!("@{legacy}:{SERVER_NAME}").as_str()),
+                "`{spelling}`: both case spellings are ONE account"
+            );
+        }
+
+        let never_signed_in = [
+            "did:pkh:eip155:1:0x254b0d7b63342fcb8955db82e95c21d72efdb6f7".to_string(),
+            DID.to_string(),
+            OTHER_DID.to_string(),
+            format!("did:pkh:ed25519:0x{}", "ab".repeat(32)),
+            format!("did:pkh:p256:0x02{}", "cd".repeat(32)),
+            "did:peer:0z6MkqRYqQiSgvZQdnBytw86Qbs2ZWUkGv22od935YF4s8M7V".to_string(),
+            long_peer_did(),
+        ];
+        for did in &never_signed_in {
+            let resp = resolve(
+                &config(Some(SERVER_NAME)),
+                Some(&synapse),
+                query(Some(did), None),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("`{did}` is a valid DID and must resolve: {e:?}"));
+            assert!(!resp.exists, "`{did}`: no account in the mock");
+            assert_eq!(
+                resp.did.as_deref(),
+                Some(did.as_str()),
+                "`{did}`: echoed in exact case"
+            );
+        }
         handle.abort();
     }
 

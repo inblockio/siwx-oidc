@@ -440,6 +440,15 @@ homeserver's own (unauthenticated, federated) profile route.
   has no account to sever, so a wrong answer is strictly worse than an honest
   error. A probe failure is a **502** carrying whatever mxid was already resolved,
   never a guessed one.
+- **A `did` no sign-in could accept is a 400, before any probe** (#23,
+  `resolve::check_did`). It reuses the sign-in path's aqua-auth parsers minus the
+  signature: `find_did_method` (unregistered method, e.g. `did:web`, is refused),
+  `DIDMethod::method_label` (did:key / did:peer multikey decode, did:pkh
+  namespace), and for did:pkh `identifier_from_did` (address / key parse). Run on
+  `canonicalize(did)`, so EIP-55 case still folds and did:key stays exact case.
+  Deliberately NOT narrowed to `supported_did_methods`: accounts outlive a method
+  being disabled. Never make it stricter than sign-in; a false reject is the worse
+  failure.
 - **Degrade, never 500.** No `SIWEOIDC_MATRIX_SERVER_NAME` or no Synapse client
   (standalone) is a **503** naming what is missing. `ResolveError` renders itself
   (400/502/503) rather than going through `CustomError`, whose only non-4xx
