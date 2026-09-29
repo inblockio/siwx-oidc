@@ -122,7 +122,11 @@ endpoint, update `e2e/synapse_mock.py` in the same change (drift check in
 
 **A test must be able to fail.** A bound such as `n <= 1` is satisfied by zero, and a test
 that prints "skipping" and returns ok is green forever. Assert the positive case, and make
-skips loud (`E2E_STRICT_SKIPS`).
+skips loud (`E2E_STRICT_SKIPS`). Known gap: several Redis-backed tests still return early
+without Redis (e.g. `forged_user_cookie_yields_usernameless_empty_allow_credentials`, the
+`d1_500_…` tests in `synapse_client.rs`, most of `account_linking_dual_write`), and
+`backfill_is_additive_link_aware_counter_preserving_and_idempotent` runs only when
+`MIGRATION_TEST_REDIS_URL` is set, which no CI job sets.
 
 ## Invariants: do not "simplify" these
 
@@ -318,7 +322,8 @@ doc; read it before changing the code the rule covers.
 - **aqua-auth has no logging** and no knowledge of ceremonies.
 - **Credential store: dual-write, not cut-over.** The legacy `webauthn:credential/*` namespace
   stays authoritative; mirror writes are best-effort; the backfill is additive and idempotent.
-  Pin: `backfill_is_additive_link_aware_counter_preserving_and_idempotent` (live Redis).
+  Pin: `backfill_is_additive_link_aware_counter_preserving_and_idempotent` (runs only with
+  `MIGRATION_TEST_REDIS_URL`; see the known gap under Build and test).
 
 ## Logging conventions
 
