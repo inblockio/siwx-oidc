@@ -1,3 +1,8 @@
+<!--
+  Portions of this file are derived from siwe-oidc (https://github.com/spruceid/siwe-oidc),
+  Copyright Spruce Systems, Inc. and contributors, used under the Apache License 2.0.
+  Modified by inblock.io assets GmbH. See NOTICE.
+-->
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { createConfig, connect, disconnect, getAccount, signMessage, reconnect, http, watchAccount } from '@wagmi/core';

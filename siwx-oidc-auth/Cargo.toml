@@ -2,9 +2,9 @@
 name = "siwx-oidc-auth"
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/inblockio/siwx-oidc/"
-description = "Headless OIDC client for siwx-oidc — sign in with a local DID key from the CLI or CI."
+description = "Headless client for siwx-oidc: agents, bots and CI sign in with their own DID key."
 
 [lib]
 name = "siwx_oidc_auth"
