@@ -24,9 +24,9 @@
 # and is NEVER printed. Run this on the server (or a host that already holds the secret).
 #
 # USAGE (run on the server, where the admin secret lives):
-#   export ISSUER=https://siwx-oidc.inblock.io
-#   export MATRIX=https://matrix.inblock.io
-#   export SERVER_NAME=inblock.io                 # the Matrix server_name (mxid domain)
+#   export ISSUER=https://siwx-oidc.example.org   # required
+#   export MATRIX=https://matrix.example.org      # required
+#   export SERVER_NAME=example.org                # the Matrix server_name (mxid domain)
 #   export ADMIN_TOKEN="$(grep -oP 'shared_secret:\s*\K\S+' /path/to/mas/config)"  # do not echo it
 #   # read-only checks:
 #   ./verify-lifecycle-live.sh
@@ -40,8 +40,8 @@
 set -uo pipefail
 
 # --- config ---------------------------------------------------------------
-ISSUER="${ISSUER:-https://siwx-oidc.inblock.io}"
-MATRIX="${MATRIX:-https://matrix.inblock.io}"
+ISSUER="${ISSUER:?set ISSUER to the siwx-oidc issuer URL, e.g. https://siwx-oidc.example.org}"
+MATRIX="${MATRIX:?set MATRIX to the homeserver base URL, e.g. https://matrix.example.org}"
 SERVER_NAME="${SERVER_NAME:-}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-}"
 TEST_LOCALPART="${TEST_LOCALPART:-}"

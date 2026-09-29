@@ -61,8 +61,8 @@ info:
     url: https://github.com/inblockio/siwx-oidc
 
 servers:
-  - url: https://dev.siwx.inblock.io
-    description: dev-staging
+  - url: https://siwx-oidc.example.org
+    description: a deployment (its SIWEOIDC_BASE_URL)
   - url: http://localhost:8000
     description: local default (SIWEOIDC_ADDRESS / SIWEOIDC_PORT)
 
@@ -331,7 +331,7 @@ paths:
         (the verifier lives in `siwx-oidc-auth`), and it authorizes nothing.
       parameters:
         - { name: did, in: query, required: false, schema: { type: string }, example: "did:key:z6Mkkx9jzu1iAVtjwHU2Vz8SLu3ZxuHZwPdAYReV7PrpWQwU" }
-        - { name: mxid, in: query, required: false, schema: { type: string }, example: "@1vo8g4vofiha69ua:dev.matrix.inblock.io" }
+        - { name: mxid, in: query, required: false, schema: { type: string }, example: "@1vo8g4vofiha69ua:matrix.example.org" }
       responses:
         "200":
           description: |
@@ -344,10 +344,10 @@ paths:
               examples:
                 attested:
                   summary: A DID with an account that publishes it
-                  value: { did: "did:key:z6Mkkx9jzu1iAVtjwHU2Vz8SLu3ZxuHZwPdAYReV7PrpWQwU", mxid: "@1vo8g4vofiha69ua:dev.matrix.inblock.io", exists: true, attested: true }
+                  value: { did: "did:key:z6Mkkx9jzu1iAVtjwHU2Vz8SLu3ZxuHZwPdAYReV7PrpWQwU", mxid: "@1vo8g4vofiha69ua:matrix.example.org", exists: true, attested: true }
                 unknown:
                   summary: A well-formed DID that has never signed in here
-                  value: { did: "did:key:z6MkpFemPtmjvPZ1gFYM6d68tuwxxrcec4H2Ck23FRchU9ue", mxid: "@04gen9jsoj657dc0:dev.matrix.inblock.io", exists: false, attested: false }
+                  value: { did: "did:key:z6MkpFemPtmjvPZ1gFYM6d68tuwxxrcec4H2Ck23FRchU9ue", mxid: "@04gen9jsoj657dc0:matrix.example.org", exists: false, attested: false }
         "400":
           description: Not exactly one selector, or an mxid belonging to another homeserver.
           content: { application/json: { schema: { $ref: "#/components/schemas/ResolveError" } } }
@@ -772,7 +772,7 @@ components:
             standalone deployment with no `SIWEOIDC_MATRIX_SERVER_NAME`, because
             a present key asserts that the thing exists. Namespaced because no
             registered OIDC claim for a Matrix ID exists.
-          example: "@1vo8g4vofiha69ua:dev.matrix.inblock.io"
+          example: "@1vo8g4vofiha69ua:matrix.example.org"
 
     ResolveResponse:
       type: object

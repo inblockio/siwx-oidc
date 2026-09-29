@@ -48,8 +48,8 @@
  * The primary signals are the SW console markers and the image render state.
  *
  * TARGET: ELEMENT_URL / MATRIX_URL / SIWX_URL (defaults: local lab). Against
- * dev-staging: ELEMENT_URL=https://dev.element.inblock.io
- * MATRIX_URL=https://dev.matrix.inblock.io SIWX_URL=https://dev.siwx.inblock.io.
+ * a remote (non-production) deployment: ELEMENT_URL=https://element.example.org
+ * MATRIX_URL=https://matrix.example.org SIWX_URL=https://siwx.example.org.
  * Creates one throwaway did:pkh account per run (fresh random wallet), five
  * private unencrypted rooms of its own (the text room is named
  * "sw-media-auth text") and four tiny PNGs, and logs the account's MXID as

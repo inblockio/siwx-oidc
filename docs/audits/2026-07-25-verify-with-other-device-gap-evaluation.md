@@ -1,5 +1,7 @@
 # "Verify with other device" — integration gap evaluation
 
+> **Unpublished references.** Session plans and handovers cited below by file name (e.g. `2026-07-25-session-onboarding-state-machine-map.md`) are the maintainers' internal working documents and are not part of this repository; the findings here stand on their own evidence.
+
 **Date:** 2026-07-25
 **Branch:** `phase2/session-onboarding-lab`
 **Method:** `/logic-model` (CONTEXT → GOAL → INPUTS → ACTIVITIES/OUTPUTS → BOUNDARY CONDITIONS)
@@ -78,11 +80,11 @@ A deployment can have any subset working. This evaluation keeps them separate th
 
 ### 1.3 Prior art consulted
 
-`CLAUDE.md`; `docs/superpowers/plans/2026-07-25-session-onboarding-state-machine-map.md`
+`CLAUDE.md`; `2026-07-25-session-onboarding-state-machine-map.md`
 (**M5**, lines 365–386, and the Q1–Q5 terminal table);
-`docs/superpowers/plans/2026-07-25-session-durability-no-forced-logins.md` (**R4**, line 102;
+`2026-07-25-session-durability-no-forced-logins.md` (**R4**, line 102;
 **H-D8**, line 137; **AC4**, line 268);
-`docs/superpowers/plans/2026-07-25-session-onboarding-AUDITED-PROPOSAL.md` (EW-D1/D2 spec
+`2026-07-25-session-onboarding-AUDITED-PROPOSAL.md` (EW-D1/D2 spec
 contracts line 107–108; MSC conformance table line 181–185; the P0-class finding at line 456).
 
 ---
@@ -456,7 +458,7 @@ Caddy). A 412 through the edge and a 202 direct confirms H-V4. Do this in the la
 |---|---|---|---|
 | **A1** | After a successful SAS verification the second device's `isSecretStorageReady()` returns true, so the patched `shouldForceVerification()` (`force-first-device-recovery.patch`) does not then demand a recovery key anyway. | **ASSUMED** — the patch's loop calls `accessSecretStorage(…, {forceReset: !hasExisting4S})`; with 4S already present it would prompt for the **existing** key. This is the single most load-bearing unknown for R4. | Two-context Playwright: login A → wizard → login B → verify B from A → assert B reaches `.mx_MatrixChat` with **zero** 4S prompts fired. This is exactly `H-D8` / `AC4`. |
 | **A2** | Element X mobile still uses the 2024 MSC4108 path (not MSC4388) and scans an Element Web QR successfully. | **ASSUMED** — untestable here; no mobile in podman. MSC4388 is structurally unavailable (§4.1). | Manual: current Element X against prod. |
-| **A3** | The repo's `Caddyfile.production` reflects the live prod edge. | **PARTIALLY REFUTED** — the repo file emits `m.authentication: {…, "account": …}` (nested) but live prod returns a **top-level** `"m.authentication.account"` key and no nested `account`. The files diverge. Rendezvous routing is nonetheless **VERIFIED live** (§4.1), so the conclusion is unaffected. | `cat /home/portal/portal/Caddyfile` on the prod host. |
+| **A3** | The repo's `Caddyfile.production` reflects the live prod edge. | **PARTIALLY REFUTED** — the repo file emits `m.authentication: {…, "account": …}` (nested) but live prod returns a **top-level** `"m.authentication.account"` key and no nested `account`. The files diverge. Rendezvous routing is nonetheless **VERIFIED live** (§4.1), so the conclusion is unaffected. | `cat <prod-edge-caddyfile>` on `<prod-host>`. |
 | **A4** | Caddy weakens/alters ETags on compressed rendezvous responses, breaking MSC4108 `If-Match` (H-V4). | **ASSUMED** | §4.7 falsification test. |
 | **A5** | matrix-js-sdk v42 hard-requires `response_modes_supported`. | **REPO-SOURCED** (`ew-zdiag-bump.spec.mjs:9-13`), not independently re-derived — v42 tag sources were unfetchable. The *absence* of the field is **VERIFIED** live. | Read `matrix-js-sdk@42.0.0/src/oidc/validate.ts` from npm. |
 | **A6** | The lab (Element 1.12.20 + `Caddyfile.local`) is representative of prod. | **VERIFIED for the axes that matter** — same Element version (1.12.20 live), same config.json, same `msc4108` advertisement, same `grant_types_supported`. | — |

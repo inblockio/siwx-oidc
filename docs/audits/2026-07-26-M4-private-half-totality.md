@@ -1,14 +1,16 @@
 # M4 private half — closing the totality hole (T-M4)
 
+> **Unpublished references.** Session plans and handovers cited below by file name (e.g. `2026-07-25-session-onboarding-state-machine-map.md`) are the maintainers' internal working documents and are not part of this repository; the findings here stand on their own evidence.
+
 **Date:** 2026-07-26
 **Task:** Finding **T-M4** — `S4_Absent`, `S4_Present`, `S4_Rotated`, `Backup_Vn`, `Backup_Deleted`
 are declared in the map's §M4 with **no transition table, no events, and no terminals**. The machine
 is not total. This document makes it total.
 **Branch / worktree:** `feat/session-durability-marathon` @ **`10c9494`**, `~/wt/siwx-durability`.
 **Companion repo:** `siwx-oidc-matrix-server` `main` @ **`cd17c90`** (vendored Element patches).
-**Authority:** `docs/superpowers/plans/2026-07-25-session-onboarding-state-machine-map.md` §M4/§M4c
+**Authority:** `2026-07-25-session-onboarding-state-machine-map.md` §M4/§M4c
 (notation, completeness criteria) · `docs/audits/2026-07-25-state-machine-coverage-matrix.md`
-§5.7/§6/§10 · `docs/2026-07-26-FINISH-LINE-goal-confirmed-and-remaining-work.md` §1/§4 (task **A2**).
+§5.7/§6/§10 · `2026-07-26-FINISH-LINE-goal-confirmed-and-remaining-work.md` §1/§4 (task **A2**).
 **Mode:** design/documentation only. **No code changed. No test run. No container touched. Nothing
 committed.**
 

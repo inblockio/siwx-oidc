@@ -6,7 +6,7 @@ exact-case DID as an MSC4133 extended profile field, `org.aqua-protocol.did`, so
 downstream agents stop trying to reconstruct it from the (lowercased, one-way)
 Matrix localpart.
 **Method:** read the installed Synapse 1.159.0 source inside the live dev container
-(`matrix-staging-matrix_synapse-1`, `ssh -p 8022 dev@207.154.209.103`), cross-checked
+(`<dev-synapse-container>` on `<dev-host>`), cross-checked
 against the running config (`/data/homeserver.yaml`) and the live SQLite DB
 (`/data/homeserver.db`, opened read-only), plus three safe, read-only `curl GET`
 probes against `https://dev.matrix.inblock.io`. No POST/PUT was sent to the
@@ -314,9 +314,9 @@ Three accounts on dev currently have a `users` row with **no** matching `profile
 row (confirmed via read-only SQLite query on `/data/homeserver.db`):
 ```
 users: 102   profiles: 99   → 3 accounts with no profiles row, all deactivated=1
-  @did-key-zdnaeskrgk1qmczqwg6rvbskbq7bnh3nhra7gdpdbvmtuv87r:dev.matrix.inblock.io
-  @did-pkh-eip155-1-0x83477e7ba0b901dc8a3ae78ee50fe2cb67861b0d:dev.matrix.inblock.io
-  @did-pkh-eip155-1-0xa79bbdade22853874b6df6beb80f05a8a5577761:dev.matrix.inblock.io
+  @did-key-zdnae<redacted>:<dev-server>   (legacy did:key localpart)
+  @did-pkh-eip155-1-0x<redacted>:<dev-server>   (legacy did:pkh localpart)
+  @did-pkh-eip155-1-0x<redacted>:<dev-server>   (legacy did:pkh localpart)
 ```
 These are erased/deactivated accounts, not fresh-provisioning failures — Synapse's
 own erasure path (`ProfileHandler.delete_profile_upon_deactivation` →

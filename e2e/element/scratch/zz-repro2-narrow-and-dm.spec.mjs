@@ -1,6 +1,6 @@
 /**
  * ZZ-REPRO2: three follow-up reproduction probes for the S1/S2 Element Web
- * bug reports (dev.element.inblock.io, source-built 1.12.24), run after the
+ * bug reports (dev-staging Element Web, source-built 1.12.24), run after the
  * first pass (ew-zz-repro-sessions-avatar.spec.mjs) found:
  *   - avatars render fine at the settings/user-menu/timeline surfaces tested
  *     so far (all naturalWidth/Height > 0, no broken <img>s)
@@ -34,9 +34,9 @@
  * go to a SEPARATE file (findings2.txt) to avoid clobbering pass 1's evidence.
  *
  * Run:
- *   ELEMENT_URL=https://dev.element.inblock.io \
- *   MATRIX_URL=https://dev.matrix.inblock.io \
- *   SIWX_URL=https://dev.siwx.inblock.io \
+ *   ELEMENT_URL=https://element.example.org \
+ *   MATRIX_URL=https://matrix.example.org \
+ *   SIWX_URL=https://siwx.example.org \
  *   npx playwright test ew-zz-repro2-narrow-and-dm
  */
 import { test, expect } from "@playwright/test";

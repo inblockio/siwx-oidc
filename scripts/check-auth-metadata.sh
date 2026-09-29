@@ -14,7 +14,7 @@
 # shim) — a total, SILENT login dead-end. This happened in the local Element
 # lab (endpoints-only dict with internal docker URLs, fixed 2026-07-25); prod
 # also sets sso_redirect_options.immediate, so any future regression there is
-# an outage. See docs/2026-07-25-HANDOVER-phase2-session-onboarding.md §14.
+# an outage.
 #
 # Checks (FAILURES — any one makes the script exit non-zero):
 #   a. response_types_supported contains "code"
@@ -34,7 +34,7 @@
 #
 # USAGE:
 #   scripts/check-auth-metadata.sh <matrix-base-url> [expected-issuer]
-#   scripts/check-auth-metadata.sh https://matrix.inblock.io https://siwx-oidc.inblock.io/
+#   scripts/check-auth-metadata.sh https://matrix.example.org https://siwx-oidc.example.org/
 #   scripts/check-auth-metadata.sh http://localhost:28080 http://localhost:28081/
 
 set -uo pipefail

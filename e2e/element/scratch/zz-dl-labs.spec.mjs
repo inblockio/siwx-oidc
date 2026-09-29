@@ -6,9 +6,9 @@
  * event fires for an encrypted attachment.
  *
  * Run against dev-staging (same source-built element as prod):
- *   ELEMENT_URL=https://dev.element.inblock.io \
- *   MATRIX_URL=https://dev.matrix.inblock.io \
- *   SIWX_URL=https://dev.siwx.inblock.io \
+ *   ELEMENT_URL=https://element.example.org \
+ *   MATRIX_URL=https://matrix.example.org \
+ *   SIWX_URL=https://siwx.example.org \
  *   npx playwright test ew-download
  */
 import { test, expect } from "@playwright/test";

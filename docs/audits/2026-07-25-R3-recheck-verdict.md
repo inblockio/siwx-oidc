@@ -1,8 +1,10 @@
 # R3 adversarial re-check — "Redis hiccups for ~2s" — ADOPT-MODIFIED
 
+> **Unpublished references.** Session plans and handovers cited below by file name (e.g. `2026-07-25-session-onboarding-state-machine-map.md`) are the maintainers' internal working documents and are not part of this repository; the findings here stand on their own evidence.
+
 **Date:** 2026-07-25
 **Scope:** requirement **R3** only, from
-`docs/superpowers/plans/2026-07-25-session-durability-no-forced-logins.md` §2
+`2026-07-25-session-durability-no-forced-logins.md` §2
 (hypotheses `H-D2`, `H-D3`; tasks `T1`, `T2`, `T4`).
 **Method:** `/logic-model` — every claim below is a falsifiable if-then link, tagged
 **VERIFIED** (file:line / config path / crate source) or **ASSUMPTION**.
@@ -162,7 +164,7 @@ This is the sharpest single finding for D1. **VERIFIED** on all three legs:
 - Registered: `src/axum_lib.rs:1278-1281` → `post(compat::refresh)`.
 - Prod edge: `../siwx-oidc-matrix-server/deploy.sh:126-128` —
   `handle /_matrix/client/v3/refresh { reverse_proxy siwx-oidc:8081 }`, appended to the
-  external `portal-caddy-1` Caddyfile. Also reachable via the `siwx-oidc.inblock.io`
+  external `<prod-edge-caddy>` Caddyfile. Also reachable via the `siwx-oidc.inblock.io`
   catch-all vhost (`deploy.sh:142-145`).
 - Same split in `Caddyfile.production:47-52`, `e2e/real-stack/Caddyfile:111-117`,
   `Caddyfile.local:82-87`, `Caddyfile.e2e:89-94`.

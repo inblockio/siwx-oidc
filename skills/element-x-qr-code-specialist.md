@@ -152,7 +152,7 @@ on the *create* call, so an unauthenticated new device cannot open the channel
 - Synapse >= 1.106.0 for the rendezvous server itself. On >= 1.157 you additionally
   need the `matrix_authentication_service` block configured, or `msc4108_enabled`
   is a startup `ConfigError` (image is `ghcr.io/element-hq/synapse`)
-- siwx-oidc with RFC 8628 implemented (Phase 3 of PLAN_webauthn.md)
+- siwx-oidc with RFC 8628 implemented (Phase 3 of `docs/design/webauthn-plan.md`)
 - Element Web with "Link new device" feature (production Element Web has this)
 - Element X mobile app (production iOS/Android)
 - Working OIDC delegated auth, already deployed — via `matrix_authentication_service`

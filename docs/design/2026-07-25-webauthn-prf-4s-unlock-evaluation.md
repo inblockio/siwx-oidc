@@ -1,5 +1,7 @@
 # WebAuthn PRF as a Matrix 4S unlock path — evaluation
 
+> **Unpublished references.** Session plans and handovers cited below by file name (e.g. `2026-07-25-session-onboarding-state-machine-map.md`) are the maintainers' internal working documents and are not part of this repository; the findings here stand on their own evidence.
+
 **Written:** 2026-07-25
 **Method:** `/logic-model` (CONTEXT → GOAL → INPUTS → ACTIVITIES/OUTPUTS → BOUNDARY CONDITIONS)
 **Status:** evaluation only. No code was written or modified.
@@ -44,9 +46,8 @@ Scorecard against the finished analysis:
 | Synapse (homeserver) | `matrix.inblock.io` | stores `m.secret_storage.*` ciphertext |
 
 RP ID defaults to the hostname of `SIWEOIDC_BASE_URL` and is overridable by `SIWEOIDC_RP_ID`
-(`src/webauthn.rs:671-707`, `build_webauthn`). Hosts confirmed in
-`docs/2026-06-18-passkey-followup-test-plan-and-handoff.md:169` and
-`docs/2026-05-19-third-party-client-cors-analysis.md:40,57`.
+(`src/webauthn.rs:671-707`, `build_webauthn`). Hosts confirmed against the production
+deployment's configuration (recorded in the maintainers' internal deployment notes).
 
 **So every passkey this deployment has ever issued is bound to RP ID `siwx-oidc.inblock.io` —
 the authentication provider's own origin.** This single fact drives the verdict.
@@ -67,7 +68,7 @@ the authentication provider's own origin.** This single fact drives the verdict.
 |---|---|---|
 | L6 | **Element Web is already built from source at pinned tag `v1.12.20` with a vendored patch**, in CI. The patch edits `MatrixChat.tsx` and calls `accessSecretStorage` / `cli.secretStorage.hasKey()`. | `../siwx-oidc-matrix-server/dockerfiles/Dockerfile.element`, `patches/element-web/force-first-device-recovery.patch`, `docs/element-web-source-build.md` |
 | L7 | Element X mobile authenticates through a **system browser** (Chrome Custom Tabs / `ASWebAuthenticationSession`) pointed at `siwx-oidc.inblock.io`. The native app performs no WebAuthn ceremony and is a stock app-store binary. | `../siwx-oidc-matrix-server/docs/2026-05-23-element-x-mobile-compatibility.md` steps 4-8 |
-| L8 | "Forking Element Web" is an explicit non-goal of the current phase plans. | `docs/superpowers/plans/2026-07-25-session-onboarding-state-machine-map.md:146,479` |
+| L8 | "Forking Element Web" is an explicit non-goal of the current phase plans. | `2026-07-25-session-onboarding-state-machine-map.md:146,479` |
 | L9 | The CDP virtual authenticator used by the e2e lab supports `hasPrf` and `hasHmacSecret`, so PRF *is* testable in the existing harness. | https://chromedevtools.github.io/devtools-protocol/tot/WebAuthn/ ; `e2e/element/ew-passkey.spec.mjs` |
 
 ### The actual user pain this idea was proposed against (verified)
@@ -76,7 +77,7 @@ the authentication provider's own origin.** This single fact drives the verdict.
 > NOT crypto: lands on "Confirm your digital identity" whose ONLY exits are "Use another device"
 > or identity RESET — **no recovery-key entry**. 4S exists server-side and the backup is
 > reachable at gate time. Element-build UX gap, not a siwx failure.
-> — `docs/superpowers/plans/2026-07-25-session-onboarding-AUDITED-PROPOSAL.md:456`
+> — `2026-07-25-session-onboarding-AUDITED-PROPOSAL.md:456`
 
 **This is decisive for prioritisation.** The bottleneck is not that entering the recovery key is
 tedious; it is that Element **does not offer the unlock path at all** at the gate users actually

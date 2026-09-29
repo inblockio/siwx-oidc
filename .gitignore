@@ -4,3 +4,7 @@
 **/dist
 *.png
 *:Zone.Identifier
+
+# maintainer-local material, never published
+/internal/
+/CLAUDE.local.md

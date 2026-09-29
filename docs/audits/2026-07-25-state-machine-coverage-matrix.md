@@ -1,10 +1,12 @@
 # Session & Onboarding — State-Machine Coverage Matrix
 
+> **Unpublished references.** Session plans and handovers cited below by file name (e.g. `2026-07-25-session-onboarding-state-machine-map.md`) are the maintainers' internal working documents and are not part of this repository; the findings here stand on their own evidence.
+
 **Date:** 2026-07-25
 **Method:** `/logic-model` (CONTEXT → GOAL → INPUTS → ACTIVITIES/OUTPUTS → BOUNDARY CONDITIONS)
 **Mode:** Read-only analysis. No source, config, or container was modified. No container was
 started, stopped, or removed. This file is the only artifact written.
-**Authority document:** `docs/superpowers/plans/2026-07-25-session-onboarding-state-machine-map.md`
+**Authority document:** `2026-07-25-session-onboarding-state-machine-map.md`
 (machines M0–M5, undefined states U1–U4, QR terminals Q1–Q5).
 
 > **Labelling contract.** **VERIFIED** = backed by a `file:line` in a tree named below, or a
@@ -514,7 +516,7 @@ in §5 marked "Covered" is guarded by nothing automated.
 | **B7** | The `e2e/browser` Synapse mock faithfully models the real admin/MAS API for the paths it stands in for | **ASSUMED** | Cross-run the same assertions against the Element lab (real Synapse) |
 | **B8** | matrix-js-sdk v42 hard-requires `response_modes_supported` | **REPO-SOURCED** (`2026-07-25-element-jssdk-v42-oauth-compat-finding.md`), reproduced via client-side shims; v42 sources not re-derived here | Read `matrix-js-sdk@42.0.0/src/oauth/discover.ts` from npm |
 | **B9** | `hasDevicesToVerifyAgainst` counts the current device, so "Use another device" can render with no peer | **Source-VERIFIED** (`SetupEncryptionStore.ts:104-119` has no self-exclusion); consequence **INFERRED** | Single-device lab session: reload, click it, observe whether any peer responds. **EW-L1b asserts this button visible on a single-device account — consistent with the inference** |
-| **B10** | Prod is still `sha-db79e75` | **ASSUMED** — carried from the map; not re-probed (no prod access used in this audit) | `grep SIWX_OIDC_TAG /home/deploy/matrix/stack/.env` |
+| **B10** | Prod is still `sha-db79e75` | **ASSUMED** — carried from the map; not re-probed (no prod access used in this audit) | `grep SIWX_OIDC_TAG <prod-stack-dir>/.env` on `<prod-host>` |
 | **B11** | No test clicks the new-user confirm/cancel gate | **VERIFIED by absence** across `e2e/browser` + `e2e/element` | — |
 
 ---

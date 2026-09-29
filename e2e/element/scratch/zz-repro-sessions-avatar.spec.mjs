@@ -1,6 +1,6 @@
 /**
  * ZZ-REPRO: reproduction probe for two reported Element Web UI bugs
- * (dev.element.inblock.io, source-built 1.12.24):
+ * (dev-staging Element Web, source-built 1.12.24):
  *
  *   S1  "Settings -> Sessions" is missing a back button when drilled into
  *       a single session's details.
@@ -20,9 +20,9 @@
  * on whether the bugs exist.
  *
  * Run:
- *   ELEMENT_URL=https://dev.element.inblock.io \
- *   MATRIX_URL=https://dev.matrix.inblock.io \
- *   SIWX_URL=https://dev.siwx.inblock.io \
+ *   ELEMENT_URL=https://element.example.org \
+ *   MATRIX_URL=https://matrix.example.org \
+ *   SIWX_URL=https://siwx.example.org \
  *   npx playwright test ew-zz-repro-sessions-avatar
  */
 import { test, expect } from "@playwright/test";
