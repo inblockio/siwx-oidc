@@ -829,7 +829,7 @@ mod tests {
             obj["did"].as_str().unwrap(),
             DID,
             "the DID must be exact-case; a lowercased did:key is a DIFFERENT key \
-             (MEMORY.md 'MXID to DID is not invertible', siwx-oidc#17)"
+             (siwx-oidc#17: an MXID is not invertible to a DID)"
         );
 
         // The `proof` member must be the real thing, not merely a string.
