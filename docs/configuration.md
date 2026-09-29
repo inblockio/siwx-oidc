@@ -194,7 +194,7 @@ a generated key, a public-key fingerprint).
 
 ```bash
 docker run -d --rm --name siwx-redis -p 6379:6379 redis:7-alpine  # Redis on localhost:6379
-(cd js/ui && npm install --legacy-peer-deps && npm run build)  # login page into static/build
+(cd js/ui && npm ci && npm run build)  # login page into static/build
 SIWXOIDC_BASE_URL=http://localhost:8000 cargo run
 ```
 
@@ -222,13 +222,19 @@ directory, `/siwx-oidc`. `GET /health` answers when the server is up.
 - **License notices.** `/usr/share/licenses/siwx-oidc/` holds `LICENSE`, `NOTICE` and the
   third-party license texts generated during the build: `THIRD-PARTY-LICENSES-rust.txt` for
   the crates linked into the binaries (cargo-about, configured in `about.toml`) and
-  `THIRD-PARTY-LICENSES-js.txt` for the npm packages bundled into the login page. The Alpine
-  base packages list their licenses in `/lib/apk/db/installed`.
+  `THIRD-PARTY-LICENSES-js.txt` for the npm packages bundled into the login page. The image
+  is built on Alpine Linux 3.24.2. Its packages declare their licenses in
+  `/lib/apk/db/installed`, and `/usr/share/licenses/alpine/` holds the text of every license
+  they declare (SPDX license-list-data, pinned by tag and checksum). `NOTICE` says where the
+  packages' source is: the aports tag `v3.24.2` and Alpine's `distfiles/v3.24/`.
 - **Building it yourself.** The base images are pinned by digest and the build uses
   `Cargo.lock` and `package-lock.json` as they are (`--locked`, `npm ci`). The build fails
   when a dependency brings a license outside the accepted lists in `about.toml` and
-  `js/ui/third-party-licenses.js`; review the license, then add it. How to bump a base image
-  is described at the top of the `Dockerfile`.
+  `js/ui/third-party-licenses.js` (review the license, then add it), when cargo-about warns,
+  for example about a stale clarification checksum (`scripts/third-party-notices.sh`), and
+  when an Alpine package declares a license with no text in the `alpine_licenses` stage or
+  `NOTICE` does not name the Alpine release. How to bump a base image is described at the
+  top of the `Dockerfile`.
 
 ```bash
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out signing-key.pem
