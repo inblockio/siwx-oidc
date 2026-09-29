@@ -72,9 +72,11 @@ stack, Playwright suites, Element Web suites), `js/ui/` (Svelte login page, buil
 Three layers. **aqua-auth** verifies CAIP-122 proofs through the `DIDMethod` trait (and, inside
 `did:pkh`, `CipherSuite`). **Ceremony modules** in `src/` (WebAuthn, the RFC 8628 approval page)
 verify other proofs server-side and store a verified DID in the Redis session. **`oidc.rs`**
-issues tokens; `sign_in` and the device-code grant are the only places codes and tokens come
-from. Ceremonies never extend `DIDMethod`. Full picture, sign-in flows, Redis keyspace and
-lineage: [docs/architecture.md](docs/architecture.md).
+issues codes and tokens: authorization codes only in `sign_in`, tokens at `POST /token`
+(authorization-code, refresh and device-code grants). Two more endpoints mint tokens:
+`POST /_matrix/client/v3/refresh` (`compat.rs`) and `POST /oauth2/admin_token`
+(`admin_token.rs`). Ceremonies never issue either and never extend `DIDMethod`. Full picture,
+sign-in flows, Redis keyspace and lineage: [docs/architecture.md](docs/architecture.md).
 
 ## Build and test
 
@@ -167,8 +169,10 @@ doc; read it before changing the code the rule covers.
   `h4_the_same_pem_yields_the_same_kid_across_constructions`,
   `published_jwk_always_carries_the_derived_kid`.
 - **No `exp` in a DID assertion.** The binding is permanent. Pin: `payload_has_no_exp_claim`.
-- **ES256 signatures are raw `r‖s`, 64 bytes, never DER**, and ID tokens use the same
-  `sign_es256`. Pin: `signature_is_64_raw_bytes_never_der`.
+- **ES256 signatures are raw `r‖s`, 64 bytes, never DER.** Pin:
+  `signature_is_64_raw_bytes_never_der`, which covers the DID-assertion signature only. ID
+  tokens share `sign_es256` by construction (`PrivateSigningKey::sign` delegates to it); no
+  separate test pins that.
 - **Claim and header order is struct declaration order**; those bytes are signed. Pin:
   `minted_jws_has_exactly_three_parts_and_the_exact_header`.
 - **An ephemeral key mints no assertion at all.** `mint_did_assertion` returns `None`.
@@ -258,8 +262,9 @@ doc; read it before changing the code the rule covers.
 
 - **An empty `device_id` is JSON `null` on the wire, never `""`.** Synapse rejects `""`. Pin:
   `empty_device_id_renders_as_json_null`, `deviceless_token_body_carries_device_id_null`.
-- **Refresh rotation keeps a 60 s grace pointer** so a client that lost the response can replay
-  once. Pin: `refresh_grace_window_tolerates_replay` (mock stack).
+- **Refresh rotation keeps a 60 s grace pointer**: any replay of the old refresh token within
+  60 s returns the same successor pair, so a client that lost the response recovers. Pin:
+  `refresh_grace_window_tolerates_replay` (mock stack).
 - **Never infer token validity from Synapse**: it caches introspection for two minutes. Our
   introspection answer is the authority.
 - **No device-id recycling.** Sign-in upserts a fresh `SIWX_…` id and never deletes. Pin:

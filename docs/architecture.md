@@ -38,10 +38,12 @@ that reason. All of that state is in the server, so that is where the ceremony r
 Registration uses webauthn-rs; assertions are verified with aqua-auth's
 `verify_webauthn_assertion` against the stored challenge.
 
-**One issuance point.** Authorization codes are created only in `sign_in`, and tokens only in
-`POST /token`. A ceremony endpoint never issues a code; it stores `verified_did` in the session
-and redirects to `/sign_in`, which enforces the configured DID methods and `did:pkh`
-namespaces for every path.
+**One issuance point.** Authorization codes are created only in `sign_in`. Tokens are minted by
+`POST /token` (all grants), by `POST /_matrix/client/v3/refresh` (the Matrix client-server
+refresh, in `compat.rs`) and, for siwx-oidc's own calls to Synapse, by
+`POST /oauth2/admin_token`. A ceremony endpoint never issues a code; it stores `verified_did`
+in the session and redirects to `/sign_in`, which enforces the configured DID methods and
+`did:pkh` namespaces for every path.
 
 ## Extending the layers
 
@@ -78,8 +80,9 @@ New methods and namespaces are opt-in: operators enable them in
 3. `GET /sign_in` checks the DID method and namespace against configuration, verifies the
    signature through `find_did_method(did).verify(…)`, checks the nonce and that the
    `redirect_uri` is in the message's `Resources:`, then issues a single-use code.
-4. `POST /token` exchanges the code (with PKCE `S256` when a challenge was sent) for an ES256
-   ID token, an access token and a refresh token.
+4. `POST /token` exchanges the code, with its PKCE `S256` verifier, for an ES256 ID token, an
+   access token and a refresh token. PKCE is mandatory for `response_type=code`: `/authorize`
+   refuses a request without a `code_challenge`.
 
 **Server-verified ceremony (passkey):**
 

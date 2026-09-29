@@ -171,8 +171,9 @@ device provisioning, the `/account` Synapse actions, DID publication) would go u
 ## Other homeservers
 
 siwx-oidc is tested only with Synapse. Tuwunel has its own built-in OAuth 2.0/OIDC server and can
-use MAS as an upstream provider through a "private compatibility API"
-([Tuwunel docs](https://matrix-construct.github.io/tuwunel/authentication/oidc-server.html));
+use MAS as an upstream identity provider; separately, it implements a "private compatibility API"
+so that MAS can provision users
+([Tuwunel docs](https://matrix-construct.github.io/tuwunel/authentication/oidc-server.html)).
 siwx-oidc has not been tried with it. [areweoidcyet.com](https://areweoidcyet.com/) lists Dendrite
 and Conduit as not supporting the OAuth 2.0 API.
 

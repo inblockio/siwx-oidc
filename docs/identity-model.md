@@ -168,8 +168,9 @@ from the DID. It is the displayname a new account starts with.
 - **Words**: the first name is indexed by digest bytes 0..4, the surname by
   bytes 4..8, each `mod` its list length. The lists hold 271 first names and 306
   surnames (82,926 combinations).
-- **Collisions are expected.** The first one is due around 288 accounts. The
-  alias is decoration: Matrix clients disambiguate duplicate display names by
+- **Collisions are expected.** With 82,926 names, two accounts share one with
+  about 50% probability by ~339 accounts, and the expected first collision
+  comes at ~361 accounts. The alias is decoration: Matrix clients disambiguate duplicate display names by
   MXID, and the DID is published separately. Never key anything on it.
 - **It carries no DID and no key material**, so it cannot be mistaken for an
   identifier.

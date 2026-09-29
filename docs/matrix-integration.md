@@ -41,6 +41,11 @@ Older text in this repository, and some error messages and code comments, call
 the delegated-auth mode "MSC3861 mode". It means the same thing: the shared
 secret is configured.
 
+Known inconsistency: in standalone mode, discovery still advertises
+`introspection_endpoint`, the device-code grant type and
+`device_authorization_endpoint`, although introspection answers 404 and the
+grant is refused.
+
 ## How Synapse is wired
 
 ### Synapse configuration
@@ -85,7 +90,10 @@ Synapse uses fixed paths under `endpoint`, not paths from discovery:
 
 Introspection returns `active`, `username` (the Matrix localpart), `device_id`,
 `scope` (containing `urn:matrix:client:api:*`), `sub` (the DID) and expiry.
-Synapse caches an introspection result for two minutes with no invalidation.
+Synapse caches an introspection result for up to two minutes. It drops the
+cached result when the token's device no longer exists, so a sign-out that
+deletes the device takes effect at once; a token revoked without deleting its
+device can keep working at Synapse for up to two minutes.
 siwx-oidc also accepts the secret as `client_secret` in the form body.
 
 Synapse serves `GET /_matrix/client/v1/auth_metadata` (MSC2965) by forwarding
@@ -355,9 +363,10 @@ default 300) is clamped in code to 30–900 s (`clamp_admin_token_ttl`), so
 configuration cannot turn it into a standing admin key. Do not keep a
 long-lived admin credential in the environment.
 
-**Caching caveat.** Synapse caches introspection for two minutes, so a token can
-keep working at Synapse after it expires. siwx-oidc's introspection response is
-the authority.
+**Caching caveat.** Synapse caches introspection for up to two minutes and drops
+a cached result only when the token's device is gone. An admin token has no
+device, so if siwx-oidc stops accepting one, it can keep working at Synapse for
+up to two minutes. siwx-oidc's introspection response is the authority.
 
 **Errors** carry `{"error", "error_description"}`: 404 `not_configured` (no
 shared secret), 401 `unauthorized`, 503 `synapse_unavailable` or
@@ -502,7 +511,8 @@ both discovery and dispatch.
   standalone passkeys whose key derives to that `did:key`, so the DID cannot be
   signed into again from a leftover passkey.
 
-Live check against the local stack:
+Live check, which needs a real Synapse (the Synapse mock does not model
+`auth_metadata`, and CI skips this test by name):
 `cargo test --test e2e_msc3861 msc4191_metadata -- --ignored`.
 
 ## Device-code and QR login

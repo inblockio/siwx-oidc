@@ -14,8 +14,9 @@ Settings come from a TOML file and from environment variables, loaded with
 - **Environment prefix `SIWXOIDC_`**, e.g. `SIWXOIDC_BASE_URL`. The legacy prefix `SIWEOIDC_`
   (from the upstream siwe-oidc) is still accepted, with no removal scheduled. When both set the
   same key, `SIWXOIDC_` wins, and a startup warning names the legacy variables in use.
-- **Config file `siwx-oidc.toml`** in the working directory. The legacy `siwe-oidc.toml` is
-  still read.
+- **Config file `siwx-oidc.toml`** in the working directory, or else in the nearest parent
+  directory that has one (Figment searches upwards). The legacy `siwe-oidc.toml` is still read,
+  found the same way.
 - **Precedence, lowest to highest:** defaults < `siwe-oidc.toml` < `siwx-oidc.toml` <
   `SIWEOIDC_*` < `SIWXOIDC_*`.
 - **Keys go under a `[default]` table** in the file: the file's top-level tables are Figment
