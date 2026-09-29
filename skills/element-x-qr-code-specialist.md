@@ -51,7 +51,7 @@ Element X (mobile)                    Element Web (desktop, logged in)
 |-------|----------|---------|--------|
 | Transport | MSC4108 rendezvous (2024 version) | Encrypted device-to-device relay via Synapse | Built into Synapse >= 1.106.0 |
 | Auth | RFC 8628 / MSC4341 | Device Authorization Grant | Implemented in siwx-oidc |
-| Tokens | OIDC delegated auth (`matrix_authentication_service` on Synapse >= 1.157; `experimental_features.msc3861` on <= 1.156) | Token introspection | Already implemented |
+| Tokens | OAuth 2.0 delegated auth (Synapse's `matrix_authentication_service` block, since 1.136; the only option since 1.157) | Token introspection | Already implemented |
 | E2EE | MSC4108 Phase 4 | Cross-signing key transfer via rendezvous | Handled by Element clients |
 
 ---
@@ -77,8 +77,8 @@ So on 1.157+ "needs the MAS block" no longer discriminates between the two at al
 
 This skill previously claimed MSC4388 was impossible because it "requires the
 `matrix_authentication_service` block, and siwx-oidc uses
-`experimental_features.msc3861`". **Both halves of that are now false.** dev-staging
-runs Synapse 1.159.0 on the stable `matrix_authentication_service` block, and
+`experimental_features.msc3861`". **Both halves of that are now false.** siwx-oidc is
+wired through the stable `matrix_authentication_service` block, and
 `experimental_features.msc3861` no longer exists at all (removed in 1.157.0).
 
 Verified directly against the Synapse 1.159.0 image on an isolated local stack:
@@ -133,7 +133,7 @@ on the *create* call, so an unauthenticated new device cannot open the channel
 
 | Component | Status | Blocker? |
 |-----------|--------|----------|
-| Synapse rendezvous server | Available (>= 1.106.0; dev-staging 1.159.0, prod 1.154.0) | No |
+| Synapse rendezvous server | Available (>= 1.106.0) | No |
 | Synapse `msc4108_enabled` config | Deployed | No |
 | Reverse proxy (Caddy) | Works | No |
 | siwx-oidc: `POST /device_authorization` | Implemented | No |
@@ -155,8 +155,8 @@ on the *create* call, so an unauthenticated new device cannot open the channel
 - siwx-oidc with RFC 8628 implemented (Phase 3 of `docs/design/webauthn-plan.md`)
 - Element Web with "Link new device" feature (production Element Web has this)
 - Element X mobile app (production iOS/Android)
-- Working OIDC delegated auth, already deployed — via `matrix_authentication_service`
-  on Synapse >= 1.157, or `experimental_features.msc3861` on <= 1.156
+- Working delegated auth, already deployed — via Synapse's `matrix_authentication_service`
+  block
 
 ### Step 1: Enable MSC4108 in Synapse (siwx-oidc-matrix-server repo)
 
@@ -198,13 +198,14 @@ handle /_synapse/client/rendezvous/* {
 it can alter ETags and break the rendezvous protocol's sequence_token compare-and-swap.
 Either exclude these paths from compression or verify ETags pass through unmodified.
 
-### Step 3: Implement RFC 8628 in siwx-oidc (the blocker)
+### Step 3: RFC 8628 in siwx-oidc (implemented)
 
-See "Implementation Guide" section below for full details.
+Implemented in `src/device_auth.rs` and the `token` handler; it needs siwx-oidc in Matrix
+mode (`SIWXOIDC_MAS_SHARED_SECRET` set). See "Implementation Guide" below.
 
-### Step 4: Update OIDC Discovery
+### Step 4: Check OIDC Discovery
 
-In `src/oidc.rs`, update the `openid-configuration` response to include:
+The `openid-configuration` response (`src/oidc.rs`) includes:
 
 ```json
 {
@@ -244,18 +245,20 @@ Settings > Sessions).
 
 ## Configuration Reference
 
-### siwx-oidc environment variables (new for RFC 8628)
+### siwx-oidc RFC 8628 parameters
 
-| Var | Description | Default |
-|-----|-------------|---------|
-| `SIWEOIDC_DEVICE_CODE_EXPIRY` | Device code lifetime in seconds | `1800` (30 min) |
-| `SIWEOIDC_DEVICE_CODE_INTERVAL` | Minimum polling interval in seconds | `5` |
-| `SIWEOIDC_USER_CODE_LENGTH` | User code length (characters) | `6` |
-| `SIWEOIDC_USER_CODE_CHARSET` | Character set for user codes | `BCDFGHJKLMNPQRSTVWXZ` (base-20, no vowels) |
+These are compile-time constants, not configuration:
+
+| Constant | Where | Value |
+|----------|-------|-------|
+| `DEVICE_CODE_LIFETIME` | `src/db/mod.rs` | `1800` s (30 min) |
+| `DEVICE_CODE_INTERVAL` | `src/db/mod.rs` | `5` s minimum polling interval |
+| `USER_CODE_LEN` | `src/device_auth.rs` | `6` characters |
+| `USER_CODE_ALPHABET` | `src/device_auth.rs` | `BCDFGHJKLMNPQRSTVWXZ` (base-20, no vowels) |
 
 ### Synapse homeserver.yaml
 
-**Synapse >= 1.157 (dev-staging 1.159.0) — stable `matrix_authentication_service`:**
+**Synapse >= 1.136 — stable `matrix_authentication_service` (required from 1.157):**
 
 ```yaml
 matrix_authentication_service:
@@ -272,7 +275,7 @@ There is no `admin_token` here — the shared secret is honoured only on
 `/_synapse/mas/*` on 1.157+. Admin-API calls use a short-TTL `urn:synapse:admin:*`
 token minted at `POST /oauth2/admin_token` (siwx-oidc `src/admin_token.rs`).
 
-**Synapse <= 1.156 (prod today 1.154.0) — legacy `experimental_features.msc3861`:**
+**Synapse <= 1.156 — legacy `experimental_features.msc3861` (historical):**
 
 ```yaml
 experimental_features:
@@ -303,16 +306,17 @@ supported and additive, but no shipping client speaks it, so it buys nothing tod
 
 | Key pattern | TTL | Content |
 |-------------|-----|---------|
-| `device_code:{code}` | `expires_in` | `{ user_code, client_id, scope, status, did, device_id }` |
-| `user_code:{code}` | `expires_in` | `{ device_code }` (reverse lookup for approval page) |
+| `device_codes/{code}` | `expires_in` | `{ user_code, client_id, scope, status, did, device_id, last_poll, created_at }` |
+| `device_codes/{code}/redeemed` | `expires_in` | single-redemption claim |
+| `user_codes/{code}` | `expires_in` | the device code (reverse lookup for approval page) |
 
-Status: `pending` -> `approved` (with DID) or `denied`
+Status (as stored): `Pending` -> `Approved` (with DID) or `Denied`
 
 ---
 
 ## Implementation Guide: RFC 8628 in siwx-oidc
 
-### New files
+### Files
 
 | File | Purpose |
 |------|---------|
@@ -328,10 +332,10 @@ Parameters:
 
 Logic:
 1. Validate client_id exists in Redis
-2. Generate high-entropy `device_code` (32+ bytes, base62)
+2. Generate high-entropy `device_code` (`dvc_` + 32 base62 characters)
 3. Generate human-readable `user_code` (6 chars, base-20: `BCDFGHJKLMNPQRSTVWXZ`, hyphenated: `WDJ-BMJ`)
-4. Store `device_code:{code}` in Redis with TTL = `expires_in`
-5. Store `user_code:{code}` in Redis with TTL = `expires_in` (reverse lookup)
+4. Store `device_codes/{code}` in Redis with TTL = `expires_in`
+5. Store `user_codes/{code}` in Redis with TTL = `expires_in` (reverse lookup)
 6. Return JSON response
 
 Response:
@@ -355,8 +359,8 @@ Flow:
 1. If `user_code` in query string, pre-fill it
 2. User authenticates (wallet CAIP-122 signature or WebAuthn passkey)
 3. Server verifies the authentication proof
-4. Server looks up `user_code:{code}` to find the `device_code`
-5. Server updates `device_code:{code}` status to `approved`, stores verified DID
+4. Server looks up `user_codes/{code}` to find the `device_code`
+5. Server updates `device_codes/{code}` status to `approved`, stores verified DID
 6. Page shows "Device approved" confirmation
 
 The approval page must verify the user's identity. It can use the same authentication
@@ -372,7 +376,7 @@ Parameters:
 - `client_id`: must match the original request
 
 Logic:
-1. Look up `device_code:{code}` in Redis
+1. Look up `device_codes/{code}` in Redis
 2. Validate `client_id` matches
 3. Check status:
    - `pending`: return 400 `{ "error": "authorization_pending" }`
@@ -388,20 +392,23 @@ Logic:
 Rate limiting: track last poll time per device_code. If polling faster than `interval`,
 return 400 `{ "error": "slow_down" }`.
 
-### OIDC Discovery update
+### OIDC Discovery
 
-In `src/oidc.rs`, update the `/.well-known/openid-configuration` response:
+`/.well-known/openid-configuration` (`src/oidc.rs`) carries the
+`"device_authorization_endpoint"` field and `"urn:ietf:params:oauth:grant-type:device_code"`
+in `grant_types_supported`.
 
-Add `"device_authorization_endpoint"` field and `"urn:ietf:params:oauth:grant-type:device_code"`
-to `grant_types_supported`.
+### Routes
 
-### Router update
-
-In `src/axum_lib.rs`, add routes:
+In `src/axum_lib.rs` (handlers wrap the `device_auth` functions):
 
 ```rust
-.route("/device_authorization", post(device_auth::device_authorization))
-.route("/device", get(device_auth::device_page).post(device_auth::device_approve))
+.route("/device_authorization", post(device_authorization_handler))
+.route("/device", get(device_page_handler).post(device_approve_handler))
+.route("/device/verify", get(device_verify_handler))
+.route("/device/nonce", get(device_nonce_handler))
+.route("/device/passkey/start", post(device_passkey_start_handler))
+.route("/device/passkey/finish", post(device_passkey_finish_handler))
 ```
 
 ---
@@ -429,17 +436,17 @@ In `src/axum_lib.rs`, add routes:
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| 404 on `/device_authorization` | Endpoint not implemented | Implement RFC 8628 in siwx-oidc (Phase 3) |
+| 404 on `/device_authorization` | Request does not reach siwx-oidc | Check the reverse proxy routes `/device_authorization` to siwx-oidc |
 | "Invalid client_id" | Client not registered | Element X must register via dynamic client registration first |
-| "Unsupported grant type" | Token endpoint doesn't handle device_code | Add device_code grant to token handler |
+| "Unsupported grant type" | siwx-oidc runs without `mas_shared_secret`; the device-code grant needs Matrix mode | Set `SIWXOIDC_MAS_SHARED_SECRET` |
 
 ### Approval page issues
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| Approval page shows but wallet doesn't connect | Same-origin issues with wallet extension | Ensure `/device` page is served from `SIWEOIDC_BASE_URL` |
+| Approval page shows but wallet doesn't connect | Same-origin issues with wallet extension | Ensure `/device` page is served from `SIWXOIDC_BASE_URL` |
 | "User code expired" | 30-minute TTL exceeded | Retry QR flow from scratch |
-| "User code not found" | Redis flushed or wrong instance | Check `redis-cli KEYS 'user_code:*'` |
+| "User code not found" | Redis flushed or wrong instance | Check `redis-cli KEYS 'user_codes/*'` |
 
 ### Token polling fails
 
@@ -483,17 +490,17 @@ curl -v -X POST "https://{MATRIX_HOST}/_matrix/client/unstable/org.matrix.msc410
 
 ```bash
 # List active device codes
-redis-cli KEYS 'device_code:*'
+redis-cli KEYS 'device_codes/*'
 
 # Inspect a device code
-redis-cli GET 'device_code:{code}'
+redis-cli GET 'device_codes/{code}'
 
 # List active user codes
-redis-cli KEYS 'user_code:*'
+redis-cli KEYS 'user_codes/*'
 
 # Check device code status
-redis-cli GET 'device_code:{code}' | python3 -m json.tool
-# Look for: "status": "pending" | "approved" | "denied"
+redis-cli GET 'device_codes/{code}' | python3 -m json.tool
+# Look for: "status": "Pending" | "Approved" | "Denied"
 ```
 
 ### Diagnostic checklist
@@ -507,14 +514,14 @@ curl -s "https://{MATRIX_HOST}/_matrix/client/versions" | \
 # Expected: true
 
 # 2. Check OIDC discovery advertises device_code grant
-curl -s "https://{SIWEOIDC_HOST}/.well-known/openid-configuration" | \
+curl -s "https://{OIDC_HOST}/.well-known/openid-configuration" | \
   jq '.grant_types_supported'
 # Expected: includes "urn:ietf:params:oauth:grant-type:device_code"
 
 # 3. Check device_authorization_endpoint is present
-curl -s "https://{SIWEOIDC_HOST}/.well-known/openid-configuration" | \
+curl -s "https://{OIDC_HOST}/.well-known/openid-configuration" | \
   jq '.device_authorization_endpoint'
-# Expected: "https://{SIWEOIDC_HOST}/device_authorization"
+# Expected: "https://{OIDC_HOST}/device_authorization"
 
 # 4. Test rendezvous endpoint
 curl -s -X POST "https://{MATRIX_HOST}/_matrix/client/unstable/org.matrix.msc4108/rendezvous" \
@@ -522,7 +529,7 @@ curl -s -X POST "https://{MATRIX_HOST}/_matrix/client/unstable/org.matrix.msc410
 # Expected: { "id": "...", "sequence_token": "...", "expires_in_ms": ... }
 
 # 5. Test device authorization endpoint
-curl -s -X POST "https://{SIWEOIDC_HOST}/device_authorization" \
+curl -s -X POST "https://{OIDC_HOST}/device_authorization" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -d "client_id=test&scope=openid" | python3 -m json.tool
 # Expected: { "device_code": "...", "user_code": "...", ... }
@@ -542,7 +549,7 @@ docker compose logs siwx-oidc 2>&1 | grep -i device | tail -10
 
 1. Open Element Web in browser with MetaMask
 2. Sign in with Ethereum wallet (existing CAIP-122 flow)
-3. Account created with DID-based username
+3. Account created; its Matrix ID is derived from the DID
 
 ### Adding Element X mobile
 

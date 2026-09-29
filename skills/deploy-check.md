@@ -1,7 +1,8 @@
 Pre-deployment checklist for siwx-oidc with Matrix Synapse.
 
 Run through this checklist after deploying siwx-oidc in front of a Synapse
-homeserver (MSC3861 delegated auth). It is written for a Docker Compose
+homeserver (siwx-oidc as the auth service in Synapse's `matrix_authentication_service`
+integration). It is written for a Docker Compose
 deployment behind a Caddy reverse proxy, but the checks are HTTP-level and
 apply to any setup.
 
@@ -9,7 +10,7 @@ Set these once for your deployment; every command below uses them:
 
 ```bash
 MATRIX=https://matrix.example.org        # homeserver public base URL
-OIDC=https://siwx-oidc.example.org       # siwx-oidc issuer (SIWEOIDC_BASE_URL)
+OIDC=https://siwx-oidc.example.org       # siwx-oidc issuer (SIWXOIDC_BASE_URL)
 ELEMENT=https://element.example.org      # Element Web origin (if you serve it)
 ```
 
@@ -74,7 +75,7 @@ when the check fails:
 | Synapse | Source of `auth_metadata` |
 |---|---|
 | >= 1.157 | **Fetched live over HTTP** from `matrix_authentication_service.endpoint`. `api/auth/mas.py::auth_metadata()` is `self._server_metadata.get()` -> `get_json(self._metadata_url)`. There is no `issuer_metadata` config key; grep of the 1.159.0 tree finds zero occurrences. Fix regressions in **siwx-oidc's `/.well-known/openid-configuration`**, then let Synapse's metadata cache expire. |
-| <= 1.156 | Forwarded **verbatim** from the `experimental_features.msc3861.issuer_metadata` config blob, when set. Fix regressions in the **homeserver.yaml blob**. |
+| <= 1.156 (historical) | With the old `experimental_features.msc3861` block (removed in 1.157.0): forwarded **verbatim** from its `issuer_metadata` config blob, when set. Fix regressions in the **homeserver.yaml blob**. |
 
 Either way the guard script below asserts the same public contract, so it is valid
 against both.
@@ -130,7 +131,7 @@ same scope label, and updates nothing at all when only watchtower itself carries
 2. Should see "Connecting wallet..." splash (siwx-gate.js blocks Element)
 3. MetaMask prompts to sign CAIP-122 message
 4. After signing, redirected back with `?code=`, token exchange completes
-5. Element loads with DID-based username
+5. Element loads with the account's Matrix ID (derived from the DID) and a generated display name
 
 For passkey login: register a passkey first, then use "Sign in with Passkey".
 
@@ -138,6 +139,6 @@ For passkey login: register a passkey first, then use "Sign in with Passkey".
 
 - **Element shows #/welcome instead of wallet prompt**: CORS issue (dual ACAO headers, see step 5) or an auth_metadata regression sent Element down the legacy SSO 404 route (see step 4).
 - **Watchtower crash-looping**: Needs `DOCKER_API_VERSION: "1.40"` in environment.
-- **"DID method 'key' not enabled"**: Add `"key"` to `SIWEOIDC_SUPPORTED_DID_METHODS` in .env.
+- **"DID method 'key' not enabled"**: `supported_did_methods` was overridden without `"key"`; add it back to `SIWXOIDC_SUPPORTED_DID_METHODS` (default `["pkh", "key"]`).
 - **Stale client_id 401 loops**: Element caches client_id; siwx-redirect.js now always registers fresh.
 - **QR code greyed out**: Check `msc4108_enabled: true` in Synapse config (see step 3).

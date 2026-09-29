@@ -22,7 +22,7 @@ First-time setup (MSC3967):
   Any OIDC provider --> Element Web --> POST keys/device_signing/upload
   Synapse: is_cross_signing_setup=false? --> skip UIA --> upload succeeds
 
-Key reset (admin API, already implemented):
+Key reset (Synapse's /_synapse/mas/* API, already implemented):
   siwx-oidc --> POST /_synapse/mas/allow_cross_signing_reset
   Synapse: sets updatable_without_uia_before_ms --> next upload allowed
 
@@ -35,7 +35,7 @@ Key reset (spec-compliant, MSC4312 m.oauth):
 | Mechanism | Scope | Spec Status | siwx-oidc Status |
 |-----------|-------|-------------|------------------|
 | MSC3967: No UIA for first upload | Initial setup | Stable (v1.11) | Works automatically |
-| `/_synapse/mas/allow_cross_signing_reset` | Key reset | Synapse admin API | Implemented |
+| `/_synapse/mas/allow_cross_signing_reset` | Key reset | Synapse-internal API for the auth service (not in the spec) | Implemented |
 | MSC4312: `m.oauth` UIA stage | Key reset (spec) | Stable (v1.17) | Implemented (`/account` page) |
 | MSC4191: Account management discovery | UX deep-linking | Stable (v1.18) | Implemented (OIDC discovery) |
 
@@ -149,9 +149,9 @@ docker logs synapse 2>&1 | grep -i "cross.signing\|device_signing\|upload"
 ### Step 6: Verify allow_cross_signing_reset works (for key reset)
 
 ```bash
-# Test the admin API directly
+# Test the endpoint directly (it takes the MAS shared secret, not an admin token)
 curl -X POST https://SYNAPSE_URL/_synapse/mas/allow_cross_signing_reset \
-  -H "Authorization: Bearer ADMIN_TOKEN" \
+  -H "Authorization: Bearer $MAS_SHARED_SECRET" \
   -H "Content-Type: application/json" \
   -d '{"localpart": "USERNAME"}'
 # Should return 200
@@ -212,7 +212,7 @@ honest server-side signal.
 | Spec | Title | Relevance |
 |------|-------|-----------|
 | MSC3967 | No UIA for first cross-signing upload | Why first-time bootstrap works without UIA |
-| MSC3861 | Delegated OIDC auth | How siwx-oidc integrates with Synapse. **Config key note:** productised as the `matrix_authentication_service` block in Synapse >= 1.157; `experimental_features.msc3861` was removed in 1.157.0 and crashes startup |
+| MSC3861 | OAuth 2.0 authentication API (spec v1.15) | How siwx-oidc integrates with Synapse. **Config key note:** Synapse wires it through the stable `matrix_authentication_service` block (since 1.136); `experimental_features.msc3861` was removed in 1.157.0 and crashes startup |
 | MSC4312 | Cross-signing reset in OAuth world | `m.oauth` UIA stage for key reset |
 | MSC4191 | Account management deep-linking | `account_management_uri` in OIDC discovery |
 | MSC2965 | OIDC discovery for Matrix | `m.authentication` in .well-known |
@@ -224,6 +224,6 @@ honest server-side signal.
 |---------|---------|
 | "UIA is the blocker" | MSC3967 removes UIA for first-time upload. UIA only matters for key RESET. |
 | "MAS has special cross-signing code" | MAS contains zero cross-signing code. It's all Synapse-side. |
-| "Need to implement UIA bridge" | First-time bootstrap needs no UIA at all. Reset is handled by admin API. |
+| "Need to implement UIA bridge" | First-time bootstrap needs no UIA at all. Reset is handled by `/_synapse/mas/allow_cross_signing_reset`. |
 | "Cross-signing keys are E2EE secrets the server can't generate" | True, but irrelevant. The CLIENT generates and uploads them. The question is whether the upload endpoint requires UIA. |
 | "Element Web falls back to manual Secure Backup" | Element Web had a freshLogin bug (PR #30141). With the fix, auto-bootstrap works. |
