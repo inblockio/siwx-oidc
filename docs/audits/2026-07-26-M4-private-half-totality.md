@@ -6,7 +6,7 @@
 **Task:** Finding **T-M4** — `S4_Absent`, `S4_Present`, `S4_Rotated`, `Backup_Vn`, `Backup_Deleted`
 are declared in the map's §M4 with **no transition table, no events, and no terminals**. The machine
 is not total. This document makes it total.
-**Branch / worktree:** `feat/session-durability-marathon` @ **`10c9494`**, `~/wt/siwx-durability`.
+**Branch / worktree:** `feat/session-durability-marathon` @ **`10c9494`**, `<worktree>`.
 **Companion repo:** `siwx-oidc-matrix-server` `main` @ **`cd17c90`** (vendored Element patches).
 **Authority:** `2026-07-25-session-onboarding-state-machine-map.md` §M4/§M4c
 (notation, completeness criteria) · `docs/audits/2026-07-25-state-machine-coverage-matrix.md`
