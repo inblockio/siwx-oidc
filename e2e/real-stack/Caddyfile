@@ -98,11 +98,15 @@
 			import strip_upstream_cors
 		}
 	}
-	# Caddy `handle` matches a path prefix, so this also covers
-	# `DELETE /_matrix/client/v3/devices/{device_id}` (and the GET device list,
-	# which siwx-oidc does not own — but Synapse 404s the delete under MSC3861,
-	# so forwarding the whole subtree to siwx-oidc matches the owned method).
-	handle /_matrix/client/v3/devices/* {
+	# Single-device delete (DELETE /_matrix/client/v3/devices/{device_id}): the
+	# only method siwx-oidc serves under devices/ (src/axum_lib.rs), and one
+	# Synapse 404s under delegated auth. GET and PUT on a single device (read,
+	# rename) stay on Synapse: siwx-oidc would answer them 405.
+	@device_delete {
+		path /_matrix/client/v3/devices/*
+		method DELETE
+	}
+	handle @device_delete {
 		import public_cors
 		reverse_proxy siwx-real-oidc:8081 {
 			import strip_upstream_cors
