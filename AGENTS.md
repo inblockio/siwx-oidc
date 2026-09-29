@@ -91,12 +91,12 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 13 tests in six files:
-  `openapi_covers_every_route` (2) and `localpart_vectors` (1), which need nothing;
-  `account_linking_dual_write` (6), which needs the test Redis; `credential_migration_live`
-  (2), which needs its own disposable, empty Redis named by `MIGRATION_TEST_REDIS_URL`; and the
-  pure check `an_absent_strict_skips_variable_means_strict` in `e2e_account_lifecycle_live` and
-  in `e2e_did_field_live` (1 each).
+  `cargo test --workspace` runs the unit tests of both crates plus 16 tests in seven files:
+  `openapi_covers_every_route` (2), `localpart_vectors` (1) and `graceful_shutdown` (3), which
+  need nothing; `account_linking_dual_write` (6), which needs the test Redis;
+  `credential_migration_live` (2), which needs its own disposable, empty Redis named by
+  `MIGRATION_TEST_REDIS_URL`; and the pure check `an_absent_strict_skips_variable_means_strict`
+  in `e2e_account_lifecycle_live` and in `e2e_did_field_live` (1 each).
 - **Redis-backed tests** get their Redis from `siwx_oidc::test_support` (`src/test_support.rs`):
   `SIWX_TEST_REDIS_URL`, default `redis://localhost`. When it is unreachable each test prints
   one `SKIP <test>: …` line to stderr and passes; with `SIWX_TEST_REQUIRE_REDIS=1` it fails
@@ -356,9 +356,12 @@ doc; read it before changing the code the rule covers.
 - **Registries are plain functions** (`all_did_methods`, `all_cipher_suites`), no `inventory`
   crate (not WASM-safe). New DID methods and namespaces are opt-in through config.
 - **aqua-auth has no logging** and no knowledge of ceremonies.
-- **SIGTERM shuts the server down gracefully.** In the image it is PID 1, which ignores a
-  signal it has no handler for, so without `shutdown_signal` `docker stop` waits 10 s and
-  SIGKILLs. Pin: `sigterm_finishes_and_exits_zero_with_an_idle_connection_open`.
+- **SIGTERM and SIGINT shut the server down gracefully**, answering requests already in flight.
+  In the image it is PID 1, which ignores a signal it has no handler for, so without
+  `shutdown_signal` `docker stop` waits 10 s and SIGKILLs. Pin:
+  `sigterm_finishes_and_exits_zero_with_an_idle_connection_open`,
+  `sigint_finishes_and_exits_zero_with_an_idle_connection_open`,
+  `a_request_in_flight_when_sigterm_arrives_is_still_answered`.
 - **Credential store: dual-write, not cut-over.** The legacy `webauthn:credential/*` namespace
   stays authoritative; mirror writes are best-effort; the backfill is additive and idempotent.
   Pin: `backfill_is_additive_link_aware_counter_preserving_and_idempotent` (needs its own

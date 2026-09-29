@@ -219,8 +219,10 @@ directory, `/siwx-oidc`. `GET /health` answers when the server is up.
   has to be readable by UID 10001. Keep the port at 1024 or above (the default 8000 is):
   an unprivileged process cannot bind a lower one unless the runtime allows it.
 - **Stopping.** SIGTERM (`docker stop`) and SIGINT stop the server gracefully: it stops
-  accepting connections, finishes open requests and exits with status 0, logging one
-  `shutting down` line. A stop takes well under a second, not the 10 s grace period.
+  accepting connections, answers the requests already in flight and exits with status 0,
+  logging one `shutting down` line naming the signal. With no request in flight a stop takes
+  well under a second, not the 10 s grace period; an open idle connection does not delay it
+  (`tests/graceful_shutdown.rs`).
 - **License notices.** `/usr/share/licenses/siwx-oidc/` holds `LICENSE`, `NOTICE` and the
   third-party license texts generated during the build: `THIRD-PARTY-LICENSES-rust.txt` for
   the crates linked into the binaries (cargo-about, configured in `about.toml`) and
