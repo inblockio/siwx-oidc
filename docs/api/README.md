@@ -137,6 +137,10 @@ conventions are worth knowing because they look like bugs and are not:
 - **`/resolve` never returns 500.** A homeserver it cannot reach is a 502 naming
   what failed; a deployment with no homeserver configured is a 503. It will not
   guess an answer.
+- **`/resolve?did=` is a 400 for anything that is not a DID a sign-in here
+  accepts** (`kenn`, `did:pkh:garbage`, `did:web:…`), decided before the
+  homeserver is asked. So `exists: false` always means a real DID that has never
+  signed in here, never a typo.
 
 ## Stability
 
