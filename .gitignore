@@ -1,6 +1,5 @@
 **/target
 /static/build
-**/wrangler.toml
 **/node_modules
 **/dist
 *.png
