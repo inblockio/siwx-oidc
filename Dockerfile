@@ -76,11 +76,13 @@ COPY --from=node_builder /siwx-oidc/static/ ./static/
 # Apache-2.0 section 4(a) and (d): every copy of the Work, the image included,
 # carries the license and the NOTICE. Copied straight from the build context,
 # which .dockerignore does not filter, so no build stage has to carry them.
-COPY LICENSE NOTICE /usr/share/licenses/siwx-oidc/
+# --chmod, because a context file keeps the builder's mode: a checkout made
+# under umask 002 would otherwise ship them group-writable.
+COPY --chmod=0644 LICENSE NOTICE /usr/share/licenses/siwx-oidc/
 # The third-party notices the MIT, BSD and Apache licenses of the linked crates
 # and the bundled npm packages require in binary distributions (see NOTICE).
-COPY --from=builder /siwx-oidc/THIRD-PARTY-LICENSES-rust.txt /usr/share/licenses/siwx-oidc/
-COPY --from=node_builder /siwx-oidc/static/build/third-party-licenses.txt /usr/share/licenses/siwx-oidc/THIRD-PARTY-LICENSES-js.txt
+COPY --from=builder --chmod=0644 /siwx-oidc/THIRD-PARTY-LICENSES-rust.txt /usr/share/licenses/siwx-oidc/
+COPY --from=node_builder --chmod=0644 /siwx-oidc/static/build/third-party-licenses.txt /usr/share/licenses/siwx-oidc/THIRD-PARTY-LICENSES-js.txt
 # No config file ships in the image: every setting has a default or comes from
 # SIWXOIDC_* env (see config::figment). This one only makes the listener
 # reachable from outside the container. The new prefix outranks the legacy
