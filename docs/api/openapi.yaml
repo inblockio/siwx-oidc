@@ -188,8 +188,9 @@ paths:
 
         This is also the single point where a Matrix account is provisioned: the
         localpart is resolved (honouring grandfathering), the alias is seeded on
-        first sign-in only, the Synapse device is upserted, and the attested DID
-        is re-published. Every one of those is best-effort and never fails the
+        first sign-in only, the Synapse device is upserted (a new device is
+        named after the OAuth client's `client_name`, else its `client_id`; an
+        existing one keeps its name), and the attested DID is re-published. Every one of those is best-effort and never fails the
         sign-in.
       security:
         - sessionCookie: []

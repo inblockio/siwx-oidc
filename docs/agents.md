@@ -58,13 +58,16 @@ registration token or application service is involved.
   curl -s -X POST https://auth.example.org/register \
     -H 'Content-Type: application/json' \
     -d '{"redirect_uris": ["https://agent.example.org/callback"],
-         "token_endpoint_auth_method": "none"}'
+         "token_endpoint_auth_method": "none",
+         "client_name": "Example Agent"}'
   # -> {"client_id": "…", "client_secret": "…", "registration_access_token": "…", …}
   ```
 
   Keep the returned `client_id`. The redirect URI must be registered, but
   nothing needs to listen on it: the client reads the authorization code from
-  the redirect header and never follows it.
+  the redirect header and never follows it. The `client_name` becomes the name
+  of the Matrix devices the agent's sign-ins create; without one, they are
+  named after the `client_id`.
 
 ## Getting an identity
 
@@ -303,6 +306,10 @@ issuer their homeserver uses. Full details:
   operator. Move the agent to a new key (and so a new account) afterwards.
 - **Display name.** A new account's display name is a generated `Firstname
   Surname` alias.
+- **Device name.** A device created at sign-in is named after the OAuth client:
+  its registered `client_name`, else its `client_id`. A device that already
+  exists, such as one pinned with `--device-id`, keeps its current name, so a
+  name set in a Matrix client survives the next sign-in.
 - **A deactivated account cannot sign in**: `/sign_in` answers 401. If Synapse
   cannot be reached for that check, it answers 503; retry later.
 - **Common errors** at sign-in, with fixes, are in
@@ -310,10 +317,6 @@ issuer their homeserver uses. Full details:
 
 ## Known quirks
 
-- **Every device created through `/sign_in` is named `Element Web`**, whatever
-  the client: `sign_in` passes that fixed display name to
-  `provision_synapse_device` (`src/oidc.rs`), which sends it with
-  `upsert_device` at every sign-in.
 - **`--refresh-token` without `--key-file` reports the wrong DID.** With no key
   given, the CLI generates an ephemeral key (`load_key` in
   `siwx-oidc-auth/src/main.rs`) and prints that key's DID in its output; the

@@ -270,6 +270,13 @@ doc; read it before changing the code the rule covers.
   introspection answer is the authority.
 - **No device-id recycling.** Sign-in upserts a fresh `SIWX_…` id and never deletes. Pin:
   `h2_sequential_signins_mint_distinct_device_ids` (mock stack).
+- **A device is named only when a sign-in creates it**, after the OAuth client
+  (`client_name`, else `client_id`), never a fixed brand. Synapse's `upsert_device`
+  overwrites an existing device's name whenever one is sent, so a client-supplied id is
+  named only when Synapse confirms the device is new. Pin:
+  `upsert_names_only_a_device_this_sign_in_creates`,
+  `a_client_supplied_device_that_exists_keeps_its_name`,
+  `sign_in_names_a_new_device_after_the_registered_client`.
 - **`/oauth2/revoke` never deletes a device.** Only explicit sign-out (`logout`, MSC4191
   `device_delete`) does; `logout/all` never deactivates the account. Pin:
   `teardown_policy_only_deletes_device_on_explicit_signout`,

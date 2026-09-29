@@ -396,9 +396,14 @@ logged and never fails the sign-in.
    [identity-model.md](identity-model.md#publication)).
 4. **Device.** `upsert_device` creates or updates the device. The device ID is
    the one the client requested in its scope (`urn:matrix:client:device:{id}`
-   or the MSC2967 unstable form); otherwise `SIWX_` + 8 hex characters. The
-   device display name is set to `Element Web` on the `/sign_in` path and
-   `Element X` on the device-code path, whatever the client.
+   or the MSC2967 unstable form); otherwise `SIWX_` + 8 hex characters. A
+   device this sign-in creates is named after the OAuth client: its registered
+   `client_name`, else its client ID, cut to Synapse's 100-character limit.
+   An existing device keeps its name. Synapse's `upsert_device` overwrites the
+   name of an existing device whenever one is sent, so for a client-requested
+   ID siwx-oidc first lists the user's devices (admin API) and sends a name
+   only when the device is new; when it cannot tell (no
+   `SIWXOIDC_MATRIX_SERVER_NAME`, or the read failed), it sends none.
 5. **Cross-signing reset window.** `allow_cross_signing_reset` is called on
    every sign-in, so a client that is halfway through a key reset can publish
    replacement keys (see [Cross-signing](#cross-signing)).
@@ -672,6 +677,9 @@ symbol in the code.
 - **Revoke never deletes a device.** Device deletion belongs to explicit
   sign-out paths only (`compat::TeardownPolicy`).
 - **Never delete and then reuse a device ID.** Sign-in only upserts.
+- **Name a device only when this sign-in creates it**
+  (`oidc::upsert_display_name`). A name sent with `upsert_device` overwrites
+  the one the user chose.
 - **`logout/all` never deactivates the account.**
 - **Deny-list, never allow-list,** in the Synapse patch configuration.
 - **Run the deactivation gate before `resolve_identity_or_legacy`** at sign-in,
