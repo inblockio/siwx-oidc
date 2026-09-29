@@ -42,6 +42,19 @@ The license texts of the packages bundled into it are served with it at
 /build/third-party-licenses.txt and carried in the container image in
 /usr/share/licenses/siwx-oidc/THIRD-PARTY-LICENSES-js.txt.
 
-The container image is built on Alpine Linux. The packages of that base image
-carry their own licenses; they are listed, with each package's license, in
-/lib/apk/db/installed.
+The container image is built on Alpine Linux 3.24.2 (base image pinned by
+digest in the Dockerfile). Its packages carry their own licenses, recorded with
+each package in /lib/apk/db/installed; BusyBox and apk-tools, for example, are
+licensed under GPL-2.0-only. The image carries the text of every license those
+packages declare in /usr/share/licenses/alpine/. The Alpine packages are used
+unmodified.
+
+The corresponding source code of those packages is published by the Alpine
+Linux project:
+
+    Build recipes (aports), tag v3.24.2:
+    https://gitlab.alpinelinux.org/alpine/aports/-/tree/v3.24.2
+    Each package's exact aports commit is its "c:" line in /lib/apk/db/installed.
+
+    Upstream source archives those recipes build from:
+    https://distfiles.alpinelinux.org/distfiles/v3.24/

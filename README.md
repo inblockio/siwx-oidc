@@ -249,7 +249,7 @@ curl -s http://localhost:8000/.well-known/openid-configuration
 Set the base URL to a host name: WebAuthn does not accept an IP literal such as the default
 `http://127.0.0.1:8000` as its relying-party ID, and the server panics at startup with it. The
 browser sign-in page (passkey, wallet) needs the frontend built once:
-`cd js/ui && npm install && npm run build`. Agents do not need it.
+`cd js/ui && npm ci && npm run build`. Agents do not need it.
 
 Configuration comes from `siwx-oidc.toml` or `SIWXOIDC_*` environment variables. Key settings:
 

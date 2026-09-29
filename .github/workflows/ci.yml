@@ -1,16 +1,20 @@
 name: ci
 
-# Pushes to main, and every pull request, fork PRs included. Branch pushes
-# without a PR do not run, so a PR branch is not built twice.
+# Pushes to the two branches docker.yml publishes (main, fork-stable), and
+# every pull request, fork PRs included. Other branch pushes without a PR do
+# not run, so a PR branch is not built twice.
 #
 # A `pull_request` run gets a read-only token and, from a fork, no secrets.
-# Nothing in this workflow reads a secret (SIWEOIDC_MAS_SHARED_SECRET below is
+# Nothing in this workflow reads a secret (SIWXOIDC_MAS_SHARED_SECRET below is
 # a literal test value), so a fork PR runs every job in full. Keep it that
 # way: a step that needs a secret must skip visibly when it is absent, in a
 # named step that says why, and never fail or pass without running.
+#
+# Every action is pinned by full commit SHA; the comment names the release tag
+# the SHA was verified against. Bump both together.
 on:
   push:
-    branches: [main]
+    branches: [main, fork-stable]
   pull_request:
 
 permissions:
@@ -48,8 +52,10 @@ jobs:
           --health-retries 10
     steps:
       - name: Clone repo
-        uses: actions/checkout@v5
-      - uses: Swatinem/rust-cache@v2
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build
         run: cargo build --workspace
@@ -58,10 +64,10 @@ jobs:
       - name: Fmt
         run: cargo fmt --all -- --check
 
-      # The unit tests of both crates, siwx-oidc-auth's doc test, and the 13
-      # tests in tests/*.rs that are not #[ignore]d. The other 65 need a live
-      # siwx-oidc HTTP listener (Redis alone is not enough); the promotable
-      # subset runs in the `rust-e2e-mock` job below.
+      # The unit tests of both crates, siwx-oidc-auth's doc test, and the
+      # tests in tests/*.rs that are not #[ignore]d (AGENTS.md lists them). The
+      # #[ignore]d ones need a live siwx-oidc HTTP listener (Redis alone is not
+      # enough); the promotable subset runs in the `rust-e2e-mock` job below.
       #
       # SIWX_TEST_REQUIRE_REDIS=1 makes an unreachable Redis FAIL a
       # Redis-backed test instead of skipping it, and an unset
@@ -81,6 +87,41 @@ jobs:
           SIWX_TEST_REQUIRE_REDIS: "1"
           MIGRATION_TEST_REDIS_URL: redis://localhost:6398
         run: cargo test --workspace
+
+  # ---------------------------------------------------------------------------
+  # The container image, built and never pushed, so a pull request meets every
+  # gate the Dockerfile holds before docker.yml publishes from main: the Rust
+  # license gate (scripts/third-party-notices.sh, cargo-about), the npm license
+  # allowlist (js/ui/third-party-licenses.js), the check that every Alpine
+  # package's license has its text in the image, and the lockfile checks
+  # (`cargo build --locked`, `npm ci`).
+  #
+  # Least privilege: only the workflow's read-only token, no registry login and
+  # no secrets, so fork PRs run it in full. The GitHub Actions cache (type=gha)
+  # needs no token permission. A PR's cache entries are visible to that PR
+  # only, and every PR can read main's, which is why this job also runs on
+  # pushes to main. mode=max caches the intermediate stages too (the cargo-chef
+  # dependency build, the cargo-about install); mode=min would cache only the
+  # final image. A failed cache export must not fail the gate, hence
+  # ignore-error.
+  # ---------------------------------------------------------------------------
+  image:
+    # Pinned so the OS changes on purpose: `ubuntu-latest` becomes 26.04 from 2026-10-19.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      # The gha cache needs a BuildKit builder with the docker-container
+      # driver; the runner's default docker driver cannot export to it.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the image (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max,ignore-error=true
 
   # ---------------------------------------------------------------------------
   # Rust integration E2E against the MOCK stack. Added 2026-07-26 to close the
@@ -147,19 +188,25 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      SIWEOIDC_ADDRESS: 127.0.0.1
-      SIWEOIDC_PORT: "18080"
-      SIWEOIDC_BASE_URL: http://localhost:18080
-      SIWEOIDC_REDIS_URL: redis://localhost:6379
-      SIWEOIDC_MAS_SHARED_SECRET: testsecret
-      SIWEOIDC_SYNAPSE_ENDPOINT: http://localhost:8090
-      SIWEOIDC_MATRIX_SERVER_NAME: matrix.test
-      SIWEOIDC_REQUIRE_SECRET: "false"
-      SIWEOIDC_LOG_FORMAT: pretty
+      SIWXOIDC_ADDRESS: 127.0.0.1
+      SIWXOIDC_PORT: "18080"
+      SIWXOIDC_BASE_URL: http://localhost:18080
+      SIWXOIDC_REDIS_URL: redis://localhost:6379
+      SIWXOIDC_MAS_SHARED_SECRET: testsecret
+      SIWXOIDC_SYNAPSE_ENDPOINT: http://localhost:8090
+      SIWXOIDC_MATRIX_SERVER_NAME: matrix.test
+      SIWXOIDC_REQUIRE_SECRET: "false"
+      SIWXOIDC_LOG_FORMAT: pretty
       RUST_LOG: siwx_oidc=info,tower_http=warn,warn
       SYNAPSE_MOCK_SECRET: testsecret
       SYNAPSE_MOCK_PORT: "8090"
+      # The issuer the mock introspects admin tokens against. Set explicitly:
+      # its fallback reads the legacy SIWEOIDC_BASE_URL, which this job no
+      # longer sets, and without either every admin call answers 401.
+      SYNAPSE_MOCK_OIDC_BASE: http://localhost:18080
       # What the tests themselves read (tests/e2e_*.rs `oidc()` / `mock()`).
+      # SIWEOIDC_HOST is the suites' own variable, not a server setting; the
+      # server is started without it so its legacy-name warning stays quiet.
       SIWEOIDC_HOST: http://localhost:18080
       SYNAPSE_MOCK: http://localhost:8090
       # `matrix_host()` in e2e_device_code / e2e_msc3861 / e2e_session_teardown.
@@ -171,9 +218,11 @@ jobs:
       # ASSERT rather than skip.
       MATRIX_HOST: http://localhost:8090
     steps:
-      - uses: actions/checkout@v5
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.x"
 
@@ -198,14 +247,14 @@ jobs:
 
       - name: Start siwx-oidc
         run: |
-          nohup ./target/debug/siwx-oidc > /tmp/siwx-oidc.log 2>&1 &
+          nohup env -u SIWEOIDC_HOST ./target/debug/siwx-oidc > /tmp/siwx-oidc.log 2>&1 &
           for _ in $(seq 1 60); do
-            if curl -sf "${SIWEOIDC_BASE_URL}/health" >/dev/null 2>&1; then
+            if curl -sf "${SIWXOIDC_BASE_URL}/health" >/dev/null 2>&1; then
               echo "siwx-oidc healthy"; exit 0
             fi
             sleep 0.5
           done
-          echo "siwx-oidc did not become healthy on ${SIWEOIDC_BASE_URL}" >&2
+          echo "siwx-oidc did not become healthy on ${SIWXOIDC_BASE_URL}" >&2
           cat /tmp/siwx-oidc.log >&2
           exit 1
 
@@ -288,7 +337,7 @@ jobs:
 
       - name: Upload failure artifacts
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rust-e2e-mock-logs
           path: |
@@ -322,27 +371,34 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      SIWEOIDC_ADDRESS: 127.0.0.1
-      SIWEOIDC_PORT: "18080"
-      SIWEOIDC_BASE_URL: http://localhost:18080
-      SIWEOIDC_REDIS_URL: redis://localhost:6379
-      SIWEOIDC_MAS_SHARED_SECRET: testsecret
-      SIWEOIDC_SYNAPSE_ENDPOINT: http://localhost:8090
-      SIWEOIDC_MATRIX_SERVER_NAME: matrix.test
-      SIWEOIDC_REQUIRE_SECRET: "false"
-      SIWEOIDC_LOG_FORMAT: pretty
+      SIWXOIDC_ADDRESS: 127.0.0.1
+      SIWXOIDC_PORT: "18080"
+      SIWXOIDC_BASE_URL: http://localhost:18080
+      SIWXOIDC_REDIS_URL: redis://localhost:6379
+      SIWXOIDC_MAS_SHARED_SECRET: testsecret
+      SIWXOIDC_SYNAPSE_ENDPOINT: http://localhost:8090
+      SIWXOIDC_MATRIX_SERVER_NAME: matrix.test
+      SIWXOIDC_REQUIRE_SECRET: "false"
+      SIWXOIDC_LOG_FORMAT: pretty
       RUST_LOG: siwx_oidc=info,tower_http=warn,warn
       SYNAPSE_MOCK_SECRET: testsecret
       SYNAPSE_MOCK_PORT: "8090"
+      # The issuer the mock introspects admin tokens against. Set explicitly:
+      # its fallback reads the legacy SIWEOIDC_BASE_URL, which this job no
+      # longer sets, and without either every admin call answers 401.
+      SYNAPSE_MOCK_OIDC_BASE: http://localhost:18080
+      # The suites' own variable, not a server setting (see rust-e2e-mock).
       SIWEOIDC_HOST: http://localhost:18080
       SYNAPSE_MOCK: http://localhost:8090
     steps:
-      - uses: actions/checkout@v5
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "20"
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.x"
 
@@ -370,14 +426,14 @@ jobs:
 
       - name: Start siwx-oidc
         run: |
-          nohup ./target/debug/siwx-oidc > /tmp/siwx-oidc.log 2>&1 &
+          nohup env -u SIWEOIDC_HOST ./target/debug/siwx-oidc > /tmp/siwx-oidc.log 2>&1 &
           for _ in $(seq 1 60); do
-            if curl -sf "${SIWEOIDC_BASE_URL}/health" >/dev/null 2>&1; then
+            if curl -sf "${SIWXOIDC_BASE_URL}/health" >/dev/null 2>&1; then
               echo "siwx-oidc healthy"; exit 0
             fi
             sleep 0.5
           done
-          echo "siwx-oidc did not become healthy on ${SIWEOIDC_BASE_URL}" >&2
+          echo "siwx-oidc did not become healthy on ${SIWXOIDC_BASE_URL}" >&2
           cat /tmp/siwx-oidc.log >&2
           exit 1
 
@@ -399,7 +455,7 @@ jobs:
 
       - name: Upload failure artifacts
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: browser-e2e-results
           path: |
