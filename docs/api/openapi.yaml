@@ -667,7 +667,8 @@ paths:
       summary: Re-authenticate for an account action with a wallet signature
       responses:
         "200": { description: Authenticated. }
-        "400": { description: "Rejected — a new identity cannot be created here." }
+        "400": { description: "Rejected — a new identity cannot be created here, or reactivation of an erased account." }
+        "503": { description: "A required check (Synapse, or the erasure marker) could not run; nothing was changed." }
 
   /account/action:
     post:
@@ -683,7 +684,8 @@ paths:
         "200":
           description: The action outcome.
           content: { application/json: { schema: { $ref: "#/components/schemas/ActionOutcome" } } }
-        "400": { description: Missing, unknown, or unavailable action. }
+        "400": { description: "Missing, unknown, or unavailable action, or reactivation of an erased account." }
+        "503": { description: "A required check (Synapse, or the erasure marker) could not run; nothing was changed." }
 
   /account/passkey/start:
     post:
@@ -699,7 +701,8 @@ paths:
       summary: Finish passkey re-authentication for an account action
       responses:
         "200": { description: Authenticated. }
-        "400": { description: "Rejected — a new identity cannot be created here." }
+        "400": { description: "Rejected — a new identity cannot be created here, or reactivation of an erased account." }
+        "503": { description: "A required check (Synapse, or the erasure marker) could not run; nothing was changed." }
         "401": { $ref: "#/components/responses/UnknownCredential" }
 
   /_matrix/client/v3/login:

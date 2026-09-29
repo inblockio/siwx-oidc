@@ -888,18 +888,17 @@ class Handler(BaseHTTPRequestHandler):
                     PROFILE_FIELDS.pop(uid, None)
             return self._send(200, {})
         # POST /_synapse/mas/reactivate_user {localpart}
+        #
+        # Synapse 1.161.0 (`activate_account`) reactivates ANY deactivated
+        # account, erased or not: it calls `mark_user_not_erased`, recreates a
+        # blank profile row (`create_profile`) and clears the deactivated flag.
+        # This mock used to refuse an erased account, which Synapse does not do,
+        # and that hid a real hole: only siwx-oidc keeps an erasure final.
         if path == "/_synapse/mas/reactivate_user":
             uid = _mxid(body.get("localpart", ""))
             with LOCK:
-                cur = LIFECYCLE.get(uid, {"deactivated": False, "erased": False})
-                if cur.get("erased"):
-                    # Only an erase=false deactivation can be restored.
-                    return self._send(400, {
-                        "errcode": "M_UNKNOWN",
-                        "error": "cannot reactivate an erased account",
-                    })
-                cur["deactivated"] = False
-                LIFECYCLE[uid] = cur
+                LIFECYCLE[uid] = {"deactivated": False, "erased": False}
+                PROFILES.setdefault(uid, {"displayname": None, "avatar_url": None})
             return self._send(200, {})
         return self._send(404, {"errcode": "M_NOT_FOUND", "error": path})
 

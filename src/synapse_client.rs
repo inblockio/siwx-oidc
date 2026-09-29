@@ -856,7 +856,7 @@ impl SynapseClient {
     /// (below) for the pure decision function and its unit tests.
     ///
     /// **Erasure interplay:** a GDPR-erased account (`account::execute_action`'s
-    /// `org.matrix.account_erase`, which purges the profile via the MAS
+    /// `io.inblock.account_erase`, which purges the profile via the MAS
     /// `delete_user` call with `erase: true`) also 404s as "truly absent" by this
     /// same discriminator. If an erased account ever completed sign-in again this
     /// heal would resurrect a bare profile row (displayname = the generated
@@ -1082,8 +1082,11 @@ impl SynapseClient {
     ///   the account is restorable via [`reactivate_user`](Self::reactivate_user).
     ///   This backs `/account?action=org.matrix.account_deactivate`.
     /// * `erase = true` → the same deactivation **plus** GDPR erasure of the
-    ///   user's data. Irreversible. This backs
-    ///   `/account?action=org.matrix.account_erase`.
+    ///   user's data. This backs `/account?action=io.inblock.account_erase`.
+    ///   The deleted data does not come back, but Synapse does not make the
+    ///   erasure final: [`reactivate_user`](Self::reactivate_user) would
+    ///   reactivate the account. siwx-oidc refuses that itself, from a marker
+    ///   written before this call (`account::reactivation_gate`).
     ///
     /// `erase` is a **required** `StrictBool` in the MAS request model (no
     /// default, and no coercion from `"true"` or `1`), so it must be sent as a
@@ -1115,14 +1118,17 @@ impl SynapseClient {
         Ok(())
     }
 
-    /// Reactivate a previously (non-erased) deactivated account via the MAS API
+    /// Reactivate a deactivated account via the MAS API
     /// (`POST /_synapse/mas/reactivate_user`, body `{localpart}`).
     ///
     /// Ported from `PUT /_synapse/admin/v2/users/{mxid}` with
     /// `{"deactivated": false}`, which answers 401 on 1.157+. The MAS resource
     /// calls `deactivate_account_handler.activate_account(user_id)` — the same
-    /// handler the admin PUT reached — so the semantics carry over, including
-    /// the constraint that only an `erase = false` deactivation can be restored.
+    /// handler the admin PUT reached — so the semantics carry over. That
+    /// handler reactivates ANY deactivated account, an erased one included: it
+    /// clears the erased flag and recreates the profile row (1.161.0). Callers
+    /// must refuse an erased account BEFORE calling this; the account action
+    /// does, in `account::reactivation_gate`.
     ///
     /// The historical worry that reactivation demands a local password does not
     /// apply here at all: the MAS body carries only the localpart, so there is

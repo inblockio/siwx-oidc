@@ -470,7 +470,7 @@ override with `SIWXOIDC_ACCOUNT_MANAGEMENT_URI`) and
 | `org.matrix.cross_signing_reset` | | allow a cross-signing reset (MSC4312) |
 | `org.matrix.account_deactivate` | | deactivate the account (`delete_user` with `erase: false`) and revoke all tokens |
 | `io.inblock.account_erase` | `org.matrix.account_erase` | **not in the spec.** Erase the account (`delete_user` with `erase: true`: profile, media and room memberships), revoke all tokens, and delete the DID's passkey credentials and links |
-| `io.inblock.account_reactivate` | `org.matrix.account_reactivate` | **not in the spec.** Reactivate an account deactivated with `erase: false` (`reactivate_user`) |
+| `io.inblock.account_reactivate` | `org.matrix.account_reactivate` | **not in the spec.** Reactivate an account deactivated with `erase: false` (`reactivate_user`). An erased account is refused, see below |
 
 `io.inblock.account_erase` and `io.inblock.account_reactivate` are
 project-specific: Matrix does not define them, so they carry this project's
@@ -508,6 +508,17 @@ included, to the action it dispatches.
   `erase: false` deactivation with `io.inblock.account_reactivate`, which is
   exempt from the deactivation gate. Only the erase warning says "This cannot
   be undone."
+- **Erasure is final because siwx-oidc makes it so, not Synapse.** Synapse's
+  `reactivate_user` reactivates any deactivated account: it clears the erased
+  flag and recreates a blank profile row (1.161.0, `activate_account`), and
+  `query_user` does not report erasure. So erase first writes a marker to Redis
+  with no expiry (`erased:user/{localpart}` and `erased:did/{sha256 of the
+  canonical DID}`) and refuses to erase if it cannot; reactivate refuses an
+  account carrying either marker with a 400, before Synapse is asked, and a
+  marker it cannot read with a 503. The erased data itself (profile, media,
+  room memberships, passkeys) is gone either way. A server admin can still
+  reactivate the account in Synapse directly, and flushing Redis removes the
+  markers.
 - **Devices come from Synapse.** Listing and viewing use the Synapse admin API
   with a minted token, because the MAS API has no device-listing route (its
   device routes are write-only). `device_delete` deletes the Synapse device and

@@ -107,7 +107,10 @@ than rubber-stamps.
 - One wallet signature (or one passkey ceremony) covers a whole account session:
   list sessions → sign a device out → view profile, with no further prompt.
 - Device sign-out deletes the Synapse device and revokes its tokens.
-- Account erasure runs `deactivate(erase=true)` and clears the session.
+- Account erasure runs `deactivate(erase=true)` and clears the session, and a
+  later reactivation is refused before Synapse is asked (the mock, like Synapse
+  1.161, would reactivate an erased account). A plain deactivation stays
+  reversible.
 - The legacy in-client session-manager delete endpoints work.
 - An admin-token rejection fails legibly (400 naming the admin token), never a
   misleading "device not found" or a 500.
