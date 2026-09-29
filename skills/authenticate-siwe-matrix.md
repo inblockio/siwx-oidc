@@ -2,14 +2,14 @@ End-to-end authentication flow reference: Element Web to siwx-oidc to Matrix Syn
 
 Use when tracing, debugging, or explaining the authentication flow. Covers both wallet (CAIP-122) and passkey (WebAuthn) paths through OIDC delegated auth.
 
-**Key fact:** siwx-oidc **replaces MAS entirely**. It is not an upstream IdP behind MAS. Synapse delegates auth to siwx-oidc directly.
+**Key fact:** siwx-oidc **takes the place of MAS as Synapse's auth service**. It is not an upstream IdP behind MAS; Synapse delegates auth to siwx-oidc directly. It implements only what this stack needs (no password login, no upstream IdPs, no admin API, no legacy `POST /login`), and Synapse's side of the integration (`/_synapse/mas/*`) is an internal API designed for MAS, so every Synapse bump is a compatibility check.
 
 **Key fact 2 (the config key changed):** the delegation is configured with
-`matrix_authentication_service` on Synapse >= 1.157 (dev-staging runs 1.159.0) and with
-`experimental_features.msc3861` on <= 1.156 (prod still runs 1.154.0). The `msc3861`
-key was **removed** in 1.157.0 and now crashes Synapse on startup. "MSC3861" still
-names the *protocol* and siwx-oidc's internal token mode; it is no longer the name of
-a Synapse setting on current versions. See "Synapse delegated-auth config" below.
+`matrix_authentication_service` (available since Synapse 1.136, the only option since
+1.157; siwx-oidc-matrix-server builds on 1.161.0). The old
+`experimental_features.msc3861` key was **removed** in 1.157.0 and now crashes Synapse
+on startup. "MSC3861" still names the *protocol* (the Matrix OAuth 2.0 API, spec v1.15);
+it is no longer the name of a Synapse setting. See "Synapse delegated-auth config" below.
 
 ## Service Topology
 
@@ -80,7 +80,7 @@ Injected JS shims in Element Web (`siwx-gate.js`, `siwx-redirect.js`):
    - Verifies signature: `did_method.verify(&did, &message, &sig_bytes)`
    - Checks nonce matches `session.siwe_nonce`
    - Checks `redirect_uri` in CAIP-122 `Resources:` section
-3. **Synapse device lifecycle** (if `SIWEOIDC_SYNAPSE_ENDPOINT` + `MAS_SHARED_SECRET` configured):
+3. **Synapse device lifecycle** (if `SIWXOIDC_SYNAPSE_ENDPOINT` + `SIWXOIDC_MAS_SHARED_SECRET` configured):
    - **Never deletes** existing devices on sign-in (no recycle of device IDs)
    - Generates `SIWX_{uuid8}` device ID when the client did not propose one in scope
    - Provisions user via `/_synapse/mas/provision_user` if localpart free
@@ -88,7 +88,10 @@ Injected JS shims in Element Web (`siwx-gate.js`, `siwx-redirect.js`):
    - **Best-effort** `POST /_synapse/mas/allow_cross_signing_reset` after every login
      provision (product 3B): arms a short Synapse window so a half-reset client can
      republish public cross-signing keys; failures are logged and do **not** fail sign-in
-   - Localpart: DID with colons replaced by dashes, lowercased
+   - Localpart: 16 lowercase base36 characters derived from the DID's SHA-256
+     (`mxid::localpart_for`); accounts created under the older colons-to-dashes shape
+     keep it (`localpart::resolve_identity_or_legacy`, grandfathering)
+   - Publishes the provider-signed `io.inblock.did` profile field (best-effort)
 4. Creates `CodeEntry` in Redis (UUID key, 300s TTL)
 5. Redirects to `redirect_uri?code={uuid}&state={state}`
 
@@ -104,12 +107,12 @@ Injected JS shims in Element Web (`siwx-gate.js`, `siwx-redirect.js`):
 
 1. Atomically consumes code (`try_consume_code`)
 2. Validates PKCE: SHA-256(code_verifier) == stored code_challenge
-3. **MSC3861 mode**: issues opaque tokens stored in Redis:
+3. **Matrix mode** (`mas_shared_secret` set): issues opaque tokens stored in Redis:
    - Access: `mat_{32 base62}` (300s TTL)
    - Refresh: `mcr_{32 base62}` (7_776_000s TTL / 90 days)
    - `TokenMetadata`: `{ username, device_id, scope, client_id, iat, exp, did, name }`
    - Scope: `openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}`
-4. Signs ES256 ID token: `sub`=DID, `preferred_username`=DID, `name`=ENS name or DID
+4. Signs ES256 ID token: `sub`=DID, `preferred_username`=DID, `name`=ENS name when one resolves (omitted otherwise)
 5. Returns `{ access_token, token_type, id_token, expires_in, refresh_token }`
 
 ### Step 6: Element Web session
@@ -141,7 +144,7 @@ Steps 1-2 identical. Then:
 
 **`src/webauthn.rs`**
 
-1. `POST /webauthn/authenticate/start`: discoverable auth (empty allow list), stores state in Redis (120s TTL)
+1. `POST /webauthn/authenticate/start`: discoverable auth (empty allow list), or scoped to the returning user's passkeys when a valid `siwx_user` cookie is present; stores state in Redis (120s TTL)
 2. Browser prompts passkey selection
 3. `POST /webauthn/authenticate/finish`:
    - Loads credential from `webauthn:credential/{cred_id_b64}`
@@ -177,7 +180,7 @@ Steps 5-8 identical.
 Written by `entrypoints/matrix_server.sh`. **The config key changed in Synapse 1.157.0.**
 Check the homeserver version before applying either block.
 
-### Synapse >= 1.157 — stable `matrix_authentication_service` (dev-staging: 1.159.0)
+### Synapse >= 1.136 — stable `matrix_authentication_service` (required from 1.157)
 
 ```yaml
 matrix_authentication_service:
@@ -197,7 +200,7 @@ have **no equivalent here**. Synapse discovers all of that itself by fetching
 siwx-oidc's OIDC metadata from `endpoint` — `api/auth/mas.py::auth_metadata()` is
 `self._server_metadata.get()`, which does `get_json(self._metadata_url)`.
 
-### Synapse <= 1.156 — legacy `experimental_features.msc3861` (prod today: 1.154.0)
+### Synapse <= 1.156 — legacy `experimental_features.msc3861` (historical)
 
 ```yaml
 experimental_features:
@@ -254,7 +257,7 @@ Policy is **intent-based** (`compat::TeardownPolicy`), not transport-based:
 | `POST /_matrix/client/v3/logout` | **Delete** ending session device | Revoke that session's tokens |
 | `POST /_matrix/client/v3/logout/all` | Delete each device (best-effort) | Revoke all user tokens |
 
-Revoke must **not** delete the device (2026-06-12 incident). Under MSC3861 these CS-API paths are owned by siwx-oidc and must be edge-routed from the homeserver hostname.
+Revoke must **not** delete the device (2026-06-12 incident). Under delegated auth these CS-API paths are owned by siwx-oidc and must be edge-routed from the homeserver hostname.
 
 ## Common Failure Points
 

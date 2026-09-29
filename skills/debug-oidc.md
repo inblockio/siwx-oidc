@@ -26,14 +26,14 @@ RUST_LOG=siwx_oidc=debug,tower_http=debug cargo run
 RUST_LOG=siwx_oidc=trace,tower_http=trace cargo run
 
 # For JSON output (useful for piping to jq)
-SIWEOIDC_LOG_FORMAT=json RUST_LOG=siwx_oidc=debug cargo run 2>&1 | jq .
+SIWXOIDC_LOG_FORMAT=json RUST_LOG=siwx_oidc=debug cargo run 2>&1 | jq .
 ```
 
 Key log targets:
 - `siwx_oidc::oidc` -- sign-in, token, authorize, ENS resolution
 - `siwx_oidc::webauthn` -- passkey ceremonies
 - `siwx_oidc::axum_lib` -- startup, request/response lifecycle, error responses
-- `siwx_oidc::introspect` -- token introspection (MSC3861)
+- `siwx_oidc::introspect` -- token introspection for Synapse
 - `siwx_oidc::compat` -- Matrix compat endpoints (revoke, refresh, logout)
 - `siwx_oidc::synapse_client` -- Synapse provisioning API calls
 - `tower_http` -- HTTP request/response traces
@@ -45,22 +45,29 @@ curl -s http://localhost:8000/.well-known/openid-configuration | python3 -m json
 ```
 
 Verify:
-- `issuer` matches `SIWEOIDC_BASE_URL`
+- `issuer` matches `SIWXOIDC_BASE_URL` (legacy name `SIWEOIDC_BASE_URL`)
 - `authorization_endpoint`, `token_endpoint`, `userinfo_endpoint` are present
 - `jwks_uri` is accessible
 
 ## 4. Check JWKS
 
 ```bash
-curl -s http://localhost:8000/jwks | python3 -m json.tool
+curl -s http://localhost:8000/jwk | python3 -m json.tool
 ```
 
-Should return a JWK set with an ES256 key. If empty, the signing key failed to load.
+Should return a JWK set with the live ES256 key (plus any retired public keys). The
+`kid` is derived from the key; if it changes after every restart, no signing key is
+configured and an ephemeral one is generated (see docs/configuration.md).
 
 ## 5. Check registered clients
 
 ```bash
-curl -s http://localhost:8000/client/{client_id} | python3 -m json.tool
+# Needs the client's registration access token (returned by POST /register)
+curl -s http://localhost:8000/client/{client_id} \
+  -H "Authorization: Bearer {registration_access_token}" | python3 -m json.tool
+
+# Or read it straight from Redis
+redis-cli GET 'clients/{client_id}' | python3 -m json.tool
 ```
 
 Verify the client exists and `redirect_uris` includes the callback URL being used.
@@ -79,30 +86,30 @@ Common cookie issues:
 
 If the server rejects a signature, test the DID method directly:
 ```bash
-cargo test -p siwx-core
+cargo test   # in an aqua-auth checkout, at the tag siwx-oidc pins
 ```
 
-For specific DID verification, check:
-- `siwx-core/src/pkh/eip155.rs` — Ethereum (EIP-191)
-- `siwx-core/src/pkh/ed25519.rs` — Ed25519
-- `siwx-core/src/pkh/p256.rs` — P-256 ECDSA
-- `siwx-core/src/key/mod.rs` — did:key
-- `siwx-core/src/peer/mod.rs` — did:peer
+For specific DID verification, check in aqua-auth (https://github.com/inblockio/aqua-rs-auth):
+- `src/pkh/eip155.rs` — Ethereum (EIP-191)
+- `src/key/ed25519.rs` — Ed25519
+- `src/key/p256.rs` — P-256 ECDSA
+- `src/key/mod.rs` — did:key
+- `src/peer/mod.rs` — did:peer
 
 ## 8. Check supported methods config
 
 ```bash
 # What DID methods does the server accept?
-grep supported_did_methods siwe-oidc.toml
-# Env var override:
-echo $SIWEOIDC_SUPPORTED_DID_METHODS
+grep supported_did_methods siwx-oidc.toml siwe-oidc.toml
+# Env var override (SIWXOIDC_ wins over the legacy SIWEOIDC_):
+echo $SIWXOIDC_SUPPORTED_DID_METHODS $SIWEOIDC_SUPPORTED_DID_METHODS
 
 # What pkh namespaces?
-grep supported_pkh_namespaces siwe-oidc.toml
-echo $SIWEOIDC_SUPPORTED_PKH_NAMESPACES
+grep supported_pkh_namespaces siwx-oidc.toml siwe-oidc.toml
+echo $SIWXOIDC_SUPPORTED_PKH_NAMESPACES $SIWEOIDC_SUPPORTED_PKH_NAMESPACES
 ```
 
-Default: `supported_did_methods = ["pkh"]`, `supported_pkh_namespaces = ["eip155", "ed25519", "p256"]`.
+Default: `supported_did_methods = ["pkh", "key"]`, `supported_pkh_namespaces = ["eip155", "ed25519", "p256"]`.
 
 ## 9. Test with headless client
 

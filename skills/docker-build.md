@@ -5,11 +5,14 @@ builds should only be used for testing, never for production deployment.
 
 ## Steps
 
-1. Run tests first (catches Rust issues early):
+1. Run the checks CI runs first (catches Rust issues early; `cargo test` needs Redis on
+   localhost:6379, e.g. `docker compose -f test/docker-compose.yml up -d redis`):
 ```bash
-cd ../aqua-auth && cargo test --features webauthn && cd -
+cargo fmt -- --check
 cargo clippy --workspace -- -D warnings
+cargo test
 ```
+aqua-auth is a pinned git dependency; its own tests run in its repository.
 
 2. Run the frontend build locally to catch webpack errors before Docker:
 ```bash
@@ -26,8 +29,10 @@ docker build -t ghcr.io/inblockio/siwx-oidc:latest .
 # Check image size (should be ~18MB)
 docker images ghcr.io/inblockio/siwx-oidc:latest
 
-# Verify the binary runs
-docker run --rm ghcr.io/inblockio/siwx-oidc:latest --help 2>&1 || true
+# Verify both binaries are in the image (the server takes no CLI arguments;
+# it reads SIWXOIDC_* configuration and starts)
+docker run --rm --entrypoint ls ghcr.io/inblockio/siwx-oidc:latest /usr/local/bin
+docker run --rm --entrypoint migrate-credentials ghcr.io/inblockio/siwx-oidc:latest --help
 
 # Verify wget exists (needed for health checks)
 docker run --rm --entrypoint which ghcr.io/inblockio/siwx-oidc:latest wget
