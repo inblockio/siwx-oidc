@@ -24,7 +24,7 @@ shared secret, which is now a hard 401 in production and used to be fine).
 
 | Surface | Credential | Routes |
 |---|---|---|
-| `/_synapse/mas/*` | `Authorization: Bearer <SECRET>`, exact string equality | provision_user, upsert_device, allow_cross_signing_reset, is_localpart_available, query_user, delete_device, delete_user, reactivate_user |
+| `/_synapse/mas/*` | `Authorization: Bearer <SECRET>`, exact string equality | provision_user, upsert_device, update_device_display_name, allow_cross_signing_reset, is_localpart_available, query_user, delete_device, delete_user, reactivate_user |
 | `/_synapse/admin/*` + the AUTHENTICATED C-S API | a **minted admin token** (`src/admin_token.rs`, `msa_` prefix), validated by REAL introspection against siwx-oidc | list_devices (get_device is list+filter), keys/query, PUT profile field |
 | the AUTHENTICATED C-S API, as the USER | the caller's OWN access token (`mat_` / standalone), validated by the SAME real introspection | account/whoami, GET devices |
 | the UNauthenticated C-S API | none | GET profile, GET profile field |
@@ -56,6 +56,7 @@ nondeterministic, so every admin request introspects.
   -- MAS surface (shared secret) ---------------------------------------------
   POST   /_synapse/mas/provision_user             synapse_client::provision_user
   POST   /_synapse/mas/upsert_device              synapse_client::upsert_device
+  POST   /_synapse/mas/update_device_display_name synapse_client::update_device_display_name
   POST   /_synapse/mas/allow_cross_signing_reset  synapse_client::allow_cross_signing_reset
   GET    /_synapse/mas/is_localpart_available     synapse_client::is_localpart_available
   GET    /_synapse/mas/query_user                 synapse_client::query_user
@@ -818,6 +819,14 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 _mark_profile(lp, body.get("set_displayname"))
             return self._send(200, {})
+        # POST /_synapse/mas/upsert_device {localpart, device_id, display_name?}
+        #
+        # Synapse 1.161.0 answers 201 when it inserted the device and 200 when it
+        # already existed, and OVERWRITES an existing device's name whenever one
+        # is sent (`DeviceHandler.upsert_device` -> `store.update_device`). Both
+        # are modelled: siwx-oidc must read the 201 to know a device is new, and
+        # a name it wrongly sent to an existing device must show up here the way
+        # it would on Synapse. This mock used to keep the old name, which hid it.
         if path == "/_synapse/mas/upsert_device":
             uid = _mxid(body["localpart"])
             with LOCK:
@@ -827,8 +836,30 @@ class Handler(BaseHTTPRequestHandler):
                 # repair every row-less account.
                 _mark_existing(body["localpart"])
                 devs = DEVICES.setdefault(uid, [])
-                if not any(d["device_id"] == body["device_id"] for d in devs):
+                existing = next((d for d in devs if d["device_id"] == body["device_id"]), None)
+                if existing is None:
                     devs.append(_device(body["device_id"], body.get("display_name")))
+                elif body.get("display_name") is not None:
+                    existing["display_name"] = body["display_name"]
+            return self._send(201 if existing is None else 200, {})
+        # POST /_synapse/mas/update_device_display_name {localpart, device_id, display_name}
+        #
+        # `display_name` is a required StrictStr; an unknown device is a 404
+        # (`update_device` raises NotFoundError on the store's 404).
+        if path == "/_synapse/mas/update_device_display_name":
+            name = body.get("display_name")
+            if not isinstance(name, str):
+                return self._send(400, {
+                    "errcode": "M_BAD_JSON",
+                    "error": "`display_name` is required and must be a string",
+                })
+            uid = _mxid(body.get("localpart", ""))
+            with LOCK:
+                dev = next((d for d in DEVICES.get(uid, [])
+                            if d["device_id"] == body.get("device_id")), None)
+                if dev is None:
+                    return self._send(404, {"errcode": "M_NOT_FOUND", "error": "Not found"})
+                dev["display_name"] = name
             return self._send(200, {})
         if path == "/_synapse/mas/allow_cross_signing_reset":
             return self._send(200, {})

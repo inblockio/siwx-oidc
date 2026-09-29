@@ -10,7 +10,7 @@
 //!
 //! | Surface | Auth | Calls |
 //! |---|---|---|
-//! | `/_synapse/mas/*` | `Authorization: Bearer {shared_secret}`, compared for **exact string equality** against `matrix_authentication_service.secret` | `provision_user`, `upsert_device`, `allow_cross_signing_reset`, `localpart_status` (and its two-valued wrapper `is_localpart_available`), `query_user`, `delete_device`, `deactivate_user`, `reactivate_user` |
+//! | `/_synapse/mas/*` | `Authorization: Bearer {shared_secret}`, compared for **exact string equality** against `matrix_authentication_service.secret` | `provision_user`, `upsert_device`, `update_device_display_name`, `allow_cross_signing_reset`, `localpart_status` (and its two-valued wrapper `is_localpart_available`), `query_user`, `delete_device`, `deactivate_user`, `reactivate_user` |
 //! | `/_synapse/admin/*` and the authenticated C-S API | a **minted, admin-scoped access token** ([`crate::admin_token`]) | `list_devices`, `get_device`, `has_cross_signing_keys`, `publish_did_field` |
 //!
 //! Presenting the shared secret on the second surface answers **401
@@ -83,6 +83,17 @@ pub struct MasUserInfo {
     pub is_suspended: bool,
     #[serde(default)]
     pub is_deactivated: bool,
+}
+
+/// What `upsert_device` did, read from Synapse's status: 201 is
+/// [`Created`](DeviceUpsert::Created), any other 2xx
+/// [`AlreadyExisted`](DeviceUpsert::AlreadyExisted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceUpsert {
+    /// This call inserted the device, so it has no name yet and is ours to name.
+    Created,
+    /// The device was already there; its name belongs to whoever set it.
+    AlreadyExisted,
 }
 
 /// A user's device/session as reported by Synapse's admin API.
@@ -477,23 +488,23 @@ impl SynapseClient {
         Ok(())
     }
 
-    /// Create or update a device for a user.
+    /// Create a device for a user, or confirm that it exists, WITHOUT a
+    /// display name (`POST /_synapse/mas/upsert_device`).
     ///
-    /// If the device already exists its display name is updated.
-    pub async fn upsert_device(
-        &self,
-        localpart: &str,
-        device_id: &str,
-        display_name: Option<&str>,
-    ) -> Result<()> {
+    /// Never sends a name, because Synapse OVERWRITES an existing device's name
+    /// whenever one is sent (1.161.0: `DeviceHandler.upsert_device` calls
+    /// `store.update_device(new_display_name=…)` when the device existed), and
+    /// only the caller that created the device may name it. Synapse answers 201
+    /// when it inserted the device and 200 when it already existed
+    /// (`rest/synapse/mas/devices.py`); only a 201 reads as
+    /// [`DeviceUpsert::Created`], so an unexpected 2xx names nothing. Name a
+    /// created device with [`update_device_display_name`](Self::update_device_display_name).
+    pub async fn upsert_device(&self, localpart: &str, device_id: &str) -> Result<DeviceUpsert> {
         let url = format!("{}/_synapse/mas/upsert_device", self.endpoint);
-        let mut body = json!({
+        let body = json!({
             "localpart": localpart,
             "device_id": device_id,
         });
-        if let Some(name) = display_name {
-            body["display_name"] = json!(name);
-        }
 
         let resp = self
             .http
@@ -504,11 +515,50 @@ impl SynapseClient {
             .await
             .context("upsert_device: request failed")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let status = resp.status();
+        if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
             warn!(%status, body = %body_text, "upsert_device failed");
             anyhow::bail!("upsert_device: HTTP {status}");
+        }
+        Ok(if status == reqwest::StatusCode::CREATED {
+            DeviceUpsert::Created
+        } else {
+            DeviceUpsert::AlreadyExisted
+        })
+    }
+
+    /// Set a device's display name
+    /// (`POST /_synapse/mas/update_device_display_name`). Overwrites the
+    /// current name, so call it only for a device this caller just created.
+    pub async fn update_device_display_name(
+        &self,
+        localpart: &str,
+        device_id: &str,
+        display_name: &str,
+    ) -> Result<()> {
+        let url = format!("{}/_synapse/mas/update_device_display_name", self.endpoint);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.shared_secret)
+            .json(&json!({
+                "localpart": localpart,
+                "device_id": device_id,
+                "display_name": display_name,
+            }))
+            .send()
+            .await
+            .context("update_device_display_name: request failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            warn!(%status, body = %body_text, "update_device_display_name failed");
+            anyhow::bail!(
+                "update_device_display_name: HTTP {status}{}",
+                mas_status_hint(status)
+            );
         }
         Ok(())
     }

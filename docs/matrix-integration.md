@@ -109,7 +109,7 @@ interchangeable:
 
 | Surface | Credential | Calls |
 |---|---|---|
-| `/_synapse/mas/*` | the shared secret | `provision_user`, `is_localpart_available`, `query_user`, `upsert_device`, `delete_device`, `allow_cross_signing_reset`, `delete_user` (deactivate/erase), `reactivate_user` |
+| `/_synapse/mas/*` | the shared secret | `provision_user`, `is_localpart_available`, `query_user`, `upsert_device`, `update_device_display_name`, `delete_device`, `allow_cross_signing_reset`, `delete_user` (deactivate/erase), `reactivate_user` |
 | `/_synapse/admin/*` and the client-server API | a **minted admin-scoped token** ([below](#admin-scoped-token-mint)) | `GET /_synapse/admin/v2/users/{mxid}/devices` (list, view), `POST /_matrix/client/v3/keys/query` (cross-signing readback), `PUT`/`GET /_matrix/client/v3/profile/{mxid}/io.inblock.did` |
 
 The shared secret answers 401 `M_UNKNOWN_TOKEN` on the second surface. A wrong
@@ -394,16 +394,16 @@ logged and never fails the sign-in.
    overwritten.
 3. **DID field.** `io.inblock.did` is published (see
    [identity-model.md](identity-model.md#publication)).
-4. **Device.** `upsert_device` creates or updates the device. The device ID is
-   the one the client requested in its scope (`urn:matrix:client:device:{id}`
-   or the MSC2967 unstable form); otherwise `SIWX_` + 8 hex characters. A
-   device this sign-in creates is named after the OAuth client: its registered
-   `client_name`, else its client ID, cut to Synapse's 100-character limit.
-   An existing device keeps its name. Synapse's `upsert_device` overwrites the
-   name of an existing device whenever one is sent, so for a client-requested
-   ID siwx-oidc first lists the user's devices (admin API) and sends a name
-   only when the device is new; when it cannot tell (no
-   `SIWXOIDC_MATRIX_SERVER_NAME`, or the read failed), it sends none.
+4. **Device.** `upsert_device` creates the device, or confirms it exists. The
+   device ID is the one the client requested in its scope
+   (`urn:matrix:client:device:{id}` or the MSC2967 unstable form); otherwise
+   `SIWX_` + 8 hex characters. A device this sign-in creates is named after
+   the OAuth client: its registered `client_name`, else its client ID, cut to
+   Synapse's 100-character limit. An existing device keeps its name. Synapse's
+   `upsert_device` overwrites the name of an existing device whenever one is
+   sent, so siwx-oidc upserts without a name and, only when Synapse answers
+   201 (created), sets the name with `update_device_display_name`. Any other
+   success status leaves the device unnamed.
 5. **Cross-signing reset window.** `allow_cross_signing_reset` is called on
    every sign-in, so a client that is halfway through a key reset can publish
    replacement keys (see [Cross-signing](#cross-signing)).
@@ -695,9 +695,11 @@ symbol in the code.
 - **Revoke never deletes a device.** Device deletion belongs to explicit
   sign-out paths only (`compat::TeardownPolicy`).
 - **Never delete and then reuse a device ID.** Sign-in only upserts.
-- **Name a device only when this sign-in creates it**
-  (`oidc::upsert_display_name`). A name sent with `upsert_device` overwrites
-  the one the user chose.
+- **Name a device only when this sign-in creates it.** `upsert_device` never
+  carries a name, because a name sent with it overwrites the one the user
+  chose; a device the upsert created (Synapse answers 201) is then named with
+  `update_device_display_name`. The 201 is race-free, unlike a separate
+  existence check.
 - **`logout/all` never deactivates the account.**
 - **Deny-list, never allow-list,** in the Synapse patch configuration.
 - **Run the deactivation gate before `resolve_identity_or_legacy`** at sign-in,

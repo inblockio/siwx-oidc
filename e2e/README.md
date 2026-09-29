@@ -73,7 +73,7 @@ worse than no mock: it produces confident green.
 **One-line drift check** (prints nothing when the mock is in sync):
 
 ```bash
-grep -oE '"\{\}[^"]*"' src/synapse_client.rs | tr -d '"' | sed 's/^{}//' \
+grep -oE '"\{\}/[^"]*"' src/synapse_client.rs | tr -d '"' | sed 's/^{}//' \
   | cut -d'?' -f1 | sed 's#/{}.*##' | sort -u \
   | while read -r r; do grep -q -- "$r" e2e/synapse_mock.py \
       || echo "MISSING FROM MOCK: $r"; done

@@ -43,7 +43,7 @@ use siwx_oidc::db::*;
 use subtle::ConstantTimeEq;
 
 use crate::did_assertion::DidPublication;
-use crate::synapse_client::{PublishOutcome, SynapseClient};
+use crate::synapse_client::{DeviceUpsert, PublishOutcome, SynapseClient};
 
 use crate::introspect::generate_opaque_token;
 
@@ -2007,8 +2007,8 @@ fn resolve_device_id(proposed_device_id: Option<&str>) -> String {
 
 /// Synapse's limit on a device display name (`MAX_DEVICE_DISPLAY_NAME_LEN` in
 /// `synapse/handlers/device.py`, 1.161.0, counted in code points). A longer
-/// name makes `upsert_device` answer 400 `M_TOO_LARGE` and the session would
-/// get no device at all, so the name is cut to fit.
+/// name makes `update_device_display_name` answer 400 `M_TOO_LARGE` and the
+/// new device would stay unnamed, so the name is cut to fit.
 const MAX_DEVICE_DISPLAY_NAME_CHARS: usize = 100;
 
 /// The display name for a Synapse device created by a sign-in through
@@ -2035,55 +2035,6 @@ fn device_display_name(client_id: &str, client: Option<&ClientEntry>) -> String 
         .chars()
         .take(MAX_DEVICE_DISPLAY_NAME_CHARS)
         .collect()
-}
-
-/// The display name to send with `upsert_device`, or `None` to leave the
-/// device's name as it is.
-///
-/// Synapse's MAS `upsert_device` OVERWRITES the display name of an existing
-/// device whenever a name is sent, and leaves it alone only when none is
-/// (1.161.0: `DeviceHandler.upsert_device` calls
-/// `store.update_device(new_display_name=…)` when `store_device` reports the
-/// device already existed; `update_device` skips only a `None` name). So a
-/// name goes out only for a device this sign-in creates:
-///
-/// - an id this server minted (`SIWX_…`) is new by construction;
-/// - a client-supplied id may belong to a device the user has renamed (a
-///   client re-authenticating with its own device id), so it is named only
-///   when Synapse confirmed the device does not exist (`exists ==
-///   Some(false)`). An unknown state (`None`: no server name, or the read
-///   failed) sends no name: a new device left unnamed is cosmetic, a name the
-///   user chose being overwritten is not.
-fn upsert_display_name(name: &str, client_supplied_id: bool, exists: Option<bool>) -> Option<&str> {
-    match (client_supplied_id, exists) {
-        (false, _) | (true, Some(false)) => Some(name),
-        (true, Some(true) | None) => None,
-    }
-}
-
-/// Whether `device_id` already exists on `localpart`'s account, read through
-/// the Synapse admin API. `None` when that cannot be determined: without a
-/// server name there is no MXID to ask about, and an error means "unknown",
-/// never "absent".
-async fn device_exists(
-    synapse: &SynapseClient,
-    localpart: &str,
-    device_id: &str,
-    server_name: Option<&str>,
-) -> Option<bool> {
-    let server_name = server_name?;
-    match synapse.get_device(localpart, device_id, server_name).await {
-        Ok(device) => Some(device.is_some()),
-        Err(e) => {
-            warn!(
-                device_id = %device_id,
-                error = %e,
-                "could not read whether the client-supplied device exists; \
-                 upserting it without a display name so an existing name is kept"
-            );
-            None
-        }
-    }
 }
 
 /// Was this displayname written by US, or chosen by the USER?
@@ -2119,8 +2070,9 @@ fn provider_written_displayname(current: &str, did: &str, localpart: &str) -> bo
 /// is minted.
 ///
 /// `display_name` is the name a device CREATED by this sign-in gets
-/// ([`device_display_name`]). An existing device keeps its name; see
-/// [`upsert_display_name`].
+/// ([`device_display_name`]). An existing device keeps its name: the device is
+/// upserted without one and named only when Synapse reports it created it (see
+/// the upsert below).
 ///
 /// **Loud failure + self-heal (2026-08-01 incident, discriminator corrected
 /// 2026-08-02):** a `provision_user` failure at first sign-in used to be
@@ -2428,15 +2380,23 @@ pub async fn provision_synapse_device(
         }
     }
 
-    let client_supplied_id = proposed_device_id.is_some();
-    let exists = if client_supplied_id {
-        device_exists(synapse, localpart, &dev_id, server_name).await
-    } else {
-        None
-    };
-    let name = upsert_display_name(display_name, client_supplied_id, exists);
-    if let Err(e) = synapse.upsert_device(localpart, &dev_id, name).await {
-        warn!("upsert_device failed: {}", e);
+    // Upsert WITHOUT a name, then name the device only if this upsert created
+    // it. Synapse overwrites an existing device's name whenever one is sent,
+    // and a client may re-authenticate with its own device id for a device
+    // the user renamed. Synapse's 201 is the one race-free signal that the
+    // device is new: a separate "does it exist?" read could be overtaken by a
+    // concurrent sign-in. Failing to name a new device is cosmetic.
+    match synapse.upsert_device(localpart, &dev_id).await {
+        Ok(DeviceUpsert::Created) => {
+            if let Err(e) = synapse
+                .update_device_display_name(localpart, &dev_id, display_name)
+                .await
+            {
+                warn!(device_id = %dev_id, error = %e, "naming the new device failed (non-fatal)");
+            }
+        }
+        Ok(DeviceUpsert::AlreadyExisted) => {}
+        Err(e) => warn!("upsert_device failed: {}", e),
     }
 
     // 3B: arm reset window after every successful login provision (best-effort).
@@ -5380,6 +5340,7 @@ mod device_display_name_tests {
     use axum::{Json, Router};
     use headers::{HeaderMap, HeaderMapExt, HeaderValue};
     use openidconnect::{ClientName, LanguageTag};
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
 
@@ -5387,21 +5348,43 @@ mod device_display_name_tests {
     const DID: &str = "did:key:zDnDEVICEDISPLAYNAMETEST";
     const SERVER_NAME: &str = "example.org";
     const REDIRECT: &str = "https://example.com/callback";
+    const USERS_NAME: &str = "Chosen by the user";
 
     /// A homeserver on which every localpart is taken (an existing, active
-    /// account, so nothing is provisioned and no gate refuses), which lists
-    /// `devices` for every user and records every `upsert_device` body.
+    /// account, so nothing is provisioned and no gate refuses), with Synapse
+    /// 1.161.0's device semantics: `upsert_device` answers 201 for a device it
+    /// inserts and 200 for one it already has, and OVERWRITES an existing
+    /// device's name whenever one is sent; `update_device_display_name` sets
+    /// the name of a device that exists. `always_200` models a homeserver or
+    /// proxy that never says 201.
     struct Homeserver {
-        devices: Vec<String>,
+        /// device id -> display name
+        devices: Mutex<HashMap<String, Option<String>>>,
         upserts: Mutex<Vec<serde_json::Value>>,
+        renames: Mutex<Vec<serde_json::Value>>,
+        always_200: bool,
     }
 
     async fn spawn(
         devices: &[&str],
     ) -> (SynapseClient, Arc<Homeserver>, tokio::task::JoinHandle<()>) {
+        spawn_with(devices, false).await
+    }
+
+    async fn spawn_with(
+        devices: &[&str],
+        always_200: bool,
+    ) -> (SynapseClient, Arc<Homeserver>, tokio::task::JoinHandle<()>) {
         let hs = Arc::new(Homeserver {
-            devices: devices.iter().map(|d| d.to_string()).collect(),
+            devices: Mutex::new(
+                devices
+                    .iter()
+                    .map(|d| (d.to_string(), Some(USERS_NAME.to_string())))
+                    .collect(),
+            ),
             upserts: Mutex::new(Vec::new()),
+            renames: Mutex::new(Vec::new()),
+            always_200,
         });
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -5427,22 +5410,48 @@ mod device_display_name_tests {
                 }),
             )
             .route(
-                "/_synapse/admin/v2/users/{mxid}/devices",
-                get(|State(hs): State<Arc<Homeserver>>| async move {
-                    let devices: Vec<serde_json::Value> = hs
-                        .devices
-                        .iter()
-                        .map(|id| serde_json::json!({"device_id": id, "display_name": "Chosen by the user"}))
-                        .collect();
-                    Json(serde_json::json!({"devices": devices, "total": devices.len()}))
-                }),
-            )
-            .route(
                 "/_synapse/mas/upsert_device",
                 post(
                     |State(hs): State<Arc<Homeserver>>, Json(body): Json<serde_json::Value>| async move {
-                        hs.upserts.lock().unwrap().push(body);
-                        (StatusCode::OK, Json(serde_json::json!({})))
+                        hs.upserts.lock().unwrap().push(body.clone());
+                        let id = body["device_id"].as_str().unwrap().to_string();
+                        let name = body["display_name"].as_str().map(str::to_string);
+                        let mut devices = hs.devices.lock().unwrap();
+                        let created = match devices.get_mut(&id) {
+                            None => {
+                                devices.insert(id, name);
+                                true
+                            }
+                            Some(existing) => {
+                                if name.is_some() {
+                                    *existing = name;
+                                }
+                                false
+                            }
+                        };
+                        let status = if created && !hs.always_200 {
+                            StatusCode::CREATED
+                        } else {
+                            StatusCode::OK
+                        };
+                        (status, Json(serde_json::json!({})))
+                    },
+                ),
+            )
+            .route(
+                "/_synapse/mas/update_device_display_name",
+                post(
+                    |State(hs): State<Arc<Homeserver>>, Json(body): Json<serde_json::Value>| async move {
+                        hs.renames.lock().unwrap().push(body.clone());
+                        let id = body["device_id"].as_str().unwrap();
+                        let name = body["display_name"].as_str().unwrap().to_string();
+                        match hs.devices.lock().unwrap().get_mut(id) {
+                            Some(existing) => {
+                                *existing = Some(name);
+                                StatusCode::OK
+                            }
+                            None => StatusCode::NOT_FOUND,
+                        }
                     },
                 ),
             )
@@ -5457,12 +5466,6 @@ mod device_display_name_tests {
             hs,
             server,
         )
-    }
-
-    async fn redis() -> RedisClient {
-        RedisClient::new(&Config::default().redis_url)
-            .await
-            .expect("these tests need Redis on localhost:6379, as CI provides")
     }
 
     fn client_entry(client_name: Option<&str>) -> ClientEntry {
@@ -5482,16 +5485,40 @@ mod device_display_name_tests {
         }
     }
 
-    fn upserts(hs: &Homeserver) -> Vec<serde_json::Value> {
-        hs.upserts.lock().unwrap().clone()
+    /// Asserts that exactly one device was upserted, that the upsert carried
+    /// no name, and that the device was then named `expected` (`None`: not
+    /// named at all). Returns the device id.
+    fn the_one_device(hs: &Homeserver, expected: Option<&str>) -> String {
+        let upserts = hs.upserts.lock().unwrap().clone();
+        assert_eq!(upserts.len(), 1, "exactly one device upsert: {upserts:?}");
+        assert!(
+            upserts[0].get("display_name").is_none(),
+            "an upsert must never carry a name: Synapse would overwrite an existing \
+             device's: {}",
+            upserts[0]
+        );
+        let device_id = upserts[0]["device_id"].as_str().unwrap().to_string();
+        let renames = hs.renames.lock().unwrap().clone();
+        match expected {
+            Some(name) => {
+                assert_eq!(renames.len(), 1, "exactly one rename: {renames:?}");
+                assert_eq!(renames[0]["device_id"], device_id.as_str());
+                assert_eq!(renames[0]["display_name"], name);
+            }
+            None => assert!(
+                renames.is_empty(),
+                "a device this sign-in did not create must not be renamed: {renames:?}"
+            ),
+        }
+        device_id
     }
 
     /// Run one passkey-path `sign_in` for [`DID`] through a client registered
-    /// with `client_name`, with no device id in the session scope; return the
-    /// client id and the recorded upserts.
-    async fn sign_in_through(client_name: Option<&str>) -> (String, Vec<serde_json::Value>) {
+    /// with `client_name`, with no device id in the session scope. `None` when
+    /// Redis is unavailable (the test then skips, see `test_support`).
+    async fn sign_in_through(client_name: Option<&str>) -> Option<(String, Arc<Homeserver>)> {
+        let db = siwx_oidc::test_support::redis().await?;
         let (synapse, hs, server) = spawn(&[]).await;
-        let db = redis().await;
         let nonce = Uuid::new_v4().simple().to_string();
         let client_id = format!("device-name-{nonce}");
         db.set_client(client_id.clone(), client_entry(client_name))
@@ -5539,23 +5566,7 @@ mod device_display_name_tests {
         .await
         .expect("sign_in must succeed against a healthy homeserver");
         server.abort();
-        (client_id, upserts(&hs))
-    }
-
-    /// Asserts exactly one upsert happened, with `expected` as its display
-    /// name (`None`: no `display_name` key at all), and returns its device id.
-    fn the_one_upsert(upserts: &[serde_json::Value], expected: Option<&str>) -> String {
-        assert_eq!(upserts.len(), 1, "exactly one device upsert: {upserts:?}");
-        let body = &upserts[0];
-        match expected {
-            Some(name) => assert_eq!(body["display_name"], name, "{body}"),
-            None => assert!(
-                body.get("display_name").is_none(),
-                "an existing device's name must be left alone, so no display_name may be \
-                 sent: {body}"
-            ),
-        }
-        body["device_id"].as_str().unwrap().to_string()
+        Some((client_id, hs))
     }
 
     #[test]
@@ -5597,8 +5608,8 @@ mod device_display_name_tests {
         assert_eq!(device_display_name("cid", Some(&entry)), "Mein Agent");
     }
 
-    /// Synapse answers `upsert_device` with 400 `M_TOO_LARGE` for a name over
-    /// 100 code points, and the session would then get no device at all.
+    /// Synapse answers `update_device_display_name` with 400 `M_TOO_LARGE` for
+    /// a name over 100 code points, and the device would then stay unnamed.
     #[test]
     fn a_long_client_name_is_cut_to_synapses_limit() {
         let long = "é".repeat(150);
@@ -5611,40 +5622,21 @@ mod device_display_name_tests {
         );
     }
 
-    #[test]
-    fn upsert_names_only_a_device_this_sign_in_creates() {
-        // An id this server minted is new by construction.
-        assert_eq!(upsert_display_name("App", false, None), Some("App"));
-        // A client-supplied id: named only when confirmed new.
-        assert_eq!(upsert_display_name("App", true, Some(false)), Some("App"));
-        assert_eq!(
-            upsert_display_name("App", true, Some(true)),
-            None,
-            "Synapse overwrites an existing device's name whenever one is sent"
-        );
-        assert_eq!(
-            upsert_display_name("App", true, None),
-            None,
-            "an unknown state must not risk overwriting a name the user chose"
-        );
-    }
-
     #[tokio::test]
     async fn sign_in_names_a_new_device_after_the_registered_client() {
-        let (_, upserts) = sign_in_through(Some("Aqua Agent")).await;
-        let device_id = the_one_upsert(&upserts, Some("Aqua Agent"));
+        let Some((_, hs)) = sign_in_through(Some("Aqua Agent")).await else {
+            return;
+        };
+        let device_id = the_one_device(&hs, Some("Aqua Agent"));
         assert!(device_id.starts_with("SIWX_"), "{device_id}");
     }
 
     #[tokio::test]
     async fn sign_in_names_a_new_device_after_the_client_id_without_a_client_name() {
-        let (client_id, upserts) = sign_in_through(None).await;
-        the_one_upsert(&upserts, Some(&client_id));
-    }
-
-    /// Admin-API reads need a minted token, so the client gets a token store.
-    async fn with_mint(synapse: SynapseClient) -> SynapseClient {
-        synapse.with_admin_mint(redis().await, "siwx-admin".to_string(), 300)
+        let Some((client_id, hs)) = sign_in_through(None).await else {
+            return;
+        };
+        the_one_device(&hs, Some(&client_id));
     }
 
     fn identity() -> crate::localpart::ResolvedIdentity {
@@ -5655,71 +5647,83 @@ mod device_display_name_tests {
         }
     }
 
+    async fn provision(
+        synapse: &SynapseClient,
+        device: Option<&str>,
+        server_name: Option<&str>,
+    ) -> Option<String> {
+        provision_synapse_device(
+            DID,
+            &identity(),
+            Some(synapse),
+            "Aqua Agent",
+            device,
+            server_name,
+            None,
+        )
+        .await
+    }
+
+    /// A client re-authenticating with its own device id, for a device the
+    /// user renamed: the name stays the user's.
     #[tokio::test]
     async fn a_client_supplied_device_that_exists_keeps_its_name() {
         let (synapse, hs, server) = spawn(&["CLIENTDEVICE"]).await;
-        let synapse = with_mint(synapse).await;
-        let device_id = provision_synapse_device(
-            DID,
-            &identity(),
-            Some(&synapse),
-            "Aqua Agent",
-            Some("CLIENTDEVICE"),
-            Some(SERVER_NAME),
-            None,
-        )
-        .await;
+        let device_id = provision(&synapse, Some("CLIENTDEVICE"), Some(SERVER_NAME)).await;
         server.abort();
         assert_eq!(device_id.as_deref(), Some("CLIENTDEVICE"));
-        the_one_upsert(&upserts(&hs), None);
+        the_one_device(&hs, None);
+        assert_eq!(
+            hs.devices.lock().unwrap()["CLIENTDEVICE"].as_deref(),
+            Some(USERS_NAME)
+        );
     }
 
     #[tokio::test]
     async fn a_client_supplied_device_that_is_new_gets_the_client_name() {
         let (synapse, hs, server) = spawn(&["SOMEOTHERDEVICE"]).await;
-        let synapse = with_mint(synapse).await;
-        provision_synapse_device(
-            DID,
-            &identity(),
-            Some(&synapse),
-            "Aqua Agent",
-            Some("CLIENTDEVICE"),
-            Some(SERVER_NAME),
-            None,
-        )
-        .await;
+        provision(&synapse, Some("CLIENTDEVICE"), Some(SERVER_NAME)).await;
         server.abort();
+        assert_eq!(the_one_device(&hs, Some("Aqua Agent")), "CLIENTDEVICE");
         assert_eq!(
-            the_one_upsert(&upserts(&hs), Some("Aqua Agent")),
-            "CLIENTDEVICE"
+            hs.devices.lock().unwrap()["CLIENTDEVICE"].as_deref(),
+            Some("Aqua Agent")
         );
     }
 
-    /// Without a server name there is no MXID to ask about, so the state is
-    /// unknown and no name is sent.
+    /// Naming reads nothing about the account, so it needs no MXID: a new
+    /// device is named without a server name too.
     #[tokio::test]
-    async fn a_client_supplied_device_is_not_named_when_its_state_is_unknown() {
+    async fn a_new_device_is_named_without_a_server_name() {
         let (synapse, hs, server) = spawn(&[]).await;
-        let synapse = with_mint(synapse).await;
-        provision_synapse_device(
-            DID,
-            &identity(),
-            Some(&synapse),
-            "Aqua Agent",
-            Some("CLIENTDEVICE"),
-            None,
-            None,
-        )
-        .await;
+        provision(&synapse, Some("CLIENTDEVICE"), None).await;
         server.abort();
-        the_one_upsert(&upserts(&hs), None);
+        the_one_device(&hs, Some("Aqua Agent"));
+    }
+
+    /// Only Synapse's 201 means "this upsert created the device". A homeserver
+    /// that answers 200 for everything leaves every device unnamed rather than
+    /// risk renaming one the user named.
+    #[tokio::test]
+    async fn upsert_names_only_a_device_this_sign_in_creates() {
+        let (synapse, hs, server) = spawn_with(&[], true).await;
+        provision(&synapse, Some("CLIENTDEVICE"), Some(SERVER_NAME)).await;
+        provision(&synapse, None, Some(SERVER_NAME)).await;
+        server.abort();
+        assert_eq!(hs.upserts.lock().unwrap().len(), 2);
+        assert!(
+            hs.renames.lock().unwrap().is_empty(),
+            "without a 201 nothing may be renamed"
+        );
     }
 
     /// The QR / device-code path used to name every device "Element X".
     #[tokio::test]
     async fn the_device_code_grant_names_the_device_after_its_client() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
         let (synapse, hs, server) = spawn(&[]).await;
-        let db = redis().await;
         let nonce = Uuid::new_v4().simple().to_string();
         let client_id = format!("device-name-dc-{nonce}");
         db.set_client(client_id.clone(), client_entry(Some("Pocket Client")))
@@ -5766,7 +5770,7 @@ mod device_display_name_tests {
         .await
         .expect("an approved device code must be redeemed");
         server.abort();
-        let device_id = the_one_upsert(&upserts(&hs), Some("Pocket Client"));
+        let device_id = the_one_device(&hs, Some("Pocket Client"));
         assert!(device_id.starts_with("SIWX_"), "{device_id}");
         let scopes: Vec<String> = openidconnect::OAuth2TokenResponse::scopes(&response)
             .expect("the device-code response carries its scope")
