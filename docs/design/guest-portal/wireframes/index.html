@@ -1,0 +1,865 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guest Call Wireframes</title>
+<style>
+/* Tokens: light default, dark via media query or manual toggle. Grayscale plus one orange accent. */
+:root{
+  --bg:#f5f5f5;--card:#ffffff;--text:#1a1a1a;--muted:rgba(0,0,0,.5);--line:rgba(0,0,0,.12);--strong:rgba(0,0,0,.35);
+  --accent:#E8611A;--btn:#EF5402;--btn-text:#ffffff;--err:#dc2626;--err-bg:rgba(239,68,68,.06);
+  --h1:rgba(0,0,0,.03);--h2:rgba(0,0,0,.08);--soft:rgba(0,0,0,.04);--scrim:rgba(0,0,0,.45);--chrome:#e6e6e6;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#141414;--card:#1f1f1f;--text:#ededed;--muted:rgba(255,255,255,.55);--line:rgba(255,255,255,.16);--strong:rgba(255,255,255,.4);
+    --accent:#F27A3A;--btn:#F27A3A;--btn-text:#1a1a1a;--err:#f87171;--err-bg:rgba(248,113,113,.10);
+    --h1:rgba(255,255,255,.03);--h2:rgba(255,255,255,.09);--soft:rgba(255,255,255,.05);--scrim:rgba(0,0,0,.6);--chrome:#2a2a2a;
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#141414;--card:#1f1f1f;--text:#ededed;--muted:rgba(255,255,255,.55);--line:rgba(255,255,255,.16);--strong:rgba(255,255,255,.4);
+  --accent:#F27A3A;--btn:#F27A3A;--btn-text:#1a1a1a;--err:#f87171;--err-bg:rgba(248,113,113,.10);
+  --h1:rgba(255,255,255,.03);--h2:rgba(255,255,255,.09);--soft:rgba(255,255,255,.05);--scrim:rgba(0,0,0,.6);--chrome:#2a2a2a;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:auto}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+button,input,select{font-family:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+h1,h2,h3,p,ul{margin:0}
+.muted{color:var(--muted)}
+.center{text-align:center}
+.sp{flex:1}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+
+/* Gallery chrome */
+.banner{position:sticky;top:0;z-index:30;background:var(--text);color:var(--bg);padding:8px 16px;font-size:13px;font-weight:600;text-align:center}
+.tb{display:flex;flex-wrap:wrap;gap:10px 22px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--card)}
+.tbg{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.lbl{font-size:12px;color:var(--muted)}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.segb{border:0;background:transparent;padding:8px 12px;min-height:36px;font-size:13px;cursor:pointer}
+.segb+.segb{border-left:1px solid var(--line)}
+.card .seg{display:flex}
+.card .segb{flex:1}
+.segb[aria-pressed="true"]{background:var(--text);color:var(--bg)}
+.steplbl{font-size:13px;font-weight:600;max-width:440px}
+.sel{height:36px;border:1px solid var(--line);border-radius:10px;background:transparent;padding:0 8px;font-size:13px;max-width:280px}
+.layout{display:grid;grid-template-columns:272px minmax(0,1fr);gap:24px;max-width:1400px;margin:0 auto;padding:16px}
+@media (max-width:860px){.layout{grid-template-columns:1fr;padding:12px}}
+@media (min-width:861px){.side>summary{display:none}}
+.side summary{cursor:pointer;font-weight:600;padding:6px 0}
+.side h2{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:14px 0 6px}
+.li{display:flex;width:100%;gap:8px;align-items:center;text-align:left;border:1px solid transparent;background:transparent;padding:7px 8px;border-radius:8px;font-size:13px;cursor:pointer}
+.li b{font:600 12px ui-monospace,SFMono-Regular,Menlo,monospace;min-width:26px}
+.li .chip{margin-left:auto}
+.li[aria-current="true"]{background:var(--card);border-color:var(--line)}
+.chip{font-size:10px;border:1px solid var(--line);border-radius:999px;padding:1px 7px;color:var(--muted);white-space:nowrap}
+.chip.on{border-color:var(--accent);color:var(--accent)}
+.stage{min-width:0}
+.frame{margin:0 auto;border:2px solid var(--strong);background:var(--bg);overflow:hidden}
+.frame.phone{width:360px;max-width:100%;border-radius:32px}
+.frame.desktop{width:960px;max-width:100%;border-radius:12px}
+.addr{display:flex;align-items:center;gap:10px;padding:8px 14px;background:var(--chrome);border-bottom:1px solid var(--line);font-size:12px}
+.dots{display:none;gap:6px}
+.desktop .dots{display:flex}
+.dots i{width:10px;height:10px;border-radius:50%;background:var(--strong)}
+.url{flex:1;min-width:0;background:var(--card);border-radius:999px;padding:4px 12px;display:flex;gap:6px;align-items:center;white-space:nowrap;overflow:hidden}
+.vp{position:relative;padding:16px 12px 28px;min-height:580px}
+.desktop .vp{padding:32px 24px 44px;min-height:560px}
+.ctl{max-width:960px;margin:16px auto 0}
+.pg{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0}
+.pl{font-size:12px;color:var(--muted);min-width:76px}
+.pill{border:1px solid var(--line);background:transparent;border-radius:999px;padding:5px 11px;font-size:12px;cursor:pointer}
+.pill[aria-pressed="true"]{background:var(--btn);border-color:var(--btn);color:var(--btn-text)}
+.cap{font-size:13px;margin-top:10px}
+.io{font-size:12px;color:var(--muted);margin-top:6px}
+.note{border-left:3px solid var(--accent);padding:4px 10px;font-size:13px;margin:10px 0}
+
+/* Card and controls (mirrors the existing login card) */
+.card{position:relative;max-width:400px;margin:0 auto;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:40px 36px 32px}
+.phone .card{padding:34px 20px 24px}
+.desktop .card.wide{max-width:860px}
+.tag{position:absolute;top:10px;right:14px;font:10px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+.rad{display:flex;gap:8px;align-items:center;font-size:14px;margin:6px 0}
+.rad input{width:18px;height:18px}
+fieldset.f{border:0;padding:0;margin:0 0 14px}
+fieldset.f legend{font-size:13px;font-weight:500;padding:0;margin-bottom:6px}
+.trust{padding-left:18px;font-size:13px;color:var(--muted);margin:0 0 12px}
+.trust li{margin:5px 0}
+.cs{font-size:12px;font-weight:700;margin:12px 0 4px}
+.title{font-size:22px;font-weight:700;line-height:1.25}
+.sub{font-size:14px;color:var(--muted);margin:6px 0 20px}
+.logo{width:40px;height:40px;border-radius:10px;background:var(--h2);border:1px solid var(--line);font-size:9px;color:var(--muted);display:grid;place-items:center;margin:0 0 16px}
+.center .logo{margin-left:auto;margin-right:auto}
+.btn{display:flex;align-items:center;justify-content:center;width:100%;height:48px;border-radius:12px;border:1px solid transparent;background:transparent;font-size:14px;font-weight:600;cursor:pointer;margin-top:10px;text-decoration:none}
+.btn-primary{background:var(--btn);color:var(--btn-text)}
+.btn-secondary{border-color:var(--line);color:var(--text)}
+.btn-ghost{color:var(--muted)}
+.btn-danger{border-color:var(--err);color:var(--err)}
+.btn.sm{width:auto;height:36px;padding:0 14px;margin:0;font-size:13px}
+.btn[disabled],.btn[aria-disabled="true"]{opacity:.45;cursor:not-allowed}
+.lnk{background:none;border:0;padding:4px 2px;font-size:inherit;color:var(--accent);text-decoration:underline;cursor:pointer}
+.f{margin:0 0 14px}
+.f label,.f .lb{display:block;font-size:13px;font-weight:500;margin-bottom:6px}
+input[type="text"],input[type="email"],select{width:100%;height:48px;border:1px solid var(--line);border-radius:10px;background:transparent;padding:0 12px;font-size:14px}
+input[readonly]{opacity:.7}
+.help{font-size:12px;color:var(--muted);margin-top:4px}
+.f.bad input{border-color:var(--err)}
+.ferr{font-size:12px;color:var(--err);margin-top:4px}
+.err{display:flex;gap:10px;align-items:flex-start;background:var(--err-bg);color:var(--err);border-radius:10px;padding:10px 12px;font-size:13px;margin:12px 0}
+.err i{flex:none;width:18px;height:18px;border:1.5px solid currentColor;border-radius:50%;font-style:normal;font-weight:700;font-size:12px;display:grid;place-items:center}
+.box{border:1px solid var(--line);border-radius:10px;padding:12px 14px;font-size:13px;margin:0 0 14px}
+.box h3{font-size:13px;margin-bottom:6px}
+.bul{padding-left:18px;font-size:13px;color:var(--muted)}
+.bul li{margin:3px 0}
+.legal{font-size:11px;color:var(--muted);margin-top:14px}
+.legal .lnk{font-size:11px}
+.dash{border:1.5px dashed var(--strong);border-radius:10px}
+.pad{padding:12px}
+.seeas{font-size:13px;margin:-4px 0 14px}
+.recrow{display:flex;gap:10px;align-items:center;border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-size:13px;margin-bottom:4px}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--accent)}
+.chk{display:flex;gap:10px;align-items:flex-start;font-size:13px;margin-bottom:4px}
+.chk input{margin-top:2px;width:18px;height:18px}
+.cat{margin-top:14px;font-size:12px}
+.cat summary{cursor:pointer;padding:6px 10px}
+.cat ul{padding:4px 10px 10px 28px}
+.ro{list-style:none;padding:0;margin:0 0 14px;font-size:13px;color:var(--muted)}
+.ro li{padding:6px 0;border-top:1px solid var(--line)}
+.ro li:last-child{border-bottom:1px solid var(--line)}
+details.more{margin:0 0 14px;border:1px solid var(--line);border-radius:10px;padding:0 12px}
+details.more>summary{cursor:pointer;padding:12px 0;font-size:13px;font-weight:500}
+details.more[open]>summary{border-bottom:1px solid var(--line);margin-bottom:12px}
+.stepper{display:flex;align-items:center;gap:10px;margin-top:10px}
+.stepper button{width:40px;height:40px;border-radius:10px;border:1px solid var(--line);background:transparent;font-size:18px;cursor:pointer}
+.stepper output{font-weight:600;min-width:120px;text-align:center}
+.hatch{background:repeating-linear-gradient(135deg,var(--h1) 0 8px,var(--h2) 8px 16px);border:1px solid var(--line);border-radius:10px}
+.avatar{width:56px;height:56px;border-radius:50%;background:var(--card);border:1px solid var(--line);display:grid;place-items:center;font-weight:700}
+.avatar.sm{width:32px;height:32px;font-size:12px}
+.spin{display:inline-block;width:28px;height:28px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;margin-bottom:10px}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.spin{animation:none}}
+.gi{width:56px;height:56px;border-radius:50%;background:var(--h2);border:1px solid var(--line);display:grid;place-items:center;font-size:24px;font-weight:700;margin:0 auto 14px}
+.gi.ok{border-color:var(--accent);color:var(--accent)}
+.toast{position:absolute;left:16px;right:16px;bottom:16px;z-index:5;max-width:420px;margin:0 auto;background:var(--card);border:1px solid var(--strong);border-radius:12px;padding:12px 14px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.25);display:flex;flex-direction:column;gap:10px}
+.acts{display:flex;gap:8px;flex-wrap:wrap}
+.bnr{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;background:var(--soft);border:1px solid var(--line);border-radius:10px;padding:8px 12px;font-size:13px;margin-bottom:10px}
+.bnr.thin{padding:4px 10px;font-size:12px}
+.bnr.warn{border-color:var(--err);color:var(--err);background:var(--err-bg)}
+.overlay{position:absolute;inset:0;z-index:10;background:var(--scrim);display:grid;place-items:center;padding:16px}
+.modal{position:relative;background:var(--card);border-radius:16px;padding:32px 24px 22px;max-width:380px;width:100%;border:1px solid var(--line)}
+.modal .title{font-size:19px;margin-bottom:10px}
+.modal p{font-size:13px;margin-bottom:8px}
+
+/* Host screens */
+.hd{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:16px}
+.mc{border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:10px}
+.mh{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:4px}
+.mc .btn{margin-top:10px}
+.tbl{width:100%;border-collapse:collapse;font-size:13px}
+.tbl th{text-align:left;font-size:12px;color:var(--muted);font-weight:600;padding:8px 10px;border-bottom:1px solid var(--line)}
+.tbl td{padding:12px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+.tbl .r{text-align:right}
+.skel{height:64px;border-radius:12px;margin-bottom:10px;background:repeating-linear-gradient(90deg,var(--h1) 0 40px,var(--h2) 40px 80px)}
+.linkbox{border:1px solid var(--line);border-radius:10px;padding:12px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all;background:var(--soft);margin-bottom:12px}
+.linkbox.sel{background:var(--accent);color:var(--btn-text)}
+.phone-only{display:block}
+.desktop .phone-only{display:none}
+.up{padding:12px;position:relative}
+.uplabel{font-size:11px;color:var(--muted);margin-bottom:8px}
+.rhead{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.knock{border:1px solid var(--accent);border-radius:10px;padding:10px 12px;font-size:13px;display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
+.knock ul{list-style:none;padding:0;display:flex;flex-direction:column;gap:8px}
+.knock li{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+.tl{height:150px}
+.lrow{border-top:1px solid var(--line);padding:10px 0 0;margin-top:10px}
+.lrow .btn{margin-top:8px}
+
+/* Lobby and call */
+.strip{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:12px;margin-bottom:12px}
+.zones{display:flex;flex-direction:column;gap:12px;margin-top:14px}
+.desktop .zones{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
+.desktop .zdev{order:-1}
+.zone{border:1px solid var(--line);border-radius:14px;padding:16px}
+.zone h2{font-size:15px;margin-bottom:6px}
+.zone p{font-size:13px;color:var(--muted);margin-bottom:10px}
+.zone .help{text-align:center}
+.zc{text-align:center;padding:6px 0 4px}
+.prev{height:120px;display:grid;place-items:center;margin:8px 0}
+.meter{height:8px;border-radius:4px;background:var(--h2);overflow:hidden;margin:8px 0}
+.meter span{display:block;height:100%;width:62%;background:var(--accent)}
+.tog{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+.chg{margin-top:8px;font-size:13px}
+.chg summary{cursor:pointer;padding:6px 0}
+.card.call{padding:34px 14px 14px}
+.call .hdr{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.badge{font-size:11px;border:1px solid var(--accent);color:var(--accent);border-radius:999px;padding:1px 8px}
+.timewrap{position:static}
+.call .hdr{position:relative}
+.timebtn{background:none;border:0;padding:4px 2px;font-size:13px;color:var(--muted);text-decoration:underline dotted;cursor:pointer}
+.pop{position:absolute;top:100%;left:0;z-index:6;width:min(280px,100%);margin-top:4px;background:var(--card);border:1px solid var(--strong);border-radius:12px;padding:12px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.25)}
+.tiles{display:grid;gap:10px;grid-template-columns:1fr;margin:12px 0}
+.desktop .tiles{grid-template-columns:1fr 1fr}
+.tile{min-height:150px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;font-size:13px}
+.desktop .tile{min-height:290px}
+.you{font-style:normal;font-size:11px;border:1px solid var(--line);border-radius:4px;padding:0 5px;background:var(--card)}
+.callwin{min-height:200px;display:grid;place-items:center;margin:12px 0}
+.ctrls{display:flex;justify-content:center;gap:14px;margin:12px 0 6px}
+.rc{width:44px;height:44px;border-radius:50%;border:1.5px dashed var(--strong);display:grid;place-items:center;color:var(--muted)}
+.dl{display:inline-block;font-size:11px;color:var(--muted);border:1px dashed var(--strong);border-radius:6px;padding:2px 8px}
+.ic{display:block}
+.url .ic{flex:none}
+</style>
+</head>
+<body>
+<div class="banner" role="note">WIREFRAME. Low-fidelity concept, not a product. Names, hosts and addresses are placeholders.</div>
+<header class="tb">
+  <div class="tbg" role="group" aria-label="Frame"><span class="lbl">Frame</span>
+    <div class="seg"><button type="button" class="segb" data-fr="phone" aria-pressed="true">Phone</button><button type="button" class="segb" data-fr="desktop" aria-pressed="false">Desktop</button></div></div>
+  <div class="tbg" role="group" aria-label="Theme"><span class="lbl">Theme</span>
+    <div class="seg"><button type="button" class="segb" data-th="auto" aria-pressed="true">Auto</button><button type="button" class="segb" data-th="light" aria-pressed="false">Light</button><button type="button" class="segb" data-th="dark" aria-pressed="false">Dark</button></div></div>
+  <div class="tbg" role="group" aria-label="Happy path"><span class="lbl">Happy path</span>
+    <button type="button" class="btn btn-secondary sm" id="prev">Prev</button>
+    <span class="steplbl" id="steplbl" aria-live="polite"></span>
+    <button type="button" class="btn btn-primary sm" id="next">Next</button></div>
+  <div class="tbg"><label class="lbl" for="edge">Error and edge states</label><select id="edge" class="sel"></select></div>
+</header>
+<main class="layout">
+  <details class="side" id="side" open><summary>Screens</summary><nav id="list" aria-label="Screens"></nav></details>
+  <section class="stage" aria-label="Wireframe">
+    <div id="frame" class="frame phone"><div class="addr"><div class="dots"><i></i><i></i><i></i></div><div class="url" id="addr"></div></div><div class="vp" id="vp"></div></div>
+    <div class="ctl"><div id="note"></div><div id="pills"></div><p class="cap" id="cap"></p><p class="io" id="io"></p></div>
+  </section>
+</main>
+<script>
+(function(){
+'use strict';
+const $=(s,r=document)=>r.querySelector(s);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+/* ---------- shared state ---------- */
+const S={frame:'phone',screen:'H1',state:'default',adm:'asking',dev:'prompt',cam:true,mic:true,
+  who:'one',count:3,opts:false,step:0,onPath:true,timer:null,g5:'left',
+  g1:{first:'',last:'',email:'',preset:null,emailReq:false,errs:{},live:null,consent:false,dirty:false}};
+
+/* ---------- markup helpers ---------- */
+const ic=(d,s=20)=>`<svg class="ic" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+const IC={
+  mic:ic(`<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>`),
+  cam:ic(`<rect x="3" y="6" width="12" height="12" rx="2"/><path d="M15 10l6-3v10l-6-3z"/>`),
+  hang:ic(`<path d="M3 15c5-5 13-5 18 0l-2 3-4-2v-2c-3-1-5-1-8 0v2l-4 2z"/>`),
+  lock:ic(`<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>`,12),
+  check:ic(`<path d="M5 12l5 5 9-10"/>`,26)
+};
+const SPIN=`<span class="spin" aria-hidden="true"></span>`;
+const B=(l,c,a='')=>`<button type="button" class="btn ${c}" ${a}>${l}</button>`;
+const GO=(l,t,c='btn-primary',a='')=>B(l,c,`data-go="${t}" ${a}`);
+const OFF=(l,c='btn-primary')=>B(l,c,`aria-disabled="true"`);
+const LNK=(l,t)=>`<button type="button" class="lnk"${t?` data-go="${t}"`:''}>${l}</button>`;
+const ERR=(t,b)=>`<div class="err"><i aria-hidden="true">!</i><div>${b?`<b>${t}</b><br>${b}`:t}</div></div>`;
+const LOGO=`<div class="logo" aria-hidden="true">logo</div>`;
+const T=(t,s)=>`<h1 class="title">${t}</h1>${s?`<p class="sub">${s}</p>`:''}`;
+const TOAST=(t,b='')=>`<div class="toast" role="status"><span>${t}</span>${b}</div>`;
+const C=(inner,o={})=>`<div class="card ${o.cls||''}"${o.attr?' '+o.attr:''}><span class="tag">${o.id||S.screen} &middot; ${o.org||SC[S.screen].chip}</span>${inner}</div>`;
+const I=`meet.example.org`, ID=`id.example.org`, CHAT=`chat.example.org`;
+
+/* ---------- field error copy (exact) ---------- */
+const ERRMSG={
+  first_empty:`Enter your first name.`,last_empty:`Enter your last name.`,long:`Use 40 characters or fewer.`,
+  chars:`Use letters, spaces, hyphens and apostrophes only.`,
+  script:`Use letters from one alphabet in this name.`,
+  reserved:`This name can't be used here. Enter your own name.`,
+  email_missing:`Enter your e-mail address.`,
+  email_invalid:`Enter an e-mail address like name@example.org.`,box:`Tick the box to continue.`
+};
+const g1mode=()=>S.state==='email-off'?'off':(S.state==='email-required'||S.g1.emailReq)?'req':'opt';
+
+/* ---------- H3 view (also the base of H4) ---------- */
+const MEET=[
+  {n:`Weekly sync`,end:true,links:[
+    {f:`Alex`,c:`Used`,g:`Alex Example (Guest)`,m:`alex@example.org`,x:`expires in 23 h`,rev:true},
+    {f:`Sam`,c:`Not used`,g:``,m:``,x:`expires in 23 h`,rev:true}]},
+  {n:`Design review`,end:true,links:[
+    {f:`Jo`,c:`Expired`,g:`Jo Example (Guest)`,m:``,x:`expired 3 h ago`,rev:true}]},
+  {n:`Kickoff`,end:false,links:[
+    {f:`Lee`,c:`Revoked`,g:``,m:``,x:``,rev:false}]}
+];
+function h3View(mode){
+  const desk=S.frame==='desktop';
+  const rows=MEET.map((m,i)=>(mode==='done'&&i===0)?{n:m.n,end:false,links:m.links.map(l=>({f:l.f,c:`Revoked`,g:``,m:``,x:``,rev:false}))}:m);
+  const chip=c=>`<span class="chip${c==='Used'||c==='Not used'?' on':''}">${c}</span>`;
+  const guest=l=>l.g?`${l.g}${l.m?`, ${l.m} (typed by the guest, not verified)`:``}`:`-`;
+  const rv=l=>l.rev?GO(`Revoke`,`H4:revoke`,`btn-secondary sm`):'';
+  let b='';
+  if(mode==='loading')b=`<div class="skel"></div>`.repeat(3);
+  else if(mode==='empty')b=`<div class="center pad"><p>No guest meetings yet.</p><p style="margin-top:10px">${GO(`New meeting`,`H1:default`,`btn-primary sm`)}</p></div>`;
+  else if(mode==='error')b=ERR(`We couldn't load your meetings.`)+GO(`Try again`,`H3:list`,`btn-secondary sm`);
+  else if(desk)b=`<table class="tbl"><thead><tr><th>Meeting</th><th>Link for</th><th>Status</th><th>Guest</th><th>Link expires</th><th><span class="lbl">(action)</span></th></tr></thead><tbody>${rows.map(m=>m.links.map((l,k)=>`<tr><td>${k===0?`<b>${m.n}</b>${m.end?`<br>${GO(`End meeting`,`H4:confirm`,`btn-secondary sm`)}`:''}`:''}</td><td>${l.f}</td><td>${chip(l.c)}</td><td>${guest(l)}</td><td>${l.x||'-'}</td><td class="r">${rv(l)}</td></tr>`).join('')).join('')}</tbody></table>`;
+  else b=rows.map(m=>`<div class="mc"><div class="mh"><b>${m.n}</b>${m.end?GO(`End meeting`,`H4:confirm`,`btn-secondary sm`):''}</div>${m.links.map(l=>`<div class="lrow"><div class="mh"><span><b>${l.f}</b></span>${chip(l.c)}</div><p class="help">${l.g?`Joined as ${guest(l)}. `:''}${l.x?`Link ${l.x}.`:''}</p>${rv(l)}</div>`).join('')}</div>`).join('');
+  return `<div class="hd"><h1 class="title">My guest meetings</h1>${mode==='empty'?'':GO(`New meeting`,`H1:default`,`btn-primary sm`)}</div>${b}`;
+}
+
+/* ---------- G3 zones ---------- */
+const joinNote=()=>{let c=false,m=false;if(S.dev==='ready'){c=S.cam;m=S.mic}else if(S.dev==='no-camera'){m=true}
+  return `You will join with camera ${c?'on':'off'} and microphone ${m?'on':'off'}.`};
+function admZone(a){
+  const asking=`<div class="zc">${SPIN}<h2>Asking the host to let you in</h2><p>Keep this page open. You can check your camera and microphone while you wait.</p></div>${GO(`Cancel request`,`G3:cancelled`,`btn-secondary`)}`;
+  const M={
+    asking,
+    reconnecting:`<div class="bnr thin">Connection lost. Reconnecting...</div>`+asking,
+    slow:`<div class="zc"><h2>Still waiting for the host</h2><p>The host may not have seen your request yet. You could message them outside this page.</p></div>${GO(`Cancel request`,`G3:cancelled`,`btn-secondary`)}`,
+    admitted:`<div class="zc"><span class="gi ok">${IC.check}</span><h2>The host let you in</h2><p>Join when you are ready.</p></div>${GO(`Join call`,`G4:connecting`)}<p class="help">${joinNote()}</p>`,
+    declined:`<div class="zc"><h2>The host did not let you in</h2><p>You can ask up to 3 times in 10 minutes.</p></div>${GO(`Ask again`,`G3:asking`)}`,
+    cancelled:`<div class="zc"><h2>Request cancelled</h2><p>You can ask up to 3 times in 10 minutes.</p></div>${GO(`Ask again`,`G3:asking`)}`,
+    forbidden:`<div class="zc"><h2>You can't join this meeting</h2><p>The host has blocked this request. Contact the host if you think this is a mistake.</p></div>`,
+    'send-failed':`<div class="zc"><h2>We couldn't send your request</h2></div>${GO(`Try again`,`G3:asking`)}`,
+    wait:`<div class="zc"><h2>Please wait before asking again</h2><p>You asked several times. You can ask again in 6 minutes.</p></div>${OFF(`Ask again`,`btn-secondary`)}`,
+    'room-not-secure':`<div class="zc"><span class="gi">!</span><h2>This meeting isn't ready for guests</h2><p>The room is not set up for guest calls, so we did not connect you. Ask the host for a new link.</p></div>`
+  };
+  return M[a]+((a==='admitted'||a==='room-not-secure')?'':OFF(`Join call`));
+}
+function devZone(d){
+  const a=S.adm, h=t=>`<h2>${t}</h2>`;
+  const sel=(id,l,o)=>`<div class="f"><label for="${id}">${l}</label><select id="${id}">${o.map(x=>`<option>${x}</option>`).join('')}</select></div>`;
+  const M={
+    prompt:`${h(`Camera and microphone`)}<p>Allow access so the others can see and hear you. You can also join without them.</p>${GO(`Allow camera and microphone`,`G3:${a}-ready`)}<div class="center">${LNK(`Join without camera and microphone`,`G3:${a}-skipped`)}</div>`,
+    requesting:`<div class="zc">${SPIN}<h2>Waiting for your browser...</h2><p>Choose Allow in the browser prompt.</p></div>`,
+    ready:`${h(`Camera and microphone`)}<div class="prev hatch"><span class="avatar">AE</span></div><div class="meter" role="img" aria-label="Microphone level, example"><span></span></div><div class="tog"><button type="button" class="btn btn-secondary sm" data-act="cam" data-keep="cam">Camera ${S.cam?'on':'off'}</button><button type="button" class="btn btn-secondary sm" data-act="mic" data-keep="mic">Microphone ${S.mic?'on':'off'}</button></div><details class="chg"><summary>Change devices</summary>${sel('dvc',`Camera`,[`Default camera`,`Camera 2`])}${sel('dvm',`Microphone`,[`Default microphone`,`Headset microphone`])}${sel('dvs',`Speaker`,[`Default speaker`,`Headset speaker`])}</details>`,
+    denied:ERR(`Camera and microphone are blocked`,`Your browser is blocking access for this site. Open the site settings from the lock icon in the address bar, allow Camera and Microphone, then choose Try again. You can also join without them and listen.`)+GO(`Try again`,`G3:${a}-requesting`,`btn-secondary`)+GO(`Join without`,`G3:${a}-skipped`,`btn-ghost`),
+    'no-camera':`${h(`No camera found`)}<p>You can join with your microphone only.</p>${GO(`Continue with microphone only`,`G3:${a}-ready`,`btn-primary`,`data-cam="0"`)}`,
+    'no-devices':`${h(`No camera or microphone found`)}<p>You can join and listen. Connect a device and choose Try again.</p>${GO(`Try again`,`G3:${a}-requesting`,`btn-secondary`)}${GO(`Join without`,`G3:${a}-skipped`,`btn-ghost`)}`,
+    busy:`${h(`Camera or microphone is in use`)}<p>Another app or tab is using it. Close that app, then choose Try again.</p>${GO(`Try again`,`G3:${a}-requesting`,`btn-secondary`)}`,
+    skipped:`${h(`Joining without camera and microphone`)}<p>You can turn them on later in the call.</p>${GO(`Set up now`,`G3:${a}-prompt`,`btn-secondary`)}`
+  };
+  return M[d];
+}
+
+/* ---------- G7 copy ---------- */
+const G7={
+  invalid:[`This link isn't valid`,`Check that the whole link was copied, or ask the host for a new one.`],
+  expired:[`This link has expired`,`Ask the host for a new link.`],
+  used:[`This link has already been used`,`If you used it in another browser, open it there to continue. Otherwise ask the host for a new link.`],
+  exhausted:[`This link has reached its limit`,`It can't admit more guests. Ask the host for a new link.`],
+  ended:[`This meeting has ended`,`Ask the host if there will be another one.`],
+  disabled:[`Guest access isn't available`,`This service doesn't accept guests at the moment. Contact the host or the service operator.`],
+  'rate-limited':[`Too many attempts`,`Wait a few minutes, then try again.`,`Try again`],
+  unavailable:[`We can't set this up right now`,`Try again in a moment. You won't need to type your details again.`,`Try again`],
+  unsupported:[`This browser can't join video calls`,`Open the link in a current version of Chrome, Edge, Firefox or Safari. If you opened it from an email or chat app, open it in your browser instead.`]
+};
+
+/* ---------- claim trust statement (six points, before and after) ---------- */
+const TRUST=a=>[
+  `Your passkey is yours. We never see its private part.`,
+  a?`We made this account's key and destroyed it just now. We can't prove that no copy ever existed, for example in an older backup.`:`We made this account's key and destroy it when you keep the account. We can't prove that no copy ever existed, for example in an older backup.`,
+  `We still run the sign-in service, so we can technically issue a session for any account here, yours included.`,
+  a?`We keep your name. If you gave an e-mail address, nobody has verified it. We deleted it unless you chose to keep it. A kept address is for notices only: it never signs you in or recovers the account.`:`We keep your name. If you gave an e-mail address, nobody has verified it, and we delete it unless you choose to keep it below. A kept address is for notices only: it never signs you in or recovers the account.`,
+  `There is no recovery. If you lose the passkey and your device does not sync it, the account is lost. You can't add a second passkey yet.`,
+  `The account stays limited: it can join calls you are invited to but cannot create rooms or invite people until the operator changes that. Earlier encrypted messages don't carry over to other devices.`
+];
+const TRUSTL=a=>`<h3 class="cs">What you should know</h3><ul class="trust">${TRUST(a).map(x=>`<li>${x}</li>`).join('')}</ul>`;
+
+/* ---------- screens: metadata, state captions, renderers ---------- */
+const SC={
+H1:{name:`New guest meeting`,grp:`Host`,chip:`Host tool`,addr:()=>[I,`/host`],def:`default`,
+  io:[`The host opens the guest meetings tool.`,`Create link goes to H2. Sign out (refusal state only) ends the host session.`],
+  st:{
+    default:[`Default`,`One guest, one link. Each link works once and carries a note that only the host sees.`],
+    'two-guests':[`Two guests`,`Each guest gets their own link, so one can be revoked without the others.`],
+    'options-open':[`Options open`,`Link lifetime, session length and the recording flag. Defaults suit most meetings.`],
+    'open-links':[`Open links`,`Operator option, off by default: one reusable link for several people, with a shorter lifetime.`],
+    submitting:[`Submitting`,`Fields are locked while the room and the links are created.`],
+    'not-allowed':[`Not allowed`,`Hosting is deny by default. The account is not on the operator's list of hosts, so the tool shows a refusal instead of the form, on load and at create. A Sign out link is the exit.`],
+    'switched-off':[`Switched off`,`The operator has turned guest meetings off for the whole service.`],
+    'host-limit':[`Host limit`,`The host already has the maximum number of active guest meetings.`],
+    capacity:[`At capacity`,`The service has reached its global limit of live guests.`],
+    unavailable:[`Unavailable`,`The meeting room could not be created. Nothing was stored.`],
+    'signed-out':[`Signed out`,`The host session expired before the form was sent.`],
+    'rate-limited':[`Rate limited`,`The host sent too many create requests in a short time.`],
+    'email-required-info':[`E-mail required`,`The operator enforces e-mail, so guests must give one. The host can only read this line.`]},
+  render:st=>{
+    const dis=st==='submitting'?' disabled':'', two=st==='two-guests', open=st==='open-links';
+    if(st==='not-allowed')return C(`${LOGO}${T(`Guest meetings aren't enabled for your account`,`Your operator decides who can invite guests. Ask your operator to add your account.`)}<p class="center" style="margin-top:8px">${LNK(`Sign out`,`H1:signed-out`)}</p>`);
+    const E={'switched-off':`Guest meetings are switched off on this service.`,
+      'host-limit':`You have reached the limit of active guest meetings. End one to create another.`,capacity:`Guest meetings are at capacity right now. Try again later.`,
+      unavailable:`We couldn't create the meeting room. Try again in a moment.`,'signed-out':`You were signed out. Sign in again to continue.`,
+      'rate-limited':`Too many requests. Wait a minute, then try again.`};
+    const err=E[st]?ERR(E[st])+(st==='signed-out'?B(`Sign in`,`btn-secondary`):''):'';
+    const n=two?2:1;
+    const guests=Array.from({length:n},(_,k)=>`<div class="f"><label for="h1g${k}">Guest ${k+1}: who is this link for? (optional)</label><input id="h1g${k}" type="text" maxlength="40" value="${k===0?'Alex':'Sam'}"${dis}>${k===0?`<div class="help">Only you see this note. Up to 40 characters.</div>`:''}</div>`).join('')
+      +(two?GO(`Remove last guest`,`H1:default`,`btn-ghost sm`):GO(`Add another guest`,`H1:two-guests`,`btn-secondary sm`))+`<div class="help" style="margin-bottom:14px">Each link works once. Up to 10 guests per meeting, set by your operator.</div>`;
+    const openBlock=`<div class="f"><span class="lb" id="h1w">Who can use the link</span><div class="seg" role="group" aria-labelledby="h1w"><button type="button" class="segb" data-go="H1:default" aria-pressed="false">One link per person</button><button type="button" class="segb" aria-pressed="true">One link for several people</button></div><div class="stepper"><button type="button" aria-label="Fewer people">-</button><output>Up to 3 people</output><button type="button" aria-label="More people">+</button></div><div class="help">Maximum 10, set by your operator. Open links last at most 24 hours.</div></div>`;
+    return C(`${T(`New guest meeting`,`Create one link for each guest. Each link works once.`)}${err}
+<div class="f"><label for="h1n">Meeting name</label><input id="h1n" type="text" value="Weekly sync"${dis}><div class="help">Guests see this name when they ask to join. Do not put secrets in it.</div></div>
+${open?openBlock:guests}
+<details class="more"${(st==='options-open'||open)?' open':''}><summary>More options</summary>
+<div class="f"><label for="h1v">Link valid for</label><select id="h1v"${dis}><option>1 hour</option><option selected>24 hours</option>${open?'':'<option>72 hours</option>'}</select></div>
+<div class="f"><label for="h1s">Guest session lasts</label><select id="h1s"${dis}><option>1 hour</option><option selected>2 hours</option><option>4 hours</option></select><div class="help">Guests are signed out and deleted after this time, even during a call.</div></div>
+<label class="chk"><input type="checkbox"${dis}><span>This meeting may be recorded or transcribed. Guests are told before they join.</span></label></details>
+<ul class="ro"><li>Waiting room: always on. You let each guest in.</li><li>E-mail: ${st==='email-required-info'?'required':'optional'} (set by your operator)</li></ul>
+${st==='submitting'?B(n>1?`Creating room and links...`:`Creating room and link...`,`btn-primary`,`disabled`):GO(n>1?`Create ${n} links`:`Create link`,two?`H2:several`:`H2:default`)}`);
+  }},
+
+H2:{name:`Link ready`,grp:`Host`,chip:`Host tool`,addr:()=>[I,`/host`],def:`default`,
+  io:[`Create link on H1 succeeded.`,`My meetings goes to H3. The guest side (G1) starts when the host shares a link.`],
+  st:{
+    default:[`Default`,`The one moment the full link can be copied. It is not stored in readable form.`],
+    several:[`Several links`,`One link per guest, each under the host's private note. All are shown once.`],
+    copied:[`Copied`,`The copy button confirms the link is on the clipboard.`],
+    'copy-failed':[`Copy failed`,`The browser refused clipboard access. The link is pre-selected so the host can copy by hand.`]},
+  render:st=>{
+    const n=st==='several'?2:1;
+    const row=k=>`<div class="f"><span class="lb">${k===0?'Alex':'Sam'}</span><div class="linkbox${st==='copy-failed'?' sel':''}" tabindex="0">https://id.example.org/guest/join/7f3a...#gi_Xk9...</div>${GO(st==='copied'&&k===0?`Copied`:`Copy link`,`H2:copied`)}</div>`;
+    return C(`${T(n>1?`Your links are ready`:`Your link is ready`)}
+${st==='copy-failed'?ERR(`Couldn't copy automatically. Select the link and copy it.`):''}
+${Array.from({length:n},(_,k)=>row(k)).join('')}${B(`Share`,`btn-secondary phone-only`)}
+<div class="box" style="margin-top:14px">Shown once. Only a fingerprint of each link is stored, so it cannot be shown again. Lost one? Revoke it in My guest meetings and create a new one.</div>
+<p>Each link works once. Link valid for 24 hours. Guest session 2 hours.</p>
+<p class="help" style="margin:8px 0 4px">Send each link only to the person it is for. Anyone with a link can ask to join. Guests type their own name, so check it matches who you invited.</p>
+${B(`Open meeting room`,`btn-secondary`)}
+<p class="center" style="margin-top:12px">${LNK(`My meetings`,`H3:list`)}</p>`);
+  }},
+
+H3:{name:`My guest meetings`,grp:`Host`,chip:`Host tool`,addr:()=>[I,`/host`],def:`list`,
+  io:[`From H2 (My meetings) or the host's own bookmark.`,`New meeting goes to H1. End meeting goes to H4.`],
+  st:{
+    list:[`List`,`Three meetings with one link per guest, in four link statuses. A table on desktop, cards on phones.`],
+    loading:[`Loading`,`Placeholder rows while the list loads.`],
+    empty:[`Empty`,`The host has not created a guest meeting yet.`],
+    error:[`Error`,`The list could not be loaded. Nothing is lost, the host can retry.`]},
+  render:st=>C(h3View(st),{cls:'wide'})},
+
+H4:{name:`End or revoke`,grp:`Host`,chip:`Host tool`,addr:()=>[I,`/host`],def:`confirm`,
+  io:[`End meeting or Revoke on H3 (dialog over H3).`,`Keep returns to H3. The confirm button removes the link or the whole meeting, and any guest behind it.`],
+  st:{
+    confirm:[`End meeting`,`The host must confirm, because ending removes every link and deletes the guest accounts.`],
+    revoke:[`Revoke link`,`Revoking one link leaves the others working. A guest who already joined through it is removed.`],
+    submitting:[`Submitting`,`The request is running. Both buttons are locked.`],
+    done:[`Done (meeting)`,`Back on the list, the meeting's links show as Revoked and a toast confirms it.`],
+    revoked:[`Done (link)`,`Back on the list, a toast confirms the link is revoked.`],
+    error:[`Error`,`The request failed. Guest sessions still end on their own deadline, which is the backstop.`]},
+  render:st=>{
+    if(st==='done')return C(h3View('done'),{id:'H3',org:'Host tool',cls:'wide'})+TOAST(`Meeting ended.`);
+    if(st==='revoked')return C(h3View('list'),{id:'H3',org:'Host tool',cls:'wide'})+TOAST(`Link revoked.`);
+    const sub=st==='submitting', rv=st==='revoke';
+    return C(h3View('list'),{id:'H3',org:'Host tool',cls:'wide',attr:'inert'})+`<div class="overlay"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="h4t"><span class="tag">H4 &middot; Host tool</span>
+<h2 class="title" id="h4t">${rv?'Revoke this link?':'End this meeting?'}</h2>
+${rv?`<p>The link stops working. If the guest already joined, their guest account is deleted.</p>`:`<p>The links stop working. Guests are signed out and their guest accounts are deleted. Their call window can take a few minutes to close.</p><p class="help">Tip: end the call in your meeting room first, so nobody stays connected.</p>`}
+${st==='error'?ERR(rv?`We couldn't revoke the link. Try again. If it keeps failing, guest sessions still end on their own deadline.`:`We couldn't end the meeting. Try again. If it keeps failing, guest sessions still end on their own deadline.`):''}
+${sub?B(`Working...`,`btn-danger`,`disabled`):GO(rv?`Revoke link`:`End meeting`,rv?`H4:revoked`:`H4:done`,`btn-danger`)}${sub?B(`Keep`,`btn-secondary`,`disabled`):GO(rv?`Keep link`:`Keep meeting`,`H3:list`,`btn-secondary`)}</div></div>`;
+  }},
+
+H5:{name:`Knock request`,grp:`Host`,chip:`Host tool`,addr:()=>[CHAT,``],def:`one`,
+  io:[`The host is already viewing the meeting room in their own client.`,`Approve lets the guest in (G3 admitted). Deny refuses.`],
+  st:{
+    one:[`One request`,`One guest knocked. The bar is shown only while the host views this room.`],
+    several:[`Several requests`,`Three guests knocked. Each needs its own decision.`],
+    admitted:[`Admitted`,`The host approved the request. The bar disappears and the guest moves to G3 admitted.`],
+    declined:[`Declined`,`The host denied the request. The bar disappears and the guest sees G3 declined.`],
+    silent:[`Silent`,`Limit to design around: knocking sends no notification, so a host who is elsewhere never sees it.`]},
+  render:st=>{
+    const ab=(who,keep)=>`<span class="acts">${GO(`Deny`,`H5:declined`,`btn-secondary sm`)}${GO(`Approve`,keep,`btn-primary sm`)}</span>`;
+    let bar='';
+    if(st==='one')bar=`<div class="knock"><div><b>Asking to join</b><br><span>Alex Example (Guest) (@xxxx:example.org)</span></div>${ab('',`G3:admitted-ready`)}</div>`;
+    if(st==='several')bar=`<div class="knock"><b>3 people asking to join</b><ul>${[`Alex Example (Guest)`,`Jo Example (Guest)`,`Sam Guest (Guest)`].map(n=>`<li><span>${n}</span>${ab(n,`H5:admitted`)}</li>`).join('')}</ul></div>`;
+    if(st==='silent')bar=`<div class="dash pad help" style="margin:0 0 10px">No notification is sent when a guest knocks. The host sees the bar only while viewing this room.</div>`;
+    const back=st==='admitted'?LNK(`See: guest side`,`G3:admitted-ready`):st==='declined'?LNK(`See: guest side`,`G3:declined-ready`):'';
+    const toast=st==='admitted'?TOAST(`Alex Example (Guest) was approved.`,back):st==='declined'?TOAST(`Request denied.`,back):'';
+    return C(`<div class="dash up"><div class="uplabel">upstream UI, not designed here</div><div class="rhead"><span class="avatar sm">WS</span><b>Weekly sync</b></div>${bar}<div class="tl hatch" aria-hidden="true"></div></div>`)+toast;
+  }},
+
+G1:{name:`Join page`,grp:`Guest`,chip:`Issuer`,addr:()=>[ID,`/guest/join/7f3a...`],def:`ready`,
+  io:[`The guest opens the link the host shared.`,`Join as guest goes to G2 when the names are valid and the box is ticked. A bad link goes to G7.`],
+  st:{
+    checking:[`Checking`,`The page checks the browser and asks the service about the link, without using it up.`],
+    ready:[`Ready`,`The form with e-mail optional and the consent checkbox. Tick the box, or submit with empty names to see the live check.`],
+    'email-required':[`E-mail required`,`The operator enforces e-mail, so the label loses "(optional)".`],
+    'email-off':[`E-mail off`,`The operator collects no e-mail, so the field is hidden.`],
+    recording:[`Recording`,`The host expects a recording or transcript, so the guest is told before joining.`],
+    'button-consent':[`Button consent`,`Operator option for deployments whose legal basis does not need a checkbox: pressing the button is the act.`],
+    submitting:[`Submitting`,`The request is in flight. Fields are read-only.`],
+    errors:[`Errors`,`Field errors at once, to review the copy. On a real page only the failing fields show.`],
+    'network-error':[`Network error`,`The request did not reach the service. Nothing was created.`],
+    resume:[`Resume`,`The guest reopened the link in the same browser during an active session, so no form is shown. The Keep this account link appears only when the service reports that a claim is possible (the guest was admitted).`]},
+  render:st=>{
+    const g=S.g1;
+    if(st==='checking')return C(`<div class="center">${LOGO}${SPIN}${T(`Checking your link...`)}</div>`);
+    if(st==='resume')return C(`${LOGO}${T(`Welcome back`,`You already joined this meeting as Alex Example (Guest). Your guest session has 1 h 12 min left.`)}${GO(`Continue as Alex Example`,`G2:working`)}<p class="center" style="margin-top:8px">${LNK(`Keep this account`,`K1:CL-02`)}</p><p class="help center">Shown only when the service says this guest can keep the account.</p>`);
+    const mode=g1mode(), errs=(st==='errors'?g.errs:g.live)||{}, ro=st==='submitting'?' readonly':'';
+    const fl=(id,lab,type,ac,k,extra='')=>`<div class="f${errs[k]?' bad':''}"><label for="${id}">${lab}</label><input id="${id}" type="${type}" autocomplete="${ac}" data-g1="${k}" value="${esc(g[k])}"${ro}${errs[k]?` aria-invalid="true" aria-describedby="${id}e"`:''}>${errs[k]?`<div class="ferr" id="${id}e">${ERRMSG[errs[k]]}</div>`:''}${extra}</div>`;
+    const nm=`${g.first} ${g.last}`.replace(/\s+/g,' ').trim()||`Your name`;
+    const consent=st!=='button-consent', dis=st==='submitting'||(consent&&!g.consent);
+    const main=st==='network-error'?GO(`Try again`,`G2:working`):B(st==='submitting'?`Joining...`:`Join as guest`,`btn-primary`,`data-act="g1submit"${dis?' disabled':''}`);
+    const cat=(st==='errors'&&g.preset==='all')?`<details class="cat dash"><summary>All field messages (reference)</summary><ul>${Object.values(ERRMSG).map(m=>`<li>${m}</li>`).join('')}</ul></details>`:'';
+    return C(`${LOGO}${T(`Join the call as a guest`,`You have been invited to a video call.`)}
+${Object.keys(errs).length?ERR(`Some details need attention. Check the fields marked below.`):''}${st==='network-error'?ERR(`We couldn't reach the service. Check your connection and try again.`):''}
+${fl('g1f',`First name`,'text','given-name','first')}${fl('g1l',`Last name`,'text','family-name','last')}
+<p class="seeas">Others will see you as: <b id="seeas">${esc(nm)} (Guest)</b></p>
+${mode==='off'?'':fl('g1e',mode==='req'?`E-mail`:`E-mail (optional)`,'email','email','email',`<div class="help">We use it to contact you about this meeting. The host and the operator can see it. It is deleted with your guest account, unless you choose to keep it when you keep the account.</div>`)}
+<div class="box"><h3>How guest access works</h3><ul class="bul"><li>No account needed. Example Operator creates a temporary guest account for you.</li><li>The host decides whether to let you in. The host and the operator can see your name and e-mail address.</li><li>Your guest account and your details are deleted when the session ends, at the latest 2 hours after you join. Closing this page does not end it. After the call, choose End session to end it sooner.</li><li>You send no messages, so none are left behind. Other people in the call may have seen or recorded it, and server logs are kept for up to 14 days.</li></ul></div>
+${st==='recording'?`<div class="recrow"><span class="dot" aria-hidden="true"></span>This meeting may be recorded or transcribed.</div>`:''}
+${consent?`<label class="chk"><input type="checkbox" data-g1="consent"${g.consent?' checked':''}><span>I agree to the ${LNK(`Terms of Use`)} and the ${LNK(`Privacy Policy`)}</span></label>`:''}
+${main}${consent?'':`<p class="legal">By choosing Join as guest you agree to the ${LNK(`Terms of Use`)} and the ${LNK(`Privacy Policy`)}.</p>`}${cat}`);
+  }},
+
+G2:{name:`Connecting`,grp:`Guest`,chip:`Issuer + Client`,addr:()=>[ID,``],def:`working`,
+  io:[`G1 Join as guest. The page signs the guest in on the issuer, then hands over to the meeting client.`,`Happy path continues to G3. Every error state offers Try again. A passed deadline goes to G6.`],
+  st:{
+    working:[`Working`,`The guest account is created and the sign-in completes. Usually a few seconds.`],
+    slow:[`Slow`,`The wait passed the usual time, so the page asks the guest to keep it open.`],
+    'lost-session':[`Lost session`,`The sign-in state did not survive, typically because an in-app browser or blocked cookies dropped it.`],
+    unavailable:[`Unavailable`,`The sign-in service is busy or down. The typed details are kept.`],
+    timeout:[`Timeout`,`The hops did not finish within 60 seconds. The spinner stops waiting and offers Try again, which re-enters through the cookie with no form.`],
+    'callback-error':[`Callback error`,`The client's redirect URI received an OAuth error (not interaction required), or the token exchange failed. No code is shown to the guest; Try again re-enters through the cookie.`],
+    'time-up':[`Time up`,`The deadline passed while connecting. The client jumps to G6, shown here as a link.`]},
+  render:st=>{
+    const L=LOGO;
+    if(st==='working'||st==='slow')return C(`<div class="center">${L}${SPIN}${T(`Setting up your guest access`,`This takes a few seconds.`)}${st==='slow'?`<p class="help">This is taking longer than usual. Please keep this page open.</p>`:''}</div>`);
+    if(st==='lost-session')return C(`${L}${T(`We lost your sign-in`,`This can happen when a link opens inside another app. Open the link from your message again, this time in your browser. If it says the link was already used, ask the host for a new one.`)}${GO(`Try again`,`G2:working`)}`);
+    if(st==='unavailable')return C(`${L}${T(`We can't connect you right now`,`The service is busy or unavailable. Your details are saved, so you don't need to type them again.`)}${GO(`Try again`,`G2:working`)}`);
+    if(st==='timeout')return C(`<div class="center"><div class="gi">!</div>${T(`This is taking too long`,`We couldn't finish setting up your guest access. Your details are saved, so you don't need to type them again. If it keeps happening, ask the host for a new link.`)}${GO(`Try again`,`G2:working`)}</div>`);
+    if(st==='callback-error')return C(`<div class="center"><div class="gi">!</div>${T(`We couldn't finish connecting you`,`Something went wrong while signing you in. Wait a minute, then choose Try again. Your details are saved, so you don't need to type them again. If it keeps happening, ask the host for a new link.`)}${GO(`Try again`,`G2:working`)}</div>`);
+    return C(`${L}<div class="dash pad"><p class="help">Not a screen of its own. If the deadline passes while connecting, the client jumps to the session-ended screen.</p><p style="margin-top:8px">${LNK(`See: session ended`,`G6:time-up`)}</p></div>`);
+  }},
+
+G3:{name:`Lobby`,grp:`Guest`,chip:`Client`,addr:()=>[I,``],def:`asking-prompt`,
+  io:[`G2 finished. The guest lands on the meeting client.`,`Join call (only when admitted) goes to G4. End session, available in every state, goes to G5.`],
+  st:{
+    asking:[`Asking`,`The knock is sent. The Join call button stays disabled until the host admits.`],
+    slow:[`Slow`,`No answer for a long time. The client cannot tell whether the host saw the knock.`],
+    admitted:[`Admitted`,`The host let the guest in (an invite). Join call is enabled. Pressing it joins the room and, once the membership is joined, starts the call. Element Call's own lobby is skipped.`],
+    declined:[`Declined`,`The host refused. The guest may ask again.`],
+    cancelled:[`Cancelled`,`The guest withdrew the request.`],
+    forbidden:[`Forbidden`,`The host blocked this guest. Asking again is not offered; End session is the exit.`],
+    'send-failed':[`Send failed`,`The knock never left the page.`],
+    reconnecting:[`Reconnecting`,`Still asking, but the connection dropped and is being restored.`],
+    wait:[`Wait`,`The guest asked too often (3 knocks per room in 10 minutes). The policy module refuses the knock, and this screen mirrors the cap with a wait line.`],
+    'room-not-secure':[`Room not secure`,`The room lacks the encryption setting the client requires, so nothing is joined and no call is mounted. The only exit is End session.`]},
+  st2:{
+    prompt:[`Prompt`,`The browser has not been asked yet. The guest can allow access or skip.`],
+    requesting:[`Requesting`,`The browser permission prompt is open.`],
+    ready:[`Ready`,`Preview works. Toggles decide the state the guest joins with.`],
+    denied:[`Denied`,`Access is blocked for this site. The guest can fix it in browser settings or join without.`],
+    'no-camera':[`No camera`,`A microphone exists but no camera.`],
+    'no-devices':[`No devices`,`Neither camera nor microphone exists. The guest can still listen.`],
+    busy:[`Busy`,`Another app or tab holds the device.`],
+    skipped:[`Skipped`,`The guest chose to join without camera and microphone.`]},
+  render:()=>C(`<div class="strip"><b>Weekly sync</b><span class="muted">Guest session: 1 h 58 min left</span></div>${T(`Get ready to join`)}<div class="zones"><section class="zone zadm" aria-label="Admission">${admZone(S.adm)}</section><section class="zone zdev" aria-label="Devices">${devZone(S.dev)}</section></div><p class="center" style="margin-top:14px">${LNK(`End session`,`G5:confirm-delete`)}</p>`,{cls:'wide'})},
+
+G4:{name:`In call`,grp:`Guest`,chip:`Client`,addr:()=>[I,``],def:`connected`,
+  io:[`G3 Join call, or G5 Rejoin call.`,`Leave goes to G5. Keep this account opens K1 in a new tab. Rejoin call (no media) re-enters the call. A passed deadline goes to G6.`],
+  st:{
+    connecting:[`Connecting`,`Join call was pressed: the client joins the room, waits until its membership is joined, then starts the call window. It becomes connected after about a second.`],
+    connected:[`Connected`,`The steady state. The call window itself is upstream UI.`],
+    popover:[`Popover`,`Tapping the time left explains the deadline and offers to keep the account.`],
+    'warn-10':[`Warning, 10 min`,`A first, dismissible warning before the deadline.`],
+    'warn-2':[`Warning, 2 min`,`A persistent final warning. The call will end.`],
+    reconnecting:[`Reconnecting`,`The media connection dropped. The session clock keeps running.`],
+    'no-media':[`No media`,`No media key was delivered, so others may not see or hear the guest. Rejoin call leaves the call and enters it again without leaving the room, which forces a new key rotation.`],
+    alone:[`Alone`,`Nobody else is in the call.`]},
+  render:st=>{
+    const bn={reconnecting:`Connection lost. Trying to reconnect...`,alone:`You are the only one here. Waiting for others to join.`}[st];
+    const nm=st==='no-media'?`<div class="bnr warn"><span>Others may not be able to see or hear you. Rejoin the call to reconnect your camera and microphone.</span>${GO(`Rejoin call`,`G4:connecting`,`btn-secondary sm`)}</div>`:'';
+    const w2=st==='warn-2'?`<div class="bnr warn"><span>2 minutes left. Your call will end and your guest account will be deleted.</span>${GO(`Keep this account`,`K1:CL-02`,`btn-secondary sm`)}</div>`:'';
+    const pop=st==='popover'?`<div class="pop"><p>Your guest session ends in 1 h 52 min.</p><p class="help" style="margin-bottom:10px">Add a passkey to keep your account. It opens in a new tab. Saving the passkey signs this call out, and you sign in with the passkey to rejoin.</p>${GO(`Keep this account`,`K1:CL-02`)}</div>`:'';
+    const hdr=`<div class="hdr"><b>Weekly sync</b><span class="badge">Guest</span><span class="timewrap"><button type="button" class="timebtn" data-go="G4:${st==='popover'?'connected':'popover'}" aria-expanded="${st==='popover'}">1 h 52 min left</button>${pop}</span><span class="sp"></span>${GO(`Leave`,`G5:left`,`btn-secondary sm`)}</div>`;
+    const body=st==='connecting'?`<div class="callwin hatch center"><div>${SPIN}<p>Joining the call...</p></div></div>`
+      :`<div class="tiles"><div class="tile hatch"><span class="avatar">SE</span><span>Sam Example</span></div><div class="tile hatch"><span class="avatar">AE</span><span>Alex Example (Guest) <em class="you">You</em></span></div></div>`;
+    const toast=st==='warn-10'?TOAST(`10 minutes left in your guest session. Then your call ends and your guest account is deleted. Keeping the account signs this call out.`,`<span class="acts">${GO(`Keep this account`,`K1:CL-02`,`btn-primary sm`)}${GO(`Dismiss`,`G4:connected`,`btn-secondary sm`)}</span>`):'';
+    return C(`${w2}${nm}${bn?`<div class="bnr">${bn}</div>`:''}${hdr}${body}<p class="center"><span class="dl">Call window (Element Call, not designed here)</span></p><div class="ctrls"><span class="rc">${IC.mic}</span><span class="rc">${IC.cam}</span><span class="rc">${IC.hang}</span></div><p class="center"><span class="dl">call controls (upstream)</span></p>`,{cls:'call wide'})+toast;
+  }},
+
+G5:{name:`After the call`,grp:`Guest`,chip:`Client`,addr:()=>[I,``],def:`left`,
+  io:[`G4 Leave, or the host ended the call. Also End session from the lobby.`,`Keep this account goes to K1. Rejoin call goes to G4. End session ends the account.`],
+  st:{
+    left:[`Left`,`The guest left on their own. Rejoining works until the deadline.`],
+    ended:[`Ended`,`The call ended for everyone, so there is nothing to rejoin.`],
+    'confirm-delete':[`Confirm end`,`Ending the session deletes the account and cannot be undone, so it needs an inline confirmation. The lobby's End session link opens the same confirmation.`],
+    deleting:[`Deleting`,`The account is being removed. The guest can close the page. The claim page shows the same words on the issuer origin after Delete everything now.`]},
+  render:st=>{
+    if(st==='deleting')return C(T(`Your guest account is being deleted`,`You can close this page. To join again, ask the host for a new link.`));
+    const ended=st==='ended'||(st==='confirm-delete'&&S.g5==='ended');
+    const del=st==='confirm-delete'?`<div class="box" style="margin-top:12px"><p>End your session now? This guest account and your details are deleted, and you can't rejoin with this link.</p><div class="acts" style="margin-top:10px">${GO(`End session`,`G5:deleting`,`btn-danger sm`)}${GO(`Cancel`,`G5:${S.g5}`,`btn-secondary sm`)}</div></div>`:GO(`End session`,`G5:confirm-delete`,`btn-ghost`)+`<p class="help center">Deletes this guest account and your details now. You can't rejoin with this link afterwards.</p>`;
+    return C(`${T(ended?`The call has ended`:`You left the call`,ended?'':`You can rejoin while your guest session lasts (1 h 12 min left).`)}
+${ended?'':GO(`Rejoin call`,`G4:connecting`,`btn-secondary`)}
+<div class="box" style="margin-top:14px"><h3>Keep this account?</h3><p>Add a passkey and this limited account stays after the call. It can join calls you are invited to, nothing more. Otherwise this guest account is deleted at 14:32.</p>${GO(`Keep this account`,`K1:CL-02`)}</div>
+${del}`);
+  }},
+
+G6:{name:`Session ended`,grp:`Guest`,chip:`Client + Issuer`,addr:st=>(st==='closed'||st==='closed-kept')?[ID,`/guest/ended`]:[I,``],def:`time-up`,
+  io:[`The deadline passed, the session was revoked, a claim signed the call tab out, or the host removed the guest.`,`Ask to join again (removed only) goes to G3. Sign in with your passkey (kept account, and the text link of Closed) leaves for the normal sign-in. Otherwise the guest needs a new link.`],
+  st:{
+    'time-up':[`Time up`,`The guest session reached its deadline.`],
+    closed:[`Closed`,`The client cannot tell "host ended the meeting" from "token revoked mid-call", so both use this state. It is drawn by the issuer page /guest/ended when the guest cookie does not report a kept account. A courtesy passkey link stays because a claim deletes the handle.`],
+    'closed-kept':[`Closed, account kept`,`The guest kept the account, which signed the call tab out. The issuer page /guest/ended reads the cookie state (claimed) and offers passkey sign-in. No new admission is needed.`],
+    removed:[`Removed`,`The host removed this guest from the call. The session is still valid, so asking again is possible.`]},
+  render:st=>{
+    const again=`To join again, ask the host for a new link.`;
+    if(st==='time-up')return C(`${T(`Your guest session has ended`,`Guest sessions last 2 hours. Your guest account is being deleted.`)}<p>${again}</p>`);
+    if(st==='closed')return C(`${T(`Your session was closed`,`The meeting ended or the host closed it. Your guest account is being deleted.`)}<p>${again}</p><p style="margin-top:10px">Kept this account? ${LNK(`Sign in with your passkey`)}.</p>`,{org:`Issuer`});
+    if(st==='closed-kept')return C(`<div class="center"><div class="gi ok">${IC.check}</div>${T(`You kept this account`,`Your call was signed out when you saved your passkey. Sign in with your passkey to rejoin the call. You do not need to ask the host to let you in again.`)}${B(`Sign in with your passkey`,`btn-primary`)}</div>`,{org:`Issuer`});
+    return C(`${T(`You were removed from the call`,`The host removed you from this call.`)}${GO(`Ask to join again`,`G3:asking-prompt`)}<p class="help center">Your guest session is still active for 1 h 12 min.</p>`);
+  }},
+
+G7:{name:`Cannot continue`,grp:`Guest`,chip:`Issuer + Client`,addr:()=>[ID,`/guest/join/7f3a...`],def:`invalid`,
+  io:[`The guest opened the link, or a dependent request failed.`,`Try again goes to G1. Otherwise the guest asks the host for a new link.`],
+  st:{
+    invalid:[`Invalid`,`The link is malformed, truncated or unknown. The page does not say which.`],
+    expired:[`Expired`,`The link lifetime passed before it was used.`],
+    used:[`Used`,`A single-use link was already consumed, possibly in another browser.`],
+    exhausted:[`Exhausted`,`A multi-use link reached its cap.`],
+    ended:[`Ended`,`The host ended the meeting, so the link is dead.`],
+    disabled:[`Disabled`,`The operator switched guest access off.`],
+    'rate-limited':[`Rate limited`,`Too many attempts from this client.`],
+    unavailable:[`Unavailable`,`The service could not create the guest. Typed details are kept.`],
+    unsupported:[`Unsupported`,`The browser lacks what a video call needs. Checked on the join page before anything is redeemed, so a single-use link is not burned. The client repeats the check as a guard.`]},
+  render:st=>{
+    const d=G7[st];
+    return C(`<div class="center"><div class="gi">!</div>${T(d[0],d[1])}${st==='unsupported'?`<p class="help" style="margin:-8px 0 4px">Needs: camera and microphone access, a secure (https) connection.</p>${B(`Copy link`,`btn-secondary`)}`:''}${d[2]?GO(d[2],`G1:ready`):''}</div>`);
+  }},
+
+K1:{name:`Keep this account`,grp:`Claim`,chip:`Issuer`,addr:()=>[ID,`/guest/claim`],def:`CL-02`,
+  io:[`The time chip on G4, the card on G5, or the resume link on G1. It opens in a new tab so a live call continues.`,`Create passkey leads to K2 CL-06 on success. No thanks goes to K2 CL-07. Failures go to K2.`],
+  st:{
+    'CL-01':[`CL-01 Loading`,`The static page asks the service for the state of the guest session.`],
+    'CL-02':[`CL-02 Intro`,`The offer, the six-point trust statement and the e-mail choice (shown when an address exists, default Remove).`],
+    'CL-03':[`CL-03 Starting`,`Create passkey was pressed and the service is preparing the passkey request.`],
+    'CL-04':[`CL-04 Prompt`,`The browser's own passkey dialog is open. The page has no button for it.`],
+    'CL-05':[`CL-05 Saving`,`The passkey was created and is being stored on the account. The finish request is sent once and the control stays disabled while it runs. A duplicate that answers 409 claim in progress is ignored while the page's own request is running. The answer leads to CL-06 (done), CL-E2 (lost the race), CL-E3 (already kept), CL-E4 (unavailable), CL-E8 (not verified) or CL-E9 (anything else).`]},
+  render:st=>{
+    const L=LOGO;
+    if(st==='CL-01')return C(`<div class="center">${L}${SPIN}${T(`Checking your guest session...`)}</div>`);
+    if(st==='CL-04')return C(`<div class="center">${L}${SPIN}${T(`Follow the prompt on your device`,`Choose a passkey on this device, or use your phone or tablet from the same prompt.`)}</div><p class="center help">${LNK(`Simulate: passkey created`,`K1:CL-05`)}</p>`);
+    if(st==='CL-05')return C(`<div class="center">${L}${SPIN}${T(`Saving your passkey...`)}</div><p class="center help">${LNK(`Simulate: saved`,`K2:CL-06`)}</p>`);
+    const busy=st==='CL-03', dis=busy?' disabled':'';
+    return C(`${L}${T(`Keep this account`,`Your guest session ends in 1 h 12 min (at 14:32). Add a passkey to keep this account.`)}${TRUSTL(false)}
+<fieldset class="f"><legend>E-mail address</legend><label class="rad"><input type="radio" name="kem"${dis}> Keep it on the account, for notices only</label><label class="rad"><input type="radio" name="kem" checked${dis}> Remove it</label></fieldset>
+${busy?B(`Preparing...`,`btn-primary`,`disabled`):GO(`Create passkey`,`K1:CL-04`)}${GO(`No thanks`,`K2:CL-07`,`btn-ghost`,dis)}`);
+  }},
+
+K2:{name:`Claim outcome`,grp:`Claim`,chip:`Issuer`,addr:()=>[ID,`/guest/claim`],def:`CL-06`,
+  io:[`K1 finished: passkey saved, declined, cancelled or failed.`,`Back to the call opens the client, whose silent sign-in fails because the call session was revoked, so the guest lands on the passkey sign-in page (G6 closed-kept). Try again returns to K1. Delete everything now ends the account. Close ends the claim tab.`],
+  st:{
+    'CL-06':[`CL-06 Done`,`The passkey is linked. The account no longer has a deadline and stays limited. The trust statement is shown again in the past tense. The call tab was signed out by the claim, so Back to the call leads to passkey sign-in (G6 closed-kept).`],
+    'CL-07':[`CL-07 Declined`,`The guest pressed No thanks. The account still ends at its deadline and can be deleted now. Delete everything now calls the end route with the guest cookie (origin check, refused when neither header is present): 200 ends the session, 409 means the account was kept in another tab (E3), a 5xx shows E9.`],
+    'CL-E1':[`E1 No session`,`This browser does not hold the guest session. Close is the exit, so the page is never a dead end.`],
+    'CL-E2':[`E2 Ended`,`The session ended before anything was kept. Close is the exit.`],
+    'CL-E3':[`E3 Already kept`,`The account is already kept: the answer to a duplicate finish, to a retry after a lost response (the service remembers the claim for 10 minutes) and to a 409 from Delete everything now.`],
+    'CL-E4':[`E4 Unavailable`,`Keeping guest accounts is switched off or its cap is reached, so the service says it is not available right now. Close is the exit.`],
+    'CL-E5':[`E5 Unsupported`,`The browser or device cannot create passkeys.`],
+    'CL-E6':[`E6 Cancelled`,`The guest cancelled the passkey prompt. Nothing changed.`],
+    'CL-E7':[`E7 Timed out`,`The passkey prompt took too long. Nothing changed.`],
+    'CL-E8':[`E8 Not verified`,`The service could not verify the passkey, or refused its credential id with the same answer. Nothing was kept.`],
+    'CL-E9':[`E9 Unavailable`,`The service could not be reached, or an earlier finish is still running (409 claim in progress). Nothing was kept yet. A retry resolves to E3 if that finish had committed.`],
+    'CL-E10':[`E10 Rate limited`,`Too many attempts from this client.`]},
+  render:st=>{
+    const L=LOGO;
+    const E={
+      'CL-E1':[`We can't find your guest session`,`This browser does not hold your guest session. Claim in the browser you joined with.`,`Close`],
+      'CL-E2':[`This session has ended`,`This session has ended, nothing was kept. If you just created a passkey, remove it from your device.`,`Close`],
+      'CL-E3':[`You already keep this account`,`You already keep this account. Sign in with your passkey.`,`Sign in`],
+      'CL-E4':[`Keeping accounts isn't available`,`Keeping guest accounts is not available right now.`,`Close`],
+      'CL-E5':[`This browser can't create passkeys`,`Try another browser, or use a phone through the passkey prompt. Your guest session stays as it is.`,`Back`,`K1:CL-02`],
+      'CL-E6':[`Nothing was changed`,`You cancelled the passkey prompt.`,`Try again`,`K1:CL-02`],
+      'CL-E7':[`It took too long`,`The passkey prompt timed out. A phone prompt can be slow. Nothing was changed.`,`Try again`,`K1:CL-02`],
+      'CL-E8':[`We could not verify the passkey`,`Nothing was kept. Try again. If it keeps failing, contact the operator.`,`Try again`,`K1:CL-02`],
+      'CL-E9':[`We can't reach the service`,`Try again in a moment. Nothing was kept yet.`,`Try again`,`K1:CL-02`],
+      'CL-E10':[`Too many attempts`,`Wait a few minutes, then try again.`,`Try again`,`K1:CL-02`]
+    };
+    if(st==='CL-06')return C(`<div class="center">${L}<div class="gi ok">${IC.check}</div>${T(`You kept this account`,`Next time, sign in with your passkey.`)}</div>${TRUSTL(true)}${GO(`Back to the call`,`G6:closed-kept`)}${B(`Close`,`btn-ghost`)}`);
+    if(st==='CL-07')return C(`${L}${T(`Your guest account will be deleted`,`Without a passkey, this guest account and your details are deleted at 14:32 (in 1 h 12 min). You can still change your mind until then.`)}${GO(`Keep this account`,`K1:CL-02`,`btn-secondary`)}<p class="center" style="margin-top:8px">${LNK(`Delete everything now`,`G5:deleting`)}</p>`);
+    const d=E[st];
+    return C(`<div class="center"><div class="gi">!</div>${T(d[0],d[1])}${d[2]?(d[3]?GO(d[2],d[3]):B(d[2],`btn-secondary`)):''}</div>`);
+  }}
+};
+
+/* ---------- happy path ---------- */
+const PATH=[
+  {s:'H1',st:'default'},
+  {s:'H2',st:'default',note:'Host shares the link; guest side begins.'},
+  {s:'G1',st:'ready'},
+  {s:'G2',st:'working'},
+  {s:'G3',st:'asking',go:'G3:asking-prompt'},
+  {s:'H5',st:'one'},
+  {s:'G3',st:'admitted',go:'G3:admitted-ready'},
+  {s:'G4',st:'connected'},
+  {s:'G5',st:'left'},
+  {s:'K1',st:'CL-02'},
+  {s:'K2',st:'CL-06'}
+];
+const pathGo=i=>PATH[i].go||`${PATH[i].s}:${PATH[i].st}`;
+
+/* ---------- error and edge catalogue ---------- */
+const EDGE=[
+  [`Link missing or wrong`,`G7:invalid`,`Link and join`],[`Expired link`,`G7:expired`,`Link and join`],[`Link already used`,`G7:used`,`Link and join`],
+  [`Link at its limit`,`G7:exhausted`,`Link and join`],[`Meeting ended (link)`,`G7:ended`,`Link and join`],[`Guest mode disabled`,`G7:disabled`,`Link and join`],
+  [`Rate limited`,`G7:rate-limited`,`Link and join`],[`Service unavailable (join)`,`G7:unavailable`,`Link and join`],[`Unsupported browser`,`G7:unsupported`,`Link and join`],
+  [`E-mail required but empty`,`G1:errors/email`,`Link and join`],[`Invalid name`,`G1:errors/name`,`Link and join`],[`Network failure on submit`,`G1:network-error`,`Link and join`],
+  [`Sign-in lost (other app, cookies)`,`G2:lost-session`,`Sign-in`],[`Sign-in service unavailable`,`G2:unavailable`,`Sign-in`],[`Connecting takes too long`,`G2:timeout`,`Sign-in`],[`Callback error`,`G2:callback-error`,`Sign-in`],[`Resume after the deadline`,`G6:time-up`,`Sign-in`],
+  [`Camera or microphone denied`,`G3:asking-denied`,`Lobby`],[`No camera`,`G3:asking-no-camera`,`Lobby`],[`No camera or microphone`,`G3:asking-no-devices`,`Lobby`],
+  [`Camera busy`,`G3:asking-busy`,`Lobby`],[`Request could not be sent`,`G3:send-failed-prompt`,`Lobby`],[`Host declined`,`G3:declined-ready`,`Lobby`],
+  [`Waiting a long time`,`G3:slow-prompt`,`Lobby`],[`Blocked by host`,`G3:forbidden-prompt`,`Lobby`],[`Asking again too often`,`G3:wait-prompt`,`Lobby`],[`Room not set up for guests`,`G3:room-not-secure-prompt`,`Lobby`],
+  [`Removed by the host`,`G6:removed`,`In the call`],[`Deadline reached`,`G6:time-up`,`In the call`],[`Token revoked mid-call`,`G6:closed`,`In the call`],
+  [`Kept account, call signed out`,`G6:closed-kept`,`In the call`],[`Others cannot see or hear the guest`,`G4:no-media`,`In the call`],[`Connection lost in call`,`G4:reconnecting`,`In the call`],[`Time warning (10 min)`,`G4:warn-10`,`In the call`],[`Time warning (2 min)`,`G4:warn-2`,`In the call`],
+  [`Everyone else left`,`G5:ended`,`In the call`],
+  [`No guest session`,`K2:CL-E1`,`Claim`],[`Session ended`,`K2:CL-E2`,`Claim`],[`Already kept`,`K2:CL-E3`,`Claim`],[`Keeping accounts unavailable`,`K2:CL-E4`,`Claim`],
+  [`Passkeys unsupported`,`K2:CL-E5`,`Claim`],[`Prompt cancelled`,`K2:CL-E6`,`Claim`],[`Prompt timed out`,`K2:CL-E7`,`Claim`],[`Not verified`,`K2:CL-E8`,`Claim`],
+  [`Service unavailable`,`K2:CL-E9`,`Claim`],[`Rate limited`,`K2:CL-E10`,`Claim`],
+  [`Not allowed`,`H1:not-allowed`,`Host`],[`Guest meetings off`,`H1:switched-off`,`Host`],[`Room could not be created`,`H1:unavailable`,`Host`],[`Host limit reached`,`H1:host-limit`,`Host`],[`Service at capacity`,`H1:capacity`,`Host`],
+  [`Signed out`,`H1:signed-out`,`Host`],[`Rate limited`,`H1:rate-limited`,`Host`],[`Clipboard blocked`,`H2:copy-failed`,`Host`],[`List failed to load`,`H3:error`,`Host`],
+  [`End meeting failed`,`H4:error`,`Host`],[`Knock not noticed (no notification)`,`H5:silent`,`Host`]
+];
+
+/* ---------- navigation ---------- */
+function setG3(s){
+  const a=Object.keys(SC.G3.st).sort((x,y)=>y.length-x.length).find(k=>s===k||s.startsWith(k+'-'));
+  if(!a){S.adm='asking';S.dev='prompt';}
+  else{S.adm=a;const d=s.slice(a.length+1);if(d&&SC.G3.st2[d])S.dev=d;}
+  S.state=S.adm;
+}
+function applyPreset(g){
+  if(g.preset==='email'){g.first='Alex';g.last='Example';g.email='';g.errs={email:'email_missing'};}
+  else if(g.preset==='name'){g.first='Alex2';g.last='Exam\u0440le';g.email='';g.errs={first:'chars',last:'script'};}
+  else{g.first='';g.last='Example'.repeat(7);g.email='alex@';g.errs={first:'first_empty',last:'long',email:'email_invalid'};}
+  g.dirty=true;
+}
+function syncStep(){
+  const i=PATH.findIndex(p=>p.s===S.screen&&p.st===S.state);
+  if(S.screen==='G4'&&S.state==='connecting'&&(S.step===6||S.step===7)){S.step=7;S.onPath=true;}
+  else if(i>=0){S.step=i;S.onPath=true;}
+  else S.onPath=PATH[S.step].s===S.screen;
+}
+function nav(t){
+  const parts=t.split(':'), scr=parts[0], sc=SC[scr];
+  if(!sc)return;
+  const rest=(parts[1]||sc.def).split('/'), st=rest[0], variant=rest[1];
+  clearTimeout(S.timer);
+  S.screen=scr;
+  if(scr==='G3')setG3(st);else S.state=st;
+  if(scr==='H1'){S.who=st==='several'?'several':'one';S.opts=st==='options-open';}
+  if(scr==='G1'){
+    const g=S.g1;g.live=null;g.consent=false;g.emailReq=variant==='email';
+    if(st==='errors'){g.preset=variant||'all';applyPreset(g);}
+    else if(g.dirty){g.first=g.last=g.email='';g.dirty=false;}
+  }
+  if(scr==='G5'&&(st==='left'||st==='ended'))S.g5=st;
+  if(scr==='G4'&&st==='connecting')S.timer=setTimeout(()=>{if(S.screen==='G4'&&S.state==='connecting')nav('G4:connected');},1000);
+  syncStep();
+  render();
+}
+function submitG1(){
+  const g=S.g1,e={},m=g1mode();
+  ['first','last'].forEach(k=>{
+    const v=g[k].trim();
+    if(!v)e[k]=k+'_empty';
+    else if(v.length>40)e[k]='long';
+    else if(/[^\p{L}\p{M}\s'\u2019.-]/u.test(v))e[k]='chars';
+    else if(/\p{Script=Latin}/u.test(v)&&/\p{Script=Cyrillic}/u.test(v))e[k]='script';
+    else if(['admin','administrator','moderator','support','helpdesk','system','security','staff','official','host','organiser','organizer','owner','bot','guest'].includes(v.toLowerCase()))e[k]='reserved';
+  });
+  const em=g.email.trim();
+  if(m!=='off'){
+    if(!em&&m==='req')e.email='email_missing';
+    else if(em&&!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em))e.email='email_invalid';
+  }
+  if(Object.keys(e).length){
+    if(S.state==='errors')g.errs=e;else g.live=e;
+    render();
+    const f=$('#vp .f.bad input');if(f)f.focus();
+    return;
+  }
+  nav('G2:working');
+}
+
+/* ---------- rendering of the gallery around the frame ---------- */
+const stepText=()=>{
+  const sc=SC[S.screen],n=`${S.screen} ${sc.name} (${S.state})`;
+  return S.onPath?`Step ${S.step+1} of ${PATH.length}: ${n}`:`Off the happy path: ${n}. Last path step: ${S.step+1} of ${PATH.length}`;
+};
+const pg=(label,obj,cur,attr)=>`<div class="pg" role="group" aria-label="${label}"><span class="pl">${label}</span>${Object.entries(obj).map(([k,v])=>`<button type="button" class="pill" ${attr}="${k}" data-keep="${attr}-${k}" aria-pressed="${k===cur}">${v[0]}</button>`).join('')}</div>`;
+function render(){
+  const sc=SC[S.screen],fe=document.activeElement;
+  const keep=fe&&fe.getAttribute?fe.getAttribute('data-keep'):null;
+  $('#frame').className='frame '+S.frame;
+  $('#vp').innerHTML=sc.render(S.state);
+  const a=sc.addr(S.state);
+  $('#addr').innerHTML=`${IC.lock}<b>${a[0]}</b><span class="muted">${a[1]}</span>`;
+  $('#list').innerHTML=['Host','Guest','Claim'].map(g=>`<h2>${g}</h2>`+Object.entries(SC).filter(([k,v])=>v.grp===g).map(([k,v])=>`<button type="button" class="li" data-pick="${k}" data-keep="pick-${k}" aria-current="${k===S.screen}"><b>${k}</b><span>${v.name}</span><span class="chip">${v.chip}</span></button>`).join('')).join('');
+  $('#pills').innerHTML=sc.st2?pg('Admission',sc.st,S.adm,'data-st')+pg('Devices',sc.st2,S.dev,'data-dv'):pg('State',sc.st,S.state,'data-st');
+  $('#cap').innerHTML=sc.st2?`<b>Admission, ${sc.st[S.adm][0]}:</b> ${sc.st[S.adm][1]}<br><b>Devices, ${sc.st2[S.dev][0]}:</b> ${sc.st2[S.dev][1]}`:`<b>What this state means:</b> ${sc.st[S.state][1]}`;
+  $('#io').innerHTML=`<b>Origin</b> ${a[0]}${a[1]}. <b>Entry</b> ${sc.io[0]} <b>Exit</b> ${sc.io[1]}`;
+  const p=PATH[S.step];
+  $('#note').innerHTML=(S.onPath&&p.note&&p.s===S.screen&&p.st===S.state)?`<div class="note">Happy path: ${p.note}</div>`:'';
+  $('#steplbl').textContent=stepText();
+  $('#prev').disabled=(S.onPath?S.step-1:S.step)<0;
+  $('#next').disabled=S.step+1>=PATH.length;
+  document.querySelectorAll('[data-fr]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.fr===S.frame)));
+  if(keep){const n=$(`[data-keep="${keep}"]`);if(n)n.focus();}
+}
+
+/* ---------- events ---------- */
+const vp=$('#vp');
+vp.addEventListener('click',e=>{
+  const t=e.target.closest('[data-go],[data-act]');
+  if(!t||t.disabled||t.getAttribute('aria-disabled')==='true')return;
+  if(t.dataset.cam!==undefined)S.cam=t.dataset.cam==='1';
+  if(t.dataset.go){nav(t.dataset.go);return;}
+  const a=t.dataset.act;
+  if(a==='who'){
+    S.who=t.dataset.v;
+    if(['default','several','options-open'].includes(S.state))S.state=S.who==='several'?'several':(S.opts?'options-open':'default');
+    render();
+  }else if(a==='inc'||a==='dec'){S.count=Math.max(2,Math.min(10,S.count+(a==='inc'?1:-1)));render();}
+  else if(a==='cam'||a==='mic'){S[a]=!S[a];render();}
+  else if(a==='g1submit')submitG1();
+});
+vp.addEventListener('input',e=>{
+  const t=e.target,k=t.dataset&&t.dataset.g1;
+  if(!k)return;
+  if(k==='consent'){S.g1.consent=t.checked;const b=$('#vp [data-act="g1submit"]');if(b)b.disabled=!t.checked;return;}
+  S.g1[k]=t.value;
+  const n=`${S.g1.first} ${S.g1.last}`.replace(/\s+/g,' ').trim()||'Your name';
+  const el=$('#seeas');if(el)el.textContent=n+' (Guest)';
+});
+vp.addEventListener('toggle',e=>{if(e.target.classList&&e.target.classList.contains('more'))S.opts=e.target.open;},true);
+
+$('#list').addEventListener('click',e=>{
+  const t=e.target.closest('[data-pick]');if(!t)return;
+  nav(t.dataset.pick+':'+SC[t.dataset.pick].def);
+  if(!wide.matches)$('#side').open=false;
+});
+$('#pills').addEventListener('click',e=>{
+  const t=e.target.closest('[data-st],[data-dv]');if(!t)return;
+  if(S.screen==='G3'){nav(t.dataset.st?`G3:${t.dataset.st}-${S.dev}`:`G3:${S.adm}-${t.dataset.dv}`);}
+  else nav(`${S.screen}:${t.dataset.st}`);
+});
+document.querySelectorAll('[data-fr]').forEach(b=>b.addEventListener('click',()=>{S.frame=b.dataset.fr;render();}));
+document.querySelectorAll('[data-th]').forEach(b=>b.addEventListener('click',()=>{
+  const v=b.dataset.th,r=document.documentElement;
+  if(v==='auto')r.removeAttribute('data-theme');else r.setAttribute('data-theme',v);
+  document.querySelectorAll('[data-th]').forEach(x=>x.setAttribute('aria-pressed',String(x===b)));
+}));
+$('#prev').addEventListener('click',()=>nav(pathGo(S.onPath?S.step-1:S.step)));
+$('#next').addEventListener('click',()=>nav(pathGo(S.step+1)));
+const edge=$('#edge');
+const egs=[...new Set(EDGE.map(x=>x[2]))];
+edge.innerHTML=`<option value="">Choose a state...</option>`+egs.map(g=>`<optgroup label="${g}">${EDGE.map((x,i)=>x[2]===g?`<option value="${i}">${x[0]}</option>`:'').join('')}</optgroup>`).join('');
+edge.addEventListener('change',()=>{
+  const v=edge.value;edge.selectedIndex=0;
+  if(v!=='')nav(EDGE[+v][1]);
+});
+const wide=window.matchMedia('(min-width:861px)');
+$('#side').open=wide.matches;
+wide.addEventListener('change',e=>{$('#side').open=e.matches;});
+
+window.GP={S,SC,nav,PATH,EDGE};
+nav('H1:default');
+})();
+</script>
+</body>
+</html>

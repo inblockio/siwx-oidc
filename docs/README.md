@@ -44,6 +44,7 @@ describe the current behaviour.
 | [design/2026-06-19-passkey-offer-scoping-minimal-behavior.md](design/2026-06-19-passkey-offer-scoping-minimal-behavior.md) | The minimal behaviour for which passkeys are offered in each flow |
 | [design/2026-07-25-webauthn-prf-4s-unlock-evaluation.md](design/2026-07-25-webauthn-prf-4s-unlock-evaluation.md) | Evaluation of WebAuthn PRF as a Matrix secret-storage unlock (rejected as proposed) |
 | [design/2026-09-09-did-profile-field-feasibility.md](design/2026-09-09-did-profile-field-feasibility.md) | Feasibility of publishing the DID as an MSC4133 profile field on Synapse 1.159.0 |
+| [design/guest-portal/00-overview.md](design/guest-portal/00-overview.md) | Draft design set for anonymous guests joining a Matrix video call by link: flow model, Synapse validation, guest client, security limits, claim by passkey, wireframes, implementation plan (design only, nothing implemented) |
 
 ## Audits and findings
 
