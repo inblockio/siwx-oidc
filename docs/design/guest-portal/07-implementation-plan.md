@@ -1,6 +1,6 @@
 # Guest portal 07: implementation plan
 
-**Status:** DRAFT design document. Nothing here is implemented, and nothing in this document changes code.
+**Status:** DRAFT design document. Nothing here is implemented, and nothing in this document changes code. The plan is provisional until the consolidation session of [08](08-consolidation-session.md) has been held: no spike or milestone starts before it.
 **Scope:** how to build the guest portal of [01](01-flow-model.md) to [06](06-wireframes.md) (the entry point of the set is [00-overview.md](00-overview.md)): workstreams and repositories, the spikes that run
 before any guest code lands, small independently mergeable milestones in siwx-oidc, a traceability matrix from every requirement ID to a
 milestone and a test, the rollout and operations plan, risks, the test environment, and one consolidated register of the open decisions of the

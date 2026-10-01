@@ -1446,7 +1446,7 @@ One row per condition. "Where" is the screen and state in this document and in t
 `wireframes/index.html` is one self-contained file: inline CSS and script, no fonts, no images, no network requests, light and dark through `prefers-color-scheme`. Open it from disk. It shows the same screens and ids as this document:
 a phone frame and a desktop frame, the happy path as a stepper (host creates a link, guest joins, host admits, call, leave, claim), a per-screen state selector that lists exactly the states of this document (screen by screen, state by state) and an "Error and edge states" menu that jumps to each row of section 8 that has a screen. It is labelled as a wireframe on every view,
 uses only placeholder names and `example.org` hosts, and implements nothing: the only checks are the field rules on G1, there is no network and no state survives a reload. Where a screen has a desktop layout of its own (H3, G3, G4) the desktop frame shows it; every other screen
-renders the same centered card in both frames.
+renders the same centered card in both frames. A second, independent wireframe set (the waiting-room screens W1 to W7) is kept as reference in [reference/](reference/README.md); [08](08-consolidation-session.md) lines the two sets up.
 
 ## Validation status
 

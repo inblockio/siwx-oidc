@@ -1,6 +1,6 @@
 # Guest portal 00: overview
 
-**Status:** DRAFT design set for maintainer review. Design only: no code is written or changed by it, and nothing in it deploys or touches a running system.
+**Status:** DRAFT design set for maintainer review. Design only: no code is written or changed by it, and nothing in it deploys or touches a running system. **Next step:** a consolidation session with the product owner brings the reference material in [reference/](reference/README.md) and this set into one final plan ([08](08-consolidation-session.md)). It has not been held, and the set stays a draft until it has.
 **Baseline:** written against siwx-oidc `origin/main` at `3547bd2` (2026-09-30). Every `path:line` citation in the set is against that commit. Upstream facts were read
 from Synapse v1.161.0, lk-jwt-service 0.7.0 and Element Call v0.26.1 (documents 02 and 03 name the exact pins).
 
@@ -24,6 +24,8 @@ maintainers' working name for the guest client; no upstream product of that name
 | [06 wireframes](06-wireframes.md) | Low-fidelity screens, copy, states and errors of the host and guest journeys, `GP-UX-nn` |
 | [07 implementation plan](07-implementation-plan.md) | Workstreams, seven spikes, milestones M0a to M10, the traceability matrix, rollout and rollback, risks, the test environment, the decisions register |
 | [wireframes/index.html](wireframes/index.html) | The same screens as a clickable gallery. One self-contained file (inline CSS and script, no network request): open it from disk in any browser, for example by double-clicking it or with `xdg-open wireframes/index.html` from this folder. GitHub shows it as source, so check the branch out or download the file to see it rendered |
+| [08 consolidation session](08-consolidation-session.md) | The next step, prepared and not held: the two tracks, the 28 reference features lined up against this set, the collisions to settle, the order of work, the empty decision register |
+| [reference/](reference/README.md) | Source artefacts kept unchanged and unverified: a waiting-room case study with a 28-feature requirements list, and seven reference wireframes (W1 to W7) |
 
 To decide whether to proceed, read this file, then 07 sections 1 and 9. To review the security model, read 01 section 5, then 04. To build, read 07, then the IDs it names.
 Every document ends with `## Validation status` (claim, evidence, Verified or Unverified or Contradicted) and `## Open decisions` (numbered, each with a recommendation).
@@ -179,6 +181,9 @@ Identifiers are stable and are never renumbered. Some short letters serve more t
 | `HK-n` | Hand-off points of the custodial key | 01 section 11 |
 | `A1` to `A6`, `B1` to `B4`, `C1` to `C10`, `W1` to `W5`, `E1` to `E5` | Steps of the happy path, lettered by phase: A host creates the invites, B guest redeems, C OIDC hand-off, W waiting room and call, E end and teardown (cited as "01 step W2") | 01 section 4 |
 | `C1` to `C9` (client contract) | What the Meet client must do, from the side of the identity provider | 01 section 4.5 |
+| `RF-01` to `RF-28` | The 28 features of the reference case study (feature Fn is `RF-nn`) | reference/waiting-room-case-study.md |
+| `W1` to `W7` (reference screens) | The reference wireframes; not the happy-path steps W1 to W5 above | reference/waiting-room-wireframes/ |
+| `CS-01` to `CS-08` | Decision slots of the consolidation session, empty until it is held | 08 section 6 |
 | `T1`, `T2` | Client architectures: thin client with the Element Call component, or with the widget in an iframe | 03 section 2 |
 | `S1` to `S8` | Client spikes | 03 section 5.6 |
 | `SY-1` to `SY-4`, `F-0`, `F-a`, `F-b`, `C1` to `C14` (unexpected behaviours) | Synapse dev spikes; fallbacks of the canonical-name mechanism (`M1` there is a mechanism, not a milestone); behaviours that differ from what a reader might expect | 02 sections 11, 3.4 and 1.1 |
@@ -222,6 +227,7 @@ Identifiers are stable and are never renumbered. Some short letters serve more t
 - It adds documentation under `docs/design/guest-portal/` and nothing else: no code, no route, no configuration default, no test, no dependency, no deployment. No existing behaviour changes.
 - It does not verify who a guest is, protect guests from the operator, prevent recording, federate guest rooms, add chat, admit agent guests, hard-stop a connected media participant, add a
   second passkey for a claimed account, or add an account-admission policy for the homeserver. These non-goals are NG-01 to NG-12 in 04 section 6.1.
+- It does not consolidate the reference material with the set: that is the next step ([08](08-consolidation-session.md)), prepared here and not started. The reference files change no `GP-` row and no milestone.
 - It does not choose the things it lists as open: the module licence path, the public product name, the client repository, the retention numbers, and the production go.
 
 The project's rule for anything larger than a small fix is to open an issue first (`CONTRIBUTING.md:19`). This design is that larger change, put in front of the maintainers because they asked for it. Comment on
@@ -239,6 +245,8 @@ This file restates positions that the other documents validate in detail (each e
 | No upstream product named "Element Meet" exists | searches dated 2026-09-30, recorded in 03 section 1 and its validation table | Unverified (an absence claim) |
 | The eight incidental findings of section 8 are as described | the owning rows (01 section 5.6; 02 section 1.1; 04 section 8; 07 section 10) | Verified in the owning documents (code read at the baseline commit) |
 | The requirement families, milestone and register identifiers of section 9 are defined where the table says | the tables of 01 to 07 | Verified by script (every referenced identifier has a defining row) |
+| The reference files are kept unchanged | SHA-256 table in reference/README.md, checked against the export | Verified (hash) |
+| The statements of the reference case study are true | none run by this repository | Unverified |
 | Prerequisites P1 to P4 hold on the target deployment | nothing run, the server cannot verify them | Unverified (spikes SP-1 to SP-7 of 07 section 3 and the deployment check of 01 GP-FLOW-21) |
 
 ## Open decisions
@@ -250,3 +258,4 @@ Every row of the decisions log (section 7) is a recommendation that the maintain
 3. **Client repository and licence.** Recommendation: one new static-app repository for the guest client and the host tool, AGPL-3.0 because it links an AGPL component, with a legal read before any closed distribution (DR-44, PD-2 of 07).
 4. **Retention numbers.** Recommendation: proxy logs 7 days, application logs 14 days, `user_ips_max_age` 7 days where guests exist, backups rotated within 7 days (DR-52).
 5. **The production go.** Recommendation: nothing ships to production before the maintainers record an explicit go against the entry checks of 07 section 7.3 (PD-11 of 07); dev first, everything dark behind `guest_enabled`.
+6. **The consolidation session (08).** Recommendation: hold it before any spike or milestone starts, with the product owner, so that the final plan exists before work is split; the register of 08 section 6 records each decision.
