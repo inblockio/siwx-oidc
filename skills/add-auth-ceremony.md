@@ -22,7 +22,7 @@ The normalized output of every ceremony is a verified DID string stored in the R
 ### 1. DID derivation — confirm aqua-auth support
 
 Before writing any server code, confirm the DID type your ceremony produces is already
-supported in aqua-auth (https://github.com/inblockio/aqua-rs-auth):
+supported in aqua-auth (https://github.com/inblockio/aqua-auth):
 
 - `did:key:zDn…` (P-256) — for WebAuthn/passkeys. aqua-auth `src/key/`.
 - `did:key:z6Mk…` (Ed25519) — for SSH Ed25519 keys. aqua-auth `src/key/`.

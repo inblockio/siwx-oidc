@@ -46,7 +46,7 @@ mock-stack and browser end-to-end suites and a build of the container image.
   runs only when `MIGRATION_TEST_REDIS_URL` points at a disposable Redis.
 - The sign-in frontend lives in `js/ui/`: `npm ci && npm run build` writes to `static/build/`.
 - CAIP-122 and DID verification live in the external aqua-auth crate
-  ([inblockio/aqua-rs-auth](https://github.com/inblockio/aqua-rs-auth)), with its own tests.
+  ([inblockio/aqua-auth](https://github.com/inblockio/aqua-auth)), with its own tests.
 
 To run the server locally, see the [quick start](README.md#quick-start).
 

@@ -100,5 +100,5 @@ check, and building the Docker image.
   the Synapse and Element deployment, including the
   [Synapse patch registry](https://github.com/inblockio/siwx-oidc-matrix-server/blob/main/patches/synapse/README.md)
   and the [Element Web patch registry](https://github.com/inblockio/siwx-oidc-matrix-server/blob/main/patches/element-web/README.md).
-- [aqua-auth](https://github.com/inblockio/aqua-rs-auth): the DID and signature
+- [aqua-auth](https://github.com/inblockio/aqua-auth): the DID and signature
   verification library siwx-oidc builds on.

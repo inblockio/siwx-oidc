@@ -361,7 +361,7 @@ secret or an IP address, is being standardised on the web:
 agent with a CAIP-122 signature over the OIDC authorization-code flow and then
 issues bearer tokens. The same key can also sign individual HTTP requests with
 the *experimental* `http-sig` feature of
-[aqua-auth](https://github.com/inblockio/aqua-rs-auth), the library siwx-oidc
+[aqua-auth](https://github.com/inblockio/aqua-auth), the library siwx-oidc
 uses for signature verification. siwx-oidc itself does not use that feature, and
 no interoperability with third-party Web Bot Auth verifiers is claimed here.
 

@@ -18,7 +18,7 @@ path = "src/main.rs"
 # Same source spelling and pin as the root package: `ssh://` and `https://` are
 # two Cargo sources, so a mismatch here would build aqua-auth twice in one
 # workspace with features unmerged between the copies.
-aqua-auth = { git = "https://github.com/inblockio/aqua-rs-auth", tag = "v0.7.0" }
+aqua-auth = { git = "https://github.com/inblockio/aqua-auth", tag = "v0.7.0" }
 
 anyhow = "1"
 bs58 = "0.5"

@@ -37,7 +37,7 @@ description = "Key-first OpenID Connect provider and Matrix auth service: agents
 # machine-local `[patch]` the migration was developed under. aqua-node,
 # aquafier-rs and aqua-state-viewer still resolve 0.6.0 and move to this tag in
 # one batch. See CONSUMERS.md in aqua-auth.
-aqua-auth = { git = "https://github.com/inblockio/aqua-rs-auth", tag = "v0.7.0", features = ["webauthn", "ceremony", "redis"] }
+aqua-auth = { git = "https://github.com/inblockio/aqua-auth", tag = "v0.7.0", features = ["webauthn", "ceremony", "redis"] }
 alloy-primitives = { version = "1", features = ["serde"] }
 alloy = { version = "1", features = ["providers", "transport-http", "contract", "sol-types", "ens"] }
 anyhow = "1"

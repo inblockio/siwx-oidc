@@ -89,7 +89,7 @@ If the server rejects a signature, test the DID method directly:
 cargo test   # in an aqua-auth checkout, at the tag siwx-oidc pins
 ```
 
-For specific DID verification, check in aqua-auth (https://github.com/inblockio/aqua-rs-auth):
+For specific DID verification, check in aqua-auth (https://github.com/inblockio/aqua-auth):
 - `src/pkh/eip155.rs` — Ethereum (EIP-191)
 - `src/key/ed25519.rs` — Ed25519
 - `src/key/p256.rs` — P-256 ECDSA
