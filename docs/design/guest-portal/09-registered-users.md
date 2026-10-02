@@ -50,7 +50,7 @@ The source read here does not show which path a store build uses for a call, or 
 
 | # | Capability of a registered user | Today on Element X | Proven by |
 |---|---|---|---|
-| 1 | Sign in through siwx-oidc (OAuth 2.0 code flow with PKCE, refresh), with a passkey or a wallet | Passkey-first login worked on iOS from May 2026; Android was not confirmed then (`docs/troubleshooting.md:170-206`). QR login has a documented failure mode (`docs/troubleshooting.md:128-144`) | SP-8 |
+| 1 | Sign in through siwx-oidc (OAuth 2.0 code flow with PKCE, refresh), with a passkey or a wallet | Passkey-first login worked on iOS from May 2026; Android was not confirmed then (`docs/troubleshooting.md:170-206`). A wallet user usually has no injected wallet in the browser Element X opens, so their route is the QR login: approval on the `/device` page from a desktop browser (RFC 8628, `README.md:121`). It has a documented failure mode (`docs/troubleshooting.md:128-144`) | SP-8, for each of passkey, wallet through QR, and e-mail |
 | 2 | Sign in with an e-mail account (R11) | Not built | SP-8, repeated after M12 |
 | 3 | Join a guest-portal call room (encrypted, `knock`, the template of 01 section 4.3) as a participant, with two-way audio and video with guests on the thin client, Element Web users and other Element X users | Unverified | SP-8 at G1 (no guest yet), repeated at G3 |
 | 4 | Exchange call keys with an unverified guest device, with no block or warning that stops the call | Unverified | SP-8 at G3 |

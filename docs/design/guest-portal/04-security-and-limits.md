@@ -412,6 +412,8 @@ Proxy limits (GP-SEC-04). The redeem burst equals the default `max_guests` so on
 
 ### 3.4 E-mail
 
+These rules govern a **guest's** address. The registered e-mail accounts of R11 use the address as an authenticator by design, under their own rules ([09](09-registered-users.md) GP-REG-07 to GP-REG-11). Neither set loosens the other: a guest's address stays unverified and never authenticates, whatever R11 adds.
+
 | ID | Rule and why | Where | Default | Config | Abuse test |
 |---|---|---|---|---|---|
 | GP-SEC-21 | **Policy is frozen on the invite and enforced in the server.** `optional`, `required` or `off` as in 01. `required` with no address: 422. `off`: a submitted address is refused, not silently dropped. Why: enforcement cannot live in the form. | S | `optional` | config (operator) | Post `required` without the field, post `off` with the field: 422 both. |
@@ -545,7 +547,7 @@ Calls covered by GP-SEC-45. Paths: **R** redeem, **S** `sign_in` guest branch, *
 ## 4. Custodial key custody
 
 R3 is decided: the operator manages the guest's key and the guest never handles one. This section documents the
-consequences and what the key may and may not do. It invents no key-management scheme. The key-lifecycle roadmap
+consequences and what the key may and may not do. It covers guest keys only: the long-lived custodial keys of registered e-mail accounts (R11) are a separate class, wrapped under a key-encryption key with a migration path to an HSM ([09 section 4](09-registered-users.md#4-custody-with-a-migration-path-to-an-hsm)), and nothing here changes because of them. It invents no key-management scheme. The key-lifecycle roadmap
 (rotation, delegation, loss) stays with the SDK.
 
 ### 4.1 Specification
@@ -564,7 +566,7 @@ Alternatives weighed. Storing a random key encrypted under the same secret has t
 ciphertext handling and nonce management, for no benefit. Generating a key and discarding it is the zero-risk variant;
 R3 rules it out ("we manage the key"), and it forecloses a claim-time signature if the SDK ever defines one. A hardware
 module or KMS is disproportionate for a two-hour key that signs nothing, and becomes the right call only if a future flow
-signs with it.
+signs with it. For a long-lived registered key it is the right call from the start, which is why R11 uses a different scheme (09 section 4.1).
 
 ### 4.2 What the key may and must not sign
 
