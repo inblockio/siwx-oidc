@@ -356,6 +356,28 @@ pub struct SessionEntry {
     /// Original scope from /authorize, preserved so sign_in can extract a client-proposed device_id.
     #[serde(default)]
     pub scope: Option<String>,
+    /// The authorization request `/authorize` validated and bound to this
+    /// session. `sign_in` issues the code for this request, never for
+    /// front-channel parameters. `None` only on a session written by an older
+    /// build, which `sign_in` refuses with a "restart sign-in" error.
+    #[serde(default)]
+    pub request: Option<AuthorizationRequest>,
+}
+
+/// An authorization request as `/authorize` validated it, bound to the login
+/// session (the OIDC nonce is [`SessionEntry::oidc_nonce`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationRequest {
+    pub client_id: String,
+    /// Exactly as sent, and registered for `client_id`.
+    pub redirect_uri: String,
+    pub state: String,
+    /// `query` (or absent) or `fragment`.
+    #[serde(default)]
+    pub response_mode: Option<String>,
+    /// The S256 PKCE challenge (base64url). The method is always S256:
+    /// `/authorize` refuses any other.
+    pub code_challenge: String,
 }
 
 /// Status of an RFC 8628 device authorization code.

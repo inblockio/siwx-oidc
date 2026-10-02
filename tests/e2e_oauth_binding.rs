@@ -9,9 +9,9 @@
 //!   3. C2 Step 3 (`/sign_in` redirect re-validation) — `/sign_in` with an
 //!      UNREGISTERED `redirect_uri` is rejected, no code emitted to the attacker
 //!      origin (wallet / Path B; the shared validator also covers Path A).
-//!   4. C2 Step 4b (reject `plain` PKCE) — a `/token` exchange of a code carrying
-//!      a `plain` code_challenge is rejected, and `/authorize` rejects
-//!      `code_challenge_method=plain` up front.
+//!   4. C2 Step 4b (reject `plain` PKCE) — `/authorize` rejects
+//!      `code_challenge_method=plain` up front, and `/sign_in` refuses a `plain`
+//!      challenge on the front channel, so no code carries one.
 //!   5. C2 Step 4a (mandatory PKCE) — a `response_type=code` `/authorize` request
 //!      WITHOUT a `code_challenge` is rejected; the same request WITH S256 PKCE
 //!      still succeeds.
@@ -522,9 +522,10 @@ async fn unregistered_redirect_uri_at_sign_in_is_rejected() {
     let (session_cookie, nonce, domain) =
         authorize_session(&nrc, &base, &rc, &challenge, "redir_state").await;
 
-    // The attacker-controlled redirect (NOT registered for this client). Bind it
-    // in the signed Resources so the Path-B resource check does not pre-empt the
-    // redirect re-validation — proving it is the registration check that rejects.
+    // A redirect NOT registered for this client. Bind it in the signed Resources
+    // so the Path-B resource check does not pre-empt the redirect check: /sign_in
+    // refuses any redirect_uri other than the one /authorize matched against the
+    // registration and bound to the session.
     let attacker = "https://attacker.example/cb";
     let message = build_login_message(&w, &base, &domain, &nonce, attacker, 48);
     let sign_in_url = format!(
@@ -563,7 +564,7 @@ async fn unregistered_redirect_uri_at_sign_in_is_rejected() {
 }
 
 // ===========================================================================
-// 4. C2 Step 4b — `plain` PKCE is rejected (both at /authorize and /token).
+// 4. C2 Step 4b — `plain` PKCE is rejected (at /authorize and at /sign_in).
 // ===========================================================================
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
@@ -589,12 +590,11 @@ async fn plain_pkce_is_rejected() {
         "/authorize must reject code_challenge_method=plain"
     );
 
-    // (b) /token rejects a code that carries a `plain` challenge. /sign_in does
-    //     not validate the method (it passes it through), so we drive it directly
-    //     with method=plain to plant a `plain` CodeEntry, then exchange at /token.
+    // (b) Nor can a `plain` challenge enter through /sign_in: the code is bound
+    //     to the S256 challenge /authorize stored in the session, and a /sign_in
+    //     that repeats a different challenge or method is refused, so no code
+    //     carrying a `plain` challenge can be issued at all.
     let (session_cookie, nonce, domain) = {
-        // Use an S256 authorize to get a valid session + nonce, then override the
-        // method only on the /sign_in leg (the server stores what /sign_in sends).
         let (_v, s256_challenge) = pkce_pair();
         authorize_session(&nrc, &base, &rc, &s256_challenge, "plain_state").await
     };
@@ -611,52 +611,16 @@ async fn plain_pkce_is_rejected() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        sign_in_resp.status(),
-        StatusCode::SEE_OTHER,
-        "sign_in (which does not validate the method) should still issue the code"
-    );
-    let code = parse_query(
-        sign_in_resp
-            .headers()
-            .get("location")
-            .unwrap()
-            .to_str()
-            .unwrap(),
-    )
-    .get("code")
-    .unwrap()
-    .clone();
-
-    // The verifier for `plain` is the challenge itself; a compliant `plain` client
-    // would expect this to pass. It must be REJECTED.
-    let bad = c
-        .post(format!("{base}/token"))
-        .form(&[
-            ("code", code.as_str()),
-            ("client_id", rc.client_id.as_str()),
-            ("client_secret", rc.client_secret.as_str()),
-            ("grant_type", "authorization_code"),
-            ("code_verifier", plain_challenge),
-        ])
-        .send()
-        .await
-        .unwrap();
-    let status = bad.status();
-    let body = bad.text().await.unwrap_or_default();
-    assert_ne!(
-        status,
-        StatusCode::OK,
-        "a `plain` PKCE exchange must NOT 200"
-    );
+    let status = sign_in_resp.status();
+    let body = sign_in_resp.text().await.unwrap_or_default();
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
-        "a `plain` code_challenge_method must be rejected at /token, got {status}: {body}"
+        "a /sign_in carrying a `plain` challenge must be refused, got {status}: {body}"
     );
     assert!(
-        body.to_lowercase().contains("s256") || body.contains("invalid_grant"),
-        "rejection must reference the S256-only policy: {body}"
+        body.contains("code_challenge"),
+        "the refusal names the challenge: {body}"
     );
 }
 

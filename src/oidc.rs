@@ -1410,8 +1410,18 @@ async fn token_authorization_code(
         }
     }
 
-    // PKCE: validate code_verifier if a code_challenge was issued.
-    if let Some(ref challenge) = code_entry.code_challenge {
+    // PKCE: every code carries the challenge `/authorize` bound to its session,
+    // and the verifier must match it. A code without a challenge (only an older
+    // build wrote those) is refused.
+    let challenge = code_entry.code_challenge.as_ref().ok_or_else(|| {
+        CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description:
+                "This authorization code carries no PKCE challenge; restart the sign-in."
+                    .to_string(),
+        })
+    })?;
+    {
         let verifier = form.code_verifier.as_ref().ok_or_else(|| {
             CustomError::BadRequestToken(TokenError {
                 error: CoreErrorResponseType::InvalidGrant,
@@ -1636,7 +1646,7 @@ pub async fn authorize(
         return Err(CustomError::Redirect(url.to_string()));
     }
 
-    if params.response_type.is_none() {
+    let Some(response_type) = params.response_type.as_ref() else {
         let mut url = params.redirect_uri.url().clone();
         url.query_pairs_mut().append_pair("state", &state);
         url.query_pairs_mut()
@@ -1644,8 +1654,22 @@ pub async fn authorize(
         url.query_pairs_mut()
             .append_pair("error_description", "Missing response_type");
         return Err(CustomError::Redirect(url.to_string()));
+    };
+    // Only the authorization-code flow is implemented, and discovery advertises
+    // only `code`. Any other response type goes back to the (validated)
+    // redirect URI as `unsupported_response_type` (RFC 6749 §4.1.2.1), and no
+    // login session is started.
+    if !matches!(response_type, CoreResponseType::Code) {
+        let mut url = params.redirect_uri.url().clone();
+        url.query_pairs_mut().append_pair("state", &state);
+        url.query_pairs_mut().append_pair(
+            "error",
+            CoreAuthErrorResponseType::UnsupportedResponseType.as_ref(),
+        );
+        url.query_pairs_mut()
+            .append_pair("error_description", "Only response_type=code is supported.");
+        return Err(CustomError::Redirect(url.to_string()));
     }
-    let _response_type = params.response_type.as_ref().unwrap();
 
     let scope_str = params.scope.as_str().trim();
     let scopes: Vec<&str> = scope_str.split(' ').filter(|s| !s.is_empty()).collect();
@@ -1657,6 +1681,43 @@ pub async fn authorize(
         );
     }
 
+    // Validate response_mode strictly (invalid_request semantics): discovery
+    // advertises exactly {"query","fragment"}, so anything else is a 400 rather
+    // than a silently-ignored param the client then waits on.
+    if let Some(rm) = &params.response_mode {
+        if rm != "query" && rm != "fragment" {
+            return Err(CustomError::BadRequest(format!(
+                "Unsupported response_mode '{rm}' (only 'query' and 'fragment' are supported)."
+            )));
+        }
+    }
+    // C2 Step 4b: reject `code_challenge_method=plain` up front. Discovery
+    // advertises S256 only. A missing method defaults to S256.
+    if let Some(ccm) = &params.code_challenge_method {
+        if ccm != "S256" {
+            return Err(CustomError::BadRequest(
+                "Unsupported code_challenge_method (only S256 is allowed).".to_string(),
+            ));
+        }
+    }
+    // C2 Step 4a: require S256 PKCE on every authorization request (the code
+    // flow is the only one). PKCE binds a redeemed code to the client that
+    // started the request. Every real client already sends S256 (Element X per
+    // the Matrix OAuth 2.0 profile, the in-house `siwx-oidc-auth` lib, and all
+    // e2e flows). Scope: ALL clients — every registered `ClientEntry` carries a
+    // server-issued secret regardless of `token_endpoint_auth_method`, so there
+    // is no client class that legitimately omits PKCE to exempt. The
+    // device-code grant (RFC 8628) does NOT pass through /authorize.
+    let Some(code_challenge) = params.code_challenge.clone() else {
+        return Err(CustomError::BadRequest(
+            "code_challenge is required (S256 PKCE) for the authorization-code flow.".to_string(),
+        ));
+    };
+
+    // Bind the request validated above to the login session. `sign_in` issues
+    // the code for exactly this request (client, redirect URI, state, response
+    // mode, PKCE challenge) and never for parameters it receives on the front
+    // channel, which may repeat it but not change it.
     let session_id = Uuid::new_v4();
     let session_secret: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -1673,6 +1734,13 @@ pub async fn authorize(
                 signin_count: 0,
                 verified_did: None,
                 scope: Some(params.scope.as_str().to_string()),
+                request: Some(AuthorizationRequest {
+                    client_id: params.client_id.clone(),
+                    redirect_uri: params.redirect_uri.as_str().to_string(),
+                    state: state.clone(),
+                    response_mode: params.response_mode.clone(),
+                    code_challenge: code_challenge.clone(),
+                }),
             },
         )
         .await?;
@@ -1692,59 +1760,22 @@ pub async fn authorize(
         .host()
         .map(|h| h.to_string())
         .unwrap_or_else(|| params.redirect_uri.url().scheme().to_string());
+    // The login page reads these to build its CAIP-122 message and its link to
+    // /sign_in. They are informational: /sign_in takes the request from the
+    // session, and refuses a repeated parameter that differs from it.
     let oidc_nonce_param = if let Some(n) = &params.nonce {
         format!("&oidc_nonce={}", n.secret())
     } else {
         "".to_string()
     };
-    // Validate response_mode strictly (invalid_request semantics): discovery
-    // advertises exactly {"query","fragment"}, so anything else is a 400 rather
-    // than a silently-ignored param the client then waits on.
-    if let Some(rm) = &params.response_mode {
-        if rm != "query" && rm != "fragment" {
-            return Err(CustomError::BadRequest(format!(
-                "Unsupported response_mode '{rm}' (only 'query' and 'fragment' are supported)."
-            )));
-        }
-    }
-    // Round-trip the non-default mode through the login SPA to /sign_in (same
-    // client-side round-trip as the PKCE params). Absent/"query" appends
-    // nothing, keeping the SPA URL byte-identical for existing clients.
+    // Absent/"query" appends nothing, keeping the SPA URL byte-identical for
+    // existing clients.
     let response_mode_param = if params.response_mode.as_deref() == Some("fragment") {
         "&response_mode=fragment".to_string()
     } else {
         "".to_string()
     };
-    // C2 Step 4b: reject `code_challenge_method=plain` up front so a `plain`
-    // challenge is never carried into /sign_in or stored on the CodeEntry.
-    // Discovery advertises S256 only. A missing method defaults to S256.
-    if let Some(ccm) = &params.code_challenge_method {
-        if ccm != "S256" {
-            return Err(CustomError::BadRequest(
-                "Unsupported code_challenge_method (only S256 is allowed).".to_string(),
-            ));
-        }
-    }
-    // C2 Step 4a: require S256 PKCE for the authorization-code flow. PKCE is the
-    // only backstop that binds a redeemed code to the browser that initiated the
-    // request; without it, a leaked or stolen code is freely redeemable. Every
-    // real client already sends S256 (Element X per the Matrix OAuth 2.0 profile,
-    // the in-house `siwx-oidc-auth` lib, and all e2e flows), so requiring it is a
-    // spec-compliance tightening that breaks no compliant client. Scope: ALL
-    // code-flow clients — every registered `ClientEntry` carries a server-issued
-    // secret regardless of `token_endpoint_auth_method`, so there is no client
-    // class that legitimately omits PKCE to exempt. The device-code grant (RFC
-    // 8628) does NOT pass through /authorize and is unaffected.
-    if matches!(_response_type, CoreResponseType::Code) && params.code_challenge.is_none() {
-        return Err(CustomError::BadRequest(
-            "code_challenge is required (S256 PKCE) for the authorization-code flow.".to_string(),
-        ));
-    }
-    let pkce_params = match (&params.code_challenge, &params.code_challenge_method) {
-        (Some(cc), Some(ccm)) => format!("&code_challenge={cc}&code_challenge_method={ccm}"),
-        (Some(cc), None) => format!("&code_challenge={cc}&code_challenge_method=S256"),
-        _ => "".to_string(),
-    };
+    let pkce_params = format!("&code_challenge={code_challenge}&code_challenge_method=S256");
     Ok((
         format!(
             "/?nonce={}&domain={}&redirect_uri={}&state={}&client_id={}{}{}{}",
@@ -2027,19 +2058,99 @@ pub fn verify_siwx_cookie(
     Ok(siwx_cookie.did)
 }
 
-#[derive(Deserialize)]
+/// Query parameters of `GET /sign_in`.
+///
+/// All optional, and none of them decides anything: the code is issued for the
+/// authorization request `/authorize` bound to the session
+/// ([`SessionEntry::request`]). The login page repeats the request here; a
+/// parameter that is present must equal the bound value, or the sign-in is
+/// refused ([`bound_request`]).
+#[derive(Deserialize, Default)]
 pub struct SignInParams {
-    pub redirect_uri: RedirectUrl,
-    pub state: String,
+    pub redirect_uri: Option<RedirectUrl>,
+    pub state: Option<String>,
     pub oidc_nonce: Option<Nonce>,
-    pub client_id: String,
-    /// PKCE code_challenge (passed through from /authorize).
+    pub client_id: Option<String>,
     pub code_challenge: Option<String>,
-    /// PKCE code_challenge_method. Only "S256" is accepted; "plain" is
-    /// rejected at /authorize.
     pub code_challenge_method: Option<String>,
-    /// OAuth response_mode (passed through from /authorize; validated there).
     pub response_mode: Option<String>,
+}
+
+/// A bound request for `client_id` at `https://example.com/callback`, as
+/// `authorize` would store it. For tests that drive `sign_in` directly.
+#[cfg(test)]
+pub(crate) fn bound_test_request(client_id: &str) -> AuthorizationRequest {
+    AuthorizationRequest {
+        client_id: client_id.to_string(),
+        redirect_uri: "https://example.com/callback".to_string(),
+        state: "state".to_string(),
+        response_mode: None,
+        code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
+    }
+}
+
+/// The authorization request this sign-in completes: the one `/authorize`
+/// validated and bound to the session. A front-channel parameter may repeat a
+/// bound value but never change it, so a code is only ever issued to the
+/// client, redirect URI, state and PKCE challenge `/authorize` accepted.
+fn bound_request(
+    session: &SessionEntry,
+    params: &SignInParams,
+) -> Result<AuthorizationRequest, CustomError> {
+    let request = session.request.clone().ok_or_else(|| {
+        CustomError::BadRequest(
+            "This sign-in has no bound authorization request (it was started before a \
+             server update). Restart the sign-in from the application."
+                .to_string(),
+        )
+    })?;
+    let differs = |name: &str| {
+        CustomError::BadRequest(format!("{name} does not match the authorization request."))
+    };
+    if params
+        .client_id
+        .as_ref()
+        .is_some_and(|v| *v != request.client_id)
+    {
+        return Err(differs("client_id"));
+    }
+    if let Some(redirect_uri) = &params.redirect_uri {
+        let same = RedirectUrl::new(request.redirect_uri.clone())
+            .is_ok_and(|bound| bound.url() == redirect_uri.url());
+        if !same {
+            return Err(differs("redirect_uri"));
+        }
+    }
+    if params.state.as_ref().is_some_and(|v| *v != request.state) {
+        return Err(differs("state"));
+    }
+    if params
+        .code_challenge
+        .as_ref()
+        .is_some_and(|v| *v != request.code_challenge)
+    {
+        return Err(differs("code_challenge"));
+    }
+    if params
+        .code_challenge_method
+        .as_deref()
+        .is_some_and(|v| v != "S256")
+    {
+        return Err(differs("code_challenge_method"));
+    }
+    // An absent response_mode means `query`.
+    let mode = |m: Option<&str>| m.unwrap_or("query").to_string();
+    if params.response_mode.is_some()
+        && mode(params.response_mode.as_deref()) != mode(request.response_mode.as_deref())
+    {
+        return Err(differs("response_mode"));
+    }
+    if let Some(nonce) = &params.oidc_nonce {
+        if session.oidc_nonce.as_ref().map(|n| n.secret()) != Some(nonce.secret()) {
+            return Err(differs("oidc_nonce"));
+        }
+    }
+    Ok(request)
 }
 
 /// Extract a device_id from a scope string containing `urn:matrix:client:device:XXX`.
@@ -2512,6 +2623,12 @@ pub async fn sign_in(
         return Err(CustomError::BadRequest("Session not found".to_string()));
     };
 
+    // The request this sign-in completes, as `/authorize` bound it. Checked
+    // before the session is spent, so a refused request leaves it usable.
+    let request = bound_request(&session_entry, &params)?;
+    let redirect_uri = RedirectUrl::new(request.redirect_uri.clone())
+        .map_err(|e| anyhow!("bound redirect_uri does not parse: {}", e))?;
+
     // Atomically mark session as signed-in (prevents race-condition double sign-in).
     if !db_client
         .try_mark_session_signed_in(session_id.to_string())
@@ -2613,7 +2730,7 @@ pub async fn sign_in(
             return Err(CustomError::BadRequest("Nonce mismatch".to_string()));
         }
 
-        let redirect_url = params.redirect_uri.url();
+        let redirect_url = redirect_uri.url();
         if !extract_resources(&siwx_cookie.message)
             .iter()
             .any(|r| Url::parse(r).ok().as_ref() == Some(redirect_url))
@@ -2675,17 +2792,15 @@ pub async fn sign_in(
     // `axum_lib::detected_mxid_for` and `webauthn_authenticate_finish`.
     crate::webauthn::reject_if_deactivated(synapse_client, &did).await?;
 
-    // C2 Step 3: re-validate the request redirect_uri against the client's
-    // registered set before issuing the code. `authorize` checks this, but
-    // `sign_in` re-receives `redirect_uri` as a query param and previously
-    // appended the code to whatever URL was supplied. This closes the open
-    // redirect on BOTH the wallet (Path B) and WebAuthn (Path A) paths. Path B
-    // additionally binds the redirect via the signed `Resources:` list above;
-    // this is the only redirect binding Path A has.
+    // C2 Step 3: re-validate the bound redirect_uri against the client's
+    // registered set before issuing the code. `authorize` matched it when it
+    // bound the request; this re-check covers a registration that changed or
+    // expired since, on BOTH the wallet (Path B) and WebAuthn (Path A) paths.
+    // Path B additionally binds the redirect via the signed `Resources:` list
+    // above.
     let client =
-        validate_registered_redirect_uri(&params.client_id, &params.redirect_uri, db_client)
-            .await?;
-    let device_name = device_display_name(&params.client_id, Some(&client));
+        validate_registered_redirect_uri(&request.client_id, &redirect_uri, db_client).await?;
+    let device_name = device_display_name(&request.client_id, Some(&client));
 
     // Extract client-proposed device_id from the session's stored scope (if any).
     let proposed_device_id = session_entry
@@ -2720,12 +2835,12 @@ pub async fn sign_in(
 
     let code_entry = CodeEntry {
         did: did.clone(),
-        nonce: params.oidc_nonce.clone(),
+        nonce: session_entry.oidc_nonce.clone(),
         exchange_count: 0,
-        client_id: params.client_id.clone(),
+        client_id: request.client_id.clone(),
         auth_time: Utc::now(),
-        code_challenge: params.code_challenge.clone(),
-        code_challenge_method: params.code_challenge_method.clone(),
+        code_challenge: Some(request.code_challenge.clone()),
+        code_challenge_method: Some("S256".to_string()),
         localpart: Some(resolved.localpart.clone()),
         device_id,
     };
@@ -2733,8 +2848,8 @@ pub async fn sign_in(
     let code = Uuid::new_v4();
     db_client.set_code(code.to_string(), code_entry).await?;
 
-    let mut url = params.redirect_uri.url().clone();
-    if params.response_mode.as_deref() == Some("fragment") {
+    let mut url = redirect_uri.url().clone();
+    if request.response_mode.as_deref() == Some("fragment") {
         // matrix-js-sdk v42 requested `response_mode=fragment` on /authorize
         // (round-tripped here via the login SPA) and reads the authorization
         // response ONLY from the URL fragment. ALL response params go in the
@@ -2742,12 +2857,12 @@ pub async fn sign_in(
         // untouched with nothing appended to it.
         let fragment = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("code", &code.to_string())
-            .append_pair("state", &params.state)
+            .append_pair("state", &request.state)
             .finish();
         url.set_fragment(Some(&fragment));
     } else {
         url.query_pairs_mut().append_pair("code", &code.to_string());
-        url.query_pairs_mut().append_pair("state", &params.state);
+        url.query_pairs_mut().append_pair("state", &request.state);
     }
     // Surface the resolved DID alongside the redirect so the HTTP handler can mint
     // the opaque login user-session cookie ONLY on this success path (a real login
@@ -3387,6 +3502,194 @@ mod tests {
         nonce: String,
     }
 
+    /// The PKCE example pair from RFC 7636, Appendix B.
+    const RFC7636_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const RFC7636_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+    fn code_request(response_type: CoreResponseType) -> AuthorizeParams {
+        AuthorizeParams {
+            client_id: "client".into(),
+            redirect_uri: RedirectUrl::new("https://example.com".into()).unwrap(),
+            scope: Scope::new("openid".to_string()),
+            response_type: Some(response_type),
+            state: Some("state".into()),
+            nonce: Some(Nonce::new("oidc-nonce".into())),
+            prompt: None,
+            request_uri: None,
+            request: None,
+            code_challenge: Some(RFC7636_CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
+            response_mode: None,
+        }
+    }
+
+    /// `authorize` refuses every response type but `code`, back to the
+    /// validated redirect URI with `unsupported_response_type` and the state.
+    #[tokio::test]
+    async fn authorize_refuses_every_response_type_but_code() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        for response_type in [
+            CoreResponseType::IdToken,
+            CoreResponseType::Token,
+            CoreResponseType::None,
+        ] {
+            match authorize(code_request(response_type.clone()), &db_client).await {
+                Err(CustomError::Redirect(url)) => {
+                    let url = Url::parse(&url).unwrap();
+                    let q: std::collections::HashMap<_, _> = url.query_pairs().collect();
+                    assert_eq!(url.host_str(), Some("example.com"), "{url}");
+                    assert_eq!(
+                        q.get("error").map(|v| v.as_ref()),
+                        Some("unsupported_response_type"),
+                        "{url}"
+                    );
+                    assert_eq!(q.get("state").map(|v| v.as_ref()), Some("state"), "{url}");
+                }
+                other => panic!("{response_type:?} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// `authorize` binds the validated request to the session it starts.
+    #[tokio::test]
+    async fn authorize_binds_the_request_to_the_session() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        let mut params = code_request(CoreResponseType::Code);
+        params.response_mode = Some("fragment".into());
+        let (_url, cookie) = authorize(params, &db_client).await.unwrap();
+        let session = db_client
+            .get_session(cookie.value().to_string())
+            .await
+            .unwrap()
+            .expect("authorize stores the session");
+        assert_eq!(
+            session.request,
+            Some(AuthorizationRequest {
+                client_id: "client".into(),
+                redirect_uri: "https://example.com".into(),
+                state: "state".into(),
+                response_mode: Some("fragment".into()),
+                code_challenge: RFC7636_CHALLENGE.into(),
+            })
+        );
+        assert_eq!(
+            session.oidc_nonce.as_ref().map(|n| n.secret().as_str()),
+            Some("oidc-nonce")
+        );
+    }
+
+    fn session_with(request: Option<AuthorizationRequest>) -> SessionEntry {
+        SessionEntry {
+            siwe_nonce: "n".into(),
+            oidc_nonce: Some(Nonce::new("oidc-nonce".into())),
+            secret: "s".into(),
+            signin_count: 0,
+            verified_did: None,
+            scope: None,
+            request,
+        }
+    }
+
+    /// Front-channel parameters may repeat the bound request, never change it.
+    #[test]
+    fn sign_in_parameters_may_repeat_the_bound_request_but_not_change_it() {
+        let session = session_with(Some(bound_test_request("client")));
+        let request = bound_test_request("client");
+
+        // Nothing, or an exact repetition, completes the bound request.
+        assert_eq!(
+            bound_request(&session, &SignInParams::default()).unwrap(),
+            request
+        );
+        let repeated = SignInParams {
+            redirect_uri: Some(RedirectUrl::new(request.redirect_uri.clone()).unwrap()),
+            state: Some(request.state.clone()),
+            oidc_nonce: Some(Nonce::new("oidc-nonce".into())),
+            client_id: Some(request.client_id.clone()),
+            code_challenge: Some(request.code_challenge.clone()),
+            code_challenge_method: Some("S256".into()),
+            response_mode: Some("query".into()),
+        };
+        assert_eq!(bound_request(&session, &repeated).unwrap(), request);
+
+        // Any differing parameter is refused, naming it.
+        let cases: Vec<(&str, SignInParams)> = vec![
+            (
+                "client_id",
+                SignInParams {
+                    client_id: Some("other".into()),
+                    ..SignInParams::default()
+                },
+            ),
+            (
+                "redirect_uri",
+                SignInParams {
+                    redirect_uri: Some(
+                        RedirectUrl::new("https://example.com/callback?x=1".into()).unwrap(),
+                    ),
+                    ..SignInParams::default()
+                },
+            ),
+            (
+                "state",
+                SignInParams {
+                    state: Some("other".into()),
+                    ..SignInParams::default()
+                },
+            ),
+            (
+                "code_challenge",
+                SignInParams {
+                    code_challenge: Some("other".into()),
+                    ..SignInParams::default()
+                },
+            ),
+            (
+                "code_challenge_method",
+                SignInParams {
+                    code_challenge_method: Some("plain".into()),
+                    ..SignInParams::default()
+                },
+            ),
+            (
+                "response_mode",
+                SignInParams {
+                    response_mode: Some("fragment".into()),
+                    ..SignInParams::default()
+                },
+            ),
+            (
+                "oidc_nonce",
+                SignInParams {
+                    oidc_nonce: Some(Nonce::new("other".into())),
+                    ..SignInParams::default()
+                },
+            ),
+        ];
+        for (name, params) in cases {
+            match bound_request(&session, &params) {
+                Err(CustomError::BadRequest(msg)) => {
+                    assert!(msg.starts_with(name), "{name}: {msg}")
+                }
+                other => panic!("{name} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// A session written by an older build carries no bound request; the
+    /// sign-in is refused with a clear "restart" error.
+    #[test]
+    fn a_session_without_a_bound_request_is_refused() {
+        match bound_request(&session_with(None), &SignInParams::default()) {
+            Err(CustomError::BadRequest(msg)) => assert!(msg.contains("Restart"), "{msg}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     #[derive(Deserialize)]
     struct SignInQueryParams {
         code: String,
@@ -3426,14 +3729,14 @@ mod tests {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(base_url.clone()),
             scope: Scope::new("openid".to_string()),
-            response_type: Some(CoreResponseType::IdToken),
+            response_type: Some(CoreResponseType::Code),
             state: Some("state".into()),
             nonce: None,
             prompt: None,
             request_uri: None,
             request: None,
-            code_challenge: None,
-            code_challenge_method: None,
+            code_challenge: Some(RFC7636_CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
             response_mode: None,
         };
         let (redirect_url, cookie) = authorize(params, &db_client).await.unwrap();
@@ -3524,7 +3827,7 @@ mod tests {
                 client_id: Some("client".into()),
                 client_secret: Some("secret".into()),
                 grant_type: CoreGrantType::AuthorizationCode,
-                code_verifier: None,
+                code_verifier: Some(RFC7636_VERIFIER.into()),
                 refresh_token: None,
                 device_code: None,
             },
@@ -3573,14 +3876,14 @@ mod tests {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(base_url.clone()),
             scope: Scope::new("openid".to_string()),
-            response_type: Some(CoreResponseType::IdToken),
+            response_type: Some(CoreResponseType::Code),
             state: Some("state".into()),
             nonce: None,
             prompt: None,
             request_uri: None,
             request: None,
-            code_challenge: None,
-            code_challenge_method: None,
+            code_challenge: Some(RFC7636_CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
             response_mode: Some("fragment".into()),
         };
         let (redirect_url, cookie) = authorize(params, &db_client).await.unwrap();
@@ -5510,6 +5813,7 @@ mod sign_in_deactivation_order_tests {
                 signin_count: 0,
                 verified_did: Some(DID.to_string()),
                 scope: None,
+                request: Some(bound_test_request(&client_id)),
             },
         )
         .await
@@ -5521,13 +5825,10 @@ mod sign_in_deactivation_order_tests {
         );
         let cookies = headers.typed_get::<headers::Cookie>().unwrap();
         let params = SignInParams {
-            redirect_uri: RedirectUrl::new(REDIRECT.into()).unwrap(),
-            state: "state".into(),
-            oidc_nonce: None,
-            client_id,
-            code_challenge: None,
-            code_challenge_method: None,
-            response_mode: None,
+            redirect_uri: Some(RedirectUrl::new(REDIRECT.into()).unwrap()),
+            state: Some("state".into()),
+            client_id: Some(client_id),
+            ..SignInParams::default()
         };
 
         let result = sign_in(
@@ -5832,6 +6133,7 @@ mod device_display_name_tests {
                 signin_count: 0,
                 verified_did: Some(DID.to_string()),
                 scope: None,
+                request: Some(bound_test_request(&client_id)),
             },
         )
         .await
@@ -5842,13 +6144,10 @@ mod device_display_name_tests {
             HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
         );
         let params = SignInParams {
-            redirect_uri: RedirectUrl::new(REDIRECT.into()).unwrap(),
-            state: "state".into(),
-            oidc_nonce: None,
-            client_id: client_id.clone(),
-            code_challenge: None,
-            code_challenge_method: None,
-            response_mode: None,
+            redirect_uri: Some(RedirectUrl::new(REDIRECT.into()).unwrap()),
+            state: Some("state".into()),
+            client_id: Some(client_id.clone()),
+            ..SignInParams::default()
         };
         sign_in(
             &Url::parse("https://example.com").unwrap(),
