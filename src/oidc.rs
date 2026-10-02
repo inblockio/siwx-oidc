@@ -1586,11 +1586,6 @@ pub async fn authorize(
         .get_client(params.client_id.clone())
         .await
         .map_err(|e| anyhow!("Failed to get kv: {}", e))?;
-    if client_entry.is_none() {
-        return Err(CustomError::Unauthorized(
-            "Unrecognised client id.".to_string(),
-        ));
-    }
 
     let nonce: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -1598,18 +1593,12 @@ pub async fn authorize(
         .map(char::from)
         .collect();
 
-    let mut r_u = params.redirect_uri.clone().url().clone();
-    r_u.set_query(None);
-    let mut r_us: Vec<Url> = client_entry
-        .unwrap()
-        .metadata
-        .redirect_uris()
-        .clone()
-        .iter_mut()
-        .map(|u| u.url().clone())
-        .collect();
-    r_us.iter_mut().for_each(|u| u.set_query(None));
-    if !r_us.contains(&r_u) {
+    let Some(client_entry) = client_entry else {
+        return Err(CustomError::Unauthorized(
+            "Unrecognised client id.".to_string(),
+        ));
+    };
+    if !redirect_uri_is_registered(&client_entry, &params.redirect_uri) {
         return Err(CustomError::Redirect(
             "/error?message=unregistered_redirect_uri".to_string(),
         ));
@@ -1927,11 +1916,26 @@ pub fn validate_caip122_envelope(
     Ok(())
 }
 
+/// Whether `redirect_uri` is one of the client's registered redirect URIs.
+///
+/// The match is exact (RFC 9700 §4.1.3): the whole URL, query included,
+/// compared after URL parsing. A registration that carries a query (Element Web
+/// registers `…/?no_universal_links=true`) matches only that exact query, and
+/// an extra or missing query component is a different URI. This is the one
+/// matcher for both `authorize` and `sign_in`, so the two cannot disagree.
+fn redirect_uri_is_registered(client: &ClientEntry, redirect_uri: &RedirectUrl) -> bool {
+    client
+        .metadata
+        .redirect_uris()
+        .iter()
+        .any(|registered| registered.url() == redirect_uri.url())
+}
+
 /// C2 Step 3: re-validate a `redirect_uri` against the client's *registered*
-/// redirect_uris, mirroring the exact check in `authorize` (query-stripped exact
-/// match). Used by `sign_in` so a code is never appended to an unregistered (e.g.
-/// attacker-controlled) redirect_uri — closing the open-redirect on BOTH the
-/// wallet (Path B) and WebAuthn (Path A) login paths.
+/// redirect_uris with the same exact match as `authorize`
+/// ([`redirect_uri_is_registered`]). Used by `sign_in` so a code is never
+/// appended to an unregistered redirect_uri, on BOTH the wallet (Path B) and
+/// WebAuthn (Path A) login paths.
 /// Returns the client's entry, so the caller can use its registration (the
 /// device name in `sign_in`) without a second read.
 async fn validate_registered_redirect_uri(
@@ -1945,17 +1949,7 @@ async fn validate_registered_redirect_uri(
         .map_err(|e| anyhow!("Failed to get kv: {}", e))?
         .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
 
-    let mut r_u = redirect_uri.url().clone();
-    r_u.set_query(None);
-    let mut r_us: Vec<Url> = client_entry
-        .metadata
-        .redirect_uris()
-        .clone()
-        .iter_mut()
-        .map(|u| u.url().clone())
-        .collect();
-    r_us.iter_mut().for_each(|u| u.set_query(None));
-    if !r_us.contains(&r_u) {
+    if !redirect_uri_is_registered(&client_entry, redirect_uri) {
         return Err(CustomError::BadRequest(
             "redirect_uri is not registered for this client.".to_string(),
         ));
@@ -3662,6 +3656,52 @@ mod tests {
             fragment.contains("state=state"),
             "fragment must carry the state: {redirect_url}"
         );
+    }
+
+    /// Redirect URIs match the registration exactly, query included.
+    #[test]
+    fn redirect_uri_matching_is_exact() {
+        let client = |registered: &str| ClientEntry {
+            secret: "secret".into(),
+            metadata: CoreClientMetadata::new(
+                vec![RedirectUrl::new(registered.into()).unwrap()],
+                EmptyAdditionalClientMetadata {},
+            ),
+            access_token: None,
+        };
+        let uri = |u: &str| RedirectUrl::new(u.into()).unwrap();
+
+        let plain = client("https://example.com/cb");
+        assert!(redirect_uri_is_registered(
+            &plain,
+            &uri("https://example.com/cb")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &plain,
+            &uri("https://example.com/cb?x=1")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &plain,
+            &uri("https://example.com/cb/x")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &plain,
+            &uri("https://example.com/cb#x")
+        ));
+
+        let with_query = client("https://example.com/?no_universal_links=true");
+        assert!(redirect_uri_is_registered(
+            &with_query,
+            &uri("https://example.com/?no_universal_links=true")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &with_query,
+            &uri("https://example.com/")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &with_query,
+            &uri("https://example.com/?no_universal_links=true&x=1")
+        ));
     }
 
     #[tokio::test]
