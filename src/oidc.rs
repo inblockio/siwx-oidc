@@ -542,11 +542,8 @@ pub fn metadata(config: &crate::config::Config) -> Result<CoreProviderMetadata, 
                 .join(JWK_PATH)
                 .map_err(|e| anyhow!("Unable to join URL: {}", e))?,
         ),
-        vec![
-            ResponseTypes::new(vec![CoreResponseType::Code]),
-            ResponseTypes::new(vec![CoreResponseType::IdToken]),
-            ResponseTypes::new(vec![CoreResponseType::Token, CoreResponseType::IdToken]),
-        ],
+        // Exactly what `authorize` accepts: the authorization-code flow.
+        vec![ResponseTypes::new(vec![CoreResponseType::Code])],
         vec![CoreSubjectIdentifierType::Pairwise],
         SIGNING_ALG.to_vec(),
         EmptyAdditionalProviderMetadata {},
@@ -3901,6 +3898,18 @@ mod tests {
             off.get(RESOLVE_ENDPOINT_METADATA_KEY).is_none(),
             "a deployment that would answer 503 must not advertise the route"
         );
+    }
+
+    /// Discovery advertises exactly the response types `authorize` accepts.
+    #[test]
+    fn discovery_advertises_only_the_code_response_type() {
+        for matrix_ready in [true, false] {
+            let value = provider_metadata_value(&discovery_config(), matrix_ready).unwrap();
+            assert_eq!(
+                value["response_types_supported"],
+                serde_json::json!(["code"])
+            );
+        }
     }
 
     #[test]
