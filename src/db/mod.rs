@@ -497,11 +497,12 @@ pub trait DBClient {
     async fn get_client(&self, client_id: String) -> Result<Option<ClientEntry>>;
     async fn delete_client(&self, client_id: String) -> Result<()>;
     async fn set_code(&self, code: String, code_entry: CodeEntry) -> Result<()>;
-    async fn get_code(&self, code: String) -> Result<Option<CodeEntry>>;
     async fn set_session(&self, id: String, entry: SessionEntry) -> Result<()>;
     async fn get_session(&self, id: String) -> Result<Option<SessionEntry>>;
-    /// Atomically consume an authorization code. Returns the entry if this is
-    /// the first call for this code, or None if already consumed / not found.
+    /// Atomically consume an authorization code: read and delete its entry in
+    /// one step. Returns the entry to exactly one caller, or None if the code is
+    /// unknown, expired or already consumed. There is no other reader of codes:
+    /// a code is redeemable only here, at the token endpoint.
     async fn try_consume_code(&self, code: String) -> Result<Option<CodeEntry>>;
     /// Atomically mark a session as signed-in. Returns true on first call,
     /// false if the session was already signed-in.
@@ -509,8 +510,9 @@ pub trait DBClient {
 
     /// Atomically claim an *approved* device code for redemption. Returns `true`
     /// only for the first caller; concurrent polls get `false` and must not issue
-    /// tokens (S3-1 / H9). Mirrors [`try_consume_code`](Self::try_consume_code):
-    /// a `SET .../redeemed 1 NX EX <ttl>` so exactly one poll wins.
+    /// tokens (S3-1 / H9): a `SET .../redeemed 1 NX EX <ttl>` so exactly one
+    /// poll wins, as exactly one caller of
+    /// [`try_consume_code`](Self::try_consume_code) receives a code.
     async fn try_claim_device_code(&self, device_code: &str) -> Result<bool>;
 
     /// Whether a `(username, device_id)` pair currently carries a device-revoked
@@ -615,7 +617,7 @@ pub trait DBClient {
     /// Atomically consume a previously-minted CAIP-122 nonce in `category`.
     /// Returns `Some(binding)` for the FIRST consumer (the operation context the
     /// nonce was minted for); `None` if the nonce is unknown/expired OR was already
-    /// consumed (replay). Single-use via SETNX, mirroring [`Self::try_consume_code`].
+    /// consumed (replay). Single-use via SETNX on a companion flag.
     async fn try_consume_caip122_nonce(
         &self,
         category: &str,

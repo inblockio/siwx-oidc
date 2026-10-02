@@ -2976,29 +2976,27 @@ pub enum UserInfoResponse {
 /// put a network call on a hot, read-only endpoint to recompute a value the
 /// struct already carries.
 ///
-/// # Both `None` cases mean "omit", and both are honest
+/// # Both "omit" cases are honest
 ///
 /// - `server_name = None` — a standalone deployment. There is no homeserver, so
 ///   there is no Matrix ID; a guessed one would name an account on a server that
 ///   does not exist.
-/// - `localpart = None` — the legacy `CodeEntry` fallback path, for an entry
-///   written before `CodeEntry.localpart` existed. That field's own doc blesses
-///   `legacy_localpart(did)` as the fallback for PROVISIONING continuity, where
-///   the alternative is severing a user from their account. This is not that:
-///   a userinfo claim is a statement of fact to a relying party, and the honest
-///   answer to "which localpart did we resolve for this session" is "this entry
-///   does not record one". An omitted claim degrades a consumer to the lookup it
-///   would have done anyway (`GET /resolve?did=…`, see [`crate::resolve`]); a
-///   derived one could quietly name the wrong account.
-fn mxid_claim(config: &crate::config::Config, localpart: Option<&str>) -> SiwxAdditionalClaims {
-    let mxid = match (config.matrix_server_name.as_deref(), localpart) {
-        // An empty localpart is treated as absent rather than rendered as
-        // `@:server`. Deviceless/admin-minted tokens are the shape that can
-        // carry one, and `@:server` is not a Matrix ID, it is a parse error
-        // waiting at the consumer.
-        (Some(server_name), Some(localpart)) if !localpart.is_empty() => Some(
-            crate::synapse_client::matrix_user_id(localpart, server_name),
-        ),
+/// - an empty `localpart` — the token records no localpart. The claim is then
+///   omitted, never derived from the DID: `legacy_localpart(did)` is a fallback
+///   for PROVISIONING continuity, where the alternative is severing a user from
+///   their account. This is not that: a userinfo claim is a statement of fact
+///   to a relying party, and the honest answer to "which localpart did we
+///   resolve for this session" is "this token does not record one". An omitted
+///   claim degrades a consumer to the lookup it would have done anyway
+///   (`GET /resolve?did=…`, see [`crate::resolve`]); a derived one could quietly
+///   name the wrong account. `@:server` would not be a Matrix ID either, but a
+///   parse error waiting at the consumer.
+fn mxid_claim(config: &crate::config::Config, localpart: &str) -> SiwxAdditionalClaims {
+    let mxid = match config.matrix_server_name.as_deref() {
+        Some(server_name) if !localpart.is_empty() => Some(crate::synapse_client::matrix_user_id(
+            localpart,
+            server_name,
+        )),
         _ => None,
     };
     SiwxAdditionalClaims { mxid }
@@ -3031,59 +3029,28 @@ pub async fn userinfo(
         return Err(CustomError::BadRequest("Missing access token.".to_string()));
     };
 
-    // Try TokenMetadata first (covers both MSC3861 mat_ tokens and standalone
-    // tokens). Only an access token is a bearer credential: a refresh token is
-    // answered like an unknown token.
-    if let Some(metadata) = db_client
+    // Only an access token is a bearer credential (MSC3861 `mat_` tokens and
+    // standalone tokens alike). An authorization code, a refresh token and an
+    // unknown string all get the same answer: a code is redeemable only at the
+    // token endpoint, with its PKCE verifier.
+    let metadata = db_client
         .get_token(&token_str)
         .await?
         .filter(|m| m.is_kind(TokenKind::Access))
-    {
-        if metadata.exp <= Utc::now().timestamp() {
-            return Err(CustomError::BadRequest("Token expired.".to_string()));
-        }
-        let client_entry = db_client
-            .get_client(metadata.client_id.clone())
-            .await?
-            .ok_or_else(|| CustomError::BadRequest("Unknown client.".to_string()))?;
-        // `metadata.username` IS the localpart (see `TokenMetadata::username`),
-        // already resolved through the grandfathering rule at sign-in.
-        let additional = mxid_claim(config, Some(metadata.username.as_str()));
-        let response =
-            SiwxUserInfoClaims::new(resolve_claims(config, &metadata.did).await, additional)
-                .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
-                .set_audiences(Some(vec![Audience::new(metadata.client_id)]));
-        return match client_entry.metadata.userinfo_signed_response_alg() {
-            None => Ok(UserInfoResponse::Json(response)),
-            Some(alg) => Ok(UserInfoResponse::Jwt(
-                SiwxUserInfoJsonWebToken::new(response, signing_key, alg.clone())
-                    .map_err(|_| anyhow!("Error signing response."))?,
-            )),
-        };
+        .ok_or_else(|| CustomError::BadRequest("Unknown token.".to_string()))?;
+    if metadata.exp <= Utc::now().timestamp() {
+        return Err(CustomError::BadRequest("Token expired.".to_string()));
     }
-
-    // Legacy fallback: UUID-based access token backed by code entry (pre-refresh-token deployments).
-    let code_entry = if let Some(c) = db_client.get_code(token_str).await? {
-        c
-    } else {
-        return Err(CustomError::BadRequest("Unknown token.".to_string()));
-    };
-
-    let client_entry = if let Some(c) = db_client.get_client(code_entry.client_id.clone()).await? {
-        c
-    } else {
-        return Err(CustomError::BadRequest("Unknown client.".to_string()));
-    };
-
-    // The legacy path's localpart is an `Option`: a `CodeEntry` written before
-    // that field existed carries `None`, and `mxid_claim` then OMITS the claim
-    // rather than deriving one — see its doc for why a derivation would be a
-    // worse answer than silence here.
-    let additional = mxid_claim(config, code_entry.localpart.as_deref());
-    let response =
-        SiwxUserInfoClaims::new(resolve_claims(config, &code_entry.did).await, additional)
-            .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
-            .set_audiences(Some(vec![Audience::new(code_entry.client_id)]));
+    let client_entry = db_client
+        .get_client(metadata.client_id.clone())
+        .await?
+        .ok_or_else(|| CustomError::BadRequest("Unknown client.".to_string()))?;
+    // `metadata.username` IS the localpart (see `TokenMetadata::username`),
+    // already resolved through the grandfathering rule at sign-in.
+    let additional = mxid_claim(config, &metadata.username);
+    let response = SiwxUserInfoClaims::new(resolve_claims(config, &metadata.did).await, additional)
+        .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
+        .set_audiences(Some(vec![Audience::new(metadata.client_id)]));
     match client_entry.metadata.userinfo_signed_response_alg() {
         None => Ok(UserInfoResponse::Json(response)),
         Some(alg) => Ok(UserInfoResponse::Jwt(
@@ -3543,12 +3510,51 @@ mod tests {
         let signin_params: SignInQueryParams =
             serde_urlencoded::from_str(redirect_url.query().unwrap()).unwrap();
         let oidc_signing_key = EcdsaSigningKey::generate();
+        // The code is not a bearer token: /userinfo refuses it.
+        assert!(
+            userinfo(
+                &config,
+                &oidc_signing_key,
+                None,
+                UserInfoPayload {
+                    access_token: Some(signin_params.code.clone()),
+                },
+                &db_client,
+            )
+            .await
+            .is_err(),
+            "/userinfo must refuse an authorization code"
+        );
+        // It is exchanged at the token endpoint, and the access token from the
+        // exchange is accepted at /userinfo.
+        let tokens = token(
+            TokenForm {
+                code: Some(signin_params.code),
+                client_id: Some("client".into()),
+                client_secret: Some("secret".into()),
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: None,
+            },
+            None,
+            &oidc_signing_key,
+            &config,
+            &db_client,
+            None,
+        )
+        .await
+        .unwrap();
         let _ = userinfo(
             &config,
             &oidc_signing_key,
             None,
             UserInfoPayload {
-                access_token: Some(signin_params.code),
+                access_token: Some(
+                    openidconnect::OAuth2TokenResponse::access_token(&tokens)
+                        .secret()
+                        .clone(),
+                ),
             },
             &db_client,
         )
@@ -4962,8 +4968,8 @@ mod provision_synapse_device_tests {
 /// (see [`userinfo`]'s doc).
 ///
 /// Redis-backed, like the rest of this file's token tests: `userinfo` resolves
-/// its caller through `get_token`/`get_code`, and stubbing that out would test a
-/// different function than the one that ships.
+/// its caller through `get_token`, and stubbing that out would test a different
+/// function than the one that ships.
 #[cfg(test)]
 mod userinfo_mxid_claim_tests {
     use super::*;
@@ -5121,53 +5127,94 @@ mod userinfo_mxid_claim_tests {
         );
     }
 
-    /// The legacy `CodeEntry` fallback path (`get_code`, pre-refresh-token
-    /// deployments) carries an `Option<String>` localpart. Both spellings are
-    /// pinned here because the `None` arm is the one that must NOT derive a
-    /// localpart from the DID — see `mxid_claim`'s doc.
+    /// A token that records no localpart omits the claim; it is never derived
+    /// from the DID, which could name a different account than the one this
+    /// session was provisioned under. See `mxid_claim`'s doc.
     #[tokio::test]
-    async fn legacy_code_entry_path_reports_a_recorded_localpart_and_omits_an_absent_one() {
+    async fn a_token_without_a_recorded_localpart_omits_the_claim_rather_than_deriving_one() {
         let Some(db) = db().await else {
             return;
         };
-        let client_id = format!("mxid-claim-legacy-{}", nonce());
+        let client_id = format!("mxid-claim-no-localpart-{}", nonce());
         seed_client(&db, &client_id, false).await.unwrap();
-        let config = config_with_server_name(Some(SERVER_NAME));
-
-        let entry = |localpart: Option<&str>| CodeEntry {
-            exchange_count: 0,
-            did: DID.to_string(),
-            nonce: None,
-            client_id: client_id.clone(),
-            auth_time: Utc::now(),
-            code_challenge: None,
-            code_challenge_method: None,
-            device_id: None,
-            localpart: localpart.map(str::to_string),
-        };
-
-        let with_localpart = format!("code_{}", nonce());
-        db.set_code(with_localpart.clone(), entry(Some(LOCALPART)))
+        let token = format!("tok_{}", nonce());
+        db.set_token(&token, &token_meta(&client_id, ""), 120)
             .await
             .unwrap();
-        let body = userinfo_json(&config, &db, &with_localpart).await;
-        assert_eq!(
-            body.get(CLAIM).and_then(|v| v.as_str()),
-            Some(format!("@{LOCALPART}:{SERVER_NAME}").as_str()),
-            "a CodeEntry that RECORDS a localpart reports it: {body}"
-        );
 
-        let without_localpart = format!("code_{}", nonce());
-        db.set_code(without_localpart.clone(), entry(None))
-            .await
-            .unwrap();
-        let body = userinfo_json(&config, &db, &without_localpart).await;
+        let body = userinfo_json(&config_with_server_name(Some(SERVER_NAME)), &db, &token).await;
+
         assert!(
             body.get(CLAIM).is_none(),
-            "a pre-migration CodeEntry records no localpart, and userinfo must say \
-             nothing rather than DERIVE one — a derived value could name a different \
-             account than the one this session was provisioned under: {body}"
+            "a token with no recorded localpart must not carry a derived Matrix ID: {body}"
         );
+        assert_eq!(
+            body.get("sub").and_then(|v| v.as_str()),
+            Some(DID),
+            "`sub` is still the exact-case DID"
+        );
+    }
+
+    /// Only an access token is a bearer credential at `/userinfo`: an
+    /// authorization code and a refresh token are refused like unknown tokens.
+    #[tokio::test]
+    async fn userinfo_accepts_only_an_access_token() {
+        let Some(db) = db().await else {
+            return;
+        };
+        let client_id = format!("mxid-claim-kinds-{}", nonce());
+        seed_client(&db, &client_id, false).await.unwrap();
+        let config = config_with_server_name(Some(SERVER_NAME));
+        let key = EcdsaSigningKey::generate();
+
+        let code = format!("code_{}", nonce());
+        db.set_code(
+            code.clone(),
+            CodeEntry {
+                exchange_count: 0,
+                did: DID.to_string(),
+                nonce: None,
+                client_id: client_id.clone(),
+                auth_time: Utc::now(),
+                code_challenge: None,
+                code_challenge_method: None,
+                device_id: None,
+                localpart: Some(LOCALPART.to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let refresh = format!("tok_{}", nonce());
+        db.set_token(
+            &refresh,
+            &TokenMetadata {
+                kind: Some(TokenKind::Refresh),
+                ..token_meta(&client_id, LOCALPART)
+            },
+            120,
+        )
+        .await
+        .unwrap();
+
+        for (what, token) in [
+            ("an authorization code", code),
+            ("a refresh token", refresh),
+        ] {
+            let out = userinfo(
+                &config,
+                &key,
+                None,
+                UserInfoPayload {
+                    access_token: Some(token),
+                },
+                &db,
+            )
+            .await;
+            assert!(
+                matches!(out, Err(CustomError::BadRequest(ref m)) if m == "Unknown token."),
+                "/userinfo must refuse {what} like an unknown token"
+            );
+        }
     }
 
     /// The signed-JWT variant must carry the same claim. See this module's doc,
