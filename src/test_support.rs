@@ -122,8 +122,9 @@ fn redacted(url: &Url) -> Url {
     shown
 }
 
-/// Everything the code under test logs on the calling thread, at every level,
-/// for as long as the value lives.
+/// Everything the code under test logs on the calling thread at `DEBUG` and
+/// above (what `RUST_LOG=debug` shows, the most verbose setting an operator
+/// reaches for), for as long as the value lives.
 ///
 /// Built on `tracing::subscriber::set_default`, which is per thread: use it in a
 /// `#[tokio::test]` (a current-thread runtime, so every task the test awaits runs
@@ -139,12 +140,12 @@ pub struct LogCapture {
 }
 
 impl LogCapture {
-    /// Start capturing at the most verbose level (spans included, so a field a
-    /// span carries shows up on every event inside it).
+    /// Start capturing (spans included, so a field a span carries shows up on
+    /// every event inside it).
     pub fn start() -> Self {
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
+            .with_max_level(tracing::Level::DEBUG)
             .with_ansi(false)
             .with_writer(SharedBuffer(buffer.clone()))
             .finish();

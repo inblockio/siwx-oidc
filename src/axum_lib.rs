@@ -1862,3 +1862,64 @@ mod unknown_credential_response_tests {
         redis.del_raw(&key).await.ok();
     }
 }
+
+#[cfg(test)]
+mod request_logging_tests {
+    //! What the request-logging layer may put in the logs. Drives the layer over
+    //! a real socket: the span a layer opens is part of every line logged while
+    //! the request is handled, so only a request through the real stack shows it.
+    use super::*;
+
+    /// A query carries credentials (`/device` takes the user code in its
+    /// `verification_uri_complete`), so a request is logged by method and path.
+    /// tower-http's default span records the full URI and prints it in front of
+    /// every event logged during the request when debug logging is on, which is
+    /// the case this guards.
+    #[tokio::test]
+    async fn request_logging_names_the_path_and_never_the_query() {
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let app = with_request_logging(Router::new().route(
+            "/device",
+            get(|| async {
+                // An event inside the handler carries the request's span.
+                info!("handling");
+                "ok"
+            }),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let secret = "QUERYSECRET-WDJB-MJHT";
+        let response = reqwest::get(format!(
+            "http://{addr}/device?user_code={secret}&access_token=tok-{secret}"
+        ))
+        .await
+        .unwrap();
+        assert!(response.status().is_success());
+        server.abort();
+        let output = logs.output();
+
+        assert!(
+            output.contains("path=/device"),
+            "the request line names the path; captured:\n{output}"
+        );
+        assert!(
+            output.contains("handling"),
+            "the handler's own event was captured; captured:\n{output}"
+        );
+        assert!(
+            !output.contains(secret),
+            "a query value appears in the logs:\n{}",
+            output
+                .lines()
+                .filter(|l| l.contains(secret))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(
+            !output.contains("user_code="),
+            "a query parameter name appears in the logs:\n{output}"
+        );
+    }
+}

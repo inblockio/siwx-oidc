@@ -4395,6 +4395,82 @@ mod tests {
         db.delete_device_code(&device_code).await.ok();
     }
 
+    /// A device-code poll that loses the claim to a concurrent poll logs that at
+    /// `debug!`. The device code is the credential the device polls with, so the
+    /// line names its fingerprint, never the code. Needs Redis.
+    #[tokio::test]
+    async fn a_device_poll_that_loses_the_claim_logs_the_code_only_as_a_fingerprint() {
+        use siwx_oidc::redact::fingerprint;
+
+        let Some((config, db)) = default_config().await else {
+            return;
+        };
+        let config = Config {
+            mas_shared_secret: Some("shared-secret".to_string()),
+            ..config
+        };
+        let device_code = format!("dvc_claimlost-{}", Uuid::new_v4().simple());
+        db.set_device_code(
+            &device_code,
+            &DeviceCodeEntry {
+                user_code: format!("CL-{}", Uuid::new_v4().simple()),
+                client_id: "client".to_string(),
+                scope: "openid".to_string(),
+                status: DeviceCodeStatus::Approved,
+                did: Some("did:key:zDnCLAIMLOST".to_string()),
+                device_id: None,
+                last_poll: None,
+                created_at: Utc::now().timestamp(),
+            },
+            DEVICE_CODE_LIFETIME,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.try_claim_device_code(&device_code).await.unwrap(),
+            "the winning poll claims the code"
+        );
+
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let losing = token(
+            TokenForm {
+                code: None,
+                client_id: Some("client".to_string()),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code.clone()),
+            },
+            None,
+            &EcdsaSigningKey::generate(),
+            &config,
+            &db,
+            None,
+        )
+        .await;
+        let output = logs.output();
+        match losing {
+            Err(CustomError::BadRequestToken(e)) => assert_eq!(
+                e.error,
+                CoreErrorResponseType::Extension("authorization_pending".to_string())
+            ),
+            other => panic!(
+                "the losing poll must be told to wait: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        assert!(
+            output.contains(&fingerprint(&device_code)),
+            "the claim-lost line names the code's fingerprint; captured:\n{output}"
+        );
+        assert!(
+            !output.contains(&device_code),
+            "the device code appears in the logs in the clear:\n{output}"
+        );
+        db.delete_device_code(&device_code).await.ok();
+    }
+
     #[tokio::test]
     async fn authorize_accepts_matrix_only_scopes_without_openid() {
         let Some((_config, db_client)) = default_config().await else {
