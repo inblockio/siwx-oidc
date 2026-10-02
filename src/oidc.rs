@@ -1421,40 +1421,38 @@ async fn token_authorization_code(
                     .to_string(),
         })
     })?;
-    {
-        let verifier = form.code_verifier.as_ref().ok_or_else(|| {
-            CustomError::BadRequestToken(TokenError {
-                error: CoreErrorResponseType::InvalidGrant,
-                error_description: "code_verifier required (PKCE).".to_string(),
-            })
-        })?;
-        let method = code_entry
-            .code_challenge_method
-            .as_deref()
-            .unwrap_or("S256");
-        // C2 Step 4b: reject the `plain` PKCE method. Discovery advertises S256
-        // only (`code_challenge_methods_supported = ["S256"]`); no compliant
-        // client sends `plain`, and the downgrade weakens the PKCE binding.
-        let computed = match method {
-            "S256" => {
-                use sha2::{Digest, Sha256};
-                let hash = Sha256::digest(verifier.as_bytes());
-                URL_SAFE_NO_PAD.encode(hash)
-            }
-            _ => {
-                return Err(CustomError::BadRequestToken(TokenError {
-                    error: CoreErrorResponseType::InvalidGrant,
-                    error_description: "Unsupported code_challenge_method (only S256 is allowed)."
-                        .to_string(),
-                }));
-            }
-        };
-        if !constant_time_eq(&computed, challenge) {
+    let verifier = form.code_verifier.as_ref().ok_or_else(|| {
+        CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "code_verifier required (PKCE).".to_string(),
+        })
+    })?;
+    let method = code_entry
+        .code_challenge_method
+        .as_deref()
+        .unwrap_or("S256");
+    // C2 Step 4b: reject the `plain` PKCE method. Discovery advertises S256
+    // only (`code_challenge_methods_supported = ["S256"]`); no compliant
+    // client sends `plain`, and the downgrade weakens the PKCE binding.
+    let computed = match method {
+        "S256" => {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(verifier.as_bytes());
+            URL_SAFE_NO_PAD.encode(hash)
+        }
+        _ => {
             return Err(CustomError::BadRequestToken(TokenError {
                 error: CoreErrorResponseType::InvalidGrant,
-                error_description: "code_verifier mismatch.".to_string(),
+                error_description: "Unsupported code_challenge_method (only S256 is allowed)."
+                    .to_string(),
             }));
         }
+    };
+    if !constant_time_eq(&computed, challenge) {
+        return Err(CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "code_verifier mismatch.".to_string(),
+        }));
     }
 
     let msc3861_mode = config.mas_shared_secret.is_some();
