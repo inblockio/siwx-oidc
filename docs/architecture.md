@@ -73,16 +73,22 @@ New methods and namespaces are opt-in: operators enable them in
 
 **CAIP-122 (wallet, or any key the browser can sign with):**
 
-1. `GET /authorize` validates the client and redirect URI, creates a session (`sessions/{id}`,
-   300 s) and sets the `session` cookie, then redirects to the login page with a nonce.
+1. `GET /authorize` validates the client, the redirect URI (exact match against the
+   registration, query included), `response_type=code` (the only one accepted) and the `S256`
+   PKCE challenge. It creates a session (`sessions/{id}`, 300 s) that binds the validated
+   request (client, redirect URI, state, response mode, challenge), sets the `session` cookie,
+   and redirects to the login page with a nonce and the request's values, each percent-encoded
+   so the page reads back the exact redirect URI its CAIP-122 message must bind.
 2. The page builds a CAIP-122 message (for Ethereum, an EIP-4361 message) containing the
    nonce, has the wallet sign it, and sets the `siwx` cookie to `{did, message, signature}`.
 3. `GET /sign_in` checks the DID method and namespace against configuration, verifies the
-   signature through `find_did_method(did).verify(…)`, checks the nonce and that the
-   `redirect_uri` is in the message's `Resources:`, then issues a single-use code.
+   signature through `find_did_method(did).verify(…)`, checks the nonce and that the bound
+   redirect URI is in the message's `Resources:`, then issues a single-use code for the request
+   bound to the session. `/sign_in` reads no authorization parameter from its query (the page
+   still appends them to its link; they are ignored).
 4. `POST /token` exchanges the code, with its PKCE `S256` verifier, for an ES256 ID token, an
-   access token and a refresh token. PKCE is mandatory for `response_type=code`: `/authorize`
-   refuses a request without a `code_challenge`.
+   access token and a refresh token. PKCE is mandatory: `/authorize` refuses a request without a
+   `code_challenge`, and `/token` refuses a code without one.
 
 **Server-verified ceremony (passkey):**
 
@@ -90,7 +96,8 @@ New methods and namespaces are opt-in: operators enable them in
 2. `/webauthn/authenticate/start` and `/finish` run the WebAuthn ceremony. On success the
    server derives `did:key:zDn…` from the passkey's P-256 key (or takes the linked wallet DID,
    see [passkeys.md](passkeys.md)) and stores it as `verified_did` in the session.
-3. `GET /sign_in` reads `verified_did` from the session (trusted, server-side) and issues the code.
+3. `GET /sign_in` reads `verified_did` from the session (trusted, server-side) and issues the
+   code for the bound request.
 4. `POST /token` as above.
 
 **Headless agent:** the same CAIP-122 flow, driven by `siwx-oidc-auth` with a local Ed25519 or
@@ -145,11 +152,11 @@ All state lives in one Redis (`redis_url`). Prefixes are defined in `src/db/mod.
 
 | Key | TTL | Holds |
 |---|---|---|
-| `sessions/{id}` | 300 s | `SessionEntry`: nonces, `verified_did`, sign-in count |
+| `sessions/{id}` | 300 s | `SessionEntry`: nonces, `verified_did`, sign-in count, and the authorization request `/authorize` bound to it (client, redirect URI, state, response mode, PKCE challenge) |
 | `sessions/{id}/signed_in` | 300 s | one-shot flag against double sign-in |
-| `codes/{code}` and `codes/{code}/consumed` | 300 s | `CodeEntry` (DID, client, PKCE challenge, device id, localpart) and its single-use flag |
+| `codes/{code}` | 300 s | `CodeEntry` (DID, client, PKCE challenge, device id, localpart); read and deleted in one atomic step on exchange. A `codes/{code}/consumed` marker exists only from older builds, which kept exchanged codes |
 | `clients/{client_id}` | 30 d | `ClientEntry` (secret, metadata); `default_clients` are rewritten at every start |
-| `token/{token}` | access 300 s, refresh 90 d, admin 30–900 s | `TokenMetadata` (username, device id, scope, client, DID) |
+| `token/{token}` | access 300 s, refresh 90 d, admin 30–900 s | `TokenMetadata` (kind: access or refresh, username, device id, scope, client, DID); each endpoint accepts one kind, see [matrix-integration.md](matrix-integration.md#token-kinds) |
 | `token_rotated/{old_refresh}` | 60 s | successor pair for a lost refresh response |
 | `idx:user_device/{username}/{device_id}` | 90 d | SET of token keys, for atomic revocation |
 | `tombstone:device/{username}/{device_id}`, `tombstone:user/{username}` | 900 s | refuse refresh while a revoke or deactivation sweep runs |

@@ -91,6 +91,24 @@ pub const ACCESS_TOKEN_TTL: u64 = 300; // 5 minutes
 /// TTL for opaque refresh tokens (both modes).
 pub const REFRESH_TOKEN_TTL: u64 = 7_776_000; // 90 days
 
+/// The longest lifetime (`exp - iat`) an access token is ever written with: a
+/// user access token lives [`ACCESS_TOKEN_TTL`] and a minted admin token at most
+/// 900 s (`admin_token::ADMIN_TOKEN_TTL_MAX`, which a const assertion in that
+/// module ties to this value). Every refresh token lives [`REFRESH_TOKEN_TTL`].
+/// Read only by [`legacy_token_kind`].
+pub const ACCESS_TOKEN_MAX_LIFETIME: i64 = 900;
+
+const _: () = assert!(
+    (ACCESS_TOKEN_TTL as i64) <= ACCESS_TOKEN_MAX_LIFETIME
+        && ACCESS_TOKEN_MAX_LIFETIME < REFRESH_TOKEN_TTL as i64,
+    "the lifetimes of the two token kinds must not overlap, or legacy_token_kind \
+     cannot tell them apart"
+);
+
+/// The scope Synapse tests in `is_server_admin()`. Only a minted admin token
+/// (an access token) ever carries it; see [`legacy_token_kind`].
+pub const SYNAPSE_ADMIN_SCOPE: &str = "urn:synapse:admin:*";
+
 /// Prefix for the short-lived refresh-token rotation grace pointer:
 /// `token_rotated/{old_refresh}` -> the successor token pair already minted by the
 /// rotation that consumed `old_refresh`. Lets a client that LOST the rotation
@@ -338,6 +356,28 @@ pub struct SessionEntry {
     /// Original scope from /authorize, preserved so sign_in can extract a client-proposed device_id.
     #[serde(default)]
     pub scope: Option<String>,
+    /// The authorization request `/authorize` validated and bound to this
+    /// session. `sign_in` issues the code for this request, never for
+    /// front-channel parameters. `None` only on a session written by an older
+    /// build, which `sign_in` refuses with a "restart sign-in" error.
+    #[serde(default)]
+    pub request: Option<AuthorizationRequest>,
+}
+
+/// An authorization request as `/authorize` validated it, bound to the login
+/// session (the OIDC nonce is [`SessionEntry::oidc_nonce`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationRequest {
+    pub client_id: String,
+    /// Exactly as sent, and registered for `client_id`.
+    pub redirect_uri: String,
+    pub state: String,
+    /// `query` (or absent) or `fragment`.
+    #[serde(default)]
+    pub response_mode: Option<String>,
+    /// The S256 PKCE challenge (base64url). The method is always S256:
+    /// `/authorize` refuses any other.
+    pub code_challenge: String,
 }
 
 /// Status of an RFC 8628 device authorization code.
@@ -359,6 +399,52 @@ pub struct DeviceCodeEntry {
     pub device_id: Option<String>,
     pub last_poll: Option<i64>,
     pub created_at: i64,
+}
+
+/// What a stored token may be presented for.
+///
+/// Every endpoint accepts exactly one kind, and answers a token of the other
+/// kind exactly like an unknown token, leaving it untouched:
+///
+/// | Endpoint | Accepts |
+/// |---|---|
+/// | `POST /token` (`grant_type=refresh_token`), `POST /_matrix/client/v3/refresh` | [`TokenKind::Refresh`] |
+/// | `POST /oauth2/introspect`, `/userinfo`, the bearer-authenticated Matrix routes (`logout`, `logout/all`, device deletion) | [`TokenKind::Access`] |
+/// | `POST /oauth2/revoke` (RFC 7009) | either |
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenKind {
+    /// A bearer credential. A minted admin token is an access token.
+    Access,
+    /// Presented only to a refresh endpoint, to rotate into a new pair.
+    Refresh,
+}
+
+/// Classify a token entry written before [`TokenMetadata::kind`] existed.
+///
+/// Every writer of such an entry used a fixed lifetime (`exp - iat`), and the
+/// lifetimes of the two kinds do not overlap:
+///
+/// | Writer | Lifetime | Prefix in Matrix mode |
+/// |---|---|---|
+/// | access token (code, refresh and device-code grants, Matrix refresh) | [`ACCESS_TOKEN_TTL`] = 300 s | `mat_` |
+/// | minted admin token | 30 s to 900 s | `msa_` |
+/// | refresh token (the same four writers) | [`REFRESH_TOKEN_TTL`] = 90 days | `mcr_` |
+///
+/// so the lifetime alone decides, in both modes (generic mode has no prefix,
+/// and the prefixes agree with this rule in Matrix mode). The admin scope was
+/// only ever written on minted admin tokens, which are access tokens, so a
+/// long-lived entry that carries it fits no writer's shape: it gets no kind,
+/// and every endpoint answers it like an unknown token. Revocation still
+/// removes it.
+pub fn legacy_token_kind(meta: &TokenMetadata) -> Option<TokenKind> {
+    if meta.exp - meta.iat <= ACCESS_TOKEN_MAX_LIFETIME {
+        Some(TokenKind::Access)
+    } else if meta.scope.split(' ').any(|s| s == SYNAPSE_ADMIN_SCOPE) {
+        None
+    } else {
+        Some(TokenKind::Refresh)
+    }
 }
 
 /// Metadata stored alongside an opaque token in Redis (MSC3861 introspection).
@@ -392,6 +478,26 @@ pub struct TokenMetadata {
     /// `name` by introspection; Synapse does not read it, and the Matrix
     /// displayname is the alias seeded at first sign-in.
     pub name: String,
+    /// Which kind of token this is. Every writer sets it, and
+    /// [`DBClient::set_token`] refuses an entry without one. `None` therefore
+    /// appears only on an entry written before the field existed. Readers go
+    /// through [`TokenMetadata::is_kind`], never this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<TokenKind>,
+}
+
+impl TokenMetadata {
+    /// The kind this entry is accepted as: the recorded kind, or for an entry
+    /// written before kinds were recorded, [`legacy_token_kind`]. `None` means
+    /// the entry is accepted nowhere.
+    pub fn effective_kind(&self) -> Option<TokenKind> {
+        self.kind.or_else(|| legacy_token_kind(self))
+    }
+
+    /// Whether this entry may be presented where `kind` is required.
+    pub fn is_kind(&self, kind: TokenKind) -> bool {
+        self.effective_kind() == Some(kind)
+    }
 }
 
 /// The successor token pair recorded under [`KV_ROTATED_PREFIX`] when a refresh
@@ -413,11 +519,12 @@ pub trait DBClient {
     async fn get_client(&self, client_id: String) -> Result<Option<ClientEntry>>;
     async fn delete_client(&self, client_id: String) -> Result<()>;
     async fn set_code(&self, code: String, code_entry: CodeEntry) -> Result<()>;
-    async fn get_code(&self, code: String) -> Result<Option<CodeEntry>>;
     async fn set_session(&self, id: String, entry: SessionEntry) -> Result<()>;
     async fn get_session(&self, id: String) -> Result<Option<SessionEntry>>;
-    /// Atomically consume an authorization code. Returns the entry if this is
-    /// the first call for this code, or None if already consumed / not found.
+    /// Atomically consume an authorization code: read and delete its entry in
+    /// one step. Returns the entry to exactly one caller, or None if the code is
+    /// unknown, expired or already consumed. There is no other reader of codes:
+    /// a code is redeemable only here, at the token endpoint.
     async fn try_consume_code(&self, code: String) -> Result<Option<CodeEntry>>;
     /// Atomically mark a session as signed-in. Returns true on first call,
     /// false if the session was already signed-in.
@@ -425,8 +532,9 @@ pub trait DBClient {
 
     /// Atomically claim an *approved* device code for redemption. Returns `true`
     /// only for the first caller; concurrent polls get `false` and must not issue
-    /// tokens (S3-1 / H9). Mirrors [`try_consume_code`](Self::try_consume_code):
-    /// a `SET .../redeemed 1 NX EX <ttl>` so exactly one poll wins.
+    /// tokens (S3-1 / H9): a `SET .../redeemed 1 NX EX <ttl>` so exactly one
+    /// poll wins, as exactly one caller of
+    /// [`try_consume_code`](Self::try_consume_code) receives a code.
     async fn try_claim_device_code(&self, device_code: &str) -> Result<bool>;
 
     /// Whether a `(username, device_id)` pair currently carries a device-revoked
@@ -463,7 +571,8 @@ pub trait DBClient {
 
     // -- Opaque token storage (MSC3861) ----------------------------------------
 
-    /// Store an opaque token with metadata and a TTL in seconds.
+    /// Store an opaque token with metadata and a TTL in seconds. Refuses an
+    /// entry whose [`TokenMetadata::kind`] is unset.
     async fn set_token(&self, token: &str, metadata: &TokenMetadata, ttl: u64) -> Result<()>;
     /// Retrieve metadata for an opaque token (returns None if expired/missing).
     async fn get_token(&self, token: &str) -> Result<Option<TokenMetadata>>;
@@ -530,10 +639,128 @@ pub trait DBClient {
     /// Atomically consume a previously-minted CAIP-122 nonce in `category`.
     /// Returns `Some(binding)` for the FIRST consumer (the operation context the
     /// nonce was minted for); `None` if the nonce is unknown/expired OR was already
-    /// consumed (replay). Single-use via SETNX, mirroring [`Self::try_consume_code`].
+    /// consumed (replay). Single-use via SETNX on a companion flag.
     async fn try_consume_caip122_nonce(
         &self,
         category: &str,
         nonce: &str,
     ) -> Result<Option<String>>;
+}
+
+#[cfg(test)]
+mod token_kind_tests {
+    use super::*;
+
+    /// An entry exactly as a build without the `kind` field serialized it.
+    fn legacy_json(iat: i64, lifetime: i64, scope: &str, device_id: &str) -> String {
+        serde_json::json!({
+            "username": "k3f9x2q7ab4d8m1p",
+            "device_id": device_id,
+            "scope": scope,
+            "client_id": "c",
+            "iat": iat,
+            "exp": iat + lifetime,
+            "did": "did:key:zDnaeLegacy",
+            "name": "n",
+        })
+        .to_string()
+    }
+
+    fn classify(json: &str) -> Option<TokenKind> {
+        let meta: TokenMetadata =
+            serde_json::from_str(json).expect("a legacy entry must still deserialize");
+        assert_eq!(meta.kind, None, "a legacy entry records no kind");
+        meta.effective_kind()
+    }
+
+    const MATRIX_SCOPE: &str = "openid urn:matrix:client:api:* urn:matrix:client:device:SIWX_a";
+    const ADMIN_SCOPE: &str = "urn:matrix:client:api:* urn:synapse:admin:*";
+
+    /// Every shape a pre-kind build wrote, in both modes, gets its correct kind,
+    /// so no live session breaks when the kinds start being enforced.
+    #[test]
+    fn every_legacy_entry_shape_is_classified() {
+        let iat = 1_790_000_000;
+        let refresh = REFRESH_TOKEN_TTL as i64;
+        let access = ACCESS_TOKEN_TTL as i64;
+        // Matrix mode (mat_ / mcr_), from the code, refresh, device-code grants
+        // and the Matrix refresh endpoint.
+        assert_eq!(
+            classify(&legacy_json(iat, access, MATRIX_SCOPE, "SIWX_a")),
+            Some(TokenKind::Access)
+        );
+        assert_eq!(
+            classify(&legacy_json(iat, refresh, MATRIX_SCOPE, "SIWX_a")),
+            Some(TokenKind::Refresh)
+        );
+        // Generic mode (no prefix, no device).
+        assert_eq!(
+            classify(&legacy_json(iat, access, "openid profile", "")),
+            Some(TokenKind::Access)
+        );
+        assert_eq!(
+            classify(&legacy_json(iat, refresh, "openid profile", "")),
+            Some(TokenKind::Refresh)
+        );
+        // Minted admin tokens (msa_), at both ends of the clamped TTL window.
+        for ttl in [30, 300, ACCESS_TOKEN_MAX_LIFETIME] {
+            assert_eq!(
+                classify(&legacy_json(iat, ttl, ADMIN_SCOPE, "")),
+                Some(TokenKind::Access),
+                "an admin token with a {ttl} s lifetime is an access token"
+            );
+        }
+    }
+
+    /// No writer ever stored the admin scope with a refresh lifetime, so such an
+    /// entry gets no kind and is accepted nowhere.
+    #[test]
+    fn a_long_lived_admin_scoped_legacy_entry_has_no_kind() {
+        let json = legacy_json(1_790_000_000, REFRESH_TOKEN_TTL as i64, ADMIN_SCOPE, "");
+        assert_eq!(classify(&json), None);
+        let meta: TokenMetadata = serde_json::from_str(&json).unwrap();
+        assert!(!meta.is_kind(TokenKind::Access));
+        assert!(!meta.is_kind(TokenKind::Refresh));
+    }
+
+    /// The boundary sits between the longest access lifetime and the refresh one.
+    #[test]
+    fn the_lifetime_boundary_is_the_longest_access_lifetime() {
+        let iat = 1_790_000_000;
+        assert_eq!(
+            classify(&legacy_json(iat, ACCESS_TOKEN_MAX_LIFETIME, "openid", "")),
+            Some(TokenKind::Access)
+        );
+        assert_eq!(
+            classify(&legacy_json(
+                iat,
+                ACCESS_TOKEN_MAX_LIFETIME + 1,
+                "openid",
+                ""
+            )),
+            Some(TokenKind::Refresh)
+        );
+    }
+
+    /// A recorded kind is authoritative and round-trips through the store's
+    /// JSON; the lifetime is consulted only when no kind is recorded.
+    #[test]
+    fn a_recorded_kind_wins_and_round_trips() {
+        let meta = TokenMetadata {
+            username: "u".into(),
+            device_id: String::new(),
+            scope: "openid".into(),
+            client_id: "c".into(),
+            iat: 0,
+            exp: 60,
+            did: "did:key:zDnaeRecorded".into(),
+            name: "n".into(),
+            kind: Some(TokenKind::Refresh),
+        };
+        assert!(meta.is_kind(TokenKind::Refresh), "recorded kind wins");
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains(r#""kind":"refresh""#), "{json}");
+        let back: TokenMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, Some(TokenKind::Refresh));
+    }
 }

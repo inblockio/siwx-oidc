@@ -52,8 +52,8 @@ use crate::introspect::generate_opaque_token;
 // does (see the note in `src/lib.rs`).
 use crate::synapse_client::SynapseClient;
 use siwx_oidc::db::{
-    DBClient, RedisClient, RevocationState, RotatedToken, TokenMetadata, ACCESS_TOKEN_TTL,
-    REFRESH_GRACE_TTL, REFRESH_TOKEN_TTL,
+    DBClient, RedisClient, RevocationState, RotatedToken, TokenKind, TokenMetadata,
+    ACCESS_TOKEN_TTL, REFRESH_GRACE_TTL, REFRESH_TOKEN_TTL,
 };
 
 // -- Shared state for compat endpoints ----------------------------------------
@@ -132,12 +132,23 @@ impl TeardownPolicy {
 ///    `(username, device_id)` in Redis (access + paired refresh), or just the
 ///    presented token when there is no device_id / no Synapse integration.
 ///
+/// `required` is the token kind the caller accepts: `Some(Access)` for logout,
+/// whose bearer must be an access token, and `None` for RFC 7009 revoke, which
+/// accepts either kind. A token of another kind is answered like an unknown
+/// token: nothing is torn down and the token itself is left untouched.
+///
 /// Never fails the caller: every error is logged and swallowed so the HTTP
 /// handler can always return 200 (RFC 7009 for revoke; Matrix expects 200 for
 /// logout). Keyed on [`TokenMetadata::username`] (the lowercased localpart
 /// Synapse uses), never the raw DID, so revocation is robust to address-case
 /// differences between sign-in and re-auth DIDs.
-async fn teardown_session(state: &CompatState, token: &str, ctx: &str, policy: TeardownPolicy) {
+async fn teardown_session(
+    state: &CompatState,
+    token: &str,
+    ctx: &str,
+    policy: TeardownPolicy,
+    required: Option<TokenKind>,
+) {
     let meta = match state.redis_client.get_token(token).await {
         Ok(m) => m,
         Err(e) => {
@@ -153,6 +164,14 @@ async fn teardown_session(state: &CompatState, token: &str, ctx: &str, policy: T
         }
         return;
     };
+
+    if required.is_some_and(|kind| !meta.is_kind(kind)) {
+        debug!(
+            ctx,
+            "teardown_session: token of another kind; nothing to tear down"
+        );
+        return;
+    }
 
     // Phase 1: delete the ending session's Synapse device (best-effort) — only for
     // explicit-sign-out callers. A bare RFC 7009 revoke (TokensOnly) must never
@@ -231,7 +250,15 @@ pub async fn revoke(
 ) -> StatusCode {
     // RFC 7009 is token hygiene, not a device sign-out: revoke tokens only, never
     // delete the Synapse device (see TeardownPolicy).
-    teardown_session(&state, &form.token, "revoke", TeardownPolicy::TokensOnly).await;
+    // Either kind of token may be revoked.
+    teardown_session(
+        &state,
+        &form.token,
+        "revoke",
+        TeardownPolicy::TokensOnly,
+        None,
+    )
+    .await;
     StatusCode::OK
 }
 
@@ -260,7 +287,15 @@ pub async fn logout(
 ) -> impl IntoResponse {
     if let Some(TypedHeader(auth)) = bearer {
         // Explicit single-session sign-out: revoke tokens AND delete the device.
-        teardown_session(&state, auth.token(), "logout", TeardownPolicy::DeleteDevice).await;
+        // The bearer must be an access token.
+        teardown_session(
+            &state,
+            auth.token(),
+            "logout",
+            TeardownPolicy::DeleteDevice,
+            Some(TokenKind::Access),
+        )
+        .await;
     }
     (StatusCode::OK, Json(serde_json::json!({})))
 }
@@ -287,8 +322,10 @@ pub async fn logout_all(
     };
 
     let meta = match state.redis_client.get_token(auth.token()).await {
-        Ok(Some(m)) => m,
-        Ok(None) => return (StatusCode::OK, Json(serde_json::json!({}))), // idempotent no-op
+        // The bearer must be an access token; any other entry is a no-op like an
+        // unknown token.
+        Ok(Some(m)) if m.is_kind(TokenKind::Access) => m,
+        Ok(_) => return (StatusCode::OK, Json(serde_json::json!({}))), // idempotent no-op
         Err(e) => {
             warn!(error = %e, "logout_all: get_token failed");
             return (StatusCode::OK, Json(serde_json::json!({})));
@@ -356,7 +393,7 @@ pub struct DeleteDevicesRequest {
 }
 
 /// Resolve the bearer token to its owning localpart (`TokenMetadata.username`),
-/// or `None` if the token is missing/unknown.
+/// or `None` if the token is missing, unknown, or not an access token.
 async fn username_from_bearer(
     state: &CompatState,
     bearer: &Option<TypedHeader<Authorization<Bearer>>>,
@@ -368,6 +405,7 @@ async fn username_from_bearer(
         .await
         .ok()
         .flatten()
+        .filter(|m| m.is_kind(TokenKind::Access))
         .map(|m| m.username)
 }
 
@@ -450,8 +488,15 @@ pub async fn refresh(
     State(state): State<CompatState>,
     Json(body): Json<RefreshRequest>,
 ) -> impl IntoResponse {
-    // Look up the refresh token.
-    let metadata = match state.redis_client.get_token(&body.refresh_token).await {
+    // Look up the refresh token. Only a refresh token refreshes: any other entry
+    // (an access or admin token) is answered exactly like an unknown token, and
+    // is left untouched.
+    let metadata = match state
+        .redis_client
+        .get_token(&body.refresh_token)
+        .await
+        .map(|m| m.filter(|m| m.is_kind(TokenKind::Refresh)))
+    {
         Ok(Some(m)) => m,
         Ok(None) => {
             // Grace replay (lost-response recovery): mirror oidc::token_refresh. A
@@ -569,6 +614,7 @@ pub async fn refresh(
         exp: now + ACCESS_TOKEN_TTL as i64,
         did: metadata.did.clone(),
         name: metadata.name.clone(),
+        kind: Some(TokenKind::Access),
     };
 
     if let Err(e) = state
@@ -597,6 +643,7 @@ pub async fn refresh(
         exp: now + REFRESH_TOKEN_TTL as i64,
         did: metadata.did.clone(),
         name: metadata.name.clone(),
+        kind: Some(TokenKind::Refresh),
     };
 
     if let Err(e) = state
@@ -726,6 +773,14 @@ mod tests {
             // so the did case here intentionally differs from the username.
             did: format!("did:pkh:eip155:1:0X{}", username.to_uppercase()),
             name: "n".to_string(),
+            kind: Some(TokenKind::Access),
+        }
+    }
+
+    fn refresh_meta(username: &str, device_id: &str) -> TokenMetadata {
+        TokenMetadata {
+            kind: Some(TokenKind::Refresh),
+            ..token_meta(username, device_id)
         }
     }
 
@@ -843,6 +898,79 @@ mod tests {
         );
 
         client.delete_token(&session_b).await.ok();
+    }
+
+    /// The bearer of a logout, bulk logout or device deletion must be an access
+    /// token. A refresh token there is answered like an unknown token: nothing
+    /// is torn down, and the refresh token itself survives.
+    #[tokio::test]
+    async fn a_refresh_token_as_the_bearer_tears_nothing_down() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("kind-bearer-{n}");
+        let dev = format!("KIND_{n}");
+        let access = format!("compat_kind_access_{n}");
+        let refresh = format!("compat_kind_refresh_{n}");
+        client
+            .set_token(&access, &token_meta(&user, &dev), 120)
+            .await
+            .unwrap();
+        client
+            .set_token(&refresh, &refresh_meta(&user, &dev), 120)
+            .await
+            .unwrap();
+        let state = standalone_state(client.clone());
+
+        let resp = logout(State(state.clone()), bearer(&refresh))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "logout answers 200");
+        let resp = logout_all(State(state.clone()), bearer(&refresh))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "logout/all answers 200");
+        let resp = delete_device(State(state.clone()), Path(dev.clone()), bearer(&refresh))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "device deletion refuses a refresh token as its bearer"
+        );
+
+        assert!(
+            client.get_token(&access).await.unwrap().is_some(),
+            "the session's access token survives"
+        );
+        assert!(
+            client.get_token(&refresh).await.unwrap().is_some(),
+            "the presented refresh token is left untouched"
+        );
+        client.delete_token(&access).await.ok();
+        client.delete_token(&refresh).await.ok();
+    }
+
+    /// RFC 7009 revoke accepts either kind: a refresh token is revoked.
+    #[tokio::test]
+    async fn revoke_accepts_a_refresh_token() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("kind-revoke-{n}");
+        let refresh = format!("compat_kind_revoke_{n}");
+        client
+            .set_token(&refresh, &refresh_meta(&user, ""), 120)
+            .await
+            .unwrap();
+        let state = standalone_state(client.clone());
+        let form = RevokeForm {
+            token: refresh.clone(),
+            token_type_hint: None,
+        };
+        assert_eq!(revoke(State(state), Form(form)).await, StatusCode::OK);
+        assert!(
+            client.get_token(&refresh).await.unwrap().is_none(),
+            "revoke removes a refresh token"
+        );
     }
 
     /// Same single-session guarantee for RFC 7009 revoke with empty device_id.

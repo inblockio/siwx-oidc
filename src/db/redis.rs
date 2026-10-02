@@ -57,6 +57,23 @@ fn rotated_token_key(old_refresh: &str) -> String {
     format!("{}/{}", KV_ROTATED_PREFIX, old_refresh)
 }
 
+/// Read and delete an authorization code in one atomic step.
+///
+/// `KEYS[1]` is `codes/{id}`, `KEYS[2]` the `codes/{id}/consumed` marker an
+/// older build set on a code it had exchanged. Returns the entry only to the
+/// one caller that deletes it, and only when no such marker exists.
+const CONSUME_CODE_SCRIPT: &str = r#"
+local entry = redis.call('GET', KEYS[1])
+if not entry then
+  return false
+end
+redis.call('DEL', KEYS[1])
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  return false
+end
+return entry
+"#;
+
 impl RedisClient {
     pub async fn new(url: &Url) -> Result<Self> {
         let manager = RedisConnectionManager::new(url.as_str())
@@ -740,25 +757,6 @@ impl DBClient for RedisClient {
         Ok(())
     }
 
-    async fn get_code(&self, code: String) -> Result<Option<CodeEntry>> {
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
-        let key = format!("{}/{}", KV_CODE_PREFIX, code);
-        let entry: Option<String> = conn
-            .get(&key)
-            .await
-            .map_err(|e| anyhow!("Failed to get kv: {}", e))?;
-        if let Some(e) = entry {
-            Ok(serde_json::from_str(&e)
-                .map_err(|e| anyhow!("Failed to deserialize code entry: {}", e))?)
-        } else {
-            Ok(None)
-        }
-    }
-
     async fn set_session(&self, id: String, entry: SessionEntry) -> Result<()> {
         let mut conn = self
             .pool
@@ -803,37 +801,28 @@ impl DBClient for RedisClient {
             .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
 
         let key = format!("{}/{}", KV_CODE_PREFIX, code);
-
-        // Atomic: SETNX on a consumed flag — only one caller wins.
-        let consumed_key = format!("{}/consumed", key);
-        let was_set: bool = conn
-            .set_nx(&consumed_key, "1")
+        // One atomic step reads and deletes the entry, so exactly one caller
+        // ever receives it and no exchanged code stays in the store. A
+        // `codes/{id}/consumed` marker is what an older build left on a code it
+        // had already exchanged (it never deleted the entry); such a code is not
+        // handed out again. Both keys expire with the code (ENTRY_LIFETIME).
+        let raw: Option<String> = bb8_redis::redis::cmd("EVAL")
+            .arg(CONSUME_CODE_SCRIPT)
+            .arg(2)
+            .arg(&key)
+            .arg(format!("{key}/consumed"))
+            .query_async(&mut *conn)
             .await
-            .map_err(|e| anyhow!("Failed to SETNX consumed flag: {}", e))?;
-        if was_set {
-            let _: () = conn
-                .expire(&consumed_key, ENTRY_LIFETIME as i64)
-                .await
-                .unwrap_or(());
-        } else {
-            debug!("try_consume_code: already consumed key={}", key);
-            return Ok(None); // Already consumed by another request
-        }
-
-        // Read the code entry (safe: only the winner reaches here).
-        let entry: Option<String> = conn
-            .get(&key)
-            .await
-            .map_err(|e| anyhow!("Failed to get code entry: {}", e))?;
-        match entry {
+            .map_err(|e| anyhow!("Failed to consume code: {}", e))?;
+        match raw {
             Some(e) => {
-                debug!("try_consume_code: found key={}", key);
+                debug!("try_consume_code: consumed key={}", key);
                 Ok(Some(serde_json::from_str(&e).map_err(|e| {
                     anyhow!("Failed to deserialize code entry: {}", e)
                 })?))
             }
             None => {
-                debug!("try_consume_code: NOT FOUND key={}", key);
+                debug!("try_consume_code: unknown or already consumed key={}", key);
                 Ok(None)
             }
         }
@@ -922,6 +911,11 @@ impl DBClient for RedisClient {
     // -- Opaque token storage (MSC3861) ----------------------------------------
 
     async fn set_token(&self, token: &str, metadata: &TokenMetadata, ttl: u64) -> Result<()> {
+        // Every endpoint accepts exactly one kind of token, so an entry without a
+        // kind would be classified by lifetime instead of by its writer.
+        if metadata.kind.is_none() {
+            return Err(anyhow!("refusing to store a token without a kind"));
+        }
         let mut conn = self
             .pool
             .get()
@@ -1069,7 +1063,7 @@ impl DBClient for RedisClient {
     // device `user_code` or the account `action`). The consumer checks it, so a
     // nonce minted for one context cannot be redeemed for another (cross-context /
     // operation replay rejected). Single-use is enforced atomically via SETNX on a
-    // companion `consumed` flag, exactly like `try_consume_code`.
+    // companion `consumed` flag.
 
     async fn mint_caip122_nonce(&self, category: &str, binding: &str) -> Result<String> {
         // 16 random bytes hex-encoded (128 bits) — well above the login nonce.
@@ -1126,7 +1120,7 @@ impl DBClient for RedisClient {
 #[cfg(test)]
 mod tests {
     use super::{erased_did_key, erased_user_key};
-    use crate::db::{DBClient, TokenMetadata};
+    use crate::db::{CodeEntry, DBClient, TokenKind, TokenMetadata, KV_CODE_PREFIX};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A globally-unique nonce for test keys on the shared Redis. The nanosecond
@@ -1157,7 +1151,24 @@ mod tests {
             // so the did case here intentionally differs from the username.
             did: format!("did:pkh:eip155:1:0X{}", username.to_uppercase()),
             name: "n".to_string(),
+            kind: Some(TokenKind::Access),
         }
+    }
+
+    /// The store refuses a token entry without a kind: every writer sets one.
+    #[tokio::test]
+    async fn set_token_refuses_an_entry_without_a_kind() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let token = format!("kindless-{}", unique_nonce());
+        let mut meta = token_meta("", "kindless");
+        meta.kind = None;
+        assert!(
+            client.set_token(&token, &meta, 60).await.is_err(),
+            "a token without a kind must not be stored"
+        );
+        assert!(client.get_token(&token).await.unwrap().is_none());
     }
 
     /// H5: device_delete must revoke ONLY the OAuth session(s) for the targeted
@@ -1611,5 +1622,107 @@ mod tests {
             client.lookup_user_session(&token).await.unwrap().is_none(),
             "a destroyed session must no longer resolve"
         );
+    }
+
+    fn code_entry(did: &str) -> CodeEntry {
+        CodeEntry {
+            exchange_count: 0,
+            did: did.to_string(),
+            nonce: None,
+            client_id: "c".to_string(),
+            auth_time: chrono::Utc::now(),
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string()),
+            code_challenge_method: Some("S256".to_string()),
+            device_id: None,
+            localpart: None,
+        }
+    }
+
+    /// Consuming an authorization code removes it from the store, so nothing is
+    /// left behind that a later reader could take for a live code, and a second
+    /// consumer gets nothing. Needs Redis (`crate::test_support::redis`).
+    #[tokio::test]
+    async fn a_consumed_code_leaves_no_entry() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let code = format!("code-{}", unique_nonce());
+        let key = format!("{KV_CODE_PREFIX}/{code}");
+        client
+            .set_code(code.clone(), code_entry("did:key:zDnCONSUMED"))
+            .await
+            .unwrap();
+        assert!(
+            client.get_raw(&key).await.unwrap().is_some(),
+            "setup: the code is stored"
+        );
+
+        let first = client.try_consume_code(code.clone()).await.unwrap();
+        assert_eq!(
+            first.map(|e| e.did).as_deref(),
+            Some("did:key:zDnCONSUMED"),
+            "the first consumer gets the entry"
+        );
+        assert!(
+            client.get_raw(&key).await.unwrap().is_none(),
+            "a consumed code must leave no {key} entry"
+        );
+        assert!(
+            client.try_consume_code(code).await.unwrap().is_none(),
+            "a second consumer gets nothing"
+        );
+    }
+
+    /// A code that an older build already exchanged (it left a `/consumed`
+    /// marker and kept the entry) is not handed out again, and its entry goes.
+    #[tokio::test]
+    async fn a_code_exchanged_by_an_older_build_is_not_redeemable() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let code = format!("code-old-{}", unique_nonce());
+        let key = format!("{KV_CODE_PREFIX}/{code}");
+        client
+            .set_code(code.clone(), code_entry("did:key:zDnOLDBUILD"))
+            .await
+            .unwrap();
+        client
+            .set_ex_raw(&format!("{key}/consumed"), "1", 60)
+            .await
+            .unwrap();
+        assert!(
+            client.try_consume_code(code).await.unwrap().is_none(),
+            "a code an older build exchanged must not be redeemed again"
+        );
+        assert!(client.get_raw(&key).await.unwrap().is_none());
+    }
+
+    /// Exactly one of many concurrent consumers of one code wins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_consumers_of_one_code_have_exactly_one_winner() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        for round in 0..8 {
+            let code = format!("code-race-{round}-{}", unique_nonce());
+            client
+                .set_code(code.clone(), code_entry("did:key:zDnRACE"))
+                .await
+                .unwrap();
+            let tasks: Vec<_> = (0..16)
+                .map(|_| {
+                    let client = client.clone();
+                    let code = code.clone();
+                    tokio::spawn(async move { client.try_consume_code(code).await.unwrap() })
+                })
+                .collect();
+            let mut winners = 0;
+            for t in tasks {
+                if t.await.unwrap().is_some() {
+                    winners += 1;
+                }
+            }
+            assert_eq!(winners, 1, "round {round}: exactly one consumer wins");
+        }
     }
 }

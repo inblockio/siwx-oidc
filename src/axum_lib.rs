@@ -267,9 +267,11 @@ async fn authorize(
     Ok((headers, Redirect::to(&url)))
 }
 
+/// `GET /sign_in`. The query string is never parsed: the login page still
+/// appends the authorization parameters to its link, but the code is issued
+/// for the request `/authorize` bound to the session.
 async fn sign_in(
     State(state): State<AppState>,
-    Query(params): Query<oidc::SignInParams>,
     TypedHeader(cookies): TypedHeader<headers::Cookie>,
 ) -> Result<(HeaderMap, Redirect), CustomError> {
     // `sign_in` returns ONLY on the success path (a real login that issued a code),
@@ -292,7 +294,6 @@ async fn sign_in(
         &state.config.base_url,
         &state.config.supported_did_methods,
         &state.config.supported_pkh_namespaces,
-        params,
         cookies,
         &state.redis_client,
         state.synapse_client.as_deref(),

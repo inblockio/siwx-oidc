@@ -542,11 +542,8 @@ pub fn metadata(config: &crate::config::Config) -> Result<CoreProviderMetadata, 
                 .join(JWK_PATH)
                 .map_err(|e| anyhow!("Unable to join URL: {}", e))?,
         ),
-        vec![
-            ResponseTypes::new(vec![CoreResponseType::Code]),
-            ResponseTypes::new(vec![CoreResponseType::IdToken]),
-            ResponseTypes::new(vec![CoreResponseType::Token, CoreResponseType::IdToken]),
-        ],
+        // Exactly what `authorize` accepts: the authorization-code flow.
+        vec![ResponseTypes::new(vec![CoreResponseType::Code])],
         vec![CoreSubjectIdentifierType::Pairwise],
         SIGNING_ALG.to_vec(),
         EmptyAdditionalProviderMetadata {},
@@ -935,7 +932,13 @@ async fn token_refresh(
         })
     })?;
 
-    let metadata = match db_client.get_token(&rt).await? {
+    // Only a refresh token refreshes. Any other entry (an access or admin token)
+    // is answered exactly like an unknown token, and is left untouched.
+    let metadata = match db_client
+        .get_token(&rt)
+        .await?
+        .filter(|m| m.is_kind(TokenKind::Refresh))
+    {
         Some(m) => m,
         None => {
             // Grace replay (lost-response recovery): a rotated refresh token is
@@ -1003,6 +1006,7 @@ async fn token_refresh(
         exp: now + ACCESS_TOKEN_TTL as i64,
         did: metadata.did.clone(),
         name: metadata.name.clone(),
+        kind: Some(TokenKind::Access),
     };
     db_client
         .set_token(&new_access, &access_meta, ACCESS_TOKEN_TTL)
@@ -1018,6 +1022,7 @@ async fn token_refresh(
         exp: now + REFRESH_TOKEN_TTL as i64,
         did: metadata.did.clone(),
         name: metadata.name.clone(),
+        kind: Some(TokenKind::Refresh),
     };
     db_client
         .set_token(&new_refresh, &refresh_meta, REFRESH_TOKEN_TTL)
@@ -1266,6 +1271,7 @@ async fn token_device_code(
                 exp: iat + ACCESS_TOKEN_TTL as i64,
                 did: did.clone(),
                 name: display_name.clone(),
+                kind: Some(TokenKind::Access),
             };
             db_client
                 .set_token(&access_token, &access_meta, ACCESS_TOKEN_TTL)
@@ -1281,6 +1287,7 @@ async fn token_device_code(
                 exp: iat + REFRESH_TOKEN_TTL as i64,
                 did: did.clone(),
                 name: display_name,
+                kind: Some(TokenKind::Refresh),
             };
             db_client
                 .set_token(&refresh_token, &refresh_meta, REFRESH_TOKEN_TTL)
@@ -1403,8 +1410,18 @@ async fn token_authorization_code(
         }
     }
 
-    // PKCE: validate code_verifier if a code_challenge was issued.
-    if let Some(ref challenge) = code_entry.code_challenge {
+    // PKCE: every code carries the challenge `/authorize` bound to its session,
+    // and the verifier must match it. A code without a challenge (only an older
+    // build wrote those) is refused.
+    let challenge = code_entry.code_challenge.as_ref().ok_or_else(|| {
+        CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description:
+                "This authorization code carries no PKCE challenge; restart the sign-in."
+                    .to_string(),
+        })
+    })?;
+    {
         let verifier = form.code_verifier.as_ref().ok_or_else(|| {
             CustomError::BadRequestToken(TokenError {
                 error: CoreErrorResponseType::InvalidGrant,
@@ -1487,6 +1504,7 @@ async fn token_authorization_code(
         exp: iat + ACCESS_TOKEN_TTL as i64,
         did: code_entry.did.clone(),
         name: display_name.clone(),
+        kind: Some(TokenKind::Access),
     };
     db_client
         .set_token(&opaque, &access_metadata, ACCESS_TOKEN_TTL)
@@ -1502,6 +1520,7 @@ async fn token_authorization_code(
         exp: iat + REFRESH_TOKEN_TTL as i64,
         did: code_entry.did.clone(),
         name: display_name,
+        kind: Some(TokenKind::Refresh),
     };
     db_client
         .set_token(&refresh_opaque, &refresh_metadata, REFRESH_TOKEN_TTL)
@@ -1574,11 +1593,6 @@ pub async fn authorize(
         .get_client(params.client_id.clone())
         .await
         .map_err(|e| anyhow!("Failed to get kv: {}", e))?;
-    if client_entry.is_none() {
-        return Err(CustomError::Unauthorized(
-            "Unrecognised client id.".to_string(),
-        ));
-    }
 
     let nonce: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -1586,18 +1600,12 @@ pub async fn authorize(
         .map(char::from)
         .collect();
 
-    let mut r_u = params.redirect_uri.clone().url().clone();
-    r_u.set_query(None);
-    let mut r_us: Vec<Url> = client_entry
-        .unwrap()
-        .metadata
-        .redirect_uris()
-        .clone()
-        .iter_mut()
-        .map(|u| u.url().clone())
-        .collect();
-    r_us.iter_mut().for_each(|u| u.set_query(None));
-    if !r_us.contains(&r_u) {
+    let Some(client_entry) = client_entry else {
+        return Err(CustomError::Unauthorized(
+            "Unrecognised client id.".to_string(),
+        ));
+    };
+    if !redirect_uri_is_registered(&client_entry, &params.redirect_uri) {
         return Err(CustomError::Redirect(
             "/error?message=unregistered_redirect_uri".to_string(),
         ));
@@ -1638,7 +1646,7 @@ pub async fn authorize(
         return Err(CustomError::Redirect(url.to_string()));
     }
 
-    if params.response_type.is_none() {
+    let Some(response_type) = params.response_type.as_ref() else {
         let mut url = params.redirect_uri.url().clone();
         url.query_pairs_mut().append_pair("state", &state);
         url.query_pairs_mut()
@@ -1646,8 +1654,22 @@ pub async fn authorize(
         url.query_pairs_mut()
             .append_pair("error_description", "Missing response_type");
         return Err(CustomError::Redirect(url.to_string()));
+    };
+    // Only the authorization-code flow is implemented, and discovery advertises
+    // only `code`. Any other response type goes back to the (validated)
+    // redirect URI as `unsupported_response_type` (RFC 6749 §4.1.2.1), and no
+    // login session is started.
+    if !matches!(response_type, CoreResponseType::Code) {
+        let mut url = params.redirect_uri.url().clone();
+        url.query_pairs_mut().append_pair("state", &state);
+        url.query_pairs_mut().append_pair(
+            "error",
+            CoreAuthErrorResponseType::UnsupportedResponseType.as_ref(),
+        );
+        url.query_pairs_mut()
+            .append_pair("error_description", "Only response_type=code is supported.");
+        return Err(CustomError::Redirect(url.to_string()));
     }
-    let _response_type = params.response_type.as_ref().unwrap();
 
     let scope_str = params.scope.as_str().trim();
     let scopes: Vec<&str> = scope_str.split(' ').filter(|s| !s.is_empty()).collect();
@@ -1659,6 +1681,43 @@ pub async fn authorize(
         );
     }
 
+    // Validate response_mode strictly (invalid_request semantics): discovery
+    // advertises exactly {"query","fragment"}, so anything else is a 400 rather
+    // than a silently-ignored param the client then waits on.
+    if let Some(rm) = &params.response_mode {
+        if rm != "query" && rm != "fragment" {
+            return Err(CustomError::BadRequest(format!(
+                "Unsupported response_mode '{rm}' (only 'query' and 'fragment' are supported)."
+            )));
+        }
+    }
+    // C2 Step 4b: reject `code_challenge_method=plain` up front. Discovery
+    // advertises S256 only. A missing method defaults to S256.
+    if let Some(ccm) = &params.code_challenge_method {
+        if ccm != "S256" {
+            return Err(CustomError::BadRequest(
+                "Unsupported code_challenge_method (only S256 is allowed).".to_string(),
+            ));
+        }
+    }
+    // C2 Step 4a: require S256 PKCE on every authorization request (the code
+    // flow is the only one). PKCE binds a redeemed code to the client that
+    // started the request. Every real client already sends S256 (Element X per
+    // the Matrix OAuth 2.0 profile, the in-house `siwx-oidc-auth` lib, and all
+    // e2e flows). Scope: ALL clients — every registered `ClientEntry` carries a
+    // server-issued secret regardless of `token_endpoint_auth_method`, so there
+    // is no client class that legitimately omits PKCE to exempt. The
+    // device-code grant (RFC 8628) does NOT pass through /authorize.
+    let Some(code_challenge) = params.code_challenge.clone() else {
+        return Err(CustomError::BadRequest(
+            "code_challenge is required (S256 PKCE) for the authorization-code flow.".to_string(),
+        ));
+    };
+
+    // Bind the request validated above to the login session. `sign_in` issues
+    // the code for exactly this request (client, redirect URI, state, response
+    // mode, PKCE challenge) and never for parameters it receives on the front
+    // channel, which may repeat it but not change it.
     let session_id = Uuid::new_v4();
     let session_secret: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -1675,6 +1734,13 @@ pub async fn authorize(
                 signin_count: 0,
                 verified_did: None,
                 scope: Some(params.scope.as_str().to_string()),
+                request: Some(AuthorizationRequest {
+                    client_id: params.client_id.clone(),
+                    redirect_uri: params.redirect_uri.as_str().to_string(),
+                    state: state.clone(),
+                    response_mode: params.response_mode.clone(),
+                    code_challenge: code_challenge.clone(),
+                }),
             },
         )
         .await?;
@@ -1694,73 +1760,28 @@ pub async fn authorize(
         .host()
         .map(|h| h.to_string())
         .unwrap_or_else(|| params.redirect_uri.url().scheme().to_string());
-    let oidc_nonce_param = if let Some(n) = &params.nonce {
-        format!("&oidc_nonce={}", n.secret())
-    } else {
-        "".to_string()
-    };
-    // Validate response_mode strictly (invalid_request semantics): discovery
-    // advertises exactly {"query","fragment"}, so anything else is a 400 rather
-    // than a silently-ignored param the client then waits on.
-    if let Some(rm) = &params.response_mode {
-        if rm != "query" && rm != "fragment" {
-            return Err(CustomError::BadRequest(format!(
-                "Unsupported response_mode '{rm}' (only 'query' and 'fragment' are supported)."
-            )));
-        }
+    // The login page reads these values to build its CAIP-122 message (which
+    // binds `redirect_uri` in its `Resources:`) and its link to /sign_in. Each
+    // value is percent-encoded so the page reads it back exactly: a redirect
+    // URI with several query parameters, or a state with `&` or `+`, would
+    // otherwise be cut or altered. /sign_in itself reads none of them; it
+    // takes the request from the session.
+    let mut page = url::form_urlencoded::Serializer::new(String::new());
+    page.append_pair("nonce", &nonce)
+        .append_pair("domain", &domain)
+        .append_pair("redirect_uri", params.redirect_uri.as_str())
+        .append_pair("state", &state)
+        .append_pair("client_id", &params.client_id);
+    if let Some(n) = &params.nonce {
+        page.append_pair("oidc_nonce", n.secret());
     }
-    // Round-trip the non-default mode through the login SPA to /sign_in (same
-    // client-side round-trip as the PKCE params). Absent/"query" appends
-    // nothing, keeping the SPA URL byte-identical for existing clients.
-    let response_mode_param = if params.response_mode.as_deref() == Some("fragment") {
-        "&response_mode=fragment".to_string()
-    } else {
-        "".to_string()
-    };
-    // C2 Step 4b: reject `code_challenge_method=plain` up front so a `plain`
-    // challenge is never carried into /sign_in or stored on the CodeEntry.
-    // Discovery advertises S256 only. A missing method defaults to S256.
-    if let Some(ccm) = &params.code_challenge_method {
-        if ccm != "S256" {
-            return Err(CustomError::BadRequest(
-                "Unsupported code_challenge_method (only S256 is allowed).".to_string(),
-            ));
-        }
+    page.append_pair("code_challenge", &code_challenge)
+        .append_pair("code_challenge_method", "S256");
+    // Absent/"query" appends nothing.
+    if params.response_mode.as_deref() == Some("fragment") {
+        page.append_pair("response_mode", "fragment");
     }
-    // C2 Step 4a: require S256 PKCE for the authorization-code flow. PKCE is the
-    // only backstop that binds a redeemed code to the browser that initiated the
-    // request; without it, a leaked or stolen code is freely redeemable. Every
-    // real client already sends S256 (Element X per the Matrix OAuth 2.0 profile,
-    // the in-house `siwx-oidc-auth` lib, and all e2e flows), so requiring it is a
-    // spec-compliance tightening that breaks no compliant client. Scope: ALL
-    // code-flow clients — every registered `ClientEntry` carries a server-issued
-    // secret regardless of `token_endpoint_auth_method`, so there is no client
-    // class that legitimately omits PKCE to exempt. The device-code grant (RFC
-    // 8628) does NOT pass through /authorize and is unaffected.
-    if matches!(_response_type, CoreResponseType::Code) && params.code_challenge.is_none() {
-        return Err(CustomError::BadRequest(
-            "code_challenge is required (S256 PKCE) for the authorization-code flow.".to_string(),
-        ));
-    }
-    let pkce_params = match (&params.code_challenge, &params.code_challenge_method) {
-        (Some(cc), Some(ccm)) => format!("&code_challenge={cc}&code_challenge_method={ccm}"),
-        (Some(cc), None) => format!("&code_challenge={cc}&code_challenge_method=S256"),
-        _ => "".to_string(),
-    };
-    Ok((
-        format!(
-            "/?nonce={}&domain={}&redirect_uri={}&state={}&client_id={}{}{}{}",
-            nonce,
-            domain,
-            *params.redirect_uri,
-            state,
-            params.client_id,
-            oidc_nonce_param,
-            pkce_params,
-            response_mode_param
-        ),
-        Box::new(session_cookie),
-    ))
+    Ok((format!("/?{}", page.finish()), Box::new(session_cookie)))
 }
 
 // -- SiwX sign-in ----------------------------------------------------------
@@ -1915,11 +1936,26 @@ pub fn validate_caip122_envelope(
     Ok(())
 }
 
+/// Whether `redirect_uri` is one of the client's registered redirect URIs.
+///
+/// The match is exact (RFC 9700 §4.1.3): the whole URL, query included,
+/// compared after URL parsing. A registration that carries a query (Element Web
+/// registers `…/?no_universal_links=true`) matches only that exact query, and
+/// an extra or missing query component is a different URI. This is the one
+/// matcher for both `authorize` and `sign_in`, so the two cannot disagree.
+fn redirect_uri_is_registered(client: &ClientEntry, redirect_uri: &RedirectUrl) -> bool {
+    client
+        .metadata
+        .redirect_uris()
+        .iter()
+        .any(|registered| registered.url() == redirect_uri.url())
+}
+
 /// C2 Step 3: re-validate a `redirect_uri` against the client's *registered*
-/// redirect_uris, mirroring the exact check in `authorize` (query-stripped exact
-/// match). Used by `sign_in` so a code is never appended to an unregistered (e.g.
-/// attacker-controlled) redirect_uri — closing the open-redirect on BOTH the
-/// wallet (Path B) and WebAuthn (Path A) login paths.
+/// redirect_uris with the same exact match as `authorize`
+/// ([`redirect_uri_is_registered`]). Used by `sign_in` so a code is never
+/// appended to an unregistered redirect_uri, on BOTH the wallet (Path B) and
+/// WebAuthn (Path A) login paths.
 /// Returns the client's entry, so the caller can use its registration (the
 /// device name in `sign_in`) without a second read.
 async fn validate_registered_redirect_uri(
@@ -1933,17 +1969,7 @@ async fn validate_registered_redirect_uri(
         .map_err(|e| anyhow!("Failed to get kv: {}", e))?
         .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
 
-    let mut r_u = redirect_uri.url().clone();
-    r_u.set_query(None);
-    let mut r_us: Vec<Url> = client_entry
-        .metadata
-        .redirect_uris()
-        .clone()
-        .iter_mut()
-        .map(|u| u.url().clone())
-        .collect();
-    r_us.iter_mut().for_each(|u| u.set_query(None));
-    if !r_us.contains(&r_u) {
+    if !redirect_uri_is_registered(&client_entry, redirect_uri) {
         return Err(CustomError::BadRequest(
             "redirect_uri is not registered for this client.".to_string(),
         ));
@@ -2024,19 +2050,34 @@ pub fn verify_siwx_cookie(
     Ok(siwx_cookie.did)
 }
 
-#[derive(Deserialize)]
-pub struct SignInParams {
-    pub redirect_uri: RedirectUrl,
-    pub state: String,
-    pub oidc_nonce: Option<Nonce>,
-    pub client_id: String,
-    /// PKCE code_challenge (passed through from /authorize).
-    pub code_challenge: Option<String>,
-    /// PKCE code_challenge_method. Only "S256" is accepted; "plain" is
-    /// rejected at /authorize.
-    pub code_challenge_method: Option<String>,
-    /// OAuth response_mode (passed through from /authorize; validated there).
-    pub response_mode: Option<String>,
+/// A bound request for `client_id` at `https://example.com/callback`, as
+/// `authorize` would store it. For tests that drive `sign_in` directly.
+#[cfg(test)]
+pub(crate) fn bound_test_request(client_id: &str) -> AuthorizationRequest {
+    AuthorizationRequest {
+        client_id: client_id.to_string(),
+        redirect_uri: "https://example.com/callback".to_string(),
+        state: "state".to_string(),
+        response_mode: None,
+        code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
+    }
+}
+
+/// The authorization request this sign-in completes: the one `/authorize`
+/// validated and bound to the session. It is the only source of the client,
+/// redirect URI, state, response mode, PKCE challenge and nonce: `sign_in`
+/// reads no authorization parameter from its own query. The login page still
+/// appends them to its `/sign_in` link (encoded with `encodeURI`, which alters
+/// `&`, `+` and other characters in a state or redirect URI); they are never
+/// parsed.
+fn bound_request(session: &SessionEntry) -> Result<AuthorizationRequest, CustomError> {
+    session.request.clone().ok_or_else(|| {
+        CustomError::BadRequest(
+            "This sign-in has no bound authorization request (it was started before a \
+             server update). Restart the sign-in from the application."
+                .to_string(),
+        )
+    })
 }
 
 /// Extract a device_id from a scope string containing `urn:matrix:client:device:XXX`.
@@ -2489,7 +2530,6 @@ pub async fn sign_in(
     _base_url: &Url,
     allowed_did_methods: &[String],
     allowed_pkh_namespaces: &[String],
-    params: SignInParams,
     cookies: headers::Cookie,
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
@@ -2508,6 +2548,12 @@ pub async fn sign_in(
     } else {
         return Err(CustomError::BadRequest("Session not found".to_string()));
     };
+
+    // The request this sign-in completes, as `/authorize` bound it. Checked
+    // before the session is spent.
+    let request = bound_request(&session_entry)?;
+    let redirect_uri = RedirectUrl::new(request.redirect_uri.clone())
+        .map_err(|e| anyhow!("bound redirect_uri does not parse: {}", e))?;
 
     // Atomically mark session as signed-in (prevents race-condition double sign-in).
     if !db_client
@@ -2610,7 +2656,7 @@ pub async fn sign_in(
             return Err(CustomError::BadRequest("Nonce mismatch".to_string()));
         }
 
-        let redirect_url = params.redirect_uri.url();
+        let redirect_url = redirect_uri.url();
         if !extract_resources(&siwx_cookie.message)
             .iter()
             .any(|r| Url::parse(r).ok().as_ref() == Some(redirect_url))
@@ -2672,17 +2718,15 @@ pub async fn sign_in(
     // `axum_lib::detected_mxid_for` and `webauthn_authenticate_finish`.
     crate::webauthn::reject_if_deactivated(synapse_client, &did).await?;
 
-    // C2 Step 3: re-validate the request redirect_uri against the client's
-    // registered set before issuing the code. `authorize` checks this, but
-    // `sign_in` re-receives `redirect_uri` as a query param and previously
-    // appended the code to whatever URL was supplied. This closes the open
-    // redirect on BOTH the wallet (Path B) and WebAuthn (Path A) paths. Path B
-    // additionally binds the redirect via the signed `Resources:` list above;
-    // this is the only redirect binding Path A has.
+    // C2 Step 3: re-validate the bound redirect_uri against the client's
+    // registered set before issuing the code. `authorize` matched it when it
+    // bound the request; this re-check covers a registration that changed or
+    // expired since, on BOTH the wallet (Path B) and WebAuthn (Path A) paths.
+    // Path B additionally binds the redirect via the signed `Resources:` list
+    // above.
     let client =
-        validate_registered_redirect_uri(&params.client_id, &params.redirect_uri, db_client)
-            .await?;
-    let device_name = device_display_name(&params.client_id, Some(&client));
+        validate_registered_redirect_uri(&request.client_id, &redirect_uri, db_client).await?;
+    let device_name = device_display_name(&request.client_id, Some(&client));
 
     // Extract client-proposed device_id from the session's stored scope (if any).
     let proposed_device_id = session_entry
@@ -2717,12 +2761,12 @@ pub async fn sign_in(
 
     let code_entry = CodeEntry {
         did: did.clone(),
-        nonce: params.oidc_nonce.clone(),
+        nonce: session_entry.oidc_nonce.clone(),
         exchange_count: 0,
-        client_id: params.client_id.clone(),
+        client_id: request.client_id.clone(),
         auth_time: Utc::now(),
-        code_challenge: params.code_challenge.clone(),
-        code_challenge_method: params.code_challenge_method.clone(),
+        code_challenge: Some(request.code_challenge.clone()),
+        code_challenge_method: Some("S256".to_string()),
         localpart: Some(resolved.localpart.clone()),
         device_id,
     };
@@ -2730,8 +2774,8 @@ pub async fn sign_in(
     let code = Uuid::new_v4();
     db_client.set_code(code.to_string(), code_entry).await?;
 
-    let mut url = params.redirect_uri.url().clone();
-    if params.response_mode.as_deref() == Some("fragment") {
+    let mut url = redirect_uri.url().clone();
+    if request.response_mode.as_deref() == Some("fragment") {
         // matrix-js-sdk v42 requested `response_mode=fragment` on /authorize
         // (round-tripped here via the login SPA) and reads the authorization
         // response ONLY from the URL fragment. ALL response params go in the
@@ -2739,12 +2783,12 @@ pub async fn sign_in(
         // untouched with nothing appended to it.
         let fragment = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("code", &code.to_string())
-            .append_pair("state", &params.state)
+            .append_pair("state", &request.state)
             .finish();
         url.set_fragment(Some(&fragment));
     } else {
         url.query_pairs_mut().append_pair("code", &code.to_string());
-        url.query_pairs_mut().append_pair("state", &params.state);
+        url.query_pairs_mut().append_pair("state", &request.state);
     }
     // Surface the resolved DID alongside the redirect so the HTTP handler can mint
     // the opaque login user-session cookie ONLY on this success path (a real login
@@ -2964,29 +3008,27 @@ pub enum UserInfoResponse {
 /// put a network call on a hot, read-only endpoint to recompute a value the
 /// struct already carries.
 ///
-/// # Both `None` cases mean "omit", and both are honest
+/// # Both "omit" cases are honest
 ///
 /// - `server_name = None` — a standalone deployment. There is no homeserver, so
 ///   there is no Matrix ID; a guessed one would name an account on a server that
 ///   does not exist.
-/// - `localpart = None` — the legacy `CodeEntry` fallback path, for an entry
-///   written before `CodeEntry.localpart` existed. That field's own doc blesses
-///   `legacy_localpart(did)` as the fallback for PROVISIONING continuity, where
-///   the alternative is severing a user from their account. This is not that:
-///   a userinfo claim is a statement of fact to a relying party, and the honest
-///   answer to "which localpart did we resolve for this session" is "this entry
-///   does not record one". An omitted claim degrades a consumer to the lookup it
-///   would have done anyway (`GET /resolve?did=…`, see [`crate::resolve`]); a
-///   derived one could quietly name the wrong account.
-fn mxid_claim(config: &crate::config::Config, localpart: Option<&str>) -> SiwxAdditionalClaims {
-    let mxid = match (config.matrix_server_name.as_deref(), localpart) {
-        // An empty localpart is treated as absent rather than rendered as
-        // `@:server`. Deviceless/admin-minted tokens are the shape that can
-        // carry one, and `@:server` is not a Matrix ID, it is a parse error
-        // waiting at the consumer.
-        (Some(server_name), Some(localpart)) if !localpart.is_empty() => Some(
-            crate::synapse_client::matrix_user_id(localpart, server_name),
-        ),
+/// - an empty `localpart` — the token records no localpart. The claim is then
+///   omitted, never derived from the DID: `legacy_localpart(did)` is a fallback
+///   for PROVISIONING continuity, where the alternative is severing a user from
+///   their account. This is not that: a userinfo claim is a statement of fact
+///   to a relying party, and the honest answer to "which localpart did we
+///   resolve for this session" is "this token does not record one". An omitted
+///   claim degrades a consumer to the lookup it would have done anyway
+///   (`GET /resolve?did=…`, see [`crate::resolve`]); a derived one could quietly
+///   name the wrong account. `@:server` would not be a Matrix ID either, but a
+///   parse error waiting at the consumer.
+fn mxid_claim(config: &crate::config::Config, localpart: &str) -> SiwxAdditionalClaims {
+    let mxid = match config.matrix_server_name.as_deref() {
+        Some(server_name) if !localpart.is_empty() => Some(crate::synapse_client::matrix_user_id(
+            localpart,
+            server_name,
+        )),
         _ => None,
     };
     SiwxAdditionalClaims { mxid }
@@ -3019,53 +3061,28 @@ pub async fn userinfo(
         return Err(CustomError::BadRequest("Missing access token.".to_string()));
     };
 
-    // Try TokenMetadata first (covers both MSC3861 mat_ tokens and standalone tokens).
-    if let Some(metadata) = db_client.get_token(&token_str).await? {
-        if metadata.exp <= Utc::now().timestamp() {
-            return Err(CustomError::BadRequest("Token expired.".to_string()));
-        }
-        let client_entry = db_client
-            .get_client(metadata.client_id.clone())
-            .await?
-            .ok_or_else(|| CustomError::BadRequest("Unknown client.".to_string()))?;
-        // `metadata.username` IS the localpart (see `TokenMetadata::username`),
-        // already resolved through the grandfathering rule at sign-in.
-        let additional = mxid_claim(config, Some(metadata.username.as_str()));
-        let response =
-            SiwxUserInfoClaims::new(resolve_claims(config, &metadata.did).await, additional)
-                .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
-                .set_audiences(Some(vec![Audience::new(metadata.client_id)]));
-        return match client_entry.metadata.userinfo_signed_response_alg() {
-            None => Ok(UserInfoResponse::Json(response)),
-            Some(alg) => Ok(UserInfoResponse::Jwt(
-                SiwxUserInfoJsonWebToken::new(response, signing_key, alg.clone())
-                    .map_err(|_| anyhow!("Error signing response."))?,
-            )),
-        };
+    // Only an access token is a bearer credential (MSC3861 `mat_` tokens and
+    // standalone tokens alike). An authorization code, a refresh token and an
+    // unknown string all get the same answer: a code is redeemable only at the
+    // token endpoint, with its PKCE verifier.
+    let metadata = db_client
+        .get_token(&token_str)
+        .await?
+        .filter(|m| m.is_kind(TokenKind::Access))
+        .ok_or_else(|| CustomError::BadRequest("Unknown token.".to_string()))?;
+    if metadata.exp <= Utc::now().timestamp() {
+        return Err(CustomError::BadRequest("Token expired.".to_string()));
     }
-
-    // Legacy fallback: UUID-based access token backed by code entry (pre-refresh-token deployments).
-    let code_entry = if let Some(c) = db_client.get_code(token_str).await? {
-        c
-    } else {
-        return Err(CustomError::BadRequest("Unknown token.".to_string()));
-    };
-
-    let client_entry = if let Some(c) = db_client.get_client(code_entry.client_id.clone()).await? {
-        c
-    } else {
-        return Err(CustomError::BadRequest("Unknown client.".to_string()));
-    };
-
-    // The legacy path's localpart is an `Option`: a `CodeEntry` written before
-    // that field existed carries `None`, and `mxid_claim` then OMITS the claim
-    // rather than deriving one — see its doc for why a derivation would be a
-    // worse answer than silence here.
-    let additional = mxid_claim(config, code_entry.localpart.as_deref());
-    let response =
-        SiwxUserInfoClaims::new(resolve_claims(config, &code_entry.did).await, additional)
-            .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
-            .set_audiences(Some(vec![Audience::new(code_entry.client_id)]));
+    let client_entry = db_client
+        .get_client(metadata.client_id.clone())
+        .await?
+        .ok_or_else(|| CustomError::BadRequest("Unknown client.".to_string()))?;
+    // `metadata.username` IS the localpart (see `TokenMetadata::username`),
+    // already resolved through the grandfathering rule at sign-in.
+    let additional = mxid_claim(config, &metadata.username);
+    let response = SiwxUserInfoClaims::new(resolve_claims(config, &metadata.did).await, additional)
+        .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
+        .set_audiences(Some(vec![Audience::new(metadata.client_id)]));
     match client_entry.metadata.userinfo_signed_response_alg() {
         None => Ok(UserInfoResponse::Json(response)),
         Some(alg) => Ok(UserInfoResponse::Jwt(
@@ -3411,6 +3428,239 @@ mod tests {
         nonce: String,
     }
 
+    /// The PKCE example pair from RFC 7636, Appendix B.
+    const RFC7636_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const RFC7636_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+    fn code_request(response_type: CoreResponseType) -> AuthorizeParams {
+        AuthorizeParams {
+            client_id: "client".into(),
+            redirect_uri: RedirectUrl::new("https://example.com".into()).unwrap(),
+            scope: Scope::new("openid".to_string()),
+            response_type: Some(response_type),
+            state: Some("state".into()),
+            nonce: Some(Nonce::new("oidc-nonce".into())),
+            prompt: None,
+            request_uri: None,
+            request: None,
+            code_challenge: Some(RFC7636_CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
+            response_mode: None,
+        }
+    }
+
+    /// `authorize` refuses every response type but `code`, back to the
+    /// validated redirect URI with `unsupported_response_type` and the state.
+    #[tokio::test]
+    async fn authorize_refuses_every_response_type_but_code() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        for response_type in [
+            CoreResponseType::IdToken,
+            CoreResponseType::Token,
+            CoreResponseType::None,
+        ] {
+            match authorize(code_request(response_type.clone()), &db_client).await {
+                Err(CustomError::Redirect(url)) => {
+                    let url = Url::parse(&url).unwrap();
+                    let q: std::collections::HashMap<_, _> = url.query_pairs().collect();
+                    assert_eq!(url.host_str(), Some("example.com"), "{url}");
+                    assert_eq!(
+                        q.get("error").map(|v| v.as_ref()),
+                        Some("unsupported_response_type"),
+                        "{url}"
+                    );
+                    assert_eq!(q.get("state").map(|v| v.as_ref()), Some("state"), "{url}");
+                }
+                other => panic!("{response_type:?} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// `authorize` binds the validated request to the session it starts.
+    #[tokio::test]
+    async fn authorize_binds_the_request_to_the_session() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        let mut params = code_request(CoreResponseType::Code);
+        params.response_mode = Some("fragment".into());
+        let (_url, cookie) = authorize(params, &db_client).await.unwrap();
+        let session = db_client
+            .get_session(cookie.value().to_string())
+            .await
+            .unwrap()
+            .expect("authorize stores the session");
+        assert_eq!(
+            session.request,
+            Some(AuthorizationRequest {
+                client_id: "client".into(),
+                redirect_uri: "https://example.com".into(),
+                state: "state".into(),
+                response_mode: Some("fragment".into()),
+                code_challenge: RFC7636_CHALLENGE.into(),
+            })
+        );
+        assert_eq!(
+            session.oidc_nonce.as_ref().map(|n| n.secret().as_str()),
+            Some("oidc-nonce")
+        );
+    }
+
+    fn session_with(request: Option<AuthorizationRequest>) -> SessionEntry {
+        SessionEntry {
+            siwe_nonce: "n".into(),
+            oidc_nonce: Some(Nonce::new("oidc-nonce".into())),
+            secret: "s".into(),
+            signin_count: 0,
+            verified_did: None,
+            scope: None,
+            request,
+        }
+    }
+
+    const ROUND_TRIP_REDIRECT: &str = "https://example.com/callback?a=1&b=2";
+    const ROUND_TRIP_STATE: &str = "st+a&b c";
+
+    async fn seed_round_trip_client(db: &RedisClient, client_id: &str) {
+        db.set_client(
+            client_id.to_string(),
+            ClientEntry {
+                secret: "secret".into(),
+                metadata: CoreClientMetadata::new(
+                    vec![RedirectUrl::new(ROUND_TRIP_REDIRECT.into()).unwrap()],
+                    EmptyAdditionalClientMetadata {},
+                ),
+                access_token: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `authorize` hands the login page every value percent-encoded, so the
+    /// page reads back the exact redirect URI (which its CAIP-122 message
+    /// binds) and state, even with several query parameters or `&` and `+`.
+    #[tokio::test]
+    async fn authorize_hands_the_login_page_the_exact_values() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        let client_id = format!("round-trip-{}", Uuid::new_v4().simple());
+        seed_round_trip_client(&db_client, &client_id).await;
+        let mut params = code_request(CoreResponseType::Code);
+        params.client_id = client_id.clone();
+        params.redirect_uri = RedirectUrl::new(ROUND_TRIP_REDIRECT.into()).unwrap();
+        params.state = Some(ROUND_TRIP_STATE.into());
+        let (page_url, _cookie) = authorize(params, &db_client).await.unwrap();
+        let page = Url::parse(&format!("https://login.example{page_url}")).unwrap();
+        let q: std::collections::HashMap<_, _> = page.query_pairs().into_owned().collect();
+        assert_eq!(
+            q.get("redirect_uri").map(String::as_str),
+            Some(ROUND_TRIP_REDIRECT)
+        );
+        assert_eq!(q.get("state").map(String::as_str), Some(ROUND_TRIP_STATE));
+        assert_eq!(q.get("client_id"), Some(&client_id));
+        assert_eq!(q.get("oidc_nonce").map(String::as_str), Some("oidc-nonce"));
+        assert_eq!(
+            q.get("code_challenge").map(String::as_str),
+            Some(RFC7636_CHALLENGE)
+        );
+        assert_eq!(
+            q.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert!(
+            !q.contains_key("response_mode"),
+            "query mode is not forwarded"
+        );
+    }
+
+    /// `sign_in` reads no authorization parameter from its query (it takes
+    /// none): the code goes to the bound redirect URI with the bound state, and
+    /// the stored code carries the bound client, challenge and nonce.
+    #[tokio::test]
+    async fn sign_in_issues_the_code_for_the_bound_request() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        let nonce = Uuid::new_v4().simple().to_string();
+        let client_id = format!("round-trip-{nonce}");
+        seed_round_trip_client(&db_client, &client_id).await;
+        let session_id = format!("round-trip-{nonce}");
+        db_client
+            .set_session(
+                session_id.clone(),
+                SessionEntry {
+                    siwe_nonce: nonce.clone(),
+                    oidc_nonce: Some(Nonce::new("oidc-nonce".into())),
+                    secret: "secret".into(),
+                    signin_count: 0,
+                    verified_did: Some("did:key:zDnaeBOUNDREQUEST".into()),
+                    scope: None,
+                    request: Some(AuthorizationRequest {
+                        client_id: client_id.clone(),
+                        redirect_uri: ROUND_TRIP_REDIRECT.into(),
+                        state: ROUND_TRIP_STATE.into(),
+                        response_mode: None,
+                        code_challenge: RFC7636_CHALLENGE.into(),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
+        );
+        let (url, _did) = sign_in(
+            &Url::parse("https://example.com").unwrap(),
+            &["key".to_string()],
+            &[],
+            headers.typed_get::<headers::Cookie>().unwrap(),
+            &db_client,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            url.as_str()
+                .starts_with(&format!("{ROUND_TRIP_REDIRECT}&code=")),
+            "the code goes to the bound redirect URI: {url}"
+        );
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q.get("a").map(String::as_str), Some("1"));
+        assert_eq!(q.get("b").map(String::as_str), Some("2"));
+        assert_eq!(q.get("state").map(String::as_str), Some(ROUND_TRIP_STATE));
+        let entry = db_client
+            .try_consume_code(q["code"].clone())
+            .await
+            .unwrap()
+            .expect("the code is stored");
+        assert_eq!(entry.client_id, client_id);
+        assert_eq!(entry.code_challenge.as_deref(), Some(RFC7636_CHALLENGE));
+        assert_eq!(entry.code_challenge_method.as_deref(), Some("S256"));
+        assert_eq!(
+            entry.nonce.as_ref().map(|n| n.secret().as_str()),
+            Some("oidc-nonce")
+        );
+    }
+
+    /// A session written by an older build carries no bound request; the
+    /// sign-in is refused with a clear "restart" error.
+    #[test]
+    fn a_session_without_a_bound_request_is_refused() {
+        match bound_request(&session_with(None)) {
+            Err(CustomError::BadRequest(msg)) => assert!(msg.contains("Restart"), "{msg}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     #[derive(Deserialize)]
     struct SignInQueryParams {
         code: String,
@@ -3450,20 +3700,19 @@ mod tests {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(base_url.clone()),
             scope: Scope::new("openid".to_string()),
-            response_type: Some(CoreResponseType::IdToken),
+            response_type: Some(CoreResponseType::Code),
             state: Some("state".into()),
             nonce: None,
             prompt: None,
             request_uri: None,
             request: None,
-            code_challenge: None,
-            code_challenge_method: None,
+            code_challenge: Some(RFC7636_CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
             response_mode: None,
         };
         let (redirect_url, cookie) = authorize(params, &db_client).await.unwrap();
         let authorize_params: AuthorizeQueryParams =
             serde_urlencoded::from_str(redirect_url.split("/?").collect::<Vec<&str>>()[1]).unwrap();
-        let params: SignInParams = serde_urlencoded::from_str(&redirect_url).unwrap();
 
         // Build the CAIP-122 message (EIP-4361 format for eip155). The login
         // path now enforces the Expiration Time (C1 safe subset), so include a
@@ -3508,7 +3757,6 @@ mod tests {
             &base_url,
             &default_methods,
             &default_namespaces,
-            params,
             cookie,
             &db_client,
             None, // no synapse_client in tests
@@ -3525,12 +3773,51 @@ mod tests {
         let signin_params: SignInQueryParams =
             serde_urlencoded::from_str(redirect_url.query().unwrap()).unwrap();
         let oidc_signing_key = EcdsaSigningKey::generate();
+        // The code is not a bearer token: /userinfo refuses it.
+        assert!(
+            userinfo(
+                &config,
+                &oidc_signing_key,
+                None,
+                UserInfoPayload {
+                    access_token: Some(signin_params.code.clone()),
+                },
+                &db_client,
+            )
+            .await
+            .is_err(),
+            "/userinfo must refuse an authorization code"
+        );
+        // It is exchanged at the token endpoint, and the access token from the
+        // exchange is accepted at /userinfo.
+        let tokens = token(
+            TokenForm {
+                code: Some(signin_params.code),
+                client_id: Some("client".into()),
+                client_secret: Some("secret".into()),
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(RFC7636_VERIFIER.into()),
+                refresh_token: None,
+                device_code: None,
+            },
+            None,
+            &oidc_signing_key,
+            &config,
+            &db_client,
+            None,
+        )
+        .await
+        .unwrap();
         let _ = userinfo(
             &config,
             &oidc_signing_key,
             None,
             UserInfoPayload {
-                access_token: Some(signin_params.code),
+                access_token: Some(
+                    openidconnect::OAuth2TokenResponse::access_token(&tokens)
+                        .secret()
+                        .clone(),
+                ),
             },
             &db_client,
         )
@@ -3558,14 +3845,14 @@ mod tests {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(base_url.clone()),
             scope: Scope::new("openid".to_string()),
-            response_type: Some(CoreResponseType::IdToken),
+            response_type: Some(CoreResponseType::Code),
             state: Some("state".into()),
             nonce: None,
             prompt: None,
             request_uri: None,
             request: None,
-            code_challenge: None,
-            code_challenge_method: None,
+            code_challenge: Some(RFC7636_CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
             response_mode: Some("fragment".into()),
         };
         let (redirect_url, cookie) = authorize(params, &db_client).await.unwrap();
@@ -3575,10 +3862,6 @@ mod tests {
         );
         let authorize_params: AuthorizeQueryParams =
             serde_urlencoded::from_str(redirect_url.split("/?").collect::<Vec<&str>>()[1]).unwrap();
-        // Same client round-trip as the real SPA: SignInParams reads
-        // response_mode back out of the forwarded URL.
-        let params: SignInParams = serde_urlencoded::from_str(&redirect_url).unwrap();
-        assert_eq!(params.response_mode.as_deref(), Some("fragment"));
 
         let expiration_time =
             (Utc::now() + Duration::hours(48)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -3614,7 +3897,6 @@ mod tests {
             &base_url,
             &["pkh".to_string()],
             &["eip155".to_string()],
-            params,
             cookie,
             &db_client,
             None,
@@ -3638,6 +3920,52 @@ mod tests {
             fragment.contains("state=state"),
             "fragment must carry the state: {redirect_url}"
         );
+    }
+
+    /// Redirect URIs match the registration exactly, query included.
+    #[test]
+    fn redirect_uri_matching_is_exact() {
+        let client = |registered: &str| ClientEntry {
+            secret: "secret".into(),
+            metadata: CoreClientMetadata::new(
+                vec![RedirectUrl::new(registered.into()).unwrap()],
+                EmptyAdditionalClientMetadata {},
+            ),
+            access_token: None,
+        };
+        let uri = |u: &str| RedirectUrl::new(u.into()).unwrap();
+
+        let plain = client("https://example.com/cb");
+        assert!(redirect_uri_is_registered(
+            &plain,
+            &uri("https://example.com/cb")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &plain,
+            &uri("https://example.com/cb?x=1")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &plain,
+            &uri("https://example.com/cb/x")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &plain,
+            &uri("https://example.com/cb#x")
+        ));
+
+        let with_query = client("https://example.com/?no_universal_links=true");
+        assert!(redirect_uri_is_registered(
+            &with_query,
+            &uri("https://example.com/?no_universal_links=true")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &with_query,
+            &uri("https://example.com/")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &with_query,
+            &uri("https://example.com/?no_universal_links=true&x=1")
+        ));
     }
 
     #[tokio::test]
@@ -3837,6 +4165,18 @@ mod tests {
             off.get(RESOLVE_ENDPOINT_METADATA_KEY).is_none(),
             "a deployment that would answer 503 must not advertise the route"
         );
+    }
+
+    /// Discovery advertises exactly the response types `authorize` accepts.
+    #[test]
+    fn discovery_advertises_only_the_code_response_type() {
+        for matrix_ready in [true, false] {
+            let value = provider_metadata_value(&discovery_config(), matrix_ready).unwrap();
+            assert_eq!(
+                value["response_types_supported"],
+                serde_json::json!(["code"])
+            );
+        }
     }
 
     #[test]
@@ -4944,8 +5284,8 @@ mod provision_synapse_device_tests {
 /// (see [`userinfo`]'s doc).
 ///
 /// Redis-backed, like the rest of this file's token tests: `userinfo` resolves
-/// its caller through `get_token`/`get_code`, and stubbing that out would test a
-/// different function than the one that ships.
+/// its caller through `get_token`, and stubbing that out would test a different
+/// function than the one that ships.
 #[cfg(test)]
 mod userinfo_mxid_claim_tests {
     use super::*;
@@ -5012,6 +5352,7 @@ mod userinfo_mxid_claim_tests {
             exp: i64::MAX,
             did: DID.to_string(),
             name: "n".to_string(),
+            kind: Some(TokenKind::Access),
         }
     }
 
@@ -5102,53 +5443,94 @@ mod userinfo_mxid_claim_tests {
         );
     }
 
-    /// The legacy `CodeEntry` fallback path (`get_code`, pre-refresh-token
-    /// deployments) carries an `Option<String>` localpart. Both spellings are
-    /// pinned here because the `None` arm is the one that must NOT derive a
-    /// localpart from the DID — see `mxid_claim`'s doc.
+    /// A token that records no localpart omits the claim; it is never derived
+    /// from the DID, which could name a different account than the one this
+    /// session was provisioned under. See `mxid_claim`'s doc.
     #[tokio::test]
-    async fn legacy_code_entry_path_reports_a_recorded_localpart_and_omits_an_absent_one() {
+    async fn a_token_without_a_recorded_localpart_omits_the_claim_rather_than_deriving_one() {
         let Some(db) = db().await else {
             return;
         };
-        let client_id = format!("mxid-claim-legacy-{}", nonce());
+        let client_id = format!("mxid-claim-no-localpart-{}", nonce());
         seed_client(&db, &client_id, false).await.unwrap();
-        let config = config_with_server_name(Some(SERVER_NAME));
-
-        let entry = |localpart: Option<&str>| CodeEntry {
-            exchange_count: 0,
-            did: DID.to_string(),
-            nonce: None,
-            client_id: client_id.clone(),
-            auth_time: Utc::now(),
-            code_challenge: None,
-            code_challenge_method: None,
-            device_id: None,
-            localpart: localpart.map(str::to_string),
-        };
-
-        let with_localpart = format!("code_{}", nonce());
-        db.set_code(with_localpart.clone(), entry(Some(LOCALPART)))
+        let token = format!("tok_{}", nonce());
+        db.set_token(&token, &token_meta(&client_id, ""), 120)
             .await
             .unwrap();
-        let body = userinfo_json(&config, &db, &with_localpart).await;
-        assert_eq!(
-            body.get(CLAIM).and_then(|v| v.as_str()),
-            Some(format!("@{LOCALPART}:{SERVER_NAME}").as_str()),
-            "a CodeEntry that RECORDS a localpart reports it: {body}"
-        );
 
-        let without_localpart = format!("code_{}", nonce());
-        db.set_code(without_localpart.clone(), entry(None))
-            .await
-            .unwrap();
-        let body = userinfo_json(&config, &db, &without_localpart).await;
+        let body = userinfo_json(&config_with_server_name(Some(SERVER_NAME)), &db, &token).await;
+
         assert!(
             body.get(CLAIM).is_none(),
-            "a pre-migration CodeEntry records no localpart, and userinfo must say \
-             nothing rather than DERIVE one — a derived value could name a different \
-             account than the one this session was provisioned under: {body}"
+            "a token with no recorded localpart must not carry a derived Matrix ID: {body}"
         );
+        assert_eq!(
+            body.get("sub").and_then(|v| v.as_str()),
+            Some(DID),
+            "`sub` is still the exact-case DID"
+        );
+    }
+
+    /// Only an access token is a bearer credential at `/userinfo`: an
+    /// authorization code and a refresh token are refused like unknown tokens.
+    #[tokio::test]
+    async fn userinfo_accepts_only_an_access_token() {
+        let Some(db) = db().await else {
+            return;
+        };
+        let client_id = format!("mxid-claim-kinds-{}", nonce());
+        seed_client(&db, &client_id, false).await.unwrap();
+        let config = config_with_server_name(Some(SERVER_NAME));
+        let key = EcdsaSigningKey::generate();
+
+        let code = format!("code_{}", nonce());
+        db.set_code(
+            code.clone(),
+            CodeEntry {
+                exchange_count: 0,
+                did: DID.to_string(),
+                nonce: None,
+                client_id: client_id.clone(),
+                auth_time: Utc::now(),
+                code_challenge: None,
+                code_challenge_method: None,
+                device_id: None,
+                localpart: Some(LOCALPART.to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let refresh = format!("tok_{}", nonce());
+        db.set_token(
+            &refresh,
+            &TokenMetadata {
+                kind: Some(TokenKind::Refresh),
+                ..token_meta(&client_id, LOCALPART)
+            },
+            120,
+        )
+        .await
+        .unwrap();
+
+        for (what, token) in [
+            ("an authorization code", code),
+            ("a refresh token", refresh),
+        ] {
+            let out = userinfo(
+                &config,
+                &key,
+                None,
+                UserInfoPayload {
+                    access_token: Some(token),
+                },
+                &db,
+            )
+            .await;
+            assert!(
+                matches!(out, Err(CustomError::BadRequest(ref m)) if m == "Unknown token."),
+                "/userinfo must refuse {what} like an unknown token"
+            );
+        }
     }
 
     /// The signed-JWT variant must carry the same claim. See this module's doc,
@@ -5395,6 +5777,7 @@ mod sign_in_deactivation_order_tests {
                 signin_count: 0,
                 verified_did: Some(DID.to_string()),
                 scope: None,
+                request: Some(bound_test_request(&client_id)),
             },
         )
         .await
@@ -5405,21 +5788,11 @@ mod sign_in_deactivation_order_tests {
             HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
         );
         let cookies = headers.typed_get::<headers::Cookie>().unwrap();
-        let params = SignInParams {
-            redirect_uri: RedirectUrl::new(REDIRECT.into()).unwrap(),
-            state: "state".into(),
-            oidc_nonce: None,
-            client_id,
-            code_challenge: None,
-            code_challenge_method: None,
-            response_mode: None,
-        };
 
         let result = sign_in(
             &Url::parse("https://example.com").unwrap(),
             &["key".to_string()],
             &[],
-            params,
             cookies,
             &db,
             Some(&synapse),
@@ -5717,6 +6090,7 @@ mod device_display_name_tests {
                 signin_count: 0,
                 verified_did: Some(DID.to_string()),
                 scope: None,
+                request: Some(bound_test_request(&client_id)),
             },
         )
         .await
@@ -5726,20 +6100,10 @@ mod device_display_name_tests {
             "cookie",
             HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
         );
-        let params = SignInParams {
-            redirect_uri: RedirectUrl::new(REDIRECT.into()).unwrap(),
-            state: "state".into(),
-            oidc_nonce: None,
-            client_id: client_id.clone(),
-            code_challenge: None,
-            code_challenge_method: None,
-            response_mode: None,
-        };
         sign_in(
             &Url::parse("https://example.com").unwrap(),
             &["key".to_string()],
             &[],
-            params,
             headers.typed_get::<headers::Cookie>().unwrap(),
             &db,
             Some(&synapse),

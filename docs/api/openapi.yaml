@@ -122,6 +122,9 @@ paths:
         `op_policy_uri` are present only when the operator configured them
         (`SIWXOIDC_OP_TOS_URI`, `SIWXOIDC_OP_POLICY_URI`); there is no
         default. The login page reads them here for its footer.
+
+        `response_types_supported` is exactly `["code"]`: the
+        authorization-code flow is the only one `/authorize` accepts.
       responses:
         "200":
           description: Provider metadata.
@@ -167,18 +170,34 @@ paths:
       operationId: authorize
       summary: Begin an authorization-code flow
       description: |
-        Standard OIDC authorization request. Issues the `siwx` session cookie
-        and the CAIP-122 nonce the client signs, then renders the login page.
+        Standard OIDC authorization request, authorization-code flow only.
+        Issues the `session` cookie and the CAIP-122 nonce the client signs,
+        then redirects to the login page.
+
+        - `response_type` must be `code`. Any other value is answered by a
+          redirect to the (validated) `redirect_uri` with
+          `error=unsupported_response_type` and the `state`.
+        - PKCE is required: `code_challenge` with `code_challenge_method=S256`
+          (the default). A missing challenge or another method is a 400.
+        - `redirect_uri` must equal one of the client's registered redirect
+          URIs exactly, query included (RFC 9700 §4.1.3); otherwise the browser
+          is sent to `/error?message=unregistered_redirect_uri`.
+
+        The validated request (client, redirect URI, state, response mode,
+        PKCE challenge) is bound to the session; `/sign_in` issues the code for
+        exactly that request.
       parameters:
         - { name: client_id, in: query, required: true, schema: { type: string } }
         - { name: redirect_uri, in: query, required: true, schema: { type: string, format: uri } }
-        - { name: response_type, in: query, required: true, schema: { type: string } }
-        - { name: scope, in: query, required: false, schema: { type: string } }
-        - { name: state, in: query, required: false, schema: { type: string } }
+        - { name: response_type, in: query, required: true, schema: { type: string, enum: [code] } }
+        - { name: scope, in: query, required: true, schema: { type: string } }
+        - { name: state, in: query, required: true, schema: { type: string } }
         - { name: nonce, in: query, required: false, schema: { type: string } }
+        - { name: code_challenge, in: query, required: true, schema: { type: string } }
+        - { name: code_challenge_method, in: query, required: false, schema: { type: string, enum: [S256] } }
+        - { name: response_mode, in: query, required: false, schema: { type: string, enum: [query, fragment] } }
       responses:
-        "200": { description: The login page. }
-        "302": { description: Redirect back to the relying party. }
+        "303": { description: Redirect to the login page, or back to the relying party with an OAuth error. }
         "400": { $ref: "#/components/responses/BadRequest" }
 
   /sign_in:
@@ -189,7 +208,16 @@ paths:
       description: |
         Reads the verified DID — from the `siwx` cookie's CAIP-122 signature, or
         from the server-side session a WebAuthn ceremony wrote — and redirects
-        to the relying party with an authorization code.
+        to the relying party with an authorization code for the request
+        `/authorize` bound to the session: its client, redirect URI, state,
+        response mode and PKCE challenge.
+
+        No query parameter is read. The login page still appends the
+        authorization parameters (`redirect_uri`, `state`, `client_id`,
+        `oidc_nonce`, `code_challenge`, `code_challenge_method`,
+        `response_mode`) to its link; they are ignored. A session started
+        before the request was bound (an older server build) is refused with
+        a restart-sign-in error.
 
         This is also the single point where a Matrix account is provisioned: the
         localpart is resolved (honouring grandfathering), the alias is seeded on
@@ -200,7 +228,8 @@ paths:
       security:
         - sessionCookie: []
       responses:
-        "302": { description: Redirect to `redirect_uri` with `code` and `state`. }
+        "303": { description: Redirect to the bound `redirect_uri` with `code` and the bound `state`. }
+        "400": { description: The session has no bound request, or the CAIP-122 proof is invalid. }
         "401": { description: The account is deactivated, or the ceremony did not verify. }
 
   /token:
@@ -211,6 +240,11 @@ paths:
       description: |
         Supports `authorization_code`, `refresh_token` and
         `urn:ietf:params:oauth:grant-type:device_code`.
+
+        `authorization_code`: the code is single use (deleted on exchange) and
+        needs the PKCE `code_verifier` for the challenge bound at `/authorize`.
+        `refresh_token`: accepts only a refresh token; an access token (a
+        minted admin token included) is `invalid_grant`, like an unknown one.
 
         Refresh rotates both tokens. A bounded grace pointer (60s) lets a client
         that LOST the rotation response — common on mobile — replay the old
@@ -230,6 +264,7 @@ paths:
                 redirect_uri: { type: string, format: uri }
                 client_id: { type: string }
                 client_secret: { type: string }
+                code_verifier: { type: string, description: PKCE verifier; required with `authorization_code`. }
       responses:
         "200":
           description: Tokens.
@@ -246,6 +281,9 @@ paths:
       tags: [OIDC]
       operationId: userinfo
       summary: Claims about the authenticated user
+      description: |
+        Accepts an access token only. A refresh token, an authorization code
+        (before or after its exchange) or an unknown string is a 400.
       security: [{ bearerToken: [] }]
       responses:
         "200":
@@ -260,6 +298,7 @@ paths:
       tags: [OIDC]
       operationId: userinfoPost
       summary: Claims about the authenticated user (form-encoded token)
+      description: Accepts an access token only, like `GET /userinfo`.
       security: [{ bearerToken: [] }]
       requestBody:
         content:
@@ -426,6 +465,9 @@ paths:
 
         `device_id` is rendered as JSON `null`, never `""`: Synapse 1.159
         rejects a present-but-empty device id with a 500.
+
+        Only an access token (a minted admin token included) can be active. A
+        refresh token is `{"active": false}`, exactly like an unknown token.
       security: [{ masSharedSecret: [] }]
       requestBody:
         required: true
@@ -438,8 +480,9 @@ paths:
       responses:
         "200":
           description: |
-            Token metadata, or `{"active": false}`. An UNKNOWN token is
-            `{"active": false}` with HTTP 200 — never a 4xx.
+            Token metadata, or `{"active": false}`. An UNKNOWN token, or one
+            that is not an access token, is `{"active": false}` with HTTP 200 —
+            never a 4xx.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Introspection" }
@@ -474,8 +517,9 @@ paths:
       operationId: revoke
       summary: Revoke a token (RFC 7009)
       description: |
-        Token hygiene only. It revokes the access token and its paired refresh
-        token and **never deletes the Synapse device** — clients fire this on
+        Token hygiene only. Accepts either an access or a refresh token. It
+        revokes the access token and its paired refresh token and **never
+        deletes the Synapse device** — clients fire this on
         rotation and on dialog dismissals, and deleting the device there raced
         in-flight key uploads and wedged users' cross-signing identity.
       requestBody:
@@ -735,6 +779,7 @@ paths:
       tags: [Matrix compatibility]
       operationId: matrixRefresh
       summary: Matrix-shaped refresh, with the same rotation grace window as `/token`
+      description: Accepts only a refresh token; an access token (a minted admin token included) is `M_UNKNOWN_TOKEN`, like an unknown one.
       responses: { "200": { description: New tokens. } }
 
   /_matrix/client/v3/logout:
@@ -742,7 +787,7 @@ paths:
       tags: [Matrix compatibility]
       operationId: matrixLogout
       summary: End this session
-      description: Revokes the session's tokens **and** deletes its Synapse device — explicit intent, unlike `/oauth2/revoke`.
+      description: Revokes the session's tokens **and** deletes its Synapse device — explicit intent, unlike `/oauth2/revoke`. The bearer must be an access token; any other token is a no-op, like an unknown one.
       security: [{ bearerToken: [] }]
       responses: { "200": { description: Best-effort, idempotent, never 500. } }
 
@@ -751,7 +796,7 @@ paths:
       tags: [Matrix compatibility]
       operationId: matrixLogoutAll
       summary: End every session
-      description: Session invalidation, NOT deactivation — the account stays active and can sign in again.
+      description: Session invalidation, NOT deactivation — the account stays active and can sign in again. The bearer must be an access token; any other token is a no-op, like an unknown one.
       security: [{ bearerToken: [] }]
       responses: { "200": { description: Best-effort, idempotent, never 500. } }
 
@@ -760,6 +805,7 @@ paths:
       tags: [Matrix compatibility]
       operationId: matrixDeleteDevice
       summary: Sign out one device
+      description: The bearer must be an access token; any other token is a 401 `M_UNKNOWN_TOKEN`.
       security: [{ bearerToken: [] }]
       parameters: [{ name: device_id, in: path, required: true, schema: { type: string } }]
       responses: { "200": { description: Deleted. } }
@@ -769,6 +815,7 @@ paths:
       tags: [Matrix compatibility]
       operationId: matrixDeleteDevices
       summary: Sign out several devices
+      description: The bearer must be an access token; any other token is a 401 `M_UNKNOWN_TOKEN`.
       security: [{ bearerToken: [] }]
       responses: { "200": { description: Deleted. } }
 

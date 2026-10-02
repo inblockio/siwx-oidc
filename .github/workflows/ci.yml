@@ -262,7 +262,8 @@ jobs:
       - name: E2E account management
         run: cargo test --test e2e_account_management -- --ignored --test-threads=1
 
-      # C1/C2 OAuth + CAIP-122 signature-binding hardening (11/11 promoted).
+      # OAuth + CAIP-122 binding: authorization request bound at /authorize, exact
+      # redirect URIs, single-use codes, one token kind per endpoint (24/24 promoted).
       - name: E2E OAuth binding
         run: cargo test --test e2e_oauth_binding -- --ignored --test-threads=1
 
