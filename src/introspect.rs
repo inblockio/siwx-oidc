@@ -22,7 +22,7 @@ use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use tracing::warn;
 
-use siwx_oidc::db::{DBClient, TokenMetadata};
+use siwx_oidc::db::{DBClient, TokenKind, TokenMetadata};
 
 use super::axum_lib::IntrospectState;
 
@@ -138,7 +138,9 @@ fn render_introspection(
     };
 
     match metadata {
-        Some(m) if m.exp > now => {
+        // Only an access token is a bearer credential. A refresh token, or an
+        // entry of no known kind, renders exactly like an unknown token.
+        Some(m) if m.exp > now && m.is_kind(TokenKind::Access) => {
             let device_id = render_device_id(&m.device_id);
             Ok(Json(serde_json::json!({
             "active": true,
@@ -154,8 +156,9 @@ fn render_introspection(
             "iat": m.iat,
             })))
         }
-        // A genuinely absent or expired token IS inactive. This is the only path
-        // allowed to produce `active:false`.
+        // A genuinely absent or expired token, or one that is not an access
+        // token, IS inactive. This is the only path allowed to produce
+        // `active:false`.
         _ => Ok(Json(serde_json::json!({"active": false}))),
     }
 }
@@ -227,7 +230,37 @@ mod tests {
             exp,
             did: "did:key:zDnTest".into(),
             name: String::new(),
+            kind: Some(TokenKind::Access),
         }
+    }
+
+    #[test]
+    fn a_refresh_token_is_inactive() {
+        let mut m = meta(2_000);
+        m.kind = Some(TokenKind::Refresh);
+        let out = render_introspection(Ok(Some(m)), 1_000).expect("a refresh token is a 200");
+        assert_eq!(
+            out.0,
+            serde_json::json!({"active": false}),
+            "a refresh token renders exactly like an unknown token"
+        );
+    }
+
+    #[test]
+    fn a_legacy_entry_is_classified_by_lifetime() {
+        // Written before kinds were recorded: a 300 s entry is an access token,
+        // a 90-day entry a refresh token.
+        let mut access = meta(1_300);
+        access.iat = 1_000;
+        access.kind = None;
+        let out = render_introspection(Ok(Some(access)), 1_000).unwrap();
+        assert_eq!(out.0["active"], serde_json::json!(true));
+
+        let mut refresh = meta(1_000 + 7_776_000);
+        refresh.iat = 1_000;
+        refresh.kind = None;
+        let out = render_introspection(Ok(Some(refresh)), 1_000).unwrap();
+        assert_eq!(out.0, serde_json::json!({"active": false}));
     }
 
     #[test]

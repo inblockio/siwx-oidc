@@ -922,6 +922,11 @@ impl DBClient for RedisClient {
     // -- Opaque token storage (MSC3861) ----------------------------------------
 
     async fn set_token(&self, token: &str, metadata: &TokenMetadata, ttl: u64) -> Result<()> {
+        // Every endpoint accepts exactly one kind of token, so an entry without a
+        // kind would be classified by lifetime instead of by its writer.
+        if metadata.kind.is_none() {
+            return Err(anyhow!("refusing to store a token without a kind"));
+        }
         let mut conn = self
             .pool
             .get()
@@ -1126,7 +1131,7 @@ impl DBClient for RedisClient {
 #[cfg(test)]
 mod tests {
     use super::{erased_did_key, erased_user_key};
-    use crate::db::{CodeEntry, DBClient, TokenMetadata, KV_CODE_PREFIX};
+    use crate::db::{CodeEntry, DBClient, TokenKind, TokenMetadata, KV_CODE_PREFIX};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A globally-unique nonce for test keys on the shared Redis. The nanosecond
@@ -1157,7 +1162,24 @@ mod tests {
             // so the did case here intentionally differs from the username.
             did: format!("did:pkh:eip155:1:0X{}", username.to_uppercase()),
             name: "n".to_string(),
+            kind: Some(TokenKind::Access),
         }
+    }
+
+    /// The store refuses a token entry without a kind: every writer sets one.
+    #[tokio::test]
+    async fn set_token_refuses_an_entry_without_a_kind() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let token = format!("kindless-{}", unique_nonce());
+        let mut meta = token_meta("", "kindless");
+        meta.kind = None;
+        assert!(
+            client.set_token(&token, &meta, 60).await.is_err(),
+            "a token without a kind must not be stored"
+        );
+        assert!(client.get_token(&token).await.unwrap().is_none());
     }
 
     /// H5: device_delete must revoke ONLY the OAuth session(s) for the targeted

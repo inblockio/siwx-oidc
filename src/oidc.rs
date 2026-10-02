@@ -935,7 +935,13 @@ async fn token_refresh(
         })
     })?;
 
-    let metadata = match db_client.get_token(&rt).await? {
+    // Only a refresh token refreshes. Any other entry (an access or admin token)
+    // is answered exactly like an unknown token, and is left untouched.
+    let metadata = match db_client
+        .get_token(&rt)
+        .await?
+        .filter(|m| m.is_kind(TokenKind::Refresh))
+    {
         Some(m) => m,
         None => {
             // Grace replay (lost-response recovery): a rotated refresh token is
@@ -1003,6 +1009,7 @@ async fn token_refresh(
         exp: now + ACCESS_TOKEN_TTL as i64,
         did: metadata.did.clone(),
         name: metadata.name.clone(),
+        kind: Some(TokenKind::Access),
     };
     db_client
         .set_token(&new_access, &access_meta, ACCESS_TOKEN_TTL)
@@ -1018,6 +1025,7 @@ async fn token_refresh(
         exp: now + REFRESH_TOKEN_TTL as i64,
         did: metadata.did.clone(),
         name: metadata.name.clone(),
+        kind: Some(TokenKind::Refresh),
     };
     db_client
         .set_token(&new_refresh, &refresh_meta, REFRESH_TOKEN_TTL)
@@ -1266,6 +1274,7 @@ async fn token_device_code(
                 exp: iat + ACCESS_TOKEN_TTL as i64,
                 did: did.clone(),
                 name: display_name.clone(),
+                kind: Some(TokenKind::Access),
             };
             db_client
                 .set_token(&access_token, &access_meta, ACCESS_TOKEN_TTL)
@@ -1281,6 +1290,7 @@ async fn token_device_code(
                 exp: iat + REFRESH_TOKEN_TTL as i64,
                 did: did.clone(),
                 name: display_name,
+                kind: Some(TokenKind::Refresh),
             };
             db_client
                 .set_token(&refresh_token, &refresh_meta, REFRESH_TOKEN_TTL)
@@ -1487,6 +1497,7 @@ async fn token_authorization_code(
         exp: iat + ACCESS_TOKEN_TTL as i64,
         did: code_entry.did.clone(),
         name: display_name.clone(),
+        kind: Some(TokenKind::Access),
     };
     db_client
         .set_token(&opaque, &access_metadata, ACCESS_TOKEN_TTL)
@@ -1502,6 +1513,7 @@ async fn token_authorization_code(
         exp: iat + REFRESH_TOKEN_TTL as i64,
         did: code_entry.did.clone(),
         name: display_name,
+        kind: Some(TokenKind::Refresh),
     };
     db_client
         .set_token(&refresh_opaque, &refresh_metadata, REFRESH_TOKEN_TTL)
@@ -3019,8 +3031,14 @@ pub async fn userinfo(
         return Err(CustomError::BadRequest("Missing access token.".to_string()));
     };
 
-    // Try TokenMetadata first (covers both MSC3861 mat_ tokens and standalone tokens).
-    if let Some(metadata) = db_client.get_token(&token_str).await? {
+    // Try TokenMetadata first (covers both MSC3861 mat_ tokens and standalone
+    // tokens). Only an access token is a bearer credential: a refresh token is
+    // answered like an unknown token.
+    if let Some(metadata) = db_client
+        .get_token(&token_str)
+        .await?
+        .filter(|m| m.is_kind(TokenKind::Access))
+    {
         if metadata.exp <= Utc::now().timestamp() {
             return Err(CustomError::BadRequest("Token expired.".to_string()));
         }
@@ -5012,6 +5030,7 @@ mod userinfo_mxid_claim_tests {
             exp: i64::MAX,
             did: DID.to_string(),
             name: "n".to_string(),
+            kind: Some(TokenKind::Access),
         }
     }
 

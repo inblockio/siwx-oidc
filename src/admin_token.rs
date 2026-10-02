@@ -71,7 +71,7 @@ use chrono::Utc;
 use serde_json::json;
 use tracing::{error, info, warn};
 
-use siwx_oidc::db::{DBClient, TokenMetadata};
+use siwx_oidc::db::{DBClient, TokenKind, TokenMetadata};
 
 use super::axum_lib::AdminTokenState;
 use super::introspect::{generate_opaque_token, verify_shared_secret};
@@ -92,12 +92,13 @@ pub const ADMIN_TOKEN_PREFIX: &str = "msa_";
 /// being accepted at all (see the module docs, requirement 2).
 pub const ADMIN_SCOPE: &str = "urn:matrix:client:api:* urn:synapse:admin:*";
 
-/// The stable scope token Synapse tests in `is_server_admin()`.
+/// The stable scope token Synapse tests in `is_server_admin()`. Defined in the
+/// library, where `db::legacy_token_kind` also reads it.
 ///
 /// Referenced by the tests that pin [`ADMIN_SCOPE`]'s composition rather than by
 /// the request path, which uses the pre-joined [`ADMIN_SCOPE`] directly.
 #[allow(dead_code)]
-pub const SYNAPSE_ADMIN_SCOPE: &str = "urn:synapse:admin:*";
+pub const SYNAPSE_ADMIN_SCOPE: &str = siwx_oidc::db::SYNAPSE_ADMIN_SCOPE;
 
 /// The stable MSC2967 C-S API scope Synapse requires before it will accept the
 /// token at all.
@@ -143,6 +144,8 @@ pub fn admin_token_metadata(localpart: &str, ttl: u64, now: i64) -> TokenMetadat
         exp: now + ttl as i64,
         did: ADMIN_SUBJECT.to_string(),
         name: ADMIN_DISPLAY_NAME.to_string(),
+        // A bearer credential: no refresh endpoint accepts it.
+        kind: Some(TokenKind::Access),
     }
 }
 
@@ -155,6 +158,11 @@ pub const ADMIN_TOKEN_TTL_MIN: u64 = 30;
 /// deployment cannot promote the mint into a long-lived standing admin key by
 /// setting a large TTL in its environment.
 pub const ADMIN_TOKEN_TTL_MAX: u64 = 900;
+
+// An admin token entry written before token kinds were recorded is classified
+// by its lifetime (`db::legacy_token_kind`), so the longest admin TTL must stay
+// within the access-token lifetimes that function recognises.
+const _: () = assert!(ADMIN_TOKEN_TTL_MAX as i64 <= siwx_oidc::db::ACCESS_TOKEN_MAX_LIFETIME);
 
 /// Clamp a configured admin-token TTL into the permitted window.
 pub fn clamp_admin_token_ttl(configured: u64) -> u64 {
@@ -367,6 +375,15 @@ mod tests {
             clamp_admin_token_ttl(ADMIN_TOKEN_TTL_MAX),
             ADMIN_TOKEN_TTL_MAX
         );
+    }
+
+    /// An admin token is an access token, so no refresh endpoint accepts it.
+    #[test]
+    fn an_admin_token_is_an_access_token() {
+        let meta = admin_token_metadata("svc", ADMIN_TOKEN_TTL_MAX, 1_000);
+        assert_eq!(meta.kind, Some(TokenKind::Access));
+        assert!(meta.is_kind(TokenKind::Access));
+        assert!(!meta.is_kind(TokenKind::Refresh));
     }
 
     /// Admin tokens must be distinguishable from user tokens at a glance.
