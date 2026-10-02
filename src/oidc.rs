@@ -6453,3 +6453,564 @@ mod device_display_name_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod client_binding_tests {
+    //! A refresh token belongs to the client it was issued to (I7), and the
+    //! token endpoint authenticates a client the same way for the code exchange
+    //! and the refresh grant. Needs Redis.
+    use super::*;
+    use crate::config::Config;
+    use openidconnect::core::CoreClientAuthMethod;
+
+    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    const SECRET: &str = "the-registered-secret";
+
+    fn unique(prefix: &str) -> String {
+        format!("{prefix}{}", Uuid::new_v4().simple())
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Registration {
+        /// `token_endpoint_auth_method: none`, as Element Web and Element X register.
+        Public,
+        /// `client_secret_post`.
+        Confidential,
+        /// No `token_endpoint_auth_method`: confidential when `require_secret`.
+        Unset,
+    }
+
+    async fn seed_client(db: &RedisClient, registration: Registration) -> String {
+        let id = unique("bind-");
+        let mut metadata = CoreClientMetadata::new(
+            vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
+            EmptyAdditionalClientMetadata {},
+        );
+        metadata = match registration {
+            Registration::Public => {
+                metadata.set_token_endpoint_auth_method(Some(CoreClientAuthMethod::None))
+            }
+            Registration::Confidential => metadata
+                .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::ClientSecretPost)),
+            Registration::Unset => metadata,
+        };
+        db.set_client(
+            id.clone(),
+            ClientEntry {
+                secret: SECRET.into(),
+                metadata,
+                access_token: None,
+            },
+        )
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn seed_refresh_token(db: &RedisClient, client_id: &str) -> String {
+        let refresh = unique("mcr_");
+        let now = Utc::now().timestamp();
+        db.set_token(
+            &refresh,
+            &TokenMetadata {
+                username: unique("localpart"),
+                device_id: String::new(),
+                scope: "openid".into(),
+                client_id: client_id.into(),
+                iat: now,
+                exp: now + REFRESH_TOKEN_TTL as i64,
+                did: "did:key:zDnBINDING".into(),
+                name: "did:key:zDnBINDING".into(),
+                kind: Some(TokenKind::Refresh),
+            },
+            REFRESH_TOKEN_TTL,
+        )
+        .await
+        .unwrap();
+        refresh
+    }
+
+    async fn seed_code(db: &RedisClient, client_id: &str) -> String {
+        let code = unique("code-");
+        db.set_code(
+            code.clone(),
+            CodeEntry {
+                exchange_count: 0,
+                did: "did:key:zDnBINDING".into(),
+                nonce: None,
+                client_id: client_id.into(),
+                auth_time: Utc::now(),
+                code_challenge: Some(CHALLENGE.into()),
+                code_challenge_method: Some("S256".into()),
+                device_id: None,
+                localpart: Some(unique("localpart")),
+            },
+        )
+        .await
+        .unwrap();
+        code
+    }
+
+    /// What the caller says about itself: the `client_id` of the form, the
+    /// `client_secret` of the form, and a secret from an `Authorization` header.
+    #[derive(Clone, Copy)]
+    struct Presented<'a> {
+        client_id: Option<&'a str>,
+        form_secret: Option<&'a str>,
+        header_secret: Option<&'a str>,
+    }
+
+    const NOTHING: Presented<'static> = Presented {
+        client_id: None,
+        form_secret: None,
+        header_secret: None,
+    };
+
+    async fn refresh(
+        db: &RedisClient,
+        config: &Config,
+        refresh_token: &str,
+        who: Presented<'_>,
+    ) -> Result<CoreTokenResponse, CustomError> {
+        token(
+            TokenForm {
+                code: None,
+                client_id: who.client_id.map(str::to_string),
+                client_secret: who.form_secret.map(str::to_string),
+                grant_type: CoreGrantType::RefreshToken,
+                code_verifier: None,
+                refresh_token: Some(refresh_token.to_string()),
+                device_code: None,
+            },
+            who.header_secret.map(str::to_string),
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            None,
+        )
+        .await
+    }
+
+    async fn exchange(
+        db: &RedisClient,
+        config: &Config,
+        code: &str,
+        who: Presented<'_>,
+    ) -> Result<CoreTokenResponse, CustomError> {
+        token(
+            TokenForm {
+                code: Some(code.to_string()),
+                client_id: who.client_id.map(str::to_string),
+                client_secret: who.form_secret.map(str::to_string),
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(VERIFIER.to_string()),
+                refresh_token: None,
+                device_code: None,
+            },
+            who.header_secret.map(str::to_string),
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            None,
+        )
+        .await
+    }
+
+    /// The answer, reduced to what a client sees: success, `invalid_grant`
+    /// (the grant does not belong to this client), or `invalid_client` (the
+    /// client did not authenticate).
+    fn outcome(result: &Result<CoreTokenResponse, CustomError>) -> String {
+        match result {
+            Ok(_) => "ok".to_string(),
+            Err(CustomError::BadRequestToken(e)) => match e.error {
+                CoreErrorResponseType::InvalidGrant => "invalid_grant".to_string(),
+                ref other => format!("{other:?}"),
+            },
+            Err(CustomError::Unauthorized(message)) => format!("invalid_client: {message}"),
+            Err(other) => format!("unexpected: {other:?}"),
+        }
+    }
+
+    fn refresh_token_of(result: Result<CoreTokenResponse, CustomError>) -> String {
+        use openidconnect::OAuth2TokenResponse;
+        result
+            .unwrap_or_else(|e| panic!("the refresh must succeed: {e:?}"))
+            .refresh_token()
+            .expect("a rotation returns a refresh token")
+            .secret()
+            .clone()
+    }
+
+    async fn still_exists(db: &RedisClient, refresh_token: &str) -> bool {
+        db.get_token(refresh_token).await.unwrap().is_some()
+    }
+
+    /// Another client, even one that authenticates correctly as itself, cannot
+    /// refresh the token. A refusal leaves the token alone.
+    #[tokio::test]
+    async fn a_refresh_token_is_refused_to_a_client_it_was_not_issued_to() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let owner = seed_client(&db, Registration::Public).await;
+        let other = seed_client(&db, Registration::Confidential).await;
+        let rt = seed_refresh_token(&db, &owner).await;
+
+        let stolen = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&other),
+                form_secret: Some(SECRET),
+                header_secret: None,
+            },
+        )
+        .await;
+        assert_eq!(outcome(&stolen), "invalid_grant");
+        assert!(
+            still_exists(&db, &rt).await,
+            "a refusal never deletes the token"
+        );
+
+        let own = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&owner),
+                ..NOTHING
+            },
+        )
+        .await;
+        assert_eq!(outcome(&own), "ok", "the owner still refreshes it");
+    }
+
+    /// A confidential client authenticates at the refresh grant exactly as it
+    /// does at the code exchange: with the secret in the form or in a header.
+    #[tokio::test]
+    async fn a_confidential_client_must_authenticate_to_refresh() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Confidential).await;
+        let rt = seed_refresh_token(&db, &client).await;
+
+        for (what, who, expected) in [
+            (
+                "no credentials",
+                NOTHING,
+                "invalid_client: Secret required.",
+            ),
+            (
+                "a client_id and no secret",
+                Presented {
+                    client_id: Some(&client),
+                    ..NOTHING
+                },
+                "invalid_client: Secret required.",
+            ),
+            (
+                "a wrong form secret",
+                Presented {
+                    client_id: Some(&client),
+                    form_secret: Some("wrong"),
+                    header_secret: None,
+                },
+                "invalid_client: Bad secret.",
+            ),
+            (
+                "a wrong header secret",
+                Presented {
+                    header_secret: Some("wrong"),
+                    ..NOTHING
+                },
+                "invalid_client: Bad secret.",
+            ),
+        ] {
+            let result = refresh(&db, &config, &rt, who).await;
+            assert_eq!(outcome(&result), expected, "{what}");
+            assert!(
+                still_exists(&db, &rt).await,
+                "{what}: the token is untouched"
+            );
+        }
+
+        let with_form_secret = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&client),
+                form_secret: Some(SECRET),
+                header_secret: None,
+            },
+        )
+        .await;
+        let rt2 = refresh_token_of(with_form_secret);
+        let with_header_secret = refresh(
+            &db,
+            &config,
+            &rt2,
+            Presented {
+                header_secret: Some(SECRET),
+                ..NOTHING
+            },
+        )
+        .await;
+        assert_eq!(outcome(&with_header_secret), "ok");
+    }
+
+    /// A public client authenticates nothing: it may name itself or not. Naming
+    /// is optional because `siwx-oidc-auth` and Matrix clients send the id but
+    /// an older agent may not (provisional: see docs/matrix-integration.md).
+    #[tokio::test]
+    async fn a_public_client_refreshes_with_or_without_naming_itself() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Public).await;
+        let rt = seed_refresh_token(&db, &client).await;
+
+        let named = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&client),
+                ..NOTHING
+            },
+        )
+        .await;
+        let rt2 = refresh_token_of(named);
+        let anonymous = refresh(&db, &config, &rt2, NOTHING).await;
+        assert_eq!(outcome(&anonymous), "ok");
+    }
+
+    /// A client registered without an authentication method is confidential
+    /// when `require_secret` is on and public when it is off, the same rule the
+    /// code exchange applies.
+    #[tokio::test]
+    async fn an_unset_authentication_method_follows_require_secret() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client = seed_client(&db, Registration::Unset).await;
+        let strict = Config {
+            require_secret: true,
+            ..Config::default()
+        };
+        let lax = Config {
+            require_secret: false,
+            ..Config::default()
+        };
+
+        let rt = seed_refresh_token(&db, &client).await;
+        assert_eq!(
+            outcome(&refresh(&db, &strict, &rt, NOTHING).await),
+            "invalid_client: Secret required."
+        );
+        assert_eq!(outcome(&refresh(&db, &lax, &rt, NOTHING).await), "ok");
+    }
+
+    /// A refresh token outlives its client's registration (a registration lasts
+    /// 30 days, a refresh token 90 days from its last use). Refusing every such
+    /// token would sign out every session older than a registration, so the
+    /// token keeps refreshing when the request names the same client or none.
+    /// What cannot be done: name another client, or present a secret that can
+    /// no longer be checked. Provisional: a deployment decision for the
+    /// maintainers (see docs/matrix-integration.md).
+    #[tokio::test]
+    async fn a_token_outlives_its_clients_registration_but_not_its_binding() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let gone = seed_client(&db, Registration::Public).await;
+        let other = seed_client(&db, Registration::Public).await;
+        let rt = seed_refresh_token(&db, &gone).await;
+        db.delete_client(gone.clone()).await.unwrap();
+
+        assert_eq!(
+            outcome(
+                &refresh(
+                    &db,
+                    &config,
+                    &rt,
+                    Presented {
+                        client_id: Some(&other),
+                        ..NOTHING
+                    }
+                )
+                .await
+            ),
+            "invalid_grant",
+            "another client is refused"
+        );
+        assert_eq!(
+            outcome(
+                &refresh(
+                    &db,
+                    &config,
+                    &rt,
+                    Presented {
+                        client_id: Some(&gone),
+                        form_secret: Some(SECRET),
+                        header_secret: None
+                    }
+                )
+                .await
+            ),
+            "invalid_client: Unrecognised client id.",
+            "a secret that cannot be checked is refused"
+        );
+        let named = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&gone),
+                ..NOTHING
+            },
+        )
+        .await;
+        let rt2 = refresh_token_of(named);
+        assert_eq!(
+            outcome(&refresh(&db, &config, &rt2, NOTHING).await),
+            "ok",
+            "the same client, or none, still refreshes"
+        );
+    }
+
+    /// The grace replay hands out the successor pair, so it needs the same
+    /// client binding as a fresh rotation: anyone holding the old token for a
+    /// minute after the rotation must not get the new pair without the client's
+    /// credentials.
+    #[tokio::test]
+    async fn the_grace_replay_is_bound_to_the_client_too() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Confidential).await;
+        let other = seed_client(&db, Registration::Confidential).await;
+        let old = seed_refresh_token(&db, &client).await;
+        let credentials = Presented {
+            client_id: Some(&client),
+            form_secret: Some(SECRET),
+            header_secret: None,
+        };
+
+        let successor = refresh_token_of(refresh(&db, &config, &old, credentials).await);
+        assert_eq!(
+            outcome(&refresh(&db, &config, &old, NOTHING).await),
+            "invalid_client: Secret required.",
+            "a replay without credentials gets no successor pair"
+        );
+        assert_eq!(
+            outcome(
+                &refresh(
+                    &db,
+                    &config,
+                    &old,
+                    Presented {
+                        client_id: Some(&other),
+                        form_secret: Some(SECRET),
+                        header_secret: None
+                    }
+                )
+                .await
+            ),
+            "invalid_grant",
+            "a replay by another client gets no successor pair"
+        );
+        let replay = refresh_token_of(refresh(&db, &config, &old, credentials).await);
+        assert_eq!(
+            replay, successor,
+            "the client itself still recovers the same pair within the grace window"
+        );
+    }
+
+    /// One helper authenticates the client for both grants, so the two cannot
+    /// drift: every way a request can present itself gets the same answer from
+    /// the code exchange and the refresh grant.
+    #[tokio::test]
+    async fn the_code_exchange_and_the_refresh_grant_authenticate_clients_identically() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let strict = Config {
+            require_secret: true,
+            ..Config::default()
+        };
+        let lax = Config {
+            require_secret: false,
+            ..Config::default()
+        };
+        let other = seed_client(&db, Registration::Confidential).await;
+
+        for (registration, config, label) in [
+            (Registration::Public, &strict, "public"),
+            (Registration::Confidential, &strict, "confidential"),
+            (Registration::Unset, &strict, "unset, secret required"),
+            (Registration::Unset, &lax, "unset, secret optional"),
+        ] {
+            let client = seed_client(&db, registration).await;
+            for (what, who) in [
+                ("nothing", NOTHING),
+                (
+                    "its id",
+                    Presented {
+                        client_id: Some(&client),
+                        ..NOTHING
+                    },
+                ),
+                (
+                    "its id and secret",
+                    Presented {
+                        client_id: Some(&client),
+                        form_secret: Some(SECRET),
+                        header_secret: None,
+                    },
+                ),
+                (
+                    "its id and a wrong secret",
+                    Presented {
+                        client_id: Some(&client),
+                        form_secret: Some("wrong"),
+                        header_secret: None,
+                    },
+                ),
+                (
+                    "a header secret",
+                    Presented {
+                        header_secret: Some(SECRET),
+                        ..NOTHING
+                    },
+                ),
+                (
+                    "another client's id and secret",
+                    Presented {
+                        client_id: Some(&other),
+                        form_secret: Some(SECRET),
+                        header_secret: None,
+                    },
+                ),
+            ] {
+                let code = seed_code(&db, &client).await;
+                let rt = seed_refresh_token(&db, &client).await;
+                let by_code = outcome(&exchange(&db, config, &code, who).await);
+                let by_refresh = outcome(&refresh(&db, config, &rt, who).await);
+                assert_eq!(
+                    by_refresh, by_code,
+                    "{label} client presenting {what}: the refresh grant answered \
+                     `{by_refresh}`, the code exchange `{by_code}`"
+                );
+            }
+        }
+    }
+}

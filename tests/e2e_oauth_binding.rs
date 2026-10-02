@@ -2078,3 +2078,326 @@ async fn discovery_advertises_only_the_code_response_type() {
         meta["response_types_supported"]
     );
 }
+
+// ===========================================================================
+// Refresh tokens are bound to their client (I7).
+//
+// A refresh token belongs to the client it was issued to. At the refresh grant
+// the client named in the request (form, or the user name of an HTTP Basic
+// header) must be that client, and a confidential client authenticates with
+// its secret, exactly as at the code exchange. `POST /_matrix/client/v3/refresh`
+// carries no client identity by specification and is not covered here.
+// ===========================================================================
+
+/// A client registered the way Element Web and Element X register: public,
+/// `token_endpoint_auth_method: none`, allowed the refresh grant.
+async fn register_public_client(c: &Client, base: &str) -> RegisteredClient {
+    let redirect_uri = format!("{base}/callback");
+    let reg: Value = c
+        .post(format!("{base}/register"))
+        .json(&json!({
+            "redirect_uris": [&redirect_uri],
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    RegisteredClient {
+        client_id: reg["client_id"].as_str().unwrap().to_string(),
+        client_secret: reg["client_secret"].as_str().unwrap().to_string(),
+        redirect_uri,
+    }
+}
+
+/// A code-flow sign-in for `rc` with a fresh wallet. A confidential client
+/// authenticates the exchange with its secret; a public one sends none.
+/// Returns (access, refresh).
+async fn tokens_for_client(
+    c: &Client,
+    nrc: &Client,
+    base: &str,
+    rc: &RegisteredClient,
+    confidential: bool,
+) -> (String, String) {
+    let w = new_wallet();
+    let (verifier, challenge) = pkce_pair();
+    let code = sign_in_for_code(nrc, base, rc, &w, &challenge, "bind_state").await;
+    let mut form = vec![
+        ("code", code),
+        ("client_id", rc.client_id.clone()),
+        ("grant_type", "authorization_code".to_string()),
+        ("code_verifier", verifier),
+    ];
+    if confidential {
+        form.push(("client_secret", rc.client_secret.clone()));
+    }
+    let resp = c
+        .post(format!("{base}/token"))
+        .form(&form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "setup: code exchange");
+    let body: Value = resp.json().await.unwrap();
+    (
+        body["access_token"].as_str().unwrap().to_string(),
+        body["refresh_token"].as_str().unwrap().to_string(),
+    )
+}
+
+/// POST /token with the refresh grant and the given extra form fields and
+/// optional HTTP Basic credentials.
+async fn refresh_as(
+    c: &Client,
+    base: &str,
+    refresh_token: &str,
+    form: &[(&str, &str)],
+    basic: Option<(&str, &str)>,
+) -> reqwest::Response {
+    let mut fields = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+    ];
+    fields.extend_from_slice(form);
+    let mut request = c.post(format!("{base}/token")).form(&fields);
+    if let Some((user, password)) = basic {
+        request = request.basic_auth(user, Some(password));
+    }
+    request.send().await.unwrap()
+}
+
+/// (status, error code, WWW-Authenticate header) of an error response.
+async fn refusal(resp: reqwest::Response) -> (StatusCode, String, Option<String>) {
+    let status = resp.status();
+    let challenge = resp
+        .headers()
+        .get("www-authenticate")
+        .map(|v| v.to_str().unwrap().to_string());
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    (
+        status,
+        body["error"].as_str().unwrap_or("").to_string(),
+        challenge,
+    )
+}
+
+/// Another client cannot refresh the token, whether it names itself in the
+/// form or in a Basic header and whatever secret it authenticates with, and a
+/// request whose form and header name different clients is malformed. The
+/// refusals leave the token alone: its owner refreshes it afterwards.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn a_refresh_token_is_refused_to_another_client() {
+    let base = oidc();
+    let c = Client::new();
+    let nrc = no_redirect_client();
+    let owner = register_client(&c, &base).await;
+    let other = register_client(&c, &base).await;
+    let (_access, refresh) = tokens_for_client(&c, &nrc, &base, &owner, true).await;
+
+    let in_form = refresh_as(
+        &c,
+        &base,
+        &refresh,
+        &[
+            ("client_id", other.client_id.as_str()),
+            ("client_secret", other.client_secret.as_str()),
+        ],
+        None,
+    )
+    .await;
+    let (status, error, _) = refusal(in_form).await;
+    assert_eq!(
+        (status, error.as_str()),
+        (StatusCode::BAD_REQUEST, "invalid_grant"),
+        "another client, named in the form"
+    );
+
+    let in_header = refresh_as(
+        &c,
+        &base,
+        &refresh,
+        &[],
+        Some((&other.client_id, &other.client_secret)),
+    )
+    .await;
+    let (status, error, _) = refusal(in_header).await;
+    assert_eq!(
+        (status, error.as_str()),
+        (StatusCode::BAD_REQUEST, "invalid_grant"),
+        "another client, named in a Basic header"
+    );
+
+    let split = refresh_as(
+        &c,
+        &base,
+        &refresh,
+        &[("client_id", owner.client_id.as_str())],
+        Some((&other.client_id, &owner.client_secret)),
+    )
+    .await;
+    let (status, error, _) = refusal(split).await;
+    assert_eq!(
+        (status, error.as_str()),
+        (StatusCode::BAD_REQUEST, "invalid_request"),
+        "a form and a header that name different clients"
+    );
+
+    let own = refresh_as(
+        &c,
+        &base,
+        &refresh,
+        &[
+            ("client_id", owner.client_id.as_str()),
+            ("client_secret", owner.client_secret.as_str()),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(
+        own.status(),
+        StatusCode::OK,
+        "the refusals did not consume the token: its owner refreshes it"
+    );
+}
+
+/// A confidential client authenticates at the refresh grant: no credentials
+/// and a wrong secret are `invalid_client` with a 401, and a request that
+/// attempted HTTP Basic is answered with the matching challenge. The secret
+/// goes in the form or in a Basic header. The replay of a just-rotated token
+/// hands out the successor pair only to the same client.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn a_confidential_client_must_authenticate_to_refresh() {
+    let base = oidc();
+    let c = Client::new();
+    let nrc = no_redirect_client();
+    let rc = register_client(&c, &base).await;
+    let (_access, refresh) = tokens_for_client(&c, &nrc, &base, &rc, true).await;
+
+    let anonymous = refresh_as(&c, &base, &refresh, &[], None).await;
+    assert_eq!(
+        refusal(anonymous).await,
+        (StatusCode::UNAUTHORIZED, "invalid_client".to_string(), None),
+        "no credentials, and no Basic attempt to challenge"
+    );
+    let named = refresh_as(
+        &c,
+        &base,
+        &refresh,
+        &[("client_id", rc.client_id.as_str())],
+        None,
+    )
+    .await;
+    let (status, error, _) = refusal(named).await;
+    assert_eq!(
+        (status, error.as_str()),
+        (StatusCode::UNAUTHORIZED, "invalid_client"),
+        "naming itself is not authenticating"
+    );
+    let wrong_basic = refresh_as(&c, &base, &refresh, &[], Some((&rc.client_id, "wrong"))).await;
+    let (status, error, challenge) = refusal(wrong_basic).await;
+    assert_eq!(
+        (status, error.as_str()),
+        (StatusCode::UNAUTHORIZED, "invalid_client"),
+        "a wrong Basic secret"
+    );
+    assert!(
+        challenge.is_some_and(|c| c.starts_with("Basic")),
+        "a 401 for a Basic attempt carries `WWW-Authenticate: Basic` (RFC 6749 §5.2)"
+    );
+
+    // The refusals consumed nothing. The form secret refreshes ...
+    let by_form = refresh_as(
+        &c,
+        &base,
+        &refresh,
+        &[
+            ("client_id", rc.client_id.as_str()),
+            ("client_secret", rc.client_secret.as_str()),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(by_form.status(), StatusCode::OK, "secret in the form");
+    let rotated: Value = by_form.json().await.unwrap();
+    let successor = rotated["refresh_token"].as_str().unwrap().to_string();
+
+    // ... and so does Basic, with no client_id in the form.
+    let by_basic = refresh_as(
+        &c,
+        &base,
+        &successor,
+        &[],
+        Some((&rc.client_id, &rc.client_secret)),
+    )
+    .await;
+    assert_eq!(
+        by_basic.status(),
+        StatusCode::OK,
+        "secret in a Basic header"
+    );
+
+    // The old token replayed inside the grace window: the client recovers the
+    // pair it lost, a caller without the client's credentials does not.
+    let replay_anonymous = refresh_as(&c, &base, &refresh, &[], None).await;
+    let (status, error, _) = refusal(replay_anonymous).await;
+    assert_eq!(
+        (status, error.as_str()),
+        (StatusCode::UNAUTHORIZED, "invalid_client"),
+        "the grace replay is bound to the client too"
+    );
+    let replay_owner = refresh_as(
+        &c,
+        &base,
+        &refresh,
+        &[
+            ("client_id", rc.client_id.as_str()),
+            ("client_secret", rc.client_secret.as_str()),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(
+        replay_owner.status(),
+        StatusCode::OK,
+        "the client's own replay still recovers the pair"
+    );
+}
+
+/// A public client has nothing to authenticate with: it refreshes naming
+/// itself, as Matrix clients and `siwx-oidc-auth` do, and also without
+/// naming itself (provisional, for agents that never sent a client id).
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn a_public_client_refreshes_without_client_credentials() {
+    let base = oidc();
+    let c = Client::new();
+    let nrc = no_redirect_client();
+    let rc = register_public_client(&c, &base).await;
+    let (_access, refresh) = tokens_for_client(&c, &nrc, &base, &rc, false).await;
+
+    let named = refresh_as(
+        &c,
+        &base,
+        &refresh,
+        &[("client_id", rc.client_id.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(named.status(), StatusCode::OK, "naming itself");
+    let body: Value = named.json().await.unwrap();
+    let successor = body["refresh_token"].as_str().unwrap().to_string();
+
+    let anonymous = refresh_as(&c, &base, &successor, &[], None).await;
+    assert_eq!(
+        anonymous.status(),
+        StatusCode::OK,
+        "naming nobody (provisional)"
+    );
+}
