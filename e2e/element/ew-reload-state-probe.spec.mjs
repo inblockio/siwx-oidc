@@ -13,10 +13,9 @@
 // Delete once the state is named and covered by a real spec.
 import { test } from '@playwright/test';
 import { injectMockWallet, makeWallet } from '../browser/wallet-helper.mjs';
+import { ELEMENT_URL, SIWX_URL } from './helpers/element.mjs';
 
 const SERVER_NAME = process.env.SERVER_NAME || 'localhost';
-const ELEMENT_URL = process.env.ELEMENT_URL || 'http://localhost:28088';
-const SIWX_URL = process.env.SIWX_URL || 'http://localhost:28081';
 
 // Inlined rather than imported from ew-recovery-entry.spec.mjs: importing a spec
 // file would register that file's tests here too.

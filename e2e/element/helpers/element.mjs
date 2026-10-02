@@ -1,12 +1,16 @@
 /**
  * Element Web UI helpers for Phase 2.0 EW-* Playwright specs.
  *
- * The local stack serves Element at ELEMENT_URL (default http://localhost:8088)
- * with homeserver discovery pointing at http://localhost:8080 and OIDC at
- * http://localhost:8081 (see siwx-oidc-matrix-server/Caddyfile.local).
+ * The local stack serves Element at ELEMENT_URL with homeserver discovery
+ * pointing at MATRIX_URL and OIDC at SIWX_URL (see
+ * siwx-oidc-matrix-server/Caddyfile.local).
+ *
+ * run.sh always passes all three, taken from stack-env.sh (the one source for
+ * the ports stack-up.sh publishes). The fallbacks below only serve a bare
+ * `npx playwright test`; they must equal the E2E_*_PORT defaults in stack-env.sh
+ * (Phase-2 lab remaps: portal-e2e often owns host :8080).
  */
 
-// Defaults match Phase-2 lab remaps (portal-e2e often owns host :8080).
 export const ELEMENT_URL = process.env.ELEMENT_URL || 'http://localhost:28088';
 export const MATRIX_URL = process.env.MATRIX_URL || 'http://localhost:28080';
 export const SIWX_URL = process.env.SIWX_URL || 'http://localhost:28081';

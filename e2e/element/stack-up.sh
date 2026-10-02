@@ -2,6 +2,9 @@
 # Bring up the local Element + Synapse + siwx-oidc stack for EW-* Playwright.
 # Uses siwx-oidc-matrix-server/docker-compose.local.yml (sibling of this repo).
 set -euo pipefail
+# Compose project, host ports and URLs: one source for stack-up/down, t5 and run.sh.
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "$0")" && pwd)/stack-env.sh"
 SIWX_REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 MS_REPO="${MATRIX_SERVER_REPO:-$(cd "$SIWX_REPO/../siwx-oidc-matrix-server" && pwd)}"
 
@@ -16,29 +19,27 @@ if [ ! -f .env.local ]; then
   exit 1
 fi
 
-# Prefer docker compose; fall back to docker-compose / podman-compose.
+# Prefer docker compose; fall back to docker-compose / podman-compose. Always
+# `-p`: never let compose derive the project from the directory name (stack-env.sh).
 if docker compose version >/dev/null 2>&1; then
-  COMPOSE=(docker compose -f docker-compose.local.yml --env-file .env.local)
+  COMPOSE=(docker compose -p "$E2E_COMPOSE_PROJECT" -f docker-compose.local.yml --env-file .env.local)
 elif command -v docker-compose >/dev/null 2>&1; then
-  COMPOSE=(docker-compose -f docker-compose.local.yml --env-file .env.local)
+  COMPOSE=(docker-compose -p "$E2E_COMPOSE_PROJECT" -f docker-compose.local.yml --env-file .env.local)
 elif command -v podman-compose >/dev/null 2>&1; then
-  COMPOSE=(podman-compose -f docker-compose.local.yml --env-file .env.local)
+  COMPOSE=(podman-compose -p "$E2E_COMPOSE_PROJECT" -f docker-compose.local.yml --env-file .env.local)
 else
   echo "no docker compose / podman-compose found" >&2
   exit 1
 fi
 
-echo "[stack-up] building + starting Element stack (siwx build context: $SIWX_REPO) ..."
+echo "[stack-up] building + starting Element stack, compose project ${E2E_COMPOSE_PROJECT} (siwx build context: $SIWX_REPO) ..."
 "${COMPOSE[@]}" up --build -d
 
-# Host ports (read from .env.local via already-exported compose env, or defaults
-# that avoid portal-e2e on :8080).
-set -a; # shellcheck disable=SC1091
-. .env.local
-set +a
-MATRIX_P="${MATRIX_HOST_PORT:-28080}"
-SIWX_P="${SIWEOIDC_HOST_PORT:-28081}"
-ELEM_P="${CLIENT_HOST_PORT:-28088}"
+# Host ports come from stack-env.sh, the same values compose was started with
+# and run.sh hands to the specs (never re-read from .env.local here).
+MATRIX_P="$E2E_MATRIX_PORT"
+SIWX_P="$E2E_SIWX_PORT"
+ELEM_P="$E2E_ELEMENT_PORT"
 
 echo "[stack-up] waiting for health (matrix :${MATRIX_P} siwx :${SIWX_P} element :${ELEM_P}) ..."
 for i in $(seq 1 90); do

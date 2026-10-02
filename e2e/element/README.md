@@ -4,23 +4,43 @@ Drives a **real Element Web** instance against local Synapse + siwx-oidc (MSC386
 
 ## Stack
 
-Bring up from `siwx-oidc-matrix-server` (sibling repo):
-
-```bash
-# From siwx-oidc-matrix-server (needs ../siwx-oidc build context)
-docker compose -f docker-compose.local.yml --env-file .env.local up --build -d
-# Element:  http://localhost:8088
-# Matrix:   http://localhost:8080
-# siwx:     http://localhost:8081
-```
-
-Or from this repo:
+Bring it up from this repo (the scripts expect `siwx-oidc-matrix-server` as a sibling
+checkout, with its gitignored `.env.local`):
 
 ```bash
 bash e2e/element/stack-up.sh
-bash e2e/element/run.sh
+bash e2e/element/run.sh [spec ...]
 bash e2e/element/stack-down.sh
 ```
+
+`stack-up.sh`, `stack-down.sh`, `t5-restart-survival.sh` and `run.sh` all source
+[`stack-env.sh`](stack-env.sh), the single source for the compose project and the host
+ports, so the stack `stack-up.sh` starts is the stack `run.sh` tests:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `E2E_COMPOSE_PROJECT` | `siwx-e2e-element` | Compose project (`-p`) for every compose call. Containers are named `<project>-<service>-N`, volumes and the network carry the same prefix. |
+| `E2E_ELEMENT_PORT` | `28088` | Host port of Element Web. |
+| `E2E_MATRIX_PORT` | `28080` | Host port of the Matrix edge (Synapse). |
+| `E2E_SIWX_PORT` | `28081` | Host port of siwx-oidc. |
+| `ELEMENT_URL`, `MATRIX_URL`, `SIWX_URL` | `http://localhost:<port above>` | Read by `run.sh` and the specs. Set only to point the specs at a stack that is not the one `stack-up.sh` started. |
+
+Why a dedicated project: without `-p`, compose names the project after the directory of
+`docker-compose.local.yml`, `siwx-oidc-matrix-server`. On a host where other people run
+that checkout's stack, `up` and `down` would then recreate or remove their containers,
+volumes and images. The scripts never rely on that default. Set `E2E_COMPOSE_PROJECT` to
+run a second copy next to the first (give it different ports too).
+
+The ports are exported to compose as `MATRIX_HOST_PORT`, `SIWEOIDC_HOST_PORT`,
+`CLIENT_HOST_PORT` and the matching `*_BASE_URL` / `SIWEOIDC_HOST` values. Compose lets the
+calling environment beat `--env-file`, so the ports in `stack-env.sh` win over whatever
+`.env.local` says. The lab defaults 28080/28081/28088 keep clear of other stacks on
+:8080/:8081/:8088; use `E2E_*_PORT=8080 ...` for the compose.local defaults.
+
+Running `docker compose -f docker-compose.local.yml --env-file .env.local up --build -d`
+by hand in `siwx-oidc-matrix-server` uses the compose.local defaults (Element :8088,
+Matrix :8080, siwx :8081) and the directory project; pass `-p` and the ports yourself, or
+use the scripts.
 
 ## Specs (EW-* IDs from the audited plan)
 
@@ -43,5 +63,5 @@ bash e2e/element/stack-down.sh
 
 ## Notes
 
-- Element OIDC redirects land on `http://localhost:8081` (siwx); mock wallet must be injected on **both** Element and siwx origins when needed.
-- Device delete/logout need the Caddy MSC3861 edge routes (logout/all, devices/*) on `:8080`.
+- Element OIDC redirects land on siwx (`SIWX_URL`, host port `E2E_SIWX_PORT`); mock wallet must be injected on **both** Element and siwx origins when needed.
+- Device delete/logout need the Caddy MSC3861 edge routes (logout/all, devices/*) on the Matrix edge port (`E2E_MATRIX_PORT`).

@@ -19,6 +19,10 @@
 # both the container exiting between phases 1 and 4 AND the stack restart.
 set -euo pipefail
 
+# Compose project, ports and URLs: the same source stack-up.sh and run.sh use.
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "$0")" && pwd)/stack-env.sh"
+
 SIWX_REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"   # e2e/element -> repo root
 # Overridable like stack-up.sh's MATRIX_SERVER_REPO, with the same default: a
 # siwx-oidc-matrix-server checkout next to this repository. When running from a
@@ -27,9 +31,9 @@ SIWX_REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"   # e2e/element -> repo roo
 MS_REPO="${MATRIX_SERVER_REPO:-$SIWX_REPO_DIR/../siwx-oidc-matrix-server}"
 ELEMENT_DIR="$SIWX_REPO_DIR/e2e/element"
 
-SIWX_URL="${SIWX_URL:-http://localhost:28081}"
-MATRIX_URL="${MATRIX_URL:-http://localhost:28080}"
-ELEMENT_URL="${ELEMENT_URL:-http://localhost:28088}"
+SIWX_URL="${SIWX_URL:-$E2E_SIWX_URL}"
+MATRIX_URL="${MATRIX_URL:-$E2E_MATRIX_URL}"
+ELEMENT_URL="${ELEMENT_URL:-$E2E_ELEMENT_URL}"
 
 if [ ! -d "$MS_REPO" ]; then
   echo "[t5] matrix-server repo not found at $MS_REPO" >&2
@@ -44,7 +48,9 @@ fi
 # --env-file resolves SIWEOIDC_SIGNING_KEY_PEM (and other secrets sourced from
 # .env.local) to empty, which panics siwx-oidc at startup — a real incident on
 # this lab. Do not "simplify" this to a bare `-f docker-compose.local.yml`.
-COMPOSE=(docker-compose -f docker-compose.local.yml --env-file .env.local)
+# `-p` is required too: without it compose targets the directory-named project
+# ("siwx-oidc-matrix-server"), i.e. some other checkout's stack, not this one.
+COMPOSE=(docker-compose -p "$E2E_COMPOSE_PROJECT" -f docker-compose.local.yml --env-file .env.local)
 
 cd "$MS_REPO"
 
