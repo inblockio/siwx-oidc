@@ -270,7 +270,8 @@ random strings.
 |---|---|---|
 | Access token prefix | `mat_` | none |
 | Refresh token prefix | `mcr_` | none |
-| Scope recorded | `openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}` | `openid profile` |
+| Refresh token issued | always | only for `offline_access`, to a client whose registration allows the `refresh_token` grant |
+| Scope recorded | `openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}` | the requested scopes among `openid`, `profile` and `offline_access`, as far as the client may have them (`openid` if none) |
 | Access token TTL | 300 s | 300 s |
 | Refresh token TTL | 7,776,000 s (90 days), renewed by each rotation | same |
 | ID token TTL | 300 s by default (`id_token_ttl_secs`) | same |
@@ -279,8 +280,19 @@ random strings.
 
 Minted admin tokens use the prefix `msa_`. Device codes use `dvc_`.
 
-The authorization-code grant records the Matrix scope above regardless of the
-scopes requested. Clients request the Matrix scopes in either the stable form
+In delegated-auth mode the authorization-code grant records the Matrix scope
+above regardless of the scopes requested, and always issues a refresh token. In
+standalone mode ("generic mode": no `mas_shared_secret`) it grants least
+privilege: the scope the request asked for, limited to `openid`, `profile` and
+`offline_access`, and a refresh token only when `offline_access` was requested and
+the client's registration allows the `refresh_token` grant (a registration that
+lists no `grant_types` allows it). When the granted scope differs from the
+request, the token response says so in `scope` (RFC 6749 §5.1). The requested scope
+travels from `/authorize` through the session into the stored code. A code
+written by the previous build has none, and is exchanged as it always was
+(`openid profile` and a refresh token) for the 300 s it lives.
+
+Clients request the Matrix scopes in either the stable form
 (`urn:matrix:client:api:*`, `urn:matrix:client:device:{id}`) or the MSC2967
 unstable form (`urn:matrix:org.matrix.msc2967.client:…`); both are advertised.
 
@@ -377,6 +389,8 @@ token is bound the same way, to the client of the successor token it returns.
 
 Provisional choices, open for the maintainers:
 
+- **A registration without `grant_types` allows the refresh grant**, and a
+  generic-mode request that asks for no grantable scope is granted `openid`.
 - **A public client may omit `client_id` at the refresh grant.** `siwx-oidc-auth`
   and the Matrix clients send it, an older agent may not; requiring it would
   sign those out.

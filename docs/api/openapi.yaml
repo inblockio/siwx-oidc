@@ -254,6 +254,12 @@ paths:
         that LOST the rotation response — common on mobile — replay the old
         refresh token once instead of being signed out.
 
+        In a standalone deployment (no MAS shared secret) the code exchange
+        grants the requested scope among `openid`, `profile` and `offline_access`
+        and issues a refresh token only for `offline_access` to a client whose
+        registration allows the refresh grant; a delegated-auth deployment always
+        records the Matrix scope and issues one.
+
         **Client authentication.** `authorization_code` and `refresh_token` are
         bound to the client the code or token was issued to, and share one rule.
         The client named in the request, in `client_id` or as the user name of an
@@ -904,9 +910,9 @@ components:
         access_token: { type: string }
         token_type: { type: string }
         expires_in: { type: integer, description: 300 seconds. }
-        refresh_token: { type: string, description: 90-day TTL, rotated on every use. }
+        refresh_token: { type: string, description: "90-day TTL, rotated on every use. In a standalone deployment the code exchange issues one only for `offline_access`, to a client whose registration allows the `refresh_token` grant." }
         id_token: { type: string, description: "ES256 JWT. `sub` is the DID." }
-        scope: { type: string, description: "Carries `urn:matrix:client:device:{id}` so a client can discover its provisioned device." }
+        scope: { type: string, description: "The granted scope. In the device-code grant it carries `urn:matrix:client:device:{id}` so a client can discover its provisioned device. In a standalone (generic-mode) code exchange it is present when the granted scope differs from the request. A Matrix-mode code exchange omits it." }
 
     UserInfo:
       type: object

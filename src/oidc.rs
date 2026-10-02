@@ -62,6 +62,9 @@ lazy_static::lazy_static! {
     static ref SCOPES: Vec<Scope> = vec![
         Scope::new("openid".to_string()),
         Scope::new("profile".to_string()),
+        // A refresh token for a generic client is issued only when this was
+        // requested and the registration allows the refresh grant (I10).
+        Scope::new("offline_access".to_string()),
         // Stable Matrix scopes (MSC2967 graduated)
         Scope::new("urn:matrix:client:api:*".to_string()),
         Scope::new("urn:matrix:client:device:*".to_string()),
@@ -1493,6 +1496,79 @@ async fn token_device_code(
     }
 }
 
+/// The scopes generic mode can grant, in the order they are issued.
+const GENERIC_GRANTABLE_SCOPES: [&str; 3] = ["openid", "profile", "offline_access"];
+
+/// What a generic-mode code exchange issues for the scope the authorization
+/// request asked for.
+#[derive(Debug, PartialEq, Eq)]
+struct GenericGrant {
+    /// The scope recorded on the tokens: the requested scopes among
+    /// [`GENERIC_GRANTABLE_SCOPES`] that the registration allows, in that order.
+    scope: String,
+    /// Whether a refresh token is issued.
+    refresh_token: bool,
+    /// Whether the token response must name the scope, because it differs from
+    /// the request (RFC 6749 §5.1).
+    report_scope: bool,
+}
+
+/// The grant for a generic-mode (no MAS shared secret) code exchange (I10):
+/// least privilege for a relying party that is not a Matrix client.
+///
+/// - The scope granted is what was requested, limited to `openid`, `profile`
+///   and `offline_access`. Matrix scopes mean nothing here and are not granted.
+///   If nothing grantable was requested the grant is `openid`: the exchange
+///   issues an ID token regardless, so that is what is being granted
+///   (provisional).
+/// - `offline_access`, and with it a refresh token, is granted only when the
+///   client's registration allows the refresh grant. A registration that lists
+///   no `grant_types` is not a restriction (provisional): refusing it would
+///   withhold refresh tokens from clients that registered before this rule
+///   existed and never listed any.
+/// - `requested == None` is a code written by a build from before the scope
+///   travelled with it. Such a code lives 300 s, and for that window it is
+///   exchanged as it always was: `openid profile` and a refresh token.
+fn generic_grant(requested: Option<&str>, registration: &ClientEntry) -> GenericGrant {
+    let Some(requested) = requested else {
+        return GenericGrant {
+            scope: "openid profile".to_string(),
+            refresh_token: true,
+            report_scope: false,
+        };
+    };
+    let asked: Vec<&str> = requested.split_whitespace().collect();
+    let may_refresh = registration
+        .metadata
+        .grant_types()
+        .is_none_or(|grants| grants.contains(&CoreGrantType::RefreshToken));
+    let granted: Vec<&str> = GENERIC_GRANTABLE_SCOPES
+        .iter()
+        .copied()
+        .filter(|scope| asked.contains(scope))
+        .filter(|scope| *scope != "offline_access" || may_refresh)
+        .collect();
+    let refresh_token = granted.contains(&"offline_access");
+    let scope = if granted.is_empty() {
+        "openid".to_string()
+    } else {
+        granted.join(" ")
+    };
+    let report_scope = {
+        let mut requested_set = asked.clone();
+        requested_set.sort_unstable();
+        requested_set.dedup();
+        let mut granted_set: Vec<&str> = scope.split(' ').collect();
+        granted_set.sort_unstable();
+        requested_set != granted_set
+    };
+    GenericGrant {
+        scope,
+        refresh_token,
+        report_scope,
+    }
+}
+
 async fn token_authorization_code(
     form: TokenForm,
     credentials: ClientCredentials,
@@ -1529,7 +1605,7 @@ async fn token_authorization_code(
     } else {
         named_client.clone().unwrap_or_default()
     };
-    authenticate_client(
+    let client_entry = authenticate_client(
         &client_id,
         named_client.as_deref(),
         presented_secret.as_deref(),
@@ -1538,7 +1614,9 @@ async fn token_authorization_code(
         config,
         db_client,
     )
-    .await?;
+    .await?
+    // `Refuse` never answers `None`; the arm is the same refusal, spelled out.
+    .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
 
     // PKCE: every code carries the challenge `/authorize` bound to its session,
     // and the verifier must match it. A code without a challenge (only an older
@@ -1606,7 +1684,12 @@ async fn token_authorization_code(
         .map(|n| n.to_string())
         .unwrap_or_else(|| code_entry.did.clone());
 
-    let (access_prefix, refresh_prefix, scope) = if msc3861_mode {
+    // Matrix mode records the Matrix scope for the device and always issues a
+    // refresh token, whatever was requested: Synapse, Element Web and Element X
+    // depend on exactly that. Generic mode grants what was requested and
+    // allowed, and issues a refresh token only for `offline_access` (I10).
+    let (access_prefix, refresh_prefix, scope, issue_refresh_token, report_scope) = if msc3861_mode
+    {
         let device_id = code_entry.device_id.clone().unwrap_or_default();
         (
             "mat_",
@@ -1615,9 +1698,12 @@ async fn token_authorization_code(
                 "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
                 device_id
             ),
+            true,
+            false,
         )
     } else {
-        ("", "", "openid profile".to_string())
+        let grant = generic_grant(code_entry.scope.as_deref(), &client_entry);
+        ("", "", grant.scope, grant.refresh_token, grant.report_scope)
     };
 
     let device_id = code_entry.device_id.clone().unwrap_or_default();
@@ -1638,24 +1724,28 @@ async fn token_authorization_code(
         .set_token(&opaque, &access_metadata, ACCESS_TOKEN_TTL)
         .await?;
 
-    let refresh_opaque = generate_opaque_token(refresh_prefix);
-    let refresh_metadata = TokenMetadata {
-        username,
-        device_id,
-        scope,
-        client_id: client_id.clone(),
-        iat,
-        exp: iat + REFRESH_TOKEN_TTL as i64,
-        did: code_entry.did.clone(),
-        name: display_name,
-        kind: Some(TokenKind::Refresh),
+    let refresh_token = if issue_refresh_token {
+        let refresh_opaque = generate_opaque_token(refresh_prefix);
+        let refresh_metadata = TokenMetadata {
+            username,
+            device_id,
+            scope: scope.clone(),
+            client_id: client_id.clone(),
+            iat,
+            exp: iat + REFRESH_TOKEN_TTL as i64,
+            did: code_entry.did.clone(),
+            name: display_name,
+            kind: Some(TokenKind::Refresh),
+        };
+        db_client
+            .set_token(&refresh_opaque, &refresh_metadata, REFRESH_TOKEN_TTL)
+            .await?;
+        Some(RefreshToken::new(refresh_opaque))
+    } else {
+        None
     };
-    db_client
-        .set_token(&refresh_opaque, &refresh_metadata, REFRESH_TOKEN_TTL)
-        .await?;
 
     let access_token = AccessToken::new(opaque);
-    let refresh_token = Some(RefreshToken::new(refresh_opaque));
 
     let core_id_token = CoreIdTokenClaims::new(
         IssuerUrl::from_url(config.base_url.clone()),
@@ -1686,6 +1776,16 @@ async fn token_authorization_code(
     );
     response.set_expires_in(Some(&time::Duration::from_secs(expires_in_secs)));
     response.set_refresh_token(refresh_token);
+    // RFC 6749 §5.1: the response says the granted scope when it differs from
+    // the request. Only generic mode can differ; Matrix mode never put one here.
+    if report_scope {
+        response.set_scopes(Some(
+            scope
+                .split_whitespace()
+                .map(|s| Scope::new(s.to_string()))
+                .collect(),
+        ));
+    }
     Ok(response)
 }
 
@@ -7527,6 +7627,64 @@ mod scope_grant_tests {
                 "Matrix token prefixes are unchanged"
             );
         }
+    }
+
+    fn registration(grants: Option<Vec<CoreGrantType>>) -> ClientEntry {
+        let mut metadata = CoreClientMetadata::new(
+            vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
+            EmptyAdditionalClientMetadata {},
+        );
+        if let Some(grants) = grants {
+            metadata = metadata.set_grant_types(Some(grants));
+        }
+        ClientEntry {
+            secret: "secret".into(),
+            metadata,
+            access_token: None,
+        }
+    }
+
+    /// The pure decision, without Redis: ordering and duplicates do not matter,
+    /// the response names the scope only when it differs from the request.
+    #[test]
+    fn the_generic_grant_follows_the_request_and_the_registration() {
+        let grant =
+            |requested: Option<&str>, grants| generic_grant(requested, &registration(grants));
+        let expect = |scope: &str, refresh_token: bool, report_scope: bool| GenericGrant {
+            scope: scope.to_string(),
+            refresh_token,
+            report_scope,
+        };
+
+        assert_eq!(
+            grant(Some("profile  openid openid"), None),
+            expect("openid profile", false, false),
+            "order, spacing and repeats of the request are immaterial"
+        );
+        assert_eq!(
+            grant(Some("offline_access openid"), may_refresh()),
+            expect("openid offline_access", true, false)
+        );
+        assert_eq!(
+            grant(Some("openid offline_access"), code_grant_only()),
+            expect("openid", false, true),
+            "offline_access needs the refresh grant in the registration"
+        );
+        assert_eq!(
+            grant(Some("openid email"), None),
+            expect("openid", false, true),
+            "a scope generic mode does not know is not granted"
+        );
+        assert_eq!(
+            grant(Some(""), None),
+            expect("openid", false, true),
+            "nothing requested: openid, because an ID token is issued"
+        );
+        assert_eq!(
+            grant(None, code_grant_only()),
+            expect("openid profile", true, false),
+            "a code with no recorded scope is exchanged as it was before the scope travelled"
+        );
     }
 
     /// Discovery says `offline_access` is a scope this provider honours.

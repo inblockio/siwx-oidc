@@ -313,8 +313,28 @@ doc; read it before changing the code the rule covers.
   `an_authorization_code_is_never_a_bearer_token` (mock stack).
 - **Discovery advertises only what is implemented.** `subject_types_supported` is `["public"]`
   because the `sub` is the user's DID, identical for every client; advertising `pairwise` would
-  promise a per-client identifier. Pin: `discovery_advertises_public_subjects_only`; the response
-  types are pinned by `discovery_advertises_only_the_code_response_type`.
+  promise a per-client identifier. `scopes_supported` lists `offline_access` because generic mode
+  honours it (next bullet). Pin: `discovery_advertises_public_subjects_only`,
+  `discovery_advertises_offline_access`; the response types are pinned by
+  `discovery_advertises_only_the_code_response_type`.
+- **Generic mode issues a refresh token only for `offline_access`, and the scope it records is
+  the one requested and granted** (I10). Generic mode is a deployment with no
+  `mas_shared_secret`. The code exchange grants the requested scopes among `openid`, `profile`
+  and `offline_access`, issues a refresh token only when `offline_access` was requested and the
+  client's registration allows the `refresh_token` grant, and says the granted scope in the
+  response when it differs from the request. The request's scope travels `/authorize` → session →
+  `CodeEntry.scope`; a code written by the previous build has none and is exchanged as it always
+  was for its 300 s. **Matrix mode is untouched**: the Matrix scope for the device and a refresh
+  token whatever was requested, because Synapse and the Matrix clients depend on exactly that.
+  Provisional: a registration without `grant_types` allows the refresh grant; a request that asks
+  for nothing grantable is granted `openid`. Pin: `generic_mode_issues_a_refresh_token_only_for_offline_access`,
+  `generic_mode_grants_offline_access_only_to_a_client_that_may_refresh`,
+  `generic_mode_issues_the_scope_that_was_requested_and_supported`,
+  `the_generic_grant_follows_the_request_and_the_registration`,
+  `generic_mode_exchanges_a_code_with_no_recorded_scope_as_before`,
+  `matrix_mode_issues_the_matrix_scope_and_a_refresh_token_whatever_was_requested`,
+  `sign_in_issues_the_code_for_the_bound_request` (the scope reaches the code),
+  `a_code_written_before_the_scope_travelled_has_none`.
 - **An empty `device_id` is JSON `null` on the wire, never `""`.** Synapse rejects `""`. Pin:
   `empty_device_id_renders_as_json_null`, `deviceless_token_body_carries_device_id_null`.
 - **Refresh rotation keeps a 60 s grace pointer**: any replay of the old refresh token within
