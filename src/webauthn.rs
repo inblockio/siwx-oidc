@@ -533,7 +533,10 @@ pub async fn register_start(
         )
         .await?;
 
-    info!("webauthn register_start: session={}", session_id);
+    info!(
+        "webauthn register_start: session={}",
+        siwx_oidc::redact::fingerprint(session_id)
+    );
     Ok(ccr)
 }
 
@@ -591,7 +594,8 @@ pub async fn register_finish(
 
     info!(
         "webauthn register_finish: did={} cred_id={}",
-        did, cred_id_b64
+        did,
+        siwx_oidc::redact::fingerprint(&cred_id_b64)
     );
     Ok(RegisterFinishResponse {
         did,
@@ -677,14 +681,15 @@ pub async fn authenticate_start(
             rcr.public_key.allow_credentials = allow_list;
             info!(
                 "webauthn authenticate_start: session={} scoped did={} creds={}",
-                session_id,
+                siwx_oidc::redact::fingerprint(session_id),
                 did,
                 rcr.public_key.allow_credentials.len()
             );
         } else {
             info!(
                 "webauthn authenticate_start: session={} scope did={} resolved 0 creds -> discoverable fallback",
-                session_id, did
+                siwx_oidc::redact::fingerprint(session_id),
+                did
             );
         }
     }
@@ -698,7 +703,10 @@ pub async fn authenticate_start(
         )
         .await?;
 
-    info!("webauthn authenticate_start: session={}", session_id);
+    info!(
+        "webauthn authenticate_start: session={}",
+        siwx_oidc::redact::fingerprint(session_id)
+    );
     Ok(rcr)
 }
 
@@ -824,7 +832,8 @@ pub async fn verify_credential(
 
     info!(
         "webauthn verify_credential: did={} cred={}",
-        did, cred_id_b64
+        did,
+        siwx_oidc::redact::fingerprint(&cred_id_b64)
     );
     Ok(AuthenticateFinishResponse { ok: true, did })
 }
@@ -897,7 +906,8 @@ pub async fn link_start(
 
     info!(
         "webauthn link_start: session={} primary_did={}",
-        session_id, primary_did
+        siwx_oidc::redact::fingerprint(session_id),
+        primary_did
     );
     Ok(ccr)
 }
@@ -974,7 +984,8 @@ pub async fn link_finish(
 
     info!(
         "webauthn link_finish: cred_id={} primary_did={}",
-        cred_id_b64, link_state.primary_did
+        siwx_oidc::redact::fingerprint(&cred_id_b64),
+        link_state.primary_did
     );
     Ok(LinkFinishResponse {
         credential_id: cred_id_b64,

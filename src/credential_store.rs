@@ -52,6 +52,7 @@ use tracing::{error, info, warn};
 
 use crate::credential_migration::sign_count_from_blob;
 use crate::db::{RedisClient, KV_WEBAUTHN_CREDENTIAL_PREFIX};
+use crate::redact::{fingerprint, redact_url};
 
 /// The runtime flag. Set to a Redis URL to enable the shared store.
 pub const ENABLE_ENV: &str = "AQUA_WEBAUTHN_REDIS_URL";
@@ -128,12 +129,16 @@ pub async fn probe_at_boot() -> Result<()> {
     if shared_store().await.is_none() {
         error!("credential store: {ENABLE_ENV} is set but the store could not be opened");
         anyhow::bail!(
-            "{ENABLE_ENV} is set to {url} but the aqua-auth credential store could not be \
+            "{ENABLE_ENV} is set to {shown} but the aqua-auth credential store could not be \
              opened. Refusing to start: serving legacy-only while the operator believes \
-             dual-write is on silently strands every credential registered from now on."
+             dual-write is on silently strands every credential registered from now on.",
+            shown = redact_url(url)
         );
     }
-    info!("credential store: dual-write ENABLED -> {url}");
+    info!(
+        "credential store: dual-write ENABLED -> {shown}",
+        shown = redact_url(url)
+    );
     Ok(())
 }
 
@@ -148,7 +153,10 @@ pub async fn mirror_credential(cred_id_b64: &str, blob: &str, did: &str, label: 
         return;
     };
     let Some(id) = credential_id(cred_id_b64) else {
-        warn!("mirror_credential: {cred_id_b64} is not base64url; not mirrored");
+        warn!(
+            "mirror_credential: {cred} is not base64url; not mirrored",
+            cred = fingerprint(cred_id_b64)
+        );
         return;
     };
     // The counter lives inside the blob. Reading it here (rather than passing 0)
@@ -161,7 +169,10 @@ pub async fn mirror_credential(cred_id_b64: &str, blob: &str, did: &str, label: 
     {
         Some(Ok(n)) => n,
         _ => {
-            warn!("mirror_credential: {cred_id_b64} has no readable cred.counter; not mirrored");
+            warn!(
+                "mirror_credential: {cred} has no readable cred.counter; not mirrored",
+                cred = fingerprint(cred_id_b64)
+            );
             return;
         }
     };
@@ -177,8 +188,14 @@ pub async fn mirror_credential(cred_id_b64: &str, blob: &str, did: &str, label: 
         })
         .await;
     match res {
-        Ok(()) => info!("mirror_credential: {cred_id_b64} -> aqua-auth store (did={did})"),
-        Err(e) => warn!("mirror_credential: {cred_id_b64} failed: {e}"),
+        Ok(()) => info!(
+            "mirror_credential: {cred} -> aqua-auth store (did={did})",
+            cred = fingerprint(cred_id_b64)
+        ),
+        Err(e) => warn!(
+            "mirror_credential: {cred} failed: {e}",
+            cred = fingerprint(cred_id_b64)
+        ),
     }
 }
 
@@ -195,7 +212,10 @@ pub async fn mirror_sign_count(cred_id_b64: &str, new_count: u32) {
     };
     match store.update_sign_count(&id, new_count).await {
         Ok(()) | Err(WebauthnStoreError::NotFound) => {}
-        Err(e) => warn!("mirror_sign_count: {cred_id_b64} failed: {e}"),
+        Err(e) => warn!(
+            "mirror_sign_count: {cred} failed: {e}",
+            cred = fingerprint(cred_id_b64)
+        ),
     }
 }
 
@@ -213,7 +233,10 @@ pub async fn mirror_delete(did: &str, cred_id_b64: &str) {
     };
     match store.delete(did, &id).await {
         Ok(_) => {}
-        Err(e) => warn!("mirror_delete: {cred_id_b64} failed: {e}"),
+        Err(e) => warn!(
+            "mirror_delete: {cred} failed: {e}",
+            cred = fingerprint(cred_id_b64)
+        ),
     }
 }
 
@@ -260,7 +283,10 @@ fn reconcile_sign_count(cred_id_b64: &str, blob: String, stored: u32) -> String 
     match serde_json::to_string(&value) {
         Ok(s) => s,
         Err(e) => {
-            warn!("read_blob: {cred_id_b64} sign-count reconcile failed ({e}); using stored blob");
+            warn!(
+                "read_blob: {cred} sign-count reconcile failed ({e}); using stored blob",
+                cred = fingerprint(cred_id_b64)
+            );
             blob
         }
     }
@@ -275,7 +301,10 @@ pub async fn read_blob(redis: &RedisClient, cred_id_b64: &str) -> Result<Option<
                     if let Ok(blob) = String::from_utf8(row.public_key) {
                         return Ok(Some(reconcile_sign_count(cred_id_b64, blob, stored_count)));
                     }
-                    warn!("read_blob: {cred_id_b64} in the aqua-auth store is not UTF-8; falling back");
+                    warn!(
+                        "read_blob: {cred} in the aqua-auth store is not UTF-8; falling back",
+                        cred = fingerprint(cred_id_b64)
+                    );
                 }
                 Ok(None) => {}
                 Err(e) => warn!("read_blob: aqua-auth store lookup failed ({e}); falling back"),

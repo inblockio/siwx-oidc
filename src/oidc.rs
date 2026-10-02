@@ -1173,7 +1173,7 @@ async fn token_device_code(
             // winner deletes the device_code at the end, so a subsequent poll then
             // gets expired_token — same as a normal completed flow).
             if !db_client.try_claim_device_code(&dc).await? {
-                debug!(device_code = %dc, "device_code already claimed by a concurrent poll");
+                debug!(device_code_fp = %siwx_oidc::redact::fingerprint(&dc), "device_code already claimed by a concurrent poll");
                 return Err(device_code_error(
                     "authorization_pending",
                     "Device code is being processed.",

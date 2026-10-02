@@ -46,6 +46,7 @@ use super::synapse_client::SynapseClient;
 use super::webauthn as wa;
 use aqua_auth::{all_cipher_suites, all_did_methods};
 use siwx_oidc::db::*;
+use siwx_oidc::redact::fingerprint;
 
 // -- Shared application state ----------------------------------------------
 
@@ -132,7 +133,7 @@ impl IntoResponse for CustomError {
             }
             CustomError::UnknownCredential(cred_id) => {
                 // Expected user condition (stale/revoked passkey), NOT a server fault.
-                warn!(credential_id = %cred_id, "unknown_credential");
+                warn!(credential_fp = %fingerprint(cred_id), "unknown_credential");
             }
             // A server-side fault we have already CLASSIFIED, unlike
             // `internal_error`. Logged under its own name so an operator can
@@ -1563,9 +1564,24 @@ pub async fn main() {
 
 /// Request logging: one `info!` line per request (method and path) and one per
 /// response (status and latency). The path only, never the query.
+///
+/// A query carries credentials (`/device?user_code=…` is the link the device
+/// flow hands the user), so it is kept out of the span as well as out of the
+/// events. tower-http's default span records the whole URI and prints it in
+/// front of every event logged while the request is handled, which at debug
+/// level is every line. The span is at `DEBUG`, as the default one is, so it
+/// stays off under the default filter. Pinned by
+/// `request_logging_names_the_path_and_never_the_query`.
 fn with_request_logging(router: Router) -> Router {
     router.layer(
         TraceLayer::new_for_http()
+            .make_span_with(|req: &axum::http::Request<_>| {
+                tracing::debug_span!(
+                    "request",
+                    method = %req.method(),
+                    path = %req.uri().path(),
+                )
+            })
             .on_request(|req: &axum::http::Request<_>, _span: &tracing::Span| {
                 info!(
                     method = %req.method(),

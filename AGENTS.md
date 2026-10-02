@@ -46,6 +46,7 @@ everything else exists only in the binary crate.
 | `resolve.rs` | `GET /resolve`, the public DID↔MXID lookup. |
 | `localpart.rs` | Grandfathering policy: `resolve_identity` (fallible) and `resolve_identity_or_legacy` (fail-safe to legacy). |
 | `mxid.rs` (lib) | Pure localpart derivation: `localpart_for`, `legacy_localpart`, `canonicalize`. `sha2` only. |
+| `redact.rs` (lib) | `fingerprint`, `redact_key`, `redact_url`: what a log line may say about a credential. |
 | `alias.rs` (lib) | `alias_for(did)`: the generated `Firstname Surname` a new account is seeded with. |
 | `credential_identity.rs` (lib) | Which identity a stored passkey authenticates: a `webauthn:link/*` entry overrides the derived `did:key`. |
 | `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL`. |
@@ -424,6 +425,27 @@ structured output.
 | `debug!` | Internal detail (Redis key operations, token metadata, ENS attempts) |
 
 - Never log secrets, tokens, cookies or key material. Log a public-key fingerprint or `kid`.
+- **Logs carry fingerprints of credentials, never the values.** A log site that would name an
+  access or refresh token, authorization code, device code, user code, session id, cookie,
+  client secret, registration access token or passkey credential id, directly or inside a Redis
+  key, names `redact::fingerprint(..)` of it (`redact_key(..)` for a `namespace/identifier` key,
+  `redact_url(..)` for a URL that carries a password). The fingerprint is the first eight hex
+  characters of the SHA-256, so an operator can compute it for a value they hold; it is kept
+  short because a user code has about 34 bits of entropy. Request logging records method and
+  path, never the query, and that holds for the span too: tower-http's default span prints the
+  whole URI in front of every debug line. A struct that holds a credential prints its fingerprint
+  under `Debug` (`RotatedToken`, `DeviceCodeEntry`). Pin:
+  `the_redis_code_and_token_paths_log_fingerprints_never_values`,
+  `a_struct_that_holds_a_credential_prints_its_fingerprint_under_debug`,
+  `no_log_site_names_a_credential_without_its_fingerprint` (a scan of every log macro in `src/`,
+  which covers the sites no test reaches),
+  `the_device_flow_logs_fingerprints_never_its_codes`,
+  `a_device_poll_that_loses_the_claim_logs_the_code_only_as_a_fingerprint`,
+  `the_ceremony_starts_log_session_ids_only_as_fingerprints`,
+  `request_logging_names_the_path_and_never_the_query`,
+  `the_boot_check_never_prints_the_redis_password`. A new log site that names a credential
+  variable fails the scan; add the variable name to `CREDENTIAL_NAMES` in `tests/log_hygiene.rs`
+  when you introduce a new kind of credential.
 - Use structured fields (`info!(did = %did, "sign_in success")`), not string interpolation.
 - Log errors at the boundary (`CustomError::into_response`). Modules that bypass `CustomError`
   (`introspect`, `compat`, `resolve`) log their own errors.

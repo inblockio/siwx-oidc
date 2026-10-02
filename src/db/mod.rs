@@ -389,7 +389,10 @@ pub enum DeviceCodeStatus {
 }
 
 /// An RFC 8628 device authorization code stored in Redis.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// `Debug` is written by hand: the user code is a credential for the approval
+/// page, so it prints as its fingerprint (see [`crate::redact`]).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DeviceCodeEntry {
     pub user_code: String,
     pub client_id: String,
@@ -399,6 +402,21 @@ pub struct DeviceCodeEntry {
     pub device_id: Option<String>,
     pub last_poll: Option<i64>,
     pub created_at: i64,
+}
+
+impl std::fmt::Debug for DeviceCodeEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCodeEntry")
+            .field("user_code_fp", &crate::redact::fingerprint(&self.user_code))
+            .field("client_id", &self.client_id)
+            .field("scope", &self.scope)
+            .field("status", &self.status)
+            .field("did", &self.did)
+            .field("device_id", &self.device_id)
+            .field("last_poll", &self.last_poll)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 /// What a stored token may be presented for.
@@ -503,7 +521,10 @@ impl TokenMetadata {
 /// The successor token pair recorded under [`KV_ROTATED_PREFIX`] when a refresh
 /// token is rotated, so a lost-response replay of the old refresh token can recover
 /// it idempotently within the grace window.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// `Debug` is written by hand: the pair is two live credentials, so each prints
+/// as its fingerprint (see [`crate::redact`]).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RotatedToken {
     /// The successor access token minted by the rotation.
     pub access_token: String,
@@ -511,6 +532,22 @@ pub struct RotatedToken {
     pub refresh_token: String,
     /// Absolute Unix expiry of the successor access token (drives `expires_in` on replay).
     pub access_exp: i64,
+}
+
+impl std::fmt::Debug for RotatedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotatedToken")
+            .field(
+                "access_token_fp",
+                &crate::redact::fingerprint(&self.access_token),
+            )
+            .field(
+                "refresh_token_fp",
+                &crate::redact::fingerprint(&self.refresh_token),
+            )
+            .field("access_exp", &self.access_exp)
+            .finish()
+    }
 }
 
 #[async_trait]

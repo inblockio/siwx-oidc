@@ -8,6 +8,7 @@ use crate::introspect::generate_opaque_token;
 use crate::oidc::CustomError;
 use crate::synapse_client::SynapseClient;
 use siwx_oidc::db::*;
+use siwx_oidc::redact::fingerprint;
 
 /// CAIP-122 nonce-store category for device-approval nonces (C1). The stored
 /// binding is the `user_code` the nonce was minted for.
@@ -117,8 +118,8 @@ pub async fn device_authorization(
     let verification_uri_complete = format!("{}?user_code={}", verification_uri, user_code);
 
     info!(
-        device_code_prefix = &device_code[..8],
-        user_code = %user_code,
+        device_code_fp = %fingerprint(&device_code),
+        user_code_fp = %fingerprint(&user_code),
         scope = %scope,
         "device_authorization issued"
     );
@@ -942,7 +943,7 @@ pub async fn device_approve(
         let _ = db_client
             .update_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
             .await;
-        info!(user_code = %req.user_code, "device denied");
+        info!(user_code_fp = %fingerprint(&req.user_code), "device denied");
         return Ok(DeviceApproveResponse {
             status: "denied".to_string(),
             warning: None,
@@ -1041,7 +1042,7 @@ pub async fn device_approve(
     let _ = db_client
         .update_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
         .await;
-    info!(user_code = %req.user_code, did = %did, "device approved");
+    info!(user_code_fp = %fingerprint(&req.user_code), did = %did, "device approved");
 
     Ok(DeviceApproveResponse {
         status: "approved".to_string(),
@@ -1086,7 +1087,7 @@ pub async fn device_approve_passkey(
     let _ = db_client
         .update_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
         .await;
-    info!(user_code = %user_code, did = %verified_did, "device approved via passkey");
+    info!(user_code_fp = %fingerprint(user_code), did = %verified_did, "device approved via passkey");
 
     Ok(DeviceApproveResponse {
         status: "approved".to_string(),

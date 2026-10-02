@@ -190,7 +190,11 @@ Logs go to stdout through `tracing`. `RUST_LOG` sets the filter (default
 `siwx_oidc=info,tower_http=info,warn`; for example `RUST_LOG=siwx_oidc=debug,tower_http=debug`).
 `SIWXOIDC_LOG_FORMAT=json` switches to one JSON object per line for log aggregation. Secrets,
 tokens and key material are never logged; the signing key appears only as its `kid` (and, for
-a generated key, a public-key fingerprint).
+a generated key, a public-key fingerprint). A credential that a log line has to refer to (a
+token, authorization code, device code, user code, session id, passkey credential id) appears
+as a fingerprint, the first eight hex characters of its SHA-256, which you can compute for a
+value you hold to find the lines about it: `printf %s "$value" | sha256sum | cut -c1-8`. A
+request is logged by method and path, never by query.
 
 ## Running locally
 

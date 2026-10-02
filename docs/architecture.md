@@ -179,7 +179,8 @@ loses them. Troubleshooting commands: [troubleshooting.md](troubleshooting.md).
 
 `tracing` with an `EnvFilter` (default `siwx_oidc=info,tower_http=info,warn`, overridden by
 `RUST_LOG`) and a human-readable or JSON formatter. Every request and response is logged with
-method, path, status and latency. Level rules: [AGENTS.md](../AGENTS.md#logging-conventions);
+method, path (never the query), status and latency. Credentials appear in logs only as
+fingerprints. Level rules: [AGENTS.md](../AGENTS.md#logging-conventions);
 settings: [configuration.md](configuration.md#logging).
 
 ## Lineage

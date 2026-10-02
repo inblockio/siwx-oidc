@@ -10,6 +10,8 @@ use bb8_redis::{
     RedisConnectionManager,
 };
 use tracing::debug;
+
+use crate::redact::{fingerprint, redact_key};
 use url::Url;
 
 use super::*;
@@ -389,7 +391,11 @@ impl RedisClient {
                 Ok(Some(v)) => v,
                 Ok(None) => continue, // raced with another purge / expiry
                 Err(e) => {
-                    debug!("purge_identity: get link {} failed: {}", link_key, e);
+                    debug!(
+                        "purge_identity: get link {} failed: {}",
+                        redact_key(&link_key),
+                        e
+                    );
                     errors += 1;
                     continue;
                 }
@@ -408,20 +414,32 @@ impl RedisClient {
                 Ok(Some(_)) => match self.del_raw(&cred_key).await {
                     Ok(()) => purged += 1,
                     Err(e) => {
-                        debug!("purge_identity: del cred {} failed: {}", cred_key, e);
+                        debug!(
+                            "purge_identity: del cred {} failed: {}",
+                            redact_key(&cred_key),
+                            e
+                        );
                         errors += 1;
                     }
                 },
                 Ok(None) => {}
                 Err(e) => {
-                    debug!("purge_identity: get cred {} failed: {}", cred_key, e);
+                    debug!(
+                        "purge_identity: get cred {} failed: {}",
+                        redact_key(&cred_key),
+                        e
+                    );
                     errors += 1;
                 }
             }
             match self.del_raw(&link_key).await {
                 Ok(()) => purged += 1,
                 Err(e) => {
-                    debug!("purge_identity: del link {} failed: {}", link_key, e);
+                    debug!(
+                        "purge_identity: del link {} failed: {}",
+                        redact_key(&link_key),
+                        e
+                    );
                     errors += 1;
                 }
             }
@@ -431,7 +449,8 @@ impl RedisClient {
             if let Err(e) = self.index_remove_passkey(did, cred_id).await {
                 debug!(
                     "purge_identity: index_remove_passkey {} failed: {}",
-                    cred_id, e
+                    fingerprint(cred_id),
+                    e
                 );
             }
             // Delete-through: without this, an erased identity's passkey would
@@ -448,7 +467,11 @@ impl RedisClient {
                 Ok(Some(v)) => v,
                 Ok(None) => continue, // already removed in pass (a) or expired
                 Err(e) => {
-                    debug!("purge_identity: get cred {} failed: {}", cred_key, e);
+                    debug!(
+                        "purge_identity: get cred {} failed: {}",
+                        redact_key(&cred_key),
+                        e
+                    );
                     errors += 1;
                     continue;
                 }
@@ -457,7 +480,11 @@ impl RedisClient {
                 match self.del_raw(&cred_key).await {
                     Ok(()) => purged += 1,
                     Err(e) => {
-                        debug!("purge_identity: del cred {} failed: {}", cred_key, e);
+                        debug!(
+                            "purge_identity: del cred {} failed: {}",
+                            redact_key(&cred_key),
+                            e
+                        );
                         errors += 1;
                     }
                 }
@@ -466,7 +493,8 @@ impl RedisClient {
                 if let Err(e) = self.index_remove_passkey(did, cred_id).await {
                     debug!(
                         "purge_identity: index_remove_passkey {} failed: {}",
-                        cred_id, e
+                        fingerprint(cred_id),
+                        e
                     );
                 }
                 // Delete-through, as in pass (a).
@@ -565,7 +593,11 @@ impl RedisClient {
                 Ok(Some(v)) => v,
                 Ok(None) => continue,
                 Err(e) => {
-                    debug!("get_passkeys_for_did: get link {} failed: {}", link_key, e);
+                    debug!(
+                        "get_passkeys_for_did: get link {} failed: {}",
+                        redact_key(&link_key),
+                        e
+                    );
                     continue;
                 }
             };
@@ -589,7 +621,11 @@ impl RedisClient {
                 Ok(Some(v)) => v,
                 Ok(None) => continue,
                 Err(e) => {
-                    debug!("get_passkeys_for_did: get cred {} failed: {}", cred_key, e);
+                    debug!(
+                        "get_passkeys_for_did: get cred {} failed: {}",
+                        redact_key(&cred_key),
+                        e
+                    );
                     continue;
                 }
             };
@@ -753,7 +789,11 @@ impl DBClient for RedisClient {
         conn.set_ex::<_, _, ()>(&key, &value, ENTRY_LIFETIME as u64)
             .await
             .map_err(|e| anyhow!("Failed to set code in Redis: {}", e))?;
-        debug!("set_code: stored key={} ttl={}s", key, ENTRY_LIFETIME);
+        debug!(
+            "set_code: stored key={} ttl={}s",
+            redact_key(&key),
+            ENTRY_LIFETIME
+        );
         Ok(())
     }
 
@@ -816,13 +856,16 @@ impl DBClient for RedisClient {
             .map_err(|e| anyhow!("Failed to consume code: {}", e))?;
         match raw {
             Some(e) => {
-                debug!("try_consume_code: consumed key={}", key);
+                debug!("try_consume_code: consumed key={}", redact_key(&key));
                 Ok(Some(serde_json::from_str(&e).map_err(|e| {
                     anyhow!("Failed to deserialize code entry: {}", e)
                 })?))
             }
             None => {
-                debug!("try_consume_code: unknown or already consumed key={}", key);
+                debug!(
+                    "try_consume_code: unknown or already consumed key={}",
+                    redact_key(&key)
+                );
                 Ok(None)
             }
         }
@@ -945,7 +988,7 @@ impl DBClient for RedisClient {
                 .await
                 .map_err(|e| anyhow!("Failed to EXPIRE device token index: {}", e))?;
         }
-        debug!("set_token: stored key={} ttl={}s", key, ttl);
+        debug!("set_token: stored key={} ttl={}s", redact_key(&key), ttl);
         Ok(())
     }
 

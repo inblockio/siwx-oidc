@@ -177,10 +177,14 @@ const CREDENTIAL_NAMES: &[&str] = &[
 ];
 
 /// Names that are credentials only in one file, where they are a Redis key.
-const CREDENTIAL_NAMES_BY_FILE: &[(&str, &[&str])] = &[(
-    "src/db/redis.rs",
-    &["key", "idx_key", "index_key", "tomb_key"],
-)];
+const CREDENTIAL_NAMES_BY_FILE: &[(&str, &[&str])] = &[
+    (
+        "src/db/redis.rs",
+        &["key", "idx_key", "index_key", "tomb_key"],
+    ),
+    // The dual-write Redis URL carries a password.
+    ("src/credential_store.rs", &["url"]),
+];
 
 /// A log site that names one of the variables above and is safe. Each entry is
 /// `(file, line number)` with the reason; the scan has no other exemption.
