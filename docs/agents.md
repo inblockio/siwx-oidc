@@ -264,6 +264,7 @@ siwx-oidc-auth --device-flow --server https://auth.example.org --client-id "$CLI
 ```
 
 The approval URL and code go to stderr; the tokens go to stdout once approved.
+The client asks for the scope `openid offline_access urn:matrix:client:api:*`.
 The flow requires the server's delegated-auth mode, and the approving DID must
 already have an account (the device flow never creates one).
 
