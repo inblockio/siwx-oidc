@@ -1,6 +1,6 @@
 # Guest portal reference material
 
-**Status:** reference documentation. Source artefacts kept next to the design set so that the next step, the [consolidation session](../08-consolidation-session.md), has its inputs in one place. Nothing here is part of the design contract of [00](../00-overview.md) to [07](../07-implementation-plan.md): no `GP-` identifier depends on a file in this folder, and no milestone builds from it until the consolidation session has decided what to take over.
+**Status:** reference documentation. The inputs of the next step, the [consolidation session](../08-consolidation-session.md), kept next to the design set in one place. Track B is source artefacts as received; Track C is an evaluation written here. Nothing here is part of the design contract of [00](../00-overview.md) to [09](../09-registered-users.md): no `GP-` identifier depends on a file in this folder, and no milestone builds from it until the consolidation session has decided what to take over.
 
 ## Contents
 
@@ -8,14 +8,15 @@
 |---|---|---|
 | [waiting-room-case-study.md](waiting-room-case-study.md) | A survey of how seven meeting apps handle waiting rooms and guests (scorecard, security history, 12-test hands-on protocol) and the **28-feature requirements list** (13 must, 10 should, 5 could), each feature naming the app that does it best and the reference screen that draws it | [08](../08-consolidation-session.md) sections 3 and 4 |
 | [waiting-room-wireframes/](waiting-room-wireframes/) | Seven reference screens, W1 to W7: guest pre-join, waiting room and other states on a phone; host alert, waiting room panel and participant actions on desktop; waiting room and guest settings. Blue tags on each screen carry the feature number F1 to F28 of the case study | [08](../08-consolidation-session.md) sections 3 and 4 |
+| [meedio-connect.md](meedio-connect.md) | **Track C.** An evaluation of meedio-connect, an open-source (AGPL-3.0) Matrix-native video client with a knock waiting room: why it is a reference and not a base for the guest client, its Element X compatibility, and the patterns it offers. Written in this repository on 2026-10-02 against pinned commits | [08](../08-consolidation-session.md) sections 1, 3 and 4; D22; the evidence of [09](../09-registered-users.md) section 2.2 |
 
 The design set's own screens (host H0 to H5, guest G1 to G7, claim K1 and K2) stay in [06](../06-wireframes.md) and its [gallery](../wireframes/index.html). The two wireframe sets were drawn independently and are not yet reconciled; that is the work of the consolidation session.
 
 ## Rules for this folder
 
-1. **Source artefacts are kept as received.** The wireframe files are byte-identical to the copies exported from the canvas they were drawn in (hashes below). The case study is a Markdown conversion of the living document it was written in, with only the conversions its header lists. A change belongs in the source and arrives here as a new export, never as an edit in place.
+1. **Track B source artefacts are kept as received.** The wireframe files are byte-identical to the copies exported from the canvas they were drawn in (hashes below). The case study is a Markdown conversion of the living document it was written in, with only the conversions its header lists. A change belongs in the source and arrives here as a new export, never as an edit in place.
 2. **Identifiers.** The case study numbers its features F1 to F28. The design set cites them as `RF-01` to `RF-28` (RF-nn is feature Fn), so they cannot be confused with the F-numbers of the claim failure rows in 05 or the findings in 04. The screens are cited as `W1` to `W7`.
-3. **Nothing in here is verified by this repository.** The case study says no hands-on test was run. Its vendor, advisory and date claims are leads until someone checks them; before the pull request leaves draft, a maintainer should decide whether to keep the named-vendor security table in a public repository at all.
+3. **Track B is not verified by this repository; Track C is.** The case study says no hands-on test was run. The Track C evaluation carries a status for each claim and pins every source, like the design set, and is edited in place when its sources move. Its vendor, advisory and date claims are leads until someone checks them; before the pull request leaves draft, a maintainer should decide whether to keep the named-vendor security table in a public repository at all.
 4. **Sample data is placeholder data.** The wireframes use invented names (Jordan, Priya S., Sam K., Alex, MeetingBot 7), a masked phone number and bracketed placeholders. None of it is real.
 
 ## Viewing the wireframes
