@@ -15,6 +15,10 @@
 //!   5. C2 Step 4a (mandatory PKCE) — a `response_type=code` `/authorize` request
 //!      WITHOUT a `code_challenge` is rejected; the same request WITH S256 PKCE
 //!      still succeeds.
+//!   6. Token kinds — each endpoint accepts exactly one kind of token: the
+//!      refresh endpoints only refresh tokens; introspection, `/userinfo` and
+//!      the bearer-authenticated Matrix routes only access tokens (an admin
+//!      token is an access token).
 //!
 //! Targets the MOCK stack brought up by `e2e/up.sh` (siwx-oidc :8080, Synapse
 //! mock :8090, Redis :6379). Run single-threaded with the stack up:
@@ -1017,5 +1021,350 @@ async fn account_action_operation_binding_is_enforced() {
         status,
         StatusCode::OK,
         "a cross_signing_reset signature must not drive account_erase, got 200: {body}"
+    );
+}
+
+// ===========================================================================
+// Token kinds: each endpoint accepts exactly one kind of token.
+//
+// An access token (including a minted admin token) is a bearer credential: it
+// is what introspection, /userinfo and the Matrix compat routes accept. A
+// refresh token is accepted only by the two refresh endpoints. A token of the
+// wrong kind is answered exactly like an unknown token, and the presented token
+// is left untouched (it stays usable where it belongs).
+// ===========================================================================
+
+fn shared_secret() -> String {
+    std::env::var("MAS_SHARED_SECRET").unwrap_or_else(|_| "testsecret".to_string())
+}
+
+/// /authorize + /sign_in with the given wallet, passing the PKCE parameters on
+/// the /sign_in leg as the login page does. Returns the authorization code.
+async fn sign_in_for_code(
+    nrc: &Client,
+    base: &str,
+    rc: &RegisteredClient,
+    w: &Wallet,
+    challenge: &str,
+    state: &str,
+) -> String {
+    let (session_cookie, nonce, domain) = authorize_session(nrc, base, rc, challenge, state).await;
+    let message = build_login_message(w, base, &domain, &nonce, &rc.redirect_uri, 48);
+    let sign_in_url = format!(
+        "{base}/sign_in?redirect_uri={}&state={state}&client_id={}&code_challenge={}&code_challenge_method=S256",
+        urlencoding::encode(&rc.redirect_uri),
+        urlencoding::encode(&rc.client_id),
+        urlencoding::encode(challenge),
+    );
+    let resp = nrc
+        .get(&sign_in_url)
+        .header("cookie", siwx_cookie_header(&session_cookie, w, &message))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let location = resp
+        .headers()
+        .get("location")
+        .map(|v| v.to_str().unwrap().to_string());
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "setup: sign_in must issue a code (location {location:?}): {}",
+        resp.text().await.unwrap_or_default()
+    );
+    parse_query(&location.unwrap())
+        .get("code")
+        .expect("setup: the sign_in redirect carries a code")
+        .clone()
+}
+
+/// POST /token with the authorization_code grant. `verifier` None omits it.
+async fn exchange_code(
+    c: &Client,
+    base: &str,
+    rc: &RegisteredClient,
+    code: &str,
+    verifier: Option<&str>,
+) -> reqwest::Response {
+    let mut form = vec![
+        ("code", code.to_string()),
+        ("client_id", rc.client_id.clone()),
+        ("client_secret", rc.client_secret.clone()),
+        ("grant_type", "authorization_code".to_string()),
+    ];
+    if let Some(v) = verifier {
+        form.push(("code_verifier", v.to_string()));
+    }
+    c.post(format!("{base}/token"))
+        .form(&form)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A complete code-flow sign-in for a fresh wallet. Returns (access, refresh, did).
+async fn login_tokens(c: &Client, nrc: &Client, base: &str) -> (String, String, String) {
+    let rc = register_client(c, base).await;
+    let w = new_wallet();
+    let (verifier, challenge) = pkce_pair();
+    let code = sign_in_for_code(nrc, base, &rc, &w, &challenge, "kind_state").await;
+    let resp = exchange_code(c, base, &rc, &code, Some(&verifier)).await;
+    assert_eq!(resp.status(), StatusCode::OK, "setup: code exchange");
+    let body: Value = resp.json().await.unwrap();
+    (
+        body["access_token"].as_str().unwrap().to_string(),
+        body["refresh_token"].as_str().unwrap().to_string(),
+        w.did,
+    )
+}
+
+/// POST /oauth2/introspect authenticated with the MAS shared secret.
+async fn introspect(c: &Client, base: &str, token: &str) -> Value {
+    let resp = c
+        .post(format!("{base}/oauth2/introspect"))
+        .bearer_auth(shared_secret())
+        .form(&[("token", token), ("token_type_hint", "access_token")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "introspection answers 200");
+    resp.json().await.unwrap()
+}
+
+/// POST /token with the refresh_token grant.
+async fn refresh_grant(c: &Client, base: &str, token: &str) -> reqwest::Response {
+    c.post(format!("{base}/token"))
+        .form(&[("grant_type", "refresh_token"), ("refresh_token", token)])
+        .send()
+        .await
+        .unwrap()
+}
+
+/// POST /_matrix/client/v3/refresh.
+async fn matrix_refresh(c: &Client, base: &str, token: &str) -> reqwest::Response {
+    c.post(format!("{base}/_matrix/client/v3/refresh"))
+        .json(&json!({ "refresh_token": token }))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn assert_refused_by_refresh_grant(c: &Client, base: &str, token: &str, what: &str) {
+    let resp = refresh_grant(c, base, token).await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the refresh_token grant must refuse {what}, got {status}: {body}"
+    );
+    assert!(
+        body.contains("invalid_grant"),
+        "{what} must be refused like an unknown token (invalid_grant): {body}"
+    );
+}
+
+async fn assert_refused_by_matrix_refresh(c: &Client, base: &str, token: &str, what: &str) {
+    let resp = matrix_refresh(c, base, token).await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "/_matrix/client/v3/refresh must refuse {what}, got {status}: {body}"
+    );
+    assert!(
+        body.contains("M_UNKNOWN_TOKEN"),
+        "{what} must be refused like an unknown token (M_UNKNOWN_TOKEN): {body}"
+    );
+}
+
+/// The refresh_token grant at /token accepts only a refresh token. An access
+/// token is refused like an unknown one, and stays a working access token.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn the_refresh_grant_accepts_only_a_refresh_token() {
+    let base = oidc();
+    let c = Client::new();
+    let nrc = no_redirect_client();
+    let (access, refresh, _did) = login_tokens(&c, &nrc, &base).await;
+
+    assert_refused_by_refresh_grant(&c, &base, &access, "an access token").await;
+    assert_eq!(
+        introspect(&c, &base, &access).await["active"],
+        json!(true),
+        "a refused access token must stay active (never deleted by the refusal)"
+    );
+
+    // Control: the real refresh token still refreshes.
+    let ok = refresh_grant(&c, &base, &refresh).await;
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "a refresh token still refreshes"
+    );
+}
+
+/// The same rule at the Matrix-shaped refresh endpoint.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn the_matrix_refresh_endpoint_accepts_only_a_refresh_token() {
+    let base = oidc();
+    let c = Client::new();
+    let nrc = no_redirect_client();
+    let (access, refresh, _did) = login_tokens(&c, &nrc, &base).await;
+
+    assert_refused_by_matrix_refresh(&c, &base, &access, "an access token").await;
+    assert_eq!(
+        introspect(&c, &base, &access).await["active"],
+        json!(true),
+        "a refused access token must stay active (never deleted by the refusal)"
+    );
+
+    // Control: the real refresh token still refreshes.
+    let ok = matrix_refresh(&c, &base, &refresh).await;
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "a refresh token still refreshes"
+    );
+}
+
+/// A minted admin token is an access token: neither refresh endpoint accepts it.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn neither_refresh_endpoint_accepts_an_admin_token() {
+    let base = oidc();
+    let c = Client::new();
+    let minted = c
+        .post(format!("{base}/oauth2/admin_token"))
+        .bearer_auth(shared_secret())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(minted.status(), StatusCode::OK, "setup: admin token mint");
+    let minted: Value = minted.json().await.unwrap();
+    let admin = minted["access_token"].as_str().unwrap().to_string();
+
+    assert_refused_by_refresh_grant(&c, &base, &admin, "an admin token").await;
+    assert_refused_by_matrix_refresh(&c, &base, &admin, "an admin token").await;
+
+    // The refusals left the admin token itself alone.
+    let intro = introspect(&c, &base, &admin).await;
+    assert_eq!(intro["active"], json!(true), "the admin token stays active");
+    assert!(
+        intro["scope"]
+            .as_str()
+            .unwrap_or("")
+            .contains("urn:synapse:admin:*"),
+        "control: this really is the admin-scoped token: {intro}"
+    );
+}
+
+/// A refresh token is not a bearer credential: introspection reports it
+/// inactive, /userinfo refuses it, and the bearer-authenticated Matrix routes
+/// treat it as unknown without tearing the session down.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn a_refresh_token_is_not_a_bearer_credential() {
+    let base = oidc();
+    let c = Client::new();
+    let nrc = no_redirect_client();
+    let (access, refresh, did) = login_tokens(&c, &nrc, &base).await;
+
+    let intro = introspect(&c, &base, &refresh).await;
+    assert_eq!(
+        intro["active"],
+        json!(false),
+        "introspection must report a refresh token inactive: {intro}"
+    );
+
+    let ui = c
+        .get(format!("{base}/userinfo"))
+        .bearer_auth(&refresh)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        ui.status(),
+        StatusCode::OK,
+        "GET /userinfo must refuse a refresh token: {}",
+        ui.text().await.unwrap_or_default()
+    );
+    let ui_post = c
+        .post(format!("{base}/userinfo"))
+        .form(&[("access_token", refresh.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        ui_post.status(),
+        StatusCode::OK,
+        "POST /userinfo must refuse a refresh token: {}",
+        ui_post.text().await.unwrap_or_default()
+    );
+
+    // Device deletion answers a refresh token exactly like an unknown token.
+    for resp in [
+        c.delete(format!("{base}/_matrix/client/v3/devices/SIWX_any"))
+            .bearer_auth(&refresh)
+            .send()
+            .await
+            .unwrap(),
+        c.post(format!("{base}/_matrix/client/v3/delete_devices"))
+            .bearer_auth(&refresh)
+            .json(&json!({ "devices": [] }))
+            .send()
+            .await
+            .unwrap(),
+    ] {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "device deletion must refuse a refresh token as its bearer, got {status}: {body}"
+        );
+        assert!(body.contains("M_UNKNOWN_TOKEN"), "{body}");
+    }
+
+    // Logout answers 200 for any bearer (Matrix expects it), but a refresh
+    // token as the bearer must not end the session.
+    for path in ["logout", "logout/all"] {
+        let resp = c
+            .post(format!("{base}/_matrix/client/v3/{path}"))
+            .bearer_auth(&refresh)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path} answers 200");
+        assert_eq!(
+            introspect(&c, &base, &access).await["active"],
+            json!(true),
+            "a refresh token as the bearer of {path} must not end the session"
+        );
+    }
+
+    // Controls: the access token is the bearer credential, and the refresh
+    // token survived every refusal above and still refreshes.
+    let ok = c
+        .get(format!("{base}/userinfo"))
+        .bearer_auth(&access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "/userinfo accepts the access token"
+    );
+    let claims: Value = ok.json().await.unwrap();
+    assert_eq!(claims["sub"], json!(did), "userinfo sub is the DID");
+    let still = refresh_grant(&c, &base, &refresh).await;
+    assert_eq!(
+        still.status(),
+        StatusCode::OK,
+        "the refresh token was not deleted by any refusal"
     );
 }
