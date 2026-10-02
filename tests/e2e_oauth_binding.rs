@@ -19,6 +19,8 @@
 //!      refresh endpoints only refresh tokens; introspection, `/userinfo` and
 //!      the bearer-authenticated Matrix routes only access tokens (an admin
 //!      token is an access token).
+//!   7. Authorization codes — single use, and never a bearer token: `/userinfo`
+//!      refuses a code before and after its exchange.
 //!
 //! Targets the MOCK stack brought up by `e2e/up.sh` (siwx-oidc :8080, Synapse
 //! mock :8090, Redis :6379). Run single-threaded with the stack up:
@@ -1367,4 +1369,122 @@ async fn a_refresh_token_is_not_a_bearer_credential() {
         StatusCode::OK,
         "the refresh token was not deleted by any refusal"
     );
+}
+
+// ===========================================================================
+// Authorization codes: single use, and never a bearer token.
+//
+// A code is redeemable exactly once, at /token, with the PKCE verifier. It is
+// not an access token: /userinfo refuses it before and after the exchange.
+// ===========================================================================
+
+/// An authorization code is refused at /userinfo, both before and after it is
+/// exchanged. Only the access token from the exchange is a bearer credential.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn an_authorization_code_is_never_a_bearer_token() {
+    let base = oidc();
+    let c = Client::new();
+    let nrc = no_redirect_client();
+    let rc = register_client(&c, &base).await;
+    let w = new_wallet();
+    let (verifier, challenge) = pkce_pair();
+    let code = sign_in_for_code(&nrc, &base, &rc, &w, &challenge, "code_bearer").await;
+
+    let assert_refused = |resp: reqwest::Response, when: &'static str| async move {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "/userinfo must refuse an authorization code {when}, got 200: {body}"
+        );
+    };
+
+    assert_refused(
+        c.get(format!("{base}/userinfo"))
+            .bearer_auth(&code)
+            .send()
+            .await
+            .unwrap(),
+        "before the exchange (GET, bearer)",
+    )
+    .await;
+    assert_refused(
+        c.post(format!("{base}/userinfo"))
+            .form(&[("access_token", code.as_str())])
+            .send()
+            .await
+            .unwrap(),
+        "before the exchange (POST, form)",
+    )
+    .await;
+
+    let exchanged = exchange_code(&c, &base, &rc, &code, Some(&verifier)).await;
+    assert_eq!(exchanged.status(), StatusCode::OK, "setup: code exchange");
+    let tokens: Value = exchanged.json().await.unwrap();
+
+    assert_refused(
+        c.get(format!("{base}/userinfo"))
+            .bearer_auth(&code)
+            .send()
+            .await
+            .unwrap(),
+        "after the exchange (GET, bearer)",
+    )
+    .await;
+    assert_refused(
+        c.post(format!("{base}/userinfo"))
+            .form(&[("access_token", code.as_str())])
+            .send()
+            .await
+            .unwrap(),
+        "after the exchange (POST, form)",
+    )
+    .await;
+
+    // Control: the access token from the exchange is accepted.
+    let ok = c
+        .get(format!("{base}/userinfo"))
+        .bearer_auth(tokens["access_token"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "/userinfo accepts the access token"
+    );
+    let claims: Value = ok.json().await.unwrap();
+    assert_eq!(claims["sub"], json!(w.did), "userinfo sub is the DID");
+}
+
+/// A second exchange of the same code fails, even with the right verifier.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn an_authorization_code_is_single_use() {
+    let base = oidc();
+    let c = Client::new();
+    let nrc = no_redirect_client();
+    let rc = register_client(&c, &base).await;
+    let w = new_wallet();
+    let (verifier, challenge) = pkce_pair();
+    let code = sign_in_for_code(&nrc, &base, &rc, &w, &challenge, "code_once").await;
+
+    let first = exchange_code(&c, &base, &rc, &code, Some(&verifier)).await;
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "the first exchange succeeds"
+    );
+
+    let second = exchange_code(&c, &base, &rc, &code, Some(&verifier)).await;
+    let status = second.status();
+    let body = second.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a second exchange must fail, got {status}: {body}"
+    );
+    assert!(body.contains("invalid_grant"), "{body}");
 }

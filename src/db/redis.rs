@@ -1126,7 +1126,7 @@ impl DBClient for RedisClient {
 #[cfg(test)]
 mod tests {
     use super::{erased_did_key, erased_user_key};
-    use crate::db::{DBClient, TokenMetadata};
+    use crate::db::{CodeEntry, DBClient, TokenMetadata, KV_CODE_PREFIX};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A globally-unique nonce for test keys on the shared Redis. The nanosecond
@@ -1611,5 +1611,83 @@ mod tests {
             client.lookup_user_session(&token).await.unwrap().is_none(),
             "a destroyed session must no longer resolve"
         );
+    }
+
+    fn code_entry(did: &str) -> CodeEntry {
+        CodeEntry {
+            exchange_count: 0,
+            did: did.to_string(),
+            nonce: None,
+            client_id: "c".to_string(),
+            auth_time: chrono::Utc::now(),
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string()),
+            code_challenge_method: Some("S256".to_string()),
+            device_id: None,
+            localpart: None,
+        }
+    }
+
+    /// Consuming an authorization code removes it from the store, so nothing is
+    /// left behind that a later reader could take for a live code, and a second
+    /// consumer gets nothing. Needs Redis (`crate::test_support::redis`).
+    #[tokio::test]
+    async fn a_consumed_code_leaves_no_entry() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let code = format!("code-{}", unique_nonce());
+        let key = format!("{KV_CODE_PREFIX}/{code}");
+        client
+            .set_code(code.clone(), code_entry("did:key:zDnCONSUMED"))
+            .await
+            .unwrap();
+        assert!(
+            client.get_raw(&key).await.unwrap().is_some(),
+            "setup: the code is stored"
+        );
+
+        let first = client.try_consume_code(code.clone()).await.unwrap();
+        assert_eq!(
+            first.map(|e| e.did).as_deref(),
+            Some("did:key:zDnCONSUMED"),
+            "the first consumer gets the entry"
+        );
+        assert!(
+            client.get_raw(&key).await.unwrap().is_none(),
+            "a consumed code must leave no {key} entry"
+        );
+        assert!(
+            client.try_consume_code(code).await.unwrap().is_none(),
+            "a second consumer gets nothing"
+        );
+    }
+
+    /// Exactly one of many concurrent consumers of one code wins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_consumers_of_one_code_have_exactly_one_winner() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        for round in 0..8 {
+            let code = format!("code-race-{round}-{}", unique_nonce());
+            client
+                .set_code(code.clone(), code_entry("did:key:zDnRACE"))
+                .await
+                .unwrap();
+            let tasks: Vec<_> = (0..16)
+                .map(|_| {
+                    let client = client.clone();
+                    let code = code.clone();
+                    tokio::spawn(async move { client.try_consume_code(code).await.unwrap() })
+                })
+                .collect();
+            let mut winners = 0;
+            for t in tasks {
+                if t.await.unwrap().is_some() {
+                    winners += 1;
+                }
+            }
+            assert_eq!(winners, 1, "round {round}: exactly one consumer wins");
+        }
     }
 }
