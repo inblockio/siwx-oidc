@@ -308,8 +308,16 @@ test('UX1-UX8 encrypted search on hosted Element Web', async ({ page, context })
   // UX6: second account on the SAME browser profile cannot search the first account.
   // New page (injectMockWallet cannot rebind a different wallet on the same page)
   // but the same Playwright context shares IndexedDB/localStorage.
+  // Close the first tab first. Signed out, it stays on #/welcome with Element
+  // still running and holding Element's one-tab session lock, and the second
+  // login then ends on "connected in another tab" instead of the Secure Backup
+  // wizard. Closing it changes nothing UX6 checks: storage belongs to the
+  // context, not the tab.
+  await page.close();
   const w2 = makeWallet();
   const page2 = await context.newPage();
+  // UX8: the second tab's page errors count too, second login included
+  page2.on('pageerror', (e) => pageErrors.push(String(e)));
   const session2 = await elementWalletClickLogin(page2, w2);
   console.log(`[UX] account ${session2.user_id}`);
   expect(session2.user_id).not.toBe(session.user_id);
