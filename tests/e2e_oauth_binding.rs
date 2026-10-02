@@ -1688,15 +1688,14 @@ async fn the_code_is_bound_to_the_challenge_sent_to_authorize() {
 }
 
 /// Front-channel parameters on /sign_in may repeat the authorization request,
-/// never change it: a different state or client is refused.
+/// never change it: a different state is refused.
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
-async fn sign_in_refuses_parameters_that_differ_from_the_authorization_request() {
+async fn sign_in_refuses_a_state_that_differs_from_the_authorization_request() {
     let base = oidc();
     let c = Client::new();
     let nrc = no_redirect_client();
     let rc_a = register_client(&c, &base).await;
-    let rc_b = register_client(&c, &base).await;
     let w = new_wallet();
 
     // A different state.
@@ -1724,34 +1723,6 @@ async fn sign_in_refuses_parameters_that_differ_from_the_authorization_request()
         "a different state is refused: {body}"
     );
     assert!(body.contains("state"), "{body}");
-
-    // A different (registered) client with its own redirect URI.
-    let (_v, ch) = pkce_pair();
-    let s = authorize_session(&nrc, &base, &rc_a, &ch, "client_state").await;
-    let query = format!(
-        "redirect_uri={}&state=client_state&client_id={}",
-        urlencoding::encode(&rc_b.redirect_uri),
-        urlencoding::encode(&rc_b.client_id),
-    );
-    let resp = sign_in_raw(
-        &nrc,
-        &base,
-        (&s.0, &s.1, &s.2),
-        &w,
-        &rc_b.redirect_uri,
-        &query,
-    )
-    .await;
-    let status = resp.status();
-    let location = location_of(&resp);
-    let body = resp.text().await.unwrap_or_default();
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "a code must not be issued to a client other than the one /authorize \
-         validated (location {location}): {body}"
-    );
-    assert!(body.contains("client_id"), "{body}");
 
     // Control: parameters that repeat the request are fine.
     let (_v, ch) = pkce_pair();
@@ -1784,6 +1755,47 @@ async fn sign_in_refuses_parameters_that_differ_from_the_authorization_request()
         parse_query(&location).get("state").map(String::as_str),
         Some("same_state")
     );
+}
+
+/// A code is never issued to a client other than the one /authorize validated,
+/// even when the other client and its redirect URI are registered.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn sign_in_refuses_a_client_that_differs_from_the_authorization_request() {
+    let base = oidc();
+    let c = Client::new();
+    let nrc = no_redirect_client();
+    let rc_a = register_client(&c, &base).await;
+    let rc_b = register_client(&c, &base).await;
+    let w = new_wallet();
+
+    // A different (registered) client with its own redirect URI.
+    let (_v, ch) = pkce_pair();
+    let s = authorize_session(&nrc, &base, &rc_a, &ch, "client_state").await;
+    let query = format!(
+        "redirect_uri={}&state=client_state&client_id={}",
+        urlencoding::encode(&rc_b.redirect_uri),
+        urlencoding::encode(&rc_b.client_id),
+    );
+    let resp = sign_in_raw(
+        &nrc,
+        &base,
+        (&s.0, &s.1, &s.2),
+        &w,
+        &rc_b.redirect_uri,
+        &query,
+    )
+    .await;
+    let status = resp.status();
+    let location = location_of(&resp);
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a code must not be issued to a client other than the one /authorize \
+         validated (location {location}): {body}"
+    );
+    assert!(body.contains("client_id"), "{body}");
 }
 
 /// Redirect URIs match the registration exactly, query included, at
