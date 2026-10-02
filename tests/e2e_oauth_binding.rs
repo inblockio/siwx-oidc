@@ -558,9 +558,11 @@ async fn unregistered_redirect_uri_at_sign_in_is_rejected() {
         !location.contains("code="),
         "no code may be emitted for a message bound to another redirect URI: {location}"
     );
-    assert!(
-        status.is_client_error() || status.is_server_error(),
-        "a message bound to another redirect URI is refused, got {status}: {body}"
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a message bound to another redirect URI is the client's error, a 400 and not a \
+         server fault, got {status}: {body}"
     );
     assert!(body.to_lowercase().contains("resource"), "{body}");
 }
