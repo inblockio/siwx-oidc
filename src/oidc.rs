@@ -4110,6 +4110,20 @@ mod tests {
         );
     }
 
+    /// The OIDC `sub` is the user's DID, the same value for every client
+    /// (`docs/identity-model.md`), which is the definition of a *public*
+    /// subject type. Discovery used to say `pairwise`, which promises a
+    /// different `sub` per client and would lead a relying party to expect one.
+    #[test]
+    fn discovery_advertises_public_subjects_only() {
+        let value = provider_metadata_value(&discovery_config(), true).unwrap();
+        assert_eq!(
+            value["subject_types_supported"],
+            serde_json::json!(["public"]),
+            "the sub is the DID, identical for every client"
+        );
+    }
+
     #[test]
     fn provider_metadata_advertises_msc4191_account_management() {
         // AC1: served metadata must include account_management_uri and an
