@@ -731,6 +731,79 @@ async fn an_account_publishing_its_own_did_is_reported_attested_in_exact_case() 
     }
 }
 
+/// `exists` means an ACTIVE account: a deactivated account and an erased one
+/// both read as not existing, in both directions.
+///
+/// Synapse keeps the `users` row of every account it deactivates or erases, so
+/// the availability probe alone reports them as taken. The accounts are
+/// deactivated the way the account page does it (`POST /_synapse/mas/delete_user`),
+/// and each one publishes its DID first: a lookup that still read the profile
+/// of a deactivated account would show that DID (and `attested: true`) here, so
+/// `did: null` on the `?mxid=` side is what proves nothing is read from it. An
+/// erasure used to answer 502 on this stack, because the mock refused the field
+/// read of an account without a profile row.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn deactivated_and_erased_accounts_resolve_as_not_existing() {
+    let c = Client::new();
+    mock_reset(&c).await;
+    for erase in [false, true] {
+        // Fresh identities, so the suite's shared DID constants keep their meaning.
+        let did = siwx_oidc_auth::SiwxKey::generate_ed25519().did();
+        let localpart = localpart_for(&did);
+        let mxid = format!("@{localpart}:{SERVER_NAME}");
+        mock_seed_user(&c, &localpart).await;
+        seed_published_did(&c, &mxid, &did).await;
+        let by_mxid = format!("mxid={}", urlencoding::encode(&mxid));
+        let by_did = format!("did={}", urlencoding::encode(&did));
+
+        for raw in [&by_mxid, &by_did] {
+            let before = get_resolve(&c, raw).await;
+            assert_eq!(
+                before.status,
+                StatusCode::OK,
+                "`?{raw}` body={:?}",
+                before.body
+            );
+            assert_eq!(
+                before.json(),
+                json!({ "did": did, "mxid": mxid, "exists": true, "attested": true }),
+                "precondition: the seeded account is active and attested, `?{raw}`"
+            );
+        }
+
+        let status = c
+            .post(format!("{}/_synapse/mas/delete_user", mock()))
+            .bearer_auth(SHARED_SECRET)
+            .json(&json!({ "localpart": localpart, "erase": erase }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(status.is_success(), "the mock deactivates the account");
+
+        for raw in [&by_mxid, &by_did] {
+            let after = get_resolve(&c, raw).await;
+            assert_eq!(
+                after.status,
+                StatusCode::OK,
+                "erase={erase}, `?{raw}`: an answer, not an upstream error; body={:?}",
+                after.body
+            );
+            let did_field = if raw == &by_did {
+                json!(did)
+            } else {
+                Value::Null
+            };
+            assert_eq!(
+                after.json(),
+                json!({ "did": did_field, "mxid": mxid, "exists": false, "attested": false }),
+                "erase={erase}, `?{raw}`"
+            );
+        }
+    }
+}
+
 /// An empty value for the *other* selector reads as **absent**, so
 /// `?did=…&mxid=` is a one-selector request and answers 200.
 ///
