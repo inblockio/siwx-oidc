@@ -1760,36 +1760,28 @@ pub async fn authorize(
         .host()
         .map(|h| h.to_string())
         .unwrap_or_else(|| params.redirect_uri.url().scheme().to_string());
-    // The login page reads these to build its CAIP-122 message and its link to
-    // /sign_in. They are informational: /sign_in takes the request from the
-    // session, and refuses a repeated parameter that differs from it.
-    let oidc_nonce_param = if let Some(n) = &params.nonce {
-        format!("&oidc_nonce={}", n.secret())
-    } else {
-        "".to_string()
-    };
-    // Absent/"query" appends nothing, keeping the SPA URL byte-identical for
-    // existing clients.
-    let response_mode_param = if params.response_mode.as_deref() == Some("fragment") {
-        "&response_mode=fragment".to_string()
-    } else {
-        "".to_string()
-    };
-    let pkce_params = format!("&code_challenge={code_challenge}&code_challenge_method=S256");
-    Ok((
-        format!(
-            "/?nonce={}&domain={}&redirect_uri={}&state={}&client_id={}{}{}{}",
-            nonce,
-            domain,
-            *params.redirect_uri,
-            state,
-            params.client_id,
-            oidc_nonce_param,
-            pkce_params,
-            response_mode_param
-        ),
-        Box::new(session_cookie),
-    ))
+    // The login page reads these values to build its CAIP-122 message (which
+    // binds `redirect_uri` in its `Resources:`) and its link to /sign_in. Each
+    // value is percent-encoded so the page reads it back exactly: a redirect
+    // URI with several query parameters, or a state with `&` or `+`, would
+    // otherwise be cut or altered. /sign_in itself reads none of them; it
+    // takes the request from the session.
+    let mut page = url::form_urlencoded::Serializer::new(String::new());
+    page.append_pair("nonce", &nonce)
+        .append_pair("domain", &domain)
+        .append_pair("redirect_uri", params.redirect_uri.as_str())
+        .append_pair("state", &state)
+        .append_pair("client_id", &params.client_id);
+    if let Some(n) = &params.nonce {
+        page.append_pair("oidc_nonce", n.secret());
+    }
+    page.append_pair("code_challenge", &code_challenge)
+        .append_pair("code_challenge_method", "S256");
+    // Absent/"query" appends nothing.
+    if params.response_mode.as_deref() == Some("fragment") {
+        page.append_pair("response_mode", "fragment");
+    }
+    Ok((format!("/?{}", page.finish()), Box::new(session_cookie)))
 }
 
 // -- SiwX sign-in ----------------------------------------------------------
@@ -2058,24 +2050,6 @@ pub fn verify_siwx_cookie(
     Ok(siwx_cookie.did)
 }
 
-/// Query parameters of `GET /sign_in`.
-///
-/// All optional, and none of them decides anything: the code is issued for the
-/// authorization request `/authorize` bound to the session
-/// ([`SessionEntry::request`]). The login page repeats the request here; a
-/// parameter that is present must equal the bound value, or the sign-in is
-/// refused ([`bound_request`]).
-#[derive(Deserialize, Default)]
-pub struct SignInParams {
-    pub redirect_uri: Option<RedirectUrl>,
-    pub state: Option<String>,
-    pub oidc_nonce: Option<Nonce>,
-    pub client_id: Option<String>,
-    pub code_challenge: Option<String>,
-    pub code_challenge_method: Option<String>,
-    pub response_mode: Option<String>,
-}
-
 /// A bound request for `client_id` at `https://example.com/callback`, as
 /// `authorize` would store it. For tests that drive `sign_in` directly.
 #[cfg(test)]
@@ -2090,67 +2064,20 @@ pub(crate) fn bound_test_request(client_id: &str) -> AuthorizationRequest {
 }
 
 /// The authorization request this sign-in completes: the one `/authorize`
-/// validated and bound to the session. A front-channel parameter may repeat a
-/// bound value but never change it, so a code is only ever issued to the
-/// client, redirect URI, state and PKCE challenge `/authorize` accepted.
-fn bound_request(
-    session: &SessionEntry,
-    params: &SignInParams,
-) -> Result<AuthorizationRequest, CustomError> {
-    let request = session.request.clone().ok_or_else(|| {
+/// validated and bound to the session. It is the only source of the client,
+/// redirect URI, state, response mode, PKCE challenge and nonce: `sign_in`
+/// reads no authorization parameter from its own query. The login page still
+/// appends them to its `/sign_in` link (encoded with `encodeURI`, which alters
+/// `&`, `+` and other characters in a state or redirect URI); they are never
+/// parsed.
+fn bound_request(session: &SessionEntry) -> Result<AuthorizationRequest, CustomError> {
+    session.request.clone().ok_or_else(|| {
         CustomError::BadRequest(
             "This sign-in has no bound authorization request (it was started before a \
              server update). Restart the sign-in from the application."
                 .to_string(),
         )
-    })?;
-    let differs = |name: &str| {
-        CustomError::BadRequest(format!("{name} does not match the authorization request."))
-    };
-    if params
-        .client_id
-        .as_ref()
-        .is_some_and(|v| *v != request.client_id)
-    {
-        return Err(differs("client_id"));
-    }
-    if let Some(redirect_uri) = &params.redirect_uri {
-        let same = RedirectUrl::new(request.redirect_uri.clone())
-            .is_ok_and(|bound| bound.url() == redirect_uri.url());
-        if !same {
-            return Err(differs("redirect_uri"));
-        }
-    }
-    if params.state.as_ref().is_some_and(|v| *v != request.state) {
-        return Err(differs("state"));
-    }
-    if params
-        .code_challenge
-        .as_ref()
-        .is_some_and(|v| *v != request.code_challenge)
-    {
-        return Err(differs("code_challenge"));
-    }
-    if params
-        .code_challenge_method
-        .as_deref()
-        .is_some_and(|v| v != "S256")
-    {
-        return Err(differs("code_challenge_method"));
-    }
-    // An absent response_mode means `query`.
-    let mode = |m: Option<&str>| m.unwrap_or("query").to_string();
-    if params.response_mode.is_some()
-        && mode(params.response_mode.as_deref()) != mode(request.response_mode.as_deref())
-    {
-        return Err(differs("response_mode"));
-    }
-    if let Some(nonce) = &params.oidc_nonce {
-        if session.oidc_nonce.as_ref().map(|n| n.secret()) != Some(nonce.secret()) {
-            return Err(differs("oidc_nonce"));
-        }
-    }
-    Ok(request)
+    })
 }
 
 /// Extract a device_id from a scope string containing `urn:matrix:client:device:XXX`.
@@ -2603,7 +2530,6 @@ pub async fn sign_in(
     _base_url: &Url,
     allowed_did_methods: &[String],
     allowed_pkh_namespaces: &[String],
-    params: SignInParams,
     cookies: headers::Cookie,
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
@@ -2624,8 +2550,8 @@ pub async fn sign_in(
     };
 
     // The request this sign-in completes, as `/authorize` bound it. Checked
-    // before the session is spent, so a refused request leaves it usable.
-    let request = bound_request(&session_entry, &params)?;
+    // before the session is spent.
+    let request = bound_request(&session_entry)?;
     let redirect_uri = RedirectUrl::new(request.redirect_uri.clone())
         .map_err(|e| anyhow!("bound redirect_uri does not parse: {}", e))?;
 
@@ -3594,97 +3520,142 @@ mod tests {
         }
     }
 
-    /// Front-channel parameters may repeat the bound request, never change it.
-    #[test]
-    fn sign_in_parameters_may_repeat_the_bound_request_but_not_change_it() {
-        let session = session_with(Some(bound_test_request("client")));
-        let request = bound_test_request("client");
+    const ROUND_TRIP_REDIRECT: &str = "https://example.com/callback?a=1&b=2";
+    const ROUND_TRIP_STATE: &str = "st+a&b c";
 
-        // Nothing, or an exact repetition, completes the bound request.
-        assert_eq!(
-            bound_request(&session, &SignInParams::default()).unwrap(),
-            request
-        );
-        let repeated = SignInParams {
-            redirect_uri: Some(RedirectUrl::new(request.redirect_uri.clone()).unwrap()),
-            state: Some(request.state.clone()),
-            oidc_nonce: Some(Nonce::new("oidc-nonce".into())),
-            client_id: Some(request.client_id.clone()),
-            code_challenge: Some(request.code_challenge.clone()),
-            code_challenge_method: Some("S256".into()),
-            response_mode: Some("query".into()),
+    async fn seed_round_trip_client(db: &RedisClient, client_id: &str) {
+        db.set_client(
+            client_id.to_string(),
+            ClientEntry {
+                secret: "secret".into(),
+                metadata: CoreClientMetadata::new(
+                    vec![RedirectUrl::new(ROUND_TRIP_REDIRECT.into()).unwrap()],
+                    EmptyAdditionalClientMetadata {},
+                ),
+                access_token: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `authorize` hands the login page every value percent-encoded, so the
+    /// page reads back the exact redirect URI (which its CAIP-122 message
+    /// binds) and state, even with several query parameters or `&` and `+`.
+    #[tokio::test]
+    async fn authorize_hands_the_login_page_the_exact_values() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
         };
-        assert_eq!(bound_request(&session, &repeated).unwrap(), request);
+        let client_id = format!("round-trip-{}", Uuid::new_v4().simple());
+        seed_round_trip_client(&db_client, &client_id).await;
+        let mut params = code_request(CoreResponseType::Code);
+        params.client_id = client_id.clone();
+        params.redirect_uri = RedirectUrl::new(ROUND_TRIP_REDIRECT.into()).unwrap();
+        params.state = Some(ROUND_TRIP_STATE.into());
+        let (page_url, _cookie) = authorize(params, &db_client).await.unwrap();
+        let page = Url::parse(&format!("https://login.example{page_url}")).unwrap();
+        let q: std::collections::HashMap<_, _> = page.query_pairs().into_owned().collect();
+        assert_eq!(
+            q.get("redirect_uri").map(String::as_str),
+            Some(ROUND_TRIP_REDIRECT)
+        );
+        assert_eq!(q.get("state").map(String::as_str), Some(ROUND_TRIP_STATE));
+        assert_eq!(q.get("client_id"), Some(&client_id));
+        assert_eq!(q.get("oidc_nonce").map(String::as_str), Some("oidc-nonce"));
+        assert_eq!(
+            q.get("code_challenge").map(String::as_str),
+            Some(RFC7636_CHALLENGE)
+        );
+        assert_eq!(
+            q.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert!(
+            !q.contains_key("response_mode"),
+            "query mode is not forwarded"
+        );
+    }
 
-        // Any differing parameter is refused, naming it.
-        let cases: Vec<(&str, SignInParams)> = vec![
-            (
-                "client_id",
-                SignInParams {
-                    client_id: Some("other".into()),
-                    ..SignInParams::default()
+    /// `sign_in` reads no authorization parameter from its query (it takes
+    /// none): the code goes to the bound redirect URI with the bound state, and
+    /// the stored code carries the bound client, challenge and nonce.
+    #[tokio::test]
+    async fn sign_in_issues_the_code_for_the_bound_request() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        let nonce = Uuid::new_v4().simple().to_string();
+        let client_id = format!("round-trip-{nonce}");
+        seed_round_trip_client(&db_client, &client_id).await;
+        let session_id = format!("round-trip-{nonce}");
+        db_client
+            .set_session(
+                session_id.clone(),
+                SessionEntry {
+                    siwe_nonce: nonce.clone(),
+                    oidc_nonce: Some(Nonce::new("oidc-nonce".into())),
+                    secret: "secret".into(),
+                    signin_count: 0,
+                    verified_did: Some("did:key:zDnaeBOUNDREQUEST".into()),
+                    scope: None,
+                    request: Some(AuthorizationRequest {
+                        client_id: client_id.clone(),
+                        redirect_uri: ROUND_TRIP_REDIRECT.into(),
+                        state: ROUND_TRIP_STATE.into(),
+                        response_mode: None,
+                        code_challenge: RFC7636_CHALLENGE.into(),
+                    }),
                 },
-            ),
-            (
-                "redirect_uri",
-                SignInParams {
-                    redirect_uri: Some(
-                        RedirectUrl::new("https://example.com/callback?x=1".into()).unwrap(),
-                    ),
-                    ..SignInParams::default()
-                },
-            ),
-            (
-                "state",
-                SignInParams {
-                    state: Some("other".into()),
-                    ..SignInParams::default()
-                },
-            ),
-            (
-                "code_challenge",
-                SignInParams {
-                    code_challenge: Some("other".into()),
-                    ..SignInParams::default()
-                },
-            ),
-            (
-                "code_challenge_method",
-                SignInParams {
-                    code_challenge_method: Some("plain".into()),
-                    ..SignInParams::default()
-                },
-            ),
-            (
-                "response_mode",
-                SignInParams {
-                    response_mode: Some("fragment".into()),
-                    ..SignInParams::default()
-                },
-            ),
-            (
-                "oidc_nonce",
-                SignInParams {
-                    oidc_nonce: Some(Nonce::new("other".into())),
-                    ..SignInParams::default()
-                },
-            ),
-        ];
-        for (name, params) in cases {
-            match bound_request(&session, &params) {
-                Err(CustomError::BadRequest(msg)) => {
-                    assert!(msg.starts_with(name), "{name}: {msg}")
-                }
-                other => panic!("{name} must be refused, got {other:?}"),
-            }
-        }
+            )
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
+        );
+        let (url, _did) = sign_in(
+            &Url::parse("https://example.com").unwrap(),
+            &["key".to_string()],
+            &[],
+            headers.typed_get::<headers::Cookie>().unwrap(),
+            &db_client,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            url.as_str()
+                .starts_with(&format!("{ROUND_TRIP_REDIRECT}&code=")),
+            "the code goes to the bound redirect URI: {url}"
+        );
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q.get("a").map(String::as_str), Some("1"));
+        assert_eq!(q.get("b").map(String::as_str), Some("2"));
+        assert_eq!(q.get("state").map(String::as_str), Some(ROUND_TRIP_STATE));
+        let entry = db_client
+            .try_consume_code(q["code"].clone())
+            .await
+            .unwrap()
+            .expect("the code is stored");
+        assert_eq!(entry.client_id, client_id);
+        assert_eq!(entry.code_challenge.as_deref(), Some(RFC7636_CHALLENGE));
+        assert_eq!(entry.code_challenge_method.as_deref(), Some("S256"));
+        assert_eq!(
+            entry.nonce.as_ref().map(|n| n.secret().as_str()),
+            Some("oidc-nonce")
+        );
     }
 
     /// A session written by an older build carries no bound request; the
     /// sign-in is refused with a clear "restart" error.
     #[test]
     fn a_session_without_a_bound_request_is_refused() {
-        match bound_request(&session_with(None), &SignInParams::default()) {
+        match bound_request(&session_with(None)) {
             Err(CustomError::BadRequest(msg)) => assert!(msg.contains("Restart"), "{msg}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
@@ -3742,7 +3713,6 @@ mod tests {
         let (redirect_url, cookie) = authorize(params, &db_client).await.unwrap();
         let authorize_params: AuthorizeQueryParams =
             serde_urlencoded::from_str(redirect_url.split("/?").collect::<Vec<&str>>()[1]).unwrap();
-        let params: SignInParams = serde_urlencoded::from_str(&redirect_url).unwrap();
 
         // Build the CAIP-122 message (EIP-4361 format for eip155). The login
         // path now enforces the Expiration Time (C1 safe subset), so include a
@@ -3787,7 +3757,6 @@ mod tests {
             &base_url,
             &default_methods,
             &default_namespaces,
-            params,
             cookie,
             &db_client,
             None, // no synapse_client in tests
@@ -3893,10 +3862,6 @@ mod tests {
         );
         let authorize_params: AuthorizeQueryParams =
             serde_urlencoded::from_str(redirect_url.split("/?").collect::<Vec<&str>>()[1]).unwrap();
-        // Same client round-trip as the real SPA: SignInParams reads
-        // response_mode back out of the forwarded URL.
-        let params: SignInParams = serde_urlencoded::from_str(&redirect_url).unwrap();
-        assert_eq!(params.response_mode.as_deref(), Some("fragment"));
 
         let expiration_time =
             (Utc::now() + Duration::hours(48)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -3932,7 +3897,6 @@ mod tests {
             &base_url,
             &["pkh".to_string()],
             &["eip155".to_string()],
-            params,
             cookie,
             &db_client,
             None,
@@ -5824,18 +5788,11 @@ mod sign_in_deactivation_order_tests {
             HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
         );
         let cookies = headers.typed_get::<headers::Cookie>().unwrap();
-        let params = SignInParams {
-            redirect_uri: Some(RedirectUrl::new(REDIRECT.into()).unwrap()),
-            state: Some("state".into()),
-            client_id: Some(client_id),
-            ..SignInParams::default()
-        };
 
         let result = sign_in(
             &Url::parse("https://example.com").unwrap(),
             &["key".to_string()],
             &[],
-            params,
             cookies,
             &db,
             Some(&synapse),
@@ -6143,17 +6100,10 @@ mod device_display_name_tests {
             "cookie",
             HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
         );
-        let params = SignInParams {
-            redirect_uri: Some(RedirectUrl::new(REDIRECT.into()).unwrap()),
-            state: Some("state".into()),
-            client_id: Some(client_id.clone()),
-            ..SignInParams::default()
-        };
         sign_in(
             &Url::parse("https://example.com").unwrap(),
             &["key".to_string()],
             &[],
-            params,
             headers.typed_get::<headers::Cookie>().unwrap(),
             &db,
             Some(&synapse),

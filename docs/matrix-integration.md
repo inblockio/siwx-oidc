@@ -289,8 +289,8 @@ discovery advertises, and requires PKCE with `S256` (`plain` is rejected). The
 redirect URI must equal a registered one exactly, query included. `/authorize`
 binds the validated request (client, redirect URI, state, response mode, PKCE
 challenge) to the login session, and `/sign_in` issues the code for that
-request: parameters the login page repeats on `/sign_in` may not differ from
-it. A code is single use, is deleted when it is exchanged, and is redeemable
+request. `/sign_in` reads no authorization parameter from its query: the login
+page still appends them to its link, and they are ignored. A code is single use, is deleted when it is exchanged, and is redeemable
 only at `POST /token` with its verifier.
 
 ### Token kinds

@@ -284,18 +284,24 @@ doc; read it before changing the code the rule covers.
   unit: `every_legacy_entry_shape_is_classified`,
   `a_long_lived_admin_scoped_legacy_entry_has_no_kind`, `set_token_refuses_an_entry_without_a_kind`,
   `a_refresh_token_is_inactive`, `a_refresh_token_as_the_bearer_tears_nothing_down`.
-- **The authorization request, PKCE challenge included, is bound at `/authorize`.** Only
-  `response_type=code` with an `S256` challenge is accepted; the validated request (client,
-  redirect URI, state, response mode, challenge) is stored in the session. `sign_in` issues the
-  code for that request and refuses a front-channel parameter that differs from it; `/token`
-  refuses a code without a challenge. Never read these from `/sign_in` parameters again. Pin
-  (mock stack): `authorize_accepts_only_the_code_response_type`,
-  `the_code_is_bound_to_the_challenge_sent_to_authorize`,
-  `sign_in_ignores_a_state_in_its_query`, `sign_in_ignores_a_client_in_its_query`,
+- **The authorization request, PKCE challenge included, is bound at `/authorize`, and `sign_in`
+  reads no authorization parameter from its query.** Only `response_type=code` with an `S256`
+  challenge is accepted; the validated request (client, redirect URI, state, response mode,
+  challenge; the nonce sits beside it in the session) is stored in the session, and `sign_in`
+  issues the code for exactly that request. The handler has no `Query` extractor: the login page
+  still appends the parameters to its `/sign_in` link, `encodeURI`-encoded and therefore altered
+  for some values, and they are never parsed. A session without a bound request (older build) is
+  refused; `/token` refuses a code without a challenge. `authorize` percent-encodes every value
+  on the login page URL, because the page's CAIP-122 message binds the redirect URI it reads
+  there. Pin (mock stack): `authorize_accepts_only_the_code_response_type`,
+  `the_code_is_bound_to_the_challenge_sent_to_authorize`, `sign_in_ignores_a_state_in_its_query`,
+  `sign_in_ignores_a_client_in_its_query`,
   `the_login_page_round_trip_keeps_the_exact_redirect_uri_and_state`,
+  `unregistered_redirect_uri_at_sign_in_is_rejected`,
   `discovery_advertises_only_the_code_response_type`; unit:
-  `sign_in_parameters_may_repeat_the_bound_request_but_not_change_it`,
-  `a_session_without_a_bound_request_is_refused`, `authorize_binds_the_request_to_the_session`.
+  `sign_in_issues_the_code_for_the_bound_request`,
+  `authorize_hands_the_login_page_the_exact_values`, `a_session_without_a_bound_request_is_refused`,
+  `authorize_binds_the_request_to_the_session`.
 - **Redirect URIs match the registration exactly**, query included (RFC 9700 §4.1.3), through
   the one helper `oidc::redirect_uri_is_registered` used by `authorize` and `sign_in`. Pin:
   `redirect_uri_matching_is_exact`, `redirect_uris_match_the_registration_exactly` (mock stack).

@@ -210,11 +210,14 @@ paths:
         from the server-side session a WebAuthn ceremony wrote — and redirects
         to the relying party with an authorization code for the request
         `/authorize` bound to the session: its client, redirect URI, state,
-        response mode and PKCE challenge. The query parameters below are
-        optional repetitions of that request; one that is present and differs
-        from it is a 400, and no code is issued. A session started before the
-        request was bound (an older server build) is refused with a
-        restart-sign-in error.
+        response mode and PKCE challenge.
+
+        No query parameter is read. The login page still appends the
+        authorization parameters (`redirect_uri`, `state`, `client_id`,
+        `oidc_nonce`, `code_challenge`, `code_challenge_method`,
+        `response_mode`) to its link; they are ignored. A session started
+        before the request was bound (an older server build) is refused with
+        a restart-sign-in error.
 
         This is also the single point where a Matrix account is provisioned: the
         localpart is resolved (honouring grandfathering), the alias is seeded on
@@ -224,17 +227,9 @@ paths:
         sign-in.
       security:
         - sessionCookie: []
-      parameters:
-        - { name: client_id, in: query, required: false, schema: { type: string } }
-        - { name: redirect_uri, in: query, required: false, schema: { type: string, format: uri } }
-        - { name: state, in: query, required: false, schema: { type: string } }
-        - { name: oidc_nonce, in: query, required: false, schema: { type: string } }
-        - { name: code_challenge, in: query, required: false, schema: { type: string } }
-        - { name: code_challenge_method, in: query, required: false, schema: { type: string, enum: [S256] } }
-        - { name: response_mode, in: query, required: false, schema: { type: string, enum: [query, fragment] } }
       responses:
-        "303": { description: Redirect to the bound `redirect_uri` with `code` and `state`. }
-        "400": { description: A parameter differs from the bound request, the session has no bound request, or the CAIP-122 proof is invalid. }
+        "303": { description: Redirect to the bound `redirect_uri` with `code` and the bound `state`. }
+        "400": { description: The session has no bound request, or the CAIP-122 proof is invalid. }
         "401": { description: The account is deactivated, or the ceremony did not verify. }
 
   /token:

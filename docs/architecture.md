@@ -77,13 +77,15 @@ New methods and namespaces are opt-in: operators enable them in
    registration, query included), `response_type=code` (the only one accepted) and the `S256`
    PKCE challenge. It creates a session (`sessions/{id}`, 300 s) that binds the validated
    request (client, redirect URI, state, response mode, challenge), sets the `session` cookie,
-   and redirects to the login page with a nonce.
+   and redirects to the login page with a nonce and the request's values, each percent-encoded
+   so the page reads back the exact redirect URI its CAIP-122 message must bind.
 2. The page builds a CAIP-122 message (for Ethereum, an EIP-4361 message) containing the
    nonce, has the wallet sign it, and sets the `siwx` cookie to `{did, message, signature}`.
 3. `GET /sign_in` checks the DID method and namespace against configuration, verifies the
    signature through `find_did_method(did).verify(…)`, checks the nonce and that the bound
    redirect URI is in the message's `Resources:`, then issues a single-use code for the request
-   bound to the session. Parameters the page repeats on `/sign_in` may not differ from it.
+   bound to the session. `/sign_in` reads no authorization parameter from its query (the page
+   still appends them to its link; they are ignored).
 4. `POST /token` exchanges the code, with its PKCE `S256` verifier, for an ES256 ID token, an
    access token and a refresh token. PKCE is mandatory: `/authorize` refuses a request without a
    `code_challenge`, and `/token` refuses a code without one.
