@@ -1678,6 +1678,7 @@ mod tests {
             code_challenge_method: Some("S256".to_string()),
             device_id: None,
             localpart: None,
+            scope: None,
         }
     }
 

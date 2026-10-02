@@ -334,6 +334,14 @@ pub struct CodeEntry {
     /// existed before grandfathering are, by definition, legacy accounts.
     #[serde(default)]
     pub localpart: Option<String>,
+    /// The scope the authorization request asked for, exactly as `/authorize`
+    /// bound it to the session. The token endpoint reads what was requested
+    /// from here, never from the front channel. `#[serde(default)]` so a code
+    /// written by an earlier build, which a new build reads for up to
+    /// [`ENTRY_LIFETIME`], deserializes to `None`: the token endpoint then
+    /// answers as it did before the scope travelled.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -799,5 +807,39 @@ mod token_kind_tests {
         assert!(json.contains(r#""kind":"refresh""#), "{json}");
         let back: TokenMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(back.kind, Some(TokenKind::Refresh));
+    }
+}
+
+#[cfg(test)]
+mod code_entry_tests {
+    use super::*;
+
+    /// A code is stored for [`ENTRY_LIFETIME`] (300 s), so a build that adds a
+    /// field reads the codes its predecessor wrote for that long. Such a code
+    /// has no `scope`, which the token endpoint reads as "requested nothing
+    /// known" and answers with the behaviour that predates the field.
+    #[test]
+    fn a_code_written_before_the_scope_travelled_has_none() {
+        let before = r#"{
+            "exchange_count": 0,
+            "did": "did:key:zDnaeOLD",
+            "nonce": null,
+            "client_id": "client",
+            "auth_time": "2026-10-02T00:00:00Z",
+            "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "code_challenge_method": "S256",
+            "device_id": null,
+            "localpart": null
+        }"#;
+        let entry: CodeEntry = serde_json::from_str(before).expect("an old code still reads");
+        assert_eq!(entry.scope, None);
+
+        let with_scope = CodeEntry {
+            scope: Some("openid offline_access".to_string()),
+            ..entry
+        };
+        let round_trip: CodeEntry =
+            serde_json::from_str(&serde_json::to_string(&with_scope).unwrap()).unwrap();
+        assert_eq!(round_trip.scope.as_deref(), Some("openid offline_access"));
     }
 }

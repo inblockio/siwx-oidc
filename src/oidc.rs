@@ -2897,6 +2897,7 @@ pub async fn sign_in(
         code_challenge_method: Some("S256".to_string()),
         localpart: Some(resolved.localpart.clone()),
         device_id,
+        scope: session_entry.scope.clone(),
     };
 
     let code = Uuid::new_v4();
@@ -3726,7 +3727,7 @@ mod tests {
                     secret: "secret".into(),
                     signin_count: 0,
                     verified_did: Some("did:key:zDnaeBOUNDREQUEST".into()),
-                    scope: None,
+                    scope: Some("openid profile offline_access".into()),
                     request: Some(AuthorizationRequest {
                         client_id: client_id.clone(),
                         redirect_uri: ROUND_TRIP_REDIRECT.into(),
@@ -3776,6 +3777,12 @@ mod tests {
         assert_eq!(
             entry.nonce.as_ref().map(|n| n.secret().as_str()),
             Some("oidc-nonce")
+        );
+        assert_eq!(
+            entry.scope.as_deref(),
+            Some("openid profile offline_access"),
+            "the scope /authorize bound to the session travels into the code, \
+             where the token endpoint reads what was requested"
         );
     }
 
@@ -5714,6 +5721,7 @@ mod userinfo_mxid_claim_tests {
                 code_challenge_method: None,
                 device_id: None,
                 localpart: Some(LOCALPART.to_string()),
+                scope: None,
             },
         )
         .await
@@ -6673,6 +6681,7 @@ mod client_binding_tests {
                 code_challenge_method: Some("S256".into()),
                 device_id: None,
                 localpart: Some(unique("localpart")),
+                scope: None,
             },
         )
         .await

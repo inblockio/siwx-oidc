@@ -93,6 +93,7 @@ async fn the_redis_code_and_token_paths_log_fingerprints_never_values() {
             code_challenge_method: None,
             device_id: None,
             localpart: None,
+            scope: None,
         },
     )
     .await
