@@ -51,7 +51,8 @@ after a deployment.
 | `/sign_in returned 401 …: Signature verification failed` | the signature does not match the DID in the message | check the key file; do not edit the generated message |
 | `/sign_in returned 401 …: This account has been deactivated …` | the account was deactivated | a deactivated account cannot sign in |
 | `/sign_in returned 503 …` | the deactivation check could not reach Synapse | check Synapse and the shared secret; retry |
-| `/token returned 400 …: {"error":"invalid_client","error_description":"Secret required."}` | the client was registered as a confidential client | register it with `token_endpoint_auth_method: "none"` |
+| `/token returned 401 …: {"error":"invalid_client","error_description":"Secret required."}` | the client was registered as a confidential client | register it with `token_endpoint_auth_method: "none"` |
+| `/token refresh returned 400 …: invalid_grant` with "client_id does not match the refresh token." | the refresh names another client than the one the tokens were issued to | refresh with the `client_id` used at sign-in |
 | `/token refresh returned 400 …: invalid_grant` | the refresh token was already rotated (more than 60 s ago), expired, or its session was revoked | sign in again with the key; always store the newest refresh token |
 | `/token error: unsupported_grant_type: device_code grant requires MSC3861 mode.` with `--device-flow` | the server is not in delegated-auth mode ("MSC3861 mode" is the older name) | the device flow needs a Synapse-backed deployment |
 | every run shows a different DID | no key was given, so an ephemeral key was generated | pass `--key-file` or set `SIWX_KEY_FILE` |

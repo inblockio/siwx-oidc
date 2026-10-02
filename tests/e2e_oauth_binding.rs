@@ -1098,8 +1098,14 @@ async fn exchange_code(
         .unwrap()
 }
 
-/// A complete code-flow sign-in for a fresh wallet. Returns (access, refresh, did).
-async fn login_tokens(c: &Client, nrc: &Client, base: &str) -> (String, String, String) {
+/// A complete code-flow sign-in for a fresh wallet, with a confidential client.
+/// Returns (access, refresh, did, client): the refresh grant at `/token` binds
+/// the refresh token to the client and authenticates it.
+async fn login_tokens(
+    c: &Client,
+    nrc: &Client,
+    base: &str,
+) -> (String, String, String, RegisteredClient) {
     let rc = register_client(c, base).await;
     let w = new_wallet();
     let (verifier, challenge) = pkce_pair();
@@ -1111,6 +1117,7 @@ async fn login_tokens(c: &Client, nrc: &Client, base: &str) -> (String, String, 
         body["access_token"].as_str().unwrap().to_string(),
         body["refresh_token"].as_str().unwrap().to_string(),
         w.did,
+        rc,
     )
 }
 
@@ -1183,7 +1190,7 @@ async fn the_refresh_grant_accepts_only_a_refresh_token() {
     let base = oidc();
     let c = Client::new();
     let nrc = no_redirect_client();
-    let (access, refresh, _did) = login_tokens(&c, &nrc, &base).await;
+    let (access, refresh, _did, rc) = login_tokens(&c, &nrc, &base).await;
 
     assert_refused_by_refresh_grant(&c, &base, &access, "an access token").await;
     assert_eq!(
@@ -1193,7 +1200,17 @@ async fn the_refresh_grant_accepts_only_a_refresh_token() {
     );
 
     // Control: the real refresh token still refreshes.
-    let ok = refresh_grant(&c, &base, &refresh).await;
+    let ok = refresh_as(
+        &c,
+        &base,
+        &refresh,
+        &[
+            ("client_id", rc.client_id.as_str()),
+            ("client_secret", rc.client_secret.as_str()),
+        ],
+        None,
+    )
+    .await;
     assert_eq!(
         ok.status(),
         StatusCode::OK,
@@ -1208,7 +1225,7 @@ async fn the_matrix_refresh_endpoint_accepts_only_a_refresh_token() {
     let base = oidc();
     let c = Client::new();
     let nrc = no_redirect_client();
-    let (access, refresh, _did) = login_tokens(&c, &nrc, &base).await;
+    let (access, refresh, _did, _rc) = login_tokens(&c, &nrc, &base).await;
 
     assert_refused_by_matrix_refresh(&c, &base, &access, "an access token").await;
     assert_eq!(
@@ -1266,7 +1283,7 @@ async fn a_refresh_token_is_not_a_bearer_credential() {
     let base = oidc();
     let c = Client::new();
     let nrc = no_redirect_client();
-    let (access, refresh, did) = login_tokens(&c, &nrc, &base).await;
+    let (access, refresh, did, rc) = login_tokens(&c, &nrc, &base).await;
 
     let intro = introspect(&c, &base, &refresh).await;
     assert_eq!(
@@ -1356,7 +1373,17 @@ async fn a_refresh_token_is_not_a_bearer_credential() {
     );
     let claims: Value = ok.json().await.unwrap();
     assert_eq!(claims["sub"], json!(did), "userinfo sub is the DID");
-    let still = refresh_grant(&c, &base, &refresh).await;
+    let still = refresh_as(
+        &c,
+        &base,
+        &refresh,
+        &[
+            ("client_id", rc.client_id.as_str()),
+            ("client_secret", rc.client_secret.as_str()),
+        ],
+        None,
+    )
+    .await;
     assert_eq!(
         still.status(),
         StatusCode::OK,
@@ -2312,7 +2339,7 @@ async fn a_confidential_client_must_authenticate_to_refresh() {
         "a 401 for a Basic attempt carries `WWW-Authenticate: Basic` (RFC 6749 §5.2)"
     );
 
-    // The refusals consumed nothing. The form secret refreshes ...
+    // The refusals consumed nothing: the secret in the form refreshes.
     let by_form = refresh_as(
         &c,
         &base,
@@ -2327,21 +2354,6 @@ async fn a_confidential_client_must_authenticate_to_refresh() {
     assert_eq!(by_form.status(), StatusCode::OK, "secret in the form");
     let rotated: Value = by_form.json().await.unwrap();
     let successor = rotated["refresh_token"].as_str().unwrap().to_string();
-
-    // ... and so does Basic, with no client_id in the form.
-    let by_basic = refresh_as(
-        &c,
-        &base,
-        &successor,
-        &[],
-        Some((&rc.client_id, &rc.client_secret)),
-    )
-    .await;
-    assert_eq!(
-        by_basic.status(),
-        StatusCode::OK,
-        "secret in a Basic header"
-    );
 
     // The old token replayed inside the grace window: the client recovers the
     // pair it lost, a caller without the client's credentials does not.
@@ -2367,6 +2379,22 @@ async fn a_confidential_client_must_authenticate_to_refresh() {
         replay_owner.status(),
         StatusCode::OK,
         "the client's own replay still recovers the pair"
+    );
+
+    // The successor refreshes with the secret in a Basic header (and so no
+    // client_id in the form), which also ends the grace window for the old token.
+    let by_basic = refresh_as(
+        &c,
+        &base,
+        &successor,
+        &[],
+        Some((&rc.client_id, &rc.client_secret)),
+    )
+    .await;
+    assert_eq!(
+        by_basic.status(),
+        StatusCode::OK,
+        "secret in a Basic header"
     );
 }
 
@@ -2399,5 +2427,39 @@ async fn a_public_client_refreshes_without_client_credentials() {
         anonymous.status(),
         StatusCode::OK,
         "naming nobody (provisional)"
+    );
+}
+
+/// An `Authorization` header at `POST /token` is read, not rejected. A handler
+/// that takes a Bearer and a Basic extractor side by side answered every
+/// request carrying the header with a 400, so no client could authenticate with
+/// `client_secret_basic`. The client id may then come from the header alone.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn a_basic_authorization_header_authenticates_the_code_exchange() {
+    let base = oidc();
+    let c = Client::new();
+    let nrc = no_redirect_client();
+    let rc = register_client(&c, &base).await;
+    let (verifier, challenge) = pkce_pair();
+    let code = sign_in_for_code(&nrc, &base, &rc, &new_wallet(), &challenge, "basic_state").await;
+
+    let resp = c
+        .post(format!("{base}/token"))
+        .basic_auth(&rc.client_id, Some(&rc.client_secret))
+        .form(&[
+            ("code", code.as_str()),
+            ("grant_type", "authorization_code"),
+            ("code_verifier", verifier.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a Basic header carries the client id and secret: {body}"
     );
 }

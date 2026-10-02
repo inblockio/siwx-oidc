@@ -112,7 +112,7 @@ abused, leave it out of the list and let its proofs fail; the next sign-in re-as
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
 | `default_clients` | `SIWXOIDC_DEFAULT_CLIENTS` | none | Map of client id to a JSON client entry, written to Redis at every start. |
-| `require_secret` | `SIWXOIDC_REQUIRE_SECRET` | `true` | Whether `POST /token` demands a client secret from a client whose metadata names no `token_endpoint_auth_method`. A client registered with `"none"` never needs one. |
+| `require_secret` | `SIWXOIDC_REQUIRE_SECRET` | `true` | Whether `POST /token` demands a client secret, at the code exchange and at the refresh grant alike, from a client whose metadata names no `token_endpoint_auth_method`. A client registered with `"none"` never needs one. |
 
 A client entry is `{"secret": "…", "metadata": {…}}`, where `metadata` is RFC 7591 client
 metadata (at least `redirect_uris`). Clients can also register themselves through

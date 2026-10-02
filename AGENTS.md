@@ -320,6 +320,29 @@ doc; read it before changing the code the rule covers.
 - **Refresh rotation keeps a 60 s grace pointer**: any replay of the old refresh token within
   60 s returns the same successor pair, so a client that lost the response recovers. Pin:
   `refresh_grace_window_tolerates_replay` (mock stack).
+- **A refresh token is bound to the client it was issued to, through the one helper the code
+  exchange uses too.** `oidc::authenticate_client` serves both grants, so they cannot drift: a
+  request that names another client (`client_id` in the form or the Basic user name) is
+  `invalid_grant`; a confidential client (registered `token_endpoint_auth_method` other than
+  `none`, or none while `require_secret`) must present its secret, else `invalid_client`, a 401
+  (RFC 6749 §5.2, with `WWW-Authenticate: Basic` after a Basic attempt). The grace replay is bound
+  to the successor token's client. Provisional, recorded in docs/matrix-integration.md: a public
+  client may omit `client_id`; a token whose client registration has expired (30 days against 90)
+  keeps refreshing unless the request names another client or presents a secret;
+  `POST /_matrix/client/v3/refresh` carries no client identity and is not bound. Read the
+  `Authorization` header with `HeaderMap::typed_get`, never as two typed-header extractors, which
+  reject each other's scheme and turn every request that has the header into a 400. Pin: unit
+  `a_refresh_token_is_refused_to_a_client_it_was_not_issued_to`,
+  `a_confidential_client_must_authenticate_to_refresh`,
+  `a_public_client_refreshes_with_or_without_naming_itself`,
+  `an_unset_authentication_method_follows_require_secret`,
+  `a_token_outlives_its_clients_registration_but_not_its_binding`,
+  `the_grace_replay_is_bound_to_the_client_too`, `a_basic_header_names_the_client_like_the_form_does`,
+  `the_code_exchange_and_the_refresh_grant_authenticate_clients_identically`,
+  `invalid_client_is_a_401_and_every_other_token_error_a_400`; mock stack:
+  `a_refresh_token_is_refused_to_another_client`, `a_confidential_client_must_authenticate_to_refresh`,
+  `a_public_client_refreshes_without_client_credentials`,
+  `a_basic_authorization_header_authenticates_the_code_exchange`.
 - **Never infer token validity from Synapse**: it caches introspection for two minutes. Our
   introspection answer is the authority.
 - **No device-id recycling.** Sign-in upserts a fresh `SIWX_…` id and never deletes. Pin:

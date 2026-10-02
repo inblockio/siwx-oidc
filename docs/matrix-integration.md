@@ -333,7 +333,8 @@ token.
 2. `POST /token` with `grant_type=refresh_token` **rotates both**: a new access
    token, a new refresh token, and the old refresh token is deleted. The
    `device_id` and scope are carried over. The refresh response has no ID
-   token.
+   token. The refresh is bound to the client it was issued to, see
+   [Client binding](#client-binding).
 3. **Lost-response grace.** On a successful rotation, siwx-oidc records the old
    refresh token → the successor pair for `REFRESH_GRACE_TTL` (60 s). A client
    that lost the response (common on mobile) and retries with the old refresh
@@ -350,6 +351,52 @@ A refresh is refused (`invalid_grant`, "Session has been revoked.") when the
 device was just signed out or the account just deactivated. Short-lived Redis
 tombstones (15 minutes) close the race between a refresh and a concurrent
 teardown.
+
+### Client binding
+
+An authorization code and a refresh token belong to the client they were issued
+to, and `POST /token` authenticates that client by one rule for both grants
+(`oidc::authenticate_client`):
+
+1. The client named in the request must be the grant's client, else
+   `invalid_grant`. It is named by `client_id` in the form or by the user name
+   of an `Authorization: Basic` header; when both are present they must agree
+   (else `invalid_request`).
+2. A secret the request presents (`client_secret` in the form, or the
+   `Authorization` password or Bearer value, which wins) must match the
+   registration, else `invalid_client`.
+3. A request that presents none must come from a public client: registered
+   with `token_endpoint_auth_method: none`, or with no method while
+   `SIWXOIDC_REQUIRE_SECRET` is off. Otherwise `invalid_client`
+   ("Secret required."). Element Web and Element X register as public clients and send
+   `client_id` on refresh.
+
+`invalid_client` is a 401 (RFC 6749 §5.2), with `WWW-Authenticate: Basic` when
+the request attempted Basic. It used to be a 400. The grace replay of a rotated
+token is bound the same way, to the client of the successor token it returns.
+
+Provisional choices, open for the maintainers:
+
+- **A public client may omit `client_id` at the refresh grant.** `siwx-oidc-auth`
+  and the Matrix clients send it, an older agent may not; requiring it would
+  sign those out.
+- **A token outlives its client's registration.** A registration lasts 30 days
+  and a refresh token 90 days from its last use, so a session can outlast the
+  registration it was issued under. Such a token keeps refreshing when the
+  request names that client or none, and is refused when the request names
+  another client or presents a secret (which can no longer be checked). Refusing
+  it outright would sign out every session older than a registration.
+- **`POST /_matrix/client/v3/refresh` is not bound.** The Matrix client-server
+  API gives a refresh request no client identity, so that endpoint takes the
+  refresh token alone, and a confidential client's refresh token can be rotated
+  there without its secret. Closing that needs the grant to say which endpoints
+  may rotate it (plan section 8); until then the binding protects the OAuth
+  refresh grant only.
+
+An `Authorization` header at `/token` used to be answered with a 400 on every
+request (two header extractors rejecting each other's scheme), so
+`client_secret_basic` never worked. It is read now. Discovery still advertises
+only `client_secret_post` and `none`.
 
 ### Introspection never turns a storage error into a logout
 

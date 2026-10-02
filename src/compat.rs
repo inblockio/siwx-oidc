@@ -484,6 +484,18 @@ pub async fn delete_devices(
 
 // -- POST /_matrix/client/v3/refresh ------------------------------------------
 
+/// `POST /_matrix/client/v3/refresh` (MSC2918): rotate a refresh token.
+///
+/// **Not bound to a client.** The OAuth refresh grant (`oidc::token_refresh`)
+/// checks that the request comes from the client the token was issued to and
+/// authenticates a confidential one (I7). The Matrix client-server API gives
+/// this request no client identity to check (the body is the refresh token and
+/// nothing else), so this endpoint takes the token alone. The consequence: a
+/// confidential client's refresh token can be rotated here without its secret.
+/// Matrix clients are public clients, so nothing legitimate is affected, but the
+/// binding protects only the OAuth grant until this endpoint is restricted to
+/// the tokens that belong to Matrix devices (plan section 8). Do not "fix" it by
+/// demanding a client here: no Matrix client can send one.
 pub async fn refresh(
     State(state): State<CompatState>,
     Json(body): Json<RefreshRequest>,

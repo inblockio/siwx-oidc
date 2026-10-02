@@ -253,6 +253,22 @@ paths:
         Refresh rotates both tokens. A bounded grace pointer (60s) lets a client
         that LOST the rotation response — common on mobile — replay the old
         refresh token once instead of being signed out.
+
+        **Client authentication.** `authorization_code` and `refresh_token` are
+        bound to the client the code or token was issued to, and share one rule.
+        The client named in the request, in `client_id` or as the user name of an
+        `Authorization: Basic` header (both, if present, must agree), must be that
+        client: otherwise `invalid_grant`. A confidential client (registered with
+        a `token_endpoint_auth_method` other than `none`, or with none while
+        `SIWXOIDC_REQUIRE_SECRET` is on) must also present its secret, as
+        `client_secret` in the form or as the `Authorization` password: otherwise
+        `invalid_client`. A public client authenticates nothing and may omit
+        `client_id` at the refresh grant. The grace replay is bound to the client
+        like a rotation. A refresh token whose client registration has expired
+        (a registration lasts 30 days) still refreshes when the request names that
+        client or none, and is refused when it presents a secret. The Matrix
+        refresh endpoint `POST /_matrix/client/v3/refresh` has no client identity
+        to carry and is not bound.
       requestBody:
         required: true
         content:
@@ -279,6 +295,12 @@ paths:
           description: |
             OAuth error. `authorization_pending` and `slow_down` are the normal
             polling answers on the device-code grant, not failures.
+            `invalid_grant` includes a code or refresh token presented by a
+            client it was not issued to.
+        "401":
+          description: |
+            `invalid_client`: the client did not authenticate (RFC 6749 §5.2). A
+            request that tried HTTP Basic gets `WWW-Authenticate: Basic`.
 
   /userinfo:
     get:

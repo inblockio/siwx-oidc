@@ -302,6 +302,10 @@ struct LoginResult {
     access_token: String,
     refresh_token: String,
     device_id: String,
+    /// The confidential client the login was made with. The refresh grant at
+    /// `/token` binds a token to this client and authenticates it.
+    client_id: String,
+    client_secret: String,
 }
 
 /// Drive a full wallet auth-code login for `w` and return the issued tokens +
@@ -413,6 +417,8 @@ async fn wallet_login(c: &Client, base: &str, w: &Wallet) -> LoginResult {
         access_token,
         refresh_token,
         device_id,
+        client_id: rc.client_id.clone(),
+        client_secret: rc.client_secret.clone(),
     }
 }
 
@@ -1901,13 +1907,22 @@ async fn h9_device_code_approved_no_double_redemption() {
 // ===========================================================================
 
 /// Refresh via the OAuth /token endpoint (grant_type=refresh_token) — the path
-/// Element-X's matrix-rust-sdk OAuth client uses. Returns (status, json|null).
-async fn oauth_refresh(c: &Client, base: &str, refresh_token: &str) -> (StatusCode, Value) {
+/// Element-X's matrix-rust-sdk OAuth client uses. The login's client is
+/// confidential, so the request authenticates as it: the refresh grant binds a
+/// token to its client. Returns (status, json|null).
+async fn oauth_refresh(
+    c: &Client,
+    base: &str,
+    refresh_token: &str,
+    login: &LoginResult,
+) -> (StatusCode, Value) {
     let resp = c
         .post(format!("{base}/token"))
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
+            ("client_id", login.client_id.as_str()),
+            ("client_secret", login.client_secret.as_str()),
         ])
         .send()
         .await
@@ -1942,7 +1957,7 @@ async fn refresh_grace_window_tolerates_replay() {
     let login = wallet_login(&c, &base, &w).await;
 
     // First refresh rotates: login.refresh_token is consumed; rt1/at1 are minted.
-    let (s1, v1) = oauth_refresh(&c, &base, &login.refresh_token).await;
+    let (s1, v1) = oauth_refresh(&c, &base, &login.refresh_token, &login).await;
     assert_eq!(s1, StatusCode::OK, "first /token refresh must succeed");
     let rt1 = v1["refresh_token"].as_str().unwrap().to_string();
     assert!(
@@ -1952,7 +1967,7 @@ async fn refresh_grace_window_tolerates_replay() {
 
     // Replay the OLD (just-rotated) refresh token within the grace window.
     // PRE-FIX: invalid_grant (400). POST-FIX: 200 with the SAME successor pair.
-    let (s2, v2) = oauth_refresh(&c, &base, &login.refresh_token).await;
+    let (s2, v2) = oauth_refresh(&c, &base, &login.refresh_token, &login).await;
     assert_eq!(
         s2,
         StatusCode::OK,
@@ -1970,7 +1985,7 @@ async fn refresh_grace_window_tolerates_replay() {
     );
 
     // Negative: a well-formed but never-issued refresh token still fails closed.
-    let (sbad, _) = oauth_refresh(&c, &base, "mcr_never_issued_grace_probe").await;
+    let (sbad, _) = oauth_refresh(&c, &base, "mcr_never_issued_grace_probe", &login).await;
     assert_ne!(
         sbad,
         StatusCode::OK,

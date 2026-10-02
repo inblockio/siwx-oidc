@@ -12,7 +12,7 @@ use axum::{
 use axum_extra::{
     headers::{
         authorization::{Basic, Bearer},
-        Authorization, ContentType,
+        Authorization, ContentType, HeaderMapExt,
     },
     TypedHeader,
 };
@@ -155,7 +155,16 @@ impl IntoResponse for CustomError {
             CustomError::BadRequestRegister(e) => {
                 (StatusCode::BAD_REQUEST, Json(e)).into_response()
             }
-            CustomError::BadRequestToken(e) => (StatusCode::BAD_REQUEST, Json(e)).into_response(),
+            // RFC 6749 §5.2: `invalid_client` (the client did not authenticate)
+            // is a 401; every other token error is a 400.
+            CustomError::BadRequestToken(e) => {
+                let status = if e.error == CoreErrorResponseType::InvalidClient {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                (status, Json(e)).into_response()
+            }
             CustomError::Unauthorized(_) => {
                 (StatusCode::UNAUTHORIZED, self.to_string()).into_response()
             }
@@ -209,20 +218,58 @@ fn matrix_ready(state: &AppState) -> bool {
     state.config.matrix_server_name.is_some() && state.synapse_client.is_some()
 }
 
+/// A failure of `POST /token`, with whether the client tried HTTP Basic: the
+/// 401 for `invalid_client` must then carry a matching challenge (RFC 6749
+/// §5.2). The challenge is not sent to a client that authenticated in the form
+/// (or not at all), so a browser never shows a credentials prompt for it.
+struct TokenEndpointError {
+    error: CustomError,
+    basic_attempted: bool,
+}
+
+impl IntoResponse for TokenEndpointError {
+    fn into_response(self) -> Response {
+        let challenge = self.basic_attempted
+            && matches!(
+                &self.error,
+                CustomError::BadRequestToken(e) if e.error == CoreErrorResponseType::InvalidClient
+            );
+        let mut response = self.error.into_response();
+        if challenge {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                header::HeaderValue::from_static("Basic realm=\"siwx-oidc\", charset=\"UTF-8\""),
+            );
+        }
+        response
+    }
+}
+
 async fn token(
     State(state): State<AppState>,
-    bearer: Option<TypedHeader<Authorization<Bearer>>>,
-    basic: Option<TypedHeader<Authorization<Basic>>>,
+    headers: HeaderMap,
     Form(form): Form<oidc::TokenForm>,
-) -> Result<Json<serde_json::Value>, CustomError> {
-    let secret = if let Some(b) = bearer {
-        Some(b.0 .0.token().to_string())
-    } else {
-        basic.map(|b| b.0 .0.password().to_string())
+) -> Result<Json<serde_json::Value>, TokenEndpointError> {
+    // One `Authorization` header, read as either scheme. A handler that takes
+    // `Option<TypedHeader<Authorization<Bearer>>>` and
+    // `Option<TypedHeader<Authorization<Basic>>>` as two extractors answers
+    // every request that carries the header with a 400 ("invalid HTTP header"),
+    // because each extractor rejects a header of the other scheme instead of
+    // yielding `None`. That is how `client_secret_basic` never worked here.
+    let basic = headers.typed_get::<Authorization<Basic>>();
+    let bearer = headers.typed_get::<Authorization<Bearer>>();
+    let basic_attempted = basic.is_some();
+    let credentials = oidc::ClientCredentials {
+        basic_client_id: basic.as_ref().map(|b| b.username().to_string()),
+        secret: if let Some(b) = bearer {
+            Some(b.token().to_string())
+        } else {
+            basic.map(|b| b.password().to_string())
+        },
     };
     let token_response = oidc::token(
         form,
-        secret,
+        credentials,
         &state.signing_key,
         &state.config,
         &state.redis_client,
@@ -232,7 +279,7 @@ async fn token(
     .map_err(|e| {
         // OAuth2 RFC 6749 §5.2: token endpoint errors MUST be JSON.
         // Wrap non-Token errors so they always produce a JSON body.
-        match e {
+        let error = match e {
             CustomError::BadRequestToken(_) => e,
             CustomError::Unauthorized(msg) => CustomError::BadRequestToken(oidc::TokenError {
                 error: CoreErrorResponseType::InvalidClient,
@@ -242,13 +289,19 @@ async fn token(
                 error: CoreErrorResponseType::InvalidRequest,
                 error_description: other.to_string(),
             }),
+        };
+        TokenEndpointError {
+            error,
+            basic_attempted,
         }
     })?;
     // Strip null fields (e.g. "id_token": null on refresh responses) because
     // oidc-client-ts treats a present-but-null id_token as a validation target
     // and fails when it cannot decode it as a JWT.
-    let mut value = serde_json::to_value(token_response)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize token response: {}", e))?;
+    let mut value = serde_json::to_value(token_response).map_err(|e| TokenEndpointError {
+        error: anyhow::anyhow!("Failed to serialize token response: {}", e).into(),
+        basic_attempted,
+    })?;
     if let serde_json::Value::Object(ref mut map) = value {
         map.retain(|_, v| !v.is_null());
     }
@@ -1937,5 +1990,80 @@ mod request_logging_tests {
             !output.contains("user_code="),
             "a query parameter name appears in the logs:\n{output}"
         );
+    }
+}
+
+#[cfg(test)]
+mod token_endpoint_error_tests {
+    //! The status and challenge of a failed `POST /token`: RFC 6749 §5.2 makes
+    //! `invalid_client` a 401, with a `WWW-Authenticate` challenge when the
+    //! client attempted HTTP Basic, and every other token error a 400.
+    use super::*;
+
+    fn token_error(error: CoreErrorResponseType) -> CustomError {
+        CustomError::BadRequestToken(oidc::TokenError {
+            error,
+            error_description: "described".to_string(),
+        })
+    }
+
+    fn respond(error: CustomError, basic_attempted: bool) -> Response {
+        TokenEndpointError {
+            error,
+            basic_attempted,
+        }
+        .into_response()
+    }
+
+    #[test]
+    fn invalid_client_is_a_401_and_every_other_token_error_a_400() {
+        for (error, expected) in [
+            (
+                CoreErrorResponseType::InvalidClient,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (CoreErrorResponseType::InvalidGrant, StatusCode::BAD_REQUEST),
+            (
+                CoreErrorResponseType::InvalidRequest,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                CoreErrorResponseType::UnsupportedGrantType,
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let shown = format!("{error:?}");
+            assert_eq!(
+                respond(token_error(error), false).status(),
+                expected,
+                "{shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_failed_basic_attempt_is_challenged() {
+        let challenged = respond(token_error(CoreErrorResponseType::InvalidClient), true);
+        assert_eq!(challenged.status(), StatusCode::UNAUTHORIZED);
+        assert!(challenged
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .is_some_and(|v| v.to_str().unwrap().starts_with("Basic ")));
+
+        for (what, response) in [
+            (
+                "invalid_client without a Basic attempt",
+                respond(token_error(CoreErrorResponseType::InvalidClient), false),
+            ),
+            (
+                "invalid_grant after a Basic attempt",
+                respond(token_error(CoreErrorResponseType::InvalidGrant), true),
+            ),
+        ] {
+            assert!(
+                response.headers().get(header::WWW_AUTHENTICATE).is_none(),
+                "{what}"
+            );
+        }
     }
 }

@@ -896,9 +896,21 @@ pub struct TokenForm {
     pub device_code: Option<String>,
 }
 
+/// What the HTTP request says about the calling client outside the form: the
+/// `Authorization` header, which carries a client secret as `Basic` (with the
+/// client id as the user name, RFC 6749 §2.3.1) or, for some clients, as `Bearer`.
+#[derive(Default)]
+pub struct ClientCredentials {
+    /// The user name of an `Authorization: Basic` header: the client id.
+    pub basic_client_id: Option<String>,
+    /// The secret from the `Authorization` header (the Basic password or the
+    /// Bearer token). It wins over `client_secret` in the form.
+    pub secret: Option<String>,
+}
+
 pub async fn token(
     form: TokenForm,
-    secret: Option<String>,
+    credentials: ClientCredentials,
     signing_key: &EcdsaSigningKey,
     config: &crate::config::Config,
     db_client: &DBClientType,
@@ -906,10 +918,10 @@ pub async fn token(
 ) -> Result<CoreTokenResponse, CustomError> {
     match form.grant_type {
         CoreGrantType::AuthorizationCode => {
-            token_authorization_code(form, secret, signing_key, config, db_client).await
+            token_authorization_code(form, credentials, signing_key, config, db_client).await
         }
         CoreGrantType::RefreshToken => {
-            token_refresh(form, config, db_client).await
+            token_refresh(form, credentials, config, db_client).await
         }
         CoreGrantType::DeviceCode => {
             token_device_code(form, signing_key, config, db_client, synapse_client).await
@@ -922,11 +934,116 @@ pub async fn token(
     }
 }
 
+/// The client a request names, from the form and from an HTTP Basic header.
+/// They name the same client or only one of them is present: a request that
+/// names two different clients is malformed (RFC 6749 §2.3 allows one
+/// authentication method per request).
+fn named_client_id(
+    form: &TokenForm,
+    credentials: &ClientCredentials,
+) -> Result<Option<String>, CustomError> {
+    match (
+        form.client_id.as_deref(),
+        credentials.basic_client_id.as_deref(),
+    ) {
+        (Some(in_form), Some(in_header)) if !constant_time_eq(in_form, in_header) => {
+            Err(CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::InvalidRequest,
+                error_description:
+                    "client_id differs between the request body and the Authorization header."
+                        .to_string(),
+            }))
+        }
+        (Some(client_id), _) | (None, Some(client_id)) => Ok(Some(client_id.to_string())),
+        (None, None) => Ok(None),
+    }
+}
+
+/// What to do with a grant whose client registration no longer exists.
+#[derive(Clone, Copy)]
+enum UnregisteredClient {
+    /// Refuse: the client must exist. A code was issued minutes ago to a
+    /// registered client, so its absence is a fault.
+    Refuse,
+    /// Carry on without a registration. A refresh token outlives its client's
+    /// registration (30 days against 90), and refusing every such token would
+    /// sign out every session older than a registration. Nothing is lost
+    /// against the status quo: a secret cannot be checked against a registration
+    /// that is gone, and a request that presents one is still refused.
+    Tolerate,
+}
+
+/// The one place the token endpoint authenticates a client for a grant bound to
+/// a client: the authorization code and the refresh token.
+///
+/// 1. The client the request names (`named_client_id`, form or Basic header)
+///    must be the client the grant was issued to (`bound_client_id`):
+///    `invalid_grant` otherwise. A request that names none is fine here.
+/// 2. A secret the request presents is checked against the registration
+///    (`invalid_client`: "Bad secret."), whether the client is confidential or not.
+/// 3. A request that presents none must come from a public client: one
+///    registered with `token_endpoint_auth_method: none`, or with no method
+///    while `require_secret` is off (`invalid_client`: "Secret required.").
+///
+/// `credential` names the grant in the error text. Returns the registration, or
+/// `None` only when it is gone and `unregistered` is [`UnregisteredClient::Tolerate`].
+async fn authenticate_client(
+    bound_client_id: &str,
+    named_client_id: Option<&str>,
+    presented_secret: Option<&str>,
+    credential: &str,
+    unregistered: UnregisteredClient,
+    config: &crate::config::Config,
+    db_client: &DBClientType,
+) -> Result<Option<ClientEntry>, CustomError> {
+    if !bound_client_id.is_empty() {
+        if let Some(named) = named_client_id {
+            if !constant_time_eq(named, bound_client_id) {
+                return Err(CustomError::BadRequestToken(TokenError {
+                    error: CoreErrorResponseType::InvalidGrant,
+                    error_description: format!("client_id does not match the {credential}."),
+                }));
+            }
+        }
+    }
+
+    let Some(client_entry) = db_client.get_client(bound_client_id.to_string()).await? else {
+        return match (unregistered, presented_secret) {
+            (UnregisteredClient::Tolerate, None) => Ok(None),
+            _ => Err(CustomError::Unauthorized(
+                "Unrecognised client id.".to_string(),
+            )),
+        };
+    };
+
+    match presented_secret {
+        Some(secret) => {
+            if !constant_time_eq(secret, &client_entry.secret) {
+                return Err(CustomError::Unauthorized("Bad secret.".to_string()));
+            }
+        }
+        None => match client_entry.metadata.token_endpoint_auth_method() {
+            Some(CoreClientAuthMethod::None) => {}
+            Some(_) => {
+                return Err(CustomError::Unauthorized("Secret required.".to_string()));
+            }
+            None if config.require_secret => {
+                return Err(CustomError::Unauthorized("Secret required.".to_string()));
+            }
+            None => {}
+        },
+    }
+    Ok(Some(client_entry))
+}
+
 async fn token_refresh(
     form: TokenForm,
+    credentials: ClientCredentials,
     config: &crate::config::Config,
     db_client: &DBClientType,
 ) -> Result<CoreTokenResponse, CustomError> {
+    let named_client = named_client_id(&form, &credentials)?;
+    let presented_secret = credentials.secret.or(form.client_secret);
     let rt = form.refresh_token.ok_or_else(|| {
         CustomError::BadRequestToken(TokenError {
             error: CoreErrorResponseType::InvalidRequest,
@@ -941,7 +1058,25 @@ async fn token_refresh(
         .await?
         .filter(|m| m.is_kind(TokenKind::Refresh))
     {
-        Some(m) => m,
+        // A refresh token belongs to the client it was issued to (I7): before
+        // anything else is read or written, the request must be that client,
+        // and a confidential client must authenticate. This is the grant that
+        // carries a client identity. `POST /_matrix/client/v3/refresh` does not
+        // (the Matrix client-server API has none to carry), so that endpoint
+        // is not bound, and `compat::refresh` says so.
+        Some(m) => {
+            authenticate_client(
+                &m.client_id,
+                named_client.as_deref(),
+                presented_secret.as_deref(),
+                "refresh token",
+                UnregisteredClient::Tolerate,
+                config,
+                db_client,
+            )
+            .await?;
+            m
+        }
         None => {
             // Grace replay (lost-response recovery): a rotated refresh token is
             // deleted, but its successor pair is recorded under a short grace
@@ -949,16 +1084,37 @@ async fn token_refresh(
             // old token, return the SAME successor instead of signing it out.
             // Bounded by REFRESH_GRACE_TTL; genuinely unknown/expired tokens (no
             // grace record) still fail closed below.
+            //
+            // The replay hands out a live pair, so it is bound to the client like
+            // a rotation. The pointer does not record a client; the successor
+            // refresh token it names does. A successor that is gone (revoked) makes
+            // the replay an unknown token.
             if let Some(succ) = db_client.get_rotated_token(&rt).await? {
-                let expires_in = (succ.access_exp - Utc::now().timestamp()).max(0) as u64;
-                let mut response = CoreTokenResponse::new(
-                    AccessToken::new(succ.access_token),
-                    CoreTokenType::Bearer,
-                    CoreIdTokenFields::new(None, EmptyExtraTokenFields {}),
-                );
-                response.set_expires_in(Some(&time::Duration::from_secs(expires_in)));
-                response.set_refresh_token(Some(RefreshToken::new(succ.refresh_token)));
-                return Ok(response);
+                if let Some(successor) = db_client
+                    .get_token(&succ.refresh_token)
+                    .await?
+                    .filter(|m| m.is_kind(TokenKind::Refresh))
+                {
+                    authenticate_client(
+                        &successor.client_id,
+                        named_client.as_deref(),
+                        presented_secret.as_deref(),
+                        "refresh token",
+                        UnregisteredClient::Tolerate,
+                        config,
+                        db_client,
+                    )
+                    .await?;
+                    let expires_in = (succ.access_exp - Utc::now().timestamp()).max(0) as u64;
+                    let mut response = CoreTokenResponse::new(
+                        AccessToken::new(succ.access_token),
+                        CoreTokenType::Bearer,
+                        CoreIdTokenFields::new(None, EmptyExtraTokenFields {}),
+                    );
+                    response.set_expires_in(Some(&time::Duration::from_secs(expires_in)));
+                    response.set_refresh_token(Some(RefreshToken::new(succ.refresh_token)));
+                    return Ok(response);
+                }
             }
             return Err(CustomError::BadRequestToken(TokenError {
                 error: CoreErrorResponseType::InvalidGrant,
@@ -1339,11 +1495,14 @@ async fn token_device_code(
 
 async fn token_authorization_code(
     form: TokenForm,
-    secret: Option<String>,
+    credentials: ClientCredentials,
     signing_key: &EcdsaSigningKey,
     config: &crate::config::Config,
     db_client: &DBClientType,
 ) -> Result<CoreTokenResponse, CustomError> {
+    // A malformed request is refused before the code is touched.
+    let named_client = named_client_id(&form, &credentials)?;
+    let presented_secret = credentials.secret.or(form.client_secret);
     let code = form.code.ok_or_else(|| {
         CustomError::BadRequestToken(TokenError {
             error: CoreErrorResponseType::InvalidRequest,
@@ -1358,59 +1517,28 @@ async fn token_authorization_code(
         })
     })?;
 
-    // C2 Step 1: bind the auth code to the client it was issued to. A correct
-    // client presents the same `client_id` at /authorize and /token. If the code
-    // carries a client_id (always set by `sign_in`), the request's client_id —
-    // when present — must match it, and the rest of the function runs against the
-    // code's client (never the request's). This prevents a leaked confidential
-    // client's code from being redeemed by a different (public) client.
-    if !code_entry.client_id.is_empty() {
-        if let Some(ref req_client_id) = form.client_id {
-            if !constant_time_eq(req_client_id, &code_entry.client_id) {
-                return Err(CustomError::BadRequestToken(TokenError {
-                    error: CoreErrorResponseType::InvalidGrant,
-                    error_description: "client_id does not match the authorization code."
-                        .to_string(),
-                }));
-            }
-        }
-    }
+    // Bind the code to the client it was issued to, and authenticate that
+    // client, through the helper the refresh grant uses too. A correct client
+    // presents the same `client_id` at /authorize and /token; a code carries its
+    // client_id (always set by `sign_in`), and the rest of the function runs
+    // against the code's client, never the request's. This stops a leaked
+    // confidential client's code from being redeemed by a different (public)
+    // client.
     let client_id = if !code_entry.client_id.is_empty() {
         code_entry.client_id.clone()
-    } else if let Some(c) = form.client_id.clone() {
-        c
     } else {
-        code_entry.client_id.clone()
+        named_client.clone().unwrap_or_default()
     };
-
-    if let Some(secret) = if let Some(b) = secret {
-        Some(b)
-    } else {
-        form.client_secret.clone()
-    } {
-        let client_entry = db_client
-            .get_client(client_id.clone())
-            .await?
-            .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
-        if !constant_time_eq(&secret, &client_entry.secret) {
-            return Err(CustomError::Unauthorized("Bad secret.".to_string()));
-        }
-    } else {
-        let client_entry = db_client
-            .get_client(client_id.clone())
-            .await?
-            .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
-        match client_entry.metadata.token_endpoint_auth_method() {
-            Some(CoreClientAuthMethod::None) => {}
-            Some(_) => {
-                return Err(CustomError::Unauthorized("Secret required.".to_string()));
-            }
-            None if config.require_secret => {
-                return Err(CustomError::Unauthorized("Secret required.".to_string()));
-            }
-            None => {}
-        }
-    }
+    authenticate_client(
+        &client_id,
+        named_client.as_deref(),
+        presented_secret.as_deref(),
+        "authorization code",
+        UnregisteredClient::Refuse,
+        config,
+        db_client,
+    )
+    .await?;
 
     // PKCE: every code carries the challenge `/authorize` bound to its session,
     // and the verifier must match it. A code without a challenge (only an older
@@ -3800,7 +3928,7 @@ mod tests {
                 refresh_token: None,
                 device_code: None,
             },
-            None,
+            ClientCredentials::default(),
             &oidc_signing_key,
             &config,
             &db_client,
@@ -4388,7 +4516,7 @@ mod tests {
                 refresh_token: None,
                 device_code: Some(device_code.clone()),
             },
-            None,
+            ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
             &config,
             &db,
@@ -4458,7 +4586,7 @@ mod tests {
                 refresh_token: None,
                 device_code: Some(device_code.clone()),
             },
-            None,
+            ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
             &config,
             &db,
@@ -6431,7 +6559,7 @@ mod device_display_name_tests {
                 refresh_token: None,
                 device_code: Some(device_code),
             },
-            None,
+            ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
             &config,
             &db,
@@ -6558,12 +6686,15 @@ mod client_binding_tests {
     struct Presented<'a> {
         client_id: Option<&'a str>,
         form_secret: Option<&'a str>,
+        /// The user name of an `Authorization: Basic` header.
+        header_client_id: Option<&'a str>,
         header_secret: Option<&'a str>,
     }
 
     const NOTHING: Presented<'static> = Presented {
         client_id: None,
         form_secret: None,
+        header_client_id: None,
         header_secret: None,
     };
 
@@ -6583,7 +6714,10 @@ mod client_binding_tests {
                 refresh_token: Some(refresh_token.to_string()),
                 device_code: None,
             },
-            who.header_secret.map(str::to_string),
+            ClientCredentials {
+                basic_client_id: who.header_client_id.map(str::to_string),
+                secret: who.header_secret.map(str::to_string),
+            },
             &EcdsaSigningKey::generate(),
             config,
             db,
@@ -6608,7 +6742,10 @@ mod client_binding_tests {
                 refresh_token: None,
                 device_code: None,
             },
-            who.header_secret.map(str::to_string),
+            ClientCredentials {
+                basic_client_id: who.header_client_id.map(str::to_string),
+                secret: who.header_secret.map(str::to_string),
+            },
             &EcdsaSigningKey::generate(),
             config,
             db,
@@ -6625,6 +6762,7 @@ mod client_binding_tests {
             Ok(_) => "ok".to_string(),
             Err(CustomError::BadRequestToken(e)) => match e.error {
                 CoreErrorResponseType::InvalidGrant => "invalid_grant".to_string(),
+                CoreErrorResponseType::InvalidRequest => "invalid_request".to_string(),
                 ref other => format!("{other:?}"),
             },
             Err(CustomError::Unauthorized(message)) => format!("invalid_client: {message}"),
@@ -6665,6 +6803,7 @@ mod client_binding_tests {
             Presented {
                 client_id: Some(&other),
                 form_secret: Some(SECRET),
+                header_client_id: None,
                 header_secret: None,
             },
         )
@@ -6718,6 +6857,7 @@ mod client_binding_tests {
                 Presented {
                     client_id: Some(&client),
                     form_secret: Some("wrong"),
+                    header_client_id: None,
                     header_secret: None,
                 },
                 "invalid_client: Bad secret.",
@@ -6746,6 +6886,7 @@ mod client_binding_tests {
             Presented {
                 client_id: Some(&client),
                 form_secret: Some(SECRET),
+                header_client_id: None,
                 header_secret: None,
             },
         )
@@ -6860,6 +7001,7 @@ mod client_binding_tests {
                     Presented {
                         client_id: Some(&gone),
                         form_secret: Some(SECRET),
+                        header_client_id: None,
                         header_secret: None
                     }
                 )
@@ -6886,6 +7028,69 @@ mod client_binding_tests {
         );
     }
 
+    /// An HTTP Basic header names the client in its user name, and that is
+    /// checked exactly like a `client_id` in the form, at both grants. A form
+    /// and a header that name different clients are a malformed request.
+    #[tokio::test]
+    async fn a_basic_header_names_the_client_like_the_form_does() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let owner = seed_client(&db, Registration::Confidential).await;
+        let other = seed_client(&db, Registration::Confidential).await;
+        let rt = seed_refresh_token(&db, &owner).await;
+
+        let someone_else = Presented {
+            header_client_id: Some(&other),
+            header_secret: Some(SECRET),
+            ..NOTHING
+        };
+        assert_eq!(
+            outcome(&refresh(&db, &config, &rt, someone_else).await),
+            "invalid_grant"
+        );
+        let spent = seed_code(&db, &owner).await;
+        assert_eq!(
+            outcome(&exchange(&db, &config, &spent, someone_else).await),
+            "invalid_grant"
+        );
+
+        // A form and a header that name different clients are malformed, and
+        // refused before the code is spent.
+        let split = Presented {
+            client_id: Some(&owner),
+            header_client_id: Some(&other),
+            header_secret: Some(SECRET),
+            ..NOTHING
+        };
+        let intact = seed_code(&db, &owner).await;
+        assert_eq!(
+            outcome(&refresh(&db, &config, &rt, split).await),
+            "invalid_request"
+        );
+        assert_eq!(
+            outcome(&exchange(&db, &config, &intact, split).await),
+            "invalid_request"
+        );
+        assert!(
+            still_exists(&db, &rt).await,
+            "refusals leave the token alone"
+        );
+
+        let own = Presented {
+            header_client_id: Some(&owner),
+            header_secret: Some(SECRET),
+            ..NOTHING
+        };
+        assert_eq!(
+            outcome(&exchange(&db, &config, &intact, own).await),
+            "ok",
+            "the malformed request did not spend the code"
+        );
+        assert_eq!(outcome(&refresh(&db, &config, &rt, own).await), "ok");
+    }
+
     /// The grace replay hands out the successor pair, so it needs the same
     /// client binding as a fresh rotation: anyone holding the old token for a
     /// minute after the rotation must not get the new pair without the client's
@@ -6902,6 +7107,7 @@ mod client_binding_tests {
         let credentials = Presented {
             client_id: Some(&client),
             form_secret: Some(SECRET),
+            header_client_id: None,
             header_secret: None,
         };
 
@@ -6920,6 +7126,7 @@ mod client_binding_tests {
                     Presented {
                         client_id: Some(&other),
                         form_secret: Some(SECRET),
+                        header_client_id: None,
                         header_secret: None
                     }
                 )
@@ -6974,6 +7181,7 @@ mod client_binding_tests {
                     Presented {
                         client_id: Some(&client),
                         form_secret: Some(SECRET),
+                        header_client_id: None,
                         header_secret: None,
                     },
                 ),
@@ -6982,6 +7190,7 @@ mod client_binding_tests {
                     Presented {
                         client_id: Some(&client),
                         form_secret: Some("wrong"),
+                        header_client_id: None,
                         header_secret: None,
                     },
                 ),
@@ -6997,6 +7206,7 @@ mod client_binding_tests {
                     Presented {
                         client_id: Some(&other),
                         form_secret: Some(SECRET),
+                        header_client_id: None,
                         header_secret: None,
                     },
                 ),
