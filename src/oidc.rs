@@ -2889,7 +2889,11 @@ pub async fn sign_in(
             .iter()
             .any(|r| Url::parse(r).ok().as_ref() == Some(redirect_url))
         {
-            return Err(anyhow!("Missing or mismatched resource in CAIP-122 message").into());
+            // The client signed a message that binds no (or another) redirect
+            // URI: its mistake, not a server fault.
+            return Err(CustomError::BadRequest(
+                "Missing or mismatched resource in CAIP-122 message".to_string(),
+            ));
         }
 
         // C1 (login path): enforce the message Expiration Time. The login
