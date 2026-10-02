@@ -291,8 +291,8 @@ doc; read it before changing the code the rule covers.
   refuses a code without a challenge. Never read these from `/sign_in` parameters again. Pin
   (mock stack): `authorize_accepts_only_the_code_response_type`,
   `the_code_is_bound_to_the_challenge_sent_to_authorize`,
-  `sign_in_refuses_a_state_that_differs_from_the_authorization_request`,
-  `sign_in_refuses_a_client_that_differs_from_the_authorization_request`,
+  `sign_in_ignores_a_state_in_its_query`, `sign_in_ignores_a_client_in_its_query`,
+  `the_login_page_round_trip_keeps_the_exact_redirect_uri_and_state`,
   `discovery_advertises_only_the_code_response_type`; unit:
   `sign_in_parameters_may_repeat_the_bound_request_but_not_change_it`,
   `a_session_without_a_bound_request_is_refused`, `authorize_binds_the_request_to_the_session`.

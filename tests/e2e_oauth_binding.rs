@@ -6,12 +6,11 @@
 //!      headless `siwx-oidc-auth` shape) is accepted.
 //!   2. C2 Step 1 (code↔client binding) — exchanging a code with a MISMATCHED
 //!      `client_id` at `/token` is rejected `invalid_grant`.
-//!   3. C2 Step 3 (`/sign_in` redirect re-validation) — `/sign_in` with an
-//!      UNREGISTERED `redirect_uri` is rejected, no code emitted to the attacker
-//!      origin (wallet / Path B; the shared validator also covers Path A).
+//!   3. C2 Step 3 — `/sign_in` never sends a code to a `redirect_uri` named in
+//!      its query; the code goes to the redirect URI `/authorize` bound.
 //!   4. C2 Step 4b (reject `plain` PKCE) — `/authorize` rejects
-//!      `code_challenge_method=plain` up front, and `/sign_in` refuses a `plain`
-//!      challenge on the front channel, so no code carries one.
+//!      `code_challenge_method=plain` up front, and a `plain` challenge on the
+//!      `/sign_in` query has no effect, so no code carries one.
 //!   5. C2 Step 4a (mandatory PKCE) — a `response_type=code` `/authorize` request
 //!      WITHOUT a `code_challenge` is rejected; the same request WITH S256 PKCE
 //!      still succeeds.
@@ -24,8 +23,9 @@
 //!   8. The authorization request is bound at `/authorize` — only
 //!      `response_type=code`, redirect URIs matched exactly, and `/sign_in`
 //!      issues the code for the request `/authorize` validated (client,
-//!      redirect URI, state, PKCE challenge), never for different front-channel
-//!      parameters. Discovery advertises only the code response type.
+//!      redirect URI, state, PKCE challenge) and reads no authorization
+//!      parameter from its own query. The login page round trip keeps the
+//!      exact redirect URI and state. Discovery advertises only `code`.
 //!
 //! Targets the MOCK stack brought up by `e2e/up.sh` (siwx-oidc :8080, Synapse
 //! mock :8090, Redis :6379). Run single-threaded with the stack up:
@@ -507,7 +507,9 @@ async fn mismatched_client_id_at_token_is_rejected() {
 }
 
 // ===========================================================================
-// 3. C2 Step 3 — /sign_in with an UNREGISTERED redirect_uri is rejected.
+// 3. C2 Step 3 — /sign_in never sends a code to a redirect_uri from its query:
+//    an unregistered one there is ignored, and a message that binds it is
+//    refused.
 // ===========================================================================
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
@@ -518,53 +520,53 @@ async fn unregistered_redirect_uri_at_sign_in_is_rejected() {
     let w = new_wallet();
     let rc = register_client(&c, &base).await;
     let (_verifier, challenge) = pkce_pair();
-
-    let (session_cookie, nonce, domain) =
-        authorize_session(&nrc, &base, &rc, &challenge, "redir_state").await;
-
-    // A redirect NOT registered for this client. Bind it in the signed Resources
-    // so the Path-B resource check does not pre-empt the redirect check: /sign_in
-    // refuses any redirect_uri other than the one /authorize matched against the
-    // registration and bound to the session.
-    let attacker = "https://attacker.example/cb";
-    let message = build_login_message(&w, &base, &domain, &nonce, attacker, 48);
-    let sign_in_url = format!(
-        "{base}/sign_in?redirect_uri={}&state=redir_state&client_id={}&code_challenge={}&code_challenge_method=S256",
-        urlencoding::encode(attacker),
+    let unregistered = "https://unregistered.example/cb";
+    let query = format!(
+        "redirect_uri={}&state=redir_state&client_id={}&code_challenge={}&code_challenge_method=S256",
+        urlencoding::encode(unregistered),
         urlencoding::encode(&rc.client_id),
         urlencoding::encode(&challenge),
     );
-    let resp = nrc
-        .get(&sign_in_url)
-        .header("cookie", siwx_cookie_header(&session_cookie, &w, &message))
-        .send()
-        .await
-        .unwrap();
 
-    // Must NOT 303 to the attacker origin with a code.
-    if resp.status() == StatusCode::SEE_OTHER {
-        let loc = resp
-            .headers()
-            .get("location")
-            .map(|v| v.to_str().unwrap().to_string())
-            .unwrap_or_default();
-        panic!("sign_in must NOT emit a code redirect to an unregistered redirect_uri, got: {loc}");
-    }
+    // (a) The signed message binds the registered redirect URI: the code goes
+    //     there, whatever the query names.
+    let s = authorize_session(&nrc, &base, &rc, &challenge, "redir_state").await;
+    let resp = sign_in_raw(
+        &nrc,
+        &base,
+        (&s.0, &s.1, &s.2),
+        &w,
+        &rc.redirect_uri,
+        &query,
+    )
+    .await;
+    let location = location_of(&resp);
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{location}");
+    assert!(
+        location.starts_with(&format!("{}?code=", rc.redirect_uri)),
+        "the code goes to the bound redirect URI only: {location}"
+    );
+
+    // (b) A message that binds the unregistered URI instead does not match the
+    //     bound request: refused, and no code is emitted anywhere.
+    let s = authorize_session(&nrc, &base, &rc, &challenge, "redir_state").await;
+    let resp = sign_in_raw(&nrc, &base, (&s.0, &s.1, &s.2), &w, unregistered, &query).await;
     let status = resp.status();
+    let location = location_of(&resp);
     let body = resp.text().await.unwrap_or_default();
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "unregistered redirect_uri must be a clean 400, got {status}: {body}"
+    assert!(
+        !location.contains("code="),
+        "no code may be emitted for a message bound to another redirect URI: {location}"
     );
     assert!(
-        body.to_lowercase().contains("redirect_uri"),
-        "rejection must mention redirect_uri: {body}"
+        status.is_client_error() || status.is_server_error(),
+        "a message bound to another redirect URI is refused, got {status}: {body}"
     );
+    assert!(body.to_lowercase().contains("resource"), "{body}");
 }
 
 // ===========================================================================
-// 4. C2 Step 4b — `plain` PKCE is rejected (at /authorize and at /sign_in).
+// 4. C2 Step 4b — `plain` PKCE is rejected at /authorize and has no effect at /sign_in.
 // ===========================================================================
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
@@ -590,38 +592,60 @@ async fn plain_pkce_is_rejected() {
         "/authorize must reject code_challenge_method=plain"
     );
 
-    // (b) Nor can a `plain` challenge enter through /sign_in: the code is bound
-    //     to the S256 challenge /authorize stored in the session, and a /sign_in
-    //     that repeats a different challenge or method is refused, so no code
-    //     carrying a `plain` challenge can be issued at all.
-    let (session_cookie, nonce, domain) = {
-        let (_v, s256_challenge) = pkce_pair();
-        authorize_session(&nrc, &base, &rc, &s256_challenge, "plain_state").await
-    };
-    let message = build_login_message(&w, &base, &domain, &nonce, &rc.redirect_uri, 48);
-    let sign_in_url = format!(
-        "{base}/sign_in?redirect_uri={}&state=plain_state&client_id={}&code_challenge={}&code_challenge_method=plain",
+    // (b) Nor can a `plain` challenge enter through /sign_in: its query has no
+    //     effect, so the code stays bound to the S256 challenge /authorize
+    //     stored. The `plain` verifier does not redeem it; the S256 verifier
+    //     does.
+    let plain_query = format!(
+        "redirect_uri={}&state=plain_state&client_id={}&code_challenge={}&code_challenge_method=plain",
         urlencoding::encode(&rc.redirect_uri),
         urlencoding::encode(&rc.client_id),
         urlencoding::encode(plain_challenge),
     );
-    let sign_in_resp = nrc
-        .get(&sign_in_url)
-        .header("cookie", siwx_cookie_header(&session_cookie, &w, &message))
-        .send()
-        .await
-        .unwrap();
-    let status = sign_in_resp.status();
-    let body = sign_in_resp.text().await.unwrap_or_default();
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "a /sign_in carrying a `plain` challenge must be refused, got {status}: {body}"
-    );
-    assert!(
-        body.contains("code_challenge"),
-        "the refusal names the challenge: {body}"
-    );
+    for (verifier_is_plain, what) in [(true, "the plain verifier"), (false, "the S256 verifier")] {
+        let (s256_verifier, s256_challenge) = pkce_pair();
+        let s = authorize_session(&nrc, &base, &rc, &s256_challenge, "plain_state").await;
+        let resp = sign_in_raw(
+            &nrc,
+            &base,
+            (&s.0, &s.1, &s.2),
+            &w,
+            &rc.redirect_uri,
+            &plain_query,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "sign_in issues the code"
+        );
+        let code = parse_query(&location_of(&resp))
+            .get("code")
+            .unwrap()
+            .clone();
+        let verifier = if verifier_is_plain {
+            plain_challenge.to_string()
+        } else {
+            s256_verifier
+        };
+        let resp = exchange_code(&c, &base, &rc, &code, Some(&verifier)).await;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if verifier_is_plain {
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{what} must not redeem the code, got {status}: {body}"
+            );
+            assert!(body.contains("invalid_grant"), "{body}");
+        } else {
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{what} of the bound challenge redeems the code: {body}"
+            );
+        }
+    }
 }
 
 // ===========================================================================
@@ -1658,9 +1682,11 @@ async fn the_code_is_bound_to_the_challenge_sent_to_authorize() {
         "the /authorize verifier redeems the code"
     );
 
-    // (c) A different challenge on /sign_in is refused; no code is issued.
+    // (c) A different challenge in the /sign_in query has no effect: the code
+    //     is still issued for the bound request, and the verifier of the
+    //     challenge named on /sign_in does not redeem it.
     let (_v3, c3) = pkce_pair();
-    let (_vx, cx) = pkce_pair();
+    let (vx, cx) = pkce_pair();
     let s = authorize_session(&nrc, &base, &rc, &c3, "bound").await;
     let query = format!(
         "{plain_query}&code_challenge={}&code_challenge_method=S256",
@@ -1675,108 +1701,97 @@ async fn the_code_is_bound_to_the_challenge_sent_to_authorize() {
         &query,
     )
     .await;
-    let status = resp.status();
-    let location = location_of(&resp);
-    let body = resp.text().await.unwrap_or_default();
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "a /sign_in challenge that differs from /authorize's must be refused \
-         (location {location}): {body}"
-    );
-    assert!(body.contains("code_challenge"), "{body}");
-}
-
-/// Front-channel parameters on /sign_in may repeat the authorization request,
-/// never change it: a different state is refused.
-#[tokio::test]
-#[ignore = "requires live e2e stack (e2e/up.sh)"]
-async fn sign_in_refuses_a_state_that_differs_from_the_authorization_request() {
-    let base = oidc();
-    let c = Client::new();
-    let nrc = no_redirect_client();
-    let rc_a = register_client(&c, &base).await;
-    let w = new_wallet();
-
-    // A different state.
-    let (_v, ch) = pkce_pair();
-    let s = authorize_session(&nrc, &base, &rc_a, &ch, "state_one").await;
-    let query = format!(
-        "redirect_uri={}&state=state_two&client_id={}",
-        urlencoding::encode(&rc_a.redirect_uri),
-        urlencoding::encode(&rc_a.client_id),
-    );
-    let resp = sign_in_raw(
-        &nrc,
-        &base,
-        (&s.0, &s.1, &s.2),
-        &w,
-        &rc_a.redirect_uri,
-        &query,
-    )
-    .await;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "a different state is refused: {body}"
-    );
-    assert!(body.contains("state"), "{body}");
-
-    // Control: parameters that repeat the request are fine.
-    let (_v, ch) = pkce_pair();
-    let s = authorize_session(&nrc, &base, &rc_a, &ch, "same_state").await;
-    let query = format!(
-        "redirect_uri={}&state=same_state&client_id={}",
-        urlencoding::encode(&rc_a.redirect_uri),
-        urlencoding::encode(&rc_a.client_id),
-    );
-    let resp = sign_in_raw(
-        &nrc,
-        &base,
-        (&s.0, &s.1, &s.2),
-        &w,
-        &rc_a.redirect_uri,
-        &query,
-    )
-    .await;
     assert_eq!(
         resp.status(),
         StatusCode::SEE_OTHER,
-        "matching parameters issue the code"
+        "sign_in issues the code"
     );
+    let code = parse_query(&location_of(&resp))
+        .get("code")
+        .unwrap()
+        .clone();
+    let other = exchange_code(&c, &base, &rc, &code, Some(&vx)).await;
+    let status = other.status();
+    let body = other.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the verifier of a challenge named on /sign_in must not redeem the code, \
+         got {status}: {body}"
+    );
+    assert!(body.contains("invalid_grant"), "{body}");
+}
+
+/// /sign_in reads no authorization parameter from its query: a different state
+/// there has no effect, and the redirect carries the state /authorize bound.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn sign_in_ignores_a_state_in_its_query() {
+    let base = oidc();
+    let c = Client::new();
+    let nrc = no_redirect_client();
+    let rc = register_client(&c, &base).await;
+    let w = new_wallet();
+
+    let (_v, ch) = pkce_pair();
+    let s = authorize_session(&nrc, &base, &rc, &ch, "state_one").await;
+    let query = format!(
+        "redirect_uri={}&state=state_two&client_id={}",
+        urlencoding::encode(&rc.redirect_uri),
+        urlencoding::encode(&rc.client_id),
+    );
+    let resp = sign_in_raw(
+        &nrc,
+        &base,
+        (&s.0, &s.1, &s.2),
+        &w,
+        &rc.redirect_uri,
+        &query,
+    )
+    .await;
+    let status = resp.status();
     let location = location_of(&resp);
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "sign_in issues the code for the bound request: {}",
+        resp.text().await.unwrap_or_default()
+    );
     assert!(
-        location.starts_with(&format!("{}?", rc_a.redirect_uri)),
+        location.starts_with(&format!("{}?", rc.redirect_uri)),
         "{location}"
     );
     assert_eq!(
         parse_query(&location).get("state").map(String::as_str),
-        Some("same_state")
+        Some("state_one"),
+        "the redirect carries the bound state, never one from the /sign_in query: {location}"
     );
 }
 
-/// A code is never issued to a client other than the one /authorize validated,
-/// even when the other client and its redirect URI are registered.
+/// /sign_in reads no authorization parameter from its query: naming another
+/// (registered) client and its redirect URI there has no effect. No code is
+/// ever issued to that client; the code goes to the bound redirect URI, is
+/// issued for the bound client, and the other client cannot redeem it.
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
-async fn sign_in_refuses_a_client_that_differs_from_the_authorization_request() {
+async fn sign_in_ignores_a_client_in_its_query() {
     let base = oidc();
     let c = Client::new();
     let nrc = no_redirect_client();
     let rc_a = register_client(&c, &base).await;
-    let rc_b = register_client(&c, &base).await;
+    let rc_b = register_client_with_redirect(&c, &base, &format!("{base}/other-callback")).await;
     let w = new_wallet();
-
-    // A different (registered) client with its own redirect URI.
-    let (_v, ch) = pkce_pair();
-    let s = authorize_session(&nrc, &base, &rc_a, &ch, "client_state").await;
     let query = format!(
         "redirect_uri={}&state=client_state&client_id={}",
         urlencoding::encode(&rc_b.redirect_uri),
         urlencoding::encode(&rc_b.client_id),
     );
+
+    // (a) Even with the signed message binding the other client's redirect
+    //     URI, no code is issued to it: the message must bind the redirect URI
+    //     of the request /authorize validated.
+    let (_v, ch) = pkce_pair();
+    let s = authorize_session(&nrc, &base, &rc_a, &ch, "client_state").await;
     let resp = sign_in_raw(
         &nrc,
         &base,
@@ -1786,16 +1801,50 @@ async fn sign_in_refuses_a_client_that_differs_from_the_authorization_request() 
         &query,
     )
     .await;
+    let location = location_of(&resp);
+    assert!(
+        !location.contains("code="),
+        "no code may be issued to a client other than the one /authorize validated: {location}"
+    );
+
+    // (b) With the message binding the bound redirect URI, the code goes there
+    //     and belongs to the bound client.
+    let (verifier, ch) = pkce_pair();
+    let s = authorize_session(&nrc, &base, &rc_a, &ch, "client_state").await;
+    let resp = sign_in_raw(
+        &nrc,
+        &base,
+        (&s.0, &s.1, &s.2),
+        &w,
+        &rc_a.redirect_uri,
+        &query,
+    )
+    .await;
     let status = resp.status();
     let location = location_of(&resp);
-    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "sign_in issues the code for the bound request: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    assert!(
+        location.starts_with(&format!("{}?", rc_a.redirect_uri)),
+        "the code goes to the bound client's redirect URI, never to one from the \
+         /sign_in query: {location}"
+    );
+    let code = parse_query(&location).get("code").unwrap().clone();
+
+    // The client named on /sign_in cannot redeem it, even with the verifier.
+    let as_b = exchange_code(&c, &base, &rc_b, &code, Some(&verifier)).await;
+    let status = as_b.status();
+    let body = as_b.text().await.unwrap_or_default();
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
-        "a code must not be issued to a client other than the one /authorize \
-         validated (location {location}): {body}"
+        "the client named on /sign_in must not redeem the code, got {status}: {body}"
     );
-    assert!(body.contains("client_id"), "{body}");
+    assert!(body.contains("invalid_grant"), "{body}");
 }
 
 /// Redirect URIs match the registration exactly, query included, at
@@ -1829,23 +1878,30 @@ async fn redirect_uris_match_the_registration_exactly() {
         "/authorize names the reason: {location}"
     );
 
-    // (b) /sign_in: the same URI is refused there too.
+    // (b) /sign_in: the same URI in its query has no effect; the code goes to
+    //     the exact URI /authorize matched and bound.
     let s = authorize_session(&nrc, &base, &rc, &ch, "exact").await;
     let query = format!(
         "redirect_uri={}&state=exact&client_id={}",
         urlencoding::encode(&extra),
         urlencoding::encode(&rc.client_id),
     );
-    let resp = sign_in_raw(&nrc, &base, (&s.0, &s.1, &s.2), &w, &extra, &query).await;
+    let resp = sign_in_raw(
+        &nrc,
+        &base,
+        (&s.0, &s.1, &s.2),
+        &w,
+        &rc.redirect_uri,
+        &query,
+    )
+    .await;
     let status = resp.status();
     let location = location_of(&resp);
-    let body = resp.text().await.unwrap_or_default();
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "/sign_in must refuse a redirect URI with an extra query (location {location}): {body}"
+    assert_eq!(status, StatusCode::SEE_OTHER, "sign_in issues the code");
+    assert!(
+        location.starts_with(&format!("{}?code=", rc.redirect_uri)) && !location.contains("extra"),
+        "the code goes to the bound redirect URI, never to one from the /sign_in query: {location}"
     );
-    assert!(body.contains("redirect_uri"), "{body}");
 
     // (c) A registration that carries a query (as Element Web's does) works
     //     when the client sends exactly that URI, and only then.
@@ -1872,6 +1928,134 @@ async fn redirect_uris_match_the_registration_exactly() {
         StatusCode::OK,
         "the exact registered URI works end to end"
     );
+}
+
+/// JavaScript's `encodeURI`, which the login page applies to every value of
+/// its /sign_in link: it leaves `;,/?:@&=+$#` and the unreserved characters as
+/// they are.
+fn encode_uri(value: &str) -> String {
+    const KEEP: &[u8] = b";,/?:@&=+$-_.!~*'()#";
+    value
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || KEEP.contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// The /sign_in query exactly as the login page (`js/ui/src/App.svelte`)
+/// builds it from the values it read off its own URL.
+fn login_page_sign_in_query(page: &HashMap<String, String>) -> String {
+    let get = |k: &str| page.get(k).cloned().unwrap_or_default();
+    let mut tail = String::new();
+    if !get("oidc_nonce").is_empty() {
+        tail.push_str(&format!("&oidc_nonce={}", get("oidc_nonce")));
+    }
+    if !get("code_challenge").is_empty() {
+        tail.push_str(&format!("&code_challenge={}", get("code_challenge")));
+        let method = get("code_challenge_method");
+        tail.push_str(&format!(
+            "&code_challenge_method={}",
+            if method.is_empty() {
+                "S256".to_string()
+            } else {
+                method
+            }
+        ));
+    }
+    if !get("response_mode").is_empty() {
+        tail.push_str(&format!("&response_mode={}", get("response_mode")));
+    }
+    format!(
+        "redirect_uri={}&state={}&client_id={}{}",
+        encode_uri(&get("redirect_uri")),
+        encode_uri(&get("state")),
+        encode_uri(&get("client_id")),
+        encode_uri(&tail),
+    )
+}
+
+/// The login page round trip keeps the exact redirect URI and state: a
+/// registered redirect URI with several query parameters and a state with
+/// characters the page's link does not encode both reach the client
+/// unchanged, and the wallet signature binds the full redirect URI.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn the_login_page_round_trip_keeps_the_exact_redirect_uri_and_state() {
+    let base = oidc();
+    let c = Client::new();
+    let nrc = no_redirect_client();
+    let w = new_wallet();
+    let redirect = format!("{base}/callback?a=1&b=2");
+    let rc = register_client_with_redirect(&c, &base, &redirect).await;
+    let state = "st+a&b c";
+    let (verifier, challenge) = pkce_pair();
+
+    let url = format!(
+        "{base}/authorize?client_id={}&redirect_uri={}&scope=openid&response_type=code&state={}&code_challenge={}&code_challenge_method=S256",
+        urlencoding::encode(&rc.client_id),
+        urlencoding::encode(&redirect),
+        urlencoding::encode(state),
+        urlencoding::encode(&challenge),
+    );
+    let auth = nrc.get(&url).send().await.unwrap();
+    assert_eq!(auth.status(), StatusCode::SEE_OTHER, "authorize");
+    let session_cookie = auth
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let page = parse_query(&location_of(&auth));
+    assert_eq!(
+        page.get("redirect_uri"),
+        Some(&redirect),
+        "the login page must receive the whole redirect URI"
+    );
+    assert_eq!(page.get("state").map(String::as_str), Some(state));
+
+    // The page signs the redirect URI it read, and links to /sign_in with
+    // encodeURI'd values (which alters `&`, `+` and spaces here).
+    let query = login_page_sign_in_query(&page);
+    let resp = sign_in_raw(
+        &nrc,
+        &base,
+        (&session_cookie, &page["nonce"], &page["domain"]),
+        &w,
+        &page["redirect_uri"],
+        &query,
+    )
+    .await;
+    let status = resp.status();
+    let location = location_of(&resp);
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "the login page round trip completes (location {location}): {}",
+        resp.text().await.unwrap_or_default()
+    );
+    assert!(
+        location.starts_with(&format!("{redirect}&code=")),
+        "the code goes to the exact registered redirect URI: {location}"
+    );
+    let q = parse_query(&location);
+    assert_eq!(q.get("a").map(String::as_str), Some("1"), "{location}");
+    assert_eq!(q.get("b").map(String::as_str), Some("2"), "{location}");
+    assert_eq!(
+        q.get("state").map(String::as_str),
+        Some(state),
+        "the client gets its state back unchanged: {location}"
+    );
+    let ok = exchange_code(&c, &base, &rc, &q["code"], Some(&verifier)).await;
+    assert_eq!(ok.status(), StatusCode::OK, "the code redeems");
 }
 
 /// Discovery advertises exactly the response types /authorize implements.
