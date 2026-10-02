@@ -335,6 +335,16 @@ doc; read it before changing the code the rule covers.
   `matrix_mode_issues_the_matrix_scope_and_a_refresh_token_whatever_was_requested`,
   `sign_in_issues_the_code_for_the_bound_request` (the scope reaches the code),
   `a_code_written_before_the_scope_travelled_has_none`.
+- **The headless client asks for what it relies on, in every flow.** `siwx-oidc-auth` requests
+  `offline_access` (it refreshes, and a generic-mode server issues a refresh token only for it)
+  and `urn:matrix:client:api:*` (its access token is used against the Matrix client-server API)
+  in the code flow, with or without a proposed device, and in the device flow. A server ignores a
+  scope it has no use for, so the request is harmless against any deployment, including 3547bd2.
+  It must not be trimmed back to `openid profile`: an agent built that way gets no refresh token
+  from a generic-mode server. Pin: `every_flow_asks_for_offline_access_and_the_matrix_api`,
+  `build_scope_none_asks_for_what_the_client_relies_on`, `build_scope_some_requests_stable_device`,
+  and on the wire `the_code_flow_sends_the_scope_it_relies_on`,
+  `the_device_flow_sends_the_scope_it_relies_on`.
 - **An empty `device_id` is JSON `null` on the wire, never `""`.** Synapse rejects `""`. Pin:
   `empty_device_id_renders_as_json_null`, `deviceless_token_body_carries_device_id_null`.
 - **Refresh rotation keeps a 60 s grace pointer**: any replay of the old refresh token within

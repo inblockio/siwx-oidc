@@ -204,25 +204,47 @@ fn build_message(domain: &str, key: &SiwxKey, redirect_uri: &str, nonce: &str) -
 // OAuth scope construction
 // ---------------------------------------------------------------------------
 
+/// The scopes every flow asks for, whether or not a device is proposed.
+///
+/// - `offline_access`: the client relies on refresh tokens (`refresh`, and the
+///   advice to refresh instead of signing in again). A generic-mode server
+///   issues one only for this scope.
+/// - `urn:matrix:client:api:*`: the access token is used against a Matrix
+///   homeserver's client-server API. A Matrix deployment grants this scope
+///   whatever is asked today; asking for it keeps the client working against a
+///   server that grants it only on request.
+///
+/// A server that does not know a scope ignores it at `/authorize`, so this is
+/// harmless against a deployment that has no use for it.
+const RELIED_ON_SCOPES: [&str; 2] = ["offline_access", "urn:matrix:client:api:*"];
+
 /// Build the OAuth `scope` requested at `/authorize`.
 ///
-/// - `None`: the default `"openid profile"` (unchanged, backward compatible).
-/// - `Some(id)`: appends the stable Matrix device URN so the server pins this
-///   exact Synapse device_id instead of minting a fresh `SIWX_<uuid>` on every
-///   login. The siwx-oidc server validates the scope (it contains `openid`) and
-///   extracts the id via `extract_device_id_from_scope`, which strips the
-///   `urn:matrix:client:device:` prefix. The stable prefix is preferred over the
-///   `urn:matrix:org.matrix.msc2967.client:device:` (MSC2967 unstable) form.
+/// - `None`: `openid profile` plus [`RELIED_ON_SCOPES`].
+/// - `Some(id)`: the same, plus the stable Matrix device URN so the server pins
+///   this exact Synapse device_id instead of minting a fresh `SIWX_<uuid>` on
+///   every login. The siwx-oidc server validates the scope (it contains
+///   `openid`) and extracts the id via `extract_device_id_from_scope`, which
+///   strips the `urn:matrix:client:device:` prefix. The stable prefix is
+///   preferred over the `urn:matrix:org.matrix.msc2967.client:device:`
+///   (MSC2967 unstable) form.
 fn build_scope(device_id: Option<&str>) -> String {
-    match device_id {
-        None => "openid profile".to_string(),
-        Some(id) => format!("openid profile urn:matrix:client:device:{id}"),
+    let mut scopes = vec!["openid", "profile"];
+    scopes.extend(RELIED_ON_SCOPES);
+    let mut scope = scopes.join(" ");
+    if let Some(id) = device_id {
+        scope.push_str(" urn:matrix:client:device:");
+        scope.push_str(id);
     }
+    scope
 }
 
-/// The `scope` the device flow requests at `/device_authorization`.
+/// The `scope` the device flow requests at `/device_authorization`:
+/// `openid` plus [`RELIED_ON_SCOPES`].
 fn build_device_flow_scope() -> String {
-    "openid".to_string()
+    let mut scopes = vec!["openid"];
+    scopes.extend(RELIED_ON_SCOPES);
+    scopes.join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -306,10 +328,10 @@ struct TokenErrorResponse {
 /// To re-authenticate when tokens expire, call this function again — the flow
 /// is stateless and the key is deterministic.
 ///
-/// This is the backward-compatible entry point: it requests the default
-/// `"openid profile"` scope, so the server mints a fresh `SIWX_<uuid>` Synapse
-/// device on each login. To pin a stable device_id, use
-/// [`authenticate_with_device`].
+/// This is the backward-compatible entry point: it requests no device, so the
+/// server mints a fresh `SIWX_<uuid>` Synapse device on each login. To pin a
+/// stable device_id, use [`authenticate_with_device`]. The scope it requests is
+/// `openid profile offline_access urn:matrix:client:api:*`.
 pub async fn authenticate(
     server_url: &str,
     client_id: &str,
@@ -581,6 +603,9 @@ fn extract_did_from_id_token(id_token: &str) -> Option<String> {
 ///
 /// - `server_url`: Base URL of the siwx-oidc server.
 /// - `client_id`: OIDC client ID registered with the server.
+///
+/// Requests the scope `openid offline_access urn:matrix:client:api:*`: the
+/// tokens are used against a Matrix homeserver and refreshed.
 ///
 /// Prints the user code and verification URI to stderr, then polls until
 /// approved, denied, or expired.
