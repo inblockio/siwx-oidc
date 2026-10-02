@@ -1537,45 +1537,18 @@ pub async fn main() {
         .route(
             "/_matrix/client/v3/refresh",
             post(compat::refresh).with_state(compat_state),
-        )
-        .layer(
-            TraceLayer::new_for_http()
-                .on_request(|req: &axum::http::Request<_>, _span: &tracing::Span| {
-                    info!(
-                        method = %req.method(),
-                        path = %req.uri().path(),
-                        "request"
-                    );
-                })
-                .on_response(
-                    |res: &axum::http::Response<_>, latency: Duration, _span: &tracing::Span| {
-                        info!(
-                            status = res.status().as_u16(),
-                            latency_ms = latency.as_millis() as u64,
-                            "response"
-                        );
-                    },
-                )
-                .on_failure(
-                    |error: ServerErrorsFailureClass, latency: Duration, _span: &tracing::Span| {
-                        warn!(
-                            error = %error,
-                            latency_ms = latency.as_millis() as u64,
-                            "request failed"
-                        );
-                    },
-                ),
-        )
-        .layer(
-            CorsLayer::new()
-                .allow_origin(AllowOrigin::any())
-                .allow_methods([
-                    axum::http::Method::GET,
-                    axum::http::Method::POST,
-                    axum::http::Method::OPTIONS,
-                ])
-                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
         );
+
+    let app = with_request_logging(app).layer(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::any())
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
+    );
 
     let addr = SocketAddr::from((config.address, config.port));
     // Before the bind: from the moment the port accepts, a SIGTERM is handled.
@@ -1586,6 +1559,39 @@ pub async fn main() {
         .with_graceful_shutdown(shutdown)
         .await
         .unwrap();
+}
+
+/// Request logging: one `info!` line per request (method and path) and one per
+/// response (status and latency). The path only, never the query.
+fn with_request_logging(router: Router) -> Router {
+    router.layer(
+        TraceLayer::new_for_http()
+            .on_request(|req: &axum::http::Request<_>, _span: &tracing::Span| {
+                info!(
+                    method = %req.method(),
+                    path = %req.uri().path(),
+                    "request"
+                );
+            })
+            .on_response(
+                |res: &axum::http::Response<_>, latency: Duration, _span: &tracing::Span| {
+                    info!(
+                        status = res.status().as_u16(),
+                        latency_ms = latency.as_millis() as u64,
+                        "response"
+                    );
+                },
+            )
+            .on_failure(
+                |error: ServerErrorsFailureClass, latency: Duration, _span: &tracing::Span| {
+                    warn!(
+                        error = %error,
+                        latency_ms = latency.as_millis() as u64,
+                        "request failed"
+                    );
+                },
+            ),
+    )
 }
 
 /// Resolves on SIGTERM (`docker stop`, Kubernetes) or SIGINT (Ctrl-C); the
