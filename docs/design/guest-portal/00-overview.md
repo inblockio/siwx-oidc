@@ -1,6 +1,6 @@
 # Guest portal 00: overview
 
-**Status:** DRAFT design set for maintainer review. Design only: no code is written or changed by it, and nothing in it deploys or touches a running system. **Next step:** a consolidation session with the product owner brings the reference material in [reference/](reference/README.md) and this set into one final plan ([08](08-consolidation-session.md)). It has not been held, and the set stays a draft until it has.
+**Status:** DRAFT design set for maintainer review. Design only: no code is written or changed by it, and nothing in it deploys or touches a running system. **Next step:** a consolidation session with the product owner brings the reference material in [reference/](reference/README.md) and this set into one final plan ([08](08-consolidation-session.md)). It has not been held, and the set stays a draft until it has. **Added on 2026-10-02 by the product owner:** requirements R10 (Element X parity for registered users) and R11 (e-mail registration with custodial keys and a migration path to an HSM), in [09](09-registered-users.md), and the meedio-connect evaluation as reference Track C.
 **Baseline:** written against siwx-oidc `origin/main` at `3547bd2` (2026-09-30). Every `path:line` citation in the set is against that commit. Upstream facts were read
 from Synapse v1.161.0, lk-jwt-service 0.7.0 and Element Call v0.26.1 (documents 02 and 03 name the exact pins).
 
@@ -10,7 +10,7 @@ The set designs how an anonymous guest (a customer or a visitor) joins a Matrix 
 siwx-oidc: the flow, what Synapse can and cannot enforce, the guest client, the security limits, the claim of the account, the onboarding screens, and a plan of small
 flag-off milestones. It exists because the maintainers asked for it, as the basis for a decision before any code is written. It is a draft: every position in it is a
 recommendation, and section 7 of this file lists the ones that settle contradictions between the documents, so that the maintainers can overrule any of them. "Element Meet" is the
-maintainers' working name for the guest client; no upstream product of that name exists (03 section 1).
+maintainers' working name for the guest client; no upstream product of that name exists (03 section 1). Document 09 extends the set to the people who are not guests: Element X parity for registered users (R10) and registration by e-mail with a key the operator holds (R11).
 
 ## 2. Reading order
 
@@ -22,10 +22,11 @@ maintainers' working name for the guest client; no upstream product of that name
 | [04 security and limits](04-security-and-limits.md) | Assets, adversaries, abuse cases, the controls catalogue, custodial key custody, privacy, the limits v1 must enforce, non-goals, residual risks, the test plan, `GP-SEC-nn`, `ST-nn` |
 | [05 claim flow](05-claim-flow.md) | How a guest keeps the account by linking a passkey through the existing logic, what a claim changes and does not change, claim screens, `GP-CLM-nn` |
 | [06 wireframes](06-wireframes.md) | Low-fidelity screens, copy, states and errors of the host and guest journeys, `GP-UX-nn` |
-| [07 implementation plan](07-implementation-plan.md) | Workstreams, seven spikes, milestones M0a to M10, the traceability matrix, rollout and rollback, risks, the test environment, the decisions register |
+| [07 implementation plan](07-implementation-plan.md) | Workstreams, nine spikes, milestones M0a to M13, the traceability matrix, rollout and rollback, risks, the test environment, the decisions register |
+| [09 registered users](09-registered-users.md) | R10: Element X parity for registered users, the MatrixRTC mode rule, the parity surface and spike SP-8. R11: e-mail registration as a server-side ceremony, custodial P-256 keys wrapped under a KEK, the staged migration to an HSM and spike SP-9, `GP-REG-nn` |
 | [wireframes/index.html](wireframes/index.html) | The same screens as a clickable gallery. One self-contained file (inline CSS and script, no network request): open it from disk in any browser, for example by double-clicking it or with `xdg-open wireframes/index.html` from this folder. GitHub shows it as source, so check the branch out or download the file to see it rendered |
-| [08 consolidation session](08-consolidation-session.md) | The next step, prepared and not held: the two tracks, the 28 reference features lined up against this set, the collisions to settle, the order of work, the empty decision register |
-| [reference/](reference/README.md) | Source artefacts kept unchanged and unverified: a waiting-room case study with a 28-feature requirements list, and seven reference wireframes (W1 to W7) |
+| [08 consolidation session](08-consolidation-session.md) | The next step, prepared and not held: the three tracks, the 28 reference features lined up against this set, the collisions to settle, the order of work, the empty decision register |
+| [reference/](reference/README.md) | Track B, source artefacts kept unchanged and unverified: a waiting-room case study with a 28-feature requirements list, and seven reference wireframes (W1 to W7). Track C, an evaluation written here against pinned sources: [meedio-connect](reference/meedio-connect.md), an open-source Matrix-native video client, and its Element X compatibility |
 
 To decide whether to proceed, read this file, then 07 sections 1 and 9. To review the security model, read 01 section 5, then 04. To build, read 07, then the IDs it names.
 Every document ends with `## Validation status` (claim, evidence, Verified or Unverified or Contradicted) and `## Open decisions` (numbered, each with a recommendation).
@@ -73,7 +74,9 @@ flowchart LR
 9. A guest who links a passkey makes the account permanent in one compare-and-set, but it stays confined until an operator promotes it.
 10. Everything ships dark behind `guest_enabled`, dev first, and production needs the maintainers' explicit go.
 
-## 4. Requirements R1 to R9
+Registered users, e-mail accounts included, are outside the diagram: they sign in through the existing login page and use Element Web or Element X, which must reach parity for them (R10, 09).
+
+## 4. Requirements R1 to R11
 
 | R | Requirement | Documents | Requirement IDs |
 |---|---|---|---|
@@ -83,9 +86,11 @@ flowchart LR
 | R4 | The guest can claim the account by linking a passkey, reusing the existing linking logic | 05; 01 section 5.4; 06 section 7 | GP-CLM-01 to GP-CLM-26, GP-FLOW-16, GP-FLOW-30, GP-SYN-10, GP-SEC-35 to GP-SEC-38 |
 | R5 | The account is ephemeral: deactivated after the call unless claimed | 01 sections 6 and 7; 02 section 6; 04 section 3.6 | GP-FLOW-11 to GP-FLOW-18, GP-SYN-09, GP-SEC-32, GP-SEC-33, GP-SEC-48, GP-SEC-49, GP-SEC-65, GP-CLI-05, GP-CLM-25 |
 | R6 | Work order: flow model first, then security and the limits to enforce | The order of the set: 04 attacks the flow of 01 and the validation of 02 | none (a property of the set) |
-| R7 | Validate every claim against siwx-oidc code and upstream sources | `## Validation status` of every document; upstream in 02 and 03; what cannot be read becomes spikes SP-1 to SP-7 (07 section 3) | none |
+| R7 | Validate every claim against siwx-oidc code and upstream sources | `## Validation status` of every document; upstream in 02 and 03; what cannot be read becomes spikes SP-1 to SP-9 (07 section 3) | none |
 | R8 | Low-fidelity wireframes of the onboarding screens | 06 and the gallery | GP-UX-01 to GP-UX-14 |
-| R9 | Establish what upstream "Element Meet" is, and what to reuse or build | 03 sections 0 to 2 and 5 | GP-CLI-11, DR-41 to DR-44 |
+| R9 | Establish what upstream "Element Meet" is, and what to reuse or build | 03 sections 0 to 2 and 5; reference Track C | GP-CLI-11, DR-41 to DR-44, DR-78 |
+| R10 | **Element X compatibility is required for registered users** (not guests): everything a registered user can do in these flows on Element Web works on Element X for Android and iOS | 09 section 2; 03 section 5.6 (S1); 07 SP-8 | GP-REG-01 to GP-REG-05, DR-79, DR-80 |
+| R11 | **E-mail registration is a supported siwx-oidc path** with custodial key management and a migration path to HSM usage | 09 sections 3 and 4; 07 SP-9, M11 to M13 | GP-REG-06 to GP-REG-21, DR-81 to DR-85 |
 
 ## 5. Hard prerequisites P1 to P4
 
@@ -101,7 +106,7 @@ the deployment check reads what it can. P5 to P9 are operator assertions (P7 is 
 
 ## 6. Acceptance criterion
 
-The program is done for v1 when, on a dev stack that meets P1, P3 to P6, P8 and P9, all of A1 to A8 hold in one recorded run and are repeatable. [07 section 1.4](07-implementation-plan.md#14-acceptance-criterion)
+The program is done for v1 when, on a dev stack that meets P1, P3 to P6, P8 and P9, all of A1 to A9 hold in one recorded run and are repeatable. [07 section 1.4](07-implementation-plan.md#14-acceptance-criterion)
 is authoritative; in short:
 
 | # | In short |
@@ -114,6 +119,9 @@ is authoritative; in short:
 | A6 | Every named abuse test of 04 section 6.3 passes at its level, with no test skipped |
 | A7 | The three e-mail policies behave as configured, and the address is gone after the reap (and after a claim unless kept) |
 | A8 | The custodial key is derived, never stored, refused by every signature path and destroyed at reap and at claim |
+| A9 | Element X parity (R10): spike SP-8 passes on Android and iOS, including a registered Element X user in the same encrypted call as a guest and an Element Web user, and a host on Element X admitting a knock |
+
+R11 has its own acceptance, AE-1 to AE-4 in [09 section 5.3](09-registered-users.md#53-acceptance), and does not gate guest v1 (D24).
 
 ## 7. Decisions log
 
@@ -143,6 +151,9 @@ the recommendation holds, and the maintainers may overrule any row. The last col
 | D19 | The default topology is same-site (`guest_client_topology`: `same-site` or `cross-site`); the marker branch of `/authorize` refuses a `cross-site` navigation when `Sec-Fetch-Site` is present | It removes third-party-page device burning instead of only bounding it, and `SameSite=Lax` stays the cookie attribute | recommendation adopted, open for the maintainers | DR-69 |
 | D20 | A dedicated guest homeserver that delegates to the same siwx-oidc is evaluated (03 section 2) and not adopted | A remote knock reaches no hook, the claim needs the account on the main homeserver, and two deployments have to be run | recommendation adopted, open for the maintainers | DR-70 |
 | D21 | `POST /guest/peek` returns no host-controlled text; the meeting name comes from `GET /guest/context` after redeem, and the invite record holds no host display text | Nothing host-controlled or URL-controlled may appear before redeem | recommendation adopted, open for the maintainers | DR-45, DR-59 |
+| D22 | meedio-connect (reference Track C) is a reference for patterns, not a base for the guest client; D10 stands, and its findings feed the session (CS-09) and the evidence of R10 | It has no media E2EE, registers guests through `/register` on a second homeserver, runs a js-sdk 37 fork and depends on a vendor backend; rewriting those parts is the whole guest client | recommendation adopted, open for the maintainers | DR-78 |
+| D23 | Element X parity for registered users is a requirement (R10, set by the product owner): a failed parity row blocks enablement and is never a documented limitation; one MatrixRTC mode per deployment, `compatibility` in v1; parity re-tested by SP-8 at G1, G3 and after upgrades; guests exempt | Element X embeds Element Call 0.26.0, whose default is `compatibility`, and both platforms already list a native call component in pre-release, so parity is a moving target | requirement (R10); the mode and the test cadence are recommendations open for the maintainers | DR-79, DR-80 |
+| D24 | E-mail registration (R11, set by the product owner) is a server-side ceremony that creates an ordinary registered account with a custodial P-256 key, wrapped with AES-KWP under a KEK behind `KeyCustody`; the HSM migration moves the KEK into the HSM with no DID change, and no custodial key signs before that; R11 has its own acceptance and does not gate guest v1; the guest e-mail rules and D9 stand | HKDF derivation as used for guests does not carry into an HSM, while wrapped PKCS#8 is what an HSM imports; a `did:key` cannot be rotated, so signing waits for the HSM | requirement (R11); the scheme and the independence from guest v1 are recommendations open for the maintainers | DR-81 to DR-85 |
 
 ## 8. Incidental findings (D12)
 
@@ -165,15 +176,17 @@ Identifiers are stable and are never renumbered. Some short letters serve more t
 
 | Family | Meaning | Defined in |
 |---|---|---|
-| `R1` to `R9` | The maintainers' requirements (section 4) | here, 01 section 2 (restates R1 to R5) |
+| `R1` to `R11` | The maintainers' requirements (section 4); R10 and R11 set by the product owner on 2026-10-02 | here, 01 section 2 (restates R1 to R5), 09 (R10, R11) |
 | `P1` to `P9` | Prerequisites: P1 to P4 hard gates, P5 to P9 operator assertions, P7 superseded | 01 section 2; 07 section 1.3 |
-| `D1` to `D21` | Decisions of the log (section 7) | here |
+| `D1` to `D24` | Decisions of the log (section 7) | here |
 | `GP-FLOW-nn` | Flow requirements | 01 section 12 |
 | `GP-SYN-nn`, `GP-E2EE-nn` | Synapse-side requirements; call key delivery requirements | 02 sections 9 and 5 |
 | `GP-CLI-nn` | Guest client requirements | 03 section 5.4 |
 | `GP-SEC-nn` | Security controls | 04 section 3 |
 | `GP-CLM-nn` | Claim requirements | 05 section 8 |
 | `GP-UX-nn` | Screen and copy rules | 06 section 2 |
+| `GP-REG-nn` | Registered-user requirements: Element X parity (R10), e-mail registration and custody (R11) | 09 section 6 |
+| `AE-1` to `AE-4` | Acceptance of R11, separate from guest v1 | 09 section 5.3 |
 | `ST-nn` | Security test plan entries | 04 section 6.3 |
 | `ADV-n`, `AC-nn`, `CDF-nn`, `NG-nn`, `L-nn`, `RR-nn` | Adversaries, abuse cases, cross-document consistency items, non-goals, limitations v1 enforces, residual risks | 04 sections 1.2, 2, 8, 6.1 (non-goals and limitations) and 6.2 |
 | `A1` to `A8` (assets) | Assets of the security model | 04 section 1.1 |
@@ -183,17 +196,17 @@ Identifiers are stable and are never renumbered. Some short letters serve more t
 | `C1` to `C9` (client contract) | What the Meet client must do, from the side of the identity provider | 01 section 4.5 |
 | `RF-01` to `RF-28` | The 28 features of the reference case study (feature Fn is `RF-nn`) | reference/waiting-room-case-study.md |
 | `W1` to `W7` (reference screens) | The reference wireframes; not the happy-path steps W1 to W5 above | reference/waiting-room-wireframes/ |
-| `CS-01` to `CS-08` | Decision slots of the consolidation session, empty until it is held | 08 section 6 |
+| `CS-01` to `CS-10` | Decision slots of the consolidation session, empty until it is held | 08 section 6 |
 | `T1`, `T2` | Client architectures: thin client with the Element Call component, or with the widget in an iframe | 03 section 2 |
 | `S1` to `S8` | Client spikes | 03 section 5.6 |
 | `SY-1` to `SY-4`, `F-0`, `F-a`, `F-b`, `C1` to `C14` (unexpected behaviours) | Synapse dev spikes; fallbacks of the canonical-name mechanism (`M1` there is a mechanism, not a milestone); behaviours that differ from what a reader might expect | 02 sections 11, 3.4 and 1.1 |
 | `CP-nn`, `CL-nn`, `CL-En` | Claim preconditions, claim page states, terminal claim errors | 05 sections 3.3 and 6.2 |
 | `E1` to `E6`, `K1` to `K4`, `G1` to `G8`, `R-A` to `R-C`, `F1` to `F15` (failure rows) | Claim entry points (E5 and E6 are recorded as not offered); steps of the claim sequence; gaps of the existing link logic; options for what a claim does; failure rows of the claim protocol | 05 sections 6.1, 4.1, 2.6, 5.3 and 4.4 |
 | `H0` to `H5`, `G1` to `G7`, `K1`, `K2`, `F1` to `F13` (consequences) | Screens: host, guest, claim pages; consequences for the other documents. 07 writes "screen G3" for a screen because G1 to G3 are also gates | 06 sections 3, 5 to 7 and 9 |
-| `SP-1` to `SP-7`, `G1` to `G3` | Spikes and gates of the plan | 07 section 3 |
-| `M0a` to `M10` | Milestones in this repository | 07 section 4 |
+| `SP-1` to `SP-9`, `G1` to `G3` | Spikes and gates of the plan (SP-8 and SP-9 detailed in 09 section 5.1) | 07 section 3 |
+| `M0a` to `M13` | Milestones in this repository (M11 to M13 for R11) | 07 section 4 |
 | `Y0` to `Y3`, `L1`, `L2`, `C0` to `C4`, `O1` to `O7`, `X1`, `X2` | Workstreams outside this repository (module, lk-jwt, client, operations) and items out of v1 scope | 07 section 4.7 |
-| `A1` to `A8` (acceptance) | Acceptance criterion rows (not the phase steps of 01, not the assets of 04) | 07 section 1.4 |
+| `A1` to `A9` (acceptance) | Acceptance criterion rows (not the phase steps of 01, not the assets of 04) | 07 section 1.4 |
 | `DR-nn`, `PD-n` | Decisions register rows; plan-level decisions | 07 section 9 and its `## Open decisions` |
 | `R-nn`, `I-n`, `R0` to `R3` | Runbook entries; incidental findings; rollout stages (written "stage R1", unrelated to requirement R1) | 07 sections 7.7, 10, 7.2 |
 
@@ -247,6 +260,8 @@ This file restates positions that the other documents validate in detail (each e
 | The requirement families, milestone and register identifiers of section 9 are defined where the table says | the tables of 01 to 07 | Verified by script (every referenced identifier has a defining row) |
 | The reference files are kept unchanged | SHA-256 table in reference/README.md, checked against the export | Verified (hash) |
 | The statements of the reference case study are true | none run by this repository | Unverified |
+| Element X embeds Element Call 0.26.0 on both platforms, whose default MatrixRTC mode is `compatibility` (D23) | 09 section 2 and its validation table | Verified (dependency catalogues and Element Call source); the call path of a store build is Unverified |
+| The Track C statements about meedio-connect hold at commit `204593a` | reference/meedio-connect.md and its validation table | Verified, except the rows that table marks Inferred |
 | Prerequisites P1 to P4 hold on the target deployment | nothing run, the server cannot verify them | Unverified (spikes SP-1 to SP-7 of 07 section 3 and the deployment check of 01 GP-FLOW-21) |
 
 ## Open decisions

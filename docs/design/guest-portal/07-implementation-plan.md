@@ -1,11 +1,11 @@
 # Guest portal 07: implementation plan
 
 **Status:** DRAFT design document. Nothing here is implemented, and nothing in this document changes code. The plan is provisional until the consolidation session of [08](08-consolidation-session.md) has been held: no spike or milestone starts before it.
-**Scope:** how to build the guest portal of [01](01-flow-model.md) to [06](06-wireframes.md) (the entry point of the set is [00-overview.md](00-overview.md)): workstreams and repositories, the spikes that run
+**Scope:** how to build the guest portal of [01](01-flow-model.md) to [06](06-wireframes.md), and the registered-user requirements R10 and R11 of [09](09-registered-users.md) (the entry point of the set is [00-overview.md](00-overview.md)): workstreams and repositories, the spikes that run
 before any guest code lands, small independently mergeable milestones in siwx-oidc, a traceability matrix from every requirement ID to a
 milestone and a test, the rollout and operations plan, risks, the test environment, and one consolidated register of the open decisions of the
 whole set. It is the last document of the set and owns no security or flow rule: it cites the IDs of the others (`GP-FLOW`, `GP-SYN`, `GP-CLI`,
-`GP-SEC`, `GP-CLM`, plus `GP-E2EE` and `GP-UX`) and never restates them.
+`GP-SEC`, `GP-CLM`, `GP-REG`, plus `GP-E2EE` and `GP-UX`) and never restates them.
 **Baseline:** siwx-oidc `origin/main` at `3547bd2` (2026-09-30). Every `path:line` is against that commit. Upstream facts were read from the
 sources named in 02 and 03 (Synapse v1.161.0, lk-jwt-service 0.7.0, Element Call v0.26.1); the prefixes `ec:`, `ew:`, `sdk:` and `syn:` are those of 03.
 
@@ -72,7 +72,7 @@ flowchart LR
 7. **Claim is one compare-and-set** over the existing link core, which gains one refuse-overwrite rule (GP-CLM-02). A claimed account is permanent but stays confined (D3, GP-FLOW-16, GP-FLOW-30).
 8. **The client is a thin custom SPA** (D10), adopted only if spikes SP-2 to SP-4 pass, with stated fallbacks.
 9. **Everything ships dark.** `guest_enabled` defaults to false, dev comes first, and production needs P2 and the maintainers' explicit go (section 7).
-10. **The order of work is cheap-and-fatal first.** Seven spikes, three gates, then small flag-off slices (M0 to M10), with the module, lk-jwt and client workstreams running in parallel.
+10. **The order of work is cheap-and-fatal first.** Nine spikes (SP-8 and SP-9 serve R10 and R11), three gates, then small flag-off slices (M0 to M13), with the module, lk-jwt and client workstreams running in parallel.
 
 ### 1.3 Hard prerequisites and the other conditions
 
@@ -104,14 +104,16 @@ The program is done for v1 when, on a dev stack that meets P1, P3 to P6, P8 and 
 | A6 | Every named abuse test of 04 section 6.3 passes at its level, with no test skipped (`E2E_STRICT_SKIPS=1`, `SIWX_TEST_REQUIRE_REDIS=1`) | CI plus the dev-stack smoke script |
 | A7 | The three e-mail policies behave as configured (R2): `off` collects no address, `optional` accepts a join without one, `required` refuses a join without a syntactically valid one. The address lives only in the guest record, is gone after the reap, and is gone after a claim unless the claimant chose to keep it (D13) | ST-15, ST-17, GP-CLM-05, GP-CLM-16 |
 | A8 | The custodial key (R3) is derived, never stored and destroyed: no stored value or log line holds key material, every signature path refuses a guest DID, and the per-guest key value is gone after the reap and at the claim commit while the DID stays the same | ST-36, ST-37, ST-38, ST-40, ST-47 |
+| A9 | Element X parity for registered users (R10, D23): every row of the parity surface of 09 section 2.3 passes on the store builds of Element X for Android and iOS, including a registered Element X user in the same encrypted call as a guest and an Element Web user, and a host on Element X admitting a knock | SP-8 record at G3 (GP-REG-01) |
 
-Production has its own entry checks (section 7.3). Meeting A1 to A8 is a precondition of asking for that go, never a substitute for it.
+Production has its own entry checks (section 7.3). Meeting A1 to A9 is a precondition of asking for that go, never a substitute for it. R11 has its own acceptance, AE-1 to AE-4 of 09 section 5.3, which does not gate guest v1 (D24).
 
 ## 2. Workstreams and repositories
 
 | Workstream | Repository | What lands | Owner role | Milestones |
 |---|---|---|---|---|
 | IdP | this repository (siwx-oidc) | `src/guest.rs`, config, routes, Redis scripts, reaper, claim, join and claim pages, OpenAPI, docs, tests, mock updates | siwx-oidc maintainers | M0a to M10 |
+| Registered users (R11) | this repository (siwx-oidc) | the `KeyCustody` module and its `software` and `pkcs11` backends, the e-mail ceremony, the mailer, the login-page option (09 sections 3 to 5) | siwx-oidc maintainers | M11 to M13 |
 | Policy module | a new repository written against the Synapse module documentation (licence path is DR-35) | the confinement rules, canonical name, directory, media, host flag, admission re-audit; its own unit and live tests | Synapse owner | Y0 to Y3 |
 | lk-jwt | a small fork or an upstream PR to lk-jwt-service | membership check on the three OpenID routes (P1); P2: SFU eviction and a short SFU token lifetime, configurable (lk-jwt PR 235 or equivalent) | lk-jwt owner | L1, L2 |
 | Client | a new static-app repository chosen by the maintainers (AGPL-covered because it links Element Call, 03 open decision 8) | guest client (screens G3 to G6 of 06), host tool (H1 to H5), knock notice, claim entry points | client owner | C0 to C4 |
@@ -154,6 +156,8 @@ A spike prototype is never merged.
 | SP-5 P1 end to end | Does `msc4502_enabled` plus the lk-jwt patch refuse a non-member and serve a member with MAS-delegated tokens and real Element Call, including delayed-leave delegation | Dev Synapse 1.162 or later, appservice registration (the lk-jwt README key names do not match 1.161, 02 GP-SYN-01), patched lk-jwt, LiveKit with `auto_create: false` | 7 days | Non-member `get_token` and `sfu/get` answer 403, member answers a token; call works; delayed leave still works; the binding test of GP-SYN-01 passes (a fake userinfo server named in `matrix_server_name` receives no request and the call is refused, and a `sub` with another server part is refused) | The experimental pair does not work under delegated auth: an Element Call build that requests tokens through the client-server route plus an edge block (02 GP-SYN-01 item 3), or hold: no guest on any stack (P1 is hard) | Dev enablement and, through G2, M4 onward |
 | SP-6 module confinement | Does mechanism M1 fix the canonical name (SY-1); does a full call work when a marked user may send only membership and call-member events (SY-2) | Dev Synapse 1.162 or later, module scaffold Y0, a marked user minted by script (MAS `provision_user`, then admin `PUT`), no siwx-oidc change | 7 days | SY-1 and SY-2 pass as written in 02 section 11 (SY-2 includes the refused fourth knock of GP-SYN-21) | SY-1: the first working fallback F-0, F-a or F-b, recorded (DR-05). SY-2: widen `guest_allowed_event_types` or change the template, recorded | The scope of M5 (name fallback) and of M2a (template revision), not the program |
 | SP-7 teardown on a real Synapse | Do revoke, delete device, `delete_user` with erase, in that order with a call connected, leave no token, device or joined room; does the module let the `leave` through without a canonical row; do Synapse issues 19603 and 19721 bite (SY-3) | Same stack, scripted, no siwx-oidc change | 3 days, repeated as acceptance after M7b | The outcomes of 02 SY-3 | An explicit leave step, or a module fix (02 SY-3); a result on 19603 becomes a teardown assertion | M7b scope (an extra step), not the program |
+| SP-8 Element X parity (R10) | Does every row of the parity surface (09 section 2.3) hold on the store builds of Element X for Android and iOS, and does the call run in the embedded Element Call or the native component | Element X on both platforms, Element Web, the room template, the pinned MatrixRTC mode (GP-REG-02); at G1 without guests, at G3 with the guest client and patched lk-jwt | 3 days, repeated at G3 and after the upgrades of GP-REG-03 | Every row passes on both platforms; versions and call path recorded | No fallback that waives a row (GP-REG-01): the record names the failing row and the remedy (a change here, an upstream issue with a dated workaround, or a register decision that narrows R10 by name) | Dev enablement (G3) |
+| SP-9 custody HSM path (R11) | Can a P-256 key wrapped in software with AES-KWP be unwrapped inside an HSM into a sensitive, non-extractable object and sign there, with the same public key | SoftHSM2 through PKCS#11, then the target HSM model; no siwx-oidc change | 3 days | Same `did:key`, a valid `CKM_ECDSA` signature, no plaintext key outside the token (09 section 5.1) | The HSM cannot unwrap an EC key with `CKM_AES_KEY_WRAP_KWP`: stage-2 per-key import or another HSM (DR-84) | M13 and every custodial signing purpose (GP-REG-20) |
 
 SY-4 (marker fails closed) needs the siwx-oidc guest branch and is therefore the acceptance test of M5, not a spike.
 
@@ -161,10 +165,10 @@ SY-4 (marker fails closed) needs the siwx-oidc guest branch and is therefore the
 
 | Gate | Needs | Releases | Why here |
 |---|---|---|---|
-| none | | M0a to M0f | Incidental fixes and test harness have value without guests (section 10) |
+| none | | M0a to M0f; M11 and M12 (R11; M12 is enabled on dev only after its mailer review, GP-REG-09); M13 after SP-9 | Incidental fixes and test harness have value without guests (section 10); R11 shares no prerequisite with P1 to P4 (D24) |
 | G1 | SP-1 and SP-2 recorded as go (or a recorded fallback accepted by the maintainers) | M1 to M3d, M6 and M7a | No guest code is written before the two cheapest fatal questions (SP-1, SP-2) are answered. SP-3 and SP-4 do not gate it: their failures change the client and the host notice, never these IdP slices |
 | G2 | SP-5 and SP-6 recorded; for M4 also SP-3 and SP-4 recorded (they gate the C workstreams C1 to C4 as well) | M4, M5, M7b, M8, M9a, M9b and the decision to enable on dev | The expensive, risky slices wait until P1 is proven, the confinement mechanism is chosen and the client variant (T1 or T2) is known, because M4 is tested against it; SP-7 must also be recorded before M7b merges |
-| G3 | M1 to M9b merged, M10 done, O1 to O5 and O7 in place, SP-7 repeated | dev enablement (section 7.2, stage R1) | A recorded entry check, not a calendar date |
+| G3 | M1 to M9b merged, M10 done, O1 to O5 and O7 in place, SP-7 repeated, SP-8 passed on every row (GP-REG-01) | dev enablement (section 7.2, stage R1) | A recorded entry check, not a calendar date; a failed Element X parity row blocks enablement (R10) |
 
 Sequence at the start, for one person per workstream: SP-1 and SP-2 first, then G1 and the IdP slices M1 to M3d. SP-3 runs beside SP-2, and SP-4, SP-5 and SP-6
 run in parallel by their owners while those slices are built; M4 waits for SP-3, SP-4 and G2. M0a to M0f are small enough to run while the spikes do. If SP-2 fails,
@@ -213,6 +217,9 @@ milestone and are not repeated below:
 | M9a | Claim server side: gate, routes, link-core rule, single-flight lock, compare-and-set, revocation | L | M0d, M4, M6, M7b | G2 |
 | M9b | Claim page and claim browser tests | M | M9a | G2 |
 | M10 | Operator guide, deployment check, security scope | M | M1 to M9b | G3 |
+| M11 | `KeyCustody` interface, `software` backend, KEK configuration and startup checks, wrapped records, re-wrap job (R11) | M | none | none |
+| M12 | E-mail ceremony: routes, code store, mailer, login-page option, account record and index, custodial flag, refusal of login signatures, flag off (R11) | L | M11 | none; mailer review before dev enablement |
+| M13 | `pkcs11` backend over the same records, KEK import procedure, signing-purpose gate (R11) | M | M11 | SP-9 |
 
 ### 4.2 M0 group: incidental fixes and test harness (no guest concept, no gate)
 
@@ -411,6 +418,8 @@ Calls covered by GP-SEC-45 (the table of 04 section 3.8, one test per row). Path
 | O5 | LiveKit: `room.auto_create: false`, API and Twirp endpoints not public | GP-SEC-31 (hygiene) | none | S |
 | O6 | Log retention and alert wiring | GP-SEC-46 (wiring), GP-SEC-47, GP-SEC-62 | M8 | S |
 | O7 | The dev stack for acceptance (Synapse, module, patched lk-jwt, LiveKit, Element Web, the client, this repository's build) | acceptance A1 to A8 | O1 to O5 | M |
+| O8 | Element X parity runs: Element X devices on both platforms, SP-8 at G1, at G3 and after each upgrade of GP-REG-03, with the record | GP-REG-01, GP-REG-03 | O7 | S per run |
+| O9 | Custody operations: KEK backups under dual control, the restore drill, the KEK import ceremony for stage 1 | GP-REG-21 | M11; M13 for the import | S |
 | X1 | **Out of v1 scope:** agent-side recording behaviour (a recording agent announces itself in the room and deletes or hands over its output). Reason: agent behaviour lives outside this repository and the design cannot police agent presence (04 GP-SEC-64, NG-06); M10 carries only the checklist half. Owner role: host and agent operator | GP-SEC-64 (agent half) | a maintainers' decision to run a recording agent | not planned |
 | X2 | **Out of v1 scope:** an operator bot for the knock notice (service account, power level 50, a non-`m.notice` message type, a room credential and room keys). Reason: the client notice of C4 is the recommendation (DR-17) and a bot adds a credential and key handling to an encrypted room. Owner role if chosen: client owner with the operator | bot variant of GP-FLOW-29, GP-SYN-20, GP-SEC-68 | DR-17 decided for a bot | not planned (choosing it adds a workstream) |
 
@@ -521,7 +530,7 @@ Y3) and lk-jwt (SP-5, L1, and L2 for production). M0a to M0f, M3a, M3b, M6 and M
 
 ## 6. Traceability matrix
 
-Every ID of the five series (`GP-FLOW`, `GP-SYN`, `GP-CLI`, `GP-SEC`, `GP-CLM`) that a table row of documents 01 to 06 defines appears below exactly once; the check is one `grep` over the
+Every ID of the six series (`GP-FLOW`, `GP-SYN`, `GP-CLI`, `GP-SEC`, `GP-CLM`, `GP-REG`) that a table row of documents 01 to 06 and 09 defines appears below exactly once; the check is one `grep` over the
 table rows whose first cell is a `GP-<series>-<nn>` ID, compared with the first column (section 6.3). "Milestone" is the single
 place where the enforcing code, configuration or guidance lands. "Also" lists milestones, workstreams or spikes that test, assert or depend on it. "Test" is the `ST-nn` of
 04 section 6.3 when one names the ID, else the test text of the defining row, shortened. Sources are `document:line` of the first table row that starts with the ID.
@@ -692,6 +701,27 @@ place where the enforcing code, configuration or guidance lands. "Also" lists mi
 | GP-CLM-24 | Promotion is an operator act in fixed order; claim, key type, config never promote | M10 | M9a | Promote: marker absent, promoted_at set, record present, signature refused | 05:673 |
 | GP-CLM-25 | POST /guest/end accepts the guest Bearer token or the guest cookie (cookie path origin checked); both answer 409 for a claimed account | M7b | M9b, M1, C3 | Cookie only ends an unclaimed guest; foreign origin or no headers refused; claimed 409; Bearer from the Meet origin works | 05:674 |
 | GP-CLM-26 | The commit keeps the claim's device ids as pre_claim_devices; sign_in refuses a proposed pre claim device id | M9a | M4, M5 | Claim, wait past 900 s, passkey login proposing a pre claim id refused; a fresh id accepted; an ordinary account unaffected | 05:675 |
+| GP-REG-01 | Element X parity: every parity row on Element X Android and iOS, a failed row blocks enablement | O8 | SP-8, G3 | SP-8, every row on both platforms | 09:156 |
+| GP-REG-02 | One MatrixRTC mode per deployment, compatibility in v1, change gated by SP-8 | M10 | C1, O4, O8 | Deployment check reads each pinned mode; SP-8 after a change | 09:157 |
+| GP-REG-03 | Parity re-tested at G1, G3 and after Element X, component, lk-jwt and Synapse upgrades | O8 | SP-8 | A record per upgrade, versions named | 09:158 |
+| GP-REG-04 | Guest work leaves the registered Element X path intact: module on marked users only, P1 on both JWT routes, client mode | L1 | Y1, C1, O8 | SP-8 with the module and patched lk-jwt in place | 09:159 |
+| GP-REG-05 | siwx-oidc keeps Element X sign-in: discovery aligned with MAS, both scope forms, refresh grace; changes rerun SP-8 rows 1 and 2 | M10 | O8 | SP-8 rows 1 and 2 after a discovery, scope, refresh or login change | 09:160 |
+| GP-REG-06 | E-mail ceremony writes only verified_did and hands over to sign_in; flag off by default | M12 | M11 | Flag off 404; deactivated e-mail account refused before resolution | 09:161 |
+| GP-REG-07 | Eight-digit code, 10 minutes, single use, 5 attempts, session-bound, stored as HMAC | M12 |    | Attempt 6, minute 11, reuse, other session refused; code not in Redis | 09:162 |
+| GP-REG-08 | No enumeration on /email/start; mail sent outside the request path | M12 |    | Byte-identical answers for known, unknown, limited and refused addresses | 09:163 |
+| GP-REG-09 | Mailer passes the gates of GP-SEC-24: fixed templates, per-address and global limits, relay | M12 | O2 | Limits hit at their numbers; relay down gives the same 202 | 09:164 |
+| GP-REG-10 | Address normalised, indexed by HMAC, stored only in the account record, never in tokens, profile, 3PID or logs | M12 |    | Sentinel address found only in the account record | 09:165 |
+| GP-REG-11 | One account per address, created once by set-if-absent | M12 | M11 | N concurrent first verifications create one account | 09:166 |
+| GP-REG-12 | Every e-mail account has a custodial key created through KeyCustody | M12 | M11 | A new account's key_ref gives its DID | 09:167 |
+| GP-REG-13 | Login signature paths refuse an e-mail account's DID, deny by record | M12 | M6 | A CAIP-122 message signed with the custodial key refused on four paths | 09:168 |
+| GP-REG-14 | ID token and userinfo carry io.inblock.custodial true for e-mail accounts, omitted otherwise | M12 |    | Present for e-mail accounts, absent for others | 09:169 |
+| GP-REG-15 | Permitted signing set empty in v1; purpose-bound, logged by kid and purpose | M11 | M13 | sign with any purpose refused in v1; log has no payload | 09:170 |
+| GP-REG-16 | One custody interface, no other reader of keys or KEK, no export | M11 |    | Code search; no blob, KEK or key in logs or responses | 09:171 |
+| GP-REG-17 | Keys wrapped with AES-KWP at rest; public key rechecked after every unwrap | M11 | M13 | Swapped blobs refuse to sign; no PKCS#8 plaintext in a dump | 09:172 |
+| GP-REG-18 | KEK from a secret source, rotation by a resumable re-wrap job | M11 | O9 | Interrupted rotation resumes, every key still signs | 09:173 |
+| GP-REG-19 | pkcs11 backend over the same records; no key_ref, DID or MXID change | M13 | SP-9 | SP-9 on SoftHSM2 and the target HSM | 09:174 |
+| GP-REG-20 | No custodial signature before stage 1: signing purposes refused with the software backend | M13 | M11 | Startup refuses a purpose with the software backend | 09:175 |
+| GP-REG-21 | KEK backups under dual control and a restore drill; loss keeps the accounts | O9 | M11 | Restore drill record; sign-in by code works with keys unusable | 09:176 |
 
 ### 6.2 Coverage by milestone
 
@@ -717,11 +747,14 @@ harness, spikes, configuration or stack work that other rows rely on.
 | M8 | GP-SEC-46, GP-SEC-48, GP-SEC-50 | 3 |
 | M9a | GP-FLOW-16, GP-FLOW-30, GP-SYN-10, GP-SEC-35, GP-SEC-36, GP-SEC-37, GP-SEC-38, GP-CLM-01, GP-CLM-02, GP-CLM-03, GP-CLM-04, GP-CLM-05, GP-CLM-06, GP-CLM-08, GP-CLM-09, GP-CLM-10, GP-CLM-11, GP-CLM-12, GP-CLM-13, GP-CLM-14, GP-CLM-15, GP-CLM-16, GP-CLM-18, GP-CLM-21, GP-CLM-26 | 25 |
 | M9b | GP-CLM-17, GP-CLM-22 | 2 |
-| M10 | GP-FLOW-21, GP-SEC-30, GP-SEC-63, GP-SEC-64, GP-CLM-24 | 5 |
+| M10 | GP-FLOW-21, GP-SEC-30, GP-SEC-63, GP-SEC-64, GP-CLM-24, GP-REG-02, GP-REG-05 | 7 |
+| M11 | GP-REG-15, GP-REG-16, GP-REG-17, GP-REG-18 | 4 |
+| M12 | GP-REG-06, GP-REG-07, GP-REG-08, GP-REG-09, GP-REG-10, GP-REG-11, GP-REG-12, GP-REG-13, GP-REG-14 | 9 |
+| M13 | GP-REG-19, GP-REG-20 | 2 |
 | Y1 | GP-FLOW-33, GP-SYN-02, GP-SYN-04, GP-SYN-05, GP-SYN-06, GP-SYN-17, GP-SYN-18, GP-SYN-21, GP-SEC-27 | 9 |
 | Y2 | GP-SYN-08, GP-SEC-20 | 2 |
 | Y3 | GP-SYN-11, GP-SYN-13, GP-SYN-14, GP-SYN-15, GP-SYN-19, GP-SEC-29 | 6 |
-| L1 | GP-SYN-01, GP-CLI-07 | 2 |
+| L1 | GP-SYN-01, GP-CLI-07, GP-REG-04 | 3 |
 | L2 | GP-SEC-31 | 1 |
 | C1 | GP-CLI-01, GP-CLI-08, GP-CLI-11 | 3 |
 | C2 | GP-CLI-09, GP-CLI-12, GP-CLI-14 | 3 |
@@ -731,7 +764,9 @@ harness, spikes, configuration or stack work that other rows rely on.
 | O2 | GP-SEC-04 | 1 |
 | O3 | GP-FLOW-23 | 1 |
 | O6 | GP-SEC-47, GP-SEC-62 | 2 |
-| Total | | 162 |
+| O8 | GP-REG-01, GP-REG-03 | 2 |
+| O9 | GP-REG-21 | 1 |
+| Total | | 183 |
 
 ### 6.3 Gaps and placements that need a decision
 
@@ -739,8 +774,8 @@ Every ID has exactly one milestone. The placements and caveats that need a decis
 
 | Topic | Detail | Resolution in this plan |
 |---|---|---|
-| Defining rows and references | Every `GP-*` ID that a document references is defined by a table row in one of 01 to 06 | re-run the check of the section 6.1 intro whenever the set changes |
-| Enforcement outside this repository | 38 IDs have a primary in Y, L, C or O. They are proved by tests in other repositories or by the deployment check (M10) | each appears with its workstream in section 4.7; the level-L tests run from the dev-stack smoke script (section 8.3) |
+| Defining rows and references | Every `GP-*` ID that a document references is defined by a table row in one of 01 to 06 or 09 | re-run the check of the section 6.1 intro whenever the set changes |
+| Enforcement outside this repository | 42 IDs have a primary in Y, L, C or O. They are proved by tests in other repositories or by the deployment check (M10) | each appears with its workstream in section 4.7; the level-L tests run from the dev-stack smoke script (section 8.3) |
 | GP-SEC-64 agent side | The recording agent must announce itself in the room and delete or hand over its output. No v1 workstream owns it, because agent behaviour is outside this repository (04 NG-06, GP-SEC-64) | M10 carries the checklist item; the agent-side half is row X1 of section 4.7, out of v1 scope, owner role: host and agent operator |
 | GP-SYN-20, GP-FLOW-29, GP-SEC-68 bot variant | If the maintainers choose an operator bot for the knock notice instead of the client notice (DR-17), a service account, a power level of 50, a non-`m.notice` message type and a room credential are needed, and no workstream covers them | row X2 of section 4.7, out of v1 scope; the recommendation is the client notice first. Choosing the bot adds a workstream |
 | GP-SYN-03 test | siwx-oidc does not read the Synapse configuration, so no siwx-oidc test can assert `auto_join_rooms` | the test is the posture script of M10 (GP-SEC-30, run against the target homeserver) and the dev-stack smoke run |
@@ -800,7 +835,7 @@ These two series are outside the five of the matrix above (defined in 02 and 06)
 | Stage | Where | Entry checks | Exit checks |
 |---|---|---|---|
 | R0 merge | `main`, flag off | The milestone's definition of done (section 4); CI green in `build`, `image`, `rust-e2e-mock` and `browser-e2e`; docs changed in the same pull request; the ordinary-user regression set unchanged (`sign_in_deactivation_order_tests`, the refresh and teardown suites) | Merged; no assertion of an existing test was edited to make it pass |
-| R1 dev, maintainers only (gate G3) | Dev stack | M1 to M10 merged; O1 to O5 and O7 in place; SP-1 to SP-7 recorded with their outcomes; P1, P3 to P6, P8, P9 verified by the posture script on dev; `guest_key_secret` set and distinct from the MAS secret; quotas set below the defaults (for example a global cap of 10 and a daily ceiling of 50); alert wiring (O6) proven with one synthetic alert | Acceptance A1 to A8 recorded; a 24 hour soak with no record in `reaping` older than 15 minutes, an empty orphan report, refusals only in expected classes; the kill switch drill and the rollback rehearsal of sections 7.4 and 7.5 recorded |
+| R1 dev, maintainers only (gate G3) | Dev stack | M1 to M10 merged; O1 to O5 and O7 in place; SP-1 to SP-7 recorded with their outcomes, SP-8 passed on every row (GP-REG-01); P1, P3 to P6, P8, P9 verified by the posture script on dev; `guest_key_secret` set and distinct from the MAS secret; quotas set below the defaults (for example a global cap of 10 and a daily ceiling of 50); alert wiring (O6) proven with one synthetic alert | Acceptance A1 to A8 recorded; a 24 hour soak with no record in `reaping` older than 15 minutes, an empty orphan report, refusals only in expected classes; the kill switch drill and the rollback rehearsal of sections 7.4 and 7.5 recorded |
 | R2 dev, pilot hosts | Dev stack | R1 exit; the notice text and the retention settings approved by the data-protection owner; `guest_hosts` holds only named pilot hosts; proxy limits (O2) as in 04 section 3.1 | The maintainers' agreed number of real meetings with no unexplained orphan and no report of cross-room reach; alert thresholds tuned; every level-L abuse test re-run after each upgrade of Synapse, lk-jwt, Element Call or the module; the upgrade checklist (runbook R-09) executed once |
 | R3 production | Production stack | Section 7.3 | A monitored soak at low quotas; quotas raised in steps only after a clean observation window each |
 
@@ -913,7 +948,7 @@ Runtime budget targets (unmeasured): under 5 minutes added to `rust-e2e-mock` an
 
 ## 9. Decisions register
 
-Every item of the `## Open decisions` sections of documents 01 to 06 is consolidated here, de-duplicated (112 source items in rows DR-01 to DR-77). "Source" names the document and the number of the item, for example `04.10` is open decision 10 of document 04; comparing the numbered items of those sections with the Source column by script shows that every item appears in the rows that cover it. "Status" is `Recommendation adopted (D<n>)` when a decision of the [decisions log](00-overview.md#7-decisions-log) settles the position in the document set. Each of those stays open for the maintainers to overrule, and a late overrule costs what the "If decided late" column says. Rows DR-67 to DR-70 record decisions D16, D18, D19 and D20 (their Source names the decision and the section that carries it, and the numbered items that repeat it: 01.22 for D16, 01.21 and 03.14 for D19, 03.13 for D20; D18 has no numbered item). D17 is carried by DR-12 and D21 by DR-59 and DR-45.
+Every item of the `## Open decisions` sections of documents 01 to 06 and 09 is consolidated here, de-duplicated (112 source items of 01 to 06 in rows DR-01 to DR-77; the 9 items of 09 in DR-80 to DR-85). Rows DR-78 and DR-79 record decisions D22 and D23; DR-84 and DR-85 also carry D24. "Source" names the document and the number of the item, for example `04.10` is open decision 10 of document 04; comparing the numbered items of those sections with the Source column by script shows that every item appears in the rows that cover it. "Status" is `Recommendation adopted (D<n>)` when a decision of the [decisions log](00-overview.md#7-decisions-log) settles the position in the document set. Each of those stays open for the maintainers to overrule, and a late overrule costs what the "If decided late" column says. Rows DR-67 to DR-70 record decisions D16, D18, D19 and D20 (their Source names the decision and the section that carries it, and the numbered items that repeat it: 01.22 for D16, 01.21 and 03.14 for D19, 03.13 for D20; D18 has no numbered item). D17 is carried by DR-12 and D21 by DR-59 and DR-45.
 
 | Id | Question | Recommendation | If decided late | Who decides | Blocks | Status | Source |
 |---|---|---|---|---|---|---|---|
@@ -994,6 +1029,14 @@ Every item of the `## Open decisions` sections of documents 01 to 06 is consolid
 | DR-75 | Presence for guest deployments | Leave presence as it is in v1 and accept the free-text `status_msg` as the one text channel left to a guest; turn presence off only on a homeserver dedicated to the guest portal | The text channel stays until Synapse offers a hook | operator | O1 | Open | 02.17 |
 | DR-76 | The refuse-overwrite rule in the shared link core | Yes: set-if-absent writes inside `link_finish`, which also protects the wallet link route; no complete alternative exists, because a check in the claim handler cannot see the verified id | The claim compensation becomes destructive and M9a cannot ship as designed | siwx-oidc maintainers | M9a | Open | 05.17 |
 | DR-77 | Claim slot on deactivation | A deactivation without erase keeps the slot and only erase releases it; alternative: release on deactivation and count a reactivation as a new claim, which adds a check to the reactivation action | The cap can be exceeded by reactivations, or the reactivation action grows a check | siwx-oidc maintainers | M9a | Open | 05.18 |
+| DR-78 | Track C: meedio-connect as a base or a reference | A reference for patterns, not a base (D22); D10 stands. Its patterns (knock waiting room, host alert sound, camera and microphone dialogs) and its telemetry lesson go to the session (CS-09) | Choosing it as a base late means rewriting its sign-in, crypto and key transport after C1 has started on T1 | maintainers, client owner | C0, C1 | Recommendation adopted (D22); open for the maintainers | D22 (reference/meedio-connect.md section 2) |
+| DR-79 | MatrixRTC mode of the deployment | `compatibility`, pinned in every client configuration the deployment controls (GP-REG-02); a change to `matrix_2_0` only after SP-8 passes on both Element X platforms | A late or unpinned change splits calls between clients that see different membership formats | maintainers, operator | C1, O4, M10 | Recommendation adopted (D23); open for the maintainers | D23 (09 section 2.2) |
+| DR-80 | Does R10 cover claimed-restricted accounts | Yes for sign-in, joining, call keys and leaving; the host rows do not apply, because a claimed guest cannot mint invites (01 step A3) | SP-8 gains a column late and M9a's account states are re-tested on Element X | product owner | SP-8 | Open | 09.1 |
+| DR-81 | Shape of the e-mail ceremony | An eight-digit code only, no sign-in link (link scanners, cross-device use); an optional operator domain allow-list for registration, default off | M12's routes, templates and configuration change | product owner, maintainers | M12 | Open | 09.2, 09.7 |
+| DR-82 | What a relying party learns about an e-mail account | The flag `io.inblock.custodial: true`, omitted otherwise; no `email` claim and no Synapse 3PID in v1 | Relying parties built against another shape need a migration | maintainers | M12 | Open | 09.3, 09.4 |
+| DR-83 | Second authenticator, address change and recovery for e-mail accounts | Add a passkey through the `claim-authorised` link core of 05, authorised by a fresh code, with the DID unchanged; no address change or recovery beyond the mailbox in v1 | A lost mailbox is a lost account until it lands | product owner, maintainers | after M12 | Open | 09.5, 09.6 |
+| DR-84 | Custody scheme and the HSM | Per-account P-256 keys wrapped with AES-KWP under a KEK behind `KeyCustody` (D24); stage 1 moves the KEK into the HSM and unwraps there; stage 2 and the HSM product are decided at M13 with SP-9's result | After the first custodial signature a scheme change cannot keep the DIDs, and before it every key must be re-wrapped or re-derived | maintainers, operator | M11, M13 | Recommendation adopted (D24); stage 2 and the product open | D24 (09 section 4), 09.8 |
+| DR-85 | Does R11 gate guest v1 | No: R11 has its own acceptance AE-1 to AE-4 and shares no prerequisite with P1 to P4 (D24) | Coupling them makes guest dev enablement wait for the mailer review and M11 to M13 | product owner | G3 | Recommendation adopted (D24); open for the product owner | D24 (09 section 5.3), 09.9 |
 
 ## 10. Incidental findings (D12)
 
@@ -1042,7 +1085,8 @@ Verified means read in the worktree at the baseline commit (or in the named upst
 | The mock answers the admin user `PUT` with a 410 "ported away" stub on purpose, has no room model, and offers only the fault modes `500` and `timeout` | `e2e/synapse_mock.py:490-498, 955-956`, `:184-186, 471-479` | Verified (spot checks; the inventory is section 8.2) |
 | CI runs named suite steps with no glob, one siwx-oidc process and one mock, and installs Chromium only | `.github/workflows/ci.yml:190-219, 262-330, 444`, `e2e/browser/playwright.config.mjs:12-16` | Verified (workflow and Playwright configuration read) |
 | Upstream spot checks: the `msc4502_enabled` flag, `user_type` applied last in the admin modify request, the device-row check in `mas.py`, `is_user_joined` called at two sites of lk-jwt and a one hour LiveKit token, an empty-action member-event push rule, the `skipLobby` preset values | `synapse/config/experimental.py:207`, `synapse/rest/admin/users.py:470-471`, `synapse/api/auth/mas.py:396-406`, `lk-jwt/src/handler.rs:1016, 1121, 70`, `rust/src/push/base_rules.rs:120-132`, `ec/src/UrlParams.ts:383-423` | Verified (existence; the line numbers of 02 are otherwise relied on) |
-| The requirement set: 162 IDs in the five series, each with exactly one milestone; the matrix lists every defining row of 01 to 06 | a `grep` over the table rows of 01 to 06 whose first cell is a `GP-<series>-<nn>` ID, compared with the first column of section 6.1 | Verified |
+| The requirement set: 183 IDs in the six series (162 of 01 to 06, 21 `GP-REG` of 09), each with exactly one milestone; the matrix lists every defining row of 01 to 06 and 09 | a `grep` over the table rows of 01 to 06 and 09 whose first cell is a `GP-<series>-<nn>` ID, compared with the first column of section 6.1 | Verified |
+| The 21 `GP-REG` IDs of 09 each appear once in the matrix, with the line of their defining row | a script over the table rows of 09 whose first cell is a `GP-REG-nn` ID, compared with section 6.1 | Verified by script (2026-10-02) |
 | Every open decision of 01 to 06 is in the register | comparison of the numbered items under each `## Open decisions` with the Source column of section 9 | Verified |
 | Synapse behaviours, upstream issue states and MSC states cited through 02 and 03 (for example PR 20241, issues 19603 and 19721, MSC4502 and MSC4512) | not re-fetched here | Unverified (relied on from 02 and 03, dated 2026-09-30) |
 | The derived Ed25519 guest `did:key` passes the `sign_in` allow-lists | no code exists | Unverified (M3b test) |
@@ -1055,7 +1099,7 @@ Verified means read in the worktree at the baseline commit (or in the named upst
 
 ## Open decisions
 
-The full list of decisions of the whole set, with recommendations and consequences, is the register of section 9 (DR-01 to DR-77). The decisions below are plan-level: they
+The full list of decisions of the whole set, with recommendations and consequences, is the register of section 9 (DR-01 to DR-85). The decisions below are plan-level: they
 concern how this plan is executed, not what the product does.
 
 1. **PD-1. Gate placement (section 3.2).** Recommendation: M0a to M0f at any time; M1 to M3d, M6 and M7a only after G1 (SP-1 and SP-2); M4 only after G2 and after SP-3 and SP-4; M5, M7b and M9a only after G2 (SP-5, SP-6, and SP-7 before M7b). Consequence of a looser gate: guest code that is wasted if SP-2 or SP-5 fails. Who: maintainers.
@@ -1064,8 +1108,9 @@ concern how this plan is executed, not what the product does.
 4. **PD-4. Redis isolation for guest tests.** Recommendation: one shared Redis database, an explicit `guest:*` reset helper and a kill-switch drop guard, because two-instance tests need a single database (the mock introspects at one base URL); try per-test databases only for single-instance suites after verifying they are database-scoped. Who: siwx-oidc maintainers.
 5. **PD-5. Mock room model depth.** Recommendation: the two admin reads only; never implement knock, invite or join in the mock (level L covers them). Consequence of going deeper: a second, drifting implementation of Synapse. Who: siwx-oidc maintainers.
 6. **PD-6. Metrics.** Recommendation: log-derived signals and three Redis probes for v1 (section 7.6); add a metrics endpoint only if the operator's pipeline cannot derive the signals from events. Consequence: a new route and dependency in the identity service. Who: siwx-oidc maintainers, operator.
-7. **PD-7. New dependencies.** Recommendation: accept crates for Unicode normalisation and confusables (name rules), HKDF and zeroisation and a runtime Ed25519 dependency (key derivation) once each passes the licence gates and `cargo audit`; no SMTP client (GP-SEC-24). Who: siwx-oidc maintainers.
+7. **PD-7. New dependencies.** Recommendation: accept crates for Unicode normalisation and confusables (name rules), HKDF and zeroisation and a runtime Ed25519 dependency (key derivation) once each passes the licence gates and `cargo audit`; no SMTP client on the guest path (GP-SEC-24). R11 adds a mail-sending client (M12), AES key wrap and P-256 (M11) and a PKCS#11 binding (M13), each through the same gates. Who: siwx-oidc maintainers.
 8. **PD-8. Home of the level-L tests.** Recommendation: `scripts/dev-stack-guest-smoke.sh` in this repository, run at every gate and upgrade, plus a job in the operations repository for the call stack; module tests in the module repository. Who: maintainers, operator.
 9. **PD-9. Who runs the spikes and owns the dev stack.** Recommendation: the client owner runs SP-2 to SP-4, the lk-jwt owner SP-5, the Synapse owner SP-6 and SP-7, the siwx-oidc maintainers SP-1; the operator owns O7. Consequence: the spikes have no owner and G1 never closes. Who: maintainers.
 10. **PD-10. Operator guide location.** Recommendation: `docs/guest-portal.md`, linked from `docs/README.md`, with the design documents kept under `docs/design/guest-portal/` and marked as built with deltas at M10. Who: siwx-oidc maintainers.
 11. **PD-11. Production entry parameters.** Recommendation: the maintainers set the pilot size of R2, the soak durations and the initial production quotas before R2 starts, and record them with the go (section 7.3). Who: maintainers.
+12. **PD-12. Owners of SP-8 and SP-9.** Recommendation: the client owner runs SP-8 with the operator (O8), because it needs the dev stack and real Element X devices; the siwx-oidc maintainers run SP-9. Consequence: without an owner, G3 cannot close (A9) and M13 cannot start. Who: maintainers.
