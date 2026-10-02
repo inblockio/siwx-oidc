@@ -227,19 +227,31 @@ async fn mock_seed_user(c: &Client, localpart: &str) {
 
 /// Force a user's `profiles` row into `"present"`, `"empty"` or `"absent"`.
 ///
-/// `"absent"` — a `users` row with NO `profiles` row — is how this suite reaches
-/// the 502 branch at all: element-hq/synapse#19702 makes the profile-field GET
-/// answer a generic 500 for such an account, and the mock reproduces that
-/// faithfully. The mock has no fault lever for the profile-field read itself
-/// (`__fail` recognises only delete_device, list_devices, deactivate,
-/// query_user, publish_did_field), so this is the only route to an
-/// `Upstream` error.
+/// `"absent"` is a `users` row with NO `profiles` row (element-hq/synapse#19702).
+/// Synapse 1.161.0 answers the profile-field read of such an account with the
+/// same 404 as for a field that is unset, so the account reads as one that
+/// publishes nothing, not as an upstream failure. The 502 branch is reached
+/// with [`mock_fail`].
 async fn mock_profile(c: &Client, mxid: &str, state: &str) {
     c.post(format!("{}/__profile", mock()))
         .json(&json!({ "user_id": mxid, "state": state }))
         .send()
         .await
         .expect("mock __profile failed");
+}
+
+/// Arm a fault on one logical mock endpoint: `mode` is `"500"`, `"timeout"` or
+/// `"off"`, and `__reset` clears every fault.
+///
+/// `"read_did_field"` is the lever for the 502 branch: the profile-field read
+/// answers a 500 for an otherwise healthy account, which `/resolve` must report
+/// as a field it could not read, never as one that is absent.
+async fn mock_fail(c: &Client, endpoint: &str, mode: &str) {
+    c.post(format!("{}/__fail", mock()))
+        .json(&json!({ "endpoint": endpoint, "mode": mode }))
+        .send()
+        .await
+        .expect("mock __fail failed");
 }
 
 /// Every request the mock has served since the last `__reset`, as
@@ -602,10 +614,10 @@ async fn valid_dids_still_resolve_in_every_spelling_the_lookup_honours() {
 /// is an error carrying the already-resolved `mxid` — never a 200 with a guess,
 /// and never a 500.
 ///
-/// Reached through a row-less account (a `users` row with no `profiles` row),
-/// which is element-hq/synapse#19702 and makes the profile-field read answer a
-/// generic 500. That is the only lever the mock offers for this branch; see
-/// [`mock_profile`].
+/// Reached with the mock's `read_did_field` fault: the profile-field read of a
+/// healthy account answers a generic 500. A 404 reads as a field that is unset
+/// (see `a_rowless_account_resolves_as_existing_with_no_published_did`), so
+/// only another failure can make the field unreadable; see [`mock_fail`].
 #[tokio::test]
 #[ignore]
 async fn an_unreadable_profile_field_is_a_502_carrying_the_envelope_and_the_resolved_mxid() {
@@ -613,7 +625,7 @@ async fn an_unreadable_profile_field_is_a_502_carrying_the_envelope_and_the_reso
     mock_reset(&c).await;
     let mxid = mxid_for(DID_SEEDED_SILENT);
     mock_seed_user(&c, &localpart_for(DID_SEEDED_SILENT)).await;
-    mock_profile(&c, &mxid, "absent").await;
+    mock_fail(&c, "read_did_field", "500").await;
 
     for raw in [format!("mxid={mxid}"), format!("did={DID_SEEDED_SILENT}")] {
         let answer = get_resolve(&c, &raw).await;
@@ -731,6 +743,51 @@ async fn an_account_publishing_its_own_did_is_reported_attested_in_exact_case() 
     }
 }
 
+/// An account with a `users` row and no `profiles` row (element-hq/synapse#19702)
+/// is an ACTIVE account that publishes nothing: a 200 with `exists: true`,
+/// `attested: false` and, on `?mxid=`, `did: null`.
+///
+/// Synapse 1.161.0 answers the profile-field read of such an account with the
+/// same 404 as for a field that is unset, so `/resolve` cannot tell the two
+/// apart and must not try. Reading that 404 as an upstream failure would make
+/// every such account unresolvable, and reading it as a missing account would
+/// deny one that exists. A read that really fails is the 502 pinned above.
+#[tokio::test]
+#[ignore]
+async fn a_rowless_account_resolves_as_existing_with_no_published_did() {
+    let c = Client::new();
+    mock_reset(&c).await;
+    let mxid = mxid_for(DID_SEEDED_SILENT);
+    mock_seed_user(&c, &localpart_for(DID_SEEDED_SILENT)).await;
+    mock_profile(&c, &mxid, "absent").await;
+
+    let by_mxid = get_resolve(&c, &format!("mxid={mxid}")).await;
+    assert_eq!(
+        by_mxid.status,
+        StatusCode::OK,
+        "a row-less account is an answer, not an upstream error; body={:?}",
+        by_mxid.body
+    );
+    assert_eq!(
+        by_mxid.json(),
+        json!({ "did": null, "mxid": mxid, "exists": true, "attested": false }),
+        "`?mxid=`: the account exists and publishes nothing"
+    );
+
+    let by_did = get_resolve(&c, &format!("did={DID_SEEDED_SILENT}")).await;
+    assert_eq!(
+        by_did.status,
+        StatusCode::OK,
+        "a row-less account is an answer, not an upstream error; body={:?}",
+        by_did.body
+    );
+    assert_eq!(
+        by_did.json(),
+        json!({ "did": DID_SEEDED_SILENT, "mxid": mxid, "exists": true, "attested": false }),
+        "`?did=`: the account exists and does not publish this DID"
+    );
+}
+
 /// `exists` means an ACTIVE account: a deactivated account and an erased one
 /// both read as not existing, in both directions.
 ///
@@ -740,8 +797,8 @@ async fn an_account_publishing_its_own_did_is_reported_attested_in_exact_case() 
 /// and each one publishes its DID first: a lookup that still read the profile
 /// of a deactivated account would show that DID (and `attested: true`) here, so
 /// `did: null` on the `?mxid=` side is what proves nothing is read from it. An
-/// erasure used to answer 502 on this stack, because the mock refused the field
-/// read of an account without a profile row.
+/// erasure purges the profile, which reads as an unset field anyway, so for the
+/// erased account `exists: false` is the only assertion that can fail.
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn deactivated_and_erased_accounts_resolve_as_not_existing() {
