@@ -6599,16 +6599,16 @@ mod client_binding_tests {
     use crate::config::Config;
     use openidconnect::core::CoreClientAuthMethod;
 
-    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
-    const SECRET: &str = "the-registered-secret";
+    pub(super) const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    pub(super) const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    pub(super) const SECRET: &str = "the-registered-secret";
 
-    fn unique(prefix: &str) -> String {
+    pub(super) fn unique(prefix: &str) -> String {
         format!("{prefix}{}", Uuid::new_v4().simple())
     }
 
     #[derive(Clone, Copy, Debug)]
-    enum Registration {
+    pub(super) enum Registration {
         /// `token_endpoint_auth_method: none`, as Element Web and Element X register.
         Public,
         /// `client_secret_post`.
@@ -6618,6 +6618,16 @@ mod client_binding_tests {
     }
 
     async fn seed_client(db: &RedisClient, registration: Registration) -> String {
+        seed_client_with(db, registration, None).await
+    }
+
+    /// A client registered with the given grant types (`None`: the registration
+    /// names none).
+    pub(super) async fn seed_client_with(
+        db: &RedisClient,
+        registration: Registration,
+        grant_types: Option<Vec<CoreGrantType>>,
+    ) -> String {
         let id = unique("bind-");
         let mut metadata = CoreClientMetadata::new(
             vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
@@ -6631,6 +6641,9 @@ mod client_binding_tests {
                 .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::ClientSecretPost)),
             Registration::Unset => metadata,
         };
+        if let Some(grants) = grant_types {
+            metadata = metadata.set_grant_types(Some(grants));
+        }
         db.set_client(
             id.clone(),
             ClientEntry {
@@ -6668,6 +6681,15 @@ mod client_binding_tests {
     }
 
     async fn seed_code(db: &RedisClient, client_id: &str) -> String {
+        seed_code_with_scope(db, client_id, None).await
+    }
+
+    /// A code `sign_in` issued for an authorization request that asked for `scope`.
+    pub(super) async fn seed_code_with_scope(
+        db: &RedisClient,
+        client_id: &str,
+        scope: Option<&str>,
+    ) -> String {
         let code = unique("code-");
         db.set_code(
             code.clone(),
@@ -6681,7 +6703,7 @@ mod client_binding_tests {
                 code_challenge_method: Some("S256".into()),
                 device_id: None,
                 localpart: Some(unique("localpart")),
-                scope: None,
+                scope: scope.map(str::to_string),
             },
         )
         .await
@@ -7230,6 +7252,296 @@ mod client_binding_tests {
                      `{by_refresh}`, the code exchange `{by_code}`"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scope_grant_tests {
+    //! What the code exchange issues for the scope that was requested.
+    //!
+    //! Generic mode (no MAS shared secret) grants only what was asked for and
+    //! allowed, and issues a refresh token only for `offline_access` to a client
+    //! whose registration allows the refresh grant (I10). Matrix mode is
+    //! unchanged: the Matrix scope for the device and a refresh token, whatever
+    //! was requested. Needs Redis.
+    use super::client_binding_tests::{
+        seed_client_with, seed_code_with_scope, unique, Registration, VERIFIER,
+    };
+    use super::*;
+    use crate::config::Config;
+    use openidconnect::OAuth2TokenResponse;
+
+    fn generic() -> Config {
+        Config::default()
+    }
+
+    fn matrix() -> Config {
+        Config {
+            mas_shared_secret: Some("shared-secret".to_string()),
+            ..Config::default()
+        }
+    }
+
+    fn may_refresh() -> Option<Vec<CoreGrantType>> {
+        Some(vec![
+            CoreGrantType::AuthorizationCode,
+            CoreGrantType::RefreshToken,
+        ])
+    }
+
+    fn code_grant_only() -> Option<Vec<CoreGrantType>> {
+        Some(vec![CoreGrantType::AuthorizationCode])
+    }
+
+    /// Redeem a code for a public client that sends no secret.
+    async fn exchange(
+        db: &RedisClient,
+        config: &Config,
+        client_id: &str,
+        code: &str,
+    ) -> CoreTokenResponse {
+        token(
+            TokenForm {
+                code: Some(code.to_string()),
+                client_id: Some(client_id.to_string()),
+                client_secret: None,
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(VERIFIER.to_string()),
+                refresh_token: None,
+                device_code: None,
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the exchange must succeed: {e:?}"))
+    }
+
+    /// A public client, a code that asked for `scope`, and the exchange.
+    async fn issue(
+        db: &RedisClient,
+        config: &Config,
+        grants: Option<Vec<CoreGrantType>>,
+        scope: Option<&str>,
+    ) -> CoreTokenResponse {
+        let client = seed_client_with(db, Registration::Public, grants).await;
+        let code = seed_code_with_scope(db, &client, scope).await;
+        exchange(db, config, &client, &code).await
+    }
+
+    fn scope_of(response: &CoreTokenResponse) -> Option<String> {
+        response.scopes().map(|scopes| {
+            scopes
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+    }
+
+    async fn recorded_scope(db: &RedisClient, response: &CoreTokenResponse) -> String {
+        db.get_token(response.access_token().secret())
+            .await
+            .unwrap()
+            .expect("the access token is stored")
+            .scope
+    }
+
+    /// Without `offline_access` there is no refresh token: a client that did
+    /// not ask for one does not hold a credential that outlives its session.
+    #[tokio::test]
+    async fn generic_mode_issues_a_refresh_token_only_for_offline_access() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+
+        let without = issue(&db, &generic(), may_refresh(), Some("openid profile")).await;
+        assert!(
+            without.refresh_token().is_none(),
+            "no offline_access, no refresh token"
+        );
+        assert_eq!(recorded_scope(&db, &without).await, "openid profile");
+        assert_eq!(
+            scope_of(&without),
+            None,
+            "the granted scope equals the requested one, so the response omits it"
+        );
+
+        let with = issue(
+            &db,
+            &generic(),
+            may_refresh(),
+            Some("openid profile offline_access"),
+        )
+        .await;
+        assert!(with.refresh_token().is_some(), "offline_access asked for");
+        assert_eq!(
+            recorded_scope(&db, &with).await,
+            "openid profile offline_access"
+        );
+        assert_eq!(scope_of(&with), None, "granted as requested");
+    }
+
+    /// `offline_access` also needs the client's registration to allow the
+    /// refresh grant. The scope that is not granted is not in the issued scope,
+    /// and the response says what was granted because it differs.
+    #[tokio::test]
+    async fn generic_mode_grants_offline_access_only_to_a_client_that_may_refresh() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+
+        let refused = issue(
+            &db,
+            &generic(),
+            code_grant_only(),
+            Some("openid offline_access"),
+        )
+        .await;
+        assert!(
+            refused.refresh_token().is_none(),
+            "the registration lists no refresh_token grant"
+        );
+        assert_eq!(recorded_scope(&db, &refused).await, "openid");
+        assert_eq!(
+            scope_of(&refused).as_deref(),
+            Some("openid"),
+            "the response names the granted scope, which differs from the request"
+        );
+
+        // Provisional: a registration that names no grant types is not a
+        // restriction. A client that never listed any would otherwise lose
+        // refresh tokens it was entitled to under the registration it made.
+        let unspecified = issue(&db, &generic(), None, Some("openid offline_access")).await;
+        assert!(unspecified.refresh_token().is_some());
+        assert_eq!(
+            recorded_scope(&db, &unspecified).await,
+            "openid offline_access"
+        );
+    }
+
+    /// The issued scope reflects the request intersected with what generic mode
+    /// supports; Matrix scopes mean nothing there and are not granted.
+    #[tokio::test]
+    async fn generic_mode_issues_the_scope_that_was_requested_and_supported() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+
+        let openid_only = issue(&db, &generic(), may_refresh(), Some("openid")).await;
+        assert_eq!(recorded_scope(&db, &openid_only).await, "openid");
+
+        let mixed = issue(
+            &db,
+            &generic(),
+            may_refresh(),
+            Some("openid email urn:matrix:client:api:* profile"),
+        )
+        .await;
+        assert_eq!(
+            recorded_scope(&db, &mixed).await,
+            "openid profile",
+            "supported scopes only, in a fixed order"
+        );
+        assert_eq!(
+            scope_of(&mixed).as_deref(),
+            Some("openid profile"),
+            "the granted scope differs from the request, so the response says so"
+        );
+
+        // Nothing supported was asked for: the exchange still issues an ID
+        // token, so `openid` is what is granted (provisional).
+        let matrix_only = issue(
+            &db,
+            &generic(),
+            may_refresh(),
+            Some("urn:matrix:client:api:*"),
+        )
+        .await;
+        assert_eq!(recorded_scope(&db, &matrix_only).await, "openid");
+    }
+
+    /// A code written before the scope travelled with it (an earlier build, for
+    /// the 300 s a code lives) is exchanged as it was then: `openid profile`
+    /// and a refresh token.
+    #[tokio::test]
+    async fn generic_mode_exchanges_a_code_with_no_recorded_scope_as_before() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let legacy = issue(&db, &generic(), may_refresh(), None).await;
+        assert!(legacy.refresh_token().is_some());
+        assert_eq!(recorded_scope(&db, &legacy).await, "openid profile");
+        assert_eq!(scope_of(&legacy), None);
+    }
+
+    /// Matrix mode is unchanged: whatever the request asked for, the code grant
+    /// records the Matrix scope for the device and issues a refresh token, and
+    /// the response carries no `scope`.
+    #[tokio::test]
+    async fn matrix_mode_issues_the_matrix_scope_and_a_refresh_token_whatever_was_requested() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        for requested in [
+            None,
+            Some("openid"),
+            Some("openid profile"),
+            Some("openid offline_access"),
+            Some("urn:matrix:client:api:*"),
+        ] {
+            let client = seed_client_with(&db, Registration::Public, code_grant_only()).await;
+            let code = seed_code_with_scope(&db, &client, requested).await;
+            // Give the code a device, as provisioning does.
+            let mut entry = db.try_consume_code(code).await.unwrap().unwrap();
+            entry.device_id = Some("SIWX_ABCD1234".to_string());
+            let code = unique("code-");
+            db.set_code(code.clone(), entry).await.unwrap();
+
+            let response = exchange(&db, &matrix(), &client, &code).await;
+            assert!(
+                response.refresh_token().is_some(),
+                "Matrix mode issues a refresh token (requested {requested:?})"
+            );
+            assert_eq!(
+                recorded_scope(&db, &response).await,
+                "openid urn:matrix:client:api:* urn:matrix:client:device:SIWX_ABCD1234",
+                "requested {requested:?}"
+            );
+            assert_eq!(
+                scope_of(&response),
+                None,
+                "Matrix mode never put a scope in the token response (requested {requested:?})"
+            );
+            assert!(
+                response.access_token().secret().starts_with("mat_")
+                    && response
+                        .refresh_token()
+                        .unwrap()
+                        .secret()
+                        .starts_with("mcr_"),
+                "Matrix token prefixes are unchanged"
+            );
+        }
+    }
+
+    /// Discovery says `offline_access` is a scope this provider honours.
+    #[test]
+    fn discovery_advertises_offline_access() {
+        let value = provider_metadata_value(&Config::default(), false).unwrap();
+        let scopes: Vec<&str> = value["scopes_supported"]
+            .as_array()
+            .expect("scopes_supported is an array")
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        assert!(scopes.contains(&"offline_access"), "{scopes:?}");
+        for kept in ["openid", "profile", "urn:matrix:client:api:*"] {
+            assert!(scopes.contains(&kept), "{kept} is still advertised");
         }
     }
 }
