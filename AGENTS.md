@@ -50,7 +50,7 @@ everything else exists only in the binary crate.
 | `credential_identity.rs` (lib) | Which identity a stored passkey authenticates: a `webauthn:link/*` entry overrides the derived `did:key`. |
 | `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL`. |
 | `credential_migration.rs` (lib) | Additive backfill of passkey credentials into the aqua-auth store. |
-| `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry`, `ClientEntry`, `DeviceCodeEntry`, `TokenMetadata`), Redis key prefixes and TTLs. |
+| `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry`, `DeviceCodeEntry`, `TokenMetadata` with its `TokenKind`), `legacy_token_kind`, Redis key prefixes and TTLs. |
 | `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens`, `get_passkeys_for_did`, `lookup_user_session`, `purge_identity`. |
 | `bin/migrate-credentials.rs` | Operator tool for the credential backfill. Dry run unless `--apply`. |
 
@@ -271,6 +271,38 @@ doc; read it before changing the code the rule covers.
 
 ### Tokens, sessions and devices ([docs/matrix-integration.md](docs/matrix-integration.md))
 
+- **Each endpoint accepts only its token kind.** `TokenMetadata.kind` is access or refresh;
+  a minted admin token is an access token. The refresh endpoints (`grant_type=refresh_token`,
+  `/_matrix/client/v3/refresh`) take refresh tokens; introspection, `/userinfo` and the
+  bearer-authenticated Matrix routes take access tokens; `/oauth2/revoke` takes either. A wrong
+  kind is answered exactly like an unknown token and is never deleted by the refusal. Entries
+  written before the kind existed are classified in one place, `db::legacy_token_kind`, by
+  lifetime; `set_token` refuses an entry without a kind. Pin (mock stack):
+  `the_refresh_grant_accepts_only_a_refresh_token`,
+  `the_matrix_refresh_endpoint_accepts_only_a_refresh_token`,
+  `neither_refresh_endpoint_accepts_an_admin_token`, `a_refresh_token_is_not_a_bearer_credential`;
+  unit: `every_legacy_entry_shape_is_classified`,
+  `a_long_lived_admin_scoped_legacy_entry_has_no_kind`, `set_token_refuses_an_entry_without_a_kind`,
+  `a_refresh_token_is_inactive`, `a_refresh_token_as_the_bearer_tears_nothing_down`.
+- **The authorization request, PKCE challenge included, is bound at `/authorize`.** Only
+  `response_type=code` with an `S256` challenge is accepted; the validated request (client,
+  redirect URI, state, response mode, challenge) is stored in the session. `sign_in` issues the
+  code for that request and refuses a front-channel parameter that differs from it; `/token`
+  refuses a code without a challenge. Never read these from `/sign_in` parameters again. Pin
+  (mock stack): `authorize_accepts_only_the_code_response_type`,
+  `the_code_is_bound_to_the_challenge_sent_to_authorize`,
+  `sign_in_refuses_parameters_that_differ_from_the_authorization_request`,
+  `discovery_advertises_only_the_code_response_type`; unit:
+  `sign_in_parameters_may_repeat_the_bound_request_but_not_change_it`,
+  `a_session_without_a_bound_request_is_refused`, `authorize_binds_the_request_to_the_session`.
+- **Redirect URIs match the registration exactly**, query included (RFC 9700 §4.1.3), through
+  the one helper `oidc::redirect_uri_is_registered` used by `authorize` and `sign_in`. Pin:
+  `redirect_uri_matching_is_exact`, `redirect_uris_match_the_registration_exactly` (mock stack).
+- **Codes are single use and deleted on exchange.** `try_consume_code` reads and deletes the
+  entry in one atomic step; a code is redeemable only at `/token`, and `/userinfo` never reads
+  codes. Pin: `a_consumed_code_leaves_no_entry`,
+  `concurrent_consumers_of_one_code_have_exactly_one_winner`, `userinfo_accepts_only_an_access_token`,
+  `an_authorization_code_is_never_a_bearer_token` (mock stack).
 - **An empty `device_id` is JSON `null` on the wire, never `""`.** Synapse rejects `""`. Pin:
   `empty_device_id_renders_as_json_null`, `deviceless_token_body_carries_device_id_null`.
 - **Refresh rotation keeps a 60 s grace pointer**: any replay of the old refresh token within
@@ -332,7 +364,8 @@ doc; read it before changing the code the rule covers.
 - **`io.inblock.mxid` in userinfo is omitted, never `null`**, is read from `TokenMetadata`
   (never re-derived), and appears in the JSON and signed-JWT variants alike. Pin:
   `without_a_matrix_server_name_the_claim_is_omitted_not_null`,
-  `the_claim_name_on_the_wire_is_io_inblock_mxid`, `the_signed_jwt_variant_carries_the_claim_too`.
+  `the_claim_name_on_the_wire_is_io_inblock_mxid`, `the_signed_jwt_variant_carries_the_claim_too`,
+  `a_token_without_a_recorded_localpart_omits_the_claim_rather_than_deriving_one`.
 - **`io.inblock.resolve_endpoint` in discovery is read by an Element Web patch**; it is advertised
   only when `/resolve` can answer; account management likewise, and the device grant only in
   delegated-auth mode, where `/device_authorization` is also the only place it is served. Pin:

@@ -283,7 +283,36 @@ The authorization-code grant records the Matrix scope above regardless of the
 scopes requested. Clients request the Matrix scopes in either the stable form
 (`urn:matrix:client:api:*`, `urn:matrix:client:device:{id}`) or the MSC2967
 unstable form (`urn:matrix:org.matrix.msc2967.client:…`); both are advertised.
-PKCE is required with `S256`; `plain` is rejected.
+
+`/authorize` accepts only `response_type=code`, the only response type
+discovery advertises, and requires PKCE with `S256` (`plain` is rejected). The
+redirect URI must equal a registered one exactly, query included. `/authorize`
+binds the validated request (client, redirect URI, state, response mode, PKCE
+challenge) to the login session, and `/sign_in` issues the code for that
+request: parameters the login page repeats on `/sign_in` may not differ from
+it. A code is single use, is deleted when it is exchanged, and is redeemable
+only at `POST /token` with its verifier.
+
+### Token kinds
+
+Every token is either an **access token** or a **refresh token**, recorded in
+its `TokenMetadata`. A minted admin token is an access token. Each endpoint
+accepts exactly one kind:
+
+| Endpoint | Accepts |
+|---|---|
+| `POST /token` (`grant_type=refresh_token`), `POST /_matrix/client/v3/refresh` | refresh token |
+| `POST /oauth2/introspect`, `GET`/`POST /userinfo` | access token |
+| `POST /_matrix/client/v3/logout`, `logout/all`, `DELETE /_matrix/client/v3/devices/{id}`, `POST /_matrix/client/v3/delete_devices` (bearer) | access token |
+| `POST /oauth2/revoke` (RFC 7009) | either |
+
+A token of the other kind is answered exactly like an unknown token
+(`invalid_grant`, `M_UNKNOWN_TOKEN`, `{"active": false}`, or a no-op `200` for
+logout), and is left untouched. Token entries written before the kind was
+recorded are classified by their lifetime, which every earlier writer fixed:
+at most 900 s is an access token (300 s user tokens, 30–900 s admin tokens),
+90 days a refresh token. A long-lived entry that carries the admin scope fits
+no earlier writer and is accepted nowhere; revocation still removes it.
 
 ### An empty `device_id` is JSON `null`
 
@@ -297,8 +326,10 @@ token.
 
 ### Lifecycle
 
-1. `POST /token` with `grant_type=authorization_code` consumes the code and
-   stores an access token and a refresh token.
+1. `POST /token` with `grant_type=authorization_code` consumes the code (reads
+   and deletes it in one atomic step), checks the PKCE verifier against the
+   challenge bound at `/authorize`, and stores an access token and a refresh
+   token.
 2. `POST /token` with `grant_type=refresh_token` **rotates both**: a new access
    token, a new refresh token, and the old refresh token is deleted. The
    `device_id` and scope are carried over. The refresh response has no ID
@@ -312,8 +343,8 @@ token.
    [the 2026-06-23 audit](audits/2026-06-23-elementx-refresh-rotation-signout.md).
 4. `POST /token` with the device-code grant provisions the Synapse device and
    issues tokens (see [below](#device-code-and-qr-login)).
-5. `/userinfo` looks the token up, and falls back to the older authorization-code
-   record for deployments that predate refresh tokens.
+5. `/userinfo` accepts an access token only. An authorization code is not a
+   bearer token, before or after its exchange.
 
 A refresh is refused (`invalid_grant`, "Session has been revoked.") when the
 device was just signed out or the account just deactivated. Short-lived Redis
@@ -325,10 +356,8 @@ teardown.
 If Redis cannot be read, introspection answers **500**, never
 `{"active": false}`. Synapse caches a negative result for two minutes, and an
 inactive token is a hard logout that makes the client discard its crypto store.
-Only a token that is genuinely absent or expired is inactive.
-
-When upgrading from a release that predates refresh tokens, flushing Redis is
-recommended; old sessions still work through the fallback path.
+Only a token that is genuinely absent, expired, or not an access token is
+inactive.
 
 ## Admin-scoped token mint
 
