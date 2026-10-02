@@ -57,10 +57,10 @@
  * admin API with a token from siwx-oidc's POST /oauth2/admin_token.
  */
 import { test, expect } from '@playwright/test';
-import { requireElementStack, ELEMENT_URL } from './helpers/element.mjs';
+import { requireElementStack, ELEMENT_URL, SIWX_URL, MATRIX_URL } from './helpers/element.mjs';
 import { elementWalletClickLogin } from './helpers/element-login.mjs';
+import { expectOpaqueMxid, expectDidBinding } from './helpers/identity.mjs';
 import { makeWallet } from '../browser/wallet-helper.mjs';
-import { localpartFor } from '../browser/mxid-helper.mjs';
 
 const LABS_FLAG = 'feature_web_event_index';
 const TOKEN = `ewsearch-${Date.now()}-alpha`;
@@ -127,8 +127,15 @@ test('UX1-UX8 encrypted search on hosted Element Web', async ({ page, context })
 
   const session = await elementWalletClickLogin(page, w);
   console.log(`[UX] account ${session.user_id}`);
-  // A fresh wallet is a new identity, so it gets the modern opaque localpart.
-  expect(session.user_id.split(':')[0]).toBe(`@${localpartFor(w.did)}`);
+  // A fresh wallet is a new identity, so it gets the opaque localpart, and its
+  // DID resolves to exactly this account.
+  expectOpaqueMxid(session.user_id);
+  await expectDidBinding({
+    siwxUrl: SIWX_URL,
+    matrixUrl: MATRIX_URL,
+    userId: session.user_id,
+    did: w.did,
+  });
 
   // UX8: no CORS/issuer page errors
   const pageErrors = [];

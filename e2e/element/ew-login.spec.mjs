@@ -18,6 +18,7 @@ import {
 } from './helpers/element.mjs';
 import { loginWalletToTokens } from './helpers/oidc-login.mjs';
 import { elementWalletClickLogin } from './helpers/element-login.mjs';
+import { expectOpaqueMxid, expectDidBinding } from './helpers/identity.mjs';
 import { makeWallet } from '../browser/wallet-helper.mjs';
 
 test.beforeAll(async () => {
@@ -64,12 +65,18 @@ test('EW-L1: wallet CAIP-122 through siwx produces Matrix whoami (headless OIDC)
 
   expect(session.access_token).toMatch(/^mat_/);
   expect(session.refresh_token).toMatch(/^mcr_/);
-  expect(session.user_id).toBeTruthy();
-  expect(session.user_id).toMatch(/^@/);
   expect(session.device_id).toBeTruthy();
-  // DID localpart is did-pkh-eip155-1-0x… (colons → dashes, lowercased)
-  const localpart = w.did.replaceAll(':', '-').toLowerCase();
-  expect(session.user_id.toLowerCase()).toContain(localpart);
+  // A fresh wallet is a new identity: its MXID is the opaque 16-char base36
+  // localpart on the lab server_name, never a DID-derived one, and the wallet's
+  // DID resolves to exactly this account (siwx /resolve, both directions, and
+  // the account's io.inblock.did profile field).
+  expectOpaqueMxid(session.user_id);
+  await expectDidBinding({
+    siwxUrl: SIWX_URL,
+    matrixUrl: MATRIX_URL,
+    userId: session.user_id,
+    did: w.did,
+  });
 });
 
 /**
@@ -94,7 +101,13 @@ test('EW-L1b: reload restores AUTH + CRYPTO (no OIDC round-trip, no identity gat
   test.setTimeout(360_000);
   const w = makeWallet(undefined, 'localhost');
   const session = await elementWalletClickLogin(page, w);
-  expect(session.user_id).toBe(w.mxid);
+  expectOpaqueMxid(session.user_id);
+  await expectDidBinding({
+    siwxUrl: SIWX_URL,
+    matrixUrl: MATRIX_URL,
+    userId: session.user_id,
+    did: w.did,
+  });
 
   // Reload: any bounce through the OP's /authorize means the auth session was
   // NOT restored from storage.

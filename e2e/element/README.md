@@ -68,6 +68,7 @@ use the scripts.
 ## Helpers
 
 - `helpers/element.mjs` — open Element, wait for room list / login
+- `helpers/identity.mjs`: what a fresh account's Matrix ID must look like (`expectOpaqueMxid`: 16 base36 characters on the lab server_name) and `expectDidBinding` (the wallet's DID resolves to that MXID through siwx `GET /resolve` in both directions and through the account's `io.inblock.did` profile field). Specs must not compute an expected MXID from a DID.
 - Reuses `../browser/wallet-helper.mjs` and `webauthn-helper.mjs` for OIDC redirect origin
 
 ## Notes
