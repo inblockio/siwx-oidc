@@ -544,7 +544,9 @@ pub fn metadata(config: &crate::config::Config) -> Result<CoreProviderMetadata, 
         ),
         // Exactly what `authorize` accepts: the authorization-code flow.
         vec![ResponseTypes::new(vec![CoreResponseType::Code])],
-        vec![CoreSubjectIdentifierType::Pairwise],
+        // The `sub` is the user's DID, the same for every client
+        // (docs/identity-model.md), which is what `public` means.
+        vec![CoreSubjectIdentifierType::Public],
         SIGNING_ALG.to_vec(),
         EmptyAdditionalProviderMetadata {},
     )

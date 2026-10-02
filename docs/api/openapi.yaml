@@ -123,6 +123,10 @@ paths:
         (`SIWXOIDC_OP_TOS_URI`, `SIWXOIDC_OP_POLICY_URI`); there is no
         default. The login page reads them here for its footer.
 
+        `subject_types_supported` is `["public"]`: the `sub` is the user's DID,
+        the same value for every client, so a relying party must not expect a
+        pairwise identifier.
+
         `response_types_supported` is exactly `["code"]`: the
         authorization-code flow is the only one `/authorize` accepts.
       responses:

@@ -311,6 +311,10 @@ doc; read it before changing the code the rule covers.
   codes. Pin: `a_consumed_code_leaves_no_entry`,
   `concurrent_consumers_of_one_code_have_exactly_one_winner`, `userinfo_accepts_only_an_access_token`,
   `an_authorization_code_is_never_a_bearer_token` (mock stack).
+- **Discovery advertises only what is implemented.** `subject_types_supported` is `["public"]`
+  because the `sub` is the user's DID, identical for every client; advertising `pairwise` would
+  promise a per-client identifier. Pin: `discovery_advertises_public_subjects_only`; the response
+  types are pinned by `discovery_advertises_only_the_code_response_type`.
 - **An empty `device_id` is JSON `null` on the wire, never `""`.** Synapse rejects `""`. Pin:
   `empty_device_id_renders_as_json_null`, `deviceless_token_body_carries_device_id_null`.
 - **Refresh rotation keeps a 60 s grace pointer**: any replay of the old refresh token within
