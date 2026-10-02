@@ -13,6 +13,15 @@ bash e2e/element/run.sh [spec ...]
 bash e2e/element/stack-down.sh
 ```
 
+`run.sh` runs Playwright in the `mcr.microsoft.com/playwright` container (host network,
+`--userns=keep-id`, all of `e2e/` mounted at `/e2e`) and installs the npm dependencies
+there, so nothing needs installing by hand on a fresh checkout. `e2e/element`'s are
+installed from its committed lockfile. `e2e/browser`'s are installed too, because every
+spec imports `../browser/wallet-helper.mjs`, which needs `ethers` from
+`e2e/browser/node_modules`; that install is skipped while `node_modules/.package-lock.json`
+is newer than `e2e/browser/package.json` (that package has no committed lockfile, its
+direct dependencies are pinned to exact versions).
+
 `stack-up.sh`, `stack-down.sh`, `t5-restart-survival.sh` and `run.sh` all source
 [`stack-env.sh`](stack-env.sh), the single source for the compose project and the host
 ports, so the stack `stack-up.sh` starts is the stack `run.sh` tests:
