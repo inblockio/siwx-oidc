@@ -2076,3 +2076,51 @@ mod token_endpoint_error_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod client_credentials_tests {
+    //! What `POST /token` makes of the `Authorization` header.
+    use super::*;
+
+    fn form_encode(value: &str) -> String {
+        url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+    }
+
+    fn with_header(header: impl axum_extra::headers::Header) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.typed_insert(header);
+        headers
+    }
+
+    /// RFC 6749 §2.3.1: the client id and the secret are encoded with
+    /// `application/x-www-form-urlencoded` before they are joined and Base64
+    /// encoded into the Basic header, so the server must decode both before it
+    /// compares them. A secret with a character that encodes (a space, `+`, `%`,
+    /// `&`, `:`, a non-ASCII letter) would otherwise never match.
+    #[test]
+    fn basic_credentials_are_form_urldecoded_before_they_are_compared() {
+        let (id, secret) = ("client id", "p@ss w%rd+x&y:z/\u{e9}");
+        let headers = with_header(Authorization::basic(&form_encode(id), &form_encode(secret)));
+
+        let (credentials, basic_attempted) = client_credentials(&headers);
+        assert!(basic_attempted);
+        assert_eq!(credentials.basic_client_id.as_deref(), Some(id));
+        assert_eq!(credentials.secret.as_deref(), Some(secret));
+    }
+
+    /// A secret with nothing to encode, the usual generated kind, passes through
+    /// unchanged; and a Bearer token is an opaque string, never form-decoded.
+    #[test]
+    fn a_plain_basic_secret_and_a_bearer_token_are_taken_as_sent() {
+        let headers = with_header(Authorization::basic("client", "0123abcdEF-_.~"));
+        let (credentials, _) = client_credentials(&headers);
+        assert_eq!(credentials.basic_client_id.as_deref(), Some("client"));
+        assert_eq!(credentials.secret.as_deref(), Some("0123abcdEF-_.~"));
+
+        let headers = with_header(Authorization::bearer("a%2Bb+c").unwrap());
+        let (credentials, basic_attempted) = client_credentials(&headers);
+        assert!(!basic_attempted);
+        assert_eq!(credentials.basic_client_id, None);
+        assert_eq!(credentials.secret.as_deref(), Some("a%2Bb+c"));
+    }
+}
