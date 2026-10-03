@@ -419,14 +419,17 @@ doc; read it before changing the code the rule covers.
   tombstone stays: it closes the race between a device sweep and the lift of a legacy refresh
   token. Global and client epochs have no HTTP endpoint (attack surface): an operator sets them
   ([docs/matrix-integration.md](docs/matrix-integration.md#epochs)). An unset epoch is none,
-  never 0. Pin: `e1_one_user_epoch_refuses_every_older_grant_of_the_user`,
+  never 0. Teardown's resolver (`resolve_refresh_token`) treats a refused refresh token as
+  unknown, so revoking it tears nothing down. Pin:
+  `e1_one_user_epoch_refuses_every_older_grant_of_the_user`,
   `e1_after_logout_all_a_new_sign_in_refreshes_at_once`,
   `the_epoch_comparison_is_at_or_before_to_the_millisecond`,
   `e1_a_client_epoch_refuses_that_clients_older_grants_only`,
   `e1_a_global_epoch_refuses_every_older_grant`, `a_legacy_token_older_than_an_epoch_is_refused`,
   `set_epoch_takes_redis_time_and_never_moves_earlier`,
   `the_scripts_name_the_epoch_keys_the_library_writes`,
-  `a_tombstoned_device_or_user_refuses_rotation_and_replay`; mock stack:
+  `a_tombstoned_device_or_user_refuses_rotation_and_replay`,
+  `revoking_a_refresh_token_an_epoch_refuses_leaves_a_newer_grant_of_the_device`; mock stack:
   `e1_after_logout_all_older_grants_are_refused_and_a_new_sign_in_refreshes_at_once`,
   `e1_a_client_epoch_refuses_that_clients_older_grants_only`,
   `e1_a_global_epoch_refuses_every_older_grant`,
