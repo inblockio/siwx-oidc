@@ -394,6 +394,9 @@ doc; read it before changing the code the rule covers.
   `h3_a_thousand_rotations_recognise_every_superseded_token_in_constant_storage`,
   `rotating_the_successor_counts_as_its_use_and_older_tokens_are_reuse`,
   `the_reuse_event_carries_its_fields_and_fingerprints_only`,
+  `a_replay_an_hour_later_returns_the_same_pair_and_after_use_is_reuse` (the event at `/token`),
+  `the_matrix_endpoint_logs_one_reuse_event_for_a_superseded_refresh_token` (the event at
+  `/_matrix/client/v3/refresh`),
   `a_replay_returns_the_same_pair_until_the_new_access_token_is_used` (mock stack).
 - **Tokens of a build before the grant record keep working; nobody signs in again** (design 5.8).
   A legacy access entry stays readable until it expires (`check_access_token`'s read fallback,

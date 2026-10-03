@@ -1036,6 +1036,62 @@ mod tests {
         client.revoke_grants_for_device(&user, &dev).await.ok();
     }
 
+    /// I5 phase A at `POST /_matrix/client/v3/refresh`, the endpoint every
+    /// Matrix session refreshes at: a superseded refresh token (rotated twice,
+    /// the first presented again) is answered like an unknown token and logged
+    /// as exactly one reuse event that names the grant by its fingerprint and
+    /// the branch, with no token in the logs.
+    #[tokio::test]
+    async fn the_matrix_endpoint_logs_one_reuse_event_for_a_superseded_refresh_token() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("reuse-user-{n}");
+        let dev = format!("REUSE_{n}");
+        let state = standalone_state(client.clone());
+        let logs = siwx_oidc::test_support::LogCapture::start();
+
+        let grant = seed_grant(&client, &user, &dev).await;
+        let first = grant.refresh_token.clone().unwrap();
+        let mut issued = vec![grant.access_token.clone(), first.clone()];
+        let mut current = first.clone();
+        for _ in 0..2 {
+            let (status, body) = matrix_refresh(&state, &current).await;
+            assert_eq!(status, StatusCode::OK, "the current token rotates: {body}");
+            for field in ["access_token", "refresh_token"] {
+                issued.push(body[field].as_str().unwrap().to_string());
+            }
+            current = body["refresh_token"].as_str().unwrap().to_string();
+        }
+
+        let (status, body) = matrix_refresh(&state, &first).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "reuse is refused: {body}");
+        assert_eq!(
+            body["errcode"], "M_UNKNOWN_TOKEN",
+            "answered like an unknown token: {body}"
+        );
+        let output = logs.output();
+        let events: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains(siwx_oidc::db::grant::REUSE_EVENT_MESSAGE))
+            .collect();
+        assert_eq!(events.len(), 1, "exactly one reuse event: {output}");
+        let event = events[0];
+        for field in [
+            format!("grant_fp={}", grant.grant_id.fingerprint()),
+            "branch=\"superseded\"".to_string(),
+        ] {
+            assert!(event.contains(&field), "the event carries {field}: {event}");
+        }
+        for secret in &issued {
+            assert!(
+                !output.contains(secret.as_str()),
+                "no token in the logs: {output}"
+            );
+        }
+
+        client.revoke_grants_for_device(&user, &dev).await.ok();
+    }
+
     /// Item 10 at the Matrix endpoint: a legacy refresh token (`token/{raw}`,
     /// written before the grant record) of a public client is lifted into a
     /// grant and answered in the current format; a confidential client's is
