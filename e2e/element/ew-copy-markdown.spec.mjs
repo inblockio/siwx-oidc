@@ -1,17 +1,19 @@
 /**
- * CM1-CM4: the message context menu's "Copy Markdown" entry on hosted Element
+ * CM1-CM5: the message context menu's "Copy Markdown" entry on hosted Element
  * Web (siwx-oidc-matrix-server issue #24). Right-click a message, choose "Copy
  * Markdown", and the clipboard holds the message as clean CommonMark + GFM,
  * converted from the message's HTML (`formatted_body`), or from the plain `body`
- * with its Markdown metacharacters escaped when there is no HTML.
+ * with its Markdown metacharacters escaped when there is no HTML. A message
+ * composed in Element as Markdown copies back as exactly what its sender typed.
  *
- * Every event is sent through the logged-in client in the page, into a private
- * ENCRYPTED room (asserted: the room carries an `m.room.encryption` state event,
- * and each sent event is fetched back from the homeserver and must be
- * `m.room.encrypted`), so the menu is exercised on events that were decrypted
- * locally, like real traffic. Clipboard access is granted to the browser context
- * (`clipboard-read`, `clipboard-write`; localhost is a secure context) and read
- * back with `navigator.clipboard.readText()` in the page.
+ * CM1-CM4 send their events through the logged-in client in the page; CM5 types
+ * into the real composer. Everything goes into a private ENCRYPTED room
+ * (asserted: the room carries an `m.room.encryption` state event, and each sent
+ * event is fetched back from the homeserver and must be `m.room.encrypted`), so
+ * the menu is exercised on events that were decrypted locally, like real
+ * traffic. Clipboard access is granted to the browser context (`clipboard-read`,
+ * `clipboard-write`; localhost is a secure context) and read back with
+ * `navigator.clipboard.readText()` in the page.
  *
  * WHAT WOULD TURN EACH LEG RED:
  *
@@ -31,10 +33,27 @@
  *       opposite direction.
  *   CM4 (plain body escaped): the entry is missing, or a message with no HTML is
  *       copied without escaping its Markdown and HTML metacharacters.
+ *   CM5 (round trip of typed Markdown): a synthetic Markdown message (heading,
+ *       bold, nested task list, GFM table, soft line breaks, fenced code) is
+ *       put on the clipboard, pasted into the room's message composer and sent
+ *       with Enter, Element's own send path rather than the client API. The sent
+ *       event must be `m.room.encrypted` on the wire, carry the typed text as
+ *       `body` byte for byte, and have a string `formatted_body` (logged as
+ *       "[CM5] formatted_body"). The leg then right-clicks the tile, clicks "Copy
+ *       Markdown" and compares the clipboard (the sentinel is written first) with
+ *       the typed text. It fails when the copy is a re-rendering of Element's
+ *       lossy display instead of the sender's own Markdown: Element's renderer
+ *       has no GFM tables or task lists and turns newlines into <br>, so table
+ *       rows come back as `| a | b |\` with escaped pipes, soft breaks as `\`
+ *       hard breaks, `- [ ]` as `- \[ \]` and `### 1.` as `### 1\.`. The
+ *       clipboard text is logged as "[CM5] clipboard".
  *
  * Discrimination: run this spec against an Element without the entry (the
- * baseline image); CM1, CM2 and CM4 must fail on the missing "Copy Markdown"
- * menu item while CM3 passes.
+ * baseline image); CM1, CM2, CM4 and CM5 must fail on the missing "Copy
+ * Markdown" menu item while CM3 passes. Against an Element that has the entry
+ * but converts only the displayed HTML (the image deployed before the
+ * sender-source fix) CM1-CM4 pass and CM5 fails on the clipboard comparison,
+ * with the symptoms above visible in the diff. With the fix, all five pass.
  *
  * WHY NOT serial MODE: in serial mode the first failure skips every later leg,
  * so a red run would show one failure instead of the full picture. The legs
@@ -100,6 +119,39 @@ const CM2_PLAIN = 'Plan\n\nAsk Bob about old new docs.\n\none\nnested\ntwo\n\nco
 const CM4_BODY = '2*3*4 and <b>not bold</b>';
 const CM4_EXPECTED = '2\\*3\\*4 and \\<b>not bold\\</b>';
 
+/**
+ * CM5: what the user types. Synthetic text, no trailing newline. It holds what
+ * Element's own renderer cannot show faithfully: a GFM table, a nested task
+ * list, soft line breaks inside a paragraph, and a heading that starts with
+ * "1.". The leg expects the copy to be this text exactly.
+ */
+const CM5_INPUT = [
+  '### 1. +14.3% overall, driver Alice',
+  '',
+  '**core-client (main, dev): replace the `../core` path dependency with a git pin on the `vX.Y.Z` tag, then redeploy**',
+  '',
+  '- Moves: core +57.1%. Overall after this step: 53.9%.',
+  '- Repository: `core-client`. Kind: release.',
+  '- Tasks:',
+  '  - [ ] Alice: cut the first annotated `vX.Y.Z` tag of core.',
+  '  - [ ] `core-client`: switch to a git dependency on that tag, commit Cargo.lock, open a PR.',
+  '',
+  '| train | driver | score | cells |',
+  '|---|---|---|---|',
+  '| core | Alice | 🟥🟥🚂⬜⬜🏁 42.6% | 13 |',
+  '| client | Bob | 🚂⬜⬜⬜⬜🏁 0.0% | 7 |',
+  '',
+  '- `short-rev`: a `rev = "..."` shorter than 40 characters.',
+  '- `url-spelling`: the git URL is spelled differently from `https://example.org/<repo>`.',
+  '',
+  'Every **cell** is one (consumer, train) pair: each tracked branch that uses the',
+  'train, and each deployed service that runs it.',
+  '',
+  '```',
+  'cell  = max(0, value(status) - min(0.05 * flags, 0.15))',
+  '```',
+].join('\n');
+
 test.describe('Copy Markdown context-menu entry (encrypted room)', () => {
   test.describe.configure({ timeout: 240_000 });
 
@@ -164,6 +216,15 @@ test.describe('Copy Markdown context-menu entry (encrypted room)', () => {
     await context?.close();
   });
 
+  /** Fetch the event back from the homeserver; it must be stored as m.room.encrypted. */
+  async function expectEncryptedOnTheWire(eventId) {
+    const wire = await page.evaluate(
+      ({ rid, id }) => window.mxMatrixClientPeg.get().fetchRoomEvent(rid, id),
+      { rid: roomId, id: eventId },
+    );
+    expect(wire.type, 'the event must travel encrypted, like real traffic').toBe('m.room.encrypted');
+  }
+
   /** Send an m.room.message through the client; assert it went out encrypted. */
   async function sendMessage(content) {
     const eventId = await page.evaluate(
@@ -173,12 +234,60 @@ test.describe('Copy Markdown context-menu entry (encrypted room)', () => {
       },
       { rid: roomId, content },
     );
-    const wire = await page.evaluate(
-      ({ rid, id }) => window.mxMatrixClientPeg.get().fetchRoomEvent(rid, id),
-      { rid: roomId, id: eventId },
-    );
-    expect(wire.type, 'the event must travel encrypted, like real traffic').toBe('m.room.encrypted');
+    await expectEncryptedOnTheWire(eventId);
     return eventId;
+  }
+
+  /**
+   * Send text the way a user does, through Element's own send path: put it on
+   * the clipboard, focus the room's message composer, paste (Control+V), press
+   * Enter. Returns the sent event's id and content once the homeserver has
+   * accepted it (the local echo has its real id), as the client holds them.
+   */
+  async function sendThroughComposer(text) {
+    const known = await page.evaluate(
+      (rid) =>
+        window.mxMatrixClientPeg
+          .get()
+          .getRoom(rid)
+          .getLiveTimeline()
+          .getEvents()
+          .map((e) => e.getId()),
+      roomId,
+    );
+    await page.evaluate((t) => navigator.clipboard.writeText(t), text);
+    const composer = page.locator('.mx_MessageComposer [role="textbox"][contenteditable="true"]').first();
+    await composer.click();
+    await page.keyboard.press('Control+V');
+    // The paste landed: the composer holds the last line of the text.
+    const lastLine = text.split('\n').at(-1);
+    await expect(composer, 'the paste did not reach the message composer').toContainText(lastLine);
+    await page.keyboard.press('Enter');
+
+    let sent = null;
+    await expect
+      .poll(
+        async () => {
+          sent = await page.evaluate(
+            ({ rid, known }) => {
+              const cli = window.mxMatrixClientPeg.get();
+              const me = cli.getUserId();
+              const ev = cli
+                .getRoom(rid)
+                .getLiveTimeline()
+                .getEvents()
+                .find((e) => e.getType() === 'm.room.message' && e.getSender() === me && !known.includes(e.getId()));
+              // A local echo still has a "~" id; the real one starts with "$".
+              return ev && ev.getId().startsWith('$') ? { id: ev.getId(), content: ev.getContent() } : null;
+            },
+            { rid: roomId, known },
+          );
+          return sent !== null;
+        },
+        { timeout: 30_000, message: 'the composer never sent the message (no event with a server id appeared)' },
+      )
+      .toBe(true);
+    return sent;
   }
 
   const tileOf = (eventId) => page.locator(`[data-event-id="${eventId}"]`).first();
@@ -290,5 +399,30 @@ test.describe('Copy Markdown context-menu entry (encrypted room)', () => {
     await expect
       .poll(readClipboard, { timeout: 10_000, message: 'clipboard after "Copy Markdown" on the plain message' })
       .toBe(CM4_EXPECTED);
+  });
+
+  test('CM5 round trip: Markdown typed in the composer is copied back exactly', async () => {
+    const sent = await sendThroughComposer(CM5_INPUT);
+    await expectEncryptedOnTheWire(sent.id);
+
+    // The event is what Element's own send path produced for the typed text.
+    // eslint-disable-next-line no-console
+    console.log(`[CM5] formatted_body:\n${sent.content.formatted_body}`);
+    expect(sent.content.body, 'content.body must be exactly what was typed').toBe(CM5_INPUT);
+    expect(sent.content.format, 'Element must send the Markdown as HTML').toBe('org.matrix.custom.html');
+    expect(typeof sent.content.formatted_body, 'content.formatted_body must be a string').toBe('string');
+
+    await expect(tileOf(sent.id)).toContainText('overall, driver Alice', { timeout: 30_000 });
+    await clickCopyMarkdown(sent.id);
+    await expect
+      .poll(readClipboard, {
+        timeout: 10_000,
+        message: 'the clipboard still holds the sentinel: "Copy Markdown" copied nothing',
+      })
+      .not.toBe(SENTINEL);
+    const copied = await readClipboard();
+    // eslint-disable-next-line no-console
+    console.log(`[CM5] clipboard:\n${copied}`);
+    expect(copied, 'clipboard after "Copy Markdown" must equal the text that was typed').toBe(CM5_INPUT);
   });
 });
