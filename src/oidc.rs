@@ -8947,6 +8947,59 @@ mod end_session_tests {
             .unwrap();
         assert_eq!(again, EndSessionOutcome::SignedOut { ended: false });
     }
+
+    /// A store fault on the way is a retryable 503, never an answer about the
+    /// request: a fault while ending the grant the hint's `sid` names is not
+    /// "nothing to end" (200), and a fault while reading the client for its
+    /// `post_logout_redirect_uri` is not "not registered" (400). Each fault is a
+    /// value of the wrong type at the key the step reads.
+    #[tokio::test]
+    async fn a_store_fault_while_ending_the_grant_or_reading_the_client_is_a_503() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let key = EcdsaSigningKey::generate();
+        let did = "did:key:zDnEndSessionFault";
+        let params = |hint: String, uri: Option<&str>| EndSessionParams {
+            id_token_hint: Some(hint),
+            client_id: None,
+            post_logout_redirect_uri: uri.map(str::to_string),
+            state: None,
+        };
+
+        // Ending the grant: the sid index is not a string.
+        let client_id = unique("endsess-fault-grant-");
+        let sid = unique("SIDFAULT");
+        let sid_idx = format!("{}/{sid}", siwx_oidc::db::grant::KV_GRANT_SID_IDX_PREFIX);
+        db.sadd_raw(&sid_idx, "x").await.unwrap();
+        let hint = id_token(&key, &client_id, did, Some(&sid), 0, 300);
+        let outcome = end_session(params(hint, None), &key, &[], &config, &db).await;
+        db.del_raw(&sid_idx).await.ok();
+        assert!(
+            matches!(outcome, Err(CustomError::ServiceUnavailable(_))),
+            "a fault ending the grant is a 503, got {outcome:?}"
+        );
+
+        // Reading the client: its registration is not a string.
+        let client_id = unique("endsess-fault-client-");
+        let client_key = format!("clients/{client_id}");
+        db.sadd_raw(&client_key, "x").await.unwrap();
+        let hint = id_token(&key, &client_id, did, Some(&unique("SID")), 0, 300);
+        let outcome = end_session(
+            params(hint, Some("https://rp.example.org/bye")),
+            &key,
+            &[],
+            &config,
+            &db,
+        )
+        .await;
+        db.del_raw(&client_key).await.ok();
+        assert!(
+            matches!(outcome, Err(CustomError::ServiceUnavailable(_))),
+            "a fault reading the client is a 503, got {outcome:?}"
+        );
+    }
 }
 
 #[cfg(test)]

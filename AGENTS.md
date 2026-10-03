@@ -619,6 +619,7 @@ doc; read it before changing the code the rule covers.
   `post_logout_redirect_uri_matching_is_exact`,
   `end_session_ends_the_named_oidc_grant_and_redirects_with_state`,
   `end_grant_by_sid_deletes_exactly_the_named_grant_of_its_client_and_did`,
+  `a_store_fault_while_ending_the_grant_or_reading_the_client_is_a_503`,
   `registration_stores_and_echoes_post_logout_redirect_uris_and_refuses_a_fragment`,
   `discovery_advertises_the_end_session_endpoint`.
 - **Every active deletion of an `oidc` grant sends its RP a back-channel logout token, through a
