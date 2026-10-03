@@ -39,7 +39,7 @@ everything else exists only in the binary crate.
 | `admin_token.rs` | `POST /oauth2/admin_token`: short-TTL token whose scope carries `urn:synapse:admin:*`. |
 | `compat.rs` | `POST /oauth2/revoke` (RFC 7009) and the Matrix client-server endpoints siwx-oidc answers (login flows, logout, logout/all, refresh, device deletion); `TeardownPolicy`. |
 | `device_auth.rs` | RFC 8628 device authorization: `/device_authorization`, the `/device` approval page (wallet and passkey), server-issued CAIP-122 nonces. |
-| `account.rs` | MSC4191 `/account` page and actions, MSC4312 cross-signing reset, and the two non-spec actions `io.inblock.account_erase` / `io.inblock.account_reactivate`. `SUPPORTED_ACTIONS` is the single source of truth for discovery and dispatch; `canonical_action` maps `session_*` aliases to `device_*` and the legacy `org.matrix.account_erase` / `org.matrix.account_reactivate` names to the new ones. |
+| `account.rs` | MSC4191 `/account` page and actions, MSC4312 cross-signing reset, and the two non-spec actions `io.inblock.account_erase` / `io.inblock.account_reactivate`. `SUPPORTED_ACTIONS` is the single source of truth for discovery and dispatch; `canonical_action` maps `session_*` aliases to `device_*` and the legacy `org.matrix.account_erase` / `org.matrix.account_reactivate` names to the new ones. The account session (`create_account_session`) lives in the `OwnSession::Account` layout; the page's sign-out is `POST /account/sign_out` (handler in `axum_lib.rs`). |
 | `webauthn.rs` | Passkey ceremonies (register, authenticate, link), the new-identity and deactivation gates (`reject_if_new_identity`, `reject_if_deactivated`), picker scoping. |
 | `synapse_client.rs` | Synapse client with two credentials: the MAS shared secret on `/_synapse/mas/*` (`provision_user`, `upsert_device`, `update_device_display_name`, `allow_cross_signing_reset`, `localpart_status`, `delete_device`, `deactivate_user`, `reactivate_user`) and a minted admin-scoped token (`admin_request`) on `/_synapse/admin/*` and the client-server API (`list_devices`, `get_device`, `has_cross_signing_keys`, `read_profile`, `publish_did_field`, `read_did_field`). |
 | `did_assertion.rs` | `DID_PROFILE_FIELD`, `mint_did_assertion` (compact ES256 JWS), `did_profile_value`, `DidPublication`. |
@@ -52,8 +52,8 @@ everything else exists only in the binary crate.
 | `credential_identity.rs` (lib) | Which identity a stored passkey authenticates: a `webauthn:link/*` entry overrides the derived `did:key`. |
 | `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL`. |
 | `credential_migration.rs` (lib) | Additive backfill of passkey credentials into the aqua-auth store. |
-| `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry` with the digests of its secret and registration access token and `client_entry_without_plaintext`, `DeviceCodeEntry` and the `DeviceCodeRef` naming its layout, `TokenMetadata` with its `TokenKind`), `Ceremony`, `legacy_token_kind`, Redis key prefixes and TTLs. |
-| `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, `lookup_user_session`, `purge_identity`. |
+| `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry` with the digests of its secret and registration access token and `client_entry_without_plaintext`, `DeviceCodeEntry` and the `DeviceCodeRef` naming its layout, `TokenMetadata` with its `TokenKind`), `Ceremony`, `OwnSession` (the `siwx_user` and `acct_session` layouts), `legacy_token_kind`, Redis key prefixes and TTLs. |
+| `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, the own sessions (`create_own_session`, `lookup_own_session`, `end_own_session`, `revoke_own_sessions`; `lookup_user_session` for the picker), `purge_identity`. |
 | `db/outbox.rs` (lib) | The back-channel logout outbox (`outbox:backchannel_logout`): `LogoutEntry`, claim under a lease, retry, complete. Entries are queued by `drop_grant` in `db/grant.rs`. |
 | `db/grant.rs` (lib) | The grant record and its Lua scripts: `issue_grant`, the access check `check_access_token` (with the legacy read fallback), `rotate_refresh_token` (the one rotation script), `ReuseEvent`, grant revocation, and the legacy migration (`peek_refresh_token`, `lift_legacy_refresh_token`). Keyspace and decision table in its module docs. |
 | `db/tokens.rs` (lib) | Token formats (`mat_`, `msa_`, `mcr_{handle}_{secret}`), `parse_refresh_token` (never panics), `digest` (the SHA-256 every credential a client holds is stored as). |
@@ -445,7 +445,8 @@ doc; read it before changing the code the rule covers.
   `e1_a_user_tombstone_written_by_the_previous_build_still_refuses_refresh`.
 - **No credential a client holds is stored in the clear** (I1): tokens, authorization codes,
   device and user codes, session identifiers (the login `session` cookie, the WebAuthn,
-  account re-auth and device-approval ceremony ids), the device-approval and account re-auth
+  account re-auth and device-approval ceremony ids, the `siwx_user` picker hint and the
+  `acct_session` account session), the device-approval and account re-auth
   CAIP-122 nonces, client secrets and registration access tokens. Each appears in a key or value only as its SHA-256
   (`db::tokens::digest`); access tokens are keyed `at/{digest}`, refresh tokens are kept as
   digests in their grant, and the successor pair of a rotation is sealed under the previous
@@ -459,12 +460,16 @@ doc; read it before changing the code the rule covers.
   once: `token/{raw}` (lifted), `codes/`, `sessions/`, `device_codes/`, `user_codes/`,
   `caip122_nonce/`, `webauthn:challenge/`, `webauthn:link_challenge/`, and a plaintext client entry,
   upgraded atomically on first read without losing a field (marked
-  `TODO(remove one release after Phase 2b)`; plaintext clients live 30 days). Accepted deploy
+  `TODO(remove one release after Phase 2b)`; plaintext clients live 30 days); and the own
+  sessions `user:session/` (30 days) and `account_session/` (600 s), read, ended by the account
+  page's sign-out and swept by prefix when the user's sessions are revoked (marked `TODO(remove`
+  at `KV_USER_SESSION_PREFIX` and `KV_LEGACY_ACCOUNT_SESSION_PREFIX`). Accepted deploy
   residue: the previous build's consumed device-approval nonce keeps its user code for up to
   300 s after an upgrade, and the previous build's login sessions (with their signed-in flags)
   keep their raw keys until they expire (300 s), also after a sign-in on the new build, which
-  writes no session; a spent session cannot sign in again. Not covered: the `siwx_user` and
-  `acct_session` cookies (Phase 4 of the token rework moves them); passkey credential ids
+  writes no session; a spent session cannot sign in again. Not covered: the account page's
+  CSRF token, kept in the value of the digest-keyed account session, which authorizes nothing
+  without the session cookie; passkey credential ids
   (`webauthn:credential/{id}`, `webauthn:link/{id}`), which are public identifiers the server
   hands out in `allowCredentials`, not bearer credentials; a grant's `sid` (stored in the grant
   and as the key `idx:grants:sid/{sid}`), which every RP that holds the ID token receives and
@@ -665,6 +670,32 @@ doc; read it before changing the code the rule covers.
   `registration_stores_backchannel_logout_metadata_and_refuses_an_unsafe_uri`;
   generic-mode server and stub RP:
   `a_uri_on_a_refused_address_is_refused_at_registration_and_never_delivered_to`.
+- **siwx-oidc's own sessions are digest-keyed and end with the user's sessions.** The
+  `siwx_user` picker hint (`siwx_user/{digest}`, 30 days) and the `acct_session` account session
+  (`acct_session/{digest}`, 600 s) are stored under the digest of the cookie value, and each is
+  indexed under the digest of the canonical DID (`idx:own_sessions/{digest}`, a sorted set scored
+  by expiry) in the same script that writes it. `logout/all`, deactivation and erasure end every
+  own session of the DID through that index (`revoke_own_sessions`; a `did:pkh` address in any
+  case is the same user); the account page's **Sign out** (`POST /account/sign_out`) ends only
+  this browser's two sessions and clears both cookies. `/end_session` leaves the hint alone: it
+  ends an RP's grant, and the hint authorizes nothing. The lookup reads the digest key and then
+  the legacy key with two `GET`s, never one `MGET`, so a store fault is an error and not a miss.
+  Enumeration safety is unchanged (see "Passkeys"). Pin:
+  `own_sessions_are_keyed_by_the_digest_of_the_token`, `a_legacy_own_session_is_read_and_ended`,
+  `revoking_own_sessions_ends_every_session_of_the_did_and_no_other`; mock stack:
+  `no_own_session_the_client_holds_is_stored_in_the_clear`,
+  `logout_all_ends_every_own_session_of_the_user`,
+  `deactivation_ends_every_own_session_of_the_user`, `erasure_ends_every_own_session_of_the_user`,
+  `account_sign_out_ends_this_browsers_account_session_and_picker_hint`.
+- **A sign-out never reports success while revoking nothing.** `logout` and `logout/all` answer a
+  token-store fault (reading the bearer, revoking the tokens, ending the own sessions) with the
+  retryable 503 (`M_UNKNOWN`) of the refresh and device-deletion routes. A failed `logout`
+  deletes nothing as a last resort: a deleted access token would turn the client's retry into a
+  no-op while the device's refresh token lived on. RFC 7009 revocation keeps its best-effort
+  fallback and its 200. The account page's sign-out answers a fault with 503 too
+  (`oidc::store_unavailable`). Pin:
+  `a_store_fault_during_logout_is_a_retryable_503_and_the_retry_tears_down`,
+  `a_store_fault_during_logout_all_is_a_retryable_503`.
 - **`/oauth2/revoke` never deletes a device.** Only explicit sign-out (`logout`, MSC4191
   `device_delete`) does; `logout/all` never deactivates the account. Pin:
   `teardown_policy_only_deletes_device_on_explicit_signout`,

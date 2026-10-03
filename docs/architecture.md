@@ -157,7 +157,9 @@ digest-keyed prefix differs from the raw-keyed one an earlier build used, which 
 reads, and uses once, for the entry's remaining lifetime: a client presenting a stored digest as
 its credential reads a raw-keyed prefix nothing writes. A client entry keeps its key and stores
 its two credentials under member names an earlier build did not use, for the same reason. The
-`siwx_user` and `acct_session` cookies are still raw keys. Passkey credential ids are keys too:
+`siwx_user` and `acct_session` cookies are digest-keyed the same way, and indexed per DID so
+`logout/all`, deactivation and erasure end them all. The account session's CSRF token is kept in
+its value: it authorizes nothing without the cookie. Passkey credential ids are keys too:
 they are public identifiers the server hands out in `allowCredentials`, not credentials.
 
 | Key | TTL | Holds |
@@ -181,8 +183,10 @@ they are public identifiers the server hands out in `allowCredentials`, not cred
 | `device_code/{sha256(device code)}` (+ `/redeemed`) | 1800 s | `DeviceCodeEntry` (RFC 8628, with the user code's digest) and its single-redemption claim |
 | `user_code/{sha256(user code)}` | 1800 s | the device code's digest; the user code is hashed exactly as presented |
 | `caip122_nonce/{category}/{nonce}` (+ `/consumed`), `device_codes/{device_code}` (+ `/redeemed`), `user_codes/{user_code}` | 300 s / 1800 s | legacy: read until they expire. A legacy device code is found by either code and updated and deleted in place; its claim is digest-keyed, and a legacy claim still counts |
-| `account_session/{token}` | 600 s | `/account` session (`acct_session` cookie, `Path=/account`) |
-| `user:session/{token}` | 30 d | DID behind the opaque `siwx_user` cookie (passkey-picker scoping) |
+| `acct_session/{sha256(cookie)}` | 600 s | `/account` session (`acct_session` cookie, `Path=/account`): `{did, csrf, exp}` |
+| `siwx_user/{sha256(cookie)}` | 30 d | DID behind the opaque `siwx_user` cookie (passkey-picker scoping) |
+| `idx:own_sessions/{sha256(canonical DID)}` | the longest session it names | sorted set of the DID's `siwx_user/…` and `acct_session/…` keys, scored by expiry (Unix ms, Redis `TIME`); written with the session in one script, pruned of expired members on each write, emptied with the sessions by `logout/all`, deactivation and erasure |
+| `account_session/{token}`, `user:session/{token}` | 600 s / 30 d | legacy own sessions: read until they expire, ended by the account page's sign-out, and found by a prefix scan when the user's sessions are revoked |
 | `webauthn:ceremony/{sha256(ceremony id)}` | 120 s | registration or authentication ceremony state, read and deleted in one step; the ceremony id is the `session` cookie, the `session_id` the account re-auth start returns, or `device_passkey_{user_code}` |
 | `webauthn:link_ceremony/{sha256(session id)}` | 120 s | link ceremony state |
 | `webauthn:challenge/{id}`, `webauthn:link_challenge/{id}` | 120 s | legacy ceremony state, read until it expires |

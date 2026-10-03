@@ -520,6 +520,11 @@ Builds before the grant record stored each token as `token/{raw}` with its
   that lost a refresh response in the minute before the upgrade signs in again.
 - Legacy refresh tokens never presented expire on their own within 90 days;
   revocation sweeps them in the meantime.
+- `siwx_user` hints and account sessions the previous build wrote by raw token
+  (`user:session/…`, 30 days; `account_session/…`, 600 s) keep working until
+  they expire; the build writes only the digest layout. `logout/all`,
+  deactivation and erasure end the old entries too, by a prefix scan that goes
+  with the legacy read.
 - A rollback to a build before the grant record signs out every session that
   refreshed on the new build: the old build knows neither the grant tokens nor
   the lifted legacy tokens, whose entries are gone.
@@ -547,6 +552,13 @@ Builds before the grant record stored each token as `token/{raw}` with its
   still ends by revocation, expiry or an epoch. Its client registration reads
   `post_logout_redirect_uris` without knowing it, and a client update through
   the old build drops it.
+- A rollback to a build before digest-keyed own sessions reads neither
+  `siwx_user/…` nor `acct_session/…`: account pages ask for a new re-auth and
+  passkey pickers are unscoped until the next sign-in. Nothing is lost that a
+  sign-in does not restore; `logout/all` on the old build does not end the
+  sessions written by the new one (they expire on their own, at most 30 days for
+  a hint, which scopes a picker and authorizes nothing). Rolling forward reads the
+  old build's raw-keyed sessions again for their remaining lifetime.
 - A rollback to a build before back-channel logout sends no logout tokens and
   queues none. Entries queued before the rollback stay in
   `outbox:backchannel_logout` and are delivered when a build with the worker
@@ -745,10 +757,18 @@ sign-out deletes the device, token hygiene does not.
   rotation and when dialogs are dismissed. Deleting the device there raced
   in-flight key uploads and broke users' cross-signing identity in a June 2026
   incident.
-- `logout/all` ends sessions; it does **not** deactivate the account.
-- All teardown is best-effort and idempotent, and never returns 500. Revoke,
-  logout and `logout/all` always answer 200 (`{}` for the Matrix routes), even
-  for an unknown token. Without a Synapse client or server name, teardown
+- `logout/all` ends sessions; it does **not** deactivate the account. It also
+  ends the user's own sessions at this provider: every `siwx_user` picker hint
+  and `acct_session` account session of the DID (deactivation and erasure do
+  too).
+- All teardown is idempotent and never returns 500. Revoke always answers 200;
+  logout and `logout/all` answer 200 (`{}`), also for an unknown token, unless
+  the token store fails: then they answer the retryable 503 (`M_UNKNOWN`) of the
+  refresh and device-deletion routes, never a success that revoked nothing. A
+  failed logout leaves the bearer valid, so the client's retry tears the whole
+  session down; the Synapse device deletes stay best-effort. Revoke keeps its
+  best-effort fallback (it deletes the presented token where it can) and its
+  200. Without a Synapse client or server name, teardown
   revokes Redis tokens only. Revocation is keyed on the localpart (the grant's
   `username`, and `TokenMetadata.username` for a legacy entry), not the raw DID.
 - In standalone mode tokens have no device, so revoke and logout remove only the
@@ -800,7 +820,11 @@ included, to the action it dispatches.
   (`Path=/account`, `HttpOnly`, `SameSite=Strict`, 10 minutes) bound to the
   verified DID, and returns a CSRF token. Further actions go to
   `POST /account/action` with the cookie and the CSRF token, without a new
-  signature. Deactivate and erase clear the cookie.
+  signature. Deactivate and erase clear the cookie and end every account
+  session and `siwx_user` hint of the user. The session is stored under the
+  digest of the cookie value (`acct_session/{sha256}`), and the page's
+  **Sign out** button (`POST /account/sign_out`) ends it together with this
+  browser's `siwx_user` hint.
 - **No action given.** `GET /account` with no or an empty `action` shows a menu
   (profile, sessions, deactivate, erase, reactivate). Element Web's generic
   "Manage account" opens the bare URL, and the menu is the only way an Element
