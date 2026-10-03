@@ -434,18 +434,36 @@ pub async fn logout(
 
 /// Bulk sign-out: invalidates EVERY session of the bearer token's user.
 ///
-/// Resolves the user from the bearer token, then (when Synapse + `server_name`
-/// are configured) lists the user's Synapse devices and deletes each one
-/// best-effort (a per-device failure is logged and the loop continues), and
-/// finally revokes ALL of the user's OAuth tokens in Redis.
+/// Resolves the user from the bearer token, ends the user's own sessions on
+/// this provider (the `siwx_user` picker hints and `acct_session` account
+/// sessions), then (when Synapse + `server_name` are configured) lists the
+/// user's Synapse devices and deletes each one best-effort (a per-device
+/// failure is logged and the loop continues), and finally revokes ALL of the
+/// user's OAuth tokens in Redis.
 ///
 /// This is session invalidation, NOT account deactivation: the account stays
 /// active and the user can sign in again. It therefore must NEVER call
-/// `deactivate_user`. It also ends the user's own sessions on this provider
-/// (the `siwx_user` picker hints and `acct_session` account sessions).
-/// Degrades to Redis-only revocation in standalone mode, is an idempotent 200
-/// no-op when the bearer token is missing or unknown, and answers a token-store
-/// fault with the retryable 503 (the retry finds the devices already gone).
+/// `deactivate_user`. Degrades to Redis-only revocation in standalone mode, is
+/// an idempotent 200 no-op when the bearer token is missing or unknown, and
+/// answers a token-store fault with the retryable 503.
+///
+/// The order is what makes that 503 retryable: every step is idempotent, and
+/// the grants, and with them the bearer, go last. A fault ending the own
+/// sessions deletes no grant, so the retry with the same bearer runs the whole
+/// sign-out again. Revoking the grants first turned that retry into an unknown
+/// token, a 200 that left the own sessions live (an `acct_session` authorizes
+/// device deletion, deactivation and erasure for 600 s).
+///
+/// Residual: a fault in the grant sweep after its script wrote the user epoch
+/// (inside the script, which does not roll back, or in the legacy `token/*`
+/// loop after it) answers 503, and the epoch already refuses the bearer, so the
+/// retry is the 200 no-op. By then the own sessions
+/// are ended and the epoch refuses every grant of the user at every endpoint,
+/// so nothing the user holds still works; what stays behind are the grants the
+/// script did not reach, with their index entries, refused until their TTL, and
+/// their back-channel logout tokens: an OIDC grant the sweep did not delete
+/// gets one only when its RP next tries to refresh it (the rotation deletes an
+/// epoch-refused grant through `drop_grant`), never if it does not.
 pub async fn logout_all(
     State(state): State<CompatState>,
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
@@ -467,7 +485,20 @@ pub async fn logout_all(
     let username = meta.username;
     let did = meta.did;
 
-    // Phase 1: delete every Synapse device for the user (best-effort per device).
+    // Phase 1: the user's own sessions on this provider, BEFORE any grant is
+    // touched, so a fault here leaves the bearer for the retry (see above). A
+    // minted admin token carries no DID and has none.
+    if !did.is_empty() {
+        match state.redis_client.revoke_own_sessions(&did).await {
+            Ok(ended) => info!(username = %username, ended = ended as u64, "own sessions ended"),
+            Err(e) => {
+                warn!(error = %e, username = %username, "logout_all: revoke_own_sessions failed; returning retryable 503");
+                return token_store_unavailable();
+            }
+        }
+    }
+
+    // Phase 2: delete every Synapse device for the user (best-effort per device).
     if let (Some(synapse), Some(server_name)) =
         (state.synapse_client.as_ref(), state.server_name.as_deref())
     {
@@ -490,7 +521,9 @@ pub async fn logout_all(
         }
     }
 
-    // Phase 2: ALWAYS revoke every OAuth token for the user (never deactivate).
+    // Phase 3, last: ALWAYS revoke every OAuth token for the user (never
+    // deactivate). The script writes the user epoch before it deletes a grant;
+    // a fault after that write is the residual described above.
     match state.redis_client.revoke_all_user_tokens(&username).await {
         Ok(revoked) => {
             info!(username = %username, revoked = revoked as u64, "all sessions torn down")
@@ -498,17 +531,6 @@ pub async fn logout_all(
         Err(e) => {
             warn!(error = %e, username = %username, "logout_all: revoke_all_user_tokens failed; returning retryable 503");
             return token_store_unavailable();
-        }
-    }
-    // Phase 3: the user's own sessions on this provider. A minted admin token
-    // carries no DID and has none.
-    if !did.is_empty() {
-        match state.redis_client.revoke_own_sessions(&did).await {
-            Ok(ended) => info!(username = %username, ended = ended as u64, "own sessions ended"),
-            Err(e) => {
-                warn!(error = %e, username = %username, "logout_all: revoke_own_sessions failed; returning retryable 503");
-                return token_store_unavailable();
-            }
         }
     }
 

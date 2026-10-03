@@ -695,11 +695,18 @@ doc; read it before changing the code the rule covers.
   token-store fault (reading the bearer, revoking the tokens, ending the own sessions) with the
   retryable 503 (`M_UNKNOWN`) of the refresh and device-deletion routes. A failed `logout`
   deletes nothing as a last resort: a deleted access token would turn the client's retry into a
-  no-op while the device's refresh token lived on. RFC 7009 revocation keeps its best-effort
-  fallback and its 200. The account page's sign-out answers a fault with 503 too
-  (`oidc::store_unavailable`). Pin:
-  `a_store_fault_during_logout_is_a_retryable_503_and_the_retry_tears_down`,
-  `a_store_fault_during_logout_all_is_a_retryable_503`.
+  no-op while the device's refresh token lived on. For the same reason `logout/all` ends the
+  own sessions FIRST, then the Synapse devices (best-effort), and revokes the grants, and with
+  them the bearer, LAST: a fault ending the own sessions revokes no grant, so the retry with the
+  same bearer runs the whole sign-out again. Residual: a fault in the grant sweep after it wrote
+  the user epoch (a Redis script does not roll back) is a 503 whose retry is the 200 no-op; the
+  own sessions are already ended and the epoch refuses every grant of the user, but grants the
+  sweep did not reach stay stored until their TTL, and an OIDC one sends its back-channel logout
+  token only when its RP next refreshes. RFC 7009 revocation keeps its best-effort fallback and
+  its 200. The account page's sign-out answers a fault with 503 too (`oidc::store_unavailable`).
+  Pin: `a_store_fault_during_logout_is_a_retryable_503_and_the_retry_tears_down`,
+  `a_store_fault_during_logout_all_is_a_retryable_503`,
+  `a_logout_all_retry_after_an_own_session_fault_ends_the_own_sessions_and_the_grants`.
 - **`/oauth2/revoke` never deletes a device.** Only explicit sign-out (`logout`, MSC4191
   `device_delete`) does; `logout/all` never deactivates the account. Pin:
   `teardown_policy_only_deletes_device_on_explicit_signout`,
