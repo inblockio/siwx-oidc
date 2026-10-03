@@ -1260,6 +1260,153 @@ mod tests {
         client.revoke_grants_for_device(&user, &dev).await.ok();
     }
 
+    /// The members of the Redis set at `key`, and a function's worth of
+    /// restoring them: a planted fault overwrites the set, and the retry after
+    /// the fault needs it back.
+    async fn set_members(key: &str) -> Vec<String> {
+        let raw =
+            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
+        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        bb8_redis::redis::cmd("SMEMBERS")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    async fn restore_set(key: &str, members: &[String]) {
+        let raw =
+            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
+        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let _: () = bb8_redis::redis::cmd("DEL")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let _: () = bb8_redis::redis::cmd("SADD")
+            .arg(key)
+            .arg(members)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    /// A store fault during `POST /_matrix/client/v3/logout` is the retryable
+    /// 503 of the refresh and device-deletion routes, never a 200 that reports a
+    /// sign-out while nothing was revoked: a fault reading the bearer, and a
+    /// fault while revoking the device's grants. The second leaves the bearer
+    /// in place, so the client's retry tears the whole session down.
+    #[tokio::test]
+    async fn a_store_fault_during_logout_is_a_retryable_503_and_the_retry_tears_down() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("logout-fault-{n}");
+        let state = standalone_state(client.clone());
+
+        // A fault reading the bearer.
+        let dev = format!("LOOKUP_{n}");
+        let access = seed_grant(&client, &user, &dev).await.access_token;
+        plant_store_fault(&format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_ACCESS_TOKEN_PREFIX,
+            tokens::digest(&access)
+        ))
+        .await;
+        let response = logout(State(state.clone()), bearer(&access))
+            .await
+            .into_response();
+        let (status, body) = status_and_json(response).await;
+        assert_retryable_503(status, &body, "logout, bearer lookup fault");
+        client.revoke_grants_for_device(&user, &dev).await.ok();
+
+        // A fault revoking the device's grants.
+        let dev = format!("REVOKE_{n}");
+        let issued = seed_grant(&client, &user, &dev).await;
+        let idx = format!(
+            "{}/{user}/{dev}",
+            siwx_oidc::db::grant::KV_GRANT_DEVICE_IDX_PREFIX
+        );
+        let members = set_members(&idx).await;
+        assert!(!members.is_empty(), "the device index names the grant");
+        plant_store_fault(&idx).await;
+        let response = logout(State(state.clone()), bearer(&issued.access_token))
+            .await
+            .into_response();
+        let (status, body) = status_and_json(response).await;
+        assert_retryable_503(status, &body, "logout, revocation fault");
+        assert!(
+            client
+                .lookup_access_token(&issued.access_token)
+                .await
+                .unwrap()
+                .is_some(),
+            "a failed logout leaves the bearer in place for the retry"
+        );
+
+        restore_set(&idx, &members).await;
+        let response = logout(State(state.clone()), bearer(&issued.access_token))
+            .await
+            .into_response();
+        let (status, _body) = status_and_json(response).await;
+        assert_eq!(status, StatusCode::OK, "the retry signs out");
+        assert!(
+            client
+                .lookup_access_token(&issued.access_token)
+                .await
+                .unwrap()
+                .is_none(),
+            "the retry ends the access token"
+        );
+        assert!(
+            client
+                .peek_refresh_grant(issued.refresh_token.as_deref().unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "the retry ends the grant"
+        );
+    }
+
+    /// A store fault during `POST /_matrix/client/v3/logout/all` is the
+    /// retryable 503, never a 200 that reports every session ended: a fault
+    /// reading the bearer, and a fault in the sweep of the user's grants.
+    #[tokio::test]
+    async fn a_store_fault_during_logout_all_is_a_retryable_503() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let state = standalone_state(client.clone());
+
+        let user = format!("logout-all-lookup-{n}");
+        let dev = format!("ALL_{n}");
+        let access = seed_grant(&client, &user, &dev).await.access_token;
+        plant_store_fault(&format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_ACCESS_TOKEN_PREFIX,
+            tokens::digest(&access)
+        ))
+        .await;
+        let response = logout_all(State(state.clone()), bearer(&access))
+            .await
+            .into_response();
+        let (status, body) = status_and_json(response).await;
+        assert_retryable_503(status, &body, "logout/all, bearer lookup fault");
+        client.revoke_grants_for_device(&user, &dev).await.ok();
+
+        let user = format!("logout-all-sweep-{n}");
+        let access = seed_grant(&client, &user, &dev).await.access_token;
+        plant_store_fault(&format!(
+            "{}/{user}",
+            siwx_oidc::db::grant::KV_GRANT_USER_IDX_PREFIX
+        ))
+        .await;
+        let response = logout_all(State(state.clone()), bearer(&access))
+            .await
+            .into_response();
+        let (status, body) = status_and_json(response).await;
+        assert_retryable_503(status, &body, "logout/all, sweep fault");
+        client.revoke_grants_for_device(&user, &dev).await.ok();
+    }
+
     async fn status_and_json(
         response: axum::response::Response,
     ) -> (StatusCode, serde_json::Value) {

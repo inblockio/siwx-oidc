@@ -4513,3 +4513,373 @@ async fn end_session_refuses_a_foreign_or_tampered_hint() {
         );
     }
 }
+
+// ===========================================================================
+// Own sessions (design 5.7): the `siwx_user` picker hint and the `acct_session`
+// account-page session are digest-keyed (I1) and end at `logout/all`,
+// deactivation, erasure and the account page's sign-out.
+// ===========================================================================
+
+/// The value a response's Set-Cookie headers give `name`, if non-empty.
+fn set_cookie_value(resp: &reqwest::Response, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    resp.headers().get_all("set-cookie").iter().find_map(|v| {
+        let rest = v.to_str().ok()?.strip_prefix(prefix.as_str())?;
+        let value = rest.split(';').next().unwrap_or("");
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// Whether a response's Set-Cookie headers clear `name` (empty, `Max-Age=0`).
+fn set_cookie_clears(resp: &reqwest::Response, name: &str) -> bool {
+    let prefix = format!("{name}=;");
+    resp.headers().get_all("set-cookie").iter().any(|v| {
+        v.to_str()
+            .is_ok_and(|s| s.starts_with(prefix.as_str()) && s.contains("Max-Age=0"))
+    })
+}
+
+/// `GET /sign_in` for a started login: the authorization code and the
+/// `siwx_user` picker hint the response sets.
+async fn sign_in_with_hint(base: &str, w: &Wallet, login: &StartedLogin) -> (String, String) {
+    let resp = no_redirect_client()
+        .get(format!("{base}/sign_in"))
+        .header(
+            "cookie",
+            format!(
+                "{}; siwx={}",
+                login.cookie(),
+                siwx_cookie_for(base, w, login)
+            ),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "sign_in 303");
+    let hint = set_cookie_value(&resp, "siwx_user").expect("sign_in sets the siwx_user hint");
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    let code = parse_query(location)
+        .get("code")
+        .unwrap_or_else(|| panic!("sign_in redirect carries no code: {location}"))
+        .clone();
+    (code, hint)
+}
+
+/// The sessions one account re-auth gives a browser: the account session, its
+/// CSRF token, and a second picker hint.
+struct AccountSession {
+    cookie: String,
+    csrf: String,
+    hint: String,
+}
+
+/// One wallet re-auth for `action` (`POST /account/wallet`).
+async fn account_reauth_with_hint(
+    c: &Client,
+    base: &str,
+    w: &Wallet,
+    action: &str,
+) -> AccountSession {
+    let (message, signature) = sign_account_message(c, w, base, action).await;
+    let resp = c
+        .post(format!("{base}/account/wallet"))
+        .json(&json!({
+            "action": action,
+            "did": w.did, "message": message, "signature": signature, "device_id": null
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "account re-auth ({action}) must succeed"
+    );
+    let cookie = set_cookie_value(&resp, "acct_session").expect("re-auth sets acct_session");
+    let hint = set_cookie_value(&resp, "siwx_user").expect("re-auth sets the siwx_user hint");
+    let body: Value = resp.json().await.unwrap();
+    let csrf = body["csrf"]
+        .as_str()
+        .expect("re-auth carries csrf")
+        .to_string();
+    AccountSession { cookie, csrf, hint }
+}
+
+/// Whether the picker hint still scopes a login's passkey picker: the start of
+/// a passkey login names the account it detected (`detected_mxid`) exactly when
+/// the server resolves the hint (`detected_mxid_for` always answers for a
+/// resolved hint, deactivated and erased accounts included).
+async fn hint_scopes(c: &Client, base: &str, hint: &str) -> bool {
+    let login = start_login(c, base).await;
+    let cookie = format!("{}; siwx_user={hint}", login.cookie());
+    let started = post_ok(
+        c,
+        base,
+        "/webauthn/authenticate/start",
+        Some(&cookie),
+        json!({}),
+    )
+    .await;
+    started.get("detected_mxid").is_some_and(Value::is_string)
+}
+
+/// Whether an account session still authorizes an action: an ended session is
+/// a 401, a live one runs the action (whatever the action then answers).
+async fn account_session_live(c: &Client, base: &str, s: &AccountSession) -> bool {
+    let resp = account_action(c, base, &s.cookie, "org.matrix.devices_list", None, &s.csrf).await;
+    resp.status() != StatusCode::UNAUTHORIZED
+}
+
+/// H4 for own sessions: the `siwx_user` hints of a sign-in and an account
+/// re-auth and the `acct_session` cookie appear in no key and no value of the
+/// stack Redis; the positive controls find them under their digest keys.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn no_own_session_the_client_holds_is_stored_in_the_clear() {
+    let Some(url) = stack_redis_url() else {
+        let marker = "E2E_SKIP: no_own_session_the_client_holds_is_stored_in_the_clear: no \
+                      stack Redis URL (E2E_REDIS_URL, SIWXOIDC_REDIS_URL, SIWEOIDC_REDIS_URL or \
+                      REDIS_HOST/REDIS_PORT); the keyspace was NOT searched";
+        assert!(
+            std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+            "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+        );
+        eprintln!("{marker}");
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    let mut held = ClientHeld::default();
+
+    let login = start_login(&c, &base).await;
+    let (_code, hint) = sign_in_with_hint(&base, &w, &login).await;
+    held.add("siwx_user hint set by sign_in", &hint);
+    let account = account_reauth_with_hint(&c, &base, &w, "org.matrix.profile").await;
+    held.add("acct_session cookie", &account.cookie);
+    held.add("siwx_user hint set by the account re-auth", &account.hint);
+
+    let scan = assert_nothing_stored_in_the_clear(&url, &held, "with both own sessions").await;
+    for (what, key) in [
+        (
+            "the sign-in hint",
+            format!("siwx_user/{}", digest_hex(&hint)),
+        ),
+        (
+            "the re-auth hint",
+            format!("siwx_user/{}", digest_hex(&account.hint)),
+        ),
+        (
+            "the account session",
+            format!("acct_session/{}", digest_hex(&account.cookie)),
+        ),
+    ] {
+        assert!(
+            scanned(&scan, &key),
+            "positive control: {what} is stored under its digest key {key} ({} keys scanned \
+             in {url})",
+            scan.keys.len()
+        );
+    }
+    assert!(
+        hint_scopes(&c, &base, &hint).await,
+        "the digest-keyed hint still scopes the picker"
+    );
+    assert!(
+        account_session_live(&c, &base, &account).await,
+        "the digest-keyed account session still authorizes"
+    );
+}
+
+/// `logout/all` ends every own session of the user (both picker hints and the
+/// account session) and none of another user's.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn logout_all_ends_every_own_session_of_the_user() {
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let (w, other) = (new_wallet(), new_wallet());
+
+    let login = start_login(&c, &base).await;
+    let (code, signin_hint) = sign_in_with_hint(&base, &w, &login).await;
+    let tokens = exchange_code(&c, &base, &login.rc, &code, &login.verifier)
+        .await
+        .expect("the code exchanges");
+    let access = tokens["access_token"].as_str().unwrap().to_string();
+    let account = account_reauth_with_hint(&c, &base, &w, "org.matrix.profile").await;
+    let other_login = start_login(&c, &base).await;
+    let (_code, other_hint) = sign_in_with_hint(&base, &other, &other_login).await;
+
+    for (what, hint) in [
+        ("sign-in hint", &signin_hint),
+        ("re-auth hint", &account.hint),
+        ("other user's hint", &other_hint),
+    ] {
+        assert!(
+            hint_scopes(&c, &base, hint).await,
+            "before: the {what} scopes"
+        );
+    }
+    assert!(
+        account_session_live(&c, &base, &account).await,
+        "before: the account session authorizes"
+    );
+
+    let resp = c
+        .post(format!("{base}/_matrix/client/v3/logout/all"))
+        .bearer_auth(&access)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "logout/all");
+
+    assert!(
+        !hint_scopes(&c, &base, &signin_hint).await,
+        "after logout/all the sign-in hint scopes nothing"
+    );
+    assert!(
+        !hint_scopes(&c, &base, &account.hint).await,
+        "after logout/all the re-auth hint scopes nothing"
+    );
+    assert!(
+        !account_session_live(&c, &base, &account).await,
+        "after logout/all the account session is a 401"
+    );
+    assert!(
+        hint_scopes(&c, &base, &other_hint).await,
+        "logout/all leaves another user's hint alone"
+    );
+}
+
+/// A terminal account action (deactivation or erasure) through one account
+/// session ends every own session of the user: the sign-in hint, the hints of
+/// both re-auths and the second account session.
+async fn terminal_action_ends_every_own_session(action: &str) {
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    let login = start_login(&c, &base).await;
+    let (_code, signin_hint) = sign_in_with_hint(&base, &w, &login).await;
+    let acting = account_reauth_with_hint(&c, &base, &w, action).await;
+    let second = account_reauth_with_hint(&c, &base, &w, "org.matrix.profile").await;
+
+    for (what, hint) in [
+        ("sign-in hint", &signin_hint),
+        ("acting re-auth hint", &acting.hint),
+        ("second re-auth hint", &second.hint),
+    ] {
+        assert!(
+            hint_scopes(&c, &base, hint).await,
+            "before {action}: the {what} scopes"
+        );
+    }
+    assert!(
+        account_session_live(&c, &base, &second).await,
+        "before {action}: the second account session authorizes"
+    );
+
+    let resp = account_action(&c, &base, &acting.cookie, action, None, &acting.csrf).await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(status, StatusCode::OK, "{action}: {body}");
+
+    for (what, hint) in [
+        ("sign-in hint", &signin_hint),
+        ("acting re-auth hint", &acting.hint),
+        ("second re-auth hint", &second.hint),
+    ] {
+        assert!(
+            !hint_scopes(&c, &base, hint).await,
+            "after {action} the {what} scopes nothing"
+        );
+    }
+    assert!(
+        !account_session_live(&c, &base, &second).await,
+        "after {action} the second account session is a 401"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn deactivation_ends_every_own_session_of_the_user() {
+    terminal_action_ends_every_own_session("org.matrix.account_deactivate").await;
+}
+
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn erasure_ends_every_own_session_of_the_user() {
+    terminal_action_ends_every_own_session("io.inblock.account_erase").await;
+}
+
+/// The account page's sign-out (`POST /account/sign_out`) ends this browser's
+/// account session and picker hint, clears both cookies, and leaves the hint
+/// another browser holds alone. Without cookies it is an idempotent 200.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn account_sign_out_ends_this_browsers_account_session_and_picker_hint() {
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    let login = start_login(&c, &base).await;
+    let (_code, other_browser_hint) = sign_in_with_hint(&base, &w, &login).await;
+    let account = account_reauth_with_hint(&c, &base, &w, "org.matrix.profile").await;
+    assert!(
+        account_session_live(&c, &base, &account).await,
+        "before: the account session authorizes"
+    );
+    assert!(
+        hint_scopes(&c, &base, &account.hint).await,
+        "before: this browser's hint scopes"
+    );
+
+    let resp = c
+        .post(format!("{base}/account/sign_out"))
+        .header(
+            "cookie",
+            format!(
+                "acct_session={}; siwx_user={}",
+                account.cookie, account.hint
+            ),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "POST /account/sign_out");
+    assert!(
+        set_cookie_clears(&resp, "acct_session"),
+        "the sign-out clears the acct_session cookie"
+    );
+    assert!(
+        set_cookie_clears(&resp, "siwx_user"),
+        "the sign-out clears the siwx_user cookie"
+    );
+
+    assert!(
+        !account_session_live(&c, &base, &account).await,
+        "after the sign-out the account session is a 401"
+    );
+    assert!(
+        !hint_scopes(&c, &base, &account.hint).await,
+        "after the sign-out this browser's hint scopes nothing"
+    );
+    assert!(
+        hint_scopes(&c, &base, &other_browser_hint).await,
+        "the sign-out ends only this browser's sessions"
+    );
+
+    let resp = c
+        .post(format!("{base}/account/sign_out"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a sign-out without cookies is a 200"
+    );
+}

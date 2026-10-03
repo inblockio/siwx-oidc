@@ -146,12 +146,70 @@ impl Ceremony {
     }
 }
 
-/// Redis key prefix for the opaque login user-session: `user:session/{token}` ->
-/// DID. The token is the identity hint that scopes the passkey picker's
-/// `allowCredentials` on a returning login. It is an OPAQUE random token (never a
-/// plaintext DID), so a forged/guessed value is a Redis miss -> safe usernameless
-/// fallback (the load-bearing enumeration-safety invariant).
+/// Where builds before Phase 4 of the token rework kept the opaque login
+/// user-session, by raw token: `user:session/{token}` -> DID. Read for the
+/// remaining lifetime of such an entry ([`USER_SESSION_LIFETIME`]) and never
+/// written anew; [`OwnSession::PickerHint`] keys it by digest now.
+/// TODO(remove 30 days after Phase 4 is deployed): the legacy read and sweep.
 pub const KV_USER_SESSION_PREFIX: &str = "user:session";
+/// Where builds before Phase 4 kept the account-page session, by raw token.
+/// Lives [`OwnSession::Account`]'s 600 s at most.
+/// TODO(remove one release after Phase 4): the legacy read and sweep.
+const KV_LEGACY_ACCOUNT_SESSION_PREFIX: &str = "account_session";
+
+/// Per-DID index of the user's own sessions: `idx:own_sessions/{digest}`, the
+/// digest of the canonical DID ([`crate::mxid::canonicalize`]), a sorted set of
+/// the session keys with their expiry (Unix ms) as score. It is what lets
+/// `logout/all`, deactivation and erasure end every own session of the user
+/// without a keyspace scan.
+pub const KV_OWN_SESSION_IDX_PREFIX: &str = "idx:own_sessions";
+
+/// siwx-oidc's own browser sessions, each keyed by the digest of the cookie
+/// value the browser holds (I1), like the credentials of Phase 2b:
+///
+/// - [`PickerHint`](Self::PickerHint): the `siwx_user` cookie, an OPAQUE random
+///   token that scopes the passkey picker's `allowCredentials` on a returning
+///   login (`siwx_user/{digest}` -> DID). A forged or guessed value is a Redis
+///   miss and so a usernameless login (the enumeration-safety invariant).
+/// - [`Account`](Self::Account): the `acct_session` cookie of the account page
+///   (`acct_session/{digest}` -> the session JSON with its DID and CSRF token).
+///
+/// Both prefixes differ from the raw-keyed layout of earlier builds, so a
+/// stored digest presented as a cookie matches nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnSession {
+    PickerHint,
+    Account,
+}
+
+impl OwnSession {
+    pub(crate) fn prefix(self) -> &'static str {
+        match self {
+            OwnSession::PickerHint => "siwx_user",
+            OwnSession::Account => "acct_session",
+        }
+    }
+
+    /// Where a build before Phase 4 stored the same session, by raw token.
+    pub(crate) fn legacy_prefix(self) -> &'static str {
+        match self {
+            OwnSession::PickerHint => KV_USER_SESSION_PREFIX,
+            OwnSession::Account => KV_LEGACY_ACCOUNT_SESSION_PREFIX,
+        }
+    }
+
+    /// The DID an entry of this kind is bound to, from its stored value.
+    pub(crate) fn did_of(self, value: &str) -> Option<String> {
+        match self {
+            OwnSession::PickerHint => Some(value.to_string()),
+            OwnSession::Account => serde_json::from_str::<serde_json::Value>(value)
+                .ok()?
+                .get("did")?
+                .as_str()
+                .map(str::to_string),
+        }
+    }
+}
 
 /// TTL for an opaque login user-session (seconds). Long enough that a returning
 /// user's picker stays scoped across normal usage, bounded so a leaked token does

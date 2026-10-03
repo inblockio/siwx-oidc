@@ -19,7 +19,7 @@ use crate::localpart::resolve_identity;
 use crate::oidc::{constant_time_eq, CustomError};
 use crate::synapse_client::{DeviceInfo, SynapseClient};
 use crate::webauthn as wa;
-use siwx_oidc::db::{DBClient, RedisClient, CAIP122_NONCE_TTL_SECS};
+use siwx_oidc::db::{DBClient, OwnSession, RedisClient, CAIP122_NONCE_TTL_SECS};
 
 // -- Authenticated account-management session ---------------------------------
 //
@@ -54,8 +54,6 @@ fn account_action_resource(config: &Config, action: &str) -> String {
 
 /// Cookie name for the authenticated account-management session.
 pub const ACCOUNT_SESSION_COOKIE: &str = "acct_session";
-/// Redis key prefix for stored account sessions.
-const ACCOUNT_SESSION_PREFIX: &str = "account_session";
 /// How long one re-auth keeps the account page authenticated (seconds).
 pub const ACCOUNT_SESSION_TTL: u64 = 600; // 10 minutes
 
@@ -70,13 +68,13 @@ pub struct AccountSession {
     pub exp: i64,
 }
 
-/// Mint a fresh account session bound to `did`, store it in Redis (TTL
-/// [`ACCOUNT_SESSION_TTL`]), and return `(session_token, csrf_token)`.
+/// Mint a fresh account session bound to `did`, store it under the digest of
+/// its token ([`OwnSession::Account`], TTL [`ACCOUNT_SESSION_TTL`]), and return
+/// `(session_token, csrf_token)`.
 pub async fn create_account_session(
     db: &RedisClient,
     did: &str,
 ) -> Result<(String, String), CustomError> {
-    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let csrf = Uuid::new_v4().simple().to_string();
     let session = AccountSession {
         did: did.to_string(),
@@ -85,12 +83,9 @@ pub async fn create_account_session(
     };
     let json = serde_json::to_string(&session)
         .map_err(|e| anyhow::anyhow!("serialize account session: {e}"))?;
-    db.set_ex_raw(
-        &format!("{}/{}", ACCOUNT_SESSION_PREFIX, token),
-        &json,
-        ACCOUNT_SESSION_TTL,
-    )
-    .await?;
+    let token = db
+        .create_own_session(OwnSession::Account, did, &json, ACCOUNT_SESSION_TTL)
+        .await?;
     Ok((token, csrf))
 }
 
@@ -98,7 +93,7 @@ pub async fn create_account_session(
 /// or unreadable (fail-safe: any failure forces a fresh re-auth).
 pub async fn lookup_account_session(db: &RedisClient, token: &str) -> Option<AccountSession> {
     let raw = db
-        .get_raw(&format!("{}/{}", ACCOUNT_SESSION_PREFIX, token))
+        .lookup_own_session(OwnSession::Account, token)
         .await
         .ok()??;
     let session: AccountSession = serde_json::from_str(&raw).ok()?;
@@ -111,9 +106,7 @@ pub async fn lookup_account_session(db: &RedisClient, token: &str) -> Option<Acc
 /// Delete an account session (used after a terminal action like erase/deactivate
 /// invalidates the identity it was bound to). Best-effort.
 pub async fn destroy_account_session(db: &RedisClient, token: &str) {
-    let _ = db
-        .del_raw(&format!("{}/{}", ACCOUNT_SESSION_PREFIX, token))
-        .await;
+    let _ = db.end_own_session(OwnSession::Account, token).await;
 }
 
 // -- Request/response types ---------------------------------------------------

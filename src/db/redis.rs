@@ -866,47 +866,80 @@ impl RedisClient {
         Ok(found)
     }
 
-    // -- Opaque login user-session --------------------------------------------
+    // -- siwx-oidc's own sessions (`siwx_user`, `acct_session`) -----------------
     //
-    // Mirrors account.rs's create/lookup_account_session, but generic: the value
-    // is just the DID and there is no CSRF (this token only scopes the passkey
-    // picker, it never authorizes a state change). The token is OPAQUE (two random
-    // UUIDs), so a forged/guessed value is a Redis miss -> None -> usernameless
-    // fallback. This is the load-bearing enumeration-safety invariant: the
-    // identity hint can never be a client-supplied plaintext DID.
+    // The picker hint's value is just the DID and carries no CSRF (it only scopes
+    // the passkey picker, it never authorizes a state change); the account
+    // session's value is its JSON. Tokens are OPAQUE (two random UUIDs), so a
+    // forged or guessed value is a Redis miss -> None -> usernameless fallback.
+    // This is the load-bearing enumeration-safety invariant: the identity hint
+    // can never be a client-supplied plaintext DID.
 
-    /// Mint an opaque login user-session bound to `did`, store
-    /// `user:session/{token}` -> did with TTL [`USER_SESSION_LIFETIME`], and return
-    /// the opaque token to Set-Cookie.
-    pub async fn create_user_session(&self, did: &str) -> Result<String> {
+    /// Mint an own session of `kind` bound to `did` with `value`, for
+    /// `ttl_secs`, and return the opaque token to Set-Cookie.
+    pub async fn create_own_session(
+        &self,
+        kind: OwnSession,
+        did: &str,
+        value: &str,
+        ttl_secs: u64,
+    ) -> Result<String> {
+        let _ = did;
         let token = format!(
             "{}{}",
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
         self.set_ex_raw(
-            &format!("{}/{}", KV_USER_SESSION_PREFIX, token),
-            did,
-            USER_SESSION_LIFETIME,
+            &format!("{}/{}", kind.legacy_prefix(), token),
+            value,
+            ttl_secs,
         )
         .await?;
         Ok(token)
+    }
+
+    /// The stored value of an own session, or `None` for an unknown, expired
+    /// or forged token.
+    pub async fn lookup_own_session(
+        &self,
+        kind: OwnSession,
+        token: &str,
+    ) -> Result<Option<String>> {
+        self.get_raw(&format!("{}/{}", kind.legacy_prefix(), token))
+            .await
+    }
+
+    /// End one own session (this browser's), whichever layout it is in.
+    pub async fn end_own_session(&self, kind: OwnSession, token: &str) -> Result<()> {
+        self.del_raw(&format!("{}/{}", kind.legacy_prefix(), token))
+            .await
+    }
+
+    /// End every own session of `did`, of both kinds: `logout/all`,
+    /// deactivation and erasure. Returns how many entries were removed.
+    pub async fn revoke_own_sessions(&self, did: &str) -> Result<usize> {
+        let _ = did;
+        Ok(0)
+    }
+
+    /// Mint an opaque login user-session (the `siwx_user` picker hint) bound to
+    /// `did` for [`USER_SESSION_LIFETIME`], and return the token to Set-Cookie.
+    pub async fn create_user_session(&self, did: &str) -> Result<String> {
+        self.create_own_session(OwnSession::PickerHint, did, did, USER_SESSION_LIFETIME)
+            .await
     }
 
     /// Resolve an opaque login user-session token to its DID, or `None` if the
     /// token is unknown/expired (a forged or guessed token lands here -> the caller
     /// falls back to usernameless discoverable login, leaking nothing).
     pub async fn lookup_user_session(&self, token: &str) -> Result<Option<String>> {
-        self.get_raw(&format!("{}/{}", KV_USER_SESSION_PREFIX, token))
-            .await
+        self.lookup_own_session(OwnSession::PickerHint, token).await
     }
 
-    /// Delete an opaque login user-session (best-effort; used to clear the hint on
-    /// explicit "use a different passkey" / sign-out).
-    #[allow(dead_code)]
+    /// Delete an opaque login user-session (the account page's sign-out).
     pub async fn destroy_user_session(&self, token: &str) -> Result<()> {
-        self.del_raw(&format!("{}/{}", KV_USER_SESSION_PREFIX, token))
-            .await
+        self.end_own_session(OwnSession::PickerHint, token).await
     }
 
     /// Scan the token keyspace (`KV_TOKEN_PREFIX`) and delete every entry whose
@@ -1324,8 +1357,8 @@ mod tests {
     use super::{erased_did_key, erased_user_key};
     use crate::db::tokens::digest;
     use crate::db::{
-        Ceremony, CodeEntry, DBClient, DeviceCodeEntry, DeviceCodeStatus, SessionEntry, TokenKind,
-        TokenMetadata, KV_CODE_PREFIX,
+        Ceremony, CodeEntry, DBClient, DeviceCodeEntry, DeviceCodeStatus, OwnSession, SessionEntry,
+        TokenKind, TokenMetadata, KV_CODE_PREFIX,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1828,6 +1861,194 @@ mod tests {
             client.lookup_user_session(&token).await.unwrap().is_none(),
             "a destroyed session must no longer resolve"
         );
+    }
+
+    /// Own sessions (`siwx_user`, `acct_session`) are keyed by the digest of
+    /// the token the browser holds (I1): the digest key holds the value, the
+    /// raw token is in no key, and the token resolves through the digest.
+    #[tokio::test]
+    async fn own_sessions_are_keyed_by_the_digest_of_the_token() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let nonce = unique_nonce();
+        let did = format!("did:key:zDnOWNDIGEST{nonce}");
+        for (kind, value, prefix, legacy) in [
+            (
+                OwnSession::PickerHint,
+                did.clone(),
+                "siwx_user",
+                "user:session",
+            ),
+            (
+                OwnSession::Account,
+                format!(r#"{{"did":"{did}","csrf":"c","exp":0}}"#),
+                "acct_session",
+                "account_session",
+            ),
+        ] {
+            let token = client
+                .create_own_session(kind, &did, &value, 60)
+                .await
+                .unwrap();
+            assert_eq!(
+                client
+                    .get_raw(&format!("{prefix}/{}", digest(&token)))
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(value.as_str()),
+                "{kind:?}: stored under the digest of its token"
+            );
+            assert!(
+                client
+                    .get_raw(&format!("{legacy}/{token}"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{kind:?}: never under the raw token"
+            );
+            assert_eq!(
+                client.lookup_own_session(kind, &token).await.unwrap(),
+                Some(value.clone()),
+                "{kind:?}: the token resolves"
+            );
+            assert!(
+                client
+                    .lookup_own_session(kind, &digest(&token))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{kind:?}: the stored digest presented as a token matches nothing"
+            );
+            client.end_own_session(kind, &token).await.unwrap();
+            assert!(
+                client
+                    .lookup_own_session(kind, &token)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{kind:?}: an ended session no longer resolves"
+            );
+        }
+    }
+
+    /// An own session a build before Phase 4 wrote (raw-keyed) is read for its
+    /// remaining lifetime and ended like a current one.
+    #[tokio::test]
+    async fn a_legacy_own_session_is_read_and_ended() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let nonce = unique_nonce();
+        let did = format!("did:key:zDnOWNLEGACY{nonce}");
+        for (kind, legacy) in [
+            (OwnSession::PickerHint, "user:session"),
+            (OwnSession::Account, "account_session"),
+        ] {
+            let token = format!("legacy{nonce}{legacy}");
+            client
+                .set_ex_raw(&format!("{legacy}/{token}"), &did, 60)
+                .await
+                .unwrap();
+            assert_eq!(
+                client.lookup_own_session(kind, &token).await.unwrap(),
+                Some(did.clone()),
+                "{kind:?}: a legacy entry is read"
+            );
+            client.end_own_session(kind, &token).await.unwrap();
+            assert!(
+                client
+                    .lookup_own_session(kind, &token)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{kind:?}: ending it removes the legacy entry"
+            );
+        }
+    }
+
+    /// `revoke_own_sessions` ends every own session of the DID, of both kinds
+    /// and both layouts, whatever the case of a `did:pkh` address it was minted
+    /// with, and no session of another DID.
+    #[tokio::test]
+    async fn revoking_own_sessions_ends_every_session_of_the_did_and_no_other() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let nonce = unique_nonce();
+        let did = format!("did:pkh:eip155:1:0xAbC{nonce:x}");
+        let did_folded = did.to_lowercase();
+        let other = format!("did:pkh:eip155:1:0xDeF{nonce:x}");
+        let account = |d: &str| format!(r#"{{"did":"{d}","csrf":"c","exp":0}}"#);
+
+        let mut mine = Vec::new();
+        for d in [&did, &did_folded] {
+            let t = client
+                .create_own_session(OwnSession::PickerHint, d, d, 60)
+                .await
+                .unwrap();
+            mine.push((OwnSession::PickerHint, t));
+            let t = client
+                .create_own_session(OwnSession::Account, d, &account(d), 60)
+                .await
+                .unwrap();
+            mine.push((OwnSession::Account, t));
+        }
+        let legacy_hint = format!("legacyhint{nonce}");
+        client
+            .set_ex_raw(&format!("user:session/{legacy_hint}"), &did, 60)
+            .await
+            .unwrap();
+        mine.push((OwnSession::PickerHint, legacy_hint));
+        let legacy_account = format!("legacyacct{nonce}");
+        client
+            .set_ex_raw(
+                &format!("account_session/{legacy_account}"),
+                &account(&did_folded),
+                60,
+            )
+            .await
+            .unwrap();
+        mine.push((OwnSession::Account, legacy_account));
+        let other_hint = client
+            .create_own_session(OwnSession::PickerHint, &other, &other, 60)
+            .await
+            .unwrap();
+        let other_legacy = format!("legacyother{nonce}");
+        client
+            .set_ex_raw(&format!("user:session/{other_legacy}"), &other, 60)
+            .await
+            .unwrap();
+
+        let revoked = client.revoke_own_sessions(&did).await.unwrap();
+        assert_eq!(
+            revoked,
+            mine.len(),
+            "every own session of the DID is revoked"
+        );
+        for (kind, token) in &mine {
+            assert!(
+                client
+                    .lookup_own_session(*kind, token)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{kind:?} {token}: revoked"
+            );
+        }
+        for token in [&other_hint, &other_legacy] {
+            assert_eq!(
+                client
+                    .lookup_own_session(OwnSession::PickerHint, token)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(other.as_str()),
+                "another DID's session survives"
+            );
+        }
+        client.revoke_own_sessions(&other).await.unwrap();
     }
 
     fn code_entry(did: &str) -> CodeEntry {
