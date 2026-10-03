@@ -1220,14 +1220,16 @@ async fn the_refresh_grant_accepts_only_a_refresh_token() {
     );
 }
 
-/// The same rule at the Matrix-shaped refresh endpoint.
+/// The same rule at the Matrix-shaped refresh endpoint, for a public client
+/// (the endpoint refuses a confidential client's token whatever its kind).
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn the_matrix_refresh_endpoint_accepts_only_a_refresh_token() {
     let base = oidc();
     let c = Client::new();
     let nrc = no_redirect_client();
-    let (access, refresh, _did, _rc) = login_tokens(&c, &nrc, &base).await;
+    let public = register_public_client(&c, &base).await;
+    let (access, refresh) = tokens_for_client(&c, &nrc, &base, &public, false).await;
 
     assert_refused_by_matrix_refresh(&c, &base, &access, "an access token").await;
     assert_eq!(
@@ -2115,7 +2117,8 @@ async fn discovery_advertises_only_the_code_response_type() {
 // the client named in the request (form, or the user name of an HTTP Basic
 // header) must be that client, and a confidential client authenticates with
 // its secret, exactly as at the code exchange. `POST /_matrix/client/v3/refresh`
-// carries no client identity by specification and is not covered here.
+// carries no client identity by specification, so it refuses a confidential
+// client's refresh token and serves public clients only.
 // ===========================================================================
 
 /// A client registered the way Element Web and Element X register: public,

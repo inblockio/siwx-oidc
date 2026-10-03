@@ -365,7 +365,7 @@ token.
    `client_id`, `grant_kind`, `branch` (fingerprints only). Reuse revokes
    nothing yet. Nothing new is minted for a replay and the refresh lifetime
    does not grow. `POST /_matrix/client/v3/refresh` applies the same rule; it
-   carries no client identity, so it cannot bind the replay. See
+   carries no client identity, so it cannot bind the replay to a client. See
    [the 2026-06-23 audit](audits/2026-06-23-elementx-refresh-rotation-signout.md).
 4. `POST /token` with the device-code grant provisions the Synapse device and
    issues tokens (see [below](#device-code-and-qr-login)).
@@ -400,6 +400,16 @@ to, and `POST /token` authenticates that client by one rule for both grants
 the request attempted Basic. It used to be a 400. The replay of a lost response
 is bound the same way, to the grant's client.
 
+`POST /_matrix/client/v3/refresh` serves public clients only. The Matrix
+client-server API gives a refresh request no client identity, so the endpoint
+cannot authenticate a client: it refuses the refresh token of a grant whose
+client is confidential exactly like an unknown token (`M_UNKNOWN_TOKEN`) and
+leaves it untouched, so the client still refreshes at `POST /token` with its
+secret. Each grant records at issuance whether its client is confidential, by
+rule 3 above (a client without a registration counts as public). A public
+client's token needs no authentication there; rule 1 cannot apply, since no
+client is named.
+
 Provisional choices, open for the maintainers:
 
 - **A registration without `grant_types` allows the refresh grant**, and a
@@ -413,12 +423,6 @@ Provisional choices, open for the maintainers:
   request names that client or none, and is refused when the request names
   another client or presents a secret (which can no longer be checked). Refusing
   it outright would sign out every session older than a registration.
-- **`POST /_matrix/client/v3/refresh` is not bound.** The Matrix client-server
-  API gives a refresh request no client identity, so that endpoint takes the
-  refresh token alone, and a confidential client's refresh token can be rotated
-  there without its secret. Closing that needs the grant to say which endpoints
-  may rotate it (plan section 8); until then the binding protects the OAuth
-  refresh grant only.
 
 An `Authorization` header at `/token` used to be answered with a 400 on every
 request (two header extractors rejecting each other's scheme), so

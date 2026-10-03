@@ -280,7 +280,7 @@ paths:
         (a registration lasts 30 days) still refreshes when the request names that
         client or none, and is refused when it presents a secret. The Matrix
         refresh endpoint `POST /_matrix/client/v3/refresh` has no client identity
-        to carry and is not bound.
+        to carry, so it refuses a confidential client's refresh token.
       requestBody:
         required: true
         content:
@@ -820,7 +820,7 @@ paths:
       tags: [Matrix compatibility]
       operationId: matrixRefresh
       summary: Matrix-shaped refresh, with the same rotation and lost-response rule as `/token`
-      description: Accepts only a refresh token; an access token (a minted admin token included) is `M_UNKNOWN_TOKEN`, like an unknown one. A replay of the previous refresh token returns the same successor pair while that pair is unused, and is `M_UNKNOWN_TOKEN` once it was used, rotated or revoked. The endpoint carries no client identity, so unlike `/token` it cannot bind the replay to a client.
+      description: Accepts only a refresh token; an access token (a minted admin token included) is `M_UNKNOWN_TOKEN`, like an unknown one. A replay of the previous refresh token returns the same successor pair while that pair is unused, and is `M_UNKNOWN_TOKEN` once it was used, rotated or revoked. The endpoint carries no client identity, so unlike `/token` it cannot bind the replay to a client, and it refuses the refresh token of a confidential client (one that must authenticate at `/token`) exactly like an unknown token, leaving it untouched for `/token`.
       responses: { "200": { description: New tokens. } }
 
   /_matrix/client/v3/logout:

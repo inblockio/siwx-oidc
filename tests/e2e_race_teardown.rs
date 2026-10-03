@@ -270,17 +270,20 @@ fn parse_query(url: &str) -> HashMap<String, String> {
 /// A registered OAuth client (id + secret) for the wallet auth-code flow.
 struct RegisteredClient {
     client_id: String,
-    client_secret: String,
     redirect_uri: String,
 }
 
+/// A client registered the way Element Web and Element X register: public
+/// (`token_endpoint_auth_method: none`). The sessions in this suite are Matrix
+/// device sessions, refreshed at both endpoints, and
+/// `POST /_matrix/client/v3/refresh` refuses a confidential client's token.
 async fn register_client(c: &Client, base: &str) -> RegisteredClient {
     let redirect_uri = format!("{base}/callback");
     let reg: Value = c
         .post(format!("{base}/register"))
         .json(&json!({
             "redirect_uris": [&redirect_uri],
-            "token_endpoint_auth_method": "client_secret_post",
+            "token_endpoint_auth_method": "none",
             "grant_types": ["authorization_code"],
             "response_types": ["code"],
         }))
@@ -292,7 +295,6 @@ async fn register_client(c: &Client, base: &str) -> RegisteredClient {
         .unwrap();
     RegisteredClient {
         client_id: reg["client_id"].as_str().unwrap().to_string(),
-        client_secret: reg["client_secret"].as_str().unwrap().to_string(),
         redirect_uri,
     }
 }
@@ -302,10 +304,9 @@ struct LoginResult {
     access_token: String,
     refresh_token: String,
     device_id: String,
-    /// The confidential client the login was made with. The refresh grant at
-    /// `/token` binds a token to this client and authenticates it.
+    /// The public client the login was made with. The refresh grant at
+    /// `/token` binds a token to this client.
     client_id: String,
-    client_secret: String,
 }
 
 /// Drive a full wallet auth-code login for `w` and return the issued tokens +
@@ -418,7 +419,6 @@ async fn wallet_login(c: &Client, base: &str, w: &Wallet) -> LoginResult {
         refresh_token,
         device_id,
         client_id: rc.client_id.clone(),
-        client_secret: rc.client_secret.clone(),
     }
 }
 
@@ -529,7 +529,6 @@ async fn exchange_code(
         .form(&[
             ("code", code),
             ("client_id", rc.client_id.as_str()),
-            ("client_secret", rc.client_secret.as_str()),
             ("grant_type", "authorization_code"),
             ("code_verifier", verifier),
         ])
@@ -1903,8 +1902,8 @@ async fn h9_device_code_approved_no_double_redemption() {
 
 /// Refresh via the OAuth /token endpoint (grant_type=refresh_token) — the path
 /// Element-X's matrix-rust-sdk OAuth client uses. The login's client is
-/// confidential, so the request authenticates as it: the refresh grant binds a
-/// token to its client. Returns (status, json|null).
+/// public, so the request names it and presents no secret: the refresh grant
+/// binds a token to its client. Returns (status, json|null).
 async fn oauth_refresh(
     c: &Client,
     base: &str,
@@ -1917,7 +1916,6 @@ async fn oauth_refresh(
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
             ("client_id", login.client_id.as_str()),
-            ("client_secret", login.client_secret.as_str()),
         ])
         .send()
         .await

@@ -570,34 +570,37 @@ fn token_store_unavailable() -> (StatusCode, Json<serde_json::Value>) {
 
 /// `POST /_matrix/client/v3/refresh` (MSC2918): rotate a refresh token.
 ///
-/// **Not bound to a client.** The OAuth refresh grant (`oidc::token_refresh`)
+/// **Public clients only.** The OAuth refresh grant (`oidc::token_refresh`)
 /// checks that the request comes from the client the token was issued to and
 /// authenticates a confidential one (I7). The Matrix client-server API gives
-/// this request no client identity to check (the body is the refresh token and
-/// nothing else), so this endpoint takes the token alone. The consequence: a
-/// confidential client's refresh token can be rotated here without its secret.
-/// Matrix clients are public clients, so nothing legitimate is affected, but the
-/// binding protects only the OAuth grant until this endpoint is restricted to
-/// the tokens that belong to Matrix devices (plan section 8). Do not "fix" it by
-/// demanding a client here: no Matrix client can send one.
+/// this request no client identity (the body is the refresh token and nothing
+/// else), so this endpoint cannot authenticate a client: it refuses, exactly
+/// like an unknown token, the refresh token of a grant whose client is
+/// confidential (recorded on the grant at issuance by
+/// `oidc::client_is_confidential`, the rule the token endpoint applies), and
+/// leaves it untouched for `POST /token`. A public client's token needs no
+/// authentication, so this endpoint is bound as far as the binding reaches at
+/// `POST /token` without a named client. Matrix clients (Element Web, Element
+/// X) register as public clients. Do not "fix" the rest by demanding a client
+/// here: no Matrix client can send one.
 ///
 /// Rotation, the replay of a lost response and the refusals are the rotation
 /// script's (`RedisClient::rotate_refresh_token`), the same one `POST /token`
-/// runs, minus the client binding.
+/// runs.
 pub async fn refresh(
     State(state): State<CompatState>,
     Json(body): Json<RefreshRequest>,
 ) -> impl IntoResponse {
     // The one rotation script (I3) decides atomically: rotate, replay the
-    // unused successor of a lost response (I4), or refuse. No client is passed:
-    // this endpoint has none to check (see above).
-    // TODO(M2b): refuse a confidential client's grant here, test-first.
+    // unused successor of a lost response (I4), or refuse. No client is named
+    // (this endpoint has none), and a confidential client's grant is refused
+    // (see above).
     let outcome = state
         .redis_client
         .rotate_refresh_token(&RotateRequest {
             presented: &body.refresh_token,
             client_id: None,
-            refuse_confidential: false,
+            refuse_confidential: true,
         })
         .await;
     let (pair, expires_in) = match outcome {
@@ -618,6 +621,9 @@ pub async fn refresh(
         // TODO(M3): a legacy refresh token (`NotCurrentFormat`: `token/{raw}`,
         // written before the grant record) is lifted into a grant (design 5.8).
         // Until then it is an unknown token.
+        // `ConfidentialClient`: a client this endpoint cannot authenticate
+        // (see above), answered like an unknown token. `ClientMismatch` cannot
+        // happen: no client is named.
         Ok(RotateOutcome::Invalid(_))
         | Ok(RotateOutcome::ClientMismatch)
         | Ok(RotateOutcome::ConfidentialClient) => {

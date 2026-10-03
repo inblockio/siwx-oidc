@@ -363,7 +363,7 @@ doc; read it before changing the code the rule covers.
   at `/_matrix/client/v3/refresh`). No timer decides it: the decision reads grant state, never a
   clock. A replay whose successor was rotated away or whose grant was revoked is refused the same
   way. At `/token` the replay is also bound to the client (next invariant); the Matrix endpoint
-  carries no client and cannot bind it. Pin (mock stack):
+  carries no client and cannot bind it to one. Pin (mock stack):
   `concurrent_refreshes_at_the_token_endpoint_converge_on_one_pair`,
   `concurrent_refreshes_at_the_matrix_endpoint_converge_on_one_pair`,
   `a_replay_returns_the_same_pair_until_the_new_access_token_is_used`,
@@ -380,8 +380,10 @@ doc; read it before changing the code the rule covers.
   (RFC 6749 §5.2, with `WWW-Authenticate: Basic` after a Basic attempt). The replay of a lost
   response is bound to the grant's client like a rotation. Provisional, recorded in docs/matrix-integration.md: a public
   client may omit `client_id`; a token whose client registration has expired (30 days against 90)
-  keeps refreshing unless the request names another client or presents a secret;
-  `POST /_matrix/client/v3/refresh` carries no client identity and is not bound. Read the
+  keeps refreshing unless the request names another client or presents a secret.
+  `POST /_matrix/client/v3/refresh` carries no client identity, so it refuses a confidential
+  client's refresh token exactly like an unknown token, leaving it untouched for `/token`; the
+  grant records at issuance whether its client is confidential, by the same rule. Read the
   `Authorization` header with `HeaderMap::typed_get`, never as two typed-header extractors, which
   reject each other's scheme and turn every request that has the header into a 400. A Basic user
   name and password are form-urldecoded before they are compared (RFC 6749 §2.3.1: a secret with
@@ -398,7 +400,8 @@ doc; read it before changing the code the rule covers.
   `invalid_client_is_a_401_and_every_other_token_error_a_400`; mock stack:
   `a_refresh_token_is_refused_to_another_client`, `a_confidential_client_must_authenticate_to_refresh`,
   `a_public_client_refreshes_without_client_credentials`,
-  `a_basic_authorization_header_authenticates_the_code_exchange`.
+  `a_basic_authorization_header_authenticates_the_code_exchange`,
+  `the_matrix_endpoint_refuses_a_confidential_clients_refresh_token` (unit and mock stack).
 - **Never infer token validity from Synapse**: it caches introspection for two minutes. Our
   introspection answer is the authority.
 - **No device-id recycling.** Sign-in upserts a fresh `SIWX_…` id and never deletes. Pin:
