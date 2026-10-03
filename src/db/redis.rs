@@ -22,7 +22,7 @@ use super::*;
 
 #[derive(Clone)]
 pub struct RedisClient {
-    pool: Pool<RedisConnectionManager>,
+    pub(super) pool: Pool<RedisConnectionManager>,
 }
 
 /// Redis key for the per-`(username, device_id)` token index SET.
@@ -31,12 +31,12 @@ fn device_token_idx_key(username: &str, device_id: &str) -> String {
 }
 
 /// Redis key for the short-lived device-revoked tombstone.
-fn device_tombstone_key(username: &str, device_id: &str) -> String {
+pub(super) fn device_tombstone_key(username: &str, device_id: &str) -> String {
     format!("{}/{}/{}", KV_DEVICE_TOMBSTONE_PREFIX, username, device_id)
 }
 
 /// Redis key for the per-user deactivation tombstone.
-fn user_tombstone_key(username: &str) -> String {
+pub(super) fn user_tombstone_key(username: &str) -> String {
     format!("{}/{}", KV_USER_TOMBSTONE_PREFIX, username)
 }
 

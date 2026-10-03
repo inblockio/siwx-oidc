@@ -8,6 +8,7 @@ use chrono::{offset::Utc, DateTime};
 use openidconnect::{core::CoreClientMetadata, Nonce, RegistrationAccessToken};
 use serde::{Deserialize, Serialize};
 
+pub mod grant;
 mod redis;
 pub mod seal;
 pub mod tokens;
