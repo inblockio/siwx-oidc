@@ -227,6 +227,21 @@ fn a_spawned_server_never_reaches_the_redis_the_callers_environment_names() {
     );
 }
 
+/// `e2e/env.sh` exports a `default_clients` entry for the mock stack. A server that inherited
+/// it would have to write it to Redis before listening, and the Redis it is pointed at is
+/// unreachable, so it would exit after the pool's 30 s connection timeout and every test in
+/// this file would fail. The spawned server must not see the caller's configuration at all.
+#[test]
+fn a_spawned_server_ignores_the_static_clients_in_the_callers_environment() {
+    let _caller = CallerEnv::set(
+        "SIWXOIDC_DEFAULT_CLIENTS__LEAKED",
+        r#"{"secret":"not-a-secret-test-fixture","metadata":{"redirect_uris":["https://app.example.org/cb"]}}"#,
+    );
+    let (mut server, port) = spawn_server(&[]);
+    drop(connect_when_listening(&mut server, port));
+    stop(server);
+}
+
 /// A homeserver that answers every request with 200 `{}` after `delay`, and
 /// reports each request line it receives.
 fn slow_homeserver(delay: Duration) -> (u16, mpsc::Receiver<String>) {
