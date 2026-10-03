@@ -944,7 +944,8 @@ mod tests {
         let dev = format!("CONF_{n}");
         let state = standalone_state(client.clone());
 
-        let (_, unknown) = matrix_refresh(&state, &tokens::new_refresh_token("nogrant")).await;
+        let never_issued = tokens::new_refresh_token(&tokens::new_grant_handle());
+        let (_, unknown) = matrix_refresh(&state, &never_issued).await;
         let confidential = seed_grant_for(&client, &user, &dev, true)
             .await
             .refresh_token
@@ -975,6 +976,108 @@ mod tests {
         );
 
         client.revoke_grants_for_device(&user, &dev).await.ok();
+    }
+
+    /// A store fault: Redis answers the operation that reads `key` with an
+    /// error (`WRONGTYPE`: a string planted where a hash is read). The handler
+    /// gets the same `Err` from the store that a lost connection, a timeout or
+    /// an out-of-memory refusal gives it. The key expires on its own.
+    async fn plant_store_fault(key: &str) {
+        let raw =
+            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
+        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let _: () = bb8_redis::redis::cmd("SET")
+            .arg(key)
+            .arg("planted store fault")
+            .arg("EX")
+            .arg(60)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    /// The retryable answer to a store fault: 503 with `M_UNKNOWN`.
+    fn assert_retryable_503(status: StatusCode, body: &serde_json::Value, what: &str) {
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{what}: a store fault is a retryable 503: {body}"
+        );
+        assert_eq!(
+            body["errcode"], "M_UNKNOWN",
+            "{what}: never M_UNKNOWN_TOKEN, which signs a Matrix client out: {body}"
+        );
+    }
+
+    /// A store fault during `POST /_matrix/client/v3/refresh` is a retryable
+    /// 503, never `M_UNKNOWN_TOKEN`: a Matrix client treats that as "signed
+    /// out" and clears its crypto store, so a transient Redis fault would cost
+    /// the session and its cryptographic identity.
+    #[tokio::test]
+    async fn a_store_fault_at_the_matrix_refresh_endpoint_is_a_retryable_503() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let state = standalone_state(client.clone());
+        let rt = tokens::new_refresh_token(&tokens::new_grant_handle());
+        let handle = tokens::parse_refresh_token(&rt).unwrap().handle;
+        plant_store_fault(&format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_GRANT_PREFIX,
+            siwx_oidc::db::grant::GrantId::of_handle(handle).as_str()
+        ))
+        .await;
+
+        let (status, body) = matrix_refresh(&state, &rt).await;
+        assert_retryable_503(status, &body, &format!("refresh {n}"));
+    }
+
+    /// A store fault while resolving the bearer of a device-deletion route is
+    /// the same retryable 503 as at the refresh endpoint, never the
+    /// `M_UNKNOWN_TOKEN` 401 of an unknown token.
+    #[tokio::test]
+    async fn a_store_fault_on_a_bearer_route_is_a_retryable_503() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("fault-user-{n}");
+        let dev = format!("FAULT_{n}");
+        let state = standalone_state(client.clone());
+        let access = seed_grant(&client, &user, &dev).await.access_token;
+        plant_store_fault(&format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_ACCESS_TOKEN_PREFIX,
+            tokens::digest(&access)
+        ))
+        .await;
+
+        let response = delete_device(State(state.clone()), Path(dev.clone()), bearer(&access))
+            .await
+            .into_response();
+        let (status, body) = status_and_json(response).await;
+        assert_retryable_503(status, &body, "DELETE /devices/{id}");
+
+        let response = delete_devices(
+            State(state.clone()),
+            bearer(&access),
+            Json(DeleteDevicesRequest {
+                devices: vec![dev.clone()],
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = status_and_json(response).await;
+        assert_retryable_503(status, &body, "POST /delete_devices");
+
+        client.revoke_grants_for_device(&user, &dev).await.ok();
+    }
+
+    async fn status_and_json(
+        response: axum::response::Response,
+    ) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
     }
 
     /// The Matrix endpoint's replay follows the rule of the OAuth grant (I4):
