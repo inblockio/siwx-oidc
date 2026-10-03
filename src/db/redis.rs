@@ -27,6 +27,9 @@ pub struct RedisClient {
     /// The operator's absolute-lifetime caps (I6); none by default. Set with
     /// [`RedisClient::with_grant_lifetime`].
     pub(super) lifetime: super::grant::GrantLifetime,
+    /// Whether a reuse event revokes its grant (I5 phase B); off by default.
+    /// Set with [`RedisClient::with_reuse_enforcement`].
+    pub(super) reuse_revokes_grant: bool,
 }
 
 /// Redis key for the per-`(username, device_id)` token index SET.
@@ -337,6 +340,7 @@ impl RedisClient {
         Ok(Self {
             pool,
             lifetime: Default::default(),
+            reuse_revokes_grant: false,
         })
     }
 }

@@ -7954,6 +7954,7 @@ mod client_binding_tests {
             "branch=\"previous_after_use\"",
             "grant_kind=oidc",
             "generation=1",
+            "grant_revoked=false",
         ] {
             assert!(event.contains(field), "the event carries {field}: {event}");
         }
@@ -7972,6 +7973,64 @@ mod client_binding_tests {
             "ok",
             "phase A revokes nothing: the live chain keeps working"
         );
+    }
+
+    /// I5 phase B at `POST /token`, with `reuse_revokes_grant` on: a superseded
+    /// refresh token gets exactly the answer an unknown token gets, the reuse
+    /// event records that the grant was revoked, and the grant is gone, so the
+    /// current holder's refresh token is refused too and the RP is sent one
+    /// back-channel logout token.
+    #[tokio::test]
+    async fn with_reuse_enforcement_a_superseded_token_at_the_token_endpoint_ends_its_grant() {
+        let Some(base) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let db = base.clone().with_reuse_enforcement(true);
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Public).await;
+        let first = seed_refresh_token(&db, &client).await;
+        let grant = db.peek_refresh_grant(&first).await.unwrap().unwrap();
+        let second = refresh_token_of(refresh(&db, &config, &first, NOTHING).await);
+        let current = refresh_token_of(refresh(&db, &config, &second, NOTHING).await);
+
+        let unknown = refresh(&db, &config, "mcr_not_a_token", NOTHING).await;
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let reused = refresh(&db, &config, &first, NOTHING).await;
+        assert_eq!(outcome(&reused), "invalid_grant");
+        assert_eq!(
+            format!("{reused:?}"),
+            format!("{unknown:?}"),
+            "reuse is answered exactly like an unknown token"
+        );
+        let output = logs.output();
+        let events: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains(siwx_oidc::db::grant::REUSE_EVENT_MESSAGE))
+            .collect();
+        assert_eq!(events.len(), 1, "exactly one reuse event: {output}");
+        assert!(
+            events[0].contains("grant_revoked=true"),
+            "the event records the revocation: {}",
+            events[0]
+        );
+
+        assert!(
+            db.peek_refresh_grant(&current).await.unwrap().is_none(),
+            "the grant is gone"
+        );
+        assert_eq!(
+            outcome(&refresh(&db, &config, &current, NOTHING).await),
+            "invalid_grant",
+            "the current holder is refused at its next refresh"
+        );
+        let queued = db
+            .pending_logout_entries()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|(e, _)| e.grant == grant.grant_id.as_str())
+            .count();
+        assert_eq!(queued, 1, "one back-channel logout entry for the RP");
     }
 
     /// A grant records its client as confidential exactly when `POST /token`

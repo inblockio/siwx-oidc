@@ -100,6 +100,12 @@
 //! | live | `previous_rt`, `successor_used` 1 | [`RotateOutcome::Reuse`] (`PreviousAfterUse`) |
 //! | live | anything else carrying this handle | `Reuse` (`Superseded`) |
 //!
+//! A `Reuse` row revokes nothing unless reuse enforcement is on
+//! ([`RedisClient::with_reuse_enforcement`], the switch `reuse_revokes_grant`,
+//! I5 phase B): then the same script deletes the grant through `drop_grant`
+//! and drops its index entries, and [`ReuseEvent::grant_revoked`] says so. A
+//! `Replayed` row is never reuse, so a lost response never revokes.
+//!
 //! Nothing in the replay-or-reuse decision reads a clock: only state does. The
 //! access entry of a rotation is written inside the script, so no interleaving
 //! can mint a token for a grant that a revocation is deleting.
@@ -533,8 +539,9 @@ impl ReuseBranch {
     }
 }
 
-/// The security event of a reuse (I5, phase A): answered like an unknown
-/// token, logged once by [`ReuseEvent::emit`], nothing revoked. Every field is
+/// The security event of a reuse (I5): answered like an unknown token and
+/// logged once by [`ReuseEvent::emit`]; the grant was revoked only when reuse
+/// enforcement is on ([`RedisClient::with_reuse_enforcement`]). Every field is
 /// safe to log; the grant appears only as its fingerprint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReuseEvent {
@@ -543,12 +550,15 @@ pub struct ReuseEvent {
     pub client_id: String,
     pub grant_kind: GrantKind,
     pub branch: ReuseBranch,
+    /// Whether the rotation script deleted the grant for this reuse: true
+    /// exactly when reuse enforcement is on (`reuse_revokes_grant`).
+    pub grant_revoked: bool,
 }
 
 impl ReuseEvent {
     /// Log the event: one `warn!` with the message [`REUSE_EVENT_MESSAGE`] and
     /// the fields `security_event = "refresh_token_reuse"`, `grant_fp`,
-    /// `generation`, `client_id`, `grant_kind`, `branch`.
+    /// `generation`, `client_id`, `grant_kind`, `branch`, `grant_revoked`.
     pub fn emit(&self) {
         warn!(
             security_event = "refresh_token_reuse",
@@ -557,6 +567,7 @@ impl ReuseEvent {
             client_id = %self.client_id,
             grant_kind = %self.grant_kind,
             branch = self.branch.as_str(),
+            grant_revoked = self.grant_revoked,
             "{}",
             REUSE_EVENT_MESSAGE
         );
@@ -571,7 +582,8 @@ pub enum RotateOutcome {
     /// The presented token was the previous one and its successor is unused:
     /// here is that same successor (lost response, or a concurrent loser).
     Replayed(RotatedPair),
-    /// A superseded token of a live grant. Answer like an unknown token and
+    /// A superseded token of a live grant (deleted by the script when reuse
+    /// enforcement is on). Answer like an unknown token and
     /// [`emit`](ReuseEvent::emit) the event.
     Reuse(ReuseEvent),
     /// Answer like an unknown token.
@@ -853,7 +865,9 @@ return {'lifted_now'}
 /// them to name the tombstones), 6 requesting client_id (`` = unchecked),
 /// 7 refuse a confidential client (`1`/`0`), 8 grant id, 9 has device,
 /// 10 the candidate access token's `exp`, 11 the absolute-lifetime cap now
-/// configured for the grant's client (`` = none). A tombstone refuses the grant
+/// configured for the grant's client (`` = none), 12 reuse enforcement (`1`:
+/// a reuse deletes the grant and its index entries through `drop_grant`, and
+/// the reply's fourth element says `revoked`, else `kept`). A tombstone refuses the grant
 /// (`revoked`; the user tombstone is only read, for one release, see
 /// [`RedisClient::revoke_grants_for_user`]); an epoch at or after its `auth_ms`
 /// refuses and deletes it (`revoked`, I9). The absolute expiry in force
@@ -925,6 +939,7 @@ if ARGV[2] ~= '' and f[5] ~= '' and ARGV[1] == f[5] then
   if ARGV[9] == '1' then extend(KEYS[6], grant_ttl) end
   return {'rotated', next_gen}
 end
+local branch = 'superseded'
 if f[6] ~= '' and ARGV[1] == f[6] then
   if f[7] == '0' then
     if not f[8] or f[8] == '' then
@@ -932,9 +947,15 @@ if f[6] ~= '' and ARGV[1] == f[6] then
     end
     return {'replayed', tostring(generation), f[8], tostring(now)}
   end
-  return {'reuse', 'previous_after_use', tostring(generation)}
+  branch = 'previous_after_use'
 end
-return {'reuse', 'superseded', tostring(generation)}
+if ARGV[12] == '1' then
+  drop_grant(KEYS[1])
+  redis.call('SREM', KEYS[5], ARGV[8])
+  if ARGV[9] == '1' then redis.call('SREM', KEYS[6], ARGV[8]) end
+  return {'reuse', branch, tostring(generation), 'revoked'}
+end
+return {'reuse', branch, tostring(generation), 'kept'}
 "#;
 
 /// Accept an access token's grant, marking the successor used (design 5.4),
@@ -1091,6 +1112,15 @@ impl RedisClient {
     /// different caps, as instances do after a configuration change.
     pub fn with_grant_lifetime(mut self, lifetime: GrantLifetime) -> Self {
         self.lifetime = lifetime;
+        self
+    }
+
+    /// This client with reuse enforcement on or off (I5 phase B, the switch
+    /// `reuse_revokes_grant`, read once at startup). On, the rotation script
+    /// that detects a reuse also deletes the grant (never the device); off,
+    /// the default, it revokes nothing. Clones share one connection pool.
+    pub fn with_reuse_enforcement(mut self, on: bool) -> Self {
+        self.reuse_revokes_grant = on;
         self
     }
 
@@ -1612,6 +1642,7 @@ impl RedisClient {
                     flag(has_device),
                     &candidate.access_exp.to_string(),
                     &cap_arg(cap),
+                    flag(self.reuse_revokes_grant),
                 ],
             )
             .await?;
@@ -1648,6 +1679,11 @@ impl RedisClient {
                     Some("previous_after_use") => ReuseBranch::PreviousAfterUse,
                     Some("superseded") => ReuseBranch::Superseded,
                     _ => return Err(anyhow!("rotation script: unknown reuse branch")),
+                },
+                grant_revoked: match field(3) {
+                    Some("revoked") => true,
+                    Some("kept") => false,
+                    _ => return Err(anyhow!("rotation script: unknown reuse result")),
                 },
             }),
             Some("invalid") => RotateOutcome::Invalid(match field(1) {

@@ -382,8 +382,18 @@ token.
    like an unknown token (`invalid_grant`, `M_UNKNOWN_TOKEN`) and logged as one
    `warn!` security event, message `refresh token reuse detected`, fields
    `security_event="refresh_token_reuse"`, `grant_fp`, `generation`,
-   `client_id`, `grant_kind`, `branch` (fingerprints only). Reuse revokes
-   nothing yet. Nothing new is minted for a replay and the refresh lifetime
+   `client_id`, `grant_kind`, `branch`, `grant_revoked` (fingerprints only).
+   By default reuse revokes nothing (`grant_revoked=false`). With
+   [`reuse_revokes_grant`](configuration.md#refresh-token-reuse) on, the same
+   script also deletes the grant, as revoking its refresh token would: its
+   access tokens are inactive at once, whoever holds its current refresh token
+   is refused at the next refresh (the point of enforcement: one of the two
+   holders is not the client), a generic RP is sent a back-channel logout
+   token, and the Synapse device is not deleted; the answer is still the
+   unknown-token answer and the event says `grant_revoked=true`. A replay of
+   the previous token while its pair is unused is a lost response, never reuse,
+   so it never revokes. The switch is off until the maintainers decide (design
+   decision D2). Nothing new is minted for a replay and the refresh lifetime
    does not grow. `POST /_matrix/client/v3/refresh` applies the same rule; it
    carries no client identity, so it cannot bind the replay to a client. See
    [the 2026-06-23 audit](audits/2026-06-23-elementx-refresh-rotation-signout.md).

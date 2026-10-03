@@ -262,6 +262,15 @@ pub struct Config {
     /// Env: `SIWXOIDC_BACKCHANNEL_LOGOUT_REQUIRED_FOR_REFRESH`
     #[serde(default)]
     pub backchannel_logout_required_for_refresh: bool,
+    /// Revoke the grant when a superseded refresh token is presented (I5
+    /// phase B): the rotation script that detects the reuse deletes the grant
+    /// (never the Synapse device), so its current holder is refused too. Off
+    /// (the default, phase A): reuse is refused and logged, nothing revoked.
+    /// Stays off until the maintainers decide (design decision D2: 30 days of
+    /// phase-A telemetry with every reuse event explained). Read once at startup.
+    /// Env: `SIWXOIDC_REUSE_REVOKES_GRANT`
+    #[serde(default)]
+    pub reuse_revokes_grant: bool,
 }
 
 /// The shortest configurable absolute grant lifetime: a device code's
@@ -337,6 +346,7 @@ impl Default for Config {
             grant_absolute_lifetime_secs_by_client: HashMap::new(),
             backchannel_logout_allowed_hosts: Vec::new(),
             backchannel_logout_required_for_refresh: false,
+            reuse_revokes_grant: false,
         }
     }
 }
@@ -712,6 +722,28 @@ mod tests {
                 Some(7_200),
                 "new beats legacy"
             );
+            Ok(())
+        });
+    }
+
+    /// Reuse enforcement (I5 phase B) is off unless an operator turns it on,
+    /// under either prefix; the new prefix beats the legacy one.
+    #[test]
+    fn reuse_enforcement_is_off_by_default_and_read_under_both_prefixes() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            assert!(!figment().extract::<Config>()?.reuse_revokes_grant);
+            assert!(!Config::default().reuse_revokes_grant);
+            jail.set_env("SIWEOIDC_REUSE_REVOKES_GRANT", "true");
+            assert!(figment().extract::<Config>()?.reuse_revokes_grant);
+            jail.set_env("SIWXOIDC_REUSE_REVOKES_GRANT", "false");
+            assert!(
+                !figment().extract::<Config>()?.reuse_revokes_grant,
+                "new beats legacy"
+            );
+            jail.set_env("SIWEOIDC_REUSE_REVOKES_GRANT", "false");
+            jail.set_env("SIWXOIDC_REUSE_REVOKES_GRANT", "true");
+            assert!(figment().extract::<Config>()?.reuse_revokes_grant);
             Ok(())
         });
     }

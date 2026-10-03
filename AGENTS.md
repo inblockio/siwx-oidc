@@ -493,19 +493,38 @@ doc; read it before changing the code the rule covers.
   `caip122_nonces_are_stored_by_digest_and_used_once`, `a_wrong_token_cannot_open_the_successor`,
   `the_sealed_value_names_neither_token_and_is_fresh_each_time`,
   `malformed_refresh_tokens_are_unknown_never_a_panic`.
-- **Reuse is recognised and logged, never silently accepted** (I5, phase A). A refresh token whose
+- **Reuse is recognised and logged, never silently accepted** (I5). A refresh token whose
   handle names a live grant but that is neither `current_rt` nor the unused `previous_rt` is
   answered exactly like an unknown token and emits one `warn!` with the stable message
   `refresh token reuse detected` and the fields `security_event="refresh_token_reuse"`,
-  `grant_fp`, `generation`, `client_id`, `grant_kind`, `branch` (fingerprints only). Phase A
-  revokes nothing; storage per grant stays constant however long the chain. Pin:
+  `grant_fp`, `generation`, `client_id`, `grant_kind`, `branch`, `grant_revoked`
+  (fingerprints only). The rest is the switch `reuse_revokes_grant`, read once at startup
+  (`RedisClient::with_reuse_enforcement`). **Off** (the default, phase A): nothing is revoked
+  (`grant_revoked=false`); storage per grant stays constant however long the chain. **On**
+  (phase B): the rotation script that detected the reuse also deletes the grant, in the same
+  atomic step, through `drop_grant` (an `oidc` grant queues its back-channel logout, the `sid`
+  index entry goes) and drops its index entries; the event says `grant_revoked=true`; the answer
+  stays the unknown-token answer; the Synapse device is never deleted and no device tombstone is
+  planted (as with revoke). The current holder of the grant is refused from then on, its access
+  token at once and its refresh token at its next refresh: that is the point of enforcement. A
+  replay of the previous token while its successor is unused is a lost response (I4), never
+  reuse, so it never revokes. The switch stays off until the maintainers decide (D2: at least 30
+  days of phase-A telemetry from Element Web and Element X, every reuse event explained, no
+  unexplained single-holder event, H6). Pin:
   `h3_a_thousand_rotations_recognise_every_superseded_token_in_constant_storage`,
   `rotating_the_successor_counts_as_its_use_and_older_tokens_are_reuse`,
   `the_reuse_event_carries_its_fields_and_fingerprints_only`,
   `a_replay_an_hour_later_returns_the_same_pair_and_after_use_is_reuse` (the event at `/token`),
   `the_matrix_endpoint_logs_one_reuse_event_for_a_superseded_refresh_token` (the event at
   `/_matrix/client/v3/refresh`),
-  `a_replay_returns_the_same_pair_until_the_new_access_token_is_used` (mock stack).
+  `a_replay_returns_the_same_pair_until_the_new_access_token_is_used` (mock stack, switch off);
+  `with_enforcement_off_reuse_leaves_the_grant_intact`,
+  `with_enforcement_on_reuse_deletes_the_grant_and_never_the_device`,
+  `with_enforcement_on_a_lost_response_replay_returns_the_same_pair_and_deletes_nothing`,
+  `with_reuse_enforcement_a_superseded_token_at_the_token_endpoint_ends_its_grant`,
+  `with_reuse_enforcement_the_matrix_endpoint_ends_the_grant_and_never_the_device` (in process:
+  the shared mock stack runs one server with the default, which the mock-stack pins need),
+  `reuse_enforcement_is_off_by_default_and_read_under_both_prefixes`.
 - **Tokens of a build before the grant record keep working; nobody signs in again** (design 5.8).
   A legacy access entry stays readable until it expires (`check_access_token`'s read fallback,
   removed one release later). A legacy refresh token is lifted into a grant by one script the
@@ -627,8 +646,8 @@ doc; read it before changing the code the rule covers.
   Logout 1.0). `drop_grant` queues the entry (client, `sub`, `sid`, grant id) in
   `outbox:backchannel_logout` in the same script as the deletion: RFC 7009 revocation of the
   refresh token, `/end_session`, a rotation refused for an epoch or for inactivity or absolute
-  expiry (the script deletes the grant then), and revocation of all of a user's grants
-  (`logout/all`, deactivation, erasure). A grant whose key simply expires runs no script and
+  expiry (the script deletes the grant then), revocation of all of a user's grants
+  (`logout/all`, deactivation, erasure), and a reuse event while `reuse_revokes_grant` is on. A grant whose key simply expires runs no script and
   sends nothing (nothing observes it, and the RP's refresh token expired with it); an epoch that
   only refuses an access token deletes nothing and sends nothing until a rotation deletes the
   grant. A `matrix_device` or `service` grant never sends one (Synapse is not an RP here), so
@@ -646,6 +665,7 @@ doc; read it before changing the code the rule covers.
   `every_active_deletion_of_an_oidc_grant_queues_one_logout_entry`,
   `the_outbox_leases_retries_and_completes_an_entry`,
   `drop_grant_names_the_outbox_the_worker_reads`,
+  `with_enforcement_on_reuse_deletes_the_grant_and_never_the_device` (reuse),
   `the_logout_token_has_the_spec_header_claims_and_a_raw_signature`,
   `the_worker_delivers_retries_a_failing_rp_then_drops_it_with_a_warning`,
   `the_d4_switch_requires_a_backchannel_uri_from_a_client_that_may_refresh`,
