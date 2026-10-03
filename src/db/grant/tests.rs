@@ -1014,7 +1014,8 @@ async fn concurrent_presentations_of_one_legacy_token_converge_on_one_pair() {
 
 /// What must not be lifted stays as it was: a legacy access token, a
 /// confidential client's token at an endpoint that refuses those, a request
-/// naming another client, a tombstoned session, an unknown string.
+/// naming another client, an entry past its `exp`, a tombstoned session, an
+/// unknown string.
 #[tokio::test]
 async fn a_legacy_token_that_may_not_be_lifted_stays_untouched() {
     let Some(client) = crate::test_support::redis().await else {
@@ -1061,6 +1062,38 @@ async fn a_legacy_token_that_may_not_be_lifted_stays_untouched() {
             .unwrap(),
         RotateOutcome::ClientMismatch
     );
+    // A legacy refresh entry whose `exp` has passed while its Redis TTL is
+    // still live: the lift reads the entry's own expiry, not the key's TTL.
+    let (expired_rt, _) =
+        seed_legacy(&client, &user, "DEVN", REFRESH_TOKEN_TTL as i64, false).await;
+    let now = chrono::Utc::now().timestamp();
+    let stale = TokenMetadata {
+        iat: now - 60 - REFRESH_TOKEN_TTL as i64,
+        exp: now - 60,
+        ..meta.clone()
+    };
+    let stale_json = serde_json::to_string(&stale).unwrap();
+    let expired_key = format!("token/{expired_rt}");
+    let _: () = raw(&client, &["SET", &expired_key, &stale_json, "EX", "3600"]).await;
+    let expired = peek_legacy(&client, &expired_rt).await;
+    assert_eq!(
+        expired.meta.exp, stale.exp,
+        "the expired entry is the one read"
+    );
+    assert_eq!(
+        client
+            .lift_legacy_refresh_token(&request(&expired_rt), &expired, false)
+            .await
+            .unwrap(),
+        RotateOutcome::Invalid(InvalidReason::Expired),
+        "a legacy token past its exp is expired whatever its TTL"
+    );
+    let left: Option<String> = raw(&client, &["GET", &expired_key]).await;
+    assert_eq!(
+        left.as_deref(),
+        Some(stale_json.as_str()),
+        "the expired entry is left as it was"
+    );
     client.mark_user_deactivated(&meta.username).await.unwrap();
     assert_eq!(
         client
@@ -1069,7 +1102,7 @@ async fn a_legacy_token_that_may_not_be_lifted_stays_untouched() {
             .unwrap(),
         RotateOutcome::Invalid(InvalidReason::Revoked)
     );
-    for token in [&legacy_at, &legacy_rt] {
+    for token in [&legacy_at, &legacy_rt, &expired_rt] {
         let exists: i64 = raw(&client, &["EXISTS", &format!("token/{token}")]).await;
         assert_eq!(exists, 1, "the legacy entry is untouched");
         let pointer: i64 = raw(&client, &["EXISTS", &legacy_rt_key(token)]).await;
