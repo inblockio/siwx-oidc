@@ -191,6 +191,26 @@ backchannel_logout_allowed_hosts = ["rp.internal.example.org"]
 backchannel_logout_required_for_refresh = true
 ```
 
+### Refresh token reuse
+
+A refresh token that was already rotated away (an older token of the chain, or the previous one
+after its successor was used) is reuse: someone besides the client holds the chain, or the client
+lost track of it. Reuse is always refused exactly like an unknown token and logged as one
+`warn!` security event (`refresh token reuse detected`, `security_event="refresh_token_reuse"`,
+with `grant_revoked` saying whether the grant was revoked). A retry with the previous token
+while its successor is still unused is a lost response, answered with the same pair, and is
+never reuse.
+
+| Key | Environment | Default | Meaning |
+|---|---|---|---|
+| `reuse_revokes_grant` | `SIWXOIDC_REUSE_REVOKES_GRANT` | `false` | Off: reuse is refused and logged, nothing is revoked. On: reuse also revokes the grant, in the same atomic step that detected it, as revoking its refresh token would: its access tokens are inactive at once, the holder of its current refresh token is refused at its next refresh, a generic RP gets a back-channel logout token, and the Synapse device is not deleted (an Element user is signed out and usually signs in again as a new device). Read once at startup. |
+
+Leave it off. Turning it on is decision D2 for the maintainers, with these exit criteria: at
+least 30 days of reuse telemetry with the switch off from Element Web and Element X, every reuse
+event explained, and no unexplained event for a session with a single holder (hypothesis H6 of
+the token lifecycle design). A client that presents an older token on its own, for example a
+second process refreshing beside the app without a shared lock, would otherwise be signed out.
+
 ### Legal documents
 
 | Key | Environment | Default | Meaning |

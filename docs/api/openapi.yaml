@@ -265,7 +265,9 @@ paths:
         is unused (its access token not yet accepted by introspection or
         `/userinfo`, its refresh token not yet rotated). A replay after that, or
         after the successor was rotated or revoked, is `invalid_grant`; reuse of
-        a superseded token is logged as a security event. A refresh token issued
+        a superseded token is logged as a security event and, when the operator
+        enables `reuse_revokes_grant` (off by default), also revokes the grant,
+        so its current refresh token is refused too. A refresh token issued
         by a build before the grant record is answered with tokens in the current
         format (`mcr_{handle}_{secret}`), and its replays follow the same rule.
 
