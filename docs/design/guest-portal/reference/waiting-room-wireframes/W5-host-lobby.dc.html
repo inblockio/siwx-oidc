@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Host waiting room panel</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap">
+<style>
+body{margin:0}
+a{color:#1F5FD1}a:hover{color:#174AA6}
+</style>
+</helmet>
+<div style="width: 100%; height: 100vh; min-height: 720px; box-sizing: border-box; background: #1F1F1D; font-family: 'IBM Plex Sans', sans-serif; color: #1B1B19; display: flex; flex-wrap: wrap">
+<div style="flex: 1 1 560px; min-width: 0; box-sizing: border-box; padding: 16px 24px; display: flex; flex-direction: column; gap: 12px; color: #F2F2EE">
+<div style="height: 40px; display: flex; align-items: center; gap: 16px"><div style="font-size: 15px; font-weight: 600">[Meeting title]</div><div style="font-size: 13px; color: #BDBDB6">32:40</div></div>
+<div style="flex-grow: 1; min-height: 240px; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); grid-auto-rows: minmax(110px, 1fr); gap: 12px">
+<div style="position: relative; border-radius: 10px; background: #3A3A36"><span style="position: absolute; left: 10px; bottom: 8px; font-size: 13px; color: #D9D9D4">You (host)</span></div>
+<div style="position: relative; border-radius: 10px; background: #3A3A36"><span style="position: absolute; left: 10px; bottom: 8px; font-size: 13px; color: #D9D9D4">[Participant]</span></div>
+<div style="position: relative; border-radius: 10px; background: #3A3A36"><span style="position: absolute; left: 10px; bottom: 8px; font-size: 13px; color: #D9D9D4">[Participant]</span></div>
+<div style="position: relative; border-radius: 10px; background: #3A3A36"><span style="position: absolute; left: 10px; bottom: 8px; font-size: 13px; color: #D9D9D4">[Participant]</span></div>
+</div>
+</div>
+<aside aria-label="Waiting room" style="flex: 1 1 380px; max-width: 460px; box-sizing: border-box; background: #FFFFFF; display: flex; flex-direction: column; overflow: hidden">
+<div style="display: flex; align-items: center; gap: 10px; padding: 16px 16px 10px">
+<h2 style="margin: 0; font-size: 18px; font-weight: 600">Waiting room</h2>
+<span style="font-size: 12px; font-weight: 600; color: #FFFFFF; background: #1F5FD1; border-radius: 10px; padding: 1px 8px">5</span>
+<div style="margin-left: auto; display: flex; align-items: center; gap: 6px">
+<button type="button" style="height: 40px; padding: 0 12px; border: 1px solid #BDBDB6; border-radius: 8px; background: #FFFFFF; font-family: inherit; font-size: 13px; font-weight: 500; color: #1B1B19; cursor: pointer">Message all</button>
+<span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px">F14</span>
+<button type="button" aria-label="Close panel" style="width: 40px; height: 40px; border: none; background: transparent; color: #5A5A54; cursor: pointer; display: flex; align-items: center; justify-content: center"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="6" y1="6" x2="18" y2="18"></line><line x1="18" y1="6" x2="6" y2="18"></line></svg></button>
+</div>
+</div>
+<div style="display: flex; align-items: center; gap: 8px; padding: 0 16px 10px; font-size: 12px; color: #5A5A54">
+<label style="display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 500; color: #1B1B19"><input type="checkbox" style="width: 16px; height: 16px; accent-color: #1F5FD1; margin: 0">Lock meeting</label>
+<span style="margin-left: auto">Only hosts and co-hosts see this list</span>
+<span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px">F7</span>
+</div>
+<div style="display: flex; align-items: center; gap: 8px; padding: 8px 16px; background: #F1F1EE; border-top: 1px solid #E2E2DD; border-bottom: 1px solid #E2E2DD">
+<label style="display: flex; align-items: center; gap: 6px; font-size: 13px"><input type="checkbox" style="width: 18px; height: 18px; accent-color: #1F5FD1; margin: 0">Select all</label>
+<span style="font-size: 12px; color: #5A5A54">2 selected</span>
+<button type="button" style="margin-left: auto; height: 40px; padding: 0 14px; border: none; border-radius: 8px; background: #1F5FD1; color: #FFFFFF; font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer">Admit 2</button>
+<button type="button" style="height: 40px; padding: 0 14px; border: 1px solid #BDBDB6; border-radius: 8px; background: #FFFFFF; font-family: inherit; font-size: 13px; font-weight: 500; color: #1B1B19; cursor: pointer">Deny 2</button>
+<span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px">F5</span>
+</div>
+<div style="flex-grow: 1; display: flex; flex-direction: column">
+<div style="display: flex; align-items: center; gap: 8px; padding: 12px 16px 2px"><span style="font-size: 12px; font-weight: 600; color: #6A4708; background: #F6E7CC; border-radius: 10px; padding: 1px 8px">Suspected · 1</span><span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px">F11</span></div>
+<div style="display: flex; align-items: center; gap: 10px; padding: 8px 16px">
+<input type="checkbox" aria-label="Select MeetingBot 7" style="width: 18px; height: 18px; accent-color: #1F5FD1; margin: 0; flex-shrink: 0">
+<div style="width: 32px; height: 32px; flex-shrink: 0; border-radius: 16px; background: #F6E7CC; color: #6A4708; font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center">M</div>
+<div style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column"><div style="font-size: 14px; font-weight: 500">MeetingBot 7</div><div style="font-size: 12px; color: #5A5A54">Automated browser detected</div></div>
+<button type="button" style="height: 40px; padding: 0 12px; border: 1px solid #BDBDB6; border-radius: 8px; background: #FFFFFF; font-family: inherit; font-size: 13px; font-weight: 500; color: #1B1B19; cursor: pointer">Deny</button>
+<button type="button" style="height: 40px; padding: 0 12px; border: 1px solid #BDBDB6; border-radius: 8px; background: #FFFFFF; font-family: inherit; font-size: 13px; font-weight: 500; color: #1B1B19; cursor: pointer">Admit</button>
+</div>
+<div style="display: flex; align-items: center; gap: 8px; padding: 12px 16px 2px; font-size: 12px; font-weight: 600; color: #5A5A54; text-transform: uppercase; letter-spacing: 0.04em">Unverified · 1<span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px; text-transform: none; letter-spacing: 0">F4</span></div>
+<div style="display: flex; align-items: center; gap: 10px; padding: 8px 16px">
+<input type="checkbox" aria-label="Select Alex" style="width: 18px; height: 18px; accent-color: #1F5FD1; margin: 0; flex-shrink: 0">
+<div style="width: 32px; height: 32px; flex-shrink: 0; border-radius: 16px; background: #E2E2DD; font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center">A</div>
+<div style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column"><div style="font-size: 14px; font-weight: 500">Alex</div><div style="font-size: 12px; color: #5A5A54">Guest · browser · waiting 3 min</div></div>
+<button type="button" style="height: 40px; padding: 0 12px; border: none; border-radius: 8px; background: #1F5FD1; color: #FFFFFF; font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer">Admit</button>
+<button type="button" aria-label="More actions for Alex" style="width: 40px; height: 40px; border: 1px solid #BDBDB6; border-radius: 8px; background: #FFFFFF; color: #1B1B19; cursor: pointer; font-size: 18px; line-height: 1">⋯</button>
+</div>
+<div style="display: flex; align-items: center; gap: 8px; padding: 12px 16px 2px; font-size: 12px; font-weight: 600; color: #5A5A54; text-transform: uppercase; letter-spacing: 0.04em">Verified email · 1</div>
+<div style="display: flex; align-items: center; gap: 10px; padding: 8px 16px; background: #E6EEFB">
+<input type="checkbox" checked aria-label="Select Sam K." style="width: 18px; height: 18px; accent-color: #1F5FD1; margin: 0; flex-shrink: 0">
+<div style="width: 32px; height: 32px; flex-shrink: 0; border-radius: 16px; background: #E2E2DD; font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center">S</div>
+<div style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column"><div style="font-size: 14px; font-weight: 500">Sam K.</div><div style="font-size: 12px; color: #5A5A54">sam@[domain] · waiting 2 min</div></div>
+<button type="button" style="height: 40px; padding: 0 12px; border: none; border-radius: 8px; background: #1F5FD1; color: #FFFFFF; font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer">Admit</button>
+<button type="button" aria-label="More actions for Sam K." style="width: 40px; height: 40px; border: 1px solid #BDBDB6; border-radius: 8px; background: #FFFFFF; color: #1B1B19; cursor: pointer; font-size: 18px; line-height: 1">⋯</button>
+</div>
+<div style="display: flex; align-items: center; gap: 8px; padding: 12px 16px 2px; font-size: 12px; font-weight: 600; color: #5A5A54; text-transform: uppercase; letter-spacing: 0.04em">External · 1</div>
+<div style="position: relative; display: flex; align-items: center; gap: 10px; padding: 8px 16px; background: #E6EEFB">
+<input type="checkbox" checked aria-label="Select Priya S." style="width: 18px; height: 18px; accent-color: #1F5FD1; margin: 0; flex-shrink: 0">
+<div style="width: 32px; height: 32px; flex-shrink: 0; border-radius: 16px; background: #E2E2DD; font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center">P</div>
+<div style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column"><div style="font-size: 14px; font-weight: 500">Priya S.</div><div style="font-size: 12px; color: #5A5A54">[Partner organisation] · waiting 1 min</div></div>
+<button type="button" style="height: 40px; padding: 0 12px; border: none; border-radius: 8px; background: #1F5FD1; color: #FFFFFF; font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer">Admit</button>
+<button type="button" aria-label="More actions for Priya S." aria-expanded="true" style="width: 40px; height: 40px; border: 2px solid #1F5FD1; border-radius: 8px; background: #FFFFFF; color: #1B1B19; cursor: pointer; font-size: 18px; line-height: 1">⋯</button>
+<div role="menu" style="position: absolute; top: 52px; right: 16px; z-index: 2; width: 300px; background: #FFFFFF; border: 1px solid #D3D3CD; border-radius: 10px; box-shadow: 0 10px 28px rgba(0,0,0,0.18); padding: 6px; display: flex; flex-direction: column">
+<button type="button" role="menuitem" style="height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: none; border-radius: 6px; background: #FFFFFF; font-family: inherit; font-size: 14px; color: #1B1B19; text-align: left; cursor: pointer"><span style="flex-grow: 1">Admit to Room 2 (assigned)</span><span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px">F20</span></button>
+<button type="button" role="menuitem" style="height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: none; border-radius: 6px; background: #FFFFFF; font-family: inherit; font-size: 14px; color: #1B1B19; text-align: left; cursor: pointer"><span style="flex-grow: 1">Put on hold with a message</span><span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px">F18</span></button>
+<button type="button" role="menuitem" style="height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: none; border-radius: 6px; background: #FFFFFF; font-family: inherit; font-size: 14px; color: #1B1B19; text-align: left; cursor: pointer"><span style="flex-grow: 1">Message privately</span><span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px">F14</span></button>
+<button type="button" role="menuitem" style="height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: none; border-radius: 6px; background: #FFFFFF; font-family: inherit; font-size: 14px; color: #1B1B19; text-align: left; cursor: pointer"><span style="flex-grow: 1">Deny</span></button>
+<div style="height: 1px; background: #E2E2DD; margin: 4px 0"></div>
+<button type="button" role="menuitem" style="height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: none; border-radius: 6px; background: #FFFFFF; font-family: inherit; font-size: 14px; color: #1B1B19; text-align: left; cursor: pointer"><span style="flex-grow: 1">Deny and block for this meeting</span><span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px">F12</span></button>
+<button type="button" role="menuitem" style="height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: none; border-radius: 6px; background: #FFFFFF; font-family: inherit; font-size: 14px; color: #1B1B19; text-align: left; cursor: pointer"><span style="flex-grow: 1">Report</span><span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px">F22</span></button>
+</div>
+</div>
+<div style="display: flex; align-items: center; gap: 8px; padding: 12px 16px 2px; font-size: 12px; font-weight: 600; color: #5A5A54; text-transform: uppercase; letter-spacing: 0.04em">Phone · 1<span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px; text-transform: none; letter-spacing: 0">F2</span></div>
+<div style="display: flex; align-items: center; gap: 10px; padding: 8px 16px">
+<input type="checkbox" aria-label="Select phone caller" style="width: 18px; height: 18px; accent-color: #1F5FD1; margin: 0; flex-shrink: 0">
+<div style="width: 32px; height: 32px; flex-shrink: 0; border-radius: 16px; background: #E2E2DD; font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center">#</div>
+<div style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column"><div style="font-size: 14px; font-weight: 500">+49 ••• ••• 482</div><div style="font-size: 12px; color: #5A5A54">Phone caller · waiting 1 min</div></div>
+<button type="button" style="height: 40px; padding: 0 12px; border: none; border-radius: 8px; background: #1F5FD1; color: #FFFFFF; font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer">Admit</button>
+<button type="button" aria-label="More actions for phone caller" style="width: 40px; height: 40px; border: 1px solid #BDBDB6; border-radius: 8px; background: #FFFFFF; color: #1B1B19; cursor: pointer; font-size: 18px; line-height: 1">⋯</button>
+</div>
+</div>
+<div style="display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-top: 1px solid #E2E2DD">
+<label style="display: flex; align-items: center; gap: 6px; font-size: 13px"><input type="checkbox" style="width: 16px; height: 16px; accent-color: #1F5FD1; margin: 0">Remember my choice if they ask again</label>
+<span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px">F25</span>
+</div>
+</aside>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"showTags":{"editor":"boolean","default":true},"$preview":{"width":1280,"height":800}}'>
+class Component extends DCLogic {
+renderVals() {
+return { tagDisplay: (this.props.showTags ?? true) ? 'inline-block' : 'none' };
+}
+}
+</script>
+</body>
+</html>

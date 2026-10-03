@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Host participant actions</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap">
+<style>
+body{margin:0}
+a{color:#1F5FD1}a:hover{color:#174AA6}
+</style>
+</helmet>
+<div style="width: 100%; height: 100vh; min-height: 720px; box-sizing: border-box; background: #1F1F1D; font-family: 'IBM Plex Sans', sans-serif; color: #1B1B19; display: flex; flex-wrap: wrap">
+<div style="position: relative; flex: 1 1 560px; min-width: 0; box-sizing: border-box; padding: 16px 24px 96px; display: flex; flex-direction: column; gap: 12px; color: #F2F2EE">
+<div style="height: 40px; display: flex; align-items: center; gap: 16px"><div style="font-size: 15px; font-weight: 600">[Meeting title]</div><div style="font-size: 13px; color: #BDBDB6">41:05</div></div>
+<div style="flex-grow: 1; min-height: 240px; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); grid-auto-rows: minmax(110px, 1fr); gap: 12px">
+<div style="position: relative; border-radius: 10px; background: #3A3A36"><span style="position: absolute; left: 10px; bottom: 8px; font-size: 13px; color: #D9D9D4">You (host)</span></div>
+<div style="position: relative; border-radius: 10px; background: #3A3A36"><span style="position: absolute; left: 10px; bottom: 8px; font-size: 13px; color: #D9D9D4">[Co-host]</span></div>
+<div style="position: relative; border-radius: 10px; background: #3A3A36; outline: 2px solid #8FB2F0"><span style="position: absolute; left: 10px; bottom: 8px; font-size: 13px; color: #D9D9D4">Jordan (guest)</span></div>
+<div style="position: relative; border-radius: 10px; background: #3A3A36"><span style="position: absolute; left: 10px; bottom: 8px; font-size: 13px; color: #D9D9D4">Priya S.</span></div>
+<div style="position: relative; border-radius: 10px; background: #3A3A36"><span style="position: absolute; left: 10px; bottom: 8px; font-size: 13px; color: #D9D9D4">Sam K.</span></div>
+<div style="position: relative; border-radius: 10px; background: #3A3A36"><span style="position: absolute; left: 10px; bottom: 8px; font-size: 13px; color: #D9D9D4">+49 ••• 482</span></div>
+</div>
+<div role="status" style="position: absolute; left: 24px; bottom: 24px; max-width: calc(100% - 48px); box-sizing: border-box; background: #FFFFFF; color: #1B1B19; border-radius: 10px; box-shadow: 0 10px 28px rgba(0,0,0,0.35); padding: 10px 12px 10px 16px; display: flex; align-items: center; gap: 14px; font-size: 14px">
+<span>Jordan is back in the waiting room. Their audio, video and chat are off.</span>
+<button type="button" style="height: 40px; padding: 0 12px; border: none; border-radius: 8px; background: transparent; color: #1F5FD1; font-family: inherit; font-size: 14px; font-weight: 600; cursor: pointer">Undo</button>
+</div>
+</div>
+<aside aria-label="People" style="flex: 1 1 380px; max-width: 460px; box-sizing: border-box; background: #FFFFFF; display: flex; flex-direction: column">
+<div style="display: flex; align-items: center; gap: 10px; padding: 16px 16px 8px">
+<h2 style="margin: 0; font-size: 18px; font-weight: 600">People</h2>
+<button type="button" aria-label="Close panel" style="margin-left: auto; width: 40px; height: 40px; border: none; background: transparent; color: #5A5A54; cursor: pointer; display: flex; align-items: center; justify-content: center"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="6" y1="6" x2="18" y2="18"></line><line x1="18" y1="6" x2="6" y2="18"></line></svg></button>
+</div>
+<div style="display: flex; gap: 4px; padding: 0 16px 8px; border-bottom: 1px solid #E2E2DD">
+<button type="button" aria-pressed="true" style="height: 40px; padding: 0 12px; border: none; border-bottom: 2px solid #1F5FD1; background: #FFFFFF; font-family: inherit; font-size: 14px; font-weight: 600; color: #1B1B19; cursor: pointer">In the meeting · 6</button>
+<button type="button" aria-pressed="false" style="height: 40px; padding: 0 12px; border: none; background: #FFFFFF; font-family: inherit; font-size: 14px; font-weight: 500; color: #5A5A54; cursor: pointer">Waiting · 0</button>
+</div>
+<div style="display: flex; flex-direction: column; padding-top: 6px">
+<div style="display: flex; align-items: center; gap: 10px; padding: 8px 16px">
+<div style="width: 32px; height: 32px; flex-shrink: 0; border-radius: 16px; background: #E2E2DD; font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center">Y</div>
+<div style="flex-grow: 1; display: flex; flex-direction: column"><div style="font-size: 14px; font-weight: 500">You</div><div style="font-size: 12px; color: #5A5A54">Host · Internal</div></div>
+</div>
+<div style="display: flex; align-items: center; gap: 10px; padding: 8px 16px">
+<div style="width: 32px; height: 32px; flex-shrink: 0; border-radius: 16px; background: #E2E2DD; font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center">C</div>
+<div style="flex-grow: 1; display: flex; flex-direction: column"><div style="font-size: 14px; font-weight: 500">[Co-host]</div><div style="font-size: 12px; color: #5A5A54">Co-host · Internal</div></div>
+</div>
+<div style="position: relative; display: flex; align-items: center; gap: 10px; padding: 8px 16px; background: #E6EEFB">
+<div style="width: 32px; height: 32px; flex-shrink: 0; border-radius: 16px; background: #E2E2DD; font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center">J</div>
+<div style="flex-grow: 1; display: flex; flex-direction: column"><div style="font-size: 14px; font-weight: 500">Jordan</div><div style="font-size: 12px; color: #5A5A54">Guest · Unverified</div></div>
+<button type="button" aria-label="More actions for Jordan" aria-expanded="true" style="width: 40px; height: 40px; border: 2px solid #1F5FD1; border-radius: 8px; background: #FFFFFF; color: #1B1B19; cursor: pointer; font-size: 18px; line-height: 1">⋯</button>
+<div role="menu" style="position: absolute; top: 52px; right: 16px; z-index: 2; width: 300px; background: #FFFFFF; border: 1px solid #D3D3CD; border-radius: 10px; box-shadow: 0 10px 28px rgba(0,0,0,0.18); padding: 6px; display: flex; flex-direction: column">
+<button type="button" role="menuitem" style="height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: none; border-radius: 6px; background: #F1F1EE; font-family: inherit; font-size: 14px; font-weight: 600; color: #1B1B19; text-align: left; cursor: pointer"><span style="flex-grow: 1">Send to waiting room</span><span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px">F6</span></button>
+<button type="button" role="menuitem" style="height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: none; border-radius: 6px; background: #FFFFFF; font-family: inherit; font-size: 14px; color: #1B1B19; text-align: left; cursor: pointer"><span style="flex-grow: 1">Rename</span></button>
+<button type="button" role="menuitem" style="height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: none; border-radius: 6px; background: #FFFFFF; font-family: inherit; font-size: 14px; color: #1B1B19; text-align: left; cursor: pointer"><span style="flex-grow: 1">Make co-host</span></button>
+<div style="height: 1px; background: #E2E2DD; margin: 4px 0"></div>
+<button type="button" role="menuitem" style="height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: none; border-radius: 6px; background: #FFFFFF; font-family: inherit; font-size: 14px; color: #1B1B19; text-align: left; cursor: pointer"><span style="flex-grow: 1">Remove</span></button>
+<button type="button" role="menuitem" style="height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: none; border-radius: 6px; background: #FFFFFF; font-family: inherit; font-size: 14px; color: #1B1B19; text-align: left; cursor: pointer"><span style="flex-grow: 1">Remove and block from rejoining</span><span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px">F12</span></button>
+<button type="button" role="menuitem" style="height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: none; border-radius: 6px; background: #FFFFFF; font-family: inherit; font-size: 14px; color: #1B1B19; text-align: left; cursor: pointer"><span style="flex-grow: 1">Report to trust and safety</span><span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px">F22</span></button>
+</div>
+</div>
+<div style="display: flex; align-items: center; gap: 10px; padding: 8px 16px">
+<div style="width: 32px; height: 32px; flex-shrink: 0; border-radius: 16px; background: #E2E2DD; font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center">P</div>
+<div style="flex-grow: 1; display: flex; flex-direction: column"><div style="font-size: 14px; font-weight: 500">Priya S.</div><div style="font-size: 12px; color: #5A5A54">External · [Partner organisation]</div></div>
+</div>
+<div style="display: flex; align-items: center; gap: 10px; padding: 8px 16px">
+<div style="width: 32px; height: 32px; flex-shrink: 0; border-radius: 16px; background: #E2E2DD; font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center">S</div>
+<div style="flex-grow: 1; display: flex; flex-direction: column"><div style="font-size: 14px; font-weight: 500">Sam K.</div><div style="font-size: 12px; color: #5A5A54">Guest · Verified email</div></div>
+</div>
+<div style="display: flex; align-items: center; gap: 10px; padding: 8px 16px">
+<div style="width: 32px; height: 32px; flex-shrink: 0; border-radius: 16px; background: #E2E2DD; font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center">#</div>
+<div style="flex-grow: 1; display: flex; flex-direction: column"><div style="font-size: 14px; font-weight: 500">+49 ••• ••• 482</div><div style="font-size: 12px; color: #5A5A54">Phone caller</div></div>
+</div>
+</div>
+</aside>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"showTags":{"editor":"boolean","default":true},"$preview":{"width":1280,"height":800}}'>
+class Component extends DCLogic {
+renderVals() {
+return { tagDisplay: (this.props.showTags ?? true) ? 'inline-block' : 'none' };
+}
+}
+</script>
+</body>
+</html>
