@@ -709,7 +709,7 @@ pub fn provider_metadata_value(
     value["grant_types_supported"] = serde_json::json!(grant_types);
     value["revocation_endpoint"] = serde_json::json!(format!("{}/oauth2/revoke", base));
     value["token_endpoint_auth_methods_supported"] =
-        serde_json::json!(["client_secret_post", "none"]);
+        serde_json::json!(["client_secret_basic", "client_secret_post", "none"]);
     value["prompt_values_supported"] = serde_json::json!(["login", "create"]);
     // Both advertised ONLY when this deployment can answer them: a client that
     // finds a key will use it, and a route that answers 503 (`/resolve`) or an

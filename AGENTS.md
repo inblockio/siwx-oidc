@@ -321,7 +321,9 @@ doc; read it before changing the code the rule covers.
   promise a per-client identifier. `scopes_supported` lists `offline_access` because generic mode
   honours it (next bullet). Pin: `discovery_advertises_public_subjects_only`,
   `discovery_advertises_offline_access`; the response types are pinned by
-  `discovery_advertises_only_the_code_response_type`.
+  `discovery_advertises_only_the_code_response_type`, and the client authentication methods
+  (`client_secret_basic`, `client_secret_post`, `none`: what `POST /token` reads) by
+  `discovery_advertises_every_client_authentication_method_the_token_endpoint_accepts`.
 - **Generic mode issues a refresh token only for `offline_access`, and the scope it records is
   the one requested and granted** (I10). Generic mode is a deployment with no
   `mas_shared_secret`. The code exchange grants the requested scopes among `openid`, `profile`

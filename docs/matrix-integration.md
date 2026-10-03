@@ -416,8 +416,8 @@ Provisional choices, open for the maintainers:
 
 An `Authorization` header at `/token` used to be answered with a 400 on every
 request (two header extractors rejecting each other's scheme), so
-`client_secret_basic` never worked. It is read now. Discovery still advertises
-only `client_secret_post` and `none`.
+`client_secret_basic` never worked. It is read now, and discovery advertises
+`client_secret_basic`, `client_secret_post` and `none`.
 
 ### Introspection never turns a storage error into a logout
 
