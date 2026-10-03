@@ -141,18 +141,26 @@ fn a_struct_that_holds_a_credential_prints_its_fingerprint_under_debug() {
         access_exp: 1,
     };
     let user_code = "WDJB-MJHT".to_string();
-    let device = DeviceCodeEntry {
-        user_code: user_code.clone(),
-        client_id: "log-hygiene-client".to_string(),
-        scope: "openid".to_string(),
-        status: DeviceCodeStatus::Pending,
-        did: None,
-        device_id: None,
-        last_poll: None,
-        created_at: 0,
-    };
-    let shown =
-        format!("{rotated:?}\n{rotated:#?}\n{issued:?}\n{issued:#?}\n{device:?}\n{device:#?}");
+    let device = DeviceCodeEntry::new(
+        &user_code,
+        "log-hygiene-client".to_string(),
+        "openid".to_string(),
+        0,
+    );
+    // An entry the previous build wrote carries the user code in the clear.
+    let legacy_device = DeviceCodeEntry::from_stored(
+        &serde_json::json!({
+            "user_code": user_code, "client_id": "log-hygiene-client", "scope": "openid",
+            "status": "Pending", "did": null, "device_id": null, "last_poll": null,
+            "created_at": 0,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let shown = format!(
+        "{rotated:?}\n{rotated:#?}\n{issued:?}\n{issued:#?}\n{device:?}\n{device:#?}\n\
+         {legacy_device:?}\n{legacy_device:#?}"
+    );
     assert_logged_only_as_fingerprint(&shown, "successor access token", &access);
     assert_logged_only_as_fingerprint(&shown, "successor refresh token", &refresh);
     assert_logged_only_as_fingerprint(&shown, "issued access token", &issued_access);

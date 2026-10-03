@@ -15,8 +15,29 @@ pub mod tokens;
 pub use self::redis::RedisClient;
 
 const KV_CLIENT_PREFIX: &str = "clients";
+
+// Credentials a client holds are stored only as their SHA-256 digest
+// ([`tokens::digest`]): authorization codes `code/{digest}`, login sessions
+// `session/{digest}`, device codes `device_code/{digest}`, user codes
+// `user_code/{digest}`, CAIP-122 nonces `caip122/{category}/{digest}` and
+// WebAuthn ceremony state under [`Ceremony`]. Each prefix differs from the
+// legacy one it replaces, so the legacy read below can never reach a digest
+// entry: a client presenting a stored digest as its credential reads
+// `codes/{digest}`, which nothing writes.
+const KV_CODE_DIGEST_PREFIX: &str = "code";
+const KV_SESSION_DIGEST_PREFIX: &str = "session";
+const KV_DEVICE_CODE_DIGEST_PREFIX: &str = "device_code";
+const KV_USER_CODE_DIGEST_PREFIX: &str = "user_code";
+const KV_CAIP122_NONCE_DIGEST_PREFIX: &str = "caip122";
+
+// The raw-keyed layout of the builds before digest keys. Entries in it are
+// read, and used once, for their remaining lifetime (codes and sessions 300 s,
+// device codes 1800 s, nonces 300 s, ceremonies 120 s) and never written anew.
+// TODO(remove one release after Phase 2b): the legacy reads.
 const KV_SESSION_PREFIX: &str = "sessions";
 const KV_CODE_PREFIX: &str = "codes";
+const KV_LEGACY_DEVICE_CODE_PREFIX: &str = "device_codes";
+const KV_LEGACY_USER_CODE_PREFIX: &str = "user_codes";
 /// Legacy token entries `token/{raw}`, written by builds before the grant record
 /// and only read and deleted now (see [`DBClient::set_token`]).
 const KV_TOKEN_PREFIX: &str = "token";
@@ -41,10 +62,11 @@ const KV_USER_TOMBSTONE_PREFIX: &str = "tombstone:user";
 /// The DID is stored as a hash so an erased account leaves no DID in cleartext.
 const KV_ERASED_USER_PREFIX: &str = "erased:user";
 const KV_ERASED_DID_PREFIX: &str = "erased:did";
-/// Prefix for server-issued, single-use CAIP-122 nonces (C1). Used by the
-/// device-approval and account CAIP-122 paths, which (unlike the login path) have
-/// no session to carry the nonce: it is minted on a dedicated GET and consumed on
-/// submit. The stored value is the operation context the nonce is bound to.
+/// Legacy prefix for server-issued, single-use CAIP-122 nonces (C1), now stored
+/// under `caip122/{category}/{digest}`. Used by the device-approval and account
+/// CAIP-122 paths, which (unlike the login path) have no session to carry the
+/// nonce: it is minted on a dedicated GET and consumed on submit. The stored
+/// value is the operation context the nonce is bound to.
 const KV_CAIP122_NONCE_PREFIX: &str = "caip122_nonce";
 /// TTL for a server-issued CAIP-122 device/account nonce (seconds). Long enough
 /// for the user to read the page and complete a wallet signing prompt, short
@@ -79,6 +101,35 @@ pub const KV_WEBAUTHN_CREDENTIAL_PREFIX: &str = "webauthn:credential";
 /// silently attribute a linked credential to the wrong principal. Reading is not
 /// owning. See [`crate::credential_migration`].
 pub const KV_WEBAUTHN_LINK_PREFIX: &str = "webauthn:link";
+
+/// The state of a WebAuthn ceremony between its start and its finish, keyed by
+/// the digest of the ceremony id the client holds (the login `session` cookie,
+/// the `session_id` the account re-auth start returns, or the device approval's
+/// `device_passkey_{user_code}`). See [`RedisClient::put_ceremony_state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ceremony {
+    /// Registration or authentication: `webauthn:ceremony/{digest}`.
+    Challenge,
+    /// Linking a passkey to an account: `webauthn:link_ceremony/{digest}`.
+    Link,
+}
+
+impl Ceremony {
+    pub(crate) fn prefix(self) -> &'static str {
+        match self {
+            Ceremony::Challenge => "webauthn:ceremony",
+            Ceremony::Link => "webauthn:link_ceremony",
+        }
+    }
+
+    /// Where a build before digest keys stored the same state, by raw id.
+    pub(crate) fn legacy_prefix(self) -> &'static str {
+        match self {
+            Ceremony::Challenge => "webauthn:challenge",
+            Ceremony::Link => "webauthn:link_challenge",
+        }
+    }
+}
 
 /// Redis key prefix for the opaque login user-session: `user:session/{token}` ->
 /// DID. The token is the identity hint that scopes the passkey picker's
@@ -230,7 +281,17 @@ pub enum DeviceCodeStatus {
 /// page, so it prints as its fingerprint (see [`crate::redact`]).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DeviceCodeEntry {
-    pub user_code: String,
+    /// SHA-256 digest of the user code ([`tokens::digest`]); the user code
+    /// itself is never stored. Empty in an entry a build before digest keys
+    /// wrote until [`DeviceCodeEntry::from_stored`] fills it in.
+    #[serde(default)]
+    pub user_code_digest: String,
+    /// The user code in the clear: present only in an entry a build before
+    /// digest keys wrote (as `user_code`), never in a new one. It names that
+    /// entry's legacy `user_codes/{raw}` mapping, deleted with it.
+    /// TODO(remove one release after Phase 2b).
+    #[serde(default, rename = "user_code", skip_serializing_if = "Option::is_none")]
+    pub legacy_user_code: Option<String>,
     pub client_id: String,
     pub scope: String,
     pub status: DeviceCodeStatus,
@@ -243,7 +304,11 @@ pub struct DeviceCodeEntry {
 impl std::fmt::Debug for DeviceCodeEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeviceCodeEntry")
-            .field("user_code_fp", &crate::redact::fingerprint(&self.user_code))
+            // A fingerprint is the digest's first eight hex characters.
+            .field(
+                "user_code_fp",
+                &self.user_code_digest.get(..8).unwrap_or_default(),
+            )
             .field("client_id", &self.client_id)
             .field("scope", &self.scope)
             .field("status", &self.status)
@@ -251,6 +316,59 @@ impl std::fmt::Debug for DeviceCodeEntry {
             .field("device_id", &self.device_id)
             .field("last_poll", &self.last_poll)
             .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+impl DeviceCodeEntry {
+    /// A new entry for the user code `user_code`, which it stores as a digest.
+    pub fn new(user_code: &str, client_id: String, scope: String, created_at: i64) -> Self {
+        DeviceCodeEntry {
+            user_code_digest: tokens::digest(user_code),
+            legacy_user_code: None,
+            client_id,
+            scope,
+            status: DeviceCodeStatus::Pending,
+            did: None,
+            device_id: None,
+            last_poll: None,
+            created_at,
+        }
+    }
+
+    /// Parse a stored entry, in either layout: an entry a build before digest
+    /// keys wrote carries the user code in the clear and gets its digest here.
+    pub fn from_stored(json: &str) -> serde_json::Result<Self> {
+        let mut entry: DeviceCodeEntry = serde_json::from_str(json)?;
+        if entry.user_code_digest.is_empty() {
+            if let Some(user_code) = &entry.legacy_user_code {
+                entry.user_code_digest = tokens::digest(user_code);
+            }
+        }
+        Ok(entry)
+    }
+}
+
+/// Where a device code's entry is stored. It comes from a lookup
+/// ([`DBClient::get_device_code`], [`DBClient::get_device_code_by_user_code`])
+/// and names the entry for the update or delete that follows, in the layout
+/// the lookup found it in: an entry a build before digest keys wrote under
+/// `device_codes/{raw}` is updated and deleted there, and its user-code
+/// mapping still holds the raw device code, so it stays in that layout until it
+/// is redeemed or expires. Its `Debug` prints a fingerprint.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DeviceCodeRef {
+    pub(crate) digest: String,
+    /// The raw device code, set only when the entry was found under the
+    /// legacy `device_codes/{raw}`. TODO(remove one release after Phase 2b).
+    pub(crate) legacy: Option<String>,
+}
+
+impl std::fmt::Debug for DeviceCodeRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCodeRef")
+            .field("fp", &self.digest.get(..8).unwrap_or_default())
+            .field("legacy", &self.legacy.is_some())
             .finish()
     }
 }
@@ -373,9 +491,10 @@ pub trait DBClient {
 
     /// Atomically claim an *approved* device code for redemption. Returns `true`
     /// only for the first caller; concurrent polls get `false` and must not issue
-    /// tokens (S3-1 / H9): a `SET .../redeemed 1 NX EX <ttl>` so exactly one
-    /// poll wins, as exactly one caller of
-    /// [`try_consume_code`](Self::try_consume_code) receives a code.
+    /// tokens (S3-1 / H9): a `SET device_code/{digest}/redeemed 1 NX EX <ttl>`
+    /// so exactly one poll wins, as exactly one caller of
+    /// [`try_consume_code`](Self::try_consume_code) receives a code. A claim a
+    /// build before digest keys left (`device_codes/{raw}/redeemed`) counts too.
     async fn try_claim_device_code(&self, device_code: &str) -> Result<bool>;
 
     // -- Legacy token entries (`token/{raw}`) -----------------------------------
@@ -394,39 +513,50 @@ pub trait DBClient {
     async fn delete_token(&self, token: &str) -> Result<()>;
 
     // -- RFC 8628 device code storage -----------------------------------------
+    //
+    // A device code is stored under its digest, `device_code/{digest}`, and a
+    // user code as `user_code/{digest}` -> the device code's digest. The entry
+    // holds the user code's digest, never the code.
 
-    /// Store a device code entry with a TTL in seconds.
+    /// Store a new device code entry with a TTL in seconds.
     async fn set_device_code(
         &self,
         device_code: &str,
         entry: &DeviceCodeEntry,
         ttl: u64,
     ) -> Result<()>;
-    /// Retrieve a device code entry.
-    async fn get_device_code(&self, device_code: &str) -> Result<Option<DeviceCodeEntry>>;
-    /// Update a device code entry (preserving original TTL is caller's responsibility).
-    async fn update_device_code(
+    /// Look up the device code a client presents.
+    async fn get_device_code(
         &self,
         device_code: &str,
+    ) -> Result<Option<(DeviceCodeRef, DeviceCodeEntry)>>;
+    /// Update the entry a lookup returned, where the lookup found it, with a
+    /// TTL in seconds (preserving the original TTL is the caller's
+    /// responsibility).
+    async fn update_device_code(
+        &self,
+        device_code: &DeviceCodeRef,
         entry: &DeviceCodeEntry,
         ttl: u64,
     ) -> Result<()>;
-    /// Delete a device code entry.
-    async fn delete_device_code(&self, device_code: &str) -> Result<()>;
-    /// Look up a device code by its user-facing code.
+    /// Delete the entry a lookup returned.
+    async fn delete_device_code(&self, device_code: &DeviceCodeRef) -> Result<()>;
+    /// Look up a device code by the user code a person presents, exactly as
+    /// presented: the server never normalised user codes (the approval page
+    /// trims and upper-cases what the person types before sending it).
     async fn get_device_code_by_user_code(
         &self,
         user_code: &str,
-    ) -> Result<Option<(String, DeviceCodeEntry)>>;
-    /// Store the user_code -> device_code reverse mapping with a TTL.
+    ) -> Result<Option<(DeviceCodeRef, DeviceCodeEntry)>>;
+    /// Store the user code -> device code mapping with a TTL.
     async fn set_user_code_mapping(
         &self,
         user_code: &str,
         device_code: &str,
         ttl: u64,
     ) -> Result<()>;
-    /// Delete the user_code -> device_code mapping.
-    async fn delete_user_code_mapping(&self, user_code: &str) -> Result<()>;
+    /// Delete the user-code mapping of `entry`, in the layout it was written.
+    async fn delete_user_code_mapping(&self, entry: &DeviceCodeEntry) -> Result<()>;
 
     // -- CAIP-122 server-issued single-use nonce store (C1) -------------------
 
@@ -439,7 +569,9 @@ pub trait DBClient {
     /// Atomically consume a previously-minted CAIP-122 nonce in `category`.
     /// Returns `Some(binding)` for the FIRST consumer (the operation context the
     /// nonce was minted for); `None` if the nonce is unknown/expired OR was already
-    /// consumed (replay). Single-use via SETNX on a companion flag.
+    /// consumed (replay). Single use: the entry is read and deleted in one
+    /// atomic step. A legacy nonce's binding is returned as that build stored
+    /// it (for the device category, the user code in the clear).
     async fn try_consume_caip122_nonce(
         &self,
         category: &str,

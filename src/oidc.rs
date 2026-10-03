@@ -1227,7 +1227,7 @@ async fn token_device_code(
         })
     })?;
 
-    let mut entry = db_client
+    let (device_ref, mut entry) = db_client
         .get_device_code(&dc)
         .await?
         .ok_or_else(|| device_code_error("expired_token", "Device code expired or not found."))?;
@@ -1245,7 +1245,7 @@ async fn token_device_code(
         if now_ts - last < DEVICE_CODE_INTERVAL as i64 {
             entry.last_poll = Some(now_ts);
             let _ = db_client
-                .update_device_code(&dc, &entry, DEVICE_CODE_LIFETIME)
+                .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
                 .await;
             return Err(device_code_error(
                 "slow_down",
@@ -1255,7 +1255,7 @@ async fn token_device_code(
     }
     entry.last_poll = Some(now_ts);
     let _ = db_client
-        .update_device_code(&dc, &entry, DEVICE_CODE_LIFETIME)
+        .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
         .await;
 
     match entry.status {
@@ -1264,8 +1264,8 @@ async fn token_device_code(
             "User has not yet approved.",
         )),
         DeviceCodeStatus::Denied => {
-            let _ = db_client.delete_device_code(&dc).await;
-            let _ = db_client.delete_user_code_mapping(&entry.user_code).await;
+            let _ = db_client.delete_device_code(&device_ref).await;
+            let _ = db_client.delete_user_code_mapping(&entry).await;
             Err(device_code_error(
                 "access_denied",
                 "User denied the request.",
@@ -1412,8 +1412,8 @@ async fn token_device_code(
             .map_err(|e| anyhow!("{}", e))?;
 
             // Cleanup
-            let _ = db_client.delete_device_code(&dc).await;
-            let _ = db_client.delete_user_code_mapping(&entry.user_code).await;
+            let _ = db_client.delete_device_code(&device_ref).await;
+            let _ = db_client.delete_user_code_mapping(&entry).await;
 
             info!(did = %did, device_id = %dev_id, "device_code grant: tokens issued");
 
@@ -4532,7 +4532,11 @@ mod tests {
         db.set_device_code(
             &device_code,
             &DeviceCodeEntry {
-                user_code: format!("SA-{}", Uuid::new_v4().simple()),
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!(
+                    "SA-{}",
+                    Uuid::new_v4().simple()
+                )),
+                legacy_user_code: None,
                 client_id: "client".to_string(),
                 scope: "openid".to_string(),
                 status: DeviceCodeStatus::Approved,
@@ -4570,13 +4574,13 @@ mod tests {
             Err(other) => panic!("expected unsupported_grant_type, got {other:?}"),
             Ok(_) => panic!("a standalone deployment must not redeem a device code"),
         }
-        let entry = db
+        let (device_ref, entry) = db
             .get_device_code(&device_code)
             .await
             .unwrap()
             .expect("the refused code must be left in place");
         assert_eq!(entry.status, DeviceCodeStatus::Approved);
-        db.delete_device_code(&device_code).await.ok();
+        db.delete_device_code(&device_ref).await.ok();
     }
 
     /// A device-code poll that loses the claim to a concurrent poll logs that at
@@ -4597,7 +4601,11 @@ mod tests {
         db.set_device_code(
             &device_code,
             &DeviceCodeEntry {
-                user_code: format!("CL-{}", Uuid::new_v4().simple()),
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!(
+                    "CL-{}",
+                    Uuid::new_v4().simple()
+                )),
+                legacy_user_code: None,
                 client_id: "client".to_string(),
                 scope: "openid".to_string(),
                 status: DeviceCodeStatus::Approved,
@@ -4652,7 +4660,9 @@ mod tests {
             !output.contains(&device_code),
             "the device code appears in the logs in the clear:\n{output}"
         );
-        db.delete_device_code(&device_code).await.ok();
+        if let Ok(Some((device_ref, _))) = db.get_device_code(&device_code).await {
+            db.delete_device_code(&device_ref).await.ok();
+        }
     }
 
     #[tokio::test]
@@ -6572,7 +6582,8 @@ mod device_display_name_tests {
         db.set_device_code(
             &device_code,
             &DeviceCodeEntry {
-                user_code: format!("DN-{nonce}"),
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!("DN-{nonce}")),
+                legacy_user_code: None,
                 client_id: client_id.clone(),
                 scope: "openid".to_string(),
                 status: DeviceCodeStatus::Approved,

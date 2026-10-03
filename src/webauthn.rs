@@ -14,6 +14,7 @@ use aqua_auth::{verify_webauthn_assertion, WebAuthnAssertionParams};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use p256::ecdsa::Signature;
 use serde::{Deserialize, Serialize};
+use siwx_oidc::db::{Ceremony, DBClient};
 use thiserror::Error;
 use tracing::{info, warn};
 use url::Url;
@@ -24,14 +25,12 @@ use siwx_oidc::db::RedisClient;
 
 // -- Redis key prefixes for WebAuthn state --
 
-const CHALLENGE_PREFIX: &str = "webauthn:challenge";
 const CREDENTIAL_PREFIX: &str = siwx_oidc::db::KV_WEBAUTHN_CREDENTIAL_PREFIX;
 // The same constant the library's credential-identity resolver and the backfill
 // read, so a reader and this writer cannot drift onto different key spellings.
 // Ownership of the namespace is unchanged: `link_finish` is still the only
 // writer.
 const LINK_PREFIX: &str = siwx_oidc::db::KV_WEBAUTHN_LINK_PREFIX;
-const LINK_CHALLENGE_PREFIX: &str = "webauthn:link_challenge";
 const CHALLENGE_TTL: u64 = 120; // 2 min
 
 // -- DID derivation from P-256 public key --
@@ -527,11 +526,7 @@ pub async fn register_start(
     let state_json = serde_json::to_string(&reg_state)
         .map_err(|e| anyhow!("Failed to serialize registration state: {}", e))?;
     redis
-        .set_ex_raw(
-            &format!("{}/{}", CHALLENGE_PREFIX, session_id),
-            &state_json,
-            CHALLENGE_TTL,
-        )
+        .put_ceremony_state(Ceremony::Challenge, session_id, &state_json, CHALLENGE_TTL)
         .await?;
 
     info!(
@@ -548,12 +543,10 @@ pub async fn register_finish(
     reg_response: RegisterPublicKeyCredential,
 ) -> Result<RegisterFinishResponse> {
     // Retrieve and consume the registration state.
-    let challenge_key = format!("{}/{}", CHALLENGE_PREFIX, session_id);
     let state_json = redis
-        .get_raw(&challenge_key)
+        .take_ceremony_state(Ceremony::Challenge, session_id)
         .await?
         .ok_or_else(|| anyhow!("No registration challenge found (expired or already used)"))?;
-    redis.del_raw(&challenge_key).await?;
 
     let reg_state: PasskeyRegistration = serde_json::from_str(&state_json)
         .map_err(|e| anyhow!("Failed to deserialize registration state: {}", e))?;
@@ -697,8 +690,9 @@ pub async fn authenticate_start(
 
     let challenge_b64 = URL_SAFE_NO_PAD.encode(&*rcr.public_key.challenge);
     redis
-        .set_ex_raw(
-            &format!("{}/{}", CHALLENGE_PREFIX, session_id),
+        .put_ceremony_state(
+            Ceremony::Challenge,
+            session_id,
             &challenge_b64,
             CHALLENGE_TTL,
         )
@@ -721,12 +715,10 @@ pub async fn verify_credential(
     rp_origin: &str,
     auth_response: &PublicKeyCredential,
 ) -> Result<AuthenticateFinishResponse, VerifyError> {
-    let challenge_key = format!("{}/{}", CHALLENGE_PREFIX, session_id);
     let challenge_b64 = redis
-        .get_raw(&challenge_key)
+        .take_ceremony_state(Ceremony::Challenge, session_id)
         .await?
         .ok_or_else(|| anyhow!("No auth challenge found (expired or already used)"))?;
-    redis.del_raw(&challenge_key).await?;
 
     let challenge_bytes = URL_SAFE_NO_PAD
         .decode(&challenge_b64)
@@ -850,23 +842,12 @@ pub async fn authenticate_finish(
 ) -> Result<AuthenticateFinishResponse, VerifyError> {
     let resp = verify_credential(redis, session_id, rp_id, rp_origin, &auth_response).await?;
 
-    let session_key = format!("sessions/{}", session_id);
-    let session_json = redis
-        .get_raw(&session_key)
+    let mut session = redis
+        .get_session(session_id.to_string())
         .await?
         .ok_or_else(|| anyhow!("Session not found"))?;
-    let mut session: siwx_oidc::db::SessionEntry = serde_json::from_str(&session_json)
-        .map_err(|e| anyhow!("Failed to deserialize session: {}", e))?;
     session.verified_did = Some(resp.did.clone());
-    let updated_session = serde_json::to_string(&session)
-        .map_err(|e| anyhow!("Failed to serialize session: {}", e))?;
-    redis
-        .set_ex_raw(
-            &session_key,
-            &updated_session,
-            siwx_oidc::db::SESSION_LIFETIME,
-        )
-        .await?;
+    redis.set_session(session_id.to_string(), session).await?;
 
     Ok(resp)
 }
@@ -898,11 +879,7 @@ pub async fn link_start(
     let state_json = serde_json::to_string(&link_state)
         .map_err(|e| anyhow!("Failed to serialize link challenge state: {}", e))?;
     redis
-        .set_ex_raw(
-            &format!("{}/{}", LINK_CHALLENGE_PREFIX, session_id),
-            &state_json,
-            CHALLENGE_TTL,
-        )
+        .put_ceremony_state(Ceremony::Link, session_id, &state_json, CHALLENGE_TTL)
         .await?;
 
     info!(
@@ -920,12 +897,10 @@ pub async fn link_finish(
     reg_response: RegisterPublicKeyCredential,
 ) -> Result<LinkFinishResponse> {
     // Retrieve and consume the link challenge state.
-    let challenge_key = format!("{}/{}", LINK_CHALLENGE_PREFIX, session_id);
     let state_json = redis
-        .get_raw(&challenge_key)
+        .take_ceremony_state(Ceremony::Link, session_id)
         .await?
         .ok_or_else(|| anyhow!("No link challenge found (expired or already used)"))?;
-    redis.del_raw(&challenge_key).await?;
 
     let link_state: LinkChallengeState = serde_json::from_str(&state_json)
         .map_err(|e| anyhow!("Failed to deserialize link challenge state: {}", e))?;
