@@ -4764,7 +4764,9 @@ async fn terminal_action_ends_every_own_session(action: &str) {
     let w = new_wallet();
     let login = start_login(&c, &base).await;
     let (_code, signin_hint) = sign_in_with_hint(&base, &w, &login).await;
-    let acting = account_reauth_with_hint(&c, &base, &w, action).await;
+    // A re-auth for a terminal action runs it at once; the acting session is
+    // a re-auth for a view, which then runs the action without a signature.
+    let acting = account_reauth_with_hint(&c, &base, &w, "org.matrix.profile").await;
     let second = account_reauth_with_hint(&c, &base, &w, "org.matrix.profile").await;
 
     for (what, hint) in [
