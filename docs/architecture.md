@@ -156,9 +156,10 @@ All state lives in one Redis (`redis_url`). Prefixes are defined in `src/db/mod.
 | `sessions/{id}/signed_in` | 300 s | one-shot flag against double sign-in |
 | `codes/{code}` | 300 s | `CodeEntry` (DID, client, PKCE challenge, device id, localpart, requested scope); read and deleted in one atomic step on exchange. A `codes/{code}/consumed` marker exists only from older builds, which kept exchanged codes |
 | `clients/{client_id}` | 30 d | `ClientEntry` (secret, metadata); `default_clients` are rewritten at every start |
-| `token/{token}` | access 300 s, refresh 90 d, admin 30–900 s | `TokenMetadata` (kind: access or refresh, username, device id, scope, client, DID); each endpoint accepts one kind, see [matrix-integration.md](matrix-integration.md#token-kinds) |
-| `token_rotated/{old_refresh}` | 60 s | successor pair for a lost refresh response |
-| `idx:user_device/{username}/{device_id}` | 90 d | SET of token keys, for atomic revocation |
+| `grant/{sha256(handle)}` | 90 d after the last rotation; a grant with no refresh token lives as long as its access token | the grant (`src/db/grant.rs`): kind, owner, client, device id, scope, generation, digests of the current and previous refresh token, whether the successor is used, and the sealed successor pair while it is unused. No token is stored |
+| `at/{sha256(access token)}` | the token's lifetime: 300 s, admin 30–900 s | grant id, generation, kind, `iat`, `exp` |
+| `idx:grants:user/{username}`, `idx:grants:user_device/{username}/{device_id}` | the longest grant TTL written | SETs of grant ids, for atomic revocation |
+| `token/{token}`, `idx:user_device/{username}/{device_id}` | access 300 s, refresh 90 d | legacy: tokens written before the grant record (`TokenMetadata`, classified by `db::legacy_token_kind`). Legacy access tokens stay readable until they expire; revocation still sweeps both keys. Nothing new is written there |
 | `tombstone:device/{username}/{device_id}`, `tombstone:user/{username}` | 900 s | refuse refresh while a revoke or deactivation sweep runs |
 | `caip122_nonce/{category}/{nonce}` (+ `/consumed`) | 300 s | server-issued nonce for device approval and account re-auth |
 | `device_codes/{device_code}` (+ `/redeemed`) | 1800 s | `DeviceCodeEntry` (RFC 8628) and its single-redemption claim |

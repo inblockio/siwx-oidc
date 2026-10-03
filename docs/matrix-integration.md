@@ -341,23 +341,30 @@ token.
 
 1. `POST /token` with `grant_type=authorization_code` consumes the code (reads
    and deletes it in one atomic step), checks the PKCE verifier against the
-   challenge bound at `/authorize`, and stores an access token and a refresh
-   token.
-2. `POST /token` with `grant_type=refresh_token` **rotates both**: a new access
-   token, a new refresh token, and the old refresh token is deleted. The
-   `device_id` and scope are carried over. The refresh response has no ID
-   token. The refresh is bound to the client it was issued to, see
-   [Client binding](#client-binding).
-3. **Lost-response grace.** On a successful rotation, siwx-oidc records the old
-   refresh token → the successor pair for `REFRESH_GRACE_TTL` (60 s). A client
-   that lost the response (common on mobile) and retries with the old refresh
-   token within that window receives the **same** successor pair instead of
-   `invalid_grant`, as long as that successor refresh token is still live: if
-   the client already rotated it, or it was revoked, the recorded pair is dead
-   and the replay is `invalid_grant`. Nothing new is minted and the refresh
-   lifetime does not grow. At `POST /token` the replay is also bound to the
-   client (see [Client binding](#client-binding)). `POST
-   /_matrix/client/v3/refresh` applies the same live-successor rule; it
+   challenge bound at `/authorize`, and creates a **grant**: one record that
+   owns the access token and the refresh token (generic mode: a refresh token
+   only for `offline_access`). Every token belongs to exactly one grant, and
+   deleting the grant makes all its tokens inert at once.
+2. `POST /token` with `grant_type=refresh_token` and `POST
+   /_matrix/client/v3/refresh` **rotate both** through one atomic Redis script
+   (`RedisClient::rotate_refresh_token`): a new access token and a new refresh
+   token, after which the presented refresh token is the grant's previous one.
+   The `device_id` and scope are carried over. The refresh response has no ID
+   token. At `POST /token` the refresh is bound to the client it was issued
+   to, see [Client binding](#client-binding). Concurrent refreshes of one
+   token all receive the same new pair; the grant keeps one live chain.
+3. **Lost responses.** A client that lost a rotation response (common on
+   mobile) and retries with the previous refresh token receives the **same**
+   successor pair, however late it retries, as long as that pair is unused.
+   The pair counts as used once its access token is first accepted by
+   introspection or `/userinfo`, or once its refresh token rotates. A replay
+   after that, or of any older token of the grant, is **reuse**: it is answered
+   like an unknown token (`invalid_grant`, `M_UNKNOWN_TOKEN`) and logged as one
+   `warn!` security event, message `refresh token reuse detected`, fields
+   `security_event="refresh_token_reuse"`, `grant_fp`, `generation`,
+   `client_id`, `grant_kind`, `branch` (fingerprints only). Reuse revokes
+   nothing yet. Nothing new is minted for a replay and the refresh lifetime
+   does not grow. `POST /_matrix/client/v3/refresh` applies the same rule; it
    carries no client identity, so it cannot bind the replay. See
    [the 2026-06-23 audit](audits/2026-06-23-elementx-refresh-rotation-signout.md).
 4. `POST /token` with the device-code grant provisions the Synapse device and
@@ -390,9 +397,8 @@ to, and `POST /token` authenticates that client by one rule for both grants
    `client_id` on refresh.
 
 `invalid_client` is a 401 (RFC 6749 §5.2), with `WWW-Authenticate: Basic` when
-the request attempted Basic. It used to be a 400. The grace replay of a rotated
-token is bound the same way, to the client of the successor token it returns,
-and is refused once that successor is no longer live.
+the request attempted Basic. It used to be a 400. The replay of a lost response
+is bound the same way, to the grant's client.
 
 Provisional choices, open for the maintainers:
 
@@ -536,7 +542,7 @@ sign-out deletes the device, token hygiene does not.
 
 | Endpoint | Policy | Synapse | Tokens |
 |---|---|---|---|
-| `POST /oauth2/revoke` (RFC 7009) | `TokensOnly` | nothing; the device is **never** deleted | all tokens of this `(user, device)`: the access token and its paired refresh token |
+| `POST /oauth2/revoke` (RFC 7009) | `TokensOnly` | nothing; the device is **never** deleted | the grants of this `(user, device)`: the access token and its paired refresh token |
 | `POST /_matrix/client/v3/logout` | `DeleteDevice` | deletes this session's device | same as revoke |
 | `POST /_matrix/client/v3/logout/all` | bulk | lists the user's devices and deletes each (best-effort per device) | all of the user's tokens |
 | `DELETE /_matrix/client/v3/devices/{id}`, `POST …/delete_devices` | delete | deletes the named devices of the bearer's own account | tokens of each device |
@@ -553,7 +559,10 @@ sign-out deletes the device, token hygiene does not.
   revokes Redis tokens only. Revocation is keyed on the localpart
   (`TokenMetadata.username`), not the raw DID.
 - In standalone mode tokens have no device, so revoke and logout remove only the
-  presented token.
+  presented credential: an access token alone, or, for a refresh token, its whole
+  grant, the grant's live access token included (RFC 7009 §2.1). The second half
+  is provisional, for the maintainers to confirm; before the grant record a
+  revoked refresh token left its access token alive for up to 300 s.
 - The legacy device-deletion routes accept the bearer token as authorization,
   with no user-interactive auth step, as MAS does for delegated device deletion.
   An unknown token answers 401 `M_UNKNOWN_TOKEN`.

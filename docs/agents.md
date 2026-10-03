@@ -223,15 +223,17 @@ Token lifetimes:
 |---|---|
 | Access token | 300 s |
 | Refresh token | 90 days from its issue; every refresh issues a new one |
-| Lost-response grace | 60 s |
+| Lost-response recovery | until the new pair is first used |
 
-- **Refresh tokens rotate.** Each refresh returns a new refresh token and
-  deletes the old one. Persist the new one before using the new access token,
-  ideally with an atomic write.
-- **Grace window.** If a refresh response is lost, retrying with the old refresh
-  token within 60 seconds returns the **same** new pair instead of an error. Two
-  processes that refresh with the same token within that window also both get
-  the same pair. After 60 seconds the old token is `invalid_grant`.
+- **Refresh tokens rotate.** Each refresh returns a new refresh token, and the
+  old one stops working once the new pair is used. Persist the new one before
+  using the new access token, ideally with an atomic write.
+- **Lost responses.** If a refresh response is lost, retrying with the old
+  refresh token returns the **same** new pair instead of an error, however late,
+  as long as the new pair has not been used. Two processes that refresh with
+  the same token at once also both get the same pair. Once the new access token
+  has been used (or the new refresh token refreshed), the old token is
+  `invalid_grant`, and presenting it is logged as a possible token theft.
 - **Keep refreshing.** An agent that refreshes at least once every 90 days keeps
   its session indefinitely. After that, sign in again with the key (and the same
   pinned device ID).
