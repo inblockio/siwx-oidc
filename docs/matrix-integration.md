@@ -480,11 +480,12 @@ Builds before the grant record stored each token as `token/{raw}` with its
   neither. Only a refresh deletes a grant an epoch refuses; the access check
   only refuses it, so after a rollback every grant under a global or client
   epoch that has not refreshed since is accepted again, and so is a grant issued
-  after an epoch from an earlier code or approval. User epochs are not affected,
-  because `logout/all`, deactivation and erasure delete the user's grants. Caps
-  stop applying: the old rotation extends a grant to 90 days of inactivity
-  again. After rolling forward, set the global or client epochs again, or
-  delete the affected grants before rolling back.
+  after an epoch from an earlier code or approval. Under a user epoch only such
+  a late grant comes back, because `logout/all`, deactivation and erasure delete
+  the grants the user has when they run. Caps stop applying: the old rotation
+  extends a grant to 90 days of inactivity again. The epoch keys outlive the
+  rollback, so after rolling forward the same grants are refused again; to keep
+  them refused during the rollback, delete them before rolling back.
 
 A token-store fault is never answered as a refusal. `POST
 /_matrix/client/v3/refresh` and the device-deletion routes (`DELETE
