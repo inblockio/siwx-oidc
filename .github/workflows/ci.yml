@@ -193,7 +193,8 @@ jobs:
       SIWXOIDC_BASE_URL: http://localhost:18080
       # Also read by e2e_race_teardown's keyspace scans
       # (no_token_the_client_holds_is_stored_in_the_clear,
-      # no_code_or_session_the_client_holds_is_stored_in_the_clear) and by its
+      # no_code_or_session_the_client_holds_is_stored_in_the_clear,
+      # no_client_secret_or_registration_token_is_stored_in_the_clear) and by its
       # upgrade tests, which seed the legacy layouts there
       # (legacy_tokens_keep_working_after_the_upgrade,
       # in_flight_codes_and_sessions_survive_the_upgrade).
