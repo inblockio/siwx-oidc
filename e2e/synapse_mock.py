@@ -91,6 +91,15 @@ nondeterministic, so every admin request introspects.
   POST   /__profile               force a profile row present / empty / absent
   POST   /__fail                  arm a 500/timeout on a logical endpoint
 
+  -- stub OIDC relying party (NOT Synapse surface; tests/e2e_backchannel_logout.rs)
+  POST   /__rp/{name}/backchannel_logout  record the POST (content type + raw
+                                          body); answer per the RP's mode
+  POST   /__rp/{name}/mode        {"mode": "ok"|"500"|"redirect"}: 200 (default),
+                                  500, or a 303 to /__rp/{name}/redirected
+  GET    /__rp/{name}/received    {"received": [{content_type, body}, ...]}
+  ANY    /__rp/{name}/redirected  counts a followed redirect (must stay 0)
+  An RP is any name; it exists once used. __reset clears every RP.
+
 Routes REMOVED by the 1.157 port (`DELETE .../devices/{id}`,
 `POST /_synapse/admin/v1/deactivate/{mxid}`, `PUT /_synapse/admin/v2/users/{mxid}`)
 answer a loud `410` naming their MAS replacement rather than a bare 404, so a
@@ -197,6 +206,14 @@ TIMEOUT_SLEEP_SECS = float(os.environ.get("SYNAPSE_MOCK_TIMEOUT_SLEEP", "30"))
 # test can prove at most one delete actually mutated state. Distinct from
 # CALL_LOG (which records every request, including idempotent no-ops).
 EFFECTIVE_DELETES = {}
+# The stub relying party (back-channel logout receiver), keyed by RP name.
+# Not a Synapse mirror: siwx-oidc POSTs logout tokens here when a test
+# registers `{mock}/__rp/{name}/backchannel_logout` as a client's
+# `backchannel_logout_uri`. Cleared by /__reset.
+RP_RECEIVED = {}
+RP_MODE = {}
+RP_REDIRECTED = {}
+RP_PATH = re.compile(r"^/__rp/([A-Za-z0-9_.-]+)/(backchannel_logout|mode|received|redirected)$")
 
 # Twisted's generic 500 body. element-hq/synapse#19702 surfaces as an uncaught
 # TypeError, so its 500 is BYTE-IDENTICAL to the 500 from an exhausted database
@@ -524,6 +541,9 @@ class Handler(BaseHTTPRequestHandler):
                 })
         if path == "/health":
             return self._send(200, {"ok": True})
+        rp = RP_PATH.match(path)
+        if rp:
+            return self._stub_rp(rp.group(1), rp.group(2), b"")
         # Log BEFORE authenticating. A request log that silently drops rejected
         # requests is a debugging trap: the 1.157 port's symptom was a stream of
         # 401s, and the old mock's call log showed nothing at all.
@@ -693,9 +713,46 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"errcode": "M_NOT_FOUND", "error": "Profile field not found"})
         return self._send(200, {field: value})
 
+    def _stub_rp(self, name, action, raw):
+        """The stub relying party (see RP_RECEIVED). Never call-logged."""
+        with LOCK:
+            if action == "received":
+                return self._send(200, {"received": list(RP_RECEIVED.get(name, [])),
+                                        "redirected": RP_REDIRECTED.get(name, 0)})
+            if action == "redirected":
+                RP_REDIRECTED[name] = RP_REDIRECTED.get(name, 0) + 1
+                return self._send(200, {})
+            if action == "mode":
+                try:
+                    RP_MODE[name] = json.loads(raw or b"{}").get("mode", "ok")
+                except Exception:
+                    return self._send(400, {"error": "mode body"})
+                return self._send(200, {"ok": True, "mode": RP_MODE[name]})
+            RP_RECEIVED.setdefault(name, []).append({
+                "content_type": self.headers.get("Content-Type", ""),
+                "body": raw.decode("utf-8", "replace"),
+            })
+            mode = RP_MODE.get(name, "ok")
+        if mode == "500":
+            return self._send(500, {})
+        if mode == "redirect":
+            self.send_response(303)
+            self.send_header("Location", f"/__rp/{name}/redirected")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return None
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return None
+
     def do_POST(self):
         p = urlparse(self.path)
         path = unquote(p.path)
+        rp = RP_PATH.match(path)
+        if rp:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            return self._stub_rp(rp.group(1), rp.group(2), self.rfile.read(n) if n else b"")
         body = self._body()
         # test helpers (no auth, never call-logged) ------------------------
         if path == "/__seed_device":
@@ -748,6 +805,7 @@ class Handler(BaseHTTPRequestHandler):
                 DEVICES.clear(); LIFECYCLE.clear(); CALL_LOG.clear()
                 FAIL.clear(); EFFECTIVE_DELETES.clear()
                 EXISTING_USERS.clear(); PROFILES.clear(); PROFILE_FIELDS.clear()
+                RP_RECEIVED.clear(); RP_MODE.clear(); RP_REDIRECTED.clear()
                 STATE["secret"] = SECRET
                 STATE["reject_admin"] = False
             return self._send(200, {"ok": True})

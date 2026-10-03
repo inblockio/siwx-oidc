@@ -438,7 +438,9 @@ async fn register(
     State(state): State<AppState>,
     Json(payload): Json<SiwxClientMetadata>,
 ) -> Result<(StatusCode, Json<SiwxClientRegistrationResponse>), CustomError> {
-    let registration = oidc::register(payload, state.config.base_url, &state.redis_client).await?;
+    let policy = oidc::RegistrationPolicy::from_config(&state.config);
+    let registration =
+        oidc::register(payload, state.config.base_url, &state.redis_client, &policy).await?;
     Ok((StatusCode::CREATED, registration.into()))
 }
 
@@ -534,6 +536,7 @@ async fn client_update(
         payload,
         bearer.map(|b| b.0 .0),
         &state.redis_client,
+        &oidc::RegistrationPolicy::from_config(&state.config),
     )
     .await
 }

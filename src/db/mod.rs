@@ -18,8 +18,10 @@ use openidconnect::{
     Nonce, PostLogoutRedirectUrl, RegistrationAccessToken,
 };
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 pub mod grant;
+pub mod outbox;
 mod redis;
 pub mod seal;
 pub mod tokens;
@@ -237,13 +239,22 @@ pub struct CodeEntry {
 
 /// Registration metadata this provider reads beyond OIDC Core client
 /// registration: `post_logout_redirect_uris` (OpenID Connect RP-Initiated
-/// Logout 1.0 §3.1). Flattened into the registration document, so an entry
-/// written before it existed reads with none, and a build that does not know
-/// it ignores it.
+/// Logout 1.0 §3.1), `backchannel_logout_uri` and
+/// `backchannel_logout_session_required` (OpenID Connect Back-Channel Logout
+/// 1.0 §2.2). Flattened into the registration document, so an entry written
+/// before they existed reads with none, and a build that does not know them
+/// ignores them.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct LogoutClientMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_logout_redirect_uris: Option<Vec<PostLogoutRedirectUrl>>,
+    /// Where a logout token is POSTed when one of the client's `oidc` grants
+    /// is deleted. Checked by the SSRF guard at registration and at delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backchannel_logout_uri: Option<Url>,
+    /// The client requires a `sid` in every logout token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backchannel_logout_session_required: Option<bool>,
 }
 
 impl AdditionalClientMetadata for LogoutClientMetadata {}

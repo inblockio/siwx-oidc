@@ -5,6 +5,7 @@
 mod account;
 mod admin_token;
 mod axum_lib;
+mod backchannel;
 mod compat;
 mod config;
 mod device_auth;

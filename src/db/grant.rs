@@ -1098,7 +1098,7 @@ impl RedisClient {
         self
     }
 
-    async fn eval<T: redis::FromRedisValue>(
+    pub(super) async fn eval<T: redis::FromRedisValue>(
         &self,
         script: &str,
         keys: &[&str],

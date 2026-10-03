@@ -3008,11 +3008,33 @@ pub struct RegisterError {
     error: CoreRegisterErrorResponseType,
 }
 
+/// What dynamic registration checks beyond the metadata's own form: the SSRF
+/// guard on `backchannel_logout_uri` (D3) and the D4 switch.
+#[derive(Clone, Debug, Default)]
+pub struct RegistrationPolicy {
+    pub guard: crate::backchannel::UriGuard,
+    /// D4 (provisional): a client that may receive refresh tokens must register
+    /// a `backchannel_logout_uri`. Off by default, and never in Matrix mode.
+    pub require_backchannel_for_refresh: bool,
+}
+
+impl RegistrationPolicy {
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            guard: crate::backchannel::UriGuard::new(&config.backchannel_logout_allowed_hosts),
+            require_backchannel_for_refresh: config.backchannel_logout_required_for_refresh
+                && !delegated_auth_enabled(config),
+        }
+    }
+}
+
 pub async fn register(
     payload: SiwxClientMetadata,
     base_url: Url,
     db_client: &DBClientType,
+    policy: &RegistrationPolicy,
 ) -> Result<SiwxClientRegistrationResponse, CustomError> {
+    let _ = policy;
     let id = Uuid::new_v4();
     let secret: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -3366,7 +3388,9 @@ pub async fn client_update(
     payload: SiwxClientMetadata,
     bearer: Option<Bearer>,
     db_client: &DBClientType,
+    policy: &RegistrationPolicy,
 ) -> Result<(), CustomError> {
+    let _ = policy;
     let mut client_entry = client_access(client_id.clone(), bearer, db_client).await?;
     check_logout_metadata(&payload)?;
     client_entry.metadata = payload;
@@ -8642,6 +8666,7 @@ mod end_session_tests {
                         .map(|u| PostLogoutRedirectUrl::new(u.to_string()).unwrap())
                         .collect(),
                 ),
+                ..Default::default()
             },
         )
         .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::None))
@@ -8704,6 +8729,7 @@ mod end_session_tests {
             client_metadata(&["https://rp.example.org/bye"]),
             base.clone(),
             &db,
+            &RegistrationPolicy::default(),
         )
         .await
         .expect("registration succeeds");
@@ -8725,6 +8751,7 @@ mod end_session_tests {
             client_metadata(&["https://rp.example.org/bye#f"]),
             base,
             &db,
+            &RegistrationPolicy::default(),
         )
         .await;
         match refused {
@@ -8883,5 +8910,193 @@ mod end_session_tests {
             .await
             .unwrap();
         assert_eq!(again, EndSessionOutcome::SignedOut { ended: false });
+    }
+}
+
+#[cfg(test)]
+mod backchannel_registration_tests {
+    //! OpenID Connect Back-Channel Logout 1.0: the registration metadata, the
+    //! SSRF guard at registration, the D4 switch and discovery.
+    use super::*;
+    use crate::config::Config;
+
+    fn payload(extra: serde_json::Value) -> SiwxClientMetadata {
+        let mut doc = serde_json::json!({ "redirect_uris": ["https://rp.example.org/cb"] });
+        for (k, v) in extra.as_object().unwrap() {
+            doc[k] = v.clone();
+        }
+        serde_json::from_value(doc).unwrap()
+    }
+
+    fn refused_as_metadata(result: Result<impl std::fmt::Debug, CustomError>, what: &str) {
+        match result {
+            Err(CustomError::BadRequestRegister(e)) => assert_eq!(
+                serde_json::to_value(&e).unwrap()["error"],
+                "invalid_client_metadata",
+                "{what}"
+            ),
+            other => panic!("{what} must be refused as invalid_client_metadata, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_stores_backchannel_logout_metadata_and_refuses_an_unsafe_uri() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let base = Config::default().base_url;
+        let open = RegistrationPolicy::default();
+        let response = register(
+            payload(serde_json::json!({
+                "backchannel_logout_uri": "https://192.0.2.10/bcl?rp=1",
+                "backchannel_logout_session_required": true,
+            })),
+            base.clone(),
+            &db,
+            &open,
+        )
+        .await
+        .expect("a public https URI is accepted");
+        let echoed = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            echoed["backchannel_logout_uri"],
+            "https://192.0.2.10/bcl?rp=1"
+        );
+        assert_eq!(echoed["backchannel_logout_session_required"], true);
+        let stored = db
+            .get_client(response.client_id().to_string())
+            .await
+            .unwrap()
+            .expect("stored");
+        let extra = stored.metadata.additional_metadata();
+        assert_eq!(
+            extra.backchannel_logout_uri.as_ref().map(Url::as_str),
+            Some("https://192.0.2.10/bcl?rp=1")
+        );
+        assert_eq!(extra.backchannel_logout_session_required, Some(true));
+
+        for uri in [
+            "http://192.0.2.10/bcl",
+            "https://192.0.2.10/bcl#f",
+            "https://127.0.0.1/bcl",
+            "https://[::1]/bcl",
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.1/bcl",
+            "https://[fd00::1]/bcl",
+            "https://100.64.0.1/bcl",
+            "https://localhost/bcl",
+        ] {
+            let result = register(
+                payload(serde_json::json!({ "backchannel_logout_uri": uri })),
+                base.clone(),
+                &db,
+                &open,
+            )
+            .await;
+            refused_as_metadata(result, uri);
+        }
+
+        let listed = RegistrationPolicy {
+            guard: crate::backchannel::UriGuard::new(&["localhost".to_string()]),
+            ..RegistrationPolicy::default()
+        };
+        register(
+            payload(serde_json::json!({ "backchannel_logout_uri": "http://localhost:9/bcl" })),
+            base.clone(),
+            &db,
+            &listed,
+        )
+        .await
+        .expect("an allowlisted host is accepted");
+
+        let id = response.client_id().to_string();
+        let token = response
+            .registration_access_token()
+            .unwrap()
+            .secret()
+            .clone();
+        let update = client_update(
+            id,
+            payload(serde_json::json!({ "backchannel_logout_uri": "https://127.0.0.1/bcl" })),
+            Some(headers::Authorization::bearer(&token).unwrap().0),
+            &db,
+            &open,
+        )
+        .await;
+        refused_as_metadata(update, "an update to a loopback URI");
+    }
+
+    #[tokio::test]
+    async fn the_d4_switch_requires_a_backchannel_uri_from_a_client_that_may_refresh() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let generic_on = Config {
+            backchannel_logout_required_for_refresh: true,
+            ..Config::default()
+        };
+        let matrix_on = Config {
+            mas_shared_secret: Some("s".into()),
+            ..generic_on.clone()
+        };
+        let base = Config::default().base_url;
+        let required = RegistrationPolicy::from_config(&generic_on);
+        assert!(required.require_backchannel_for_refresh);
+        for (what, extra) in [
+            ("no grant_types (refresh allowed)", serde_json::json!({})),
+            (
+                "grant_types with refresh_token",
+                serde_json::json!({"grant_types": ["authorization_code", "refresh_token"]}),
+            ),
+        ] {
+            let result = register(payload(extra), base.clone(), &db, &required).await;
+            refused_as_metadata(result, what);
+        }
+        for (what, extra, policy) in [
+            (
+                "a client that may not refresh",
+                serde_json::json!({"grant_types": ["authorization_code"]}),
+                required.clone(),
+            ),
+            (
+                "a client with a back-channel URI",
+                serde_json::json!({"backchannel_logout_uri": "https://192.0.2.10/bcl"}),
+                required.clone(),
+            ),
+            (
+                "the switch off",
+                serde_json::json!({}),
+                RegistrationPolicy::from_config(&Config::default()),
+            ),
+            (
+                "Matrix mode",
+                serde_json::json!({}),
+                RegistrationPolicy::from_config(&matrix_on),
+            ),
+        ] {
+            register(payload(extra), base.clone(), &db, &policy)
+                .await
+                .unwrap_or_else(|e| panic!("{what} registers: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn discovery_advertises_backchannel_logout_only_in_generic_mode() {
+        let generic = provider_metadata_value(&Config::default(), false).unwrap();
+        assert_eq!(generic["backchannel_logout_supported"], true);
+        assert_eq!(generic["backchannel_logout_session_supported"], true);
+        let matrix = provider_metadata_value(
+            &Config {
+                mas_shared_secret: Some("s".into()),
+                ..Config::default()
+            },
+            true,
+        )
+        .unwrap();
+        assert!(
+            matrix.get("backchannel_logout_supported").is_none()
+                && matrix.get("backchannel_logout_session_supported").is_none(),
+            "Matrix mode sends no logout token, so it advertises none: {matrix}"
+        );
     }
 }
