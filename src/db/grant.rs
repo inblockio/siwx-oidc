@@ -7,8 +7,8 @@
 //!
 //! | Key | Type | Content | TTL |
 //! |---|---|---|---|
-//! | `grant/{digest(handle)}` | hash | the grant (fields below) | `inactivity_secs`, refreshed by every rotation |
-//! | `at/{digest(access token)}` | hash | `grant`, `generation`, `kind` (`access`), `iat`, `exp` | the token's lifetime |
+//! | `grant/{digest(handle)}` | hash | the grant (fields below) | `inactivity_secs`, refreshed by every rotation, never past `absolute_exp` |
+//! | `at/{digest(access token)}` | hash | `grant`, `generation`, `kind` (`access`), `iat`, `exp` | the token's lifetime, never past the grant's `absolute_exp` |
 //! | `idx:grants:user/{username}` | set | grant ids of the user | the longest grant TTL written into it |
 //! | `idx:grants:user_device/{username}/{device_id}` | set | grant ids of the device | as above |
 //! | `legacy_rt/{digest(legacy refresh token)}` | string | the grant id a legacy refresh token was lifted into | `inactivity_secs` at the lift |
@@ -33,7 +33,11 @@
 //! pointer and goes through the rotation script like the grant's own previous
 //! token: the same pair while it is unused, reuse after. The kind of a lifted
 //! grant follows the legacy scope ([`legacy_grant_kind`]); its `auth_time` is
-//! the legacy entry's `iat`, the earliest time the store still knows. Legacy
+//! the legacy entry's `iat` (never later than Redis `TIME`), the earliest time
+//! the store still knows: the legacy chain's last rotation, not the sign-in,
+//! which no legacy build recorded. A configured cap therefore counts from that
+//! rotation (provisional: the lift time would be later still, and the iat is
+//! stricter). Legacy
 //! grace pointers (`token_rotated/{raw}`, 60 s) are not read: they lived one
 //! minute, and a lost response in the minute before the upgrade is the only case
 //! they would cover.
@@ -47,7 +51,8 @@
 //! | `confidential` | `1` when the client authenticates with a secret, else `0` |
 //! | `device_id` | the Matrix device, empty when none (JSON `null` on the wire) |
 //! | `scope`, `name` | as granted; `name` is echoed by introspection |
-//! | `auth_time` | the original authentication (the base of Phase 3's absolute expiry) |
+//! | `auth_time` | the original authentication, Redis `TIME` (the sign-in or the device approval) |
+//! | `absolute_exp` | `auth_time` + the cap, when one applied ([`GrantLifetime`]); only ever moves earlier |
 //! | `access_ttl` | lifetime of each access token of this grant |
 //! | `inactivity_secs`, `last_used` | the grant ends `inactivity_secs` after `last_used` |
 //! | `generation` | 0 at issue, + 1 per rotation |
@@ -55,7 +60,7 @@
 //! | `successor_used` | `0` from a rotation until the new pair is first used, else `1` |
 //! | `successor_sealed` | the current pair, sealed under `previous_rt`'s plaintext, while unused |
 //!
-//! Phase 3 adds `absolute_exp` and the epochs, Phase 4 `sid`.
+//! Phase 3 M2 adds the epochs, Phase 4 `sid`.
 //!
 //! # The rotation decision ([`RedisClient::rotate_refresh_token`])
 //!
@@ -65,10 +70,10 @@
 //! |---|---|---|
 //! | missing | any | [`RotateOutcome::Invalid`] (`UnknownGrant`) |
 //! | user or device tombstone present | any | `Invalid` (`Revoked`) |
-//! | `last_used` + `inactivity_secs` passed | any | `Invalid` (`Expired`); the grant is deleted |
+//! | `last_used` + `inactivity_secs` passed, or the absolute expiry (the earlier of `absolute_exp` and `auth_time` + the cap now configured) | any | `Invalid` (`Expired`); the grant is deleted |
 //! | the request names another client | any | [`RotateOutcome::ClientMismatch`] |
 //! | confidential client, caller refuses those | any | [`RotateOutcome::ConfidentialClient`] |
-//! | live | `current_rt` | [`RotateOutcome::Rotated`]: previous <- current, current <- candidate, generation + 1, `successor_used` 0, sealed candidate stored, candidate access entry written, `last_used` and TTLs bumped |
+//! | live | `current_rt` | [`RotateOutcome::Rotated`]: previous <- current, current <- candidate, generation + 1, `successor_used` 0, sealed candidate stored, candidate access entry written (its `exp` no later than the absolute expiry), `absolute_exp` written back when one applies, `last_used` and TTLs bumped |
 //! | live | `previous_rt`, `successor_used` 0 | [`RotateOutcome::Replayed`]: the candidate is discarded, the sealed successor returned and opened by the caller |
 //! | live | `previous_rt`, `successor_used` 1 | [`RotateOutcome::Reuse`] (`PreviousAfterUse`) |
 //! | live | anything else carrying this handle | `Reuse` (`Superseded`) |
@@ -416,7 +421,8 @@ pub enum InvalidReason {
     UnknownGrant,
     /// A device or user tombstone refuses the grant.
     Revoked,
-    /// The grant's inactivity expiry has passed; it was deleted.
+    /// The grant's inactivity or absolute expiry has passed; it was deleted
+    /// (by the lift: the legacy token is past the cap, and stays as it is).
     Expired,
     /// A replay of the previous token found no sealed successor to return.
     NoSuccessor,

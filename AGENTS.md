@@ -379,6 +379,26 @@ doc; read it before changing the code the rule covers.
   `concurrent_refreshes_at_the_matrix_endpoint_converge_on_one_pair` (mock stack),
   `concurrent_rotations_of_one_token_converge_on_one_pair`,
   `the_current_refresh_token_rotates_into_a_new_pair`.
+- **A grant's absolute expiry is fixed at the authentication, only moves earlier, and runs on
+  Redis `TIME`** (I6). With a cap configured (`grant_absolute_lifetime_secs`, the per-client map;
+  unset by default, D1 provisional) a grant gets `absolute_exp` = `auth_time` + the smallest cap
+  that applies to its client when it is issued or lifted. The rotation script recomputes
+  min(`absolute_exp`, `auth_time` + the cap now configured), refuses and deletes the grant past
+  it like an inactive one, and writes it back; so a lowered cap applies at the next rotation and
+  nothing extends it. No access token's `exp` (nor the TTL of its entry or of the grant) passes
+  it, and the access check refuses a token whose grant is past it, judging a grant written
+  without `absolute_exp` against `auth_time` + its client's cap. `auth_time` is the sign-in or
+  the device approval, stamped from Redis `TIME` (a lifted legacy grant: the legacy entry's
+  `iat`, never later than now); never compute a deadline from an instance clock, and never let
+  a rotation, a replay or a raised cap move `absolute_exp` later. With no cap, lifetimes are
+  exactly as before. Pin: `h5_no_sequence_outlives_the_absolute_expiry` (property test, seeded,
+  `H5_SEED` replays a failure), `an_access_token_never_outlives_its_grants_absolute_expiry`,
+  `a_grant_written_without_a_cap_is_capped_from_its_auth_time`,
+  `a_lowered_cap_applies_at_the_next_rotation_and_a_raised_one_never_extends`,
+  `a_lifted_grant_counts_its_cap_from_the_legacy_issue_time`,
+  `the_cap_is_the_smallest_value_that_applies_to_the_client`,
+  `a_device_grant_counts_its_lifetime_from_the_approval`,
+  `an_absolute_grant_lifetime_shorter_than_a_device_code_is_refused`.
 - **No credential a client holds is stored in the clear** (I1): tokens, authorization codes,
   device and user codes, session identifiers (the login `session` cookie, the WebAuthn,
   account re-auth and device-approval ceremony ids), the device-approval and account re-auth

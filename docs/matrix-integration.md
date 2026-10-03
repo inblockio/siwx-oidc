@@ -290,6 +290,7 @@ lines name tokens by fingerprint only. The keyspace is in
 | Scope recorded | `openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}` | the requested scopes among `openid`, `profile` and `offline_access`, as far as the client may have them (`openid` if none) |
 | Access token TTL | 300 s | 300 s |
 | Refresh token TTL | 7,776,000 s (90 days), renewed by each rotation | same |
+| Absolute lifetime | none by default; with `grant_absolute_lifetime_secs` (or the per-client map) the grant ends at its authentication plus the cap, and no access token outlives that ([configuration.md](configuration.md#grant-lifetime)) | same |
 | ID token TTL | 300 s by default (`id_token_ttl_secs`) | same |
 | Introspection | active | 404 |
 | Device ID | `SIWX_` + 8 hex characters, or the ID the client requested | empty |
@@ -390,6 +391,21 @@ token.
    issues tokens (see [below](#device-code-and-qr-login)).
 5. `/userinfo` accepts an access token only. An authorization code is not a
    bearer token, before or after its exchange.
+
+**Lifetime.** A grant ends 90 days after its last refresh and, when an
+absolute lifetime is configured (`grant_absolute_lifetime_secs`, per client
+`grant_absolute_lifetime_secs_by_client`; none by default), at its
+authentication plus that cap. The authentication is the sign-in or the
+device approval, stamped from Redis `TIME`; a grant lifted from a legacy
+refresh token counts from that token's issue time, the last refresh under the
+previous build (the true sign-in was never recorded). Past either deadline
+both refresh endpoints answer as for an unknown token (`invalid_grant`,
+`M_UNKNOWN_TOKEN`) and delete the grant, and introspection answers inactive.
+No access token's `exp` passes the absolute expiry. The deadline only moves
+earlier: a lowered cap reaches a grant at its next refresh, a raised or
+removed one extends nothing. For an Element user the end of a grant is a
+sign-out, and signing in again usually means a new device with key-backup
+restore, so choose a short cap with care.
 
 A refresh is refused (`invalid_grant`, "Session has been revoked.") when the
 device was just signed out or the account just deactivated. Short-lived Redis
