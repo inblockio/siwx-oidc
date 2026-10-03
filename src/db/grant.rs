@@ -1311,8 +1311,9 @@ impl RedisClient {
     /// (I9): from this one write on, the rotation script and the access check
     /// refuse every grant of that scope authenticated at or before it. Returns
     /// the epoch in force, in Unix milliseconds. Behind `logout/all`,
-    /// deactivation and erasure (the user epoch) and the operator subcommand
-    /// `siwx-oidc epoch` (global and client epochs).
+    /// deactivation and erasure (the user epoch). Global and client epochs are
+    /// set by an operator with the script in docs/matrix-integration.md
+    /// ("Epochs"), which does the same thing.
     pub async fn set_epoch(&self, scope: EpochScope<'_>) -> Result<i64> {
         let script = format!("{LUA_EPOCH}{SET_EPOCH_LUA}");
         let epoch: String = self.eval(&script, &[&scope.key()], &[]).await?;

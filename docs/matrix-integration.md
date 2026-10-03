@@ -476,6 +476,15 @@ Builds before the grant record stored each token as `token/{raw}` with its
   clients fail until they register again or the entry expires (30 days). The
   old build writes `default_clients` in the clear again at its start, and
   in-flight codes, sessions and device codes are lost.
+- A rollback to a build before epochs and the absolute lifetime honours
+  neither. Only a refresh deletes a grant an epoch refuses; the access check
+  only refuses it, so after a rollback every grant under a global or client
+  epoch that has not refreshed since is accepted again, and so is a grant issued
+  after an epoch from an earlier code or approval. User epochs are not affected,
+  because `logout/all`, deactivation and erasure delete the user's grants. Caps
+  stop applying: the old rotation extends a grant to 90 days of inactivity
+  again. After rolling forward, set the global or client epochs again, or
+  delete the affected grants before rolling back.
 
 A token-store fault is never answered as a refusal. `POST
 /_matrix/client/v3/refresh` and the device-deletion routes (`DELETE

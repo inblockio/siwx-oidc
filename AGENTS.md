@@ -417,9 +417,9 @@ doc; read it before changing the code the rule covers.
   once. Never plant the user tombstone again, and keep the scripts READING it until one release
   after Phase 3: one a previous build planted must still refuse for its 900 s. The device
   tombstone stays: it closes the race between a device sweep and the lift of a legacy refresh
-  token. Global and client epochs have no HTTP endpoint (attack surface): an operator sets them
-  ([docs/matrix-integration.md](docs/matrix-integration.md#epochs)). An unset epoch is none,
-  never 0. Teardown's resolver (`resolve_refresh_token`) treats a refused refresh token as
+  token. Global and client epochs have no HTTP endpoint, to add no remote surface: an operator
+  sets them ([docs/matrix-integration.md](docs/matrix-integration.md#epochs)). An unset epoch
+  is none, never 0. Teardown's resolver (`resolve_refresh_token`) treats a refused refresh token as
   unknown, so revoking it tears nothing down. The comparisons made in Rust (a legacy access
   token, teardown) follow the scripts' rule to the millisecond. Pin:
   `e1_one_user_epoch_refuses_every_older_grant_of_the_user`,
