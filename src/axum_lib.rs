@@ -245,17 +245,17 @@ impl IntoResponse for TokenEndpointError {
     }
 }
 
-async fn token(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<oidc::TokenForm>,
-) -> Result<Json<serde_json::Value>, TokenEndpointError> {
-    // One `Authorization` header, read as either scheme. A handler that takes
-    // `Option<TypedHeader<Authorization<Bearer>>>` and
-    // `Option<TypedHeader<Authorization<Basic>>>` as two extractors answers
-    // every request that carries the header with a 400 ("invalid HTTP header"),
-    // because each extractor rejects a header of the other scheme instead of
-    // yielding `None`. That is how `client_secret_basic` never worked here.
+/// What `POST /token` learns about the calling client from the `Authorization`
+/// header, and whether the client attempted HTTP Basic (which decides the
+/// `WWW-Authenticate` challenge on a failure).
+///
+/// One header, read as either scheme. A handler that takes
+/// `Option<TypedHeader<Authorization<Bearer>>>` and
+/// `Option<TypedHeader<Authorization<Basic>>>` as two extractors answers every
+/// request that carries the header with a 400 ("invalid HTTP header"), because
+/// each extractor rejects a header of the other scheme instead of yielding
+/// `None`. That is how `client_secret_basic` never worked here.
+fn client_credentials(headers: &HeaderMap) -> (oidc::ClientCredentials, bool) {
     let basic = headers.typed_get::<Authorization<Basic>>();
     let bearer = headers.typed_get::<Authorization<Bearer>>();
     let basic_attempted = basic.is_some();
@@ -267,6 +267,15 @@ async fn token(
             basic.map(|b| b.password().to_string())
         },
     };
+    (credentials, basic_attempted)
+}
+
+async fn token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<oidc::TokenForm>,
+) -> Result<Json<serde_json::Value>, TokenEndpointError> {
+    let (credentials, basic_attempted) = client_credentials(&headers);
     let token_response = oidc::token(
         form,
         credentials,
