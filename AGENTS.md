@@ -34,7 +34,7 @@ everything else exists only in the binary crate.
 | `lib.rs` | Library crate root. `synapse_client` is deliberately not re-exported (see Invariants). |
 | `axum_lib.rs` | Startup: loads config through `config::figment()`, validates it (DID methods and pkh namespaces against the aqua-auth registries, signing key, retired keys, WebAuthn), `AppState`, the router, handler glue, the `siwx_user` / `acct_session` cookies, the CORS layer. |
 | `config.rs` | `Config`, its defaults, and `figment()`: the one place config names and precedence are defined. Reference: [docs/configuration.md](docs/configuration.md). |
-| `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_client` authenticates the client for the first two), `userinfo`, client registration, `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, and `provision_synapse_device`, the single provisioning and DID-publication path. |
+| `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_code_client` and `authenticate_refresh_client` authenticate the client for the first two, and `client_is_confidential` decides which clients must present a secret), `userinfo`, client registration, `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, and `provision_synapse_device`, the single provisioning and DID-publication path. |
 | `introspect.rs` | `POST /oauth2/introspect` (RFC 7662) for Synapse; opaque `mat_`/`mcr_` token generation. |
 | `admin_token.rs` | `POST /oauth2/admin_token`: short-TTL token whose scope carries `urn:synapse:admin:*`. |
 | `compat.rs` | `POST /oauth2/revoke` (RFC 7009) and the Matrix client-server endpoints siwx-oidc answers (login flows, logout, logout/all, refresh, device deletion); `TeardownPolicy`. |
@@ -372,9 +372,11 @@ doc; read it before changing the code the rule covers.
   `a_replay_whose_successor_has_been_rotated_or_revoked_is_refused`,
   `a_replay_is_bound_to_the_client_too`, `a_matrix_refresh_replay_needs_its_successor_live`,
   `concurrent_rotations_of_one_token_converge_on_one_pair`.
-- **A refresh token is bound to the client it was issued to, through the one helper the code
-  exchange uses too.** `oidc::authenticate_client` serves both grants, so they cannot drift: a
-  request that names another client (`client_id` in the form or the Basic user name) is
+- **A refresh token is bound to the client it was issued to, through the helpers the code
+  exchange uses too.** `oidc::authenticate_code_client` (strict) and
+  `oidc::authenticate_refresh_client` (tolerates an expired registration) share
+  `check_named_client`, `check_client_secret` and `client_is_confidential`, so the grants cannot
+  drift: a request that names another client (`client_id` in the form or the Basic user name) is
   `invalid_grant`; a confidential client (registered `token_endpoint_auth_method` other than
   `none`, or none while `require_secret`) must present its secret, else `invalid_client`, a 401
   (RFC 6749 §5.2, with `WWW-Authenticate: Basic` after a Basic attempt). The replay of a lost
@@ -383,7 +385,10 @@ doc; read it before changing the code the rule covers.
   keeps refreshing unless the request names another client or presents a secret.
   `POST /_matrix/client/v3/refresh` carries no client identity, so it refuses a confidential
   client's refresh token exactly like an unknown token, leaving it untouched for `/token`; the
-  grant records at issuance whether its client is confidential, by the same rule. Read the
+  grant records at issuance whether its client is confidential, by the same rule
+  (`client_is_confidential`, the only place that decides it). At `/token` the client is
+  authenticated before the rotation script runs (RFC 6749 order), so a superseded token presented
+  with a wrong secret is `invalid_client`, not the unknown-token answer. Read the
   `Authorization` header with `HeaderMap::typed_get`, never as two typed-header extractors, which
   reject each other's scheme and turn every request that has the header into a 400. A Basic user
   name and password are form-urldecoded before they are compared (RFC 6749 §2.3.1: a secret with
@@ -397,6 +402,7 @@ doc; read it before changing the code the rule covers.
   `basic_credentials_are_form_urldecoded_before_they_are_compared`,
   `a_plain_basic_secret_and_a_bearer_token_are_taken_as_sent`,
   `the_code_exchange_and_the_refresh_grant_authenticate_clients_identically`,
+  `a_grant_records_its_client_as_confidential_exactly_when_token_demands_a_secret`,
   `invalid_client_is_a_401_and_every_other_token_error_a_400`; mock stack:
   `a_refresh_token_is_refused_to_another_client`, `a_confidential_client_must_authenticate_to_refresh`,
   `a_public_client_refreshes_without_client_credentials`,

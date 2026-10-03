@@ -963,88 +963,118 @@ fn named_client_id(
     }
 }
 
-/// What to do with a grant whose client registration no longer exists.
-#[derive(Clone, Copy)]
-enum UnregisteredClient {
-    /// Refuse: the client must exist. A code was issued minutes ago to a
-    /// registered client, so its absence is a fault.
-    Refuse,
-    /// Carry on without a registration. A refresh token outlives its client's
-    /// registration (30 days against 90), and refusing every such token would
-    /// sign out every session older than a registration. Nothing is lost
-    /// against the status quo: a secret cannot be checked against a registration
-    /// that is gone, and a request that presents one is still refused.
-    Tolerate,
+// Client authentication at `POST /token`, for the two grants bound to a client:
+// the authorization code (`authenticate_code_client`, strict) and the refresh
+// token (`authenticate_refresh_client`, which tolerates a registration that has
+// expired). Both apply the same three steps through the same helpers, so they
+// cannot drift:
+//
+// 1. The client the request names (`named_client_id`, form or Basic header)
+//    must be the client the grant was issued to: `invalid_grant` otherwise. A
+//    request that names none is fine here (`check_named_client`).
+// 2. A secret the request presents is checked against the registration
+//    (`invalid_client`: "Bad secret."), whether the client is confidential or
+//    not (`check_client_secret`).
+// 3. A request that presents none must come from a public client
+//    (`invalid_client`: "Secret required."); which clients are confidential is
+//    decided in one place, `client_is_confidential`, which also sets the flag a
+//    grant records at issuance for the endpoint that cannot authenticate a
+//    client (`POST /_matrix/client/v3/refresh`).
+
+/// Step 1: the client the request names, if any, is the grant's client.
+/// `credential` names the grant in the error text.
+fn check_named_client(
+    bound_client_id: &str,
+    named_client_id: Option<&str>,
+    credential: &str,
+) -> Result<(), CustomError> {
+    match named_client_id {
+        Some(named) if !bound_client_id.is_empty() && !constant_time_eq(named, bound_client_id) => {
+            Err(CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::InvalidGrant,
+                error_description: format!("client_id does not match the {credential}."),
+            }))
+        }
+        _ => Ok(()),
+    }
 }
 
-/// The one place the token endpoint authenticates a client for a grant bound to
-/// a client: the authorization code and the refresh token.
-///
-/// 1. The client the request names (`named_client_id`, form or Basic header)
-///    must be the client the grant was issued to (`bound_client_id`):
-///    `invalid_grant` otherwise. A request that names none is fine here.
-/// 2. A secret the request presents is checked against the registration
-///    (`invalid_client`: "Bad secret."), whether the client is confidential or not.
-/// 3. A request that presents none must come from a public client: one
-///    registered with `token_endpoint_auth_method: none`, or with no method
-///    while `require_secret` is off (`invalid_client`: "Secret required.").
-///
-/// `credential` names the grant in the error text. Returns the registration, or
-/// `None` only when it is gone and `unregistered` is [`UnregisteredClient::Tolerate`].
-async fn authenticate_client(
+/// Steps 2 and 3 against the client's registration: a presented secret must
+/// match it, and a request without one must come from a public client.
+fn check_client_secret(
+    client_entry: &ClientEntry,
+    presented_secret: Option<&str>,
+    config: &crate::config::Config,
+) -> Result<(), CustomError> {
+    match presented_secret {
+        Some(secret) if !constant_time_eq(secret, &client_entry.secret) => {
+            Err(CustomError::Unauthorized("Bad secret.".to_string()))
+        }
+        Some(_) => Ok(()),
+        None if client_is_confidential(Some(client_entry), config) => {
+            Err(CustomError::Unauthorized("Secret required.".to_string()))
+        }
+        None => Ok(()),
+    }
+}
+
+/// Authenticate the client of an authorization code: the three steps above,
+/// and the registration must exist (a code was issued minutes ago to a
+/// registered client, so its absence is a fault: `invalid_client`). Returns
+/// the registration.
+async fn authenticate_code_client(
     bound_client_id: &str,
     named_client_id: Option<&str>,
     presented_secret: Option<&str>,
-    credential: &str,
-    unregistered: UnregisteredClient,
     config: &crate::config::Config,
     db_client: &DBClientType,
-) -> Result<Option<ClientEntry>, CustomError> {
-    if !bound_client_id.is_empty() {
-        if let Some(named) = named_client_id {
-            if !constant_time_eq(named, bound_client_id) {
-                return Err(CustomError::BadRequestToken(TokenError {
-                    error: CoreErrorResponseType::InvalidGrant,
-                    error_description: format!("client_id does not match the {credential}."),
-                }));
-            }
-        }
-    }
-
-    let Some(client_entry) = db_client.get_client(bound_client_id.to_string()).await? else {
-        return match (unregistered, presented_secret) {
-            (UnregisteredClient::Tolerate, None) => Ok(None),
-            _ => Err(CustomError::Unauthorized(
-                "Unrecognised client id.".to_string(),
-            )),
-        };
-    };
-
-    match presented_secret {
-        Some(secret) => {
-            if !constant_time_eq(secret, &client_entry.secret) {
-                return Err(CustomError::Unauthorized("Bad secret.".to_string()));
-            }
-        }
-        None => match client_entry.metadata.token_endpoint_auth_method() {
-            Some(CoreClientAuthMethod::None) => {}
-            Some(_) => {
-                return Err(CustomError::Unauthorized("Secret required.".to_string()));
-            }
-            None if config.require_secret => {
-                return Err(CustomError::Unauthorized("Secret required.".to_string()));
-            }
-            None => {}
-        },
-    }
-    Ok(Some(client_entry))
+) -> Result<ClientEntry, CustomError> {
+    check_named_client(bound_client_id, named_client_id, "authorization code")?;
+    let client_entry = db_client
+        .get_client(bound_client_id.to_string())
+        .await?
+        .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
+    check_client_secret(&client_entry, presented_secret, config)?;
+    Ok(client_entry)
 }
 
-/// Whether a client authenticates with a secret, by the rule
-/// [`authenticate_client`] applies: a registered `token_endpoint_auth_method`
-/// other than `none`, or none registered while `require_secret`. A client with
-/// no registration counts as public. Recorded on each grant so an endpoint that
-/// cannot authenticate a client can refuse a confidential client's grant.
+/// Authenticate the client of a refresh token: the three steps above, except
+/// that a registration that is gone is tolerated when the request presents no
+/// secret. A refresh token outlives its client's registration (30 days against
+/// 90), and refusing every such token would sign out every session older than a
+/// registration. Nothing is lost against the status quo: a secret cannot be
+/// checked against a registration that is gone, and a request that presents
+/// one is still refused (`invalid_client`).
+///
+/// This runs before the rotation script, as RFC 6749 orders it (client
+/// authentication first, §3.2.1 and §6). A consequence, kept on purpose: a
+/// superseded refresh token presented with a wrong secret is answered
+/// `invalid_client`, not like an unknown token. Telling the two apart needs a
+/// real token of the grant and reveals nothing about the token's state.
+async fn authenticate_refresh_client(
+    bound_client_id: &str,
+    named_client_id: Option<&str>,
+    presented_secret: Option<&str>,
+    config: &crate::config::Config,
+    db_client: &DBClientType,
+) -> Result<(), CustomError> {
+    check_named_client(bound_client_id, named_client_id, "refresh token")?;
+    match db_client.get_client(bound_client_id.to_string()).await? {
+        Some(client_entry) => check_client_secret(&client_entry, presented_secret, config),
+        None if presented_secret.is_none() => Ok(()),
+        None => Err(CustomError::Unauthorized(
+            "Unrecognised client id.".to_string(),
+        )),
+    }
+}
+
+/// Whether a client must authenticate with a secret: a registered
+/// `token_endpoint_auth_method` other than `none`, or none registered while
+/// `require_secret`. A client with no registration counts as public. The one
+/// rule behind step 3 above and behind the `confidential` flag a grant records
+/// at issuance, so `POST /_matrix/client/v3/refresh`, which cannot
+/// authenticate a client, refuses exactly the grants whose client
+/// `POST /token` would ask for a secret.
 fn client_is_confidential(client: Option<&ClientEntry>, config: &crate::config::Config) -> bool {
     match client.map(|c| c.metadata.token_endpoint_auth_method()) {
         None => false,
@@ -1082,14 +1112,12 @@ async fn token_refresh(
     // A refresh token belongs to the client it was issued to (I7): before the
     // rotation script runs, the request must be that client, and a
     // confidential client must authenticate. `POST /_matrix/client/v3/refresh`
-    // carries no client identity, so that endpoint is not bound, and
-    // `compat::refresh` says so.
-    authenticate_client(
+    // carries no client identity, so it refuses a confidential client's grant
+    // instead (`compat::refresh`).
+    authenticate_refresh_client(
         &grant.client_id,
         named_client.as_deref(),
         presented_secret.as_deref(),
-        "refresh token",
-        UnregisteredClient::Tolerate,
         config,
         db_client,
     )
@@ -1125,7 +1153,7 @@ async fn token_refresh(
         RotateOutcome::Invalid(_) | RotateOutcome::ConfidentialClient => {
             return Err(unknown_refresh_token());
         }
-        // The same answer `authenticate_client` gives a request that names
+        // The same answer `check_named_client` gives a request that names
         // another client.
         RotateOutcome::ClientMismatch => {
             return Err(CustomError::BadRequestToken(TokenError {
@@ -1488,7 +1516,7 @@ async fn token_authorization_code(
     })?;
 
     // Bind the code to the client it was issued to, and authenticate that
-    // client, through the helper the refresh grant uses too. A correct client
+    // client, through the helpers the refresh grant uses too. A correct client
     // presents the same `client_id` at /authorize and /token; a code carries its
     // client_id (always set by `sign_in`), and the rest of the function runs
     // against the code's client, never the request's. This stops a leaked
@@ -1499,18 +1527,14 @@ async fn token_authorization_code(
     } else {
         named_client.clone().unwrap_or_default()
     };
-    let client_entry = authenticate_client(
+    let client_entry = authenticate_code_client(
         &client_id,
         named_client.as_deref(),
         presented_secret.as_deref(),
-        "authorization code",
-        UnregisteredClient::Refuse,
         config,
         db_client,
     )
-    .await?
-    // `Refuse` never answers `None`; the arm is the same refusal, spelled out.
-    .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
+    .await?;
 
     // PKCE: every code carries the challenge `/authorize` bound to its session,
     // and the verifier must match it. A code without a challenge (only an older
@@ -7295,9 +7319,60 @@ mod client_binding_tests {
         );
     }
 
-    /// One helper authenticates the client for both grants, so the two cannot
-    /// drift: every way a request can present itself gets the same answer from
-    /// the code exchange and the refresh grant.
+    /// A grant records its client as confidential exactly when `POST /token`
+    /// demands that client's secret: the one rule (`client_is_confidential`)
+    /// behind both, so `POST /_matrix/client/v3/refresh`, which refuses a
+    /// confidential client's grant, refuses exactly the grants it could not
+    /// authenticate.
+    #[tokio::test]
+    async fn a_grant_records_its_client_as_confidential_exactly_when_token_demands_a_secret() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let strict = Config {
+            require_secret: true,
+            ..Config::default()
+        };
+        let lax = Config {
+            require_secret: false,
+            ..Config::default()
+        };
+        for (registration, config, label, confidential) in [
+            (Registration::Public, &strict, "public", false),
+            (Registration::Confidential, &lax, "confidential", true),
+            (Registration::Unset, &strict, "unset, secret required", true),
+            (Registration::Unset, &lax, "unset, secret optional", false),
+        ] {
+            let client = seed_client(&db, registration).await;
+            let code = seed_code_with_scope(&db, &client, Some("openid offline_access")).await;
+            let with_secret = Presented {
+                client_id: Some(&client),
+                form_secret: Some(SECRET),
+                header_client_id: None,
+                header_secret: None,
+            };
+            let rt = refresh_token_of(exchange(&db, config, &code, with_secret).await);
+            let grant = db.peek_refresh_grant(&rt).await.unwrap().unwrap();
+            assert_eq!(
+                grant.confidential_client, confidential,
+                "{label}: the flag the grant records"
+            );
+            let named_only = Presented {
+                client_id: Some(&client),
+                ..NOTHING
+            };
+            let demanded = outcome(&refresh(&db, config, &rt, named_only).await)
+                == "invalid_client: Secret required.";
+            assert_eq!(
+                grant.confidential_client, demanded,
+                "{label}: the recorded flag and the secret /token demands agree"
+            );
+        }
+    }
+
+    /// The two grants authenticate the client through the same helpers, so
+    /// they cannot drift: every way a request can present itself gets the same
+    /// answer from the code exchange and the refresh grant.
     #[tokio::test]
     async fn the_code_exchange_and_the_refresh_grant_authenticate_clients_identically() {
         let Some(db) = siwx_oidc::test_support::redis().await else {

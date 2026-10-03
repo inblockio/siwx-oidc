@@ -381,7 +381,8 @@ teardown.
 
 An authorization code and a refresh token belong to the client they were issued
 to, and `POST /token` authenticates that client by one rule for both grants
-(`oidc::authenticate_client`):
+(`oidc::authenticate_code_client` and `oidc::authenticate_refresh_client`, which
+share their checks and differ only in tolerating an expired registration, below):
 
 1. The client named in the request must be the grant's client, else
    `invalid_grant`. It is named by `client_id` in the form or by the user name
