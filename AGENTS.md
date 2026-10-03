@@ -408,6 +408,12 @@ doc; read it before changing the code the rule covers.
   `a_public_client_refreshes_without_client_credentials`,
   `a_basic_authorization_header_authenticates_the_code_exchange`,
   `the_matrix_endpoint_refuses_a_confidential_clients_refresh_token` (unit and mock stack).
+- **A token-store fault is a retryable 503 `M_UNKNOWN` at the Matrix routes, never
+  `M_UNKNOWN_TOKEN`**, which a Matrix client takes for "signed out" (it clears its crypto store):
+  `POST /_matrix/client/v3/refresh` and the device-deletion routes (`username_from_bearer`
+  returns the store error instead of folding it into "unknown"). Pin:
+  `a_store_fault_at_the_matrix_refresh_endpoint_is_a_retryable_503`,
+  `a_store_fault_on_a_bearer_route_is_a_retryable_503`.
 - **Never infer token validity from Synapse**: it caches introspection for two minutes. Our
   introspection answer is the authority.
 - **No device-id recycling.** Sign-in upserts a fresh `SIWX_…` id and never deletes. Pin:

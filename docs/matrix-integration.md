@@ -377,6 +377,15 @@ device was just signed out or the account just deactivated. Short-lived Redis
 tombstones (15 minutes) close the race between a refresh and a concurrent
 teardown.
 
+A token-store fault is never answered as a refusal. `POST
+/_matrix/client/v3/refresh` and the device-deletion routes (`DELETE
+/_matrix/client/v3/devices/{id}`, `POST /_matrix/client/v3/delete_devices`)
+answer it with a retryable 503 `M_UNKNOWN`: a Matrix client takes
+`M_UNKNOWN_TOKEN` for "signed out" and clears its crypto store, so reporting a
+transient Redis fault that way would cost the session and its cryptographic
+identity. The rotation script runs entirely or not at all, so a retry with the
+same refresh token is safe.
+
 ### Client binding
 
 An authorization code and a refresh token belong to the client they were issued

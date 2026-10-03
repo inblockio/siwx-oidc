@@ -466,20 +466,41 @@ pub struct DeleteDevicesRequest {
     pub devices: Vec<String>,
 }
 
-/// Resolve the bearer token to its owning localpart (`TokenMetadata.username`),
-/// or `None` if the token is missing, unknown, or not an access token.
+/// Resolve the bearer token to its owning localpart (`TokenMetadata.username`).
+///
+/// `Ok(None)` when the token is missing, unknown, or not an access token: the
+/// route answers `M_UNKNOWN_TOKEN`. `Err` when the store could not answer: the
+/// route answers the retryable 503 (`token_store_unavailable`), never
+/// `M_UNKNOWN_TOKEN`, which a Matrix client takes for "signed out".
 async fn username_from_bearer(
     state: &CompatState,
     bearer: &Option<TypedHeader<Authorization<Bearer>>>,
-) -> Option<String> {
-    let TypedHeader(auth) = bearer.as_ref()?;
-    state
+) -> anyhow::Result<Option<String>> {
+    let Some(TypedHeader(auth)) = bearer.as_ref() else {
+        return Ok(None);
+    };
+    Ok(state
         .redis_client
         .check_access_token(auth.token())
-        .await
-        .ok()
-        .flatten()
-        .map(|m| m.username)
+        .await?
+        .map(|m| m.username))
+}
+
+/// The bearer's owner for a device-deletion route, or the response to send:
+/// `M_UNKNOWN_TOKEN` for an unknown bearer, the retryable 503 for a store fault.
+async fn bearer_owner(
+    state: &CompatState,
+    bearer: &Option<TypedHeader<Authorization<Bearer>>>,
+    ctx: &str,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    match username_from_bearer(state, bearer).await {
+        Ok(Some(username)) => Ok(username),
+        Ok(None) => Err(unknown_token_response()),
+        Err(e) => {
+            warn!(error = %e, ctx, "bearer lookup: token store failed (infrastructure); returning retryable 503");
+            Err(token_store_unavailable())
+        }
+    }
 }
 
 /// Delete one of `username`'s Synapse devices (MAS API) and revoke its tokens.
@@ -533,8 +554,9 @@ pub async fn delete_device(
     Path(device_id): Path<String>,
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
 ) -> impl IntoResponse {
-    let Some(username) = username_from_bearer(&state, &bearer).await else {
-        return unknown_token_response();
+    let username = match bearer_owner(&state, &bearer, "compat_delete_device").await {
+        Ok(username) => username,
+        Err(response) => return response,
     };
     teardown_device(&state, &username, &device_id, "compat_delete_device").await;
     (StatusCode::OK, Json(serde_json::json!({})))
@@ -546,8 +568,9 @@ pub async fn delete_devices(
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
     Json(body): Json<DeleteDevicesRequest>,
 ) -> impl IntoResponse {
-    let Some(username) = username_from_bearer(&state, &bearer).await else {
-        return unknown_token_response();
+    let username = match bearer_owner(&state, &bearer, "compat_delete_devices").await {
+        Ok(username) => username,
+        Err(response) => return response,
     };
     for device_id in &body.devices {
         teardown_device(&state, &username, device_id, "compat_delete_devices").await;
@@ -557,7 +580,8 @@ pub async fn delete_devices(
 
 // -- POST /_matrix/client/v3/refresh ------------------------------------------
 
-/// 503 for a token-store fault during a refresh: retryable, never `M_UNKNOWN_TOKEN`.
+/// 503 for a token-store fault during a refresh or a bearer lookup: retryable,
+/// never `M_UNKNOWN_TOKEN`.
 fn token_store_unavailable() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,

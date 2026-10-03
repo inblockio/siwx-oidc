@@ -821,7 +821,10 @@ paths:
       operationId: matrixRefresh
       summary: Matrix-shaped refresh, with the same rotation and lost-response rule as `/token`
       description: Accepts only a refresh token; an access token (a minted admin token included) is `M_UNKNOWN_TOKEN`, like an unknown one. A replay of the previous refresh token returns the same successor pair while that pair is unused, and is `M_UNKNOWN_TOKEN` once it was used, rotated or revoked. The endpoint carries no client identity, so unlike `/token` it cannot bind the replay to a client, and it refuses the refresh token of a confidential client (one that must authenticate at `/token`) exactly like an unknown token, leaving it untouched for `/token`.
-      responses: { "200": { description: New tokens. } }
+      responses:
+        "200": { description: New tokens. }
+        "401": { description: "`M_UNKNOWN_TOKEN`: the refresh token is unknown, expired, reused, revoked, of another kind, or a confidential client's." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store could not answer. Never reported as `M_UNKNOWN_TOKEN`, which a Matrix client takes for \"signed out\" (it clears its crypto store). The rotation either ran entirely or not at all, so retrying with the same refresh token is safe." }
 
   /_matrix/client/v3/logout:
     post:
@@ -849,7 +852,10 @@ paths:
       description: The bearer must be an access token; any other token is a 401 `M_UNKNOWN_TOKEN`.
       security: [{ bearerToken: [] }]
       parameters: [{ name: device_id, in: path, required: true, schema: { type: string } }]
-      responses: { "200": { description: Deleted. } }
+      responses:
+        "200": { description: Deleted. }
+        "401": { description: "`M_UNKNOWN_TOKEN`: the bearer is missing, unknown, or not an access token." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store could not resolve the bearer. Never reported as `M_UNKNOWN_TOKEN`; nothing was deleted." }
 
   /_matrix/client/v3/delete_devices:
     post:
@@ -858,7 +864,10 @@ paths:
       summary: Sign out several devices
       description: The bearer must be an access token; any other token is a 401 `M_UNKNOWN_TOKEN`.
       security: [{ bearerToken: [] }]
-      responses: { "200": { description: Deleted. } }
+      responses:
+        "200": { description: Deleted. }
+        "401": { description: "`M_UNKNOWN_TOKEN`: the bearer is missing, unknown, or not an access token." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store could not resolve the bearer. Never reported as `M_UNKNOWN_TOKEN`; nothing was deleted." }
 
   /health:
     get:
