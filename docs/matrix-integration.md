@@ -408,9 +408,42 @@ sign-out, and signing in again usually means a new device with key-backup
 restore, so choose a short cap with care.
 
 A refresh is refused (`invalid_grant`, "Session has been revoked.") when the
-device was just signed out or the account just deactivated. Short-lived Redis
-tombstones (15 minutes) close the race between a refresh and a concurrent
-teardown.
+device was just signed out (a short-lived device tombstone, 15 minutes, closes
+the race between a refresh and the teardown) or when an epoch refuses the
+grant.
+
+### Epochs
+
+An epoch is a persistent not-before timestamp (Unix milliseconds, Redis
+`TIME`) for one scope: `epoch:global`, `epoch:client/{client_id}` or
+`epoch:user/{username}`. Every grant authenticated at or before the largest
+epoch that applies to it is refused at both refresh endpoints and is inactive
+at introspection at once (Synapse may still answer from its two-minute
+introspection cache); a grant authenticated later is untouched. One write
+revokes a whole scope, with no enumeration.
+
+`logout/all`, deactivation and erasure set the user epoch (and still delete
+the user's grants). A sign-in right after `logout/all` therefore refreshes at
+once; the user tombstone the epoch replaced refused that for 15 minutes. A
+user tombstone planted by the previous build is still honoured until it
+expires.
+
+Global and client epochs have no HTTP endpoint. An operator sets one with a
+single script that takes the time from Redis `TIME` and never moves an epoch
+earlier (provisional; it is what `RedisClient::set_epoch` runs):
+
+```bash
+redis-cli -u "$REDIS_URL" EVAL "local t = redis.call('TIME') \
+  local ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000) \
+  local cur = tonumber(redis.call('GET', KEYS[1]) or '0') \
+  if ms > cur then redis.call('SET', KEYS[1], string.format('%.0f', ms)) cur = ms end \
+  return string.format('%.0f', cur)" 1 epoch:global      # or epoch:client/<client_id>
+```
+
+Every user of the scope signs in again; for Matrix clients that usually
+means a new device with key-backup restore. An epoch has no TTL: deleting the
+key lifts it for grants not yet refused (a grant refused at a refresh
+endpoint is already deleted).
 
 ### Upgrading from a build before the grant record
 
@@ -726,8 +759,8 @@ included, to the action it dispatches.
 - **Standalone.** Every action requires `SIWXOIDC_MATRIX_SERVER_NAME`, and all
   but `profile` require a Synapse client. Without them the action answers 400
   with a clear message, never 500.
-- Deactivation and erasure plant a deactivation tombstone first, so a refresh
-  racing the sweep cannot restore access.
+- Deactivation and erasure set the user epoch first, so a refresh racing the
+  sweep cannot restore access, and every grant from before is refused at once.
 - Erasure removes the DID's `webauthn:link/*` entries and credentials, and
   standalone passkeys whose key derives to that `did:key`, so the DID cannot be
   signed into again from a leftover passkey.

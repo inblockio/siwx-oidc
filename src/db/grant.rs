@@ -12,6 +12,7 @@
 //! | `idx:grants:user/{username}` | set | grant ids of the user | the longest grant TTL written into it |
 //! | `idx:grants:user_device/{username}/{device_id}` | set | grant ids of the device | as above |
 //! | `legacy_rt/{digest(legacy refresh token)}` | string | the grant id a legacy refresh token was lifted into | `inactivity_secs` at the lift |
+//! | `epoch:global`, `epoch:client/{client_id}`, `epoch:user/{username}` | string | a not-before epoch, Unix ms from Redis `TIME` ([`EpochScope`]) | none |
 //!
 //! A grant id is `digest(handle)` (see [`super::tokens`]). No key or value
 //! written here contains a token: refresh tokens appear only as digests in
@@ -52,6 +53,7 @@
 //! | `device_id` | the Matrix device, empty when none (JSON `null` on the wire) |
 //! | `scope`, `name` | as granted; `name` is echoed by introspection |
 //! | `auth_time` | the original authentication, Redis `TIME` (the sign-in or the device approval) |
+//! | `auth_ms` | the same in milliseconds, compared with the epochs; absent on grants written before epochs (then `auth_time` * 1000) |
 //! | `absolute_exp` | `auth_time` + the cap, when one applied ([`GrantLifetime`]); only ever moves earlier |
 //! | `access_ttl` | lifetime of each access token of this grant |
 //! | `inactivity_secs`, `last_used` | the grant ends `inactivity_secs` after `last_used` |
@@ -60,7 +62,7 @@
 //! | `successor_used` | `0` from a rotation until the new pair is first used, else `1` |
 //! | `successor_sealed` | the current pair, sealed under `previous_rt`'s plaintext, while unused |
 //!
-//! Phase 3 M2 adds the epochs, Phase 4 `sid`.
+//! Phase 4 adds `sid`.
 //!
 //! # The rotation decision ([`RedisClient::rotate_refresh_token`])
 //!
@@ -69,7 +71,8 @@
 //! | Grant state | Presented token | Outcome |
 //! |---|---|---|
 //! | missing | any | [`RotateOutcome::Invalid`] (`UnknownGrant`) |
-//! | user or device tombstone present | any | `Invalid` (`Revoked`) |
+//! | user or device tombstone present (the user tombstone only as a previous build planted it) | any | `Invalid` (`Revoked`) |
+//! | an epoch at or after `auth_ms` | any | `Invalid` (`Revoked`); the grant is deleted |
 //! | `last_used` + `inactivity_secs` passed, or the absolute expiry (the earlier of `absolute_exp` and `auth_time` + the cap now configured) | any | `Invalid` (`Expired`); the grant is deleted |
 //! | the request names another client | any | [`RotateOutcome::ClientMismatch`] |
 //! | confidential client, caller refuses those | any | [`RotateOutcome::ConfidentialClient`] |
