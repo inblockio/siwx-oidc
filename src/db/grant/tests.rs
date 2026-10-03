@@ -658,6 +658,24 @@ async fn revoking_by_token_deletes_the_grant_of_an_accepted_token_only() {
         .await
         .unwrap()
         .is_some());
+    // The previous refresh token revokes only while its successor is unused:
+    // b2 has now been used, so b1 deletes nothing.
+    assert_eq!(
+        client
+            .revoke_grant_of_token(&b1.pair.refresh_token)
+            .await
+            .unwrap(),
+        None,
+        "the previous token revokes nothing once its successor was used"
+    );
+    assert!(
+        client
+            .peek_refresh_grant(&b2.pair.refresh_token)
+            .await
+            .unwrap()
+            .is_some(),
+        "the grant is intact"
+    );
     assert!(client
         .revoke_grant_of_token(&b2.pair.refresh_token)
         .await
