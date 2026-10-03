@@ -1110,7 +1110,12 @@ async fn a_legacy_token_that_may_not_be_lifted_stays_untouched() {
         Some(stale_json.as_str()),
         "the expired entry is left as it was"
     );
-    client.mark_user_deactivated(&meta.username).await.unwrap();
+    // A user tombstone as the previous build planted it (still read for one
+    // release; the user epoch refuses a lift too, see the epochs tests).
+    client
+        .set_ex_raw(&user_tombstone_key(&meta.username), "1", TOMBSTONE_TTL_SECS)
+        .await
+        .unwrap();
     assert_eq!(
         client
             .lift_legacy_refresh_token(&request(&legacy_rt), &legacy, false)
