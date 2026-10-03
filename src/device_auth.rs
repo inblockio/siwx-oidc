@@ -1134,8 +1134,7 @@ mod tests {
     /// served. Needs Redis for the served half.
     #[tokio::test]
     async fn device_authorization_is_refused_outside_delegated_auth_mode() {
-        use openidconnect::core::{CoreClientMetadata, CoreErrorResponseType};
-        use openidconnect::registration::EmptyAdditionalClientMetadata;
+        use openidconnect::core::CoreErrorResponseType;
         use openidconnect::RedirectUrl;
 
         let Some(db) = siwx_oidc::test_support::redis().await else {
@@ -1146,9 +1145,9 @@ mod tests {
             client_id.clone(),
             ClientEntry::new(
                 "secret",
-                CoreClientMetadata::new(
+                SiwxClientMetadata::new(
                     vec![RedirectUrl::new("https://example.com".into()).unwrap()],
-                    EmptyAdditionalClientMetadata {},
+                    LogoutClientMetadata::default(),
                 ),
                 None,
             ),
@@ -1188,8 +1187,6 @@ mod tests {
     /// or poll for its tokens. Needs Redis.
     #[tokio::test]
     async fn the_device_flow_logs_fingerprints_never_its_codes() {
-        use openidconnect::core::CoreClientMetadata;
-        use openidconnect::registration::EmptyAdditionalClientMetadata;
         use openidconnect::RedirectUrl;
         use siwx_oidc::redact::fingerprint;
 
@@ -1201,9 +1198,9 @@ mod tests {
             client_id.clone(),
             ClientEntry::new(
                 "secret",
-                CoreClientMetadata::new(
+                SiwxClientMetadata::new(
                     vec![RedirectUrl::new("https://example.com".into()).unwrap()],
-                    EmptyAdditionalClientMetadata {},
+                    LogoutClientMetadata::default(),
                 ),
                 None,
             ),

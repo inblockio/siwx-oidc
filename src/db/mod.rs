@@ -5,7 +5,18 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{offset::Utc, DateTime};
-use openidconnect::{core::CoreClientMetadata, Nonce, RegistrationAccessToken};
+use openidconnect::{
+    core::{
+        CoreApplicationType, CoreClientAuthMethod, CoreGrantType, CoreJsonWebKey,
+        CoreJweContentEncryptionAlgorithm, CoreJweKeyManagementAlgorithm, CoreResponseType,
+        CoreSubjectIdentifierType,
+    },
+    registration::{
+        AdditionalClientMetadata, ClientMetadata, ClientRegistrationResponse,
+        EmptyAdditionalClientRegistrationResponse,
+    },
+    Nonce, PostLogoutRedirectUrl, RegistrationAccessToken,
+};
 use serde::{Deserialize, Serialize};
 
 pub mod grant;
@@ -224,6 +235,46 @@ pub struct CodeEntry {
     pub scope: Option<String>,
 }
 
+/// Registration metadata this provider reads beyond OIDC Core client
+/// registration: `post_logout_redirect_uris` (OpenID Connect RP-Initiated
+/// Logout 1.0 §3.1). Flattened into the registration document, so an entry
+/// written before it existed reads with none, and a build that does not know
+/// it ignores it.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct LogoutClientMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_logout_redirect_uris: Option<Vec<PostLogoutRedirectUrl>>,
+}
+
+impl AdditionalClientMetadata for LogoutClientMetadata {}
+
+/// A client's registration: OIDC Core client metadata plus [`LogoutClientMetadata`].
+pub type SiwxClientMetadata = ClientMetadata<
+    LogoutClientMetadata,
+    CoreApplicationType,
+    CoreClientAuthMethod,
+    CoreGrantType,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJweKeyManagementAlgorithm,
+    CoreJsonWebKey,
+    CoreResponseType,
+    CoreSubjectIdentifierType,
+>;
+
+/// The registration response, echoing [`LogoutClientMetadata`].
+pub type SiwxClientRegistrationResponse = ClientRegistrationResponse<
+    LogoutClientMetadata,
+    EmptyAdditionalClientRegistrationResponse,
+    CoreApplicationType,
+    CoreClientAuthMethod,
+    CoreGrantType,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJweKeyManagementAlgorithm,
+    CoreJsonWebKey,
+    CoreResponseType,
+    CoreSubjectIdentifierType,
+>;
+
 /// A client's registration. The client secret and the registration access
 /// token are stored only as their SHA-256 digests ([`tokens::digest`]), and a
 /// presented value is compared with them digest against digest
@@ -242,7 +293,7 @@ pub struct CodeEntry {
 #[serde(try_from = "StoredClientEntry")]
 pub struct ClientEntry {
     pub secret_digest: String,
-    pub metadata: CoreClientMetadata,
+    pub metadata: SiwxClientMetadata,
     pub access_token_digest: Option<String>,
 }
 
@@ -253,7 +304,7 @@ struct StoredClientEntry {
     secret_digest: Option<String>,
     #[serde(default)]
     secret: Option<String>,
-    metadata: CoreClientMetadata,
+    metadata: SiwxClientMetadata,
     #[serde(default)]
     access_token_digest: Option<String>,
     #[serde(default)]
@@ -292,7 +343,7 @@ impl TryFrom<StoredClientEntry> for ClientEntry {
 impl ClientEntry {
     /// The registration of a client with `secret` and, if it has one, the
     /// registration access token `access_token`; it keeps their digests.
-    pub fn new(secret: &str, metadata: CoreClientMetadata, access_token: Option<&str>) -> Self {
+    pub fn new(secret: &str, metadata: SiwxClientMetadata, access_token: Option<&str>) -> Self {
         ClientEntry {
             secret_digest: tokens::digest(secret),
             metadata,
@@ -938,8 +989,8 @@ mod client_entry_tests {
     use super::*;
     use openidconnect::RedirectUrl;
 
-    fn metadata() -> CoreClientMetadata {
-        CoreClientMetadata::new(
+    fn metadata() -> SiwxClientMetadata {
+        SiwxClientMetadata::new(
             vec![RedirectUrl::new("https://rp.example.org/cb".into()).unwrap()],
             Default::default(),
         )

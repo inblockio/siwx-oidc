@@ -17,9 +17,7 @@ use axum_extra::{
     TypedHeader,
 };
 use headers::Header;
-use openidconnect::core::{
-    CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType, CoreJsonWebKeySet,
-};
+use openidconnect::core::{CoreErrorResponseType, CoreJsonWebKeySet};
 use std::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
@@ -333,6 +331,44 @@ async fn token(
     Ok(value.into())
 }
 
+async fn end_session_get(
+    State(state): State<AppState>,
+    Query(params): Query<oidc::EndSessionParams>,
+) -> Result<Response, CustomError> {
+    end_session_response(&state, params).await
+}
+
+async fn end_session_post(
+    State(state): State<AppState>,
+    Form(params): Form<oidc::EndSessionParams>,
+) -> Result<Response, CustomError> {
+    end_session_response(&state, params).await
+}
+
+/// RP-initiated logout (`oidc::end_session`): a 303 to the registered
+/// `post_logout_redirect_uri`, else the signed-out page.
+async fn end_session_response(
+    state: &AppState,
+    params: oidc::EndSessionParams,
+) -> Result<Response, CustomError> {
+    let outcome = oidc::end_session(
+        params,
+        &state.signing_key,
+        &state.retired_verification_keys,
+        &state.config,
+        &state.redis_client,
+    )
+    .await?;
+    Ok(match outcome {
+        oidc::EndSessionOutcome::Redirect(uri) => Redirect::to(uri.as_str()).into_response(),
+        oidc::EndSessionOutcome::SignedOut { ended } => (
+            [(header::CACHE_CONTROL, "no-store")],
+            axum::response::Html(oidc::signed_out_page(ended)),
+        )
+            .into_response(),
+    })
+}
+
 async fn authorize(
     State(state): State<AppState>,
     Query(params): Query<oidc::AuthorizeParams>,
@@ -400,8 +436,8 @@ async fn sign_in(
 
 async fn register(
     State(state): State<AppState>,
-    Json(payload): Json<CoreClientMetadata>,
-) -> Result<(StatusCode, Json<CoreClientRegistrationResponse>), CustomError> {
+    Json(payload): Json<SiwxClientMetadata>,
+) -> Result<(StatusCode, Json<SiwxClientRegistrationResponse>), CustomError> {
     let registration = oidc::register(payload, state.config.base_url, &state.redis_client).await?;
     Ok((StatusCode::CREATED, registration.into()))
 }
@@ -481,7 +517,7 @@ async fn userinfo_post(
 async fn clientinfo(
     State(state): State<AppState>,
     Path(client_id): Path<String>,
-) -> Result<Json<CoreClientMetadata>, CustomError> {
+) -> Result<Json<SiwxClientMetadata>, CustomError> {
     Ok(oidc::clientinfo(client_id, &state.redis_client)
         .await?
         .into())
@@ -491,7 +527,7 @@ async fn client_update(
     State(state): State<AppState>,
     Path(client_id): Path<String>,
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
-    Json(payload): Json<CoreClientMetadata>,
+    Json(payload): Json<SiwxClientMetadata>,
 ) -> Result<(), CustomError> {
     oidc::client_update(
         client_id,
@@ -1553,6 +1589,10 @@ pub async fn main() {
             get(clientinfo).delete(client_delete).post(client_update),
         )
         .route(oidc::SIGNIN_PATH, get(sign_in))
+        .route(
+            oidc::END_SESSION_PATH,
+            get(end_session_get).post(end_session_post),
+        )
         .route("/webauthn/register/start", post(webauthn_register_start))
         .route("/webauthn/register/finish", post(webauthn_register_finish))
         .route(

@@ -129,6 +129,9 @@ paths:
 
         `response_types_supported` is exactly `["code"]`: the
         authorization-code flow is the only one `/authorize` accepts.
+
+        `end_session_endpoint` (`{issuer}/end_session`) advertises
+        RP-initiated logout, in both modes.
       responses:
         "200":
           description: Provider metadata.
@@ -368,13 +371,24 @@ paths:
               properties:
                 redirect_uris: { type: array, items: { type: string, format: uri } }
                 client_name: { type: string }
+                post_logout_redirect_uris:
+                  type: array
+                  items: { type: string, format: uri }
+                  description: |
+                    Where `/end_session` may send the user back (OpenID Connect
+                    RP-Initiated Logout 1.0 §3.1). Matched exactly, query
+                    included. Echoed in the response.
       responses:
         "201":
           description: The registered client, with its secret and registration access token.
           content:
             application/json:
               schema: { type: object }
-        "400": { description: "Invalid metadata — a `redirect_uri` carrying a fragment is rejected." }
+        "400":
+          description: |
+            Invalid metadata: a `redirect_uri` carrying a fragment is
+            `invalid_redirect_uri`; a `post_logout_redirect_uri` carrying one is
+            `invalid_client_metadata`.
 
   /client/{id}:
     parameters:
@@ -490,6 +504,56 @@ paths:
         "503":
           description: This deployment has no homeserver configured and cannot answer.
           content: { application/json: { schema: { $ref: "#/components/schemas/ResolveError" } } }
+
+  /end_session:
+    get:
+      tags: [OIDC]
+      operationId: endSession
+      summary: RP-initiated logout (OpenID Connect RP-Initiated Logout 1.0)
+      description: |
+        Ends the grant whose `sid` the `id_token_hint` carries, if the grant
+        belongs to the hint's client (`aud`) and subject (`sub`): its access
+        token is inactive at once and its refresh token is refused. Only that
+        grant ends; a Matrix device is never deleted here (the Matrix `logout`
+        is the device sign-out). The hint must be an ID token this provider
+        signed, with the live or a retired key (an expired one is accepted).
+        A hint without a `sid`, or no hint, ends nothing.
+
+        Everything is checked before anything ends: a hint that does not
+        verify, a `client_id` that is not the hint's audience, or a
+        `post_logout_redirect_uri` that is not registered for the client
+        (exact match, query included) is a 400 that ends nothing and never
+        redirects.
+      parameters:
+        - { name: id_token_hint, in: query, schema: { type: string } }
+        - { name: client_id, in: query, schema: { type: string } }
+        - { name: post_logout_redirect_uri, in: query, schema: { type: string, format: uri } }
+        - { name: state, in: query, schema: { type: string } }
+      responses:
+        "200": { description: "The signed-out page (no `post_logout_redirect_uri`)." }
+        "303": { description: "To the registered `post_logout_redirect_uri`, with `state` appended when one was sent." }
+        "400": { description: "The hint, the `client_id` or the `post_logout_redirect_uri` was refused; nothing ended." }
+        "503": { description: "The token store is unavailable; nothing ended, retry." }
+    post:
+      tags: [OIDC]
+      operationId: endSessionPost
+      summary: RP-initiated logout, form-encoded
+      description: The same as `GET /end_session`, with the parameters in the body.
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                id_token_hint: { type: string }
+                client_id: { type: string }
+                post_logout_redirect_uri: { type: string, format: uri }
+                state: { type: string }
+      responses:
+        "200": { description: "The signed-out page (no `post_logout_redirect_uri`)." }
+        "303": { description: "To the registered `post_logout_redirect_uri`, with `state` appended when one was sent." }
+        "400": { description: "The hint, the `client_id` or the `post_logout_redirect_uri` was refused; nothing ended." }
+        "503": { description: "The token store is unavailable; nothing ended, retry." }
 
   /oauth2/introspect:
     post:

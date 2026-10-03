@@ -1107,12 +1107,12 @@ mod tests {
                 confidential_client.clone(),
                 siwx_oidc::db::ClientEntry::new(
                     "s",
-                    openidconnect::core::CoreClientMetadata::new(
+                    siwx_oidc::db::SiwxClientMetadata::new(
                         vec![
                             openidconnect::RedirectUrl::new("https://example.com/cb".into())
                                 .unwrap(),
                         ],
-                        openidconnect::registration::EmptyAdditionalClientMetadata {},
+                        siwx_oidc::db::LogoutClientMetadata::default(),
                     ),
                     None,
                 ),
