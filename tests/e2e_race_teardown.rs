@@ -3445,9 +3445,11 @@ fn r2_file() -> String {
 /// The checks: the code redeems once and only once; the session signs in and
 /// its code exchanges; the approved device code redeems once; the pending
 /// user code is still found, approved and redeemed. Afterwards no key or
-/// value holds the legacy code, device codes or user code (each was deleted
+/// value holds the legacy code, device codes or user codes (each was deleted
 /// on use). The legacy session entry stays until it expires (300 s): the new
-/// build reads it in place and writes nothing in the clear.
+/// build reads it in place and writes nothing in the clear. After a real
+/// upgrade, the nonce the previous build consumed for its approval also keeps
+/// the approved user code until it expires (300 s).
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn in_flight_codes_and_sessions_survive_the_upgrade() {
@@ -3464,7 +3466,8 @@ async fn in_flight_codes_and_sessions_survive_the_upgrade() {
     };
     let c = Client::new();
     let base = oidc();
-    let flight = match std::env::var("E2E_R2_STAGE").unwrap_or_default().as_str() {
+    let stage = std::env::var("E2E_R2_STAGE").unwrap_or_default();
+    let flight = match stage.as_str() {
         "mint" => {
             mock_reset(&c).await;
             let flight = put_in_flight(&c, &base).await;
@@ -3598,7 +3601,14 @@ async fn in_flight_codes_and_sessions_survive_the_upgrade() {
     let mut held = ClientHeld::default();
     held.add("legacy authorization code", &flight.code);
     held.add("legacy approved device code", &flight.approved_device_code);
-    held.add("legacy approved user code", &flight.approved_user_code);
+    // After a real upgrade the previous build's approval nonce still holds the
+    // approved user code in the clear: that build consumed it with a
+    // `/consumed` flag and left the entry, which expires within 300 s and which
+    // the new build cannot find without the nonce. The stand-in approves on the
+    // build under test, so there the user code must be gone.
+    if stage != "check" {
+        held.add("legacy approved user code", &flight.approved_user_code);
+    }
     held.add("legacy pending device code", &flight.pending_device_code);
     held.add("legacy pending user code", &flight.pending_user_code);
     assert_nothing_stored_in_the_clear(&url, &held, "after every legacy credential was used").await;
