@@ -1435,7 +1435,9 @@ mod tests {
 
     /// A store fault during `POST /_matrix/client/v3/logout/all` is the
     /// retryable 503, never a 200 that reports every session ended: a fault
-    /// reading the bearer, and a fault in the sweep of the user's grants.
+    /// reading the bearer, a fault in the sweep of the user's grants, and a
+    /// fault while ending the user's own sessions (`revoke_own_sessions`,
+    /// after the grants are gone).
     #[tokio::test]
     async fn a_store_fault_during_logout_all_is_a_retryable_503() {
         let Some(client) = redis().await else { return };
@@ -1471,6 +1473,31 @@ mod tests {
         let (status, body) = status_and_json(response).await;
         assert_retryable_503(status, &body, "logout/all, sweep fault");
         client.revoke_grants_for_device(&user, &dev).await.ok();
+
+        // A fault ending the own sessions: the DID's index is not a sorted set.
+        let user = format!("logout-all-own-{n}");
+        let issued = seed_grant(&client, &user, &dev).await;
+        let did = format!("did:key:z{user}");
+        let own_idx = format!(
+            "{}/{}",
+            siwx_oidc::db::KV_OWN_SESSION_IDX_PREFIX,
+            tokens::digest(&siwx_oidc::mxid::canonicalize(&did))
+        );
+        plant_store_fault(&own_idx).await;
+        let response = logout_all(State(state.clone()), bearer(&issued.access_token))
+            .await
+            .into_response();
+        let (status, body) = status_and_json(response).await;
+        assert_retryable_503(status, &body, "logout/all, own-session fault");
+        assert!(
+            client
+                .lookup_access_token(&issued.access_token)
+                .await
+                .unwrap()
+                .is_none(),
+            "the fault is the own sessions', after the grants were revoked"
+        );
+        client.del_raw(&own_idx).await.ok();
     }
 
     async fn status_and_json(
