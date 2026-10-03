@@ -792,7 +792,7 @@ mod tests {
     use chrono::Utc;
     use siwx_oidc::db::grant::{EpochScope, GrantKind, IssuedGrant, NewGrant};
     use siwx_oidc::db::tokens;
-    use siwx_oidc::db::{DBClient, TokenMetadata, REFRESH_TOKEN_TTL};
+    use siwx_oidc::db::{DBClient, OwnSession, TokenMetadata, REFRESH_TOKEN_TTL};
 
     /// The test Redis, or `None` after a loud skip (`siwx_oidc::test_support`).
     async fn redis() -> Option<RedisClient> {
@@ -1435,9 +1435,10 @@ mod tests {
 
     /// A store fault during `POST /_matrix/client/v3/logout/all` is the
     /// retryable 503, never a 200 that reports every session ended: a fault
-    /// reading the bearer, a fault in the sweep of the user's grants, and a
-    /// fault while ending the user's own sessions (`revoke_own_sessions`,
-    /// after the grants are gone).
+    /// reading the bearer, and a fault in the sweep of the user's grants (the
+    /// own sessions are already ended, and the user epoch the sweep wrote
+    /// first refuses the bearer). A fault ending the own sessions:
+    /// `a_logout_all_retry_after_an_own_session_fault_ends_the_own_sessions_and_the_grants`.
     #[tokio::test]
     async fn a_store_fault_during_logout_all_is_a_retryable_503() {
         let Some(client) = redis().await else { return };
@@ -1462,6 +1463,10 @@ mod tests {
 
         let user = format!("logout-all-sweep-{n}");
         let access = seed_grant(&client, &user, &dev).await.access_token;
+        let hint = client
+            .create_user_session(&format!("did:key:z{user}"))
+            .await
+            .unwrap();
         plant_store_fault(&format!(
             "{}/{user}",
             siwx_oidc::db::grant::KV_GRANT_USER_IDX_PREFIX
@@ -1472,17 +1477,48 @@ mod tests {
             .into_response();
         let (status, body) = status_and_json(response).await;
         assert_retryable_503(status, &body, "logout/all, sweep fault");
+        // The sweep script writes the user epoch before the fault (a Redis
+        // script does not roll back), so the bearer is already refused and a
+        // retry is the idempotent no-op; the own sessions were ended first.
+        assert!(
+            client.lookup_user_session(&hint).await.unwrap().is_none(),
+            "the own sessions end before the grants are revoked"
+        );
+        assert!(
+            client.check_access_token(&access).await.unwrap().is_none(),
+            "the user epoch written before the sweep's fault refuses the bearer"
+        );
         client.revoke_grants_for_device(&user, &dev).await.ok();
+    }
 
-        // A fault ending the own sessions: the DID's index is not a sorted set.
+    /// A store fault while `logout/all` ends the user's own sessions (the
+    /// DID's index is not a sorted set) is the retryable 503 with nothing
+    /// revoked: the own sessions end before the grants are touched, so the
+    /// bearer still works and the client's retry, once the fault is gone,
+    /// ends the own sessions AND the grants. Revoking the grants first turned
+    /// the retry into an unknown token, a 200 that left the `siwx_user` and
+    /// `acct_session` sessions live.
+    #[tokio::test]
+    async fn a_logout_all_retry_after_an_own_session_fault_ends_the_own_sessions_and_the_grants() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let state = standalone_state(client.clone());
+        let dev = format!("ALL_{n}");
         let user = format!("logout-all-own-{n}");
         let issued = seed_grant(&client, &user, &dev).await;
+        let refresh = issued.refresh_token.as_deref().unwrap();
         let did = format!("did:key:z{user}");
+        let hint = client.create_user_session(&did).await.unwrap();
+        let (account, _csrf) = crate::account::create_account_session(&client, &did)
+            .await
+            .unwrap();
         let own_idx = format!(
             "{}/{}",
             siwx_oidc::db::KV_OWN_SESSION_IDX_PREFIX,
             tokens::digest(&siwx_oidc::mxid::canonicalize(&did))
         );
+        let entries = zset_entries(&own_idx).await;
+        assert_eq!(entries.len(), 2, "the DID's index names both own sessions");
         plant_store_fault(&own_idx).await;
         let response = logout_all(State(state.clone()), bearer(&issued.access_token))
             .await
@@ -1491,13 +1527,86 @@ mod tests {
         assert_retryable_503(status, &body, "logout/all, own-session fault");
         assert!(
             client
-                .lookup_access_token(&issued.access_token)
+                .check_access_token(&issued.access_token)
+                .await
+                .unwrap()
+                .is_some(),
+            "a logout/all whose own-session step faults leaves the bearer working for the retry"
+        );
+        assert!(
+            client.peek_refresh_grant(refresh).await.unwrap().is_some(),
+            "a logout/all whose own-session step faults leaves the grant in place"
+        );
+
+        restore_zset(&own_idx, &entries).await;
+        let response = logout_all(State(state.clone()), bearer(&issued.access_token))
+            .await
+            .into_response();
+        let (status, _body) = status_and_json(response).await;
+        assert_eq!(status, StatusCode::OK, "the retry signs out");
+        assert!(
+            client.lookup_user_session(&hint).await.unwrap().is_none(),
+            "the retry ends the picker hint"
+        );
+        assert!(
+            client
+                .lookup_own_session(OwnSession::Account, &account)
                 .await
                 .unwrap()
                 .is_none(),
-            "the fault is the own sessions', after the grants were revoked"
+            "the retry ends the account session"
         );
-        client.del_raw(&own_idx).await.ok();
+        assert!(
+            client
+                .check_access_token(&issued.access_token)
+                .await
+                .unwrap()
+                .is_none(),
+            "the retry ends the access token"
+        );
+        assert!(
+            client.peek_refresh_grant(refresh).await.unwrap().is_none(),
+            "the retry ends the grant"
+        );
+    }
+
+    /// A sorted set's members with their scores, to put it back after a
+    /// planted fault replaced it.
+    async fn zset_entries(key: &str) -> Vec<(String, String)> {
+        let raw =
+            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
+        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        bb8_redis::redis::cmd("ZRANGE")
+            .arg(key)
+            .arg(0)
+            .arg(-1)
+            .arg("WITHSCORES")
+            .query_async(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    async fn restore_zset(key: &str, entries: &[(String, String)]) {
+        let raw =
+            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
+        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let _: () = bb8_redis::redis::cmd("DEL")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let mut zadd = bb8_redis::redis::cmd("ZADD");
+        zadd.arg(key);
+        for (member, score) in entries {
+            zadd.arg(score).arg(member);
+        }
+        let _: () = zadd.query_async(&mut conn).await.unwrap();
+        let _: () = bb8_redis::redis::cmd("EXPIRE")
+            .arg(key)
+            .arg(600)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
     }
 
     async fn status_and_json(
