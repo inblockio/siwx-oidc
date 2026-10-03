@@ -785,3 +785,349 @@ async fn h3_a_thousand_rotations_recognise_every_superseded_token_in_constant_st
     // Still one live chain, untouched by the reuse events.
     rotated(rotate(&client, &current).await);
 }
+
+/// A legacy refresh token as a build before the grant record wrote it:
+/// `token/{raw}` holding the metadata JSON (without `kind`, as 3547bd2 wrote
+/// it, or with it, as the builds after the token kinds wrote it), lifetime 90
+/// days, plus the member `token/{raw}` of the legacy device index.
+async fn seed_legacy(
+    client: &RedisClient,
+    username: &str,
+    device_id: &str,
+    lifetime: i64,
+    with_kind: bool,
+) -> (String, TokenMetadata) {
+    let raw_token = format!(
+        "mcr_{}",
+        &tokens::new_access_token()[tokens::ACCESS_TOKEN_PREFIX.len()..]
+    );
+    let now = chrono::Utc::now().timestamp();
+    let meta = TokenMetadata {
+        username: username.to_string(),
+        device_id: device_id.to_string(),
+        scope: format!("openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}"),
+        client_id: "client-legacy".to_string(),
+        iat: now - 60,
+        exp: now - 60 + lifetime,
+        did: format!("did:key:z6Mk{username}"),
+        name: "legacy name".to_string(),
+        kind: with_kind.then_some(if lifetime <= crate::db::ACCESS_TOKEN_MAX_LIFETIME {
+            TokenKind::Access
+        } else {
+            TokenKind::Refresh
+        }),
+    };
+    let key = format!("token/{raw_token}");
+    let json = serde_json::to_string(&meta).unwrap();
+    let ttl = (meta.exp - now).to_string();
+    let _: () = raw(client, &["SET", &key, &json, "EX", &ttl]).await;
+    if !device_id.is_empty() {
+        let idx = format!("idx:user_device/{username}/{device_id}");
+        let _: i64 = raw(client, &["SADD", &idx, &key]).await;
+    }
+    (raw_token, meta)
+}
+
+fn request(presented: &str) -> RotateRequest<'_> {
+    RotateRequest {
+        presented,
+        client_id: None,
+        refuse_confidential: false,
+    }
+}
+
+async fn peek_legacy(client: &RedisClient, token: &str) -> LegacyRefresh {
+    match client.peek_refresh_token(token).await.expect("peek") {
+        RefreshPeek::Legacy(legacy) => legacy,
+        other => panic!("expected a legacy refresh token, got {other:?}"),
+    }
+}
+
+/// Item 10: the first presentation lifts the legacy token into a grant (legacy
+/// entry and index member gone, pointer written, the new pair current and
+/// unused); every later presentation follows I4 through the pointer: the same
+/// pair while unused, reuse after, and the chain goes on from the new token.
+#[tokio::test]
+async fn a_legacy_refresh_token_is_lifted_once_and_its_replays_follow_the_same_rule() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("lift{}", nonce());
+    for with_kind in [false, true] {
+        let device = format!("DEVL{with_kind}");
+        let (legacy_rt, meta) =
+            seed_legacy(&client, &user, &device, REFRESH_TOKEN_TTL as i64, with_kind).await;
+        let legacy = peek_legacy(&client, &legacy_rt).await;
+        assert_eq!(legacy.meta.username, user);
+
+        let lifted = rotated(
+            client
+                .lift_legacy_refresh_token(&request(&legacy_rt), &legacy, false)
+                .await
+                .expect("lift"),
+        );
+        assert!(lifted.pair.access_token.starts_with("mat_"));
+        assert!(
+            tokens::parse_refresh_token(&lifted.pair.refresh_token).is_some(),
+            "new format"
+        );
+        assert_eq!(lifted.generation, 1);
+
+        let legacy_key = format!("token/{legacy_rt}");
+        let exists: i64 = raw(&client, &["EXISTS", &legacy_key]).await;
+        assert_eq!(exists, 0, "the legacy entry is deleted by the lift");
+        let in_idx: i64 = raw(
+            &client,
+            &[
+                "SISMEMBER",
+                &format!("idx:user_device/{user}/{device}"),
+                &legacy_key,
+            ],
+        )
+        .await;
+        assert_eq!(in_idx, 0, "the legacy index member is removed");
+        let pointer: Option<String> = raw(&client, &["GET", &legacy_rt_key(&legacy_rt)]).await;
+        assert_eq!(
+            pointer.as_deref(),
+            Some(lifted.grant_id.as_str()),
+            "pointer to the grant"
+        );
+
+        let g = hgetall(&client, &grant_key(&lifted.grant_id)).await;
+        assert_eq!(g["previous_rt"], digest(&legacy_rt));
+        assert_eq!(g["current_rt"], digest(&lifted.pair.refresh_token));
+        assert_eq!(g["generation"], "1");
+        assert_eq!(g["successor_used"], "0");
+        assert_eq!(g["kind"], "matrix_device");
+        assert_eq!(g["username"], user);
+        assert_eq!(g["device_id"], device);
+        assert_eq!(g["client_id"], meta.client_id);
+        assert_eq!(g["confidential"], "0");
+        assert_eq!(g["auth_time"], meta.iat.to_string());
+        for idx in [user_idx_key(&user), device_idx_key(&user, &device)] {
+            let m: i64 = raw(&client, &["SISMEMBER", &idx, lifted.grant_id.as_str()]).await;
+            assert_eq!(m, 1, "{idx} holds the lifted grant");
+        }
+        match client.peek_refresh_token(&legacy_rt).await.unwrap() {
+            RefreshPeek::Grant(view) => assert_eq!(view.grant_id, lifted.grant_id),
+            other => panic!("a lifted token names its grant, got {other:?}"),
+        }
+
+        // A replay, and a presenter that read the legacy entry before the lift.
+        match rotate(&client, &legacy_rt).await {
+            RotateOutcome::Replayed(p) => assert_eq!(p.pair, lifted.pair),
+            other => panic!("replay before use: {other:?}"),
+        }
+        match client
+            .lift_legacy_refresh_token(&request(&legacy_rt), &legacy, false)
+            .await
+            .unwrap()
+        {
+            RotateOutcome::Replayed(p) => assert_eq!(p.pair, lifted.pair),
+            other => panic!("a late lift follows the pointer: {other:?}"),
+        }
+
+        client
+            .lookup_access_token(&lifted.pair.access_token)
+            .await
+            .unwrap()
+            .expect("active");
+        assert_eq!(
+            reuse_branch(&rotate(&client, &legacy_rt).await),
+            Some(ReuseBranch::PreviousAfterUse),
+            "after use, the legacy token is reuse"
+        );
+        rotated(rotate(&client, &lifted.pair.refresh_token).await);
+        assert_eq!(
+            reuse_branch(&rotate(&client, &legacy_rt).await),
+            Some(ReuseBranch::Superseded),
+            "two rotations on, the legacy token is still recognised"
+        );
+    }
+}
+
+/// Concurrent presentations of one legacy token, each peeking then lifting or
+/// rotating as an endpoint does, converge on one pair: exactly one lift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_presentations_of_one_legacy_token_converge_on_one_pair() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("liftc{}", nonce());
+    let (legacy_rt, _) = seed_legacy(&client, &user, "DEVC", REFRESH_TOKEN_TTL as i64, false).await;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(20));
+    let mut tasks = Vec::new();
+    for _ in 0..20 {
+        let (client, token, barrier) = (client.clone(), legacy_rt.clone(), barrier.clone());
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            match client.peek_refresh_token(&token).await.unwrap() {
+                RefreshPeek::Legacy(legacy) => client
+                    .lift_legacy_refresh_token(&request(&token), &legacy, false)
+                    .await
+                    .unwrap(),
+                RefreshPeek::Grant(_) => {
+                    client.rotate_refresh_token(&request(&token)).await.unwrap()
+                }
+                RefreshPeek::Unknown => panic!("a concurrent presentation found nothing"),
+            }
+        }));
+    }
+    let mut pairs = Vec::new();
+    let mut lifts = 0;
+    for t in tasks {
+        match t.await.unwrap() {
+            RotateOutcome::Rotated(p) => {
+                lifts += 1;
+                pairs.push(p.pair);
+            }
+            RotateOutcome::Replayed(p) => pairs.push(p.pair),
+            other => panic!("every presentation succeeds, got {other:?}"),
+        }
+    }
+    assert_eq!(lifts, 1, "exactly one presentation lifts");
+    assert!(pairs.windows(2).all(|w| w[0] == w[1]), "one pair for all");
+}
+
+/// What must not be lifted stays as it was: a legacy access token, a
+/// confidential client's token at an endpoint that refuses those, a request
+/// naming another client, a tombstoned session, an unknown string.
+#[tokio::test]
+async fn a_legacy_token_that_may_not_be_lifted_stays_untouched() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("liftn{}", nonce());
+    let (legacy_at, _) = seed_legacy(&client, &user, "DEVN", ACCESS_TOKEN_TTL as i64, false).await;
+    assert!(matches!(
+        client.peek_refresh_token(&legacy_at).await.unwrap(),
+        RefreshPeek::Unknown
+    ));
+    assert!(matches!(
+        client
+            .peek_refresh_token("mcr_not_a_token_anywhere")
+            .await
+            .unwrap(),
+        RefreshPeek::Unknown
+    ));
+
+    let (legacy_rt, meta) =
+        seed_legacy(&client, &user, "DEVN", REFRESH_TOKEN_TTL as i64, false).await;
+    let legacy = peek_legacy(&client, &legacy_rt).await;
+    let refusing = RotateRequest {
+        presented: &legacy_rt,
+        client_id: None,
+        refuse_confidential: true,
+    };
+    assert_eq!(
+        client
+            .lift_legacy_refresh_token(&refusing, &legacy, true)
+            .await
+            .unwrap(),
+        RotateOutcome::ConfidentialClient
+    );
+    let other = RotateRequest {
+        presented: &legacy_rt,
+        client_id: Some("another-client"),
+        refuse_confidential: false,
+    };
+    assert_eq!(
+        client
+            .lift_legacy_refresh_token(&other, &legacy, false)
+            .await
+            .unwrap(),
+        RotateOutcome::ClientMismatch
+    );
+    client.mark_user_deactivated(&meta.username).await.unwrap();
+    assert_eq!(
+        client
+            .lift_legacy_refresh_token(&request(&legacy_rt), &legacy, false)
+            .await
+            .unwrap(),
+        RotateOutcome::Invalid(InvalidReason::Revoked)
+    );
+    for token in [&legacy_at, &legacy_rt] {
+        let exists: i64 = raw(&client, &["EXISTS", &format!("token/{token}")]).await;
+        assert_eq!(exists, 1, "the legacy entry is untouched");
+        let pointer: i64 = raw(&client, &["EXISTS", &legacy_rt_key(token)]).await;
+        assert_eq!(pointer, 0, "no pointer was written");
+    }
+}
+
+/// A lifted legacy token is resolved and revoked like its grant's previous
+/// token: while its successor is unused, revoking it deletes the grant.
+#[tokio::test]
+async fn a_lifted_legacy_token_is_resolved_and_revoked_like_its_grants_previous_token() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("liftr{}", nonce());
+    let (legacy_rt, _) = seed_legacy(&client, &user, "", REFRESH_TOKEN_TTL as i64, false).await;
+    let legacy = peek_legacy(&client, &legacy_rt).await;
+    let lifted = rotated(
+        client
+            .lift_legacy_refresh_token(&request(&legacy_rt), &legacy, false)
+            .await
+            .unwrap(),
+    );
+    let resolved = client
+        .resolve_refresh_token(&legacy_rt)
+        .await
+        .unwrap()
+        .expect("resolved");
+    assert_eq!(resolved.grant_id, lifted.grant_id);
+    let revoked = client
+        .revoke_grant_of_token(&legacy_rt)
+        .await
+        .unwrap()
+        .expect("revoked");
+    assert_eq!(revoked.grant_id, lifted.grant_id);
+    assert!(
+        hgetall(&client, &grant_key(&lifted.grant_id))
+            .await
+            .is_empty(),
+        "grant gone"
+    );
+    assert_eq!(
+        rotate(&client, &lifted.pair.refresh_token).await,
+        RotateOutcome::Invalid(InvalidReason::UnknownGrant)
+    );
+    assert_eq!(
+        rotate(&client, &legacy_rt).await,
+        RotateOutcome::Invalid(InvalidReason::UnknownGrant)
+    );
+}
+
+#[test]
+fn a_lifted_grant_is_a_matrix_device_grant_exactly_when_its_scope_carries_the_matrix_api() {
+    let meta = |scope: &str| TokenMetadata {
+        username: "u".into(),
+        device_id: String::new(),
+        scope: scope.into(),
+        client_id: "c".into(),
+        iat: 0,
+        exp: 1,
+        did: "did:key:z".into(),
+        name: "n".into(),
+        kind: None,
+    };
+    for (scope, kind) in [
+        (
+            "openid urn:matrix:client:api:* urn:matrix:client:device:D",
+            GrantKind::MatrixDevice,
+        ),
+        (
+            "openid urn:matrix:client:api:* urn:matrix:client:device:",
+            GrantKind::MatrixDevice,
+        ),
+        (
+            "openid urn:matrix:org.matrix.msc2967.client:api:*",
+            GrantKind::MatrixDevice,
+        ),
+        ("openid profile offline_access", GrantKind::Oidc),
+        ("openid urn:matrix:client:api:*x", GrantKind::Oidc),
+        ("", GrantKind::Oidc),
+    ] {
+        assert_eq!(legacy_grant_kind(&meta(scope)), kind, "{scope:?}");
+    }
+}

@@ -11,12 +11,32 @@
 //! | `at/{digest(access token)}` | hash | `grant`, `generation`, `kind` (`access`), `iat`, `exp` | the token's lifetime |
 //! | `idx:grants:user/{username}` | set | grant ids of the user | the longest grant TTL written into it |
 //! | `idx:grants:user_device/{username}/{device_id}` | set | grant ids of the device | as above |
+//! | `legacy_rt/{digest(legacy refresh token)}` | string | the grant id a legacy refresh token was lifted into | `inactivity_secs` at the lift |
 //!
 //! A grant id is `digest(handle)` (see [`super::tokens`]). No key or value
 //! written here contains a token: refresh tokens appear only as digests in
 //! `current_rt` / `previous_rt`, and the one value that must be handed back
 //! later, the successor pair, is sealed under a key only the presenter of the
 //! previous token can derive ([`super::seal`]).
+//!
+//! # Legacy refresh tokens (design 5.8)
+//!
+//! A refresh token written before the grant record (`token/{raw}`, see
+//! [`super::legacy_token_kind`]) is lifted into a grant the first time it is
+//! presented at either refresh endpoint ([`RedisClient::lift_legacy_refresh_token`]).
+//! One script deletes the legacy entry (and its member of the legacy device
+//! index), creates a grant whose `previous_rt` is the legacy token's digest and
+//! whose `current_rt` is the new refresh token, at generation 1 with the new
+//! pair sealed under the legacy token and unused, writes the new access entry,
+//! the grant indices and the pointer `legacy_rt/{digest(legacy token)}`. Every
+//! later presentation of the legacy token, concurrent or replayed, finds the
+//! pointer and goes through the rotation script like the grant's own previous
+//! token: the same pair while it is unused, reuse after. The kind of a lifted
+//! grant follows the legacy scope ([`legacy_grant_kind`]); its `auth_time` is
+//! the legacy entry's `iat`, the earliest time the store still knows. Legacy
+//! grace pointers (`token_rotated/{raw}`, 60 s) are not read: they lived one
+//! minute, and a lost response in the minute before the upgrade is the only case
+//! they would cover.
 //!
 //! # Grant fields
 //!
@@ -68,12 +88,15 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use bb8_redis::redis;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::redis::{device_tombstone_key, user_tombstone_key};
 use super::seal::{self, SuccessorPair};
 use super::tokens::{self, digest};
-use super::{DBClient, RedisClient, TokenKind, TokenMetadata, TOMBSTONE_TTL_SECS};
+use super::{
+    DBClient, RedisClient, TokenKind, TokenMetadata, ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL,
+    TOMBSTONE_TTL_SECS,
+};
 
 /// Prefix of the grant hashes: `grant/{grant id}`.
 pub const KV_GRANT_PREFIX: &str = "grant";
@@ -84,6 +107,10 @@ pub const KV_GRANT_USER_IDX_PREFIX: &str = "idx:grants:user";
 /// Prefix of the per-device grant index:
 /// `idx:grants:user_device/{username}/{device_id}`.
 pub const KV_GRANT_DEVICE_IDX_PREFIX: &str = "idx:grants:user_device";
+
+/// Prefix of the pointer from a lifted legacy refresh token to its grant:
+/// `legacy_rt/{digest(legacy refresh token)}`.
+pub const KV_LEGACY_RT_PREFIX: &str = "legacy_rt";
 
 /// The message of the reuse security event. Stable: dashboards count it.
 pub const REUSE_EVENT_MESSAGE: &str = "refresh token reuse detected";
@@ -168,6 +195,15 @@ fn user_idx_key(username: &str) -> String {
 
 fn device_idx_key(username: &str, device_id: &str) -> String {
     format!("{KV_GRANT_DEVICE_IDX_PREFIX}/{username}/{device_id}")
+}
+
+fn legacy_rt_key(legacy_refresh_token: &str) -> String {
+    format!("{KV_LEGACY_RT_PREFIX}/{}", digest(legacy_refresh_token))
+}
+
+/// The key a build before the grant record stored a token under.
+fn legacy_token_key(token: &str) -> String {
+    format!("{}/{token}", super::KV_TOKEN_PREFIX)
 }
 
 /// What [`RedisClient::issue_grant`] creates.
@@ -395,6 +431,43 @@ pub enum RotateOutcome {
     ConfidentialClient,
 }
 
+/// A legacy refresh token (`token/{raw}`, written before the grant record)
+/// that has not been lifted into a grant yet.
+#[derive(Clone, Debug)]
+pub struct LegacyRefresh {
+    /// The entry exactly as read; the lift acts only on an unchanged entry.
+    stored: String,
+    pub meta: TokenMetadata,
+}
+
+/// What a presented refresh token names, before any decision about it
+/// ([`RedisClient::peek_refresh_token`]).
+#[derive(Clone, Debug)]
+pub enum RefreshPeek {
+    /// A grant: the token's handle names it, or the token is a legacy refresh
+    /// token already lifted into it.
+    Grant(GrantView),
+    /// A legacy refresh token not lifted yet:
+    /// [`RedisClient::lift_legacy_refresh_token`] lifts it.
+    Legacy(LegacyRefresh),
+    /// Nothing: answer like an unknown token.
+    Unknown,
+}
+
+/// The kind of the grant a legacy refresh token is lifted into: `matrix_device`
+/// when its scope carries the Matrix client API (every Matrix-mode writer put it
+/// there, with or without a device), else `oidc`.
+pub fn legacy_grant_kind(meta: &TokenMetadata) -> GrantKind {
+    let matrix = meta.scope.split(' ').any(|s| {
+        s == "urn:matrix:client:api:*" || s == "urn:matrix:org.matrix.msc2967.client:api:*"
+    });
+    if matrix {
+        GrantKind::MatrixDevice
+    } else {
+        GrantKind::Oidc
+    }
+}
+
 /// Extend a key's TTL to at least `secs`, never shorten it. An index holds
 /// grants of different lifetimes and must outlive the longest.
 const LUA_EXTEND: &str = r#"
@@ -402,6 +475,20 @@ local function extend(key, secs)
   if redis.call('TTL', key) < secs then
     redis.call('EXPIRE', key, secs)
   end
+end
+"#;
+
+/// Add grant `id` to the index `key`, pruning members whose grant (under
+/// `prefix`) is gone, and extend the index to `ttl`. Needs [`LUA_EXTEND`].
+const LUA_INDEX: &str = r#"
+local function index(key, id, prefix, ttl)
+  for _, member in ipairs(redis.call('SMEMBERS', key)) do
+    if redis.call('EXISTS', prefix .. member) == 0 then
+      redis.call('SREM', key, member)
+    end
+  end
+  redis.call('SADD', key, id)
+  extend(key, ttl)
 end
 "#;
 
@@ -431,18 +518,65 @@ redis.call('EXPIRE', KEYS[1], grant_ttl)
 redis.call('HSET', KEYS[2], 'grant', ARGV[1], 'generation', '0', 'kind', 'access',
   'iat', tostring(now), 'exp', tostring(now + access_ttl))
 redis.call('EXPIRE', KEYS[2], access_ttl)
-local function index(key)
-  for _, id in ipairs(redis.call('SMEMBERS', key)) do
-    if redis.call('EXISTS', ARGV[2] .. id) == 0 then
-      redis.call('SREM', key, id)
-    end
-  end
-  redis.call('SADD', key, ARGV[1])
-  extend(key, grant_ttl)
-end
-index(KEYS[3])
-if ARGV[3] == '1' then index(KEYS[4]) end
+index(KEYS[3], ARGV[1], ARGV[2], grant_ttl)
+if ARGV[3] == '1' then index(KEYS[4], ARGV[1], ARGV[2], grant_ttl) end
 return {tostring(now), tostring(now + access_ttl)}
+"#;
+
+/// Lift a legacy refresh token into a new grant (design 5.8; module docs).
+///
+/// KEYS: 1 legacy entry (`token/{raw}`), 2 pointer (`legacy_rt/…`), 3 grant,
+/// 4 new access entry, 5 user tombstone, 6 device tombstone, 7 user index,
+/// 8 device index, 9 legacy device index (`idx:user_device/…`).
+/// ARGV: 1 legacy entry as read, 2 grant id, 3 grant key prefix, 4 has device,
+/// 5 kind, 6 username, 7 did, 8 client_id, 9 confidential, 10 device_id,
+/// 11 scope, 12 name, 13 auth_time, 14 access_ttl, 15 inactivity, 16 digest of
+/// the legacy token, 17 digest of the new refresh token, 18 the new pair sealed
+/// under the legacy token, 19 the new access token's `exp`, 20 requesting
+/// client_id (`` = unchecked), 21 the legacy entry's `exp`.
+/// Replies `{'lifted', grant id}` when the pointer already exists (the caller
+/// then runs the rotation script on that grant), else `{'lifted_now'}` or a
+/// refusal shaped like the rotation script's.
+const LIFT_LUA: &str = r#"
+local lifted = redis.call('GET', KEYS[2])
+if lifted then
+  return {'lifted', lifted}
+end
+local entry = redis.call('GET', KEYS[1])
+if not entry or entry ~= ARGV[1] then
+  return {'invalid', 'unknown_grant'}
+end
+if redis.call('EXISTS', KEYS[5]) == 1 or (ARGV[4] == '1' and redis.call('EXISTS', KEYS[6]) == 1) then
+  return {'invalid', 'revoked'}
+end
+local now = tonumber(redis.call('TIME')[1])
+if now >= tonumber(ARGV[21]) then
+  return {'invalid', 'expired'}
+end
+if ARGV[20] ~= '' and ARGV[20] ~= ARGV[8] then
+  return {'client_mismatch'}
+end
+if redis.call('EXISTS', KEYS[3]) == 1 then
+  return redis.error_reply('grant id collision')
+end
+local access_ttl = tonumber(ARGV[14])
+local inactivity = tonumber(ARGV[15])
+redis.call('DEL', KEYS[1])
+if ARGV[4] == '1' then redis.call('SREM', KEYS[9], KEYS[1]) end
+redis.call('HSET', KEYS[3], 'kind', ARGV[5], 'username', ARGV[6], 'did', ARGV[7],
+  'client_id', ARGV[8], 'confidential', ARGV[9], 'device_id', ARGV[10], 'scope', ARGV[11],
+  'name', ARGV[12], 'auth_time', ARGV[13], 'access_ttl', ARGV[14],
+  'inactivity_secs', ARGV[15], 'last_used', tostring(now), 'generation', '1',
+  'current_rt', ARGV[17], 'previous_rt', ARGV[16], 'successor_used', '0',
+  'successor_sealed', ARGV[18])
+redis.call('EXPIRE', KEYS[3], inactivity)
+redis.call('HSET', KEYS[4], 'grant', ARGV[2], 'generation', '1', 'kind', 'access',
+  'iat', tostring(now), 'exp', ARGV[19])
+redis.call('EXPIRE', KEYS[4], access_ttl)
+redis.call('SET', KEYS[2], ARGV[2], 'EX', inactivity)
+index(KEYS[7], ARGV[2], ARGV[3], inactivity)
+if ARGV[4] == '1' then index(KEYS[8], ARGV[2], ARGV[3], inactivity) end
+return {'lifted_now'}
 "#;
 
 /// The one rotation script (design 5.3; the decision table is in the module docs).
@@ -453,7 +587,9 @@ return {tostring(now), tostring(now + access_ttl)}
 /// token, 3 sealed candidate, 4 username, 5 device_id (both as the caller read
 /// them to name the tombstones), 6 requesting client_id (`` = unchecked),
 /// 7 refuse a confidential client (`1`/`0`), 8 grant id, 9 has device,
-/// 10 the candidate access token's `exp`.
+/// 10 the candidate access token's `exp`. An empty candidate digest (ARGV 2)
+/// means the caller has no handle to mint a candidate with (a lifted legacy
+/// token, which is never `current_rt`): the rotate branch is then never taken.
 const ROTATE_LUA: &str = r#"
 local f = redis.call('HMGET', KEYS[1], 'username', 'device_id', 'client_id', 'confidential',
   'current_rt', 'previous_rt', 'successor_used', 'successor_sealed', 'generation',
@@ -479,7 +615,7 @@ if ARGV[7] == '1' and f[4] == '1' then
   return {'confidential_client'}
 end
 local generation = tonumber(f[9])
-if f[5] ~= '' and ARGV[1] == f[5] then
+if ARGV[2] ~= '' and f[5] ~= '' and ARGV[1] == f[5] then
   local next_gen = tostring(generation + 1)
   local access_ttl = tonumber(f[12])
   redis.call('HSET', KEYS[1], 'previous_rt', f[5], 'current_rt', ARGV[2],
@@ -673,7 +809,7 @@ impl RedisClient {
             .map(|_| tokens::new_refresh_token(&handle));
         let current_rt = refresh_token.as_deref().map(digest).unwrap_or_default();
         let has_device = !new.device_id.is_empty();
-        let script = format!("{LUA_EXTEND}{ISSUE_LUA}");
+        let script = format!("{LUA_EXTEND}{LUA_INDEX}{ISSUE_LUA}");
         let reply: Vec<String> = self
             .eval(
                 &script,
@@ -771,10 +907,196 @@ impl RedisClient {
     /// [`rotate_refresh_token`](Self::rotate_refresh_token), never for
     /// accepting the token.
     pub async fn peek_refresh_grant(&self, token: &str) -> Result<Option<GrantView>> {
-        match tokens::parse_refresh_token(token) {
-            Some(parsed) => self.grant_view(&GrantId::of_handle(parsed.handle)).await,
-            None => Ok(None),
+        Ok(match self.peek_refresh_token(token).await? {
+            RefreshPeek::Grant(view) => Some(view),
+            RefreshPeek::Legacy(_) | RefreshPeek::Unknown => None,
+        })
+    }
+
+    /// What a presented refresh token names, without judging it (like
+    /// [`peek_refresh_grant`](Self::peek_refresh_grant)): the grant its handle
+    /// names, the grant a legacy token was lifted into, a legacy refresh token
+    /// not lifted yet, or nothing. A legacy entry of another kind (an access
+    /// token) is nothing. The legacy entry and the pointer are read in one
+    /// `MGET`, so a lift between two reads cannot hide both.
+    pub async fn peek_refresh_token(&self, token: &str) -> Result<RefreshPeek> {
+        if let Some(parsed) = tokens::parse_refresh_token(token) {
+            return Ok(
+                match self.grant_view(&GrantId::of_handle(parsed.handle)).await? {
+                    Some(view) => RefreshPeek::Grant(view),
+                    None => RefreshPeek::Unknown,
+                },
+            );
         }
+        let (stored, lifted): (Option<String>, Option<String>) = {
+            let mut conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| anyhow!("Redis pool: {e}"))?;
+            redis::cmd("MGET")
+                .arg(legacy_token_key(token))
+                .arg(legacy_rt_key(token))
+                .query_async(&mut *conn)
+                .await
+                .map_err(|e| anyhow!("grant store MGET: {e}"))?
+        };
+        if let Some(id) = lifted {
+            return Ok(match self.grant_view(&GrantId(id)).await? {
+                Some(view) => RefreshPeek::Grant(view),
+                None => RefreshPeek::Unknown,
+            });
+        }
+        let Some(stored) = stored else {
+            return Ok(RefreshPeek::Unknown);
+        };
+        let meta: TokenMetadata = serde_json::from_str(&stored)
+            .map_err(|e| anyhow!("grant store: malformed legacy token entry: {e}"))?;
+        Ok(if meta.is_kind(TokenKind::Refresh) {
+            RefreshPeek::Legacy(LegacyRefresh { stored, meta })
+        } else {
+            RefreshPeek::Unknown
+        })
+    }
+
+    /// The grant a refresh token belongs to and, for a token in the current
+    /// format, its handle: the handle names the grant, and a legacy token
+    /// already lifted names it through its `legacy_rt/…` pointer (no handle).
+    async fn refresh_grant_id<'t>(
+        &self,
+        token: &'t str,
+    ) -> Result<Option<(GrantId, Option<&'t str>)>> {
+        if let Some(parsed) = tokens::parse_refresh_token(token) {
+            return Ok(Some((
+                GrantId::of_handle(parsed.handle),
+                Some(parsed.handle),
+            )));
+        }
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let lifted: Option<String> = redis::cmd("GET")
+            .arg(legacy_rt_key(token))
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("grant store GET: {e}"))?;
+        Ok(lifted.map(|id| (GrantId(id), None)))
+    }
+
+    /// Redis `TIME`, in seconds.
+    async fn redis_time(&self) -> Result<i64> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let (secs, _micros): (String, String) = redis::cmd("TIME")
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("grant store TIME: {e}"))?;
+        number(Some(&secs), "TIME")
+    }
+
+    /// Lift a legacy refresh token into a new grant and answer it with a pair
+    /// in the current format (design 5.8; the module docs say what is written).
+    ///
+    /// `legacy` is what [`peek_refresh_token`](Self::peek_refresh_token) read;
+    /// `confidential_client` is the caller's verdict on the legacy entry's
+    /// client (`oidc::client_is_confidential`, as at every issuance). A caller
+    /// that refuses confidential clients gets
+    /// [`RotateOutcome::ConfidentialClient`] for one and the entry stays as it
+    /// is, for `POST /token`. When another presentation lifted the token first,
+    /// the rotation script decides on that grant exactly as for its previous
+    /// token: the same pair while it is unused, reuse after.
+    pub async fn lift_legacy_refresh_token(
+        &self,
+        req: &RotateRequest<'_>,
+        legacy: &LegacyRefresh,
+        confidential_client: bool,
+    ) -> Result<RotateOutcome> {
+        if req.refuse_confidential && confidential_client {
+            return Ok(RotateOutcome::ConfidentialClient);
+        }
+        let meta = &legacy.meta;
+        let kind = legacy_grant_kind(meta);
+        let handle = tokens::new_grant_handle();
+        let grant_id = GrantId::of_handle(&handle);
+        let now = self.redis_time().await?;
+        let candidate = SuccessorPair {
+            access_token: tokens::new_access_token(),
+            refresh_token: tokens::new_refresh_token(&handle),
+            access_exp: now + ACCESS_TOKEN_TTL as i64,
+        };
+        let sealed = seal::seal(req.presented, grant_id.as_str(), &candidate)?;
+        let has_device = !meta.device_id.is_empty();
+        let script = format!("{LUA_EXTEND}{LUA_INDEX}{LIFT_LUA}");
+        let reply: Vec<String> = self
+            .eval(
+                &script,
+                &[
+                    &legacy_token_key(req.presented),
+                    &legacy_rt_key(req.presented),
+                    &grant_key(&grant_id),
+                    &at_key(&candidate.access_token),
+                    &user_tombstone_key(&meta.username),
+                    &device_tombstone_key(&meta.username, &meta.device_id),
+                    &user_idx_key(&meta.username),
+                    &device_idx_key(&meta.username, &meta.device_id),
+                    &super::redis::device_token_idx_key(&meta.username, &meta.device_id),
+                ],
+                &[
+                    &legacy.stored,
+                    grant_id.as_str(),
+                    &format!("{KV_GRANT_PREFIX}/"),
+                    flag(has_device),
+                    kind.as_str(),
+                    &meta.username,
+                    &meta.did,
+                    &meta.client_id,
+                    flag(confidential_client),
+                    &meta.device_id,
+                    &meta.scope,
+                    &meta.name,
+                    &meta.iat.to_string(),
+                    &ACCESS_TOKEN_TTL.to_string(),
+                    &REFRESH_TOKEN_TTL.to_string(),
+                    &digest(req.presented),
+                    &digest(&candidate.refresh_token),
+                    &sealed,
+                    &candidate.access_exp.to_string(),
+                    req.client_id.unwrap_or(""),
+                    &meta.exp.to_string(),
+                ],
+            )
+            .await?;
+        let field = |i: usize| reply.get(i).map(String::as_str);
+        Ok(match field(0) {
+            Some("lifted_now") => {
+                info!(
+                    grant_fp = %grant_id.fingerprint(),
+                    legacy_fp = %crate::redact::fingerprint(req.presented),
+                    grant_kind = %kind,
+                    client_id = %meta.client_id,
+                    "legacy refresh token lifted into a grant"
+                );
+                RotateOutcome::Rotated(RotatedPair {
+                    grant_id,
+                    generation: 1,
+                    pair: candidate,
+                })
+            }
+            Some("lifted") => self.rotate_refresh_token(req).await?,
+            Some("invalid") => RotateOutcome::Invalid(match field(1) {
+                Some("unknown_grant") => InvalidReason::UnknownGrant,
+                Some("revoked") => InvalidReason::Revoked,
+                Some("expired") => InvalidReason::Expired,
+                _ => return Err(anyhow!("lift script: unknown invalid reason")),
+            }),
+            Some("client_mismatch") => RotateOutcome::ClientMismatch,
+            _ => return Err(anyhow!("lift script: unexpected reply")),
+        })
     }
 
     /// Rotate a refresh token through the one rotation script.
@@ -783,21 +1105,35 @@ impl RedisClient {
     /// tombstones) and Redis `TIME` in one round trip, mint a candidate pair,
     /// seal it under the presented token, run the script, and on a replay open
     /// the sealed successor with the presented token.
+    ///
+    /// A legacy refresh token already lifted into a grant reaches that grant
+    /// through its pointer and is judged like the grant's previous token; the
+    /// caller has no handle for it, so no candidate is minted and the script
+    /// cannot rotate it (it is never `current_rt`). A token that is neither
+    /// in the current format nor lifted is
+    /// [`InvalidReason::NotCurrentFormat`]: a legacy refresh token not lifted
+    /// yet ([`lift_legacy_refresh_token`](Self::lift_legacy_refresh_token)),
+    /// another kind of token, or garbage.
     pub async fn rotate_refresh_token(&self, req: &RotateRequest<'_>) -> Result<RotateOutcome> {
-        let Some(parsed) = tokens::parse_refresh_token(req.presented) else {
+        let Some((grant_id, handle)) = self.refresh_grant_id(req.presented).await? else {
             return Ok(RotateOutcome::Invalid(InvalidReason::NotCurrentFormat));
         };
-        let grant_id = GrantId::of_handle(parsed.handle);
         let (now, view) = self.time_and_grant(&grant_id).await?;
         let Some(view) = view else {
             return Ok(RotateOutcome::Invalid(InvalidReason::UnknownGrant));
         };
         let candidate = SuccessorPair {
             access_token: tokens::new_access_token(),
-            refresh_token: tokens::new_refresh_token(parsed.handle),
+            refresh_token: handle.map(tokens::new_refresh_token).unwrap_or_default(),
             access_exp: now + view.access_ttl as i64,
         };
-        let sealed = seal::seal(req.presented, grant_id.as_str(), &candidate)?;
+        let (candidate_digest, sealed) = match handle {
+            Some(_) => (
+                digest(&candidate.refresh_token),
+                seal::seal(req.presented, grant_id.as_str(), &candidate)?,
+            ),
+            None => (String::new(), String::new()),
+        };
         let has_device = !view.device_id.is_empty();
         let script = format!("{LUA_EXTEND}{ROTATE_LUA}");
         let reply: Vec<String> = self
@@ -813,7 +1149,7 @@ impl RedisClient {
                 ],
                 &[
                     &digest(req.presented),
-                    &digest(&candidate.refresh_token),
+                    &candidate_digest,
                     &sealed,
                     &view.username,
                     &view.device_id,
@@ -827,6 +1163,9 @@ impl RedisClient {
             .await?;
         let field = |i: usize| reply.get(i).map(String::as_str);
         Ok(match field(0) {
+            Some("rotated") if handle.is_none() => {
+                return Err(anyhow!("rotation script rotated a token without a handle"))
+            }
             Some("rotated") => RotateOutcome::Rotated(RotatedPair {
                 grant_id,
                 generation: number(field(1), "rotation reply")?,
@@ -908,20 +1247,27 @@ impl RedisClient {
         let (grant_id, presented) = match tokens::parse_refresh_token(token) {
             Some(parsed) => (GrantId::of_handle(parsed.handle), digest(token)),
             None => {
-                let mut conn = self
-                    .pool
-                    .get()
-                    .await
-                    .map_err(|e| anyhow!("Redis pool: {e}"))?;
-                let owner: Option<String> = redis::cmd("HGET")
-                    .arg(at_key(token))
-                    .arg("grant")
-                    .query_async(&mut *conn)
-                    .await
-                    .map_err(|e| anyhow!("grant store HGET: {e}"))?;
+                let owner: Option<String> = {
+                    let mut conn = self
+                        .pool
+                        .get()
+                        .await
+                        .map_err(|e| anyhow!("Redis pool: {e}"))?;
+                    redis::cmd("HGET")
+                        .arg(at_key(token))
+                        .arg("grant")
+                        .query_async(&mut *conn)
+                        .await
+                        .map_err(|e| anyhow!("grant store HGET: {e}"))?
+                };
                 match owner {
                     Some(id) => (GrantId(id), String::new()),
-                    None => return Ok(None),
+                    // A legacy refresh token lifted into a grant: judged like
+                    // the grant's previous token.
+                    None => match self.refresh_grant_id(token).await? {
+                        Some((id, _)) => (id, digest(token)),
+                        None => return Ok(None),
+                    },
                 }
             }
         };
@@ -985,13 +1331,13 @@ impl RedisClient {
 
     /// The grant of a refresh token the refresh endpoints would accept now:
     /// the current one, or the previous one while its successor is unused.
-    /// Reads only; a superseded token, or one whose grant is gone, is `None`.
+    /// Reads only; a superseded token, or one whose grant is gone, is `None`. A
+    /// legacy token lifted into a grant counts as that grant's previous token.
     /// For teardown, which must not act on a token the endpoints refuse.
     pub async fn resolve_refresh_token(&self, token: &str) -> Result<Option<GrantView>> {
-        let Some(parsed) = tokens::parse_refresh_token(token) else {
+        let Some((grant_id, _)) = self.refresh_grant_id(token).await? else {
             return Ok(None);
         };
-        let grant_id = GrantId::of_handle(parsed.handle);
         let fields: HashMap<String, String> = {
             let mut conn = self
                 .pool

@@ -26,7 +26,7 @@ pub struct RedisClient {
 }
 
 /// Redis key for the per-`(username, device_id)` token index SET.
-fn device_token_idx_key(username: &str, device_id: &str) -> String {
+pub(super) fn device_token_idx_key(username: &str, device_id: &str) -> String {
     format!("{}/{}/{}", KV_DEVICE_TOKEN_IDX_PREFIX, username, device_id)
 }
 
@@ -54,7 +54,6 @@ fn erased_did_key(did: &str) -> String {
     format!("{}/{}", KV_ERASED_DID_PREFIX, hex::encode(digest))
 }
 
-/// Redis key for the short-lived refresh-token rotation grace pointer.
 /// Read and delete an authorization code in one atomic step.
 ///
 /// `KEYS[1]` is `codes/{id}`, `KEYS[2]` the `codes/{id}/consumed` marker an
