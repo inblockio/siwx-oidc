@@ -1283,10 +1283,11 @@ async fn h14_synapse_delete_failure_is_surfaced_not_500() {
 // fresh access+refresh) throughout the delete window and require that, once the
 // dust settles, EVERY minted token is inactive.
 // REGRESSION GUARD (was repro S3-3 / H3): device_delete TOCTOU + KEYS-scan revoke
-// races a refresh and a stale token survived. Fixed by the per-(user,device) token
-// index + atomic Lua revoke + device-revoked tombstone (check-mint-recheck in the
-// refresh paths). See fix commit for S3-3/H3. Now runs unconditionally with the
-// live stack (no RUN_REPRO gate), asserting survivors == 0.
+// races a refresh and a stale token survived. Fixed by the per-(user,device) grant
+// index + atomic Lua revoke + device-revoked tombstone, which the rotation script
+// both refresh endpoints run checks in the same atomic step as the mint. See fix
+// commit for S3-3/H3. Now runs unconditionally with the live stack (no RUN_REPRO
+// gate), asserting survivors == 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn h3_concurrent_same_device_delete_revokes_all_tokens() {
@@ -1446,7 +1447,8 @@ async fn h3_concurrent_same_device_delete_revokes_all_tokens() {
 // --- H6 / S3-4: account_deactivate (revoke ALL) vs. a refresh pump ----------
 // REGRESSION GUARD (was repro S3-4 / H6): account_deactivate's non-atomic sweep let
 // an in-flight refresh resurrect access. Fixed by planting a per-user deactivation
-// tombstone BEFORE the sweep (checked + check-mint-rechecked by the refresh paths).
+// tombstone BEFORE the sweep, which the rotation script both refresh endpoints run
+// checks in the same atomic step as the mint.
 //
 // WHAT THIS TEST ACTUALLY PROVES — AND WHAT IT DOES NOT.
 //
@@ -1468,11 +1470,12 @@ async fn h3_concurrent_same_device_delete_revokes_all_tokens() {
 // The deactivate wins because it is BUILT to win: `account.rs` plants the
 // deactivation tombstone as the first thing the handler does, before the Synapse
 // call and before the sweep ("Plant the deactivation tombstone FIRST (S3-4/H6)").
-// That is one cheap Redis SET after session validation, while a refresh is a
-// multi-step read-mint-write. A client cannot reliably get its tombstone check in
-// first, and the resurrection window it would then need — check before the plant,
-// WRITE after the sweep ~70ms later — is closed a second time by the
-// check-mint-recheck rollback. So the race is not merely hard to hit here: the
+// That is one cheap Redis SET after session validation, while a refresh is a read
+// followed by the rotation script. A client cannot reliably get its tombstone
+// check in first, and the resurrection window it would then need — check before
+// the plant, WRITE after the sweep ~70ms later — does not exist: the rotation
+// script checks the tombstone and writes the successor in one atomic step. So the
+// race is not merely hard to hit here: the
 // fix is what makes it unhittable, and a test that demanded a post-barrier mint
 // would be permanently red against correct code.
 //
@@ -1637,10 +1640,11 @@ async fn h6_deactivate_revokes_every_minted_token_and_the_tombstone_wins() {
         // ANTI-VACUITY, PART 2: the post-barrier half must have a LEGIBLE
         // outcome. Either the refresh won the race and minted (checked for
         // survival just above), or it was refused BY THE DEACTIVATION TOMBSTONE
-        // — 401 M_UNKNOWN_TOKEN, from either `compat::refresh`'s pre-check or
-        // its check-mint-recheck rollback. Any other answer means the pump broke
-        // for a reason unrelated to deactivation, which is precisely the state
-        // this test spent two remediations silently sitting in.
+        // — 401 M_UNKNOWN_TOKEN, from the rotation script's tombstone check,
+        // which runs in the same atomic step as the mint. Any other answer
+        // means the pump broke for a reason unrelated to deactivation, which is
+        // precisely the state this test spent two remediations silently
+        // sitting in.
         match (post_barrier.len(), &first_post_refusal) {
             (0, None) => panic!(
                 "round {round}: the post-barrier pump neither minted nor was \
