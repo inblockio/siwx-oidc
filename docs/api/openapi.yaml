@@ -132,6 +132,11 @@ paths:
 
         `end_session_endpoint` (`{issuer}/end_session`) advertises
         RP-initiated logout, in both modes.
+
+        `backchannel_logout_supported` and `backchannel_logout_session_supported`
+        (both `true`) advertise OpenID Connect Back-Channel Logout 1.0 in
+        generic mode only (no MAS shared secret): logout tokens are sent for
+        `oidc` grants, and in Matrix mode every grant is a Matrix device grant.
       responses:
         "200":
           description: Provider metadata.
@@ -378,6 +383,23 @@ paths:
                     Where `/end_session` may send the user back (OpenID Connect
                     RP-Initiated Logout 1.0 §3.1). Matched exactly, query
                     included. Echoed in the response.
+                backchannel_logout_uri:
+                  type: string
+                  format: uri
+                  description: |
+                    Where a logout token (`logout_token=…`, a form POST) is sent
+                    when one of the client's grants is deleted (OpenID Connect
+                    Back-Channel Logout 1.0 §2.2; generic mode). No fragment;
+                    `https`, and every address its host resolves to must be
+                    public (not loopback, private, CGNAT, link-local,
+                    multicast, unspecified or reserved), unless the operator
+                    allowlisted the host. Checked again at every delivery.
+                    Echoed in the response.
+                backchannel_logout_session_required:
+                  type: boolean
+                  description: |
+                    The client requires a `sid` in every logout token; a grant
+                    without one sends it none. Echoed in the response.
       responses:
         "201":
           description: The registered client, with its secret and registration access token.
@@ -387,8 +409,11 @@ paths:
         "400":
           description: |
             Invalid metadata: a `redirect_uri` carrying a fragment is
-            `invalid_redirect_uri`; a `post_logout_redirect_uri` carrying one is
-            `invalid_client_metadata`.
+            `invalid_redirect_uri`; a `post_logout_redirect_uri` carrying one,
+            a `backchannel_logout_uri` the SSRF guard refuses, and (with the
+            operator's `backchannel_logout_required_for_refresh`, generic
+            mode) a client that may refresh without a `backchannel_logout_uri`
+            are `invalid_client_metadata`.
 
   /client/{id}:
     parameters:
@@ -407,6 +432,10 @@ paths:
       security: [{ registrationAccessToken: [] }]
       responses:
         "200": { description: Updated client metadata. }
+        "400":
+          description: |
+            `invalid_client_metadata`, as at registration (the same logout
+            metadata checks, the SSRF guard included).
     delete:
       tags: [OIDC]
       operationId: deleteClient

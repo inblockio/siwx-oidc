@@ -167,6 +167,30 @@ grant_absolute_lifetime_secs = 2592000   # 30 days
 my-app = 86400                           # 1 day
 ```
 
+### Back-channel logout
+
+A client may register a `backchannel_logout_uri` (OpenID Connect Back-Channel Logout 1.0). In
+generic mode (no `mas_shared_secret`), every active deletion of one of its grants (revocation of
+the refresh token, `/end_session`, a refresh refused for an epoch or expiry, revocation of all
+of a user's grants) POSTs a signed logout token there, from a Redis outbox, with five attempts
+and 2 s doubling backoff. A grant that simply expires sends nothing. Matrix mode sends none.
+
+Because registration is open, the URI is checked at registration and at every delivery: it must
+use `https` and every address its host resolves to must be public (not loopback, private,
+CGNAT, link-local such as the cloud metadata address, multicast, unspecified or reserved).
+Delivery connects only to the addresses it checked and follows no redirect.
+
+| Key | Environment | Default | Meaning |
+|---|---|---|---|
+| `backchannel_logout_allowed_hosts` | `SIWXOIDC_BACKCHANNEL_LOGOUT_ALLOWED_HOSTS` | `[]` | Hosts exempt from the address check: a listed host may resolve to a private or loopback address and may use `http`. Matched against the URI's host, case-insensitively, on any port. For relying parties on a private network and for test stubs; every listed host is trusted with logout tokens for its clients. |
+| `backchannel_logout_required_for_refresh` | `SIWXOIDC_BACKCHANNEL_LOGOUT_REQUIRED_FOR_REFRESH` | `false` | Refuse the dynamic registration (`400 invalid_client_metadata`) of a client that may receive refresh tokens (its `grant_types` lists `refresh_token` or is absent) unless it registers a `backchannel_logout_uri`. Generic mode only; ignored in Matrix mode. Provisional. |
+
+```toml
+[default]
+backchannel_logout_allowed_hosts = ["rp.internal.example.org"]
+backchannel_logout_required_for_refresh = true
+```
+
 ### Legal documents
 
 | Key | Environment | Default | Meaning |

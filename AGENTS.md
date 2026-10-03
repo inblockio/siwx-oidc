@@ -44,6 +44,7 @@ everything else exists only in the binary crate.
 | `synapse_client.rs` | Synapse client with two credentials: the MAS shared secret on `/_synapse/mas/*` (`provision_user`, `upsert_device`, `update_device_display_name`, `allow_cross_signing_reset`, `localpart_status`, `delete_device`, `deactivate_user`, `reactivate_user`) and a minted admin-scoped token (`admin_request`) on `/_synapse/admin/*` and the client-server API (`list_devices`, `get_device`, `has_cross_signing_keys`, `read_profile`, `publish_did_field`, `read_did_field`). |
 | `did_assertion.rs` | `DID_PROFILE_FIELD`, `mint_did_assertion` (compact ES256 JWS), `did_profile_value`, `DidPublication`. |
 | `resolve.rs` | `GET /resolve`, the public DID↔MXID lookup. |
+| `backchannel.rs` | OpenID Connect Back-Channel Logout: `mint_logout_token`, the SSRF guard (`refused_class`, `UriGuard`), `deliver`, and the outbox `Worker` started by `axum_lib::main`. |
 | `localpart.rs` | Grandfathering policy: `resolve_identity` (fallible) and `resolve_identity_or_legacy` (fail-safe to legacy). |
 | `mxid.rs` (lib) | Pure localpart derivation: `localpart_for`, `legacy_localpart`, `canonicalize`. `sha2` only. |
 | `redact.rs` (lib) | `fingerprint`, `redact_key`, `redact_url`: what a log line may say about a credential. |
@@ -53,6 +54,7 @@ everything else exists only in the binary crate.
 | `credential_migration.rs` (lib) | Additive backfill of passkey credentials into the aqua-auth store. |
 | `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry` with the digests of its secret and registration access token and `client_entry_without_plaintext`, `DeviceCodeEntry` and the `DeviceCodeRef` naming its layout, `TokenMetadata` with its `TokenKind`), `Ceremony`, `legacy_token_kind`, Redis key prefixes and TTLs. |
 | `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, `lookup_user_session`, `purge_identity`. |
+| `db/outbox.rs` (lib) | The back-channel logout outbox (`outbox:backchannel_logout`): `LogoutEntry`, claim under a lease, retry, complete. Entries are queued by `drop_grant` in `db/grant.rs`. |
 | `db/grant.rs` (lib) | The grant record and its Lua scripts: `issue_grant`, the access check `check_access_token` (with the legacy read fallback), `rotate_refresh_token` (the one rotation script), `ReuseEvent`, grant revocation, and the legacy migration (`peek_refresh_token`, `lift_legacy_refresh_token`). Keyspace and decision table in its module docs. |
 | `db/tokens.rs` (lib) | Token formats (`mat_`, `msa_`, `mcr_{handle}_{secret}`), `parse_refresh_token` (never panics), `digest` (the SHA-256 every credential a client holds is stored as). |
 | `db/seal.rs` (lib) | The sealed successor pair: AES-256-GCM under a key HKDF-derived from the previous refresh token, so only its presenter can open it. |
@@ -116,6 +118,9 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 - **Mock stack:** `e2e/up.sh` / `e2e/down.sh` start Redis, `e2e/synapse_mock.py` and siwx-oidc
   in podman; `bash e2e/run-all.sh` runs everything. See [e2e/README.md](e2e/README.md).
   `--test-threads=1` is required: the suites share one stack and reset the mock.
+  `e2e_backchannel_logout` needs a second siwx-oidc in generic mode (no MAS shared secret, its
+  own port and Redis database, `localhost` in `SIWXOIDC_BACKCHANNEL_LOGOUT_ALLOWED_HOSTS`) and
+  uses the stub relying party in the Synapse mock (`/__rp/*`); see e2e/README.md.
 - **Live suites** need a real Synapse and run in no CI job: `e2e_did_field_live` (a patched
   Synapse), `e2e_account_lifecycle_live`, five of the six `e2e_msc4191_live` tests,
   `e2e_msc3861::msc4191_metadata_advertised_and_forwarded` and `e2e_messaging`. Set
@@ -131,7 +136,8 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   `cargo test --workspace` against two Redis services with `SIWX_TEST_REQUIRE_REDIS=1`; job
   `image` builds the container image without pushing it, which runs the license gates
   (`scripts/third-party-notices.sh`, `js/ui/third-party-licenses.js`, the Alpine license
-  check); job `rust-e2e-mock` runs the promotable mock-stack suites; job `browser-e2e` runs
+  check); job `rust-e2e-mock` runs the promotable mock-stack suites (plus a generic-mode
+  server for `e2e_backchannel_logout`); job `browser-e2e` runs
   `e2e/browser`. Actions are pinned by commit SHA.
 
 **Route documentation is enforced.** `tests/openapi_covers_every_route.rs`
@@ -462,7 +468,9 @@ doc; read it before changing the code the rule covers.
   (`webauthn:credential/{id}`, `webauthn:link/{id}`), which are public identifiers the server
   hands out in `allowCredentials`, not bearer credentials; a grant's `sid` (stored in the grant
   and as the key `idx:grants:sid/{sid}`), which every RP that holds the ID token receives and
-  which ends a session only together with an ID token this provider signed; and the login
+  which ends a session only together with an ID token this provider signed; the back-channel
+  outbox entries (`outbox:backchannel_logout`: a client id, the DID, the `sid` and the grant
+  id, no credential; logout tokens are signed at delivery and never stored); and the login
   CAIP-122 nonce, a
   challenge kept in the value of the digest-keyed session, which authenticates nothing without
   the session id and a signature. Pin (mock stack, each scans the whole stack Redis):
@@ -608,6 +616,55 @@ doc; read it before changing the code the rule covers.
   `end_grant_by_sid_deletes_exactly_the_named_grant_of_its_client_and_did`,
   `registration_stores_and_echoes_post_logout_redirect_uris_and_refuses_a_fragment`,
   `discovery_advertises_the_end_session_endpoint`.
+- **Every active deletion of an `oidc` grant sends its RP a back-channel logout token, through a
+  durable outbox, and never blocks the request that deleted it** (OpenID Connect Back-Channel
+  Logout 1.0). `drop_grant` queues the entry (client, `sub`, `sid`, grant id) in
+  `outbox:backchannel_logout` in the same script as the deletion: RFC 7009 revocation of the
+  refresh token, `/end_session`, a rotation refused for an epoch or for inactivity or absolute
+  expiry (the script deletes the grant then), and revocation of all of a user's grants
+  (`logout/all`, deactivation, erasure). A grant whose key simply expires runs no script and
+  sends nothing (nothing observes it, and the RP's refresh token expired with it); an epoch that
+  only refuses an access token deletes nothing and sends nothing until a rotation deletes the
+  grant. A `matrix_device` or `service` grant never sends one (Synapse is not an RP here), so
+  discovery advertises `backchannel_logout_supported` / `_session_supported` in generic mode
+  only. The worker (`backchannel::Worker`, one per instance) claims entries under a lease
+  (atomic, so instances never deliver one twice at once), signs a fresh token per attempt (ES256
+  with the live key and its `kid`, raw r||s, header `typ` `logout+jwt`; claims `iss`, `aud` =
+  client id, `iat`, `exp` = `iat` + 120 s, a random `jti`, `sub` = the DID, `sid` when the grant
+  has one, `events`; never a `nonce`) and POSTs `logout_token=…`; 200 and 204 are success,
+  anything else is retried with exponential backoff, five attempts in all, then dropped with a
+  `warn!` naming the client and the grant fingerprint, never the URI or the token. A client that
+  requires a `sid` gets no token for a grant without one. D4 (provisional): with
+  `backchannel_logout_required_for_refresh`, generic-mode registration refuses a client that may
+  refresh without a `backchannel_logout_uri`. Pin:
+  `every_active_deletion_of_an_oidc_grant_queues_one_logout_entry`,
+  `the_outbox_leases_retries_and_completes_an_entry`,
+  `drop_grant_names_the_outbox_the_worker_reads`,
+  `the_logout_token_has_the_spec_header_claims_and_a_raw_signature`,
+  `the_worker_delivers_retries_a_failing_rp_then_drops_it_with_a_warning`,
+  `the_d4_switch_requires_a_backchannel_uri_from_a_client_that_may_refresh`,
+  `discovery_advertises_backchannel_logout_only_in_generic_mode`; generic-mode server and stub RP:
+  `revoking_a_refresh_token_sends_the_rp_a_verifiable_logout_token`,
+  `end_session_sends_a_logout_token_for_the_grant_it_ends`,
+  `a_failing_rp_is_retried_a_bounded_number_of_times_then_dropped`,
+  `discovery_advertises_back_channel_logout_with_sessions`.
+- **A `backchannel_logout_uri` passes the SSRF guard at registration and at every delivery**
+  (`backchannel::UriGuard`; registration stays open, D3). No fragment; `https`; every address the
+  host resolves to outside the refused classes of `backchannel::refused_class` (unspecified,
+  loopback, RFC 1918 and RFC 4193 private, CGNAT, link-local including the cloud metadata
+  address, multicast, reserved; IPv4 inside IPv6, mapped, compatible or NAT64, judged as IPv4).
+  Delivery connects only to the addresses it checked (the HTTP client is pinned to them, so a
+  second DNS answer cannot slip in), through no proxy, following no redirect, with timeouts of a
+  few seconds, and ignores the response body. A refused URI is a 400 `invalid_client_metadata`
+  at registration and client update, and at delivery the entry is dropped without a connection.
+  Only a host on the operator's `backchannel_logout_allowed_hosts` skips the address check (and
+  may use `http`); the fragment rule still applies. Pin:
+  `the_address_classifier_refuses_every_internal_class`,
+  `the_uri_guard_checks_scheme_fragment_and_every_resolved_address`,
+  `delivery_connects_only_to_a_checked_or_listed_host_and_follows_no_redirect`,
+  `registration_stores_backchannel_logout_metadata_and_refuses_an_unsafe_uri`;
+  generic-mode server and stub RP:
+  `a_uri_on_a_refused_address_is_refused_at_registration_and_never_delivered_to`.
 - **`/oauth2/revoke` never deletes a device.** Only explicit sign-out (`logout`, MSC4191
   `device_delete`) does; `logout/all` never deactivates the account. Pin:
   `teardown_policy_only_deletes_device_on_explicit_signout`,

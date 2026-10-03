@@ -407,6 +407,28 @@ token.
    it ends the device's grant and leaves the device to the Matrix `logout` or
    the account page, like `/oauth2/revoke`. A grant issued before `sid`
    existed has none and ends by revocation, expiry or an epoch instead.
+7. **Back-channel logout** (OpenID Connect Back-Channel Logout 1.0, generic
+   mode). A client may register `backchannel_logout_uri` and
+   `backchannel_logout_session_required`. Every active deletion of one of its
+   `oidc` grants sends it a logout token: revocation of the refresh token,
+   end-session, a refresh refused for an epoch, inactivity or the absolute
+   expiry (the refusal deletes the grant), and the revocation of all of a
+   user's grants (`logout/all`, deactivation, erasure). The deleting script
+   queues the entry in a Redis outbox; a worker in every instance delivers it
+   apart from the request, signing a fresh ES256 token per attempt (`typ`
+   `logout+jwt`, `aud` the client, `sub` the DID, the grant's `sid`, `exp`
+   two minutes after `iat`), and retries a failing RP five times in all with
+   2 s doubling backoff before dropping the entry with a warning. **A grant
+   whose Redis key simply expires sends nothing:** no script runs, nothing
+   observes it, and the RP's own refresh token expired with it, so the RP
+   learns of it at its next refresh (`invalid_grant`). Likewise an epoch that
+   so far only refused an access token sends nothing until a refresh deletes
+   the grant. A Matrix device grant never sends a logout token (Synapse is not
+   a relying party here), so Matrix mode does not advertise
+   `backchannel_logout_supported`. The URI passes an SSRF guard at
+   registration and at every delivery (`https`, public addresses only, no
+   redirects; an operator allowlist exempts named hosts): see
+   [configuration.md](configuration.md#back-channel-logout).
 
 **What Element Web sends on sign-out.** Element Web signed in through the
 OAuth 2.0 API does not call `POST /_matrix/client/v3/logout`; it revokes both
@@ -525,6 +547,12 @@ Builds before the grant record stored each token as `token/{raw}` with its
   still ends by revocation, expiry or an epoch. Its client registration reads
   `post_logout_redirect_uris` without knowing it, and a client update through
   the old build drops it.
+- A rollback to a build before back-channel logout sends no logout tokens and
+  queues none. Entries queued before the rollback stay in
+  `outbox:backchannel_logout` and are delivered when a build with the worker
+  runs again, with fresh tokens; a deletion made during the rollback is never
+  sent. Client registrations keep `backchannel_logout_uri` without the old build
+  knowing it, and a client update through the old build drops it.
 
 A token-store fault is never answered as a refusal. `POST
 /_matrix/client/v3/refresh` and the device-deletion routes (`DELETE
