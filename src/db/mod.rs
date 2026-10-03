@@ -17,18 +17,21 @@ pub use self::redis::RedisClient;
 const KV_CLIENT_PREFIX: &str = "clients";
 const KV_SESSION_PREFIX: &str = "sessions";
 const KV_CODE_PREFIX: &str = "codes";
+/// Legacy token entries `token/{raw}`, written by builds before the grant record
+/// and only read and deleted now (see [`DBClient::set_token`]).
 const KV_TOKEN_PREFIX: &str = "token";
-/// Secondary index: a Redis SET of token keys per `(username, device_id)`, kept
-/// in sync on every token mint/refresh so revocation is an atomic O(members)
-/// delete instead of a racy `KEYS` scan (S3-3 / H3 fix).
+/// Legacy secondary index: a Redis SET of `token/{raw}` keys per
+/// `(username, device_id)`, which builds before the grant record kept so
+/// revocation was an atomic O(members) delete (S3-3 / H3 fix). Revocation still
+/// sweeps it; the lift of a legacy refresh token removes its member.
 const KV_DEVICE_TOKEN_IDX_PREFIX: &str = "idx:user_device";
 /// Short-lived tombstone marking a `(username, device_id)` as just-revoked, so an
 /// in-flight refresh that completes right after the sweep cannot leave a survivor
-/// (S3-3 / H3 fix). Checked by the refresh/mint paths.
+/// (S3-3 / H3 fix). Checked by the rotation and lift scripts (`db::grant`).
 const KV_DEVICE_TOMBSTONE_PREFIX: &str = "tombstone:device";
 /// Per-user deactivation tombstone set BEFORE the deactivate/erase sweep so any
-/// concurrent refresh/mint refuses to issue tokens for a terminating user
-/// (S3-4 / H6 fix). Checked by the refresh/mint paths.
+/// concurrent refresh refuses to issue tokens for a terminating user (S3-4 / H6
+/// fix). Checked by the rotation and lift scripts (`db::grant`).
 const KV_USER_TOMBSTONE_PREFIX: &str = "tombstone:user";
 /// Durable erasure markers: `erased:user/{localpart}` and
 /// `erased:did/{hex(sha256(canonical DID))}`, written with NO TTL before an
@@ -89,9 +92,10 @@ pub const KV_USER_SESSION_PREFIX: &str = "user:session";
 /// not scope forever. 30 days mirrors a typical "remember this device" horizon.
 pub const USER_SESSION_LIFETIME: u64 = 30 * 24 * 3600; // 30 days
 
-/// TTL for opaque access tokens (both modes).
+/// Lifetime of an access token (both modes).
 pub const ACCESS_TOKEN_TTL: u64 = 300; // 5 minutes
-/// TTL for opaque refresh tokens (both modes).
+/// Inactivity lifetime of a grant with a refresh token: it ends this long after
+/// its last rotation (both modes).
 pub const REFRESH_TOKEN_TTL: u64 = 7_776_000; // 90 days
 
 /// The longest lifetime (`exp - iat`) an access token is ever written with: a
@@ -113,7 +117,8 @@ const _: () = assert!(
 pub const SYNAPSE_ADMIN_SCOPE: &str = "urn:synapse:admin:*";
 
 /// TTL for the short-lived device/user revocation tombstones, which revocation
-/// plants and the rotation script (`grant::ROTATE_LUA`) refuses a grant under.
+/// plants and the rotation and lift scripts (`grant::ROTATE_LUA`,
+/// `grant::LIFT_LUA`) refuse a grant under.
 /// Long enough to outlast a refresh that was in flight when a revoke sweep ran.
 /// A lingering tombstone only makes a refresh refuse (a user tombstone also
 /// refuses the refresh of a grant signed in after `logout/all` or deactivation,
@@ -373,25 +378,19 @@ pub trait DBClient {
     /// [`try_consume_code`](Self::try_consume_code) receives a code.
     async fn try_claim_device_code(&self, device_code: &str) -> Result<bool>;
 
-    /// Whether a `(username, device_id)` pair currently carries a device-revoked
-    /// tombstone (set by [`revoke_device_tokens`]). A refresh/mint that sees this
-    /// must refuse so it cannot resurrect a just-signed-out device (S3-3 / H3).
-    async fn is_device_revoked(&self, username: &str, device_id: &str) -> Result<bool>;
+    // -- Legacy token entries (`token/{raw}`) -----------------------------------
+    //
+    // Builds before the grant record stored every token this way. Tokens now
+    // live in grants (`db::grant`); these entries are only read (the access
+    // check's fallback, teardown, the migration of refresh tokens) and deleted.
 
-    /// Whether a user currently carries a deactivation tombstone (set by
-    /// `account_deactivate` / `account_erase` BEFORE the token sweep). A
-    /// refresh/mint that sees this must refuse so it cannot resurrect access for a
-    /// terminating account (S3-4 / H6).
-    async fn is_user_deactivated(&self, username: &str) -> Result<bool>;
-
-    // -- Opaque token storage (MSC3861) ----------------------------------------
-
-    /// Store an opaque token with metadata and a TTL in seconds. Refuses an
-    /// entry whose [`TokenMetadata::kind`] is unset.
+    /// Store a legacy token entry with a TTL in seconds. No production code
+    /// writes one any more; tests use it to seed the layout an older build
+    /// left. Refuses an entry whose [`TokenMetadata::kind`] is unset.
     async fn set_token(&self, token: &str, metadata: &TokenMetadata, ttl: u64) -> Result<()>;
-    /// Retrieve metadata for an opaque token (returns None if expired/missing).
+    /// Retrieve a legacy token entry (None if expired or missing).
     async fn get_token(&self, token: &str) -> Result<Option<TokenMetadata>>;
-    /// Delete an opaque token (e.g. on revocation).
+    /// Delete a legacy token entry (e.g. on revocation).
     async fn delete_token(&self, token: &str) -> Result<()>;
 
     // -- RFC 8628 device code storage -----------------------------------------

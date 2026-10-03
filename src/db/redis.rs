@@ -920,17 +920,6 @@ impl DBClient for RedisClient {
         Ok(was_set.is_some())
     }
 
-    async fn is_device_revoked(&self, username: &str, device_id: &str) -> Result<bool> {
-        Ok(self
-            .get_raw(&device_tombstone_key(username, device_id))
-            .await?
-            .is_some())
-    }
-
-    async fn is_user_deactivated(&self, username: &str) -> Result<bool> {
-        Ok(self.get_raw(&user_tombstone_key(username)).await?.is_some())
-    }
-
     async fn set_token(&self, token: &str, metadata: &TokenMetadata, ttl: u64) -> Result<()> {
         // Every endpoint accepts exactly one kind of token, so an entry without a
         // kind would be classified by lifetime instead of by its writer.

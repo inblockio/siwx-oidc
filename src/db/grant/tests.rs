@@ -1,7 +1,7 @@
 //! Redis-backed tests of the grant layer (`crate::test_support::redis`).
 
 use super::*;
-use crate::db::{DBClient, ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL};
+use crate::db::{ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A unique suffix so tests sharing one Redis never see each other's keys.
@@ -21,6 +21,11 @@ async fn raw<T: redis::FromRedisValue>(client: &RedisClient, args: &[&str]) -> T
         cmd.arg(*a);
     }
     cmd.query_async(&mut *conn).await.expect("redis command")
+}
+
+/// Whether the tombstone `key` is planted.
+async fn tombstone(client: &RedisClient, key: &str) -> bool {
+    raw::<i64>(client, &["EXISTS", key]).await == 1
 }
 
 async fn hgetall(client: &RedisClient, key: &str) -> HashMap<String, String> {
@@ -489,7 +494,7 @@ async fn a_tombstoned_device_or_user_refuses_rotation_and_replay() {
         rotate(&client, b.refresh_token.as_deref().unwrap()).await,
         RotateOutcome::Invalid(InvalidReason::Revoked)
     );
-    assert!(client.is_user_deactivated(&user2).await.unwrap());
+    assert!(tombstone(&client, &user_tombstone_key(&user2)).await);
 }
 
 #[tokio::test]
@@ -583,7 +588,7 @@ async fn revoking_a_device_deletes_its_grants_only_and_plants_the_tombstone() {
             .unwrap()
             .is_some());
     }
-    assert!(client.is_device_revoked(&user, "DEVA").await.unwrap());
+    assert!(tombstone(&client, &device_tombstone_key(&user, "DEVA")).await);
     let members: Vec<String> = raw(&client, &["SMEMBERS", &user_idx_key(&user)]).await;
     assert_eq!(members, vec![b.grant_id.as_str().to_string()]);
 }
@@ -613,7 +618,7 @@ async fn revoking_a_user_deletes_every_grant_of_the_user() {
         .await
         .unwrap()
         .is_some());
-    assert!(client.is_user_deactivated(&user).await.unwrap());
+    assert!(tombstone(&client, &user_tombstone_key(&user)).await);
     for idx in [user_idx_key(&user), device_idx_key(&user, "DEVA")] {
         let exists: i64 = raw(&client, &["EXISTS", &idx]).await;
         assert_eq!(exists, 0, "{idx}");
