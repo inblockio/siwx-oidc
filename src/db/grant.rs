@@ -211,6 +211,38 @@ fn legacy_token_key(token: &str) -> String {
     format!("{}/{token}", super::KV_TOKEN_PREFIX)
 }
 
+/// The global epoch (I9): every grant authenticated at or before it is refused.
+pub const KV_EPOCH_GLOBAL: &str = "epoch:global";
+/// Prefix of the per-client epochs: `epoch:client/{client_id}`.
+pub const KV_EPOCH_CLIENT_PREFIX: &str = "epoch:client";
+/// Prefix of the per-user epochs: `epoch:user/{username}`.
+pub const KV_EPOCH_USER_PREFIX: &str = "epoch:user";
+
+/// Whose grants an epoch refuses (I9). An epoch is a persistent not-before
+/// timestamp in Unix milliseconds from Redis `TIME`: a grant whose `auth_ms`
+/// is at or before the largest epoch that applies to it is refused, so a
+/// grant authenticated in the epoch's own millisecond is refused too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpochScope<'a> {
+    /// Every grant.
+    Global,
+    /// The grants of one client id.
+    Client(&'a str),
+    /// The grants of one username (the localpart revocation keys on).
+    User(&'a str),
+}
+
+impl EpochScope<'_> {
+    /// The Redis key of this epoch.
+    pub fn key(&self) -> String {
+        match self {
+            EpochScope::Global => KV_EPOCH_GLOBAL.to_string(),
+            EpochScope::Client(client_id) => format!("{KV_EPOCH_CLIENT_PREFIX}/{client_id}"),
+            EpochScope::User(username) => format!("{KV_EPOCH_USER_PREFIX}/{username}"),
+        }
+    }
+}
+
 /// The operator's absolute-lifetime caps, in seconds (I6; decision D1,
 /// provisional): one global value and one per client id, both unset by
 /// default, which caps nothing (a grant then ends only by inactivity). The
@@ -273,10 +305,11 @@ pub struct NewGrant {
     pub device_id: String,
     pub scope: String,
     pub name: String,
-    /// The original authentication (Unix seconds, Redis `TIME`): the base of
-    /// the absolute expiry. `None`: the authentication is this request, and
-    /// the script takes Redis `TIME`.
-    pub auth_time: Option<i64>,
+    /// The original authentication (Unix milliseconds, Redis `TIME`): the
+    /// grant's `auth_ms`, compared with the epochs (I9), and, in whole
+    /// seconds, its `auth_time`, the base of the absolute expiry (I6). `None`:
+    /// the authentication is this request, and the script takes Redis `TIME`.
+    pub auth_ms: Option<i64>,
     /// Lifetime of each access token, in seconds.
     pub access_ttl: u64,
     /// `Some(inactivity)` issues a refresh token and keeps the grant for that
@@ -330,6 +363,11 @@ pub struct GrantView {
     pub scope: String,
     pub name: String,
     pub auth_time: i64,
+    /// The authentication in Unix milliseconds, compared with the epochs
+    /// (I9): the written `auth_ms`, else (a grant written before epochs
+    /// existed) the start of `auth_time`'s second, so such a grant whose
+    /// authentication falls in an epoch's second is refused.
+    pub auth_ms: i64,
     /// The absolute expiry written into the grant (Unix seconds); `None` when
     /// no cap applied when it was written (see [`GrantLifetime`]).
     pub absolute_exp: Option<i64>,
@@ -351,6 +389,10 @@ impl GrantView {
             scope: s("scope")?,
             name: s("name")?,
             auth_time: f.get("auth_time")?.parse().ok()?,
+            auth_ms: match f.get("auth_ms") {
+                Some(v) => v.parse().ok()?,
+                None => f.get("auth_time")?.parse::<i64>().ok()?.checked_mul(1000)?,
+            },
             absolute_exp: match f.get("absolute_exp") {
                 Some(v) => Some(v.parse().ok()?),
                 None => None,
@@ -540,6 +582,43 @@ local function extend(key, secs)
 end
 "#;
 
+/// Redis `TIME` in milliseconds and the epochs (I9). `epoch_refuses` says
+/// whether an epoch that applies to a grant of `username` and `client_id` is
+/// at or after its authentication `auth_ms`; `set_epoch` moves an epoch to
+/// now, never earlier. The key names are [`EpochScope::key`]'s, pinned by
+/// `the_scripts_name_the_epoch_keys_the_library_writes`.
+const LUA_EPOCH: &str = r#"
+local function now_ms()
+  local t = redis.call('TIME')
+  return tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+end
+local function epoch_refuses(auth_ms, username, client_id)
+  local epochs = redis.call('MGET', 'epoch:global', 'epoch:client/' .. client_id,
+    'epoch:user/' .. username)
+  for i = 1, 3 do
+    if epochs[i] and tonumber(epochs[i]) >= auth_ms then
+      return true
+    end
+  end
+  return false
+end
+local function set_epoch(key)
+  local ms = now_ms()
+  local current = tonumber(redis.call('GET', key) or '0')
+  if ms > current then
+    redis.call('SET', key, string.format('%.0f', ms))
+    current = ms
+  end
+  return current
+end
+"#;
+
+/// Set one epoch to Redis `TIME`, never earlier than it was. Needs
+/// [`LUA_EPOCH`]. KEYS: 1 the epoch. Returns the epoch in force.
+const SET_EPOCH_LUA: &str = r#"
+return string.format('%.0f', set_epoch(KEYS[1]))
+"#;
+
 /// Add grant `id` to the index `key`, pruning members whose grant (under
 /// `prefix`) is gone, and extend the index to `ttl`. Needs [`LUA_EXTEND`].
 const LUA_INDEX: &str = r#"
@@ -559,15 +638,17 @@ end
 /// KEYS: 1 grant, 2 access entry, 3 user index, 4 device index.
 /// ARGV: 1 grant id, 2 grant key prefix (`grant/`), 3 has device (`1`/`0`),
 /// 4 kind, 5 username, 6 did, 7 client_id, 8 confidential, 9 device_id,
-/// 10 scope, 11 name, 12 auth_time (`` = now), 13 access_ttl, 14 inactivity
+/// 10 scope, 11 name, 12 auth_ms (`` = now), 13 access_ttl, 14 inactivity
 /// (`0`: no refresh token, the grant lives as long as its access token),
 /// 15 current_rt, 16 the absolute-lifetime cap (`` = none).
+/// `auth_time` is `auth_ms` in whole seconds.
 /// With a cap, `absolute_exp` = `auth_time` + cap is written, the access token
 /// and the keys expire no later than it, and an authentication already older
 /// than the cap is an error. Returns `{iat, exp}` of the access token. Index
 /// members whose grant is gone are pruned, so an index holds live grants only.
 const ISSUE_LUA: &str = r#"
-local now = tonumber(redis.call('TIME')[1])
+local clock = redis.call('TIME')
+local now = tonumber(clock[1])
 if redis.call('EXISTS', KEYS[1]) == 1 then
   return redis.error_reply('grant id collision')
 end
@@ -575,8 +656,9 @@ local access_ttl = tonumber(ARGV[13])
 local grant_ttl = tonumber(ARGV[14])
 if grant_ttl == 0 then grant_ttl = access_ttl end
 local inactivity = grant_ttl
-local auth_time = now
-if ARGV[12] ~= '' then auth_time = tonumber(ARGV[12]) end
+local auth_ms = now * 1000 + math.floor(tonumber(clock[2]) / 1000)
+if ARGV[12] ~= '' then auth_ms = tonumber(ARGV[12]) end
+local auth_time = math.floor(auth_ms / 1000)
 local access_exp = now + access_ttl
 local access_life = access_ttl
 local absolute_exp = nil
@@ -591,7 +673,8 @@ if ARGV[16] ~= '' then
 end
 redis.call('HSET', KEYS[1], 'kind', ARGV[4], 'username', ARGV[5], 'did', ARGV[6],
   'client_id', ARGV[7], 'confidential', ARGV[8], 'device_id', ARGV[9], 'scope', ARGV[10],
-  'name', ARGV[11], 'auth_time', tostring(auth_time), 'access_ttl', ARGV[13],
+  'name', ARGV[11], 'auth_time', tostring(auth_time),
+  'auth_ms', string.format('%.0f', auth_ms), 'access_ttl', ARGV[13],
   'inactivity_secs', tostring(inactivity), 'last_used', tostring(now), 'generation', '0',
   'current_rt', ARGV[15], 'previous_rt', '', 'successor_used', '1')
 if absolute_exp then
@@ -668,7 +751,8 @@ redis.call('DEL', KEYS[1])
 if ARGV[4] == '1' then redis.call('SREM', KEYS[9], KEYS[1]) end
 redis.call('HSET', KEYS[3], 'kind', ARGV[5], 'username', ARGV[6], 'did', ARGV[7],
   'client_id', ARGV[8], 'confidential', ARGV[9], 'device_id', ARGV[10], 'scope', ARGV[11],
-  'name', ARGV[12], 'auth_time', tostring(auth_time), 'access_ttl', ARGV[14],
+  'name', ARGV[12], 'auth_time', tostring(auth_time),
+  'auth_ms', string.format('%.0f', auth_time * 1000), 'access_ttl', ARGV[14],
   'inactivity_secs', ARGV[15], 'last_used', tostring(now), 'generation', '1',
   'current_rt', ARGV[17], 'previous_rt', ARGV[16], 'successor_used', '0',
   'successor_sealed', ARGV[18])
@@ -987,7 +1071,7 @@ impl RedisClient {
                     &new.device_id,
                     &new.scope,
                     &new.name,
-                    &new.auth_time.map(|t| t.to_string()).unwrap_or_default(),
+                    &new.auth_ms.map(|t| t.to_string()).unwrap_or_default(),
                     &new.access_ttl.to_string(),
                     &new.refresh_inactivity_secs.unwrap_or(0).to_string(),
                     &current_rt,
@@ -1173,6 +1257,34 @@ impl RedisClient {
             .await
             .map_err(|e| anyhow!("grant store GET: {e}"))?;
         Ok(lifted.map(|id| (GrantId(id), None)))
+    }
+
+    /// Set the epoch of `scope` to Redis `TIME`, never moving it earlier
+    /// (I9): from this one write on, the rotation script and the access check
+    /// refuse every grant of that scope authenticated at or before it. Returns
+    /// the epoch in force, in Unix milliseconds. Behind `logout/all`,
+    /// deactivation and erasure (the user epoch) and the operator subcommand
+    /// `siwx-oidc epoch` (global and client epochs).
+    pub async fn set_epoch(&self, scope: EpochScope<'_>) -> Result<i64> {
+        let script = format!("{LUA_EPOCH}{SET_EPOCH_LUA}");
+        let epoch: String = self.eval(&script, &[&scope.key()], &[]).await?;
+        number(Some(&epoch), "epoch")
+    }
+
+    /// Redis `TIME`, in milliseconds.
+    pub(super) async fn redis_time_ms(&self) -> Result<i64> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let (secs, micros): (String, String) = redis::cmd("TIME")
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("grant store TIME: {e}"))?;
+        let secs: i64 = number(Some(&secs), "TIME")?;
+        let micros: i64 = number(Some(&micros), "TIME")?;
+        Ok(secs * 1000 + micros / 1000)
     }
 
     /// Redis `TIME`, in seconds.

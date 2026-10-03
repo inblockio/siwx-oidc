@@ -1384,7 +1384,7 @@ async fn token_device_code(
                     name: display_name,
                     // The approval, recorded from Redis `TIME`; an entry an
                     // older build approved counts from this poll.
-                    auth_time: entry.auth_time,
+                    auth_ms: entry.auth_ms,
                     access_ttl: ACCESS_TOKEN_TTL,
                     refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
                 })
@@ -1656,7 +1656,7 @@ async fn token_authorization_code(
             device_id: code_entry.device_id.clone().unwrap_or_default(),
             scope: scope.clone(),
             name: display_name,
-            auth_time: Some(code_entry.auth_time.timestamp()),
+            auth_ms: Some(code_entry.auth_time.timestamp_millis()),
             access_ttl: ACCESS_TOKEN_TTL,
             refresh_inactivity_secs: issue_refresh_token.then_some(REFRESH_TOKEN_TTL),
         })
@@ -2917,8 +2917,10 @@ pub async fn sign_in(
         client_id: request.client_id.clone(),
         // The authentication, from Redis `TIME` like every lifetime deadline
         // (I6); the grant's absolute expiry counts from it.
-        auth_time: chrono::DateTime::<Utc>::from_timestamp(db_client.server_time().await?, 0)
-            .ok_or_else(|| anyhow!("Redis TIME out of range"))?,
+        auth_time: chrono::DateTime::<Utc>::from_timestamp_millis(
+            db_client.server_time_ms().await?,
+        )
+        .ok_or_else(|| anyhow!("Redis TIME out of range"))?,
         code_challenge: Some(request.code_challenge.clone()),
         code_challenge_method: Some("S256".to_string()),
         localpart: Some(resolved.localpart.clone()),
@@ -4577,7 +4579,7 @@ mod tests {
                 device_id: None,
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
-                auth_time: None,
+                auth_ms: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -4647,7 +4649,7 @@ mod tests {
                 device_id: None,
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
-                auth_time: None,
+                auth_ms: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -6617,7 +6619,7 @@ mod device_display_name_tests {
                 device_id: None,
                 last_poll: None,
                 created_at: approved_at - 10,
-                auth_time: Some(approved_at),
+                auth_ms: Some(approved_at * 1000),
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -6655,6 +6657,7 @@ mod device_display_name_tests {
             .expect("the issued access token is live")
             .grant;
         assert_eq!(grant.auth_time, approved_at, "auth_time is the approval");
+        assert_eq!(grant.auth_ms, approved_at * 1000, "auth_ms is the approval");
     }
 
     /// The QR / device-code path used to name every device "Element X".
@@ -6682,7 +6685,7 @@ mod device_display_name_tests {
                 device_id: None,
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
-                auth_time: None,
+                auth_ms: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -6797,7 +6800,7 @@ mod client_binding_tests {
             device_id: String::new(),
             scope: "openid".into(),
             name: "did:key:zDnBINDING".into(),
-            auth_time: Some(Utc::now().timestamp()),
+            auth_ms: Some(Utc::now().timestamp_millis()),
             access_ttl: ACCESS_TOKEN_TTL,
             refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
         })

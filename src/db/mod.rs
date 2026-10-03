@@ -489,12 +489,12 @@ pub struct DeviceCodeEntry {
     pub device_id: Option<String>,
     pub last_poll: Option<i64>,
     pub created_at: i64,
-    /// When the user approved the request (Unix seconds, Redis `TIME`): the
-    /// authentication, so the grant's `auth_time`. `None` before approval and
+    /// When the user approved the request (Unix milliseconds, Redis `TIME`):
+    /// the authentication, so the grant's `auth_ms` and `auth_time`. `None` before approval and
     /// in an entry an older build approved, whose grant then counts from the
     /// poll that redeems it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_time: Option<i64>,
+    pub auth_ms: Option<i64>,
 }
 
 impl std::fmt::Debug for DeviceCodeEntry {
@@ -512,7 +512,7 @@ impl std::fmt::Debug for DeviceCodeEntry {
             .field("device_id", &self.device_id)
             .field("last_poll", &self.last_poll)
             .field("created_at", &self.created_at)
-            .field("auth_time", &self.auth_time)
+            .field("auth_ms", &self.auth_ms)
             .finish()
     }
 }
@@ -530,7 +530,7 @@ impl DeviceCodeEntry {
             device_id: None,
             last_poll: None,
             created_at,
-            auth_time: None,
+            auth_ms: None,
         }
     }
 
@@ -737,9 +737,9 @@ pub trait DBClient {
         entry: &DeviceCodeEntry,
         ttl: u64,
     ) -> Result<()>;
-    /// Redis `TIME` in Unix seconds: the clock of every lifetime deadline (I6),
-    /// so instances with skewed clocks agree.
-    async fn server_time(&self) -> Result<i64>;
+    /// Redis `TIME` in Unix milliseconds: the clock of every lifetime deadline
+    /// (I6) and of the epochs (I9), so instances with skewed clocks agree.
+    async fn server_time_ms(&self) -> Result<i64>;
     /// Delete the entry a lookup returned.
     async fn delete_device_code(&self, device_code: &DeviceCodeRef) -> Result<()>;
     /// Look up a device code by the user code a person presents, exactly as

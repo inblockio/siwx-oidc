@@ -13,13 +13,16 @@ async fn redis_now(client: &RedisClient) -> i64 {
     secs.parse().expect("TIME")
 }
 
-/// Shift a grant's `auth_time`, `absolute_exp` (when present) and `last_used`
-/// `ARGV[1]` seconds into the past, as if that much time had passed.
+/// Shift a grant's `auth_time`, `auth_ms`, `absolute_exp` (when present) and
+/// `last_used` `ARGV[1]` seconds into the past, as if that much time had passed.
 const AGE_LUA: &str = r#"
 for _, f in ipairs({'auth_time', 'absolute_exp', 'last_used'}) do
   if redis.call('HEXISTS', KEYS[1], f) == 1 then
     redis.call('HINCRBY', KEYS[1], f, -tonumber(ARGV[1]))
   end
+end
+if redis.call('HEXISTS', KEYS[1], 'auth_ms') == 1 then
+  redis.call('HINCRBY', KEYS[1], 'auth_ms', -1000 * tonumber(ARGV[1]))
 end
 return 1
 "#;
@@ -57,7 +60,7 @@ fn grant_for(client_id: &str, device_id: &str, auth_time: i64) -> NewGrant {
     if device_id.is_empty() {
         g.kind = GrantKind::Oidc;
     }
-    g.auth_time = Some(auth_time);
+    g.auth_ms = Some(auth_time * 1000);
     g
 }
 

@@ -138,7 +138,7 @@ pub fn admin_service_grant(localpart: &str, ttl: u64) -> NewGrant {
         scope: ADMIN_SCOPE.to_string(),
         name: ADMIN_DISPLAY_NAME.to_string(),
         // Authenticated by this request: the grant store takes Redis `TIME`.
-        auth_time: None,
+        auth_ms: None,
         access_ttl: ttl,
         // A bearer credential: no refresh token, so no refresh endpoint accepts it.
         refresh_inactivity_secs: None,

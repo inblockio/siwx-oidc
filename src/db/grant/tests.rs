@@ -42,7 +42,7 @@ fn matrix_grant(username: &str, device_id: &str) -> NewGrant {
         device_id: device_id.to_string(),
         scope: "openid urn:matrix:client:api:*".to_string(),
         name: "n".to_string(),
-        auth_time: Some(1_700_000_000),
+        auth_ms: Some(1_700_000_000_000),
         access_ttl: ACCESS_TOKEN_TTL,
         refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
     }
@@ -192,7 +192,7 @@ async fn a_refresh_less_grant_and_a_service_grant_live_as_long_as_their_access_t
         device_id: String::new(),
         scope: "urn:matrix:client:api:* urn:synapse:admin:*".into(),
         name: "admin".into(),
-        auth_time: None,
+        auth_ms: None,
         access_ttl: 120,
         refresh_inactivity_secs: None,
     };
@@ -484,17 +484,26 @@ async fn a_tombstoned_device_or_user_refuses_rotation_and_replay() {
         hgetall(&client, &grant_key(&a.grant_id)).await["generation"],
         "1"
     );
-    // User tombstone, deviceless grant.
+    // User tombstone, deviceless grant: no build writes one any more (the user
+    // epoch replaced it), but one a previous build wrote still refuses for its
+    // lifetime, so it is seeded the way that build planted it.
     let user2 = format!("tombu{}", nonce());
     let mut new = matrix_grant(&user2, "");
     new.kind = GrantKind::Oidc;
     let b = issue(&client, &new).await;
-    client.mark_user_deactivated(&user2).await.unwrap();
-    assert_eq!(
-        rotate(&client, b.refresh_token.as_deref().unwrap()).await,
-        RotateOutcome::Invalid(InvalidReason::Revoked)
-    );
-    assert!(tombstone(&client, &user_tombstone_key(&user2)).await);
+    let b0 = b.refresh_token.clone().unwrap();
+    let b1 = rotated(rotate(&client, &b0).await);
+    client
+        .set_ex_raw(&user_tombstone_key(&user2), "1", TOMBSTONE_TTL_SECS)
+        .await
+        .unwrap();
+    for t in [&b0, &b1.pair.refresh_token] {
+        assert_eq!(
+            rotate(&client, t).await,
+            RotateOutcome::Invalid(InvalidReason::Revoked),
+            "a user tombstone written by the previous build still refuses"
+        );
+    }
 }
 
 #[tokio::test]
@@ -618,7 +627,14 @@ async fn revoking_a_user_deletes_every_grant_of_the_user() {
         .await
         .unwrap()
         .is_some());
-    assert!(tombstone(&client, &user_tombstone_key(&user)).await);
+    assert!(
+        tombstone(&client, &EpochScope::User(&user).key()).await,
+        "revoking a user sets the user epoch"
+    );
+    assert!(
+        !tombstone(&client, &user_tombstone_key(&user)).await,
+        "and plants no user tombstone"
+    );
     for idx in [user_idx_key(&user), device_idx_key(&user, "DEVA")] {
         let exists: i64 = raw(&client, &["EXISTS", &idx]).await;
         assert_eq!(exists, 0, "{idx}");
@@ -1188,4 +1204,5 @@ fn a_lifted_grant_is_a_matrix_device_grant_exactly_when_its_scope_carries_the_ma
     }
 }
 
+mod epochs;
 mod lifetime;
