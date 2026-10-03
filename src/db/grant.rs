@@ -220,10 +220,39 @@ pub struct GrantLifetime {
 impl GrantLifetime {
     /// The cap for a grant of `client_id`, `None` when no value applies.
     pub fn cap_for(&self, client_id: &str) -> Option<u64> {
-        // TODO(phase 3 M1): test-first stub, no cap yet.
-        let _ = client_id;
-        None
+        [
+            self.per_client_secs.get(client_id).copied(),
+            self.global_secs,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
+
+    /// Whether any cap is configured.
+    pub fn is_configured(&self) -> bool {
+        self.global_secs.is_some() || !self.per_client_secs.is_empty()
+    }
+}
+
+/// The absolute expiry in force for a grant: the earlier of the one written
+/// into it (`stored`) and `auth_time` + `cap`; `None` when neither exists.
+/// This is the recomputation the rotation script runs, so a lowered cap
+/// applies at the next rotation and nothing moves the deadline later.
+pub fn effective_absolute_exp(
+    auth_time: i64,
+    stored: Option<i64>,
+    cap: Option<u64>,
+) -> Option<i64> {
+    let from_cap = cap.map(|c| auth_time.saturating_add(i64::try_from(c).unwrap_or(i64::MAX)));
+    [stored, from_cap].into_iter().flatten().min()
+}
+
+/// An access token's `exp`: its own lifetime from `now`, never past the
+/// grant's absolute expiry.
+fn clamped_access_exp(now: i64, access_ttl: u64, deadline: Option<i64>) -> i64 {
+    let own = now + access_ttl as i64;
+    deadline.map_or(own, |d| own.min(d))
 }
 
 /// What [`RedisClient::issue_grant`] creates.
@@ -524,10 +553,13 @@ end
 /// KEYS: 1 grant, 2 access entry, 3 user index, 4 device index.
 /// ARGV: 1 grant id, 2 grant key prefix (`grant/`), 3 has device (`1`/`0`),
 /// 4 kind, 5 username, 6 did, 7 client_id, 8 confidential, 9 device_id,
-/// 10 scope, 11 name, 12 auth_time, 13 access_ttl, 14 inactivity (`0`: no
-/// refresh token, the grant lives as long as its access token), 15 current_rt.
-/// Returns `{iat, exp}` of the access token. Index members whose grant is gone
-/// are pruned, so an index holds live grants only.
+/// 10 scope, 11 name, 12 auth_time (`` = now), 13 access_ttl, 14 inactivity
+/// (`0`: no refresh token, the grant lives as long as its access token),
+/// 15 current_rt, 16 the absolute-lifetime cap (`` = none).
+/// With a cap, `absolute_exp` = `auth_time` + cap is written, the access token
+/// and the keys expire no later than it, and an authentication already older
+/// than the cap is an error. Returns `{iat, exp}` of the access token. Index
+/// members whose grant is gone are pruned, so an index holds live grants only.
 const ISSUE_LUA: &str = r#"
 local now = tonumber(redis.call('TIME')[1])
 if redis.call('EXISTS', KEYS[1]) == 1 then
@@ -536,18 +568,36 @@ end
 local access_ttl = tonumber(ARGV[13])
 local grant_ttl = tonumber(ARGV[14])
 if grant_ttl == 0 then grant_ttl = access_ttl end
+local inactivity = grant_ttl
+local auth_time = now
+if ARGV[12] ~= '' then auth_time = tonumber(ARGV[12]) end
+local access_exp = now + access_ttl
+local access_life = access_ttl
+local absolute_exp = nil
+if ARGV[16] ~= '' then
+  absolute_exp = auth_time + tonumber(ARGV[16])
+  if now >= absolute_exp then
+    return redis.error_reply('authentication older than the absolute lifetime')
+  end
+  access_exp = math.min(access_exp, absolute_exp)
+  access_life = math.min(access_life, absolute_exp - now)
+  grant_ttl = math.min(grant_ttl, absolute_exp - now)
+end
 redis.call('HSET', KEYS[1], 'kind', ARGV[4], 'username', ARGV[5], 'did', ARGV[6],
   'client_id', ARGV[7], 'confidential', ARGV[8], 'device_id', ARGV[9], 'scope', ARGV[10],
-  'name', ARGV[11], 'auth_time', ARGV[12], 'access_ttl', ARGV[13],
-  'inactivity_secs', tostring(grant_ttl), 'last_used', tostring(now), 'generation', '0',
+  'name', ARGV[11], 'auth_time', tostring(auth_time), 'access_ttl', ARGV[13],
+  'inactivity_secs', tostring(inactivity), 'last_used', tostring(now), 'generation', '0',
   'current_rt', ARGV[15], 'previous_rt', '', 'successor_used', '1')
+if absolute_exp then
+  redis.call('HSET', KEYS[1], 'absolute_exp', tostring(absolute_exp))
+end
 redis.call('EXPIRE', KEYS[1], grant_ttl)
 redis.call('HSET', KEYS[2], 'grant', ARGV[1], 'generation', '0', 'kind', 'access',
-  'iat', tostring(now), 'exp', tostring(now + access_ttl))
-redis.call('EXPIRE', KEYS[2], access_ttl)
+  'iat', tostring(now), 'exp', tostring(access_exp))
+redis.call('EXPIRE', KEYS[2], access_life)
 index(KEYS[3], ARGV[1], ARGV[2], grant_ttl)
 if ARGV[3] == '1' then index(KEYS[4], ARGV[1], ARGV[2], grant_ttl) end
-return {tostring(now), tostring(now + access_ttl)}
+return {tostring(now), tostring(access_exp)}
 "#;
 
 /// Lift a legacy refresh token into a new grant (design 5.8; module docs).
@@ -560,7 +610,11 @@ return {tostring(now), tostring(now + access_ttl)}
 /// 11 scope, 12 name, 13 auth_time, 14 access_ttl, 15 inactivity, 16 digest of
 /// the legacy token, 17 digest of the new refresh token, 18 the new pair sealed
 /// under the legacy token, 19 the new access token's `exp`, 20 requesting
-/// client_id (`` = unchecked), 21 the legacy entry's `exp`.
+/// client_id (`` = unchecked), 21 the legacy entry's `exp`, 22 the
+/// absolute-lifetime cap (`` = none). The grant's `auth_time` is the legacy
+/// entry's `iat`, never later than now; with a cap it is refused as expired
+/// once `auth_time` + cap has passed, else `absolute_exp` is written and the
+/// access token and keys expire no later than it.
 /// Replies `{'lifted', grant id}` when the pointer already exists (the caller
 /// then runs the rotation script on that grant), else `{'lifted_now'}` or a
 /// refusal shaped like the rotation script's.
@@ -580,6 +634,14 @@ local now = tonumber(redis.call('TIME')[1])
 if now >= tonumber(ARGV[21]) then
   return {'invalid', 'expired'}
 end
+local auth_time = math.min(tonumber(ARGV[13]), now)
+local absolute_exp = nil
+if ARGV[22] ~= '' then
+  absolute_exp = auth_time + tonumber(ARGV[22])
+  if now >= absolute_exp then
+    return {'invalid', 'expired'}
+  end
+end
 if ARGV[20] ~= '' and ARGV[20] ~= ARGV[8] then
   return {'client_mismatch'}
 end
@@ -588,21 +650,32 @@ if redis.call('EXISTS', KEYS[3]) == 1 then
 end
 local access_ttl = tonumber(ARGV[14])
 local inactivity = tonumber(ARGV[15])
+local access_exp = tonumber(ARGV[19])
+local access_life = access_ttl
+local grant_ttl = inactivity
+if absolute_exp then
+  access_exp = math.min(access_exp, absolute_exp)
+  access_life = math.min(access_life, absolute_exp - now)
+  grant_ttl = math.min(grant_ttl, absolute_exp - now)
+end
 redis.call('DEL', KEYS[1])
 if ARGV[4] == '1' then redis.call('SREM', KEYS[9], KEYS[1]) end
 redis.call('HSET', KEYS[3], 'kind', ARGV[5], 'username', ARGV[6], 'did', ARGV[7],
   'client_id', ARGV[8], 'confidential', ARGV[9], 'device_id', ARGV[10], 'scope', ARGV[11],
-  'name', ARGV[12], 'auth_time', ARGV[13], 'access_ttl', ARGV[14],
+  'name', ARGV[12], 'auth_time', tostring(auth_time), 'access_ttl', ARGV[14],
   'inactivity_secs', ARGV[15], 'last_used', tostring(now), 'generation', '1',
   'current_rt', ARGV[17], 'previous_rt', ARGV[16], 'successor_used', '0',
   'successor_sealed', ARGV[18])
-redis.call('EXPIRE', KEYS[3], inactivity)
+if absolute_exp then
+  redis.call('HSET', KEYS[3], 'absolute_exp', tostring(absolute_exp))
+end
+redis.call('EXPIRE', KEYS[3], grant_ttl)
 redis.call('HSET', KEYS[4], 'grant', ARGV[2], 'generation', '1', 'kind', 'access',
-  'iat', tostring(now), 'exp', ARGV[19])
-redis.call('EXPIRE', KEYS[4], access_ttl)
+  'iat', tostring(now), 'exp', tostring(access_exp))
+redis.call('EXPIRE', KEYS[4], access_life)
 redis.call('SET', KEYS[2], ARGV[2], 'EX', inactivity)
-index(KEYS[7], ARGV[2], ARGV[3], inactivity)
-if ARGV[4] == '1' then index(KEYS[8], ARGV[2], ARGV[3], inactivity) end
+index(KEYS[7], ARGV[2], ARGV[3], grant_ttl)
+if ARGV[4] == '1' then index(KEYS[8], ARGV[2], ARGV[3], grant_ttl) end
 return {'lifted_now'}
 "#;
 
@@ -614,13 +687,18 @@ return {'lifted_now'}
 /// token, 3 sealed candidate, 4 username, 5 device_id (both as the caller read
 /// them to name the tombstones), 6 requesting client_id (`` = unchecked),
 /// 7 refuse a confidential client (`1`/`0`), 8 grant id, 9 has device,
-/// 10 the candidate access token's `exp`. An empty candidate digest (ARGV 2)
+/// 10 the candidate access token's `exp`, 11 the absolute-lifetime cap now
+/// configured for the grant's client (`` = none). The absolute expiry in force
+/// is the earlier of the written `absolute_exp` and `auth_time` + cap
+/// ([`effective_absolute_exp`]); past it the grant is deleted like an
+/// inactive one, and a rotation writes it back, so a lowered cap applies at
+/// the next rotation and nothing moves it later. An empty candidate digest (ARGV 2)
 /// means the caller has no handle to mint a candidate with (a lifted legacy
 /// token, which is never `current_rt`): the rotate branch is then never taken.
 const ROTATE_LUA: &str = r#"
 local f = redis.call('HMGET', KEYS[1], 'username', 'device_id', 'client_id', 'confidential',
   'current_rt', 'previous_rt', 'successor_used', 'successor_sealed', 'generation',
-  'last_used', 'inactivity_secs', 'access_ttl')
+  'last_used', 'inactivity_secs', 'access_ttl', 'auth_time', 'absolute_exp')
 if not f[1] or f[1] ~= ARGV[4] or f[2] ~= ARGV[5] then
   return {'invalid', 'unknown_grant'}
 end
@@ -629,7 +707,13 @@ if redis.call('EXISTS', KEYS[3]) == 1 or (ARGV[9] == '1' and redis.call('EXISTS'
 end
 local now = tonumber(redis.call('TIME')[1])
 local inactivity = tonumber(f[11])
-if now - tonumber(f[10]) > inactivity then
+local absolute_exp = nil
+if f[14] then absolute_exp = tonumber(f[14]) end
+if ARGV[11] ~= '' then
+  local capped = tonumber(f[13]) + tonumber(ARGV[11])
+  if not absolute_exp or capped < absolute_exp then absolute_exp = capped end
+end
+if now - tonumber(f[10]) > inactivity or (absolute_exp and now >= absolute_exp) then
   redis.call('DEL', KEYS[1])
   redis.call('SREM', KEYS[5], ARGV[8])
   if ARGV[9] == '1' then redis.call('SREM', KEYS[6], ARGV[8]) end
@@ -644,16 +728,24 @@ end
 local generation = tonumber(f[9])
 if ARGV[2] ~= '' and f[5] ~= '' and ARGV[1] == f[5] then
   local next_gen = tostring(generation + 1)
-  local access_ttl = tonumber(f[12])
+  local access_life = tonumber(f[12])
+  local access_exp = tonumber(ARGV[10])
+  local grant_ttl = inactivity
+  if absolute_exp then
+    access_exp = math.min(access_exp, absolute_exp)
+    access_life = math.min(access_life, absolute_exp - now)
+    grant_ttl = math.min(grant_ttl, absolute_exp - now)
+    redis.call('HSET', KEYS[1], 'absolute_exp', tostring(absolute_exp))
+  end
   redis.call('HSET', KEYS[1], 'previous_rt', f[5], 'current_rt', ARGV[2],
     'generation', next_gen, 'successor_used', '0', 'successor_sealed', ARGV[3],
     'last_used', tostring(now))
-  redis.call('EXPIRE', KEYS[1], inactivity)
+  redis.call('EXPIRE', KEYS[1], grant_ttl)
   redis.call('HSET', KEYS[2], 'grant', ARGV[8], 'generation', next_gen, 'kind', 'access',
-    'iat', tostring(now), 'exp', ARGV[10])
-  redis.call('EXPIRE', KEYS[2], access_ttl)
-  extend(KEYS[5], inactivity)
-  if ARGV[9] == '1' then extend(KEYS[6], inactivity) end
+    'iat', tostring(now), 'exp', tostring(access_exp))
+  redis.call('EXPIRE', KEYS[2], access_life)
+  extend(KEYS[5], grant_ttl)
+  if ARGV[9] == '1' then extend(KEYS[6], grant_ttl) end
   return {'rotated', next_gen}
 end
 if f[6] ~= '' and ARGV[1] == f[6] then
@@ -668,20 +760,38 @@ end
 return {'reuse', 'superseded', tostring(generation)}
 "#;
 
-/// Accept an access token's grant, marking the successor used (design 5.4).
+/// Accept an access token's grant, marking the successor used (design 5.4),
+/// unless the grant is past its absolute expiry (I6).
 ///
-/// KEYS: 1 grant. ARGV: 1 the access token's generation.
-/// Returns the grant's fields after the update, or nil when the grant is gone.
+/// KEYS: 1 grant. ARGV: 1 the access token's generation, 2 `1` when a cap is
+/// configured, so a grant written without `absolute_exp` must first be judged
+/// by the caller against `auth_time` + its client's cap.
+/// Returns nil when the grant is gone, `{'expired'}` past the written
+/// `absolute_exp`, `{'check', now, fields…}` for the caller to judge (nothing
+/// written), else `{'ok', now, fields…}` after the update. `now` is Redis `TIME`.
 const MARK_USED_LUA: &str = r#"
-local f = redis.call('HMGET', KEYS[1], 'generation', 'successor_used')
+local now = redis.call('TIME')[1]
+local f = redis.call('HMGET', KEYS[1], 'generation', 'successor_used', 'absolute_exp')
 if not f[1] then
   return false
 end
-if f[1] == ARGV[1] and f[2] == '0' then
+local status = 'ok'
+if f[3] then
+  if tonumber(now) >= tonumber(f[3]) then
+    return {'expired'}
+  end
+elseif ARGV[2] == '1' then
+  status = 'check'
+end
+if status == 'ok' and f[1] == ARGV[1] and f[2] == '0' then
   redis.call('HSET', KEYS[1], 'successor_used', '1')
   redis.call('HDEL', KEYS[1], 'successor_sealed')
 end
-return redis.call('HGETALL', KEYS[1])
+local reply = {status, now}
+for _, v in ipairs(redis.call('HGETALL', KEYS[1])) do
+  reply[#reply + 1] = v
+end
+return reply
 "#;
 
 /// Delete every grant of one device and plant the device tombstone.
@@ -741,6 +851,11 @@ redis.call('SREM', KEYS[2], ARGV[1])
 if ARGV[3] == '1' then redis.call('SREM', KEYS[3], ARGV[1]) end
 return 1
 "#;
+
+/// A cap as a script argument: `` for none.
+fn cap_arg(cap: Option<u64>) -> String {
+    cap.map(|c| c.to_string()).unwrap_or_default()
+}
 
 fn flag(value: bool) -> &'static str {
     if value {
@@ -870,6 +985,7 @@ impl RedisClient {
                     &new.access_ttl.to_string(),
                     &new.refresh_inactivity_secs.unwrap_or(0).to_string(),
                     &current_rt,
+                    &cap_arg(self.lifetime.cap_for(&new.client_id)),
                 ],
             )
             .await?;
@@ -913,27 +1029,60 @@ impl RedisClient {
         );
         let generation: u64 = number(get("generation"), "access entry")?;
         let iat = number(get("iat"), "access entry")?;
-        let exp = number(get("exp"), "access entry")?;
-        let fields: Option<HashMap<String, String>> = self
-            .eval(
-                MARK_USED_LUA,
-                &[&grant_key(&grant_id)],
-                &[&generation.to_string()],
-            )
-            .await?;
-        let Some(grant) = fields
-            .map(|f| view_or_none(grant_id, &f))
-            .transpose()?
-            .flatten()
-        else {
-            return Ok(None);
+        let exp: i64 = number(get("exp"), "access entry")?;
+        let mut judge = self.lifetime.is_configured();
+        let grant = loop {
+            let reply: Option<Vec<String>> = self
+                .eval(
+                    MARK_USED_LUA,
+                    &[&grant_key(&grant_id)],
+                    &[&generation.to_string(), flag(judge)],
+                )
+                .await?;
+            let Some(reply) = reply else {
+                return Ok(None);
+            };
+            let (status, now) = match reply.as_slice() {
+                [status, now, ..] => (status.as_str(), number::<i64>(Some(now), "TIME")?),
+                [status] if status == "expired" => return Ok(None),
+                _ => return Err(anyhow!("grant store: unexpected access-check reply")),
+            };
+            let fields: HashMap<String, String> = reply[2..]
+                .chunks_exact(2)
+                .map(|kv| (kv[0].clone(), kv[1].clone()))
+                .collect();
+            let Some(view) = view_or_none(grant_id.clone(), &fields)? else {
+                return Ok(None);
+            };
+            if self.access_deadline(&view).is_some_and(|d| now >= d) {
+                return Ok(None);
+            }
+            match status {
+                // A grant written without `absolute_exp` is inside its
+                // client's cap: now count it as used.
+                "check" => judge = false,
+                "ok" => break view,
+                _ => return Err(anyhow!("grant store: unexpected access-check status")),
+            }
         };
+        let exp = self.access_deadline(&grant).map_or(exp, |d| exp.min(d));
         Ok(Some(AccessGrant {
             grant,
             generation,
             iat,
             exp,
         }))
+    }
+
+    /// The absolute expiry the access check enforces: the one written into the
+    /// grant, else (a grant written while no cap applied) `auth_time` + the cap
+    /// now configured for its client. A lowered cap reaches a grant that has
+    /// one written at its next rotation; its access tokens live at most
+    /// [`ACCESS_TOKEN_TTL`] beyond.
+    fn access_deadline(&self, view: &GrantView) -> Option<i64> {
+        view.absolute_exp.or_else(|| {
+            effective_absolute_exp(view.auth_time, None, self.lifetime.cap_for(&view.client_id))
+        })
     }
 
     /// The grant a refresh token's handle names, without judging the token:
@@ -1059,10 +1208,15 @@ impl RedisClient {
         let handle = tokens::new_grant_handle();
         let grant_id = GrantId::of_handle(&handle);
         let now = self.redis_time().await?;
+        let cap = self.lifetime.cap_for(&meta.client_id);
         let candidate = SuccessorPair {
             access_token: tokens::new_access_token(),
             refresh_token: tokens::new_refresh_token(&handle),
-            access_exp: now + ACCESS_TOKEN_TTL as i64,
+            access_exp: clamped_access_exp(
+                now,
+                ACCESS_TOKEN_TTL,
+                effective_absolute_exp(meta.iat.min(now), None, cap),
+            ),
         };
         let sealed = seal::seal(req.presented, grant_id.as_str(), &candidate)?;
         let has_device = !meta.device_id.is_empty();
@@ -1103,6 +1257,7 @@ impl RedisClient {
                     &candidate.access_exp.to_string(),
                     req.client_id.unwrap_or(""),
                     &meta.exp.to_string(),
+                    &cap_arg(cap),
                 ],
             )
             .await?;
@@ -1157,10 +1312,15 @@ impl RedisClient {
         let Some(view) = view else {
             return Ok(RotateOutcome::Invalid(InvalidReason::UnknownGrant));
         };
+        let cap = self.lifetime.cap_for(&view.client_id);
         let candidate = SuccessorPair {
             access_token: tokens::new_access_token(),
             refresh_token: handle.map(tokens::new_refresh_token).unwrap_or_default(),
-            access_exp: now + view.access_ttl as i64,
+            access_exp: clamped_access_exp(
+                now,
+                view.access_ttl,
+                effective_absolute_exp(view.auth_time, view.absolute_exp, cap),
+            ),
         };
         let (candidate_digest, sealed) = match handle {
             Some(_) => (
@@ -1193,6 +1353,7 @@ impl RedisClient {
                     grant_id.as_str(),
                     flag(has_device),
                     &candidate.access_exp.to_string(),
+                    &cap_arg(cap),
                 ],
             )
             .await?;
