@@ -4365,6 +4365,20 @@ mod tests {
         );
     }
 
+    /// `POST /token` reads the client secret from an `Authorization: Basic`
+    /// header (`client_secret_basic`), from the form (`client_secret_post`), and
+    /// accepts a public client with no secret (`none`). Discovery lists what
+    /// the endpoint implements, so a client that picks the RFC 8414 default
+    /// (`client_secret_basic`) finds it.
+    #[test]
+    fn discovery_advertises_every_client_authentication_method_the_token_endpoint_accepts() {
+        let value = provider_metadata_value(&discovery_config(), true).unwrap();
+        assert_eq!(
+            value["token_endpoint_auth_methods_supported"],
+            serde_json::json!(["client_secret_basic", "client_secret_post", "none"]),
+        );
+    }
+
     #[test]
     fn provider_metadata_advertises_msc4191_account_management() {
         // AC1: served metadata must include account_management_uri and an
