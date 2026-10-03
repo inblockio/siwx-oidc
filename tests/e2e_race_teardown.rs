@@ -1890,20 +1890,15 @@ async fn h9_device_code_approved_no_double_redemption() {
 }
 
 // ===========================================================================
-// Refresh-token rotation GRACE WINDOW (Element-X mobile sign-out fix)
+// Refresh rotation: one live chain (H1, I3) and lost-response recovery (H2, I4)
 //
-// Root cause (see docs/audits/2026-06-23-elementx-refresh-rotation-signout.md):
-// rotation hard-deletes the old refresh token with NO grace, so a client that
-// LOSES the rotation response (mobile: radio handoff, app suspension,
-// cross-process refresh) replays the old token, gets `invalid_grant`, and is
-// signed out. Desired: a replay within REFRESH_GRACE_TTL returns the SAME
-// successor pair. Covers BOTH refresh entry points (OAuth /token = the path
-// Element-X uses, and the compat /_matrix/client/v3/refresh CS-API path). A
-// never-issued token still fails closed (grace must not blanket-accept).
-//
-// This is a normal #[ignore] guard (not RUN_REPRO-gated): it is RED against the
-// pre-fix server (replay -> invalid_grant / M_UNKNOWN_TOKEN) and GREEN once the
-// grace window lands.
+// Both refresh endpoints run the same rotation script. H1: concurrent
+// refreshes of one token converge on ONE successor pair, and exactly one chain
+// stays live. H2: a replay of the immediately previous refresh token returns
+// the same successor pair for as long as that pair is unused, whatever the
+// delay (no timer), and is refused as reuse once its access token has been
+// accepted. The audit behind the recovery requirement (mobile clients that lose
+// a rotation response) is docs/audits/2026-06-23-elementx-refresh-rotation-signout.md.
 // ===========================================================================
 
 /// Refresh via the OAuth /token endpoint (grant_type=refresh_token) — the path
@@ -1945,72 +1940,228 @@ async fn compat_refresh(c: &Client, base: &str, refresh_token: &str) -> (StatusC
     (status, body)
 }
 
-#[tokio::test]
-#[ignore = "requires live e2e stack (e2e/up.sh)"]
-async fn refresh_grace_window_tolerates_replay() {
+/// Which refresh endpoint a test drives.
+#[derive(Clone, Copy, Debug)]
+enum RefreshAt {
+    /// `POST /token`, `grant_type=refresh_token`, as the login's client.
+    Token,
+    /// `POST /_matrix/client/v3/refresh`.
+    Matrix,
+}
+
+/// Refresh at `at`; returns the status and the `(access, refresh)` pair on a 200.
+async fn refresh_at(
+    c: &Client,
+    base: &str,
+    at: RefreshAt,
+    refresh_token: &str,
+    login: &LoginResult,
+) -> (StatusCode, Value, Option<(String, String)>) {
+    let (status, body) = match at {
+        RefreshAt::Token => oauth_refresh(c, base, refresh_token, login).await,
+        RefreshAt::Matrix => compat_refresh(c, base, refresh_token).await,
+    };
+    let pair = (status == StatusCode::OK).then(|| {
+        (
+            body["access_token"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            body["refresh_token"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        )
+    });
+    (status, body, pair)
+}
+
+/// The refusal each endpoint gives an unknown (or reused) refresh token.
+fn assert_refused_as_unknown(at: RefreshAt, status: StatusCode, body: &Value, what: &str) {
+    match at {
+        RefreshAt::Token => {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{what} at /token: {body}");
+            assert_eq!(body["error"], "invalid_grant", "{what} at /token: {body}");
+        }
+        RefreshAt::Matrix => {
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{what} at the Matrix endpoint: {body}"
+            );
+            assert_eq!(
+                body["errcode"], "M_UNKNOWN_TOKEN",
+                "{what} at the Matrix endpoint: {body}"
+            );
+        }
+    }
+}
+
+const H1_PARALLEL: usize = 50;
+
+/// H1: `H1_PARALLEL` concurrent refreshes of one refresh token all succeed and
+/// all carry the SAME new pair; afterwards exactly one chain is live.
+async fn concurrent_refreshes_converge(at: RefreshAt) {
     let base = oidc();
     let c = Client::new();
-
-    // ---- OAuth /token path (the path Element-X uses) ----
     mock_reset(&c).await;
-    let w = new_wallet();
-    let login = wallet_login(&c, &base, &w).await;
+    let login = Arc::new(wallet_login(&c, &base, &new_wallet()).await);
 
-    // First refresh rotates: login.refresh_token is consumed; rt1/at1 are minted.
-    let (s1, v1) = oauth_refresh(&c, &base, &login.refresh_token, &login).await;
-    assert_eq!(s1, StatusCode::OK, "first /token refresh must succeed");
-    let rt1 = v1["refresh_token"].as_str().unwrap().to_string();
-    assert!(
-        token_active(&c, v1["access_token"].as_str().unwrap()).await,
-        "freshly rotated access token must be active"
-    );
-
-    // Replay the OLD (just-rotated) refresh token within the grace window.
-    // PRE-FIX: invalid_grant (400). POST-FIX: 200 with the SAME successor pair.
-    let (s2, v2) = oauth_refresh(&c, &base, &login.refresh_token, &login).await;
-    assert_eq!(
-        s2,
-        StatusCode::OK,
-        "grace replay of a just-rotated refresh token must succeed (got {s2}); \
-         this is the Element-X mobile sign-out bug"
-    );
-    assert!(
-        token_active(&c, v2["access_token"].as_str().unwrap()).await,
-        "the access token returned on grace replay must be active"
-    );
-    assert_eq!(
-        v2["refresh_token"].as_str().unwrap(),
-        rt1,
-        "grace replay must return the SAME successor refresh token (idempotent)"
-    );
-
-    // Negative: a well-formed but never-issued refresh token still fails closed.
-    let (sbad, _) = oauth_refresh(&c, &base, "mcr_never_issued_grace_probe", &login).await;
+    let barrier = Arc::new(Barrier::new(H1_PARALLEL));
+    let mut tasks = Vec::new();
+    for _ in 0..H1_PARALLEL {
+        let cc = Client::new();
+        let base = base.clone();
+        let login = login.clone();
+        let b = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            b.wait().await;
+            let (status, body, pair) =
+                refresh_at(&cc, &base, at, &login.refresh_token, &login).await;
+            (status, body, pair)
+        }));
+    }
+    let mut pairs = Vec::new();
+    for t in tasks {
+        let (status, body, pair) = t.await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{at:?}: every concurrent refresh succeeds: {body}"
+        );
+        pairs.push(pair.unwrap());
+    }
+    let first = pairs[0].clone();
     assert_ne!(
-        sbad,
-        StatusCode::OK,
-        "an unknown refresh token must be rejected, never graced"
+        first.1, login.refresh_token,
+        "{at:?}: the refresh token rotated"
+    );
+    let distinct: std::collections::HashSet<_> = pairs.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        1,
+        "{at:?}: all {H1_PARALLEL} responses carry the same pair, got {} distinct",
+        distinct.len()
     );
 
-    // ---- Compat /_matrix/client/v3/refresh path ----
-    mock_reset(&c).await;
-    let w2 = new_wallet();
-    let login2 = wallet_login(&c, &base, &w2).await;
-
-    let (cs1, _) = compat_refresh(&c, &base, &login2.refresh_token).await;
-    assert_eq!(cs1, StatusCode::OK, "compat first refresh must succeed");
-
-    // Replay the OLD refresh token on the compat endpoint -> grace.
-    let (cs2, cv2) = compat_refresh(&c, &base, &login2.refresh_token).await;
+    // Exactly one chain: the returned refresh token rotates once, and once that
+    // pair is in use neither the original token nor the first successor
+    // refreshes any more.
+    let (status, body, second) = refresh_at(&c, &base, at, &first.1, &login).await;
     assert_eq!(
-        cs2,
+        status,
         StatusCode::OK,
-        "compat grace replay of a just-rotated refresh token must succeed (got {cs2})"
+        "{at:?}: the returned refresh token rotates: {body}"
+    );
+    let second = second.unwrap();
+    assert_ne!(
+        second.1, first.1,
+        "{at:?}: the second rotation mints a new token"
     );
     assert!(
-        token_active(&c, cv2["access_token"].as_str().unwrap()).await,
-        "compat grace replay access token must be active"
+        token_active(&c, &second.0).await,
+        "{at:?}: the new access token is active"
     );
+    for (old, what) in [
+        (&login.refresh_token, "the original token"),
+        (&first.1, "the first successor"),
+    ] {
+        let (status, body, _) = refresh_at(&c, &base, at, old, &login).await;
+        assert_refused_as_unknown(at, status, &body, what);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn concurrent_refreshes_at_the_token_endpoint_converge_on_one_pair() {
+    concurrent_refreshes_converge(RefreshAt::Token).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn concurrent_refreshes_at_the_matrix_endpoint_converge_on_one_pair() {
+    concurrent_refreshes_converge(RefreshAt::Matrix).await;
+}
+
+/// H2: a replay of the previous refresh token returns the same pair while the
+/// pair is unused, and is reuse (refused like an unknown token) once its access
+/// token has been introspected. Reuse is logged, never acted on (phase A): the
+/// live chain keeps working. A never-issued token is refused.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn a_replay_returns_the_same_pair_until_the_new_access_token_is_used() {
+    let base = oidc();
+    let c = Client::new();
+    for at in [RefreshAt::Token, RefreshAt::Matrix] {
+        mock_reset(&c).await;
+        let login = wallet_login(&c, &base, &new_wallet()).await;
+        let (status, body, pair) = refresh_at(&c, &base, at, &login.refresh_token, &login).await;
+        assert_eq!(status, StatusCode::OK, "{at:?}: first refresh: {body}");
+        let pair = pair.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let (status, body, replay) = refresh_at(&c, &base, at, &login.refresh_token, &login).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{at:?}: a replay before first use recovers: {body}"
+        );
+        assert_eq!(
+            replay.unwrap(),
+            pair,
+            "{at:?}: the replay returns the SAME pair"
+        );
+
+        assert!(
+            token_active(&c, &pair.0).await,
+            "{at:?}: the new access token is active"
+        );
+        let (status, body, _) = refresh_at(&c, &base, at, &login.refresh_token, &login).await;
+        assert_refused_as_unknown(at, status, &body, "a replay after the new pair was used");
+
+        let (status, body, _) = refresh_at(&c, &base, at, &pair.1, &login).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{at:?}: reuse revokes nothing in phase A: {body}"
+        );
+
+        let (status, body, _) =
+            refresh_at(&c, &base, at, "mcr_never_issued_replay_probe", &login).await;
+        assert_refused_as_unknown(at, status, &body, "a never-issued token");
+    }
+}
+
+/// H2: the recovery has no timer. A replay more than a minute after the
+/// rotation (the old grace window was 60 s) still returns the same pair, at
+/// both endpoints. One real wait covers both.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn a_replay_after_more_than_a_minute_still_returns_the_same_pair() {
+    let base = oidc();
+    let c = Client::new();
+    mock_reset(&c).await;
+    let mut rotated = Vec::new();
+    for at in [RefreshAt::Token, RefreshAt::Matrix] {
+        let login = wallet_login(&c, &base, &new_wallet()).await;
+        let (status, body, pair) = refresh_at(&c, &base, at, &login.refresh_token, &login).await;
+        assert_eq!(status, StatusCode::OK, "{at:?}: first refresh: {body}");
+        rotated.push((at, login, pair.unwrap()));
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(65)).await;
+    for (at, login, pair) in &rotated {
+        let (status, body, replay) = refresh_at(&c, &base, *at, &login.refresh_token, login).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{at:?}: a replay after 65 s recovers: {body}"
+        );
+        assert_eq!(
+            replay.as_ref(),
+            Some(pair),
+            "{at:?}: the replay returns the SAME pair"
+        );
+    }
 }
 
 // ===========================================================================
