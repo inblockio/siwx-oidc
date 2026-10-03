@@ -34,7 +34,7 @@ everything else exists only in the binary crate.
 | `lib.rs` | Library crate root. `synapse_client` is deliberately not re-exported (see Invariants). |
 | `axum_lib.rs` | Startup: loads config through `config::figment()`, validates it (DID methods and pkh namespaces against the aqua-auth registries, signing key, retired keys, WebAuthn), `store_default_clients` (digested), `AppState`, the router, handler glue, the `siwx_user` / `acct_session` cookies, the CORS layer. |
 | `config.rs` | `Config`, its defaults, and `figment()`: the one place config names and precedence are defined. Reference: [docs/configuration.md](docs/configuration.md). |
-| `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_code_client` and `authenticate_refresh_client` authenticate the client for the first two, and `client_is_confidential` decides which clients must present a secret), `userinfo`, client registration, `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, and `provision_synapse_device`, the single provisioning and DID-publication path. |
+| `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_code_client` and `authenticate_refresh_client` authenticate the client for the first two, and `client_is_confidential` decides which clients must present a secret), `userinfo`, client registration, RP-initiated logout (`end_session`, `verify_id_token_hint`), `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, and `provision_synapse_device`, the single provisioning and DID-publication path. |
 | `introspect.rs` | `POST /oauth2/introspect` (RFC 7662) for Synapse; opaque `mat_`/`mcr_` token generation. |
 | `admin_token.rs` | `POST /oauth2/admin_token`: short-TTL token whose scope carries `urn:synapse:admin:*`. |
 | `compat.rs` | `POST /oauth2/revoke` (RFC 7009) and the Matrix client-server endpoints siwx-oidc answers (login flows, logout, logout/all, refresh, device deletion); `TeardownPolicy`. |
@@ -460,7 +460,10 @@ doc; read it before changing the code the rule covers.
   writes no session; a spent session cannot sign in again. Not covered: the `siwx_user` and
   `acct_session` cookies (Phase 4 of the token rework moves them); passkey credential ids
   (`webauthn:credential/{id}`, `webauthn:link/{id}`), which are public identifiers the server
-  hands out in `allowCredentials`, not bearer credentials; and the login CAIP-122 nonce, a
+  hands out in `allowCredentials`, not bearer credentials; a grant's `sid` (stored in the grant
+  and as the key `idx:grants:sid/{sid}`), which every RP that holds the ID token receives and
+  which ends a session only together with an ID token this provider signed; and the login
+  CAIP-122 nonce, a
   challenge kept in the value of the digest-keyed session, which authenticates nothing without
   the session id and a signature. Pin (mock stack, each scans the whole stack Redis):
   `no_token_the_client_holds_is_stored_in_the_clear`,
@@ -576,6 +579,35 @@ doc; read it before changing the code the rule covers.
   `upsert_names_only_a_device_this_sign_in_creates`,
   `a_client_supplied_device_that_exists_keeps_its_name`,
   `sign_in_names_a_new_device_after_the_registered_client`.
+- **Every grant issued with an ID token has its own random `sid`, and every ID token carries
+  it** (I8). The `sid` is 22 random base62 characters (`tokens::new_session_id`), never derived
+  from the grant handle, a token or the device id; `idx:grants:sid/{sid}` names the grant for
+  exactly the grant's lifetime (issue and rotation set both TTLs; every script that deletes a
+  grant goes through the one Lua helper `drop_grant`, which drops the index entry and is where
+  back-channel logout enqueues). A `service` grant has none, and a grant issued before `sid`
+  existed (or lifted from a legacy token) never gets one: a refresh response has no ID token,
+  so no RP could learn it. Pin: `every_grant_with_an_id_token_has_its_own_random_sid`,
+  `the_sid_index_lives_and_dies_with_its_grant`,
+  `the_scripts_name_the_sid_index_the_library_reads`,
+  `every_id_token_carries_the_sid_of_its_grant`.
+- **RP-initiated logout (`/end_session`) checks everything before it ends anything, ends
+  exactly the grant the hint's `sid` names, and never deletes a Matrix device.** The
+  `id_token_hint` must be an ID token this provider signed (live or retired key, by `kid`,
+  over the received bytes, `alg` ES256 only, `iss` this provider; expiry not checked); a
+  `client_id` must be its audience; the grant must belong to the hint's `aud` and `sub`; a
+  `post_logout_redirect_uri` is honoured only when registered for that client, matched exactly
+  through the one helper `oidc::post_logout_redirect_uri_is_registered`, with `state` appended.
+  Any refusal is a 400 that ends nothing and never redirects (no open redirect); a store fault
+  is a 503. Pin: `end_session_deletes_exactly_the_grant_its_hint_names_and_never_a_device`,
+  `end_session_redirects_only_to_an_exactly_registered_uri_with_state`,
+  `end_session_refuses_a_foreign_or_tampered_hint` (mock stack);
+  `an_id_token_hint_verifies_with_the_live_or_a_retired_key_expired_or_not`,
+  `a_tampered_foreign_unsigned_or_misissued_hint_is_refused`,
+  `post_logout_redirect_uri_matching_is_exact`,
+  `end_session_ends_the_named_oidc_grant_and_redirects_with_state`,
+  `end_grant_by_sid_deletes_exactly_the_named_grant_of_its_client_and_did`,
+  `registration_stores_and_echoes_post_logout_redirect_uris_and_refuses_a_fragment`,
+  `discovery_advertises_the_end_session_endpoint`.
 - **`/oauth2/revoke` never deletes a device.** Only explicit sign-out (`logout`, MSC4191
   `device_delete`) does; `logout/all` never deactivates the account. Pin:
   `teardown_policy_only_deletes_device_on_explicit_signout`,

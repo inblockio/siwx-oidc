@@ -391,6 +391,36 @@ token.
    issues tokens (see [below](#device-code-and-qr-login)).
 5. `/userinfo` accepts an access token only. An authorization code is not a
    bearer token, before or after its exchange.
+6. **RP-initiated logout.** Every grant issued with an ID token has a random
+   session id, `sid`, which its ID token carries (both modes). `GET` or `POST
+   /end_session` (OpenID Connect RP-Initiated Logout 1.0, advertised as
+   `end_session_endpoint`) with an `id_token_hint` ends exactly the grant that
+   `sid` names, if it belongs to the hint's client and subject: its access
+   token is inactive at once and its refresh token is refused at both
+   endpoints. The hint must be an ID token this provider signed, with the live
+   or a retired key; an expired one is accepted. A `client_id` must be the
+   hint's audience. A `post_logout_redirect_uri` is honoured only when the
+   client registered it (`post_logout_redirect_uris`, matched exactly, query
+   included), with `state` appended; without one the answer is a signed-out
+   page. Any refusal is a 400 that ends nothing and never redirects; a store
+   fault is a 503. End-session never deletes a Synapse device: in Matrix mode
+   it ends the device's grant and leaves the device to the Matrix `logout` or
+   the account page, like `/oauth2/revoke`. A grant issued before `sid`
+   existed has none and ends by revocation, expiry or an epoch instead.
+
+**What Element Web sends on sign-out.** Element Web signed in through the
+OAuth 2.0 API does not call `POST /_matrix/client/v3/logout`; it revokes both
+tokens at `/oauth2/revoke` in parallel, each with `client_id` and
+`token_type_hint` (matrix-js-sdk 42.4, `Lifecycle.ts` `doLogout`). In Matrix
+mode either revocation ends the device's grants (the first one wins, the
+second finds nothing and answers 200), and neither deletes the Synapse device
+(`TeardownPolicy::TokensOnly`): the device stays until it is removed from the
+session list or the account page. Grant-level RFC 7009 (provisional): for a
+token with no device, a refresh token ends its grant and an access token only
+itself. Pin: `h1_revoke_does_not_delete_device_but_logout_does`,
+`teardown_policy_only_deletes_device_on_explicit_signout`,
+`revoking_a_deviceless_refresh_token_revokes_its_grant_an_access_token_only_itself`,
+`revoking_by_token_deletes_the_grant_of_an_accepted_token_only`.
 
 **Lifetime.** A grant ends 90 days after its last refresh and, when an
 absolute lifetime is configured (`grant_absolute_lifetime_secs`, per client
@@ -486,6 +516,15 @@ Builds before the grant record stored each token as `token/{raw}` with its
   extends a grant to 90 days of inactivity again. The epoch keys outlive the
   rollback, so after rolling forward the same grants are refused again; to keep
   them refused during the rollback, delete them before rolling back.
+- A rollback to a build before `sid` serves no `/end_session` (404) and issues
+  ID tokens without `sid`. It ignores the grants' `sid` field and the
+  `idx:grants:sid/*` keys: its rotation extends a grant but not the index
+  entry, and its deletions leave the entry behind (it names a grant that is
+  gone, and expires on its own). After rolling forward, end-session ends
+  nothing for a grant whose index entry expired during the rollback; that grant
+  still ends by revocation, expiry or an epoch. Its client registration reads
+  `post_logout_redirect_uris` without knowing it, and a client update through
+  the old build drops it.
 
 A token-store fault is never answered as a refusal. `POST
 /_matrix/client/v3/refresh` and the device-deletion routes (`DELETE
