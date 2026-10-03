@@ -12,19 +12,19 @@ use openidconnect::{
     core::{
         CoreAuthErrorResponseType, CoreAuthPrompt, CoreClaimName, CoreClientAuthMethod,
         CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType, CoreGenderClaim,
-        CoreGrantType, CoreIdToken, CoreIdTokenClaims, CoreIdTokenFields, CoreJsonWebKey,
-        CoreJsonWebKeySet, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm,
-        CoreProviderMetadata, CoreRegisterErrorResponseType, CoreResponseType,
-        CoreSubjectIdentifierType, CoreTokenResponse, CoreTokenType,
+        CoreGrantType, CoreJsonWebKey, CoreJsonWebKeySet, CoreJweContentEncryptionAlgorithm,
+        CoreJwsSigningAlgorithm, CoreProviderMetadata, CoreRegisterErrorResponseType,
+        CoreResponseType, CoreSubjectIdentifierType, CoreTokenType,
     },
     registration::{EmptyAdditionalClientMetadata, EmptyAdditionalClientRegistrationResponse},
     url::Url,
     AccessToken, AdditionalClaims, Audience, AuthUrl, ClientConfigUrl, ClientId, ClientSecret,
-    EmptyAdditionalClaims, EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserName,
-    EndUserUsername, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl, LocalizedClaim, Nonce, OpPolicyUrl,
-    OpTosUrl, PrivateSigningKey, RedirectUrl, RefreshToken, RegistrationAccessToken,
+    EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserName, EndUserUsername, IdToken,
+    IdTokenClaims, IdTokenFields, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl, LocalizedClaim, Nonce,
+    OpPolicyUrl, OpTosUrl, PrivateSigningKey, RedirectUrl, RefreshToken, RegistrationAccessToken,
     RegistrationUrl, RequestUrl, ResponseTypes, Scope, SigningError, StandardClaims,
-    SubjectIdentifier, TokenUrl, UserInfoClaims, UserInfoJsonWebToken, UserInfoUrl,
+    StandardTokenResponse, SubjectIdentifier, TokenUrl, UserInfoClaims, UserInfoJsonWebToken,
+    UserInfoUrl,
 };
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
@@ -296,6 +296,37 @@ fn verification_jwk(verifying_key: &p256::ecdsa::VerifyingKey, kid: &str) -> Cor
     jwk_value["kid"] = serde_json::Value::String(kid.to_string());
     serde_json::from_value(jwk_value).expect("Failed to construct EC JWK")
 }
+
+// -- ID tokens ---------------------------------------------------------------
+
+/// The claims this provider adds to an ID token: the session id of the grant
+/// the token was issued with (I8; OpenID Connect Front-/Back-Channel Logout
+/// and RP-Initiated Logout name a session by it). Omitted, never `null`, when
+/// a grant has none (a `service` grant never comes with an ID token).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SidClaims {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+}
+
+impl AdditionalClaims for SidClaims {}
+
+/// The ID token claim set: the OIDC Core claims plus [`SidClaims`].
+pub type SiwxIdTokenClaims = IdTokenClaims<SidClaims, CoreGenderClaim>;
+/// A signed ID token of [`SiwxIdTokenClaims`].
+pub type SiwxIdToken =
+    IdToken<SidClaims, CoreGenderClaim, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm>;
+/// The token response fields carrying a [`SiwxIdToken`].
+pub type SiwxIdTokenFields = IdTokenFields<
+    SidClaims,
+    EmptyExtraTokenFields,
+    CoreGenderClaim,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJwsSigningAlgorithm,
+>;
+/// `POST /token`'s response: `CoreTokenResponse` with [`SidClaims`] in the ID
+/// token. The JSON shape is unchanged apart from the `sid` claim inside it.
+pub type SiwxTokenResponse = StandardTokenResponse<SiwxIdTokenFields, CoreTokenType>;
 
 // -- Error types -----------------------------------------------------------
 
@@ -921,7 +952,7 @@ pub async fn token(
     config: &crate::config::Config,
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
-) -> Result<CoreTokenResponse, CustomError> {
+) -> Result<SiwxTokenResponse, CustomError> {
     match form.grant_type {
         CoreGrantType::AuthorizationCode => {
             token_authorization_code(form, credentials, signing_key, config, db_client).await
@@ -1091,7 +1122,7 @@ async fn token_refresh(
     credentials: ClientCredentials,
     config: &crate::config::Config,
     db_client: &DBClientType,
-) -> Result<CoreTokenResponse, CustomError> {
+) -> Result<SiwxTokenResponse, CustomError> {
     let named_client = named_client_id(&form, &credentials)?;
     let presented_secret = credentials.secret.or(form.client_secret);
     let rt = form.refresh_token.ok_or_else(|| {
@@ -1176,10 +1207,10 @@ async fn token_refresh(
         }
     };
 
-    let mut response = CoreTokenResponse::new(
+    let mut response = SiwxTokenResponse::new(
         AccessToken::new(pair.access_token),
         CoreTokenType::Bearer,
-        CoreIdTokenFields::new(None, EmptyExtraTokenFields {}),
+        SiwxIdTokenFields::new(None, EmptyExtraTokenFields {}),
     );
     response.set_expires_in(Some(&time::Duration::from_secs(expires_in)));
     response.set_refresh_token(Some(RefreshToken::new(pair.refresh_token)));
@@ -1208,7 +1239,7 @@ async fn token_device_code(
     config: &crate::config::Config,
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
-) -> Result<CoreTokenResponse, CustomError> {
+) -> Result<SiwxTokenResponse, CustomError> {
     if !delegated_auth_enabled(config) {
         return Err(device_grant_unsupported());
     }
@@ -1393,16 +1424,16 @@ async fn token_device_code(
                 anyhow!("device_code grant: issue_grant returned no refresh token")
             })?;
 
-            let core_id_token = CoreIdTokenClaims::new(
+            let core_id_token = SiwxIdTokenClaims::new(
                 IssuerUrl::from_url(config.base_url.clone()),
                 vec![Audience::new(client_id)],
                 now + Duration::seconds(config.id_token_ttl_secs as i64),
                 now,
                 claims,
-                EmptyAdditionalClaims {},
+                SidClaims { sid: issued.sid },
             );
 
-            let id_token = CoreIdToken::new(
+            let id_token = SiwxIdToken::new(
                 core_id_token,
                 signing_key,
                 CoreJwsSigningAlgorithm::EcdsaP256Sha256,
@@ -1417,10 +1448,10 @@ async fn token_device_code(
 
             info!(did = %did, device_id = %dev_id, "device_code grant: tokens issued");
 
-            let mut response = CoreTokenResponse::new(
+            let mut response = SiwxTokenResponse::new(
                 AccessToken::new(access_token),
                 CoreTokenType::Bearer,
-                CoreIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
+                SiwxIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
             );
             response.set_expires_in(Some(&time::Duration::from_secs(ACCESS_TOKEN_TTL)));
             response.set_refresh_token(Some(RefreshToken::new(refresh_token)));
@@ -1514,7 +1545,7 @@ async fn token_authorization_code(
     signing_key: &EcdsaSigningKey,
     config: &crate::config::Config,
     db_client: &DBClientType,
-) -> Result<CoreTokenResponse, CustomError> {
+) -> Result<SiwxTokenResponse, CustomError> {
     // A malformed request is refused before the code is touched.
     let named_client = named_client_id(&form, &credentials)?;
     let presented_secret = credentials.secret.or(form.client_secret);
@@ -1663,18 +1694,18 @@ async fn token_authorization_code(
     let refresh_token = issued.refresh_token.map(RefreshToken::new);
     let access_token = AccessToken::new(issued.access_token);
 
-    let core_id_token = CoreIdTokenClaims::new(
+    let core_id_token = SiwxIdTokenClaims::new(
         IssuerUrl::from_url(config.base_url.clone()),
         vec![Audience::new(client_id.clone())],
         now + Duration::seconds(config.id_token_ttl_secs as i64),
         now,
         claims,
-        EmptyAdditionalClaims {},
+        SidClaims { sid: issued.sid },
     )
     .set_nonce(code_entry.nonce)
     .set_auth_time(Some(code_entry.auth_time));
 
-    let id_token = CoreIdToken::new(
+    let id_token = SiwxIdToken::new(
         core_id_token,
         signing_key,
         CoreJwsSigningAlgorithm::EcdsaP256Sha256,
@@ -1685,10 +1716,10 @@ async fn token_authorization_code(
 
     let expires_in_secs = ACCESS_TOKEN_TTL;
 
-    let mut response = CoreTokenResponse::new(
+    let mut response = SiwxTokenResponse::new(
         access_token,
         CoreTokenType::Bearer,
-        CoreIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
+        SiwxIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
     );
     response.set_expires_in(Some(&time::Duration::from_secs(expires_in_secs)));
     response.set_refresh_token(refresh_token);
@@ -6863,7 +6894,7 @@ mod client_binding_tests {
         config: &Config,
         refresh_token: &str,
         who: Presented<'_>,
-    ) -> Result<CoreTokenResponse, CustomError> {
+    ) -> Result<SiwxTokenResponse, CustomError> {
         token(
             TokenForm {
                 code: None,
@@ -6891,7 +6922,7 @@ mod client_binding_tests {
         config: &Config,
         code: &str,
         who: Presented<'_>,
-    ) -> Result<CoreTokenResponse, CustomError> {
+    ) -> Result<SiwxTokenResponse, CustomError> {
         token(
             TokenForm {
                 code: Some(code.to_string()),
@@ -6917,7 +6948,7 @@ mod client_binding_tests {
     /// The answer, reduced to what a client sees: success, `invalid_grant`
     /// (the grant does not belong to this client), or `invalid_client` (the
     /// client did not authenticate).
-    fn outcome(result: &Result<CoreTokenResponse, CustomError>) -> String {
+    fn outcome(result: &Result<SiwxTokenResponse, CustomError>) -> String {
         match result {
             Ok(_) => "ok".to_string(),
             Err(CustomError::BadRequestToken(e)) => match e.error {
@@ -6930,7 +6961,7 @@ mod client_binding_tests {
         }
     }
 
-    fn refresh_token_of(result: Result<CoreTokenResponse, CustomError>) -> String {
+    fn refresh_token_of(result: Result<SiwxTokenResponse, CustomError>) -> String {
         use openidconnect::OAuth2TokenResponse;
         result
             .unwrap_or_else(|e| panic!("the refresh must succeed: {e:?}"))
@@ -7780,7 +7811,7 @@ mod scope_grant_tests {
         config: &Config,
         client_id: &str,
         code: &str,
-    ) -> CoreTokenResponse {
+    ) -> SiwxTokenResponse {
         token(
             TokenForm {
                 code: Some(code.to_string()),
@@ -7807,13 +7838,13 @@ mod scope_grant_tests {
         config: &Config,
         grants: Option<Vec<CoreGrantType>>,
         scope: Option<&str>,
-    ) -> CoreTokenResponse {
+    ) -> SiwxTokenResponse {
         let client = seed_client_with(db, Registration::Public, grants).await;
         let code = seed_code_with_scope(db, &client, scope).await;
         exchange(db, config, &client, &code).await
     }
 
-    fn scope_of(response: &CoreTokenResponse) -> Option<String> {
+    fn scope_of(response: &SiwxTokenResponse) -> Option<String> {
         response.scopes().map(|scopes| {
             scopes
                 .iter()
@@ -7823,7 +7854,7 @@ mod scope_grant_tests {
         })
     }
 
-    async fn recorded_scope(db: &RedisClient, response: &CoreTokenResponse) -> String {
+    async fn recorded_scope(db: &RedisClient, response: &SiwxTokenResponse) -> String {
         db.check_access_token(response.access_token().secret())
             .await
             .unwrap()
@@ -7963,7 +7994,7 @@ mod scope_grant_tests {
     /// records the Matrix scope for the device and issues a refresh token, and
     /// the response carries no `scope`.
     /// The claims of a response's ID token, decoded without verification.
-    pub(super) fn id_token_claims(response: &CoreTokenResponse) -> serde_json::Value {
+    pub(super) fn id_token_claims(response: &SiwxTokenResponse) -> serde_json::Value {
         let jws = response
             .extra_fields()
             .id_token()

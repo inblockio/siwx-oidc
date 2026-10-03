@@ -137,6 +137,7 @@ fn a_struct_that_holds_a_credential_prints_its_fingerprint_under_debug() {
         grant_id: GrantId::of_handle("log-hygiene-handle"),
         access_token: issued_access.clone(),
         refresh_token: Some(issued_refresh.clone()),
+        sid: Some("log-hygiene-sid".to_string()),
         iat: 0,
         access_exp: 1,
     };

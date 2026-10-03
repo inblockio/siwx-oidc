@@ -1402,3 +1402,96 @@ async fn the_sid_index_lives_and_dies_with_its_grant() {
         "user revoke drops it"
     );
 }
+
+/// The scripts spell the sid index the way the library reads it.
+#[test]
+fn the_scripts_name_the_sid_index_the_library_reads() {
+    let literal = format!("'{KV_GRANT_SID_IDX_PREFIX}/'");
+    for (name, script) in [
+        ("drop_grant", LUA_DROP),
+        ("issue", ISSUE_LUA),
+        ("rotate", ROTATE_LUA),
+    ] {
+        assert!(script.contains(&literal), "{name} must name {literal}");
+    }
+}
+
+/// `end_grant_by_sid` deletes exactly the grant the sid names, with its index
+/// entries, only for the client and DID it was issued to; any other sid, or a
+/// second call, deletes nothing.
+#[tokio::test]
+async fn end_grant_by_sid_deletes_exactly_the_named_grant_of_its_client_and_did() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("endsid{}", nonce());
+    let device = format!("SIWX_{}", nonce());
+    let new = matrix_grant(&user, &device);
+    let named = issue(&client, &new).await;
+    let sibling = issue(&client, &matrix_grant(&user, &device)).await;
+    let sid = named.sid.clone().expect("a matrix grant carries a sid");
+    assert_eq!(
+        sid_of(&client, &named.grant_id).await.as_deref(),
+        Some(sid.as_str())
+    );
+
+    for (client_id, did) in [
+        ("client-b", new.did.as_str()),
+        ("client-a", "did:key:zOther"),
+    ] {
+        assert_eq!(
+            client.end_grant_by_sid(&sid, client_id, did).await.unwrap(),
+            EndedGrant::Mismatch,
+            "{client_id} {did}"
+        );
+    }
+    assert!(client
+        .lookup_access_token(&named.access_token)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        client
+            .end_grant_by_sid("NoSuchSid0000000000000", "client-a", &new.did)
+            .await
+            .unwrap(),
+        EndedGrant::NotFound
+    );
+
+    assert_eq!(
+        client
+            .end_grant_by_sid(&sid, "client-a", &new.did)
+            .await
+            .unwrap(),
+        EndedGrant::Ended {
+            grant_id: named.grant_id.clone(),
+            kind: GrantKind::MatrixDevice
+        }
+    );
+    assert!(client
+        .lookup_access_token(&named.access_token)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(sid_index(&client, &sid).await, None);
+    let members: Vec<String> = raw(&client, &["SMEMBERS", &user_idx_key(&user)]).await;
+    assert_eq!(members, vec![sibling.grant_id.as_str().to_string()]);
+    let members: Vec<String> = raw(&client, &["SMEMBERS", &device_idx_key(&user, &device)]).await;
+    assert_eq!(members, vec![sibling.grant_id.as_str().to_string()]);
+    assert!(
+        !tombstone(&client, &device_tombstone_key(&user, &device)).await,
+        "ending one grant plants no device tombstone"
+    );
+    assert!(client
+        .lookup_access_token(&sibling.access_token)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        client
+            .end_grant_by_sid(&sid, "client-a", &new.did)
+            .await
+            .unwrap(),
+        EndedGrant::NotFound
+    );
+}
