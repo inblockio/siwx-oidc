@@ -40,7 +40,6 @@ use axum_extra::{
     headers::{authorization::Bearer, Authorization},
     TypedHeader,
 };
-use chrono::Utc;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -662,10 +661,9 @@ pub async fn refresh(
         Err(e) => Err(e),
     };
     let (pair, expires_in) = match outcome {
-        Ok(RotateOutcome::Rotated(rotated)) => (rotated.pair, ACCESS_TOKEN_TTL),
-        Ok(RotateOutcome::Replayed(replayed)) => {
-            let left = (replayed.pair.access_exp - Utc::now().timestamp()).max(0) as u64;
-            (replayed.pair, left.min(ACCESS_TOKEN_TTL))
+        Ok(RotateOutcome::Rotated(pair)) | Ok(RotateOutcome::Replayed(pair)) => {
+            let expires_in = pair.expires_in(ACCESS_TOKEN_TTL);
+            (pair.pair, expires_in)
         }
         // Reuse (I5, phase A): recorded, and answered like an unknown token.
         Ok(RotateOutcome::Reuse(event)) => {
@@ -725,6 +723,7 @@ mod tests {
     use super::*;
     use axum::extract::{Form, State};
     use axum::response::IntoResponse;
+    use chrono::Utc;
     use siwx_oidc::db::grant::{GrantKind, IssuedGrant, NewGrant};
     use siwx_oidc::db::tokens;
     use siwx_oidc::db::{DBClient, TokenMetadata, REFRESH_TOKEN_TTL};

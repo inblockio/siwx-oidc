@@ -16,7 +16,6 @@ use axum_extra::{
     headers::{authorization::Bearer, Authorization},
     TypedHeader,
 };
-use chrono::Utc;
 use rand::{thread_rng, Rng};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
@@ -106,8 +105,14 @@ pub async fn introspect(
     }
 
     // Look up the token in Redis.
-    let lookup = state.redis_client.check_access_token(&form.token).await;
-    render_introspection(lookup, Utc::now().timestamp())
+    // Judged and rendered on the store's Redis `TIME` (I6), never this
+    // instance's clock.
+    let lookup = state.redis_client.check_access_token_at(&form.token).await;
+    let now = match &lookup {
+        Ok(Some((_, now))) => *now,
+        _ => 0,
+    };
+    render_introspection(lookup.map(|found| found.map(|(meta, _)| meta)), now)
 }
 
 /// Render an introspection lookup outcome.

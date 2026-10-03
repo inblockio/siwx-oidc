@@ -411,6 +411,8 @@ pub struct AccessGrant {
     pub generation: u64,
     pub iat: i64,
     pub exp: i64,
+    /// Redis `TIME` (Unix seconds) the token was judged at; `exp` is after it.
+    pub now: i64,
 }
 
 impl AccessGrant {
@@ -449,6 +451,18 @@ pub struct RotatedPair {
     /// The grant's generation after the rotation the pair came from.
     pub generation: u64,
     pub pair: SuccessorPair,
+    /// Redis `TIME` (Unix seconds) the pair's `expires_in` counts from: the
+    /// instant of the rotation, or the instant a replay was answered.
+    pub at: i64,
+}
+
+impl RotatedPair {
+    /// The `expires_in` both refresh endpoints answer: the seconds the access
+    /// token has left at [`at`](Self::at), at most `ttl`, never negative. On
+    /// Redis `TIME`, never an instance clock (I6).
+    pub fn expires_in(&self, ttl: u64) -> u64 {
+        (self.pair.access_exp - self.at).clamp(0, i64::try_from(ttl).unwrap_or(i64::MAX)) as u64
+    }
 }
 
 /// Why a refresh token was refused as unknown.
@@ -862,7 +876,7 @@ if f[6] ~= '' and ARGV[1] == f[6] then
     if not f[8] or f[8] == '' then
       return {'invalid', 'no_successor'}
     end
-    return {'replayed', tostring(generation), f[8]}
+    return {'replayed', tostring(generation), f[8], tostring(now)}
   end
   return {'reuse', 'previous_after_use', tostring(generation)}
 end
@@ -1146,7 +1160,7 @@ impl RedisClient {
         let exp: i64 = number(get("exp"), "access entry")?;
         let mut judge = self.lifetime.is_configured();
         let mark_used = format!("{LUA_EPOCH}{MARK_USED_LUA}");
-        let grant = loop {
+        let (grant, now) = loop {
             let reply: Option<Vec<String>> = self
                 .eval(
                     &mark_used,
@@ -1176,16 +1190,22 @@ impl RedisClient {
                 // A grant written without `absolute_exp` is inside its
                 // client's cap: now count it as used.
                 "check" => judge = false,
-                "ok" => break view,
+                "ok" => break (view, now),
                 _ => return Err(anyhow!("grant store: unexpected access-check status")),
             }
         };
         let exp = self.access_deadline(&grant).map_or(exp, |d| exp.min(d));
+        // The token's own `exp`, on Redis `TIME` (I6): its entry's TTL ends at
+        // the same instant, but the store, not an instance clock, decides.
+        if exp <= now {
+            return Ok(None);
+        }
         Ok(Some(AccessGrant {
             grant,
             generation,
             iat,
             exp,
+            now,
         }))
     }
 
@@ -1418,6 +1438,7 @@ impl RedisClient {
                     grant_id,
                     generation: 1,
                     pair: candidate,
+                    at: now,
                 })
             }
             Some("lifted") => self.rotate_refresh_token(req).await?,
@@ -1509,14 +1530,17 @@ impl RedisClient {
                 grant_id,
                 generation: number(field(1), "rotation reply")?,
                 pair: candidate,
+                at: now,
             }),
             Some("replayed") => {
                 let generation = number(field(1), "rotation reply")?;
+                let at = number(field(3), "rotation reply")?;
                 match field(2).and_then(|s| seal::open(req.presented, grant_id.as_str(), s)) {
                     Some(pair) => RotateOutcome::Replayed(RotatedPair {
                         grant_id,
                         generation,
                         pair,
+                        at,
                     }),
                     None => RotateOutcome::Invalid(InvalidReason::NoSuccessor),
                 }
@@ -1668,8 +1692,18 @@ impl RedisClient {
     /// the grant record wrote access tokens as `token/{raw}` with a lifetime of
     /// at most 900 s, so one release later none is left.
     pub async fn check_access_token(&self, token: &str) -> Result<Option<TokenMetadata>> {
+        Ok(self
+            .check_access_token_at(token)
+            .await?
+            .map(|(meta, _)| meta))
+    }
+
+    /// [`check_access_token`](Self::check_access_token) with the Redis `TIME`
+    /// (Unix seconds) the token was judged at, for introspection's
+    /// `expires_in` (I6: no instance clock).
+    pub async fn check_access_token_at(&self, token: &str) -> Result<Option<(TokenMetadata, i64)>> {
         if let Some(access) = self.lookup_access_token(token).await? {
-            return Ok(Some(access.metadata()));
+            return Ok(Some((access.metadata(), access.now)));
         }
         let Some(meta) = self
             .get_token(token)
@@ -1680,16 +1714,24 @@ impl RedisClient {
         };
         // An epoch refuses a legacy access token issued at or before it, its
         // `iat` counted from the start of its second like a grant's `auth_time`.
-        if meta.iat.saturating_mul(1000) <= self.epoch_for(&meta.username, &meta.client_id).await? {
+        if self
+            .epoch_for(&meta.username, &meta.client_id)
+            .await?
+            .is_some_and(|epoch| meta.iat.saturating_mul(1000) <= epoch)
+        {
             return Ok(None);
         }
-        Ok(Some(meta))
+        let now = self.redis_time().await?;
+        if meta.exp <= now {
+            return Ok(None);
+        }
+        Ok(Some((meta, now)))
     }
 
     /// The largest epoch that applies to a grant of `username` at `client_id`
-    /// (Unix milliseconds; 0 when none is set), for the checks made outside
-    /// the scripts (I9).
-    async fn epoch_for(&self, username: &str, client_id: &str) -> Result<i64> {
+    /// (Unix milliseconds; `None` when none is set), for the checks made
+    /// outside the scripts (I9).
+    async fn epoch_for(&self, username: &str, client_id: &str) -> Result<Option<i64>> {
         let mut conn = self
             .pool
             .get()
@@ -1702,9 +1744,12 @@ impl RedisClient {
             .query_async(&mut *conn)
             .await
             .map_err(|e| anyhow!("grant store MGET: {e}"))?;
-        epochs.iter().flatten().try_fold(0, |max, epoch| {
-            number::<i64>(Some(epoch), "epoch").map(|e| max.max(e))
-        })
+        epochs
+            .iter()
+            .flatten()
+            .try_fold(None, |max: Option<i64>, epoch| {
+                number::<i64>(Some(epoch), "epoch").map(|e| Some(max.map_or(e, |m| m.max(e))))
+            })
     }
 
     /// The grant of a refresh token the refresh endpoints would accept now:
@@ -1741,7 +1786,11 @@ impl RedisClient {
         let Some(view) = view_or_none(grant_id, &fields)? else {
             return Ok(None);
         };
-        if view.auth_ms <= self.epoch_for(&view.username, &view.client_id).await? {
+        if self
+            .epoch_for(&view.username, &view.client_id)
+            .await?
+            .is_some_and(|epoch| view.auth_ms <= epoch)
+        {
             return Ok(None);
         }
         Ok(Some(view))

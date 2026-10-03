@@ -528,3 +528,87 @@ async fn h5_no_sequence_outlives_the_absolute_expiry() {
     assert!(rotations > SEQUENCES && replays > 0 && accepted > SEQUENCES);
     assert_eq!(expiries, SEQUENCES, "every sequence reached its expiry");
 }
+
+/// The access check judges a token's own `exp` on Redis `TIME` (I6), not only
+/// by the TTL of its entry, and reports the instant it judged at, which
+/// introspection renders `expires_in` from instead of an instance clock.
+#[tokio::test]
+async fn the_access_check_judges_exp_on_redis_time() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let g = issue(
+        &client,
+        &grant_for("client-exp", "", redis_now(&client).await),
+    )
+    .await;
+    let key = at_key(&g.access_token);
+    let past = redis_now(&client).await - 1;
+    let _: i64 = raw(&client, &["HSET", &key, "exp", &past.to_string()]).await;
+    assert!(
+        ttl(&client, &key).await > 0,
+        "the entry itself is still alive"
+    );
+    assert!(
+        client
+            .check_access_token(&g.access_token)
+            .await
+            .unwrap()
+            .is_none(),
+        "a token past its exp on Redis TIME is refused"
+    );
+}
+
+/// `expires_in` at both refresh endpoints counts from the store's Redis `TIME`
+/// (I6): a rotation's from its own instant (the full lifetime without a cap,
+/// less near the absolute expiry), a replay's from the instant it was answered.
+#[tokio::test]
+async fn expires_in_counts_from_the_stores_redis_time() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let g = issue(
+        &client,
+        &grant_for("client-ei", "", redis_now(&client).await),
+    )
+    .await;
+    let rt = g.refresh_token.clone().unwrap();
+    let before = redis_now(&client).await;
+    let r = rotated(rotate(&client, &rt).await);
+    assert_eq!(r.expires_in(ACCESS_TOKEN_TTL), ACCESS_TOKEN_TTL);
+    let replay = match rotate(&client, &rt).await {
+        RotateOutcome::Replayed(p) => p,
+        other => panic!("expected a replay, got {other:?}"),
+    };
+    let after = redis_now(&client).await;
+    assert!(
+        (before..=after).contains(&replay.at),
+        "{before} <= {} <= {after}",
+        replay.at
+    );
+    assert_eq!(
+        replay.expires_in(ACCESS_TOKEN_TTL) as i64,
+        replay.pair.access_exp - replay.at
+    );
+    let late = RotatedPair {
+        at: replay.pair.access_exp + 5,
+        ..replay.clone()
+    };
+    assert_eq!(late.expires_in(ACCESS_TOKEN_TTL), 0, "never negative");
+
+    let capped = client
+        .clone()
+        .with_grant_lifetime(caps("client-ei2", Some(1_800), true));
+    let g2 = issue(
+        &capped,
+        &grant_for("client-ei2", "", redis_now(&client).await),
+    )
+    .await;
+    age(&capped, &g2.grant_id, 1_700).await;
+    let r2 = rotated(rotate(&capped, g2.refresh_token.as_deref().unwrap()).await);
+    assert!(
+        r2.expires_in(ACCESS_TOKEN_TTL) <= 100,
+        "near the absolute expiry: {}",
+        r2.expires_in(ACCESS_TOKEN_TTL)
+    );
+}

@@ -1148,10 +1148,9 @@ async fn token_refresh(
         None => db_client.rotate_refresh_token(&request).await?,
     };
     let (pair, expires_in) = match outcome {
-        RotateOutcome::Rotated(rotated) => (rotated.pair, ACCESS_TOKEN_TTL),
-        RotateOutcome::Replayed(replayed) => {
-            let left = (replayed.pair.access_exp - Utc::now().timestamp()).max(0) as u64;
-            (replayed.pair, left.min(ACCESS_TOKEN_TTL))
+        RotateOutcome::Rotated(pair) | RotateOutcome::Replayed(pair) => {
+            let expires_in = pair.expires_in(ACCESS_TOKEN_TTL);
+            (pair.pair, expires_in)
         }
         // Reuse (I5, phase A): recorded, and answered like an unknown token.
         RotateOutcome::Reuse(event) => {
