@@ -192,7 +192,9 @@ jobs:
       SIWXOIDC_PORT: "18080"
       SIWXOIDC_BASE_URL: http://localhost:18080
       # Also read by e2e_race_teardown's keyspace scan
-      # (no_token_the_client_holds_is_stored_in_the_clear).
+      # (no_token_the_client_holds_is_stored_in_the_clear) and by its upgrade
+      # test, which seeds the legacy token layout there
+      # (legacy_tokens_keep_working_after_the_upgrade).
       SIWXOIDC_REDIS_URL: redis://localhost:6379
       SIWXOIDC_MAS_SHARED_SECRET: testsecret
       SIWXOIDC_SYNAPSE_ENDPOINT: http://localhost:8090
