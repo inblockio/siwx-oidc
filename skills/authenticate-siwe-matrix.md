@@ -168,8 +168,9 @@ Steps 5-8 identical.
 |---------|-----|---------|
 | `sessions/{uuid}` | 300s | Session (siwe_nonce, verified_did, signin_count) |
 | `codes/{uuid}` | 300s | Auth code (did, client_id, code_challenge, device_id) |
-| `token/{mat_...}` | 300s | Access token metadata |
-| `token/{mcr_...}` | 7776000s (90d) | Refresh token metadata |
+| `grant/{sha256(handle)}` | 90d after the last rotation | Grant: owner, client, device, scope, refresh-token digests |
+| `at/{sha256(mat_...)}` | 300s | Access token -> grant, generation, iat, exp |
+| `legacy_rt/{sha256(legacy refresh token)}` | 90d from the lift | Grant a pre-grant refresh token was lifted into |
 | `clients/{uuid}` | 30d | Client registration |
 | `webauthn:challenge/{session_id}` | 120s | Ceremony state |
 | `webauthn:credential/{cred_id_b64}` | none | Stored passkey |

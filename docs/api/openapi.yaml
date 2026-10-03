@@ -250,11 +250,16 @@ paths:
         `refresh_token`: accepts only a refresh token; an access token (a
         minted admin token included) is `invalid_grant`, like an unknown one.
 
-        Refresh rotates both tokens. A bounded grace pointer (60s) lets a client
-        that LOST the rotation response — common on mobile — replay the old
-        refresh token and receive the same successor pair instead of being
-        signed out, for as long as that successor refresh token is live. A
-        replay after the successor was rotated or revoked is `invalid_grant`.
+        Refresh rotates both tokens, atomically: concurrent refreshes of one
+        token all receive the same new pair. A client that LOST the rotation
+        response — common on mobile — can replay the previous refresh token and
+        receive the same successor pair, however late, for as long as that pair
+        is unused (its access token not yet accepted by introspection or
+        `/userinfo`, its refresh token not yet rotated). A replay after that, or
+        after the successor was rotated or revoked, is `invalid_grant`; reuse of
+        a superseded token is logged as a security event. A refresh token issued
+        by a build before the grant record is answered with tokens in the current
+        format (`mcr_{handle}_{secret}`), and its replays follow the same rule.
 
         In a standalone deployment (no MAS shared secret) the code exchange
         grants the requested scope among `openid`, `profile` and `offline_access`
@@ -272,12 +277,12 @@ paths:
         `client_secret` in the form or as the `Authorization` password (the Basic
         user name and password are form-urldecoded, RFC 6749 §2.3.1): otherwise
         `invalid_client`. A public client authenticates nothing and may omit
-        `client_id` at the refresh grant. The grace replay is bound to the client
-        like a rotation. A refresh token whose client registration has expired
+        `client_id` at the refresh grant. The replay of a lost response is bound to
+        the client like a rotation. A refresh token whose client registration has expired
         (a registration lasts 30 days) still refreshes when the request names that
         client or none, and is refused when it presents a secret. The Matrix
         refresh endpoint `POST /_matrix/client/v3/refresh` has no client identity
-        to carry and is not bound.
+        to carry, so it refuses a confidential client's refresh token.
       requestBody:
         required: true
         content:
@@ -552,8 +557,11 @@ paths:
       operationId: revoke
       summary: Revoke a token (RFC 7009)
       description: |
-        Token hygiene only. Accepts either an access or a refresh token. It
-        revokes the access token and its paired refresh token and **never
+        Token hygiene only. Accepts either an access or a refresh token. For a
+        Matrix device it revokes the device's grant (the access token and its
+        paired refresh token). For a token with no device, an access token is
+        revoked alone, and a refresh token revokes its whole grant, the grant's
+        live access token included (RFC 7009 §2.1; provisional). It **never
         deletes the Synapse device** — clients fire this on
         rotation and on dialog dismissals, and deleting the device there raced
         in-flight key uploads and wedged users' cross-signing identity.
@@ -813,9 +821,12 @@ paths:
     post:
       tags: [Matrix compatibility]
       operationId: matrixRefresh
-      summary: Matrix-shaped refresh, with the same rotation grace window as `/token`
-      description: Accepts only a refresh token; an access token (a minted admin token included) is `M_UNKNOWN_TOKEN`, like an unknown one. A replay of a just-rotated token returns the same successor pair while that successor is live, and is `M_UNKNOWN_TOKEN` once it was rotated or revoked. The endpoint carries no client identity, so unlike `/token` it cannot bind the replay to a client.
-      responses: { "200": { description: New tokens. } }
+      summary: Matrix-shaped refresh, with the same rotation and lost-response rule as `/token`
+      description: Accepts only a refresh token; an access token (a minted admin token included) is `M_UNKNOWN_TOKEN`, like an unknown one. A replay of the previous refresh token returns the same successor pair while that pair is unused, and is `M_UNKNOWN_TOKEN` once it was used, rotated or revoked. The endpoint carries no client identity, so unlike `/token` it cannot bind the replay to a client, and it refuses the refresh token of a confidential client (one that must authenticate at `/token`) exactly like an unknown token, leaving it untouched for `/token`. A public client's refresh token issued by a build before the grant record is answered with tokens in the current format, and its replays follow the same rule.
+      responses:
+        "200": { description: New tokens. }
+        "401": { description: "`M_UNKNOWN_TOKEN`: the refresh token is unknown, expired, reused, revoked, of another kind, or a confidential client's." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store could not answer. Never reported as `M_UNKNOWN_TOKEN`, which a Matrix client takes for \"signed out\" (it clears its crypto store). The rotation either ran entirely or not at all, so retrying with the same refresh token is safe." }
 
   /_matrix/client/v3/logout:
     post:
@@ -843,7 +854,10 @@ paths:
       description: The bearer must be an access token; any other token is a 401 `M_UNKNOWN_TOKEN`.
       security: [{ bearerToken: [] }]
       parameters: [{ name: device_id, in: path, required: true, schema: { type: string } }]
-      responses: { "200": { description: Deleted. } }
+      responses:
+        "200": { description: Deleted. }
+        "401": { description: "`M_UNKNOWN_TOKEN`: the bearer is missing, unknown, or not an access token." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store could not resolve the bearer. Never reported as `M_UNKNOWN_TOKEN`; nothing was deleted." }
 
   /_matrix/client/v3/delete_devices:
     post:
@@ -852,7 +866,10 @@ paths:
       summary: Sign out several devices
       description: The bearer must be an access token; any other token is a 401 `M_UNKNOWN_TOKEN`.
       security: [{ bearerToken: [] }]
-      responses: { "200": { description: Deleted. } }
+      responses:
+        "200": { description: Deleted. }
+        "401": { description: "`M_UNKNOWN_TOKEN`: the bearer is missing, unknown, or not an access token." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store could not resolve the bearer. Never reported as `M_UNKNOWN_TOKEN`; nothing was deleted." }
 
   /health:
     get:

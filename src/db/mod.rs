@@ -8,24 +8,30 @@ use chrono::{offset::Utc, DateTime};
 use openidconnect::{core::CoreClientMetadata, Nonce, RegistrationAccessToken};
 use serde::{Deserialize, Serialize};
 
+pub mod grant;
 mod redis;
+pub mod seal;
+pub mod tokens;
 pub use self::redis::RedisClient;
 
 const KV_CLIENT_PREFIX: &str = "clients";
 const KV_SESSION_PREFIX: &str = "sessions";
 const KV_CODE_PREFIX: &str = "codes";
+/// Legacy token entries `token/{raw}`, written by builds before the grant record
+/// and only read and deleted now (see [`DBClient::set_token`]).
 const KV_TOKEN_PREFIX: &str = "token";
-/// Secondary index: a Redis SET of token keys per `(username, device_id)`, kept
-/// in sync on every token mint/refresh so revocation is an atomic O(members)
-/// delete instead of a racy `KEYS` scan (S3-3 / H3 fix).
+/// Legacy secondary index: a Redis SET of `token/{raw}` keys per
+/// `(username, device_id)`, which builds before the grant record kept so
+/// revocation was an atomic O(members) delete (S3-3 / H3 fix). Revocation still
+/// sweeps it; the lift of a legacy refresh token removes its member.
 const KV_DEVICE_TOKEN_IDX_PREFIX: &str = "idx:user_device";
 /// Short-lived tombstone marking a `(username, device_id)` as just-revoked, so an
 /// in-flight refresh that completes right after the sweep cannot leave a survivor
-/// (S3-3 / H3 fix). Checked by the refresh/mint paths.
+/// (S3-3 / H3 fix). Checked by the rotation and lift scripts (`db::grant`).
 const KV_DEVICE_TOMBSTONE_PREFIX: &str = "tombstone:device";
 /// Per-user deactivation tombstone set BEFORE the deactivate/erase sweep so any
-/// concurrent refresh/mint refuses to issue tokens for a terminating user
-/// (S3-4 / H6 fix). Checked by the refresh/mint paths.
+/// concurrent refresh refuses to issue tokens for a terminating user (S3-4 / H6
+/// fix). Checked by the rotation and lift scripts (`db::grant`).
 const KV_USER_TOMBSTONE_PREFIX: &str = "tombstone:user";
 /// Durable erasure markers: `erased:user/{localpart}` and
 /// `erased:did/{hex(sha256(canonical DID))}`, written with NO TTL before an
@@ -86,9 +92,10 @@ pub const KV_USER_SESSION_PREFIX: &str = "user:session";
 /// not scope forever. 30 days mirrors a typical "remember this device" horizon.
 pub const USER_SESSION_LIFETIME: u64 = 30 * 24 * 3600; // 30 days
 
-/// TTL for opaque access tokens (both modes).
+/// Lifetime of an access token (both modes).
 pub const ACCESS_TOKEN_TTL: u64 = 300; // 5 minutes
-/// TTL for opaque refresh tokens (both modes).
+/// Inactivity lifetime of a grant with a refresh token: it ends this long after
+/// its last rotation (both modes).
 pub const REFRESH_TOKEN_TTL: u64 = 7_776_000; // 90 days
 
 /// The longest lifetime (`exp - iat`) an access token is ever written with: a
@@ -109,194 +116,15 @@ const _: () = assert!(
 /// (an access token) ever carries it; see [`legacy_token_kind`].
 pub const SYNAPSE_ADMIN_SCOPE: &str = "urn:synapse:admin:*";
 
-/// Prefix for the short-lived refresh-token rotation grace pointer:
-/// `token_rotated/{old_refresh}` -> the successor token pair already minted by the
-/// rotation that consumed `old_refresh`. Lets a client that LOST the rotation
-/// response (common on mobile: radio handoff, app suspension, cross-process
-/// refresh) replay the old refresh token once within the grace window and receive
-/// the same successor, instead of being signed out by `invalid_grant`.
-const KV_ROTATED_PREFIX: &str = "token_rotated";
-/// Grace window (seconds) for replaying a just-rotated refresh token. Bounded well
-/// under [`ACCESS_TOKEN_TTL`] so the successor access token stored in the pointer
-/// is still valid when replayed. It does NOT widen the refresh lifetime: the old
-/// token is still removed as a live credential, and unknown/expired tokens are
-/// still rejected.
-pub const REFRESH_GRACE_TTL: u64 = 60; // 1 min
-
-/// TTL for the short-lived device/user revocation tombstones. Long enough to
-/// outlast an in-flight refresh that started before a revoke sweep, **and** to
-/// outlive the bounded fail-open window below with real margin.
-///
-/// Raised from 600s to 900s on 2026-07-25: at 600 the margin against
-/// `2 * ACCESS_TOKEN_TTL` was exactly **zero** (600 == 600), so a tombstone
-/// expired at precisely the moment the second refresh cycle completed, leaving no
-/// slack for clock skew or a delayed refresh. The assertion below caught this on
-/// its first compile. Lengthening is cheap: a lingering tombstone only makes a
-/// refresh refuse, and a fresh sign-in never consults it.
+/// TTL for the short-lived device/user revocation tombstones, which revocation
+/// plants and the rotation and lift scripts (`grant::ROTATE_LUA`,
+/// `grant::LIFT_LUA`) refuse a grant under.
+/// Long enough to outlast a refresh that was in flight when a revoke sweep ran.
+/// A lingering tombstone only makes a refresh refuse (a user tombstone also
+/// refuses the refresh of a grant signed in after `logout/all` or deactivation,
+/// for at most this long; Phase 3's epochs replace tombstones), and a fresh
+/// sign-in never consults it.
 pub const TOMBSTONE_TTL_SECS: u64 = 900; // 15 min
-
-/// Compile-time guarantee that failing OPEN on an *indeterminate* revocation
-/// probe (see [`RevocationState::Indeterminate`]) is self-limiting.
-///
-/// A tombstone must still be readable on the refresh that follows an outage. As
-/// long as the tombstone outlives two access-token cycles, a genuine revocation
-/// planted while Redis was unreachable is observed at the next rotation, so the
-/// fail-open window is bounded by one access-token lifetime rather than being
-/// open-ended. Shortening the tombstone TTL or lengthening the access-token TTL
-/// past this bound breaks the build instead of silently widening the hole.
-const _: () = assert!(
-    TOMBSTONE_TTL_SECS > 2 * ACCESS_TOKEN_TTL,
-    "fail-open on an indeterminate revocation probe is only safe while the \
-     tombstone outlives two access-token cycles; adjust TOMBSTONE_TTL_SECS"
-);
-
-/// Outcome of probing the revocation tombstones for a session.
-///
-/// The distinction that matters is **definite vs indeterminate**. A definite
-/// tombstone must tear the session down; an infrastructure error must NOT.
-///
-/// Why the asymmetry is load-bearing: at the post-mint recheck the caller has
-/// already deleted the presented refresh token and has not yet written the grace
-/// pointer, so rolling back leaves the client holding *neither* the old nor the
-/// new token — an unrecoverable sign-out. Treating an I/O error as a revocation
-/// therefore converts a transient fault into permanent, silent session loss.
-/// Treating it as "proceed" costs at most one access-token cycle of extra life
-/// for a session that may already be revoked, which the tombstone TTL bounds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RevocationState {
-    /// A tombstone is definitely present. Fail **closed**: refuse or roll back.
-    Revoked,
-    /// No tombstone is present. Proceed.
-    Live,
-    /// The probe could not complete (I/O error). Fail **open**: proceed.
-    Indeterminate,
-}
-
-impl RevocationState {
-    /// Whether this outcome must tear the session down.
-    ///
-    /// Only [`Revoked`](Self::Revoked) does. This is the single place the
-    /// fail-open policy is expressed, so it cannot drift between call sites.
-    pub fn must_refuse(self) -> bool {
-        matches!(self, RevocationState::Revoked)
-    }
-}
-
-/// Collapse the two tombstone probes into one [`RevocationState`].
-///
-/// Extracted as a pure function so the policy can be exercised exhaustively
-/// (all nine combinations) without standing up a `DBClient` double — the
-/// decision here is security-relevant enough that it should not be reachable
-/// only through an integration path.
-///
-/// Precedence is deliberate: a **definite** `Ok(true)` on either axis wins even
-/// when the other probe errored. Erring on one axis must never mask a tombstone
-/// we did successfully read on the other.
-pub(crate) fn collapse_revocation(device: Result<bool>, user: Result<bool>) -> RevocationState {
-    if matches!(device, Ok(true)) || matches!(user, Ok(true)) {
-        return RevocationState::Revoked;
-    }
-    if device.is_err() || user.is_err() {
-        return RevocationState::Indeterminate;
-    }
-    RevocationState::Live
-}
-
-#[cfg(test)]
-mod revocation_policy_tests {
-    use super::*;
-    use anyhow::anyhow;
-
-    fn err() -> Result<bool> {
-        Err(anyhow!("redis i/o"))
-    }
-
-    // -- The regression guard. A DEFINITE tombstone must always fail closed. ----
-    // If any of these three start returning anything but `Revoked`, the fail-open
-    // change has destroyed the property it was required to preserve (invariant
-    // I8). Do not "fix" a failure here by relaxing the assertion.
-
-    #[test]
-    fn definite_device_tombstone_fails_closed() {
-        assert_eq!(
-            collapse_revocation(Ok(true), Ok(false)),
-            RevocationState::Revoked
-        );
-    }
-
-    #[test]
-    fn definite_user_tombstone_fails_closed() {
-        assert_eq!(
-            collapse_revocation(Ok(false), Ok(true)),
-            RevocationState::Revoked
-        );
-    }
-
-    #[test]
-    fn definite_tombstone_wins_over_an_errored_sibling_probe() {
-        // The dangerous middle case: one axis errored, the other definitively
-        // says revoked. Fail-open must NOT swallow the tombstone we did read.
-        assert_eq!(
-            collapse_revocation(err(), Ok(true)),
-            RevocationState::Revoked
-        );
-        assert_eq!(
-            collapse_revocation(Ok(true), err()),
-            RevocationState::Revoked
-        );
-    }
-
-    // -- Fail open only when the answer is genuinely unknown -------------------
-
-    #[test]
-    fn io_error_on_either_axis_is_indeterminate() {
-        assert_eq!(
-            collapse_revocation(err(), Ok(false)),
-            RevocationState::Indeterminate
-        );
-        assert_eq!(
-            collapse_revocation(Ok(false), err()),
-            RevocationState::Indeterminate
-        );
-        assert_eq!(
-            collapse_revocation(err(), err()),
-            RevocationState::Indeterminate
-        );
-    }
-
-    #[test]
-    fn no_tombstone_is_live() {
-        assert_eq!(
-            collapse_revocation(Ok(false), Ok(false)),
-            RevocationState::Live
-        );
-    }
-
-    #[test]
-    fn only_revoked_refuses() {
-        assert!(RevocationState::Revoked.must_refuse());
-        assert!(!RevocationState::Live.must_refuse());
-        assert!(!RevocationState::Indeterminate.must_refuse());
-    }
-
-    #[test]
-    fn fail_open_window_is_bounded_by_the_tombstone_ttl() {
-        // Mirrors the compile-time assertion, so the reasoning is visible in the
-        // test suite too rather than only as a build error.
-        //
-        // `const { .. }` because both operands are constants: clippy's
-        // `assertions_on_constants` correctly points out that a plain `assert!`
-        // over constants is evaluated at compile time anyway. Keeping it in a
-        // const block preserves the intent (a build error if the invariant is
-        // broken) while making that explicit rather than incidental.
-        const {
-            assert!(
-                TOMBSTONE_TTL_SECS > 2 * ACCESS_TOKEN_TTL,
-                "tombstone must outlive two access-token cycles for fail-open to be bounded"
-            );
-        }
-    }
-}
 
 /// Default device code lifetime (RFC 8628 `expires_in`).
 pub const DEVICE_CODE_LIFETIME: u64 = 1800; // 30 minutes
@@ -526,38 +354,6 @@ impl TokenMetadata {
     }
 }
 
-/// The successor token pair recorded under [`KV_ROTATED_PREFIX`] when a refresh
-/// token is rotated, so a lost-response replay of the old refresh token can recover
-/// it idempotently within the grace window.
-///
-/// `Debug` is written by hand: the pair is two live credentials, so each prints
-/// as its fingerprint (see [`crate::redact`]).
-#[derive(Clone, Serialize, Deserialize)]
-pub struct RotatedToken {
-    /// The successor access token minted by the rotation.
-    pub access_token: String,
-    /// The successor refresh token minted by the rotation.
-    pub refresh_token: String,
-    /// Absolute Unix expiry of the successor access token (drives `expires_in` on replay).
-    pub access_exp: i64,
-}
-
-impl std::fmt::Debug for RotatedToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RotatedToken")
-            .field(
-                "access_token_fp",
-                &crate::redact::fingerprint(&self.access_token),
-            )
-            .field(
-                "refresh_token_fp",
-                &crate::redact::fingerprint(&self.refresh_token),
-            )
-            .field("access_exp", &self.access_exp)
-            .finish()
-    }
-}
-
 #[async_trait]
 pub trait DBClient {
     async fn set_client(&self, client_id: String, client_entry: ClientEntry) -> Result<()>;
@@ -582,61 +378,20 @@ pub trait DBClient {
     /// [`try_consume_code`](Self::try_consume_code) receives a code.
     async fn try_claim_device_code(&self, device_code: &str) -> Result<bool>;
 
-    /// Whether a `(username, device_id)` pair currently carries a device-revoked
-    /// tombstone (set by [`revoke_device_tokens`]). A refresh/mint that sees this
-    /// must refuse so it cannot resurrect a just-signed-out device (S3-3 / H3).
-    async fn is_device_revoked(&self, username: &str, device_id: &str) -> Result<bool>;
+    // -- Legacy token entries (`token/{raw}`) -----------------------------------
+    //
+    // Builds before the grant record stored every token this way. Tokens now
+    // live in grants (`db::grant`); these entries are only read (the access
+    // check's fallback, teardown, the migration of refresh tokens) and deleted.
 
-    /// Whether a user currently carries a deactivation tombstone (set by
-    /// `account_deactivate` / `account_erase` BEFORE the token sweep). A
-    /// refresh/mint that sees this must refuse so it cannot resurrect access for a
-    /// terminating account (S3-4 / H6).
-    async fn is_user_deactivated(&self, username: &str) -> Result<bool>;
-
-    /// Probe both revocation tombstones for a session and collapse them into a
-    /// single [`RevocationState`].
-    ///
-    /// `Revoked` **dominates**: a definite tombstone on either axis fails closed
-    /// even if the other probe errored. Only when neither probe found a tombstone
-    /// *and* at least one could not complete is the result `Indeterminate`.
-    /// An empty `device_id` means "no device to revoke" and skips that probe.
-    ///
-    /// This is the one place the fail-open policy lives, so the four call sites
-    /// (pre- and post-mint, in both `oidc::token_refresh` and `compat::refresh`)
-    /// cannot drift apart.
-    async fn probe_revocation(&self, username: &str, device_id: &str) -> RevocationState {
-        let device = if device_id.is_empty() {
-            Ok(false)
-        } else {
-            self.is_device_revoked(username, device_id).await
-        };
-        let user = self.is_user_deactivated(username).await;
-        collapse_revocation(device, user)
-    }
-
-    // -- Opaque token storage (MSC3861) ----------------------------------------
-
-    /// Store an opaque token with metadata and a TTL in seconds. Refuses an
-    /// entry whose [`TokenMetadata::kind`] is unset.
+    /// Store a legacy token entry with a TTL in seconds. No production code
+    /// writes one any more; tests use it to seed the layout an older build
+    /// left. Refuses an entry whose [`TokenMetadata::kind`] is unset.
     async fn set_token(&self, token: &str, metadata: &TokenMetadata, ttl: u64) -> Result<()>;
-    /// Retrieve metadata for an opaque token (returns None if expired/missing).
+    /// Retrieve a legacy token entry (None if expired or missing).
     async fn get_token(&self, token: &str) -> Result<Option<TokenMetadata>>;
-    /// Delete an opaque token (e.g. on revocation).
+    /// Delete a legacy token entry (e.g. on revocation).
     async fn delete_token(&self, token: &str) -> Result<()>;
-
-    /// Record the successor pair for a just-rotated refresh token so a lost-response
-    /// replay of `old_refresh` within the grace window returns the same pair instead
-    /// of `invalid_grant`. Best-effort at the call site: a failure must not fail the
-    /// rotation the client already observed.
-    async fn set_rotated_token(
-        &self,
-        old_refresh: &str,
-        successor: &RotatedToken,
-        ttl: u64,
-    ) -> Result<()>;
-    /// Look up the successor pair for a just-rotated refresh token (grace replay).
-    /// Returns None once the grace window has expired (Redis TTL).
-    async fn get_rotated_token(&self, old_refresh: &str) -> Result<Option<RotatedToken>>;
 
     // -- RFC 8628 device code storage -----------------------------------------
 

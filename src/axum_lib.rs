@@ -1514,6 +1514,7 @@ pub async fn main() {
         redis_client: state.redis_client.clone(),
         synapse_client: state.synapse_client.clone(),
         server_name: state.config.matrix_server_name.clone(),
+        require_secret: state.config.require_secret,
     };
 
     let app = Router::new()

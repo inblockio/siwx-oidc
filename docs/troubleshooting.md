@@ -262,8 +262,15 @@ redis-cli --scan --pattern 'device_codes/*'
 redis-cli GET 'device_codes/<device_code>' | python3 -m json.tool
 redis-cli --scan --pattern 'user_codes/*'
 
-# Tokens and their metadata (username = localpart, device_id, scope, DID)
+# Grants (username = localpart, device_id, scope, DID). Tokens are stored as
+# SHA-256 digests only: hash a token you hold to find its entry.
+redis-cli HGETALL "at/$(printf %s '<access token>' | sha256sum | cut -d' ' -f1)"
+redis-cli HGETALL 'grant/<grant id from the access entry>'
+redis-cli SMEMBERS 'idx:grants:user/<localpart>'
+# Tokens written before the grant record (legacy, until they expire or, for a
+# refresh token, until it is presented and lifted into a grant)
 redis-cli GET 'token/<access or refresh token>' | python3 -m json.tool
+redis-cli GET "legacy_rt/$(printf %s '<legacy refresh token>' | sha256sum | cut -d' ' -f1)"
 ```
 
 Values can contain tokens and DIDs. Treat the output as sensitive.

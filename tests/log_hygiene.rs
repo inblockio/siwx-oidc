@@ -22,6 +22,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use siwx_oidc::db::grant::{GrantId, IssuedGrant};
+use siwx_oidc::db::seal::SuccessorPair;
 use siwx_oidc::db::*;
 use siwx_oidc::redact::fingerprint;
 use siwx_oidc::test_support::{redis, LogCapture};
@@ -116,16 +118,26 @@ async fn the_redis_code_and_token_paths_log_fingerprints_never_values() {
 
 // -- 2. Debug output -----------------------------------------------------
 
-/// `RotatedToken` holds the raw successor pair and `DeviceCodeEntry` the raw
-/// user code. Neither is logged today; both print fingerprints under `{:?}` and
-/// `{:#?}` so that logging one by mistake is not a leak.
+/// `SuccessorPair` holds a raw successor pair, `IssuedGrant` the raw pair a
+/// grant is issued with, and `DeviceCodeEntry` the raw user code. None is
+/// logged today; all print fingerprints under `{:?}` and `{:#?}` so that
+/// logging one by mistake is not a leak.
 #[test]
 fn a_struct_that_holds_a_credential_prints_its_fingerprint_under_debug() {
     let access = unique("mat_");
     let refresh = unique("mcr_");
-    let rotated = RotatedToken {
+    let rotated = SuccessorPair {
         access_token: access.clone(),
         refresh_token: refresh.clone(),
+        access_exp: 1,
+    };
+    let issued_access = unique("mat_");
+    let issued_refresh = unique("mcr_");
+    let issued = IssuedGrant {
+        grant_id: GrantId::of_handle("log-hygiene-handle"),
+        access_token: issued_access.clone(),
+        refresh_token: Some(issued_refresh.clone()),
+        iat: 0,
         access_exp: 1,
     };
     let user_code = "WDJB-MJHT".to_string();
@@ -139,9 +151,12 @@ fn a_struct_that_holds_a_credential_prints_its_fingerprint_under_debug() {
         last_poll: None,
         created_at: 0,
     };
-    let shown = format!("{rotated:?}\n{rotated:#?}\n{device:?}\n{device:#?}");
+    let shown =
+        format!("{rotated:?}\n{rotated:#?}\n{issued:?}\n{issued:#?}\n{device:?}\n{device:#?}");
     assert_logged_only_as_fingerprint(&shown, "successor access token", &access);
     assert_logged_only_as_fingerprint(&shown, "successor refresh token", &refresh);
+    assert_logged_only_as_fingerprint(&shown, "issued access token", &issued_access);
+    assert_logged_only_as_fingerprint(&shown, "issued refresh token", &issued_refresh);
     assert_logged_only_as_fingerprint(&shown, "user code", &user_code);
     assert!(
         shown.contains("log-hygiene-client"),

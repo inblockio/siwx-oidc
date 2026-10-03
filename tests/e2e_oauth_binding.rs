@@ -1220,14 +1220,16 @@ async fn the_refresh_grant_accepts_only_a_refresh_token() {
     );
 }
 
-/// The same rule at the Matrix-shaped refresh endpoint.
+/// The same rule at the Matrix-shaped refresh endpoint, for a public client
+/// (the endpoint refuses a confidential client's token whatever its kind).
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn the_matrix_refresh_endpoint_accepts_only_a_refresh_token() {
     let base = oidc();
     let c = Client::new();
     let nrc = no_redirect_client();
-    let (access, refresh, _did, _rc) = login_tokens(&c, &nrc, &base).await;
+    let public = register_public_client(&c, &base).await;
+    let (access, refresh) = tokens_for_client(&c, &nrc, &base, &public, false).await;
 
     assert_refused_by_matrix_refresh(&c, &base, &access, "an access token").await;
     assert_eq!(
@@ -2115,7 +2117,8 @@ async fn discovery_advertises_only_the_code_response_type() {
 // the client named in the request (form, or the user name of an HTTP Basic
 // header) must be that client, and a confidential client authenticates with
 // its secret, exactly as at the code exchange. `POST /_matrix/client/v3/refresh`
-// carries no client identity by specification and is not covered here.
+// carries no client identity by specification, so it refuses a confidential
+// client's refresh token and serves public clients only.
 // ===========================================================================
 
 /// A client registered the way Element Web and Element X register: public,
@@ -2295,11 +2298,60 @@ async fn a_refresh_token_is_refused_to_another_client() {
     );
 }
 
+/// `POST /_matrix/client/v3/refresh` carries no client identity, so it cannot
+/// authenticate a confidential client: it refuses that client's refresh token
+/// exactly like an unknown token (I7), and the refusal consumes nothing, so the
+/// client still refreshes at `POST /token` with its secret. A public client,
+/// registered the way Element Web and Element X register, refreshes there as
+/// before.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn the_matrix_endpoint_refuses_a_confidential_clients_refresh_token() {
+    let base = oidc();
+    let c = Client::new();
+    let nrc = no_redirect_client();
+    let rc = register_client(&c, &base).await;
+    let (_access, refresh) = tokens_for_client(&c, &nrc, &base, &rc, true).await;
+
+    assert_refused_by_matrix_refresh(
+        &c,
+        &base,
+        &refresh,
+        "a confidential client's refresh token (no secret can be presented here)",
+    )
+    .await;
+    let by_secret = refresh_as(
+        &c,
+        &base,
+        &refresh,
+        &[
+            ("client_id", rc.client_id.as_str()),
+            ("client_secret", rc.client_secret.as_str()),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(
+        by_secret.status(),
+        StatusCode::OK,
+        "the refusal consumed nothing: the token refreshes at /token with the secret"
+    );
+
+    let public = register_public_client(&c, &base).await;
+    let (_access, refresh) = tokens_for_client(&c, &nrc, &base, &public, false).await;
+    let resp = matrix_refresh(&c, &base, &refresh).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a public client's refresh token rotates at the Matrix endpoint"
+    );
+}
+
 /// A confidential client authenticates at the refresh grant: no credentials
 /// and a wrong secret are `invalid_client` with a 401, and a request that
 /// attempted HTTP Basic is answered with the matching challenge. The secret
-/// goes in the form or in a Basic header. The replay of a just-rotated token
-/// hands out the successor pair only to the same client.
+/// goes in the form or in a Basic header. The replay of a lost response hands
+/// out the successor pair only to the same client.
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn a_confidential_client_must_authenticate_to_refresh() {
@@ -2357,14 +2409,14 @@ async fn a_confidential_client_must_authenticate_to_refresh() {
     let rotated: Value = by_form.json().await.unwrap();
     let successor = rotated["refresh_token"].as_str().unwrap().to_string();
 
-    // The old token replayed inside the grace window: the client recovers the
-    // pair it lost, a caller without the client's credentials does not.
+    // The old token replayed while the new pair is unused: the client recovers
+    // the pair it lost, a caller without the client's credentials does not.
     let replay_anonymous = refresh_as(&c, &base, &refresh, &[], None).await;
     let (status, error, _) = refusal(replay_anonymous).await;
     assert_eq!(
         (status, error.as_str()),
         (StatusCode::UNAUTHORIZED, "invalid_client"),
-        "the grace replay is bound to the client too"
+        "the replay is bound to the client too"
     );
     let replay_owner = refresh_as(
         &c,
@@ -2384,7 +2436,7 @@ async fn a_confidential_client_must_authenticate_to_refresh() {
     );
 
     // The successor refreshes with the secret in a Basic header (and so no
-    // client_id in the form), which also ends the grace window for the old token.
+    // client_id in the form), which also ends the recovery for the old token.
     let by_basic = refresh_as(
         &c,
         &base,

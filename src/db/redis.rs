@@ -22,21 +22,21 @@ use super::*;
 
 #[derive(Clone)]
 pub struct RedisClient {
-    pool: Pool<RedisConnectionManager>,
+    pub(super) pool: Pool<RedisConnectionManager>,
 }
 
 /// Redis key for the per-`(username, device_id)` token index SET.
-fn device_token_idx_key(username: &str, device_id: &str) -> String {
+pub(super) fn device_token_idx_key(username: &str, device_id: &str) -> String {
     format!("{}/{}/{}", KV_DEVICE_TOKEN_IDX_PREFIX, username, device_id)
 }
 
 /// Redis key for the short-lived device-revoked tombstone.
-fn device_tombstone_key(username: &str, device_id: &str) -> String {
+pub(super) fn device_tombstone_key(username: &str, device_id: &str) -> String {
     format!("{}/{}/{}", KV_DEVICE_TOMBSTONE_PREFIX, username, device_id)
 }
 
 /// Redis key for the per-user deactivation tombstone.
-fn user_tombstone_key(username: &str) -> String {
+pub(super) fn user_tombstone_key(username: &str) -> String {
     format!("{}/{}", KV_USER_TOMBSTONE_PREFIX, username)
 }
 
@@ -52,11 +52,6 @@ fn erased_did_key(did: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(crate::mxid::canonicalize(did).as_bytes());
     format!("{}/{}", KV_ERASED_DID_PREFIX, hex::encode(digest))
-}
-
-/// Redis key for the short-lived refresh-token rotation grace pointer.
-fn rotated_token_key(old_refresh: &str) -> String {
-    format!("{}/{}", KV_ROTATED_PREFIX, old_refresh)
 }
 
 /// Read and delete an authorization code in one atomic step.
@@ -229,6 +224,11 @@ impl RedisClient {
     /// pre-index token (e.g. minted before an upgrade); it never re-creates the
     /// race because the tombstone already blocks new mints.
     pub async fn revoke_device_tokens(&self, username: &str, device_id: &str) -> Result<usize> {
+        // The grants of the device first (one atomic script that also plants
+        // the tombstone): deleting a grant makes all its tokens inert at once.
+        // The legacy index and scan below catch `token/{raw}` entries written
+        // before the grant record.
+        let revoked_grants = self.revoke_grants_for_device(username, device_id).await?;
         let mut conn = self
             .pool
             .get()
@@ -269,10 +269,10 @@ impl RedisClient {
             .await
             .unwrap_or(0);
 
-        let revoked = revoked_idx + revoked_scan;
+        let revoked = revoked_grants + revoked_idx + revoked_scan;
         debug!(
-            "revoke_device_tokens: username={} device_id={} revoked_idx={} revoked_scan={} total={}",
-            username, device_id, revoked_idx, revoked_scan, revoked
+            username,
+            device_id, revoked_grants, revoked_idx, revoked_scan, revoked, "revoke_device_tokens"
         );
         Ok(revoked)
     }
@@ -302,7 +302,10 @@ impl RedisClient {
         // did not set it (the explicit callers do, before this point).
         self.mark_user_deactivated(username).await?;
 
-        let mut total = 0usize;
+        // Every grant of the user, in one atomic script (which plants the
+        // tombstone again). The loop below is the backstop for legacy
+        // `token/{raw}` entries written before the grant record.
+        let mut total = self.revoke_grants_for_user(username).await?;
         for _ in 0..5 {
             let n = self
                 .revoke_tokens_where(|meta| meta.username == username)
@@ -916,42 +919,6 @@ impl DBClient for RedisClient {
         // Redis returns "OK" when the key was set, nil (None) when NX rejected it.
         Ok(was_set.is_some())
     }
-
-    async fn is_device_revoked(&self, username: &str, device_id: &str) -> Result<bool> {
-        Ok(self
-            .get_raw(&device_tombstone_key(username, device_id))
-            .await?
-            .is_some())
-    }
-
-    async fn is_user_deactivated(&self, username: &str) -> Result<bool> {
-        Ok(self.get_raw(&user_tombstone_key(username)).await?.is_some())
-    }
-
-    async fn set_rotated_token(
-        &self,
-        old_refresh: &str,
-        successor: &RotatedToken,
-        ttl: u64,
-    ) -> Result<()> {
-        let value = serde_json::to_string(successor)
-            .map_err(|e| anyhow!("Failed to serialize rotated token: {}", e))?;
-        self.set_ex_raw(&rotated_token_key(old_refresh), &value, ttl)
-            .await
-    }
-
-    async fn get_rotated_token(&self, old_refresh: &str) -> Result<Option<RotatedToken>> {
-        match self.get_raw(&rotated_token_key(old_refresh)).await? {
-            Some(v) => {
-                Ok(Some(serde_json::from_str(&v).map_err(|e| {
-                    anyhow!("Failed to deserialize rotated token: {}", e)
-                })?))
-            }
-            None => Ok(None),
-        }
-    }
-
-    // -- Opaque token storage (MSC3861) ----------------------------------------
 
     async fn set_token(&self, token: &str, metadata: &TokenMetadata, ttl: u64) -> Result<()> {
         // Every endpoint accepts exactly one kind of token, so an entry without a

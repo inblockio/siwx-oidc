@@ -41,7 +41,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use siwx_oidc::db::{DBClient, RedisClient};
+use siwx_oidc::db::RedisClient;
 
 /// What a profile read found.
 ///
@@ -58,9 +58,8 @@ pub struct ProfileState {
     pub displayname: Option<String>,
 }
 
-use crate::admin_token::{admin_token_metadata, ADMIN_DISPLAY_NAME, ADMIN_TOKEN_PREFIX};
+use crate::admin_token::{admin_service_grant, ADMIN_DISPLAY_NAME};
 use crate::did_assertion::DID_PROFILE_FIELD;
-use crate::introspect::generate_opaque_token;
 
 /// A user's account status as reported by the MAS query endpoint.
 ///
@@ -388,13 +387,12 @@ impl SynapseClient {
                 .context("admin mint: could not provision the admin service user")?;
         }
 
-        let token = generate_opaque_token(ADMIN_TOKEN_PREFIX);
-        let metadata = admin_token_metadata(&admin.localpart, admin.ttl, now);
-        admin
+        let token = admin
             .db
-            .set_token(&token, &metadata, admin.ttl)
+            .issue_grant(&admin_service_grant(&admin.localpart, admin.ttl, now))
             .await
-            .context("admin mint: could not store the minted token")?;
+            .context("admin mint: could not store the minted token")?
+            .access_token;
 
         debug!(
             localpart = %admin.localpart,
@@ -1905,6 +1903,7 @@ fn profile_404_means_row_absent(body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use siwx_oidc::db::tokens::ADMIN_TOKEN_PREFIX;
 
     #[test]
     fn new_strips_trailing_slash() {

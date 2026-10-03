@@ -34,7 +34,7 @@ everything else exists only in the binary crate.
 | `lib.rs` | Library crate root. `synapse_client` is deliberately not re-exported (see Invariants). |
 | `axum_lib.rs` | Startup: loads config through `config::figment()`, validates it (DID methods and pkh namespaces against the aqua-auth registries, signing key, retired keys, WebAuthn), `AppState`, the router, handler glue, the `siwx_user` / `acct_session` cookies, the CORS layer. |
 | `config.rs` | `Config`, its defaults, and `figment()`: the one place config names and precedence are defined. Reference: [docs/configuration.md](docs/configuration.md). |
-| `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_client` authenticates the client for the first two), `userinfo`, client registration, `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, and `provision_synapse_device`, the single provisioning and DID-publication path. |
+| `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_code_client` and `authenticate_refresh_client` authenticate the client for the first two, and `client_is_confidential` decides which clients must present a secret), `userinfo`, client registration, `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, and `provision_synapse_device`, the single provisioning and DID-publication path. |
 | `introspect.rs` | `POST /oauth2/introspect` (RFC 7662) for Synapse; opaque `mat_`/`mcr_` token generation. |
 | `admin_token.rs` | `POST /oauth2/admin_token`: short-TTL token whose scope carries `urn:synapse:admin:*`. |
 | `compat.rs` | `POST /oauth2/revoke` (RFC 7009) and the Matrix client-server endpoints siwx-oidc answers (login flows, logout, logout/all, refresh, device deletion); `TeardownPolicy`. |
@@ -52,7 +52,10 @@ everything else exists only in the binary crate.
 | `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL`. |
 | `credential_migration.rs` (lib) | Additive backfill of passkey credentials into the aqua-auth store. |
 | `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry`, `DeviceCodeEntry`, `TokenMetadata` with its `TokenKind`), `legacy_token_kind`, Redis key prefixes and TTLs. |
-| `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens`, `get_passkeys_for_did`, `lookup_user_session`, `purge_identity`. |
+| `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, `lookup_user_session`, `purge_identity`. |
+| `db/grant.rs` (lib) | The grant record and its Lua scripts: `issue_grant`, the access check `check_access_token` (with the legacy read fallback), `rotate_refresh_token` (the one rotation script), `ReuseEvent`, grant revocation, and the legacy migration (`peek_refresh_token`, `lift_legacy_refresh_token`). Keyspace and decision table in its module docs. |
+| `db/tokens.rs` (lib) | Token formats (`mat_`, `msa_`, `mcr_{handle}_{secret}`), `parse_refresh_token` (never panics), `digest` (the SHA-256 every token is stored as). |
+| `db/seal.rs` (lib) | The sealed successor pair: AES-256-GCM under a key HKDF-derived from the previous refresh token, so only its presenter can open it. |
 | `bin/migrate-credentials.rs` | Operator tool for the credential backfill. Dry run unless `--apply`. |
 
 | `siwx-oidc-auth/src/` | Role |
@@ -354,25 +357,96 @@ doc; read it before changing the code the rule covers.
   `the_device_flow_sends_the_scope_it_relies_on`.
 - **An empty `device_id` is JSON `null` on the wire, never `""`.** Synapse rejects `""`. Pin:
   `empty_device_id_renders_as_json_null`, `deviceless_token_body_carries_device_id_null`.
-- **Refresh rotation keeps a 60 s grace pointer**: within 60 s a replay of the old refresh token
-  returns the same successor pair, so a client that lost the response recovers, but only while the
-  successor refresh token is still live. Once the successor was rotated away or revoked, the
-  recorded pair is dead and the replay is `invalid_grant` at `/token` and `M_UNKNOWN_TOKEN` at
-  `/_matrix/client/v3/refresh`. At `/token` the replay is also bound to the client (next
-  invariant); the Matrix endpoint carries no client and cannot bind it. Pin:
-  `refresh_grace_window_tolerates_replay` (mock stack),
+- **The grant is the unit** (I2). Every access and refresh token belongs to exactly one grant
+  (`grant/{digest(handle)}`, `src/db/grant.rs`); issuance creates it, rotation and revocation act
+  on it, and the access check reads the grant behind the `at/…` entry, so deleting a grant makes
+  all its tokens inert at once. Indices hold grant ids, never token keys. A grant with no refresh
+  token (a `service` grant, a generic-mode grant without `offline_access`) lives as long as its
+  access token. Pin: `issue_grant_writes_the_grant_its_access_entry_and_both_indices`,
+  `an_access_token_resolves_to_its_grant_until_the_grant_is_gone`,
+  `revoking_a_device_deletes_its_grants_only_and_plants_the_tombstone`,
+  `revoking_a_user_deletes_every_grant_of_the_user`,
+  `revoking_by_token_deletes_the_grant_of_an_accepted_token_only`,
+  `revoking_a_deviceless_refresh_token_revokes_its_grant_an_access_token_only_itself`.
+- **One rotation script, one live chain** (I3). Both refresh endpoints rotate only through
+  `RedisClient::rotate_refresh_token`, one Lua script that reads `now` from Redis `TIME` and
+  writes the new access entry itself, so no interleaving can fork the chain or mint a token for a
+  grant being revoked. Do not add a second refresh path or move a check out of the script. Pin:
+  `concurrent_refreshes_at_the_token_endpoint_converge_on_one_pair`,
+  `concurrent_refreshes_at_the_matrix_endpoint_converge_on_one_pair` (mock stack),
+  `concurrent_rotations_of_one_token_converge_on_one_pair`,
+  `the_current_refresh_token_rotates_into_a_new_pair`.
+- **No token is stored** (I1 for tokens). Access tokens are keyed by their SHA-256 digest
+  (`at/{digest}`), refresh tokens are kept as digests in their grant, and the successor pair of a
+  rotation is sealed under the previous refresh token (`db::seal`); no key or value written by
+  the server holds a token, its body, or a refresh token's handle or secret. Legacy `token/{raw}`
+  entries are read, never written. Pin: `no_token_the_client_holds_is_stored_in_the_clear`
+  (mock stack, scans the whole stack Redis), `legacy_tokens_keep_working_after_the_upgrade` (the
+  same scan after a lift), `a_wrong_token_cannot_open_the_successor`,
+  `the_sealed_value_names_neither_token_and_is_fresh_each_time`,
+  `malformed_refresh_tokens_are_unknown_never_a_panic`.
+- **Reuse is recognised and logged, never silently accepted** (I5, phase A). A refresh token whose
+  handle names a live grant but that is neither `current_rt` nor the unused `previous_rt` is
+  answered exactly like an unknown token and emits one `warn!` with the stable message
+  `refresh token reuse detected` and the fields `security_event="refresh_token_reuse"`,
+  `grant_fp`, `generation`, `client_id`, `grant_kind`, `branch` (fingerprints only). Phase A
+  revokes nothing; storage per grant stays constant however long the chain. Pin:
+  `h3_a_thousand_rotations_recognise_every_superseded_token_in_constant_storage`,
+  `rotating_the_successor_counts_as_its_use_and_older_tokens_are_reuse`,
+  `the_reuse_event_carries_its_fields_and_fingerprints_only`,
+  `a_replay_an_hour_later_returns_the_same_pair_and_after_use_is_reuse` (the event at `/token`),
+  `the_matrix_endpoint_logs_one_reuse_event_for_a_superseded_refresh_token` (the event at
+  `/_matrix/client/v3/refresh`),
+  `a_replay_returns_the_same_pair_until_the_new_access_token_is_used` (mock stack).
+- **Tokens of a build before the grant record keep working; nobody signs in again** (design 5.8).
+  A legacy access entry stays readable until it expires (`check_access_token`'s read fallback,
+  removed one release later). A legacy refresh token is lifted into a grant by one script the
+  first time either refresh endpoint sees it (`lift_legacy_refresh_token`), with its client
+  authenticated as for any refresh and its confidentiality decided by `client_is_confidential`;
+  the `legacy_rt/…` pointer sends every later presentation through the rotation script as the
+  grant's previous token. Legacy grace pointers are not read. Pin:
+  `legacy_tokens_keep_working_after_the_upgrade` (mock stack; a real upgrade with
+  `E2E_R1_STAGE=mint`/`check`), `a_legacy_refresh_token_is_lifted_once_and_its_replays_follow_the_same_rule`,
+  `concurrent_presentations_of_one_legacy_token_converge_on_one_pair`,
+  `a_legacy_token_that_may_not_be_lifted_stays_untouched`,
+  `a_legacy_refresh_token_is_lifted_for_its_own_client_with_its_confidentiality`,
+  `the_matrix_endpoint_lifts_a_public_clients_legacy_token_but_not_a_confidential_ones`,
+  `a_lifted_legacy_token_is_resolved_and_revoked_like_its_grants_previous_token`.
+- **A replay of the immediately previous refresh token returns the same successor pair if, and
+  only if, the successor is unused** (I4). Both refresh endpoints run the one rotation script
+  (`RedisClient::rotate_refresh_token`), so concurrent refreshes of one token all get the same
+  pair and leave one live chain. The successor counts as used once its access token is first
+  accepted by introspection or `/userinfo`, or once its refresh token rotates; after that the
+  replay is reuse, answered like an unknown token (`invalid_grant` at `/token`, `M_UNKNOWN_TOKEN`
+  at `/_matrix/client/v3/refresh`). No timer decides it: the decision reads grant state, never a
+  clock. A replay whose successor was rotated away or whose grant was revoked is refused the same
+  way. At `/token` the replay is also bound to the client (next invariant); the Matrix endpoint
+  carries no client and cannot bind it to one. Pin (mock stack):
+  `concurrent_refreshes_at_the_token_endpoint_converge_on_one_pair`,
+  `concurrent_refreshes_at_the_matrix_endpoint_converge_on_one_pair`,
+  `a_replay_returns_the_same_pair_until_the_new_access_token_is_used`,
+  `a_replay_after_more_than_a_minute_still_returns_the_same_pair`; unit:
+  `a_replay_an_hour_later_returns_the_same_pair_and_after_use_is_reuse`,
   `a_replay_whose_successor_has_been_rotated_or_revoked_is_refused`,
-  `the_grace_replay_is_bound_to_the_client_too`, `a_matrix_refresh_replay_needs_its_successor_live`.
-- **A refresh token is bound to the client it was issued to, through the one helper the code
-  exchange uses too.** `oidc::authenticate_client` serves both grants, so they cannot drift: a
-  request that names another client (`client_id` in the form or the Basic user name) is
+  `a_replay_is_bound_to_the_client_too`, `a_matrix_refresh_replay_needs_its_successor_live`,
+  `concurrent_rotations_of_one_token_converge_on_one_pair`.
+- **A refresh token is bound to the client it was issued to, through the helpers the code
+  exchange uses too.** `oidc::authenticate_code_client` (strict) and
+  `oidc::authenticate_refresh_client` (tolerates an expired registration) share
+  `check_named_client`, `check_client_secret` and `client_is_confidential`, so the grants cannot
+  drift: a request that names another client (`client_id` in the form or the Basic user name) is
   `invalid_grant`; a confidential client (registered `token_endpoint_auth_method` other than
   `none`, or none while `require_secret`) must present its secret, else `invalid_client`, a 401
-  (RFC 6749 §5.2, with `WWW-Authenticate: Basic` after a Basic attempt). The grace replay is bound
-  to the successor token's client. Provisional, recorded in docs/matrix-integration.md: a public
+  (RFC 6749 §5.2, with `WWW-Authenticate: Basic` after a Basic attempt). The replay of a lost
+  response is bound to the grant's client like a rotation. Provisional, recorded in docs/matrix-integration.md: a public
   client may omit `client_id`; a token whose client registration has expired (30 days against 90)
-  keeps refreshing unless the request names another client or presents a secret;
-  `POST /_matrix/client/v3/refresh` carries no client identity and is not bound. Read the
+  keeps refreshing unless the request names another client or presents a secret.
+  `POST /_matrix/client/v3/refresh` carries no client identity, so it refuses a confidential
+  client's refresh token exactly like an unknown token, leaving it untouched for `/token`; the
+  grant records at issuance whether its client is confidential, by the same rule
+  (`client_is_confidential`, the only place that decides it). At `/token` the client is
+  authenticated before the rotation script runs (RFC 6749 order), so a superseded token presented
+  with a wrong secret is `invalid_client`, not the unknown-token answer. Read the
   `Authorization` header with `HeaderMap::typed_get`, never as two typed-header extractors, which
   reject each other's scheme and turn every request that has the header into a 400. A Basic user
   name and password are form-urldecoded before they are compared (RFC 6749 §2.3.1: a secret with
@@ -382,14 +456,22 @@ doc; read it before changing the code the rule covers.
   `a_public_client_refreshes_with_or_without_naming_itself`,
   `an_unset_authentication_method_follows_require_secret`,
   `a_token_outlives_its_clients_registration_but_not_its_binding`,
-  `the_grace_replay_is_bound_to_the_client_too`, `a_basic_header_names_the_client_like_the_form_does`,
+  `a_replay_is_bound_to_the_client_too`, `a_basic_header_names_the_client_like_the_form_does`,
   `basic_credentials_are_form_urldecoded_before_they_are_compared`,
   `a_plain_basic_secret_and_a_bearer_token_are_taken_as_sent`,
   `the_code_exchange_and_the_refresh_grant_authenticate_clients_identically`,
+  `a_grant_records_its_client_as_confidential_exactly_when_token_demands_a_secret`,
   `invalid_client_is_a_401_and_every_other_token_error_a_400`; mock stack:
   `a_refresh_token_is_refused_to_another_client`, `a_confidential_client_must_authenticate_to_refresh`,
   `a_public_client_refreshes_without_client_credentials`,
-  `a_basic_authorization_header_authenticates_the_code_exchange`.
+  `a_basic_authorization_header_authenticates_the_code_exchange`,
+  `the_matrix_endpoint_refuses_a_confidential_clients_refresh_token` (unit and mock stack).
+- **A token-store fault is a retryable 503 `M_UNKNOWN` at the Matrix routes, never
+  `M_UNKNOWN_TOKEN`**, which a Matrix client takes for "signed out" (it clears its crypto store):
+  `POST /_matrix/client/v3/refresh` and the device-deletion routes (`username_from_bearer`
+  returns the store error instead of folding it into "unknown"). Pin:
+  `a_store_fault_at_the_matrix_refresh_endpoint_is_a_retryable_503`,
+  `a_store_fault_on_a_bearer_route_is_a_retryable_503`.
 - **Never infer token validity from Synapse**: it caches introspection for two minutes. Our
   introspection answer is the authority.
 - **No device-id recycling.** Sign-in upserts a fresh `SIWX_…` id and never deletes. Pin:
@@ -407,7 +489,8 @@ doc; read it before changing the code the rule covers.
   `teardown_policy_only_deletes_device_on_explicit_signout`,
   `h1_revoke_does_not_delete_device_but_logout_does`,
   `logout_all_invalidates_all_sessions_without_deactivating`.
-- **Revocation keys on `TokenMetadata.username`** (the localpart), not the raw DID.
+- **Revocation keys on the username** (the localpart: a grant's `username`, a legacy entry's
+  `TokenMetadata.username`), not the raw DID.
 
 ### Passkeys ([docs/passkeys.md](docs/passkeys.md))
 
@@ -508,7 +591,7 @@ structured output.
   short because a user code has about 34 bits of entropy. Request logging records method and
   path, never the query, and that holds for the span too: tower-http's default span prints the
   whole URI in front of every debug line. A struct that holds a credential prints its fingerprint
-  under `Debug` (`RotatedToken`, `DeviceCodeEntry`). Pin:
+  under `Debug` (`SuccessorPair`, `IssuedGrant`, `DeviceCodeEntry`). Pin:
   `the_redis_code_and_token_paths_log_fingerprints_never_values`,
   `a_struct_that_holds_a_credential_prints_its_fingerprint_under_debug`,
   `no_log_site_names_a_credential_without_its_fingerprint` (a scan of every log macro in `src/`,

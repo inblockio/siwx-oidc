@@ -3,9 +3,9 @@
 //! This module provides:
 //! - `POST /oauth2/introspect` for Synapse to validate opaque access tokens
 //!   (active only when `mas_shared_secret` is configured; a 404 otherwise)
-//! - `generate_opaque_token`, used for every opaque token this provider issues
-//!   (`mat_`/`mcr_` in MSC3861 mode, unprefixed in standalone mode, `msa_` for
-//!   minted admin tokens)
+//! - `generate_opaque_token`, the random opaque string behind the RFC 8628
+//!   device code (`dvc_`). Access, refresh and admin tokens have their own
+//!   formats in `siwx_oidc::db::tokens`.
 
 use axum::{
     extract::{Form, State},
@@ -22,7 +22,7 @@ use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use tracing::warn;
 
-use siwx_oidc::db::{DBClient, TokenKind, TokenMetadata};
+use siwx_oidc::db::{TokenKind, TokenMetadata};
 
 use super::axum_lib::IntrospectState;
 
@@ -106,7 +106,7 @@ pub async fn introspect(
     }
 
     // Look up the token in Redis.
-    let lookup = state.redis_client.get_token(&form.token).await;
+    let lookup = state.redis_client.check_access_token(&form.token).await;
     render_introspection(lookup, Utc::now().timestamp())
 }
 

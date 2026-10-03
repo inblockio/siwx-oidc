@@ -44,17 +44,14 @@ use chrono::Utc;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::introspect::generate_opaque_token;
 // Use the binary crate's own `synapse_client` module (the same one `axum_lib`
 // and `account` use) so `CompatState.synapse_client` is type-compatible with
 // `AppState.synapse_client`. The lib crate used to re-expose the same file as
 // `siwx_oidc::synapse_client`, which was a *distinct* type here; it no longer
 // does (see the note in `src/lib.rs`).
 use crate::synapse_client::SynapseClient;
-use siwx_oidc::db::{
-    DBClient, RedisClient, RevocationState, RotatedToken, TokenKind, TokenMetadata,
-    ACCESS_TOKEN_TTL, REFRESH_GRACE_TTL, REFRESH_TOKEN_TTL,
-};
+use siwx_oidc::db::grant::{InvalidReason, RefreshPeek, RotateOutcome, RotateRequest};
+use siwx_oidc::db::{DBClient, RedisClient, TokenKind, ACCESS_TOKEN_TTL};
 
 // -- Shared state for compat endpoints ----------------------------------------
 
@@ -67,6 +64,10 @@ pub struct CompatState {
     /// Matrix `server_name` (e.g. `matrix.inblock.io`), needed to build the
     /// mxid for Synapse admin-API device calls. `None` in standalone mode.
     pub server_name: Option<String>,
+    /// `config.require_secret`: whether a client registered without a
+    /// `token_endpoint_auth_method` is confidential
+    /// (`oidc::client_is_confidential`), for lifting a legacy refresh token.
+    pub require_secret: bool,
 }
 
 // -- Request/response types ---------------------------------------------------
@@ -149,30 +150,27 @@ async fn teardown_session(
     policy: TeardownPolicy,
     required: Option<TokenKind>,
 ) {
-    let meta = match state.redis_client.get_token(token).await {
-        Ok(m) => m,
+    let meta = match resolve_presented(state, token).await {
+        Ok(Some(m)) => m,
+        // Unknown token: an idempotent no-op.
+        Ok(None) => return,
         Err(e) => {
-            warn!(error = %e, ctx, "teardown_session: get_token failed; falling back to delete_token");
-            None
+            warn!(error = %e, ctx, "teardown_session: token lookup failed; deleting the presented token");
+            // Best effort: whichever layout the token is in.
+            let _ = state.redis_client.delete_access_token(token).await;
+            if let Err(e) = state.redis_client.delete_token(token).await {
+                warn!(error = %e, ctx, "teardown_session: delete_token (fallback) failed");
+            }
+            return;
         }
     };
-
-    let Some(meta) = meta else {
-        // Unknown token (idempotent no-op) or lookup error: best-effort delete.
-        if let Err(e) = state.redis_client.delete_token(token).await {
-            warn!(error = %e, ctx, "teardown_session: delete_token (fallback) failed");
-        }
-        return;
-    };
-
-    if required.is_some_and(|kind| !meta.is_kind(kind)) {
+    if required.is_some_and(|kind| meta.kind != Some(kind)) {
         debug!(
             ctx,
             "teardown_session: token of another kind; nothing to tear down"
         );
         return;
     }
-
     // Phase 1: delete the ending session's Synapse device (best-effort) — only for
     // explicit-sign-out callers. A bare RFC 7009 revoke (TokensOnly) must never
     // delete a device: that is what wedged users in the 2026-06-12 login incident.
@@ -195,31 +193,30 @@ async fn teardown_session(
             }
         }
     }
-
     // Phase 2: revoke the OAuth session's tokens.
     //
     // Single-session semantics: in standalone mode every token carries an empty
     // device_id, so `revoke_device_tokens(username, "")` would match (and revoke)
     // EVERY session of that user. To keep single-session logout / revoke scoped to
-    // the presented session (RFC 7009), revoke only the presented token when there
-    // is no device_id. In Synapse mode the device_id is a unique `SIWX_{uuid}`, so
-    // revoking by (username, device_id) correctly scopes to this one device's
-    // access + paired refresh tokens.
+    // the presented session (RFC 7009), revoke only the presented credential when
+    // there is no device_id: an access token alone, or a refresh token's whole
+    // grant (RFC 7009 §2.1; its live access token goes with it). In Synapse mode
+    // the device_id is a unique `SIWX_{uuid}`, so revoking by (username,
+    // device_id) correctly scopes to this one device's grants.
     if meta.device_id.is_empty() {
-        match state.redis_client.delete_token(token).await {
+        match delete_presented(state, token, meta.source).await {
             Ok(()) => info!(
                 ctx,
                 username = %meta.username,
                 "session torn down (standalone, presented token only)"
             ),
             Err(e) => {
-                warn!(error = %e, ctx, "teardown_session: delete_token failed")
+                warn!(error = %e, ctx, "teardown_session: deleting the presented token failed")
             }
         }
         return;
     }
-
-    // Phase 2 (device session): revoke this device's tokens (access + paired refresh).
+    // Phase 2 (device session): revoke this device's grants (access + refresh).
     match state
         .redis_client
         .revoke_device_tokens(&meta.username, &meta.device_id)
@@ -235,10 +232,94 @@ async fn teardown_session(
         Err(e) => {
             warn!(error = %e, ctx, "teardown_session: revoke_device_tokens failed; deleting token directly");
             // Last-resort: at least remove the presented token.
-            if let Err(e) = state.redis_client.delete_token(token).await {
-                warn!(error = %e, ctx, "teardown_session: delete_token (last resort) failed");
+            if let Err(e) = delete_presented(state, token, meta.source).await {
+                warn!(error = %e, ctx, "teardown_session: deleting the presented token (last resort) failed");
             }
         }
+    }
+}
+
+/// Where a presented token is stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenSource {
+    /// A grant's access token (`at/{digest}`).
+    GrantAccess,
+    /// A grant's refresh token that the refresh endpoints would accept now.
+    GrantRefresh,
+    /// A `token/{raw}` entry written before the grant record.
+    Legacy,
+}
+
+/// What teardown needs to know about a presented token.
+struct PresentedToken {
+    username: String,
+    device_id: String,
+    kind: Option<TokenKind>,
+    source: TokenSource,
+}
+
+/// Resolve a token for teardown: a grant's live access token, a grant's refresh
+/// token the refresh endpoints would accept (a superseded one is unknown), or a
+/// legacy entry.
+///
+/// A legacy refresh token already lifted counts as its grant's previous token
+/// (`resolve_refresh_token` follows the `legacy_rt/…` pointer). The legacy read
+/// stays while legacy entries can still be presented: access entries for at
+/// most 900 s after the upgrade, refresh entries never presented for up to 90
+/// days (`REFRESH_TOKEN_TTL`); remove it one release after that.
+async fn resolve_presented(
+    state: &CompatState,
+    token: &str,
+) -> anyhow::Result<Option<PresentedToken>> {
+    if let Some(access) = state.redis_client.lookup_access_token(token).await? {
+        return Ok(Some(PresentedToken {
+            username: access.grant.username,
+            device_id: access.grant.device_id,
+            kind: Some(TokenKind::Access),
+            source: TokenSource::GrantAccess,
+        }));
+    }
+    if let Some(grant) = state.redis_client.resolve_refresh_token(token).await? {
+        return Ok(Some(PresentedToken {
+            username: grant.username,
+            device_id: grant.device_id,
+            kind: Some(TokenKind::Refresh),
+            source: TokenSource::GrantRefresh,
+        }));
+    }
+    Ok(state.redis_client.get_token(token).await?.map(|m| {
+        let kind = [TokenKind::Access, TokenKind::Refresh]
+            .into_iter()
+            .find(|k| m.is_kind(*k));
+        PresentedToken {
+            username: m.username,
+            device_id: m.device_id,
+            kind,
+            source: TokenSource::Legacy,
+        }
+    }))
+}
+
+/// Delete only the presented credential: an access token's entry (its grant
+/// stays), a refresh token's whole grant (D-M1-1, RFC 7009 §2.1), or a legacy
+/// entry.
+async fn delete_presented(
+    state: &CompatState,
+    token: &str,
+    source: TokenSource,
+) -> anyhow::Result<()> {
+    match source {
+        TokenSource::GrantAccess => state
+            .redis_client
+            .delete_access_token(token)
+            .await
+            .map(|_| ()),
+        TokenSource::GrantRefresh => state
+            .redis_client
+            .revoke_grant_of_token(token)
+            .await
+            .map(|_| ()),
+        TokenSource::Legacy => state.redis_client.delete_token(token).await,
     }
 }
 
@@ -321,13 +402,13 @@ pub async fn logout_all(
         return (StatusCode::OK, Json(serde_json::json!({})));
     };
 
-    let meta = match state.redis_client.get_token(auth.token()).await {
+    let meta = match state.redis_client.check_access_token(auth.token()).await {
         // The bearer must be an access token; any other entry is a no-op like an
         // unknown token.
-        Ok(Some(m)) if m.is_kind(TokenKind::Access) => m,
-        Ok(_) => return (StatusCode::OK, Json(serde_json::json!({}))), // idempotent no-op
+        Ok(Some(m)) => m,
+        Ok(None) => return (StatusCode::OK, Json(serde_json::json!({}))), // idempotent no-op
         Err(e) => {
-            warn!(error = %e, "logout_all: get_token failed");
+            warn!(error = %e, "logout_all: token lookup failed");
             return (StatusCode::OK, Json(serde_json::json!({})));
         }
     };
@@ -392,21 +473,41 @@ pub struct DeleteDevicesRequest {
     pub devices: Vec<String>,
 }
 
-/// Resolve the bearer token to its owning localpart (`TokenMetadata.username`),
-/// or `None` if the token is missing, unknown, or not an access token.
+/// Resolve the bearer token to its owning localpart (`TokenMetadata.username`).
+///
+/// `Ok(None)` when the token is missing, unknown, or not an access token: the
+/// route answers `M_UNKNOWN_TOKEN`. `Err` when the store could not answer: the
+/// route answers the retryable 503 (`token_store_unavailable`), never
+/// `M_UNKNOWN_TOKEN`, which a Matrix client takes for "signed out".
 async fn username_from_bearer(
     state: &CompatState,
     bearer: &Option<TypedHeader<Authorization<Bearer>>>,
-) -> Option<String> {
-    let TypedHeader(auth) = bearer.as_ref()?;
-    state
+) -> anyhow::Result<Option<String>> {
+    let Some(TypedHeader(auth)) = bearer.as_ref() else {
+        return Ok(None);
+    };
+    Ok(state
         .redis_client
-        .get_token(auth.token())
-        .await
-        .ok()
-        .flatten()
-        .filter(|m| m.is_kind(TokenKind::Access))
-        .map(|m| m.username)
+        .check_access_token(auth.token())
+        .await?
+        .map(|m| m.username))
+}
+
+/// The bearer's owner for a device-deletion route, or the response to send:
+/// `M_UNKNOWN_TOKEN` for an unknown bearer, the retryable 503 for a store fault.
+async fn bearer_owner(
+    state: &CompatState,
+    bearer: &Option<TypedHeader<Authorization<Bearer>>>,
+    ctx: &str,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    match username_from_bearer(state, bearer).await {
+        Ok(Some(username)) => Ok(username),
+        Ok(None) => Err(unknown_token_response()),
+        Err(e) => {
+            warn!(error = %e, ctx, "bearer lookup: token store failed (infrastructure); returning retryable 503");
+            Err(token_store_unavailable())
+        }
+    }
 }
 
 /// Delete one of `username`'s Synapse devices (MAS API) and revoke its tokens.
@@ -460,8 +561,9 @@ pub async fn delete_device(
     Path(device_id): Path<String>,
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
 ) -> impl IntoResponse {
-    let Some(username) = username_from_bearer(&state, &bearer).await else {
-        return unknown_token_response();
+    let username = match bearer_owner(&state, &bearer, "compat_delete_device").await {
+        Ok(username) => username,
+        Err(response) => return response,
     };
     teardown_device(&state, &username, &device_id, "compat_delete_device").await;
     (StatusCode::OK, Json(serde_json::json!({})))
@@ -473,8 +575,9 @@ pub async fn delete_devices(
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
     Json(body): Json<DeleteDevicesRequest>,
 ) -> impl IntoResponse {
-    let Some(username) = username_from_bearer(&state, &bearer).await else {
-        return unknown_token_response();
+    let username = match bearer_owner(&state, &bearer, "compat_delete_devices").await {
+        Ok(username) => username,
+        Err(response) => return response,
     };
     for device_id in &body.devices {
         teardown_device(&state, &username, device_id, "compat_delete_devices").await;
@@ -484,7 +587,8 @@ pub async fn delete_devices(
 
 // -- POST /_matrix/client/v3/refresh ------------------------------------------
 
-/// 503 for a token-store fault during a refresh: retryable, never `M_UNKNOWN_TOKEN`.
+/// 503 for a token-store fault during a refresh or a bearer lookup: retryable,
+/// never `M_UNKNOWN_TOKEN`.
 fn token_store_unavailable() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -497,281 +601,121 @@ fn token_store_unavailable() -> (StatusCode, Json<serde_json::Value>) {
 
 /// `POST /_matrix/client/v3/refresh` (MSC2918): rotate a refresh token.
 ///
-/// **Not bound to a client.** The OAuth refresh grant (`oidc::token_refresh`)
+/// **Public clients only.** The OAuth refresh grant (`oidc::token_refresh`)
 /// checks that the request comes from the client the token was issued to and
 /// authenticates a confidential one (I7). The Matrix client-server API gives
-/// this request no client identity to check (the body is the refresh token and
-/// nothing else), so this endpoint takes the token alone. The consequence: a
-/// confidential client's refresh token can be rotated here without its secret.
-/// Matrix clients are public clients, so nothing legitimate is affected, but the
-/// binding protects only the OAuth grant until this endpoint is restricted to
-/// the tokens that belong to Matrix devices (plan section 8). Do not "fix" it by
-/// demanding a client here: no Matrix client can send one.
+/// this request no client identity (the body is the refresh token and nothing
+/// else), so this endpoint cannot authenticate a client: it refuses, exactly
+/// like an unknown token, the refresh token of a grant whose client is
+/// confidential (recorded on the grant at issuance by
+/// `oidc::client_is_confidential`, the rule the token endpoint applies), and
+/// leaves it untouched for `POST /token`. A public client's token needs no
+/// authentication, so this endpoint is bound as far as the binding reaches at
+/// `POST /token` without a named client. Matrix clients (Element Web, Element
+/// X) register as public clients. Do not "fix" the rest by demanding a client
+/// here: no Matrix client can send one.
 ///
-/// The grace replay of a just-rotated token is handed out only while the
-/// successor refresh token is live (the rule `POST /token` applies as well, minus
-/// the client binding).
+/// Rotation, the replay of a lost response and the refusals are the rotation
+/// script's (`RedisClient::rotate_refresh_token`), the same one `POST /token`
+/// runs.
 pub async fn refresh(
     State(state): State<CompatState>,
     Json(body): Json<RefreshRequest>,
 ) -> impl IntoResponse {
-    // Look up the refresh token. Only a refresh token refreshes: any other entry
-    // (an access or admin token) is answered exactly like an unknown token, and
-    // is left untouched.
-    let metadata = match state
+    // The one rotation script (I3) decides atomically: rotate, replay the
+    // unused successor of a lost response (I4), or refuse. No client is named
+    // (this endpoint has none), and a confidential client's grant is refused
+    // (see above). A legacy refresh token (`token/{raw}`, written before the
+    // grant record) is lifted into a grant instead (design 5.8), unless its
+    // client is confidential: the same rule, decided by `client_is_confidential`
+    // as at every issuance, and the legacy token is left for `POST /token`.
+    let request = RotateRequest {
+        presented: &body.refresh_token,
+        client_id: None,
+        refuse_confidential: true,
+    };
+    let outcome = match state
         .redis_client
-        .get_token(&body.refresh_token)
+        .peek_refresh_token(&body.refresh_token)
         .await
-        .map(|m| m.filter(|m| m.is_kind(TokenKind::Refresh)))
     {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            // Grace replay (lost-response recovery): mirror oidc::token_refresh. A
-            // just-rotated refresh token is deleted but its successor is recorded
-            // under a short grace window; a client that lost the rotation response
-            // can replay the old token and recover instead of being logged out.
-            // The recorded pair is handed out only while the successor refresh
-            // token is live: once it has been rotated away or revoked, the pair is
-            // dead and the replay is an unknown token, as at `POST /token`. (That
-            // endpoint also binds the replay to the client; this one cannot.)
-            let replay = match state
+        Ok(RefreshPeek::Legacy(legacy)) => {
+            match state
                 .redis_client
-                .get_rotated_token(&body.refresh_token)
+                .get_client(legacy.meta.client_id.clone())
                 .await
             {
-                Ok(Some(succ)) => state
-                    .redis_client
-                    .get_token(&succ.refresh_token)
-                    .await
-                    .map(|m| m.filter(|m| m.is_kind(TokenKind::Refresh)).map(|_| succ)),
-                Ok(None) => Ok(None),
+                Ok(client) => {
+                    let confidential =
+                        crate::oidc::client_is_confidential(client.as_ref(), state.require_secret);
+                    state
+                        .redis_client
+                        .lift_legacy_refresh_token(&request, &legacy, confidential)
+                        .await
+                }
                 Err(e) => Err(e),
-            };
-            match replay {
-                Ok(Some(succ)) => {
-                    let expires_in = (succ.access_exp - Utc::now().timestamp()).max(0) as u64;
-                    return (
-                        StatusCode::OK,
-                        Json(serde_json::json!({
-                            "access_token": succ.access_token,
-                            "expires_in_ms": expires_in * 1000,
-                            "refresh_token": succ.refresh_token,
-                        })),
-                    );
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(error = %e, "refresh: grace lookup failed (infrastructure); returning retryable 503");
-                    return token_store_unavailable();
-                }
             }
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "errcode": "M_UNKNOWN_TOKEN",
-                    "error": "Invalid refresh token"
-                })),
-            );
+        }
+        Ok(RefreshPeek::Grant(_)) | Ok(RefreshPeek::Unknown) => {
+            state.redis_client.rotate_refresh_token(&request).await
+        }
+        Err(e) => Err(e),
+    };
+    let (pair, expires_in) = match outcome {
+        Ok(RotateOutcome::Rotated(rotated)) => (rotated.pair, ACCESS_TOKEN_TTL),
+        Ok(RotateOutcome::Replayed(replayed)) => {
+            let left = (replayed.pair.access_exp - Utc::now().timestamp()).max(0) as u64;
+            (replayed.pair, left.min(ACCESS_TOKEN_TTL))
+        }
+        // Reuse (I5, phase A): recorded, and answered like an unknown token.
+        Ok(RotateOutcome::Reuse(event)) => {
+            event.emit();
+            return invalid_refresh_token("Invalid refresh token");
+        }
+        Ok(RotateOutcome::Invalid(InvalidReason::Revoked)) => {
+            debug!("refresh refused: device/account torn down");
+            return invalid_refresh_token("Session has been revoked");
+        }
+        // `NotCurrentFormat`: neither a token in the current format, nor a
+        // legacy refresh token (lifted above), nor one already lifted: garbage
+        // or another kind of token. `ConfidentialClient`: a client this endpoint cannot authenticate
+        // (see above), answered like an unknown token. `ClientMismatch` cannot
+        // happen: no client is named.
+        Ok(RotateOutcome::Invalid(_))
+        | Ok(RotateOutcome::ClientMismatch)
+        | Ok(RotateOutcome::ConfidentialClient) => {
+            return invalid_refresh_token("Invalid refresh token");
         }
         Err(e) => {
             // Infrastructure failure, NOT an authorization failure. `M_UNKNOWN_TOKEN`
             // is terminal for a Matrix client (it signs out and clears its crypto
             // store, and under MSC3861 Synapse never offers a soft logout), so
             // reporting a Redis error that way would turn a transient fault into
-            // permanent session and cryptographic-identity loss. 503 is retryable.
-            warn!(error = %e, "refresh: token lookup failed (infrastructure); returning retryable 503");
+            // permanent session and cryptographic-identity loss. 503 is retryable,
+            // and the script either ran entirely or not at all.
+            warn!(error = %e, "refresh: token store failed (infrastructure); returning retryable 503");
             return token_store_unavailable();
         }
     };
 
-    // Verify the refresh token has not expired.
-    if metadata.exp <= Utc::now().timestamp() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "errcode": "M_UNKNOWN_TOKEN",
-                "error": "Invalid refresh token"
-            })),
-        );
-    }
-
-    // Race guard (S3-3 / H3 + S3-4 / H6): refuse to mint if this device was just
-    // signed out, or this user was just deactivated/erased. The tombstone is
-    // planted atomically by the revoke sweep, so a refresh that started before the
-    // sweep but lands after it cannot resurrect access for a torn-down device /
-    // terminated account. (Best-effort: a Redis error here fails closed below.)
-    //
-    // PRE-mint: nothing has been destroyed yet and the client still holds a usable
-    // refresh token, so an indeterminate probe must NOT be resolved by guessing.
-    // Minting under uncertainty is unsafe; deleting the client's token over an I/O
-    // error is destructive. Return a retryable 503 instead and let the client come
-    // back — the strictly safest option, available only because we are pre-mint.
-    let revocation = state
-        .redis_client
-        .probe_revocation(&metadata.username, &metadata.device_id)
-        .await;
-    if revocation == RevocationState::Indeterminate {
-        warn!(
-            username = %metadata.username,
-            device_id = %metadata.device_id,
-            "refresh: revocation probe indeterminate before mint; returning \
-             retryable 503 without touching the client's refresh token"
-        );
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "errcode": "M_UNKNOWN",
-                "error": "Revocation state temporarily unavailable; retry"
-            })),
-        );
-    }
-    if revocation.must_refuse() {
-        // Also revoke the presented refresh token so the chain cannot continue.
-        let _ = state.redis_client.delete_token(&body.refresh_token).await;
-        debug!(
-            username = %metadata.username,
-            device_id = %metadata.device_id,
-            revocation = ?revocation,
-            "refresh refused: device/account torn down"
-        );
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "errcode": "M_UNKNOWN_TOKEN",
-                "error": "Session has been revoked"
-            })),
-        );
-    }
-
-    // Generate new access token with same metadata.
-    let new_access_token = generate_opaque_token("mat_");
-    let now = Utc::now().timestamp();
-    let access_meta = TokenMetadata {
-        username: metadata.username.clone(),
-        device_id: metadata.device_id.clone(),
-        scope: metadata.scope.clone(),
-        client_id: metadata.client_id.clone(),
-        iat: now,
-        exp: now + ACCESS_TOKEN_TTL as i64,
-        did: metadata.did.clone(),
-        name: metadata.name.clone(),
-        kind: Some(TokenKind::Access),
-    };
-
-    if let Err(e) = state
-        .redis_client
-        .set_token(&new_access_token, &access_meta, ACCESS_TOKEN_TTL)
-        .await
-    {
-        warn!("refresh: failed to store new access token: {}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "errcode": "M_UNKNOWN",
-                "error": "Internal server error"
-            })),
-        );
-    }
-
-    // Rotate the refresh token.
-    let new_refresh_token = generate_opaque_token("mcr_");
-    let refresh_meta = TokenMetadata {
-        username: metadata.username.clone(),
-        device_id: metadata.device_id.clone(),
-        scope: metadata.scope.clone(),
-        client_id: metadata.client_id.clone(),
-        iat: now,
-        exp: now + REFRESH_TOKEN_TTL as i64,
-        did: metadata.did.clone(),
-        name: metadata.name.clone(),
-        kind: Some(TokenKind::Refresh),
-    };
-
-    if let Err(e) = state
-        .redis_client
-        .set_token(&new_refresh_token, &refresh_meta, REFRESH_TOKEN_TTL)
-        .await
-    {
-        warn!("refresh: failed to store new refresh token: {}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "errcode": "M_UNKNOWN",
-                "error": "Internal server error"
-            })),
-        );
-    }
-
-    // Delete the old refresh token.
-    let _ = state.redis_client.delete_token(&body.refresh_token).await;
-
-    // Re-check the tombstones AFTER minting (check-mint-recheck). This closes the
-    // last race window (S3-3 / H3 + S3-4 / H6): if a revoke/deactivate sweep
-    // planted a tombstone in the gap between our pre-mint check and our writes,
-    // the sweep's atomic index-delete may have missed our just-minted tokens
-    // (they were written after its SMEMBERS snapshot). Detecting the tombstone now
-    // and deleting our own tokens guarantees no resurrected token survives.
-    //
-    // Fail OPEN on an indeterminate probe, CLOSED only on a definite tombstone —
-    // same reasoning as `oidc::token_refresh`: the presented refresh token is
-    // already gone by this point, so rolling back on a mere I/O error would sign
-    // the client out with no recoverable credential.
-    let revoked_now = state
-        .redis_client
-        .probe_revocation(&metadata.username, &metadata.device_id)
-        .await;
-    if revoked_now == RevocationState::Indeterminate {
-        warn!(
-            username = %metadata.username,
-            device_id = %metadata.device_id,
-            "refresh: revocation probe indeterminate after mint; committing \
-             (fail-open, bounded by tombstone TTL)"
-        );
-    }
-    if revoked_now.must_refuse() {
-        let _ = state.redis_client.delete_token(&new_access_token).await;
-        let _ = state.redis_client.delete_token(&new_refresh_token).await;
-        debug!(
-            username = %metadata.username,
-            "refresh: tombstoned mid-mint; rolled back just-minted tokens"
-        );
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "errcode": "M_UNKNOWN_TOKEN",
-                "error": "Session has been revoked"
-            })),
-        );
-    }
-
-    // Grace window (mirror oidc::token_refresh): record old refresh token -> the
-    // successor pair, so a lost rotation response can be replayed once within
-    // REFRESH_GRACE_TTL instead of signing the client out. Written only on the
-    // committed success path (after the H3/H6 recheck above). Best-effort.
-    let _ = state
-        .redis_client
-        .set_rotated_token(
-            &body.refresh_token,
-            &RotatedToken {
-                access_token: new_access_token.clone(),
-                refresh_token: new_refresh_token.clone(),
-                access_exp: now + ACCESS_TOKEN_TTL as i64,
-            },
-            REFRESH_GRACE_TTL,
-        )
-        .await;
-
-    debug!(
-        username = %metadata.username,
-        "refresh: tokens rotated successfully"
-    );
-
+    debug!("refresh: tokens rotated successfully");
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "access_token": new_access_token,
-            "expires_in_ms": ACCESS_TOKEN_TTL * 1000,
-            "refresh_token": new_refresh_token,
+            "access_token": pair.access_token,
+            "expires_in_ms": expires_in * 1000,
+            "refresh_token": pair.refresh_token,
+        })),
+    )
+}
+
+/// `M_UNKNOWN_TOKEN` for a refresh token this endpoint refuses.
+fn invalid_refresh_token(error: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "errcode": "M_UNKNOWN_TOKEN",
+            "error": error
         })),
     )
 }
@@ -781,7 +725,9 @@ mod tests {
     use super::*;
     use axum::extract::{Form, State};
     use axum::response::IntoResponse;
-    use siwx_oidc::db::DBClient;
+    use siwx_oidc::db::grant::{GrantKind, IssuedGrant, NewGrant};
+    use siwx_oidc::db::tokens;
+    use siwx_oidc::db::{DBClient, TokenMetadata, REFRESH_TOKEN_TTL};
 
     /// The test Redis, or `None` after a loud skip (`siwx_oidc::test_support`).
     async fn redis() -> Option<RedisClient> {
@@ -829,6 +775,7 @@ mod tests {
     fn standalone_state(redis_client: RedisClient) -> CompatState {
         CompatState {
             redis_client,
+            require_secret: true,
             synapse_client: None,
             server_name: None,
         }
@@ -1008,11 +955,327 @@ mod tests {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
-    /// The Matrix endpoint's grace replay follows the rule of the OAuth grant: it
-    /// returns the recorded successor pair only while the successor refresh token
-    /// is live. After the successor was rotated away or revoked the recorded pair
-    /// is dead, so the replay is answered like an unknown token. (The endpoint
-    /// cannot bind the replay to a client: the Matrix API carries none.)
+    /// A grant with a refresh token, for the refresh and revoke tests.
+    async fn seed_grant(client: &RedisClient, user: &str, dev: &str) -> IssuedGrant {
+        seed_grant_for(client, user, dev, false).await
+    }
+
+    /// A grant with a refresh token issued to a public or a confidential client.
+    async fn seed_grant_for(
+        client: &RedisClient,
+        user: &str,
+        dev: &str,
+        confidential_client: bool,
+    ) -> IssuedGrant {
+        client
+            .issue_grant(&NewGrant {
+                kind: if dev.is_empty() {
+                    GrantKind::Oidc
+                } else {
+                    GrantKind::MatrixDevice
+                },
+                username: user.to_string(),
+                did: format!("did:key:z{user}"),
+                client_id: "compat-test".into(),
+                confidential_client,
+                device_id: dev.to_string(),
+                scope: "openid".into(),
+                name: user.to_string(),
+                auth_time: Utc::now().timestamp(),
+                access_ttl: ACCESS_TOKEN_TTL,
+                refresh_inactivity_secs: Some(120),
+            })
+            .await
+            .unwrap()
+    }
+
+    /// `POST /_matrix/client/v3/refresh` carries no client identity, so it
+    /// cannot authenticate a confidential client (I7): it refuses that client's
+    /// refresh token exactly like an unknown token and leaves it untouched, so
+    /// the client can still refresh at `POST /token` with its secret. A public
+    /// client's token rotates there as before.
+    #[tokio::test]
+    async fn the_matrix_endpoint_refuses_a_confidential_clients_refresh_token() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("conf-user-{n}");
+        let dev = format!("CONF_{n}");
+        let state = standalone_state(client.clone());
+
+        let never_issued = tokens::new_refresh_token(&tokens::new_grant_handle());
+        let (_, unknown) = matrix_refresh(&state, &never_issued).await;
+        let confidential = seed_grant_for(&client, &user, &dev, true)
+            .await
+            .refresh_token
+            .unwrap();
+        let (status, body) = matrix_refresh(&state, &confidential).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a confidential client's refresh token is refused: {body}"
+        );
+        assert_eq!(body, unknown, "refused exactly like an unknown token");
+        let grant = client
+            .resolve_refresh_token(&confidential)
+            .await
+            .unwrap()
+            .expect("the refused token is still the grant's current refresh token");
+        assert_eq!(grant.generation, 0, "the refusal rotated nothing");
+
+        let public = seed_grant_for(&client, &user, &dev, false)
+            .await
+            .refresh_token
+            .unwrap();
+        let (status, body) = matrix_refresh(&state, &public).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a public client's token rotates: {body}"
+        );
+
+        client.revoke_grants_for_device(&user, &dev).await.ok();
+    }
+
+    /// I5 phase A at `POST /_matrix/client/v3/refresh`, the endpoint every
+    /// Matrix session refreshes at: a superseded refresh token (rotated twice,
+    /// the first presented again) is answered like an unknown token and logged
+    /// as exactly one reuse event that names the grant by its fingerprint and
+    /// the branch, with no token in the logs.
+    #[tokio::test]
+    async fn the_matrix_endpoint_logs_one_reuse_event_for_a_superseded_refresh_token() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("reuse-user-{n}");
+        let dev = format!("REUSE_{n}");
+        let state = standalone_state(client.clone());
+        let logs = siwx_oidc::test_support::LogCapture::start();
+
+        let grant = seed_grant(&client, &user, &dev).await;
+        let first = grant.refresh_token.clone().unwrap();
+        let mut issued = vec![grant.access_token.clone(), first.clone()];
+        let mut current = first.clone();
+        for _ in 0..2 {
+            let (status, body) = matrix_refresh(&state, &current).await;
+            assert_eq!(status, StatusCode::OK, "the current token rotates: {body}");
+            for field in ["access_token", "refresh_token"] {
+                issued.push(body[field].as_str().unwrap().to_string());
+            }
+            current = body["refresh_token"].as_str().unwrap().to_string();
+        }
+
+        let (status, body) = matrix_refresh(&state, &first).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "reuse is refused: {body}");
+        assert_eq!(
+            body["errcode"], "M_UNKNOWN_TOKEN",
+            "answered like an unknown token: {body}"
+        );
+        let output = logs.output();
+        let events: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains(siwx_oidc::db::grant::REUSE_EVENT_MESSAGE))
+            .collect();
+        assert_eq!(events.len(), 1, "exactly one reuse event: {output}");
+        let event = events[0];
+        for field in [
+            format!("grant_fp={}", grant.grant_id.fingerprint()),
+            "branch=\"superseded\"".to_string(),
+        ] {
+            assert!(event.contains(&field), "the event carries {field}: {event}");
+        }
+        for secret in &issued {
+            assert!(
+                !output.contains(secret.as_str()),
+                "no token in the logs: {output}"
+            );
+        }
+
+        client.revoke_grants_for_device(&user, &dev).await.ok();
+    }
+
+    /// Item 10 at the Matrix endpoint: a legacy refresh token (`token/{raw}`,
+    /// written before the grant record) of a public client is lifted into a
+    /// grant and answered in the current format; a confidential client's is
+    /// refused like an unknown token and left as it was, for `POST /token`
+    /// (the client registered without a method under `require_secret`).
+    #[tokio::test]
+    async fn the_matrix_endpoint_lifts_a_public_clients_legacy_token_but_not_a_confidential_ones() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let state = standalone_state(client.clone());
+        let confidential_client = format!("legacy-conf-{n}");
+        client
+            .set_client(
+                confidential_client.clone(),
+                siwx_oidc::db::ClientEntry {
+                    secret: "s".into(),
+                    metadata: openidconnect::core::CoreClientMetadata::new(
+                        vec![
+                            openidconnect::RedirectUrl::new("https://example.com/cb".into())
+                                .unwrap(),
+                        ],
+                        openidconnect::registration::EmptyAdditionalClientMetadata {},
+                    ),
+                    access_token: None,
+                },
+            )
+            .await
+            .unwrap();
+        let seed = |client_id: String| {
+            let client = client.clone();
+            async move {
+                let raw = format!("mcr_legacy{n}{client_id}");
+                let mut meta = refresh_meta(&format!("legacy-user-{n}"), "");
+                meta.client_id = client_id;
+                meta.iat = Utc::now().timestamp();
+                meta.exp = meta.iat + REFRESH_TOKEN_TTL as i64;
+                client
+                    .set_token(&raw, &meta, REFRESH_TOKEN_TTL)
+                    .await
+                    .unwrap();
+                raw
+            }
+        };
+        let (_, unknown) = matrix_refresh(&state, "mcr_never_issued_legacy").await;
+
+        let refused = seed(confidential_client).await;
+        let (status, body) = matrix_refresh(&state, &refused).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body, unknown, "refused exactly like an unknown token");
+        assert!(
+            client.get_token(&refused).await.unwrap().is_some(),
+            "the refused legacy token is left for POST /token"
+        );
+
+        let public = seed(format!("legacy-unregistered-{n}")).await;
+        let (status, body) = matrix_refresh(&state, &public).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a public client's legacy token is lifted: {body}"
+        );
+        let new_rt = body["refresh_token"].as_str().unwrap();
+        assert!(
+            tokens::parse_refresh_token(new_rt).is_some(),
+            "current format: {body}"
+        );
+        assert!(
+            client.get_token(&public).await.unwrap().is_none(),
+            "legacy entry gone"
+        );
+        let grant = client.peek_refresh_grant(new_rt).await.unwrap().unwrap();
+        assert!(
+            !grant.confidential_client,
+            "an unregistered client is public"
+        );
+    }
+
+    /// A store fault: Redis answers the operation that reads `key` with an
+    /// error (`WRONGTYPE`: a string planted where a hash is read). The handler
+    /// gets the same `Err` from the store that a lost connection, a timeout or
+    /// an out-of-memory refusal gives it. The key expires on its own.
+    async fn plant_store_fault(key: &str) {
+        let raw =
+            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
+        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let _: () = bb8_redis::redis::cmd("SET")
+            .arg(key)
+            .arg("planted store fault")
+            .arg("EX")
+            .arg(60)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    /// The retryable answer to a store fault: 503 with `M_UNKNOWN`.
+    fn assert_retryable_503(status: StatusCode, body: &serde_json::Value, what: &str) {
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{what}: a store fault is a retryable 503: {body}"
+        );
+        assert_eq!(
+            body["errcode"], "M_UNKNOWN",
+            "{what}: never M_UNKNOWN_TOKEN, which signs a Matrix client out: {body}"
+        );
+    }
+
+    /// A store fault during `POST /_matrix/client/v3/refresh` is a retryable
+    /// 503, never `M_UNKNOWN_TOKEN`: a Matrix client treats that as "signed
+    /// out" and clears its crypto store, so a transient Redis fault would cost
+    /// the session and its cryptographic identity.
+    #[tokio::test]
+    async fn a_store_fault_at_the_matrix_refresh_endpoint_is_a_retryable_503() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let state = standalone_state(client.clone());
+        let rt = tokens::new_refresh_token(&tokens::new_grant_handle());
+        let handle = tokens::parse_refresh_token(&rt).unwrap().handle;
+        plant_store_fault(&format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_GRANT_PREFIX,
+            siwx_oidc::db::grant::GrantId::of_handle(handle).as_str()
+        ))
+        .await;
+
+        let (status, body) = matrix_refresh(&state, &rt).await;
+        assert_retryable_503(status, &body, &format!("refresh {n}"));
+    }
+
+    /// A store fault while resolving the bearer of a device-deletion route is
+    /// the same retryable 503 as at the refresh endpoint, never the
+    /// `M_UNKNOWN_TOKEN` 401 of an unknown token.
+    #[tokio::test]
+    async fn a_store_fault_on_a_bearer_route_is_a_retryable_503() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("fault-user-{n}");
+        let dev = format!("FAULT_{n}");
+        let state = standalone_state(client.clone());
+        let access = seed_grant(&client, &user, &dev).await.access_token;
+        plant_store_fault(&format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_ACCESS_TOKEN_PREFIX,
+            tokens::digest(&access)
+        ))
+        .await;
+
+        let response = delete_device(State(state.clone()), Path(dev.clone()), bearer(&access))
+            .await
+            .into_response();
+        let (status, body) = status_and_json(response).await;
+        assert_retryable_503(status, &body, "DELETE /devices/{id}");
+
+        let response = delete_devices(
+            State(state.clone()),
+            bearer(&access),
+            Json(DeleteDevicesRequest {
+                devices: vec![dev.clone()],
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = status_and_json(response).await;
+        assert_retryable_503(status, &body, "POST /delete_devices");
+
+        client.revoke_grants_for_device(&user, &dev).await.ok();
+    }
+
+    async fn status_and_json(
+        response: axum::response::Response,
+    ) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// The Matrix endpoint's replay follows the rule of the OAuth grant (I4):
+    /// it returns the successor pair only while that pair is live and unused.
+    /// After the successor was rotated away or its grant revoked, the replay is
+    /// answered like an unknown token. (The endpoint cannot bind the replay to
+    /// a client: the Matrix API carries none.)
     #[tokio::test]
     async fn a_matrix_refresh_replay_needs_its_successor_live() {
         let Some(client) = redis().await else { return };
@@ -1022,10 +1285,9 @@ mod tests {
         let state = standalone_state(client.clone());
 
         // Rotated: the client received the successor and has since used it.
-        let old = format!("compat_replay_old_{n}");
-        client
-            .set_token(&old, &refresh_meta(&user, &dev), 120)
+        let old = seed_grant(&client, &user, &dev)
             .await
+            .refresh_token
             .unwrap();
         let (status, first) = matrix_refresh(&state, &old).await;
         assert_eq!(status, StatusCode::OK, "the rotation succeeds: {first}");
@@ -1048,15 +1310,18 @@ mod tests {
         );
         assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN");
 
-        // Revoked: the successor was deleted before the client used it.
-        let old = format!("compat_replay_revoked_{n}");
-        client
-            .set_token(&old, &refresh_meta(&user, &dev), 120)
+        // Revoked: the successor's grant was deleted before the client used it.
+        let old = seed_grant(&client, &user, &dev)
             .await
+            .refresh_token
             .unwrap();
         let (_, first) = matrix_refresh(&state, &old).await;
         let successor = first["refresh_token"].as_str().unwrap().to_string();
-        client.delete_token(&successor).await.unwrap();
+        client
+            .revoke_grant_of_token(&successor)
+            .await
+            .unwrap()
+            .expect("the successor's grant is revoked");
         let (status, body) = matrix_refresh(&state, &old).await;
         assert_eq!(
             status,
@@ -1065,13 +1330,58 @@ mod tests {
         );
         assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN");
 
-        for token in [
-            first["access_token"].as_str().unwrap(),
-            second["access_token"].as_str().unwrap(),
-            second["refresh_token"].as_str().unwrap(),
-        ] {
-            client.delete_token(token).await.ok();
-        }
+        client.revoke_grants_for_device(&user, &dev).await.ok();
+    }
+
+    /// D-M1-1 (provisional): RFC 7009 revoke of a deviceless grant's refresh
+    /// token revokes the whole grant, its live access token included (RFC 7009
+    /// §2.1); revoking its access token removes only that access token.
+    #[tokio::test]
+    async fn revoking_a_deviceless_refresh_token_revokes_its_grant_an_access_token_only_itself() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let state = standalone_state(client.clone());
+        let revoke_token = |token: &str| {
+            revoke(
+                State(state.clone()),
+                Form(RevokeForm {
+                    token: token.to_string(),
+                    token_type_hint: None,
+                }),
+            )
+        };
+
+        let by_refresh = seed_grant(&client, &format!("grant-revoke-rt-{n}"), "").await;
+        let refresh_token = by_refresh.refresh_token.clone().unwrap();
+        assert_eq!(revoke_token(&refresh_token).await, StatusCode::OK);
+        assert!(
+            client
+                .check_access_token(&by_refresh.access_token)
+                .await
+                .unwrap()
+                .is_none(),
+            "revoking the refresh token takes the grant's access token with it"
+        );
+        let (status, body) = matrix_refresh(&state, &refresh_token).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the refresh token is gone: {body}"
+        );
+
+        let by_access = seed_grant(&client, &format!("grant-revoke-at-{n}"), "").await;
+        assert_eq!(revoke_token(&by_access.access_token).await, StatusCode::OK);
+        assert!(
+            client
+                .check_access_token(&by_access.access_token)
+                .await
+                .unwrap()
+                .is_none(),
+            "the access token is revoked"
+        );
+        let (status, body) =
+            matrix_refresh(&state, by_access.refresh_token.as_deref().unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "the grant itself survives: {body}");
     }
 
     /// RFC 7009 revoke accepts either kind: a refresh token is revoked.
