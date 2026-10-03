@@ -1873,17 +1873,17 @@ pub async fn authorize(
             session_id.to_string(),
             SessionEntry {
                 siwe_nonce: nonce.clone(),
-                oidc_nonce: params.nonce.clone(),
                 secret: session_secret.clone(),
                 signin_count: 0,
                 verified_did: None,
-                scope: Some(params.scope.as_str().to_string()),
                 request: Some(AuthorizationRequest {
                     client_id: params.client_id.clone(),
                     redirect_uri: params.redirect_uri.as_str().to_string(),
                     state: state.clone(),
                     response_mode: params.response_mode.clone(),
                     code_challenge: code_challenge.clone(),
+                    scope: Some(params.scope.as_str().to_string()),
+                    nonce: params.nonce.clone(),
                 }),
             },
         )
@@ -2204,6 +2204,8 @@ pub(crate) fn bound_test_request(client_id: &str) -> AuthorizationRequest {
         state: "state".to_string(),
         response_mode: None,
         code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
+        scope: None,
+        nonce: None,
     }
 }
 
@@ -2876,8 +2878,8 @@ pub async fn sign_in(
         validate_registered_redirect_uri(&request.client_id, &redirect_uri, db_client).await?;
     let device_name = device_display_name(&request.client_id, Some(&client));
 
-    // Extract client-proposed device_id from the session's stored scope (if any).
-    let proposed_device_id = session_entry
+    // Extract a client-proposed device_id from the bound request's scope (if any).
+    let proposed_device_id = request
         .scope
         .as_deref()
         .and_then(extract_device_id_from_scope);
@@ -2909,7 +2911,7 @@ pub async fn sign_in(
 
     let code_entry = CodeEntry {
         did: did.clone(),
-        nonce: session_entry.oidc_nonce.clone(),
+        nonce: request.nonce.clone(),
         exchange_count: 0,
         client_id: request.client_id.clone(),
         auth_time: Utc::now(),
@@ -2917,7 +2919,7 @@ pub async fn sign_in(
         code_challenge_method: Some("S256".to_string()),
         localpart: Some(resolved.localpart.clone()),
         device_id,
-        scope: session_entry.scope.clone(),
+        scope: request.scope.clone(),
     };
 
     let code = Uuid::new_v4();
@@ -3642,22 +3644,18 @@ mod tests {
                 state: "state".into(),
                 response_mode: Some("fragment".into()),
                 code_challenge: RFC7636_CHALLENGE.into(),
+                scope: Some("openid".into()),
+                nonce: Some(Nonce::new("oidc-nonce".into())),
             })
-        );
-        assert_eq!(
-            session.oidc_nonce.as_ref().map(|n| n.secret().as_str()),
-            Some("oidc-nonce")
         );
     }
 
     fn session_with(request: Option<AuthorizationRequest>) -> SessionEntry {
         SessionEntry {
             siwe_nonce: "n".into(),
-            oidc_nonce: Some(Nonce::new("oidc-nonce".into())),
             secret: "s".into(),
             signin_count: 0,
             verified_did: None,
-            scope: None,
             request,
         }
     }
@@ -3721,9 +3719,21 @@ mod tests {
 
     /// `sign_in` reads no authorization parameter from its query (it takes
     /// none): the code goes to the bound redirect URI with the bound state, and
-    /// the stored code carries the bound client, challenge and nonce.
+    /// the stored code carries the bound client, challenge, nonce and scope.
     #[tokio::test]
     async fn sign_in_issues_the_code_for_the_bound_request() {
+        sign_in_round_trip(false).await;
+    }
+
+    /// The same for a session a build before Phase 2b started (it lives 300 s):
+    /// stored under its raw id, with the scope and the OIDC nonce beside the
+    /// bound request. Its code carries both, as before the upgrade.
+    #[tokio::test]
+    async fn a_session_the_previous_build_bound_issues_its_code_with_its_scope_and_nonce() {
+        sign_in_round_trip(true).await;
+    }
+
+    async fn sign_in_round_trip(previous_build: bool) {
         let Some((_config, db_client)) = default_config().await else {
             return;
         };
@@ -3731,27 +3741,50 @@ mod tests {
         let client_id = format!("round-trip-{nonce}");
         seed_round_trip_client(&db_client, &client_id).await;
         let session_id = format!("round-trip-{nonce}");
-        db_client
-            .set_session(
-                session_id.clone(),
-                SessionEntry {
-                    siwe_nonce: nonce.clone(),
-                    oidc_nonce: Some(Nonce::new("oidc-nonce".into())),
-                    secret: "secret".into(),
-                    signin_count: 0,
-                    verified_did: Some("did:key:zDnaeBOUNDREQUEST".into()),
-                    scope: Some("openid profile offline_access".into()),
-                    request: Some(AuthorizationRequest {
-                        client_id: client_id.clone(),
-                        redirect_uri: ROUND_TRIP_REDIRECT.into(),
-                        state: ROUND_TRIP_STATE.into(),
-                        response_mode: None,
-                        code_challenge: RFC7636_CHALLENGE.into(),
-                    }),
+        if previous_build {
+            // Exactly the JSON 88027dc serialized for this session.
+            let stored = serde_json::json!({
+                "siwe_nonce": nonce,
+                "oidc_nonce": "oidc-nonce",
+                "secret": "secret",
+                "signin_count": 0,
+                "verified_did": "did:key:zDnaeBOUNDREQUEST",
+                "scope": "openid profile offline_access",
+                "request": {
+                    "client_id": client_id,
+                    "redirect_uri": ROUND_TRIP_REDIRECT,
+                    "state": ROUND_TRIP_STATE,
+                    "response_mode": null,
+                    "code_challenge": RFC7636_CHALLENGE,
                 },
-            )
-            .await
-            .unwrap();
+            });
+            db_client
+                .set_ex_raw(&format!("sessions/{session_id}"), &stored.to_string(), 300)
+                .await
+                .unwrap();
+        } else {
+            db_client
+                .set_session(
+                    session_id.clone(),
+                    SessionEntry {
+                        siwe_nonce: nonce.clone(),
+                        secret: "secret".into(),
+                        signin_count: 0,
+                        verified_did: Some("did:key:zDnaeBOUNDREQUEST".into()),
+                        request: Some(AuthorizationRequest {
+                            client_id: client_id.clone(),
+                            redirect_uri: ROUND_TRIP_REDIRECT.into(),
+                            state: ROUND_TRIP_STATE.into(),
+                            response_mode: None,
+                            code_challenge: RFC7636_CHALLENGE.into(),
+                            scope: Some("openid profile offline_access".into()),
+                            nonce: Some(Nonce::new("oidc-nonce".into())),
+                        }),
+                    },
+                )
+                .await
+                .unwrap();
+        }
         let mut headers = HeaderMap::new();
         headers.insert(
             "cookie",
@@ -6033,11 +6066,9 @@ mod sign_in_deactivation_order_tests {
             session_id.clone(),
             SessionEntry {
                 siwe_nonce: nonce.clone(),
-                oidc_nonce: None,
                 secret: "secret".into(),
                 signin_count: 0,
                 verified_did: Some(DID.to_string()),
-                scope: None,
                 request: Some(bound_test_request(&client_id)),
             },
         )
@@ -6342,11 +6373,9 @@ mod device_display_name_tests {
             session_id.clone(),
             SessionEntry {
                 siwe_nonce: nonce.clone(),
-                oidc_nonce: None,
                 secret: "secret".into(),
                 signin_count: 0,
                 verified_did: Some(DID.to_string()),
-                scope: None,
                 request: Some(bound_test_request(&client_id)),
             },
         )

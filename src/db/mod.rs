@@ -349,19 +349,21 @@ pub fn client_entry_without_plaintext(stored: &serde_json::Value) -> Option<serd
     Some(serde_json::Value::Object(upgraded))
 }
 
+/// A login session, started at `/authorize`.
+///
+/// Deserializes through [`StoredSessionEntry`], which also reads the form a
+/// build before Phase 2b stored, with the scope and the OIDC nonce beside the
+/// bound request instead of in it, and moves them into the request.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(from = "StoredSessionEntry")]
 pub struct SessionEntry {
     pub siwe_nonce: String,
-    pub oidc_nonce: Option<Nonce>,
     pub secret: String,
     pub signin_count: u64,
     /// Set by a server-verified ceremony (e.g. WebAuthn) before redirecting to /sign_in.
     /// When present, sign_in trusts this DID without re-verifying a CAIP-122 cookie.
     #[serde(default)]
     pub verified_did: Option<String>,
-    /// Original scope from /authorize, preserved so sign_in can extract a client-proposed device_id.
-    #[serde(default)]
-    pub scope: Option<String>,
     /// The authorization request `/authorize` validated and bound to this
     /// session. `sign_in` issues the code for this request, never for
     /// front-channel parameters. `None` only on a session written by an older
@@ -370,9 +372,45 @@ pub struct SessionEntry {
     pub request: Option<AuthorizationRequest>,
 }
 
+/// Every form a login session is read in; see [`SessionEntry`].
+#[derive(Deserialize)]
+struct StoredSessionEntry {
+    siwe_nonce: String,
+    secret: String,
+    signin_count: u64,
+    #[serde(default)]
+    verified_did: Option<String>,
+    #[serde(default)]
+    request: Option<AuthorizationRequest>,
+    /// Beside the request in a session a build before Phase 2b stored; it
+    /// lives [`SESSION_LIFETIME`]. TODO(remove one release after Phase 2b).
+    #[serde(default)]
+    oidc_nonce: Option<Nonce>,
+    /// Same.
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+impl From<StoredSessionEntry> for SessionEntry {
+    fn from(stored: StoredSessionEntry) -> Self {
+        let request = stored.request.map(|mut request| {
+            request.scope = request.scope.or(stored.scope);
+            request.nonce = request.nonce.or(stored.oidc_nonce);
+            request
+        });
+        SessionEntry {
+            siwe_nonce: stored.siwe_nonce,
+            secret: stored.secret,
+            signin_count: stored.signin_count,
+            verified_did: stored.verified_did,
+            request,
+        }
+    }
+}
+
 /// An authorization request as `/authorize` validated it, bound to the login
-/// session (the OIDC nonce is [`SessionEntry::oidc_nonce`]).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// session as one value.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthorizationRequest {
     pub client_id: String,
     /// Exactly as sent, and registered for `client_id`.
@@ -384,7 +422,40 @@ pub struct AuthorizationRequest {
     /// The S256 PKCE challenge (base64url). The method is always S256:
     /// `/authorize` refuses any other.
     pub code_challenge: String,
+    /// The scope as requested. `sign_in` copies it into the code (where the
+    /// token endpoint reads what was requested) and takes a client-proposed
+    /// device id from it.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// The OIDC `nonce`, which the ID token carries.
+    #[serde(default)]
+    pub nonce: Option<Nonce>,
 }
+
+/// Written out because [`Nonce`] has no `PartialEq`; destructured so that a
+/// field added later cannot be left out of the comparison.
+impl PartialEq for AuthorizationRequest {
+    fn eq(&self, other: &Self) -> bool {
+        let AuthorizationRequest {
+            client_id,
+            redirect_uri,
+            state,
+            response_mode,
+            code_challenge,
+            scope,
+            nonce,
+        } = self;
+        *client_id == other.client_id
+            && *redirect_uri == other.redirect_uri
+            && *state == other.state
+            && *response_mode == other.response_mode
+            && *code_challenge == other.code_challenge
+            && *scope == other.scope
+            && nonce.as_ref().map(Nonce::secret) == other.nonce.as_ref().map(Nonce::secret)
+    }
+}
+
+impl Eq for AuthorizationRequest {}
 
 /// Status of an RFC 8628 device authorization code.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -960,5 +1031,79 @@ mod client_entry_tests {
         let mut none = plaintext_entry();
         none.as_object_mut().unwrap().remove("secret");
         assert!(serde_json::from_value::<ClientEntry>(none).is_err());
+    }
+}
+
+#[cfg(test)]
+mod session_entry_tests {
+    use super::*;
+
+    /// A session as the previous build serialized it: the scope and the OIDC
+    /// nonce beside the bound request.
+    fn previous_build_session() -> serde_json::Value {
+        serde_json::json!({
+            "siwe_nonce": "siwe-nonce",
+            "oidc_nonce": "oidc-nonce",
+            "secret": "s",
+            "signin_count": 0,
+            "verified_did": null,
+            "scope": "openid urn:matrix:client:device:ABC",
+            "request": {
+                "client_id": "client",
+                "redirect_uri": "https://rp.example.org/cb",
+                "state": "state",
+                "response_mode": null,
+                "code_challenge": "challenge",
+            },
+        })
+    }
+
+    /// It deserializes with the scope and the nonce moved into the request,
+    /// and is written back as one request with nothing beside it.
+    #[test]
+    fn a_previous_build_session_reads_its_scope_and_nonce_into_the_request() {
+        let session: SessionEntry = serde_json::from_value(previous_build_session()).unwrap();
+        let request = session.request.clone().expect("the bound request");
+        assert_eq!(
+            request.scope.as_deref(),
+            Some("openid urn:matrix:client:device:ABC")
+        );
+        assert_eq!(
+            request
+                .nonce
+                .as_ref()
+                .map(Nonce::secret)
+                .map(String::as_str),
+            Some("oidc-nonce")
+        );
+        assert_eq!(request.client_id, "client");
+        assert_eq!(request.code_challenge, "challenge");
+
+        let written = serde_json::to_value(&session).unwrap();
+        assert!(written.get("scope").is_none(), "{written}");
+        assert!(written.get("oidc_nonce").is_none(), "{written}");
+        assert_eq!(
+            written["request"]["scope"],
+            "openid urn:matrix:client:device:ABC"
+        );
+        assert_eq!(written["request"]["nonce"], "oidc-nonce");
+        let again: SessionEntry = serde_json::from_value(written).unwrap();
+        assert_eq!(again.request, Some(request));
+    }
+
+    /// A previous-build session without a nonce or scope has none in its
+    /// request, and one that predates the bound request still has none (sign_in
+    /// refuses it with "restart sign-in").
+    #[test]
+    fn absent_legacy_members_stay_absent() {
+        let mut stored = previous_build_session();
+        stored["oidc_nonce"] = serde_json::Value::Null;
+        stored.as_object_mut().unwrap().remove("scope");
+        let session: SessionEntry = serde_json::from_value(stored.clone()).unwrap();
+        let request = session.request.unwrap();
+        assert!(request.scope.is_none() && request.nonce.is_none());
+        stored.as_object_mut().unwrap().remove("request");
+        let session: SessionEntry = serde_json::from_value(stored).unwrap();
+        assert!(session.request.is_none());
     }
 }

@@ -1999,11 +1999,9 @@ mod tests {
     fn session_entry(nonce: &str) -> SessionEntry {
         SessionEntry {
             siwe_nonce: nonce.to_string(),
-            oidc_nonce: None,
             secret: "s".to_string(),
             signin_count: 0,
             verified_did: None,
-            scope: None,
             request: None,
         }
     }
