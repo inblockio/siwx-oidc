@@ -320,6 +320,77 @@ async fn a_legacy_token_older_than_an_epoch_is_refused() {
     );
 }
 
+/// The epoch comparison made outside the scripts for a legacy access token
+/// follows the scripts' rule (`the_epoch_comparison_is_at_or_before_to_the_millisecond`):
+/// its `iat`, counted from the start of its second, is refused by an epoch in
+/// that very millisecond or after it, and accepted by one a millisecond earlier.
+#[tokio::test]
+async fn the_legacy_access_check_refuses_at_or_before_the_epoch_to_the_millisecond() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("eplms{}", nonce());
+    let (access, meta) = seed_legacy(&client, &user, "DEVL", ACCESS_TOKEN_TTL as i64, true).await;
+    let key = EpochScope::User(&user).key();
+    let auth_ms = meta.iat * 1000;
+    for (offset, refused) in [(-1, true), (0, true), (1, false)] {
+        let _: () = raw(&client, &["SET", &key, &(auth_ms - offset).to_string()]).await;
+        assert_eq!(
+            client.check_access_token(&access).await.unwrap().is_none(),
+            refused,
+            "iat ms = epoch {offset:+}: refused must be {refused}"
+        );
+    }
+    let _: i64 = raw(&client, &["DEL", &key]).await;
+}
+
+/// The same rule at teardown's resolver ([`RedisClient::resolve_refresh_token`]):
+/// a refresh token whose grant was authenticated in the epoch's millisecond or
+/// before it resolves to nothing, one authenticated a millisecond later to its
+/// grant; a grant written without `auth_ms` counts from the start of its
+/// `auth_time` second.
+#[tokio::test]
+async fn the_teardown_resolver_refuses_at_or_before_the_epoch_to_the_millisecond() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("eprms{}", nonce());
+    let auth_ms = redis_ms(&client).await;
+    let g = issue(&client, &grant_of(&user, "client-a", "DEVR", Some(auth_ms))).await;
+    let refresh = g.refresh_token.clone().unwrap();
+    let key = EpochScope::User(&user).key();
+    for (offset, refused) in [(-1, true), (0, true), (1, false)] {
+        let _: () = raw(&client, &["SET", &key, &(auth_ms - offset).to_string()]).await;
+        assert_eq!(
+            client
+                .resolve_refresh_token(&refresh)
+                .await
+                .unwrap()
+                .is_none(),
+            refused,
+            "auth_ms = epoch {offset:+}: refused must be {refused}"
+        );
+    }
+    let grant = grant_key(&g.grant_id);
+    let second = auth_ms.div_euclid(1000);
+    let _: i64 = raw(&client, &["HDEL", &grant, "auth_ms"]).await;
+    let _: i64 = raw(&client, &["HSET", &grant, "auth_time", &second.to_string()]).await;
+    for (epoch, refused) in [(second * 1000, true), (second * 1000 - 1, false)] {
+        let _: () = raw(&client, &["SET", &key, &epoch.to_string()]).await;
+        assert_eq!(
+            client
+                .resolve_refresh_token(&refresh)
+                .await
+                .unwrap()
+                .is_none(),
+            refused,
+            "no auth_ms, epoch = auth_time second {:+} ms: refused must be {refused}",
+            epoch - second * 1000
+        );
+    }
+    let _: i64 = raw(&client, &["DEL", &key]).await;
+}
+
 /// The library function behind the operator path: the epoch is Redis `TIME`
 /// in milliseconds, persistent, and never moves earlier.
 #[tokio::test]

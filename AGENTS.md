@@ -420,10 +420,13 @@ doc; read it before changing the code the rule covers.
   token. Global and client epochs have no HTTP endpoint (attack surface): an operator sets them
   ([docs/matrix-integration.md](docs/matrix-integration.md#epochs)). An unset epoch is none,
   never 0. Teardown's resolver (`resolve_refresh_token`) treats a refused refresh token as
-  unknown, so revoking it tears nothing down. Pin:
+  unknown, so revoking it tears nothing down. The comparisons made in Rust (a legacy access
+  token, teardown) follow the scripts' rule to the millisecond. Pin:
   `e1_one_user_epoch_refuses_every_older_grant_of_the_user`,
   `e1_after_logout_all_a_new_sign_in_refreshes_at_once`,
   `the_epoch_comparison_is_at_or_before_to_the_millisecond`,
+  `the_legacy_access_check_refuses_at_or_before_the_epoch_to_the_millisecond`,
+  `the_teardown_resolver_refuses_at_or_before_the_epoch_to_the_millisecond`,
   `e1_a_client_epoch_refuses_that_clients_older_grants_only`,
   `e1_a_global_epoch_refuses_every_older_grant`, `a_legacy_token_older_than_an_epoch_is_refused`,
   `set_epoch_takes_redis_time_and_never_moves_earlier`,
