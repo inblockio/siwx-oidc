@@ -484,6 +484,17 @@ pub async fn delete_devices(
 
 // -- POST /_matrix/client/v3/refresh ------------------------------------------
 
+/// 503 for a token-store fault during a refresh: retryable, never `M_UNKNOWN_TOKEN`.
+fn token_store_unavailable() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "errcode": "M_UNKNOWN",
+            "error": "Token store temporarily unavailable; retry"
+        })),
+    )
+}
+
 /// `POST /_matrix/client/v3/refresh` (MSC2918): rotate a refresh token.
 ///
 /// **Not bound to a client.** The OAuth refresh grant (`oidc::token_refresh`)
@@ -496,6 +507,10 @@ pub async fn delete_devices(
 /// binding protects only the OAuth grant until this endpoint is restricted to
 /// the tokens that belong to Matrix devices (plan section 8). Do not "fix" it by
 /// demanding a client here: no Matrix client can send one.
+///
+/// The grace replay of a just-rotated token is handed out only while the
+/// successor refresh token is live (the rule `POST /token` applies as well, minus
+/// the client binding).
 pub async fn refresh(
     State(state): State<CompatState>,
     Json(body): Json<RefreshRequest>,
@@ -514,21 +529,41 @@ pub async fn refresh(
             // Grace replay (lost-response recovery): mirror oidc::token_refresh. A
             // just-rotated refresh token is deleted but its successor is recorded
             // under a short grace window; a client that lost the rotation response
-            // can replay the old token once and recover instead of being logged out.
-            if let Ok(Some(succ)) = state
+            // can replay the old token and recover instead of being logged out.
+            // The recorded pair is handed out only while the successor refresh
+            // token is live: once it has been rotated away or revoked, the pair is
+            // dead and the replay is an unknown token, as at `POST /token`. (That
+            // endpoint also binds the replay to the client; this one cannot.)
+            let replay = match state
                 .redis_client
                 .get_rotated_token(&body.refresh_token)
                 .await
             {
-                let expires_in = (succ.access_exp - Utc::now().timestamp()).max(0) as u64;
-                return (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "access_token": succ.access_token,
-                        "expires_in_ms": expires_in * 1000,
-                        "refresh_token": succ.refresh_token,
-                    })),
-                );
+                Ok(Some(succ)) => state
+                    .redis_client
+                    .get_token(&succ.refresh_token)
+                    .await
+                    .map(|m| m.filter(|m| m.is_kind(TokenKind::Refresh)).map(|_| succ)),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            };
+            match replay {
+                Ok(Some(succ)) => {
+                    let expires_in = (succ.access_exp - Utc::now().timestamp()).max(0) as u64;
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "access_token": succ.access_token,
+                            "expires_in_ms": expires_in * 1000,
+                            "refresh_token": succ.refresh_token,
+                        })),
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(error = %e, "refresh: grace lookup failed (infrastructure); returning retryable 503");
+                    return token_store_unavailable();
+                }
             }
             return (
                 StatusCode::UNAUTHORIZED,
@@ -545,13 +580,7 @@ pub async fn refresh(
             // reporting a Redis error that way would turn a transient fault into
             // permanent session and cryptographic-identity loss. 503 is retryable.
             warn!(error = %e, "refresh: token lookup failed (infrastructure); returning retryable 503");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "errcode": "M_UNKNOWN",
-                    "error": "Token store temporarily unavailable; retry"
-                })),
-            );
+            return token_store_unavailable();
         }
     };
 
