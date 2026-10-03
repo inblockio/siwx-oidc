@@ -70,15 +70,17 @@ Add storage for ceremony-specific state. Example for WebAuthn:
 // In SessionEntry — add optional verified_did field
 pub struct SessionEntry {
     pub siwe_nonce: String,
-    pub oidc_nonce: Option<Nonce>,
     pub secret: String,
     pub signin_count: u64,
     pub verified_did: Option<String>,  // ← NEW: set by ceremony, read by sign_in
+    pub request: Option<AuthorizationRequest>,  // bound at /authorize (incl. scope, OIDC nonce)
 }
 
 // Ceremony-specific keys (as WebAuthn does it; see docs/architecture.md "Redis keyspace")
 // webauthn:credential/{cred_id_b64}  no TTL   → serialized webauthn_rs::Passkey
-// webauthn:challenge/{session_id}    TTL 120s → ceremony state
+// webauthn:ceremony/{sha256(id)}     TTL 120s → ceremony state, keyed by the digest of the
+//                                    ceremony id the client holds (put_ceremony_state /
+//                                    take_ceremony_state in src/db/redis.rs)
 ```
 
 ### 4. Register routes — `src/axum_lib.rs`
@@ -150,7 +152,8 @@ Before shipping a new ceremony:
 - [ ] Server-verified path in `sign_in` enforces both `allowed_did_methods` AND `allowed_pkh_namespaces`
 - [ ] Challenge TTLs are set (default 120s) and challenges are consumed (deleted) after use
 - [ ] `supported_did_methods` (`SIWXOIDC_SUPPORTED_DID_METHODS`) includes the DID method the ceremony produces (e.g. `"key"` for passkeys; the default `["pkh", "key"]` already does)
-- [ ] Redis key prefixes are unique and don't collide with existing prefixes (sessions/, codes/, clients/)
+- [ ] Redis key prefixes are unique and don't collide with existing prefixes (session/, code/, clients/, and the legacy sessions/, codes/)
+- [ ] Any key built from a value the client holds (a ceremony id, a code) uses its digest (`db::tokens::digest`), never the value: no credential is stored in the clear
 - [ ] Frontend `buildSignInUrl()` passes PKCE params through to `/sign_in`
 - [ ] `docs/troubleshooting.md` updated with ceremony-specific error messages, and the new routes added to `docs/api/openapi.yaml` (`tests/openapi_covers_every_route.rs` fails otherwise)
 

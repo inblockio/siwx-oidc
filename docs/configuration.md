@@ -115,8 +115,16 @@ abused, leave it out of the list and let its proofs fail; the next sign-in re-as
 | `require_secret` | `SIWXOIDC_REQUIRE_SECRET` | `true` | Whether `POST /token` demands a client secret, at the code exchange and at the refresh grant alike, from a client whose metadata names no `token_endpoint_auth_method`. A client registered with `"none"` never needs one. |
 
 A client entry is `{"secret": "…", "metadata": {…}}`, where `metadata` is RFC 7591 client
-metadata (at least `redirect_uris`). Clients can also register themselves through
+metadata (at least `redirect_uris`); an optional `"access_token"` is the registration access
+token that manages the client at `/client/{id}`. Clients can also register themselves through
 `POST /register` (dynamic client registration), which is what Matrix clients do.
+
+Redis holds only the SHA-256 digests of the secret and of the registration access token, never
+the values, for configured and registered clients alike. A registered client's secret is random;
+a configured one is whatever you chose, and an unsalted digest of a weak secret can be guessed
+offline by someone who can read Redis. Such a reader on the same host can usually read this
+configuration too, where the secret is in the clear, so choose a long random secret and protect
+the configuration as you would the secret.
 
 ```toml
 [default.default_clients]

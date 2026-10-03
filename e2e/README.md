@@ -40,7 +40,11 @@ e2e-harness stack — it holds 18080/18081/18448, and a stray redis often holds
 6379. The Rust suites read `SIWEOIDC_HOST` and `SYNAPSE_MOCK`, so point those at
 whatever ports you brought the stack up on. `e2e_race_teardown` also searches
 the stack's Redis for tokens stored in the clear
-(`no_token_the_client_holds_is_stored_in_the_clear`); it reads `E2E_REDIS_URL`,
+(`no_token_the_client_holds_is_stored_in_the_clear`) and for codes, device and
+user codes, session and ceremony ids and nonces stored in the clear
+(`no_code_or_session_the_client_holds_is_stored_in_the_clear`) and for client secrets and
+registration access tokens stored in the clear
+(`no_client_secret_or_registration_token_is_stored_in_the_clear`); they read `E2E_REDIS_URL`,
 else `SIWXOIDC_REDIS_URL`, `SIWEOIDC_REDIS_URL` (set by `env.sh`) or
 `REDIS_HOST`/`REDIS_PORT`, and skips loudly without one (a failure under
 `E2E_STRICT_SKIPS=1`):
@@ -62,6 +66,14 @@ swap that keeps Redis: `E2E_R1_STAGE=mint E2E_R1_SESSIONS=<file>` against the
 previous build (it signs in and asserts the legacy layout was written), then
 `E2E_R1_STAGE=check E2E_R1_SESSIONS=<file>` against the new build within 300 s,
 while the legacy access tokens are still live.
+
+`in_flight_codes_and_sessions_survive_the_upgrade` does the same for an issued
+code, a started login session, an approved and a pending device code: it
+rewrites what the server stored into the raw-keyed layout of builds before
+digest keys and checks each completes once. For a real upgrade:
+`E2E_R2_STAGE=mint E2E_R2_FILE=<file>` against the previous build, then
+`E2E_R2_STAGE=check E2E_R2_FILE=<file>` against the new build within 300 s,
+keeping Redis and the mock.
 
 ## The mock MUST be updated whenever `synapse_client.rs` moves an endpoint
 

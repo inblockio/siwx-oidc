@@ -75,7 +75,7 @@ New methods and namespaces are opt-in: operators enable them in
 
 1. `GET /authorize` validates the client, the redirect URI (exact match against the
    registration, query included), `response_type=code` (the only one accepted) and the `S256`
-   PKCE challenge. It creates a session (`sessions/{id}`, 300 s) that binds the validated
+   PKCE challenge. It creates a session (`session/{sha256(id)}`, 300 s) that binds the validated
    request (client, redirect URI, state, response mode, challenge), sets the `session` cookie,
    and redirects to the login page with a nonce and the request's values, each percent-encoded
    so the page reads back the exact redirect URI its CAIP-122 message must bind.
@@ -148,27 +148,40 @@ the server (`device_auth.rs`, `account.rs`) with their own inline scripts.
 ## Redis keyspace
 
 All state lives in one Redis (`redis_url`). Prefixes are defined in `src/db/mod.rs`,
-`src/webauthn.rs` and `src/account.rs`.
+`src/db/grant.rs`, `src/webauthn.rs` and `src/account.rs`.
+
+A credential a client holds (a token, an authorization code, a device or user code, a login
+session id, a ceremony id, a server-issued nonce, a client secret, a registration access token)
+appears in a key or value only as its lowercase hex SHA-256 (`db::tokens::digest`). Each
+digest-keyed prefix differs from the raw-keyed one an earlier build used, which the server still
+reads, and uses once, for the entry's remaining lifetime: a client presenting a stored digest as
+its credential reads a raw-keyed prefix nothing writes. A client entry keeps its key and stores
+its two credentials under member names an earlier build did not use, for the same reason. The
+`siwx_user` and `acct_session` cookies are still raw keys. Passkey credential ids are keys too:
+they are public identifiers the server hands out in `allowCredentials`, not credentials.
 
 | Key | TTL | Holds |
 |---|---|---|
-| `sessions/{id}` | 300 s | `SessionEntry`: nonces, `verified_did`, sign-in count, and the authorization request `/authorize` bound to it (client, redirect URI, state, response mode, PKCE challenge) |
-| `sessions/{id}/signed_in` | 300 s | one-shot flag against double sign-in |
-| `codes/{code}` | 300 s | `CodeEntry` (DID, client, PKCE challenge, device id, localpart, requested scope); read and deleted in one atomic step on exchange. A `codes/{code}/consumed` marker exists only from older builds, which kept exchanged codes |
-| `clients/{client_id}` | 30 d | `ClientEntry` (secret, metadata); `default_clients` are rewritten at every start |
+| `session/{sha256(id)}` | 300 s | `SessionEntry`: the CAIP-122 nonce, `verified_did`, sign-in count, and the authorization request `/authorize` bound to it (client, redirect URI, state, response mode, PKCE challenge, scope, OIDC nonce) |
+| `session/{sha256(id)}/signed_in` | 300 s | one-shot flag against double sign-in |
+| `code/{sha256(code)}` | 300 s | `CodeEntry` (DID, client, PKCE challenge, device id, localpart, requested scope); read and deleted in one atomic step on exchange |
+| `sessions/{id}` (+ `/signed_in`), `codes/{code}` (+ `/consumed`) | 300 s | legacy: written by builds before digest keys and read until they expire. A legacy session moves to its digest key on its first write (a wallet sign-in writes none, so a session the previous build started keeps its raw key, spent, until it expires); a legacy signed-in flag still counts; a legacy code is consumed like a new one, unless a `/consumed` marker (left by older builds, which kept exchanged codes) exists. A legacy session holds the scope and the OIDC nonce beside its request; they are read into it |
+| `clients/{client_id}` | 30 d | `ClientEntry`: metadata and the digests of the client secret and the registration access token (`secret_digest`, `access_token_digest`); `default_clients` are rewritten, digested, at every start. An entry an earlier build wrote (`secret`, `access_token` in the clear) authenticates as it is and is replaced by its digest-only form, keeping its expiry, on its first read |
 | `grant/{sha256(handle)}` | 90 d after the last rotation; a grant with no refresh token lives as long as its access token | the grant (`src/db/grant.rs`): kind, owner, client, device id, scope, generation, digests of the current and previous refresh token, whether the successor is used, and the sealed successor pair while it is unused. No token is stored |
 | `at/{sha256(access token)}` | the token's lifetime: 300 s, admin 30–900 s | grant id, generation, kind, `iat`, `exp` |
 | `idx:grants:user/{username}`, `idx:grants:user_device/{username}/{device_id}` | the longest grant TTL written | SETs of grant ids, for atomic revocation |
 | `token/{token}`, `idx:user_device/{username}/{device_id}` | access 300 s, refresh 90 d | legacy: tokens written before the grant record (`TokenMetadata`, classified by `db::legacy_token_kind`). Legacy access tokens stay readable until they expire; a legacy refresh token is lifted into a grant when it is first presented, which deletes its entry and index member; revocation still sweeps both keys. Nothing new is written there |
 | `legacy_rt/{sha256(legacy refresh token)}` | 90 d from the lift | the grant id a legacy refresh token was lifted into, so a replay of it is judged like the grant's previous token |
 | `tombstone:device/{username}/{device_id}`, `tombstone:user/{username}` | 900 s | refuse refresh while a revoke or deactivation sweep runs |
-| `caip122_nonce/{category}/{nonce}` (+ `/consumed`) | 300 s | server-issued nonce for device approval and account re-auth |
-| `device_codes/{device_code}` (+ `/redeemed`) | 1800 s | `DeviceCodeEntry` (RFC 8628) and its single-redemption claim |
-| `user_codes/{user_code}` | 1800 s | reverse lookup to the device code |
+| `caip122/{category}/{sha256(nonce)}` | 300 s | server-issued nonce for device approval (bound to the user code's digest) and account re-auth (bound to the action); read and deleted on use |
+| `device_code/{sha256(device code)}` (+ `/redeemed`) | 1800 s | `DeviceCodeEntry` (RFC 8628, with the user code's digest) and its single-redemption claim |
+| `user_code/{sha256(user code)}` | 1800 s | the device code's digest; the user code is hashed exactly as presented |
+| `caip122_nonce/{category}/{nonce}` (+ `/consumed`), `device_codes/{device_code}` (+ `/redeemed`), `user_codes/{user_code}` | 300 s / 1800 s | legacy: read until they expire. A legacy device code is found by either code and updated and deleted in place; its claim is digest-keyed, and a legacy claim still counts |
 | `account_session/{token}` | 600 s | `/account` session (`acct_session` cookie, `Path=/account`) |
 | `user:session/{token}` | 30 d | DID behind the opaque `siwx_user` cookie (passkey-picker scoping) |
-| `webauthn:challenge/{session_id}` | 120 s | registration or authentication ceremony state |
-| `webauthn:link_challenge/{session_id}` | 120 s | link ceremony state |
+| `webauthn:ceremony/{sha256(ceremony id)}` | 120 s | registration or authentication ceremony state, read and deleted in one step; the ceremony id is the `session` cookie, the `session_id` the account re-auth start returns, or `device_passkey_{user_code}` |
+| `webauthn:link_ceremony/{sha256(session id)}` | 120 s | link ceremony state |
+| `webauthn:challenge/{id}`, `webauthn:link_challenge/{id}` | 120 s | legacy ceremony state, read until it expires |
 | `webauthn:credential/{cred_id_b64}` | none | stored passkey (serialized `webauthn_rs::Passkey`) |
 | `webauthn:link/{cred_id_b64}` | none | `{primary_did, label}`: the passkey signs in as this DID |
 | `webauthn:by_did/{did}` | none | SET of credential ids for a DID (advisory index) |

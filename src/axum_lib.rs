@@ -1302,6 +1302,18 @@ async fn account_passkey_finish_handler(
 
 // -- Application entry point -----------------------------------------------
 
+/// Write the configured `default_clients` to Redis, at every start. Each is
+/// configured with its secret (and registration access token, if any) in the
+/// clear; [`ClientEntry`] keeps only their digests, so that is what is stored.
+async fn store_default_clients(config: &config::Config, db: &RedisClient) -> anyhow::Result<()> {
+    for (id, entry) in &config.default_clients {
+        let entry: ClientEntry = serde_json::from_str(entry)
+            .map_err(|e| anyhow::anyhow!("Deserialisation of ClientEntry {id} failed: {e}"))?;
+        db.set_client(id.to_string(), entry).await?;
+    }
+    Ok(())
+}
+
 pub async fn main() {
     // Precedence and the naming contract (SIWXOIDC_ / siwx-oidc.toml, with the
     // legacy SIWEOIDC_ / siwe-oidc.toml still read) live in `config::figment`.
@@ -1382,14 +1394,9 @@ pub async fn main() {
         .await
         .expect("Could not build Redis client");
 
-    for (id, entry) in &config.default_clients.clone() {
-        let entry: ClientEntry =
-            serde_json::from_str(entry).expect("Deserialisation of ClientEntry failed");
-        redis_client
-            .set_client(id.to_string(), entry.clone())
-            .await
-            .unwrap();
-    }
+    store_default_clients(&config, &redis_client)
+        .await
+        .expect("Could not store default_clients");
 
     // The `kid` is NOT chosen here. Both branches let `EcdsaSigningKey` derive
     // it from the public key, because this used to stamp the literal `"key1"` on
@@ -2139,5 +2146,57 @@ mod client_credentials_tests {
         assert!(!basic_attempted);
         assert_eq!(credentials.basic_client_id, None);
         assert_eq!(credentials.secret.as_deref(), Some("a%2Bb+c"));
+    }
+}
+
+#[cfg(test)]
+mod default_clients_tests {
+    //! `default_clients` are configured in the clear and stored as digests.
+    //! In process, because neither the CI mock stack nor any e2e harness
+    //! configures one. Needs Redis.
+    use super::*;
+
+    /// The configured secret and registration access token appear in no key
+    /// and no value Redis holds for the client after the start-up write, and
+    /// the client authenticates with exactly the configured values.
+    #[tokio::test]
+    async fn default_clients_are_stored_only_as_digests_and_authenticate() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let id = format!("default-{}", uuid::Uuid::new_v4().simple());
+        let secret = format!("configured-secret-{}", uuid::Uuid::new_v4().simple());
+        let token = format!("configured-token-{}", uuid::Uuid::new_v4().simple());
+        let configured = serde_json::json!({
+            "secret": secret,
+            "metadata": {"redirect_uris": ["https://rp.example.org/cb"]},
+            "access_token": token,
+        });
+        let mut config = config::Config::default();
+        config
+            .default_clients
+            .insert(id.clone(), configured.to_string());
+
+        store_default_clients(&config, &redis).await.unwrap();
+
+        let key = format!("clients/{id}");
+        assert_eq!(
+            redis.keys_raw(&format!("*{id}*")).await.unwrap(),
+            vec![key.clone()]
+        );
+        let stored = redis.get_raw(&key).await.unwrap().unwrap();
+        assert!(
+            !stored.contains(&secret),
+            "the secret is stored in the clear: {stored}"
+        );
+        assert!(
+            !stored.contains(&token),
+            "the token is stored in the clear: {stored}"
+        );
+        let entry = redis.get_client(id.clone()).await.unwrap().unwrap();
+        assert!(entry.secret_matches(&secret));
+        assert!(entry.access_token_matches(&token));
+        assert!(!entry.secret_matches(&entry.secret_digest));
+        redis.del_raw(&key).await.unwrap();
     }
 }

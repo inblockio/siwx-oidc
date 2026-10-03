@@ -250,17 +250,21 @@ redis-cli GET 'webauthn:credential/<cred_id_b64>'
 redis-cli --scan --pattern 'webauthn:link/*'
 redis-cli SMEMBERS 'webauthn:by_did/<did>'
 
+# Session ids, codes and ceremony ids are stored as SHA-256 digests only:
+# hash the value you hold to find its entry.
+digest() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+
 # Ceremony challenges in flight (120 s)
-redis-cli --scan --pattern 'webauthn:challenge/*'
+redis-cli --scan --pattern 'webauthn:ceremony/*'
 
 # OIDC sessions (5 minutes); a passkey sign-in stores verified_did here
-redis-cli --scan --pattern 'sessions/*'
-redis-cli GET 'sessions/<session_id>' | python3 -m json.tool
+redis-cli --scan --pattern 'session/*'
+redis-cli GET "session/$(digest '<session cookie value>')" | python3 -m json.tool
 
 # Device-code grants (30 minutes)
-redis-cli --scan --pattern 'device_codes/*'
-redis-cli GET 'device_codes/<device_code>' | python3 -m json.tool
-redis-cli --scan --pattern 'user_codes/*'
+redis-cli --scan --pattern 'device_code/*'
+redis-cli GET "device_code/$(digest '<device_code>')" | python3 -m json.tool
+redis-cli GET "user_code/$(digest '<user_code>')"   # the device code's digest
 
 # Grants (username = localpart, device_id, scope, DID). Tokens are stored as
 # SHA-256 digests only: hash a token you hold to find its entry.

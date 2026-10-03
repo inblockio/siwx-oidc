@@ -1009,7 +1009,7 @@ fn check_client_secret(
     config: &crate::config::Config,
 ) -> Result<(), CustomError> {
     match presented_secret {
-        Some(secret) if !constant_time_eq(secret, &client_entry.secret) => {
+        Some(secret) if !client_entry.secret_matches(secret) => {
             Err(CustomError::Unauthorized("Bad secret.".to_string()))
         }
         Some(_) => Ok(()),
@@ -1227,7 +1227,7 @@ async fn token_device_code(
         })
     })?;
 
-    let mut entry = db_client
+    let (device_ref, mut entry) = db_client
         .get_device_code(&dc)
         .await?
         .ok_or_else(|| device_code_error("expired_token", "Device code expired or not found."))?;
@@ -1245,7 +1245,7 @@ async fn token_device_code(
         if now_ts - last < DEVICE_CODE_INTERVAL as i64 {
             entry.last_poll = Some(now_ts);
             let _ = db_client
-                .update_device_code(&dc, &entry, DEVICE_CODE_LIFETIME)
+                .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
                 .await;
             return Err(device_code_error(
                 "slow_down",
@@ -1255,7 +1255,7 @@ async fn token_device_code(
     }
     entry.last_poll = Some(now_ts);
     let _ = db_client
-        .update_device_code(&dc, &entry, DEVICE_CODE_LIFETIME)
+        .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
         .await;
 
     match entry.status {
@@ -1264,8 +1264,8 @@ async fn token_device_code(
             "User has not yet approved.",
         )),
         DeviceCodeStatus::Denied => {
-            let _ = db_client.delete_device_code(&dc).await;
-            let _ = db_client.delete_user_code_mapping(&entry.user_code).await;
+            let _ = db_client.delete_device_code(&device_ref).await;
+            let _ = db_client.delete_user_code_mapping(&entry).await;
             Err(device_code_error(
                 "access_denied",
                 "User denied the request.",
@@ -1412,8 +1412,8 @@ async fn token_device_code(
             .map_err(|e| anyhow!("{}", e))?;
 
             // Cleanup
-            let _ = db_client.delete_device_code(&dc).await;
-            let _ = db_client.delete_user_code_mapping(&entry.user_code).await;
+            let _ = db_client.delete_device_code(&device_ref).await;
+            let _ = db_client.delete_user_code_mapping(&entry).await;
 
             info!(did = %did, device_id = %dev_id, "device_code grant: tokens issued");
 
@@ -1873,17 +1873,17 @@ pub async fn authorize(
             session_id.to_string(),
             SessionEntry {
                 siwe_nonce: nonce.clone(),
-                oidc_nonce: params.nonce.clone(),
                 secret: session_secret.clone(),
                 signin_count: 0,
                 verified_did: None,
-                scope: Some(params.scope.as_str().to_string()),
                 request: Some(AuthorizationRequest {
                     client_id: params.client_id.clone(),
                     redirect_uri: params.redirect_uri.as_str().to_string(),
                     state: state.clone(),
                     response_mode: params.response_mode.clone(),
                     code_challenge: code_challenge.clone(),
+                    scope: Some(params.scope.as_str().to_string()),
+                    nonce: params.nonce.clone(),
                 }),
             },
         )
@@ -2204,6 +2204,8 @@ pub(crate) fn bound_test_request(client_id: &str) -> AuthorizationRequest {
         state: "state".to_string(),
         response_mode: None,
         code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
+        scope: None,
+        nonce: None,
     }
 }
 
@@ -2876,8 +2878,8 @@ pub async fn sign_in(
         validate_registered_redirect_uri(&request.client_id, &redirect_uri, db_client).await?;
     let device_name = device_display_name(&request.client_id, Some(&client));
 
-    // Extract client-proposed device_id from the session's stored scope (if any).
-    let proposed_device_id = session_entry
+    // Extract a client-proposed device_id from the bound request's scope (if any).
+    let proposed_device_id = request
         .scope
         .as_deref()
         .and_then(extract_device_id_from_scope);
@@ -2909,7 +2911,7 @@ pub async fn sign_in(
 
     let code_entry = CodeEntry {
         did: did.clone(),
-        nonce: session_entry.oidc_nonce.clone(),
+        nonce: request.nonce.clone(),
         exchange_count: 0,
         client_id: request.client_id.clone(),
         auth_time: Utc::now(),
@@ -2917,7 +2919,7 @@ pub async fn sign_in(
         code_challenge_method: Some("S256".to_string()),
         localpart: Some(resolved.localpart.clone()),
         device_id,
-        scope: session_entry.scope.clone(),
+        scope: request.scope.clone(),
     };
 
     let code = Uuid::new_v4();
@@ -2981,11 +2983,9 @@ pub async fn register(
             .collect(),
     );
 
-    let entry = ClientEntry {
-        secret: secret.clone(),
-        metadata: payload,
-        access_token: Some(access_token.clone()),
-    };
+    // The response below is the only place the secret and the registration
+    // access token appear: the entry keeps their digests.
+    let entry = ClientEntry::new(&secret, payload, Some(access_token.secret()));
     db_client.set_client(id.to_string(), entry).await?;
 
     Ok(CoreClientRegistrationResponse::new(
@@ -3019,11 +3019,7 @@ async fn client_access(
         .get_client(client_id)
         .await?
         .ok_or(CustomError::NotFound)?;
-    let stored_access_token = client_entry.access_token.clone();
-    let stored = stored_access_token
-        .as_ref()
-        .ok_or_else(|| CustomError::Unauthorized("Bad access token.".to_string()))?;
-    if !constant_time_eq(stored.secret(), &access_token) {
+    if !client_entry.access_token_matches(&access_token) {
         return Err(CustomError::Unauthorized("Bad access token.".to_string()));
     }
     Ok(client_entry)
@@ -3523,14 +3519,14 @@ mod tests {
         db_client
             .set_client(
                 "client".into(),
-                ClientEntry {
-                    secret: "secret".into(),
-                    metadata: CoreClientMetadata::new(
+                ClientEntry::new(
+                    "secret",
+                    CoreClientMetadata::new(
                         vec![RedirectUrl::new("https://example.com".into()).unwrap()],
                         EmptyAdditionalClientMetadata {},
                     ),
-                    access_token: None,
-                },
+                    None,
+                ),
             )
             .await
             .unwrap();
@@ -3648,22 +3644,18 @@ mod tests {
                 state: "state".into(),
                 response_mode: Some("fragment".into()),
                 code_challenge: RFC7636_CHALLENGE.into(),
+                scope: Some("openid".into()),
+                nonce: Some(Nonce::new("oidc-nonce".into())),
             })
-        );
-        assert_eq!(
-            session.oidc_nonce.as_ref().map(|n| n.secret().as_str()),
-            Some("oidc-nonce")
         );
     }
 
     fn session_with(request: Option<AuthorizationRequest>) -> SessionEntry {
         SessionEntry {
             siwe_nonce: "n".into(),
-            oidc_nonce: Some(Nonce::new("oidc-nonce".into())),
             secret: "s".into(),
             signin_count: 0,
             verified_did: None,
-            scope: None,
             request,
         }
     }
@@ -3674,14 +3666,14 @@ mod tests {
     async fn seed_round_trip_client(db: &RedisClient, client_id: &str) {
         db.set_client(
             client_id.to_string(),
-            ClientEntry {
-                secret: "secret".into(),
-                metadata: CoreClientMetadata::new(
+            ClientEntry::new(
+                "secret",
+                CoreClientMetadata::new(
                     vec![RedirectUrl::new(ROUND_TRIP_REDIRECT.into()).unwrap()],
                     EmptyAdditionalClientMetadata {},
                 ),
-                access_token: None,
-            },
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -3727,9 +3719,21 @@ mod tests {
 
     /// `sign_in` reads no authorization parameter from its query (it takes
     /// none): the code goes to the bound redirect URI with the bound state, and
-    /// the stored code carries the bound client, challenge and nonce.
+    /// the stored code carries the bound client, challenge, nonce and scope.
     #[tokio::test]
     async fn sign_in_issues_the_code_for_the_bound_request() {
+        sign_in_round_trip(false).await;
+    }
+
+    /// The same for a session a build before Phase 2b started (it lives 300 s):
+    /// stored under its raw id, with the scope and the OIDC nonce beside the
+    /// bound request. Its code carries both, as before the upgrade.
+    #[tokio::test]
+    async fn a_session_the_previous_build_bound_issues_its_code_with_its_scope_and_nonce() {
+        sign_in_round_trip(true).await;
+    }
+
+    async fn sign_in_round_trip(previous_build: bool) {
         let Some((_config, db_client)) = default_config().await else {
             return;
         };
@@ -3737,27 +3741,50 @@ mod tests {
         let client_id = format!("round-trip-{nonce}");
         seed_round_trip_client(&db_client, &client_id).await;
         let session_id = format!("round-trip-{nonce}");
-        db_client
-            .set_session(
-                session_id.clone(),
-                SessionEntry {
-                    siwe_nonce: nonce.clone(),
-                    oidc_nonce: Some(Nonce::new("oidc-nonce".into())),
-                    secret: "secret".into(),
-                    signin_count: 0,
-                    verified_did: Some("did:key:zDnaeBOUNDREQUEST".into()),
-                    scope: Some("openid profile offline_access".into()),
-                    request: Some(AuthorizationRequest {
-                        client_id: client_id.clone(),
-                        redirect_uri: ROUND_TRIP_REDIRECT.into(),
-                        state: ROUND_TRIP_STATE.into(),
-                        response_mode: None,
-                        code_challenge: RFC7636_CHALLENGE.into(),
-                    }),
+        if previous_build {
+            // Exactly the JSON 88027dc serialized for this session.
+            let stored = serde_json::json!({
+                "siwe_nonce": nonce,
+                "oidc_nonce": "oidc-nonce",
+                "secret": "secret",
+                "signin_count": 0,
+                "verified_did": "did:key:zDnaeBOUNDREQUEST",
+                "scope": "openid profile offline_access",
+                "request": {
+                    "client_id": client_id,
+                    "redirect_uri": ROUND_TRIP_REDIRECT,
+                    "state": ROUND_TRIP_STATE,
+                    "response_mode": null,
+                    "code_challenge": RFC7636_CHALLENGE,
                 },
-            )
-            .await
-            .unwrap();
+            });
+            db_client
+                .set_ex_raw(&format!("sessions/{session_id}"), &stored.to_string(), 300)
+                .await
+                .unwrap();
+        } else {
+            db_client
+                .set_session(
+                    session_id.clone(),
+                    SessionEntry {
+                        siwe_nonce: nonce.clone(),
+                        secret: "secret".into(),
+                        signin_count: 0,
+                        verified_did: Some("did:key:zDnaeBOUNDREQUEST".into()),
+                        request: Some(AuthorizationRequest {
+                            client_id: client_id.clone(),
+                            redirect_uri: ROUND_TRIP_REDIRECT.into(),
+                            state: ROUND_TRIP_STATE.into(),
+                            response_mode: None,
+                            code_challenge: RFC7636_CHALLENGE.into(),
+                            scope: Some("openid profile offline_access".into()),
+                            nonce: Some(Nonce::new("oidc-nonce".into())),
+                        }),
+                    },
+                )
+                .await
+                .unwrap();
+        }
         let mut headers = HeaderMap::new();
         headers.insert(
             "cookie",
@@ -4079,13 +4106,15 @@ mod tests {
     /// Redirect URIs match the registration exactly, query included.
     #[test]
     fn redirect_uri_matching_is_exact() {
-        let client = |registered: &str| ClientEntry {
-            secret: "secret".into(),
-            metadata: CoreClientMetadata::new(
-                vec![RedirectUrl::new(registered.into()).unwrap()],
-                EmptyAdditionalClientMetadata {},
-            ),
-            access_token: None,
+        let client = |registered: &str| {
+            ClientEntry::new(
+                "secret",
+                CoreClientMetadata::new(
+                    vec![RedirectUrl::new(registered.into()).unwrap()],
+                    EmptyAdditionalClientMetadata {},
+                ),
+                None,
+            )
         };
         let uri = |u: &str| RedirectUrl::new(u.into()).unwrap();
 
@@ -4532,7 +4561,11 @@ mod tests {
         db.set_device_code(
             &device_code,
             &DeviceCodeEntry {
-                user_code: format!("SA-{}", Uuid::new_v4().simple()),
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!(
+                    "SA-{}",
+                    Uuid::new_v4().simple()
+                )),
+                legacy_user_code: None,
                 client_id: "client".to_string(),
                 scope: "openid".to_string(),
                 status: DeviceCodeStatus::Approved,
@@ -4570,13 +4603,13 @@ mod tests {
             Err(other) => panic!("expected unsupported_grant_type, got {other:?}"),
             Ok(_) => panic!("a standalone deployment must not redeem a device code"),
         }
-        let entry = db
+        let (device_ref, entry) = db
             .get_device_code(&device_code)
             .await
             .unwrap()
             .expect("the refused code must be left in place");
         assert_eq!(entry.status, DeviceCodeStatus::Approved);
-        db.delete_device_code(&device_code).await.ok();
+        db.delete_device_code(&device_ref).await.ok();
     }
 
     /// A device-code poll that loses the claim to a concurrent poll logs that at
@@ -4597,7 +4630,11 @@ mod tests {
         db.set_device_code(
             &device_code,
             &DeviceCodeEntry {
-                user_code: format!("CL-{}", Uuid::new_v4().simple()),
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!(
+                    "CL-{}",
+                    Uuid::new_v4().simple()
+                )),
+                legacy_user_code: None,
                 client_id: "client".to_string(),
                 scope: "openid".to_string(),
                 status: DeviceCodeStatus::Approved,
@@ -4652,7 +4689,9 @@ mod tests {
             !output.contains(&device_code),
             "the device code appears in the logs in the clear:\n{output}"
         );
-        db.delete_device_code(&device_code).await.ok();
+        if let Ok(Some((device_ref, _))) = db.get_device_code(&device_code).await {
+            db.delete_device_code(&device_ref).await.ok();
+        }
     }
 
     #[tokio::test]
@@ -5591,11 +5630,7 @@ mod userinfo_mxid_claim_tests {
         }
         db.set_client(
             client_id.to_string(),
-            ClientEntry {
-                secret: "secret".into(),
-                metadata,
-                access_token: None,
-            },
+            ClientEntry::new("secret", metadata, None),
         )
         .await
     }
@@ -6013,14 +6048,14 @@ mod sign_in_deactivation_order_tests {
         let client_id = format!("deactivation-order-{nonce}");
         db.set_client(
             client_id.clone(),
-            ClientEntry {
-                secret: "secret".into(),
-                metadata: CoreClientMetadata::new(
+            ClientEntry::new(
+                "secret",
+                CoreClientMetadata::new(
                     vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
                     EmptyAdditionalClientMetadata {},
                 ),
-                access_token: None,
-            },
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -6031,11 +6066,9 @@ mod sign_in_deactivation_order_tests {
             session_id.clone(),
             SessionEntry {
                 siwe_nonce: nonce.clone(),
-                oidc_nonce: None,
                 secret: "secret".into(),
                 signin_count: 0,
                 verified_did: Some(DID.to_string()),
-                scope: None,
                 request: Some(bound_test_request(&client_id)),
             },
         )
@@ -6293,11 +6326,7 @@ mod device_display_name_tests {
             names.insert(None, ClientName::new(name.to_string()));
             metadata = metadata.set_client_name(Some(names));
         }
-        ClientEntry {
-            secret: "secret".into(),
-            metadata,
-            access_token: None,
-        }
+        ClientEntry::new("secret", metadata, None)
     }
 
     /// Asserts that exactly one device was upserted, that the upsert carried
@@ -6344,11 +6373,9 @@ mod device_display_name_tests {
             session_id.clone(),
             SessionEntry {
                 siwe_nonce: nonce.clone(),
-                oidc_nonce: None,
                 secret: "secret".into(),
                 signin_count: 0,
                 verified_did: Some(DID.to_string()),
-                scope: None,
                 request: Some(bound_test_request(&client_id)),
             },
         )
@@ -6572,7 +6599,8 @@ mod device_display_name_tests {
         db.set_device_code(
             &device_code,
             &DeviceCodeEntry {
-                user_code: format!("DN-{nonce}"),
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!("DN-{nonce}")),
+                legacy_user_code: None,
                 client_id: client_id.clone(),
                 scope: "openid".to_string(),
                 status: DeviceCodeStatus::Approved,
@@ -6677,16 +6705,9 @@ mod client_binding_tests {
         if let Some(grants) = grant_types {
             metadata = metadata.set_grant_types(Some(grants));
         }
-        db.set_client(
-            id.clone(),
-            ClientEntry {
-                secret: SECRET.into(),
-                metadata,
-                access_token: None,
-            },
-        )
-        .await
-        .unwrap();
+        db.set_client(id.clone(), ClientEntry::new(SECRET, metadata, None))
+            .await
+            .unwrap();
         id
     }
 
@@ -6891,6 +6912,69 @@ mod client_binding_tests {
         )
         .await;
         assert_eq!(outcome(&own), "ok", "the owner still refreshes it");
+    }
+
+    /// Every path that authenticates a client compares digests: the code
+    /// exchange and the refresh grant (the secret) and `/client/{id}`
+    /// management (the registration access token). A client entry the previous
+    /// build stored in the clear authenticates with its secret and token, and
+    /// a digest read out of Redis is refused everywhere.
+    #[tokio::test]
+    async fn every_client_authentication_compares_digests_of_what_is_presented() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let id = unique("prev-client-");
+        let metadata = CoreClientMetadata::new(
+            vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
+            EmptyAdditionalClientMetadata {},
+        )
+        .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::ClientSecretBasic));
+        let previous_build = serde_json::json!({
+            "secret": SECRET,
+            "metadata": metadata,
+            "access_token": "the-registration-token",
+        });
+        db.set_ex_raw(&format!("clients/{id}"), &previous_build.to_string(), 600)
+            .await
+            .unwrap();
+        let bearer = |token: &str| Some(headers::Authorization::bearer(token).unwrap().0);
+        let outcome = |r: Result<(), CustomError>| match r {
+            Ok(()) => "ok".to_string(),
+            Err(CustomError::Unauthorized(message)) => format!("invalid_client: {message}"),
+            Err(other) => format!("{other:?}"),
+        };
+
+        // The previous build's entry: the plaintext credentials authenticate.
+        let code = authenticate_code_client(&id, None, Some(SECRET), &config, &db).await;
+        assert_eq!(outcome(code.map(|_| ())), "ok");
+        let stored = db.get_client(id.clone()).await.unwrap().unwrap();
+        assert!(!db
+            .get_raw(&format!("clients/{id}"))
+            .await
+            .unwrap()
+            .unwrap()
+            .contains(SECRET));
+        let refresh = authenticate_refresh_client(&id, None, Some(SECRET), &config, &db).await;
+        assert_eq!(outcome(refresh), "ok");
+        let manage = client_access(id.clone(), bearer("the-registration-token"), &db).await;
+        assert_eq!(outcome(manage.map(|_| ())), "ok");
+
+        // What Redis holds is no credential.
+        let secret_digest = stored.secret_digest.as_str();
+        let token_digest = stored.access_token_digest.clone().unwrap();
+        let code = authenticate_code_client(&id, None, Some(secret_digest), &config, &db).await;
+        assert_eq!(outcome(code.map(|_| ())), "invalid_client: Bad secret.");
+        let refresh =
+            authenticate_refresh_client(&id, None, Some(secret_digest), &config, &db).await;
+        assert_eq!(outcome(refresh), "invalid_client: Bad secret.");
+        let manage = client_access(id.clone(), bearer(&token_digest), &db).await;
+        assert_eq!(
+            outcome(manage.map(|_| ())),
+            "invalid_client: Bad access token."
+        );
+        db.del_raw(&format!("clients/{id}")).await.unwrap();
     }
 
     /// A confidential client authenticates at the refresh grant exactly as it
@@ -7856,11 +7940,7 @@ mod scope_grant_tests {
         if let Some(grants) = grants {
             metadata = metadata.set_grant_types(Some(grants));
         }
-        ClientEntry {
-            secret: "secret".into(),
-            metadata,
-            access_token: None,
-        }
+        ClientEntry::new("secret", metadata, None)
     }
 
     /// The pure decision, without Redis: ordering and duplicates do not matter,

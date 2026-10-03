@@ -15,8 +15,29 @@ pub mod tokens;
 pub use self::redis::RedisClient;
 
 const KV_CLIENT_PREFIX: &str = "clients";
+
+// Credentials a client holds are stored only as their SHA-256 digest
+// ([`tokens::digest`]): authorization codes `code/{digest}`, login sessions
+// `session/{digest}`, device codes `device_code/{digest}`, user codes
+// `user_code/{digest}`, CAIP-122 nonces `caip122/{category}/{digest}` and
+// WebAuthn ceremony state under [`Ceremony`]. Each prefix differs from the
+// legacy one it replaces, so the legacy read below can never reach a digest
+// entry: a client presenting a stored digest as its credential reads
+// `codes/{digest}`, which nothing writes.
+const KV_CODE_DIGEST_PREFIX: &str = "code";
+const KV_SESSION_DIGEST_PREFIX: &str = "session";
+const KV_DEVICE_CODE_DIGEST_PREFIX: &str = "device_code";
+const KV_USER_CODE_DIGEST_PREFIX: &str = "user_code";
+const KV_CAIP122_NONCE_DIGEST_PREFIX: &str = "caip122";
+
+// The raw-keyed layout of the builds before digest keys. Entries in it are
+// read, and used once, for their remaining lifetime (codes and sessions 300 s,
+// device codes 1800 s, nonces 300 s, ceremonies 120 s) and never written anew.
+// TODO(remove one release after Phase 2b): the legacy reads.
 const KV_SESSION_PREFIX: &str = "sessions";
 const KV_CODE_PREFIX: &str = "codes";
+const KV_LEGACY_DEVICE_CODE_PREFIX: &str = "device_codes";
+const KV_LEGACY_USER_CODE_PREFIX: &str = "user_codes";
 /// Legacy token entries `token/{raw}`, written by builds before the grant record
 /// and only read and deleted now (see [`DBClient::set_token`]).
 const KV_TOKEN_PREFIX: &str = "token";
@@ -41,10 +62,11 @@ const KV_USER_TOMBSTONE_PREFIX: &str = "tombstone:user";
 /// The DID is stored as a hash so an erased account leaves no DID in cleartext.
 const KV_ERASED_USER_PREFIX: &str = "erased:user";
 const KV_ERASED_DID_PREFIX: &str = "erased:did";
-/// Prefix for server-issued, single-use CAIP-122 nonces (C1). Used by the
-/// device-approval and account CAIP-122 paths, which (unlike the login path) have
-/// no session to carry the nonce: it is minted on a dedicated GET and consumed on
-/// submit. The stored value is the operation context the nonce is bound to.
+/// Legacy prefix for server-issued, single-use CAIP-122 nonces (C1), now stored
+/// under `caip122/{category}/{digest}`. Used by the device-approval and account
+/// CAIP-122 paths, which (unlike the login path) have no session to carry the
+/// nonce: it is minted on a dedicated GET and consumed on submit. The stored
+/// value is the operation context the nonce is bound to.
 const KV_CAIP122_NONCE_PREFIX: &str = "caip122_nonce";
 /// TTL for a server-issued CAIP-122 device/account nonce (seconds). Long enough
 /// for the user to read the page and complete a wallet signing prompt, short
@@ -79,6 +101,35 @@ pub const KV_WEBAUTHN_CREDENTIAL_PREFIX: &str = "webauthn:credential";
 /// silently attribute a linked credential to the wrong principal. Reading is not
 /// owning. See [`crate::credential_migration`].
 pub const KV_WEBAUTHN_LINK_PREFIX: &str = "webauthn:link";
+
+/// The state of a WebAuthn ceremony between its start and its finish, keyed by
+/// the digest of the ceremony id the client holds (the login `session` cookie,
+/// the `session_id` the account re-auth start returns, or the device approval's
+/// `device_passkey_{user_code}`). See [`RedisClient::put_ceremony_state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ceremony {
+    /// Registration or authentication: `webauthn:ceremony/{digest}`.
+    Challenge,
+    /// Linking a passkey to an account: `webauthn:link_ceremony/{digest}`.
+    Link,
+}
+
+impl Ceremony {
+    pub(crate) fn prefix(self) -> &'static str {
+        match self {
+            Ceremony::Challenge => "webauthn:ceremony",
+            Ceremony::Link => "webauthn:link_ceremony",
+        }
+    }
+
+    /// Where a build before digest keys stored the same state, by raw id.
+    pub(crate) fn legacy_prefix(self) -> &'static str {
+        match self {
+            Ceremony::Challenge => "webauthn:challenge",
+            Ceremony::Link => "webauthn:link_challenge",
+        }
+    }
+}
 
 /// Redis key prefix for the opaque login user-session: `user:session/{token}` ->
 /// DID. The token is the identity hint that scopes the passkey picker's
@@ -172,26 +223,147 @@ pub struct CodeEntry {
     pub scope: Option<String>,
 }
 
+/// A client's registration. The client secret and the registration access
+/// token are stored only as their SHA-256 digests ([`tokens::digest`]), and a
+/// presented value is compared with them digest against digest
+/// ([`ClientEntry::secret_matches`], [`ClientEntry::access_token_matches`]).
+/// Both are random (16 and 11 alphanumeric characters from `POST /register`),
+/// so an unsalted digest is enough; an operator-chosen `default_clients`
+/// secret may be weak, but its plaintext sits in the configuration anyway.
+///
+/// Deserializes from the stored form (`secret_digest`, `access_token_digest`)
+/// and from the form a build before digest keys stored and `default_clients`
+/// still configures (`secret`, `access_token`, in the clear), which it digests
+/// on the way in; it serializes only the digests. The member names differ on
+/// purpose: a stored digest presented as the secret is digested again and
+/// never matches.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(try_from = "StoredClientEntry")]
 pub struct ClientEntry {
-    pub secret: String,
+    pub secret_digest: String,
     pub metadata: CoreClientMetadata,
-    pub access_token: Option<RegistrationAccessToken>,
+    pub access_token_digest: Option<String>,
 }
 
+/// Every form a client entry is read in; see [`ClientEntry`].
+#[derive(Deserialize)]
+struct StoredClientEntry {
+    #[serde(default)]
+    secret_digest: Option<String>,
+    #[serde(default)]
+    secret: Option<String>,
+    metadata: CoreClientMetadata,
+    #[serde(default)]
+    access_token_digest: Option<String>,
+    #[serde(default)]
+    access_token: Option<RegistrationAccessToken>,
+}
+
+impl TryFrom<StoredClientEntry> for ClientEntry {
+    type Error = &'static str;
+
+    fn try_from(stored: StoredClientEntry) -> Result<Self, Self::Error> {
+        let secret_digest = match (stored.secret_digest, stored.secret) {
+            (Some(digest), None) => digest,
+            (None, Some(secret)) => tokens::digest(&secret),
+            (Some(_), Some(_)) => {
+                return Err("a client entry holds its secret both as a digest and in the clear")
+            }
+            (None, None) => return Err("a client entry holds no secret"),
+        };
+        let access_token_digest =
+            match (stored.access_token_digest, stored.access_token) {
+                (digest, None) => digest,
+                (None, Some(token)) => Some(tokens::digest(token.secret())),
+                (Some(_), Some(_)) => return Err(
+                    "a client entry holds its registration access token both as a digest and in \
+                     the clear",
+                ),
+            };
+        Ok(ClientEntry {
+            secret_digest,
+            metadata: stored.metadata,
+            access_token_digest,
+        })
+    }
+}
+
+impl ClientEntry {
+    /// The registration of a client with `secret` and, if it has one, the
+    /// registration access token `access_token`; it keeps their digests.
+    pub fn new(secret: &str, metadata: CoreClientMetadata, access_token: Option<&str>) -> Self {
+        ClientEntry {
+            secret_digest: tokens::digest(secret),
+            metadata,
+            access_token_digest: access_token.map(tokens::digest),
+        }
+    }
+
+    /// Whether `presented` is the client secret.
+    pub fn secret_matches(&self, presented: &str) -> bool {
+        digests_match(&tokens::digest(presented), &self.secret_digest)
+    }
+
+    /// Whether `presented` is the registration access token. A client without
+    /// one (a `default_clients` entry that configures none) matches nothing.
+    pub fn access_token_matches(&self, presented: &str) -> bool {
+        self.access_token_digest
+            .as_deref()
+            .is_some_and(|stored| digests_match(&tokens::digest(presented), stored))
+    }
+}
+
+/// Constant-time comparison of two digests. Both are 64 hex characters, so
+/// the length check never short-circuits on a real comparison.
+fn digests_match(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
+/// The digest-only form of a stored client entry that holds its secret or its
+/// registration access token in the clear (written by a build before digest
+/// keys), or `None` when it holds neither. Only those two members change, so
+/// nothing else the entry holds is lost.
+/// TODO(remove once no entry a build before Phase 2b wrote can be alive:
+/// [`CLIENT_LIFETIME`] after the deploy).
+pub fn client_entry_without_plaintext(stored: &serde_json::Value) -> Option<serde_json::Value> {
+    let object = stored.as_object()?;
+    if !object.contains_key("secret") && !object.contains_key("access_token") {
+        return None;
+    }
+    let mut upgraded = object.clone();
+    for (plain, digested) in [
+        ("secret", "secret_digest"),
+        ("access_token", "access_token_digest"),
+    ] {
+        if let Some(value) = upgraded.remove(plain) {
+            let digest = match value {
+                serde_json::Value::String(plain) => {
+                    serde_json::Value::String(tokens::digest(&plain))
+                }
+                _ => serde_json::Value::Null,
+            };
+            upgraded.insert(digested.to_string(), digest);
+        }
+    }
+    Some(serde_json::Value::Object(upgraded))
+}
+
+/// A login session, started at `/authorize`.
+///
+/// Deserializes through [`StoredSessionEntry`], which also reads the form a
+/// build before Phase 2b stored, with the scope and the OIDC nonce beside the
+/// bound request instead of in it, and moves them into the request.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(from = "StoredSessionEntry")]
 pub struct SessionEntry {
     pub siwe_nonce: String,
-    pub oidc_nonce: Option<Nonce>,
     pub secret: String,
     pub signin_count: u64,
     /// Set by a server-verified ceremony (e.g. WebAuthn) before redirecting to /sign_in.
     /// When present, sign_in trusts this DID without re-verifying a CAIP-122 cookie.
     #[serde(default)]
     pub verified_did: Option<String>,
-    /// Original scope from /authorize, preserved so sign_in can extract a client-proposed device_id.
-    #[serde(default)]
-    pub scope: Option<String>,
     /// The authorization request `/authorize` validated and bound to this
     /// session. `sign_in` issues the code for this request, never for
     /// front-channel parameters. `None` only on a session written by an older
@@ -200,9 +372,45 @@ pub struct SessionEntry {
     pub request: Option<AuthorizationRequest>,
 }
 
+/// Every form a login session is read in; see [`SessionEntry`].
+#[derive(Deserialize)]
+struct StoredSessionEntry {
+    siwe_nonce: String,
+    secret: String,
+    signin_count: u64,
+    #[serde(default)]
+    verified_did: Option<String>,
+    #[serde(default)]
+    request: Option<AuthorizationRequest>,
+    /// Beside the request in a session a build before Phase 2b stored; it
+    /// lives [`SESSION_LIFETIME`]. TODO(remove one release after Phase 2b).
+    #[serde(default)]
+    oidc_nonce: Option<Nonce>,
+    /// Same.
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+impl From<StoredSessionEntry> for SessionEntry {
+    fn from(stored: StoredSessionEntry) -> Self {
+        let request = stored.request.map(|mut request| {
+            request.scope = request.scope.or(stored.scope);
+            request.nonce = request.nonce.or(stored.oidc_nonce);
+            request
+        });
+        SessionEntry {
+            siwe_nonce: stored.siwe_nonce,
+            secret: stored.secret,
+            signin_count: stored.signin_count,
+            verified_did: stored.verified_did,
+            request,
+        }
+    }
+}
+
 /// An authorization request as `/authorize` validated it, bound to the login
-/// session (the OIDC nonce is [`SessionEntry::oidc_nonce`]).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// session as one value.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthorizationRequest {
     pub client_id: String,
     /// Exactly as sent, and registered for `client_id`.
@@ -214,7 +422,40 @@ pub struct AuthorizationRequest {
     /// The S256 PKCE challenge (base64url). The method is always S256:
     /// `/authorize` refuses any other.
     pub code_challenge: String,
+    /// The scope as requested. `sign_in` copies it into the code (where the
+    /// token endpoint reads what was requested) and takes a client-proposed
+    /// device id from it.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// The OIDC `nonce`, which the ID token carries.
+    #[serde(default)]
+    pub nonce: Option<Nonce>,
 }
+
+/// Written out because [`Nonce`] has no `PartialEq`; destructured so that a
+/// field added later cannot be left out of the comparison.
+impl PartialEq for AuthorizationRequest {
+    fn eq(&self, other: &Self) -> bool {
+        let AuthorizationRequest {
+            client_id,
+            redirect_uri,
+            state,
+            response_mode,
+            code_challenge,
+            scope,
+            nonce,
+        } = self;
+        *client_id == other.client_id
+            && *redirect_uri == other.redirect_uri
+            && *state == other.state
+            && *response_mode == other.response_mode
+            && *code_challenge == other.code_challenge
+            && *scope == other.scope
+            && nonce.as_ref().map(Nonce::secret) == other.nonce.as_ref().map(Nonce::secret)
+    }
+}
+
+impl Eq for AuthorizationRequest {}
 
 /// Status of an RFC 8628 device authorization code.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -230,7 +471,17 @@ pub enum DeviceCodeStatus {
 /// page, so it prints as its fingerprint (see [`crate::redact`]).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DeviceCodeEntry {
-    pub user_code: String,
+    /// SHA-256 digest of the user code ([`tokens::digest`]); the user code
+    /// itself is never stored. Empty in an entry a build before digest keys
+    /// wrote until [`DeviceCodeEntry::from_stored`] fills it in.
+    #[serde(default)]
+    pub user_code_digest: String,
+    /// The user code in the clear: present only in an entry a build before
+    /// digest keys wrote (as `user_code`), never in a new one. It names that
+    /// entry's legacy `user_codes/{raw}` mapping, deleted with it.
+    /// TODO(remove one release after Phase 2b).
+    #[serde(default, rename = "user_code", skip_serializing_if = "Option::is_none")]
+    pub legacy_user_code: Option<String>,
     pub client_id: String,
     pub scope: String,
     pub status: DeviceCodeStatus,
@@ -243,7 +494,11 @@ pub struct DeviceCodeEntry {
 impl std::fmt::Debug for DeviceCodeEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeviceCodeEntry")
-            .field("user_code_fp", &crate::redact::fingerprint(&self.user_code))
+            // A fingerprint is the digest's first eight hex characters.
+            .field(
+                "user_code_fp",
+                &self.user_code_digest.get(..8).unwrap_or_default(),
+            )
             .field("client_id", &self.client_id)
             .field("scope", &self.scope)
             .field("status", &self.status)
@@ -251,6 +506,59 @@ impl std::fmt::Debug for DeviceCodeEntry {
             .field("device_id", &self.device_id)
             .field("last_poll", &self.last_poll)
             .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+impl DeviceCodeEntry {
+    /// A new entry for the user code `user_code`, which it stores as a digest.
+    pub fn new(user_code: &str, client_id: String, scope: String, created_at: i64) -> Self {
+        DeviceCodeEntry {
+            user_code_digest: tokens::digest(user_code),
+            legacy_user_code: None,
+            client_id,
+            scope,
+            status: DeviceCodeStatus::Pending,
+            did: None,
+            device_id: None,
+            last_poll: None,
+            created_at,
+        }
+    }
+
+    /// Parse a stored entry, in either layout: an entry a build before digest
+    /// keys wrote carries the user code in the clear and gets its digest here.
+    pub fn from_stored(json: &str) -> serde_json::Result<Self> {
+        let mut entry: DeviceCodeEntry = serde_json::from_str(json)?;
+        if entry.user_code_digest.is_empty() {
+            if let Some(user_code) = &entry.legacy_user_code {
+                entry.user_code_digest = tokens::digest(user_code);
+            }
+        }
+        Ok(entry)
+    }
+}
+
+/// Where a device code's entry is stored. It comes from a lookup
+/// ([`DBClient::get_device_code`], [`DBClient::get_device_code_by_user_code`])
+/// and names the entry for the update or delete that follows, in the layout
+/// the lookup found it in: an entry a build before digest keys wrote under
+/// `device_codes/{raw}` is updated and deleted there, and its user-code
+/// mapping still holds the raw device code, so it stays in that layout until it
+/// is redeemed or expires. Its `Debug` prints a fingerprint.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DeviceCodeRef {
+    pub(crate) digest: String,
+    /// The raw device code, set only when the entry was found under the
+    /// legacy `device_codes/{raw}`. TODO(remove one release after Phase 2b).
+    pub(crate) legacy: Option<String>,
+}
+
+impl std::fmt::Debug for DeviceCodeRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCodeRef")
+            .field("fp", &self.digest.get(..8).unwrap_or_default())
+            .field("legacy", &self.legacy.is_some())
             .finish()
     }
 }
@@ -373,9 +681,10 @@ pub trait DBClient {
 
     /// Atomically claim an *approved* device code for redemption. Returns `true`
     /// only for the first caller; concurrent polls get `false` and must not issue
-    /// tokens (S3-1 / H9): a `SET .../redeemed 1 NX EX <ttl>` so exactly one
-    /// poll wins, as exactly one caller of
-    /// [`try_consume_code`](Self::try_consume_code) receives a code.
+    /// tokens (S3-1 / H9): a `SET device_code/{digest}/redeemed 1 NX EX <ttl>`
+    /// so exactly one poll wins, as exactly one caller of
+    /// [`try_consume_code`](Self::try_consume_code) receives a code. A claim a
+    /// build before digest keys left (`device_codes/{raw}/redeemed`) counts too.
     async fn try_claim_device_code(&self, device_code: &str) -> Result<bool>;
 
     // -- Legacy token entries (`token/{raw}`) -----------------------------------
@@ -394,39 +703,50 @@ pub trait DBClient {
     async fn delete_token(&self, token: &str) -> Result<()>;
 
     // -- RFC 8628 device code storage -----------------------------------------
+    //
+    // A device code is stored under its digest, `device_code/{digest}`, and a
+    // user code as `user_code/{digest}` -> the device code's digest. The entry
+    // holds the user code's digest, never the code.
 
-    /// Store a device code entry with a TTL in seconds.
+    /// Store a new device code entry with a TTL in seconds.
     async fn set_device_code(
         &self,
         device_code: &str,
         entry: &DeviceCodeEntry,
         ttl: u64,
     ) -> Result<()>;
-    /// Retrieve a device code entry.
-    async fn get_device_code(&self, device_code: &str) -> Result<Option<DeviceCodeEntry>>;
-    /// Update a device code entry (preserving original TTL is caller's responsibility).
-    async fn update_device_code(
+    /// Look up the device code a client presents.
+    async fn get_device_code(
         &self,
         device_code: &str,
+    ) -> Result<Option<(DeviceCodeRef, DeviceCodeEntry)>>;
+    /// Update the entry a lookup returned, where the lookup found it, with a
+    /// TTL in seconds (preserving the original TTL is the caller's
+    /// responsibility).
+    async fn update_device_code(
+        &self,
+        device_code: &DeviceCodeRef,
         entry: &DeviceCodeEntry,
         ttl: u64,
     ) -> Result<()>;
-    /// Delete a device code entry.
-    async fn delete_device_code(&self, device_code: &str) -> Result<()>;
-    /// Look up a device code by its user-facing code.
+    /// Delete the entry a lookup returned.
+    async fn delete_device_code(&self, device_code: &DeviceCodeRef) -> Result<()>;
+    /// Look up a device code by the user code a person presents, exactly as
+    /// presented: the server never normalised user codes (the approval page
+    /// trims and upper-cases what the person types before sending it).
     async fn get_device_code_by_user_code(
         &self,
         user_code: &str,
-    ) -> Result<Option<(String, DeviceCodeEntry)>>;
-    /// Store the user_code -> device_code reverse mapping with a TTL.
+    ) -> Result<Option<(DeviceCodeRef, DeviceCodeEntry)>>;
+    /// Store the user code -> device code mapping with a TTL.
     async fn set_user_code_mapping(
         &self,
         user_code: &str,
         device_code: &str,
         ttl: u64,
     ) -> Result<()>;
-    /// Delete the user_code -> device_code mapping.
-    async fn delete_user_code_mapping(&self, user_code: &str) -> Result<()>;
+    /// Delete the user-code mapping of `entry`, in the layout it was written.
+    async fn delete_user_code_mapping(&self, entry: &DeviceCodeEntry) -> Result<()>;
 
     // -- CAIP-122 server-issued single-use nonce store (C1) -------------------
 
@@ -439,7 +759,9 @@ pub trait DBClient {
     /// Atomically consume a previously-minted CAIP-122 nonce in `category`.
     /// Returns `Some(binding)` for the FIRST consumer (the operation context the
     /// nonce was minted for); `None` if the nonce is unknown/expired OR was already
-    /// consumed (replay). Single-use via SETNX on a companion flag.
+    /// consumed (replay). Single use: the entry is read and deleted in one
+    /// atomic step. A legacy nonce's binding is returned as that build stored
+    /// it (for the device category, the user code in the clear).
     async fn try_consume_caip122_nonce(
         &self,
         category: &str,
@@ -596,5 +918,192 @@ mod code_entry_tests {
         let round_trip: CodeEntry =
             serde_json::from_str(&serde_json::to_string(&with_scope).unwrap()).unwrap();
         assert_eq!(round_trip.scope.as_deref(), Some("openid offline_access"));
+    }
+}
+
+#[cfg(test)]
+mod client_entry_tests {
+    use super::*;
+    use openidconnect::RedirectUrl;
+
+    fn metadata() -> CoreClientMetadata {
+        CoreClientMetadata::new(
+            vec![RedirectUrl::new("https://rp.example.org/cb".into()).unwrap()],
+            Default::default(),
+        )
+    }
+
+    /// The entry as a build before digest keys stored it, and as
+    /// `default_clients` configures it.
+    fn plaintext_entry() -> serde_json::Value {
+        serde_json::json!({
+            "secret": "the-client-secret",
+            "metadata": metadata(),
+            "access_token": "the-registration-token",
+        })
+    }
+
+    #[test]
+    fn a_client_entry_stores_only_the_digests_of_its_credentials() {
+        let entry = ClientEntry::new(
+            "the-client-secret",
+            metadata(),
+            Some("the-registration-token"),
+        );
+        let stored = serde_json::to_string(&entry).unwrap();
+        assert!(!stored.contains("the-client-secret"), "{stored}");
+        assert!(!stored.contains("the-registration-token"), "{stored}");
+        assert!(stored.contains(&tokens::digest("the-client-secret")));
+        assert!(stored.contains(&tokens::digest("the-registration-token")));
+        let read: ClientEntry = serde_json::from_str(&stored).unwrap();
+        assert!(read.secret_matches("the-client-secret"));
+        assert!(read.access_token_matches("the-registration-token"));
+    }
+
+    /// A previous build's entry (and a configured one) authenticates exactly
+    /// as before: the same secret and token match, nothing else does.
+    #[test]
+    fn a_plaintext_client_entry_authenticates_as_before() {
+        let entry: ClientEntry = serde_json::from_value(plaintext_entry()).unwrap();
+        assert!(entry.secret_matches("the-client-secret"));
+        assert!(entry.access_token_matches("the-registration-token"));
+        assert!(!entry.secret_matches("the-client-secre"));
+        assert!(!entry.secret_matches("the-registration-token"));
+        assert!(!entry.access_token_matches("the-client-secret"));
+        let mut tokenless = plaintext_entry();
+        tokenless["access_token"] = serde_json::Value::Null;
+        let tokenless: ClientEntry = serde_json::from_value(tokenless).unwrap();
+        assert!(!tokenless.access_token_matches(""));
+        assert!(!tokenless.access_token_matches("the-registration-token"));
+    }
+
+    /// Someone who can read Redis cannot present what is stored there.
+    #[test]
+    fn a_stored_digest_presented_as_a_credential_matches_nothing() {
+        let entry = ClientEntry::new("the-client-secret", metadata(), Some("tok"));
+        assert!(!entry.secret_matches(&entry.secret_digest));
+        assert!(!entry.access_token_matches(entry.access_token_digest.as_deref().unwrap()));
+    }
+
+    /// The upgrade replaces exactly the two credentials by their digests and
+    /// keeps every other member, including one this build does not know.
+    #[test]
+    fn the_digest_only_form_changes_only_the_two_credentials() {
+        let mut stored = plaintext_entry();
+        stored["io.example.unknown"] = serde_json::json!({"kept": true});
+        let upgraded = client_entry_without_plaintext(&stored).expect("a plaintext entry");
+        let mut expected = stored.as_object().unwrap().clone();
+        expected.remove("secret");
+        expected.remove("access_token");
+        expected.insert(
+            "secret_digest".into(),
+            tokens::digest("the-client-secret").into(),
+        );
+        expected.insert(
+            "access_token_digest".into(),
+            tokens::digest("the-registration-token").into(),
+        );
+        assert_eq!(upgraded, serde_json::Value::Object(expected));
+        let read: ClientEntry = serde_json::from_value(upgraded.clone()).unwrap();
+        assert!(read.secret_matches("the-client-secret"));
+        assert!(read.access_token_matches("the-registration-token"));
+        assert_eq!(
+            client_entry_without_plaintext(&upgraded),
+            None,
+            "idempotent"
+        );
+
+        let mut tokenless = plaintext_entry();
+        tokenless["access_token"] = serde_json::Value::Null;
+        let upgraded = client_entry_without_plaintext(&tokenless).unwrap();
+        assert_eq!(upgraded["access_token_digest"], serde_json::Value::Null);
+        assert!(upgraded.get("access_token").is_none());
+    }
+
+    #[test]
+    fn a_client_entry_with_a_credential_in_both_forms_is_refused() {
+        let mut both = plaintext_entry();
+        both["secret_digest"] = tokens::digest("other").into();
+        assert!(serde_json::from_value::<ClientEntry>(both).is_err());
+        let mut both = plaintext_entry();
+        both["access_token_digest"] = tokens::digest("other").into();
+        assert!(serde_json::from_value::<ClientEntry>(both).is_err());
+        let mut none = plaintext_entry();
+        none.as_object_mut().unwrap().remove("secret");
+        assert!(serde_json::from_value::<ClientEntry>(none).is_err());
+    }
+}
+
+#[cfg(test)]
+mod session_entry_tests {
+    use super::*;
+
+    /// A session as the previous build serialized it: the scope and the OIDC
+    /// nonce beside the bound request.
+    fn previous_build_session() -> serde_json::Value {
+        serde_json::json!({
+            "siwe_nonce": "siwe-nonce",
+            "oidc_nonce": "oidc-nonce",
+            "secret": "s",
+            "signin_count": 0,
+            "verified_did": null,
+            "scope": "openid urn:matrix:client:device:ABC",
+            "request": {
+                "client_id": "client",
+                "redirect_uri": "https://rp.example.org/cb",
+                "state": "state",
+                "response_mode": null,
+                "code_challenge": "challenge",
+            },
+        })
+    }
+
+    /// It deserializes with the scope and the nonce moved into the request,
+    /// and is written back as one request with nothing beside it.
+    #[test]
+    fn a_previous_build_session_reads_its_scope_and_nonce_into_the_request() {
+        let session: SessionEntry = serde_json::from_value(previous_build_session()).unwrap();
+        let request = session.request.clone().expect("the bound request");
+        assert_eq!(
+            request.scope.as_deref(),
+            Some("openid urn:matrix:client:device:ABC")
+        );
+        assert_eq!(
+            request
+                .nonce
+                .as_ref()
+                .map(Nonce::secret)
+                .map(String::as_str),
+            Some("oidc-nonce")
+        );
+        assert_eq!(request.client_id, "client");
+        assert_eq!(request.code_challenge, "challenge");
+
+        let written = serde_json::to_value(&session).unwrap();
+        assert!(written.get("scope").is_none(), "{written}");
+        assert!(written.get("oidc_nonce").is_none(), "{written}");
+        assert_eq!(
+            written["request"]["scope"],
+            "openid urn:matrix:client:device:ABC"
+        );
+        assert_eq!(written["request"]["nonce"], "oidc-nonce");
+        let again: SessionEntry = serde_json::from_value(written).unwrap();
+        assert_eq!(again.request, Some(request));
+    }
+
+    /// A previous-build session without a nonce or scope has none in its
+    /// request, and one that predates the bound request still has none (sign_in
+    /// refuses it with "restart sign-in").
+    #[test]
+    fn absent_legacy_members_stay_absent() {
+        let mut stored = previous_build_session();
+        stored["oidc_nonce"] = serde_json::Value::Null;
+        stored.as_object_mut().unwrap().remove("scope");
+        let session: SessionEntry = serde_json::from_value(stored.clone()).unwrap();
+        let request = session.request.unwrap();
+        assert!(request.scope.is_none() && request.nonce.is_none());
+        stored.as_object_mut().unwrap().remove("request");
+        let session: SessionEntry = serde_json::from_value(stored).unwrap();
+        assert!(session.request.is_none());
     }
 }

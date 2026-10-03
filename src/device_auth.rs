@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::introspect::generate_opaque_token;
 use crate::oidc::CustomError;
 use crate::synapse_client::SynapseClient;
+use siwx_oidc::db::tokens::digest;
 use siwx_oidc::db::*;
 use siwx_oidc::redact::fingerprint;
 
@@ -93,16 +94,12 @@ pub async fn device_authorization(
     let scope = form.scope.unwrap_or_else(|| "openid".to_string());
 
     // 3. Build entry
-    let entry = DeviceCodeEntry {
-        user_code: user_code.clone(),
-        client_id: form.client_id,
-        scope: scope.clone(),
-        status: DeviceCodeStatus::Pending,
-        did: None,
-        device_id: None,
-        last_poll: None,
-        created_at: chrono::Utc::now().timestamp(),
-    };
+    let entry = DeviceCodeEntry::new(
+        &user_code,
+        form.client_id,
+        scope.clone(),
+        chrono::Utc::now().timestamp(),
+    );
 
     // 4. Store device code and user_code -> device_code mapping
     db_client
@@ -900,10 +897,11 @@ pub async fn device_nonce(
     db_client: &(dyn DBClient + Sync),
     user_code: &str,
 ) -> Result<DeviceNonceResponse, CustomError> {
-    // Only mint a nonce for a real, still-pending code.
+    // Only mint a nonce for a real, still-pending code. The nonce is bound to
+    // the user code's digest: the user code is not stored in the clear.
     device_verify(db_client, user_code).await?;
     let nonce = db_client
-        .mint_caip122_nonce(CAIP122_NONCE_CATEGORY_DEVICE, user_code)
+        .mint_caip122_nonce(CAIP122_NONCE_CATEGORY_DEVICE, &digest(user_code))
         .await?;
     let exp = chrono::Utc::now() + chrono::Duration::seconds(CAIP122_NONCE_TTL_SECS as i64);
     Ok(DeviceNonceResponse {
@@ -929,7 +927,7 @@ pub async fn device_approve(
     req: DeviceApproveRequest,
     synapse_client: Option<&SynapseClient>,
 ) -> Result<DeviceApproveResponse, CustomError> {
-    let (device_code, mut entry) = db_client
+    let (device_ref, mut entry) = db_client
         .get_device_code_by_user_code(&req.user_code)
         .await?
         .ok_or_else(|| CustomError::BadRequest("User code not found or expired".to_string()))?;
@@ -941,7 +939,7 @@ pub async fn device_approve(
     if req.action == "deny" {
         entry.status = DeviceCodeStatus::Denied;
         let _ = db_client
-            .update_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
+            .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
             .await;
         info!(user_code_fp = %fingerprint(&req.user_code), "device denied");
         return Ok(DeviceApproveResponse {
@@ -1008,7 +1006,11 @@ pub async fn device_approve(
                 "Invalid, expired, or replayed device-approval nonce".to_string(),
             )
         })?;
-    if bound_user_code != req.user_code {
+    // A nonce the previous build minted is bound to the user code in the clear.
+    // A digest can never pass that comparison: the user code was looked up
+    // above, and no user code is 64 hex characters.
+    // TODO(remove the raw comparison one release after Phase 2b).
+    if bound_user_code != digest(&req.user_code) && bound_user_code != req.user_code {
         return Err(CustomError::Unauthorized(
             "Device-approval nonce was issued for a different device login".to_string(),
         ));
@@ -1040,7 +1042,7 @@ pub async fn device_approve(
     entry.status = DeviceCodeStatus::Approved;
     entry.did = Some(did.clone());
     let _ = db_client
-        .update_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
+        .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
         .await;
     info!(user_code_fp = %fingerprint(&req.user_code), did = %did, "device approved");
 
@@ -1059,7 +1061,7 @@ pub async fn device_approve_passkey(
     synapse_client: Option<&SynapseClient>,
     matrix_server_name: Option<&str>,
 ) -> Result<DeviceApproveResponse, CustomError> {
-    let (device_code, mut entry) = db_client
+    let (device_ref, mut entry) = db_client
         .get_device_code_by_user_code(user_code)
         .await?
         .ok_or_else(|| CustomError::BadRequest("User code not found or expired".to_string()))?;
@@ -1085,7 +1087,7 @@ pub async fn device_approve_passkey(
     entry.status = DeviceCodeStatus::Approved;
     entry.did = Some(verified_did.to_string());
     let _ = db_client
-        .update_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
+        .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
         .await;
     info!(user_code_fp = %fingerprint(user_code), did = %verified_did, "device approved via passkey");
 
@@ -1139,14 +1141,14 @@ mod tests {
         let client_id = format!("device-auth-{}", uuid::Uuid::new_v4().simple());
         db.set_client(
             client_id.clone(),
-            ClientEntry {
-                secret: "secret".into(),
-                metadata: CoreClientMetadata::new(
+            ClientEntry::new(
+                "secret",
+                CoreClientMetadata::new(
                     vec![RedirectUrl::new("https://example.com".into()).unwrap()],
                     EmptyAdditionalClientMetadata {},
                 ),
-                access_token: None,
-            },
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -1194,14 +1196,14 @@ mod tests {
         let client_id = format!("device-log-{}", uuid::Uuid::new_v4().simple());
         db.set_client(
             client_id.clone(),
-            ClientEntry {
-                secret: "secret".into(),
-                metadata: CoreClientMetadata::new(
+            ClientEntry::new(
+                "secret",
+                CoreClientMetadata::new(
                     vec![RedirectUrl::new("https://example.com".into()).unwrap()],
                     EmptyAdditionalClientMetadata {},
                 ),
-                access_token: None,
-            },
+                None,
+            ),
         )
         .await
         .unwrap();
