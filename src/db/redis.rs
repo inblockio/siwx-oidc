@@ -24,6 +24,9 @@ use super::*;
 #[derive(Clone)]
 pub struct RedisClient {
     pub(super) pool: Pool<RedisConnectionManager>,
+    /// The operator's absolute-lifetime caps (I6); none by default. Set with
+    /// [`RedisClient::with_grant_lifetime`].
+    pub(super) lifetime: super::grant::GrantLifetime,
 }
 
 /// Redis key for the per-`(username, device_id)` token index SET.
@@ -284,7 +287,10 @@ impl RedisClient {
             .build(manager.clone())
             .await
             .context("Could not build Redis pool")?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            lifetime: Default::default(),
+        })
     }
 }
 

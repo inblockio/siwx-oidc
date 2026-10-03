@@ -206,6 +206,26 @@ fn legacy_token_key(token: &str) -> String {
     format!("{}/{token}", super::KV_TOKEN_PREFIX)
 }
 
+/// The operator's absolute-lifetime caps, in seconds (I6; decision D1,
+/// provisional): one global value and one per client id, both unset by
+/// default, which caps nothing (a grant then ends only by inactivity). The
+/// cap of a grant is the smallest value that applies to its client, so a
+/// per-client value can shorten the global cap, never lengthen it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GrantLifetime {
+    pub global_secs: Option<u64>,
+    pub per_client_secs: std::sync::Arc<HashMap<String, u64>>,
+}
+
+impl GrantLifetime {
+    /// The cap for a grant of `client_id`, `None` when no value applies.
+    pub fn cap_for(&self, client_id: &str) -> Option<u64> {
+        // TODO(phase 3 M1): test-first stub, no cap yet.
+        let _ = client_id;
+        None
+    }
+}
+
 /// What [`RedisClient::issue_grant`] creates.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewGrant {
@@ -276,6 +296,9 @@ pub struct GrantView {
     pub scope: String,
     pub name: String,
     pub auth_time: i64,
+    /// The absolute expiry written into the grant (Unix seconds); `None` when
+    /// no cap applied when it was written (see [`GrantLifetime`]).
+    pub absolute_exp: Option<i64>,
     pub access_ttl: u64,
     pub generation: u64,
 }
@@ -294,6 +317,10 @@ impl GrantView {
             scope: s("scope")?,
             name: s("name")?,
             auth_time: f.get("auth_time")?.parse().ok()?,
+            absolute_exp: match f.get("absolute_exp") {
+                Some(v) => Some(v.parse().ok()?),
+                None => None,
+            },
             access_ttl: f.get("access_ttl")?.parse().ok()?,
             generation: f.get("generation")?.parse().ok()?,
         })
@@ -730,6 +757,14 @@ fn number<T: std::str::FromStr>(value: Option<&str>, what: &str) -> Result<T> {
 }
 
 impl RedisClient {
+    /// This client with the operator's absolute-lifetime caps (I6). Clones
+    /// share one connection pool, so tests can look at one store through
+    /// different caps, as instances do after a configuration change.
+    pub fn with_grant_lifetime(mut self, lifetime: GrantLifetime) -> Self {
+        self.lifetime = lifetime;
+        self
+    }
+
     async fn eval<T: redis::FromRedisValue>(
         &self,
         script: &str,

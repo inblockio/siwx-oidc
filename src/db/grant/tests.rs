@@ -1187,3 +1187,5 @@ fn a_lifted_grant_is_a_matrix_device_grant_exactly_when_its_scope_carries_the_ma
         assert_eq!(legacy_grant_kind(&meta(scope)), kind, "{scope:?}");
     }
 }
+
+mod lifetime;
