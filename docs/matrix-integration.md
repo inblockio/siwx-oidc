@@ -352,8 +352,13 @@ token.
    refresh token → the successor pair for `REFRESH_GRACE_TTL` (60 s). A client
    that lost the response (common on mobile) and retries with the old refresh
    token within that window receives the **same** successor pair instead of
-   `invalid_grant`. Nothing new is minted and the refresh lifetime does not
-   grow. The same mechanism applies to `POST /_matrix/client/v3/refresh`. See
+   `invalid_grant`, as long as that successor refresh token is still live: if
+   the client already rotated it, or it was revoked, the recorded pair is dead
+   and the replay is `invalid_grant`. Nothing new is minted and the refresh
+   lifetime does not grow. At `POST /token` the replay is also bound to the
+   client (see [Client binding](#client-binding)). `POST
+   /_matrix/client/v3/refresh` applies the same live-successor rule; it
+   carries no client identity, so it cannot bind the replay. See
    [the 2026-06-23 audit](audits/2026-06-23-elementx-refresh-rotation-signout.md).
 4. `POST /token` with the device-code grant provisions the Synapse device and
    issues tokens (see [below](#device-code-and-qr-login)).
@@ -386,7 +391,8 @@ to, and `POST /token` authenticates that client by one rule for both grants
 
 `invalid_client` is a 401 (RFC 6749 §5.2), with `WWW-Authenticate: Basic` when
 the request attempted Basic. It used to be a 400. The grace replay of a rotated
-token is bound the same way, to the client of the successor token it returns.
+token is bound the same way, to the client of the successor token it returns,
+and is refused once that successor is no longer live.
 
 Provisional choices, open for the maintainers:
 

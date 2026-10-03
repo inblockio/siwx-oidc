@@ -252,7 +252,9 @@ paths:
 
         Refresh rotates both tokens. A bounded grace pointer (60s) lets a client
         that LOST the rotation response — common on mobile — replay the old
-        refresh token once instead of being signed out.
+        refresh token and receive the same successor pair instead of being
+        signed out, for as long as that successor refresh token is live. A
+        replay after the successor was rotated or revoked is `invalid_grant`.
 
         In a standalone deployment (no MAS shared secret) the code exchange
         grants the requested scope among `openid`, `profile` and `offline_access`
@@ -811,7 +813,7 @@ paths:
       tags: [Matrix compatibility]
       operationId: matrixRefresh
       summary: Matrix-shaped refresh, with the same rotation grace window as `/token`
-      description: Accepts only a refresh token; an access token (a minted admin token included) is `M_UNKNOWN_TOKEN`, like an unknown one.
+      description: Accepts only a refresh token; an access token (a minted admin token included) is `M_UNKNOWN_TOKEN`, like an unknown one. A replay of a just-rotated token returns the same successor pair while that successor is live, and is `M_UNKNOWN_TOKEN` once it was rotated or revoked. The endpoint carries no client identity, so unlike `/token` it cannot bind the replay to a client.
       responses: { "200": { description: New tokens. } }
 
   /_matrix/client/v3/logout:

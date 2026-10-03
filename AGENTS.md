@@ -92,9 +92,11 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 16 tests in seven files:
-  `openapi_covers_every_route` (2), `localpart_vectors` (1) and `graceful_shutdown` (3), which
-  need nothing; `account_linking_dual_write` (6), which needs the test Redis;
+  `cargo test --workspace` runs the unit tests of both crates plus 22 tests in ten files:
+  `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (3),
+  `log_hygiene_credential_store` (1) and `log_capture_callsite_interest` (1), which
+  need nothing; `account_linking_dual_write` (6), which needs the test Redis, and `log_hygiene`
+  (4, one of them needs it);
   `credential_migration_live` (2), which needs its own disposable, empty Redis named by
   `MIGRATION_TEST_REDIS_URL`; and the pure check `an_absent_strict_skips_variable_means_strict`
   in `e2e_account_lifecycle_live` and in `e2e_did_field_live` (1 each).
@@ -350,9 +352,15 @@ doc; read it before changing the code the rule covers.
   `the_device_flow_sends_the_scope_it_relies_on`.
 - **An empty `device_id` is JSON `null` on the wire, never `""`.** Synapse rejects `""`. Pin:
   `empty_device_id_renders_as_json_null`, `deviceless_token_body_carries_device_id_null`.
-- **Refresh rotation keeps a 60 s grace pointer**: any replay of the old refresh token within
-  60 s returns the same successor pair, so a client that lost the response recovers. Pin:
-  `refresh_grace_window_tolerates_replay` (mock stack).
+- **Refresh rotation keeps a 60 s grace pointer**: within 60 s a replay of the old refresh token
+  returns the same successor pair, so a client that lost the response recovers, but only while the
+  successor refresh token is still live. Once the successor was rotated away or revoked, the
+  recorded pair is dead and the replay is `invalid_grant` at `/token` and `M_UNKNOWN_TOKEN` at
+  `/_matrix/client/v3/refresh`. At `/token` the replay is also bound to the client (next
+  invariant); the Matrix endpoint carries no client and cannot bind it. Pin:
+  `refresh_grace_window_tolerates_replay` (mock stack),
+  `a_replay_whose_successor_has_been_rotated_or_revoked_is_refused`,
+  `the_grace_replay_is_bound_to_the_client_too`, `a_matrix_refresh_replay_needs_its_successor_live`.
 - **A refresh token is bound to the client it was issued to, through the one helper the code
   exchange uses too.** `oidc::authenticate_client` serves both grants, so they cannot drift: a
   request that names another client (`client_id` in the form or the Basic user name) is
