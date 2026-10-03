@@ -1,14 +1,56 @@
 //! Back-channel logout (OpenID Connect Back-Channel Logout 1.0; design 5.6,
 //! D3, D4): the logout token, the SSRF guard on `backchannel_logout_uri`, and
 //! the worker that delivers the outbox ([`siwx_oidc::db::outbox`]).
+//!
+//! # What sends a logout token
+//!
+//! Every ACTIVE deletion of an `oidc` grant queues one entry, in the script
+//! that deletes it (`drop_grant`): RFC 7009 revocation of its refresh token,
+//! RP-initiated logout, a rotation refused for an epoch or for inactivity or
+//! absolute expiry (the script deletes the grant then), and every revocation
+//! of all of a user's grants (`logout/all`, deactivation, erasure). A grant
+//! whose key simply expires sends nothing: no script observes it, and the RP's
+//! refresh token has expired with it. A `matrix_device` grant never sends one
+//! (Synapse is not a relying party here), nor does a `service` grant.
+//!
+//! # Delivery
+//!
+//! The worker ([`Worker`], one per instance, started by `axum_lib::main`)
+//! claims due entries, looks up the client's `backchannel_logout_uri`, signs a
+//! fresh token per attempt ([`mint_logout_token`]: ES256 with the live key,
+//! raw r‖s, `typ` `logout+jwt`, a new `jti`, `exp` = `iat` + 120 s) and POSTs
+//! it as `logout_token=…`. 200 and 204 are success; anything else, a timeout
+//! or a connection failure is retried with exponential backoff up to
+//! [`OutboxPolicy::max_attempts`] attempts in all, then dropped with a
+//! `warn!` naming the client and the grant fingerprint only. A URI the guard
+//! refuses is dropped at once, never connected to. Delivery runs apart from
+//! the request that deleted the grant, which never waits for it.
+//!
+//! # The SSRF guard ([`UriGuard`])
+//!
+//! A `backchannel_logout_uri` comes from open dynamic registration (D3), so
+//! both registration and every delivery check it: no fragment; `https`; every
+//! address the host resolves to outside the refused classes
+//! ([`refused_class`]: unspecified, loopback, RFC 1918 and RFC 4193 private,
+//! CGNAT, link-local including the cloud metadata address, multicast,
+//! reserved; an IPv4 address inside IPv6, mapped, compatible or NAT64, is
+//! judged as IPv4). Delivery connects only to the addresses it checked (the
+//! client is pinned to them, so DNS cannot answer differently between the
+//! check and the connection), through no proxy, following no redirect, with
+//! short timeouts, and ignores the response body. A host on the operator's
+//! allowlist (`backchannel_logout_allowed_hosts`) skips the address check and
+//! may use `http`.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::Serialize;
 use siwx_oidc::db::outbox::{ClaimedEntry, LogoutEntry};
-use siwx_oidc::db::RedisClient;
-use url::Url;
+use siwx_oidc::db::{DBClient, RedisClient};
+use tokio::task::JoinSet;
+use tracing::{debug, info, warn};
+use url::{Host, Url};
 
 use crate::oidc::EcdsaSigningKey;
 
@@ -19,33 +61,137 @@ pub const LOGOUT_TOKEN_TYP: &str = "logout+jwt";
 /// A logout token's lifetime: `exp` = `iat` + this.
 pub const LOGOUT_TOKEN_LIFETIME_SECS: i64 = 120;
 
-/// The logout token for `entry`, signed now.
+/// How long resolving a host may take.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long connecting to an RP may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long one delivery may take in all.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Serialize)]
+struct LogoutHeader<'a> {
+    alg: &'a str,
+    typ: &'a str,
+    kid: &'a str,
+}
+
+/// The claims of a logout token, in this order (the bytes are signed).
+#[derive(Serialize)]
+struct LogoutClaims<'a> {
+    iss: &'a str,
+    aud: &'a str,
+    iat: i64,
+    exp: i64,
+    jti: String,
+    sub: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sid: Option<&'a str>,
+    events: serde_json::Value,
+}
+
+/// The logout token for `entry`, signed at `now` (Unix seconds) with a new
+/// random `jti`. `sid` is omitted, never empty, for a grant without one.
 pub fn mint_logout_token(
     key: &EcdsaSigningKey,
     issuer: &str,
     entry: &LogoutEntry,
     now: i64,
 ) -> String {
-    let _ = (key, issuer, entry, now);
-    String::new()
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let header = LogoutHeader {
+        alg: "ES256",
+        typ: LOGOUT_TOKEN_TYP,
+        kid: key.kid(),
+    };
+    let claims = LogoutClaims {
+        iss: issuer,
+        aud: &entry.client_id,
+        iat: now,
+        exp: now + LOGOUT_TOKEN_LIFETIME_SECS,
+        jti: siwx_oidc::db::tokens::new_session_id(),
+        sub: &entry.sub,
+        sid: entry.sid(),
+        events: serde_json::json!({ BACKCHANNEL_LOGOUT_EVENT: {} }),
+    };
+    let input = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("encodable header")),
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("encodable claims"))
+    );
+    let signature = key.sign_es256(input.as_bytes());
+    format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature))
 }
 
 /// An address class delivery never connects to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddressClass {
+    /// `0.0.0.0/8`, `::`.
     Unspecified,
+    /// `127.0.0.0/8`, `::1`.
     Loopback,
+    /// RFC 1918, RFC 4193 (`fc00::/7`) and the deprecated site-local `fec0::/10`.
     Private,
+    /// `100.64.0.0/10` (RFC 6598).
     SharedCgnat,
+    /// `169.254.0.0/16` (the cloud metadata address among them), `fe80::/10`.
     LinkLocal,
+    /// `224.0.0.0/4`, `ff00::/8`.
     Multicast,
+    /// `240.0.0.0/4` (broadcast included), `192.0.0.0/24`, `198.18.0.0/15`.
     Reserved,
 }
 
-/// The class `ip` belongs to when delivery must refuse it, else `None`.
+/// The class `ip` belongs to when delivery must refuse it, else `None`. An
+/// IPv4 address carried in IPv6 (mapped `::ffff:0:0/96`, compatible `::/96`,
+/// NAT64 `64:ff9b::/96`) is judged as the IPv4 address. Documentation ranges
+/// are not refused.
 pub fn refused_class(ip: IpAddr) -> Option<AddressClass> {
-    let _ = ip;
-    None
+    match ip {
+        IpAddr::V4(v4) => v4_class(v4),
+        IpAddr::V6(v6) => {
+            if v6.is_unspecified() {
+                return Some(AddressClass::Unspecified);
+            }
+            if v6.is_loopback() {
+                return Some(AddressClass::Loopback);
+            }
+            let seg = v6.segments();
+            let embedded = || {
+                Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    seg[6] as u8,
+                    (seg[7] >> 8) as u8,
+                    seg[7] as u8,
+                )
+            };
+            if seg[..5] == [0; 5] && (seg[5] == 0xffff || seg[5] == 0)
+                || seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
+            {
+                return v4_class(embedded());
+            }
+            match seg[0] {
+                s if s & 0xfe00 == 0xfc00 => Some(AddressClass::Private),
+                s if s & 0xffc0 == 0xfe80 => Some(AddressClass::LinkLocal),
+                s if s & 0xffc0 == 0xfec0 => Some(AddressClass::Private),
+                s if s & 0xff00 == 0xff00 => Some(AddressClass::Multicast),
+                _ => None,
+            }
+        }
+    }
+}
+
+fn v4_class(ip: Ipv4Addr) -> Option<AddressClass> {
+    match ip.octets() {
+        [0, ..] => Some(AddressClass::Unspecified),
+        [127, ..] => Some(AddressClass::Loopback),
+        [10, ..] | [172, 16..=31, ..] | [192, 168, ..] => Some(AddressClass::Private),
+        [100, 64..=127, ..] => Some(AddressClass::SharedCgnat),
+        [169, 254, ..] => Some(AddressClass::LinkLocal),
+        [224..=239, ..] => Some(AddressClass::Multicast),
+        [240..=255, ..] | [192, 0, 0, _] | [198, 18..=19, ..] => Some(AddressClass::Reserved),
+        _ => None,
+    }
 }
 
 /// Why a `backchannel_logout_uri` is refused.
@@ -70,17 +216,58 @@ impl UriGuard {
             allowed_hosts: Arc::new(
                 allowed_hosts
                     .iter()
-                    .map(|h| h.to_ascii_lowercase())
+                    .map(|h| {
+                        h.trim_start_matches('[')
+                            .trim_end_matches(']')
+                            .to_ascii_lowercase()
+                    })
                     .collect(),
             ),
         }
     }
 
+    /// Whether `host` (as in a URL, IPv6 in brackets) is allowlisted.
+    pub fn allows_host(&self, host: &str) -> bool {
+        let host = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        self.allowed_hosts.contains(&host)
+    }
+
     /// `Ok(None)` for an allowlisted host (no address check), `Ok(Some(addrs))`
     /// with every address the host resolved to, all checked.
     pub async fn check(&self, uri: &Url) -> Result<Option<Vec<SocketAddr>>, UriRefusal> {
-        let _ = uri;
-        Ok(None)
+        if uri.fragment().is_some() {
+            return Err(UriRefusal::Fragment);
+        }
+        let listed = uri.host_str().is_some_and(|h| self.allows_host(h));
+        if !listed && uri.scheme() != "https" {
+            return Err(UriRefusal::NotHttps);
+        }
+        let host = uri.host().ok_or(UriRefusal::NoHost)?;
+        if listed {
+            return Ok(None);
+        }
+        let port = uri.port_or_known_default().ok_or(UriRefusal::NoHost)?;
+        let addrs: Vec<SocketAddr> = match host {
+            Host::Ipv4(ip) => vec![SocketAddr::new(ip.into(), port)],
+            Host::Ipv6(ip) => vec![SocketAddr::new(ip.into(), port)],
+            Host::Domain(domain) => {
+                tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((domain, port)))
+                    .await
+                    .map_err(|_| UriRefusal::Unresolvable)?
+                    .map_err(|_| UriRefusal::Unresolvable)?
+                    .collect()
+            }
+        };
+        if addrs.is_empty() {
+            return Err(UriRefusal::Unresolvable);
+        }
+        if let Some(class) = addrs.iter().find_map(|a| refused_class(a.ip())) {
+            return Err(UriRefusal::Address(class));
+        }
+        Ok(Some(addrs))
     }
 }
 
@@ -89,21 +276,46 @@ impl UriGuard {
 pub enum DeliveryError {
     /// The URI is refused; nothing was sent.
     Refused(UriRefusal),
-    /// The RP did not answer 200 or 204.
+    /// The RP did not answer 200 or 204 (or not at all). Never carries the URI.
     Failed(String),
 }
 
-/// POST `logout_token` to `uri`.
+/// POST `logout_token` to `uri` after the guard's check, connecting only to
+/// the checked addresses, through no proxy, following no redirect.
 pub async fn deliver(guard: &UriGuard, uri: &Url, token: &str) -> Result<(), DeliveryError> {
-    let _ = (guard, uri, token);
-    Ok(())
+    let checked = guard.check(uri).await.map_err(DeliveryError::Refused)?;
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT);
+    if let (Some(addrs), Some(Host::Domain(domain))) = (&checked, uri.host()) {
+        // Pin the connection to the addresses just checked: no second lookup.
+        builder = builder.resolve_to_addrs(domain, addrs);
+    }
+    let client = builder
+        .build()
+        .map_err(|e| DeliveryError::Failed(e.without_url().to_string()))?;
+    let response = client
+        .post(uri.clone())
+        .form(&[("logout_token", token)])
+        .send()
+        .await
+        .map_err(|e| DeliveryError::Failed(e.without_url().to_string()))?;
+    match response.status().as_u16() {
+        200 | 204 => Ok(()),
+        status => Err(DeliveryError::Failed(format!("status {status}"))),
+    }
 }
 
-/// The retry schedule.
+/// The retry schedule (provisional): `max_attempts` attempts in all, the
+/// n-th retry `backoff_base` × 2ⁿ after the previous attempt.
 #[derive(Clone, Debug)]
 pub struct OutboxPolicy {
     pub max_attempts: u32,
     pub backoff_base: Duration,
+    /// How long a claimed entry is hidden from other workers; longer than a
+    /// delivery may take ([`REQUEST_TIMEOUT`] plus resolution).
     pub lease: Duration,
     pub poll: Duration,
     pub batch: usize,
@@ -121,7 +333,12 @@ impl Default for OutboxPolicy {
     }
 }
 
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// The outbox worker.
+#[derive(Clone)]
 pub struct Worker {
     pub redis: RedisClient,
     pub signing_key: Arc<EcdsaSigningKey>,
@@ -131,14 +348,109 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Claim and handle due entries once; returns how many were claimed.
-    pub async fn tick(&self) -> usize {
-        let _ = self.handle(None).await;
-        0
+    /// Poll the outbox forever.
+    pub async fn run(self) {
+        loop {
+            self.tick().await;
+            tokio::time::sleep(self.policy.poll).await;
+        }
     }
 
-    async fn handle(&self, claimed: Option<ClaimedEntry>) {
-        let _ = claimed;
+    /// Claim the due entries and handle them concurrently; returns how many
+    /// were claimed. A store fault is logged and leaves the entries leased, so
+    /// they are claimed again when the lease ends.
+    pub async fn tick(&self) -> usize {
+        let claimed = match self
+            .redis
+            .claim_logout_entries(millis(self.policy.lease), self.policy.batch)
+            .await
+        {
+            Ok(claimed) => claimed,
+            Err(e) => {
+                warn!(error = %e, "back-channel logout outbox unavailable");
+                return 0;
+            }
+        };
+        let count = claimed.len();
+        let mut tasks = JoinSet::new();
+        for entry in claimed {
+            let worker = self.clone();
+            tasks.spawn(async move { worker.handle(entry).await });
+        }
+        while tasks.join_next().await.is_some() {}
+        count
+    }
+
+    async fn handle(&self, claimed: ClaimedEntry) {
+        let entry = &claimed.entry;
+        let client_id = entry.client_id.as_str();
+        let grant = entry.grant_fingerprint();
+        let registration = match self.redis.get_client(entry.client_id.clone()).await {
+            Ok(registration) => registration,
+            Err(e) => {
+                warn!(client_id, grant, error = %e, "back-channel logout: client lookup failed, retried after the lease");
+                return;
+            }
+        };
+        let target = registration.as_ref().and_then(|r| {
+            let extra = r.metadata.additional_metadata();
+            extra
+                .backchannel_logout_uri
+                .clone()
+                .map(|uri| (uri, extra.backchannel_logout_session_required == Some(true)))
+        });
+        let Some((uri, session_required)) = target else {
+            debug!(
+                client_id,
+                grant, "back-channel logout: the client registered no URI"
+            );
+            self.finish(&claimed).await;
+            return;
+        };
+        if session_required && entry.sid().is_none() {
+            info!(
+                client_id,
+                grant,
+                "back-channel logout skipped: the client requires a sid and the grant has none"
+            );
+            self.finish(&claimed).await;
+            return;
+        }
+        let host = uri.host_str().unwrap_or_default().to_string();
+        let token = mint_logout_token(
+            &self.signing_key,
+            &self.issuer,
+            entry,
+            chrono::Utc::now().timestamp(),
+        );
+        let attempt = entry.attempt + 1;
+        match deliver(&self.guard, &uri, &token).await {
+            Ok(()) => {
+                info!(client_id, grant, attempt, "back-channel logout delivered");
+                self.finish(&claimed).await;
+            }
+            Err(DeliveryError::Refused(refusal)) => {
+                warn!(client_id, grant, host = %host, refusal = ?refusal, "back-channel logout dropped: the URI is refused");
+                self.finish(&claimed).await;
+            }
+            Err(DeliveryError::Failed(reason)) if attempt >= self.policy.max_attempts => {
+                warn!(client_id, grant, host = %host, attempt, reason = %reason, "back-channel logout dropped after the last attempt");
+                self.finish(&claimed).await;
+            }
+            Err(DeliveryError::Failed(reason)) => {
+                let delay = self.policy.backoff_base * 2u32.saturating_pow(entry.attempt);
+                info!(client_id, grant, host = %host, attempt, reason = %reason, retry_in_ms = millis(delay), "back-channel logout failed, will retry");
+                if let Err(e) = self.redis.retry_logout_entry(&claimed, millis(delay)).await {
+                    warn!(client_id, grant, error = %e, "back-channel logout: could not re-queue, retried after the lease");
+                }
+            }
+        }
+    }
+
+    async fn finish(&self, claimed: &ClaimedEntry) {
+        if let Err(e) = self.redis.complete_logout_entry(claimed).await {
+            warn!(client_id = %claimed.entry.client_id, grant = claimed.entry.grant_fingerprint(), error = %e, "back-channel logout: could not remove the entry");
+        }
     }
 }
 

@@ -1565,6 +1565,30 @@ pub async fn main() {
         synapse_client,
     };
 
+    // Back-channel logout: one outbox worker per instance (claims are atomic,
+    // so instances never deliver one entry twice at once). Never awaited by a
+    // request; it stops with the process.
+    tokio::spawn(
+        crate::backchannel::Worker {
+            redis: state.redis_client.clone(),
+            signing_key: state.signing_key.clone(),
+            issuer: openidconnect::IssuerUrl::from_url(state.config.base_url.clone())
+                .as_str()
+                .to_string(),
+            guard: crate::backchannel::UriGuard::new(
+                &state.config.backchannel_logout_allowed_hosts,
+            ),
+            policy: crate::backchannel::OutboxPolicy::default(),
+        }
+        .run(),
+    );
+    if !state.config.backchannel_logout_allowed_hosts.is_empty() {
+        info!(
+            hosts = ?state.config.backchannel_logout_allowed_hosts,
+            "back-channel logout: these hosts skip the address check"
+        );
+    }
+
     let introspect_state = IntrospectState::from(&state);
     let admin_token_state = AdminTokenState::from(&state);
     let compat_state = compat::CompatState {

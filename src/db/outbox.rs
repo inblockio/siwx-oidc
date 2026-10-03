@@ -67,37 +67,124 @@ pub struct ClaimedEntry {
     pub entry: LogoutEntry,
 }
 
+/// Claim due entries. KEYS: 1 the outbox. ARGV: 1 lease (ms), 2 limit.
+/// Returns the claimed members; each one's score is now + lease.
+const CLAIM_LUA: &str = r#"
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', string.format('%.0f', now),
+  'LIMIT', 0, tonumber(ARGV[2]))
+local until_ms = string.format('%.0f', now + tonumber(ARGV[1]))
+for _, member in ipairs(due) do
+  redis.call('ZADD', KEYS[1], 'XX', until_ms, member)
+end
+return due
+"#;
+
+/// Re-queue a claimed entry. KEYS: 1 the outbox. ARGV: 1 the claimed member,
+/// 2 its successor (attempt + 1), 3 delay (ms). Returns 0 when the claimed
+/// member is gone, else 1.
+const RETRY_LUA: &str = r#"
+if redis.call('ZREM', KEYS[1], ARGV[1]) == 0 then
+  return 0
+end
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+redis.call('ZADD', KEYS[1], string.format('%.0f', now + tonumber(ARGV[3])), ARGV[2])
+return 1
+"#;
+
 impl RedisClient {
     /// Claim up to `limit` due entries for `lease_ms`: each one's score moves
     /// to now + `lease_ms` in one script, so no other worker claims it until
-    /// then. A member that does not parse is removed (and named in the error
-    /// log by its length only), so it cannot block the queue.
+    /// then. A member that does not parse is removed with an error log naming
+    /// its length only, so it cannot block the queue.
     pub async fn claim_logout_entries(
         &self,
         lease_ms: u64,
         limit: usize,
     ) -> Result<Vec<ClaimedEntry>> {
-        let _ = (lease_ms, limit);
-        Ok(Vec::new())
+        let members: Vec<String> = self
+            .eval(
+                CLAIM_LUA,
+                &[KV_BACKCHANNEL_OUTBOX],
+                &[&lease_ms.to_string(), &limit.to_string()],
+            )
+            .await?;
+        let mut claimed = Vec::with_capacity(members.len());
+        for member in members {
+            match serde_json::from_str::<LogoutEntry>(&member) {
+                Ok(entry) => claimed.push(ClaimedEntry { member, entry }),
+                Err(e) => {
+                    tracing::error!(
+                        len = member.len(),
+                        error = %e,
+                        "back-channel logout outbox: unreadable entry removed"
+                    );
+                    self.zrem(&member).await?;
+                }
+            }
+        }
+        Ok(claimed)
     }
 
     /// Remove a delivered (or dropped) entry.
     pub async fn complete_logout_entry(&self, claimed: &ClaimedEntry) -> Result<()> {
-        let _ = claimed;
-        Ok(())
+        self.zrem(&claimed.member).await
     }
 
     /// Re-queue a claimed entry with its attempt count raised, due `delay_ms`
     /// from now. `false` when the entry was no longer there (another worker
     /// completed it after this one's lease ran out).
     pub async fn retry_logout_entry(&self, claimed: &ClaimedEntry, delay_ms: u64) -> Result<bool> {
-        let _ = (claimed, delay_ms);
-        Ok(false)
+        let next = LogoutEntry {
+            attempt: claimed.entry.attempt + 1,
+            ..claimed.entry.clone()
+        };
+        let successor = serde_json::to_string(&next)?;
+        let moved: i64 = self
+            .eval(
+                RETRY_LUA,
+                &[KV_BACKCHANNEL_OUTBOX],
+                &[&claimed.member, &successor, &delay_ms.to_string()],
+            )
+            .await?;
+        Ok(moved == 1)
     }
 
-    /// Every queued entry with the Unix millisecond it is due, oldest first.
+    /// Every queued entry with the Unix millisecond it is due, soonest first.
     pub async fn pending_logout_entries(&self) -> Result<Vec<(LogoutEntry, i64)>> {
-        Ok(Vec::new())
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let raw: Vec<(String, f64)> = bb8_redis::redis::cmd("ZRANGE")
+            .arg(KV_BACKCHANNEL_OUTBOX)
+            .arg(0)
+            .arg(-1)
+            .arg("WITHSCORES")
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("outbox: {e}"))?;
+        raw.into_iter()
+            .map(|(member, due)| Ok((serde_json::from_str(&member)?, due as i64)))
+            .collect()
+    }
+
+    async fn zrem(&self, member: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let _: i64 = bb8_redis::redis::cmd("ZREM")
+            .arg(KV_BACKCHANNEL_OUTBOX)
+            .arg(member)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("outbox: {e}"))?;
+        Ok(())
     }
 }
 

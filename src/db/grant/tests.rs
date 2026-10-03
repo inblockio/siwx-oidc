@@ -1416,6 +1416,16 @@ fn the_scripts_name_the_sid_index_the_library_reads() {
     }
 }
 
+/// `drop_grant` queues into the outbox the worker reads.
+#[test]
+fn drop_grant_names_the_outbox_the_worker_reads() {
+    let literal = format!("'{}'", crate::db::outbox::KV_BACKCHANNEL_OUTBOX);
+    assert!(
+        LUA_DROP.contains(&literal),
+        "drop_grant must name {literal}"
+    );
+}
+
 /// `end_grant_by_sid` deletes exactly the grant the sid names, with its index
 /// entries, only for the client and DID it was issued to; any other sid, or a
 /// second call, deletes nothing.

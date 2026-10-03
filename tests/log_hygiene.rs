@@ -189,6 +189,7 @@ const CREDENTIAL_NAMES: &[&str] = &[
     "dc",
     "device_code",
     "link_key",
+    "logout_token",
     "new_access",
     "new_refresh",
     "password",

@@ -78,9 +78,10 @@
 //!
 //! Every script that deletes a grant does so through `drop_grant`
 //! ([`LUA_DROP`]), which also deletes the grant's sid index entry: the one place
-//! a grant deletion can be observed, and where back-channel logout (Phase 4 M2)
-//! enqueues its logout token. A grant whose key simply expires leaves its index
-//! entry to expire with it (same TTL).
+//! a grant deletion can be observed, and where the logout entry of an `oidc`
+//! grant is queued for back-channel logout ([`super::outbox`]). A grant whose
+//! key simply expires runs no script: its index entry expires with it (same
+//! TTL), and no logout token is sent.
 //!
 //! # The rotation decision ([`RedisClient::rotate_refresh_token`])
 //!
@@ -687,33 +688,28 @@ end
 
 /// Delete the grant at `key` and its sid index entry; returns 1 when the grant
 /// existed, else 0. Every script that deletes a grant calls this, so it is the
-/// one hook for whatever must follow a grant deletion.
-// Phase 4 M2: back-channel logout enqueues the logout token of an `oidc` grant
-// here (read `kind`, `client_id`, `did` and `sid` before the DEL).
+/// one hook for whatever must follow a grant deletion: for an `oidc` grant it
+/// queues the back-channel logout entry in the outbox
+/// ([`super::outbox::KV_BACKCHANNEL_OUTBOX`], due now), in the same script as
+/// the deletion. A `matrix_device` or `service` grant queues nothing.
 const LUA_DROP: &str = r#"
 local function drop_grant(key)
-  local sid = redis.call('HGET', key, 'sid')
-  if sid and sid ~= '' then
-    redis.call('DEL', 'idx:grants:sid/' .. sid)
+  local f = redis.call('HMGET', key, 'sid', 'kind', 'client_id', 'did')
+  if f[1] and f[1] ~= '' then
+    redis.call('DEL', 'idx:grants:sid/' .. f[1])
   end
-  return redis.call('DEL', key)
+  local n = redis.call('DEL', key)
+  if n == 1 and f[2] == 'oidc' then
+    local t = redis.call('TIME')
+    local due = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+    redis.call('ZADD', 'outbox:backchannel_logout', string.format('%.0f', due),
+      cjson.encode({client_id = f[3], sub = f[4], sid = f[1] or '',
+        grant = string.match(key, '([^/]+)$'), attempt = 0}))
+  end
+  return n
 end
 "#;
 
-/// Create a grant, its first access entry and its index entries.
-///
-/// KEYS: 1 grant, 2 access entry, 3 user index, 4 device index.
-/// ARGV: 1 grant id, 2 grant key prefix (`grant/`), 3 has device (`1`/`0`),
-/// 4 kind, 5 username, 6 did, 7 client_id, 8 confidential, 9 device_id,
-/// 10 scope, 11 name, 12 auth_ms (`` = now), 13 access_ttl, 14 inactivity
-/// (`0`: no refresh token, the grant lives as long as its access token),
-/// 15 current_rt, 16 the absolute-lifetime cap (`` = none), 17 the `sid`
-/// (`` = none; else written into the grant and indexed for the grant's TTL).
-/// `auth_time` is `auth_ms` in whole seconds.
-/// With a cap, `absolute_exp` = `auth_time` + cap is written, the access token
-/// and the keys expire no later than it, and an authentication already older
-/// than the cap is an error. Returns `{iat, exp}` of the access token. Index
-/// members whose grant is gone are pruned, so an index holds live grants only.
 const ISSUE_LUA: &str = r#"
 local clock = redis.call('TIME')
 local now = tonumber(clock[1])

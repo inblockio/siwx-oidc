@@ -745,6 +745,12 @@ pub fn provider_metadata_value(
     value["revocation_endpoint"] = serde_json::json!(format!("{}/oauth2/revoke", base));
     // RP-initiated logout ends the grant an ID token's `sid` names, in both modes.
     value["end_session_endpoint"] = serde_json::json!(format!("{base}{END_SESSION_PATH}"));
+    // Back-channel logout is sent for `oidc` grants only, and only generic mode
+    // issues them: in Matrix mode every grant is a Matrix device grant.
+    if !delegated_auth_enabled(config) {
+        value["backchannel_logout_supported"] = serde_json::json!(true);
+        value["backchannel_logout_session_supported"] = serde_json::json!(true);
+    }
     value["token_endpoint_auth_methods_supported"] =
         serde_json::json!(["client_secret_basic", "client_secret_post", "none"]);
     value["prompt_values_supported"] = serde_json::json!(["login", "create"]);
@@ -1511,10 +1517,7 @@ fn generic_grant(requested: Option<&str>, registration: &ClientEntry) -> Generic
         };
     };
     let asked: Vec<&str> = requested.split_whitespace().collect();
-    let may_refresh = registration
-        .metadata
-        .grant_types()
-        .is_none_or(|grants| grants.contains(&CoreGrantType::RefreshToken));
+    let may_refresh = registration_may_refresh(&registration.metadata);
     let granted: Vec<&str> = GENERIC_GRANTABLE_SCOPES
         .iter()
         .copied()
@@ -3034,7 +3037,6 @@ pub async fn register(
     db_client: &DBClientType,
     policy: &RegistrationPolicy,
 ) -> Result<SiwxClientRegistrationResponse, CustomError> {
-    let _ = policy;
     let id = Uuid::new_v4();
     let secret: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -3050,7 +3052,7 @@ pub async fn register(
             }));
         }
     }
-    check_logout_metadata(&payload)?;
+    check_logout_metadata(&payload, policy).await?;
     let logout_metadata = payload.additional_metadata().clone();
 
     let access_token = RegistrationAccessToken::new(
@@ -3081,21 +3083,56 @@ pub async fn register(
     .set_registration_access_token(Some(access_token)))
 }
 
-/// The logout metadata a registration may carry: every
+/// The logout metadata a registration may carry, else
+/// `invalid_client_metadata` (RFC 7591 §3.2.2): every
 /// `post_logout_redirect_uris` entry is an absolute URI without a fragment
-/// (as `redirect_uris`), else `invalid_client_metadata` (RFC 7591 §3.2.2).
-fn check_logout_metadata(payload: &SiwxClientMetadata) -> Result<(), CustomError> {
-    let uris = payload
-        .additional_metadata()
+/// (as `redirect_uris`); a `backchannel_logout_uri` passes the SSRF guard
+/// ([`crate::backchannel::UriGuard::check`]: no fragment, `https`, every
+/// resolved address outside the refused classes, unless the host is
+/// allowlisted); and with the D4 switch on, a client that may receive refresh
+/// tokens registers one.
+async fn check_logout_metadata(
+    payload: &SiwxClientMetadata,
+    policy: &RegistrationPolicy,
+) -> Result<(), CustomError> {
+    let invalid = || {
+        CustomError::BadRequestRegister(RegisterError {
+            error: CoreRegisterErrorResponseType::InvalidClientMetadata,
+        })
+    };
+    let extra = payload.additional_metadata();
+    let uris = extra
         .post_logout_redirect_uris
         .as_deref()
         .unwrap_or_default();
     if uris.iter().any(|uri| uri.url().fragment().is_some()) {
-        return Err(CustomError::BadRequestRegister(RegisterError {
-            error: CoreRegisterErrorResponseType::InvalidClientMetadata,
-        }));
+        return Err(invalid());
+    }
+    match &extra.backchannel_logout_uri {
+        Some(uri) => {
+            if let Err(refusal) = policy.guard.check(uri).await {
+                warn!(
+                    host = uri.host_str().unwrap_or_default(),
+                    refusal = ?refusal,
+                    "registration: backchannel_logout_uri refused"
+                );
+                return Err(invalid());
+            }
+        }
+        None if policy.require_backchannel_for_refresh && registration_may_refresh(payload) => {
+            return Err(invalid());
+        }
+        None => {}
     }
     Ok(())
+}
+
+/// Whether a registration allows the refresh grant: it lists `refresh_token`
+/// in `grant_types`, or lists no `grant_types` at all (provisional).
+fn registration_may_refresh(metadata: &SiwxClientMetadata) -> bool {
+    metadata
+        .grant_types()
+        .is_none_or(|grants| grants.contains(&CoreGrantType::RefreshToken))
 }
 
 // -- RP-initiated logout (OpenID Connect RP-Initiated Logout 1.0) -------------
@@ -3390,9 +3427,8 @@ pub async fn client_update(
     db_client: &DBClientType,
     policy: &RegistrationPolicy,
 ) -> Result<(), CustomError> {
-    let _ = policy;
     let mut client_entry = client_access(client_id.clone(), bearer, db_client).await?;
-    check_logout_metadata(&payload)?;
+    check_logout_metadata(&payload, policy).await?;
     client_entry.metadata = payload;
     Ok(db_client.set_client(client_id, client_entry).await?)
 }
