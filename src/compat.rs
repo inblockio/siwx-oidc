@@ -1106,17 +1106,17 @@ mod tests {
         client
             .set_client(
                 confidential_client.clone(),
-                siwx_oidc::db::ClientEntry {
-                    secret: "s".into(),
-                    metadata: openidconnect::core::CoreClientMetadata::new(
+                siwx_oidc::db::ClientEntry::new(
+                    "s",
+                    openidconnect::core::CoreClientMetadata::new(
                         vec![
                             openidconnect::RedirectUrl::new("https://example.com/cb".into())
                                 .unwrap(),
                         ],
                         openidconnect::registration::EmptyAdditionalClientMetadata {},
                     ),
-                    access_token: None,
-                },
+                    None,
+                ),
             )
             .await
             .unwrap();

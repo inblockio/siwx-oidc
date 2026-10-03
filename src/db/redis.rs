@@ -92,6 +92,24 @@ end
 return 0
 "#;
 
+/// Replace a client entry by its digest-only form only while it is still
+/// exactly the entry that was read, keeping its expiry. `KEYS[1]` the entry,
+/// `ARGV[1]` the value read, `ARGV[2]` its digest-only form. A concurrent
+/// upgrade (same result) or update (newer metadata) wins, so no reader sees a
+/// half-upgraded entry and no field is lost. Returns 1 when it replaced it.
+const UPGRADE_CLIENT_SCRIPT: &str = r#"
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+local ttl = redis.call('PTTL', KEYS[1])
+if ttl > 0 then
+  redis.call('SET', KEYS[1], ARGV[2], 'PX', ttl)
+else
+  redis.call('SET', KEYS[1], ARGV[2])
+end
+return 1
+"#;
+
 fn code_key(code: &str) -> String {
     format!("{KV_CODE_DIGEST_PREFIX}/{}", digest(code))
 }
@@ -943,16 +961,36 @@ impl DBClient for RedisClient {
             .get()
             .await
             .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
-        let entry: Option<String> = conn
-            .get(format!("{}/{}", KV_CLIENT_PREFIX, client_id))
+        let key = format!("{}/{}", KV_CLIENT_PREFIX, client_id);
+        let stored: Option<String> = conn
+            .get(&key)
             .await
             .map_err(|e| anyhow!("Failed to get kv: {}", e))?;
-        if let Some(e) = entry {
-            Ok(serde_json::from_str(&e)
-                .map_err(|e| anyhow!("Failed to deserialize client entry: {}", e))?)
-        } else {
-            Ok(None)
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_str(&stored)
+            .map_err(|e| anyhow!("Failed to deserialize client entry: {}", e))?;
+        // A plaintext entry (a build before digest keys wrote it) authenticates
+        // as it is: it deserializes into its digests.
+        let entry: ClientEntry = serde_json::from_value(value.clone())
+            .map_err(|e| anyhow!("Failed to deserialize client entry: {}", e))?;
+        // ...and is replaced by its digest-only form on this first read.
+        // TODO(remove once no entry a build before Phase 2b wrote can be alive:
+        // CLIENT_LIFETIME after the deploy).
+        if let Some(upgraded) = client_entry_without_plaintext(&value) {
+            let replaced: i64 = bb8_redis::redis::cmd("EVAL")
+                .arg(UPGRADE_CLIENT_SCRIPT)
+                .arg(1)
+                .arg(&key)
+                .arg(&stored)
+                .arg(upgraded.to_string())
+                .query_async(&mut *conn)
+                .await
+                .map_err(|e| anyhow!("Failed to upgrade a client entry: {}", e))?;
+            debug!(client_id = %client_id, replaced, "client entry stored as digests");
         }
+        Ok(Some(entry))
     }
 
     async fn delete_client(&self, client_id: String) -> Result<()> {
@@ -2318,5 +2356,135 @@ mod tests {
             );
             assert!(client.get_raw(&legacy).await.unwrap().is_none());
         }
+    }
+
+    /// A client entry the previous build wrote (plaintext secret and
+    /// registration access token), stored with a 1000 s expiry under a fresh id.
+    async fn seed_plaintext_client(client: &super::RedisClient) -> (String, String) {
+        let id = format!("client-prev-{}", unique_nonce());
+        let stored = serde_json::json!({
+            "secret": "prev-secret",
+            "metadata": openidconnect::core::CoreClientMetadata::new(
+                vec![openidconnect::RedirectUrl::new("https://rp.example.org/cb".into()).unwrap()],
+                Default::default(),
+            ),
+            "access_token": "prev-token",
+        })
+        .to_string();
+        client
+            .set_ex_raw(&format!("clients/{id}"), &stored, 1000)
+            .await
+            .unwrap();
+        (id, stored)
+    }
+
+    async fn pttl(client: &super::RedisClient, key: &str) -> i64 {
+        let mut conn = client.pool.get().await.unwrap();
+        bb8_redis::redis::cmd("PTTL")
+            .arg(key)
+            .query_async(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    /// The first read of a previous build's client entry authenticates with
+    /// the old secret and token and replaces the entry by its digest-only form,
+    /// keeping its expiry; later reads change nothing.
+    #[tokio::test]
+    async fn a_plaintext_client_entry_is_upgraded_on_first_read_keeping_its_expiry() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let (id, stored) = seed_plaintext_client(&client).await;
+        let key = format!("clients/{id}");
+        let entry = client.get_client(id.clone()).await.unwrap().unwrap();
+        assert!(entry.secret_matches("prev-secret"));
+        assert!(entry.access_token_matches("prev-token"));
+        let upgraded = client.get_raw(&key).await.unwrap().unwrap();
+        assert!(!upgraded.contains("prev-secret"), "{upgraded}");
+        assert!(!upgraded.contains("prev-token"), "{upgraded}");
+        let expected =
+            crate::db::client_entry_without_plaintext(&serde_json::from_str(&stored).unwrap())
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&upgraded).unwrap(),
+            expected
+        );
+        let ttl = pttl(&client, &key).await;
+        assert!(
+            ttl > 900_000 && ttl <= 1_000_000,
+            "the expiry is kept: {ttl} ms"
+        );
+
+        let again = client.get_client(id.clone()).await.unwrap().unwrap();
+        assert!(again.secret_matches("prev-secret"));
+        assert_eq!(client.get_raw(&key).await.unwrap().unwrap(), upgraded);
+        client.del_raw(&key).await.unwrap();
+    }
+
+    /// Concurrent first reads of one plaintext entry all authenticate, and
+    /// exactly one digest-only entry is left, whoever wrote it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_reads_of_a_plaintext_client_all_authenticate_and_leave_one_digested_entry(
+    ) {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let (id, stored) = seed_plaintext_client(&client).await;
+        let mut reads = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let (client, id) = (client.clone(), id.clone());
+            reads.spawn(async move { client.get_client(id).await });
+        }
+        while let Some(read) = reads.join_next().await {
+            let entry = read
+                .unwrap()
+                .unwrap()
+                .expect("every reader finds the client");
+            assert!(entry.secret_matches("prev-secret"));
+            assert!(entry.access_token_matches("prev-token"));
+        }
+        let expected =
+            crate::db::client_entry_without_plaintext(&serde_json::from_str(&stored).unwrap())
+                .unwrap();
+        let key = format!("clients/{id}");
+        let left = client.get_raw(&key).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&left).unwrap(),
+            expected
+        );
+        assert_eq!(
+            client.keys_raw(&format!("clients/{id}*")).await.unwrap(),
+            vec![key.clone()]
+        );
+        client.del_raw(&key).await.unwrap();
+    }
+
+    /// The upgrade replaces only the entry it read: an entry that changed in
+    /// between (an update, or another reader's upgrade) is left as it is, so
+    /// no field written meanwhile is lost.
+    #[tokio::test]
+    async fn an_upgrade_never_overwrites_an_entry_that_changed_since_it_was_read() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let (id, stored) = seed_plaintext_client(&client).await;
+        let key = format!("clients/{id}");
+        let updated = stored.replace("rp.example.org", "updated.example.org");
+        client.set_ex_raw(&key, &updated, 1000).await.unwrap();
+        let mut conn = client.pool.get().await.unwrap();
+        let replaced: i64 = bb8_redis::redis::cmd("EVAL")
+            .arg(super::UPGRADE_CLIENT_SCRIPT)
+            .arg(1)
+            .arg(&key)
+            .arg(&stored)
+            .arg("{}")
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        assert_eq!(replaced, 0);
+        assert_eq!(client.get_raw(&key).await.unwrap().unwrap(), updated);
+        client.del_raw(&key).await.unwrap();
     }
 }

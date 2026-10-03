@@ -1009,7 +1009,7 @@ fn check_client_secret(
     config: &crate::config::Config,
 ) -> Result<(), CustomError> {
     match presented_secret {
-        Some(secret) if !constant_time_eq(secret, &client_entry.secret) => {
+        Some(secret) if !client_entry.secret_matches(secret) => {
             Err(CustomError::Unauthorized("Bad secret.".to_string()))
         }
         Some(_) => Ok(()),
@@ -2981,11 +2981,9 @@ pub async fn register(
             .collect(),
     );
 
-    let entry = ClientEntry {
-        secret: secret.clone(),
-        metadata: payload,
-        access_token: Some(access_token.clone()),
-    };
+    // The response below is the only place the secret and the registration
+    // access token appear: the entry keeps their digests.
+    let entry = ClientEntry::new(&secret, payload, Some(access_token.secret()));
     db_client.set_client(id.to_string(), entry).await?;
 
     Ok(CoreClientRegistrationResponse::new(
@@ -3019,11 +3017,7 @@ async fn client_access(
         .get_client(client_id)
         .await?
         .ok_or(CustomError::NotFound)?;
-    let stored_access_token = client_entry.access_token.clone();
-    let stored = stored_access_token
-        .as_ref()
-        .ok_or_else(|| CustomError::Unauthorized("Bad access token.".to_string()))?;
-    if !constant_time_eq(stored.secret(), &access_token) {
+    if !client_entry.access_token_matches(&access_token) {
         return Err(CustomError::Unauthorized("Bad access token.".to_string()));
     }
     Ok(client_entry)
@@ -3523,14 +3517,14 @@ mod tests {
         db_client
             .set_client(
                 "client".into(),
-                ClientEntry {
-                    secret: "secret".into(),
-                    metadata: CoreClientMetadata::new(
+                ClientEntry::new(
+                    "secret",
+                    CoreClientMetadata::new(
                         vec![RedirectUrl::new("https://example.com".into()).unwrap()],
                         EmptyAdditionalClientMetadata {},
                     ),
-                    access_token: None,
-                },
+                    None,
+                ),
             )
             .await
             .unwrap();
@@ -3674,14 +3668,14 @@ mod tests {
     async fn seed_round_trip_client(db: &RedisClient, client_id: &str) {
         db.set_client(
             client_id.to_string(),
-            ClientEntry {
-                secret: "secret".into(),
-                metadata: CoreClientMetadata::new(
+            ClientEntry::new(
+                "secret",
+                CoreClientMetadata::new(
                     vec![RedirectUrl::new(ROUND_TRIP_REDIRECT.into()).unwrap()],
                     EmptyAdditionalClientMetadata {},
                 ),
-                access_token: None,
-            },
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -4079,13 +4073,15 @@ mod tests {
     /// Redirect URIs match the registration exactly, query included.
     #[test]
     fn redirect_uri_matching_is_exact() {
-        let client = |registered: &str| ClientEntry {
-            secret: "secret".into(),
-            metadata: CoreClientMetadata::new(
-                vec![RedirectUrl::new(registered.into()).unwrap()],
-                EmptyAdditionalClientMetadata {},
-            ),
-            access_token: None,
+        let client = |registered: &str| {
+            ClientEntry::new(
+                "secret",
+                CoreClientMetadata::new(
+                    vec![RedirectUrl::new(registered.into()).unwrap()],
+                    EmptyAdditionalClientMetadata {},
+                ),
+                None,
+            )
         };
         let uri = |u: &str| RedirectUrl::new(u.into()).unwrap();
 
@@ -5601,11 +5597,7 @@ mod userinfo_mxid_claim_tests {
         }
         db.set_client(
             client_id.to_string(),
-            ClientEntry {
-                secret: "secret".into(),
-                metadata,
-                access_token: None,
-            },
+            ClientEntry::new("secret", metadata, None),
         )
         .await
     }
@@ -6023,14 +6015,14 @@ mod sign_in_deactivation_order_tests {
         let client_id = format!("deactivation-order-{nonce}");
         db.set_client(
             client_id.clone(),
-            ClientEntry {
-                secret: "secret".into(),
-                metadata: CoreClientMetadata::new(
+            ClientEntry::new(
+                "secret",
+                CoreClientMetadata::new(
                     vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
                     EmptyAdditionalClientMetadata {},
                 ),
-                access_token: None,
-            },
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -6303,11 +6295,7 @@ mod device_display_name_tests {
             names.insert(None, ClientName::new(name.to_string()));
             metadata = metadata.set_client_name(Some(names));
         }
-        ClientEntry {
-            secret: "secret".into(),
-            metadata,
-            access_token: None,
-        }
+        ClientEntry::new("secret", metadata, None)
     }
 
     /// Asserts that exactly one device was upserted, that the upsert carried
@@ -6688,16 +6676,9 @@ mod client_binding_tests {
         if let Some(grants) = grant_types {
             metadata = metadata.set_grant_types(Some(grants));
         }
-        db.set_client(
-            id.clone(),
-            ClientEntry {
-                secret: SECRET.into(),
-                metadata,
-                access_token: None,
-            },
-        )
-        .await
-        .unwrap();
+        db.set_client(id.clone(), ClientEntry::new(SECRET, metadata, None))
+            .await
+            .unwrap();
         id
     }
 
@@ -6902,6 +6883,69 @@ mod client_binding_tests {
         )
         .await;
         assert_eq!(outcome(&own), "ok", "the owner still refreshes it");
+    }
+
+    /// Every path that authenticates a client compares digests: the code
+    /// exchange and the refresh grant (the secret) and `/client/{id}`
+    /// management (the registration access token). A client entry the previous
+    /// build stored in the clear authenticates with its secret and token, and
+    /// a digest read out of Redis is refused everywhere.
+    #[tokio::test]
+    async fn every_client_authentication_compares_digests_of_what_is_presented() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let id = unique("prev-client-");
+        let metadata = CoreClientMetadata::new(
+            vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
+            EmptyAdditionalClientMetadata {},
+        )
+        .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::ClientSecretBasic));
+        let previous_build = serde_json::json!({
+            "secret": SECRET,
+            "metadata": metadata,
+            "access_token": "the-registration-token",
+        });
+        db.set_ex_raw(&format!("clients/{id}"), &previous_build.to_string(), 600)
+            .await
+            .unwrap();
+        let bearer = |token: &str| Some(headers::Authorization::bearer(token).unwrap().0);
+        let outcome = |r: Result<(), CustomError>| match r {
+            Ok(()) => "ok".to_string(),
+            Err(CustomError::Unauthorized(message)) => format!("invalid_client: {message}"),
+            Err(other) => format!("{other:?}"),
+        };
+
+        // The previous build's entry: the plaintext credentials authenticate.
+        let code = authenticate_code_client(&id, None, Some(SECRET), &config, &db).await;
+        assert_eq!(outcome(code.map(|_| ())), "ok");
+        let stored = db.get_client(id.clone()).await.unwrap().unwrap();
+        assert!(!db
+            .get_raw(&format!("clients/{id}"))
+            .await
+            .unwrap()
+            .unwrap()
+            .contains(SECRET));
+        let refresh = authenticate_refresh_client(&id, None, Some(SECRET), &config, &db).await;
+        assert_eq!(outcome(refresh), "ok");
+        let manage = client_access(id.clone(), bearer("the-registration-token"), &db).await;
+        assert_eq!(outcome(manage.map(|_| ())), "ok");
+
+        // What Redis holds is no credential.
+        let secret_digest = stored.secret_digest.as_str();
+        let token_digest = stored.access_token_digest.clone().unwrap();
+        let code = authenticate_code_client(&id, None, Some(secret_digest), &config, &db).await;
+        assert_eq!(outcome(code.map(|_| ())), "invalid_client: Bad secret.");
+        let refresh =
+            authenticate_refresh_client(&id, None, Some(secret_digest), &config, &db).await;
+        assert_eq!(outcome(refresh), "invalid_client: Bad secret.");
+        let manage = client_access(id.clone(), bearer(&token_digest), &db).await;
+        assert_eq!(
+            outcome(manage.map(|_| ())),
+            "invalid_client: Bad access token."
+        );
+        db.del_raw(&format!("clients/{id}")).await.unwrap();
     }
 
     /// A confidential client authenticates at the refresh grant exactly as it
@@ -7867,11 +7911,7 @@ mod scope_grant_tests {
         if let Some(grants) = grants {
             metadata = metadata.set_grant_types(Some(grants));
         }
-        ClientEntry {
-            secret: "secret".into(),
-            metadata,
-            access_token: None,
-        }
+        ClientEntry::new("secret", metadata, None)
     }
 
     /// The pure decision, without Redis: ordering and duplicates do not matter,

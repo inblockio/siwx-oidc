@@ -223,11 +223,130 @@ pub struct CodeEntry {
     pub scope: Option<String>,
 }
 
+/// A client's registration. The client secret and the registration access
+/// token are stored only as their SHA-256 digests ([`tokens::digest`]), and a
+/// presented value is compared with them digest against digest
+/// ([`ClientEntry::secret_matches`], [`ClientEntry::access_token_matches`]).
+/// Both are random (16 and 11 alphanumeric characters from `POST /register`),
+/// so an unsalted digest is enough; an operator-chosen `default_clients`
+/// secret may be weak, but its plaintext sits in the configuration anyway.
+///
+/// Deserializes from the stored form (`secret_digest`, `access_token_digest`)
+/// and from the form a build before digest keys stored and `default_clients`
+/// still configures (`secret`, `access_token`, in the clear), which it digests
+/// on the way in; it serializes only the digests. The member names differ on
+/// purpose: a stored digest presented as the secret is digested again and
+/// never matches.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(try_from = "StoredClientEntry")]
 pub struct ClientEntry {
-    pub secret: String,
+    pub secret_digest: String,
     pub metadata: CoreClientMetadata,
-    pub access_token: Option<RegistrationAccessToken>,
+    pub access_token_digest: Option<String>,
+}
+
+/// Every form a client entry is read in; see [`ClientEntry`].
+#[derive(Deserialize)]
+struct StoredClientEntry {
+    #[serde(default)]
+    secret_digest: Option<String>,
+    #[serde(default)]
+    secret: Option<String>,
+    metadata: CoreClientMetadata,
+    #[serde(default)]
+    access_token_digest: Option<String>,
+    #[serde(default)]
+    access_token: Option<RegistrationAccessToken>,
+}
+
+impl TryFrom<StoredClientEntry> for ClientEntry {
+    type Error = &'static str;
+
+    fn try_from(stored: StoredClientEntry) -> Result<Self, Self::Error> {
+        let secret_digest = match (stored.secret_digest, stored.secret) {
+            (Some(digest), None) => digest,
+            (None, Some(secret)) => tokens::digest(&secret),
+            (Some(_), Some(_)) => {
+                return Err("a client entry holds its secret both as a digest and in the clear")
+            }
+            (None, None) => return Err("a client entry holds no secret"),
+        };
+        let access_token_digest =
+            match (stored.access_token_digest, stored.access_token) {
+                (digest, None) => digest,
+                (None, Some(token)) => Some(tokens::digest(token.secret())),
+                (Some(_), Some(_)) => return Err(
+                    "a client entry holds its registration access token both as a digest and in \
+                     the clear",
+                ),
+            };
+        Ok(ClientEntry {
+            secret_digest,
+            metadata: stored.metadata,
+            access_token_digest,
+        })
+    }
+}
+
+impl ClientEntry {
+    /// The registration of a client with `secret` and, if it has one, the
+    /// registration access token `access_token`; it keeps their digests.
+    pub fn new(secret: &str, metadata: CoreClientMetadata, access_token: Option<&str>) -> Self {
+        ClientEntry {
+            secret_digest: tokens::digest(secret),
+            metadata,
+            access_token_digest: access_token.map(tokens::digest),
+        }
+    }
+
+    /// Whether `presented` is the client secret.
+    pub fn secret_matches(&self, presented: &str) -> bool {
+        digests_match(&tokens::digest(presented), &self.secret_digest)
+    }
+
+    /// Whether `presented` is the registration access token. A client without
+    /// one (a `default_clients` entry that configures none) matches nothing.
+    pub fn access_token_matches(&self, presented: &str) -> bool {
+        self.access_token_digest
+            .as_deref()
+            .is_some_and(|stored| digests_match(&tokens::digest(presented), stored))
+    }
+}
+
+/// Constant-time comparison of two digests. Both are 64 hex characters, so
+/// the length check never short-circuits on a real comparison.
+fn digests_match(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
+/// The digest-only form of a stored client entry that holds its secret or its
+/// registration access token in the clear (written by a build before digest
+/// keys), or `None` when it holds neither. Only those two members change, so
+/// nothing else the entry holds is lost.
+/// TODO(remove once no entry a build before Phase 2b wrote can be alive:
+/// [`CLIENT_LIFETIME`] after the deploy).
+pub fn client_entry_without_plaintext(stored: &serde_json::Value) -> Option<serde_json::Value> {
+    let object = stored.as_object()?;
+    if !object.contains_key("secret") && !object.contains_key("access_token") {
+        return None;
+    }
+    let mut upgraded = object.clone();
+    for (plain, digested) in [
+        ("secret", "secret_digest"),
+        ("access_token", "access_token_digest"),
+    ] {
+        if let Some(value) = upgraded.remove(plain) {
+            let digest = match value {
+                serde_json::Value::String(plain) => {
+                    serde_json::Value::String(tokens::digest(&plain))
+                }
+                _ => serde_json::Value::Null,
+            };
+            upgraded.insert(digested.to_string(), digest);
+        }
+    }
+    Some(serde_json::Value::Object(upgraded))
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -728,5 +847,118 @@ mod code_entry_tests {
         let round_trip: CodeEntry =
             serde_json::from_str(&serde_json::to_string(&with_scope).unwrap()).unwrap();
         assert_eq!(round_trip.scope.as_deref(), Some("openid offline_access"));
+    }
+}
+
+#[cfg(test)]
+mod client_entry_tests {
+    use super::*;
+    use openidconnect::RedirectUrl;
+
+    fn metadata() -> CoreClientMetadata {
+        CoreClientMetadata::new(
+            vec![RedirectUrl::new("https://rp.example.org/cb".into()).unwrap()],
+            Default::default(),
+        )
+    }
+
+    /// The entry as a build before digest keys stored it, and as
+    /// `default_clients` configures it.
+    fn plaintext_entry() -> serde_json::Value {
+        serde_json::json!({
+            "secret": "the-client-secret",
+            "metadata": metadata(),
+            "access_token": "the-registration-token",
+        })
+    }
+
+    #[test]
+    fn a_client_entry_stores_only_the_digests_of_its_credentials() {
+        let entry = ClientEntry::new(
+            "the-client-secret",
+            metadata(),
+            Some("the-registration-token"),
+        );
+        let stored = serde_json::to_string(&entry).unwrap();
+        assert!(!stored.contains("the-client-secret"), "{stored}");
+        assert!(!stored.contains("the-registration-token"), "{stored}");
+        assert!(stored.contains(&tokens::digest("the-client-secret")));
+        assert!(stored.contains(&tokens::digest("the-registration-token")));
+        let read: ClientEntry = serde_json::from_str(&stored).unwrap();
+        assert!(read.secret_matches("the-client-secret"));
+        assert!(read.access_token_matches("the-registration-token"));
+    }
+
+    /// A previous build's entry (and a configured one) authenticates exactly
+    /// as before: the same secret and token match, nothing else does.
+    #[test]
+    fn a_plaintext_client_entry_authenticates_as_before() {
+        let entry: ClientEntry = serde_json::from_value(plaintext_entry()).unwrap();
+        assert!(entry.secret_matches("the-client-secret"));
+        assert!(entry.access_token_matches("the-registration-token"));
+        assert!(!entry.secret_matches("the-client-secre"));
+        assert!(!entry.secret_matches("the-registration-token"));
+        assert!(!entry.access_token_matches("the-client-secret"));
+        let mut tokenless = plaintext_entry();
+        tokenless["access_token"] = serde_json::Value::Null;
+        let tokenless: ClientEntry = serde_json::from_value(tokenless).unwrap();
+        assert!(!tokenless.access_token_matches(""));
+        assert!(!tokenless.access_token_matches("the-registration-token"));
+    }
+
+    /// Someone who can read Redis cannot present what is stored there.
+    #[test]
+    fn a_stored_digest_presented_as_a_credential_matches_nothing() {
+        let entry = ClientEntry::new("the-client-secret", metadata(), Some("tok"));
+        assert!(!entry.secret_matches(&entry.secret_digest));
+        assert!(!entry.access_token_matches(entry.access_token_digest.as_deref().unwrap()));
+    }
+
+    /// The upgrade replaces exactly the two credentials by their digests and
+    /// keeps every other member, including one this build does not know.
+    #[test]
+    fn the_digest_only_form_changes_only_the_two_credentials() {
+        let mut stored = plaintext_entry();
+        stored["io.example.unknown"] = serde_json::json!({"kept": true});
+        let upgraded = client_entry_without_plaintext(&stored).expect("a plaintext entry");
+        let mut expected = stored.as_object().unwrap().clone();
+        expected.remove("secret");
+        expected.remove("access_token");
+        expected.insert(
+            "secret_digest".into(),
+            tokens::digest("the-client-secret").into(),
+        );
+        expected.insert(
+            "access_token_digest".into(),
+            tokens::digest("the-registration-token").into(),
+        );
+        assert_eq!(upgraded, serde_json::Value::Object(expected));
+        let read: ClientEntry = serde_json::from_value(upgraded.clone()).unwrap();
+        assert!(read.secret_matches("the-client-secret"));
+        assert!(read.access_token_matches("the-registration-token"));
+        assert_eq!(
+            client_entry_without_plaintext(&upgraded),
+            None,
+            "idempotent"
+        );
+
+        let mut tokenless = plaintext_entry();
+        tokenless["access_token"] = serde_json::Value::Null;
+        let upgraded = client_entry_without_plaintext(&tokenless).unwrap();
+        assert_eq!(upgraded["access_token_digest"], serde_json::Value::Null);
+        assert!(upgraded.get("access_token").is_none());
+    }
+
+    #[test]
+    fn a_client_entry_with_a_credential_in_both_forms_is_refused() {
+        let mut both = plaintext_entry();
+        both["secret_digest"] = tokens::digest("other").into();
+        assert!(serde_json::from_value::<ClientEntry>(both).is_err());
+        let mut both = plaintext_entry();
+        both["access_token_digest"] = tokens::digest("other").into();
+        assert!(serde_json::from_value::<ClientEntry>(both).is_err());
+        let mut none = plaintext_entry();
+        none.as_object_mut().unwrap().remove("secret");
+        assert!(serde_json::from_value::<ClientEntry>(none).is_err());
     }
 }

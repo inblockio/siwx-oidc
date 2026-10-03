@@ -1141,14 +1141,14 @@ mod tests {
         let client_id = format!("device-auth-{}", uuid::Uuid::new_v4().simple());
         db.set_client(
             client_id.clone(),
-            ClientEntry {
-                secret: "secret".into(),
-                metadata: CoreClientMetadata::new(
+            ClientEntry::new(
+                "secret",
+                CoreClientMetadata::new(
                     vec![RedirectUrl::new("https://example.com".into()).unwrap()],
                     EmptyAdditionalClientMetadata {},
                 ),
-                access_token: None,
-            },
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -1196,14 +1196,14 @@ mod tests {
         let client_id = format!("device-log-{}", uuid::Uuid::new_v4().simple());
         db.set_client(
             client_id.clone(),
-            ClientEntry {
-                secret: "secret".into(),
-                metadata: CoreClientMetadata::new(
+            ClientEntry::new(
+                "secret",
+                CoreClientMetadata::new(
                     vec![RedirectUrl::new("https://example.com".into()).unwrap()],
                     EmptyAdditionalClientMetadata {},
                 ),
-                access_token: None,
-            },
+                None,
+            ),
         )
         .await
         .unwrap();
