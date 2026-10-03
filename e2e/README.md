@@ -38,12 +38,18 @@ Every port is overridable through `env.sh` (`SIWEOIDC_PORT`, `SYNAPSE_MOCK_PORT`
 `SIWEOIDC_REDIS_PORT`), which matters on a machine already running the
 e2e-harness stack — it holds 18080/18081/18448, and a stray redis often holds
 6379. The Rust suites read `SIWEOIDC_HOST` and `SYNAPSE_MOCK`, so point those at
-whatever ports you brought the stack up on:
+whatever ports you brought the stack up on. `e2e_race_teardown` also searches
+the stack's Redis for tokens stored in the clear
+(`no_token_the_client_holds_is_stored_in_the_clear`); it reads `E2E_REDIS_URL`,
+else `SIWXOIDC_REDIS_URL`, `SIWEOIDC_REDIS_URL` (set by `env.sh`) or
+`REDIS_HOST`/`REDIS_PORT`, and skips loudly without one (a failure under
+`E2E_STRICT_SKIPS=1`):
 
 ```bash
 SIWEOIDC_PORT=18191 SYNAPSE_MOCK_PORT=18190 SIWEOIDC_REDIS_PORT=16379 \
   SIWEOIDC_SYNAPSE_ENDPOINT=http://localhost:18190 bash e2e/up.sh
 SIWEOIDC_HOST=http://localhost:18191 SYNAPSE_MOCK=http://localhost:18190 \
+  E2E_REDIS_URL=redis://localhost:16379 \
   cargo test --test e2e_race_teardown -- --ignored --test-threads=1
 SIWEOIDC_HOST=http://localhost:18191 SYNAPSE_MOCK=http://localhost:18190 \
   cargo test --test e2e_account_management -- --ignored --test-threads=1

@@ -2264,3 +2264,264 @@ async fn did_field_is_published_at_signin_and_a_rowless_account_still_signs_in()
         "device provisioning must still happen for a row-less account"
     );
 }
+
+// ===========================================================================
+// H4 (I1 for tokens): no client-held secret is stored in the clear.
+// ===========================================================================
+
+/// The strings a client holds that the server must never store in the clear
+/// (I1): every key and every value of the stack Redis is searched for each of
+/// them. Add a new kind of client-held secret (authorization codes, session
+/// ids, client secrets) with [`ClientHeld::add`] under its own label.
+#[derive(Default)]
+struct ClientHeld(Vec<(String, String)>);
+
+impl ClientHeld {
+    fn add(&mut self, label: impl Into<String>, value: &str) {
+        assert!(
+            !value.is_empty(),
+            "a client-held string to search for is empty"
+        );
+        self.0.push((label.into(), value.to_string()));
+    }
+
+    /// A token and the parts a store could keep without the whole: the body
+    /// after its `mat_` / `msa_` / `mcr_` prefix and, for a refresh token
+    /// (`mcr_{handle}_{secret}`), the handle and the secret.
+    fn add_token(&mut self, label: &str, token: &str) {
+        self.add(label, token);
+        if let Some((_prefix, body)) = token.split_once('_') {
+            self.add(format!("{label} without its prefix"), body);
+            if token.starts_with("mcr_") {
+                if let Some((handle, secret)) = body.split_once('_') {
+                    self.add(format!("{label} handle"), handle);
+                    self.add(format!("{label} secret part"), secret);
+                }
+            }
+        }
+    }
+}
+
+/// The stack's Redis, for a test that inspects what the server stored:
+/// `E2E_REDIS_URL`, else the server's own `SIWXOIDC_REDIS_URL` (the CI job sets
+/// it for the server and the tests alike), else the legacy `SIWEOIDC_REDIS_URL`
+/// (`e2e/env.sh`), else `REDIS_HOST`/`REDIS_PORT`. `None` when none is set.
+fn stack_redis_url() -> Option<String> {
+    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    var("E2E_REDIS_URL")
+        .or_else(|| var("SIWXOIDC_REDIS_URL"))
+        .or_else(|| var("SIWEOIDC_REDIS_URL"))
+        .or_else(|| {
+            Some(format!(
+                "redis://{}:{}",
+                var("REDIS_HOST")?,
+                var("REDIS_PORT")?
+            ))
+        })
+}
+
+/// Every string inside a Redis reply, whatever its shape.
+fn reply_strings(value: &bb8_redis::redis::Value, out: &mut Vec<String>) {
+    use bb8_redis::redis::Value;
+    match value {
+        Value::BulkString(bytes) => out.push(String::from_utf8_lossy(bytes).into_owned()),
+        Value::SimpleString(s) => out.push(s.clone()),
+        Value::VerbatimString { text, .. } => out.push(text.clone()),
+        Value::Array(items) | Value::Set(items) => {
+            items.iter().for_each(|item| reply_strings(item, out));
+        }
+        Value::Map(pairs) => pairs.iter().for_each(|(k, v)| {
+            reply_strings(k, out);
+            reply_strings(v, out);
+        }),
+        Value::Push { data, .. } => data.iter().for_each(|item| reply_strings(item, out)),
+        _ => {}
+    }
+}
+
+/// What a scan of the whole stack Redis found.
+struct RedisScan {
+    /// One line per place a client-held string appears: label, database, key.
+    hits: Vec<String>,
+    /// Every key, as `{db}:{key}`, for positive controls.
+    keys: Vec<String>,
+}
+
+/// Scan every database of the Redis at `url`: every key, and every value of
+/// every type, searched for each client-held string.
+async fn scan_redis_for(url: &str, held: &ClientHeld) -> RedisScan {
+    use bb8_redis::redis;
+    let client = redis::Client::open(url).unwrap_or_else(|e| panic!("stack Redis URL: {e}"));
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap_or_else(|e| panic!("stack Redis at {url} is unreachable: {e}"));
+    let databases: (String, u32) = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("databases")
+        .query_async(&mut conn)
+        .await
+        .expect("CONFIG GET databases");
+    let mut scan = RedisScan {
+        hits: Vec::new(),
+        keys: Vec::new(),
+    };
+    for db in 0..databases.1 {
+        let _: () = redis::cmd("SELECT")
+            .arg(db)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let mut cursor: u64 = 0;
+        loop {
+            let (next, keys): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("COUNT")
+                .arg(1000)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            for raw_key in keys {
+                let key = String::from_utf8_lossy(&raw_key).into_owned();
+                let kind: String = redis::cmd("TYPE")
+                    .arg(&raw_key)
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap();
+                let read = match kind.as_str() {
+                    "string" => redis::cmd("GET").arg(&raw_key).clone(),
+                    "hash" => redis::cmd("HGETALL").arg(&raw_key).clone(),
+                    "list" => redis::cmd("LRANGE").arg(&raw_key).arg(0).arg(-1).clone(),
+                    "set" => redis::cmd("SMEMBERS").arg(&raw_key).clone(),
+                    "zset" => redis::cmd("ZRANGE").arg(&raw_key).arg(0).arg(-1).clone(),
+                    "stream" => redis::cmd("XRANGE").arg(&raw_key).arg("-").arg("+").clone(),
+                    // Expired between SCAN and TYPE.
+                    "none" => continue,
+                    other => panic!("key {key}: Redis type `{other}` is not searched"),
+                };
+                let value: redis::Value = read.query_async(&mut conn).await.unwrap();
+                let mut strings = Vec::new();
+                reply_strings(&value, &mut strings);
+                for (label, secret) in &held.0 {
+                    if key.contains(secret.as_str()) {
+                        scan.hits
+                            .push(format!("{label}: in the key of db {db} `{key}`"));
+                    }
+                    if strings.iter().any(|s| s.contains(secret.as_str())) {
+                        scan.hits.push(format!(
+                            "{label}: in the {kind} value of db {db} key `{key}`"
+                        ));
+                    }
+                }
+                scan.keys.push(format!("{db}:{key}"));
+            }
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+    }
+    scan
+}
+
+/// Scan, and fail on any client-held string found; returns the scan.
+async fn assert_nothing_stored_in_the_clear(
+    url: &str,
+    held: &ClientHeld,
+    stage: &str,
+) -> RedisScan {
+    let scan = scan_redis_for(url, held).await;
+    assert!(
+        scan.hits.is_empty(),
+        "{stage}: client-held strings stored in the clear (I1):\n  {}",
+        scan.hits.join("\n  ")
+    );
+    scan
+}
+
+/// H4 for tokens: after sign-in, refresh at both endpoints, the replay of a
+/// lost response (which stores the sealed successor), introspection and RFC
+/// 7009 revocation, no key and no value anywhere in the stack Redis contains
+/// any access or refresh token the client received, or any part of one. The
+/// first scan's positive control (the digest key of the live access token)
+/// proves it searched the stack's Redis.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn no_token_the_client_holds_is_stored_in_the_clear() {
+    let Some(url) = stack_redis_url() else {
+        let marker = "E2E_SKIP: no_token_the_client_holds_is_stored_in_the_clear: no stack \
+                      Redis URL (E2E_REDIS_URL, SIWXOIDC_REDIS_URL, SIWEOIDC_REDIS_URL or \
+                      REDIS_HOST/REDIS_PORT); the keyspace was NOT searched";
+        assert!(
+            std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+            "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+        );
+        eprintln!("{marker}");
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    let mut held = ClientHeld::default();
+
+    let login = wallet_login(&c, &base, &new_wallet()).await;
+    held.add_token("sign-in access token", &login.access_token);
+    held.add_token("sign-in refresh token", &login.refresh_token);
+
+    let (status, body, pair) =
+        refresh_at(&c, &base, RefreshAt::Token, &login.refresh_token, &login).await;
+    let (access1, refresh1) = pair.unwrap_or_else(|| panic!("refresh at /token: {status} {body}"));
+    held.add_token("first refreshed access token", &access1);
+    held.add_token("first refreshed refresh token", &refresh1);
+
+    // A lost response replayed: the server keeps the successor pair, sealed.
+    let (status, body, replayed) =
+        refresh_at(&c, &base, RefreshAt::Matrix, &login.refresh_token, &login).await;
+    let (replayed_access, replayed_refresh) =
+        replayed.unwrap_or_else(|| panic!("replay at the Matrix endpoint: {status} {body}"));
+    held.add_token("replayed access token", &replayed_access);
+    held.add_token("replayed refresh token", &replayed_refresh);
+
+    let scan =
+        assert_nothing_stored_in_the_clear(&url, &held, "after a refresh and a replay").await;
+    let live_access_key = format!("at/{}", hex::encode(Sha256::digest(access1.as_bytes())));
+    assert!(
+        scan.keys
+            .iter()
+            .any(|k| k.ends_with(&format!(":{live_access_key}"))),
+        "positive control: the scan of {url} finds the live access token's digest key \
+         {live_access_key} ({} keys scanned); is this the stack's Redis?",
+        scan.keys.len()
+    );
+
+    assert!(
+        token_active(&c, &access1).await,
+        "the refreshed access token is active"
+    );
+    let (status, body, pair) = refresh_at(&c, &base, RefreshAt::Matrix, &refresh1, &login).await;
+    let (access2, refresh2) =
+        pair.unwrap_or_else(|| panic!("refresh at the Matrix endpoint: {status} {body}"));
+    held.add_token("second refreshed access token", &access2);
+    held.add_token("second refreshed refresh token", &refresh2);
+    assert!(
+        token_active(&c, &access2).await,
+        "the second access token is active"
+    );
+    assert_nothing_stored_in_the_clear(&url, &held, "after introspection").await;
+
+    let r = c
+        .post(format!("{base}/oauth2/revoke"))
+        .form(&[("token", refresh2.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "revoke is always 200 (RFC 7009)"
+    );
+    assert!(
+        !token_active(&c, &access2).await,
+        "the revoked session's access token is inactive"
+    );
+    assert_nothing_stored_in_the_clear(&url, &held, "after revocation").await;
+}
