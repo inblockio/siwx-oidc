@@ -469,20 +469,69 @@ async fn end_session_sends_a_logout_token_for_the_grant_it_ends() {
     assert_valid_logout_token(&c, &got[1], &kept).await;
 }
 
+/// The outbox entries queued for `client_id`, read from the generic server's
+/// Redis.
+async fn queued_for(db: &siwx_oidc::db::RedisClient, client_id: &str) -> usize {
+    db.pending_logout_entries()
+        .await
+        .expect("read the outbox")
+        .iter()
+        .filter(|(entry, _)| entry.client_id == client_id)
+        .count()
+}
+
+/// Five attempts, then the entry is gone from the outbox. Waiting out a
+/// sixth attempt would take 32 s, so the drop is read from the outbox itself
+/// (`E2E_GENERIC_REDIS_URL`): the entry is there from the revocation on, and
+/// gone right after the last attempt's answer, where a build that never drops
+/// would have re-queued it.
 #[tokio::test]
 #[ignore = "needs a generic-mode siwx-oidc and the synapse mock"]
 async fn a_failing_rp_is_retried_a_bounded_number_of_times_then_dropped() {
     let c = Client::new();
+    let outbox = match std::env::var("E2E_GENERIC_REDIS_URL") {
+        Ok(url) => Some(
+            siwx_oidc::db::RedisClient::new(&url.parse().unwrap())
+                .await
+                .unwrap(),
+        ),
+        Err(_) => {
+            assert!(
+                !strict_skips(),
+                "E2E_GENERIC_REDIS_URL is unset; E2E_STRICT_SKIPS=1 forbids skipping the outbox check"
+            );
+            eprintln!("SKIP outbox check: E2E_GENERIC_REDIS_URL unset");
+            None
+        }
+    };
     let rp = rp_name("failing");
     rp_mode(&c, &rp, "500").await;
     let client_id = register_ok(&c, &rp_uri(&rp)).await;
     let s = sign_in(&c, &client_id).await;
     revoke(&c, &s).await;
+    if let Some(db) = &outbox {
+        assert_eq!(
+            queued_for(db, &client_id).await,
+            1,
+            "the revocation queued one entry (the outbox read is the right one)"
+        );
+    }
     // 2 + 4 + 8 + 16 s of backoff between five attempts, plus the polls.
     let got = wait_for(&c, &rp, MAX_ATTEMPTS, Duration::from_secs(50)).await;
     assert_eq!(got.len(), MAX_ATTEMPTS, "every attempt reached the RP");
     for delivery in &got {
         assert_valid_logout_token(&c, delivery, &s).await;
+    }
+    if let Some(db) = &outbox {
+        let start = Instant::now();
+        while queued_for(db, &client_id).await > 0 && start.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            queued_for(db, &client_id).await,
+            0,
+            "the entry is dropped after the last attempt, never re-queued"
+        );
     }
     tokio::time::sleep(Duration::from_secs(20)).await;
     assert_eq!(
