@@ -119,6 +119,10 @@ pub const KV_GRANT_DEVICE_IDX_PREFIX: &str = "idx:grants:user_device";
 /// Prefix of the pointer from a lifted legacy refresh token to its grant:
 /// `legacy_rt/{digest(legacy refresh token)}`.
 pub const KV_LEGACY_RT_PREFIX: &str = "legacy_rt";
+/// Prefix of the session-id index: `idx:grants:sid/{sid}` -> the grant id. A
+/// `sid` is not a credential (it names a grant to the RP that holds its ID
+/// token and authorises nothing alone), so it is stored as it is.
+pub const KV_GRANT_SID_IDX_PREFIX: &str = "idx:grants:sid";
 
 /// The message of the reuse security event. Stable: dashboards count it.
 pub const REUSE_EVENT_MESSAGE: &str = "refresh token reuse detected";

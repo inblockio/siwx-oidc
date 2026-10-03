@@ -7962,6 +7962,80 @@ mod scope_grant_tests {
     /// Matrix mode is unchanged: whatever the request asked for, the code grant
     /// records the Matrix scope for the device and issues a refresh token, and
     /// the response carries no `scope`.
+    /// The claims of a response's ID token, decoded without verification.
+    pub(super) fn id_token_claims(response: &CoreTokenResponse) -> serde_json::Value {
+        let jws = response
+            .extra_fields()
+            .id_token()
+            .expect("the code exchange returns an ID token")
+            .to_string();
+        let payload = jws.split('.').nth(1).expect("a compact JWS");
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap()
+    }
+
+    /// One raw `GET` on the test Redis.
+    pub(super) async fn raw_get(key: &str) -> Option<String> {
+        let url = siwx_oidc::test_support::redis_url();
+        let client = bb8_redis::redis::Client::open(url.as_str()).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        bb8_redis::redis::cmd("GET")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    /// The grant id an access token belongs to, read from the store.
+    async fn grant_of_access_token(access: &str) -> Option<String> {
+        let url = siwx_oidc::test_support::redis_url();
+        let client = bb8_redis::redis::Client::open(url.as_str()).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let key = format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_ACCESS_TOKEN_PREFIX,
+            siwx_oidc::db::tokens::digest(access)
+        );
+        bb8_redis::redis::cmd("HGET")
+            .arg(key)
+            .arg("grant")
+            .query_async(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    /// Every ID token carries the `sid` of the grant the exchange created (I8),
+    /// in both modes, and two exchanges get two different sids.
+    #[tokio::test]
+    async fn every_id_token_carries_the_sid_of_its_grant() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let mut sids = Vec::new();
+        for config in [generic(), generic(), matrix()] {
+            let response = issue(&db, &config, may_refresh(), Some("openid offline_access")).await;
+            let claims = id_token_claims(&response);
+            let sid = claims["sid"]
+                .as_str()
+                .unwrap_or_else(|| panic!("the ID token carries a sid: {claims}"))
+                .to_string();
+            let grant = grant_of_access_token(response.access_token().secret())
+                .await
+                .expect("the access token names its grant");
+            assert_eq!(
+                raw_get(&format!(
+                    "{}/{sid}",
+                    siwx_oidc::db::grant::KV_GRANT_SID_IDX_PREFIX
+                ))
+                .await
+                .as_deref(),
+                Some(grant.as_str()),
+                "the sid names the grant of this exchange"
+            );
+            assert!(!sids.contains(&sid), "each grant has its own sid");
+            sids.push(sid);
+        }
+    }
+
     #[tokio::test]
     async fn matrix_mode_issues_the_matrix_scope_and_a_refresh_token_whatever_was_requested() {
         let Some(db) = siwx_oidc::test_support::redis().await else {

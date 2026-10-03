@@ -311,12 +311,19 @@ struct LoginResult {
     /// The public client the login was made with. The refresh grant at
     /// `/token` binds a token to this client.
     client_id: String,
+    /// The ID token of the code exchange (empty for a seeded legacy session).
+    id_token: String,
 }
 
 /// Drive a full wallet auth-code login for `w` and return the issued tokens +
 /// the `SIWX_*` device id provisioned in the mock. One fresh client per call.
 async fn wallet_login(c: &Client, base: &str, w: &Wallet) -> LoginResult {
     let rc = register_client(c, base).await;
+    wallet_login_as(c, base, w, rc).await
+}
+
+/// [`wallet_login`] with a client the caller registered.
+async fn wallet_login_as(c: &Client, base: &str, w: &Wallet, rc: RegisteredClient) -> LoginResult {
     let (verifier, challenge) = pkce_pair();
     let state = "race_state";
     let nrc = no_redirect_client();
@@ -414,6 +421,7 @@ async fn wallet_login(c: &Client, base: &str, w: &Wallet) -> LoginResult {
         .expect("token exchange must succeed");
     let access_token = token["access_token"].as_str().unwrap().to_string();
     let refresh_token = token["refresh_token"].as_str().unwrap().to_string();
+    let id_token = token["id_token"].as_str().unwrap_or_default().to_string();
     let device_id = introspect(c, &access_token).await["device_id"]
         .as_str()
         .unwrap()
@@ -423,6 +431,7 @@ async fn wallet_login(c: &Client, base: &str, w: &Wallet) -> LoginResult {
         refresh_token,
         device_id,
         client_id: rc.client_id.clone(),
+        id_token,
     }
 }
 
@@ -2555,6 +2564,7 @@ impl LegacySession {
             refresh_token: self.refresh_token.clone(),
             device_id: String::new(),
             client_id: self.client_id.clone(),
+            id_token: String::new(),
         }
     }
 }
@@ -4183,5 +4193,323 @@ async fn e1_a_user_tombstone_written_by_the_previous_build_still_refuses_refresh
     redis_del(&url, &key).await;
     for (at, status, body) in &outcome {
         assert_refused_as_unknown(*at, *status, body, "a tombstoned user's grant");
+    }
+}
+
+// ===========================================================================
+// RP-initiated logout (OpenID Connect RP-Initiated Logout 1.0, Phase 4, B4)
+// ===========================================================================
+
+/// A public client like [`register_client`] that also registers
+/// `post_logout_redirect_uris`.
+async fn register_client_with_post_logout(
+    c: &Client,
+    base: &str,
+    uris: &[&str],
+) -> RegisteredClient {
+    let redirect_uri = format!("{base}/callback");
+    let resp = c
+        .post(format!("{base}/register"))
+        .json(&json!({
+            "redirect_uris": [&redirect_uri],
+            "post_logout_redirect_uris": uris,
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "setup: registration");
+    let reg: Value = resp.json().await.unwrap();
+    RegisteredClient {
+        client_id: reg["client_id"].as_str().unwrap().to_string(),
+        redirect_uri,
+    }
+}
+
+/// The claims of a compact JWS, decoded without verification.
+fn jws_claims(jws: &str) -> Value {
+    use base64::Engine;
+    let payload = jws.split('.').nth(1).expect("a compact JWS");
+    serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("base64url payload"),
+    )
+    .expect("JSON claims")
+}
+
+fn b64url(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// `GET /end_session` with the given query parameters, redirects not followed.
+async fn end_session_get(base: &str, params: &[(&str, &str)]) -> reqwest::Response {
+    no_redirect_client()
+        .get(format!("{base}/end_session"))
+        .query(params)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// `POST /end_session` with the given form, redirects not followed.
+async fn end_session_post(base: &str, params: &[(&str, &str)]) -> reqwest::Response {
+    no_redirect_client()
+        .post(format!("{base}/end_session"))
+        .form(params)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Whether both refresh endpoints refuse `login`'s refresh token like an
+/// unknown one.
+async fn assert_refresh_refused_at_both(c: &Client, base: &str, login: &LoginResult, what: &str) {
+    for at in [RefreshAt::Token, RefreshAt::Matrix] {
+        let (status, body, pair) = refresh_at(c, base, at, &login.refresh_token, login).await;
+        assert!(pair.is_none(), "{what}: the refresh token must not refresh");
+        assert_refused_as_unknown(at, status, &body, what);
+    }
+}
+
+/// B4: end-session deletes exactly the grant its `id_token_hint` names (by its
+/// `sid`): that grant's access token is inactive at once, its refresh token is
+/// refused at both endpoints, another grant of the same user lives on, and no
+/// Synapse device is deleted (RP-initiated logout is not a device sign-out).
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn end_session_deletes_exactly_the_grant_its_hint_names_and_never_a_device() {
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    let a = wallet_login(&c, &base, &w).await;
+    let b = wallet_login(&c, &base, &w).await;
+    let (sid_a, sid_b) = (
+        jws_claims(&a.id_token)["sid"].clone(),
+        jws_claims(&b.id_token)["sid"].clone(),
+    );
+    assert!(
+        sid_a.is_string() && sid_b.is_string(),
+        "every ID token carries a sid: {sid_a} {sid_b}"
+    );
+    assert_ne!(sid_a, sid_b, "two grants, two sids");
+
+    let resp = end_session_get(&base, &[("id_token_hint", a.id_token.as_str())]).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "no post_logout_redirect_uri: a signed-out page"
+    );
+    assert!(
+        resp.headers().get("location").is_none(),
+        "no redirect without a registered URI"
+    );
+
+    assert!(
+        !token_active(&c, &a.access_token).await,
+        "the named grant's access token is inactive at once"
+    );
+    assert_refresh_refused_at_both(&c, &base, &a, "the ended grant's refresh token").await;
+    assert!(
+        token_active(&c, &b.access_token).await,
+        "another grant of the same user lives on"
+    );
+
+    let state = mock_state(&c).await;
+    assert_eq!(
+        count_calls(&state, DELETE_DEVICE_CALL),
+        0,
+        "end-session never deletes a Synapse device"
+    );
+    assert!(
+        device_ids(&state, &w.mxid).contains(&a.device_id),
+        "the ended grant's device stays"
+    );
+
+    // Ending it again is a no-op that still answers.
+    let again = end_session_get(&base, &[("id_token_hint", a.id_token.as_str())]).await;
+    assert_eq!(again.status(), StatusCode::OK);
+    assert!(token_active(&c, &b.access_token).await);
+}
+
+/// B4: the RP is sent back only to a `post_logout_redirect_uri` registered for
+/// the hint's client, matched exactly (query included), with `state` appended.
+/// Anything else is refused without a redirect and ends nothing.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn end_session_redirects_only_to_an_exactly_registered_uri_with_state() {
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let registered = format!("{base}/signed-out?from=rp");
+    let rc = register_client_with_post_logout(&c, &base, &[registered.as_str()]).await;
+    let login = wallet_login_as(&c, &base, &new_wallet(), rc).await;
+
+    for unregistered in [
+        format!("{base}/signed-out"),
+        format!("{base}/signed-out?from=rp&x=1"),
+        format!("{base}/signed-out/?from=rp"),
+        "https://attacker.example/signed-out?from=rp".to_string(),
+    ] {
+        let resp = end_session_get(
+            &base,
+            &[
+                ("id_token_hint", login.id_token.as_str()),
+                ("post_logout_redirect_uri", unregistered.as_str()),
+                ("state", "s1"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "unregistered {unregistered}"
+        );
+        assert!(
+            resp.headers().get("location").is_none(),
+            "never a redirect to {unregistered}"
+        );
+        assert!(
+            token_active(&c, &login.access_token).await,
+            "a refused request ends nothing ({unregistered})"
+        );
+    }
+    // A client_id that is not the hint's audience is refused too.
+    let resp = end_session_get(
+        &base,
+        &[
+            ("id_token_hint", login.id_token.as_str()),
+            ("client_id", "another-client"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "client_id must match the hint's aud"
+    );
+    assert!(token_active(&c, &login.access_token).await);
+
+    let resp = end_session_post(
+        &base,
+        &[
+            ("id_token_hint", login.id_token.as_str()),
+            ("client_id", login.client_id.as_str()),
+            ("post_logout_redirect_uri", registered.as_str()),
+            ("state", "st 1&2"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::SEE_OTHER,
+        "a registered URI is honoured"
+    );
+    let location = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        location.starts_with(&format!("{base}/signed-out?")),
+        "{location}"
+    );
+    let q = parse_query(&location);
+    assert_eq!(
+        q.get("from").map(String::as_str),
+        Some("rp"),
+        "the registered query stays: {location}"
+    );
+    assert_eq!(
+        q.get("state").map(String::as_str),
+        Some("st 1&2"),
+        "state comes back: {location}"
+    );
+    assert_eq!(q.len(), 2, "nothing else is added: {location}");
+    assert!(
+        !token_active(&c, &login.access_token).await,
+        "the grant is ended"
+    );
+}
+
+/// B4: a hint this provider did not sign as presented is refused (400), ends
+/// nothing, and never redirects: a tampered payload, a signature by another
+/// key under our `kid`, `alg: none`, an unknown `kid`.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn end_session_refuses_a_foreign_or_tampered_hint() {
+    use p256::ecdsa::{signature::Signer, Signature as P256Signature, SigningKey as P256Key};
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let login = wallet_login(&c, &base, &new_wallet()).await;
+    let other = wallet_login(&c, &base, &new_wallet()).await;
+    let parts: Vec<&str> = login.id_token.split('.').collect();
+    assert_eq!(parts.len(), 3, "a compact JWS");
+    let header: Value = {
+        use base64::Engine;
+        serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(parts[0])
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let mut claims = jws_claims(&login.id_token);
+
+    // The other login's sid in this login's signed token.
+    claims["sid"] = jws_claims(&other.id_token)["sid"].clone();
+    let tampered = format!(
+        "{}.{}.{}",
+        parts[0],
+        b64url(claims.to_string().as_bytes()),
+        parts[2]
+    );
+    // Our claims, our kid, someone else's key.
+    let foreign_key = P256Key::random(&mut OsRng);
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let sig: P256Signature = foreign_key.sign(signing_input.as_bytes());
+    let foreign = format!("{signing_input}.{}", b64url(&sig.to_bytes()));
+    let none = format!("{}.{}.", b64url(br#"{"alg":"none"}"#), parts[1]);
+    let mut unknown_header = header.clone();
+    unknown_header["kid"] = json!("0000000000000000");
+    let unknown_kid = format!(
+        "{}.{}.{}",
+        b64url(unknown_header.to_string().as_bytes()),
+        parts[1],
+        parts[2]
+    );
+
+    for (what, hint) in [
+        ("a tampered payload", tampered),
+        ("another key under our kid", foreign),
+        ("alg none", none),
+        ("an unknown kid", unknown_kid),
+        ("garbage", "not-a-jwt".to_string()),
+    ] {
+        let resp = end_session_get(&base, &[("id_token_hint", hint.as_str())]).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{what} must be refused"
+        );
+        assert!(
+            resp.headers().get("location").is_none(),
+            "{what}: no redirect"
+        );
+        assert!(
+            token_active(&c, &login.access_token).await,
+            "{what} ends nothing"
+        );
+        assert!(
+            token_active(&c, &other.access_token).await,
+            "{what} ends nothing"
+        );
     }
 }
