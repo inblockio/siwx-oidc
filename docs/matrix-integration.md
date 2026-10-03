@@ -290,6 +290,7 @@ lines name tokens by fingerprint only. The keyspace is in
 | Scope recorded | `openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}` | the requested scopes among `openid`, `profile` and `offline_access`, as far as the client may have them (`openid` if none) |
 | Access token TTL | 300 s | 300 s |
 | Refresh token TTL | 7,776,000 s (90 days), renewed by each rotation | same |
+| Absolute lifetime | none by default; with `grant_absolute_lifetime_secs` (or the per-client map) the grant ends at its authentication plus the cap, and no access token outlives that ([configuration.md](configuration.md#grant-lifetime)) | same |
 | ID token TTL | 300 s by default (`id_token_ttl_secs`) | same |
 | Introspection | active | 404 |
 | Device ID | `SIWX_` + 8 hex characters, or the ID the client requested | empty |
@@ -391,10 +392,58 @@ token.
 5. `/userinfo` accepts an access token only. An authorization code is not a
    bearer token, before or after its exchange.
 
+**Lifetime.** A grant ends 90 days after its last refresh and, when an
+absolute lifetime is configured (`grant_absolute_lifetime_secs`, per client
+`grant_absolute_lifetime_secs_by_client`; none by default), at its
+authentication plus that cap. The authentication is the sign-in or the
+device approval, stamped from Redis `TIME`; a grant lifted from a legacy
+refresh token counts from that token's issue time, the last refresh under the
+previous build (the true sign-in was never recorded). Past either deadline
+both refresh endpoints answer as for an unknown token (`invalid_grant`,
+`M_UNKNOWN_TOKEN`) and delete the grant, and introspection answers inactive.
+No access token's `exp` passes the absolute expiry. The deadline only moves
+earlier: a lowered cap reaches a grant at its next refresh, a raised or
+removed one extends nothing. For an Element user the end of a grant is a
+sign-out, and signing in again usually means a new device with key-backup
+restore, so choose a short cap with care.
+
 A refresh is refused (`invalid_grant`, "Session has been revoked.") when the
-device was just signed out or the account just deactivated. Short-lived Redis
-tombstones (15 minutes) close the race between a refresh and a concurrent
-teardown.
+device was just signed out (a short-lived device tombstone, 15 minutes, closes
+the race between a refresh and the teardown) or when an epoch refuses the
+grant.
+
+### Epochs
+
+An epoch is a persistent not-before timestamp (Unix milliseconds, Redis
+`TIME`) for one scope: `epoch:global`, `epoch:client/{client_id}` or
+`epoch:user/{username}`. Every grant authenticated at or before the largest
+epoch that applies to it is refused at both refresh endpoints and is inactive
+at introspection at once (Synapse may still answer from its two-minute
+introspection cache); a grant authenticated later is untouched. One write
+revokes a whole scope, with no enumeration.
+
+`logout/all`, deactivation and erasure set the user epoch (and still delete
+the user's grants). A sign-in right after `logout/all` therefore refreshes at
+once; the user tombstone the epoch replaced refused that for 15 minutes. A
+user tombstone planted by the previous build is still honoured until it
+expires.
+
+Global and client epochs have no HTTP endpoint. An operator sets one with a
+single script that takes the time from Redis `TIME` and never moves an epoch
+earlier (provisional; it is what `RedisClient::set_epoch` runs):
+
+```bash
+redis-cli -u "$REDIS_URL" EVAL "local t = redis.call('TIME') \
+  local ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000) \
+  local cur = tonumber(redis.call('GET', KEYS[1]) or '0') \
+  if ms > cur then redis.call('SET', KEYS[1], string.format('%.0f', ms)) cur = ms end \
+  return string.format('%.0f', cur)" 1 epoch:global      # or epoch:client/<client_id>
+```
+
+Every user of the scope signs in again; for Matrix clients that usually
+means a new device with key-backup restore. An epoch has no TTL: deleting the
+key lifts it for grants not yet refused (a grant refused at a refresh
+endpoint is already deleted).
 
 ### Upgrading from a build before the grant record
 
@@ -427,6 +476,16 @@ Builds before the grant record stored each token as `token/{raw}` with its
   clients fail until they register again or the entry expires (30 days). The
   old build writes `default_clients` in the clear again at its start, and
   in-flight codes, sessions and device codes are lost.
+- A rollback to a build before epochs and the absolute lifetime honours
+  neither. Only a refresh deletes a grant an epoch refuses; the access check
+  only refuses it, so after a rollback every grant under a global or client
+  epoch that has not refreshed since is accepted again, and so is a grant issued
+  after an epoch from an earlier code or approval. Under a user epoch only such
+  a late grant comes back, because `logout/all`, deactivation and erasure delete
+  the grants the user has when they run. Caps stop applying: the old rotation
+  extends a grant to 90 days of inactivity again. The epoch keys outlive the
+  rollback, so after rolling forward the same grants are refused again; to keep
+  them refused during the rollback, delete them before rolling back.
 
 A token-store fault is never answered as a refusal. `POST
 /_matrix/client/v3/refresh` and the device-deletion routes (`DELETE
@@ -710,8 +769,8 @@ included, to the action it dispatches.
 - **Standalone.** Every action requires `SIWXOIDC_MATRIX_SERVER_NAME`, and all
   but `profile` require a Synapse client. Without them the action answers 400
   with a clear message, never 500.
-- Deactivation and erasure plant a deactivation tombstone first, so a refresh
-  racing the sweep cannot restore access.
+- Deactivation and erasure set the user epoch first, so a refresh racing the
+  sweep cannot restore access, and every grant from before is refused at once.
 - Erasure removes the DID's `webauthn:link/*` entries and credentials, and
   standalone passkeys whose key derives to that `did:key`, so the DID cannot be
   signed into again from a leftover passkey.

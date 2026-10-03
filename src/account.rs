@@ -662,12 +662,13 @@ async fn execute_action(
         Action::AccountDeactivate => {
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
-            // Plant the deactivation tombstone FIRST (S3-4 / H6): from now on any
-            // concurrent refresh/mint for this user refuses to issue tokens, so a
-            // refresh racing the sweep below cannot resurrect access. Best-effort:
-            // the sweep itself re-plants it, so a transient error here is not fatal.
-            if let Err(e) = db_client.mark_user_deactivated(&localpart).await {
-                warn!(error = %e, "mark_user_deactivated failed (pre-deactivate)");
+            // Set the user epoch FIRST (S3-4 / H6, I9): from now on every grant
+            // of this user authenticated until now is refused by both refresh
+            // endpoints and the access check, so a refresh racing the sweep
+            // below cannot resurrect access. Best-effort: the sweep sets it
+            // again, so a transient error here is not fatal.
+            if let Err(e) = db_client.set_user_epoch(&localpart).await {
+                warn!(error = %e, "set_user_epoch failed (pre-deactivate)");
             }
             synapse
                 .deactivate_user(&localpart, server, false)
@@ -705,11 +706,11 @@ async fn execute_action(
                     warn!(error = %e, "could not record the erasure; nothing was erased");
                     CustomError::ServiceUnavailable(ERASURE_NOT_RECORDED_MSG.to_string())
                 })?;
-            // Then plant the deactivation tombstone (S3-4 / H6), still before
-            // Synapse, so a concurrent refresh/mint cannot resurrect access
-            // during the erase sweep.
-            if let Err(e) = db_client.mark_user_deactivated(&localpart).await {
-                warn!(error = %e, "mark_user_deactivated failed (pre-erase)");
+            // Then set the user epoch (S3-4 / H6, I9), still before Synapse, so
+            // a concurrent refresh cannot resurrect access during the erase
+            // sweep.
+            if let Err(e) = db_client.set_user_epoch(&localpart).await {
+                warn!(error = %e, "set_user_epoch failed (pre-erase)");
             }
             // Irreversible: GDPR erasure removes profile, media, and room
             // memberships in addition to deactivating the account.

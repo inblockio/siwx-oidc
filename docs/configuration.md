@@ -131,6 +131,42 @@ the configuration as you would the secret.
 my-app = '{"secret":"change-me","metadata":{"redirect_uris":["https://app.example.org/callback"]}}'
 ```
 
+### Grant lifetime
+
+| Key | Environment | Default | Meaning |
+|---|---|---|---|
+| `grant_absolute_lifetime_secs` | `SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS` | none: no cap | Absolute lifetime of every grant, in seconds, counted from the authentication (the sign-in or the device approval). Past it the refresh token and every access token of the grant are refused, however recently it was refreshed. At least 1800. |
+| `grant_absolute_lifetime_secs_by_client` | `SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS_BY_CLIENT__<client id>` | none | Map of client id to seconds, the same cap for one client. A per-client value overrides the global one for that client, longer or shorter, so a client (say Element) can get a longer cap than a short global default. At least 1800. |
+
+With neither set, lifetimes are as before: an access token lives 300 s and a grant ends 90 days
+after its last refresh. With a cap, a grant also ends at its authentication plus the cap, and no
+access token lives past that moment. The deadline is written into the grant when it is issued
+and only ever moves earlier: lowering a cap reaches an existing grant at its next refresh (its
+access tokens then live at most 300 s more), raising or removing one never extends a grant. A
+grant issued while no cap applied counts from its authentication once one is configured. All
+of it runs on the Redis clock, so instances with skewed clocks agree. A value below 1800 s (a
+device code's lifetime) is refused at startup: it could refuse a grant before its first token.
+
+These defaults, and the rule that a per-client value overrides the global one rather than only
+shortening it, are provisional (decision D1 in the token lifecycle design). Weigh the cost for
+Matrix clients before setting a short cap: when a grant ends, Element signs out, and signing in
+again usually creates a new device, which must be verified again and restore its key backup.
+Agents that hold their own key (`siwx-oidc-auth`) re-authenticate without a person, so a short
+cap costs them nothing.
+
+The environment form lowercases the client id (`…_BY_CLIENT__MY-APP` names `my-app`); use the
+file for a client id with capitals. Registered client ids are random, so the per-client map is
+for configured clients (`default_clients`) and other ids you know; a client cannot yet ask for a
+shorter cap in its own registration.
+
+```toml
+[default]
+grant_absolute_lifetime_secs = 2592000   # 30 days
+
+[default.grant_absolute_lifetime_secs_by_client]
+my-app = 86400                           # 1 day
+```
+
 ### Legal documents
 
 | Key | Environment | Default | Meaning |

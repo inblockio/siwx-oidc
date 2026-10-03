@@ -313,10 +313,10 @@ pub const DEACTIVATION_CHECK_UNAVAILABLE_MSG: &str =
 /// auth path (`synapse/api/auth/mas.py`, 1.159.0) contains **zero** references
 /// to `deactivated` — under MSC3861 Synapse does not own the tokens, so it
 /// trusts our introspection response and never consults `users.deactivated`.
-/// On our side the Redis user tombstone (`tombstone:user/{username}`, which the
-/// rotation script reads) is a bounded-TTL race guard for the refresh path
-/// (S3-4 / H6), not a durable
-/// authority, and nothing consulted it at sign-in. The net effect was that
+/// On our side the user epoch (`epoch:user/{username}`, which replaced the
+/// bounded-TTL user tombstone) refuses grants authenticated BEFORE the
+/// deactivation (S3-4 / H6, I9), and by design nothing newer: it is no
+/// authority over a sign-in made after it. The net effect was that
 /// `account_deactivate` and `account_erase` were undone by simply signing in
 /// again: `is_localpart_available` reports a deactivated user's localpart as
 /// *taken*, so the new-identity gate classified them as a normal returning

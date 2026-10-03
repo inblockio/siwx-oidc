@@ -1390,9 +1390,20 @@ pub async fn main() {
         }
     }
 
+    let grant_lifetime = config
+        .grant_lifetime()
+        .unwrap_or_else(|e| panic!("FATAL: {e}"));
+    if grant_lifetime.is_configured() {
+        info!(
+            global_secs = ?grant_lifetime.global_secs,
+            per_client = grant_lifetime.per_client_secs.len(),
+            "absolute grant lifetime configured"
+        );
+    }
     let redis_client = RedisClient::new(&config.redis_url)
         .await
-        .expect("Could not build Redis client");
+        .expect("Could not build Redis client")
+        .with_grant_lifetime(grant_lifetime);
 
     store_default_clients(&config, &redis_client)
         .await

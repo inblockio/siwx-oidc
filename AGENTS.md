@@ -379,6 +379,64 @@ doc; read it before changing the code the rule covers.
   `concurrent_refreshes_at_the_matrix_endpoint_converge_on_one_pair` (mock stack),
   `concurrent_rotations_of_one_token_converge_on_one_pair`,
   `the_current_refresh_token_rotates_into_a_new_pair`.
+- **A grant's absolute expiry is fixed at the authentication, only moves earlier, and runs on
+  Redis `TIME`** (I6). With a cap configured (`grant_absolute_lifetime_secs`, the per-client map;
+  unset by default, D1 provisional) a grant gets `absolute_exp` = `auth_time` + its client's cap
+  when it is issued or lifted: the client's per-client value when one is set (longer or shorter),
+  else the global default (provisional, maintainers to confirm). The rotation script recomputes
+  min(`absolute_exp`, `auth_time` + the cap now configured), refuses and deletes the grant past
+  it like an inactive one, and writes it back; so a lowered cap applies at the next rotation and
+  nothing extends it. No access token's `exp` (nor the TTL of its entry or of the grant) passes
+  it, and the access check refuses a token whose grant is past it, judging a grant written
+  without `absolute_exp` against `auth_time` + its client's cap. `auth_time` is the sign-in or
+  the device approval, stamped from Redis `TIME` (a lifted legacy grant: the legacy entry's
+  `iat`, never later than now); never compute a deadline from an instance clock, and never let
+  a rotation, a replay or a raised cap move `absolute_exp` later. With no cap, lifetimes are
+  exactly as before. Pin: `h5_no_sequence_outlives_the_absolute_expiry` (property test, seeded,
+  `H5_SEED` replays a failure), `an_access_token_never_outlives_its_grants_absolute_expiry`,
+  `a_grant_written_without_a_cap_is_capped_from_its_auth_time`,
+  `a_lowered_cap_applies_at_the_next_rotation_and_a_raised_one_never_extends`,
+  `a_lifted_grant_counts_its_cap_from_the_legacy_issue_time`,
+  `a_per_client_cap_overrides_the_global_default`,
+  `a_device_grant_counts_its_lifetime_from_the_approval`,
+  `an_absolute_grant_lifetime_shorter_than_a_device_code_is_refused`. The access check also judges
+  a token's own `exp` on Redis `TIME`, and introspection and both refresh endpoints answer
+  `expires_in` from the store's instant (`check_access_token_at`, `RotatedPair::expires_in`),
+  never `Utc::now()`. Pin: `the_access_check_judges_exp_on_redis_time`,
+  `expires_in_counts_from_the_stores_redis_time`.
+- **Epochs refuse every older grant of a scope with one write; the user epoch replaced the user
+  tombstone** (I9). `epoch:global`, `epoch:client/{client_id}` and `epoch:user/{username}` hold
+  Unix milliseconds from Redis `TIME`, have no TTL and only move later (`RedisClient::set_epoch`).
+  A grant whose `auth_ms` (the authentication in milliseconds, beside `auth_time`) is at or before
+  the largest epoch that applies is refused by the rotation script (which deletes it), by the
+  access check (introspection answers inactive at once; Synapse's two-minute cache is the known
+  limit) and by the lift script; a legacy access token is judged by its `iat`. A grant
+  authenticated in the epoch's own millisecond is refused; a grant written without `auth_ms`
+  counts from the start of its `auth_time` second. `logout/all`, deactivation and erasure set the
+  user epoch in the script that deletes the user's grants, so a sign-in after them refreshes at
+  once. Never plant the user tombstone again, and keep the scripts READING it until one release
+  after Phase 3: one a previous build planted must still refuse for its 900 s. The device
+  tombstone stays: it closes the race between a device sweep and the lift of a legacy refresh
+  token. Global and client epochs have no HTTP endpoint, to add no remote surface: an operator
+  sets them ([docs/matrix-integration.md](docs/matrix-integration.md#epochs)). An unset epoch
+  is none, never 0. Teardown's resolver (`resolve_refresh_token`) treats a refused refresh token as
+  unknown, so revoking it tears nothing down. The comparisons made in Rust (a legacy access
+  token, teardown) follow the scripts' rule to the millisecond. Pin:
+  `e1_one_user_epoch_refuses_every_older_grant_of_the_user`,
+  `e1_after_logout_all_a_new_sign_in_refreshes_at_once`,
+  `the_epoch_comparison_is_at_or_before_to_the_millisecond`,
+  `the_legacy_access_check_refuses_at_or_before_the_epoch_to_the_millisecond`,
+  `the_teardown_resolver_refuses_at_or_before_the_epoch_to_the_millisecond`,
+  `e1_a_client_epoch_refuses_that_clients_older_grants_only`,
+  `e1_a_global_epoch_refuses_every_older_grant`, `a_legacy_token_older_than_an_epoch_is_refused`,
+  `set_epoch_takes_redis_time_and_never_moves_earlier`,
+  `the_scripts_name_the_epoch_keys_the_library_writes`,
+  `a_tombstoned_device_or_user_refuses_rotation_and_replay`,
+  `revoking_a_refresh_token_an_epoch_refuses_leaves_a_newer_grant_of_the_device`; mock stack:
+  `e1_after_logout_all_older_grants_are_refused_and_a_new_sign_in_refreshes_at_once`,
+  `e1_a_client_epoch_refuses_that_clients_older_grants_only`,
+  `e1_a_global_epoch_refuses_every_older_grant`,
+  `e1_a_user_tombstone_written_by_the_previous_build_still_refuses_refresh`.
 - **No credential a client holds is stored in the clear** (I1): tokens, authorization codes,
   device and user codes, session identifiers (the login `session` cookie, the WebAuthn,
   account re-auth and device-approval ceremony ids), the device-approval and account re-auth

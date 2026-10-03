@@ -3974,3 +3974,214 @@ async fn in_flight_codes_and_sessions_survive_the_upgrade() {
     held.add("legacy pending user code", &flight.pending_user_code);
     assert_nothing_stored_in_the_clear(&url, &held, "after every legacy credential was used").await;
 }
+
+// ===========================================================================
+// E1 (I9): epochs. `logout/all` sets the user epoch, which refuses every grant
+// of the user authenticated before it at both refresh endpoints and makes its
+// access tokens inactive at introspection, while a sign-in right after it
+// refreshes at once (the user tombstone it replaced refused that for 900 s).
+// A client epoch refuses that client's older grants only, a global epoch every
+// older grant. A user tombstone a previous build wrote still refuses for its
+// lifetime. The client and global epochs have no HTTP endpoint (an operator
+// sets them), so these tests write them into the stack Redis from Redis `TIME`
+// exactly as the server's `set_epoch` does.
+// ===========================================================================
+
+/// The stack Redis URL, or a loud skip (a failure under `E2E_STRICT_SKIPS=1`).
+fn stack_redis_or_skip(test: &str) -> Option<String> {
+    let url = stack_redis_url();
+    if url.is_none() {
+        let marker = format!(
+            "E2E_SKIP: {test}: no stack Redis URL (E2E_REDIS_URL, SIWXOIDC_REDIS_URL, \
+             SIWEOIDC_REDIS_URL or REDIS_HOST/REDIS_PORT); nothing was checked"
+        );
+        assert!(
+            std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+            "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+        );
+        eprintln!("{marker}");
+    }
+    url
+}
+
+/// Write `key` = Redis `TIME` in milliseconds, as `set_epoch` does.
+async fn write_epoch(url: &str, key: &str) {
+    let mut conn = stack_redis(url).await;
+    let _: String = bb8_redis::redis::cmd("EVAL")
+        .arg(
+            "local t = redis.call('TIME') \
+             local ms = string.format('%.0f', tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)) \
+             redis.call('SET', KEYS[1], ms) return ms",
+        )
+        .arg(1)
+        .arg(key)
+        .query_async(&mut conn)
+        .await
+        .unwrap_or_else(|e| panic!("write {key}: {e}"));
+}
+
+async fn redis_del(url: &str, key: &str) {
+    let mut conn = stack_redis(url).await;
+    let _: i64 = bb8_redis::redis::cmd("DEL")
+        .arg(key)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+}
+
+/// `login`'s access token is inactive at introspection and its refresh token is
+/// refused at both refresh endpoints. Introspection is asked first, while the
+/// grant still exists: a refusal by an epoch at a refresh deletes the grant, so
+/// only an introspection before it shows the access check's own epoch check.
+/// Then the Matrix endpoint, and `/token` must refuse the deleted grant too.
+async fn assert_login_refused(c: &Client, base: &str, login: &LoginResult, what: &str) {
+    assert!(
+        !token_active(c, &login.access_token).await,
+        "{what}: the access token is still active at introspection"
+    );
+    for at in [RefreshAt::Matrix, RefreshAt::Token] {
+        let (status, body, _) = refresh_at(c, base, at, &login.refresh_token, login).await;
+        assert_refused_as_unknown(at, status, &body, what);
+    }
+}
+
+/// `login` refreshes at `/token`, then its successor at the Matrix endpoint.
+async fn assert_login_refreshes(c: &Client, base: &str, login: &LoginResult, what: &str) {
+    assert!(
+        token_active(c, &login.access_token).await,
+        "{what}: the access token is inactive"
+    );
+    let (status, body, pair) =
+        refresh_at(c, base, RefreshAt::Token, &login.refresh_token, login).await;
+    let (_, refresh) = pair.unwrap_or_else(|| panic!("{what}: /token refused: {status} {body}"));
+    let (status, body, pair) = refresh_at(c, base, RefreshAt::Matrix, &refresh, login).await;
+    assert!(
+        pair.is_some(),
+        "{what}: the Matrix endpoint refused the successor: {status} {body}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn e1_after_logout_all_older_grants_are_refused_and_a_new_sign_in_refreshes_at_once() {
+    let c = Client::new();
+    let base = oidc();
+    let w = new_wallet();
+    let first = wallet_login(&c, &base, &w).await;
+    let second = wallet_login(&c, &base, &w).await;
+    let resp = c
+        .post(format!("{base}/_matrix/client/v3/logout/all"))
+        .bearer_auth(&first.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "logout/all");
+    for (login, what) in [
+        (&first, "the grant that called logout/all"),
+        (&second, "another grant of the user"),
+    ] {
+        assert_login_refused(&c, &base, login, what).await;
+    }
+    let after = wallet_login(&c, &base, &w).await;
+    assert_login_refreshes(&c, &base, &after, "a sign-in right after logout/all").await;
+}
+
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn e1_a_client_epoch_refuses_that_clients_older_grants_only() {
+    let Some(url) = stack_redis_or_skip("e1_a_client_epoch_refuses_that_clients_older_grants_only")
+    else {
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    let w = new_wallet();
+    let target = wallet_login(&c, &base, &w).await;
+    let other = wallet_login(&c, &base, &w).await;
+    let key = format!("epoch:client/{}", target.client_id);
+    write_epoch(&url, &key).await;
+    assert_login_refused(&c, &base, &target, "the client's grant").await;
+    assert_login_refreshes(&c, &base, &other, "the same user's grant at another client").await;
+    redis_del(&url, &key).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn e1_a_global_epoch_refuses_every_older_grant() {
+    let Some(url) = stack_redis_or_skip("e1_a_global_epoch_refuses_every_older_grant") else {
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    let older = [
+        wallet_login(&c, &base, &new_wallet()).await,
+        wallet_login(&c, &base, &new_wallet()).await,
+    ];
+    write_epoch(&url, "epoch:global").await;
+    // Collected, so the global epoch is removed before any assertion fails:
+    // left behind it would refuse nothing newer, but the stack is shared.
+    let mut refused = Vec::new();
+    for login in &older {
+        // Introspection first, before a refresh deletes the grant.
+        let active = token_active(&c, &login.access_token).await;
+        let mut outcome = Vec::new();
+        for at in [RefreshAt::Matrix, RefreshAt::Token] {
+            let (status, body, _) = refresh_at(&c, &base, at, &login.refresh_token, login).await;
+            outcome.push((at, status, body));
+        }
+        refused.push((outcome, active));
+    }
+    let later = wallet_login(&c, &base, &new_wallet()).await;
+    let (status, body, later_pair) =
+        refresh_at(&c, &base, RefreshAt::Token, &later.refresh_token, &later).await;
+    redis_del(&url, "epoch:global").await;
+    for (i, (outcome, active)) in refused.iter().enumerate() {
+        for (at, status, body) in outcome {
+            assert_refused_as_unknown(*at, *status, body, &format!("older grant {i}"));
+        }
+        assert!(!active, "older grant {i}: the access token is still active");
+    }
+    assert!(
+        later_pair.is_some(),
+        "a sign-in after the global epoch refreshes: {status} {body}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn e1_a_user_tombstone_written_by_the_previous_build_still_refuses_refresh() {
+    let Some(url) = stack_redis_or_skip(
+        "e1_a_user_tombstone_written_by_the_previous_build_still_refuses_refresh",
+    ) else {
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    let login = wallet_login(&c, &base, &new_wallet()).await;
+    let username = introspect(&c, &login.access_token).await["username"]
+        .as_str()
+        .expect("introspection names the user")
+        .to_string();
+    let key = format!("tombstone:user/{username}");
+    {
+        // Exactly as the previous build planted it: `SET … 1 EX 900`.
+        let mut conn = stack_redis(&url).await;
+        let _: () = bb8_redis::redis::cmd("SET")
+            .arg(&key)
+            .arg("1")
+            .arg("EX")
+            .arg(900)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+    let mut outcome = Vec::new();
+    for at in [RefreshAt::Matrix, RefreshAt::Token] {
+        let (status, body, _) = refresh_at(&c, &base, at, &login.refresh_token, &login).await;
+        outcome.push((at, status, body));
+    }
+    redis_del(&url, &key).await;
+    for (at, status, body) in &outcome {
+        assert_refused_as_unknown(*at, *status, body, "a tombstoned user's grant");
+    }
+}

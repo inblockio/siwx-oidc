@@ -67,7 +67,6 @@ use axum_extra::{
     headers::{authorization::Bearer, Authorization},
     TypedHeader,
 };
-use chrono::Utc;
 use serde_json::json;
 use tracing::{error, info, warn};
 
@@ -126,7 +125,7 @@ pub const ADMIN_DISPLAY_NAME: &str = "siwx-oidc service admin";
 /// JSON `null` — see requirement 4. Do not set it to a placeholder. The grant
 /// carries no refresh token and lives exactly as long as its one access token
 /// (`ttl`, already clamped by the caller); `issue_grant` mints the `msa_` token.
-pub fn admin_service_grant(localpart: &str, ttl: u64, now: i64) -> NewGrant {
+pub fn admin_service_grant(localpart: &str, ttl: u64) -> NewGrant {
     NewGrant {
         kind: GrantKind::Service,
         username: localpart.to_string(),
@@ -138,7 +137,8 @@ pub fn admin_service_grant(localpart: &str, ttl: u64, now: i64) -> NewGrant {
         device_id: String::new(),
         scope: ADMIN_SCOPE.to_string(),
         name: ADMIN_DISPLAY_NAME.to_string(),
-        auth_time: now,
+        // Authenticated by this request: the grant store takes Redis `TIME`.
+        auth_ms: None,
         access_ttl: ttl,
         // A bearer credential: no refresh token, so no refresh endpoint accepts it.
         refresh_inactivity_secs: None,
@@ -279,12 +279,11 @@ pub async fn admin_token(
     })?;
 
     let ttl = state.admin_token_ttl_secs;
-    let now = Utc::now().timestamp();
     // Shared with the in-process mint in `crate::synapse_client` — see
     // `admin_service_grant`. Do not inline these fields again here.
     let issued = state
         .redis_client
-        .issue_grant(&admin_service_grant(localpart, ttl, now))
+        .issue_grant(&admin_service_grant(localpart, ttl))
         .await
         .map_err(|e| {
             error!(error = %e, "admin_token: failed to store the minted token");
@@ -375,7 +374,7 @@ mod tests {
     /// token, so no refresh endpoint accepts it, and its grant has no device.
     #[test]
     fn an_admin_token_is_an_access_token() {
-        let grant = admin_service_grant("svc", ADMIN_TOKEN_TTL_MAX, 1_000);
+        let grant = admin_service_grant("svc", ADMIN_TOKEN_TTL_MAX);
         assert_eq!(grant.kind, GrantKind::Service);
         assert_eq!(grant.refresh_inactivity_secs, None);
         assert_eq!(grant.access_ttl, ADMIN_TOKEN_TTL_MAX);

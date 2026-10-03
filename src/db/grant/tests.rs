@@ -42,7 +42,7 @@ fn matrix_grant(username: &str, device_id: &str) -> NewGrant {
         device_id: device_id.to_string(),
         scope: "openid urn:matrix:client:api:*".to_string(),
         name: "n".to_string(),
-        auth_time: 1_700_000_000,
+        auth_ms: Some(1_700_000_000_000),
         access_ttl: ACCESS_TOKEN_TTL,
         refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
     }
@@ -67,6 +67,32 @@ fn rotated(outcome: RotateOutcome) -> RotatedPair {
     match outcome {
         RotateOutcome::Rotated(p) => p,
         other => panic!("expected Rotated, got {other:?}"),
+    }
+}
+
+/// `pair` without the instant it was answered at. `at` (the Redis second
+/// `expires_in` counts from) belongs to each answer, so a rotation and its
+/// replay, or two concurrent answers, that straddle a second differ there;
+/// everything else (the grant, the generation and the pair, byte for byte)
+/// must still be equal.
+fn timeless_pair(pair: RotatedPair) -> RotatedPair {
+    RotatedPair { at: 0, ..pair }
+}
+
+/// `outcome` with the instant of its answer cleared ([`timeless_pair`]).
+fn timeless(outcome: RotateOutcome) -> RotateOutcome {
+    match outcome {
+        RotateOutcome::Rotated(p) => RotateOutcome::Rotated(timeless_pair(p)),
+        RotateOutcome::Replayed(p) => RotateOutcome::Replayed(timeless_pair(p)),
+        other => other,
+    }
+}
+
+/// Waits until Redis `TIME` has passed the second `at`, so that the next
+/// answer is given in a later second than one stamped `at`.
+async fn after_second(client: &RedisClient, at: i64) {
+    while client.redis_time().await.expect("TIME") <= at {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
 
@@ -192,7 +218,7 @@ async fn a_refresh_less_grant_and_a_service_grant_live_as_long_as_their_access_t
         device_id: String::new(),
         scope: "urn:matrix:client:api:* urn:synapse:admin:*".into(),
         name: "admin".into(),
-        auth_time: 0,
+        auth_ms: None,
         access_ttl: 120,
         refresh_inactivity_secs: None,
     };
@@ -307,10 +333,17 @@ async fn a_replay_returns_the_same_pair_until_the_successor_is_used() {
     let issued = issue(&client, &matrix_grant(&user, "DEV1")).await;
     let t0 = issued.refresh_token.clone().unwrap();
     let first = rotated(rotate(&client, &t0).await);
+    // Replays answered in a later second than the rotation: only `at` differs.
+    after_second(&client, first.at).await;
     for _ in 0..2 {
+        let replay = rotate(&client, &t0).await;
+        assert!(
+            matches!(&replay, RotateOutcome::Replayed(p) if p.at > first.at),
+            "answered in a later second: {replay:?}"
+        );
         assert_eq!(
-            rotate(&client, &t0).await,
-            RotateOutcome::Replayed(first.clone())
+            timeless(replay),
+            timeless(RotateOutcome::Replayed(first.clone()))
         );
     }
 
@@ -319,8 +352,8 @@ async fn a_replay_returns_the_same_pair_until_the_successor_is_used() {
     let _: i64 = raw(&client, &["HINCRBY", &key, "last_used", "-3600"]).await;
     let _: i64 = raw(&client, &["HINCRBY", &key, "auth_time", "-3600"]).await;
     assert_eq!(
-        rotate(&client, &t0).await,
-        RotateOutcome::Replayed(first.clone())
+        timeless(rotate(&client, &t0).await),
+        timeless(RotateOutcome::Replayed(first.clone()))
     );
 
     // The successor's access token is accepted once: from now on, reuse.
@@ -358,8 +391,8 @@ async fn an_access_token_of_an_older_generation_does_not_use_the_successor() {
         .expect("still valid until it expires");
     assert_eq!(old.generation, 0);
     assert_eq!(
-        rotate(&client, &t0).await,
-        RotateOutcome::Replayed(first.clone())
+        timeless(rotate(&client, &t0).await),
+        timeless(RotateOutcome::Replayed(first.clone()))
     );
 }
 
@@ -385,8 +418,8 @@ async fn rotating_the_successor_counts_as_its_use_and_older_tokens_are_reuse() {
     assert_eq!(reuse.grant_fp, issued.grant_id.fingerprint());
     // t1 is now the previous token and t2 is unused: t1 replays t2's pair.
     assert_eq!(
-        rotate(&client, &p1.pair.refresh_token).await,
-        RotateOutcome::Replayed(p2.clone())
+        timeless(rotate(&client, &p1.pair.refresh_token).await),
+        timeless(RotateOutcome::Replayed(p2.clone()))
     );
     // A secret this grant never issued, under its live handle, is reuse too.
     let handle = tokens::parse_refresh_token(&t0).unwrap().handle.to_string();
@@ -430,7 +463,9 @@ async fn concurrent_rotations_of_one_token_converge_on_one_pair() {
     assert_eq!(rotations, 1, "exactly one request rotates");
     assert_eq!(pairs.len(), 50);
     assert!(
-        pairs.iter().all(|p| p == &pairs[0]),
+        pairs
+            .iter()
+            .all(|p| timeless_pair(p.clone()) == timeless_pair(pairs[0].clone())),
         "all carry the same pair"
     );
     let g = hgetall(&client, &grant_key(&issued.grant_id)).await;
@@ -484,17 +519,26 @@ async fn a_tombstoned_device_or_user_refuses_rotation_and_replay() {
         hgetall(&client, &grant_key(&a.grant_id)).await["generation"],
         "1"
     );
-    // User tombstone, deviceless grant.
+    // User tombstone, deviceless grant: no build writes one any more (the user
+    // epoch replaced it), but one a previous build wrote still refuses for its
+    // lifetime, so it is seeded the way that build planted it.
     let user2 = format!("tombu{}", nonce());
     let mut new = matrix_grant(&user2, "");
     new.kind = GrantKind::Oidc;
     let b = issue(&client, &new).await;
-    client.mark_user_deactivated(&user2).await.unwrap();
-    assert_eq!(
-        rotate(&client, b.refresh_token.as_deref().unwrap()).await,
-        RotateOutcome::Invalid(InvalidReason::Revoked)
-    );
-    assert!(tombstone(&client, &user_tombstone_key(&user2)).await);
+    let b0 = b.refresh_token.clone().unwrap();
+    let b1 = rotated(rotate(&client, &b0).await);
+    client
+        .set_ex_raw(&user_tombstone_key(&user2), "1", TOMBSTONE_TTL_SECS)
+        .await
+        .unwrap();
+    for t in [&b0, &b1.pair.refresh_token] {
+        assert_eq!(
+            rotate(&client, t).await,
+            RotateOutcome::Invalid(InvalidReason::Revoked),
+            "a user tombstone written by the previous build still refuses"
+        );
+    }
 }
 
 #[tokio::test]
@@ -618,7 +662,14 @@ async fn revoking_a_user_deletes_every_grant_of_the_user() {
         .await
         .unwrap()
         .is_some());
-    assert!(tombstone(&client, &user_tombstone_key(&user)).await);
+    assert!(
+        tombstone(&client, &EpochScope::User(&user).key()).await,
+        "revoking a user sets the user epoch"
+    );
+    assert!(
+        !tombstone(&client, &user_tombstone_key(&user)).await,
+        "and plants no user tombstone"
+    );
     for idx in [user_idx_key(&user), device_idx_key(&user, "DEVA")] {
         let exists: i64 = raw(&client, &["EXISTS", &idx]).await;
         assert_eq!(exists, 0, "{idx}");
@@ -1094,7 +1145,12 @@ async fn a_legacy_token_that_may_not_be_lifted_stays_untouched() {
         Some(stale_json.as_str()),
         "the expired entry is left as it was"
     );
-    client.mark_user_deactivated(&meta.username).await.unwrap();
+    // A user tombstone as the previous build planted it (still read for one
+    // release; the user epoch refuses a lift too, see the epochs tests).
+    client
+        .set_ex_raw(&user_tombstone_key(&meta.username), "1", TOMBSTONE_TTL_SECS)
+        .await
+        .unwrap();
     assert_eq!(
         client
             .lift_legacy_refresh_token(&request(&legacy_rt), &legacy, false)
@@ -1187,3 +1243,6 @@ fn a_lifted_grant_is_a_matrix_device_grant_exactly_when_its_scope_carries_the_ma
         assert_eq!(legacy_grant_kind(&meta(scope)), kind, "{scope:?}");
     }
 }
+
+mod epochs;
+mod lifetime;

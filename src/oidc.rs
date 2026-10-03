@@ -1148,10 +1148,9 @@ async fn token_refresh(
         None => db_client.rotate_refresh_token(&request).await?,
     };
     let (pair, expires_in) = match outcome {
-        RotateOutcome::Rotated(rotated) => (rotated.pair, ACCESS_TOKEN_TTL),
-        RotateOutcome::Replayed(replayed) => {
-            let left = (replayed.pair.access_exp - Utc::now().timestamp()).max(0) as u64;
-            (replayed.pair, left.min(ACCESS_TOKEN_TTL))
+        RotateOutcome::Rotated(pair) | RotateOutcome::Replayed(pair) => {
+            let expires_in = pair.expires_in(ACCESS_TOKEN_TTL);
+            (pair.pair, expires_in)
         }
         // Reuse (I5, phase A): recorded, and answered like an unknown token.
         RotateOutcome::Reuse(event) => {
@@ -1354,7 +1353,6 @@ async fn token_device_code(
             .unwrap_or_else(|| resolve_device_id(proposed_device_id.as_deref()));
 
             let now = Utc::now();
-            let iat = now.timestamp();
             let username = resolved.localpart;
             let scope = format!(
                 "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
@@ -1383,7 +1381,9 @@ async fn token_device_code(
                     device_id: dev_id.clone(),
                     scope: scope.clone(),
                     name: display_name,
-                    auth_time: iat,
+                    // The approval, recorded from Redis `TIME`; an entry an
+                    // older build approved counts from this poll.
+                    auth_ms: entry.auth_ms,
                     access_ttl: ACCESS_TOKEN_TTL,
                     refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
                 })
@@ -1655,7 +1655,7 @@ async fn token_authorization_code(
             device_id: code_entry.device_id.clone().unwrap_or_default(),
             scope: scope.clone(),
             name: display_name,
-            auth_time: code_entry.auth_time.timestamp(),
+            auth_ms: Some(code_entry.auth_time.timestamp_millis()),
             access_ttl: ACCESS_TOKEN_TTL,
             refresh_inactivity_secs: issue_refresh_token.then_some(REFRESH_TOKEN_TTL),
         })
@@ -2914,7 +2914,12 @@ pub async fn sign_in(
         nonce: request.nonce.clone(),
         exchange_count: 0,
         client_id: request.client_id.clone(),
-        auth_time: Utc::now(),
+        // The authentication, from Redis `TIME` like every lifetime deadline
+        // (I6); the grant's absolute expiry counts from it.
+        auth_time: chrono::DateTime::<Utc>::from_timestamp_millis(
+            db_client.server_time_ms().await?,
+        )
+        .ok_or_else(|| anyhow!("Redis TIME out of range"))?,
         code_challenge: Some(request.code_challenge.clone()),
         code_challenge_method: Some("S256".to_string()),
         localpart: Some(resolved.localpart.clone()),
@@ -4573,6 +4578,7 @@ mod tests {
                 device_id: None,
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
+                auth_ms: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -4642,6 +4648,7 @@ mod tests {
                 device_id: None,
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
+                auth_ms: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -6583,6 +6590,75 @@ mod device_display_name_tests {
         );
     }
 
+    /// The grant of an approved device code counts from the approval, the
+    /// authentication, which the approval records on the entry from Redis
+    /// `TIME`; not from the poll that redeems it (I6).
+    #[tokio::test]
+    async fn a_device_grant_counts_its_lifetime_from_the_approval() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (synapse, _hs, server) = spawn(&[]).await;
+        let nonce = Uuid::new_v4().simple().to_string();
+        let client_id = format!("device-auth-time-{nonce}");
+        db.set_client(client_id.clone(), client_entry(Some("Pocket Client")))
+            .await
+            .unwrap();
+        let device_code = format!("dvc_auth-time-{nonce}");
+        let approved_at = Utc::now().timestamp() - 1_000;
+        db.set_device_code(
+            &device_code,
+            &DeviceCodeEntry {
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!("AT-{nonce}")),
+                legacy_user_code: None,
+                client_id: client_id.clone(),
+                scope: "openid".to_string(),
+                status: DeviceCodeStatus::Approved,
+                did: Some(DID.to_string()),
+                device_id: None,
+                last_poll: None,
+                created_at: approved_at - 10,
+                auth_ms: Some(approved_at * 1000),
+            },
+            DEVICE_CODE_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let config = Config {
+            mas_shared_secret: Some("secret".to_string()),
+            matrix_server_name: Some(SERVER_NAME.to_string()),
+            ..Config::default()
+        };
+        let response = token(
+            TokenForm {
+                code: None,
+                client_id: Some(client_id),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code),
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &config,
+            &db,
+            Some(&synapse),
+        )
+        .await
+        .expect("an approved device code must be redeemed");
+        server.abort();
+        let access = openidconnect::OAuth2TokenResponse::access_token(&response);
+        let grant = db
+            .lookup_access_token(access.secret())
+            .await
+            .unwrap()
+            .expect("the issued access token is live")
+            .grant;
+        assert_eq!(grant.auth_time, approved_at, "auth_time is the approval");
+        assert_eq!(grant.auth_ms, approved_at * 1000, "auth_ms is the approval");
+    }
+
     /// The QR / device-code path used to name every device "Element X".
     #[tokio::test]
     async fn the_device_code_grant_names_the_device_after_its_client() {
@@ -6608,6 +6684,7 @@ mod device_display_name_tests {
                 device_id: None,
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
+                auth_ms: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -6722,7 +6799,7 @@ mod client_binding_tests {
             device_id: String::new(),
             scope: "openid".into(),
             name: "did:key:zDnBINDING".into(),
-            auth_time: Utc::now().timestamp(),
+            auth_ms: Some(Utc::now().timestamp_millis()),
             access_ttl: ACCESS_TOKEN_TTL,
             refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
         })

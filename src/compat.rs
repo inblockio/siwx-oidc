@@ -40,7 +40,6 @@ use axum_extra::{
     headers::{authorization::Bearer, Authorization},
     TypedHeader,
 };
-use chrono::Utc;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -662,10 +661,9 @@ pub async fn refresh(
         Err(e) => Err(e),
     };
     let (pair, expires_in) = match outcome {
-        Ok(RotateOutcome::Rotated(rotated)) => (rotated.pair, ACCESS_TOKEN_TTL),
-        Ok(RotateOutcome::Replayed(replayed)) => {
-            let left = (replayed.pair.access_exp - Utc::now().timestamp()).max(0) as u64;
-            (replayed.pair, left.min(ACCESS_TOKEN_TTL))
+        Ok(RotateOutcome::Rotated(pair)) | Ok(RotateOutcome::Replayed(pair)) => {
+            let expires_in = pair.expires_in(ACCESS_TOKEN_TTL);
+            (pair.pair, expires_in)
         }
         // Reuse (I5, phase A): recorded, and answered like an unknown token.
         Ok(RotateOutcome::Reuse(event)) => {
@@ -725,7 +723,8 @@ mod tests {
     use super::*;
     use axum::extract::{Form, State};
     use axum::response::IntoResponse;
-    use siwx_oidc::db::grant::{GrantKind, IssuedGrant, NewGrant};
+    use chrono::Utc;
+    use siwx_oidc::db::grant::{EpochScope, GrantKind, IssuedGrant, NewGrant};
     use siwx_oidc::db::tokens;
     use siwx_oidc::db::{DBClient, TokenMetadata, REFRESH_TOKEN_TTL};
 
@@ -981,7 +980,7 @@ mod tests {
                 device_id: dev.to_string(),
                 scope: "openid".into(),
                 name: user.to_string(),
-                auth_time: Utc::now().timestamp(),
+                auth_ms: None,
                 access_ttl: ACCESS_TOKEN_TTL,
                 refresh_inactivity_secs: Some(120),
             })
@@ -1405,6 +1404,59 @@ mod tests {
             client.get_token(&refresh).await.unwrap().is_none(),
             "revoke removes a refresh token"
         );
+    }
+
+    /// I9 at teardown: a refresh token an epoch refuses resolves to nothing
+    /// (`resolve_refresh_token`), so revoking it acts like revoking an unknown
+    /// token. It must not tear down by its grant's (username, device_id): a
+    /// newer grant on the same device, authenticated after the epoch, lives on.
+    #[tokio::test]
+    async fn revoking_a_refresh_token_an_epoch_refuses_leaves_a_newer_grant_of_the_device() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("epoch-revoke-{n}");
+        let dev = format!("EPOCH_{n}");
+        let old = seed_grant(&client, &user, &dev)
+            .await
+            .refresh_token
+            .unwrap();
+        assert!(
+            client.resolve_refresh_token(&old).await.unwrap().is_some(),
+            "before the epoch the refresh token resolves to its grant"
+        );
+        client.set_epoch(EpochScope::User(&user)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // A later sign-in that proposes the same device id.
+        let newer = seed_grant(&client, &user, &dev).await;
+
+        let form = RevokeForm {
+            token: old.clone(),
+            token_type_hint: None,
+        };
+        let status = revoke(State(standalone_state(client.clone())), Form(form)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            client
+                .resolve_refresh_token(newer.refresh_token.as_deref().unwrap())
+                .await
+                .unwrap()
+                .is_some(),
+            "revoking the refused token tore down the device's newer grant"
+        );
+        assert!(
+            client
+                .check_access_token(&newer.access_token)
+                .await
+                .unwrap()
+                .is_some(),
+            "revoking the refused token revoked the newer grant's access token"
+        );
+        assert!(
+            client.resolve_refresh_token(&old).await.unwrap().is_none(),
+            "a refresh token an epoch refuses resolves to nothing"
+        );
+
+        client.revoke_grants_for_device(&user, &dev).await.ok();
     }
 
     /// Same single-session guarantee for RFC 7009 revoke with empty device_id.

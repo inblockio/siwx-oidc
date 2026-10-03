@@ -1041,6 +1041,8 @@ pub async fn device_approve(
 
     entry.status = DeviceCodeStatus::Approved;
     entry.did = Some(did.clone());
+    // The authentication, from Redis `TIME`: the grant's `auth_time` (I6).
+    entry.auth_ms = Some(db_client.server_time_ms().await?);
     let _ = db_client
         .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
         .await;
@@ -1086,6 +1088,7 @@ pub async fn device_approve_passkey(
 
     entry.status = DeviceCodeStatus::Approved;
     entry.did = Some(verified_did.to_string());
+    entry.auth_ms = Some(db_client.server_time_ms().await?);
     let _ = db_client
         .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
         .await;

@@ -24,6 +24,9 @@ use super::*;
 #[derive(Clone)]
 pub struct RedisClient {
     pub(super) pool: Pool<RedisConnectionManager>,
+    /// The operator's absolute-lifetime caps (I6); none by default. Set with
+    /// [`RedisClient::with_grant_lifetime`].
+    pub(super) lifetime: super::grant::GrantLifetime,
 }
 
 /// Redis key for the per-`(username, device_id)` token index SET.
@@ -284,7 +287,10 @@ impl RedisClient {
             .build(manager.clone())
             .await
             .context("Could not build Redis pool")?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            lifetime: Default::default(),
+        })
     }
 }
 
@@ -493,23 +499,19 @@ impl RedisClient {
     /// account under) so it is
     /// robust to address-case differences between sign-in and re-auth DIDs.
     ///
-    /// **Race-free (S3-4 / H6):** the caller (`account_deactivate`/`account_erase`)
-    /// plants the per-user deactivation tombstone via
-    /// [`mark_user_deactivated`](Self::mark_user_deactivated) BEFORE calling this,
-    /// so a concurrent refresh/mint refuses to issue tokens during/after the
-    /// sweep. As a defence-in-depth backstop this method also (re)sets the
-    /// tombstone itself, then loops the scan until a pass finds zero tokens, so a
-    /// writer that slipped in between the tombstone and the first scan is still
-    /// cleaned up. No new token can be minted (the refresh path is tombstoned), so
-    /// the loop terminates.
+    /// **Race-free (S3-4 / H6, I9):** the script that deletes the user's grants
+    /// sets the user epoch in the same atomic step, so a refresh racing the
+    /// sweep is refused by the epoch whichever runs first; the callers
+    /// `account_deactivate`/`account_erase` also set it via
+    /// [`set_user_epoch`](Self::set_user_epoch) before asking Synapse. The
+    /// legacy scan loops until a pass finds zero tokens; no legacy token can be
+    /// minted any more, so the loop terminates.
     pub async fn revoke_all_user_tokens(&self, username: &str) -> Result<usize> {
-        // Defence-in-depth: ensure the tombstone is present even if the caller
-        // did not set it (the explicit callers do, before this point).
-        self.mark_user_deactivated(username).await?;
-
-        // Every grant of the user, in one atomic script (which plants the
-        // tombstone again). The loop below is the backstop for legacy
-        // `token/{raw}` entries written before the grant record.
+        // The user epoch and every grant of the user, in one atomic script:
+        // the epoch refuses every grant authenticated until now (I9), wherever
+        // it is. The loop below is the backstop for legacy `token/{raw}`
+        // entries written before the grant record; an epoch refuses those too
+        // (their `iat` is before it), but they are deleted all the same.
         let mut total = self.revoke_grants_for_user(username).await?;
         for _ in 0..5 {
             let n = self
@@ -527,13 +529,16 @@ impl RedisClient {
         Ok(total)
     }
 
-    /// Plant the per-user deactivation tombstone so any concurrent (or later)
-    /// refresh/mint for this user refuses to issue tokens. Set FIRST, before the
-    /// `revoke_all_user_tokens` sweep, by `account_deactivate`/`account_erase`
-    /// (S3-4 / H6). Idempotent.
-    pub async fn mark_user_deactivated(&self, username: &str) -> Result<()> {
-        self.set_ex_raw(&user_tombstone_key(username), "1", TOMBSTONE_TTL_SECS)
+    /// Set the user epoch (I9) so every grant of this user authenticated
+    /// until now is refused at once by both refresh endpoints and the access
+    /// check. Set FIRST, before Synapse is asked and before the
+    /// `revoke_all_user_tokens` sweep (which sets it again, later), by
+    /// `account_deactivate`/`account_erase` (S3-4 / H6). Replaces the user
+    /// tombstone, which also refused sign-ins made after it for 900 s.
+    pub async fn set_user_epoch(&self, username: &str) -> Result<()> {
+        self.set_epoch(super::grant::EpochScope::User(username))
             .await
+            .map(|_| ())
     }
 
     /// Record, with no TTL, that the account `localpart` of `did` is being
@@ -937,6 +942,10 @@ impl RedisClient {
 
 #[async_trait]
 impl DBClient for RedisClient {
+    async fn server_time_ms(&self) -> Result<i64> {
+        self.redis_time_ms().await
+    }
+
     async fn set_client(&self, client_id: String, client_entry: ClientEntry) -> Result<()> {
         let mut conn = self
             .pool
