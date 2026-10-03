@@ -381,8 +381,8 @@ doc; read it before changing the code the rule covers.
   `the_current_refresh_token_rotates_into_a_new_pair`.
 - **No credential a client holds is stored in the clear** (I1): tokens, authorization codes,
   device and user codes, session identifiers (the login `session` cookie, the WebAuthn,
-  account re-auth and device-approval ceremony ids), server-issued CAIP-122 nonces, client
-  secrets and registration access tokens. Each appears in a key or value only as its SHA-256
+  account re-auth and device-approval ceremony ids), the device-approval and account re-auth
+  CAIP-122 nonces, client secrets and registration access tokens. Each appears in a key or value only as its SHA-256
   (`db::tokens::digest`); access tokens are keyed `at/{digest}`, refresh tokens are kept as
   digests in their grant, and the successor pair of a rotation is sealed under the previous
   refresh token (`db::seal`); no key or value holds a token, its body, or a refresh token's
@@ -397,10 +397,14 @@ doc; read it before changing the code the rule covers.
   upgraded atomically on first read without losing a field (marked
   `TODO(remove one release after Phase 2b)`; plaintext clients live 30 days). Accepted deploy
   residue: the previous build's consumed device-approval nonce keeps its user code for up to
-  300 s after an upgrade. Not covered: the `siwx_user` and `acct_session` cookies (Phase 4 of
-  the token rework moves them), and passkey credential ids (`webauthn:credential/{id}`,
-  `webauthn:link/{id}`), which are public identifiers the server hands out in
-  `allowCredentials`, not bearer credentials. Pin (mock stack, each scans the whole stack Redis):
+  300 s after an upgrade, and the previous build's login sessions (with their signed-in flags)
+  keep their raw keys until they expire (300 s), also after a sign-in on the new build, which
+  writes no session; a spent session cannot sign in again. Not covered: the `siwx_user` and
+  `acct_session` cookies (Phase 4 of the token rework moves them); passkey credential ids
+  (`webauthn:credential/{id}`, `webauthn:link/{id}`), which are public identifiers the server
+  hands out in `allowCredentials`, not bearer credentials; and the login CAIP-122 nonce, a
+  challenge kept in the value of the digest-keyed session, which authenticates nothing without
+  the session id and a signature. Pin (mock stack, each scans the whole stack Redis):
   `no_token_the_client_holds_is_stored_in_the_clear`,
   `no_code_or_session_the_client_holds_is_stored_in_the_clear`,
   `no_client_secret_or_registration_token_is_stored_in_the_clear`,

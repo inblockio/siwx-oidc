@@ -422,6 +422,11 @@ Builds before the grant record stored each token as `token/{raw}` with its
 - A rollback to a build before the grant record signs out every session that
   refreshed on the new build: the old build knows neither the grant tokens nor
   the lifted legacy tokens, whose entries are gone.
+- A rollback to a build before digest-keyed credentials cannot read a client
+  entry the new build wrote or upgraded (it has no `secret` member): those
+  clients fail until they register again or the entry expires (30 days). The
+  old build writes `default_clients` in the clear again at its start, and
+  in-flight codes, sessions and device codes are lost.
 
 A token-store fault is never answered as a refusal. `POST
 /_matrix/client/v3/refresh` and the device-deletion routes (`DELETE
