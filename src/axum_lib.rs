@@ -637,8 +637,9 @@ fn user_session_token(
 
 /// Resolve the opaque `siwx_user` login cookie to a DID for scoping a passkey picker,
 /// or `None` (usernameless) when `force_all`, or when the cookie is absent, forged, or
-/// expired. NEVER errors: a Redis hiccup degrades to `None`. The login handler inlines
-/// the same read; the account + device re-auth start handlers share this.
+/// expired. NEVER errors: a Redis hiccup degrades to `None`. Every passkey picker
+/// reads the cookie through this: the login handler and the account + device re-auth
+/// start handlers.
 ///
 /// Enumeration-safety: the cookie value is an opaque server token (two UUIDs); a
 /// forged/guessed value is a Redis miss -> `None` -> usernameless, leaking nothing.
@@ -849,22 +850,15 @@ async fn webauthn_authenticate_start(
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-    // Read the opaque `siwx_user` cookie -> DID (Redis). A missing/forged/expired
-    // token resolves to None -> usernameless (enumeration-safe). When forced, skip
-    // the lookup entirely.
-    let scope_did = if force_all {
-        None
-    } else {
-        match cookies.get(USER_SESSION_COOKIE) {
-            Some(token) => state
-                .redis_client
-                .lookup_user_session(token)
-                .await
-                .ok()
-                .flatten(),
-            None => None,
-        }
-    };
+    // Read the opaque `siwx_user` cookie -> DID through the helper every passkey
+    // picker shares. A missing/forged/expired token or a Redis fault resolves to
+    // None -> usernameless (enumeration-safe); when forced, there is no lookup.
+    let scope_did = user_session_scope_did(
+        &state.redis_client,
+        &Some(TypedHeader(cookies.clone())),
+        force_all,
+    )
+    .await;
 
     let challenge = wa::authenticate_start(
         &state.webauthn,
