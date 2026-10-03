@@ -70,10 +70,10 @@ Add storage for ceremony-specific state. Example for WebAuthn:
 // In SessionEntry — add optional verified_did field
 pub struct SessionEntry {
     pub siwe_nonce: String,
-    pub oidc_nonce: Option<Nonce>,
     pub secret: String,
     pub signin_count: u64,
     pub verified_did: Option<String>,  // ← NEW: set by ceremony, read by sign_in
+    pub request: Option<AuthorizationRequest>,  // bound at /authorize (incl. scope, OIDC nonce)
 }
 
 // Ceremony-specific keys (as WebAuthn does it; see docs/architecture.md "Redis keyspace")

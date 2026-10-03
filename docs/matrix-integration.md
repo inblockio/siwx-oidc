@@ -445,7 +445,9 @@ share their checks and differ only in tolerating an expired registration, below)
    (else `invalid_request`).
 2. A secret the request presents (`client_secret` in the form, or the
    `Authorization` password or Bearer value, which wins) must match the
-   registration, else `invalid_client`.
+   registration, else `invalid_client`. The registration holds only the
+   secret's SHA-256 digest; the presented secret is digested and compared in
+   constant time.
 3. A request that presents none must come from a public client: registered
    with `token_endpoint_auth_method: none`, or with no method while
    `SIWXOIDC_REQUIRE_SECRET` is off. Otherwise `invalid_client`
@@ -742,6 +744,10 @@ Rules:
 - **Existing accounts only.** Approval rejects a DID with no account (400) and a
   deactivated account (401). See [Gates](#gates-that-protect-accounts).
 - The tokens belong to the **approving** user's DID, not to the device.
+- The device code, the user code and the approval nonce are stored only as
+  digests (`device_code/`, `user_code/`, `caip122/` in the
+  [Redis keyspace](architecture.md#redis-keyspace)); the user code is hashed
+  exactly as presented, which the approval page sends trimmed and upper-cased.
 
 ### MSC4108 and Secure Backup
 

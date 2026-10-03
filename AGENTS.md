@@ -32,7 +32,7 @@ everything else exists only in the binary crate.
 |---|---|
 | `main.rs` | Binary entry point. Declares the binary-only modules and calls `axum_lib::main`. |
 | `lib.rs` | Library crate root. `synapse_client` is deliberately not re-exported (see Invariants). |
-| `axum_lib.rs` | Startup: loads config through `config::figment()`, validates it (DID methods and pkh namespaces against the aqua-auth registries, signing key, retired keys, WebAuthn), `AppState`, the router, handler glue, the `siwx_user` / `acct_session` cookies, the CORS layer. |
+| `axum_lib.rs` | Startup: loads config through `config::figment()`, validates it (DID methods and pkh namespaces against the aqua-auth registries, signing key, retired keys, WebAuthn), `store_default_clients` (digested), `AppState`, the router, handler glue, the `siwx_user` / `acct_session` cookies, the CORS layer. |
 | `config.rs` | `Config`, its defaults, and `figment()`: the one place config names and precedence are defined. Reference: [docs/configuration.md](docs/configuration.md). |
 | `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_code_client` and `authenticate_refresh_client` authenticate the client for the first two, and `client_is_confidential` decides which clients must present a secret), `userinfo`, client registration, `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, and `provision_synapse_device`, the single provisioning and DID-publication path. |
 | `introspect.rs` | `POST /oauth2/introspect` (RFC 7662) for Synapse; opaque `mat_`/`mcr_` token generation. |
@@ -51,10 +51,10 @@ everything else exists only in the binary crate.
 | `credential_identity.rs` (lib) | Which identity a stored passkey authenticates: a `webauthn:link/*` entry overrides the derived `did:key`. |
 | `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL`. |
 | `credential_migration.rs` (lib) | Additive backfill of passkey credentials into the aqua-auth store. |
-| `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry`, `DeviceCodeEntry`, `TokenMetadata` with its `TokenKind`), `legacy_token_kind`, Redis key prefixes and TTLs. |
+| `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry` with the digests of its secret and registration access token and `client_entry_without_plaintext`, `DeviceCodeEntry` and the `DeviceCodeRef` naming its layout, `TokenMetadata` with its `TokenKind`), `Ceremony`, `legacy_token_kind`, Redis key prefixes and TTLs. |
 | `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, `lookup_user_session`, `purge_identity`. |
 | `db/grant.rs` (lib) | The grant record and its Lua scripts: `issue_grant`, the access check `check_access_token` (with the legacy read fallback), `rotate_refresh_token` (the one rotation script), `ReuseEvent`, grant revocation, and the legacy migration (`peek_refresh_token`, `lift_legacy_refresh_token`). Keyspace and decision table in its module docs. |
-| `db/tokens.rs` (lib) | Token formats (`mat_`, `msa_`, `mcr_{handle}_{secret}`), `parse_refresh_token` (never panics), `digest` (the SHA-256 every token is stored as). |
+| `db/tokens.rs` (lib) | Token formats (`mat_`, `msa_`, `mcr_{handle}_{secret}`), `parse_refresh_token` (never panics), `digest` (the SHA-256 every credential a client holds is stored as). |
 | `db/seal.rs` (lib) | The sealed successor pair: AES-256-GCM under a key HKDF-derived from the previous refresh token, so only its presenter can open it. |
 | `bin/migrate-credentials.rs` | Operator tool for the credential backfill. Dry run unless `--apply`. |
 
@@ -296,8 +296,9 @@ doc; read it before changing the code the rule covers.
 - **The authorization request, PKCE challenge included, is bound at `/authorize`, and `sign_in`
   reads no authorization parameter from its query.** Only `response_type=code` with an `S256`
   challenge is accepted; the validated request (client, redirect URI, state, response mode,
-  challenge; the nonce sits beside it in the session) is stored in the session, and `sign_in`
-  issues the code for exactly that request. The handler has no `Query` extractor: the login page
+  challenge, scope, nonce) is stored in the session as one value, and `sign_in` issues the code
+  for exactly that request; a session the previous build stored, with the scope and the nonce
+  beside the request, is read into it. The handler has no `Query` extractor: the login page
   still appends the parameters to its `/sign_in` link, `encodeURI`-encoded and therefore altered
   for some values, and they are never parsed. A session without a bound request (older build) is
   refused; `/token` refuses a code without a challenge. `authorize` percent-encodes every value
@@ -310,7 +311,9 @@ doc; read it before changing the code the rule covers.
   `discovery_advertises_only_the_code_response_type`; unit:
   `sign_in_issues_the_code_for_the_bound_request`,
   `authorize_hands_the_login_page_the_exact_values`, `a_session_without_a_bound_request_is_refused`,
-  `authorize_binds_the_request_to_the_session`.
+  `authorize_binds_the_request_to_the_session`,
+  `a_previous_build_session_reads_its_scope_and_nonce_into_the_request`,
+  `a_session_the_previous_build_bound_issues_its_code_with_its_scope_and_nonce`.
 - **Redirect URIs match the registration exactly**, query included (RFC 9700 §4.1.3), through
   the one helper `oidc::redirect_uri_is_registered` used by `authorize` and `sign_in`. Pin:
   `redirect_uri_matching_is_exact`, `redirect_uris_match_the_registration_exactly` (mock stack).
@@ -376,13 +379,40 @@ doc; read it before changing the code the rule covers.
   `concurrent_refreshes_at_the_matrix_endpoint_converge_on_one_pair` (mock stack),
   `concurrent_rotations_of_one_token_converge_on_one_pair`,
   `the_current_refresh_token_rotates_into_a_new_pair`.
-- **No token is stored** (I1 for tokens). Access tokens are keyed by their SHA-256 digest
-  (`at/{digest}`), refresh tokens are kept as digests in their grant, and the successor pair of a
-  rotation is sealed under the previous refresh token (`db::seal`); no key or value written by
-  the server holds a token, its body, or a refresh token's handle or secret. Legacy `token/{raw}`
-  entries are read, never written. Pin: `no_token_the_client_holds_is_stored_in_the_clear`
-  (mock stack, scans the whole stack Redis), `legacy_tokens_keep_working_after_the_upgrade` (the
-  same scan after a lift), `a_wrong_token_cannot_open_the_successor`,
+- **No credential a client holds is stored in the clear** (I1): tokens, authorization codes,
+  device and user codes, session identifiers (the login `session` cookie, the WebAuthn,
+  account re-auth and device-approval ceremony ids), server-issued CAIP-122 nonces, client
+  secrets and registration access tokens. Each appears in a key or value only as its SHA-256
+  (`db::tokens::digest`); access tokens are keyed `at/{digest}`, refresh tokens are kept as
+  digests in their grant, and the successor pair of a rotation is sealed under the previous
+  refresh token (`db::seal`); no key or value holds a token, its body, or a refresh token's
+  handle or secret. A client entry keeps the digests of its secret and registration access token
+  (`ClientEntry::secret_matches` / `access_token_matches` compare digests in constant time, on
+  every path: code exchange, refresh grant, `/client/{id}`), and `default_clients` are written
+  digested. Each digest-keyed prefix, and the client entry's member names, differ from what an
+  earlier build wrote, so a stored digest presented as a credential matches nothing; do not
+  "unify" them. Entries an earlier build wrote are read for their remaining lifetime and used
+  once: `token/{raw}` (lifted), `codes/`, `sessions/`, `device_codes/`, `user_codes/`,
+  `caip122_nonce/`, `webauthn:challenge/`, `webauthn:link_challenge/`, and a plaintext client entry,
+  upgraded atomically on first read without losing a field (marked
+  `TODO(remove one release after Phase 2b)`; plaintext clients live 30 days). Accepted deploy
+  residue: the previous build's consumed device-approval nonce keeps its user code for up to
+  300 s after an upgrade. Not covered: the `siwx_user` and `acct_session` cookies (Phase 4 of
+  the token rework moves them), and passkey credential ids (`webauthn:credential/{id}`,
+  `webauthn:link/{id}`), which are public identifiers the server hands out in
+  `allowCredentials`, not bearer credentials. Pin (mock stack, each scans the whole stack Redis):
+  `no_token_the_client_holds_is_stored_in_the_clear`,
+  `no_code_or_session_the_client_holds_is_stored_in_the_clear`,
+  `no_client_secret_or_registration_token_is_stored_in_the_clear`,
+  `legacy_tokens_keep_working_after_the_upgrade`, `in_flight_codes_and_sessions_survive_the_upgrade`;
+  unit: `a_stored_digest_presented_as_a_code_is_not_a_code`,
+  `a_stored_digest_presented_as_a_credential_matches_nothing`,
+  `every_client_authentication_compares_digests_of_what_is_presented`,
+  `concurrent_first_reads_of_a_plaintext_client_all_authenticate_and_leave_one_digested_entry`,
+  `an_upgrade_never_overwrites_an_entry_that_changed_since_it_was_read`,
+  `default_clients_are_stored_only_as_digests_and_authenticate`,
+  `device_and_user_codes_are_stored_only_as_digests`, `ceremony_state_is_digest_keyed_and_taken_once`,
+  `caip122_nonces_are_stored_by_digest_and_used_once`, `a_wrong_token_cannot_open_the_successor`,
   `the_sealed_value_names_neither_token_and_is_fresh_each_time`,
   `malformed_refresh_tokens_are_unknown_never_a_panic`.
 - **Reuse is recognised and logged, never silently accepted** (I5, phase A). A refresh token whose

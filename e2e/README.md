@@ -42,7 +42,9 @@ whatever ports you brought the stack up on. `e2e_race_teardown` also searches
 the stack's Redis for tokens stored in the clear
 (`no_token_the_client_holds_is_stored_in_the_clear`) and for codes, device and
 user codes, session and ceremony ids and nonces stored in the clear
-(`no_code_or_session_the_client_holds_is_stored_in_the_clear`); they read `E2E_REDIS_URL`,
+(`no_code_or_session_the_client_holds_is_stored_in_the_clear`) and for client secrets and
+registration access tokens stored in the clear
+(`no_client_secret_or_registration_token_is_stored_in_the_clear`); they read `E2E_REDIS_URL`,
 else `SIWXOIDC_REDIS_URL`, `SIWEOIDC_REDIS_URL` (set by `env.sh`) or
 `REDIS_HOST`/`REDIS_PORT`, and skips loudly without one (a failure under
 `E2E_STRICT_SKIPS=1`):

@@ -151,19 +151,22 @@ All state lives in one Redis (`redis_url`). Prefixes are defined in `src/db/mod.
 `src/db/grant.rs`, `src/webauthn.rs` and `src/account.rs`.
 
 A credential a client holds (a token, an authorization code, a device or user code, a login
-session id, a ceremony id, a server-issued nonce) appears in a key or value only as its
-lowercase hex SHA-256 (`db::tokens::digest`). Each digest-keyed prefix differs from the raw-keyed
-one an earlier build used, which the server still reads, and uses once, for the entry's remaining
-lifetime: a client presenting a stored digest as its credential reads a raw-keyed prefix nothing
-writes. The `siwx_user` and `acct_session` cookies are still raw keys.
+session id, a ceremony id, a server-issued nonce, a client secret, a registration access token)
+appears in a key or value only as its lowercase hex SHA-256 (`db::tokens::digest`). Each
+digest-keyed prefix differs from the raw-keyed one an earlier build used, which the server still
+reads, and uses once, for the entry's remaining lifetime: a client presenting a stored digest as
+its credential reads a raw-keyed prefix nothing writes. A client entry keeps its key and stores
+its two credentials under member names an earlier build did not use, for the same reason. The
+`siwx_user` and `acct_session` cookies are still raw keys. Passkey credential ids are keys too:
+they are public identifiers the server hands out in `allowCredentials`, not credentials.
 
 | Key | TTL | Holds |
 |---|---|---|
-| `session/{sha256(id)}` | 300 s | `SessionEntry`: nonces, `verified_did`, sign-in count, and the authorization request `/authorize` bound to it (client, redirect URI, state, response mode, PKCE challenge) |
+| `session/{sha256(id)}` | 300 s | `SessionEntry`: the CAIP-122 nonce, `verified_did`, sign-in count, and the authorization request `/authorize` bound to it (client, redirect URI, state, response mode, PKCE challenge, scope, OIDC nonce) |
 | `session/{sha256(id)}/signed_in` | 300 s | one-shot flag against double sign-in |
 | `code/{sha256(code)}` | 300 s | `CodeEntry` (DID, client, PKCE challenge, device id, localpart, requested scope); read and deleted in one atomic step on exchange |
-| `sessions/{id}` (+ `/signed_in`), `codes/{code}` (+ `/consumed`) | 300 s | legacy: written by builds before digest keys and read until they expire. A legacy session moves to its digest key on its first write; a legacy signed-in flag still counts; a legacy code is consumed like a new one, unless a `/consumed` marker (left by older builds, which kept exchanged codes) exists |
-| `clients/{client_id}` | 30 d | `ClientEntry` (secret, metadata); `default_clients` are rewritten at every start |
+| `sessions/{id}` (+ `/signed_in`), `codes/{code}` (+ `/consumed`) | 300 s | legacy: written by builds before digest keys and read until they expire. A legacy session moves to its digest key on its first write; a legacy signed-in flag still counts; a legacy code is consumed like a new one, unless a `/consumed` marker (left by older builds, which kept exchanged codes) exists. A legacy session holds the scope and the OIDC nonce beside its request; they are read into it |
+| `clients/{client_id}` | 30 d | `ClientEntry`: metadata and the digests of the client secret and the registration access token (`secret_digest`, `access_token_digest`); `default_clients` are rewritten, digested, at every start. An entry an earlier build wrote (`secret`, `access_token` in the clear) authenticates as it is and is replaced by its digest-only form, keeping its expiry, on its first read |
 | `grant/{sha256(handle)}` | 90 d after the last rotation; a grant with no refresh token lives as long as its access token | the grant (`src/db/grant.rs`): kind, owner, client, device id, scope, generation, digests of the current and previous refresh token, whether the successor is used, and the sealed successor pair while it is unused. No token is stored |
 | `at/{sha256(access token)}` | the token's lifetime: 300 s, admin 30–900 s | grant id, generation, kind, `iat`, `exp` |
 | `idx:grants:user/{username}`, `idx:grants:user_device/{username}/{device_id}` | the longest grant TTL written | SETs of grant ids, for atomic revocation |

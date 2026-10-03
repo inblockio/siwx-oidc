@@ -55,7 +55,7 @@ Injected JS shims in Element Web (`siwx-gate.js`, `siwx-redirect.js`):
 **`src/oidc.rs:authorize`**
 
 - Validates `client_id`, `redirect_uri`, requires `state` and `openid` scope
-- Creates `SessionEntry` in Redis (300s TTL): `{ siwe_nonce, oidc_nonce, signin_count: 0, verified_did: None }`
+- Creates `SessionEntry` in Redis (300s TTL, keyed by the digest of the session id): `{ siwe_nonce, signin_count: 0, verified_did: None, request }`, where `request` is the validated authorization request (client, redirect URI, state, response mode, PKCE challenge, scope, OIDC nonce)
 - Sets `session` cookie (HttpOnly, SameSite=Strict)
 - Redirects to login page with `nonce`, `domain`, `redirect_uri`, `state`, `client_id`, PKCE params
 
