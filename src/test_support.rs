@@ -143,6 +143,25 @@ impl LogCapture {
     /// Start capturing (spans included, so a field a span carries shows up on
     /// every event inside it).
     pub fn start() -> Self {
+        // A second dispatcher, registered for the life of the process and
+        // writing nowhere. tracing-core caches per callsite whether anyone
+        // wants it, and while exactly one dispatcher exists it asks only the
+        // dispatcher of the thread that first reaches the callsite. With the
+        // capture as that one dispatcher, a callsite first hit on a thread that
+        // has no capture is cached as "never", and the capturing thread then
+        // loses every event from it: a log assertion failed about every other
+        // run of the unit tests. With two registered, tracing-core asks every
+        // dispatcher, and this one enables DEBUG, so the callsite stays on.
+        // Pin: `tests/log_capture_callsite_interest.rs`.
+        static KEEP: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        KEEP.get_or_init(|| {
+            tracing::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::DEBUG)
+                    .with_writer(std::io::sink)
+                    .finish(),
+            )
+        });
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
