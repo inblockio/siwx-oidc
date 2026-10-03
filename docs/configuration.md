@@ -136,7 +136,7 @@ my-app = '{"secret":"change-me","metadata":{"redirect_uris":["https://app.exampl
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
 | `grant_absolute_lifetime_secs` | `SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS` | none: no cap | Absolute lifetime of every grant, in seconds, counted from the authentication (the sign-in or the device approval). Past it the refresh token and every access token of the grant are refused, however recently it was refreshed. At least 1800. |
-| `grant_absolute_lifetime_secs_by_client` | `SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS_BY_CLIENT__<client id>` | none | Map of client id to seconds, the same cap for one client. A grant gets the smallest value that applies to its client, so a per-client value can shorten the global one, never lengthen it. At least 1800. |
+| `grant_absolute_lifetime_secs_by_client` | `SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS_BY_CLIENT__<client id>` | none | Map of client id to seconds, the same cap for one client. A per-client value overrides the global one for that client, longer or shorter, so a client (say Element) can get a longer cap than a short global default. At least 1800. |
 
 With neither set, lifetimes are as before: an access token lives 300 s and a grant ends 90 days
 after its last refresh. With a cap, a grant also ends at its authentication plus the cap, and no
@@ -147,7 +147,8 @@ grant issued while no cap applied counts from its authentication once one is con
 of it runs on the Redis clock, so instances with skewed clocks agree. A value below 1800 s (a
 device code's lifetime) is refused at startup: it could refuse a grant before its first token.
 
-These defaults are provisional (decision D1 in the token lifecycle design). Weigh the cost for
+These defaults, and the rule that a per-client value overrides the global one rather than only
+shortening it, are provisional (decision D1 in the token lifecycle design). Weigh the cost for
 Matrix clients before setting a short cap: when a grant ends, Element signs out, and signing in
 again usually creates a new device, which must be verified again and restore its key backup.
 Agents that hold their own key (`siwx-oidc-auth`) re-authenticate without a person, so a short

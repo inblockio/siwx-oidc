@@ -65,8 +65,12 @@ async fn ttl(client: &RedisClient, key: &str) -> i64 {
     raw(client, &["TTL", key]).await
 }
 
+/// The cap of a grant is its client's operator value when one is set, else
+/// the global default (D1, provisional): a per-client value replaces the
+/// global one, longer or shorter, so an operator can give one client (say
+/// Element) a longer cap than a short global default.
 #[test]
-fn the_cap_is_the_smallest_value_that_applies_to_the_client() {
+fn a_per_client_cap_overrides_the_global_default() {
     assert_eq!(GrantLifetime::default().cap_for("a"), None);
     let global = GrantLifetime {
         global_secs: Some(7_200),
@@ -86,13 +90,13 @@ fn the_cap_is_the_smallest_value_that_applies_to_the_client() {
             ("b".to_string(), 10_800),
         ])),
     };
-    assert_eq!(both.cap_for("a"), Some(3_600));
+    assert_eq!(both.cap_for("a"), Some(3_600), "a shorter per-client value");
     assert_eq!(
         both.cap_for("b"),
-        Some(7_200),
-        "a per-client value never lengthens the global cap"
+        Some(10_800),
+        "a longer per-client value replaces the global default"
     );
-    assert_eq!(both.cap_for("c"), Some(7_200));
+    assert_eq!(both.cap_for("c"), Some(7_200), "the global default");
 }
 
 /// The access token's `exp` is the earlier of its own lifetime and the

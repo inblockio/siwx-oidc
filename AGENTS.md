@@ -381,8 +381,9 @@ doc; read it before changing the code the rule covers.
   `the_current_refresh_token_rotates_into_a_new_pair`.
 - **A grant's absolute expiry is fixed at the authentication, only moves earlier, and runs on
   Redis `TIME`** (I6). With a cap configured (`grant_absolute_lifetime_secs`, the per-client map;
-  unset by default, D1 provisional) a grant gets `absolute_exp` = `auth_time` + the smallest cap
-  that applies to its client when it is issued or lifted. The rotation script recomputes
+  unset by default, D1 provisional) a grant gets `absolute_exp` = `auth_time` + its client's cap
+  when it is issued or lifted: the client's per-client value when one is set (longer or shorter),
+  else the global default (provisional, maintainers to confirm). The rotation script recomputes
   min(`absolute_exp`, `auth_time` + the cap now configured), refuses and deletes the grant past
   it like an inactive one, and writes it back; so a lowered cap applies at the next rotation and
   nothing extends it. No access token's `exp` (nor the TTL of its entry or of the grant) passes
@@ -396,7 +397,7 @@ doc; read it before changing the code the rule covers.
   `a_grant_written_without_a_cap_is_capped_from_its_auth_time`,
   `a_lowered_cap_applies_at_the_next_rotation_and_a_raised_one_never_extends`,
   `a_lifted_grant_counts_its_cap_from_the_legacy_issue_time`,
-  `the_cap_is_the_smallest_value_that_applies_to_the_client`,
+  `a_per_client_cap_overrides_the_global_default`,
   `a_device_grant_counts_its_lifetime_from_the_approval`,
   `an_absolute_grant_lifetime_shorter_than_a_device_code_is_refused`.
 - **No credential a client holds is stored in the clear** (I1): tokens, authorization codes,

@@ -242,8 +242,8 @@ pub struct Config {
     /// Env: `SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS`
     #[serde(default)]
     pub grant_absolute_lifetime_secs: Option<u64>,
-    /// The same per client id, which can only shorten the global value: a
-    /// grant gets the smallest value that applies to its client.
+    /// The same per client id, overriding the global value for that client,
+    /// longer or shorter (D1, provisional).
     /// Env: `SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS_BY_CLIENT__<client id>`
     #[serde(default)]
     pub grant_absolute_lifetime_secs_by_client: HashMap<String, u64>,
@@ -684,8 +684,8 @@ mod tests {
             assert_eq!(lifetime.cap_for("alpha"), Some(3_600));
             assert_eq!(
                 lifetime.cap_for("beta"),
-                Some(86_400),
-                "a per-client value never lengthens the global one"
+                Some(172_800),
+                "a per-client value overrides the global one"
             );
             assert_eq!(lifetime.cap_for("gamma"), Some(86_400));
             jail.set_env("SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS", 7_200);

@@ -214,8 +214,9 @@ fn legacy_token_key(token: &str) -> String {
 /// The operator's absolute-lifetime caps, in seconds (I6; decision D1,
 /// provisional): one global value and one per client id, both unset by
 /// default, which caps nothing (a grant then ends only by inactivity). The
-/// cap of a grant is the smallest value that applies to its client, so a
-/// per-client value can shorten the global cap, never lengthen it.
+/// cap of a grant is its client's value when one is set, else the global
+/// default: a per-client value overrides the global one, longer or shorter
+/// (design 5.5: "per-client setting with a global default").
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GrantLifetime {
     pub global_secs: Option<u64>,
@@ -225,13 +226,10 @@ pub struct GrantLifetime {
 impl GrantLifetime {
     /// The cap for a grant of `client_id`, `None` when no value applies.
     pub fn cap_for(&self, client_id: &str) -> Option<u64> {
-        [
-            self.per_client_secs.get(client_id).copied(),
-            self.global_secs,
-        ]
-        .into_iter()
-        .flatten()
-        .min()
+        self.per_client_secs
+            .get(client_id)
+            .copied()
+            .or(self.global_secs)
     }
 
     /// Whether any cap is configured.
