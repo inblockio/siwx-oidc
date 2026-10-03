@@ -270,7 +270,8 @@ random strings.
 |---|---|---|
 | Access token prefix | `mat_` | none |
 | Refresh token prefix | `mcr_` | none |
-| Scope recorded | `openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}` | `openid profile` |
+| Refresh token issued | always | only for `offline_access`, to a client whose registration allows the `refresh_token` grant |
+| Scope recorded | `openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}` | the requested scopes among `openid`, `profile` and `offline_access`, as far as the client may have them (`openid` if none) |
 | Access token TTL | 300 s | 300 s |
 | Refresh token TTL | 7,776,000 s (90 days), renewed by each rotation | same |
 | ID token TTL | 300 s by default (`id_token_ttl_secs`) | same |
@@ -279,8 +280,19 @@ random strings.
 
 Minted admin tokens use the prefix `msa_`. Device codes use `dvc_`.
 
-The authorization-code grant records the Matrix scope above regardless of the
-scopes requested. Clients request the Matrix scopes in either the stable form
+In delegated-auth mode the authorization-code grant records the Matrix scope
+above regardless of the scopes requested, and always issues a refresh token. In
+standalone mode ("generic mode": no `mas_shared_secret`) it grants least
+privilege: the scope the request asked for, limited to `openid`, `profile` and
+`offline_access`, and a refresh token only when `offline_access` was requested and
+the client's registration allows the `refresh_token` grant (a registration that
+lists no `grant_types` allows it). When the granted scope differs from the
+request, the token response says so in `scope` (RFC 6749 §5.1). The requested scope
+travels from `/authorize` through the session into the stored code. A code
+written by the previous build has none, and is exchanged as it always was
+(`openid profile` and a refresh token) for the 300 s it lives.
+
+Clients request the Matrix scopes in either the stable form
 (`urn:matrix:client:api:*`, `urn:matrix:client:device:{id}`) or the MSC2967
 unstable form (`urn:matrix:org.matrix.msc2967.client:…`); both are advertised.
 
@@ -290,8 +302,9 @@ redirect URI must equal a registered one exactly, query included. `/authorize`
 binds the validated request (client, redirect URI, state, response mode, PKCE
 challenge) to the login session, and `/sign_in` issues the code for that
 request. `/sign_in` reads no authorization parameter from its query: the login
-page still appends them to its link, and they are ignored. A code is single use, is deleted when it is exchanged, and is redeemable
-only at `POST /token` with its verifier.
+page still appends them to its link, and they are ignored. A code is single use,
+is deleted when it is exchanged, and is redeemable only at `POST /token` with
+its verifier.
 
 ### Token kinds
 
@@ -333,13 +346,19 @@ token.
 2. `POST /token` with `grant_type=refresh_token` **rotates both**: a new access
    token, a new refresh token, and the old refresh token is deleted. The
    `device_id` and scope are carried over. The refresh response has no ID
-   token.
+   token. The refresh is bound to the client it was issued to, see
+   [Client binding](#client-binding).
 3. **Lost-response grace.** On a successful rotation, siwx-oidc records the old
    refresh token → the successor pair for `REFRESH_GRACE_TTL` (60 s). A client
    that lost the response (common on mobile) and retries with the old refresh
    token within that window receives the **same** successor pair instead of
-   `invalid_grant`. Nothing new is minted and the refresh lifetime does not
-   grow. The same mechanism applies to `POST /_matrix/client/v3/refresh`. See
+   `invalid_grant`, as long as that successor refresh token is still live: if
+   the client already rotated it, or it was revoked, the recorded pair is dead
+   and the replay is `invalid_grant`. Nothing new is minted and the refresh
+   lifetime does not grow. At `POST /token` the replay is also bound to the
+   client (see [Client binding](#client-binding)). `POST
+   /_matrix/client/v3/refresh` applies the same live-successor rule; it
+   carries no client identity, so it cannot bind the replay. See
    [the 2026-06-23 audit](audits/2026-06-23-elementx-refresh-rotation-signout.md).
 4. `POST /token` with the device-code grant provisions the Synapse device and
    issues tokens (see [below](#device-code-and-qr-login)).
@@ -350,6 +369,55 @@ A refresh is refused (`invalid_grant`, "Session has been revoked.") when the
 device was just signed out or the account just deactivated. Short-lived Redis
 tombstones (15 minutes) close the race between a refresh and a concurrent
 teardown.
+
+### Client binding
+
+An authorization code and a refresh token belong to the client they were issued
+to, and `POST /token` authenticates that client by one rule for both grants
+(`oidc::authenticate_client`):
+
+1. The client named in the request must be the grant's client, else
+   `invalid_grant`. It is named by `client_id` in the form or by the user name
+   of an `Authorization: Basic` header; when both are present they must agree
+   (else `invalid_request`).
+2. A secret the request presents (`client_secret` in the form, or the
+   `Authorization` password or Bearer value, which wins) must match the
+   registration, else `invalid_client`.
+3. A request that presents none must come from a public client: registered
+   with `token_endpoint_auth_method: none`, or with no method while
+   `SIWXOIDC_REQUIRE_SECRET` is off. Otherwise `invalid_client`
+   ("Secret required."). Element Web and Element X register as public clients and send
+   `client_id` on refresh.
+
+`invalid_client` is a 401 (RFC 6749 §5.2), with `WWW-Authenticate: Basic` when
+the request attempted Basic. It used to be a 400. The grace replay of a rotated
+token is bound the same way, to the client of the successor token it returns,
+and is refused once that successor is no longer live.
+
+Provisional choices, open for the maintainers:
+
+- **A registration without `grant_types` allows the refresh grant**, and a
+  generic-mode request that asks for no grantable scope is granted `openid`.
+- **A public client may omit `client_id` at the refresh grant.** `siwx-oidc-auth`
+  and the Matrix clients send it, an older agent may not; requiring it would
+  sign those out.
+- **A token outlives its client's registration.** A registration lasts 30 days
+  and a refresh token 90 days from its last use, so a session can outlast the
+  registration it was issued under. Such a token keeps refreshing when the
+  request names that client or none, and is refused when the request names
+  another client or presents a secret (which can no longer be checked). Refusing
+  it outright would sign out every session older than a registration.
+- **`POST /_matrix/client/v3/refresh` is not bound.** The Matrix client-server
+  API gives a refresh request no client identity, so that endpoint takes the
+  refresh token alone, and a confidential client's refresh token can be rotated
+  there without its secret. Closing that needs the grant to say which endpoints
+  may rotate it (plan section 8); until then the binding protects the OAuth
+  refresh grant only.
+
+An `Authorization` header at `/token` used to be answered with a 400 on every
+request (two header extractors rejecting each other's scheme), so
+`client_secret_basic` never worked. It is read now, and discovery advertises
+`client_secret_basic`, `client_secret_post` and `none`.
 
 ### Introspection never turns a storage error into a logout
 

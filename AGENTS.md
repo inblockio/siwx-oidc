@@ -34,7 +34,7 @@ everything else exists only in the binary crate.
 | `lib.rs` | Library crate root. `synapse_client` is deliberately not re-exported (see Invariants). |
 | `axum_lib.rs` | Startup: loads config through `config::figment()`, validates it (DID methods and pkh namespaces against the aqua-auth registries, signing key, retired keys, WebAuthn), `AppState`, the router, handler glue, the `siwx_user` / `acct_session` cookies, the CORS layer. |
 | `config.rs` | `Config`, its defaults, and `figment()`: the one place config names and precedence are defined. Reference: [docs/configuration.md](docs/configuration.md). |
-| `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants), `userinfo`, client registration, `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, and `provision_synapse_device`, the single provisioning and DID-publication path. |
+| `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_client` authenticates the client for the first two), `userinfo`, client registration, `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, and `provision_synapse_device`, the single provisioning and DID-publication path. |
 | `introspect.rs` | `POST /oauth2/introspect` (RFC 7662) for Synapse; opaque `mat_`/`mcr_` token generation. |
 | `admin_token.rs` | `POST /oauth2/admin_token`: short-TTL token whose scope carries `urn:synapse:admin:*`. |
 | `compat.rs` | `POST /oauth2/revoke` (RFC 7009) and the Matrix client-server endpoints siwx-oidc answers (login flows, logout, logout/all, refresh, device deletion); `TeardownPolicy`. |
@@ -46,6 +46,7 @@ everything else exists only in the binary crate.
 | `resolve.rs` | `GET /resolve`, the public DID↔MXID lookup. |
 | `localpart.rs` | Grandfathering policy: `resolve_identity` (fallible) and `resolve_identity_or_legacy` (fail-safe to legacy). |
 | `mxid.rs` (lib) | Pure localpart derivation: `localpart_for`, `legacy_localpart`, `canonicalize`. `sha2` only. |
+| `redact.rs` (lib) | `fingerprint`, `redact_key`, `redact_url`: what a log line may say about a credential. |
 | `alias.rs` (lib) | `alias_for(did)`: the generated `Firstname Surname` a new account is seeded with. |
 | `credential_identity.rs` (lib) | Which identity a stored passkey authenticates: a `webauthn:link/*` entry overrides the derived `did:key`. |
 | `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL`. |
@@ -91,9 +92,11 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 16 tests in seven files:
-  `openapi_covers_every_route` (2), `localpart_vectors` (1) and `graceful_shutdown` (3), which
-  need nothing; `account_linking_dual_write` (6), which needs the test Redis;
+  `cargo test --workspace` runs the unit tests of both crates plus 22 tests in ten files:
+  `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (3),
+  `log_hygiene_credential_store` (1) and `log_capture_callsite_interest` (1), which
+  need nothing; `account_linking_dual_write` (6), which needs the test Redis, and `log_hygiene`
+  (4, one of them needs it);
   `credential_migration_live` (2), which needs its own disposable, empty Redis named by
   `MIGRATION_TEST_REDIS_URL`; and the pure check `an_absent_strict_skips_variable_means_strict`
   in `e2e_account_lifecycle_live` and in `e2e_did_field_live` (1 each).
@@ -104,6 +107,9 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   CI sets both. Use the helper in any new Redis-backed test: `RedisClient::new` never connects
   (bb8 builds the pool with `min_idle` 0), so a `RedisClient::new(..).ok()` guard never skips,
   and without Redis the test fails after bb8's 30-second timeout.
+- **Tests that pin what is logged** use `siwx_oidc::test_support::LogCapture`, which records the
+  calling thread's log output at debug level (use it in a current-thread `#[tokio::test]`). The
+  checks that apply to every log site live in `tests/log_hygiene.rs`.
 - **Mock stack:** `e2e/up.sh` / `e2e/down.sh` start Redis, `e2e/synapse_mock.py` and siwx-oidc
   in podman; `bash e2e/run-all.sh` runs everything. See [e2e/README.md](e2e/README.md).
   `--test-threads=1` is required: the suites share one stack and reset the mock.
@@ -310,11 +316,80 @@ doc; read it before changing the code the rule covers.
   codes. Pin: `a_consumed_code_leaves_no_entry`,
   `concurrent_consumers_of_one_code_have_exactly_one_winner`, `userinfo_accepts_only_an_access_token`,
   `an_authorization_code_is_never_a_bearer_token` (mock stack).
+- **Discovery advertises only what is implemented.** `subject_types_supported` is `["public"]`
+  because the `sub` is the user's DID, identical for every client; advertising `pairwise` would
+  promise a per-client identifier. `scopes_supported` lists `offline_access` because generic mode
+  honours it (next bullet). Pin: `discovery_advertises_public_subjects_only`,
+  `discovery_advertises_offline_access`; the response types are pinned by
+  `discovery_advertises_only_the_code_response_type`, and the client authentication methods
+  (`client_secret_basic`, `client_secret_post`, `none`: what `POST /token` reads) by
+  `discovery_advertises_every_client_authentication_method_the_token_endpoint_accepts`.
+- **Generic mode issues a refresh token only for `offline_access`, and the scope it records is
+  the one requested and granted** (I10). Generic mode is a deployment with no
+  `mas_shared_secret`. The code exchange grants the requested scopes among `openid`, `profile`
+  and `offline_access`, issues a refresh token only when `offline_access` was requested and the
+  client's registration allows the `refresh_token` grant, and says the granted scope in the
+  response when it differs from the request. The request's scope travels `/authorize` → session →
+  `CodeEntry.scope`; a code written by the previous build has none and is exchanged as it always
+  was for its 300 s. **Matrix mode is untouched**: the Matrix scope for the device and a refresh
+  token whatever was requested, because Synapse and the Matrix clients depend on exactly that.
+  Provisional: a registration without `grant_types` allows the refresh grant; a request that asks
+  for nothing grantable is granted `openid`. Pin: `generic_mode_issues_a_refresh_token_only_for_offline_access`,
+  `generic_mode_grants_offline_access_only_to_a_client_that_may_refresh`,
+  `generic_mode_issues_the_scope_that_was_requested_and_supported`,
+  `the_generic_grant_follows_the_request_and_the_registration`,
+  `generic_mode_exchanges_a_code_with_no_recorded_scope_as_before`,
+  `matrix_mode_issues_the_matrix_scope_and_a_refresh_token_whatever_was_requested`,
+  `sign_in_issues_the_code_for_the_bound_request` (the scope reaches the code),
+  `a_code_written_before_the_scope_travelled_has_none`.
+- **The headless client asks for what it relies on, in every flow.** `siwx-oidc-auth` requests
+  `offline_access` (it refreshes, and a generic-mode server issues a refresh token only for it)
+  and `urn:matrix:client:api:*` (its access token is used against the Matrix client-server API)
+  in the code flow, with or without a proposed device, and in the device flow. A server ignores a
+  scope it has no use for, so the request is harmless against any deployment, including 3547bd2.
+  It must not be trimmed back to `openid profile`: an agent built that way gets no refresh token
+  from a generic-mode server. Pin: `every_flow_asks_for_offline_access_and_the_matrix_api`,
+  `build_scope_none_asks_for_what_the_client_relies_on`, `build_scope_some_requests_stable_device`,
+  and on the wire `the_code_flow_sends_the_scope_it_relies_on`,
+  `the_device_flow_sends_the_scope_it_relies_on`.
 - **An empty `device_id` is JSON `null` on the wire, never `""`.** Synapse rejects `""`. Pin:
   `empty_device_id_renders_as_json_null`, `deviceless_token_body_carries_device_id_null`.
-- **Refresh rotation keeps a 60 s grace pointer**: any replay of the old refresh token within
-  60 s returns the same successor pair, so a client that lost the response recovers. Pin:
-  `refresh_grace_window_tolerates_replay` (mock stack).
+- **Refresh rotation keeps a 60 s grace pointer**: within 60 s a replay of the old refresh token
+  returns the same successor pair, so a client that lost the response recovers, but only while the
+  successor refresh token is still live. Once the successor was rotated away or revoked, the
+  recorded pair is dead and the replay is `invalid_grant` at `/token` and `M_UNKNOWN_TOKEN` at
+  `/_matrix/client/v3/refresh`. At `/token` the replay is also bound to the client (next
+  invariant); the Matrix endpoint carries no client and cannot bind it. Pin:
+  `refresh_grace_window_tolerates_replay` (mock stack),
+  `a_replay_whose_successor_has_been_rotated_or_revoked_is_refused`,
+  `the_grace_replay_is_bound_to_the_client_too`, `a_matrix_refresh_replay_needs_its_successor_live`.
+- **A refresh token is bound to the client it was issued to, through the one helper the code
+  exchange uses too.** `oidc::authenticate_client` serves both grants, so they cannot drift: a
+  request that names another client (`client_id` in the form or the Basic user name) is
+  `invalid_grant`; a confidential client (registered `token_endpoint_auth_method` other than
+  `none`, or none while `require_secret`) must present its secret, else `invalid_client`, a 401
+  (RFC 6749 §5.2, with `WWW-Authenticate: Basic` after a Basic attempt). The grace replay is bound
+  to the successor token's client. Provisional, recorded in docs/matrix-integration.md: a public
+  client may omit `client_id`; a token whose client registration has expired (30 days against 90)
+  keeps refreshing unless the request names another client or presents a secret;
+  `POST /_matrix/client/v3/refresh` carries no client identity and is not bound. Read the
+  `Authorization` header with `HeaderMap::typed_get`, never as two typed-header extractors, which
+  reject each other's scheme and turn every request that has the header into a 400. A Basic user
+  name and password are form-urldecoded before they are compared (RFC 6749 §2.3.1: a secret with
+  a space, `+` or `%` arrives escaped); a Bearer token is taken as sent. Pin: unit
+  `a_refresh_token_is_refused_to_a_client_it_was_not_issued_to`,
+  `a_confidential_client_must_authenticate_to_refresh`,
+  `a_public_client_refreshes_with_or_without_naming_itself`,
+  `an_unset_authentication_method_follows_require_secret`,
+  `a_token_outlives_its_clients_registration_but_not_its_binding`,
+  `the_grace_replay_is_bound_to_the_client_too`, `a_basic_header_names_the_client_like_the_form_does`,
+  `basic_credentials_are_form_urldecoded_before_they_are_compared`,
+  `a_plain_basic_secret_and_a_bearer_token_are_taken_as_sent`,
+  `the_code_exchange_and_the_refresh_grant_authenticate_clients_identically`,
+  `invalid_client_is_a_401_and_every_other_token_error_a_400`; mock stack:
+  `a_refresh_token_is_refused_to_another_client`, `a_confidential_client_must_authenticate_to_refresh`,
+  `a_public_client_refreshes_without_client_credentials`,
+  `a_basic_authorization_header_authenticates_the_code_exchange`.
 - **Never infer token validity from Synapse**: it caches introspection for two minutes. Our
   introspection answer is the authority.
 - **No device-id recycling.** Sign-in upserts a fresh `SIWX_…` id and never deletes. Pin:
@@ -424,6 +499,27 @@ structured output.
 | `debug!` | Internal detail (Redis key operations, token metadata, ENS attempts) |
 
 - Never log secrets, tokens, cookies or key material. Log a public-key fingerprint or `kid`.
+- **Logs carry fingerprints of credentials, never the values.** A log site that would name an
+  access or refresh token, authorization code, device code, user code, session id, cookie,
+  client secret, registration access token or passkey credential id, directly or inside a Redis
+  key, names `redact::fingerprint(..)` of it (`redact_key(..)` for a `namespace/identifier` key,
+  `redact_url(..)` for a URL that carries a password). The fingerprint is the first eight hex
+  characters of the SHA-256, so an operator can compute it for a value they hold; it is kept
+  short because a user code has about 34 bits of entropy. Request logging records method and
+  path, never the query, and that holds for the span too: tower-http's default span prints the
+  whole URI in front of every debug line. A struct that holds a credential prints its fingerprint
+  under `Debug` (`RotatedToken`, `DeviceCodeEntry`). Pin:
+  `the_redis_code_and_token_paths_log_fingerprints_never_values`,
+  `a_struct_that_holds_a_credential_prints_its_fingerprint_under_debug`,
+  `no_log_site_names_a_credential_without_its_fingerprint` (a scan of every log macro in `src/`,
+  which covers the sites no test reaches),
+  `the_device_flow_logs_fingerprints_never_its_codes`,
+  `a_device_poll_that_loses_the_claim_logs_the_code_only_as_a_fingerprint`,
+  `the_ceremony_starts_log_session_ids_only_as_fingerprints`,
+  `request_logging_names_the_path_and_never_the_query`,
+  `the_boot_check_never_prints_the_redis_password`. A new log site that names a credential
+  variable fails the scan; add the variable name to `CREDENTIAL_NAMES` in `tests/log_hygiene.rs`
+  when you introduce a new kind of credential.
 - Use structured fields (`info!(did = %did, "sign_in success")`), not string interpolation.
 - Log errors at the boundary (`CustomError::into_response`). Modules that bypass `CustomError`
   (`introspect`, `compat`, `resolve`) log their own errors.

@@ -112,7 +112,7 @@ abused, leave it out of the list and let its proofs fail; the next sign-in re-as
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
 | `default_clients` | `SIWXOIDC_DEFAULT_CLIENTS` | none | Map of client id to a JSON client entry, written to Redis at every start. |
-| `require_secret` | `SIWXOIDC_REQUIRE_SECRET` | `true` | Whether `POST /token` demands a client secret from a client whose metadata names no `token_endpoint_auth_method`. A client registered with `"none"` never needs one. |
+| `require_secret` | `SIWXOIDC_REQUIRE_SECRET` | `true` | Whether `POST /token` demands a client secret, at the code exchange and at the refresh grant alike, from a client whose metadata names no `token_endpoint_auth_method`. A client registered with `"none"` never needs one. |
 
 A client entry is `{"secret": "…", "metadata": {…}}`, where `metadata` is RFC 7591 client
 metadata (at least `redirect_uris`). Clients can also register themselves through
@@ -190,7 +190,11 @@ Logs go to stdout through `tracing`. `RUST_LOG` sets the filter (default
 `siwx_oidc=info,tower_http=info,warn`; for example `RUST_LOG=siwx_oidc=debug,tower_http=debug`).
 `SIWXOIDC_LOG_FORMAT=json` switches to one JSON object per line for log aggregation. Secrets,
 tokens and key material are never logged; the signing key appears only as its `kid` (and, for
-a generated key, a public-key fingerprint).
+a generated key, a public-key fingerprint). A credential that a log line has to refer to (a
+token, authorization code, device code, user code, session id, passkey credential id) appears
+as a fingerprint, the first eight hex characters of its SHA-256, which you can compute for a
+value you hold to find the lines about it: `printf %s "$value" | sha256sum | cut -c1-8`. A
+request is logged by method and path, never by query.
 
 ## Running locally
 

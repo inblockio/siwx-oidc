@@ -484,6 +484,33 @@ pub async fn delete_devices(
 
 // -- POST /_matrix/client/v3/refresh ------------------------------------------
 
+/// 503 for a token-store fault during a refresh: retryable, never `M_UNKNOWN_TOKEN`.
+fn token_store_unavailable() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "errcode": "M_UNKNOWN",
+            "error": "Token store temporarily unavailable; retry"
+        })),
+    )
+}
+
+/// `POST /_matrix/client/v3/refresh` (MSC2918): rotate a refresh token.
+///
+/// **Not bound to a client.** The OAuth refresh grant (`oidc::token_refresh`)
+/// checks that the request comes from the client the token was issued to and
+/// authenticates a confidential one (I7). The Matrix client-server API gives
+/// this request no client identity to check (the body is the refresh token and
+/// nothing else), so this endpoint takes the token alone. The consequence: a
+/// confidential client's refresh token can be rotated here without its secret.
+/// Matrix clients are public clients, so nothing legitimate is affected, but the
+/// binding protects only the OAuth grant until this endpoint is restricted to
+/// the tokens that belong to Matrix devices (plan section 8). Do not "fix" it by
+/// demanding a client here: no Matrix client can send one.
+///
+/// The grace replay of a just-rotated token is handed out only while the
+/// successor refresh token is live (the rule `POST /token` applies as well, minus
+/// the client binding).
 pub async fn refresh(
     State(state): State<CompatState>,
     Json(body): Json<RefreshRequest>,
@@ -502,21 +529,41 @@ pub async fn refresh(
             // Grace replay (lost-response recovery): mirror oidc::token_refresh. A
             // just-rotated refresh token is deleted but its successor is recorded
             // under a short grace window; a client that lost the rotation response
-            // can replay the old token once and recover instead of being logged out.
-            if let Ok(Some(succ)) = state
+            // can replay the old token and recover instead of being logged out.
+            // The recorded pair is handed out only while the successor refresh
+            // token is live: once it has been rotated away or revoked, the pair is
+            // dead and the replay is an unknown token, as at `POST /token`. (That
+            // endpoint also binds the replay to the client; this one cannot.)
+            let replay = match state
                 .redis_client
                 .get_rotated_token(&body.refresh_token)
                 .await
             {
-                let expires_in = (succ.access_exp - Utc::now().timestamp()).max(0) as u64;
-                return (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "access_token": succ.access_token,
-                        "expires_in_ms": expires_in * 1000,
-                        "refresh_token": succ.refresh_token,
-                    })),
-                );
+                Ok(Some(succ)) => state
+                    .redis_client
+                    .get_token(&succ.refresh_token)
+                    .await
+                    .map(|m| m.filter(|m| m.is_kind(TokenKind::Refresh)).map(|_| succ)),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            };
+            match replay {
+                Ok(Some(succ)) => {
+                    let expires_in = (succ.access_exp - Utc::now().timestamp()).max(0) as u64;
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "access_token": succ.access_token,
+                            "expires_in_ms": expires_in * 1000,
+                            "refresh_token": succ.refresh_token,
+                        })),
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(error = %e, "refresh: grace lookup failed (infrastructure); returning retryable 503");
+                    return token_store_unavailable();
+                }
             }
             return (
                 StatusCode::UNAUTHORIZED,
@@ -533,13 +580,7 @@ pub async fn refresh(
             // reporting a Redis error that way would turn a transient fault into
             // permanent session and cryptographic-identity loss. 503 is retryable.
             warn!(error = %e, "refresh: token lookup failed (infrastructure); returning retryable 503");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "errcode": "M_UNKNOWN",
-                    "error": "Token store temporarily unavailable; retry"
-                })),
-            );
+            return token_store_unavailable();
         }
     };
 
@@ -948,6 +989,89 @@ mod tests {
         );
         client.delete_token(&access).await.ok();
         client.delete_token(&refresh).await.ok();
+    }
+
+    /// `POST /_matrix/client/v3/refresh` with a refresh token: status and JSON body.
+    async fn matrix_refresh(state: &CompatState, token: &str) -> (StatusCode, serde_json::Value) {
+        let response = refresh(
+            State(state.clone()),
+            Json(RefreshRequest {
+                refresh_token: token.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// The Matrix endpoint's grace replay follows the rule of the OAuth grant: it
+    /// returns the recorded successor pair only while the successor refresh token
+    /// is live. After the successor was rotated away or revoked the recorded pair
+    /// is dead, so the replay is answered like an unknown token. (The endpoint
+    /// cannot bind the replay to a client: the Matrix API carries none.)
+    #[tokio::test]
+    async fn a_matrix_refresh_replay_needs_its_successor_live() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("replay-user-{n}");
+        let dev = format!("REPLAY_{n}");
+        let state = standalone_state(client.clone());
+
+        // Rotated: the client received the successor and has since used it.
+        let old = format!("compat_replay_old_{n}");
+        client
+            .set_token(&old, &refresh_meta(&user, &dev), 120)
+            .await
+            .unwrap();
+        let (status, first) = matrix_refresh(&state, &old).await;
+        assert_eq!(status, StatusCode::OK, "the rotation succeeds: {first}");
+        let successor = first["refresh_token"].as_str().unwrap().to_string();
+
+        let (status, replay) = matrix_refresh(&state, &old).await;
+        assert_eq!(status, StatusCode::OK, "a replay with a live successor");
+        assert_eq!(
+            replay["refresh_token"], first["refresh_token"],
+            "while the successor is live the replay returns the same pair"
+        );
+
+        let (status, second) = matrix_refresh(&state, &successor).await;
+        assert_eq!(status, StatusCode::OK, "the successor rotates: {second}");
+        let (status, body) = matrix_refresh(&state, &old).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a replay whose successor was rotated gets no pair: {body}"
+        );
+        assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN");
+
+        // Revoked: the successor was deleted before the client used it.
+        let old = format!("compat_replay_revoked_{n}");
+        client
+            .set_token(&old, &refresh_meta(&user, &dev), 120)
+            .await
+            .unwrap();
+        let (_, first) = matrix_refresh(&state, &old).await;
+        let successor = first["refresh_token"].as_str().unwrap().to_string();
+        client.delete_token(&successor).await.unwrap();
+        let (status, body) = matrix_refresh(&state, &old).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a replay whose successor was revoked gets no pair: {body}"
+        );
+        assert_eq!(body["errcode"], "M_UNKNOWN_TOKEN");
+
+        for token in [
+            first["access_token"].as_str().unwrap(),
+            second["access_token"].as_str().unwrap(),
+            second["refresh_token"].as_str().unwrap(),
+        ] {
+            client.delete_token(token).await.ok();
+        }
     }
 
     /// RFC 7009 revoke accepts either kind: a refresh token is revoked.

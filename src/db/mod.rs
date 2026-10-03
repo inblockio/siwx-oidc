@@ -334,6 +334,14 @@ pub struct CodeEntry {
     /// existed before grandfathering are, by definition, legacy accounts.
     #[serde(default)]
     pub localpart: Option<String>,
+    /// The scope the authorization request asked for, exactly as `/authorize`
+    /// bound it to the session. The token endpoint reads what was requested
+    /// from here, never from the front channel. `#[serde(default)]` so a code
+    /// written by an earlier build, which a new build reads for up to
+    /// [`ENTRY_LIFETIME`], deserializes to `None`: the token endpoint then
+    /// answers as it did before the scope travelled.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -389,7 +397,10 @@ pub enum DeviceCodeStatus {
 }
 
 /// An RFC 8628 device authorization code stored in Redis.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// `Debug` is written by hand: the user code is a credential for the approval
+/// page, so it prints as its fingerprint (see [`crate::redact`]).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DeviceCodeEntry {
     pub user_code: String,
     pub client_id: String,
@@ -399,6 +410,21 @@ pub struct DeviceCodeEntry {
     pub device_id: Option<String>,
     pub last_poll: Option<i64>,
     pub created_at: i64,
+}
+
+impl std::fmt::Debug for DeviceCodeEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCodeEntry")
+            .field("user_code_fp", &crate::redact::fingerprint(&self.user_code))
+            .field("client_id", &self.client_id)
+            .field("scope", &self.scope)
+            .field("status", &self.status)
+            .field("did", &self.did)
+            .field("device_id", &self.device_id)
+            .field("last_poll", &self.last_poll)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 /// What a stored token may be presented for.
@@ -503,7 +529,10 @@ impl TokenMetadata {
 /// The successor token pair recorded under [`KV_ROTATED_PREFIX`] when a refresh
 /// token is rotated, so a lost-response replay of the old refresh token can recover
 /// it idempotently within the grace window.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// `Debug` is written by hand: the pair is two live credentials, so each prints
+/// as its fingerprint (see [`crate::redact`]).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RotatedToken {
     /// The successor access token minted by the rotation.
     pub access_token: String,
@@ -511,6 +540,22 @@ pub struct RotatedToken {
     pub refresh_token: String,
     /// Absolute Unix expiry of the successor access token (drives `expires_in` on replay).
     pub access_exp: i64,
+}
+
+impl std::fmt::Debug for RotatedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotatedToken")
+            .field(
+                "access_token_fp",
+                &crate::redact::fingerprint(&self.access_token),
+            )
+            .field(
+                "refresh_token_fp",
+                &crate::redact::fingerprint(&self.refresh_token),
+            )
+            .field("access_exp", &self.access_exp)
+            .finish()
+    }
 }
 
 #[async_trait]
@@ -762,5 +807,39 @@ mod token_kind_tests {
         assert!(json.contains(r#""kind":"refresh""#), "{json}");
         let back: TokenMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(back.kind, Some(TokenKind::Refresh));
+    }
+}
+
+#[cfg(test)]
+mod code_entry_tests {
+    use super::*;
+
+    /// A code is stored for [`ENTRY_LIFETIME`] (300 s), so a build that adds a
+    /// field reads the codes its predecessor wrote for that long. Such a code
+    /// has no `scope`, which the token endpoint reads as "requested nothing
+    /// known" and answers with the behaviour that predates the field.
+    #[test]
+    fn a_code_written_before_the_scope_travelled_has_none() {
+        let before = r#"{
+            "exchange_count": 0,
+            "did": "did:key:zDnaeOLD",
+            "nonce": null,
+            "client_id": "client",
+            "auth_time": "2026-10-02T00:00:00Z",
+            "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "code_challenge_method": "S256",
+            "device_id": null,
+            "localpart": null
+        }"#;
+        let entry: CodeEntry = serde_json::from_str(before).expect("an old code still reads");
+        assert_eq!(entry.scope, None);
+
+        let with_scope = CodeEntry {
+            scope: Some("openid offline_access".to_string()),
+            ..entry
+        };
+        let round_trip: CodeEntry =
+            serde_json::from_str(&serde_json::to_string(&with_scope).unwrap()).unwrap();
+        assert_eq!(round_trip.scope.as_deref(), Some("openid offline_access"));
     }
 }

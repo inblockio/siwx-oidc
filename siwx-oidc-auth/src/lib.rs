@@ -204,20 +204,47 @@ fn build_message(domain: &str, key: &SiwxKey, redirect_uri: &str, nonce: &str) -
 // OAuth scope construction
 // ---------------------------------------------------------------------------
 
+/// The scopes every flow asks for, whether or not a device is proposed.
+///
+/// - `offline_access`: the client relies on refresh tokens (`refresh`, and the
+///   advice to refresh instead of signing in again). A generic-mode server
+///   issues one only for this scope.
+/// - `urn:matrix:client:api:*`: the access token is used against a Matrix
+///   homeserver's client-server API. A Matrix deployment grants this scope
+///   whatever is asked today; asking for it keeps the client working against a
+///   server that grants it only on request.
+///
+/// A server that does not know a scope ignores it at `/authorize`, so this is
+/// harmless against a deployment that has no use for it.
+const RELIED_ON_SCOPES: [&str; 2] = ["offline_access", "urn:matrix:client:api:*"];
+
 /// Build the OAuth `scope` requested at `/authorize`.
 ///
-/// - `None`: the default `"openid profile"` (unchanged, backward compatible).
-/// - `Some(id)`: appends the stable Matrix device URN so the server pins this
-///   exact Synapse device_id instead of minting a fresh `SIWX_<uuid>` on every
-///   login. The siwx-oidc server validates the scope (it contains `openid`) and
-///   extracts the id via `extract_device_id_from_scope`, which strips the
-///   `urn:matrix:client:device:` prefix. The stable prefix is preferred over the
-///   `urn:matrix:org.matrix.msc2967.client:device:` (MSC2967 unstable) form.
+/// - `None`: `openid profile` plus [`RELIED_ON_SCOPES`].
+/// - `Some(id)`: the same, plus the stable Matrix device URN so the server pins
+///   this exact Synapse device_id instead of minting a fresh `SIWX_<uuid>` on
+///   every login. The siwx-oidc server validates the scope (it contains
+///   `openid`) and extracts the id via `extract_device_id_from_scope`, which
+///   strips the `urn:matrix:client:device:` prefix. The stable prefix is
+///   preferred over the `urn:matrix:org.matrix.msc2967.client:device:`
+///   (MSC2967 unstable) form.
 fn build_scope(device_id: Option<&str>) -> String {
-    match device_id {
-        None => "openid profile".to_string(),
-        Some(id) => format!("openid profile urn:matrix:client:device:{id}"),
+    let mut scopes = vec!["openid", "profile"];
+    scopes.extend(RELIED_ON_SCOPES);
+    let mut scope = scopes.join(" ");
+    if let Some(id) = device_id {
+        scope.push_str(" urn:matrix:client:device:");
+        scope.push_str(id);
     }
+    scope
+}
+
+/// The `scope` the device flow requests at `/device_authorization`:
+/// `openid` plus [`RELIED_ON_SCOPES`].
+fn build_device_flow_scope() -> String {
+    let mut scopes = vec!["openid"];
+    scopes.extend(RELIED_ON_SCOPES);
+    scopes.join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -301,10 +328,10 @@ struct TokenErrorResponse {
 /// To re-authenticate when tokens expire, call this function again — the flow
 /// is stateless and the key is deterministic.
 ///
-/// This is the backward-compatible entry point: it requests the default
-/// `"openid profile"` scope, so the server mints a fresh `SIWX_<uuid>` Synapse
-/// device on each login. To pin a stable device_id, use
-/// [`authenticate_with_device`].
+/// This is the backward-compatible entry point: it requests no device, so the
+/// server mints a fresh `SIWX_<uuid>` Synapse device on each login. To pin a
+/// stable device_id, use [`authenticate_with_device`]. The scope it requests is
+/// `openid profile offline_access urn:matrix:client:api:*`.
 pub async fn authenticate(
     server_url: &str,
     client_id: &str,
@@ -577,6 +604,9 @@ fn extract_did_from_id_token(id_token: &str) -> Option<String> {
 /// - `server_url`: Base URL of the siwx-oidc server.
 /// - `client_id`: OIDC client ID registered with the server.
 ///
+/// Requests the scope `openid offline_access urn:matrix:client:api:*`: the
+/// tokens are used against a Matrix homeserver and refreshed.
+///
 /// Prints the user code and verification URI to stderr, then polls until
 /// approved, denied, or expired.
 pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Result<AuthTokens> {
@@ -587,7 +617,10 @@ pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Resu
     let device_auth_url = base.join("/device_authorization")?;
     let resp = client
         .post(device_auth_url)
-        .form(&[("client_id", client_id), ("scope", "openid")])
+        .form(&[
+            ("client_id", client_id),
+            ("scope", build_device_flow_scope().as_str()),
+        ])
         .send()
         .await
         .context("POST /device_authorization failed")?;
@@ -692,19 +725,142 @@ pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// What the client asks for in the code flow, in the order it asks.
+    const CODE_FLOW_SCOPE: &str = "openid profile offline_access urn:matrix:client:api:*";
+    /// What the client asks for in the device flow.
+    const DEVICE_FLOW_SCOPE: &str = "openid offline_access urn:matrix:client:api:*";
 
     #[test]
-    fn build_scope_none_is_unchanged() {
-        assert_eq!(build_scope(None), "openid profile");
+    fn build_scope_none_asks_for_what_the_client_relies_on() {
+        assert_eq!(build_scope(None), CODE_FLOW_SCOPE);
     }
 
     #[test]
     fn build_scope_some_requests_stable_device() {
         let scope = build_scope(Some("agent-x"));
         // Must contain the stable Matrix device URN the server extracts from.
-        assert_eq!(scope, "openid profile urn:matrix:client:device:agent-x");
+        assert_eq!(
+            scope,
+            format!("{CODE_FLOW_SCOPE} urn:matrix:client:device:agent-x")
+        );
         assert!(scope.contains("urn:matrix:client:device:agent-x"));
         // Still an OIDC request (keeps openid + profile).
         assert!(scope.starts_with("openid profile"));
+    }
+
+    /// The client relies on a refresh token (`offline_access`: a generic-mode
+    /// server issues one only for it) and, against a Matrix deployment, on the
+    /// Matrix client-server API (`urn:matrix:client:api:*`: a server that grants
+    /// it only when asked would otherwise hand out tokens Synapse refuses). It
+    /// asks for both in every flow, whether or not a device is proposed.
+    #[test]
+    fn every_flow_asks_for_offline_access_and_the_matrix_api() {
+        for scope in [
+            build_scope(None),
+            build_scope(Some("agent-x")),
+            build_device_flow_scope(),
+        ] {
+            let asked: Vec<&str> = scope.split(' ').collect();
+            for needed in ["openid", "offline_access", "urn:matrix:client:api:*"] {
+                assert!(asked.contains(&needed), "`{scope}` lacks {needed}");
+            }
+        }
+        assert_eq!(build_device_flow_scope(), DEVICE_FLOW_SCOPE);
+    }
+
+    /// Answer the first request with a 500 and hand back the request line and
+    /// body. Enough server to see what a flow sends first.
+    fn capture_first_request() -> (String, std::thread::JoinHandle<(String, String)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut received = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let (head_end, content_length) = loop {
+                let n = stream.read(&mut chunk).unwrap();
+                received.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&received).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    break (end + 4, length);
+                }
+            };
+            while received.len() < head_end + content_length {
+                let n = stream.read(&mut chunk).unwrap();
+                received.extend_from_slice(&chunk[..n]);
+            }
+            let _ = stream.write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            );
+            let text = String::from_utf8_lossy(&received).to_string();
+            let request_line = text.lines().next().unwrap_or("").to_string();
+            let body = text[head_end..].to_string();
+            (request_line, body)
+        });
+        (base, handle)
+    }
+
+    fn scope_in(query_or_form: &str) -> String {
+        let fields: HashMap<String, String> = serde_urlencoded::from_str(query_or_form).unwrap();
+        fields
+            .get("scope")
+            .unwrap_or_else(|| panic!("no scope in `{query_or_form}`"))
+            .clone()
+    }
+
+    /// The scope the code flow puts on the wire at `/authorize`, with and
+    /// without a proposed device.
+    #[tokio::test]
+    async fn the_code_flow_sends_the_scope_it_relies_on() {
+        let key = SiwxKey::generate_ed25519();
+        for (device, expected) in [
+            (None, CODE_FLOW_SCOPE.to_string()),
+            (
+                Some("agent-x"),
+                format!("{CODE_FLOW_SCOPE} urn:matrix:client:device:agent-x"),
+            ),
+        ] {
+            let (base, request) = capture_first_request();
+            let outcome = authenticate_with_device(
+                &base,
+                "client",
+                "https://agent.example.org/callback",
+                &key,
+                device,
+            )
+            .await;
+            assert!(outcome.is_err(), "the stub answers 500");
+            let (request_line, _) = request.join().unwrap();
+            let target = request_line.split(' ').nth(1).unwrap();
+            let (path, query) = target.split_once('?').expect("a query");
+            assert_eq!(path, "/authorize");
+            assert_eq!(scope_in(query), expected, "device {device:?}");
+        }
+    }
+
+    /// The scope the device flow puts on the wire at `/device_authorization`.
+    #[tokio::test]
+    async fn the_device_flow_sends_the_scope_it_relies_on() {
+        let (base, request) = capture_first_request();
+        let outcome = authenticate_device_flow(&base, "client").await;
+        assert!(outcome.is_err(), "the stub answers 500");
+        let (request_line, body) = request.join().unwrap();
+        assert!(
+            request_line.starts_with("POST /device_authorization"),
+            "{request_line}"
+        );
+        assert_eq!(scope_in(&body), DEVICE_FLOW_SCOPE);
     }
 }

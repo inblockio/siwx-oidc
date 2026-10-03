@@ -258,12 +258,13 @@ jobs:
           cat /tmp/siwx-oidc.log >&2
           exit 1
 
-      # MSC4191 account-management protocol flows (6/6 promoted).
+      # MSC4191 account-management protocol flows (8/8 promoted).
       - name: E2E account management
         run: cargo test --test e2e_account_management -- --ignored --test-threads=1
 
       # OAuth + CAIP-122 binding: authorization request bound at /authorize, exact
-      # redirect URIs, single-use codes, one token kind per endpoint (24/24 promoted).
+      # redirect URIs, single-use codes, one token kind per endpoint, refresh tokens bound to
+      # their client (28/28 promoted).
       - name: E2E OAuth binding
         run: cargo test --test e2e_oauth_binding -- --ignored --test-threads=1
 

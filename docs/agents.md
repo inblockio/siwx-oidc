@@ -58,9 +58,15 @@ registration token or application service is involved.
     -H 'Content-Type: application/json' \
     -d '{"redirect_uris": ["https://agent.example.org/callback"],
          "token_endpoint_auth_method": "none",
+         "grant_types": ["authorization_code", "refresh_token"],
          "client_name": "Example Agent"}'
   # -> {"client_id": "…", "client_secret": "…", "registration_access_token": "…", …}
   ```
+
+  List `refresh_token` among the `grant_types`: a standalone (non-Matrix)
+  server issues a refresh token only to a client that asked for
+  `offline_access`, which the client does, and whose registration allows the
+  refresh grant.
 
   Keep the returned `client_id`. The redirect URI must be registered, but
   nothing needs to listen on it: the client reads the authorization code from
@@ -107,7 +113,9 @@ It prints the tokens as JSON on stdout (diagnostics go to stderr):
   "expires_in": 300, "refresh_token": "mcr_…", "did": "did:key:z6Mk…" }
 ```
 
-What happens: `GET /authorize` with PKCE (S256) returns a session cookie and a
+What happens: `GET /authorize` with PKCE (S256), asking for the scope
+`openid profile offline_access urn:matrix:client:api:*` (plus the device scope
+when `--device-id` is given), returns a session cookie and a
 nonce; the client builds a CAIP-122 message for the server's host with that
 nonce and the redirect URI in `Resources:`, signs it with the key, sends it to
 `GET /sign_in`, and exchanges the returned code at `POST /token`.
@@ -256,6 +264,7 @@ siwx-oidc-auth --device-flow --server https://auth.example.org --client-id "$CLI
 ```
 
 The approval URL and code go to stderr; the tokens go to stdout once approved.
+The client asks for the scope `openid offline_access urn:matrix:client:api:*`.
 The flow requires the server's delegated-auth mode, and the approving DID must
 already have an account (the device flow never creates one).
 

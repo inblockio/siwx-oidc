@@ -18,6 +18,7 @@ exec podman run --rm --network host --userns=keep-id \
   -e HOME=/tmp \
   -e SIWEOIDC_HOST="${SIWEOIDC_HOST:-$SIWEOIDC_BASE_URL}" \
   -e SYNAPSE_MOCK="${SYNAPSE_MOCK:-http://localhost:${SYNAPSE_MOCK_PORT}}" \
+  -e REDIS_PORT="${REDIS_PORT:-$SIWEOIDC_REDIS_PORT}" \
   -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
   -e PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
   -e npm_config_cache=/tmp/.npm \

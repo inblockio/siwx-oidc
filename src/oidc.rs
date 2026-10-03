@@ -62,6 +62,9 @@ lazy_static::lazy_static! {
     static ref SCOPES: Vec<Scope> = vec![
         Scope::new("openid".to_string()),
         Scope::new("profile".to_string()),
+        // A refresh token for a generic client is issued only when this was
+        // requested and the registration allows the refresh grant (I10).
+        Scope::new("offline_access".to_string()),
         // Stable Matrix scopes (MSC2967 graduated)
         Scope::new("urn:matrix:client:api:*".to_string()),
         Scope::new("urn:matrix:client:device:*".to_string()),
@@ -544,7 +547,9 @@ pub fn metadata(config: &crate::config::Config) -> Result<CoreProviderMetadata, 
         ),
         // Exactly what `authorize` accepts: the authorization-code flow.
         vec![ResponseTypes::new(vec![CoreResponseType::Code])],
-        vec![CoreSubjectIdentifierType::Pairwise],
+        // The `sub` is the user's DID, the same for every client
+        // (docs/identity-model.md), which is what `public` means.
+        vec![CoreSubjectIdentifierType::Public],
         SIGNING_ALG.to_vec(),
         EmptyAdditionalProviderMetadata {},
     )
@@ -704,7 +709,7 @@ pub fn provider_metadata_value(
     value["grant_types_supported"] = serde_json::json!(grant_types);
     value["revocation_endpoint"] = serde_json::json!(format!("{}/oauth2/revoke", base));
     value["token_endpoint_auth_methods_supported"] =
-        serde_json::json!(["client_secret_post", "none"]);
+        serde_json::json!(["client_secret_basic", "client_secret_post", "none"]);
     value["prompt_values_supported"] = serde_json::json!(["login", "create"]);
     // Both advertised ONLY when this deployment can answer them: a client that
     // finds a key will use it, and a route that answers 503 (`/resolve`) or an
@@ -894,9 +899,21 @@ pub struct TokenForm {
     pub device_code: Option<String>,
 }
 
+/// What the HTTP request says about the calling client outside the form: the
+/// `Authorization` header, which carries a client secret as `Basic` (with the
+/// client id as the user name, RFC 6749 §2.3.1) or, for some clients, as `Bearer`.
+#[derive(Default)]
+pub struct ClientCredentials {
+    /// The user name of an `Authorization: Basic` header: the client id.
+    pub basic_client_id: Option<String>,
+    /// The secret from the `Authorization` header (the Basic password or the
+    /// Bearer token). It wins over `client_secret` in the form.
+    pub secret: Option<String>,
+}
+
 pub async fn token(
     form: TokenForm,
-    secret: Option<String>,
+    credentials: ClientCredentials,
     signing_key: &EcdsaSigningKey,
     config: &crate::config::Config,
     db_client: &DBClientType,
@@ -904,10 +921,10 @@ pub async fn token(
 ) -> Result<CoreTokenResponse, CustomError> {
     match form.grant_type {
         CoreGrantType::AuthorizationCode => {
-            token_authorization_code(form, secret, signing_key, config, db_client).await
+            token_authorization_code(form, credentials, signing_key, config, db_client).await
         }
         CoreGrantType::RefreshToken => {
-            token_refresh(form, config, db_client).await
+            token_refresh(form, credentials, config, db_client).await
         }
         CoreGrantType::DeviceCode => {
             token_device_code(form, signing_key, config, db_client, synapse_client).await
@@ -920,11 +937,116 @@ pub async fn token(
     }
 }
 
+/// The client a request names, from the form and from an HTTP Basic header.
+/// They name the same client or only one of them is present: a request that
+/// names two different clients is malformed (RFC 6749 §2.3 allows one
+/// authentication method per request).
+fn named_client_id(
+    form: &TokenForm,
+    credentials: &ClientCredentials,
+) -> Result<Option<String>, CustomError> {
+    match (
+        form.client_id.as_deref(),
+        credentials.basic_client_id.as_deref(),
+    ) {
+        (Some(in_form), Some(in_header)) if !constant_time_eq(in_form, in_header) => {
+            Err(CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::InvalidRequest,
+                error_description:
+                    "client_id differs between the request body and the Authorization header."
+                        .to_string(),
+            }))
+        }
+        (Some(client_id), _) | (None, Some(client_id)) => Ok(Some(client_id.to_string())),
+        (None, None) => Ok(None),
+    }
+}
+
+/// What to do with a grant whose client registration no longer exists.
+#[derive(Clone, Copy)]
+enum UnregisteredClient {
+    /// Refuse: the client must exist. A code was issued minutes ago to a
+    /// registered client, so its absence is a fault.
+    Refuse,
+    /// Carry on without a registration. A refresh token outlives its client's
+    /// registration (30 days against 90), and refusing every such token would
+    /// sign out every session older than a registration. Nothing is lost
+    /// against the status quo: a secret cannot be checked against a registration
+    /// that is gone, and a request that presents one is still refused.
+    Tolerate,
+}
+
+/// The one place the token endpoint authenticates a client for a grant bound to
+/// a client: the authorization code and the refresh token.
+///
+/// 1. The client the request names (`named_client_id`, form or Basic header)
+///    must be the client the grant was issued to (`bound_client_id`):
+///    `invalid_grant` otherwise. A request that names none is fine here.
+/// 2. A secret the request presents is checked against the registration
+///    (`invalid_client`: "Bad secret."), whether the client is confidential or not.
+/// 3. A request that presents none must come from a public client: one
+///    registered with `token_endpoint_auth_method: none`, or with no method
+///    while `require_secret` is off (`invalid_client`: "Secret required.").
+///
+/// `credential` names the grant in the error text. Returns the registration, or
+/// `None` only when it is gone and `unregistered` is [`UnregisteredClient::Tolerate`].
+async fn authenticate_client(
+    bound_client_id: &str,
+    named_client_id: Option<&str>,
+    presented_secret: Option<&str>,
+    credential: &str,
+    unregistered: UnregisteredClient,
+    config: &crate::config::Config,
+    db_client: &DBClientType,
+) -> Result<Option<ClientEntry>, CustomError> {
+    if !bound_client_id.is_empty() {
+        if let Some(named) = named_client_id {
+            if !constant_time_eq(named, bound_client_id) {
+                return Err(CustomError::BadRequestToken(TokenError {
+                    error: CoreErrorResponseType::InvalidGrant,
+                    error_description: format!("client_id does not match the {credential}."),
+                }));
+            }
+        }
+    }
+
+    let Some(client_entry) = db_client.get_client(bound_client_id.to_string()).await? else {
+        return match (unregistered, presented_secret) {
+            (UnregisteredClient::Tolerate, None) => Ok(None),
+            _ => Err(CustomError::Unauthorized(
+                "Unrecognised client id.".to_string(),
+            )),
+        };
+    };
+
+    match presented_secret {
+        Some(secret) => {
+            if !constant_time_eq(secret, &client_entry.secret) {
+                return Err(CustomError::Unauthorized("Bad secret.".to_string()));
+            }
+        }
+        None => match client_entry.metadata.token_endpoint_auth_method() {
+            Some(CoreClientAuthMethod::None) => {}
+            Some(_) => {
+                return Err(CustomError::Unauthorized("Secret required.".to_string()));
+            }
+            None if config.require_secret => {
+                return Err(CustomError::Unauthorized("Secret required.".to_string()));
+            }
+            None => {}
+        },
+    }
+    Ok(Some(client_entry))
+}
+
 async fn token_refresh(
     form: TokenForm,
+    credentials: ClientCredentials,
     config: &crate::config::Config,
     db_client: &DBClientType,
 ) -> Result<CoreTokenResponse, CustomError> {
+    let named_client = named_client_id(&form, &credentials)?;
+    let presented_secret = credentials.secret.or(form.client_secret);
     let rt = form.refresh_token.ok_or_else(|| {
         CustomError::BadRequestToken(TokenError {
             error: CoreErrorResponseType::InvalidRequest,
@@ -939,7 +1061,25 @@ async fn token_refresh(
         .await?
         .filter(|m| m.is_kind(TokenKind::Refresh))
     {
-        Some(m) => m,
+        // A refresh token belongs to the client it was issued to (I7): before
+        // anything else is read or written, the request must be that client,
+        // and a confidential client must authenticate. This is the grant that
+        // carries a client identity. `POST /_matrix/client/v3/refresh` does not
+        // (the Matrix client-server API has none to carry), so that endpoint
+        // is not bound, and `compat::refresh` says so.
+        Some(m) => {
+            authenticate_client(
+                &m.client_id,
+                named_client.as_deref(),
+                presented_secret.as_deref(),
+                "refresh token",
+                UnregisteredClient::Tolerate,
+                config,
+                db_client,
+            )
+            .await?;
+            m
+        }
         None => {
             // Grace replay (lost-response recovery): a rotated refresh token is
             // deleted, but its successor pair is recorded under a short grace
@@ -947,16 +1087,37 @@ async fn token_refresh(
             // old token, return the SAME successor instead of signing it out.
             // Bounded by REFRESH_GRACE_TTL; genuinely unknown/expired tokens (no
             // grace record) still fail closed below.
+            //
+            // The replay hands out a live pair, so it is bound to the client like
+            // a rotation. The pointer does not record a client; the successor
+            // refresh token it names does. A successor that is gone (revoked) makes
+            // the replay an unknown token.
             if let Some(succ) = db_client.get_rotated_token(&rt).await? {
-                let expires_in = (succ.access_exp - Utc::now().timestamp()).max(0) as u64;
-                let mut response = CoreTokenResponse::new(
-                    AccessToken::new(succ.access_token),
-                    CoreTokenType::Bearer,
-                    CoreIdTokenFields::new(None, EmptyExtraTokenFields {}),
-                );
-                response.set_expires_in(Some(&time::Duration::from_secs(expires_in)));
-                response.set_refresh_token(Some(RefreshToken::new(succ.refresh_token)));
-                return Ok(response);
+                if let Some(successor) = db_client
+                    .get_token(&succ.refresh_token)
+                    .await?
+                    .filter(|m| m.is_kind(TokenKind::Refresh))
+                {
+                    authenticate_client(
+                        &successor.client_id,
+                        named_client.as_deref(),
+                        presented_secret.as_deref(),
+                        "refresh token",
+                        UnregisteredClient::Tolerate,
+                        config,
+                        db_client,
+                    )
+                    .await?;
+                    let expires_in = (succ.access_exp - Utc::now().timestamp()).max(0) as u64;
+                    let mut response = CoreTokenResponse::new(
+                        AccessToken::new(succ.access_token),
+                        CoreTokenType::Bearer,
+                        CoreIdTokenFields::new(None, EmptyExtraTokenFields {}),
+                    );
+                    response.set_expires_in(Some(&time::Duration::from_secs(expires_in)));
+                    response.set_refresh_token(Some(RefreshToken::new(succ.refresh_token)));
+                    return Ok(response);
+                }
             }
             return Err(CustomError::BadRequestToken(TokenError {
                 error: CoreErrorResponseType::InvalidGrant,
@@ -1173,7 +1334,7 @@ async fn token_device_code(
             // winner deletes the device_code at the end, so a subsequent poll then
             // gets expired_token — same as a normal completed flow).
             if !db_client.try_claim_device_code(&dc).await? {
-                debug!(device_code = %dc, "device_code already claimed by a concurrent poll");
+                debug!(device_code_fp = %siwx_oidc::redact::fingerprint(&dc), "device_code already claimed by a concurrent poll");
                 return Err(device_code_error(
                     "authorization_pending",
                     "Device code is being processed.",
@@ -1335,13 +1496,89 @@ async fn token_device_code(
     }
 }
 
+/// The scopes generic mode can grant, in the order they are issued.
+const GENERIC_GRANTABLE_SCOPES: [&str; 3] = ["openid", "profile", "offline_access"];
+
+/// What a generic-mode code exchange issues for the scope the authorization
+/// request asked for.
+#[derive(Debug, PartialEq, Eq)]
+struct GenericGrant {
+    /// The scope recorded on the tokens: the requested scopes among
+    /// [`GENERIC_GRANTABLE_SCOPES`] that the registration allows, in that order.
+    scope: String,
+    /// Whether a refresh token is issued.
+    refresh_token: bool,
+    /// Whether the token response must name the scope, because it differs from
+    /// the request (RFC 6749 §5.1).
+    report_scope: bool,
+}
+
+/// The grant for a generic-mode (no MAS shared secret) code exchange (I10):
+/// least privilege for a relying party that is not a Matrix client.
+///
+/// - The scope granted is what was requested, limited to `openid`, `profile`
+///   and `offline_access`. Matrix scopes mean nothing here and are not granted.
+///   If nothing grantable was requested the grant is `openid`: the exchange
+///   issues an ID token regardless, so that is what is being granted
+///   (provisional).
+/// - `offline_access`, and with it a refresh token, is granted only when the
+///   client's registration allows the refresh grant. A registration that lists
+///   no `grant_types` is not a restriction (provisional): refusing it would
+///   withhold refresh tokens from clients that registered before this rule
+///   existed and never listed any.
+/// - `requested == None` is a code written by a build from before the scope
+///   travelled with it. Such a code lives 300 s, and for that window it is
+///   exchanged as it always was: `openid profile` and a refresh token.
+fn generic_grant(requested: Option<&str>, registration: &ClientEntry) -> GenericGrant {
+    let Some(requested) = requested else {
+        return GenericGrant {
+            scope: "openid profile".to_string(),
+            refresh_token: true,
+            report_scope: false,
+        };
+    };
+    let asked: Vec<&str> = requested.split_whitespace().collect();
+    let may_refresh = registration
+        .metadata
+        .grant_types()
+        .is_none_or(|grants| grants.contains(&CoreGrantType::RefreshToken));
+    let granted: Vec<&str> = GENERIC_GRANTABLE_SCOPES
+        .iter()
+        .copied()
+        .filter(|scope| asked.contains(scope))
+        .filter(|scope| *scope != "offline_access" || may_refresh)
+        .collect();
+    let refresh_token = granted.contains(&"offline_access");
+    let scope = if granted.is_empty() {
+        "openid".to_string()
+    } else {
+        granted.join(" ")
+    };
+    let report_scope = {
+        let mut requested_set = asked.clone();
+        requested_set.sort_unstable();
+        requested_set.dedup();
+        let mut granted_set: Vec<&str> = scope.split(' ').collect();
+        granted_set.sort_unstable();
+        requested_set != granted_set
+    };
+    GenericGrant {
+        scope,
+        refresh_token,
+        report_scope,
+    }
+}
+
 async fn token_authorization_code(
     form: TokenForm,
-    secret: Option<String>,
+    credentials: ClientCredentials,
     signing_key: &EcdsaSigningKey,
     config: &crate::config::Config,
     db_client: &DBClientType,
 ) -> Result<CoreTokenResponse, CustomError> {
+    // A malformed request is refused before the code is touched.
+    let named_client = named_client_id(&form, &credentials)?;
+    let presented_secret = credentials.secret.or(form.client_secret);
     let code = form.code.ok_or_else(|| {
         CustomError::BadRequestToken(TokenError {
             error: CoreErrorResponseType::InvalidRequest,
@@ -1356,59 +1593,30 @@ async fn token_authorization_code(
         })
     })?;
 
-    // C2 Step 1: bind the auth code to the client it was issued to. A correct
-    // client presents the same `client_id` at /authorize and /token. If the code
-    // carries a client_id (always set by `sign_in`), the request's client_id —
-    // when present — must match it, and the rest of the function runs against the
-    // code's client (never the request's). This prevents a leaked confidential
-    // client's code from being redeemed by a different (public) client.
-    if !code_entry.client_id.is_empty() {
-        if let Some(ref req_client_id) = form.client_id {
-            if !constant_time_eq(req_client_id, &code_entry.client_id) {
-                return Err(CustomError::BadRequestToken(TokenError {
-                    error: CoreErrorResponseType::InvalidGrant,
-                    error_description: "client_id does not match the authorization code."
-                        .to_string(),
-                }));
-            }
-        }
-    }
+    // Bind the code to the client it was issued to, and authenticate that
+    // client, through the helper the refresh grant uses too. A correct client
+    // presents the same `client_id` at /authorize and /token; a code carries its
+    // client_id (always set by `sign_in`), and the rest of the function runs
+    // against the code's client, never the request's. This stops a leaked
+    // confidential client's code from being redeemed by a different (public)
+    // client.
     let client_id = if !code_entry.client_id.is_empty() {
         code_entry.client_id.clone()
-    } else if let Some(c) = form.client_id.clone() {
-        c
     } else {
-        code_entry.client_id.clone()
+        named_client.clone().unwrap_or_default()
     };
-
-    if let Some(secret) = if let Some(b) = secret {
-        Some(b)
-    } else {
-        form.client_secret.clone()
-    } {
-        let client_entry = db_client
-            .get_client(client_id.clone())
-            .await?
-            .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
-        if !constant_time_eq(&secret, &client_entry.secret) {
-            return Err(CustomError::Unauthorized("Bad secret.".to_string()));
-        }
-    } else {
-        let client_entry = db_client
-            .get_client(client_id.clone())
-            .await?
-            .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
-        match client_entry.metadata.token_endpoint_auth_method() {
-            Some(CoreClientAuthMethod::None) => {}
-            Some(_) => {
-                return Err(CustomError::Unauthorized("Secret required.".to_string()));
-            }
-            None if config.require_secret => {
-                return Err(CustomError::Unauthorized("Secret required.".to_string()));
-            }
-            None => {}
-        }
-    }
+    let client_entry = authenticate_client(
+        &client_id,
+        named_client.as_deref(),
+        presented_secret.as_deref(),
+        "authorization code",
+        UnregisteredClient::Refuse,
+        config,
+        db_client,
+    )
+    .await?
+    // `Refuse` never answers `None`; the arm is the same refusal, spelled out.
+    .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
 
     // PKCE: every code carries the challenge `/authorize` bound to its session,
     // and the verifier must match it. A code without a challenge (only an older
@@ -1421,40 +1629,38 @@ async fn token_authorization_code(
                     .to_string(),
         })
     })?;
-    {
-        let verifier = form.code_verifier.as_ref().ok_or_else(|| {
-            CustomError::BadRequestToken(TokenError {
-                error: CoreErrorResponseType::InvalidGrant,
-                error_description: "code_verifier required (PKCE).".to_string(),
-            })
-        })?;
-        let method = code_entry
-            .code_challenge_method
-            .as_deref()
-            .unwrap_or("S256");
-        // C2 Step 4b: reject the `plain` PKCE method. Discovery advertises S256
-        // only (`code_challenge_methods_supported = ["S256"]`); no compliant
-        // client sends `plain`, and the downgrade weakens the PKCE binding.
-        let computed = match method {
-            "S256" => {
-                use sha2::{Digest, Sha256};
-                let hash = Sha256::digest(verifier.as_bytes());
-                URL_SAFE_NO_PAD.encode(hash)
-            }
-            _ => {
-                return Err(CustomError::BadRequestToken(TokenError {
-                    error: CoreErrorResponseType::InvalidGrant,
-                    error_description: "Unsupported code_challenge_method (only S256 is allowed)."
-                        .to_string(),
-                }));
-            }
-        };
-        if !constant_time_eq(&computed, challenge) {
+    let verifier = form.code_verifier.as_ref().ok_or_else(|| {
+        CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "code_verifier required (PKCE).".to_string(),
+        })
+    })?;
+    let method = code_entry
+        .code_challenge_method
+        .as_deref()
+        .unwrap_or("S256");
+    // C2 Step 4b: reject the `plain` PKCE method. Discovery advertises S256
+    // only (`code_challenge_methods_supported = ["S256"]`); no compliant
+    // client sends `plain`, and the downgrade weakens the PKCE binding.
+    let computed = match method {
+        "S256" => {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(verifier.as_bytes());
+            URL_SAFE_NO_PAD.encode(hash)
+        }
+        _ => {
             return Err(CustomError::BadRequestToken(TokenError {
                 error: CoreErrorResponseType::InvalidGrant,
-                error_description: "code_verifier mismatch.".to_string(),
+                error_description: "Unsupported code_challenge_method (only S256 is allowed)."
+                    .to_string(),
             }));
         }
+    };
+    if !constant_time_eq(&computed, challenge) {
+        return Err(CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "code_verifier mismatch.".to_string(),
+        }));
     }
 
     let msc3861_mode = config.mas_shared_secret.is_some();
@@ -1478,7 +1684,12 @@ async fn token_authorization_code(
         .map(|n| n.to_string())
         .unwrap_or_else(|| code_entry.did.clone());
 
-    let (access_prefix, refresh_prefix, scope) = if msc3861_mode {
+    // Matrix mode records the Matrix scope for the device and always issues a
+    // refresh token, whatever was requested: Synapse, Element Web and Element X
+    // depend on exactly that. Generic mode grants what was requested and
+    // allowed, and issues a refresh token only for `offline_access` (I10).
+    let (access_prefix, refresh_prefix, scope, issue_refresh_token, report_scope) = if msc3861_mode
+    {
         let device_id = code_entry.device_id.clone().unwrap_or_default();
         (
             "mat_",
@@ -1487,9 +1698,12 @@ async fn token_authorization_code(
                 "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
                 device_id
             ),
+            true,
+            false,
         )
     } else {
-        ("", "", "openid profile".to_string())
+        let grant = generic_grant(code_entry.scope.as_deref(), &client_entry);
+        ("", "", grant.scope, grant.refresh_token, grant.report_scope)
     };
 
     let device_id = code_entry.device_id.clone().unwrap_or_default();
@@ -1510,24 +1724,28 @@ async fn token_authorization_code(
         .set_token(&opaque, &access_metadata, ACCESS_TOKEN_TTL)
         .await?;
 
-    let refresh_opaque = generate_opaque_token(refresh_prefix);
-    let refresh_metadata = TokenMetadata {
-        username,
-        device_id,
-        scope,
-        client_id: client_id.clone(),
-        iat,
-        exp: iat + REFRESH_TOKEN_TTL as i64,
-        did: code_entry.did.clone(),
-        name: display_name,
-        kind: Some(TokenKind::Refresh),
+    let refresh_token = if issue_refresh_token {
+        let refresh_opaque = generate_opaque_token(refresh_prefix);
+        let refresh_metadata = TokenMetadata {
+            username,
+            device_id,
+            scope: scope.clone(),
+            client_id: client_id.clone(),
+            iat,
+            exp: iat + REFRESH_TOKEN_TTL as i64,
+            did: code_entry.did.clone(),
+            name: display_name,
+            kind: Some(TokenKind::Refresh),
+        };
+        db_client
+            .set_token(&refresh_opaque, &refresh_metadata, REFRESH_TOKEN_TTL)
+            .await?;
+        Some(RefreshToken::new(refresh_opaque))
+    } else {
+        None
     };
-    db_client
-        .set_token(&refresh_opaque, &refresh_metadata, REFRESH_TOKEN_TTL)
-        .await?;
 
     let access_token = AccessToken::new(opaque);
-    let refresh_token = Some(RefreshToken::new(refresh_opaque));
 
     let core_id_token = CoreIdTokenClaims::new(
         IssuerUrl::from_url(config.base_url.clone()),
@@ -1558,6 +1776,16 @@ async fn token_authorization_code(
     );
     response.set_expires_in(Some(&time::Duration::from_secs(expires_in_secs)));
     response.set_refresh_token(refresh_token);
+    // RFC 6749 §5.1: the response says the granted scope when it differs from
+    // the request. Only generic mode can differ; Matrix mode never put one here.
+    if report_scope {
+        response.set_scopes(Some(
+            scope
+                .split_whitespace()
+                .map(|s| Scope::new(s.to_string()))
+                .collect(),
+        ));
+    }
     Ok(response)
 }
 
@@ -2661,7 +2889,11 @@ pub async fn sign_in(
             .iter()
             .any(|r| Url::parse(r).ok().as_ref() == Some(redirect_url))
         {
-            return Err(anyhow!("Missing or mismatched resource in CAIP-122 message").into());
+            // The client signed a message that binds no (or another) redirect
+            // URI: its mistake, not a server fault.
+            return Err(CustomError::BadRequest(
+                "Missing or mismatched resource in CAIP-122 message".to_string(),
+            ));
         }
 
         // C1 (login path): enforce the message Expiration Time. The login
@@ -2769,6 +3001,7 @@ pub async fn sign_in(
         code_challenge_method: Some("S256".to_string()),
         localpart: Some(resolved.localpart.clone()),
         device_id,
+        scope: session_entry.scope.clone(),
     };
 
     let code = Uuid::new_v4();
@@ -3598,7 +3831,7 @@ mod tests {
                     secret: "secret".into(),
                     signin_count: 0,
                     verified_did: Some("did:key:zDnaeBOUNDREQUEST".into()),
-                    scope: None,
+                    scope: Some("openid profile offline_access".into()),
                     request: Some(AuthorizationRequest {
                         client_id: client_id.clone(),
                         redirect_uri: ROUND_TRIP_REDIRECT.into(),
@@ -3648,6 +3881,12 @@ mod tests {
         assert_eq!(
             entry.nonce.as_ref().map(|n| n.secret().as_str()),
             Some("oidc-nonce")
+        );
+        assert_eq!(
+            entry.scope.as_deref(),
+            Some("openid profile offline_access"),
+            "the scope /authorize bound to the session travels into the code, \
+             where the token endpoint reads what was requested"
         );
     }
 
@@ -3800,7 +4039,7 @@ mod tests {
                 refresh_token: None,
                 device_code: None,
             },
-            None,
+            ClientCredentials::default(),
             &oidc_signing_key,
             &config,
             &db_client,
@@ -4112,6 +4351,34 @@ mod tests {
         );
     }
 
+    /// The OIDC `sub` is the user's DID, the same value for every client
+    /// (`docs/identity-model.md`), which is the definition of a *public*
+    /// subject type. Discovery used to say `pairwise`, which promises a
+    /// different `sub` per client and would lead a relying party to expect one.
+    #[test]
+    fn discovery_advertises_public_subjects_only() {
+        let value = provider_metadata_value(&discovery_config(), true).unwrap();
+        assert_eq!(
+            value["subject_types_supported"],
+            serde_json::json!(["public"]),
+            "the sub is the DID, identical for every client"
+        );
+    }
+
+    /// `POST /token` reads the client secret from an `Authorization: Basic`
+    /// header (`client_secret_basic`), from the form (`client_secret_post`), and
+    /// accepts a public client with no secret (`none`). Discovery lists what
+    /// the endpoint implements, so a client that picks the RFC 8414 default
+    /// (`client_secret_basic`) finds it.
+    #[test]
+    fn discovery_advertises_every_client_authentication_method_the_token_endpoint_accepts() {
+        let value = provider_metadata_value(&discovery_config(), true).unwrap();
+        assert_eq!(
+            value["token_endpoint_auth_methods_supported"],
+            serde_json::json!(["client_secret_basic", "client_secret_post", "none"]),
+        );
+    }
+
     #[test]
     fn provider_metadata_advertises_msc4191_account_management() {
         // AC1: served metadata must include account_management_uri and an
@@ -4374,7 +4641,7 @@ mod tests {
                 refresh_token: None,
                 device_code: Some(device_code.clone()),
             },
-            None,
+            ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
             &config,
             &db,
@@ -4394,6 +4661,82 @@ mod tests {
             .unwrap()
             .expect("the refused code must be left in place");
         assert_eq!(entry.status, DeviceCodeStatus::Approved);
+        db.delete_device_code(&device_code).await.ok();
+    }
+
+    /// A device-code poll that loses the claim to a concurrent poll logs that at
+    /// `debug!`. The device code is the credential the device polls with, so the
+    /// line names its fingerprint, never the code. Needs Redis.
+    #[tokio::test]
+    async fn a_device_poll_that_loses_the_claim_logs_the_code_only_as_a_fingerprint() {
+        use siwx_oidc::redact::fingerprint;
+
+        let Some((config, db)) = default_config().await else {
+            return;
+        };
+        let config = Config {
+            mas_shared_secret: Some("shared-secret".to_string()),
+            ..config
+        };
+        let device_code = format!("dvc_claimlost-{}", Uuid::new_v4().simple());
+        db.set_device_code(
+            &device_code,
+            &DeviceCodeEntry {
+                user_code: format!("CL-{}", Uuid::new_v4().simple()),
+                client_id: "client".to_string(),
+                scope: "openid".to_string(),
+                status: DeviceCodeStatus::Approved,
+                did: Some("did:key:zDnCLAIMLOST".to_string()),
+                device_id: None,
+                last_poll: None,
+                created_at: Utc::now().timestamp(),
+            },
+            DEVICE_CODE_LIFETIME,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.try_claim_device_code(&device_code).await.unwrap(),
+            "the winning poll claims the code"
+        );
+
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let losing = token(
+            TokenForm {
+                code: None,
+                client_id: Some("client".to_string()),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code.clone()),
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &config,
+            &db,
+            None,
+        )
+        .await;
+        let output = logs.output();
+        match losing {
+            Err(CustomError::BadRequestToken(e)) => assert_eq!(
+                e.error,
+                CoreErrorResponseType::Extension("authorization_pending".to_string())
+            ),
+            other => panic!(
+                "the losing poll must be told to wait: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        assert!(
+            output.contains(&fingerprint(&device_code)),
+            "the claim-lost line names the code's fingerprint; captured:\n{output}"
+        );
+        assert!(
+            !output.contains(&device_code),
+            "the device code appears in the logs in the clear:\n{output}"
+        );
         db.delete_device_code(&device_code).await.ok();
     }
 
@@ -5496,6 +5839,7 @@ mod userinfo_mxid_claim_tests {
                 code_challenge_method: None,
                 device_id: None,
                 localpart: Some(LOCALPART.to_string()),
+                scope: None,
             },
         )
         .await
@@ -6341,7 +6685,7 @@ mod device_display_name_tests {
                 refresh_token: None,
                 device_code: Some(device_code),
             },
-            None,
+            ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
             &config,
             &db,
@@ -6361,5 +6705,1060 @@ mod device_display_name_tests {
             scopes.contains(&format!("urn:matrix:client:device:{device_id}")),
             "the token must be scoped to the device that was provisioned: {scopes:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod client_binding_tests {
+    //! A refresh token belongs to the client it was issued to (I7), and the
+    //! token endpoint authenticates a client the same way for the code exchange
+    //! and the refresh grant. Needs Redis.
+    use super::*;
+    use crate::config::Config;
+    use openidconnect::core::CoreClientAuthMethod;
+
+    pub(super) const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    pub(super) const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    pub(super) const SECRET: &str = "the-registered-secret";
+
+    pub(super) fn unique(prefix: &str) -> String {
+        format!("{prefix}{}", Uuid::new_v4().simple())
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum Registration {
+        /// `token_endpoint_auth_method: none`, as Element Web and Element X register.
+        Public,
+        /// `client_secret_post`.
+        Confidential,
+        /// No `token_endpoint_auth_method`: confidential when `require_secret`.
+        Unset,
+    }
+
+    async fn seed_client(db: &RedisClient, registration: Registration) -> String {
+        seed_client_with(db, registration, None).await
+    }
+
+    /// A client registered with the given grant types (`None`: the registration
+    /// names none).
+    pub(super) async fn seed_client_with(
+        db: &RedisClient,
+        registration: Registration,
+        grant_types: Option<Vec<CoreGrantType>>,
+    ) -> String {
+        let id = unique("bind-");
+        let mut metadata = CoreClientMetadata::new(
+            vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
+            EmptyAdditionalClientMetadata {},
+        );
+        metadata = match registration {
+            Registration::Public => {
+                metadata.set_token_endpoint_auth_method(Some(CoreClientAuthMethod::None))
+            }
+            Registration::Confidential => metadata
+                .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::ClientSecretPost)),
+            Registration::Unset => metadata,
+        };
+        if let Some(grants) = grant_types {
+            metadata = metadata.set_grant_types(Some(grants));
+        }
+        db.set_client(
+            id.clone(),
+            ClientEntry {
+                secret: SECRET.into(),
+                metadata,
+                access_token: None,
+            },
+        )
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn seed_refresh_token(db: &RedisClient, client_id: &str) -> String {
+        let refresh = unique("mcr_");
+        let now = Utc::now().timestamp();
+        db.set_token(
+            &refresh,
+            &TokenMetadata {
+                username: unique("localpart"),
+                device_id: String::new(),
+                scope: "openid".into(),
+                client_id: client_id.into(),
+                iat: now,
+                exp: now + REFRESH_TOKEN_TTL as i64,
+                did: "did:key:zDnBINDING".into(),
+                name: "did:key:zDnBINDING".into(),
+                kind: Some(TokenKind::Refresh),
+            },
+            REFRESH_TOKEN_TTL,
+        )
+        .await
+        .unwrap();
+        refresh
+    }
+
+    async fn seed_code(db: &RedisClient, client_id: &str) -> String {
+        seed_code_with_scope(db, client_id, None).await
+    }
+
+    /// A code `sign_in` issued for an authorization request that asked for `scope`.
+    pub(super) async fn seed_code_with_scope(
+        db: &RedisClient,
+        client_id: &str,
+        scope: Option<&str>,
+    ) -> String {
+        let code = unique("code-");
+        db.set_code(
+            code.clone(),
+            CodeEntry {
+                exchange_count: 0,
+                did: "did:key:zDnBINDING".into(),
+                nonce: None,
+                client_id: client_id.into(),
+                auth_time: Utc::now(),
+                code_challenge: Some(CHALLENGE.into()),
+                code_challenge_method: Some("S256".into()),
+                device_id: None,
+                localpart: Some(unique("localpart")),
+                scope: scope.map(str::to_string),
+            },
+        )
+        .await
+        .unwrap();
+        code
+    }
+
+    /// What the caller says about itself: the `client_id` of the form, the
+    /// `client_secret` of the form, and a secret from an `Authorization` header.
+    #[derive(Clone, Copy)]
+    struct Presented<'a> {
+        client_id: Option<&'a str>,
+        form_secret: Option<&'a str>,
+        /// The user name of an `Authorization: Basic` header.
+        header_client_id: Option<&'a str>,
+        header_secret: Option<&'a str>,
+    }
+
+    const NOTHING: Presented<'static> = Presented {
+        client_id: None,
+        form_secret: None,
+        header_client_id: None,
+        header_secret: None,
+    };
+
+    async fn refresh(
+        db: &RedisClient,
+        config: &Config,
+        refresh_token: &str,
+        who: Presented<'_>,
+    ) -> Result<CoreTokenResponse, CustomError> {
+        token(
+            TokenForm {
+                code: None,
+                client_id: who.client_id.map(str::to_string),
+                client_secret: who.form_secret.map(str::to_string),
+                grant_type: CoreGrantType::RefreshToken,
+                code_verifier: None,
+                refresh_token: Some(refresh_token.to_string()),
+                device_code: None,
+            },
+            ClientCredentials {
+                basic_client_id: who.header_client_id.map(str::to_string),
+                secret: who.header_secret.map(str::to_string),
+            },
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            None,
+        )
+        .await
+    }
+
+    async fn exchange(
+        db: &RedisClient,
+        config: &Config,
+        code: &str,
+        who: Presented<'_>,
+    ) -> Result<CoreTokenResponse, CustomError> {
+        token(
+            TokenForm {
+                code: Some(code.to_string()),
+                client_id: who.client_id.map(str::to_string),
+                client_secret: who.form_secret.map(str::to_string),
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(VERIFIER.to_string()),
+                refresh_token: None,
+                device_code: None,
+            },
+            ClientCredentials {
+                basic_client_id: who.header_client_id.map(str::to_string),
+                secret: who.header_secret.map(str::to_string),
+            },
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            None,
+        )
+        .await
+    }
+
+    /// The answer, reduced to what a client sees: success, `invalid_grant`
+    /// (the grant does not belong to this client), or `invalid_client` (the
+    /// client did not authenticate).
+    fn outcome(result: &Result<CoreTokenResponse, CustomError>) -> String {
+        match result {
+            Ok(_) => "ok".to_string(),
+            Err(CustomError::BadRequestToken(e)) => match e.error {
+                CoreErrorResponseType::InvalidGrant => "invalid_grant".to_string(),
+                CoreErrorResponseType::InvalidRequest => "invalid_request".to_string(),
+                ref other => format!("{other:?}"),
+            },
+            Err(CustomError::Unauthorized(message)) => format!("invalid_client: {message}"),
+            Err(other) => format!("unexpected: {other:?}"),
+        }
+    }
+
+    fn refresh_token_of(result: Result<CoreTokenResponse, CustomError>) -> String {
+        use openidconnect::OAuth2TokenResponse;
+        result
+            .unwrap_or_else(|e| panic!("the refresh must succeed: {e:?}"))
+            .refresh_token()
+            .expect("a rotation returns a refresh token")
+            .secret()
+            .clone()
+    }
+
+    async fn still_exists(db: &RedisClient, refresh_token: &str) -> bool {
+        db.get_token(refresh_token).await.unwrap().is_some()
+    }
+
+    /// Another client, even one that authenticates correctly as itself, cannot
+    /// refresh the token. A refusal leaves the token alone.
+    #[tokio::test]
+    async fn a_refresh_token_is_refused_to_a_client_it_was_not_issued_to() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let owner = seed_client(&db, Registration::Public).await;
+        let other = seed_client(&db, Registration::Confidential).await;
+        let rt = seed_refresh_token(&db, &owner).await;
+
+        let stolen = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&other),
+                form_secret: Some(SECRET),
+                header_client_id: None,
+                header_secret: None,
+            },
+        )
+        .await;
+        assert_eq!(outcome(&stolen), "invalid_grant");
+        assert!(
+            still_exists(&db, &rt).await,
+            "a refusal never deletes the token"
+        );
+
+        let own = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&owner),
+                ..NOTHING
+            },
+        )
+        .await;
+        assert_eq!(outcome(&own), "ok", "the owner still refreshes it");
+    }
+
+    /// A confidential client authenticates at the refresh grant exactly as it
+    /// does at the code exchange: with the secret in the form or in a header.
+    #[tokio::test]
+    async fn a_confidential_client_must_authenticate_to_refresh() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Confidential).await;
+        let rt = seed_refresh_token(&db, &client).await;
+
+        for (what, who, expected) in [
+            (
+                "no credentials",
+                NOTHING,
+                "invalid_client: Secret required.",
+            ),
+            (
+                "a client_id and no secret",
+                Presented {
+                    client_id: Some(&client),
+                    ..NOTHING
+                },
+                "invalid_client: Secret required.",
+            ),
+            (
+                "a wrong form secret",
+                Presented {
+                    client_id: Some(&client),
+                    form_secret: Some("wrong"),
+                    header_client_id: None,
+                    header_secret: None,
+                },
+                "invalid_client: Bad secret.",
+            ),
+            (
+                "a wrong header secret",
+                Presented {
+                    header_secret: Some("wrong"),
+                    ..NOTHING
+                },
+                "invalid_client: Bad secret.",
+            ),
+        ] {
+            let result = refresh(&db, &config, &rt, who).await;
+            assert_eq!(outcome(&result), expected, "{what}");
+            assert!(
+                still_exists(&db, &rt).await,
+                "{what}: the token is untouched"
+            );
+        }
+
+        let with_form_secret = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&client),
+                form_secret: Some(SECRET),
+                header_client_id: None,
+                header_secret: None,
+            },
+        )
+        .await;
+        let rt2 = refresh_token_of(with_form_secret);
+        let with_header_secret = refresh(
+            &db,
+            &config,
+            &rt2,
+            Presented {
+                header_secret: Some(SECRET),
+                ..NOTHING
+            },
+        )
+        .await;
+        assert_eq!(outcome(&with_header_secret), "ok");
+    }
+
+    /// A public client authenticates nothing: it may name itself or not. Naming
+    /// is optional because `siwx-oidc-auth` and Matrix clients send the id but
+    /// an older agent may not (provisional: see docs/matrix-integration.md).
+    #[tokio::test]
+    async fn a_public_client_refreshes_with_or_without_naming_itself() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Public).await;
+        let rt = seed_refresh_token(&db, &client).await;
+
+        let named = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&client),
+                ..NOTHING
+            },
+        )
+        .await;
+        let rt2 = refresh_token_of(named);
+        let anonymous = refresh(&db, &config, &rt2, NOTHING).await;
+        assert_eq!(outcome(&anonymous), "ok");
+    }
+
+    /// A client registered without an authentication method is confidential
+    /// when `require_secret` is on and public when it is off, the same rule the
+    /// code exchange applies.
+    #[tokio::test]
+    async fn an_unset_authentication_method_follows_require_secret() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client = seed_client(&db, Registration::Unset).await;
+        let strict = Config {
+            require_secret: true,
+            ..Config::default()
+        };
+        let lax = Config {
+            require_secret: false,
+            ..Config::default()
+        };
+
+        let rt = seed_refresh_token(&db, &client).await;
+        assert_eq!(
+            outcome(&refresh(&db, &strict, &rt, NOTHING).await),
+            "invalid_client: Secret required."
+        );
+        assert_eq!(outcome(&refresh(&db, &lax, &rt, NOTHING).await), "ok");
+    }
+
+    /// A refresh token outlives its client's registration (a registration lasts
+    /// 30 days, a refresh token 90 days from its last use). Refusing every such
+    /// token would sign out every session older than a registration, so the
+    /// token keeps refreshing when the request names the same client or none.
+    /// What cannot be done: name another client, or present a secret that can
+    /// no longer be checked. Provisional: a deployment decision for the
+    /// maintainers (see docs/matrix-integration.md).
+    #[tokio::test]
+    async fn a_token_outlives_its_clients_registration_but_not_its_binding() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let gone = seed_client(&db, Registration::Public).await;
+        let other = seed_client(&db, Registration::Public).await;
+        let rt = seed_refresh_token(&db, &gone).await;
+        db.delete_client(gone.clone()).await.unwrap();
+
+        assert_eq!(
+            outcome(
+                &refresh(
+                    &db,
+                    &config,
+                    &rt,
+                    Presented {
+                        client_id: Some(&other),
+                        ..NOTHING
+                    }
+                )
+                .await
+            ),
+            "invalid_grant",
+            "another client is refused"
+        );
+        assert_eq!(
+            outcome(
+                &refresh(
+                    &db,
+                    &config,
+                    &rt,
+                    Presented {
+                        client_id: Some(&gone),
+                        form_secret: Some(SECRET),
+                        header_client_id: None,
+                        header_secret: None
+                    }
+                )
+                .await
+            ),
+            "invalid_client: Unrecognised client id.",
+            "a secret that cannot be checked is refused"
+        );
+        let named = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&gone),
+                ..NOTHING
+            },
+        )
+        .await;
+        let rt2 = refresh_token_of(named);
+        assert_eq!(
+            outcome(&refresh(&db, &config, &rt2, NOTHING).await),
+            "ok",
+            "the same client, or none, still refreshes"
+        );
+    }
+
+    /// An HTTP Basic header names the client in its user name, and that is
+    /// checked exactly like a `client_id` in the form, at both grants. A form
+    /// and a header that name different clients are a malformed request.
+    #[tokio::test]
+    async fn a_basic_header_names_the_client_like_the_form_does() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let owner = seed_client(&db, Registration::Confidential).await;
+        let other = seed_client(&db, Registration::Confidential).await;
+        let rt = seed_refresh_token(&db, &owner).await;
+
+        let someone_else = Presented {
+            header_client_id: Some(&other),
+            header_secret: Some(SECRET),
+            ..NOTHING
+        };
+        assert_eq!(
+            outcome(&refresh(&db, &config, &rt, someone_else).await),
+            "invalid_grant"
+        );
+        let spent = seed_code(&db, &owner).await;
+        assert_eq!(
+            outcome(&exchange(&db, &config, &spent, someone_else).await),
+            "invalid_grant"
+        );
+
+        // A form and a header that name different clients are malformed, and
+        // refused before the code is spent.
+        let split = Presented {
+            client_id: Some(&owner),
+            header_client_id: Some(&other),
+            header_secret: Some(SECRET),
+            ..NOTHING
+        };
+        let intact = seed_code(&db, &owner).await;
+        assert_eq!(
+            outcome(&refresh(&db, &config, &rt, split).await),
+            "invalid_request"
+        );
+        assert_eq!(
+            outcome(&exchange(&db, &config, &intact, split).await),
+            "invalid_request"
+        );
+        assert!(
+            still_exists(&db, &rt).await,
+            "refusals leave the token alone"
+        );
+
+        let own = Presented {
+            header_client_id: Some(&owner),
+            header_secret: Some(SECRET),
+            ..NOTHING
+        };
+        assert_eq!(
+            outcome(&exchange(&db, &config, &intact, own).await),
+            "ok",
+            "the malformed request did not spend the code"
+        );
+        assert_eq!(outcome(&refresh(&db, &config, &rt, own).await), "ok");
+    }
+
+    /// The grace replay hands out the successor pair, so it needs the same
+    /// client binding as a fresh rotation: anyone holding the old token for a
+    /// minute after the rotation must not get the new pair without the client's
+    /// credentials.
+    #[tokio::test]
+    async fn the_grace_replay_is_bound_to_the_client_too() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Confidential).await;
+        let other = seed_client(&db, Registration::Confidential).await;
+        let old = seed_refresh_token(&db, &client).await;
+        let credentials = Presented {
+            client_id: Some(&client),
+            form_secret: Some(SECRET),
+            header_client_id: None,
+            header_secret: None,
+        };
+
+        let successor = refresh_token_of(refresh(&db, &config, &old, credentials).await);
+        assert_eq!(
+            outcome(&refresh(&db, &config, &old, NOTHING).await),
+            "invalid_client: Secret required.",
+            "a replay without credentials gets no successor pair"
+        );
+        assert_eq!(
+            outcome(
+                &refresh(
+                    &db,
+                    &config,
+                    &old,
+                    Presented {
+                        client_id: Some(&other),
+                        form_secret: Some(SECRET),
+                        header_client_id: None,
+                        header_secret: None
+                    }
+                )
+                .await
+            ),
+            "invalid_grant",
+            "a replay by another client gets no successor pair"
+        );
+        let replay = refresh_token_of(refresh(&db, &config, &old, credentials).await);
+        assert_eq!(
+            replay, successor,
+            "the client itself still recovers the same pair within the grace window"
+        );
+    }
+
+    /// A grace replay returns the successor pair only while the successor
+    /// refresh token is live. Once it has been rotated away or revoked, the
+    /// recorded pair is dead (the next rotation or the revocation took its
+    /// access token with it), so handing it out would answer a lost-response
+    /// retry with tokens that do not work. The replay is `invalid_grant`, like
+    /// any unknown token.
+    #[tokio::test]
+    async fn a_replay_whose_successor_has_been_rotated_or_revoked_is_refused() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Public).await;
+
+        // Rotated: the client received the successor and has since used it.
+        let old = seed_refresh_token(&db, &client).await;
+        let successor = refresh_token_of(refresh(&db, &config, &old, NOTHING).await);
+        assert_eq!(
+            refresh_token_of(refresh(&db, &config, &old, NOTHING).await),
+            successor,
+            "while the successor is live the replay returns it"
+        );
+        let next = refresh_token_of(refresh(&db, &config, &successor, NOTHING).await);
+        assert_ne!(next, successor);
+        assert_eq!(
+            outcome(&refresh(&db, &config, &old, NOTHING).await),
+            "invalid_grant",
+            "a replay whose successor was rotated gets no pair"
+        );
+
+        // Revoked: the successor was deleted before the client used it.
+        let old = seed_refresh_token(&db, &client).await;
+        let successor = refresh_token_of(refresh(&db, &config, &old, NOTHING).await);
+        db.delete_token(&successor).await.unwrap();
+        assert_eq!(
+            outcome(&refresh(&db, &config, &old, NOTHING).await),
+            "invalid_grant",
+            "a replay whose successor was revoked gets no pair"
+        );
+    }
+
+    /// One helper authenticates the client for both grants, so the two cannot
+    /// drift: every way a request can present itself gets the same answer from
+    /// the code exchange and the refresh grant.
+    #[tokio::test]
+    async fn the_code_exchange_and_the_refresh_grant_authenticate_clients_identically() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let strict = Config {
+            require_secret: true,
+            ..Config::default()
+        };
+        let lax = Config {
+            require_secret: false,
+            ..Config::default()
+        };
+        let other = seed_client(&db, Registration::Confidential).await;
+
+        for (registration, config, label) in [
+            (Registration::Public, &strict, "public"),
+            (Registration::Confidential, &strict, "confidential"),
+            (Registration::Unset, &strict, "unset, secret required"),
+            (Registration::Unset, &lax, "unset, secret optional"),
+        ] {
+            let client = seed_client(&db, registration).await;
+            for (what, who) in [
+                ("nothing", NOTHING),
+                (
+                    "its id",
+                    Presented {
+                        client_id: Some(&client),
+                        ..NOTHING
+                    },
+                ),
+                (
+                    "its id and secret",
+                    Presented {
+                        client_id: Some(&client),
+                        form_secret: Some(SECRET),
+                        header_client_id: None,
+                        header_secret: None,
+                    },
+                ),
+                (
+                    "its id and a wrong secret",
+                    Presented {
+                        client_id: Some(&client),
+                        form_secret: Some("wrong"),
+                        header_client_id: None,
+                        header_secret: None,
+                    },
+                ),
+                (
+                    "a header secret",
+                    Presented {
+                        header_secret: Some(SECRET),
+                        ..NOTHING
+                    },
+                ),
+                (
+                    "another client's id and secret",
+                    Presented {
+                        client_id: Some(&other),
+                        form_secret: Some(SECRET),
+                        header_client_id: None,
+                        header_secret: None,
+                    },
+                ),
+            ] {
+                let code = seed_code(&db, &client).await;
+                let rt = seed_refresh_token(&db, &client).await;
+                let by_code = outcome(&exchange(&db, config, &code, who).await);
+                let by_refresh = outcome(&refresh(&db, config, &rt, who).await);
+                assert_eq!(
+                    by_refresh, by_code,
+                    "{label} client presenting {what}: the refresh grant answered \
+                     `{by_refresh}`, the code exchange `{by_code}`"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scope_grant_tests {
+    //! What the code exchange issues for the scope that was requested.
+    //!
+    //! Generic mode (no MAS shared secret) grants only what was asked for and
+    //! allowed, and issues a refresh token only for `offline_access` to a client
+    //! whose registration allows the refresh grant (I10). Matrix mode is
+    //! unchanged: the Matrix scope for the device and a refresh token, whatever
+    //! was requested. Needs Redis.
+    use super::client_binding_tests::{
+        seed_client_with, seed_code_with_scope, unique, Registration, VERIFIER,
+    };
+    use super::*;
+    use crate::config::Config;
+    use openidconnect::OAuth2TokenResponse;
+
+    fn generic() -> Config {
+        Config::default()
+    }
+
+    fn matrix() -> Config {
+        Config {
+            mas_shared_secret: Some("shared-secret".to_string()),
+            ..Config::default()
+        }
+    }
+
+    fn may_refresh() -> Option<Vec<CoreGrantType>> {
+        Some(vec![
+            CoreGrantType::AuthorizationCode,
+            CoreGrantType::RefreshToken,
+        ])
+    }
+
+    fn code_grant_only() -> Option<Vec<CoreGrantType>> {
+        Some(vec![CoreGrantType::AuthorizationCode])
+    }
+
+    /// Redeem a code for a public client that sends no secret.
+    async fn exchange(
+        db: &RedisClient,
+        config: &Config,
+        client_id: &str,
+        code: &str,
+    ) -> CoreTokenResponse {
+        token(
+            TokenForm {
+                code: Some(code.to_string()),
+                client_id: Some(client_id.to_string()),
+                client_secret: None,
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(VERIFIER.to_string()),
+                refresh_token: None,
+                device_code: None,
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the exchange must succeed: {e:?}"))
+    }
+
+    /// A public client, a code that asked for `scope`, and the exchange.
+    async fn issue(
+        db: &RedisClient,
+        config: &Config,
+        grants: Option<Vec<CoreGrantType>>,
+        scope: Option<&str>,
+    ) -> CoreTokenResponse {
+        let client = seed_client_with(db, Registration::Public, grants).await;
+        let code = seed_code_with_scope(db, &client, scope).await;
+        exchange(db, config, &client, &code).await
+    }
+
+    fn scope_of(response: &CoreTokenResponse) -> Option<String> {
+        response.scopes().map(|scopes| {
+            scopes
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+    }
+
+    async fn recorded_scope(db: &RedisClient, response: &CoreTokenResponse) -> String {
+        db.get_token(response.access_token().secret())
+            .await
+            .unwrap()
+            .expect("the access token is stored")
+            .scope
+    }
+
+    /// Without `offline_access` there is no refresh token: a client that did
+    /// not ask for one does not hold a credential that outlives its session.
+    #[tokio::test]
+    async fn generic_mode_issues_a_refresh_token_only_for_offline_access() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+
+        let without = issue(&db, &generic(), may_refresh(), Some("openid profile")).await;
+        assert!(
+            without.refresh_token().is_none(),
+            "no offline_access, no refresh token"
+        );
+        assert_eq!(recorded_scope(&db, &without).await, "openid profile");
+        assert_eq!(
+            scope_of(&without),
+            None,
+            "the granted scope equals the requested one, so the response omits it"
+        );
+
+        let with = issue(
+            &db,
+            &generic(),
+            may_refresh(),
+            Some("openid profile offline_access"),
+        )
+        .await;
+        assert!(with.refresh_token().is_some(), "offline_access asked for");
+        assert_eq!(
+            recorded_scope(&db, &with).await,
+            "openid profile offline_access"
+        );
+        assert_eq!(scope_of(&with), None, "granted as requested");
+    }
+
+    /// `offline_access` also needs the client's registration to allow the
+    /// refresh grant. The scope that is not granted is not in the issued scope,
+    /// and the response says what was granted because it differs.
+    #[tokio::test]
+    async fn generic_mode_grants_offline_access_only_to_a_client_that_may_refresh() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+
+        let refused = issue(
+            &db,
+            &generic(),
+            code_grant_only(),
+            Some("openid offline_access"),
+        )
+        .await;
+        assert!(
+            refused.refresh_token().is_none(),
+            "the registration lists no refresh_token grant"
+        );
+        assert_eq!(recorded_scope(&db, &refused).await, "openid");
+        assert_eq!(
+            scope_of(&refused).as_deref(),
+            Some("openid"),
+            "the response names the granted scope, which differs from the request"
+        );
+
+        // Provisional: a registration that names no grant types is not a
+        // restriction. A client that never listed any would otherwise lose
+        // refresh tokens it was entitled to under the registration it made.
+        let unspecified = issue(&db, &generic(), None, Some("openid offline_access")).await;
+        assert!(unspecified.refresh_token().is_some());
+        assert_eq!(
+            recorded_scope(&db, &unspecified).await,
+            "openid offline_access"
+        );
+    }
+
+    /// The issued scope reflects the request intersected with what generic mode
+    /// supports; Matrix scopes mean nothing there and are not granted.
+    #[tokio::test]
+    async fn generic_mode_issues_the_scope_that_was_requested_and_supported() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+
+        let openid_only = issue(&db, &generic(), may_refresh(), Some("openid")).await;
+        assert_eq!(recorded_scope(&db, &openid_only).await, "openid");
+
+        let mixed = issue(
+            &db,
+            &generic(),
+            may_refresh(),
+            Some("openid email urn:matrix:client:api:* profile"),
+        )
+        .await;
+        assert_eq!(
+            recorded_scope(&db, &mixed).await,
+            "openid profile",
+            "supported scopes only, in a fixed order"
+        );
+        assert_eq!(
+            scope_of(&mixed).as_deref(),
+            Some("openid profile"),
+            "the granted scope differs from the request, so the response says so"
+        );
+
+        // Nothing supported was asked for: the exchange still issues an ID
+        // token, so `openid` is what is granted (provisional).
+        let matrix_only = issue(
+            &db,
+            &generic(),
+            may_refresh(),
+            Some("urn:matrix:client:api:*"),
+        )
+        .await;
+        assert_eq!(recorded_scope(&db, &matrix_only).await, "openid");
+    }
+
+    /// A code written before the scope travelled with it (an earlier build, for
+    /// the 300 s a code lives) is exchanged as it was then: `openid profile`
+    /// and a refresh token.
+    #[tokio::test]
+    async fn generic_mode_exchanges_a_code_with_no_recorded_scope_as_before() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let legacy = issue(&db, &generic(), may_refresh(), None).await;
+        assert!(legacy.refresh_token().is_some());
+        assert_eq!(recorded_scope(&db, &legacy).await, "openid profile");
+        assert_eq!(scope_of(&legacy), None);
+    }
+
+    /// Matrix mode is unchanged: whatever the request asked for, the code grant
+    /// records the Matrix scope for the device and issues a refresh token, and
+    /// the response carries no `scope`.
+    #[tokio::test]
+    async fn matrix_mode_issues_the_matrix_scope_and_a_refresh_token_whatever_was_requested() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        for requested in [
+            None,
+            Some("openid"),
+            Some("openid profile"),
+            Some("openid offline_access"),
+            Some("urn:matrix:client:api:*"),
+        ] {
+            let client = seed_client_with(&db, Registration::Public, code_grant_only()).await;
+            let code = seed_code_with_scope(&db, &client, requested).await;
+            // Give the code a device, as provisioning does.
+            let mut entry = db.try_consume_code(code).await.unwrap().unwrap();
+            entry.device_id = Some("SIWX_ABCD1234".to_string());
+            let code = unique("code-");
+            db.set_code(code.clone(), entry).await.unwrap();
+
+            let response = exchange(&db, &matrix(), &client, &code).await;
+            assert!(
+                response.refresh_token().is_some(),
+                "Matrix mode issues a refresh token (requested {requested:?})"
+            );
+            assert_eq!(
+                recorded_scope(&db, &response).await,
+                "openid urn:matrix:client:api:* urn:matrix:client:device:SIWX_ABCD1234",
+                "requested {requested:?}"
+            );
+            assert_eq!(
+                scope_of(&response),
+                None,
+                "Matrix mode never put a scope in the token response (requested {requested:?})"
+            );
+            assert!(
+                response.access_token().secret().starts_with("mat_")
+                    && response
+                        .refresh_token()
+                        .unwrap()
+                        .secret()
+                        .starts_with("mcr_"),
+                "Matrix token prefixes are unchanged"
+            );
+        }
+    }
+
+    fn registration(grants: Option<Vec<CoreGrantType>>) -> ClientEntry {
+        let mut metadata = CoreClientMetadata::new(
+            vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
+            EmptyAdditionalClientMetadata {},
+        );
+        if let Some(grants) = grants {
+            metadata = metadata.set_grant_types(Some(grants));
+        }
+        ClientEntry {
+            secret: "secret".into(),
+            metadata,
+            access_token: None,
+        }
+    }
+
+    /// The pure decision, without Redis: ordering and duplicates do not matter,
+    /// the response names the scope only when it differs from the request.
+    #[test]
+    fn the_generic_grant_follows_the_request_and_the_registration() {
+        let grant =
+            |requested: Option<&str>, grants| generic_grant(requested, &registration(grants));
+        let expect = |scope: &str, refresh_token: bool, report_scope: bool| GenericGrant {
+            scope: scope.to_string(),
+            refresh_token,
+            report_scope,
+        };
+
+        assert_eq!(
+            grant(Some("profile  openid openid"), None),
+            expect("openid profile", false, false),
+            "order, spacing and repeats of the request are immaterial"
+        );
+        assert_eq!(
+            grant(Some("offline_access openid"), may_refresh()),
+            expect("openid offline_access", true, false)
+        );
+        assert_eq!(
+            grant(Some("openid offline_access"), code_grant_only()),
+            expect("openid", false, true),
+            "offline_access needs the refresh grant in the registration"
+        );
+        assert_eq!(
+            grant(Some("openid email"), None),
+            expect("openid", false, true),
+            "a scope generic mode does not know is not granted"
+        );
+        assert_eq!(
+            grant(Some(""), None),
+            expect("openid", false, true),
+            "nothing requested: openid, because an ID token is issued"
+        );
+        assert_eq!(
+            grant(None, code_grant_only()),
+            expect("openid profile", true, false),
+            "a code with no recorded scope is exchanged as it was before the scope travelled"
+        );
+    }
+
+    /// Discovery says `offline_access` is a scope this provider honours.
+    #[test]
+    fn discovery_advertises_offline_access() {
+        let value = provider_metadata_value(&Config::default(), false).unwrap();
+        let scopes: Vec<&str> = value["scopes_supported"]
+            .as_array()
+            .expect("scopes_supported is an array")
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        assert!(scopes.contains(&"offline_access"), "{scopes:?}");
+        for kept in ["openid", "profile", "urn:matrix:client:api:*"] {
+            assert!(scopes.contains(&kept), "{kept} is still advertised");
+        }
     }
 }

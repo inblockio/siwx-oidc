@@ -122,6 +122,91 @@ fn redacted(url: &Url) -> Url {
     shown
 }
 
+/// Everything the code under test logs on the calling thread at `DEBUG` and
+/// above (what `RUST_LOG=debug` shows, the most verbose setting an operator
+/// reaches for), for as long as the value lives.
+///
+/// Built on `tracing::subscriber::set_default`, which is per thread: use it in a
+/// `#[tokio::test]` (a current-thread runtime, so every task the test awaits runs
+/// on the test's own thread) and in a plain `#[test]`. Tests running in parallel
+/// on other threads never write into it, and a global subscriber set by
+/// `test_log` or `env_logger` does not matter, because the thread-local one
+/// wins. A task spawned onto another thread logs elsewhere and is invisible
+/// here, so a test of such a path must not rely on `LogCapture` for its negative
+/// assertion.
+pub struct LogCapture {
+    buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+impl LogCapture {
+    /// Start capturing (spans included, so a field a span carries shows up on
+    /// every event inside it).
+    pub fn start() -> Self {
+        // A second dispatcher, registered for the life of the process and
+        // writing nowhere. tracing-core caches per callsite whether anyone
+        // wants it, and while exactly one dispatcher exists it asks only the
+        // dispatcher of the thread that first reaches the callsite. With the
+        // capture as that one dispatcher, a callsite first hit on a thread that
+        // has no capture is cached as "never", and the capturing thread then
+        // loses every event from it: a log assertion failed about every other
+        // run of the unit tests. With two registered, tracing-core asks every
+        // dispatcher, and this one enables DEBUG, so the callsite stays on.
+        // Pin: `tests/log_capture_callsite_interest.rs`.
+        static KEEP: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        KEEP.get_or_init(|| {
+            tracing::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::DEBUG)
+                    .with_writer(std::io::sink)
+                    .finish(),
+            )
+        });
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(SharedBuffer(buffer.clone()))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        Self {
+            buffer,
+            _guard: guard,
+        }
+    }
+
+    /// Everything captured so far.
+    pub fn output(&self) -> String {
+        let bytes = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+#[derive(Clone)]
+struct SharedBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Write for SharedBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuffer {
+    type Writer = SharedBuffer;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

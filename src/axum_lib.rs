@@ -12,7 +12,7 @@ use axum::{
 use axum_extra::{
     headers::{
         authorization::{Basic, Bearer},
-        Authorization, ContentType,
+        Authorization, ContentType, HeaderMapExt,
     },
     TypedHeader,
 };
@@ -46,6 +46,7 @@ use super::synapse_client::SynapseClient;
 use super::webauthn as wa;
 use aqua_auth::{all_cipher_suites, all_did_methods};
 use siwx_oidc::db::*;
+use siwx_oidc::redact::fingerprint;
 
 // -- Shared application state ----------------------------------------------
 
@@ -132,7 +133,7 @@ impl IntoResponse for CustomError {
             }
             CustomError::UnknownCredential(cred_id) => {
                 // Expected user condition (stale/revoked passkey), NOT a server fault.
-                warn!(credential_id = %cred_id, "unknown_credential");
+                warn!(credential_fp = %fingerprint(cred_id), "unknown_credential");
             }
             // A server-side fault we have already CLASSIFIED, unlike
             // `internal_error`. Logged under its own name so an operator can
@@ -154,7 +155,16 @@ impl IntoResponse for CustomError {
             CustomError::BadRequestRegister(e) => {
                 (StatusCode::BAD_REQUEST, Json(e)).into_response()
             }
-            CustomError::BadRequestToken(e) => (StatusCode::BAD_REQUEST, Json(e)).into_response(),
+            // RFC 6749 §5.2: `invalid_client` (the client did not authenticate)
+            // is a 401; every other token error is a 400.
+            CustomError::BadRequestToken(e) => {
+                let status = if e.error == CoreErrorResponseType::InvalidClient {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                (status, Json(e)).into_response()
+            }
             CustomError::Unauthorized(_) => {
                 (StatusCode::UNAUTHORIZED, self.to_string()).into_response()
             }
@@ -208,20 +218,83 @@ fn matrix_ready(state: &AppState) -> bool {
     state.config.matrix_server_name.is_some() && state.synapse_client.is_some()
 }
 
+/// A failure of `POST /token`, with whether the client tried HTTP Basic: the
+/// 401 for `invalid_client` must then carry a matching challenge (RFC 6749
+/// §5.2). The challenge is not sent to a client that authenticated in the form
+/// (or not at all), so a browser never shows a credentials prompt for it.
+struct TokenEndpointError {
+    error: CustomError,
+    basic_attempted: bool,
+}
+
+impl IntoResponse for TokenEndpointError {
+    fn into_response(self) -> Response {
+        let challenge = self.basic_attempted
+            && matches!(
+                &self.error,
+                CustomError::BadRequestToken(e) if e.error == CoreErrorResponseType::InvalidClient
+            );
+        let mut response = self.error.into_response();
+        if challenge {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                header::HeaderValue::from_static("Basic realm=\"siwx-oidc\", charset=\"UTF-8\""),
+            );
+        }
+        response
+    }
+}
+
+/// What `POST /token` learns about the calling client from the `Authorization`
+/// header, and whether the client attempted HTTP Basic (which decides the
+/// `WWW-Authenticate` challenge on a failure).
+///
+/// One header, read as either scheme. A handler that takes
+/// `Option<TypedHeader<Authorization<Bearer>>>` and
+/// `Option<TypedHeader<Authorization<Basic>>>` as two extractors answers every
+/// request that carries the header with a 400 ("invalid HTTP header"), because
+/// each extractor rejects a header of the other scheme instead of yielding
+/// `None`. That is how `client_secret_basic` never worked here.
+///
+/// A Basic user name and password are form-urldecoded (`form_urldecode`); a
+/// Bearer token is an opaque string and is taken as sent.
+fn client_credentials(headers: &HeaderMap) -> (oidc::ClientCredentials, bool) {
+    let basic = headers.typed_get::<Authorization<Basic>>();
+    let bearer = headers.typed_get::<Authorization<Bearer>>();
+    let basic_attempted = basic.is_some();
+    let credentials = oidc::ClientCredentials {
+        basic_client_id: basic.as_ref().map(|b| form_urldecode(b.username())),
+        secret: if let Some(b) = bearer {
+            Some(b.token().to_string())
+        } else {
+            basic.map(|b| form_urldecode(b.password()))
+        },
+    };
+    (credentials, basic_attempted)
+}
+
+/// Undo the `application/x-www-form-urlencoded` encoding RFC 6749 section 2.3.1
+/// applies to a client id and a secret before they go into a Basic header:
+/// `+` is a space and `%XX` a byte. Without it a secret that contains a
+/// character that encodes never matches its registration. Bytes that are not
+/// UTF-8 once decoded are kept as the `+`-expanded text, which then simply fails
+/// the comparison.
+fn form_urldecode(value: &str) -> String {
+    let spaced = value.replace('+', " ");
+    urlencoding::decode(&spaced)
+        .map(std::borrow::Cow::into_owned)
+        .unwrap_or(spaced)
+}
+
 async fn token(
     State(state): State<AppState>,
-    bearer: Option<TypedHeader<Authorization<Bearer>>>,
-    basic: Option<TypedHeader<Authorization<Basic>>>,
+    headers: HeaderMap,
     Form(form): Form<oidc::TokenForm>,
-) -> Result<Json<serde_json::Value>, CustomError> {
-    let secret = if let Some(b) = bearer {
-        Some(b.0 .0.token().to_string())
-    } else {
-        basic.map(|b| b.0 .0.password().to_string())
-    };
+) -> Result<Json<serde_json::Value>, TokenEndpointError> {
+    let (credentials, basic_attempted) = client_credentials(&headers);
     let token_response = oidc::token(
         form,
-        secret,
+        credentials,
         &state.signing_key,
         &state.config,
         &state.redis_client,
@@ -231,7 +304,7 @@ async fn token(
     .map_err(|e| {
         // OAuth2 RFC 6749 §5.2: token endpoint errors MUST be JSON.
         // Wrap non-Token errors so they always produce a JSON body.
-        match e {
+        let error = match e {
             CustomError::BadRequestToken(_) => e,
             CustomError::Unauthorized(msg) => CustomError::BadRequestToken(oidc::TokenError {
                 error: CoreErrorResponseType::InvalidClient,
@@ -241,13 +314,19 @@ async fn token(
                 error: CoreErrorResponseType::InvalidRequest,
                 error_description: other.to_string(),
             }),
+        };
+        TokenEndpointError {
+            error,
+            basic_attempted,
         }
     })?;
     // Strip null fields (e.g. "id_token": null on refresh responses) because
     // oidc-client-ts treats a present-but-null id_token as a validation target
     // and fails when it cannot decode it as a JWT.
-    let mut value = serde_json::to_value(token_response)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize token response: {}", e))?;
+    let mut value = serde_json::to_value(token_response).map_err(|e| TokenEndpointError {
+        error: anyhow::anyhow!("Failed to serialize token response: {}", e).into(),
+        basic_attempted,
+    })?;
     if let serde_json::Value::Object(ref mut map) = value {
         map.retain(|_, v| !v.is_null());
     }
@@ -1537,45 +1616,18 @@ pub async fn main() {
         .route(
             "/_matrix/client/v3/refresh",
             post(compat::refresh).with_state(compat_state),
-        )
-        .layer(
-            TraceLayer::new_for_http()
-                .on_request(|req: &axum::http::Request<_>, _span: &tracing::Span| {
-                    info!(
-                        method = %req.method(),
-                        path = %req.uri().path(),
-                        "request"
-                    );
-                })
-                .on_response(
-                    |res: &axum::http::Response<_>, latency: Duration, _span: &tracing::Span| {
-                        info!(
-                            status = res.status().as_u16(),
-                            latency_ms = latency.as_millis() as u64,
-                            "response"
-                        );
-                    },
-                )
-                .on_failure(
-                    |error: ServerErrorsFailureClass, latency: Duration, _span: &tracing::Span| {
-                        warn!(
-                            error = %error,
-                            latency_ms = latency.as_millis() as u64,
-                            "request failed"
-                        );
-                    },
-                ),
-        )
-        .layer(
-            CorsLayer::new()
-                .allow_origin(AllowOrigin::any())
-                .allow_methods([
-                    axum::http::Method::GET,
-                    axum::http::Method::POST,
-                    axum::http::Method::OPTIONS,
-                ])
-                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
         );
+
+    let app = with_request_logging(app).layer(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::any())
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
+    );
 
     let addr = SocketAddr::from((config.address, config.port));
     // Before the bind: from the moment the port accepts, a SIGTERM is handled.
@@ -1586,6 +1638,54 @@ pub async fn main() {
         .with_graceful_shutdown(shutdown)
         .await
         .unwrap();
+}
+
+/// Request logging: one `info!` line per request (method and path) and one per
+/// response (status and latency). The path only, never the query.
+///
+/// A query carries credentials (`/device?user_code=…` is the link the device
+/// flow hands the user), so it is kept out of the span as well as out of the
+/// events. tower-http's default span records the whole URI and prints it in
+/// front of every event logged while the request is handled, which at debug
+/// level is every line. The span is at `DEBUG`, as the default one is, so it
+/// stays off under the default filter. Pinned by
+/// `request_logging_names_the_path_and_never_the_query`.
+fn with_request_logging(router: Router) -> Router {
+    router.layer(
+        TraceLayer::new_for_http()
+            .make_span_with(|req: &axum::http::Request<_>| {
+                tracing::debug_span!(
+                    "request",
+                    method = %req.method(),
+                    path = %req.uri().path(),
+                )
+            })
+            .on_request(|req: &axum::http::Request<_>, _span: &tracing::Span| {
+                info!(
+                    method = %req.method(),
+                    path = %req.uri().path(),
+                    "request"
+                );
+            })
+            .on_response(
+                |res: &axum::http::Response<_>, latency: Duration, _span: &tracing::Span| {
+                    info!(
+                        status = res.status().as_u16(),
+                        latency_ms = latency.as_millis() as u64,
+                        "response"
+                    );
+                },
+            )
+            .on_failure(
+                |error: ServerErrorsFailureClass, latency: Duration, _span: &tracing::Span| {
+                    warn!(
+                        error = %error,
+                        latency_ms = latency.as_millis() as u64,
+                        "request failed"
+                    );
+                },
+            ),
+    )
 }
 
 /// Resolves on SIGTERM (`docker stop`, Kubernetes) or SIGINT (Ctrl-C); the
@@ -1854,5 +1954,189 @@ mod unknown_credential_response_tests {
         );
 
         redis.del_raw(&key).await.ok();
+    }
+}
+
+#[cfg(test)]
+mod request_logging_tests {
+    //! What the request-logging layer may put in the logs. Drives the layer over
+    //! a real socket: the span a layer opens is part of every line logged while
+    //! the request is handled, so only a request through the real stack shows it.
+    use super::*;
+
+    /// A query carries credentials (`/device` takes the user code in its
+    /// `verification_uri_complete`), so a request is logged by method and path.
+    /// tower-http's default span records the full URI and prints it in front of
+    /// every event logged during the request when debug logging is on, which is
+    /// the case this guards.
+    #[tokio::test]
+    async fn request_logging_names_the_path_and_never_the_query() {
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let app = with_request_logging(Router::new().route(
+            "/device",
+            get(|| async {
+                // An event inside the handler carries the request's span.
+                info!("handling");
+                "ok"
+            }),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let secret = "QUERYSECRET-WDJB-MJHT";
+        let response = reqwest::get(format!(
+            "http://{addr}/device?user_code={secret}&access_token=tok-{secret}"
+        ))
+        .await
+        .unwrap();
+        assert!(response.status().is_success());
+        server.abort();
+        let output = logs.output();
+
+        assert!(
+            output.contains("path=/device"),
+            "the request line names the path; captured:\n{output}"
+        );
+        assert!(
+            output.contains("handling"),
+            "the handler's own event was captured; captured:\n{output}"
+        );
+        assert!(
+            !output.contains(secret),
+            "a query value appears in the logs:\n{}",
+            output
+                .lines()
+                .filter(|l| l.contains(secret))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(
+            !output.contains("user_code="),
+            "a query parameter name appears in the logs:\n{output}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod token_endpoint_error_tests {
+    //! The status and challenge of a failed `POST /token`: RFC 6749 §5.2 makes
+    //! `invalid_client` a 401, with a `WWW-Authenticate` challenge when the
+    //! client attempted HTTP Basic, and every other token error a 400.
+    use super::*;
+
+    fn token_error(error: CoreErrorResponseType) -> CustomError {
+        CustomError::BadRequestToken(oidc::TokenError {
+            error,
+            error_description: "described".to_string(),
+        })
+    }
+
+    fn respond(error: CustomError, basic_attempted: bool) -> Response {
+        TokenEndpointError {
+            error,
+            basic_attempted,
+        }
+        .into_response()
+    }
+
+    #[test]
+    fn invalid_client_is_a_401_and_every_other_token_error_a_400() {
+        for (error, expected) in [
+            (
+                CoreErrorResponseType::InvalidClient,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (CoreErrorResponseType::InvalidGrant, StatusCode::BAD_REQUEST),
+            (
+                CoreErrorResponseType::InvalidRequest,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                CoreErrorResponseType::UnsupportedGrantType,
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let shown = format!("{error:?}");
+            assert_eq!(
+                respond(token_error(error), false).status(),
+                expected,
+                "{shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_failed_basic_attempt_is_challenged() {
+        let challenged = respond(token_error(CoreErrorResponseType::InvalidClient), true);
+        assert_eq!(challenged.status(), StatusCode::UNAUTHORIZED);
+        assert!(challenged
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .is_some_and(|v| v.to_str().unwrap().starts_with("Basic ")));
+
+        for (what, response) in [
+            (
+                "invalid_client without a Basic attempt",
+                respond(token_error(CoreErrorResponseType::InvalidClient), false),
+            ),
+            (
+                "invalid_grant after a Basic attempt",
+                respond(token_error(CoreErrorResponseType::InvalidGrant), true),
+            ),
+        ] {
+            assert!(
+                response.headers().get(header::WWW_AUTHENTICATE).is_none(),
+                "{what}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod client_credentials_tests {
+    //! What `POST /token` makes of the `Authorization` header.
+    use super::*;
+
+    fn form_encode(value: &str) -> String {
+        url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+    }
+
+    fn with_header(header: impl axum_extra::headers::Header) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.typed_insert(header);
+        headers
+    }
+
+    /// RFC 6749 §2.3.1: the client id and the secret are encoded with
+    /// `application/x-www-form-urlencoded` before they are joined and Base64
+    /// encoded into the Basic header, so the server must decode both before it
+    /// compares them. A secret with a character that encodes (a space, `+`, `%`,
+    /// `&`, `:`, a non-ASCII letter) would otherwise never match.
+    #[test]
+    fn basic_credentials_are_form_urldecoded_before_they_are_compared() {
+        let (id, secret) = ("client id", "p@ss w%rd+x&y:z/\u{e9}");
+        let headers = with_header(Authorization::basic(&form_encode(id), &form_encode(secret)));
+
+        let (credentials, basic_attempted) = client_credentials(&headers);
+        assert!(basic_attempted);
+        assert_eq!(credentials.basic_client_id.as_deref(), Some(id));
+        assert_eq!(credentials.secret.as_deref(), Some(secret));
+    }
+
+    /// A secret with nothing to encode, the usual generated kind, passes through
+    /// unchanged; and a Bearer token is an opaque string, never form-decoded.
+    #[test]
+    fn a_plain_basic_secret_and_a_bearer_token_are_taken_as_sent() {
+        let headers = with_header(Authorization::basic("client", "0123abcdEF-_.~"));
+        let (credentials, _) = client_credentials(&headers);
+        assert_eq!(credentials.basic_client_id.as_deref(), Some("client"));
+        assert_eq!(credentials.secret.as_deref(), Some("0123abcdEF-_.~"));
+
+        let headers = with_header(Authorization::bearer("a%2Bb+c").unwrap());
+        let (credentials, basic_attempted) = client_credentials(&headers);
+        assert!(!basic_attempted);
+        assert_eq!(credentials.basic_client_id, None);
+        assert_eq!(credentials.secret.as_deref(), Some("a%2Bb+c"));
     }
 }

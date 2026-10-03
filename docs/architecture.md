@@ -154,7 +154,7 @@ All state lives in one Redis (`redis_url`). Prefixes are defined in `src/db/mod.
 |---|---|---|
 | `sessions/{id}` | 300 s | `SessionEntry`: nonces, `verified_did`, sign-in count, and the authorization request `/authorize` bound to it (client, redirect URI, state, response mode, PKCE challenge) |
 | `sessions/{id}/signed_in` | 300 s | one-shot flag against double sign-in |
-| `codes/{code}` | 300 s | `CodeEntry` (DID, client, PKCE challenge, device id, localpart); read and deleted in one atomic step on exchange. A `codes/{code}/consumed` marker exists only from older builds, which kept exchanged codes |
+| `codes/{code}` | 300 s | `CodeEntry` (DID, client, PKCE challenge, device id, localpart, requested scope); read and deleted in one atomic step on exchange. A `codes/{code}/consumed` marker exists only from older builds, which kept exchanged codes |
 | `clients/{client_id}` | 30 d | `ClientEntry` (secret, metadata); `default_clients` are rewritten at every start |
 | `token/{token}` | access 300 s, refresh 90 d, admin 30–900 s | `TokenMetadata` (kind: access or refresh, username, device id, scope, client, DID); each endpoint accepts one kind, see [matrix-integration.md](matrix-integration.md#token-kinds) |
 | `token_rotated/{old_refresh}` | 60 s | successor pair for a lost refresh response |
@@ -179,7 +179,8 @@ loses them. Troubleshooting commands: [troubleshooting.md](troubleshooting.md).
 
 `tracing` with an `EnvFilter` (default `siwx_oidc=info,tower_http=info,warn`, overridden by
 `RUST_LOG`) and a human-readable or JSON formatter. Every request and response is logged with
-method, path, status and latency. Level rules: [AGENTS.md](../AGENTS.md#logging-conventions);
+method, path (never the query), status and latency. Credentials appear in logs only as
+fingerprints. Level rules: [AGENTS.md](../AGENTS.md#logging-conventions);
 settings: [configuration.md](configuration.md#logging).
 
 ## Lineage
