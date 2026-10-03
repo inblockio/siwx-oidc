@@ -4573,6 +4573,7 @@ mod tests {
                 device_id: None,
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
+                auth_time: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -4642,6 +4643,7 @@ mod tests {
                 device_id: None,
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
+                auth_time: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -6584,6 +6586,74 @@ mod device_display_name_tests {
     }
 
     /// The QR / device-code path used to name every device "Element X".
+
+    /// The grant of an approved device code counts from the approval, the
+    /// authentication, which the approval records on the entry from Redis
+    /// `TIME`; not from the poll that redeems it (I6).
+    #[tokio::test]
+    async fn a_device_grant_counts_its_lifetime_from_the_approval() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (synapse, _hs, server) = spawn(&[]).await;
+        let nonce = Uuid::new_v4().simple().to_string();
+        let client_id = format!("device-auth-time-{nonce}");
+        db.set_client(client_id.clone(), client_entry(Some("Pocket Client")))
+            .await
+            .unwrap();
+        let device_code = format!("dvc_auth-time-{nonce}");
+        let approved_at = Utc::now().timestamp() - 1_000;
+        db.set_device_code(
+            &device_code,
+            &DeviceCodeEntry {
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!("AT-{nonce}")),
+                legacy_user_code: None,
+                client_id: client_id.clone(),
+                scope: "openid".to_string(),
+                status: DeviceCodeStatus::Approved,
+                did: Some(DID.to_string()),
+                device_id: None,
+                last_poll: None,
+                created_at: approved_at - 10,
+                auth_time: Some(approved_at),
+            },
+            DEVICE_CODE_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let config = Config {
+            mas_shared_secret: Some("secret".to_string()),
+            matrix_server_name: Some(SERVER_NAME.to_string()),
+            ..Config::default()
+        };
+        let response = token(
+            TokenForm {
+                code: None,
+                client_id: Some(client_id),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code),
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &config,
+            &db,
+            Some(&synapse),
+        )
+        .await
+        .expect("an approved device code must be redeemed");
+        server.abort();
+        let access = openidconnect::OAuth2TokenResponse::access_token(&response);
+        let grant = db
+            .lookup_access_token(access.secret())
+            .await
+            .unwrap()
+            .expect("the issued access token is live")
+            .grant;
+        assert_eq!(grant.auth_time, approved_at, "auth_time is the approval");
+    }
     #[tokio::test]
     async fn the_device_code_grant_names_the_device_after_its_client() {
         let Some(db) = siwx_oidc::test_support::redis().await else {
@@ -6608,6 +6678,7 @@ mod device_display_name_tests {
                 device_id: None,
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
+                auth_time: None,
             },
             DEVICE_CODE_LIFETIME,
         )
