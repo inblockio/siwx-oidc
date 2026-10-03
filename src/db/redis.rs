@@ -164,6 +164,53 @@ fn legacy_caip122_nonce_key(category: &str, nonce: &str) -> String {
     format!("{KV_CAIP122_NONCE_PREFIX}/{category}/{nonce}")
 }
 
+fn own_session_key(kind: OwnSession, token: &str) -> String {
+    format!("{}/{}", kind.prefix(), digest(token))
+}
+
+fn legacy_own_session_key(kind: OwnSession, token: &str) -> String {
+    format!("{}/{token}", kind.legacy_prefix())
+}
+
+/// The index of a DID's own sessions, keyed by the digest of the canonical
+/// DID, so a `did:pkh` address in any case finds the same index and the key
+/// carries no DID.
+fn own_session_idx_key(did: &str) -> String {
+    format!(
+        "{KV_OWN_SESSION_IDX_PREFIX}/{}",
+        digest(&crate::mxid::canonicalize(did))
+    )
+}
+
+/// Store an own session and index it under its DID, in one step. `KEYS[1]`
+/// the session key, `KEYS[2]` the DID's index; `ARGV[1]` the value, `ARGV[2]`
+/// the lifetime in seconds. The index entry's score is the session's expiry
+/// (Redis `TIME`, ms); entries already expired are pruned, and the index lives
+/// as long as its longest session.
+const CREATE_OWN_SESSION: &str = r#"
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local ttl_ms = tonumber(ARGV[2]) * 1000
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ttl_ms)
+redis.call('ZADD', KEYS[2], now + ttl_ms, KEYS[1])
+redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
+if redis.call('PTTL', KEYS[2]) < ttl_ms then
+  redis.call('PEXPIRE', KEYS[2], ttl_ms)
+end
+return 1
+"#;
+
+/// End every session a DID's index names, and the index. `KEYS[1]` the
+/// index. Returns how many sessions were removed.
+const REVOKE_OWN_SESSIONS: &str = r#"
+local n = 0
+for _, key in ipairs(redis.call('ZRANGE', KEYS[1], 0, -1)) do
+  n = n + redis.call('DEL', key)
+end
+redis.call('DEL', KEYS[1])
+return n
+"#;
+
 fn ceremony_key(ceremony: Ceremony, id: &str) -> String {
     format!("{}/{}", ceremony.prefix(), digest(id))
 }
@@ -876,7 +923,9 @@ impl RedisClient {
     // can never be a client-supplied plaintext DID.
 
     /// Mint an own session of `kind` bound to `did` with `value`, for
-    /// `ttl_secs`, and return the opaque token to Set-Cookie.
+    /// `ttl_secs`, and return the opaque token to Set-Cookie. The entry is
+    /// keyed by the token's digest (I1) and indexed under the DID, in one
+    /// script, so [`revoke_own_sessions`](Self::revoke_own_sessions) finds it.
     pub async fn create_own_session(
         &self,
         kind: OwnSession,
@@ -884,43 +933,87 @@ impl RedisClient {
         value: &str,
         ttl_secs: u64,
     ) -> Result<String> {
-        let _ = did;
         let token = format!(
             "{}{}",
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        self.set_ex_raw(
-            &format!("{}/{}", kind.legacy_prefix(), token),
-            value,
-            ttl_secs,
-        )
-        .await?;
+        let _: i64 = self
+            .eval(
+                CREATE_OWN_SESSION,
+                &[&own_session_key(kind, &token), &own_session_idx_key(did)],
+                &[value, &ttl_secs.to_string()],
+            )
+            .await?;
         Ok(token)
     }
 
     /// The stored value of an own session, or `None` for an unknown, expired
-    /// or forged token.
+    /// or forged token. A session a build before Phase 4 stored by its raw
+    /// token is read for its remaining lifetime. Two reads, not one `MGET`,
+    /// so a fault at either key is an error rather than a miss.
     pub async fn lookup_own_session(
         &self,
         kind: OwnSession,
         token: &str,
     ) -> Result<Option<String>> {
-        self.get_raw(&format!("{}/{}", kind.legacy_prefix(), token))
-            .await
+        if let Some(value) = self.get_raw(&own_session_key(kind, token)).await? {
+            return Ok(Some(value));
+        }
+        // TODO(remove with the legacy own-session layout, see `OwnSession`).
+        self.get_raw(&legacy_own_session_key(kind, token)).await
     }
 
-    /// End one own session (this browser's), whichever layout it is in.
+    /// End one own session (this browser's), whichever layout it is in. Its
+    /// index entry stays until it expires or the DID's sessions are revoked;
+    /// it names a key that no longer exists.
     pub async fn end_own_session(&self, kind: OwnSession, token: &str) -> Result<()> {
-        self.del_raw(&format!("{}/{}", kind.legacy_prefix(), token))
+        let mut conn = self
+            .pool
+            .get()
             .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+        let _: i64 = bb8_redis::redis::cmd("DEL")
+            .arg(own_session_key(kind, token))
+            .arg(legacy_own_session_key(kind, token))
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("Failed to end an own session: {}", e))?;
+        Ok(())
     }
 
     /// End every own session of `did`, of both kinds: `logout/all`,
-    /// deactivation and erasure. Returns how many entries were removed.
+    /// deactivation and erasure. Returns how many entries were removed. The
+    /// DID is compared canonically ([`crate::mxid::canonicalize`]), so a
+    /// `did:pkh` address signed in with another case is the same user.
+    ///
+    /// Current sessions go through the DID's index in one script. Sessions a
+    /// build before Phase 4 stored by raw token have no index and are found by
+    /// a scan of their prefix. TODO(remove with the legacy own-session layout).
     pub async fn revoke_own_sessions(&self, did: &str) -> Result<usize> {
-        let _ = did;
-        Ok(0)
+        let mut revoked: i64 = self
+            .eval(REVOKE_OWN_SESSIONS, &[&own_session_idx_key(did)], &[])
+            .await?;
+        let canonical = crate::mxid::canonicalize(did);
+        for kind in [OwnSession::PickerHint, OwnSession::Account] {
+            for key in self
+                .keys_raw(&format!("{}/*", kind.legacy_prefix()))
+                .await?
+            {
+                let Some(value) = self.get_raw(&key).await? else {
+                    continue;
+                };
+                if kind
+                    .did_of(&value)
+                    .is_some_and(|d| crate::mxid::canonicalize(&d) == canonical)
+                {
+                    self.del_raw(&key).await?;
+                    revoked += 1;
+                }
+            }
+        }
+        debug!(revoked, "revoke_own_sessions");
+        Ok(revoked as usize)
     }
 
     /// Mint an opaque login user-session (the `siwx_user` picker hint) bound to

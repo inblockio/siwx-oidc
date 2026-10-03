@@ -137,9 +137,10 @@ impl TeardownPolicy {
 /// accepts either kind. A token of another kind is answered like an unknown
 /// token: nothing is torn down and the token itself is left untouched.
 ///
-/// Never fails the caller: every error is logged and swallowed so the HTTP
-/// handler can always return 200 (RFC 7009 for revoke; Matrix expects 200 for
-/// logout). Keyed on [`TokenMetadata::username`] (the lowercased localpart
+/// A token-store fault is returned, not swallowed: logout answers it with the
+/// retryable 503 and leaves the bearer in place for the retry, while RFC 7009
+/// revocation still deletes what it can ([`TeardownFault::fallback`]) and
+/// answers 200. Keyed on [`TokenMetadata::username`] (the lowercased localpart
 /// Synapse uses), never the raw DID, so revocation is robust to address-case
 /// differences between sign-in and re-auth DIDs.
 async fn teardown_session(
@@ -148,19 +149,16 @@ async fn teardown_session(
     ctx: &str,
     policy: TeardownPolicy,
     required: Option<TokenKind>,
-) {
+) -> Result<(), TeardownFault> {
     let meta = match resolve_presented(state, token).await {
         Ok(Some(m)) => m,
         // Unknown token: an idempotent no-op.
-        Ok(None) => return,
-        Err(e) => {
-            warn!(error = %e, ctx, "teardown_session: token lookup failed; deleting the presented token");
-            // Best effort: whichever layout the token is in.
-            let _ = state.redis_client.delete_access_token(token).await;
-            if let Err(e) = state.redis_client.delete_token(token).await {
-                warn!(error = %e, ctx, "teardown_session: delete_token (fallback) failed");
-            }
-            return;
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            return Err(TeardownFault {
+                error: error.context("token lookup"),
+                fallback: Fallback::AnyLayout,
+            })
         }
     };
     if required.is_some_and(|kind| meta.kind != Some(kind)) {
@@ -168,7 +166,7 @@ async fn teardown_session(
             ctx,
             "teardown_session: token of another kind; nothing to tear down"
         );
-        return;
+        return Ok(());
     }
     // Phase 1: delete the ending session's Synapse device (best-effort) — only for
     // explicit-sign-out callers. A bare RFC 7009 revoke (TokensOnly) must never
@@ -203,17 +201,20 @@ async fn teardown_session(
     // the device_id is a unique `SIWX_{uuid}`, so revoking by (username,
     // device_id) correctly scopes to this one device's grants.
     if meta.device_id.is_empty() {
-        match delete_presented(state, token, meta.source).await {
-            Ok(()) => info!(
-                ctx,
-                username = %meta.username,
-                "session torn down (standalone, presented token only)"
-            ),
-            Err(e) => {
-                warn!(error = %e, ctx, "teardown_session: deleting the presented token failed")
+        return match delete_presented(state, token, meta.source).await {
+            Ok(()) => {
+                info!(
+                    ctx,
+                    username = %meta.username,
+                    "session torn down (standalone, presented token only)"
+                );
+                Ok(())
             }
-        }
-        return;
+            Err(error) => Err(TeardownFault {
+                error: error.context("deleting the presented token"),
+                fallback: Fallback::Nothing,
+            }),
+        };
     }
     // Phase 2 (device session): revoke this device's grants (access + refresh).
     match state
@@ -221,20 +222,60 @@ async fn teardown_session(
         .revoke_device_tokens(&meta.username, &meta.device_id)
         .await
     {
-        Ok(revoked) => info!(
-            ctx,
-            username = %meta.username,
-            device_id = %meta.device_id,
-            revoked = revoked as u64,
-            "session torn down"
-        ),
-        Err(e) => {
-            warn!(error = %e, ctx, "teardown_session: revoke_device_tokens failed; deleting token directly");
-            // Last-resort: at least remove the presented token.
-            if let Err(e) = delete_presented(state, token, meta.source).await {
-                warn!(error = %e, ctx, "teardown_session: deleting the presented token (last resort) failed");
+        Ok(revoked) => {
+            info!(
+                ctx,
+                username = %meta.username,
+                device_id = %meta.device_id,
+                revoked = revoked as u64,
+                "session torn down"
+            );
+            Ok(())
+        }
+        Err(error) => Err(TeardownFault {
+            error: error.context("revoke_device_tokens"),
+            fallback: Fallback::Presented(meta.source),
+        }),
+    }
+}
+
+/// A token-store fault during [`teardown_session`].
+struct TeardownFault {
+    error: anyhow::Error,
+    /// What RFC 7009 revocation may still delete before its 200. Logout
+    /// deletes nothing more: it answers 503 so the client retries with the
+    /// same bearer, which a deleted access token would turn into a no-op
+    /// while the device's refresh token lived on.
+    fallback: Fallback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fallback {
+    /// The token's layout is unknown: delete it from both.
+    AnyLayout,
+    /// Delete only the presented credential, where it was found.
+    Presented(TokenSource),
+    /// Nothing more to try.
+    Nothing,
+}
+
+/// RFC 7009's best effort after a teardown fault: delete the presented
+/// credential if possible; the endpoint answers 200 either way.
+async fn revoke_fallback(state: &CompatState, token: &str, fault: TeardownFault) {
+    warn!(error = %fault.error, "revoke: token store failed; deleting the presented token where possible");
+    match fault.fallback {
+        Fallback::AnyLayout => {
+            let _ = state.redis_client.delete_access_token(token).await;
+            if let Err(e) = state.redis_client.delete_token(token).await {
+                warn!(error = %e, "revoke: delete_token (fallback) failed");
             }
         }
+        Fallback::Presented(source) => {
+            if let Err(e) = delete_presented(state, token, source).await {
+                warn!(error = %e, "revoke: deleting the presented token (last resort) failed");
+            }
+        }
+        Fallback::Nothing => {}
     }
 }
 
@@ -331,14 +372,17 @@ pub async fn revoke(
     // RFC 7009 is token hygiene, not a device sign-out: revoke tokens only, never
     // delete the Synapse device (see TeardownPolicy).
     // Either kind of token may be revoked.
-    teardown_session(
+    if let Err(fault) = teardown_session(
         &state,
         &form.token,
         "revoke",
         TeardownPolicy::TokensOnly,
         None,
     )
-    .await;
+    .await
+    {
+        revoke_fallback(&state, &form.token, fault).await;
+    }
     StatusCode::OK
 }
 
@@ -359,8 +403,10 @@ pub async fn login_flows() -> Json<serde_json::Value> {
 // -- POST /_matrix/client/v3/logout -------------------------------------------
 
 /// Single-session logout: tears down the session bound to the bearer token
-/// (Synapse device + Redis tokens). Always returns 200 with `{}` (Matrix
-/// expects an empty object), even with no bearer or an unknown token.
+/// (Synapse device + Redis tokens). Returns 200 with `{}` (Matrix expects an
+/// empty object), also with no bearer or an unknown token, and the retryable
+/// 503 of the refresh and device-deletion routes when the token store fails:
+/// a sign-out never reports success while revoking nothing.
 pub async fn logout(
     State(state): State<CompatState>,
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
@@ -368,14 +414,18 @@ pub async fn logout(
     if let Some(TypedHeader(auth)) = bearer {
         // Explicit single-session sign-out: revoke tokens AND delete the device.
         // The bearer must be an access token.
-        teardown_session(
+        if let Err(fault) = teardown_session(
             &state,
             auth.token(),
             "logout",
             TeardownPolicy::DeleteDevice,
             Some(TokenKind::Access),
         )
-        .await;
+        .await
+        {
+            warn!(error = %fault.error, "logout: token store failed (infrastructure); returning retryable 503");
+            return token_store_unavailable();
+        }
     }
     (StatusCode::OK, Json(serde_json::json!({})))
 }
@@ -391,8 +441,11 @@ pub async fn logout(
 ///
 /// This is session invalidation, NOT account deactivation: the account stays
 /// active and the user can sign in again. It therefore must NEVER call
-/// `deactivate_user`. Degrades to Redis-only revocation in standalone mode and
-/// is an idempotent 200 no-op when the bearer token is missing or unknown.
+/// `deactivate_user`. It also ends the user's own sessions on this provider
+/// (the `siwx_user` picker hints and `acct_session` account sessions).
+/// Degrades to Redis-only revocation in standalone mode, is an idempotent 200
+/// no-op when the bearer token is missing or unknown, and answers a token-store
+/// fault with the retryable 503 (the retry finds the devices already gone).
 pub async fn logout_all(
     State(state): State<CompatState>,
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
@@ -407,11 +460,12 @@ pub async fn logout_all(
         Ok(Some(m)) => m,
         Ok(None) => return (StatusCode::OK, Json(serde_json::json!({}))), // idempotent no-op
         Err(e) => {
-            warn!(error = %e, "logout_all: token lookup failed");
-            return (StatusCode::OK, Json(serde_json::json!({})));
+            warn!(error = %e, "logout_all: token lookup failed (infrastructure); returning retryable 503");
+            return token_store_unavailable();
         }
     };
     let username = meta.username;
+    let did = meta.did;
 
     // Phase 1: delete every Synapse device for the user (best-effort per device).
     if let (Some(synapse), Some(server_name)) =
@@ -442,7 +496,19 @@ pub async fn logout_all(
             info!(username = %username, revoked = revoked as u64, "all sessions torn down")
         }
         Err(e) => {
-            warn!(error = %e, username = %username, "logout_all: revoke_all_user_tokens failed")
+            warn!(error = %e, username = %username, "logout_all: revoke_all_user_tokens failed; returning retryable 503");
+            return token_store_unavailable();
+        }
+    }
+    // Phase 3: the user's own sessions on this provider. A minted admin token
+    // carries no DID and has none.
+    if !did.is_empty() {
+        match state.redis_client.revoke_own_sessions(&did).await {
+            Ok(ended) => info!(username = %username, ended = ended as u64, "own sessions ended"),
+            Err(e) => {
+                warn!(error = %e, username = %username, "logout_all: revoke_own_sessions failed; returning retryable 503");
+                return token_store_unavailable();
+            }
         }
     }
 

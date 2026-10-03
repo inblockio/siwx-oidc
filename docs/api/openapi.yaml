@@ -880,6 +880,25 @@ paths:
         "400": { description: "Missing, unknown, or unavailable action, or reactivation of an erased account." }
         "503": { description: "A required check (Synapse, or the erasure marker) could not run; nothing was changed." }
 
+  /account/sign_out:
+    post:
+      tags: [Account management]
+      operationId: accountSignOut
+      summary: Sign this browser out of the account page
+      description: |
+        Ends the account session (`acct_session` cookie) and the passkey-picker
+        hint (`siwx_user` cookie) this browser presents, each found by the digest
+        of the cookie value, and clears both cookies. Sessions of other browsers
+        stay; `logout/all`, deactivation and erasure end every session of the
+        user. Idempotent: without cookies it answers 200 and clears them all the
+        same. Needs no CSRF token: both cookies are `SameSite=Strict`, and a
+        forged request could only sign the browser out.
+      responses:
+        "200":
+          description: Signed out; both cookies cleared.
+          content: { application/json: { schema: { type: object, properties: { signed_out: { type: boolean, enum: [true] } } } } }
+        "503": { description: "Retryable: the session store could not end a session; the cookies are not cleared." }
+
   /account/passkey/start:
     post:
       tags: [Account management]
@@ -928,16 +947,20 @@ paths:
       summary: End this session
       description: Revokes the session's tokens **and** deletes its Synapse device — explicit intent, unlike `/oauth2/revoke`. The bearer must be an access token; any other token is a no-op, like an unknown one.
       security: [{ bearerToken: [] }]
-      responses: { "200": { description: Best-effort, idempotent, never 500. } }
+      responses:
+        "200": { description: "Signed out; also for a missing, unknown or non-access bearer (idempotent). The Synapse device delete is best-effort." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store failed while resolving the bearer or revoking the device's tokens. Nothing is reported as signed out, and the bearer stays valid so the retry tears the session down." }
 
   /_matrix/client/v3/logout/all:
     post:
       tags: [Matrix compatibility]
       operationId: matrixLogoutAll
       summary: End every session
-      description: Session invalidation, NOT deactivation — the account stays active and can sign in again. The bearer must be an access token; any other token is a no-op, like an unknown one.
+      description: Session invalidation, NOT deactivation — the account stays active and can sign in again. Ends every grant of the user (setting the user epoch), deletes every Synapse device (best-effort), and ends the user's own sessions on this provider (`siwx_user` picker hints, `acct_session` account sessions). The bearer must be an access token; any other token is a no-op, like an unknown one.
       security: [{ bearerToken: [] }]
-      responses: { "200": { description: Best-effort, idempotent, never 500. } }
+      responses:
+        "200": { description: "Every session ended; also for a missing, unknown or non-access bearer (idempotent)." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store failed while resolving the bearer, revoking the user's tokens or ending the own sessions. Nothing is reported as signed out; the retry finishes the job." }
 
   /_matrix/client/v3/devices/{device_id}:
     delete:

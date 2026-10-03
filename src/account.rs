@@ -679,7 +679,16 @@ async fn execute_action(
                     warn!(error = %e, "revoke_all_user_tokens failed during account deactivation");
                     0
                 });
-            info!(did = %did, revoked = revoked as u64, "account deactivated via account management");
+            // End the user's own sessions on this provider too: every `siwx_user`
+            // picker hint and `acct_session` account session of the DID.
+            let ended = db_client
+                .revoke_own_sessions(did)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "revoke_own_sessions failed during account deactivation");
+                    0
+                });
+            info!(did = %did, revoked = revoked as u64, own_sessions = ended as u64, "account deactivated via account management");
             Ok(ActionOutcome::Deactivated)
         }
         Action::AccountErase => {
@@ -723,6 +732,15 @@ async fn execute_action(
                     warn!(error = %e, "revoke_all_user_tokens failed during account erasure");
                     0
                 });
+            // End the user's own sessions on this provider too: every `siwx_user`
+            // picker hint and `acct_session` account session of the DID.
+            let ended = db_client
+                .revoke_own_sessions(did)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "revoke_own_sessions failed during account erasure");
+                    0
+                });
             // Purge WebAuthn identity artifacts (best-effort) so the erased DID
             // cannot be silently re-derived from a leftover passkey/link. The
             // standalone-credential pass reuses the webauthn layer's single
@@ -737,6 +755,7 @@ async fn execute_action(
             info!(
                 did = %did,
                 revoked = revoked as u64,
+                own_sessions = ended as u64,
                 purged = purged as u64,
                 "account erased via account management"
             );
@@ -1357,6 +1376,8 @@ pub fn account_page_inner(
 
       <div id="result-section" class="result-section hidden"></div>
 
+      <button class="btn btn-secondary hidden" id="btn-sign-out" onclick="signOut()">Sign out</button>
+
       <div id="status" class="error-msg hidden">
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="error-icon">
           <path fill-rule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-8-5a.75.75 0 0 1 .75.75v4.5a.75.75 0 0 1-1.5 0v-4.5A.75.75 0 0 1 10 5Zm0 10a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" clip-rule="evenodd"/>
@@ -1778,7 +1799,7 @@ async function authWallet() {
     });
     if (r.ok) {
       const data = await r.json();
-      AUTHED = true; if (data.csrf) CSRF = data.csrf;
+      AUTHED = true; syncSignOut(); if (data.csrf) CSRF = data.csrf;
       renderOutcome(data);
     } else {
       const t = await r.text();
@@ -1838,7 +1859,7 @@ async function authPasskey(forceAll) {
     });
     if (finishR.ok) {
       const data = await finishR.json();
-      AUTHED = true; if (data.csrf) CSRF = data.csrf;
+      AUTHED = true; syncSignOut(); if (data.csrf) CSRF = data.csrf;
       renderOutcome(data);
     } else {
       const errBody = await finishR.clone().json().catch(() => null);
@@ -2068,6 +2089,26 @@ function bufferToBase64(buf) {
   cb.addEventListener('change', sync);
   sync();
 })();
+
+// Explicit sign-out (POST /account/sign_out): ends this browser's account
+// session and passkey-picker hint and clears both cookies. Shown while the page
+// is authenticated.
+function syncSignOut() {
+  const b = $('btn-sign-out');
+  if (b) b.classList.toggle('hidden', !AUTHED);
+}
+async function signOut() {
+  hideStatus();
+  try {
+    const r = await fetch(BASE + '/account/sign_out', { method: 'POST' });
+    if (!r.ok) { showStatus('Sign-out failed — please try again.'); return; }
+    AUTHED = false; CSRF = ''; syncSignOut();
+    showTerminal('Signed out', 'This browser is signed out of account management.', false);
+  } catch (_) {
+    showStatus('Sign-out failed — please try again.');
+  }
+}
+syncSignOut();
 
 // In-page session actions: device View/Sign out buttons and the "back to
 // sessions" button carry data-act/data-dev and run against the live session

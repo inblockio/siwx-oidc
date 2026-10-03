@@ -3243,7 +3243,7 @@ pub enum EndSessionOutcome {
 }
 
 /// A store fault on a sign-out path: retryable, never a pretended success.
-fn store_unavailable(e: anyhow::Error) -> CustomError {
+pub(crate) fn store_unavailable(e: anyhow::Error) -> CustomError {
     warn!(error = %e, "sign-out: the token store is unavailable");
     CustomError::ServiceUnavailable("The session store is unavailable; retry.".to_string())
 }

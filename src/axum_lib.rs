@@ -1072,7 +1072,6 @@ fn user_cookie_set(base_url: &url::Url, token: &str) -> String {
 
 /// `Set-Cookie` value that clears the opaque login user-session (escape hatch /
 /// sign-out). Mirrors [`account_cookie_clear`] with `Path=/`.
-#[allow(dead_code)]
 fn user_cookie_clear(base_url: &url::Url) -> String {
     let secure = if base_url.scheme() == "https" {
         "; Secure"
@@ -1259,6 +1258,46 @@ async fn account_action_handler(
         }
     }
     Ok((headers, Json(response)))
+}
+
+/// `POST /account/sign_out`: the account page's explicit sign-out. Ends this
+/// browser's account session and `siwx_user` picker hint (each found by the
+/// digest of the cookie presented) and clears both cookies; the sessions of
+/// other browsers stay. Idempotent: without cookies it clears them all the
+/// same. A store fault is the retryable 503, never a sign-out that reports
+/// success while a session stays live.
+async fn account_sign_out_handler(
+    State(state): State<AppState>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
+) -> Result<(axum::http::HeaderMap, Json<serde_json::Value>), CustomError> {
+    if let Some(token) = account_session_token(&cookies) {
+        state
+            .redis_client
+            .end_own_session(OwnSession::Account, token)
+            .await
+            .map_err(oidc::store_unavailable)?;
+    }
+    if let Some(token) = cookies
+        .as_ref()
+        .and_then(|TypedHeader(c)| c.get(USER_SESSION_COOKIE))
+    {
+        state
+            .redis_client
+            .end_own_session(OwnSession::PickerHint, token)
+            .await
+            .map_err(oidc::store_unavailable)?;
+    }
+    let mut headers = axum::http::HeaderMap::new();
+    for cookie in [
+        account_cookie_clear(&state.config.base_url),
+        user_cookie_clear(&state.config.base_url),
+    ] {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+            headers.append(axum::http::header::SET_COOKIE, v);
+        }
+    }
+    info!("account page sign-out");
+    Ok((headers, Json(serde_json::json!({ "signed_out": true }))))
 }
 
 async fn account_passkey_start_handler(
@@ -1652,6 +1691,7 @@ pub async fn main() {
         .route("/account/nonce", get(account_nonce_handler))
         .route("/account/wallet", post(account_wallet_handler))
         .route("/account/action", post(account_action_handler))
+        .route("/account/sign_out", post(account_sign_out_handler))
         .route(
             "/account/passkey/start",
             post(account_passkey_start_handler),
@@ -2013,7 +2053,7 @@ mod unknown_credential_response_tests {
     /// usernameless `None`, NEVER propagate it (which would 500 the picker). A future
     /// refactor to `?` would break this invariant while every miss-path test stayed
     /// green — so pin the error path here. We force a real, fast `WRONGTYPE` error by
-    /// storing the `user:session/{token}` key as a SET, so the `GET` in
+    /// storing the `siwx_user/{digest}` key as a SET, so the `GET` in
     /// `lookup_user_session` errors. Needs Redis (`siwx_oidc::test_support::redis`).
     #[tokio::test]
     async fn user_session_scope_did_degrades_open_on_redis_error() {
@@ -2021,8 +2061,8 @@ mod unknown_credential_response_tests {
             return;
         };
         let token = format!("wrongtype{}", uuid::Uuid::new_v4().simple());
-        // KV_USER_SESSION_PREFIX is in scope via `use siwx_oidc::db::*` at the top.
-        let key = format!("{}/{}", KV_USER_SESSION_PREFIX, token);
+        // The digest key the lookup reads first (`OwnSession::PickerHint`).
+        let key = format!("siwx_user/{}", siwx_oidc::db::tokens::digest(&token));
         // SET-typed value at the exact key lookup_user_session GETs -> WRONGTYPE error.
         redis
             .sadd_raw(&key, "x")
