@@ -39,13 +39,12 @@ use urlencoding::decode;
 use uuid::Uuid;
 
 use aqua_auth::find_did_method;
+use siwx_oidc::db::grant::{GrantKind, InvalidReason, NewGrant, RotateOutcome, RotateRequest};
 use siwx_oidc::db::*;
 use subtle::ConstantTimeEq;
 
 use crate::did_assertion::DidPublication;
 use crate::synapse_client::{DeviceUpsert, PublishOutcome, SynapseClient};
-
-use crate::introspect::generate_opaque_token;
 
 /// Constant-time string comparison to prevent timing attacks on secrets.
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -86,7 +85,9 @@ pub const SIWX_COOKIE_KEY: &str = "siwx";
 /// RFC 8628 grant type of the device-code grant (`POST /token`).
 pub const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-type DBClientType = dyn DBClient + Sync;
+/// The token store. Concrete because the grant record (`siwx_oidc::db::grant`)
+/// is implemented on `RedisClient` itself, outside the `DBClient` trait.
+type DBClientType = RedisClient;
 
 // -- ES256 key wrapper implementing openidconnect's PrivateSigningKey ------
 
@@ -1039,6 +1040,20 @@ async fn authenticate_client(
     Ok(Some(client_entry))
 }
 
+/// Whether a client authenticates with a secret, by the rule
+/// [`authenticate_client`] applies: a registered `token_endpoint_auth_method`
+/// other than `none`, or none registered while `require_secret`. A client with
+/// no registration counts as public. Recorded on each grant so an endpoint that
+/// cannot authenticate a client can refuse a confidential client's grant.
+fn client_is_confidential(client: Option<&ClientEntry>, config: &crate::config::Config) -> bool {
+    match client.map(|c| c.metadata.token_endpoint_auth_method()) {
+        None => false,
+        Some(Some(CoreClientAuthMethod::None)) => false,
+        Some(Some(_)) => true,
+        Some(None) => config.require_secret,
+    }
+}
+
 async fn token_refresh(
     form: TokenForm,
     credentials: ClientCredentials,
@@ -1054,200 +1069,89 @@ async fn token_refresh(
         })
     })?;
 
-    // Only a refresh token refreshes. Any other entry (an access or admin token)
-    // is answered exactly like an unknown token, and is left untouched.
-    let metadata = match db_client
-        .get_token(&rt)
-        .await?
-        .filter(|m| m.is_kind(TokenKind::Refresh))
-    {
-        // A refresh token belongs to the client it was issued to (I7): before
-        // anything else is read or written, the request must be that client,
-        // and a confidential client must authenticate. This is the grant that
-        // carries a client identity. `POST /_matrix/client/v3/refresh` does not
-        // (the Matrix client-server API has none to carry), so that endpoint
-        // is not bound, and `compat::refresh` says so.
-        Some(m) => {
-            authenticate_client(
-                &m.client_id,
-                named_client.as_deref(),
-                presented_secret.as_deref(),
-                "refresh token",
-                UnregisteredClient::Tolerate,
-                config,
-                db_client,
-            )
-            .await?;
-            m
+    // The grant the token's handle names. Only a refresh token in the grant
+    // format has one: an access or admin token, garbage, and a token of a grant
+    // that is gone are all answered exactly like an unknown token.
+    let Some(grant) = db_client.peek_refresh_grant(&rt).await? else {
+        // TODO(M3): a legacy refresh token (`token/{raw}`, written before the
+        // grant record) is lifted into a grant here (design 5.8). Until then it
+        // is an unknown token.
+        return Err(unknown_refresh_token());
+    };
+
+    // A refresh token belongs to the client it was issued to (I7): before the
+    // rotation script runs, the request must be that client, and a
+    // confidential client must authenticate. `POST /_matrix/client/v3/refresh`
+    // carries no client identity, so that endpoint is not bound, and
+    // `compat::refresh` says so.
+    authenticate_client(
+        &grant.client_id,
+        named_client.as_deref(),
+        presented_secret.as_deref(),
+        "refresh token",
+        UnregisteredClient::Tolerate,
+        config,
+        db_client,
+    )
+    .await?;
+
+    // The one rotation script (I3) decides everything else atomically: rotate,
+    // replay the unused successor of a lost response (I4), or refuse. The
+    // script checks the named client again; it can only agree here.
+    let outcome = db_client
+        .rotate_refresh_token(&RotateRequest {
+            presented: &rt,
+            client_id: named_client.as_deref(),
+            refuse_confidential: false,
+        })
+        .await?;
+    let (pair, expires_in) = match outcome {
+        RotateOutcome::Rotated(rotated) => (rotated.pair, ACCESS_TOKEN_TTL),
+        RotateOutcome::Replayed(replayed) => {
+            let left = (replayed.pair.access_exp - Utc::now().timestamp()).max(0) as u64;
+            (replayed.pair, left.min(ACCESS_TOKEN_TTL))
         }
-        None => {
-            // Grace replay (lost-response recovery): a rotated refresh token is
-            // deleted, but its successor pair is recorded under a short grace
-            // window. If the client lost the rotation response and retries with the
-            // old token, return the SAME successor instead of signing it out.
-            // Bounded by REFRESH_GRACE_TTL; genuinely unknown/expired tokens (no
-            // grace record) still fail closed below.
-            //
-            // The replay hands out a live pair, so it is bound to the client like
-            // a rotation. The pointer does not record a client; the successor
-            // refresh token it names does. A successor that is gone (revoked) makes
-            // the replay an unknown token.
-            if let Some(succ) = db_client.get_rotated_token(&rt).await? {
-                if let Some(successor) = db_client
-                    .get_token(&succ.refresh_token)
-                    .await?
-                    .filter(|m| m.is_kind(TokenKind::Refresh))
-                {
-                    authenticate_client(
-                        &successor.client_id,
-                        named_client.as_deref(),
-                        presented_secret.as_deref(),
-                        "refresh token",
-                        UnregisteredClient::Tolerate,
-                        config,
-                        db_client,
-                    )
-                    .await?;
-                    let expires_in = (succ.access_exp - Utc::now().timestamp()).max(0) as u64;
-                    let mut response = CoreTokenResponse::new(
-                        AccessToken::new(succ.access_token),
-                        CoreTokenType::Bearer,
-                        CoreIdTokenFields::new(None, EmptyExtraTokenFields {}),
-                    );
-                    response.set_expires_in(Some(&time::Duration::from_secs(expires_in)));
-                    response.set_refresh_token(Some(RefreshToken::new(succ.refresh_token)));
-                    return Ok(response);
-                }
-            }
+        // Reuse (I5, phase A): recorded, and answered like an unknown token.
+        RotateOutcome::Reuse(event) => {
+            event.emit();
+            return Err(unknown_refresh_token());
+        }
+        RotateOutcome::Invalid(InvalidReason::Revoked) => {
             return Err(CustomError::BadRequestToken(TokenError {
                 error: CoreErrorResponseType::InvalidGrant,
-                error_description: "Unknown or expired refresh token.".to_string(),
+                error_description: "Session has been revoked.".to_string(),
+            }));
+        }
+        RotateOutcome::Invalid(_) | RotateOutcome::ConfidentialClient => {
+            return Err(unknown_refresh_token());
+        }
+        // The same answer `authenticate_client` gives a request that names
+        // another client.
+        RotateOutcome::ClientMismatch => {
+            return Err(CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::InvalidGrant,
+                error_description: "client_id does not match the refresh token.".to_string(),
             }));
         }
     };
 
-    if metadata.exp <= Utc::now().timestamp() {
-        return Err(CustomError::BadRequestToken(TokenError {
-            error: CoreErrorResponseType::InvalidGrant,
-            error_description: "Refresh token has expired.".to_string(),
-        }));
-    }
-
-    // Race guard (S3-3 / H3 + S3-4 / H6): refuse to rotate if this device was just
-    // signed out or the user was just deactivated/erased. Mirrors the same check
-    // in compat::refresh so neither refresh entry point can resurrect access for a
-    // torn-down device / terminated account.
-    let device_revoked = !metadata.device_id.is_empty()
-        && db_client
-            .is_device_revoked(&metadata.username, &metadata.device_id)
-            .await?;
-    if device_revoked || db_client.is_user_deactivated(&metadata.username).await? {
-        let _ = db_client.delete_token(&rt).await;
-        return Err(CustomError::BadRequestToken(TokenError {
-            error: CoreErrorResponseType::InvalidGrant,
-            error_description: "Session has been revoked.".to_string(),
-        }));
-    }
-
-    let (access_prefix, refresh_prefix) = if config.mas_shared_secret.is_some() {
-        ("mat_", "mcr_")
-    } else {
-        ("", "")
-    };
-
-    let now = Utc::now().timestamp();
-
-    let new_access = generate_opaque_token(access_prefix);
-    let access_meta = TokenMetadata {
-        username: metadata.username.clone(),
-        device_id: metadata.device_id.clone(),
-        scope: metadata.scope.clone(),
-        client_id: metadata.client_id.clone(),
-        iat: now,
-        exp: now + ACCESS_TOKEN_TTL as i64,
-        did: metadata.did.clone(),
-        name: metadata.name.clone(),
-        kind: Some(TokenKind::Access),
-    };
-    db_client
-        .set_token(&new_access, &access_meta, ACCESS_TOKEN_TTL)
-        .await?;
-
-    let new_refresh = generate_opaque_token(refresh_prefix);
-    let refresh_meta = TokenMetadata {
-        username: metadata.username.clone(),
-        device_id: metadata.device_id.clone(),
-        scope: metadata.scope.clone(),
-        client_id: metadata.client_id.clone(),
-        iat: now,
-        exp: now + REFRESH_TOKEN_TTL as i64,
-        did: metadata.did.clone(),
-        name: metadata.name.clone(),
-        kind: Some(TokenKind::Refresh),
-    };
-    db_client
-        .set_token(&new_refresh, &refresh_meta, REFRESH_TOKEN_TTL)
-        .await?;
-
-    let _ = db_client.delete_token(&rt).await;
-
-    // Check-mint-recheck (S3-3 / H3 + S3-4 / H6): if a revoke/deactivate sweep
-    // tombstoned this device/user in the gap between our pre-mint check and our
-    // writes, roll back the just-minted tokens so none can be resurrected.
-    //
-    // Fail OPEN on an indeterminate probe (Redis I/O error), CLOSED only on a
-    // definite tombstone. By this point `rt` has already been deleted and the
-    // grace pointer is not yet written, so a rollback here leaves the client
-    // holding neither the old nor the new refresh token — an unrecoverable
-    // sign-out. Treating an I/O error as a tombstone would convert a transient
-    // fault into permanent session loss; the tombstone TTL bounds the opposite
-    // risk to one access-token cycle (see `RevocationState`).
-    let revoked_now = db_client
-        .probe_revocation(&metadata.username, &metadata.device_id)
-        .await;
-    if revoked_now == RevocationState::Indeterminate {
-        warn!(
-            username = %metadata.username,
-            device_id = %metadata.device_id,
-            "refresh: revocation probe indeterminate after mint; committing \
-             (fail-open, bounded by tombstone TTL)"
-        );
-    }
-    if revoked_now.must_refuse() {
-        let _ = db_client.delete_token(&new_access).await;
-        let _ = db_client.delete_token(&new_refresh).await;
-        return Err(CustomError::BadRequestToken(TokenError {
-            error: CoreErrorResponseType::InvalidGrant,
-            error_description: "Session has been revoked.".to_string(),
-        }));
-    }
-
-    // Grace window: record old refresh token -> the successor pair we just minted,
-    // so a client that LOSES this rotation response (common on mobile) can replay
-    // the old token once within REFRESH_GRACE_TTL and recover instead of being
-    // signed out. Written only here, on the committed success path (after the
-    // H3/H6 check-mint-recheck), so it can never resolve to rolled-back tokens.
-    // Best-effort: a failure must not fail the rotation the client will observe.
-    let _ = db_client
-        .set_rotated_token(
-            &rt,
-            &RotatedToken {
-                access_token: new_access.clone(),
-                refresh_token: new_refresh.clone(),
-                access_exp: now + ACCESS_TOKEN_TTL as i64,
-            },
-            REFRESH_GRACE_TTL,
-        )
-        .await;
-
     let mut response = CoreTokenResponse::new(
-        AccessToken::new(new_access),
+        AccessToken::new(pair.access_token),
         CoreTokenType::Bearer,
         CoreIdTokenFields::new(None, EmptyExtraTokenFields {}),
     );
-    response.set_expires_in(Some(&time::Duration::from_secs(ACCESS_TOKEN_TTL)));
-    response.set_refresh_token(Some(RefreshToken::new(new_refresh)));
+    response.set_expires_in(Some(&time::Duration::from_secs(expires_in)));
+    response.set_refresh_token(Some(RefreshToken::new(pair.refresh_token)));
     Ok(response)
+}
+
+/// The answer to a refresh token that is unknown, expired, of another kind, or
+/// reused: one answer, so a refusal reveals nothing about which it was.
+fn unknown_refresh_token() -> CustomError {
+    CustomError::BadRequestToken(TokenError {
+        error: CoreErrorResponseType::InvalidGrant,
+        error_description: "Unknown or expired refresh token.".to_string(),
+    })
 }
 
 fn device_code_error(error: &str, description: &str) -> CustomError {
@@ -1422,37 +1326,27 @@ async fn token_device_code(
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| did.clone());
 
-            let access_token = generate_opaque_token("mat_");
-            let access_meta = TokenMetadata {
-                username: username.clone(),
-                device_id: dev_id.clone(),
-                scope: scope.clone(),
-                client_id: client_id.clone(),
-                iat,
-                exp: iat + ACCESS_TOKEN_TTL as i64,
-                did: did.clone(),
-                name: display_name.clone(),
-                kind: Some(TokenKind::Access),
-            };
-            db_client
-                .set_token(&access_token, &access_meta, ACCESS_TOKEN_TTL)
+            // One Matrix-device grant per approved device code (I2).
+            let client_entry = db_client.get_client(client_id.clone()).await?;
+            let issued = db_client
+                .issue_grant(&NewGrant {
+                    kind: GrantKind::MatrixDevice,
+                    username,
+                    did: did.clone(),
+                    client_id: client_id.clone(),
+                    confidential_client: client_is_confidential(client_entry.as_ref(), config),
+                    device_id: dev_id.clone(),
+                    scope: scope.clone(),
+                    name: display_name,
+                    auth_time: iat,
+                    access_ttl: ACCESS_TOKEN_TTL,
+                    refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+                })
                 .await?;
-
-            let refresh_token = generate_opaque_token("mcr_");
-            let refresh_meta = TokenMetadata {
-                username,
-                device_id: dev_id.clone(),
-                scope: scope.clone(),
-                client_id: client_id.clone(),
-                iat,
-                exp: iat + REFRESH_TOKEN_TTL as i64,
-                did: did.clone(),
-                name: display_name,
-                kind: Some(TokenKind::Refresh),
-            };
-            db_client
-                .set_token(&refresh_token, &refresh_meta, REFRESH_TOKEN_TTL)
-                .await?;
+            let access_token = issued.access_token;
+            let refresh_token = issued.refresh_token.ok_or_else(|| {
+                anyhow!("device_code grant: issue_grant returned no refresh token")
+            })?;
 
             let core_id_token = CoreIdTokenClaims::new(
                 IssuerUrl::from_url(config.base_url.clone()),
@@ -1666,7 +1560,6 @@ async fn token_authorization_code(
     let msc3861_mode = config.mas_shared_secret.is_some();
 
     let now = Utc::now();
-    let iat = now.timestamp();
     // This request is DIFFERENT from the sign_in that provisioned the account,
     // so the resolved localpart travels via `CodeEntry.localpart` (set at
     // sign_in) rather than being recomputed here. `None` means the entry was
@@ -1688,12 +1581,10 @@ async fn token_authorization_code(
     // refresh token, whatever was requested: Synapse, Element Web and Element X
     // depend on exactly that. Generic mode grants what was requested and
     // allowed, and issues a refresh token only for `offline_access` (I10).
-    let (access_prefix, refresh_prefix, scope, issue_refresh_token, report_scope) = if msc3861_mode
-    {
+    let (kind, scope, issue_refresh_token, report_scope) = if msc3861_mode {
         let device_id = code_entry.device_id.clone().unwrap_or_default();
         (
-            "mat_",
-            "mcr_",
+            GrantKind::MatrixDevice,
             format!(
                 "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
                 device_id
@@ -1703,49 +1594,33 @@ async fn token_authorization_code(
         )
     } else {
         let grant = generic_grant(code_entry.scope.as_deref(), &client_entry);
-        ("", "", grant.scope, grant.refresh_token, grant.report_scope)
+        (
+            GrantKind::Oidc,
+            grant.scope,
+            grant.refresh_token,
+            grant.report_scope,
+        )
     };
 
-    let device_id = code_entry.device_id.clone().unwrap_or_default();
-
-    let opaque = generate_opaque_token(access_prefix);
-    let access_metadata = TokenMetadata {
-        username: username.clone(),
-        device_id: device_id.clone(),
-        scope: scope.clone(),
-        client_id: client_id.clone(),
-        iat,
-        exp: iat + ACCESS_TOKEN_TTL as i64,
-        did: code_entry.did.clone(),
-        name: display_name.clone(),
-        kind: Some(TokenKind::Access),
-    };
-    db_client
-        .set_token(&opaque, &access_metadata, ACCESS_TOKEN_TTL)
-        .await?;
-
-    let refresh_token = if issue_refresh_token {
-        let refresh_opaque = generate_opaque_token(refresh_prefix);
-        let refresh_metadata = TokenMetadata {
+    // One grant per code exchange (I2): its first access token, its refresh
+    // token when one is issued, and its index entries, written in one step.
+    let issued = db_client
+        .issue_grant(&NewGrant {
+            kind,
             username,
-            device_id,
-            scope: scope.clone(),
-            client_id: client_id.clone(),
-            iat,
-            exp: iat + REFRESH_TOKEN_TTL as i64,
             did: code_entry.did.clone(),
+            client_id: client_id.clone(),
+            confidential_client: client_is_confidential(Some(&client_entry), config),
+            device_id: code_entry.device_id.clone().unwrap_or_default(),
+            scope: scope.clone(),
             name: display_name,
-            kind: Some(TokenKind::Refresh),
-        };
-        db_client
-            .set_token(&refresh_opaque, &refresh_metadata, REFRESH_TOKEN_TTL)
-            .await?;
-        Some(RefreshToken::new(refresh_opaque))
-    } else {
-        None
-    };
-
-    let access_token = AccessToken::new(opaque);
+            auth_time: code_entry.auth_time.timestamp(),
+            access_ttl: ACCESS_TOKEN_TTL,
+            refresh_inactivity_secs: issue_refresh_token.then_some(REFRESH_TOKEN_TTL),
+        })
+        .await?;
+    let refresh_token = issued.refresh_token.map(RefreshToken::new);
+    let access_token = AccessToken::new(issued.access_token);
 
     let core_id_token = CoreIdTokenClaims::new(
         IssuerUrl::from_url(config.base_url.clone()),
@@ -3299,9 +3174,8 @@ pub async fn userinfo(
     // unknown string all get the same answer: a code is redeemable only at the
     // token endpoint, with its PKCE verifier.
     let metadata = db_client
-        .get_token(&token_str)
+        .check_access_token(&token_str)
         .await?
-        .filter(|m| m.is_kind(TokenKind::Access))
         .ok_or_else(|| CustomError::BadRequest("Unknown token.".to_string()))?;
     if metadata.exp <= Utc::now().timestamp() {
         return Err(CustomError::BadRequest("Token expired.".to_string()));
@@ -6775,27 +6649,25 @@ mod client_binding_tests {
         id
     }
 
+    /// A deviceless grant of `client_id` with a refresh token; returns the token.
     async fn seed_refresh_token(db: &RedisClient, client_id: &str) -> String {
-        let refresh = unique("mcr_");
-        let now = Utc::now().timestamp();
-        db.set_token(
-            &refresh,
-            &TokenMetadata {
-                username: unique("localpart"),
-                device_id: String::new(),
-                scope: "openid".into(),
-                client_id: client_id.into(),
-                iat: now,
-                exp: now + REFRESH_TOKEN_TTL as i64,
-                did: "did:key:zDnBINDING".into(),
-                name: "did:key:zDnBINDING".into(),
-                kind: Some(TokenKind::Refresh),
-            },
-            REFRESH_TOKEN_TTL,
-        )
+        db.issue_grant(&NewGrant {
+            kind: GrantKind::Oidc,
+            username: unique("localpart"),
+            did: "did:key:zDnBINDING".into(),
+            client_id: client_id.into(),
+            confidential_client: false,
+            device_id: String::new(),
+            scope: "openid".into(),
+            name: "did:key:zDnBINDING".into(),
+            auth_time: Utc::now().timestamp(),
+            access_ttl: ACCESS_TOKEN_TTL,
+            refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+        })
         .await
-        .unwrap();
-        refresh
+        .unwrap()
+        .refresh_token
+        .expect("the grant carries a refresh token")
     }
 
     async fn seed_code(db: &RedisClient, client_id: &str) -> String {
@@ -6929,8 +6801,12 @@ mod client_binding_tests {
             .clone()
     }
 
+    /// The token's grant exists and was never rotated: a refusal consumed nothing.
     async fn still_exists(db: &RedisClient, refresh_token: &str) -> bool {
-        db.get_token(refresh_token).await.unwrap().is_some()
+        db.peek_refresh_grant(refresh_token)
+            .await
+            .unwrap()
+            .is_some_and(|grant| grant.generation == 0)
     }
 
     /// Another client, even one that authenticates correctly as itself, cannot
@@ -7240,12 +7116,11 @@ mod client_binding_tests {
         assert_eq!(outcome(&refresh(&db, &config, &rt, own).await), "ok");
     }
 
-    /// The grace replay hands out the successor pair, so it needs the same
-    /// client binding as a fresh rotation: anyone holding the old token for a
-    /// minute after the rotation must not get the new pair without the client's
-    /// credentials.
+    /// The replay of a lost response (I4) hands out the successor pair, so it
+    /// needs the same client binding as a fresh rotation: anyone holding the old
+    /// token must not get the new pair without the client's credentials.
     #[tokio::test]
-    async fn the_grace_replay_is_bound_to_the_client_too() {
+    async fn a_replay_is_bound_to_the_client_too() {
         let Some(db) = siwx_oidc::test_support::redis().await else {
             return;
         };
@@ -7287,16 +7162,14 @@ mod client_binding_tests {
         let replay = refresh_token_of(refresh(&db, &config, &old, credentials).await);
         assert_eq!(
             replay, successor,
-            "the client itself still recovers the same pair within the grace window"
+            "the client itself still recovers the same pair while it is unused"
         );
     }
 
-    /// A grace replay returns the successor pair only while the successor
-    /// refresh token is live. Once it has been rotated away or revoked, the
-    /// recorded pair is dead (the next rotation or the revocation took its
-    /// access token with it), so handing it out would answer a lost-response
-    /// retry with tokens that do not work. The replay is `invalid_grant`, like
-    /// any unknown token.
+    /// A replay returns the successor pair only while that pair is live and
+    /// unused. Once the successor has been rotated away or its grant revoked,
+    /// handing the pair out would answer a lost-response retry with tokens that
+    /// do not work. The replay is `invalid_grant`, like any unknown token.
     #[tokio::test]
     async fn a_replay_whose_successor_has_been_rotated_or_revoked_is_refused() {
         let Some(db) = siwx_oidc::test_support::redis().await else {
@@ -7324,11 +7197,101 @@ mod client_binding_tests {
         // Revoked: the successor was deleted before the client used it.
         let old = seed_refresh_token(&db, &client).await;
         let successor = refresh_token_of(refresh(&db, &config, &old, NOTHING).await);
-        db.delete_token(&successor).await.unwrap();
+        db.revoke_grant_of_token(&successor)
+            .await
+            .unwrap()
+            .expect("the successor's grant is revoked");
         assert_eq!(
             outcome(&refresh(&db, &config, &old, NOTHING).await),
             "invalid_grant",
             "a replay whose successor was revoked gets no pair"
+        );
+    }
+
+    /// H2 (I4, I5 phase A): the lost-response decision reads state, never a
+    /// clock. With the grant's recorded timestamps moved an hour into the past,
+    /// a replay of the previous refresh token still returns the same pair; once
+    /// the new access token has been accepted (as introspection or `/userinfo`
+    /// accepts it), the same replay is reuse: `invalid_grant`, one security
+    /// event with fingerprints only, and nothing revoked.
+    #[tokio::test]
+    async fn a_replay_an_hour_later_returns_the_same_pair_and_after_use_is_reuse() {
+        use bb8_redis::redis::AsyncCommands;
+        use openidconnect::OAuth2TokenResponse;
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Public).await;
+        let old = seed_refresh_token(&db, &client).await;
+        let first = refresh(&db, &config, &old, NOTHING).await.unwrap();
+        let pair = (
+            first.access_token().secret().clone(),
+            refresh_token_of(Ok(first)),
+        );
+
+        let grant = db.peek_refresh_grant(&old).await.unwrap().unwrap();
+        let key = format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_GRANT_PREFIX,
+            grant.grant_id.as_str()
+        );
+        let raw =
+            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
+        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        for field in ["last_used", "auth_time"] {
+            let _: i64 = conn.hincr(&key, field, -3600).await.unwrap();
+        }
+
+        let replay = refresh(&db, &config, &old, NOTHING).await.unwrap();
+        assert_eq!(
+            (
+                replay.access_token().secret().clone(),
+                refresh_token_of(Ok(replay))
+            ),
+            pair,
+            "an hour later the replay returns the SAME pair"
+        );
+
+        assert!(
+            db.lookup_access_token(&pair.0).await.unwrap().is_some(),
+            "the new access token is accepted"
+        );
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        assert_eq!(
+            outcome(&refresh(&db, &config, &old, NOTHING).await),
+            "invalid_grant",
+            "after first use the replay is reuse, answered like an unknown token"
+        );
+        let output = logs.output();
+        let events: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains(siwx_oidc::db::grant::REUSE_EVENT_MESSAGE))
+            .collect();
+        assert_eq!(events.len(), 1, "exactly one reuse event: {output}");
+        let event = events[0];
+        for field in [
+            "security_event=\"refresh_token_reuse\"",
+            "branch=\"previous_after_use\"",
+            "grant_kind=oidc",
+            "generation=1",
+        ] {
+            assert!(event.contains(field), "the event carries {field}: {event}");
+        }
+        assert!(
+            event.contains(grant.grant_id.fingerprint()),
+            "the event names the grant by its fingerprint: {event}"
+        );
+        for secret in [&old, &pair.0, &pair.1] {
+            assert!(
+                !output.contains(secret.as_str()),
+                "no token in the logs: {output}"
+            );
+        }
+        assert_eq!(
+            outcome(&refresh(&db, &config, &pair.1, NOTHING).await),
+            "ok",
+            "phase A revokes nothing: the live chain keeps working"
         );
     }
 
@@ -7503,7 +7466,7 @@ mod scope_grant_tests {
     }
 
     async fn recorded_scope(db: &RedisClient, response: &CoreTokenResponse) -> String {
-        db.get_token(response.access_token().secret())
+        db.check_access_token(response.access_token().secret())
             .await
             .unwrap()
             .expect("the access token is stored")

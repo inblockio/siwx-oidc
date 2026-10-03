@@ -354,22 +354,31 @@ doc; read it before changing the code the rule covers.
   `the_device_flow_sends_the_scope_it_relies_on`.
 - **An empty `device_id` is JSON `null` on the wire, never `""`.** Synapse rejects `""`. Pin:
   `empty_device_id_renders_as_json_null`, `deviceless_token_body_carries_device_id_null`.
-- **Refresh rotation keeps a 60 s grace pointer**: within 60 s a replay of the old refresh token
-  returns the same successor pair, so a client that lost the response recovers, but only while the
-  successor refresh token is still live. Once the successor was rotated away or revoked, the
-  recorded pair is dead and the replay is `invalid_grant` at `/token` and `M_UNKNOWN_TOKEN` at
-  `/_matrix/client/v3/refresh`. At `/token` the replay is also bound to the client (next
-  invariant); the Matrix endpoint carries no client and cannot bind it. Pin:
-  `refresh_grace_window_tolerates_replay` (mock stack),
+- **A replay of the immediately previous refresh token returns the same successor pair if, and
+  only if, the successor is unused** (I4). Both refresh endpoints run the one rotation script
+  (`RedisClient::rotate_refresh_token`), so concurrent refreshes of one token all get the same
+  pair and leave one live chain. The successor counts as used once its access token is first
+  accepted by introspection or `/userinfo`, or once its refresh token rotates; after that the
+  replay is reuse, answered like an unknown token (`invalid_grant` at `/token`, `M_UNKNOWN_TOKEN`
+  at `/_matrix/client/v3/refresh`). No timer decides it: the decision reads grant state, never a
+  clock. A replay whose successor was rotated away or whose grant was revoked is refused the same
+  way. At `/token` the replay is also bound to the client (next invariant); the Matrix endpoint
+  carries no client and cannot bind it. Pin (mock stack):
+  `concurrent_refreshes_at_the_token_endpoint_converge_on_one_pair`,
+  `concurrent_refreshes_at_the_matrix_endpoint_converge_on_one_pair`,
+  `a_replay_returns_the_same_pair_until_the_new_access_token_is_used`,
+  `a_replay_after_more_than_a_minute_still_returns_the_same_pair`; unit:
+  `a_replay_an_hour_later_returns_the_same_pair_and_after_use_is_reuse`,
   `a_replay_whose_successor_has_been_rotated_or_revoked_is_refused`,
-  `the_grace_replay_is_bound_to_the_client_too`, `a_matrix_refresh_replay_needs_its_successor_live`.
+  `a_replay_is_bound_to_the_client_too`, `a_matrix_refresh_replay_needs_its_successor_live`,
+  `concurrent_rotations_of_one_token_converge_on_one_pair`.
 - **A refresh token is bound to the client it was issued to, through the one helper the code
   exchange uses too.** `oidc::authenticate_client` serves both grants, so they cannot drift: a
   request that names another client (`client_id` in the form or the Basic user name) is
   `invalid_grant`; a confidential client (registered `token_endpoint_auth_method` other than
   `none`, or none while `require_secret`) must present its secret, else `invalid_client`, a 401
-  (RFC 6749 §5.2, with `WWW-Authenticate: Basic` after a Basic attempt). The grace replay is bound
-  to the successor token's client. Provisional, recorded in docs/matrix-integration.md: a public
+  (RFC 6749 §5.2, with `WWW-Authenticate: Basic` after a Basic attempt). The replay of a lost
+  response is bound to the grant's client like a rotation. Provisional, recorded in docs/matrix-integration.md: a public
   client may omit `client_id`; a token whose client registration has expired (30 days against 90)
   keeps refreshing unless the request names another client or presents a secret;
   `POST /_matrix/client/v3/refresh` carries no client identity and is not bound. Read the
@@ -382,7 +391,7 @@ doc; read it before changing the code the rule covers.
   `a_public_client_refreshes_with_or_without_naming_itself`,
   `an_unset_authentication_method_follows_require_secret`,
   `a_token_outlives_its_clients_registration_but_not_its_binding`,
-  `the_grace_replay_is_bound_to_the_client_too`, `a_basic_header_names_the_client_like_the_form_does`,
+  `a_replay_is_bound_to_the_client_too`, `a_basic_header_names_the_client_like_the_form_does`,
   `basic_credentials_are_form_urldecoded_before_they_are_compared`,
   `a_plain_basic_secret_and_a_bearer_token_are_taken_as_sent`,
   `the_code_exchange_and_the_refresh_grant_authenticate_clients_identically`,
@@ -508,7 +517,7 @@ structured output.
   short because a user code has about 34 bits of entropy. Request logging records method and
   path, never the query, and that holds for the span too: tower-http's default span prints the
   whole URI in front of every debug line. A struct that holds a credential prints its fingerprint
-  under `Debug` (`RotatedToken`, `DeviceCodeEntry`). Pin:
+  under `Debug` (`SuccessorPair`, `IssuedGrant`, `DeviceCodeEntry`). Pin:
   `the_redis_code_and_token_paths_log_fingerprints_never_values`,
   `a_struct_that_holds_a_credential_prints_its_fingerprint_under_debug`,
   `no_log_site_names_a_credential_without_its_fingerprint` (a scan of every log macro in `src/`,

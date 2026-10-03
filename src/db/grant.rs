@@ -73,7 +73,7 @@ use tracing::warn;
 use super::redis::{device_tombstone_key, user_tombstone_key};
 use super::seal::{self, SuccessorPair};
 use super::tokens::{self, digest};
-use super::{RedisClient, TokenKind, TokenMetadata, TOMBSTONE_TTL_SECS};
+use super::{DBClient, RedisClient, TokenKind, TokenMetadata, TOMBSTONE_TTL_SECS};
 
 /// Prefix of the grant hashes: `grant/{grant id}`.
 pub const KV_GRANT_PREFIX: &str = "grant";
@@ -959,6 +959,61 @@ impl RedisClient {
             .await
             .map_err(|e| anyhow!("grant store DEL: {e}"))?;
         Ok(n > 0)
+    }
+}
+
+impl RedisClient {
+    /// The access check of every bearer endpoint (introspection, `/userinfo`,
+    /// the bearer-authenticated Matrix routes): the claims of a live access
+    /// token, or `None`. A grant's access token is looked up first
+    /// ([`lookup_access_token`](Self::lookup_access_token), which marks the
+    /// successor of a rotation used), then a legacy `token/{raw}` access entry.
+    /// An `Err` means the store could not answer, never "inactive".
+    ///
+    /// TODO(remove one release after Phase 2a): the legacy read. Builds before
+    /// the grant record wrote access tokens as `token/{raw}` with a lifetime of
+    /// at most 900 s, so one release later none is left.
+    pub async fn check_access_token(&self, token: &str) -> Result<Option<TokenMetadata>> {
+        if let Some(access) = self.lookup_access_token(token).await? {
+            return Ok(Some(access.metadata()));
+        }
+        Ok(self
+            .get_token(token)
+            .await?
+            .filter(|m| m.is_kind(TokenKind::Access)))
+    }
+
+    /// The grant of a refresh token the refresh endpoints would accept now:
+    /// the current one, or the previous one while its successor is unused.
+    /// Reads only; a superseded token, or one whose grant is gone, is `None`.
+    /// For teardown, which must not act on a token the endpoints refuse.
+    pub async fn resolve_refresh_token(&self, token: &str) -> Result<Option<GrantView>> {
+        let Some(parsed) = tokens::parse_refresh_token(token) else {
+            return Ok(None);
+        };
+        let grant_id = GrantId::of_handle(parsed.handle);
+        let fields: HashMap<String, String> = {
+            let mut conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| anyhow!("Redis pool: {e}"))?;
+            redis::cmd("HGETALL")
+                .arg(grant_key(&grant_id))
+                .query_async(&mut *conn)
+                .await
+                .map_err(|e| anyhow!("grant store HGETALL: {e}"))?
+        };
+        let presented = digest(token);
+        let field = |k: &str| fields.get(k).map(String::as_str).unwrap_or("");
+        let is_current = !field("current_rt").is_empty() && field("current_rt") == presented;
+        let is_unused_previous = !field("previous_rt").is_empty()
+            && field("previous_rt") == presented
+            && field("successor_used") == "0";
+        if !(is_current || is_unused_previous) {
+            return Ok(None);
+        }
+        view_or_none(grant_id, &fields)
     }
 }
 

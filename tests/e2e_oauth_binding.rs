@@ -2298,8 +2298,8 @@ async fn a_refresh_token_is_refused_to_another_client() {
 /// A confidential client authenticates at the refresh grant: no credentials
 /// and a wrong secret are `invalid_client` with a 401, and a request that
 /// attempted HTTP Basic is answered with the matching challenge. The secret
-/// goes in the form or in a Basic header. The replay of a just-rotated token
-/// hands out the successor pair only to the same client.
+/// goes in the form or in a Basic header. The replay of a lost response hands
+/// out the successor pair only to the same client.
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn a_confidential_client_must_authenticate_to_refresh() {
@@ -2357,14 +2357,14 @@ async fn a_confidential_client_must_authenticate_to_refresh() {
     let rotated: Value = by_form.json().await.unwrap();
     let successor = rotated["refresh_token"].as_str().unwrap().to_string();
 
-    // The old token replayed inside the grace window: the client recovers the
-    // pair it lost, a caller without the client's credentials does not.
+    // The old token replayed while the new pair is unused: the client recovers
+    // the pair it lost, a caller without the client's credentials does not.
     let replay_anonymous = refresh_as(&c, &base, &refresh, &[], None).await;
     let (status, error, _) = refusal(replay_anonymous).await;
     assert_eq!(
         (status, error.as_str()),
         (StatusCode::UNAUTHORIZED, "invalid_client"),
-        "the grace replay is bound to the client too"
+        "the replay is bound to the client too"
     );
     let replay_owner = refresh_as(
         &c,
@@ -2384,7 +2384,7 @@ async fn a_confidential_client_must_authenticate_to_refresh() {
     );
 
     // The successor refreshes with the secret in a Basic header (and so no
-    // client_id in the form), which also ends the grace window for the old token.
+    // client_id in the form), which also ends the recovery for the old token.
     let by_basic = refresh_as(
         &c,
         &base,

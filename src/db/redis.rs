@@ -55,10 +55,6 @@ fn erased_did_key(did: &str) -> String {
 }
 
 /// Redis key for the short-lived refresh-token rotation grace pointer.
-fn rotated_token_key(old_refresh: &str) -> String {
-    format!("{}/{}", KV_ROTATED_PREFIX, old_refresh)
-}
-
 /// Read and delete an authorization code in one atomic step.
 ///
 /// `KEYS[1]` is `codes/{id}`, `KEYS[2]` the `codes/{id}/consumed` marker an
@@ -229,6 +225,11 @@ impl RedisClient {
     /// pre-index token (e.g. minted before an upgrade); it never re-creates the
     /// race because the tombstone already blocks new mints.
     pub async fn revoke_device_tokens(&self, username: &str, device_id: &str) -> Result<usize> {
+        // The grants of the device first (one atomic script that also plants
+        // the tombstone): deleting a grant makes all its tokens inert at once.
+        // The legacy index and scan below catch `token/{raw}` entries written
+        // before the grant record.
+        let revoked_grants = self.revoke_grants_for_device(username, device_id).await?;
         let mut conn = self
             .pool
             .get()
@@ -269,10 +270,10 @@ impl RedisClient {
             .await
             .unwrap_or(0);
 
-        let revoked = revoked_idx + revoked_scan;
+        let revoked = revoked_grants + revoked_idx + revoked_scan;
         debug!(
-            "revoke_device_tokens: username={} device_id={} revoked_idx={} revoked_scan={} total={}",
-            username, device_id, revoked_idx, revoked_scan, revoked
+            username,
+            device_id, revoked_grants, revoked_idx, revoked_scan, revoked, "revoke_device_tokens"
         );
         Ok(revoked)
     }
@@ -302,7 +303,10 @@ impl RedisClient {
         // did not set it (the explicit callers do, before this point).
         self.mark_user_deactivated(username).await?;
 
-        let mut total = 0usize;
+        // Every grant of the user, in one atomic script (which plants the
+        // tombstone again). The loop below is the backstop for legacy
+        // `token/{raw}` entries written before the grant record.
+        let mut total = self.revoke_grants_for_user(username).await?;
         for _ in 0..5 {
             let n = self
                 .revoke_tokens_where(|meta| meta.username == username)
@@ -927,31 +931,6 @@ impl DBClient for RedisClient {
     async fn is_user_deactivated(&self, username: &str) -> Result<bool> {
         Ok(self.get_raw(&user_tombstone_key(username)).await?.is_some())
     }
-
-    async fn set_rotated_token(
-        &self,
-        old_refresh: &str,
-        successor: &RotatedToken,
-        ttl: u64,
-    ) -> Result<()> {
-        let value = serde_json::to_string(successor)
-            .map_err(|e| anyhow!("Failed to serialize rotated token: {}", e))?;
-        self.set_ex_raw(&rotated_token_key(old_refresh), &value, ttl)
-            .await
-    }
-
-    async fn get_rotated_token(&self, old_refresh: &str) -> Result<Option<RotatedToken>> {
-        match self.get_raw(&rotated_token_key(old_refresh)).await? {
-            Some(v) => {
-                Ok(Some(serde_json::from_str(&v).map_err(|e| {
-                    anyhow!("Failed to deserialize rotated token: {}", e)
-                })?))
-            }
-            None => Ok(None),
-        }
-    }
-
-    // -- Opaque token storage (MSC3861) ----------------------------------------
 
     async fn set_token(&self, token: &str, metadata: &TokenMetadata, ttl: u64) -> Result<()> {
         // Every endpoint accepts exactly one kind of token, so an entry without a
