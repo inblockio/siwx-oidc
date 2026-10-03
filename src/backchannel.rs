@@ -284,12 +284,23 @@ pub enum DeliveryError {
 /// the checked addresses, through no proxy, following no redirect.
 pub async fn deliver(guard: &UriGuard, uri: &Url, token: &str) -> Result<(), DeliveryError> {
     let checked = guard.check(uri).await.map_err(DeliveryError::Refused)?;
+    post_logout_token(uri, checked.as_deref(), token).await
+}
+
+/// The POST of [`deliver`]: `checked` is what the guard resolved and accepted
+/// (`None` for a listed host). A separate function only so a test can hand it
+/// addresses that differ from what the host resolves to now.
+async fn post_logout_token(
+    uri: &Url,
+    checked: Option<&[SocketAddr]>,
+    token: &str,
+) -> Result<(), DeliveryError> {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT);
-    if let (Some(addrs), Some(Host::Domain(domain))) = (&checked, uri.host()) {
+    if let (Some(addrs), Some(Host::Domain(domain))) = (checked, uri.host()) {
         // Pin the connection to the addresses just checked: no second lookup.
         builder = builder.resolve_to_addrs(domain, addrs);
     }
@@ -677,6 +688,10 @@ mod tests {
     }
 
     async fn stub_rp() -> (Stub, SocketAddr) {
+        stub_rp_at("127.0.0.1:0".parse().unwrap()).await
+    }
+
+    async fn stub_rp_at(bind: SocketAddr) -> (Stub, SocketAddr) {
         async fn bcl(
             State(s): State<Stub>,
             headers: HeaderMap,
@@ -705,7 +720,9 @@ mod tests {
             .route("/bcl", post(bcl))
             .route("/elsewhere", post(elsewhere).get(elsewhere))
             .with_state(stub.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind(bind)
+            .await
+            .unwrap_or_else(|e| panic!("bind the stub RP to {bind}: {e}"));
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (stub, addr)
@@ -756,6 +773,165 @@ mod tests {
             0,
             "a redirect is never followed"
         );
+    }
+
+    /// DNS rebinding: delivery connects to the addresses the guard checked and
+    /// never resolves the host a second time. The host is `localhost`, which
+    /// resolves to loopback, where stub A listens: that stands for the second
+    /// answer a rebinding name gives (an address the guard refuses). The checked
+    /// address is 127.0.0.2 on the same port, where stub B listens. The pinned
+    /// delivery must reach B and never A. The control, a POST with no checked
+    /// addresses (as for a listed host), resolves `localhost` afresh and does
+    /// reach A, so the pinned case can fail. (The guard's own resolution is
+    /// bypassed through `post_logout_token`: no resolver available to a test
+    /// answers one name differently on two lookups.)
+    #[tokio::test]
+    async fn delivery_connects_only_to_the_checked_address_never_a_second_resolution() {
+        let (rebound, a) = stub_rp().await;
+        let (checked, b) = stub_rp_at(SocketAddr::new(
+            Ipv4Addr::new(127, 0, 0, 2).into(),
+            a.port(),
+        ))
+        .await;
+        let uri = Url::parse(&format!("http://localhost:{}/bcl", a.port())).unwrap();
+
+        post_logout_token(&uri, Some(&[b]), "pinned")
+            .await
+            .expect("the checked address answers");
+        assert_eq!(checked.hits().len(), 1, "delivered to the checked address");
+        assert!(
+            rebound.hits().is_empty(),
+            "never to the address a second resolution of the host returns"
+        );
+
+        post_logout_token(&uri, None, "unpinned")
+            .await
+            .expect("control: a fresh resolution of localhost reaches stub A");
+        assert_eq!(
+            rebound.hits(),
+            vec![(
+                "application/x-www-form-urlencoded".to_string(),
+                "logout_token=unpinned".to_string()
+            )],
+            "control: the unpinned POST went to the resolved address"
+        );
+        assert_eq!(checked.hits().len(), 1);
+    }
+
+    /// Names the stub RP's address for [`proxy_environment_child`].
+    const PROXY_CHILD_RP: &str = "SIWX_TEST_PROXY_CHILD_RP";
+
+    /// Delivery goes through no proxy, even when the environment names one
+    /// (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, which a reqwest client honours
+    /// unless told not to). Those variables are process-wide and read whenever
+    /// a client is built, so the deliveries run in a child process of this
+    /// test binary ([`proxy_environment_child`]) whose environment names a
+    /// recording proxy, and no other test sees them. The child's control, a
+    /// client that honours the environment, does reach the proxy, so the test
+    /// can fail.
+    #[tokio::test]
+    async fn delivery_uses_no_proxy_even_when_the_environment_names_one() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (rp, rp_addr) = stub_rp().await;
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let record = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]);
+                    let line = head.lines().next().unwrap_or_default().to_string();
+                    record.lock().unwrap().push(line);
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+        child.args([
+            "backchannel::tests::proxy_environment_child",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        for var in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            child.env(var, &proxy);
+        }
+        for var in ["NO_PROXY", "no_proxy", "REQUEST_METHOD"] {
+            child.env_remove(var);
+        }
+        child.env(PROXY_CHILD_RP, rp_addr.to_string());
+        let out = child.output().await.expect("run the child test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|line| line.contains("/control")),
+            "control: a client that honours the environment reaches the proxy: {seen:?}\n{stdout}{stderr}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|line| line.contains("/bcl") || line.starts_with("CONNECT")),
+            "a delivery never goes through the proxy: {seen:?}"
+        );
+        assert_eq!(
+            rp.hits(),
+            vec![(
+                "application/x-www-form-urlencoded".to_string(),
+                "logout_token=direct".to_string()
+            )],
+            "the delivery reached the RP directly"
+        );
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the child ran its one test and it passed:\n{stdout}{stderr}"
+        );
+    }
+
+    /// The deliveries of [`delivery_uses_no_proxy_even_when_the_environment_names_one`],
+    /// run by it in a child process whose environment names a proxy.
+    #[tokio::test]
+    #[ignore = "a child process of delivery_uses_no_proxy_even_when_the_environment_names_one"]
+    async fn proxy_environment_child() {
+        let Ok(rp) = std::env::var(PROXY_CHILD_RP) else {
+            eprintln!("SKIP proxy_environment_child: it runs only as a child process");
+            return;
+        };
+        let listed = UriGuard::new(&["127.0.0.1".to_string()]);
+        let _ = reqwest::Client::new()
+            .post(format!("http://{rp}/control"))
+            .send()
+            .await;
+        deliver(
+            &listed,
+            &Url::parse(&format!("http://{rp}/bcl")).unwrap(),
+            "direct",
+        )
+        .await
+        .expect("delivered to the RP directly");
+        // The stub speaks no TLS, so this fails either way; only the route counts.
+        let _ = deliver(
+            &listed,
+            &Url::parse(&format!("https://{rp}/bcl")).unwrap(),
+            "tls",
+        )
+        .await;
     }
 
     async fn register_rp(db: &RedisClient, client_id: &str, uri: &str) {

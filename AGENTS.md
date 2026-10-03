@@ -667,6 +667,9 @@ doc; read it before changing the code the rule covers.
   `the_address_classifier_refuses_every_internal_class`,
   `the_uri_guard_checks_scheme_fragment_and_every_resolved_address`,
   `delivery_connects_only_to_a_checked_or_listed_host_and_follows_no_redirect`,
+  `delivery_connects_only_to_the_checked_address_never_a_second_resolution`,
+  `delivery_uses_no_proxy_even_when_the_environment_names_one` (a child process of the test
+  binary carries the proxy variables),
   `registration_stores_backchannel_logout_metadata_and_refuses_an_unsafe_uri`;
   generic-mode server and stub RP:
   `a_uri_on_a_refused_address_is_refused_at_registration_and_never_delivered_to`.
