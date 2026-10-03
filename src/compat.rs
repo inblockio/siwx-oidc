@@ -1179,6 +1179,86 @@ mod tests {
         client.revoke_grants_for_device(&user, &dev).await.ok();
     }
 
+    /// I5 phase B at `POST /_matrix/client/v3/refresh`, with
+    /// `reuse_revokes_grant` on: a superseded refresh token gets exactly the
+    /// answer an unknown token gets, the event records the revocation, the
+    /// grant is gone (the current token is refused too), and the Synapse
+    /// device is never deleted: the homeserver is never contacted.
+    #[tokio::test]
+    async fn with_reuse_enforcement_the_matrix_endpoint_ends_the_grant_and_never_the_device() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(base) = redis().await else { return };
+        let client = base.clone().with_reuse_enforcement(true);
+        let n = nonce();
+        let user = format!("reuse-on-user-{n}");
+        let dev = format!("REUSEON_{n}");
+
+        // A homeserver that counts every connection made to it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let contacted = Arc::new(AtomicUsize::new(0));
+        let counter = contacted.clone();
+        let homeserver = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let state = CompatState {
+            redis_client: client.clone(),
+            require_secret: true,
+            synapse_client: Some(Arc::new(SynapseClient::new(
+                &format!("http://{addr}"),
+                "secret",
+            ))),
+            server_name: Some("example.org".to_string()),
+        };
+
+        let grant = seed_grant(&client, &user, &dev).await;
+        let first = grant.refresh_token.clone().unwrap();
+        let mut current = first.clone();
+        for _ in 0..2 {
+            let (status, body) = matrix_refresh(&state, &current).await;
+            assert_eq!(status, StatusCode::OK, "the current token rotates: {body}");
+            current = body["refresh_token"].as_str().unwrap().to_string();
+        }
+
+        let unknown = matrix_refresh(&state, "mcr_not_a_token").await;
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let reused = matrix_refresh(&state, &first).await;
+        assert_eq!(reused.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(reused.1["errcode"], "M_UNKNOWN_TOKEN");
+        assert_eq!(reused, unknown, "answered exactly like an unknown token");
+        let output = logs.output();
+        let events: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains(siwx_oidc::db::grant::REUSE_EVENT_MESSAGE))
+            .collect();
+        assert_eq!(events.len(), 1, "exactly one reuse event: {output}");
+        assert!(
+            events[0].contains("grant_revoked=true"),
+            "the event records the revocation: {}",
+            events[0]
+        );
+
+        assert!(
+            client.peek_refresh_grant(&current).await.unwrap().is_none(),
+            "the grant is gone"
+        );
+        assert_eq!(
+            matrix_refresh(&state, &current).await,
+            unknown,
+            "the current holder is refused at its next refresh"
+        );
+        assert_eq!(
+            contacted.load(Ordering::SeqCst),
+            0,
+            "the Synapse device is never deleted: the homeserver was not contacted"
+        );
+        homeserver.abort();
+        client.revoke_grants_for_device(&user, &dev).await.ok();
+    }
+
     /// Item 10 at the Matrix endpoint: a legacy refresh token (`token/{raw}`,
     /// written before the grant record) of a public client is lifted into a
     /// grant and answered in the current format; a confidential client's is

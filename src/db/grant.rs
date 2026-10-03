@@ -543,6 +543,8 @@ pub struct ReuseEvent {
     pub client_id: String,
     pub grant_kind: GrantKind,
     pub branch: ReuseBranch,
+    /// Whether the event revoked the grant (`reuse_revokes_grant`).
+    pub grant_revoked: bool,
 }
 
 impl ReuseEvent {
@@ -1091,6 +1093,13 @@ impl RedisClient {
     /// different caps, as instances do after a configuration change.
     pub fn with_grant_lifetime(mut self, lifetime: GrantLifetime) -> Self {
         self.lifetime = lifetime;
+        self
+    }
+
+    /// This client with reuse enforcement on or off (I5 phase B,
+    /// `reuse_revokes_grant`). Clones share one connection pool.
+    pub fn with_reuse_enforcement(mut self, on: bool) -> Self {
+        self.reuse_revokes_grant = on;
         self
     }
 
@@ -1649,6 +1658,7 @@ impl RedisClient {
                     Some("superseded") => ReuseBranch::Superseded,
                     _ => return Err(anyhow!("rotation script: unknown reuse branch")),
                 },
+                grant_revoked: false,
             }),
             Some("invalid") => RotateOutcome::Invalid(match field(1) {
                 Some("unknown_grant") => InvalidReason::UnknownGrant,

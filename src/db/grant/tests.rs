@@ -763,6 +763,7 @@ fn the_reuse_event_carries_its_fields_and_fingerprints_only() {
         client_id: "client-a".into(),
         grant_kind: GrantKind::Oidc,
         branch: ReuseBranch::PreviousAfterUse,
+        grant_revoked: true,
     };
     event.emit();
     let out = capture.output();
@@ -775,6 +776,7 @@ fn the_reuse_event_carries_its_fields_and_fingerprints_only() {
         "client_id=client-a",
         "grant_kind=oidc",
         "branch=\"previous_after_use\"",
+        "grant_revoked=true",
     ] {
         assert!(out.contains(needle), "missing {needle:?} in {out:?}");
     }
@@ -1246,6 +1248,7 @@ fn a_lifted_grant_is_a_matrix_device_grant_exactly_when_its_scope_carries_the_ma
 
 mod epochs;
 mod lifetime;
+mod reuse;
 
 // -- `sid` (I8, Phase 4) ------------------------------------------------------
 
