@@ -120,7 +120,10 @@ fn eip55_checksum(addr: &[u8; 20]) -> String {
 }
 
 fn new_wallet() -> Wallet {
-    let key = SigningKey::random(&mut OsRng);
+    wallet_from_key(SigningKey::random(&mut OsRng))
+}
+
+fn wallet_from_key(key: SigningKey) -> Wallet {
     let addr = address_from_key(key.verifying_key());
     let address = eip55_checksum(&addr);
     let did = format!("did:pkh:eip155:1:{address}");
@@ -2820,4 +2823,783 @@ async fn legacy_tokens_keep_working_after_the_upgrade() {
         );
         assert!(is_grant_refresh_token(&next.unwrap().1));
     }
+}
+
+// ===========================================================================
+// H4 (I1) for every other credential a client holds: authorization codes,
+// device and user codes, login session ids, the ids of the WebAuthn ceremonies
+// and the CAIP-122 nonces the server hands out (Phase 2b).
+// ===========================================================================
+
+/// Lowercase hex SHA-256: the form a credential is stored under.
+fn digest_hex(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+/// A login started at `/authorize`: the session the cookie names and what the
+/// login page reads to build its CAIP-122 message.
+struct StartedLogin {
+    rc: RegisteredClient,
+    verifier: String,
+    session_id: String,
+    nonce: String,
+    domain: String,
+}
+
+impl StartedLogin {
+    fn cookie(&self) -> String {
+        format!("session={}", self.session_id)
+    }
+}
+
+/// `GET /authorize` for a fresh public client with an S256 challenge.
+async fn start_login(c: &Client, base: &str) -> StartedLogin {
+    let rc = register_client(c, base).await;
+    let (verifier, challenge) = pkce_pair();
+    let authorize_url = format!(
+        "{base}/authorize?client_id={}&redirect_uri={}&scope=openid&response_type=code&state=h4_state&code_challenge={}&code_challenge_method=S256",
+        urlencoding::encode(&rc.client_id),
+        urlencoding::encode(&rc.redirect_uri),
+        urlencoding::encode(&challenge),
+    );
+    let resp = no_redirect_client()
+        .get(&authorize_url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "authorize 303");
+    let session_id = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok()?.strip_prefix("session="))
+        .map(|rest| rest.split(';').next().unwrap_or("").to_string())
+        .find(|v| !v.is_empty())
+        .expect("authorize sets the session cookie");
+    let q = parse_query(resp.headers().get("location").unwrap().to_str().unwrap());
+    StartedLogin {
+        rc,
+        verifier,
+        session_id,
+        nonce: q["nonce"].clone(),
+        domain: q["domain"].clone(),
+    }
+}
+
+/// The `siwx` cookie value (URL-encoded) the login page sets after `w` signed
+/// the CAIP-122 message for `login`.
+fn siwx_cookie_for(base: &str, w: &Wallet, login: &StartedLogin) -> String {
+    let now = chrono::Utc::now();
+    let issued_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let expiration_time =
+        (now + chrono::Duration::hours(48)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let message = format!(
+        "{domain} wants you to sign in with your Ethereum account:\n\
+         {addr}\n\n\
+         You are signing-in to {domain}.\n\n\
+         URI: {base}\n\
+         Version: 1\n\
+         Chain ID: 1\n\
+         Nonce: {nonce}\n\
+         Issued At: {issued_at}\n\
+         Expiration Time: {expiration_time}\n\
+         Resources:\n\
+         - {redirect}",
+        domain = login.domain,
+        addr = w.address,
+        nonce = login.nonce,
+        redirect = login.rc.redirect_uri,
+    );
+    let signature = eip191_sign(&w.key, &message);
+    let value =
+        serde_json::to_string(&json!({ "did": w.did, "message": message, "signature": signature }))
+            .unwrap();
+    urlencoding::encode(&value).into_owned()
+}
+
+/// `GET /sign_in` for a started login; returns the authorization code.
+async fn sign_in_to_code(base: &str, w: &Wallet, login: &StartedLogin) -> String {
+    let resp = no_redirect_client()
+        .get(format!("{base}/sign_in"))
+        .header(
+            "cookie",
+            format!(
+                "{}; siwx={}",
+                login.cookie(),
+                siwx_cookie_for(base, w, login)
+            ),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "sign_in 303");
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    parse_query(location)
+        .get("code")
+        .unwrap_or_else(|| panic!("sign_in redirect carries no code: {location}"))
+        .clone()
+}
+
+/// `POST /device_authorization` for `client_id`: `(device_code, user_code)`.
+async fn request_device_code(c: &Client, base: &str, client_id: &str) -> (String, String) {
+    let da: Value = c
+        .post(format!("{base}/device_authorization"))
+        .form(&[("client_id", client_id), ("scope", "openid")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    (
+        da["device_code"].as_str().unwrap().to_string(),
+        da["user_code"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Approve `user_code` with `w`'s wallet over a fresh server-issued nonce;
+/// returns the nonce the approval consumed.
+async fn approve_device(c: &Client, base: &str, w: &Wallet, user_code: &str) -> String {
+    let (message, signature) = sign_device_message(c, w, base, user_code).await;
+    let r = c
+        .post(format!("{base}/device"))
+        .json(&json!({
+            "user_code": user_code, "action": "approve",
+            "did": w.did, "message": message, "signature": signature
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "device approval: {}",
+        r.text().await.unwrap_or_default()
+    );
+    message
+        .lines()
+        .find_map(|l| l.strip_prefix("Nonce: "))
+        .expect("the device message carries a nonce")
+        .to_string()
+}
+
+/// One device-code poll at `/token`: `(status, body)`.
+async fn poll_device_code(
+    c: &Client,
+    base: &str,
+    device_code: &str,
+    client_id: &str,
+) -> (StatusCode, Value) {
+    let r = c
+        .post(format!("{base}/token"))
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", device_code),
+            ("client_id", client_id),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    (status, r.json().await.unwrap_or(Value::Null))
+}
+
+/// `POST {path}` with a JSON body and optional cookie; asserts a 200 and
+/// returns the body.
+async fn post_ok(c: &Client, base: &str, path: &str, cookie: Option<&str>, body: Value) -> Value {
+    let mut req = c.post(format!("{base}{path}")).json(&body);
+    if let Some(cookie) = cookie {
+        req = req.header("cookie", cookie);
+    }
+    let r = req.send().await.unwrap();
+    let status = r.status();
+    let text = r.text().await.unwrap_or_default();
+    assert_eq!(status, StatusCode::OK, "POST {path}: {text}");
+    serde_json::from_str(&text).unwrap_or(Value::Null)
+}
+
+/// Whether the scan saw `key` in any database.
+fn scanned(scan: &RedisScan, key: &str) -> bool {
+    scan.keys.iter().any(|k| k.ends_with(&format!(":{key}")))
+}
+
+/// H4 for codes, device and user codes, session ids and nonces: a login
+/// session with every WebAuthn ceremony started under it, an issued and then
+/// an exchanged authorization code, an account re-auth ceremony and nonce, and
+/// a device-code flow through a passkey ceremony start, approval and
+/// redemption. After each stage no key and no value of the stack Redis holds
+/// any of these strings. The positive controls (the digest keys of the
+/// session, the code, the device code and its redemption claim) prove the scan
+/// searched the stack's Redis and the credentials were stored by digest.
+///
+/// WebAuthn ceremonies are only started here: finishing one needs an
+/// authenticator, which this suite does not drive (the browser suite does).
+/// Starting one is what stores its state under the ceremony id; finishing
+/// reads and deletes it, and the session update it makes goes through the
+/// same session store the login uses.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn no_code_or_session_the_client_holds_is_stored_in_the_clear() {
+    let Some(url) = stack_redis_url() else {
+        let marker = "E2E_SKIP: no_code_or_session_the_client_holds_is_stored_in_the_clear: no \
+                      stack Redis URL (E2E_REDIS_URL, SIWXOIDC_REDIS_URL, SIWEOIDC_REDIS_URL or \
+                      REDIS_HOST/REDIS_PORT); the keyspace was NOT searched";
+        assert!(
+            std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+            "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+        );
+        eprintln!("{marker}");
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    let mut held = ClientHeld::default();
+
+    // A login session, and the ceremonies keyed by its id.
+    let login = start_login(&c, &base).await;
+    held.add("login session id", &login.session_id);
+    let cookie = login.cookie();
+    post_ok(
+        &c,
+        &base,
+        "/webauthn/authenticate/start",
+        Some(&cookie),
+        json!({}),
+    )
+    .await;
+    post_ok(
+        &c,
+        &base,
+        "/webauthn/register/start",
+        Some(&cookie),
+        json!({}),
+    )
+    .await;
+    let link_cookie = format!("{cookie}; siwx={}", siwx_cookie_for(&base, &w, &login));
+    post_ok(
+        &c,
+        &base,
+        "/link/webauthn/start",
+        Some(&link_cookie),
+        json!({}),
+    )
+    .await;
+    // The account re-auth ceremony hands its id to the client in the body.
+    let started = post_ok(
+        &c,
+        &base,
+        "/account/passkey/start",
+        None,
+        json!({ "action": "org.matrix.profile" }),
+    )
+    .await;
+    held.add(
+        "account passkey ceremony id",
+        started["session_id"]
+            .as_str()
+            .expect("start returns session_id"),
+    );
+    let account_nonce: Value = c
+        .get(format!("{base}/account/nonce?action=org.matrix.profile"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    held.add(
+        "account CAIP-122 nonce",
+        account_nonce["nonce"].as_str().expect("account nonce"),
+    );
+    let scan =
+        assert_nothing_stored_in_the_clear(&url, &held, "with a login session and its ceremonies")
+            .await;
+    let session_key = format!("session/{}", digest_hex(&login.session_id));
+    assert!(
+        scanned(&scan, &session_key),
+        "positive control: the login session is stored under its digest key {session_key} \
+         ({} keys scanned in {url})",
+        scan.keys.len()
+    );
+
+    // An issued, unconsumed authorization code.
+    let code = sign_in_to_code(&base, &w, &login).await;
+    held.add("authorization code", &code);
+    let scan = assert_nothing_stored_in_the_clear(&url, &held, "with an unconsumed code").await;
+    let code_key = format!("code/{}", digest_hex(&code));
+    assert!(
+        scanned(&scan, &code_key),
+        "positive control: the code is stored under its digest key {code_key}"
+    );
+
+    // The code exchanged.
+    let tokens = exchange_code(&c, &base, &login.rc, &code, &login.verifier)
+        .await
+        .expect("the code exchanges");
+    held.add_token("access token", tokens["access_token"].as_str().unwrap());
+    held.add_token("refresh token", tokens["refresh_token"].as_str().unwrap());
+    let scan = assert_nothing_stored_in_the_clear(&url, &held, "after the code exchange").await;
+    assert!(
+        !scanned(&scan, &code_key),
+        "an exchanged code leaves no entry"
+    );
+
+    // A device-code flow: a pending code, its user code, a passkey ceremony
+    // keyed by the user code, approval over a server-issued nonce, redemption.
+    let device_client = register_client(&c, &base).await;
+    let (device_code, user_code) = request_device_code(&c, &base, &device_client.client_id).await;
+    held.add("device code", &device_code);
+    held.add("user code", &user_code);
+    post_ok(
+        &c,
+        &base,
+        "/device/passkey/start",
+        None,
+        json!({ "user_code": user_code }),
+    )
+    .await;
+    let scan = assert_nothing_stored_in_the_clear(&url, &held, "with a pending device code").await;
+    let device_key = format!("device_code/{}", digest_hex(&device_code));
+    assert!(
+        scanned(&scan, &device_key),
+        "positive control: the device code is stored under its digest key {device_key}"
+    );
+    assert!(
+        scanned(&scan, &format!("user_code/{}", digest_hex(&user_code))),
+        "positive control: the user code is stored under its digest key"
+    );
+
+    let device_nonce = approve_device(&c, &base, &w, &user_code).await;
+    held.add("device CAIP-122 nonce", &device_nonce);
+    assert_nothing_stored_in_the_clear(&url, &held, "after the device approval").await;
+
+    let (status, body) = poll_device_code(&c, &base, &device_code, &device_client.client_id).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the approved device code redeems: {body}"
+    );
+    held.add_token(
+        "device access token",
+        body["access_token"].as_str().unwrap(),
+    );
+    held.add_token(
+        "device refresh token",
+        body["refresh_token"].as_str().unwrap(),
+    );
+    let scan = assert_nothing_stored_in_the_clear(&url, &held, "after redemption").await;
+    let claim_key = format!("{device_key}/redeemed");
+    assert!(
+        scanned(&scan, &claim_key),
+        "positive control: the redemption claim is keyed by the digest, {claim_key}"
+    );
+}
+
+// ===========================================================================
+// R2: codes, device and user codes and login sessions a build before digest
+// keys wrote keep working after the upgrade, within their lifetimes (Phase 2b).
+// ===========================================================================
+
+/// The credentials a previous build left in flight, as the client holds them.
+struct InFlight {
+    /// An issued, unconsumed authorization code, its client and verifier.
+    code_client: RegisteredClient,
+    code: String,
+    code_verifier: String,
+    /// A login session started at `/authorize`, not yet signed in.
+    session: StartedLogin,
+    /// An approved, unredeemed device code.
+    approved_client: String,
+    approved_device_code: String,
+    approved_user_code: String,
+    /// A pending device code and its user code.
+    pending_client: String,
+    pending_device_code: String,
+    pending_user_code: String,
+}
+
+impl InFlight {
+    fn to_json(&self) -> Value {
+        json!({
+            "code_client": self.code_client.client_id,
+            "code_redirect_uri": self.code_client.redirect_uri,
+            "code": self.code,
+            "code_verifier": self.code_verifier,
+            "session_client": self.session.rc.client_id,
+            "session_redirect_uri": self.session.rc.redirect_uri,
+            "session_verifier": self.session.verifier,
+            "session_id": self.session.session_id,
+            "session_nonce": self.session.nonce,
+            "session_domain": self.session.domain,
+            "approved_client": self.approved_client,
+            "approved_device_code": self.approved_device_code,
+            "approved_user_code": self.approved_user_code,
+            "pending_client": self.pending_client,
+            "pending_device_code": self.pending_device_code,
+            "pending_user_code": self.pending_user_code,
+        })
+    }
+
+    fn from_json(v: &Value) -> Self {
+        let s = |k: &str| {
+            v[k].as_str()
+                .unwrap_or_else(|| panic!("R2 file lacks {k}"))
+                .to_string()
+        };
+        InFlight {
+            code_client: RegisteredClient {
+                client_id: s("code_client"),
+                redirect_uri: s("code_redirect_uri"),
+            },
+            code: s("code"),
+            code_verifier: s("code_verifier"),
+            session: StartedLogin {
+                rc: RegisteredClient {
+                    client_id: s("session_client"),
+                    redirect_uri: s("session_redirect_uri"),
+                },
+                verifier: s("session_verifier"),
+                session_id: s("session_id"),
+                nonce: s("session_nonce"),
+                domain: s("session_domain"),
+            },
+            approved_client: s("approved_client"),
+            approved_device_code: s("approved_device_code"),
+            approved_user_code: s("approved_user_code"),
+            pending_client: s("pending_client"),
+            pending_device_code: s("pending_device_code"),
+            pending_user_code: s("pending_user_code"),
+        }
+    }
+}
+
+/// Drive every flow to the point where its credential is in flight: a code
+/// issued, a session started, a device code approved, another pending.
+async fn put_in_flight(c: &Client, base: &str) -> InFlight {
+    let w = new_wallet();
+    let login = start_login(c, base).await;
+    let code = sign_in_to_code(base, &w, &login).await;
+    let session = start_login(c, base).await;
+
+    let approver = new_wallet();
+    mock_seed_user(c, &approver.localpart).await;
+    let approved = register_client(c, base).await;
+    let (approved_device_code, approved_user_code) =
+        request_device_code(c, base, &approved.client_id).await;
+    approve_device(c, base, &approver, &approved_user_code).await;
+
+    let pending = register_client(c, base).await;
+    let (pending_device_code, pending_user_code) =
+        request_device_code(c, base, &pending.client_id).await;
+    InFlight {
+        code_client: login.rc,
+        code,
+        code_verifier: login.verifier,
+        session,
+        approved_client: approved.client_id,
+        approved_device_code,
+        approved_user_code,
+        pending_client: pending.client_id,
+        pending_device_code,
+        pending_user_code,
+    }
+}
+
+/// A device-code entry exactly as a build before digest keys serialized it:
+/// the user code in the clear in the entry.
+fn legacy_device_entry(user_code: &str, client_id: &str, status: &str, did: Option<&str>) -> Value {
+    json!({
+        "user_code": user_code,
+        "client_id": client_id,
+        "scope": "openid",
+        "status": status,
+        "did": did,
+        "device_id": null,
+        "last_poll": null,
+        "created_at": chrono_now(),
+    })
+}
+
+/// Rewrite what the server under test stored for `flight` into the layout a
+/// build before digest keys wrote: `codes/{raw}`, `sessions/{raw}`,
+/// `device_codes/{raw}` with the user code in the entry, `user_codes/{raw}` ->
+/// the raw device code. The code and session entries keep their values (their
+/// format did not change); the device entries are rewritten whole.
+async fn rewrite_as_legacy(url: &str, flight: &InFlight) {
+    use bb8_redis::redis;
+    let mut conn = stack_redis(url).await;
+    for (digest_key, legacy_key) in [
+        (
+            format!("code/{}", digest_hex(&flight.code)),
+            format!("codes/{}", flight.code),
+        ),
+        (
+            format!("session/{}", digest_hex(&flight.session.session_id)),
+            format!("sessions/{}", flight.session.session_id),
+        ),
+    ] {
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(&digest_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        if exists {
+            let _: () = redis::cmd("RENAME")
+                .arg(&digest_key)
+                .arg(&legacy_key)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+        }
+        let legacy: bool = redis::cmd("EXISTS")
+            .arg(&legacy_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(legacy, "the stand-in wrote {legacy_key}");
+    }
+    let approver_did = {
+        // The approved entry's DID, from whichever layout holds it.
+        let mut did = None;
+        for key in [
+            format!("device_code/{}", digest_hex(&flight.approved_device_code)),
+            format!("device_codes/{}", flight.approved_device_code),
+        ] {
+            let raw: Option<String> = redis::cmd("GET")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            if let Some(raw) = raw {
+                let entry: Value = serde_json::from_str(&raw).unwrap();
+                did = entry["did"].as_str().map(str::to_string);
+            }
+        }
+        did.expect("the approved device code's entry names its approver")
+    };
+    for (device_code, user_code, client, status, did) in [
+        (
+            &flight.approved_device_code,
+            flight.approved_user_code.as_str(),
+            &flight.approved_client,
+            "Approved",
+            Some(approver_did.as_str()),
+        ),
+        (
+            &flight.pending_device_code,
+            flight.pending_user_code.as_str(),
+            &flight.pending_client,
+            "Pending",
+            None,
+        ),
+    ] {
+        let _: () = redis::cmd("DEL")
+            .arg(format!("device_code/{}", digest_hex(device_code)))
+            .arg(format!("device_codes/{device_code}"))
+            .arg(format!("user_code/{}", digest_hex(user_code)))
+            .arg(format!("user_codes/{user_code}"))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let entry = legacy_device_entry(user_code, client, status, did);
+        let _: () = redis::cmd("SET")
+            .arg(format!("device_codes/{device_code}"))
+            .arg(entry.to_string())
+            .arg("EX")
+            .arg(1800)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("SET")
+            .arg(format!("user_codes/{user_code}"))
+            .arg(device_code)
+            .arg("EX")
+            .arg(1800)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+}
+
+fn r2_file() -> String {
+    std::env::var("E2E_R2_FILE").unwrap_or_else(|_| {
+        panic!("E2E_R2_FILE names the file the mint stage writes and the check stage reads")
+    })
+}
+
+/// R2, a real upgrade or its seeded stand-in. In-flight credentials come from
+/// one of three places, chosen by `E2E_R2_STAGE`:
+///
+/// - `mint`: run against the PREVIOUS build. Puts a code, a session and two
+///   device codes in flight, asserts the server stored them in the clear
+///   (`codes/{raw}`, `sessions/{raw}`, `device_codes/{raw}`, `user_codes/{raw}`),
+///   saves them to `E2E_R2_FILE` and stops. Then swap the binary, keeping
+///   Redis and the mock, and run `check` within 300 s.
+/// - `check`: reads them back and runs the checks below against the new build.
+/// - unset (CI and every regular run): puts them in flight on the server under
+///   test and rewrites what it stored into the previous build's layout.
+///
+/// The checks: the code redeems once and only once; the session signs in and
+/// its code exchanges; the approved device code redeems once; the pending
+/// user code is still found, approved and redeemed. Afterwards no key or
+/// value holds the legacy code, device codes or user code (each was deleted
+/// on use). The legacy session entry stays until it expires (300 s): the new
+/// build reads it in place and writes nothing in the clear.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn in_flight_codes_and_sessions_survive_the_upgrade() {
+    let Some(url) = stack_redis_url() else {
+        let marker = "E2E_SKIP: in_flight_codes_and_sessions_survive_the_upgrade: no stack Redis \
+                      URL (E2E_REDIS_URL, SIWXOIDC_REDIS_URL, SIWEOIDC_REDIS_URL or \
+                      REDIS_HOST/REDIS_PORT); the upgrade was NOT exercised";
+        assert!(
+            std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+            "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+        );
+        eprintln!("{marker}");
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    let flight = match std::env::var("E2E_R2_STAGE").unwrap_or_default().as_str() {
+        "mint" => {
+            mock_reset(&c).await;
+            let flight = put_in_flight(&c, &base).await;
+            let mut conn = stack_redis(&url).await;
+            for key in [
+                format!("codes/{}", flight.code),
+                format!("sessions/{}", flight.session.session_id),
+                format!("device_codes/{}", flight.approved_device_code),
+                format!("device_codes/{}", flight.pending_device_code),
+                format!("user_codes/{}", flight.pending_user_code),
+            ] {
+                let legacy: bool = bb8_redis::redis::cmd("EXISTS")
+                    .arg(&key)
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap();
+                assert!(
+                    legacy,
+                    "mint: the server under test did not store {key}: run the mint stage \
+                     against the previous build"
+                );
+            }
+            std::fs::write(r2_file(), flight.to_json().to_string()).unwrap();
+            eprintln!("R2 mint: in-flight credentials written; swap the binary and run E2E_R2_STAGE=check");
+            return;
+        }
+        "check" => InFlight::from_json(
+            &serde_json::from_str(&std::fs::read_to_string(r2_file()).unwrap()).unwrap(),
+        ),
+        "" => {
+            mock_reset(&c).await;
+            let flight = put_in_flight(&c, &base).await;
+            rewrite_as_legacy(&url, &flight).await;
+            flight
+        }
+        other => panic!("E2E_R2_STAGE={other}: expected mint, check or unset"),
+    };
+
+    // The issued code redeems once and only once.
+    let tokens = exchange_code(
+        &c,
+        &base,
+        &flight.code_client,
+        &flight.code,
+        &flight.code_verifier,
+    )
+    .await
+    .expect("a code the previous build issued redeems after the upgrade");
+    assert!(token_active(&c, tokens["access_token"].as_str().unwrap()).await);
+    assert_eq!(
+        exchange_code(
+            &c,
+            &base,
+            &flight.code_client,
+            &flight.code,
+            &flight.code_verifier
+        )
+        .await
+        .err(),
+        Some(StatusCode::BAD_REQUEST),
+        "the code redeems only once"
+    );
+
+    // The session started on the previous build signs in, and its code exchanges.
+    let w = new_wallet();
+    let code = sign_in_to_code(&base, &w, &flight.session).await;
+    let session_tokens = exchange_code(
+        &c,
+        &base,
+        &flight.session.rc,
+        &code,
+        &flight.session.verifier,
+    )
+    .await
+    .expect("the session's code exchanges");
+    assert!(token_active(&c, session_tokens["access_token"].as_str().unwrap()).await);
+
+    // The approved device code redeems once.
+    let (status, body) = poll_device_code(
+        &c,
+        &base,
+        &flight.approved_device_code,
+        &flight.approved_client,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an approved device code redeems: {body}"
+    );
+    assert!(token_active(&c, body["access_token"].as_str().unwrap()).await);
+    let (status, body) = poll_device_code(
+        &c,
+        &base,
+        &flight.approved_device_code,
+        &flight.approved_client,
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("expired_token")),
+        "the approved device code redeems only once: {body}"
+    );
+
+    // The pending user code is still found and can be approved.
+    let r = c
+        .get(format!(
+            "{base}/device/verify?user_code={}",
+            flight.pending_user_code
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "the pending user code is found");
+    let approver = new_wallet();
+    mock_seed_user(&c, &approver.localpart).await;
+    approve_device(&c, &base, &approver, &flight.pending_user_code).await;
+    let (status, body) = poll_device_code(
+        &c,
+        &base,
+        &flight.pending_device_code,
+        &flight.pending_client,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the device code approved after the upgrade redeems: {body}"
+    );
+
+    let mut held = ClientHeld::default();
+    held.add("legacy authorization code", &flight.code);
+    held.add("legacy approved device code", &flight.approved_device_code);
+    held.add("legacy approved user code", &flight.approved_user_code);
+    held.add("legacy pending device code", &flight.pending_device_code);
+    held.add("legacy pending user code", &flight.pending_user_code);
+    assert_nothing_stored_in_the_clear(&url, &held, "after every legacy credential was used").await;
 }
