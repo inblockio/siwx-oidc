@@ -9,6 +9,7 @@ use openidconnect::{core::CoreClientMetadata, Nonce, RegistrationAccessToken};
 use serde::{Deserialize, Serialize};
 
 mod redis;
+pub mod seal;
 pub mod tokens;
 pub use self::redis::RedisClient;
 
