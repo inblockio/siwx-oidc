@@ -271,6 +271,7 @@ fn parse_query(url: &str) -> HashMap<String, String> {
 }
 
 /// A registered OAuth client (id + secret) for the wallet auth-code flow.
+#[derive(Clone)]
 struct RegisteredClient {
     client_id: String,
     redirect_uri: String,
@@ -2855,6 +2856,11 @@ impl StartedLogin {
 /// `GET /authorize` for a fresh public client with an S256 challenge.
 async fn start_login(c: &Client, base: &str) -> StartedLogin {
     let rc = register_client(c, base).await;
+    start_login_for(base, rc).await
+}
+
+/// `GET /authorize` for the registered client `rc` with an S256 challenge.
+async fn start_login_for(base: &str, rc: RegisteredClient) -> StartedLogin {
     let (verifier, challenge) = pkce_pair();
     let authorize_url = format!(
         "{base}/authorize?client_id={}&redirect_uri={}&scope=openid&response_type=code&state=h4_state&code_challenge={}&code_challenge_method=S256",
@@ -3198,6 +3204,167 @@ async fn no_code_or_session_the_client_holds_is_stored_in_the_clear() {
     );
 }
 
+/// A confidential client (`client_secret_basic`) and the two credentials its
+/// registration response returned.
+struct ConfidentialClient {
+    rc: RegisteredClient,
+    secret: String,
+    registration_token: String,
+}
+
+/// The registration metadata of a confidential client, for `POST /register`
+/// and the RFC 7592 update; `client_name` tells the two apart.
+fn confidential_metadata(redirect_uri: &str, client_name: &str) -> Value {
+    json!({
+        "redirect_uris": [redirect_uri],
+        "client_name": client_name,
+        "token_endpoint_auth_method": "client_secret_basic",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+    })
+}
+
+async fn register_confidential_client(c: &Client, base: &str) -> ConfidentialClient {
+    let redirect_uri = format!("{base}/callback");
+    let reg: Value = c
+        .post(format!("{base}/register"))
+        .json(&confidential_metadata(&redirect_uri, "registered"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let field = |k: &str| {
+        reg[k]
+            .as_str()
+            .unwrap_or_else(|| panic!("the registration response carries {k}: {reg}"))
+            .to_string()
+    };
+    ConfidentialClient {
+        rc: RegisteredClient {
+            client_id: field("client_id"),
+            redirect_uri,
+        },
+        secret: field("client_secret"),
+        registration_token: field("registration_access_token"),
+    }
+}
+
+/// `POST /token` authenticated with `secret` in an HTTP Basic header
+/// (`client_secret_basic`): `(status, json|null)`.
+async fn token_with_secret(
+    c: &Client,
+    base: &str,
+    rc: &RegisteredClient,
+    secret: &str,
+    form: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let resp = c
+        .post(format!("{base}/token"))
+        .basic_auth(&rc.client_id, Some(secret))
+        .form(form)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, resp.json::<Value>().await.unwrap_or(Value::Null))
+}
+
+/// RFC 7592 update (`POST /client/{id}`) with `token` as the bearer: the status.
+async fn update_client(c: &Client, base: &str, rc: &RegisteredClient, token: &str) -> StatusCode {
+    c.post(format!("{base}/client/{}", rc.client_id))
+        .bearer_auth(token)
+        .json(&confidential_metadata(&rc.redirect_uri, "updated"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+/// H4 for clients: a confidential client's secret and registration access
+/// token, after its registration, after it updated its registration with the
+/// token, and after it authenticated with the secret at the code exchange and
+/// the refresh grant. No key and no value of the stack Redis holds either. The
+/// positive control (the registration's key in the scan) proves the scan read
+/// the entry that would hold them. `default_clients` entries are covered in
+/// process (`axum_lib` tests): the mock stack configures none.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn no_client_secret_or_registration_token_is_stored_in_the_clear() {
+    let Some(url) = stack_redis_url() else {
+        let marker = "E2E_SKIP: no_client_secret_or_registration_token_is_stored_in_the_clear: \
+                      no stack Redis URL (E2E_REDIS_URL, SIWXOIDC_REDIS_URL, SIWEOIDC_REDIS_URL \
+                      or REDIS_HOST/REDIS_PORT); the keyspace was NOT searched";
+        assert!(
+            std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+            "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+        );
+        eprintln!("{marker}");
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let client = register_confidential_client(&c, &base).await;
+    let mut held = ClientHeld::default();
+    held.add("client secret", &client.secret);
+    held.add("registration access token", &client.registration_token);
+    let key = format!("clients/{}", client.rc.client_id);
+    let scan = assert_nothing_stored_in_the_clear(&url, &held, "after the registration").await;
+    assert!(
+        scanned(&scan, &key),
+        "positive control: the scan read the registration, {key}"
+    );
+
+    // The client manages itself with its registration access token, and only
+    // with it.
+    assert_eq!(
+        update_client(&c, &base, &client.rc, "not-the-registration-token").await,
+        StatusCode::UNAUTHORIZED,
+        "a wrong registration access token is refused"
+    );
+    assert_eq!(
+        update_client(&c, &base, &client.rc, &client.registration_token).await,
+        StatusCode::OK,
+        "the registration access token updates the registration"
+    );
+    assert_nothing_stored_in_the_clear(&url, &held, "after the client updated itself").await;
+
+    // It authenticates with its secret at the code exchange and the refresh
+    // grant, and a wrong secret is refused.
+    let login = start_login_for(&base, client.rc.clone()).await;
+    let code = sign_in_to_code(&base, &new_wallet(), &login).await;
+    let (status, tokens) = token_with_secret(
+        &c,
+        &base,
+        &client.rc,
+        &client.secret,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("code_verifier", &login.verifier),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the code exchanges: {tokens}");
+    let refresh_token = tokens["refresh_token"].as_str().expect("a refresh token");
+    let refresh = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+    ];
+    let (status, body) = token_with_secret(&c, &base, &client.rc, "not-the-secret", &refresh).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "a wrong secret: {body}");
+    let (status, body) = token_with_secret(&c, &base, &client.rc, &client.secret, &refresh).await;
+    assert_eq!(status, StatusCode::OK, "the refresh grant: {body}");
+    assert_nothing_stored_in_the_clear(
+        &url,
+        &held,
+        "after the code exchange and the refresh grant",
+    )
+    .await;
+}
+
 // ===========================================================================
 // R2: codes, device and user codes and login sessions a build before digest
 // keys wrote keep working after the upgrade, within their lifetimes (Phase 2b).
@@ -3219,6 +3386,42 @@ struct InFlight {
     pending_client: String,
     pending_device_code: String,
     pending_user_code: String,
+    /// A confidential client and an issued, unconsumed code for it: its
+    /// registration is first read again when the code is exchanged with its
+    /// secret.
+    secret_client: ConfidentialClient,
+    secret_code: String,
+    secret_code_verifier: String,
+    /// A confidential client whose registration is first read again when it
+    /// updates itself with its registration access token.
+    managed_client: ConfidentialClient,
+}
+
+impl ConfidentialClient {
+    fn to_json(&self) -> Value {
+        json!({
+            "client_id": self.rc.client_id,
+            "redirect_uri": self.rc.redirect_uri,
+            "secret": self.secret,
+            "registration_token": self.registration_token,
+        })
+    }
+
+    fn from_json(v: &Value) -> Self {
+        let s = |k: &str| {
+            v[k].as_str()
+                .unwrap_or_else(|| panic!("R2 file lacks the client's {k}"))
+                .to_string()
+        };
+        ConfidentialClient {
+            rc: RegisteredClient {
+                client_id: s("client_id"),
+                redirect_uri: s("redirect_uri"),
+            },
+            secret: s("secret"),
+            registration_token: s("registration_token"),
+        }
+    }
 }
 
 impl InFlight {
@@ -3240,6 +3443,10 @@ impl InFlight {
             "pending_client": self.pending_client,
             "pending_device_code": self.pending_device_code,
             "pending_user_code": self.pending_user_code,
+            "secret_client": self.secret_client.to_json(),
+            "secret_code": self.secret_code,
+            "secret_code_verifier": self.secret_code_verifier,
+            "managed_client": self.managed_client.to_json(),
         })
     }
 
@@ -3272,6 +3479,10 @@ impl InFlight {
             pending_client: s("pending_client"),
             pending_device_code: s("pending_device_code"),
             pending_user_code: s("pending_user_code"),
+            secret_client: ConfidentialClient::from_json(&v["secret_client"]),
+            secret_code: s("secret_code"),
+            secret_code_verifier: s("secret_code_verifier"),
+            managed_client: ConfidentialClient::from_json(&v["managed_client"]),
         }
     }
 }
@@ -3294,6 +3505,11 @@ async fn put_in_flight(c: &Client, base: &str) -> InFlight {
     let pending = register_client(c, base).await;
     let (pending_device_code, pending_user_code) =
         request_device_code(c, base, &pending.client_id).await;
+
+    let secret_client = register_confidential_client(c, base).await;
+    let secret_login = start_login_for(base, secret_client.rc.clone()).await;
+    let secret_code = sign_in_to_code(base, &new_wallet(), &secret_login).await;
+    let managed_client = register_confidential_client(c, base).await;
     InFlight {
         code_client: login.rc,
         code,
@@ -3305,6 +3521,10 @@ async fn put_in_flight(c: &Client, base: &str) -> InFlight {
         pending_client: pending.client_id,
         pending_device_code,
         pending_user_code,
+        secret_client,
+        secret_code,
+        secret_code_verifier: secret_login.verifier,
+        managed_client,
     }
 }
 
@@ -3339,6 +3559,10 @@ async fn rewrite_as_legacy(url: &str, flight: &InFlight) {
         (
             format!("session/{}", digest_hex(&flight.session.session_id)),
             format!("sessions/{}", flight.session.session_id),
+        ),
+        (
+            format!("code/{}", digest_hex(&flight.secret_code)),
+            format!("codes/{}", flight.secret_code),
         ),
     ] {
         let exists: bool = redis::cmd("EXISTS")
@@ -3422,6 +3646,47 @@ async fn rewrite_as_legacy(url: &str, flight: &InFlight) {
             .await
             .unwrap();
     }
+    for client in [&flight.secret_client, &flight.managed_client] {
+        rewrite_client_as_legacy(&mut conn, client).await;
+    }
+}
+
+/// Rewrite a client's registration into the entry a build before digest keys
+/// wrote, `{secret, metadata, access_token}` with both credentials in the
+/// clear, keeping its metadata and its expiry.
+async fn rewrite_client_as_legacy(
+    conn: &mut bb8_redis::redis::aio::MultiplexedConnection,
+    client: &ConfidentialClient,
+) {
+    use bb8_redis::redis;
+    let key = format!("clients/{}", client.rc.client_id);
+    let stored: String = redis::cmd("GET").arg(&key).query_async(conn).await.unwrap();
+    let stored: Value = serde_json::from_str(&stored).unwrap();
+    let legacy = json!({
+        "secret": client.secret,
+        "metadata": stored["metadata"],
+        "access_token": client.registration_token,
+    });
+    let _: () = redis::cmd("SET")
+        .arg(&key)
+        .arg(legacy.to_string())
+        .arg("KEEPTTL")
+        .query_async(conn)
+        .await
+        .unwrap();
+}
+
+/// Whether the registration of `client` holds its secret and its
+/// registration access token in the clear, as a build before digest keys
+/// stored them.
+async fn client_stored_in_the_clear(url: &str, client: &ConfidentialClient) -> bool {
+    let mut conn = stack_redis(url).await;
+    let stored: Option<String> = bb8_redis::redis::cmd("GET")
+        .arg(format!("clients/{}", client.rc.client_id))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    stored.is_some_and(|v| v.contains(&client.secret) && v.contains(&client.registration_token))
 }
 
 fn r2_file() -> String {
@@ -3434,9 +3699,11 @@ fn r2_file() -> String {
 /// one of three places, chosen by `E2E_R2_STAGE`:
 ///
 /// - `mint`: run against the PREVIOUS build. Puts a code, a session and two
-///   device codes in flight, asserts the server stored them in the clear
-///   (`codes/{raw}`, `sessions/{raw}`, `device_codes/{raw}`, `user_codes/{raw}`),
-///   saves them to `E2E_R2_FILE` and stops. Then swap the binary, keeping
+///   device codes in flight and registers two confidential clients, asserts
+///   the server stored them in the clear (`codes/{raw}`, `sessions/{raw}`,
+///   `device_codes/{raw}`, `user_codes/{raw}`, and each client's secret and
+///   registration access token in its entry), saves them to `E2E_R2_FILE`
+///   and stops. Then swap the binary, keeping
 ///   Redis and the mock, and run `check` within 300 s.
 /// - `check`: reads them back and runs the checks below against the new build.
 /// - unset (CI and every regular run): puts them in flight on the server under
@@ -3444,9 +3711,12 @@ fn r2_file() -> String {
 ///
 /// The checks: the code redeems once and only once; the session signs in and
 /// its code exchanges; the approved device code redeems once; the pending
-/// user code is still found, approved and redeemed. Afterwards no key or
+/// user code is still found, approved and redeemed; one client authenticates
+/// with its secret at the code exchange and the refresh grant, the other
+/// updates itself with its registration access token. Afterwards no key or
 /// value holds the legacy code, device codes or user codes (each was deleted
-/// on use). The legacy session entry stays until it expires (300 s): the new
+/// on use), or a client's secret or registration access token (each entry was
+/// upgraded to digests when it was first read). The legacy session entry stays until it expires (300 s): the new
 /// build reads it in place and writes nothing in the clear. After a real
 /// upgrade, the nonce the previous build consumed for its approval also keeps
 /// the approved user code until it expires (300 s).
@@ -3474,6 +3744,7 @@ async fn in_flight_codes_and_sessions_survive_the_upgrade() {
             let mut conn = stack_redis(&url).await;
             for key in [
                 format!("codes/{}", flight.code),
+                format!("codes/{}", flight.secret_code),
                 format!("sessions/{}", flight.session.session_id),
                 format!("device_codes/{}", flight.approved_device_code),
                 format!("device_codes/{}", flight.pending_device_code),
@@ -3488,6 +3759,13 @@ async fn in_flight_codes_and_sessions_survive_the_upgrade() {
                     legacy,
                     "mint: the server under test did not store {key}: run the mint stage \
                      against the previous build"
+                );
+            }
+            for client in [&flight.secret_client, &flight.managed_client] {
+                assert!(
+                    client_stored_in_the_clear(&url, client).await,
+                    "mint: the server under test stored a client's credentials as digests: run \
+                     the mint stage against the previous build"
                 );
             }
             std::fs::write(r2_file(), flight.to_json().to_string()).unwrap();
@@ -3598,8 +3876,91 @@ async fn in_flight_codes_and_sessions_survive_the_upgrade() {
         "the device code approved after the upgrade redeems: {body}"
     );
 
+    // The confidential client registered on the previous build authenticates
+    // with its secret: first at the exchange of its code, then at the refresh
+    // grant, where a wrong secret is still refused.
+    let secret_client = &flight.secret_client;
+    if stage != "check" {
+        assert!(
+            client_stored_in_the_clear(&url, secret_client).await,
+            "the stand-in stored the client as the previous build did"
+        );
+    }
+    let (status, tokens) = token_with_secret(
+        &c,
+        &base,
+        &secret_client.rc,
+        &secret_client.secret,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &flight.secret_code),
+            ("code_verifier", &flight.secret_code_verifier),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a client registered on the previous build authenticates at /token: {tokens}"
+    );
+    let refresh = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", tokens["refresh_token"].as_str().unwrap()),
+    ];
+    let (status, body) =
+        token_with_secret(&c, &base, &secret_client.rc, "not-the-secret", &refresh).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "a wrong secret: {body}");
+    let (status, body) = token_with_secret(
+        &c,
+        &base,
+        &secret_client.rc,
+        &secret_client.secret,
+        &refresh,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the refresh grant: {body}");
+
+    // The other one manages itself with its registration access token, and
+    // only with it.
+    let managed = &flight.managed_client.rc;
+    assert_eq!(
+        update_client(
+            &c,
+            &base,
+            managed,
+            &flight.managed_client.registration_token
+        )
+        .await,
+        StatusCode::OK,
+        "a client registered on the previous build updates itself"
+    );
+    assert_eq!(
+        update_client(&c, &base, managed, "not-the-registration-token").await,
+        StatusCode::UNAUTHORIZED,
+        "a wrong registration access token is refused"
+    );
+    assert_eq!(
+        update_client(
+            &c,
+            &base,
+            managed,
+            &flight.managed_client.registration_token
+        )
+        .await,
+        StatusCode::OK,
+        "the registration access token still works after the upgrade of the entry"
+    );
+
     let mut held = ClientHeld::default();
+    for client in [&flight.secret_client, &flight.managed_client] {
+        held.add("previous build's client secret", &client.secret);
+        held.add(
+            "previous build's registration access token",
+            &client.registration_token,
+        );
+    }
     held.add("legacy authorization code", &flight.code);
+    held.add("legacy confidential client's code", &flight.secret_code);
     held.add("legacy approved device code", &flight.approved_device_code);
     // After a real upgrade the previous build's approval nonce still holds the
     // approved user code in the clear: that build consumed it with a
