@@ -25,7 +25,7 @@ probe → headless browser E2E (wallet + passkey).
 | `synapse_mock.py` | Faithful in-memory mock of the Synapse endpoints siwx-oidc calls — both credential surfaces (see below) — with `/__seed_user`, `/__seed_device`, `/__profile`, `/__state`, `/__set_secret`, `/__reject_admin_token`, `/__fail`, `/__reset` test hooks |
 | `../tests/e2e_race_teardown.rs` | The race/teardown hazard register (H1..H14), the grandfathered-localpart invariant, and the attested-DID sign-in path. Run: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1` |
 | `../tests/e2e_account_management.rs` | Drives the exact HTTP requests the page JS makes — real EIP-191 wallet signatures, the account-session cookie, `/account/action`. Run: `cargo test --test e2e_account_management -- --ignored --test-threads=1` |
-| `legacy-cs-api-probe.sh` | `DELETE /_matrix/client/v3/devices/{id}` + `/delete_devices` with a Redis-seeded bearer |
+| `legacy-cs-api-probe.sh` | `DELETE /_matrix/client/v3/devices/{id}` + `/delete_devices` with Redis-seeded bearers: a grant's access token and a legacy `token/{raw}` access entry (`REDIS_CONTAINER` names the Redis container) |
 | `browser/account.spec.mjs` | Playwright: mock `window.ethereum` (real ethers signing) + CDP WebAuthn virtual authenticator, driving the real `/account` DOM. Run: `bash browser/run.sh` |
 
 ## Stack endpoints
@@ -54,6 +54,14 @@ SIWEOIDC_HOST=http://localhost:18191 SYNAPSE_MOCK=http://localhost:18190 \
 SIWEOIDC_HOST=http://localhost:18191 SYNAPSE_MOCK=http://localhost:18190 \
   cargo test --test e2e_account_management -- --ignored --test-threads=1
 ```
+
+`legacy_tokens_keep_working_after_the_upgrade` (same suite, same Redis URL)
+writes the token layout of builds before the grant record itself and checks that
+the server lifts it. For a real upgrade, run it in two stages around a binary
+swap that keeps Redis: `E2E_R1_STAGE=mint E2E_R1_SESSIONS=<file>` against the
+previous build (it signs in and asserts the legacy layout was written), then
+`E2E_R1_STAGE=check E2E_R1_SESSIONS=<file>` against the new build within 300 s,
+while the legacy access tokens are still live.
 
 ## The mock MUST be updated whenever `synapse_client.rs` moves an endpoint
 

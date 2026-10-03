@@ -257,7 +257,9 @@ paths:
         is unused (its access token not yet accepted by introspection or
         `/userinfo`, its refresh token not yet rotated). A replay after that, or
         after the successor was rotated or revoked, is `invalid_grant`; reuse of
-        a superseded token is logged as a security event.
+        a superseded token is logged as a security event. A refresh token issued
+        by a build before the grant record is answered with tokens in the current
+        format (`mcr_{handle}_{secret}`), and its replays follow the same rule.
 
         In a standalone deployment (no MAS shared secret) the code exchange
         grants the requested scope among `openid`, `profile` and `offline_access`
@@ -820,7 +822,7 @@ paths:
       tags: [Matrix compatibility]
       operationId: matrixRefresh
       summary: Matrix-shaped refresh, with the same rotation and lost-response rule as `/token`
-      description: Accepts only a refresh token; an access token (a minted admin token included) is `M_UNKNOWN_TOKEN`, like an unknown one. A replay of the previous refresh token returns the same successor pair while that pair is unused, and is `M_UNKNOWN_TOKEN` once it was used, rotated or revoked. The endpoint carries no client identity, so unlike `/token` it cannot bind the replay to a client, and it refuses the refresh token of a confidential client (one that must authenticate at `/token`) exactly like an unknown token, leaving it untouched for `/token`.
+      description: Accepts only a refresh token; an access token (a minted admin token included) is `M_UNKNOWN_TOKEN`, like an unknown one. A replay of the previous refresh token returns the same successor pair while that pair is unused, and is `M_UNKNOWN_TOKEN` once it was used, rotated or revoked. The endpoint carries no client identity, so unlike `/token` it cannot bind the replay to a client, and it refuses the refresh token of a confidential client (one that must authenticate at `/token`) exactly like an unknown token, leaving it untouched for `/token`. A public client's refresh token issued by a build before the grant record is answered with tokens in the current format, and its replays follow the same rule.
       responses:
         "200": { description: New tokens. }
         "401": { description: "`M_UNKNOWN_TOKEN`: the refresh token is unknown, expired, reused, revoked, of another kind, or a confidential client's." }

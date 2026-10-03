@@ -52,7 +52,10 @@ everything else exists only in the binary crate.
 | `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL`. |
 | `credential_migration.rs` (lib) | Additive backfill of passkey credentials into the aqua-auth store. |
 | `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry`, `DeviceCodeEntry`, `TokenMetadata` with its `TokenKind`), `legacy_token_kind`, Redis key prefixes and TTLs. |
-| `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens`, `get_passkeys_for_did`, `lookup_user_session`, `purge_identity`. |
+| `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, `lookup_user_session`, `purge_identity`. |
+| `db/grant.rs` (lib) | The grant record and its Lua scripts: `issue_grant`, the access check `check_access_token` (with the legacy read fallback), `rotate_refresh_token` (the one rotation script), `ReuseEvent`, grant revocation, and the legacy migration (`peek_refresh_token`, `lift_legacy_refresh_token`). Keyspace and decision table in its module docs. |
+| `db/tokens.rs` (lib) | Token formats (`mat_`, `msa_`, `mcr_{handle}_{secret}`), `parse_refresh_token` (never panics), `digest` (the SHA-256 every token is stored as). |
+| `db/seal.rs` (lib) | The sealed successor pair: AES-256-GCM under a key HKDF-derived from the previous refresh token, so only its presenter can open it. |
 | `bin/migrate-credentials.rs` | Operator tool for the credential backfill. Dry run unless `--apply`. |
 
 | `siwx-oidc-auth/src/` | Role |
@@ -354,6 +357,58 @@ doc; read it before changing the code the rule covers.
   `the_device_flow_sends_the_scope_it_relies_on`.
 - **An empty `device_id` is JSON `null` on the wire, never `""`.** Synapse rejects `""`. Pin:
   `empty_device_id_renders_as_json_null`, `deviceless_token_body_carries_device_id_null`.
+- **The grant is the unit** (I2). Every access and refresh token belongs to exactly one grant
+  (`grant/{digest(handle)}`, `src/db/grant.rs`); issuance creates it, rotation and revocation act
+  on it, and the access check reads the grant behind the `at/…` entry, so deleting a grant makes
+  all its tokens inert at once. Indices hold grant ids, never token keys. A grant with no refresh
+  token (a `service` grant, a generic-mode grant without `offline_access`) lives as long as its
+  access token. Pin: `issue_grant_writes_the_grant_its_access_entry_and_both_indices`,
+  `an_access_token_resolves_to_its_grant_until_the_grant_is_gone`,
+  `revoking_a_device_deletes_its_grants_only_and_plants_the_tombstone`,
+  `revoking_a_user_deletes_every_grant_of_the_user`,
+  `revoking_by_token_deletes_the_grant_of_an_accepted_token_only`,
+  `revoking_a_deviceless_refresh_token_revokes_its_grant_an_access_token_only_itself`.
+- **One rotation script, one live chain** (I3). Both refresh endpoints rotate only through
+  `RedisClient::rotate_refresh_token`, one Lua script that reads `now` from Redis `TIME` and
+  writes the new access entry itself, so no interleaving can fork the chain or mint a token for a
+  grant being revoked. Do not add a second refresh path or move a check out of the script. Pin:
+  `concurrent_refreshes_at_the_token_endpoint_converge_on_one_pair`,
+  `concurrent_refreshes_at_the_matrix_endpoint_converge_on_one_pair` (mock stack),
+  `concurrent_rotations_of_one_token_converge_on_one_pair`,
+  `the_current_refresh_token_rotates_into_a_new_pair`.
+- **No token is stored** (I1 for tokens). Access tokens are keyed by their SHA-256 digest
+  (`at/{digest}`), refresh tokens are kept as digests in their grant, and the successor pair of a
+  rotation is sealed under the previous refresh token (`db::seal`); no key or value written by
+  the server holds a token, its body, or a refresh token's handle or secret. Legacy `token/{raw}`
+  entries are read, never written. Pin: `no_token_the_client_holds_is_stored_in_the_clear`
+  (mock stack, scans the whole stack Redis), `legacy_tokens_keep_working_after_the_upgrade` (the
+  same scan after a lift), `a_wrong_token_cannot_open_the_successor`,
+  `the_sealed_value_names_neither_token_and_is_fresh_each_time`,
+  `malformed_refresh_tokens_are_unknown_never_a_panic`.
+- **Reuse is recognised and logged, never silently accepted** (I5, phase A). A refresh token whose
+  handle names a live grant but that is neither `current_rt` nor the unused `previous_rt` is
+  answered exactly like an unknown token and emits one `warn!` with the stable message
+  `refresh token reuse detected` and the fields `security_event="refresh_token_reuse"`,
+  `grant_fp`, `generation`, `client_id`, `grant_kind`, `branch` (fingerprints only). Phase A
+  revokes nothing; storage per grant stays constant however long the chain. Pin:
+  `h3_a_thousand_rotations_recognise_every_superseded_token_in_constant_storage`,
+  `rotating_the_successor_counts_as_its_use_and_older_tokens_are_reuse`,
+  `the_reuse_event_carries_its_fields_and_fingerprints_only`,
+  `a_replay_returns_the_same_pair_until_the_new_access_token_is_used` (mock stack).
+- **Tokens of a build before the grant record keep working; nobody signs in again** (design 5.8).
+  A legacy access entry stays readable until it expires (`check_access_token`'s read fallback,
+  removed one release later). A legacy refresh token is lifted into a grant by one script the
+  first time either refresh endpoint sees it (`lift_legacy_refresh_token`), with its client
+  authenticated as for any refresh and its confidentiality decided by `client_is_confidential`;
+  the `legacy_rt/…` pointer sends every later presentation through the rotation script as the
+  grant's previous token. Legacy grace pointers are not read. Pin:
+  `legacy_tokens_keep_working_after_the_upgrade` (mock stack; a real upgrade with
+  `E2E_R1_STAGE=mint`/`check`), `a_legacy_refresh_token_is_lifted_once_and_its_replays_follow_the_same_rule`,
+  `concurrent_presentations_of_one_legacy_token_converge_on_one_pair`,
+  `a_legacy_token_that_may_not_be_lifted_stays_untouched`,
+  `a_legacy_refresh_token_is_lifted_for_its_own_client_with_its_confidentiality`,
+  `the_matrix_endpoint_lifts_a_public_clients_legacy_token_but_not_a_confidential_ones`,
+  `a_lifted_legacy_token_is_resolved_and_revoked_like_its_grants_previous_token`.
 - **A replay of the immediately previous refresh token returns the same successor pair if, and
   only if, the successor is unused** (I4). Both refresh endpoints run the one rotation script
   (`RedisClient::rotate_refresh_token`), so concurrent refreshes of one token all get the same
@@ -431,7 +486,8 @@ doc; read it before changing the code the rule covers.
   `teardown_policy_only_deletes_device_on_explicit_signout`,
   `h1_revoke_does_not_delete_device_but_logout_does`,
   `logout_all_invalidates_all_sessions_without_deactivating`.
-- **Revocation keys on `TokenMetadata.username`** (the localpart), not the raw DID.
+- **Revocation keys on the username** (the localpart: a grant's `username`, a legacy entry's
+  `TokenMetadata.username`), not the raw DID.
 
 ### Passkeys ([docs/passkeys.md](docs/passkeys.md))
 

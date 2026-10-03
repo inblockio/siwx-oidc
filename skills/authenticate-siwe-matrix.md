@@ -170,6 +170,7 @@ Steps 5-8 identical.
 | `codes/{uuid}` | 300s | Auth code (did, client_id, code_challenge, device_id) |
 | `grant/{sha256(handle)}` | 90d after the last rotation | Grant: owner, client, device, scope, refresh-token digests |
 | `at/{sha256(mat_...)}` | 300s | Access token -> grant, generation, iat, exp |
+| `legacy_rt/{sha256(legacy refresh token)}` | 90d from the lift | Grant a pre-grant refresh token was lifted into |
 | `clients/{uuid}` | 30d | Client registration |
 | `webauthn:challenge/{session_id}` | 120s | Ceremony state |
 | `webauthn:credential/{cred_id_b64}` | none | Stored passkey |

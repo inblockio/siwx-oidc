@@ -263,13 +263,29 @@ authentication to siwx-oidc.
 
 ## Token model
 
-Both modes store token metadata (`TokenMetadata`) in Redis. Tokens are opaque
-random strings.
+Both modes issue the same token formats and keep every token in a **grant**
+(`src/db/grant.rs`), the one Redis record that owns a session's access and
+refresh tokens:
+
+| Token | Format |
+|---|---|
+| access | `mat_` + 32 base62 characters |
+| minted admin token (a `service` grant's access token) | `msa_` + 32 base62 characters |
+| refresh | `mcr_` + handle (22 base62 characters, about 131 random bits) + `_` + secret (32 base62 characters) |
+
+The handle names the grant, so every refresh token of a chain, current or
+superseded, leads to its grant; it is random and never derived from the device
+ID. **No token is stored**: an access token is kept as the SHA-256 digest of the
+token (`at/{digest}`), a refresh token as the digest in its grant's `current_rt`
+or `previous_rt`, and the one value that must be handed back later, the
+successor pair of a rotation, is encrypted under a key derived from the previous
+refresh token (AES-256-GCM, HKDF-SHA256), which only its presenter holds. Log
+lines name tokens by fingerprint only. The keyspace is in
+[architecture.md](architecture.md#redis-keyspace).
 
 | | Delegated auth | Standalone |
 |---|---|---|
-| Access token prefix | `mat_` | none |
-| Refresh token prefix | `mcr_` | none |
+| Grant kind | `matrix_device` | `oidc` |
 | Refresh token issued | always | only for `offline_access`, to a client whose registration allows the `refresh_token` grant |
 | Scope recorded | `openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}` | the requested scopes among `openid`, `profile` and `offline_access`, as far as the client may have them (`openid` if none) |
 | Access token TTL | 300 s | 300 s |
@@ -278,7 +294,8 @@ random strings.
 | Introspection | active | 404 |
 | Device ID | `SIWX_` + 8 hex characters, or the ID the client requested | empty |
 
-Minted admin tokens use the prefix `msa_`. Device codes use `dvc_`.
+Minted admin tokens (`service` grants, no refresh token) use the prefix
+`msa_`. Device codes use `dvc_`.
 
 In delegated-auth mode the authorization-code grant records the Matrix scope
 above regardless of the scopes requested, and always issues a refresh token. In
@@ -308,9 +325,11 @@ its verifier.
 
 ### Token kinds
 
-Every token is either an **access token** or a **refresh token**, recorded in
-its `TokenMetadata`. A minted admin token is an access token. Each endpoint
-accepts exactly one kind:
+Every token is either an **access token** or a **refresh token**: an access
+token has an `at/…` entry that says so, a refresh token is known only to its
+grant, and a legacy entry (`token/{raw}`, written before the grant record)
+records its kind in its `TokenMetadata`. A minted admin token is an access
+token. Each endpoint accepts exactly one kind:
 
 | Endpoint | Accepts |
 |---|---|
@@ -376,6 +395,33 @@ A refresh is refused (`invalid_grant`, "Session has been revoked.") when the
 device was just signed out or the account just deactivated. Short-lived Redis
 tombstones (15 minutes) close the race between a refresh and a concurrent
 teardown.
+
+### Upgrading from a build before the grant record
+
+Builds before the grant record stored each token as `token/{raw}` with its
+`TokenMetadata`. After the upgrade no user signs in again:
+
+- A legacy **access** token stays valid until it expires (at most 900 s): the
+  access check reads the legacy entry when no `at/…` entry exists. This read
+  fallback is removed one release after the upgrade.
+- A legacy **refresh** token presented at either refresh endpoint is **lifted**
+  into a new grant and answered with a pair in the current format. One script
+  deletes the legacy entry, creates the grant with the legacy token as its
+  previous refresh token and the new pair sealed under it, and writes a pointer
+  `legacy_rt/{digest(legacy token)}` to the grant. A concurrent or later
+  presentation of the same legacy token follows the pointer and gets the rule
+  above: the same pair while it is unused, reuse after. `POST /token`
+  authenticates the legacy entry's client as for any refresh; the Matrix endpoint
+  lifts only a public client's token and leaves a confidential client's for
+  `POST /token`. The grant records the client's confidentiality by the same rule
+  as every issuance.
+- Legacy grace pointers (`token_rotated/{raw}`, 60 s) are not read. A client
+  that lost a refresh response in the minute before the upgrade signs in again.
+- Legacy refresh tokens never presented expire on their own within 90 days;
+  revocation sweeps them in the meantime.
+- A rollback to a build before the grant record signs out every session that
+  refreshed on the new build: the old build knows neither the grant tokens nor
+  the lifted legacy tokens, whose entries are gone.
 
 A token-store fault is never answered as a refusal. `POST
 /_matrix/client/v3/refresh` and the device-deletion routes (`DELETE
