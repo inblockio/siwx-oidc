@@ -981,7 +981,7 @@ mod tests {
                 device_id: dev.to_string(),
                 scope: "openid".into(),
                 name: user.to_string(),
-                auth_time: Utc::now().timestamp(),
+                auth_time: None,
                 access_ttl: ACCESS_TOKEN_TTL,
                 refresh_inactivity_secs: Some(120),
             })

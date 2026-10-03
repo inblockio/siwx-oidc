@@ -389,7 +389,7 @@ impl SynapseClient {
 
         let token = admin
             .db
-            .issue_grant(&admin_service_grant(&admin.localpart, admin.ttl, now))
+            .issue_grant(&admin_service_grant(&admin.localpart, admin.ttl))
             .await
             .context("admin mint: could not store the minted token")?
             .access_token;

@@ -943,6 +943,10 @@ impl RedisClient {
 
 #[async_trait]
 impl DBClient for RedisClient {
+    async fn server_time(&self) -> Result<i64> {
+        self.redis_time().await
+    }
+
     async fn set_client(&self, client_id: String, client_entry: ClientEntry) -> Result<()> {
         let mut conn = self
             .pool

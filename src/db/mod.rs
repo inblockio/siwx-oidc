@@ -737,6 +737,9 @@ pub trait DBClient {
         entry: &DeviceCodeEntry,
         ttl: u64,
     ) -> Result<()>;
+    /// Redis `TIME` in Unix seconds: the clock of every lifetime deadline (I6),
+    /// so instances with skewed clocks agree.
+    async fn server_time(&self) -> Result<i64>;
     /// Delete the entry a lookup returned.
     async fn delete_device_code(&self, device_code: &DeviceCodeRef) -> Result<()>;
     /// Look up a device code by the user code a person presents, exactly as

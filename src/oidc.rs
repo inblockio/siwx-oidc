@@ -1354,7 +1354,6 @@ async fn token_device_code(
             .unwrap_or_else(|| resolve_device_id(proposed_device_id.as_deref()));
 
             let now = Utc::now();
-            let iat = now.timestamp();
             let username = resolved.localpart;
             let scope = format!(
                 "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
@@ -1383,7 +1382,9 @@ async fn token_device_code(
                     device_id: dev_id.clone(),
                     scope: scope.clone(),
                     name: display_name,
-                    auth_time: iat,
+                    // The approval, recorded from Redis `TIME`; an entry an
+                    // older build approved counts from this poll.
+                    auth_time: entry.auth_time,
                     access_ttl: ACCESS_TOKEN_TTL,
                     refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
                 })
@@ -1655,7 +1656,7 @@ async fn token_authorization_code(
             device_id: code_entry.device_id.clone().unwrap_or_default(),
             scope: scope.clone(),
             name: display_name,
-            auth_time: code_entry.auth_time.timestamp(),
+            auth_time: Some(code_entry.auth_time.timestamp()),
             access_ttl: ACCESS_TOKEN_TTL,
             refresh_inactivity_secs: issue_refresh_token.then_some(REFRESH_TOKEN_TTL),
         })
@@ -2914,7 +2915,10 @@ pub async fn sign_in(
         nonce: request.nonce.clone(),
         exchange_count: 0,
         client_id: request.client_id.clone(),
-        auth_time: Utc::now(),
+        // The authentication, from Redis `TIME` like every lifetime deadline
+        // (I6); the grant's absolute expiry counts from it.
+        auth_time: chrono::DateTime::<Utc>::from_timestamp(db_client.server_time().await?, 0)
+            .ok_or_else(|| anyhow!("Redis TIME out of range"))?,
         code_challenge: Some(request.code_challenge.clone()),
         code_challenge_method: Some("S256".to_string()),
         localpart: Some(resolved.localpart.clone()),
@@ -6585,8 +6589,6 @@ mod device_display_name_tests {
         );
     }
 
-    /// The QR / device-code path used to name every device "Element X".
-
     /// The grant of an approved device code counts from the approval, the
     /// authentication, which the approval records on the entry from Redis
     /// `TIME`; not from the poll that redeems it (I6).
@@ -6654,6 +6656,8 @@ mod device_display_name_tests {
             .grant;
         assert_eq!(grant.auth_time, approved_at, "auth_time is the approval");
     }
+
+    /// The QR / device-code path used to name every device "Element X".
     #[tokio::test]
     async fn the_device_code_grant_names_the_device_after_its_client() {
         let Some(db) = siwx_oidc::test_support::redis().await else {
@@ -6793,7 +6797,7 @@ mod client_binding_tests {
             device_id: String::new(),
             scope: "openid".into(),
             name: "did:key:zDnBINDING".into(),
-            auth_time: Utc::now().timestamp(),
+            auth_time: Some(Utc::now().timestamp()),
             access_ttl: ACCESS_TOKEN_TTL,
             refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
         })

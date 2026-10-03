@@ -42,7 +42,7 @@ fn matrix_grant(username: &str, device_id: &str) -> NewGrant {
         device_id: device_id.to_string(),
         scope: "openid urn:matrix:client:api:*".to_string(),
         name: "n".to_string(),
-        auth_time: 1_700_000_000,
+        auth_time: Some(1_700_000_000),
         access_ttl: ACCESS_TOKEN_TTL,
         refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
     }
@@ -192,7 +192,7 @@ async fn a_refresh_less_grant_and_a_service_grant_live_as_long_as_their_access_t
         device_id: String::new(),
         scope: "urn:matrix:client:api:* urn:synapse:admin:*".into(),
         name: "admin".into(),
-        auth_time: 0,
+        auth_time: None,
         access_ttl: 120,
         refresh_inactivity_secs: None,
     };

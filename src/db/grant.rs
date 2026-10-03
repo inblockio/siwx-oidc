@@ -270,8 +270,10 @@ pub struct NewGrant {
     pub device_id: String,
     pub scope: String,
     pub name: String,
-    /// The original authentication (Unix seconds).
-    pub auth_time: i64,
+    /// The original authentication (Unix seconds, Redis `TIME`): the base of
+    /// the absolute expiry. `None`: the authentication is this request, and
+    /// the script takes Redis `TIME`.
+    pub auth_time: Option<i64>,
     /// Lifetime of each access token, in seconds.
     pub access_ttl: u64,
     /// `Some(inactivity)` issues a refresh token and keeps the grant for that
@@ -981,7 +983,7 @@ impl RedisClient {
                     &new.device_id,
                     &new.scope,
                     &new.name,
-                    &new.auth_time.to_string(),
+                    &new.auth_time.map(|t| t.to_string()).unwrap_or_default(),
                     &new.access_ttl.to_string(),
                     &new.refresh_inactivity_secs.unwrap_or(0).to_string(),
                     &current_rt,
@@ -1170,7 +1172,7 @@ impl RedisClient {
     }
 
     /// Redis `TIME`, in seconds.
-    async fn redis_time(&self) -> Result<i64> {
+    pub(super) async fn redis_time(&self) -> Result<i64> {
         let mut conn = self
             .pool
             .get()

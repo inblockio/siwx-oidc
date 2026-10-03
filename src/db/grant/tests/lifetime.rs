@@ -57,7 +57,7 @@ fn grant_for(client_id: &str, device_id: &str, auth_time: i64) -> NewGrant {
     if device_id.is_empty() {
         g.kind = GrantKind::Oidc;
     }
-    g.auth_time = auth_time;
+    g.auth_time = Some(auth_time);
     g
 }
 
@@ -380,7 +380,7 @@ async fn h5_no_sequence_outlives_the_absolute_expiry() {
             let access_limit = written.or(cap).map(|c| c as i64);
             let before = elapsed(shift).await;
             match rng.gen_range(0..7) {
-                0 | 1 | 2 => {
+                0..=2 => {
                     let replay = rng.gen_bool(0.3) && previous.is_some();
                     let presented = if replay {
                         previous.clone().unwrap()
