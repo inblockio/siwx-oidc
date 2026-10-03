@@ -5,10 +5,23 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{offset::Utc, DateTime};
-use openidconnect::{core::CoreClientMetadata, Nonce, RegistrationAccessToken};
+use openidconnect::{
+    core::{
+        CoreApplicationType, CoreClientAuthMethod, CoreGrantType, CoreJsonWebKey,
+        CoreJweContentEncryptionAlgorithm, CoreJweKeyManagementAlgorithm, CoreResponseType,
+        CoreSubjectIdentifierType,
+    },
+    registration::{
+        AdditionalClientMetadata, ClientMetadata, ClientRegistrationResponse,
+        EmptyAdditionalClientRegistrationResponse,
+    },
+    Nonce, PostLogoutRedirectUrl, RegistrationAccessToken,
+};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 pub mod grant;
+pub mod outbox;
 mod redis;
 pub mod seal;
 pub mod tokens;
@@ -133,12 +146,70 @@ impl Ceremony {
     }
 }
 
-/// Redis key prefix for the opaque login user-session: `user:session/{token}` ->
-/// DID. The token is the identity hint that scopes the passkey picker's
-/// `allowCredentials` on a returning login. It is an OPAQUE random token (never a
-/// plaintext DID), so a forged/guessed value is a Redis miss -> safe usernameless
-/// fallback (the load-bearing enumeration-safety invariant).
+/// Where builds before Phase 4 of the token rework kept the opaque login
+/// user-session, by raw token: `user:session/{token}` -> DID. Read for the
+/// remaining lifetime of such an entry ([`USER_SESSION_LIFETIME`]) and never
+/// written anew; [`OwnSession::PickerHint`] keys it by digest now.
+/// TODO(remove 30 days after Phase 4 is deployed): the legacy read and sweep.
 pub const KV_USER_SESSION_PREFIX: &str = "user:session";
+/// Where builds before Phase 4 kept the account-page session, by raw token.
+/// Lives [`OwnSession::Account`]'s 600 s at most.
+/// TODO(remove one release after Phase 4): the legacy read and sweep.
+const KV_LEGACY_ACCOUNT_SESSION_PREFIX: &str = "account_session";
+
+/// Per-DID index of the user's own sessions: `idx:own_sessions/{digest}`, the
+/// digest of the canonical DID ([`crate::mxid::canonicalize`]), a sorted set of
+/// the session keys with their expiry (Unix ms) as score. It is what lets
+/// `logout/all`, deactivation and erasure end every own session of the user
+/// without a keyspace scan.
+pub const KV_OWN_SESSION_IDX_PREFIX: &str = "idx:own_sessions";
+
+/// siwx-oidc's own browser sessions, each keyed by the digest of the cookie
+/// value the browser holds (I1), like the credentials of Phase 2b:
+///
+/// - [`PickerHint`](Self::PickerHint): the `siwx_user` cookie, an OPAQUE random
+///   token that scopes the passkey picker's `allowCredentials` on a returning
+///   login (`siwx_user/{digest}` -> DID). A forged or guessed value is a Redis
+///   miss and so a usernameless login (the enumeration-safety invariant).
+/// - [`Account`](Self::Account): the `acct_session` cookie of the account page
+///   (`acct_session/{digest}` -> the session JSON with its DID and CSRF token).
+///
+/// Both prefixes differ from the raw-keyed layout of earlier builds, so a
+/// stored digest presented as a cookie matches nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnSession {
+    PickerHint,
+    Account,
+}
+
+impl OwnSession {
+    pub(crate) fn prefix(self) -> &'static str {
+        match self {
+            OwnSession::PickerHint => "siwx_user",
+            OwnSession::Account => "acct_session",
+        }
+    }
+
+    /// Where a build before Phase 4 stored the same session, by raw token.
+    pub(crate) fn legacy_prefix(self) -> &'static str {
+        match self {
+            OwnSession::PickerHint => KV_USER_SESSION_PREFIX,
+            OwnSession::Account => KV_LEGACY_ACCOUNT_SESSION_PREFIX,
+        }
+    }
+
+    /// The DID an entry of this kind is bound to, from its stored value.
+    pub(crate) fn did_of(self, value: &str) -> Option<String> {
+        match self {
+            OwnSession::PickerHint => Some(value.to_string()),
+            OwnSession::Account => serde_json::from_str::<serde_json::Value>(value)
+                .ok()?
+                .get("did")?
+                .as_str()
+                .map(str::to_string),
+        }
+    }
+}
 
 /// TTL for an opaque login user-session (seconds). Long enough that a returning
 /// user's picker stays scoped across normal usage, bounded so a leaked token does
@@ -224,6 +295,55 @@ pub struct CodeEntry {
     pub scope: Option<String>,
 }
 
+/// Registration metadata this provider reads beyond OIDC Core client
+/// registration: `post_logout_redirect_uris` (OpenID Connect RP-Initiated
+/// Logout 1.0 §3.1), `backchannel_logout_uri` and
+/// `backchannel_logout_session_required` (OpenID Connect Back-Channel Logout
+/// 1.0 §2.2). Flattened into the registration document, so an entry written
+/// before they existed reads with none, and a build that does not know them
+/// ignores them.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct LogoutClientMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_logout_redirect_uris: Option<Vec<PostLogoutRedirectUrl>>,
+    /// Where a logout token is POSTed when one of the client's `oidc` grants
+    /// is deleted. Checked by the SSRF guard at registration and at delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backchannel_logout_uri: Option<Url>,
+    /// The client requires a `sid` in every logout token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backchannel_logout_session_required: Option<bool>,
+}
+
+impl AdditionalClientMetadata for LogoutClientMetadata {}
+
+/// A client's registration: OIDC Core client metadata plus [`LogoutClientMetadata`].
+pub type SiwxClientMetadata = ClientMetadata<
+    LogoutClientMetadata,
+    CoreApplicationType,
+    CoreClientAuthMethod,
+    CoreGrantType,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJweKeyManagementAlgorithm,
+    CoreJsonWebKey,
+    CoreResponseType,
+    CoreSubjectIdentifierType,
+>;
+
+/// The registration response, echoing [`LogoutClientMetadata`].
+pub type SiwxClientRegistrationResponse = ClientRegistrationResponse<
+    LogoutClientMetadata,
+    EmptyAdditionalClientRegistrationResponse,
+    CoreApplicationType,
+    CoreClientAuthMethod,
+    CoreGrantType,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJweKeyManagementAlgorithm,
+    CoreJsonWebKey,
+    CoreResponseType,
+    CoreSubjectIdentifierType,
+>;
+
 /// A client's registration. The client secret and the registration access
 /// token are stored only as their SHA-256 digests ([`tokens::digest`]), and a
 /// presented value is compared with them digest against digest
@@ -242,7 +362,7 @@ pub struct CodeEntry {
 #[serde(try_from = "StoredClientEntry")]
 pub struct ClientEntry {
     pub secret_digest: String,
-    pub metadata: CoreClientMetadata,
+    pub metadata: SiwxClientMetadata,
     pub access_token_digest: Option<String>,
 }
 
@@ -253,7 +373,7 @@ struct StoredClientEntry {
     secret_digest: Option<String>,
     #[serde(default)]
     secret: Option<String>,
-    metadata: CoreClientMetadata,
+    metadata: SiwxClientMetadata,
     #[serde(default)]
     access_token_digest: Option<String>,
     #[serde(default)]
@@ -292,7 +412,7 @@ impl TryFrom<StoredClientEntry> for ClientEntry {
 impl ClientEntry {
     /// The registration of a client with `secret` and, if it has one, the
     /// registration access token `access_token`; it keeps their digests.
-    pub fn new(secret: &str, metadata: CoreClientMetadata, access_token: Option<&str>) -> Self {
+    pub fn new(secret: &str, metadata: SiwxClientMetadata, access_token: Option<&str>) -> Self {
         ClientEntry {
             secret_digest: tokens::digest(secret),
             metadata,
@@ -938,8 +1058,8 @@ mod client_entry_tests {
     use super::*;
     use openidconnect::RedirectUrl;
 
-    fn metadata() -> CoreClientMetadata {
-        CoreClientMetadata::new(
+    fn metadata() -> SiwxClientMetadata {
+        SiwxClientMetadata::new(
             vec![RedirectUrl::new("https://rp.example.org/cb".into()).unwrap()],
             Default::default(),
         )

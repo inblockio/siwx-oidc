@@ -12,6 +12,7 @@
 //! | `idx:grants:user/{username}` | set | grant ids of the user | the longest grant TTL written into it |
 //! | `idx:grants:user_device/{username}/{device_id}` | set | grant ids of the device | as above |
 //! | `legacy_rt/{digest(legacy refresh token)}` | string | the grant id a legacy refresh token was lifted into | `inactivity_secs` at the lift |
+//! | `idx:grants:sid/{sid}` | string | the grant id of the grant whose `sid` this is | the grant's TTL, extended with it |
 //! | `epoch:global`, `epoch:client/{client_id}`, `epoch:user/{username}` | string | a not-before epoch, Unix ms from Redis `TIME` ([`EpochScope`]) | none |
 //!
 //! A grant id is `digest(handle)` (see [`super::tokens`]). No key or value
@@ -61,8 +62,26 @@
 //! | `current_rt`, `previous_rt` | digests of the live refresh token and its predecessor; empty when none |
 //! | `successor_used` | `0` from a rotation until the new pair is first used, else `1` |
 //! | `successor_sealed` | the current pair, sealed under `previous_rt`'s plaintext, while unused |
+//! | `sid` | the OIDC session id (I8), emitted in the grant's ID token; absent on a `service` grant, a lifted legacy grant and a grant written before Phase 4 |
 //!
-//! Phase 4 adds `sid`.
+//! # The session id (`sid`, I8)
+//!
+//! Every grant issued with an ID token (`matrix_device`, `oidc`) gets a random
+//! `sid` ([`tokens::new_session_id`]), never derived from its handle, a token or
+//! the device id, and `idx:grants:sid/{sid}` names the grant for RP-initiated
+//! logout ([`RedisClient::end_grant_by_sid`]). A `sid` is not a credential: the
+//! RP that holds the ID token receives it, and it authorises nothing alone
+//! (end-session needs an ID token this provider signed), so it is stored as it
+//! is. A grant without one is never given one later: a refresh response carries
+//! no ID token, so no RP could learn a `sid` minted at a rotation, and such a
+//! grant ends by revocation, expiry or an epoch instead.
+//!
+//! Every script that deletes a grant does so through `drop_grant`
+//! ([`LUA_DROP`]), which also deletes the grant's sid index entry: the one place
+//! a grant deletion can be observed, and where the logout entry of an `oidc`
+//! grant is queued for back-channel logout ([`super::outbox`]). A grant whose
+//! key simply expires runs no script: its index entry expires with it (same
+//! TTL), and no logout token is sent.
 //!
 //! # The rotation decision ([`RedisClient::rotate_refresh_token`])
 //!
@@ -119,6 +138,10 @@ pub const KV_GRANT_DEVICE_IDX_PREFIX: &str = "idx:grants:user_device";
 /// Prefix of the pointer from a lifted legacy refresh token to its grant:
 /// `legacy_rt/{digest(legacy refresh token)}`.
 pub const KV_LEGACY_RT_PREFIX: &str = "legacy_rt";
+/// Prefix of the session-id index: `idx:grants:sid/{sid}` -> the grant id. A
+/// `sid` is not a credential (it names a grant to the RP that holds its ID
+/// token and authorises nothing alone), so it is stored as it is.
+pub const KV_GRANT_SID_IDX_PREFIX: &str = "idx:grants:sid";
 
 /// The message of the reuse security event. Stable: dashboards count it.
 pub const REUSE_EVENT_MESSAGE: &str = "refresh token reuse detected";
@@ -327,6 +350,8 @@ pub struct IssuedGrant {
     pub grant_id: GrantId,
     pub access_token: String,
     pub refresh_token: Option<String>,
+    /// The grant's session id, for the ID token (`None` for a `service` grant).
+    pub sid: Option<String>,
     /// Issued-at and expiry of the access token, from Redis `TIME`.
     pub iat: i64,
     pub access_exp: i64,
@@ -347,6 +372,7 @@ impl std::fmt::Debug for IssuedGrant {
                     .as_deref()
                     .map(crate::redact::fingerprint),
             )
+            .field("sid", &self.sid)
             .field("iat", &self.iat)
             .field("access_exp", &self.access_exp)
             .finish()
@@ -376,6 +402,9 @@ pub struct GrantView {
     pub absolute_exp: Option<i64>,
     pub access_ttl: u64,
     pub generation: u64,
+    /// The OIDC session id (I8); `None` for a grant issued without an ID token
+    /// or before Phase 4.
+    pub sid: Option<String>,
 }
 
 impl GrantView {
@@ -402,6 +431,7 @@ impl GrantView {
             },
             access_ttl: f.get("access_ttl")?.parse().ok()?,
             generation: f.get("generation")?.parse().ok()?,
+            sid: f.get("sid").filter(|v| !v.is_empty()).cloned(),
         })
     }
 }
@@ -656,19 +686,30 @@ local function index(key, id, prefix, ttl)
 end
 "#;
 
-/// Create a grant, its first access entry and its index entries.
-///
-/// KEYS: 1 grant, 2 access entry, 3 user index, 4 device index.
-/// ARGV: 1 grant id, 2 grant key prefix (`grant/`), 3 has device (`1`/`0`),
-/// 4 kind, 5 username, 6 did, 7 client_id, 8 confidential, 9 device_id,
-/// 10 scope, 11 name, 12 auth_ms (`` = now), 13 access_ttl, 14 inactivity
-/// (`0`: no refresh token, the grant lives as long as its access token),
-/// 15 current_rt, 16 the absolute-lifetime cap (`` = none).
-/// `auth_time` is `auth_ms` in whole seconds.
-/// With a cap, `absolute_exp` = `auth_time` + cap is written, the access token
-/// and the keys expire no later than it, and an authentication already older
-/// than the cap is an error. Returns `{iat, exp}` of the access token. Index
-/// members whose grant is gone are pruned, so an index holds live grants only.
+/// Delete the grant at `key` and its sid index entry; returns 1 when the grant
+/// existed, else 0. Every script that deletes a grant calls this, so it is the
+/// one hook for whatever must follow a grant deletion: for an `oidc` grant it
+/// queues the back-channel logout entry in the outbox
+/// ([`super::outbox::KV_BACKCHANNEL_OUTBOX`], due now), in the same script as
+/// the deletion. A `matrix_device` or `service` grant queues nothing.
+const LUA_DROP: &str = r#"
+local function drop_grant(key)
+  local f = redis.call('HMGET', key, 'sid', 'kind', 'client_id', 'did')
+  if f[1] and f[1] ~= '' then
+    redis.call('DEL', 'idx:grants:sid/' .. f[1])
+  end
+  local n = redis.call('DEL', key)
+  if n == 1 and f[2] == 'oidc' then
+    local t = redis.call('TIME')
+    local due = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+    redis.call('ZADD', 'outbox:backchannel_logout', string.format('%.0f', due),
+      cjson.encode({client_id = f[3], sub = f[4], sid = f[1] or '',
+        grant = string.match(key, '([^/]+)$'), attempt = 0}))
+  end
+  return n
+end
+"#;
+
 const ISSUE_LUA: &str = r#"
 local clock = redis.call('TIME')
 local now = tonumber(clock[1])
@@ -702,6 +743,13 @@ redis.call('HSET', KEYS[1], 'kind', ARGV[4], 'username', ARGV[5], 'did', ARGV[6]
   'current_rt', ARGV[15], 'previous_rt', '', 'successor_used', '1')
 if absolute_exp then
   redis.call('HSET', KEYS[1], 'absolute_exp', tostring(absolute_exp))
+end
+if ARGV[17] ~= '' then
+  if not redis.call('SET', 'idx:grants:sid/' .. ARGV[17], ARGV[1], 'NX', 'EX', grant_ttl) then
+    redis.call('DEL', KEYS[1])
+    return redis.error_reply('sid collision')
+  end
+  redis.call('HSET', KEYS[1], 'sid', ARGV[17])
 end
 redis.call('EXPIRE', KEYS[1], grant_ttl)
 redis.call('HSET', KEYS[2], 'grant', ARGV[1], 'generation', '0', 'kind', 'access',
@@ -818,7 +866,7 @@ return {'lifted_now'}
 const ROTATE_LUA: &str = r#"
 local f = redis.call('HMGET', KEYS[1], 'username', 'device_id', 'client_id', 'confidential',
   'current_rt', 'previous_rt', 'successor_used', 'successor_sealed', 'generation',
-  'last_used', 'inactivity_secs', 'access_ttl', 'auth_time', 'absolute_exp', 'auth_ms')
+  'last_used', 'inactivity_secs', 'access_ttl', 'auth_time', 'absolute_exp', 'auth_ms', 'sid')
 if not f[1] or f[1] ~= ARGV[4] or f[2] ~= ARGV[5] then
   return {'invalid', 'unknown_grant'}
 end
@@ -826,7 +874,7 @@ if redis.call('EXISTS', KEYS[3]) == 1 or (ARGV[9] == '1' and redis.call('EXISTS'
   return {'invalid', 'revoked'}
 end
 if epoch_refuses(auth_ms_of(f[15], f[13]), f[1], f[3]) then
-  redis.call('DEL', KEYS[1])
+  drop_grant(KEYS[1])
   redis.call('SREM', KEYS[5], ARGV[8])
   if ARGV[9] == '1' then redis.call('SREM', KEYS[6], ARGV[8]) end
   return {'invalid', 'revoked'}
@@ -840,7 +888,7 @@ if ARGV[11] ~= '' then
   if not absolute_exp or capped < absolute_exp then absolute_exp = capped end
 end
 if now - tonumber(f[10]) > inactivity or (absolute_exp and now >= absolute_exp) then
-  redis.call('DEL', KEYS[1])
+  drop_grant(KEYS[1])
   redis.call('SREM', KEYS[5], ARGV[8])
   if ARGV[9] == '1' then redis.call('SREM', KEYS[6], ARGV[8]) end
   return {'invalid', 'expired'}
@@ -867,6 +915,9 @@ if ARGV[2] ~= '' and f[5] ~= '' and ARGV[1] == f[5] then
     'generation', next_gen, 'successor_used', '0', 'successor_sealed', ARGV[3],
     'last_used', tostring(now))
   redis.call('EXPIRE', KEYS[1], grant_ttl)
+  if f[16] and f[16] ~= '' then
+    redis.call('EXPIRE', 'idx:grants:sid/' .. f[16], grant_ttl)
+  end
   redis.call('HSET', KEYS[2], 'grant', ARGV[8], 'generation', next_gen, 'kind', 'access',
     'iat', tostring(now), 'exp', tostring(access_exp))
   redis.call('EXPIRE', KEYS[2], access_life)
@@ -932,7 +983,7 @@ return reply
 const REVOKE_DEVICE_LUA: &str = r#"
 local n = 0
 for _, id in ipairs(redis.call('SMEMBERS', KEYS[1])) do
-  n = n + redis.call('DEL', ARGV[2] .. id)
+  n = n + drop_grant(ARGV[2] .. id)
   redis.call('SREM', KEYS[3], id)
 end
 redis.call('DEL', KEYS[1])
@@ -954,7 +1005,7 @@ for _, id in ipairs(redis.call('SMEMBERS', KEYS[1])) do
   if device and device ~= '' then
     redis.call('DEL', ARGV[2] .. device)
   end
-  n = n + redis.call('DEL', ARGV[1] .. id)
+  n = n + drop_grant(ARGV[1] .. id)
 end
 redis.call('DEL', KEYS[1])
 return n
@@ -977,11 +1028,43 @@ if ARGV[2] ~= '' then
     return 0
   end
 end
-redis.call('DEL', KEYS[1])
+drop_grant(KEYS[1])
 redis.call('SREM', KEYS[2], ARGV[1])
 if ARGV[3] == '1' then redis.call('SREM', KEYS[3], ARGV[1]) end
 return 1
 "#;
+
+/// End the grant a `sid` names (RP-initiated logout), if it belongs to the
+/// client and the DID of the ID token that named it. Needs [`LUA_DROP`].
+///
+/// KEYS: 1 the sid index entry. ARGV: 1 sid, 2 client_id, 3 did, 4 grant key
+/// prefix, 5 user index prefix, 6 device index prefix (both with their `/`).
+/// Returns nil when no live grant carries the sid, `{'mismatch'}` when it
+/// belongs to another client or DID (nothing deleted), else
+/// `{'ended', grant id, kind}` after deleting the grant and its index entries.
+const END_GRANT_LUA: &str = r#"
+local id = redis.call('GET', KEYS[1])
+if not id then return false end
+local key = ARGV[4] .. id
+local f = redis.call('HMGET', key, 'sid', 'client_id', 'did', 'username', 'device_id', 'kind')
+if not f[1] or f[1] ~= ARGV[1] then return false end
+if f[2] ~= ARGV[2] or f[3] ~= ARGV[3] then return {'mismatch'} end
+drop_grant(key)
+redis.call('SREM', ARGV[5] .. f[4], id)
+if f[5] and f[5] ~= '' then redis.call('SREM', ARGV[6] .. f[4] .. '/' .. f[5], id) end
+return {'ended', id, f[6]}
+"#;
+
+/// What [`RedisClient::end_grant_by_sid`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EndedGrant {
+    /// The grant was deleted, with its index entries.
+    Ended { grant_id: GrantId, kind: GrantKind },
+    /// No live grant carries the sid (never issued, already ended or expired).
+    NotFound,
+    /// The sid names a grant of another client or DID; nothing was deleted.
+    Mismatch,
+}
 
 /// A cap as a script argument: `` for none.
 fn cap_arg(cap: Option<u64>) -> String {
@@ -1011,7 +1094,7 @@ impl RedisClient {
         self
     }
 
-    async fn eval<T: redis::FromRedisValue>(
+    pub(super) async fn eval<T: redis::FromRedisValue>(
         &self,
         script: &str,
         keys: &[&str],
@@ -1090,6 +1173,11 @@ impl RedisClient {
             .map(|_| tokens::new_refresh_token(&handle));
         let current_rt = refresh_token.as_deref().map(digest).unwrap_or_default();
         let has_device = !new.device_id.is_empty();
+        // A grant issued with an ID token gets its own random session id (I8).
+        let sid = match new.kind {
+            GrantKind::Service => None,
+            GrantKind::MatrixDevice | GrantKind::Oidc => Some(tokens::new_session_id()),
+        };
         let script = format!("{LUA_EXTEND}{LUA_INDEX}{ISSUE_LUA}");
         let reply: Vec<String> = self
             .eval(
@@ -1117,6 +1205,7 @@ impl RedisClient {
                     &new.refresh_inactivity_secs.unwrap_or(0).to_string(),
                     &current_rt,
                     &cap_arg(self.lifetime.cap_for(&new.client_id)),
+                    sid.as_deref().unwrap_or_default(),
                 ],
             )
             .await?;
@@ -1125,6 +1214,7 @@ impl RedisClient {
             grant_id,
             access_token,
             refresh_token,
+            sid,
             iat: number(field(0), "issue reply")?,
             access_exp: number(field(1), "issue reply")?,
         })
@@ -1498,7 +1588,7 @@ impl RedisClient {
             None => (String::new(), String::new()),
         };
         let has_device = !view.device_id.is_empty();
-        let script = format!("{LUA_EXTEND}{LUA_EPOCH}{ROTATE_LUA}");
+        let script = format!("{LUA_EXTEND}{LUA_EPOCH}{LUA_DROP}{ROTATE_LUA}");
         let reply: Vec<String> = self
             .eval(
                 &script,
@@ -1577,7 +1667,7 @@ impl RedisClient {
     /// tombstone, in one atomic step. Returns the number of grants deleted.
     pub async fn revoke_grants_for_device(&self, username: &str, device_id: &str) -> Result<usize> {
         self.eval(
-            REVOKE_DEVICE_LUA,
+            &format!("{LUA_DROP}{REVOKE_DEVICE_LUA}"),
             &[
                 &device_idx_key(username, device_id),
                 &device_tombstone_key(username, device_id),
@@ -1603,7 +1693,7 @@ impl RedisClient {
     /// `tombstone:user/{username}`, so one a previous build planted refuses for
     /// the rest of its 900 s.
     pub async fn revoke_grants_for_user(&self, username: &str) -> Result<usize> {
-        let script = format!("{LUA_EPOCH}{REVOKE_USER_LUA}");
+        let script = format!("{LUA_EPOCH}{LUA_DROP}{REVOKE_USER_LUA}");
         self.eval(
             &script,
             &[&user_idx_key(username), &EpochScope::User(username).key()],
@@ -1613,6 +1703,52 @@ impl RedisClient {
             ],
         )
         .await
+    }
+
+    /// End the grant whose session id is `sid` (RP-initiated logout), if it
+    /// was issued to `client_id` for `did`: the grant, its access tokens (they
+    /// read the grant) and its index entries go in one atomic step. Plants no
+    /// tombstone and touches no Matrix device.
+    pub async fn end_grant_by_sid(
+        &self,
+        sid: &str,
+        client_id: &str,
+        did: &str,
+    ) -> Result<EndedGrant> {
+        let reply: Option<Vec<String>> = self
+            .eval(
+                &format!("{LUA_DROP}{END_GRANT_LUA}"),
+                &[&format!("{KV_GRANT_SID_IDX_PREFIX}/{sid}")],
+                &[
+                    sid,
+                    client_id,
+                    did,
+                    &format!("{KV_GRANT_PREFIX}/"),
+                    &format!("{KV_GRANT_USER_IDX_PREFIX}/"),
+                    &format!("{KV_GRANT_DEVICE_IDX_PREFIX}/"),
+                ],
+            )
+            .await?;
+        let Some(reply) = reply else {
+            return Ok(EndedGrant::NotFound);
+        };
+        match reply.first().map(String::as_str) {
+            Some("mismatch") => Ok(EndedGrant::Mismatch),
+            Some("ended") => {
+                let grant_id = GrantId(
+                    reply
+                        .get(1)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("end-grant script: no grant id"))?,
+                );
+                let kind = reply
+                    .get(2)
+                    .and_then(|k| GrantKind::parse(k))
+                    .ok_or_else(|| anyhow!("end-grant script: malformed kind"))?;
+                Ok(EndedGrant::Ended { grant_id, kind })
+            }
+            _ => Err(anyhow!("end-grant script: unexpected reply")),
+        }
     }
 
     /// Delete the grant of a token the endpoints would accept: a live access
@@ -1652,7 +1788,7 @@ impl RedisClient {
         };
         let deleted: i64 = self
             .eval(
-                REVOKE_ONE_LUA,
+                &format!("{LUA_DROP}{REVOKE_ONE_LUA}"),
                 &[
                     &grant_key(&grant_id),
                     &user_idx_key(&view.username),

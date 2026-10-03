@@ -11,20 +11,19 @@ use headers::{self, authorization::Bearer};
 use openidconnect::{
     core::{
         CoreAuthErrorResponseType, CoreAuthPrompt, CoreClaimName, CoreClientAuthMethod,
-        CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType, CoreGenderClaim,
-        CoreGrantType, CoreIdToken, CoreIdTokenClaims, CoreIdTokenFields, CoreJsonWebKey,
-        CoreJsonWebKeySet, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm,
-        CoreProviderMetadata, CoreRegisterErrorResponseType, CoreResponseType,
-        CoreSubjectIdentifierType, CoreTokenResponse, CoreTokenType,
+        CoreErrorResponseType, CoreGenderClaim, CoreGrantType, CoreJsonWebKey, CoreJsonWebKeySet,
+        CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm, CoreProviderMetadata,
+        CoreRegisterErrorResponseType, CoreResponseType, CoreSubjectIdentifierType, CoreTokenType,
     },
-    registration::{EmptyAdditionalClientMetadata, EmptyAdditionalClientRegistrationResponse},
+    registration::EmptyAdditionalClientRegistrationResponse,
     url::Url,
     AccessToken, AdditionalClaims, Audience, AuthUrl, ClientConfigUrl, ClientId, ClientSecret,
-    EmptyAdditionalClaims, EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserName,
-    EndUserUsername, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl, LocalizedClaim, Nonce, OpPolicyUrl,
-    OpTosUrl, PrivateSigningKey, RedirectUrl, RefreshToken, RegistrationAccessToken,
+    EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserName, EndUserUsername, IdToken,
+    IdTokenClaims, IdTokenFields, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl, LocalizedClaim, Nonce,
+    OpPolicyUrl, OpTosUrl, PrivateSigningKey, RedirectUrl, RefreshToken, RegistrationAccessToken,
     RegistrationUrl, RequestUrl, ResponseTypes, Scope, SigningError, StandardClaims,
-    SubjectIdentifier, TokenUrl, UserInfoClaims, UserInfoJsonWebToken, UserInfoUrl,
+    StandardTokenResponse, SubjectIdentifier, TokenUrl, UserInfoClaims, UserInfoJsonWebToken,
+    UserInfoUrl,
 };
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
@@ -40,7 +39,7 @@ use uuid::Uuid;
 
 use aqua_auth::find_did_method;
 use siwx_oidc::db::grant::{
-    GrantKind, InvalidReason, NewGrant, RefreshPeek, RotateOutcome, RotateRequest,
+    EndedGrant, GrantKind, InvalidReason, NewGrant, RefreshPeek, RotateOutcome, RotateRequest,
 };
 use siwx_oidc::db::*;
 use subtle::ConstantTimeEq;
@@ -83,6 +82,8 @@ pub const REGISTER_PATH: &str = "/register";
 pub const CLIENT_PATH: &str = "/client";
 pub const USERINFO_PATH: &str = "/userinfo";
 pub const SIGNIN_PATH: &str = "/sign_in";
+/// OpenID Connect RP-Initiated Logout 1.0 `end_session_endpoint`.
+pub const END_SESSION_PATH: &str = "/end_session";
 pub const SIWX_COOKIE_KEY: &str = "siwx";
 /// RFC 8628 grant type of the device-code grant (`POST /token`).
 pub const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
@@ -296,6 +297,37 @@ fn verification_jwk(verifying_key: &p256::ecdsa::VerifyingKey, kid: &str) -> Cor
     jwk_value["kid"] = serde_json::Value::String(kid.to_string());
     serde_json::from_value(jwk_value).expect("Failed to construct EC JWK")
 }
+
+// -- ID tokens ---------------------------------------------------------------
+
+/// The claims this provider adds to an ID token: the session id of the grant
+/// the token was issued with (I8; OpenID Connect Front-/Back-Channel Logout
+/// and RP-Initiated Logout name a session by it). Omitted, never `null`, when
+/// a grant has none (a `service` grant never comes with an ID token).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SidClaims {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+}
+
+impl AdditionalClaims for SidClaims {}
+
+/// The ID token claim set: the OIDC Core claims plus [`SidClaims`].
+pub type SiwxIdTokenClaims = IdTokenClaims<SidClaims, CoreGenderClaim>;
+/// A signed ID token of [`SiwxIdTokenClaims`].
+pub type SiwxIdToken =
+    IdToken<SidClaims, CoreGenderClaim, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm>;
+/// The token response fields carrying a [`SiwxIdToken`].
+pub type SiwxIdTokenFields = IdTokenFields<
+    SidClaims,
+    EmptyExtraTokenFields,
+    CoreGenderClaim,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJwsSigningAlgorithm,
+>;
+/// `POST /token`'s response: `CoreTokenResponse` with [`SidClaims`] in the ID
+/// token. The JSON shape is unchanged apart from the `sid` claim inside it.
+pub type SiwxTokenResponse = StandardTokenResponse<SiwxIdTokenFields, CoreTokenType>;
 
 // -- Error types -----------------------------------------------------------
 
@@ -711,6 +743,14 @@ pub fn provider_metadata_value(
     }
     value["grant_types_supported"] = serde_json::json!(grant_types);
     value["revocation_endpoint"] = serde_json::json!(format!("{}/oauth2/revoke", base));
+    // RP-initiated logout ends the grant an ID token's `sid` names, in both modes.
+    value["end_session_endpoint"] = serde_json::json!(format!("{base}{END_SESSION_PATH}"));
+    // Back-channel logout is sent for `oidc` grants only, and only generic mode
+    // issues them: in Matrix mode every grant is a Matrix device grant.
+    if !delegated_auth_enabled(config) {
+        value["backchannel_logout_supported"] = serde_json::json!(true);
+        value["backchannel_logout_session_supported"] = serde_json::json!(true);
+    }
     value["token_endpoint_auth_methods_supported"] =
         serde_json::json!(["client_secret_basic", "client_secret_post", "none"]);
     value["prompt_values_supported"] = serde_json::json!(["login", "create"]);
@@ -921,7 +961,7 @@ pub async fn token(
     config: &crate::config::Config,
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
-) -> Result<CoreTokenResponse, CustomError> {
+) -> Result<SiwxTokenResponse, CustomError> {
     match form.grant_type {
         CoreGrantType::AuthorizationCode => {
             token_authorization_code(form, credentials, signing_key, config, db_client).await
@@ -1091,7 +1131,7 @@ async fn token_refresh(
     credentials: ClientCredentials,
     config: &crate::config::Config,
     db_client: &DBClientType,
-) -> Result<CoreTokenResponse, CustomError> {
+) -> Result<SiwxTokenResponse, CustomError> {
     let named_client = named_client_id(&form, &credentials)?;
     let presented_secret = credentials.secret.or(form.client_secret);
     let rt = form.refresh_token.ok_or_else(|| {
@@ -1176,10 +1216,10 @@ async fn token_refresh(
         }
     };
 
-    let mut response = CoreTokenResponse::new(
+    let mut response = SiwxTokenResponse::new(
         AccessToken::new(pair.access_token),
         CoreTokenType::Bearer,
-        CoreIdTokenFields::new(None, EmptyExtraTokenFields {}),
+        SiwxIdTokenFields::new(None, EmptyExtraTokenFields {}),
     );
     response.set_expires_in(Some(&time::Duration::from_secs(expires_in)));
     response.set_refresh_token(Some(RefreshToken::new(pair.refresh_token)));
@@ -1208,7 +1248,7 @@ async fn token_device_code(
     config: &crate::config::Config,
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
-) -> Result<CoreTokenResponse, CustomError> {
+) -> Result<SiwxTokenResponse, CustomError> {
     if !delegated_auth_enabled(config) {
         return Err(device_grant_unsupported());
     }
@@ -1393,16 +1433,16 @@ async fn token_device_code(
                 anyhow!("device_code grant: issue_grant returned no refresh token")
             })?;
 
-            let core_id_token = CoreIdTokenClaims::new(
+            let core_id_token = SiwxIdTokenClaims::new(
                 IssuerUrl::from_url(config.base_url.clone()),
                 vec![Audience::new(client_id)],
                 now + Duration::seconds(config.id_token_ttl_secs as i64),
                 now,
                 claims,
-                EmptyAdditionalClaims {},
+                SidClaims { sid: issued.sid },
             );
 
-            let id_token = CoreIdToken::new(
+            let id_token = SiwxIdToken::new(
                 core_id_token,
                 signing_key,
                 CoreJwsSigningAlgorithm::EcdsaP256Sha256,
@@ -1417,10 +1457,10 @@ async fn token_device_code(
 
             info!(did = %did, device_id = %dev_id, "device_code grant: tokens issued");
 
-            let mut response = CoreTokenResponse::new(
+            let mut response = SiwxTokenResponse::new(
                 AccessToken::new(access_token),
                 CoreTokenType::Bearer,
-                CoreIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
+                SiwxIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
             );
             response.set_expires_in(Some(&time::Duration::from_secs(ACCESS_TOKEN_TTL)));
             response.set_refresh_token(Some(RefreshToken::new(refresh_token)));
@@ -1477,10 +1517,7 @@ fn generic_grant(requested: Option<&str>, registration: &ClientEntry) -> Generic
         };
     };
     let asked: Vec<&str> = requested.split_whitespace().collect();
-    let may_refresh = registration
-        .metadata
-        .grant_types()
-        .is_none_or(|grants| grants.contains(&CoreGrantType::RefreshToken));
+    let may_refresh = registration_may_refresh(&registration.metadata);
     let granted: Vec<&str> = GENERIC_GRANTABLE_SCOPES
         .iter()
         .copied()
@@ -1514,7 +1551,7 @@ async fn token_authorization_code(
     signing_key: &EcdsaSigningKey,
     config: &crate::config::Config,
     db_client: &DBClientType,
-) -> Result<CoreTokenResponse, CustomError> {
+) -> Result<SiwxTokenResponse, CustomError> {
     // A malformed request is refused before the code is touched.
     let named_client = named_client_id(&form, &credentials)?;
     let presented_secret = credentials.secret.or(form.client_secret);
@@ -1663,18 +1700,18 @@ async fn token_authorization_code(
     let refresh_token = issued.refresh_token.map(RefreshToken::new);
     let access_token = AccessToken::new(issued.access_token);
 
-    let core_id_token = CoreIdTokenClaims::new(
+    let core_id_token = SiwxIdTokenClaims::new(
         IssuerUrl::from_url(config.base_url.clone()),
         vec![Audience::new(client_id.clone())],
         now + Duration::seconds(config.id_token_ttl_secs as i64),
         now,
         claims,
-        EmptyAdditionalClaims {},
+        SidClaims { sid: issued.sid },
     )
     .set_nonce(code_entry.nonce)
     .set_auth_time(Some(code_entry.auth_time));
 
-    let id_token = CoreIdToken::new(
+    let id_token = SiwxIdToken::new(
         core_id_token,
         signing_key,
         CoreJwsSigningAlgorithm::EcdsaP256Sha256,
@@ -1685,10 +1722,10 @@ async fn token_authorization_code(
 
     let expires_in_secs = ACCESS_TOKEN_TTL;
 
-    let mut response = CoreTokenResponse::new(
+    let mut response = SiwxTokenResponse::new(
         access_token,
         CoreTokenType::Bearer,
-        CoreIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
+        SiwxIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
     );
     response.set_expires_in(Some(&time::Duration::from_secs(expires_in_secs)));
     response.set_refresh_token(refresh_token);
@@ -2093,6 +2130,21 @@ fn redirect_uri_is_registered(client: &ClientEntry, redirect_uri: &RedirectUrl) 
         .redirect_uris()
         .iter()
         .any(|registered| registered.url() == redirect_uri.url())
+}
+
+/// Whether `uri` is one of the client's registered `post_logout_redirect_uris`,
+/// matched exactly like [`redirect_uri_is_registered`] (RFC 9700 §4.1.3: the
+/// whole URL, query included, after URL parsing). The one matcher for
+/// RP-initiated logout, so a URI that is not registered never redirects.
+fn post_logout_redirect_uri_is_registered(client: &ClientEntry, uri: &Url) -> bool {
+    client
+        .metadata
+        .additional_metadata()
+        .post_logout_redirect_uris
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|registered| registered.url() == uri)
 }
 
 /// C2 Step 3: re-validate a `redirect_uri` against the client's *registered*
@@ -2959,11 +3011,32 @@ pub struct RegisterError {
     error: CoreRegisterErrorResponseType,
 }
 
+/// What dynamic registration checks beyond the metadata's own form: the SSRF
+/// guard on `backchannel_logout_uri` (D3) and the D4 switch.
+#[derive(Clone, Debug, Default)]
+pub struct RegistrationPolicy {
+    pub guard: crate::backchannel::UriGuard,
+    /// D4 (provisional): a client that may receive refresh tokens must register
+    /// a `backchannel_logout_uri`. Off by default, and never in Matrix mode.
+    pub require_backchannel_for_refresh: bool,
+}
+
+impl RegistrationPolicy {
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            guard: crate::backchannel::UriGuard::new(&config.backchannel_logout_allowed_hosts),
+            require_backchannel_for_refresh: config.backchannel_logout_required_for_refresh
+                && !delegated_auth_enabled(config),
+        }
+    }
+}
+
 pub async fn register(
-    payload: CoreClientMetadata,
+    payload: SiwxClientMetadata,
     base_url: Url,
     db_client: &DBClientType,
-) -> Result<CoreClientRegistrationResponse, CustomError> {
+    policy: &RegistrationPolicy,
+) -> Result<SiwxClientRegistrationResponse, CustomError> {
     let id = Uuid::new_v4();
     let secret: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -2979,6 +3052,8 @@ pub async fn register(
             }));
         }
     }
+    check_logout_metadata(&payload, policy).await?;
+    let logout_metadata = payload.additional_metadata().clone();
 
     let access_token = RegistrationAccessToken::new(
         thread_rng()
@@ -2993,10 +3068,10 @@ pub async fn register(
     let entry = ClientEntry::new(&secret, payload, Some(access_token.secret()));
     db_client.set_client(id.to_string(), entry).await?;
 
-    Ok(CoreClientRegistrationResponse::new(
+    Ok(SiwxClientRegistrationResponse::new(
         ClientId::new(id.to_string()),
         redirect_uris,
-        EmptyAdditionalClientMetadata::default(),
+        logout_metadata,
         EmptyAdditionalClientRegistrationResponse::default(),
     )
     .set_client_secret(Some(ClientSecret::new(secret)))
@@ -3006,6 +3081,301 @@ pub async fn register(
             .map_err(|e| anyhow!("Unable to join URL: {}", e))?,
     )))
     .set_registration_access_token(Some(access_token)))
+}
+
+/// The logout metadata a registration may carry, else
+/// `invalid_client_metadata` (RFC 7591 §3.2.2): every
+/// `post_logout_redirect_uris` entry is an absolute URI without a fragment
+/// (as `redirect_uris`); a `backchannel_logout_uri` passes the SSRF guard
+/// ([`crate::backchannel::UriGuard::check`]: no fragment, `https`, every
+/// resolved address outside the refused classes, unless the host is
+/// allowlisted); and with the D4 switch on, a client that may receive refresh
+/// tokens registers one.
+async fn check_logout_metadata(
+    payload: &SiwxClientMetadata,
+    policy: &RegistrationPolicy,
+) -> Result<(), CustomError> {
+    let invalid = || {
+        CustomError::BadRequestRegister(RegisterError {
+            error: CoreRegisterErrorResponseType::InvalidClientMetadata,
+        })
+    };
+    let extra = payload.additional_metadata();
+    let uris = extra
+        .post_logout_redirect_uris
+        .as_deref()
+        .unwrap_or_default();
+    if uris.iter().any(|uri| uri.url().fragment().is_some()) {
+        return Err(invalid());
+    }
+    match &extra.backchannel_logout_uri {
+        Some(uri) => {
+            if let Err(refusal) = policy.guard.check(uri).await {
+                warn!(
+                    host = uri.host_str().unwrap_or_default(),
+                    refusal = ?refusal,
+                    "registration: backchannel_logout_uri refused"
+                );
+                return Err(invalid());
+            }
+        }
+        None if policy.require_backchannel_for_refresh && registration_may_refresh(payload) => {
+            return Err(invalid());
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// Whether a registration allows the refresh grant: it lists `refresh_token`
+/// in `grant_types`, or lists no `grant_types` at all (provisional).
+fn registration_may_refresh(metadata: &SiwxClientMetadata) -> bool {
+    metadata
+        .grant_types()
+        .is_none_or(|grants| grants.contains(&CoreGrantType::RefreshToken))
+}
+
+// -- RP-initiated logout (OpenID Connect RP-Initiated Logout 1.0) -------------
+
+/// The parameters of `GET`/`POST` [`END_SESSION_PATH`]. `logout_hint` and
+/// `ui_locales` are accepted by being ignored.
+#[derive(Debug, Default, Deserialize)]
+pub struct EndSessionParams {
+    pub id_token_hint: Option<String>,
+    pub client_id: Option<String>,
+    pub post_logout_redirect_uri: Option<String>,
+    pub state: Option<String>,
+}
+
+/// The claims end-session reads from a verified `id_token_hint`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HintClaims {
+    pub sub: String,
+    pub aud: Vec<String>,
+    pub sid: Option<String>,
+}
+
+/// Why an `id_token_hint` was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HintError {
+    /// Not a compact JWS with a JSON header and payload carrying `sub` and `aud`.
+    Malformed,
+    /// `alg` is not ES256 (`none` and `HS*` included).
+    Algorithm,
+    /// No `kid`, or one that is neither the live key's nor a retired key's.
+    UnknownKid,
+    /// The signature does not verify over the received bytes.
+    Signature,
+    /// `iss` is not this provider.
+    Issuer,
+}
+
+/// Verify an `id_token_hint`: an ID token this provider signed, with the live
+/// key or a retired one, named by its `kid`, over the received bytes, and
+/// issued by this provider. Its expiry is NOT checked: RP-Initiated Logout
+/// §2 lets an RP send an expired ID token, which still names the session.
+pub fn verify_id_token_hint(
+    hint: &str,
+    signing_key: &EcdsaSigningKey,
+    retired: &[CoreJsonWebKey],
+    issuer: &IssuerUrl,
+) -> Result<HintClaims, HintError> {
+    use openidconnect::JsonWebKey;
+
+    let mut parts = hint.split('.');
+    let (Some(header), Some(payload), Some(signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(HintError::Malformed);
+    };
+    let decode = |part: &str| {
+        URL_SAFE_NO_PAD
+            .decode(part)
+            .map_err(|_| HintError::Malformed)
+    };
+    let header: serde_json::Value =
+        serde_json::from_slice(&decode(header)?).map_err(|_| HintError::Malformed)?;
+    if header["alg"] != "ES256" {
+        return Err(HintError::Algorithm);
+    }
+    let kid = header["kid"].as_str().ok_or(HintError::UnknownKid)?;
+    let live = signing_key.as_verification_key();
+    let key = std::iter::once(&live)
+        .chain(retired.iter())
+        .find(|k| k.key_id().map(|id| id.as_str()) == Some(kid))
+        .ok_or(HintError::UnknownKid)?;
+    let signing_input_len = hint.len() - signature.len() - 1;
+    key.verify_signature(
+        &CoreJwsSigningAlgorithm::EcdsaP256Sha256,
+        &hint.as_bytes()[..signing_input_len],
+        &decode(signature)?,
+    )
+    .map_err(|_| HintError::Signature)?;
+    let claims: serde_json::Value =
+        serde_json::from_slice(&decode(payload)?).map_err(|_| HintError::Malformed)?;
+    if claims["iss"].as_str() != Some(issuer.as_str()) {
+        return Err(HintError::Issuer);
+    }
+    let sub = claims["sub"]
+        .as_str()
+        .ok_or(HintError::Malformed)?
+        .to_string();
+    let aud = match &claims["aud"] {
+        serde_json::Value::String(one) => vec![one.clone()],
+        serde_json::Value::Array(many) => many
+            .iter()
+            .map(|a| a.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(HintError::Malformed)?,
+        _ => return Err(HintError::Malformed),
+    };
+    let sid = claims["sid"].as_str().map(str::to_string);
+    Ok(HintClaims { sub, aud, sid })
+}
+
+/// What end-session answers.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EndSessionOutcome {
+    /// Back to the registered `post_logout_redirect_uri`, `state` appended.
+    Redirect(Url),
+    /// The signed-out page; `ended` says whether a grant was ended.
+    SignedOut { ended: bool },
+}
+
+/// A store fault on a sign-out path: retryable, never a pretended success.
+pub(crate) fn store_unavailable(e: anyhow::Error) -> CustomError {
+    warn!(error = %e, "sign-out: the token store is unavailable");
+    CustomError::ServiceUnavailable("The session store is unavailable; retry.".to_string())
+}
+
+/// OpenID Connect RP-Initiated Logout 1.0 at [`END_SESSION_PATH`].
+///
+/// Everything is checked before anything is ended: an `id_token_hint` must be
+/// an ID token this provider signed ([`verify_id_token_hint`]; expired is
+/// fine); a `client_id` must be the hint's audience; a
+/// `post_logout_redirect_uri` must be registered for that client, matched
+/// exactly ([`post_logout_redirect_uri_is_registered`]). Any failure is a 400
+/// that ends nothing and never redirects, so no unregistered URI is ever a
+/// redirect target. Then the grant the hint's `sid` names is ended, if it
+/// belongs to the hint's client and `sub` ([`RedisClient::end_grant_by_sid`]):
+/// only that grant, never a Matrix device (a device sign-out is the Matrix
+/// `logout`; see `compat::TeardownPolicy`). A hint without a `sid` (an ID
+/// token issued before grants had one) ends nothing. Back-channel logout of an
+/// ended `oidc` grant is enqueued by the deletion script itself (`drop_grant`).
+pub async fn end_session(
+    params: EndSessionParams,
+    signing_key: &EcdsaSigningKey,
+    retired: &[CoreJsonWebKey],
+    config: &crate::config::Config,
+    db_client: &DBClientType,
+) -> Result<EndSessionOutcome, CustomError> {
+    let issuer = IssuerUrl::from_url(config.base_url.clone());
+    let hint = match params.id_token_hint.as_deref().filter(|h| !h.is_empty()) {
+        Some(raw) => Some(
+            verify_id_token_hint(raw, signing_key, retired, &issuer).map_err(|reason| {
+                warn!(?reason, "end_session: id_token_hint refused");
+                CustomError::BadRequest(
+                    "id_token_hint is not an ID token this provider issued.".to_string(),
+                )
+            })?,
+        ),
+        None => None,
+    };
+    let named_client = params.client_id.as_deref().filter(|c| !c.is_empty());
+    let client_id = match (&hint, named_client) {
+        (Some(hint), Some(named)) => {
+            if !hint.aud.iter().any(|aud| aud == named) {
+                warn!(
+                    client_id = named,
+                    "end_session: client_id is not the hint's audience"
+                );
+                return Err(CustomError::BadRequest(
+                    "client_id does not match the id_token_hint.".to_string(),
+                ));
+            }
+            Some(named.to_string())
+        }
+        (Some(hint), None) => match hint.aud.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        },
+        (None, named) => named.map(str::to_string),
+    };
+
+    let redirect = match params
+        .post_logout_redirect_uri
+        .as_deref()
+        .filter(|u| !u.is_empty())
+    {
+        None => None,
+        Some(raw) => {
+            let refused = || {
+                warn!("end_session: post_logout_redirect_uri is not registered for the client");
+                CustomError::BadRequest(
+                    "post_logout_redirect_uri is not registered for this client.".to_string(),
+                )
+            };
+            let mut uri = Url::parse(raw).map_err(|_| refused())?;
+            let client_id = client_id.as_deref().ok_or_else(refused)?;
+            let client = db_client
+                .get_client(client_id.to_string())
+                .await
+                .map_err(store_unavailable)?
+                .ok_or_else(refused)?;
+            if !post_logout_redirect_uri_is_registered(&client, &uri) {
+                return Err(refused());
+            }
+            if let Some(state) = params.state.as_deref() {
+                uri.query_pairs_mut().append_pair("state", state);
+            }
+            Some(uri)
+        }
+    };
+
+    let mut ended = false;
+    if let (Some(hint), Some(client_id)) = (&hint, client_id.as_deref()) {
+        if let Some(sid) = hint.sid.as_deref() {
+            match db_client
+                .end_grant_by_sid(sid, client_id, &hint.sub)
+                .await
+                .map_err(store_unavailable)?
+            {
+                EndedGrant::Ended { grant_id, kind } => {
+                    ended = true;
+                    info!(grant_fp = %grant_id.fingerprint(), grant_kind = kind.as_str(),
+                        client_id, "end_session: grant ended");
+                }
+                EndedGrant::NotFound => {
+                    debug!(client_id, "end_session: no live grant carries the sid")
+                }
+                EndedGrant::Mismatch => warn!(
+                    client_id,
+                    "end_session: the sid names a grant of another client or subject; nothing ended"
+                ),
+            }
+        } else {
+            debug!(
+                client_id,
+                "end_session: the hint carries no sid; nothing ended"
+            );
+        }
+    }
+    Ok(match redirect {
+        Some(uri) => EndSessionOutcome::Redirect(uri),
+        None => EndSessionOutcome::SignedOut { ended },
+    })
+}
+
+/// The page end-session shows when it does not redirect. Reflects no input.
+pub fn signed_out_page(ended: bool) -> String {
+    let message = if ended {
+        "You are signed out: the session has ended."
+    } else {
+        "Nothing to sign out: no session was named, or it had already ended."
+    };
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Signed out</title></head><body><p>{message}</p></body></html>"
+    )
 }
 
 // -- Client info / update / delete -----------------------------------------
@@ -3033,7 +3403,7 @@ async fn client_access(
 pub async fn clientinfo(
     client_id: String,
     db_client: &DBClientType,
-) -> Result<CoreClientMetadata, CustomError> {
+) -> Result<SiwxClientMetadata, CustomError> {
     Ok(db_client
         .get_client(client_id)
         .await?
@@ -3052,11 +3422,13 @@ pub async fn client_delete(
 
 pub async fn client_update(
     client_id: String,
-    payload: CoreClientMetadata,
+    payload: SiwxClientMetadata,
     bearer: Option<Bearer>,
     db_client: &DBClientType,
+    policy: &RegistrationPolicy,
 ) -> Result<(), CustomError> {
     let mut client_entry = client_access(client_id.clone(), bearer, db_client).await?;
+    check_logout_metadata(&payload, policy).await?;
     client_entry.metadata = payload;
     Ok(db_client.set_client(client_id, client_entry).await?)
 }
@@ -3526,9 +3898,9 @@ mod tests {
                 "client".into(),
                 ClientEntry::new(
                     "secret",
-                    CoreClientMetadata::new(
+                    SiwxClientMetadata::new(
                         vec![RedirectUrl::new("https://example.com".into()).unwrap()],
-                        EmptyAdditionalClientMetadata {},
+                        LogoutClientMetadata::default(),
                     ),
                     None,
                 ),
@@ -3673,9 +4045,9 @@ mod tests {
             client_id.to_string(),
             ClientEntry::new(
                 "secret",
-                CoreClientMetadata::new(
+                SiwxClientMetadata::new(
                     vec![RedirectUrl::new(ROUND_TRIP_REDIRECT.into()).unwrap()],
-                    EmptyAdditionalClientMetadata {},
+                    LogoutClientMetadata::default(),
                 ),
                 None,
             ),
@@ -4114,9 +4486,9 @@ mod tests {
         let client = |registered: &str| {
             ClientEntry::new(
                 "secret",
-                CoreClientMetadata::new(
+                SiwxClientMetadata::new(
                     vec![RedirectUrl::new(registered.into()).unwrap()],
-                    EmptyAdditionalClientMetadata {},
+                    LogoutClientMetadata::default(),
                 ),
                 None,
             )
@@ -5627,9 +5999,9 @@ mod userinfo_mxid_claim_tests {
 
     /// Register a client, optionally one that wants a SIGNED userinfo response.
     async fn seed_client(db: &RedisClient, client_id: &str, signed: bool) -> anyhow::Result<()> {
-        let mut metadata = CoreClientMetadata::new(
+        let mut metadata = SiwxClientMetadata::new(
             vec![RedirectUrl::new("https://example.com".into()).unwrap()],
-            EmptyAdditionalClientMetadata {},
+            LogoutClientMetadata::default(),
         );
         if signed {
             metadata = metadata
@@ -6057,9 +6429,9 @@ mod sign_in_deactivation_order_tests {
             client_id.clone(),
             ClientEntry::new(
                 "secret",
-                CoreClientMetadata::new(
+                SiwxClientMetadata::new(
                     vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
-                    EmptyAdditionalClientMetadata {},
+                    LogoutClientMetadata::default(),
                 ),
                 None,
             ),
@@ -6324,9 +6696,9 @@ mod device_display_name_tests {
     }
 
     fn client_entry(client_name: Option<&str>) -> ClientEntry {
-        let mut metadata = CoreClientMetadata::new(
+        let mut metadata = SiwxClientMetadata::new(
             vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
-            EmptyAdditionalClientMetadata {},
+            LogoutClientMetadata::default(),
         );
         if let Some(name) = client_name {
             let mut names = LocalizedClaim::new();
@@ -6767,9 +7139,9 @@ mod client_binding_tests {
         grant_types: Option<Vec<CoreGrantType>>,
     ) -> String {
         let id = unique("bind-");
-        let mut metadata = CoreClientMetadata::new(
+        let mut metadata = SiwxClientMetadata::new(
             vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
-            EmptyAdditionalClientMetadata {},
+            LogoutClientMetadata::default(),
         );
         metadata = match registration {
             Registration::Public => {
@@ -6863,7 +7235,7 @@ mod client_binding_tests {
         config: &Config,
         refresh_token: &str,
         who: Presented<'_>,
-    ) -> Result<CoreTokenResponse, CustomError> {
+    ) -> Result<SiwxTokenResponse, CustomError> {
         token(
             TokenForm {
                 code: None,
@@ -6891,7 +7263,7 @@ mod client_binding_tests {
         config: &Config,
         code: &str,
         who: Presented<'_>,
-    ) -> Result<CoreTokenResponse, CustomError> {
+    ) -> Result<SiwxTokenResponse, CustomError> {
         token(
             TokenForm {
                 code: Some(code.to_string()),
@@ -6917,7 +7289,7 @@ mod client_binding_tests {
     /// The answer, reduced to what a client sees: success, `invalid_grant`
     /// (the grant does not belong to this client), or `invalid_client` (the
     /// client did not authenticate).
-    fn outcome(result: &Result<CoreTokenResponse, CustomError>) -> String {
+    fn outcome(result: &Result<SiwxTokenResponse, CustomError>) -> String {
         match result {
             Ok(_) => "ok".to_string(),
             Err(CustomError::BadRequestToken(e)) => match e.error {
@@ -6930,7 +7302,7 @@ mod client_binding_tests {
         }
     }
 
-    fn refresh_token_of(result: Result<CoreTokenResponse, CustomError>) -> String {
+    fn refresh_token_of(result: Result<SiwxTokenResponse, CustomError>) -> String {
         use openidconnect::OAuth2TokenResponse;
         result
             .unwrap_or_else(|e| panic!("the refresh must succeed: {e:?}"))
@@ -7003,9 +7375,9 @@ mod client_binding_tests {
         };
         let config = Config::default();
         let id = unique("prev-client-");
-        let metadata = CoreClientMetadata::new(
+        let metadata = SiwxClientMetadata::new(
             vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
-            EmptyAdditionalClientMetadata {},
+            LogoutClientMetadata::default(),
         )
         .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::ClientSecretBasic));
         let previous_build = serde_json::json!({
@@ -7780,7 +8152,7 @@ mod scope_grant_tests {
         config: &Config,
         client_id: &str,
         code: &str,
-    ) -> CoreTokenResponse {
+    ) -> SiwxTokenResponse {
         token(
             TokenForm {
                 code: Some(code.to_string()),
@@ -7807,13 +8179,13 @@ mod scope_grant_tests {
         config: &Config,
         grants: Option<Vec<CoreGrantType>>,
         scope: Option<&str>,
-    ) -> CoreTokenResponse {
+    ) -> SiwxTokenResponse {
         let client = seed_client_with(db, Registration::Public, grants).await;
         let code = seed_code_with_scope(db, &client, scope).await;
         exchange(db, config, &client, &code).await
     }
 
-    fn scope_of(response: &CoreTokenResponse) -> Option<String> {
+    fn scope_of(response: &SiwxTokenResponse) -> Option<String> {
         response.scopes().map(|scopes| {
             scopes
                 .iter()
@@ -7823,7 +8195,7 @@ mod scope_grant_tests {
         })
     }
 
-    async fn recorded_scope(db: &RedisClient, response: &CoreTokenResponse) -> String {
+    async fn recorded_scope(db: &RedisClient, response: &SiwxTokenResponse) -> String {
         db.check_access_token(response.access_token().secret())
             .await
             .unwrap()
@@ -7962,6 +8334,80 @@ mod scope_grant_tests {
     /// Matrix mode is unchanged: whatever the request asked for, the code grant
     /// records the Matrix scope for the device and issues a refresh token, and
     /// the response carries no `scope`.
+    /// The claims of a response's ID token, decoded without verification.
+    pub(super) fn id_token_claims(response: &SiwxTokenResponse) -> serde_json::Value {
+        let jws = response
+            .extra_fields()
+            .id_token()
+            .expect("the code exchange returns an ID token")
+            .to_string();
+        let payload = jws.split('.').nth(1).expect("a compact JWS");
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap()
+    }
+
+    /// One raw `GET` on the test Redis.
+    pub(super) async fn raw_get(key: &str) -> Option<String> {
+        let url = siwx_oidc::test_support::redis_url();
+        let client = bb8_redis::redis::Client::open(url.as_str()).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        bb8_redis::redis::cmd("GET")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    /// The grant id an access token belongs to, read from the store.
+    async fn grant_of_access_token(access: &str) -> Option<String> {
+        let url = siwx_oidc::test_support::redis_url();
+        let client = bb8_redis::redis::Client::open(url.as_str()).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let key = format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_ACCESS_TOKEN_PREFIX,
+            siwx_oidc::db::tokens::digest(access)
+        );
+        bb8_redis::redis::cmd("HGET")
+            .arg(key)
+            .arg("grant")
+            .query_async(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    /// Every ID token carries the `sid` of the grant the exchange created (I8),
+    /// in both modes, and two exchanges get two different sids.
+    #[tokio::test]
+    async fn every_id_token_carries_the_sid_of_its_grant() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let mut sids = Vec::new();
+        for config in [generic(), generic(), matrix()] {
+            let response = issue(&db, &config, may_refresh(), Some("openid offline_access")).await;
+            let claims = id_token_claims(&response);
+            let sid = claims["sid"]
+                .as_str()
+                .unwrap_or_else(|| panic!("the ID token carries a sid: {claims}"))
+                .to_string();
+            let grant = grant_of_access_token(response.access_token().secret())
+                .await
+                .expect("the access token names its grant");
+            assert_eq!(
+                raw_get(&format!(
+                    "{}/{sid}",
+                    siwx_oidc::db::grant::KV_GRANT_SID_IDX_PREFIX
+                ))
+                .await
+                .as_deref(),
+                Some(grant.as_str()),
+                "the sid names the grant of this exchange"
+            );
+            assert!(!sids.contains(&sid), "each grant has its own sid");
+            sids.push(sid);
+        }
+    }
+
     #[tokio::test]
     async fn matrix_mode_issues_the_matrix_scope_and_a_refresh_token_whatever_was_requested() {
         let Some(db) = siwx_oidc::test_support::redis().await else {
@@ -8010,9 +8456,9 @@ mod scope_grant_tests {
     }
 
     fn registration(grants: Option<Vec<CoreGrantType>>) -> ClientEntry {
-        let mut metadata = CoreClientMetadata::new(
+        let mut metadata = SiwxClientMetadata::new(
             vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
-            EmptyAdditionalClientMetadata {},
+            LogoutClientMetadata::default(),
         );
         if let Some(grants) = grants {
             metadata = metadata.set_grant_types(Some(grants));
@@ -8077,5 +8523,669 @@ mod scope_grant_tests {
         for kept in ["openid", "profile", "urn:matrix:client:api:*"] {
             assert!(scopes.contains(&kept), "{kept} is still advertised");
         }
+    }
+}
+
+#[cfg(test)]
+mod end_session_tests {
+    //! RP-initiated logout (OpenID Connect RP-Initiated Logout 1.0): the
+    //! `id_token_hint` check, the exact `post_logout_redirect_uri` match, the
+    //! registration metadata and discovery. Redis-backed tests skip without it.
+    use super::client_binding_tests::{unique, VERIFIER};
+    use super::scope_grant_tests::id_token_claims;
+    use super::*;
+    use crate::config::Config;
+    use openidconnect::{OAuth2TokenResponse, PostLogoutRedirectUrl};
+
+    fn issuer() -> IssuerUrl {
+        IssuerUrl::from_url(Config::default().base_url)
+    }
+
+    /// An ID token for `client_id` and `did` carrying `sid`, signed by `key`,
+    /// issued `age` seconds ago and valid for `ttl` seconds from then.
+    fn id_token(
+        key: &EcdsaSigningKey,
+        client_id: &str,
+        did: &str,
+        sid: Option<&str>,
+        age: i64,
+        ttl: i64,
+    ) -> String {
+        let iat = Utc::now() - Duration::seconds(age);
+        let claims = SiwxIdTokenClaims::new(
+            issuer(),
+            vec![Audience::new(client_id.to_string())],
+            iat + Duration::seconds(ttl),
+            iat,
+            StandardClaims::new(SubjectIdentifier::new(did.to_string())),
+            SidClaims {
+                sid: sid.map(str::to_string),
+            },
+        );
+        SiwxIdToken::new(
+            claims,
+            key,
+            CoreJwsSigningAlgorithm::EcdsaP256Sha256,
+            None,
+            None,
+        )
+        .unwrap()
+        .to_string()
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    #[test]
+    fn an_id_token_hint_verifies_with_the_live_or_a_retired_key_expired_or_not() {
+        let live = EcdsaSigningKey::generate();
+        let fresh = id_token(&live, "rp", "did:key:zDnLive", Some("SID1"), 0, 300);
+        let expired = id_token(&live, "rp", "did:key:zDnLive", Some("SID1"), 7200, 300);
+        for hint in [&fresh, &expired] {
+            assert_eq!(
+                verify_id_token_hint(hint, &live, &[], &issuer()),
+                Ok(HintClaims {
+                    sub: "did:key:zDnLive".into(),
+                    aud: vec!["rp".into()],
+                    sid: Some("SID1".into()),
+                })
+            );
+        }
+        let old = EcdsaSigningKey::generate();
+        let by_old = id_token(&old, "rp", "did:key:zDnOld", None, 0, 300);
+        assert_eq!(
+            verify_id_token_hint(&by_old, &live, &[old.as_verification_key()], &issuer())
+                .map(|c| c.sid),
+            Ok(None),
+            "a retired key still verifies; a hint without a sid names nothing"
+        );
+        assert_eq!(
+            verify_id_token_hint(&by_old, &live, &[], &issuer()),
+            Err(HintError::UnknownKid)
+        );
+    }
+
+    #[test]
+    fn a_tampered_foreign_unsigned_or_misissued_hint_is_refused() {
+        let live = EcdsaSigningKey::generate();
+        let hint = id_token(&live, "rp", "did:key:zDnLive", Some("SID1"), 0, 300);
+        let parts: Vec<&str> = hint.split('.').collect();
+        let mut claims: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        claims["sid"] = serde_json::json!("SID2");
+        let tampered = format!(
+            "{}.{}.{}",
+            parts[0],
+            b64(claims.to_string().as_bytes()),
+            parts[2]
+        );
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+        let foreign_key = EcdsaSigningKey::generate();
+        let input = format!("{}.{}", parts[0], parts[1]);
+        let foreign = format!("{input}.{}", b64(&foreign_key.sign_es256(input.as_bytes())));
+        let with_alg = |alg: &str| {
+            let mut h = header.clone();
+            h["alg"] = serde_json::json!(alg);
+            format!(
+                "{}.{}.{}",
+                b64(h.to_string().as_bytes()),
+                parts[1],
+                parts[2]
+            )
+        };
+        let mut no_kid = header.clone();
+        no_kid.as_object_mut().unwrap().remove("kid");
+        let no_kid = format!(
+            "{}.{}.{}",
+            b64(no_kid.to_string().as_bytes()),
+            parts[1],
+            parts[2]
+        );
+        let other_issuer = IssuerUrl::new("https://other.example.org/".into()).unwrap();
+        for (what, hint, issuer, expected) in [
+            (
+                "a tampered payload",
+                tampered,
+                issuer(),
+                HintError::Signature,
+            ),
+            (
+                "another key under our kid",
+                foreign,
+                issuer(),
+                HintError::Signature,
+            ),
+            ("alg none", with_alg("none"), issuer(), HintError::Algorithm),
+            (
+                "alg HS256",
+                with_alg("HS256"),
+                issuer(),
+                HintError::Algorithm,
+            ),
+            ("no kid", no_kid, issuer(), HintError::UnknownKid),
+            (
+                "another issuer",
+                hint.clone(),
+                other_issuer,
+                HintError::Issuer,
+            ),
+            (
+                "four parts",
+                format!("{hint}.x"),
+                issuer(),
+                HintError::Malformed,
+            ),
+            (
+                "garbage",
+                "garbage".to_string(),
+                issuer(),
+                HintError::Malformed,
+            ),
+        ] {
+            assert_eq!(
+                verify_id_token_hint(&hint, &live, &[], &issuer),
+                Err(expected),
+                "{what}"
+            );
+        }
+    }
+
+    fn client_metadata(post_logout: &[&str]) -> SiwxClientMetadata {
+        SiwxClientMetadata::new(
+            vec![RedirectUrl::new("https://rp.example.org/cb".into()).unwrap()],
+            LogoutClientMetadata {
+                post_logout_redirect_uris: Some(
+                    post_logout
+                        .iter()
+                        .map(|u| PostLogoutRedirectUrl::new(u.to_string()).unwrap())
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+        )
+        .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::None))
+        .set_grant_types(Some(vec![
+            CoreGrantType::AuthorizationCode,
+            CoreGrantType::RefreshToken,
+        ]))
+    }
+
+    #[test]
+    fn post_logout_redirect_uri_matching_is_exact() {
+        let client = ClientEntry::new(
+            "s",
+            client_metadata(&["https://rp.example.org/bye?x=1"]),
+            None,
+        );
+        let is = |u: &str| post_logout_redirect_uri_is_registered(&client, &Url::parse(u).unwrap());
+        assert!(is("https://rp.example.org/bye?x=1"));
+        for other in [
+            "https://rp.example.org/bye",
+            "https://rp.example.org/bye?x=1&y=2",
+            "https://rp.example.org/bye?x=2",
+            "https://rp.example.org/bye/?x=1",
+            "http://rp.example.org/bye?x=1",
+            "https://rp.example.org.evil.example/bye?x=1",
+        ] {
+            assert!(!is(other), "{other}");
+        }
+        let none = ClientEntry::new("s", client_metadata(&[]), None);
+        assert!(!post_logout_redirect_uri_is_registered(
+            &none,
+            &Url::parse("https://rp.example.org/bye?x=1").unwrap()
+        ));
+    }
+
+    #[test]
+    fn discovery_advertises_the_end_session_endpoint() {
+        for config in [
+            Config::default(),
+            Config {
+                mas_shared_secret: Some("s".into()),
+                ..Config::default()
+            },
+        ] {
+            let value = provider_metadata_value(&config, false).unwrap();
+            assert_eq!(
+                value["end_session_endpoint"],
+                "http://127.0.0.1:8000/end_session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_stores_and_echoes_post_logout_redirect_uris_and_refuses_a_fragment() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let base = Config::default().base_url;
+        let response = register(
+            client_metadata(&["https://rp.example.org/bye"]),
+            base.clone(),
+            &db,
+            &RegistrationPolicy::default(),
+        )
+        .await
+        .expect("registration succeeds");
+        let echoed = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            echoed["post_logout_redirect_uris"],
+            serde_json::json!(["https://rp.example.org/bye"])
+        );
+        let stored = db
+            .get_client(response.client_id().to_string())
+            .await
+            .unwrap()
+            .expect("stored");
+        assert!(post_logout_redirect_uri_is_registered(
+            &stored,
+            &Url::parse("https://rp.example.org/bye").unwrap()
+        ));
+        let refused = register(
+            client_metadata(&["https://rp.example.org/bye#f"]),
+            base,
+            &db,
+            &RegistrationPolicy::default(),
+        )
+        .await;
+        match refused {
+            Err(CustomError::BadRequestRegister(e)) => assert_eq!(
+                serde_json::to_value(&e).unwrap()["error"],
+                "invalid_client_metadata"
+            ),
+            other => panic!("a fragment must be refused, got {other:?}"),
+        }
+    }
+
+    /// End-to-end in process, generic mode: an `oidc` grant from a real code
+    /// exchange is ended by its ID token, and the RP is sent back to its exact
+    /// registered URI with `state`; an expired hint naming another grant ends
+    /// that one; nothing else ends.
+    #[tokio::test]
+    async fn end_session_ends_the_named_oidc_grant_and_redirects_with_state() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let key = EcdsaSigningKey::generate();
+        let client_id = unique("endsess-");
+        db.set_client(
+            client_id.clone(),
+            ClientEntry::new("s", client_metadata(&["https://rp.example.org/bye"]), None),
+        )
+        .await
+        .unwrap();
+        let code = super::client_binding_tests::seed_code_with_scope(
+            &db,
+            &client_id,
+            Some("openid offline_access"),
+        )
+        .await;
+        let response = token(
+            TokenForm {
+                code: Some(code),
+                client_id: Some(client_id.clone()),
+                client_secret: None,
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(VERIFIER.to_string()),
+                refresh_token: None,
+                device_code: None,
+            },
+            ClientCredentials::default(),
+            &key,
+            &config,
+            &db,
+            None,
+        )
+        .await
+        .expect("the exchange succeeds");
+        let hint = response.extra_fields().id_token().unwrap().to_string();
+        let did = id_token_claims(&response)["sub"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let access = response.access_token().secret().clone();
+        let refresh = response
+            .refresh_token()
+            .expect("offline_access")
+            .secret()
+            .clone();
+
+        // A second grant of the same client and user, named by an expired hint.
+        let other = db
+            .issue_grant(&NewGrant {
+                kind: GrantKind::Oidc,
+                username: unique("lp"),
+                did: did.clone(),
+                client_id: client_id.clone(),
+                confidential_client: false,
+                device_id: String::new(),
+                scope: "openid".into(),
+                name: did.clone(),
+                auth_ms: None,
+                access_ttl: ACCESS_TOKEN_TTL,
+                refresh_inactivity_secs: None,
+            })
+            .await
+            .unwrap();
+        let expired = id_token(&key, &client_id, &did, other.sid.as_deref(), 7200, 300);
+
+        let params = |hint: &str, uri: Option<&str>| EndSessionParams {
+            id_token_hint: Some(hint.to_string()),
+            client_id: None,
+            post_logout_redirect_uri: uri.map(str::to_string),
+            state: Some("s 1&2".into()),
+        };
+        let refused = end_session(
+            params(&hint, Some("https://rp.example.org/bye/")),
+            &key,
+            &[],
+            &config,
+            &db,
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(CustomError::BadRequest(_))),
+            "{refused:?}"
+        );
+        assert!(
+            db.check_access_token(&access).await.unwrap().is_some(),
+            "a refused request ends nothing"
+        );
+
+        let outcome = end_session(
+            params(&hint, Some("https://rp.example.org/bye")),
+            &key,
+            &[],
+            &config,
+            &db,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            EndSessionOutcome::Redirect(
+                Url::parse("https://rp.example.org/bye?state=s+1%262").unwrap()
+            )
+        );
+        assert!(
+            db.check_access_token(&access).await.unwrap().is_none(),
+            "the access token is inactive"
+        );
+        assert!(
+            matches!(
+                db.peek_refresh_token(&refresh).await.unwrap(),
+                RefreshPeek::Unknown
+            ),
+            "the refresh token names nothing"
+        );
+        assert!(
+            db.check_access_token(&other.access_token)
+                .await
+                .unwrap()
+                .is_some(),
+            "only the named grant ended"
+        );
+
+        let outcome = end_session(params(&expired, None), &key, &[], &config, &db)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            EndSessionOutcome::SignedOut { ended: true },
+            "an expired hint still names its grant"
+        );
+        assert!(db
+            .check_access_token(&other.access_token)
+            .await
+            .unwrap()
+            .is_none());
+        let again = end_session(params(&expired, None), &key, &[], &config, &db)
+            .await
+            .unwrap();
+        assert_eq!(again, EndSessionOutcome::SignedOut { ended: false });
+    }
+
+    /// A store fault on the way is a retryable 503, never an answer about the
+    /// request: a fault while ending the grant the hint's `sid` names is not
+    /// "nothing to end" (200), and a fault while reading the client for its
+    /// `post_logout_redirect_uri` is not "not registered" (400). Each fault is a
+    /// value of the wrong type at the key the step reads.
+    #[tokio::test]
+    async fn a_store_fault_while_ending_the_grant_or_reading_the_client_is_a_503() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let key = EcdsaSigningKey::generate();
+        let did = "did:key:zDnEndSessionFault";
+        let params = |hint: String, uri: Option<&str>| EndSessionParams {
+            id_token_hint: Some(hint),
+            client_id: None,
+            post_logout_redirect_uri: uri.map(str::to_string),
+            state: None,
+        };
+
+        // Ending the grant: the sid index is not a string.
+        let client_id = unique("endsess-fault-grant-");
+        let sid = unique("SIDFAULT");
+        let sid_idx = format!("{}/{sid}", siwx_oidc::db::grant::KV_GRANT_SID_IDX_PREFIX);
+        db.sadd_raw(&sid_idx, "x").await.unwrap();
+        let hint = id_token(&key, &client_id, did, Some(&sid), 0, 300);
+        let outcome = end_session(params(hint, None), &key, &[], &config, &db).await;
+        db.del_raw(&sid_idx).await.ok();
+        assert!(
+            matches!(outcome, Err(CustomError::ServiceUnavailable(_))),
+            "a fault ending the grant is a 503, got {outcome:?}"
+        );
+
+        // Reading the client: its registration is not a string.
+        let client_id = unique("endsess-fault-client-");
+        let client_key = format!("clients/{client_id}");
+        db.sadd_raw(&client_key, "x").await.unwrap();
+        let hint = id_token(&key, &client_id, did, Some(&unique("SID")), 0, 300);
+        let outcome = end_session(
+            params(hint, Some("https://rp.example.org/bye")),
+            &key,
+            &[],
+            &config,
+            &db,
+        )
+        .await;
+        db.del_raw(&client_key).await.ok();
+        assert!(
+            matches!(outcome, Err(CustomError::ServiceUnavailable(_))),
+            "a fault reading the client is a 503, got {outcome:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod backchannel_registration_tests {
+    //! OpenID Connect Back-Channel Logout 1.0: the registration metadata, the
+    //! SSRF guard at registration, the D4 switch and discovery.
+    use super::*;
+    use crate::config::Config;
+
+    fn payload(extra: serde_json::Value) -> SiwxClientMetadata {
+        let mut doc = serde_json::json!({ "redirect_uris": ["https://rp.example.org/cb"] });
+        for (k, v) in extra.as_object().unwrap() {
+            doc[k] = v.clone();
+        }
+        serde_json::from_value(doc).unwrap()
+    }
+
+    fn refused_as_metadata(result: Result<impl std::fmt::Debug, CustomError>, what: &str) {
+        match result {
+            Err(CustomError::BadRequestRegister(e)) => assert_eq!(
+                serde_json::to_value(&e).unwrap()["error"],
+                "invalid_client_metadata",
+                "{what}"
+            ),
+            other => panic!("{what} must be refused as invalid_client_metadata, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_stores_backchannel_logout_metadata_and_refuses_an_unsafe_uri() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let base = Config::default().base_url;
+        let open = RegistrationPolicy::default();
+        let response = register(
+            payload(serde_json::json!({
+                "backchannel_logout_uri": "https://192.0.2.10/bcl?rp=1",
+                "backchannel_logout_session_required": true,
+            })),
+            base.clone(),
+            &db,
+            &open,
+        )
+        .await
+        .expect("a public https URI is accepted");
+        let echoed = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            echoed["backchannel_logout_uri"],
+            "https://192.0.2.10/bcl?rp=1"
+        );
+        assert_eq!(echoed["backchannel_logout_session_required"], true);
+        let stored = db
+            .get_client(response.client_id().to_string())
+            .await
+            .unwrap()
+            .expect("stored");
+        let extra = stored.metadata.additional_metadata();
+        assert_eq!(
+            extra.backchannel_logout_uri.as_ref().map(Url::as_str),
+            Some("https://192.0.2.10/bcl?rp=1")
+        );
+        assert_eq!(extra.backchannel_logout_session_required, Some(true));
+
+        for uri in [
+            "http://192.0.2.10/bcl",
+            "https://192.0.2.10/bcl#f",
+            "https://127.0.0.1/bcl",
+            "https://[::1]/bcl",
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.1/bcl",
+            "https://[fd00::1]/bcl",
+            "https://100.64.0.1/bcl",
+            "https://localhost/bcl",
+        ] {
+            let result = register(
+                payload(serde_json::json!({ "backchannel_logout_uri": uri })),
+                base.clone(),
+                &db,
+                &open,
+            )
+            .await;
+            refused_as_metadata(result, uri);
+        }
+
+        let listed = RegistrationPolicy {
+            guard: crate::backchannel::UriGuard::new(&["localhost".to_string()]),
+            ..RegistrationPolicy::default()
+        };
+        register(
+            payload(serde_json::json!({ "backchannel_logout_uri": "http://localhost:9/bcl" })),
+            base.clone(),
+            &db,
+            &listed,
+        )
+        .await
+        .expect("an allowlisted host is accepted");
+
+        let id = response.client_id().to_string();
+        let token = response
+            .registration_access_token()
+            .unwrap()
+            .secret()
+            .clone();
+        let update = client_update(
+            id,
+            payload(serde_json::json!({ "backchannel_logout_uri": "https://127.0.0.1/bcl" })),
+            Some(headers::Authorization::bearer(&token).unwrap().0),
+            &db,
+            &open,
+        )
+        .await;
+        refused_as_metadata(update, "an update to a loopback URI");
+    }
+
+    #[tokio::test]
+    async fn the_d4_switch_requires_a_backchannel_uri_from_a_client_that_may_refresh() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let generic_on = Config {
+            backchannel_logout_required_for_refresh: true,
+            ..Config::default()
+        };
+        let matrix_on = Config {
+            mas_shared_secret: Some("s".into()),
+            ..generic_on.clone()
+        };
+        let base = Config::default().base_url;
+        let required = RegistrationPolicy::from_config(&generic_on);
+        assert!(required.require_backchannel_for_refresh);
+        for (what, extra) in [
+            ("no grant_types (refresh allowed)", serde_json::json!({})),
+            (
+                "grant_types with refresh_token",
+                serde_json::json!({"grant_types": ["authorization_code", "refresh_token"]}),
+            ),
+        ] {
+            let result = register(payload(extra), base.clone(), &db, &required).await;
+            refused_as_metadata(result, what);
+        }
+        for (what, extra, policy) in [
+            (
+                "a client that may not refresh",
+                serde_json::json!({"grant_types": ["authorization_code"]}),
+                required.clone(),
+            ),
+            (
+                "a client with a back-channel URI",
+                serde_json::json!({"backchannel_logout_uri": "https://192.0.2.10/bcl"}),
+                required.clone(),
+            ),
+            (
+                "the switch off",
+                serde_json::json!({}),
+                RegistrationPolicy::from_config(&Config::default()),
+            ),
+            (
+                "Matrix mode",
+                serde_json::json!({}),
+                RegistrationPolicy::from_config(&matrix_on),
+            ),
+        ] {
+            register(payload(extra), base.clone(), &db, &policy)
+                .await
+                .unwrap_or_else(|e| panic!("{what} registers: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn discovery_advertises_backchannel_logout_only_in_generic_mode() {
+        let generic = provider_metadata_value(&Config::default(), false).unwrap();
+        assert_eq!(generic["backchannel_logout_supported"], true);
+        assert_eq!(generic["backchannel_logout_session_supported"], true);
+        let matrix = provider_metadata_value(
+            &Config {
+                mas_shared_secret: Some("s".into()),
+                ..Config::default()
+            },
+            true,
+        )
+        .unwrap();
+        assert!(
+            matrix.get("backchannel_logout_supported").is_none()
+                && matrix.get("backchannel_logout_session_supported").is_none(),
+            "Matrix mode sends no logout token, so it advertises none: {matrix}"
+        );
     }
 }

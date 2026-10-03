@@ -247,6 +247,21 @@ pub struct Config {
     /// Env: `SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS_BY_CLIENT__<client id>`
     #[serde(default)]
     pub grant_absolute_lifetime_secs_by_client: HashMap<String, u64>,
+    /// Hosts a `backchannel_logout_uri` may name without the address check
+    /// (OIDC Back-Channel Logout; the SSRF guard): a listed host may resolve
+    /// to a loopback or private address and may use `http`. Matched against
+    /// the URI's host, case-insensitively, any port. Empty (the default):
+    /// every URI must be `https` and resolve only to public addresses.
+    /// Env: `SIWXOIDC_BACKCHANNEL_LOGOUT_ALLOWED_HOSTS='["rp.internal"]'`
+    #[serde(default)]
+    pub backchannel_logout_allowed_hosts: Vec<String>,
+    /// Refuse the dynamic registration of a client that may receive refresh
+    /// tokens unless it registers a `backchannel_logout_uri` (D4,
+    /// provisional). Enforced in generic mode only: in Matrix mode every grant
+    /// is a Matrix device grant, which never sends a logout token. Default off.
+    /// Env: `SIWXOIDC_BACKCHANNEL_LOGOUT_REQUIRED_FOR_REFRESH`
+    #[serde(default)]
+    pub backchannel_logout_required_for_refresh: bool,
 }
 
 /// The shortest configurable absolute grant lifetime: a device code's
@@ -320,6 +335,8 @@ impl Default for Config {
             admin_token_localpart: "siwx-admin".to_string(),
             grant_absolute_lifetime_secs: None,
             grant_absolute_lifetime_secs_by_client: HashMap::new(),
+            backchannel_logout_allowed_hosts: Vec::new(),
+            backchannel_logout_required_for_refresh: false,
         }
     }
 }

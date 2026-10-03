@@ -53,6 +53,12 @@ pub fn new_grant_handle() -> String {
     random_base62(HANDLE_LEN)
 }
 
+/// A new OIDC session id (`sid`, 22 base62, about 131 random bits): random,
+/// never derived from a handle, a token or a Matrix device id.
+pub fn new_session_id() -> String {
+    random_base62(HANDLE_LEN)
+}
+
 /// A new refresh token of the grant named by `handle`: `mcr_{handle}_{secret}`.
 pub fn new_refresh_token(handle: &str) -> String {
     format!(

@@ -1246,3 +1246,325 @@ fn a_lifted_grant_is_a_matrix_device_grant_exactly_when_its_scope_carries_the_ma
 
 mod epochs;
 mod lifetime;
+
+// -- `sid` (I8, Phase 4) ------------------------------------------------------
+
+/// The grant's `sid` and what its index names, read from the store.
+async fn sid_of(client: &RedisClient, id: &GrantId) -> Option<String> {
+    raw::<Option<String>>(client, &["HGET", &grant_key(id), "sid"]).await
+}
+
+async fn sid_index(client: &RedisClient, sid: &str) -> Option<String> {
+    raw::<Option<String>>(
+        client,
+        &["GET", &format!("{KV_GRANT_SID_IDX_PREFIX}/{sid}")],
+    )
+    .await
+}
+
+/// Whether `sid` and `other` share a run of [`SID_WINDOW`] characters: a sid
+/// cut from (or embedding) a credential or identifier shares one with it,
+/// while a random 22-character base62 sid does so with odds below 1e-9.
+const SID_WINDOW: usize = 8;
+fn shares_a_window(sid: &str, other: &str) -> bool {
+    sid.len() >= SID_WINDOW
+        && (0..=sid.len() - SID_WINDOW).any(|i| other.contains(&sid[i..i + SID_WINDOW]))
+}
+
+/// Every grant that comes with an ID token (`matrix_device`, `oidc`) gets its
+/// own random `sid`: 22 base62 characters, different per grant, indexed
+/// `idx:grants:sid/{sid}` -> grant id for no longer than the grant lives. A
+/// `service` grant (an admin token, no ID token) has none.
+///
+/// Randomness itself is not observable from outside; what is pinned is its
+/// consequence: across many grants every sid is distinct, and no sid shares
+/// an 8-character run with anything an RP or another user could learn or
+/// that names the grant (the grant handle and id, the access and refresh
+/// tokens and their digests, the device id, the username, the DID). A sid
+/// derived from any of them (a prefix, a substring, a slice of a digest)
+/// fails here.
+#[tokio::test]
+async fn every_grant_with_an_id_token_has_its_own_random_sid() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("sid{}", nonce());
+    let device = format!("SIWX_{}", nonce());
+    let mut a = matrix_grant(&user, "");
+    a.kind = GrantKind::Oidc;
+    let a = issue(&client, &a).await;
+    let mut b = matrix_grant(&user, "");
+    b.kind = GrantKind::Oidc;
+    let b = issue(&client, &b).await;
+    let c = issue(&client, &matrix_grant(&user, &device)).await;
+
+    let mut seen = Vec::new();
+    for issued in [&a, &b, &c] {
+        let sid = sid_of(&client, &issued.grant_id)
+            .await
+            .expect("a grant with an ID token carries a sid");
+        assert_eq!(sid.len(), 22, "sid {sid:?}");
+        assert!(sid.chars().all(|ch| ch.is_ascii_alphanumeric()), "{sid:?}");
+        assert!(!sid.contains(&device) && !device.contains(&sid));
+        assert_ne!(sid, issued.grant_id.as_str());
+        assert!(!seen.contains(&sid), "every grant gets its own sid");
+        assert_eq!(
+            sid_index(&client, &sid).await.as_deref(),
+            Some(issued.grant_id.as_str()),
+            "the sid index names its grant"
+        );
+        let idx_ttl: i64 = raw(
+            &client,
+            &["TTL", &format!("{KV_GRANT_SID_IDX_PREFIX}/{sid}")],
+        )
+        .await;
+        let grant_ttl: i64 = raw(&client, &["TTL", &grant_key(&issued.grant_id)]).await;
+        assert!(
+            idx_ttl > 0 && idx_ttl <= grant_ttl,
+            "index TTL {idx_ttl}, grant TTL {grant_ttl}"
+        );
+        seen.push(sid);
+    }
+
+    // Many grants: every sid distinct, none sharing a run with what names the
+    // grant or with any credential or identifier of it.
+    let mut sids: std::collections::HashSet<String> = seen.into_iter().collect();
+    for i in 0..40 {
+        let mut new = matrix_grant(&format!("{user}m{i}"), &format!("SIWX_{}", nonce()));
+        if i % 2 == 0 {
+            new.kind = GrantKind::Oidc;
+            new.device_id = String::new();
+        }
+        let issued = issue(&client, &new).await;
+        let sid = sid_of(&client, &issued.grant_id)
+            .await
+            .expect("a grant with an ID token carries a sid");
+        assert!(sids.insert(sid.clone()), "sid {sid:?} issued twice");
+        let refresh = issued
+            .refresh_token
+            .clone()
+            .expect("a grant with an ID token here has a refresh token");
+        let handle = refresh
+            .strip_prefix(tokens::REFRESH_TOKEN_PREFIX)
+            .and_then(|rest| rest.split('_').next())
+            .expect("mcr_{handle}_{secret}")
+            .to_string();
+        assert_eq!(GrantId::of_handle(&handle), issued.grant_id);
+        let named = [
+            ("the grant handle", handle.clone()),
+            ("the grant id", issued.grant_id.as_str().to_string()),
+            ("the access token", issued.access_token.clone()),
+            (
+                "the access token digest",
+                tokens::digest(&issued.access_token),
+            ),
+            ("the refresh token", refresh.clone()),
+            ("the refresh token digest", tokens::digest(&refresh)),
+            ("the device id", new.device_id),
+            ("the username", new.username),
+            ("the DID", new.did),
+        ];
+        for (what, value) in named {
+            assert!(
+                !shares_a_window(&sid, &value),
+                "sid {sid:?} shares an {SID_WINDOW}-character run with {what}"
+            );
+        }
+    }
+    assert_eq!(sids.len(), 43, "every grant gets its own sid");
+
+    let admin = issue(
+        &client,
+        &NewGrant {
+            kind: GrantKind::Service,
+            username: format!("admin{}", nonce()),
+            did: "did:web:service".into(),
+            client_id: "siwx-oidc-admin".into(),
+            confidential_client: true,
+            device_id: String::new(),
+            scope: "urn:synapse:admin:*".into(),
+            name: "admin".into(),
+            auth_ms: None,
+            access_ttl: 120,
+            refresh_inactivity_secs: None,
+        },
+    )
+    .await;
+    assert_eq!(sid_of(&client, &admin.grant_id).await, None);
+}
+
+/// The sid index lives exactly as long as its grant: a rotation extends both
+/// to the same TTL, and every script that deletes a grant deletes its index
+/// entry with it.
+#[tokio::test]
+async fn the_sid_index_lives_and_dies_with_its_grant() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("sidlife{}", nonce());
+    let mut new = matrix_grant(&user, "");
+    new.kind = GrantKind::Oidc;
+    new.auth_ms = None;
+    let issued = issue(&client, &new).await;
+    let sid = sid_of(&client, &issued.grant_id)
+        .await
+        .expect("the grant carries a sid");
+    let idx = format!("{KV_GRANT_SID_IDX_PREFIX}/{sid}");
+    raw::<i64>(&client, &["EXPIRE", &idx, "60"]).await;
+    raw::<i64>(&client, &["EXPIRE", &grant_key(&issued.grant_id), "60"]).await;
+    let pair = rotated(rotate(&client, issued.refresh_token.as_deref().unwrap()).await);
+    let grant_ttl: i64 = raw(&client, &["TTL", &grant_key(&issued.grant_id)]).await;
+    let idx_ttl: i64 = raw(&client, &["TTL", &idx]).await;
+    assert!(
+        grant_ttl > 60,
+        "the rotation extends the grant: {grant_ttl}"
+    );
+    assert!(
+        (grant_ttl - idx_ttl).abs() <= 1,
+        "the rotation extends the index with it: grant {grant_ttl}, index {idx_ttl}"
+    );
+    assert_eq!(
+        sid_of(&client, &issued.grant_id).await.as_deref(),
+        Some(sid.as_str()),
+        "a rotation keeps the sid"
+    );
+
+    client
+        .revoke_grant_of_token(&pair.pair.refresh_token)
+        .await
+        .unwrap()
+        .expect("the current refresh token names the grant");
+    assert_eq!(
+        sid_index(&client, &sid).await,
+        None,
+        "revoke drops the index"
+    );
+
+    // The user-wide and device-wide revocations drop it too.
+    let device = format!("SIWX_{}", nonce());
+    let d = issue(&client, &matrix_grant(&user, &device)).await;
+    let d_sid = sid_of(&client, &d.grant_id).await.expect("sid");
+    client
+        .revoke_grants_for_device(&user, &device)
+        .await
+        .unwrap();
+    assert_eq!(
+        sid_index(&client, &d_sid).await,
+        None,
+        "device revoke drops it"
+    );
+    let mut u = matrix_grant(&user, "");
+    u.kind = GrantKind::Oidc;
+    u.auth_ms = None;
+    let u = issue(&client, &u).await;
+    let u_sid = sid_of(&client, &u.grant_id).await.expect("sid");
+    client.revoke_grants_for_user(&user).await.unwrap();
+    assert_eq!(
+        sid_index(&client, &u_sid).await,
+        None,
+        "user revoke drops it"
+    );
+}
+
+/// The scripts spell the sid index the way the library reads it.
+#[test]
+fn the_scripts_name_the_sid_index_the_library_reads() {
+    let literal = format!("'{KV_GRANT_SID_IDX_PREFIX}/'");
+    for (name, script) in [
+        ("drop_grant", LUA_DROP),
+        ("issue", ISSUE_LUA),
+        ("rotate", ROTATE_LUA),
+    ] {
+        assert!(script.contains(&literal), "{name} must name {literal}");
+    }
+}
+
+/// `drop_grant` queues into the outbox the worker reads.
+#[test]
+fn drop_grant_names_the_outbox_the_worker_reads() {
+    let literal = format!("'{}'", crate::db::outbox::KV_BACKCHANNEL_OUTBOX);
+    assert!(
+        LUA_DROP.contains(&literal),
+        "drop_grant must name {literal}"
+    );
+}
+
+/// `end_grant_by_sid` deletes exactly the grant the sid names, with its index
+/// entries, only for the client and DID it was issued to; any other sid, or a
+/// second call, deletes nothing.
+#[tokio::test]
+async fn end_grant_by_sid_deletes_exactly_the_named_grant_of_its_client_and_did() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("endsid{}", nonce());
+    let device = format!("SIWX_{}", nonce());
+    let new = matrix_grant(&user, &device);
+    let named = issue(&client, &new).await;
+    let sibling = issue(&client, &matrix_grant(&user, &device)).await;
+    let sid = named.sid.clone().expect("a matrix grant carries a sid");
+    assert_eq!(
+        sid_of(&client, &named.grant_id).await.as_deref(),
+        Some(sid.as_str())
+    );
+
+    for (client_id, did) in [
+        ("client-b", new.did.as_str()),
+        ("client-a", "did:key:zOther"),
+    ] {
+        assert_eq!(
+            client.end_grant_by_sid(&sid, client_id, did).await.unwrap(),
+            EndedGrant::Mismatch,
+            "{client_id} {did}"
+        );
+    }
+    assert!(client
+        .lookup_access_token(&named.access_token)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        client
+            .end_grant_by_sid("NoSuchSid0000000000000", "client-a", &new.did)
+            .await
+            .unwrap(),
+        EndedGrant::NotFound
+    );
+
+    assert_eq!(
+        client
+            .end_grant_by_sid(&sid, "client-a", &new.did)
+            .await
+            .unwrap(),
+        EndedGrant::Ended {
+            grant_id: named.grant_id.clone(),
+            kind: GrantKind::MatrixDevice
+        }
+    );
+    assert!(client
+        .lookup_access_token(&named.access_token)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(sid_index(&client, &sid).await, None);
+    let members: Vec<String> = raw(&client, &["SMEMBERS", &user_idx_key(&user)]).await;
+    assert_eq!(members, vec![sibling.grant_id.as_str().to_string()]);
+    let members: Vec<String> = raw(&client, &["SMEMBERS", &device_idx_key(&user, &device)]).await;
+    assert_eq!(members, vec![sibling.grant_id.as_str().to_string()]);
+    assert!(
+        !tombstone(&client, &device_tombstone_key(&user, &device)).await,
+        "ending one grant plants no device tombstone"
+    );
+    assert!(client
+        .lookup_access_token(&sibling.access_token)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        client
+            .end_grant_by_sid(&sid, "client-a", &new.did)
+            .await
+            .unwrap(),
+        EndedGrant::NotFound
+    );
+}

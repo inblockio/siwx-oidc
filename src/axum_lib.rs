@@ -17,9 +17,7 @@ use axum_extra::{
     TypedHeader,
 };
 use headers::Header;
-use openidconnect::core::{
-    CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType, CoreJsonWebKeySet,
-};
+use openidconnect::core::{CoreErrorResponseType, CoreJsonWebKeySet};
 use std::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
@@ -333,6 +331,44 @@ async fn token(
     Ok(value.into())
 }
 
+async fn end_session_get(
+    State(state): State<AppState>,
+    Query(params): Query<oidc::EndSessionParams>,
+) -> Result<Response, CustomError> {
+    end_session_response(&state, params).await
+}
+
+async fn end_session_post(
+    State(state): State<AppState>,
+    Form(params): Form<oidc::EndSessionParams>,
+) -> Result<Response, CustomError> {
+    end_session_response(&state, params).await
+}
+
+/// RP-initiated logout (`oidc::end_session`): a 303 to the registered
+/// `post_logout_redirect_uri`, else the signed-out page.
+async fn end_session_response(
+    state: &AppState,
+    params: oidc::EndSessionParams,
+) -> Result<Response, CustomError> {
+    let outcome = oidc::end_session(
+        params,
+        &state.signing_key,
+        &state.retired_verification_keys,
+        &state.config,
+        &state.redis_client,
+    )
+    .await?;
+    Ok(match outcome {
+        oidc::EndSessionOutcome::Redirect(uri) => Redirect::to(uri.as_str()).into_response(),
+        oidc::EndSessionOutcome::SignedOut { ended } => (
+            [(header::CACHE_CONTROL, "no-store")],
+            axum::response::Html(oidc::signed_out_page(ended)),
+        )
+            .into_response(),
+    })
+}
+
 async fn authorize(
     State(state): State<AppState>,
     Query(params): Query<oidc::AuthorizeParams>,
@@ -400,9 +436,11 @@ async fn sign_in(
 
 async fn register(
     State(state): State<AppState>,
-    Json(payload): Json<CoreClientMetadata>,
-) -> Result<(StatusCode, Json<CoreClientRegistrationResponse>), CustomError> {
-    let registration = oidc::register(payload, state.config.base_url, &state.redis_client).await?;
+    Json(payload): Json<SiwxClientMetadata>,
+) -> Result<(StatusCode, Json<SiwxClientRegistrationResponse>), CustomError> {
+    let policy = oidc::RegistrationPolicy::from_config(&state.config);
+    let registration =
+        oidc::register(payload, state.config.base_url, &state.redis_client, &policy).await?;
     Ok((StatusCode::CREATED, registration.into()))
 }
 
@@ -481,7 +519,7 @@ async fn userinfo_post(
 async fn clientinfo(
     State(state): State<AppState>,
     Path(client_id): Path<String>,
-) -> Result<Json<CoreClientMetadata>, CustomError> {
+) -> Result<Json<SiwxClientMetadata>, CustomError> {
     Ok(oidc::clientinfo(client_id, &state.redis_client)
         .await?
         .into())
@@ -491,13 +529,14 @@ async fn client_update(
     State(state): State<AppState>,
     Path(client_id): Path<String>,
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
-    Json(payload): Json<CoreClientMetadata>,
+    Json(payload): Json<SiwxClientMetadata>,
 ) -> Result<(), CustomError> {
     oidc::client_update(
         client_id,
         payload,
         bearer.map(|b| b.0 .0),
         &state.redis_client,
+        &oidc::RegistrationPolicy::from_config(&state.config),
     )
     .await
 }
@@ -598,8 +637,9 @@ fn user_session_token(
 
 /// Resolve the opaque `siwx_user` login cookie to a DID for scoping a passkey picker,
 /// or `None` (usernameless) when `force_all`, or when the cookie is absent, forged, or
-/// expired. NEVER errors: a Redis hiccup degrades to `None`. The login handler inlines
-/// the same read; the account + device re-auth start handlers share this.
+/// expired. NEVER errors: a Redis hiccup degrades to `None`. Every passkey picker
+/// reads the cookie through this: the login handler and the account + device re-auth
+/// start handlers.
 ///
 /// Enumeration-safety: the cookie value is an opaque server token (two UUIDs); a
 /// forged/guessed value is a Redis miss -> `None` -> usernameless, leaking nothing.
@@ -810,22 +850,15 @@ async fn webauthn_authenticate_start(
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-    // Read the opaque `siwx_user` cookie -> DID (Redis). A missing/forged/expired
-    // token resolves to None -> usernameless (enumeration-safe). When forced, skip
-    // the lookup entirely.
-    let scope_did = if force_all {
-        None
-    } else {
-        match cookies.get(USER_SESSION_COOKIE) {
-            Some(token) => state
-                .redis_client
-                .lookup_user_session(token)
-                .await
-                .ok()
-                .flatten(),
-            None => None,
-        }
-    };
+    // Read the opaque `siwx_user` cookie -> DID through the helper every passkey
+    // picker shares. A missing/forged/expired token or a Redis fault resolves to
+    // None -> usernameless (enumeration-safe); when forced, there is no lookup.
+    let scope_did = user_session_scope_did(
+        &state.redis_client,
+        &Some(TypedHeader(cookies.clone())),
+        force_all,
+    )
+    .await;
 
     let challenge = wa::authenticate_start(
         &state.webauthn,
@@ -1033,7 +1066,6 @@ fn user_cookie_set(base_url: &url::Url, token: &str) -> String {
 
 /// `Set-Cookie` value that clears the opaque login user-session (escape hatch /
 /// sign-out). Mirrors [`account_cookie_clear`] with `Path=/`.
-#[allow(dead_code)]
 fn user_cookie_clear(base_url: &url::Url) -> String {
     let secure = if base_url.scheme() == "https" {
         "; Secure"
@@ -1220,6 +1252,46 @@ async fn account_action_handler(
         }
     }
     Ok((headers, Json(response)))
+}
+
+/// `POST /account/sign_out`: the account page's explicit sign-out. Ends this
+/// browser's account session and `siwx_user` picker hint (each found by the
+/// digest of the cookie presented) and clears both cookies; the sessions of
+/// other browsers stay. Idempotent: without cookies it clears them all the
+/// same. A store fault is the retryable 503, never a sign-out that reports
+/// success while a session stays live.
+async fn account_sign_out_handler(
+    State(state): State<AppState>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
+) -> Result<(axum::http::HeaderMap, Json<serde_json::Value>), CustomError> {
+    if let Some(token) = account_session_token(&cookies) {
+        state
+            .redis_client
+            .end_own_session(OwnSession::Account, token)
+            .await
+            .map_err(oidc::store_unavailable)?;
+    }
+    if let Some(token) = cookies
+        .as_ref()
+        .and_then(|TypedHeader(c)| c.get(USER_SESSION_COOKIE))
+    {
+        state
+            .redis_client
+            .end_own_session(OwnSession::PickerHint, token)
+            .await
+            .map_err(oidc::store_unavailable)?;
+    }
+    let mut headers = axum::http::HeaderMap::new();
+    for cookie in [
+        account_cookie_clear(&state.config.base_url),
+        user_cookie_clear(&state.config.base_url),
+    ] {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+            headers.append(axum::http::header::SET_COOKIE, v);
+        }
+    }
+    info!("account page sign-out");
+    Ok((headers, Json(serde_json::json!({ "signed_out": true }))))
 }
 
 async fn account_passkey_start_handler(
@@ -1526,6 +1598,30 @@ pub async fn main() {
         synapse_client,
     };
 
+    // Back-channel logout: one outbox worker per instance (claims are atomic,
+    // so instances never deliver one entry twice at once). Never awaited by a
+    // request; it stops with the process.
+    tokio::spawn(
+        crate::backchannel::Worker {
+            redis: state.redis_client.clone(),
+            signing_key: state.signing_key.clone(),
+            issuer: openidconnect::IssuerUrl::from_url(state.config.base_url.clone())
+                .as_str()
+                .to_string(),
+            guard: crate::backchannel::UriGuard::new(
+                &state.config.backchannel_logout_allowed_hosts,
+            ),
+            policy: crate::backchannel::OutboxPolicy::default(),
+        }
+        .run(),
+    );
+    if !state.config.backchannel_logout_allowed_hosts.is_empty() {
+        info!(
+            hosts = ?state.config.backchannel_logout_allowed_hosts,
+            "back-channel logout: these hosts skip the address check"
+        );
+    }
+
     let introspect_state = IntrospectState::from(&state);
     let admin_token_state = AdminTokenState::from(&state);
     let compat_state = compat::CompatState {
@@ -1553,6 +1649,10 @@ pub async fn main() {
             get(clientinfo).delete(client_delete).post(client_update),
         )
         .route(oidc::SIGNIN_PATH, get(sign_in))
+        .route(
+            oidc::END_SESSION_PATH,
+            get(end_session_get).post(end_session_post),
+        )
         .route("/webauthn/register/start", post(webauthn_register_start))
         .route("/webauthn/register/finish", post(webauthn_register_finish))
         .route(
@@ -1585,6 +1685,7 @@ pub async fn main() {
         .route("/account/nonce", get(account_nonce_handler))
         .route("/account/wallet", post(account_wallet_handler))
         .route("/account/action", post(account_action_handler))
+        .route("/account/sign_out", post(account_sign_out_handler))
         .route(
             "/account/passkey/start",
             post(account_passkey_start_handler),
@@ -1946,7 +2047,7 @@ mod unknown_credential_response_tests {
     /// usernameless `None`, NEVER propagate it (which would 500 the picker). A future
     /// refactor to `?` would break this invariant while every miss-path test stayed
     /// green — so pin the error path here. We force a real, fast `WRONGTYPE` error by
-    /// storing the `user:session/{token}` key as a SET, so the `GET` in
+    /// storing the `siwx_user/{digest}` key as a SET, so the `GET` in
     /// `lookup_user_session` errors. Needs Redis (`siwx_oidc::test_support::redis`).
     #[tokio::test]
     async fn user_session_scope_did_degrades_open_on_redis_error() {
@@ -1954,8 +2055,8 @@ mod unknown_credential_response_tests {
             return;
         };
         let token = format!("wrongtype{}", uuid::Uuid::new_v4().simple());
-        // KV_USER_SESSION_PREFIX is in scope via `use siwx_oidc::db::*` at the top.
-        let key = format!("{}/{}", KV_USER_SESSION_PREFIX, token);
+        // The digest key the lookup reads first (`OwnSession::PickerHint`).
+        let key = format!("siwx_user/{}", siwx_oidc::db::tokens::digest(&token));
         // SET-typed value at the exact key lookup_user_session GETs -> WRONGTYPE error.
         redis
             .sadd_raw(&key, "x")
@@ -1973,6 +2074,94 @@ mod unknown_credential_response_tests {
         );
 
         redis.del_raw(&key).await.ok();
+    }
+
+    /// Enumeration safety with a DID-shaped forged value: a `siwx_user` cookie
+    /// whose value is the DID of an account with a registered passkey (a
+    /// `did:key`, and a `did:pkh` address) is a miss like any other forged
+    /// value. The picker stays usernameless with zero credential ids and no
+    /// `detected_mxid`, so a client can never name the account it wants listed.
+    /// The control: a genuine session for the same DID does scope the picker to
+    /// the seeded passkey, so the empty answer is not an empty index.
+    #[tokio::test]
+    async fn a_did_shaped_forged_user_cookie_yields_usernameless_empty_allow_credentials() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let base = url::Url::parse("http://localhost:8000").unwrap();
+        let cfg = wa::build_webauthn(&base, None, None).expect("build webauthn");
+        let cookie_of = |value: &str| {
+            let header = format!("siwx_user={value}");
+            let hv = axum::http::HeaderValue::from_str(&header).expect("header value");
+            Some(TypedHeader(
+                headers::Cookie::decode(&mut std::iter::once(&hv)).expect("decode cookie"),
+            ))
+        };
+        let n = uuid::Uuid::new_v4().simple().to_string();
+        let dids = [
+            format!("did:key:zDnaeForged{n}"),
+            format!("did:pkh:eip155:1:0x{n}00000000"),
+        ];
+        for (i, did) in dids.iter().enumerate() {
+            let cred = URL_SAFE_NO_PAD.encode(format!("cred-{n}-{i}").as_bytes());
+            redis.index_add_passkey(did, &cred).await.expect("seed");
+
+            let genuine = redis.create_user_session(did).await.expect("mint");
+            let scope = user_session_scope_did(&redis, &cookie_of(&genuine), false).await;
+            assert_eq!(scope.as_deref(), Some(did.as_str()), "control: {did}");
+            let rcr = wa::authenticate_start(
+                &cfg.webauthn,
+                &redis,
+                &format!("didgenuine{n}{i}"),
+                scope.as_deref(),
+            )
+            .await
+            .expect("authenticate_start");
+            assert_eq!(
+                rcr.public_key.allow_credentials.len(),
+                1,
+                "control: a genuine session offers the seeded passkey of {did}"
+            );
+
+            let forged = cookie_of(did);
+            assert_eq!(
+                user_session_token(&forged, false),
+                Some(did.as_str()),
+                "the forged value reaches the lookup"
+            );
+            let scope = user_session_scope_did(&redis, &forged, false).await;
+            assert_eq!(
+                scope, None,
+                "a DID as the cookie value scopes nothing: {did}"
+            );
+            let rcr = wa::authenticate_start(
+                &cfg.webauthn,
+                &redis,
+                &format!("didforged{n}{i}"),
+                scope.as_deref(),
+            )
+            .await
+            .expect("authenticate_start");
+            assert!(
+                rcr.public_key.allow_credentials.is_empty(),
+                "a DID-shaped forged cookie lists no credential id: {did}"
+            );
+            assert_eq!(
+                detected_mxid_for(None, Some("matrix.example.com"), scope.as_deref()).await,
+                None,
+                "and detects no account: {did}"
+            );
+
+            redis.revoke_own_sessions(did).await.ok();
+            redis
+                .del_raw(&format!(
+                    "{}/{did}",
+                    siwx_oidc::db::KV_WEBAUTHN_BY_DID_PREFIX
+                ))
+                .await
+                .ok();
+        }
     }
 }
 

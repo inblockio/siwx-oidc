@@ -102,7 +102,8 @@ after a deployment.
    ([passkeys.md](passkeys.md#migration-notes)).
 7. **The picker shows only one account's passkeys**: the `siwx_user` cookie
    scoped it to the last signed-in user. "Use a different passkey" (`all: true`)
-   shows all of them ([passkeys.md](passkeys.md#scoping-the-passkey-picker)).
+   shows all of them ([passkeys.md](passkeys.md#scoping-the-passkey-picker)), and
+   **Sign out** on the account page ends the hint in this browser.
 8. **"User Verification flag not set"** or **"Sign count regression"**: the
    authenticator did not verify the user, or reported a counter lower than the
    stored one (a possible cloned authenticator).

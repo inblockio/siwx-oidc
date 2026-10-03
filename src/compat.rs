@@ -137,9 +137,10 @@ impl TeardownPolicy {
 /// accepts either kind. A token of another kind is answered like an unknown
 /// token: nothing is torn down and the token itself is left untouched.
 ///
-/// Never fails the caller: every error is logged and swallowed so the HTTP
-/// handler can always return 200 (RFC 7009 for revoke; Matrix expects 200 for
-/// logout). Keyed on [`TokenMetadata::username`] (the lowercased localpart
+/// A token-store fault is returned, not swallowed: logout answers it with the
+/// retryable 503 and leaves the bearer in place for the retry, while RFC 7009
+/// revocation still deletes what it can ([`TeardownFault::fallback`]) and
+/// answers 200. Keyed on [`TokenMetadata::username`] (the lowercased localpart
 /// Synapse uses), never the raw DID, so revocation is robust to address-case
 /// differences between sign-in and re-auth DIDs.
 async fn teardown_session(
@@ -148,19 +149,16 @@ async fn teardown_session(
     ctx: &str,
     policy: TeardownPolicy,
     required: Option<TokenKind>,
-) {
+) -> Result<(), TeardownFault> {
     let meta = match resolve_presented(state, token).await {
         Ok(Some(m)) => m,
         // Unknown token: an idempotent no-op.
-        Ok(None) => return,
-        Err(e) => {
-            warn!(error = %e, ctx, "teardown_session: token lookup failed; deleting the presented token");
-            // Best effort: whichever layout the token is in.
-            let _ = state.redis_client.delete_access_token(token).await;
-            if let Err(e) = state.redis_client.delete_token(token).await {
-                warn!(error = %e, ctx, "teardown_session: delete_token (fallback) failed");
-            }
-            return;
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            return Err(TeardownFault {
+                error: error.context("token lookup"),
+                fallback: Fallback::AnyLayout,
+            })
         }
     };
     if required.is_some_and(|kind| meta.kind != Some(kind)) {
@@ -168,7 +166,7 @@ async fn teardown_session(
             ctx,
             "teardown_session: token of another kind; nothing to tear down"
         );
-        return;
+        return Ok(());
     }
     // Phase 1: delete the ending session's Synapse device (best-effort) — only for
     // explicit-sign-out callers. A bare RFC 7009 revoke (TokensOnly) must never
@@ -203,17 +201,20 @@ async fn teardown_session(
     // the device_id is a unique `SIWX_{uuid}`, so revoking by (username,
     // device_id) correctly scopes to this one device's grants.
     if meta.device_id.is_empty() {
-        match delete_presented(state, token, meta.source).await {
-            Ok(()) => info!(
-                ctx,
-                username = %meta.username,
-                "session torn down (standalone, presented token only)"
-            ),
-            Err(e) => {
-                warn!(error = %e, ctx, "teardown_session: deleting the presented token failed")
+        return match delete_presented(state, token, meta.source).await {
+            Ok(()) => {
+                info!(
+                    ctx,
+                    username = %meta.username,
+                    "session torn down (standalone, presented token only)"
+                );
+                Ok(())
             }
-        }
-        return;
+            Err(error) => Err(TeardownFault {
+                error: error.context("deleting the presented token"),
+                fallback: Fallback::Nothing,
+            }),
+        };
     }
     // Phase 2 (device session): revoke this device's grants (access + refresh).
     match state
@@ -221,20 +222,60 @@ async fn teardown_session(
         .revoke_device_tokens(&meta.username, &meta.device_id)
         .await
     {
-        Ok(revoked) => info!(
-            ctx,
-            username = %meta.username,
-            device_id = %meta.device_id,
-            revoked = revoked as u64,
-            "session torn down"
-        ),
-        Err(e) => {
-            warn!(error = %e, ctx, "teardown_session: revoke_device_tokens failed; deleting token directly");
-            // Last-resort: at least remove the presented token.
-            if let Err(e) = delete_presented(state, token, meta.source).await {
-                warn!(error = %e, ctx, "teardown_session: deleting the presented token (last resort) failed");
+        Ok(revoked) => {
+            info!(
+                ctx,
+                username = %meta.username,
+                device_id = %meta.device_id,
+                revoked = revoked as u64,
+                "session torn down"
+            );
+            Ok(())
+        }
+        Err(error) => Err(TeardownFault {
+            error: error.context("revoke_device_tokens"),
+            fallback: Fallback::Presented(meta.source),
+        }),
+    }
+}
+
+/// A token-store fault during [`teardown_session`].
+struct TeardownFault {
+    error: anyhow::Error,
+    /// What RFC 7009 revocation may still delete before its 200. Logout
+    /// deletes nothing more: it answers 503 so the client retries with the
+    /// same bearer, which a deleted access token would turn into a no-op
+    /// while the device's refresh token lived on.
+    fallback: Fallback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fallback {
+    /// The token's layout is unknown: delete it from both.
+    AnyLayout,
+    /// Delete only the presented credential, where it was found.
+    Presented(TokenSource),
+    /// Nothing more to try.
+    Nothing,
+}
+
+/// RFC 7009's best effort after a teardown fault: delete the presented
+/// credential if possible; the endpoint answers 200 either way.
+async fn revoke_fallback(state: &CompatState, token: &str, fault: TeardownFault) {
+    warn!(error = %fault.error, "revoke: token store failed; deleting the presented token where possible");
+    match fault.fallback {
+        Fallback::AnyLayout => {
+            let _ = state.redis_client.delete_access_token(token).await;
+            if let Err(e) = state.redis_client.delete_token(token).await {
+                warn!(error = %e, "revoke: delete_token (fallback) failed");
             }
         }
+        Fallback::Presented(source) => {
+            if let Err(e) = delete_presented(state, token, source).await {
+                warn!(error = %e, "revoke: deleting the presented token (last resort) failed");
+            }
+        }
+        Fallback::Nothing => {}
     }
 }
 
@@ -331,14 +372,17 @@ pub async fn revoke(
     // RFC 7009 is token hygiene, not a device sign-out: revoke tokens only, never
     // delete the Synapse device (see TeardownPolicy).
     // Either kind of token may be revoked.
-    teardown_session(
+    if let Err(fault) = teardown_session(
         &state,
         &form.token,
         "revoke",
         TeardownPolicy::TokensOnly,
         None,
     )
-    .await;
+    .await
+    {
+        revoke_fallback(&state, &form.token, fault).await;
+    }
     StatusCode::OK
 }
 
@@ -359,8 +403,10 @@ pub async fn login_flows() -> Json<serde_json::Value> {
 // -- POST /_matrix/client/v3/logout -------------------------------------------
 
 /// Single-session logout: tears down the session bound to the bearer token
-/// (Synapse device + Redis tokens). Always returns 200 with `{}` (Matrix
-/// expects an empty object), even with no bearer or an unknown token.
+/// (Synapse device + Redis tokens). Returns 200 with `{}` (Matrix expects an
+/// empty object), also with no bearer or an unknown token, and the retryable
+/// 503 of the refresh and device-deletion routes when the token store fails:
+/// a sign-out never reports success while revoking nothing.
 pub async fn logout(
     State(state): State<CompatState>,
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
@@ -368,14 +414,18 @@ pub async fn logout(
     if let Some(TypedHeader(auth)) = bearer {
         // Explicit single-session sign-out: revoke tokens AND delete the device.
         // The bearer must be an access token.
-        teardown_session(
+        if let Err(fault) = teardown_session(
             &state,
             auth.token(),
             "logout",
             TeardownPolicy::DeleteDevice,
             Some(TokenKind::Access),
         )
-        .await;
+        .await
+        {
+            warn!(error = %fault.error, "logout: token store failed (infrastructure); returning retryable 503");
+            return token_store_unavailable();
+        }
     }
     (StatusCode::OK, Json(serde_json::json!({})))
 }
@@ -384,15 +434,36 @@ pub async fn logout(
 
 /// Bulk sign-out: invalidates EVERY session of the bearer token's user.
 ///
-/// Resolves the user from the bearer token, then (when Synapse + `server_name`
-/// are configured) lists the user's Synapse devices and deletes each one
-/// best-effort (a per-device failure is logged and the loop continues), and
-/// finally revokes ALL of the user's OAuth tokens in Redis.
+/// Resolves the user from the bearer token, ends the user's own sessions on
+/// this provider (the `siwx_user` picker hints and `acct_session` account
+/// sessions), then (when Synapse + `server_name` are configured) lists the
+/// user's Synapse devices and deletes each one best-effort (a per-device
+/// failure is logged and the loop continues), and finally revokes ALL of the
+/// user's OAuth tokens in Redis.
 ///
 /// This is session invalidation, NOT account deactivation: the account stays
 /// active and the user can sign in again. It therefore must NEVER call
-/// `deactivate_user`. Degrades to Redis-only revocation in standalone mode and
-/// is an idempotent 200 no-op when the bearer token is missing or unknown.
+/// `deactivate_user`. Degrades to Redis-only revocation in standalone mode, is
+/// an idempotent 200 no-op when the bearer token is missing or unknown, and
+/// answers a token-store fault with the retryable 503.
+///
+/// The order is what makes that 503 retryable: every step is idempotent, and
+/// the grants, and with them the bearer, go last. A fault ending the own
+/// sessions deletes no grant, so the retry with the same bearer runs the whole
+/// sign-out again. Revoking the grants first turned that retry into an unknown
+/// token, a 200 that left the own sessions live (an `acct_session` authorizes
+/// device deletion, deactivation and erasure for 600 s).
+///
+/// Residual: a fault in the grant sweep after its script wrote the user epoch
+/// (inside the script, which does not roll back, or in the legacy `token/*`
+/// loop after it) answers 503, and the epoch already refuses the bearer, so the
+/// retry is the 200 no-op. By then the own sessions
+/// are ended and the epoch refuses every grant of the user at every endpoint,
+/// so nothing the user holds still works; what stays behind are the grants the
+/// script did not reach, with their index entries, refused until their TTL, and
+/// their back-channel logout tokens: an OIDC grant the sweep did not delete
+/// gets one only when its RP next tries to refresh it (the rotation deletes an
+/// epoch-refused grant through `drop_grant`), never if it does not.
 pub async fn logout_all(
     State(state): State<CompatState>,
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
@@ -407,13 +478,27 @@ pub async fn logout_all(
         Ok(Some(m)) => m,
         Ok(None) => return (StatusCode::OK, Json(serde_json::json!({}))), // idempotent no-op
         Err(e) => {
-            warn!(error = %e, "logout_all: token lookup failed");
-            return (StatusCode::OK, Json(serde_json::json!({})));
+            warn!(error = %e, "logout_all: token lookup failed (infrastructure); returning retryable 503");
+            return token_store_unavailable();
         }
     };
     let username = meta.username;
+    let did = meta.did;
 
-    // Phase 1: delete every Synapse device for the user (best-effort per device).
+    // Phase 1: the user's own sessions on this provider, BEFORE any grant is
+    // touched, so a fault here leaves the bearer for the retry (see above). A
+    // minted admin token carries no DID and has none.
+    if !did.is_empty() {
+        match state.redis_client.revoke_own_sessions(&did).await {
+            Ok(ended) => info!(username = %username, ended = ended as u64, "own sessions ended"),
+            Err(e) => {
+                warn!(error = %e, username = %username, "logout_all: revoke_own_sessions failed; returning retryable 503");
+                return token_store_unavailable();
+            }
+        }
+    }
+
+    // Phase 2: delete every Synapse device for the user (best-effort per device).
     if let (Some(synapse), Some(server_name)) =
         (state.synapse_client.as_ref(), state.server_name.as_deref())
     {
@@ -436,13 +521,16 @@ pub async fn logout_all(
         }
     }
 
-    // Phase 2: ALWAYS revoke every OAuth token for the user (never deactivate).
+    // Phase 3, last: ALWAYS revoke every OAuth token for the user (never
+    // deactivate). The script writes the user epoch before it deletes a grant;
+    // a fault after that write is the residual described above.
     match state.redis_client.revoke_all_user_tokens(&username).await {
         Ok(revoked) => {
             info!(username = %username, revoked = revoked as u64, "all sessions torn down")
         }
         Err(e) => {
-            warn!(error = %e, username = %username, "logout_all: revoke_all_user_tokens failed")
+            warn!(error = %e, username = %username, "logout_all: revoke_all_user_tokens failed; returning retryable 503");
+            return token_store_unavailable();
         }
     }
 
@@ -726,7 +814,7 @@ mod tests {
     use chrono::Utc;
     use siwx_oidc::db::grant::{EpochScope, GrantKind, IssuedGrant, NewGrant};
     use siwx_oidc::db::tokens;
-    use siwx_oidc::db::{DBClient, TokenMetadata, REFRESH_TOKEN_TTL};
+    use siwx_oidc::db::{DBClient, OwnSession, TokenMetadata, REFRESH_TOKEN_TTL};
 
     /// The test Redis, or `None` after a loud skip (`siwx_oidc::test_support`).
     async fn redis() -> Option<RedisClient> {
@@ -1107,12 +1195,12 @@ mod tests {
                 confidential_client.clone(),
                 siwx_oidc::db::ClientEntry::new(
                     "s",
-                    openidconnect::core::CoreClientMetadata::new(
+                    siwx_oidc::db::SiwxClientMetadata::new(
                         vec![
                             openidconnect::RedirectUrl::new("https://example.com/cb".into())
                                 .unwrap(),
                         ],
-                        openidconnect::registration::EmptyAdditionalClientMetadata {},
+                        siwx_oidc::db::LogoutClientMetadata::default(),
                     ),
                     None,
                 ),
@@ -1258,6 +1346,289 @@ mod tests {
         assert_retryable_503(status, &body, "POST /delete_devices");
 
         client.revoke_grants_for_device(&user, &dev).await.ok();
+    }
+
+    /// The members of the Redis set at `key`, and a function's worth of
+    /// restoring them: a planted fault overwrites the set, and the retry after
+    /// the fault needs it back.
+    async fn set_members(key: &str) -> Vec<String> {
+        let raw =
+            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
+        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        bb8_redis::redis::cmd("SMEMBERS")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    async fn restore_set(key: &str, members: &[String]) {
+        let raw =
+            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
+        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let _: () = bb8_redis::redis::cmd("DEL")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let _: () = bb8_redis::redis::cmd("SADD")
+            .arg(key)
+            .arg(members)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    /// A store fault during `POST /_matrix/client/v3/logout` is the retryable
+    /// 503 of the refresh and device-deletion routes, never a 200 that reports a
+    /// sign-out while nothing was revoked: a fault reading the bearer, and a
+    /// fault while revoking the device's grants. The second leaves the bearer
+    /// in place, so the client's retry tears the whole session down.
+    #[tokio::test]
+    async fn a_store_fault_during_logout_is_a_retryable_503_and_the_retry_tears_down() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("logout-fault-{n}");
+        let state = standalone_state(client.clone());
+
+        // A fault reading the bearer.
+        let dev = format!("LOOKUP_{n}");
+        let access = seed_grant(&client, &user, &dev).await.access_token;
+        plant_store_fault(&format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_ACCESS_TOKEN_PREFIX,
+            tokens::digest(&access)
+        ))
+        .await;
+        let response = logout(State(state.clone()), bearer(&access))
+            .await
+            .into_response();
+        let (status, body) = status_and_json(response).await;
+        assert_retryable_503(status, &body, "logout, bearer lookup fault");
+        client.revoke_grants_for_device(&user, &dev).await.ok();
+
+        // A fault revoking the device's grants.
+        let dev = format!("REVOKE_{n}");
+        let issued = seed_grant(&client, &user, &dev).await;
+        let idx = format!(
+            "{}/{user}/{dev}",
+            siwx_oidc::db::grant::KV_GRANT_DEVICE_IDX_PREFIX
+        );
+        let members = set_members(&idx).await;
+        assert!(!members.is_empty(), "the device index names the grant");
+        plant_store_fault(&idx).await;
+        let response = logout(State(state.clone()), bearer(&issued.access_token))
+            .await
+            .into_response();
+        let (status, body) = status_and_json(response).await;
+        assert_retryable_503(status, &body, "logout, revocation fault");
+        assert!(
+            client
+                .lookup_access_token(&issued.access_token)
+                .await
+                .unwrap()
+                .is_some(),
+            "a failed logout leaves the bearer in place for the retry"
+        );
+
+        restore_set(&idx, &members).await;
+        let response = logout(State(state.clone()), bearer(&issued.access_token))
+            .await
+            .into_response();
+        let (status, _body) = status_and_json(response).await;
+        assert_eq!(status, StatusCode::OK, "the retry signs out");
+        assert!(
+            client
+                .lookup_access_token(&issued.access_token)
+                .await
+                .unwrap()
+                .is_none(),
+            "the retry ends the access token"
+        );
+        assert!(
+            client
+                .peek_refresh_grant(issued.refresh_token.as_deref().unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "the retry ends the grant"
+        );
+    }
+
+    /// A store fault during `POST /_matrix/client/v3/logout/all` is the
+    /// retryable 503, never a 200 that reports every session ended: a fault
+    /// reading the bearer, and a fault in the sweep of the user's grants (the
+    /// own sessions are already ended, and the user epoch the sweep wrote
+    /// first refuses the bearer). A fault ending the own sessions:
+    /// `a_logout_all_retry_after_an_own_session_fault_ends_the_own_sessions_and_the_grants`.
+    #[tokio::test]
+    async fn a_store_fault_during_logout_all_is_a_retryable_503() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let state = standalone_state(client.clone());
+
+        let user = format!("logout-all-lookup-{n}");
+        let dev = format!("ALL_{n}");
+        let access = seed_grant(&client, &user, &dev).await.access_token;
+        plant_store_fault(&format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_ACCESS_TOKEN_PREFIX,
+            tokens::digest(&access)
+        ))
+        .await;
+        let response = logout_all(State(state.clone()), bearer(&access))
+            .await
+            .into_response();
+        let (status, body) = status_and_json(response).await;
+        assert_retryable_503(status, &body, "logout/all, bearer lookup fault");
+        client.revoke_grants_for_device(&user, &dev).await.ok();
+
+        let user = format!("logout-all-sweep-{n}");
+        let access = seed_grant(&client, &user, &dev).await.access_token;
+        let hint = client
+            .create_user_session(&format!("did:key:z{user}"))
+            .await
+            .unwrap();
+        plant_store_fault(&format!(
+            "{}/{user}",
+            siwx_oidc::db::grant::KV_GRANT_USER_IDX_PREFIX
+        ))
+        .await;
+        let response = logout_all(State(state.clone()), bearer(&access))
+            .await
+            .into_response();
+        let (status, body) = status_and_json(response).await;
+        assert_retryable_503(status, &body, "logout/all, sweep fault");
+        // The sweep script writes the user epoch before the fault (a Redis
+        // script does not roll back), so the bearer is already refused and a
+        // retry is the idempotent no-op; the own sessions were ended first.
+        assert!(
+            client.lookup_user_session(&hint).await.unwrap().is_none(),
+            "the own sessions end before the grants are revoked"
+        );
+        assert!(
+            client.check_access_token(&access).await.unwrap().is_none(),
+            "the user epoch written before the sweep's fault refuses the bearer"
+        );
+        client.revoke_grants_for_device(&user, &dev).await.ok();
+    }
+
+    /// A store fault while `logout/all` ends the user's own sessions (the
+    /// DID's index is not a sorted set) is the retryable 503 with nothing
+    /// revoked: the own sessions end before the grants are touched, so the
+    /// bearer still works and the client's retry, once the fault is gone,
+    /// ends the own sessions AND the grants. Revoking the grants first turned
+    /// the retry into an unknown token, a 200 that left the `siwx_user` and
+    /// `acct_session` sessions live.
+    #[tokio::test]
+    async fn a_logout_all_retry_after_an_own_session_fault_ends_the_own_sessions_and_the_grants() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let state = standalone_state(client.clone());
+        let dev = format!("ALL_{n}");
+        let user = format!("logout-all-own-{n}");
+        let issued = seed_grant(&client, &user, &dev).await;
+        let refresh = issued.refresh_token.as_deref().unwrap();
+        let did = format!("did:key:z{user}");
+        let hint = client.create_user_session(&did).await.unwrap();
+        let (account, _csrf) = crate::account::create_account_session(&client, &did)
+            .await
+            .unwrap();
+        let own_idx = format!(
+            "{}/{}",
+            siwx_oidc::db::KV_OWN_SESSION_IDX_PREFIX,
+            tokens::digest(&siwx_oidc::mxid::canonicalize(&did))
+        );
+        let entries = zset_entries(&own_idx).await;
+        assert_eq!(entries.len(), 2, "the DID's index names both own sessions");
+        plant_store_fault(&own_idx).await;
+        let response = logout_all(State(state.clone()), bearer(&issued.access_token))
+            .await
+            .into_response();
+        let (status, body) = status_and_json(response).await;
+        assert_retryable_503(status, &body, "logout/all, own-session fault");
+        assert!(
+            client
+                .check_access_token(&issued.access_token)
+                .await
+                .unwrap()
+                .is_some(),
+            "a logout/all whose own-session step faults leaves the bearer working for the retry"
+        );
+        assert!(
+            client.peek_refresh_grant(refresh).await.unwrap().is_some(),
+            "a logout/all whose own-session step faults leaves the grant in place"
+        );
+
+        restore_zset(&own_idx, &entries).await;
+        let response = logout_all(State(state.clone()), bearer(&issued.access_token))
+            .await
+            .into_response();
+        let (status, _body) = status_and_json(response).await;
+        assert_eq!(status, StatusCode::OK, "the retry signs out");
+        assert!(
+            client.lookup_user_session(&hint).await.unwrap().is_none(),
+            "the retry ends the picker hint"
+        );
+        assert!(
+            client
+                .lookup_own_session(OwnSession::Account, &account)
+                .await
+                .unwrap()
+                .is_none(),
+            "the retry ends the account session"
+        );
+        assert!(
+            client
+                .check_access_token(&issued.access_token)
+                .await
+                .unwrap()
+                .is_none(),
+            "the retry ends the access token"
+        );
+        assert!(
+            client.peek_refresh_grant(refresh).await.unwrap().is_none(),
+            "the retry ends the grant"
+        );
+    }
+
+    /// A sorted set's members with their scores, to put it back after a
+    /// planted fault replaced it.
+    async fn zset_entries(key: &str) -> Vec<(String, String)> {
+        let raw =
+            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
+        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        bb8_redis::redis::cmd("ZRANGE")
+            .arg(key)
+            .arg(0)
+            .arg(-1)
+            .arg("WITHSCORES")
+            .query_async(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    async fn restore_zset(key: &str, entries: &[(String, String)]) {
+        let raw =
+            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
+        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let _: () = bb8_redis::redis::cmd("DEL")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let mut zadd = bb8_redis::redis::cmd("ZADD");
+        zadd.arg(key);
+        for (member, score) in entries {
+            zadd.arg(score).arg(member);
+        }
+        let _: () = zadd.query_async(&mut conn).await.unwrap();
+        let _: () = bb8_redis::redis::cmd("EXPIRE")
+            .arg(key)
+            .arg(600)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
     }
 
     async fn status_and_json(

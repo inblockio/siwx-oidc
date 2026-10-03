@@ -129,6 +129,14 @@ paths:
 
         `response_types_supported` is exactly `["code"]`: the
         authorization-code flow is the only one `/authorize` accepts.
+
+        `end_session_endpoint` (`{issuer}/end_session`) advertises
+        RP-initiated logout, in both modes.
+
+        `backchannel_logout_supported` and `backchannel_logout_session_supported`
+        (both `true`) advertise OpenID Connect Back-Channel Logout 1.0 in
+        generic mode only (no MAS shared secret): logout tokens are sent for
+        `oidc` grants, and in Matrix mode every grant is a Matrix device grant.
       responses:
         "200":
           description: Provider metadata.
@@ -368,13 +376,44 @@ paths:
               properties:
                 redirect_uris: { type: array, items: { type: string, format: uri } }
                 client_name: { type: string }
+                post_logout_redirect_uris:
+                  type: array
+                  items: { type: string, format: uri }
+                  description: |
+                    Where `/end_session` may send the user back (OpenID Connect
+                    RP-Initiated Logout 1.0 §3.1). Matched exactly, query
+                    included. Echoed in the response.
+                backchannel_logout_uri:
+                  type: string
+                  format: uri
+                  description: |
+                    Where a logout token (`logout_token=…`, a form POST) is sent
+                    when one of the client's grants is deleted (OpenID Connect
+                    Back-Channel Logout 1.0 §2.2; generic mode). No fragment;
+                    `https`, and every address its host resolves to must be
+                    public (not loopback, private, CGNAT, link-local,
+                    multicast, unspecified or reserved), unless the operator
+                    allowlisted the host. Checked again at every delivery.
+                    Echoed in the response.
+                backchannel_logout_session_required:
+                  type: boolean
+                  description: |
+                    The client requires a `sid` in every logout token; a grant
+                    without one sends it none. Echoed in the response.
       responses:
         "201":
           description: The registered client, with its secret and registration access token.
           content:
             application/json:
               schema: { type: object }
-        "400": { description: "Invalid metadata — a `redirect_uri` carrying a fragment is rejected." }
+        "400":
+          description: |
+            Invalid metadata: a `redirect_uri` carrying a fragment is
+            `invalid_redirect_uri`; a `post_logout_redirect_uri` carrying one,
+            a `backchannel_logout_uri` the SSRF guard refuses, and (with the
+            operator's `backchannel_logout_required_for_refresh`, generic
+            mode) a client that may refresh without a `backchannel_logout_uri`
+            are `invalid_client_metadata`.
 
   /client/{id}:
     parameters:
@@ -393,6 +432,10 @@ paths:
       security: [{ registrationAccessToken: [] }]
       responses:
         "200": { description: Updated client metadata. }
+        "400":
+          description: |
+            `invalid_client_metadata`, as at registration (the same logout
+            metadata checks, the SSRF guard included).
     delete:
       tags: [OIDC]
       operationId: deleteClient
@@ -490,6 +533,56 @@ paths:
         "503":
           description: This deployment has no homeserver configured and cannot answer.
           content: { application/json: { schema: { $ref: "#/components/schemas/ResolveError" } } }
+
+  /end_session:
+    get:
+      tags: [OIDC]
+      operationId: endSession
+      summary: RP-initiated logout (OpenID Connect RP-Initiated Logout 1.0)
+      description: |
+        Ends the grant whose `sid` the `id_token_hint` carries, if the grant
+        belongs to the hint's client (`aud`) and subject (`sub`): its access
+        token is inactive at once and its refresh token is refused. Only that
+        grant ends; a Matrix device is never deleted here (the Matrix `logout`
+        is the device sign-out). The hint must be an ID token this provider
+        signed, with the live or a retired key (an expired one is accepted).
+        A hint without a `sid`, or no hint, ends nothing.
+
+        Everything is checked before anything ends: a hint that does not
+        verify, a `client_id` that is not the hint's audience, or a
+        `post_logout_redirect_uri` that is not registered for the client
+        (exact match, query included) is a 400 that ends nothing and never
+        redirects.
+      parameters:
+        - { name: id_token_hint, in: query, schema: { type: string } }
+        - { name: client_id, in: query, schema: { type: string } }
+        - { name: post_logout_redirect_uri, in: query, schema: { type: string, format: uri } }
+        - { name: state, in: query, schema: { type: string } }
+      responses:
+        "200": { description: "The signed-out page (no `post_logout_redirect_uri`)." }
+        "303": { description: "To the registered `post_logout_redirect_uri`, with `state` appended when one was sent." }
+        "400": { description: "The hint, the `client_id` or the `post_logout_redirect_uri` was refused; nothing ended." }
+        "503": { description: "The token store is unavailable; nothing ended, retry." }
+    post:
+      tags: [OIDC]
+      operationId: endSessionPost
+      summary: RP-initiated logout, form-encoded
+      description: The same as `GET /end_session`, with the parameters in the body.
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                id_token_hint: { type: string }
+                client_id: { type: string }
+                post_logout_redirect_uri: { type: string, format: uri }
+                state: { type: string }
+      responses:
+        "200": { description: "The signed-out page (no `post_logout_redirect_uri`)." }
+        "303": { description: "To the registered `post_logout_redirect_uri`, with `state` appended when one was sent." }
+        "400": { description: "The hint, the `client_id` or the `post_logout_redirect_uri` was refused; nothing ended." }
+        "503": { description: "The token store is unavailable; nothing ended, retry." }
 
   /oauth2/introspect:
     post:
@@ -787,6 +880,25 @@ paths:
         "400": { description: "Missing, unknown, or unavailable action, or reactivation of an erased account." }
         "503": { description: "A required check (Synapse, or the erasure marker) could not run; nothing was changed." }
 
+  /account/sign_out:
+    post:
+      tags: [Account management]
+      operationId: accountSignOut
+      summary: Sign this browser out of the account page
+      description: |
+        Ends the account session (`acct_session` cookie) and the passkey-picker
+        hint (`siwx_user` cookie) this browser presents, each found by the digest
+        of the cookie value, and clears both cookies. Sessions of other browsers
+        stay; `logout/all`, deactivation and erasure end every session of the
+        user. Idempotent: without cookies it answers 200 and clears them all the
+        same. Needs no CSRF token: both cookies are `SameSite=Strict`, and a
+        forged request could only sign the browser out.
+      responses:
+        "200":
+          description: Signed out; both cookies cleared.
+          content: { application/json: { schema: { type: object, properties: { signed_out: { type: boolean, enum: [true] } } } } }
+        "503": { description: "Retryable: the session store could not end a session; the cookies are not cleared." }
+
   /account/passkey/start:
     post:
       tags: [Account management]
@@ -835,16 +947,20 @@ paths:
       summary: End this session
       description: Revokes the session's tokens **and** deletes its Synapse device — explicit intent, unlike `/oauth2/revoke`. The bearer must be an access token; any other token is a no-op, like an unknown one.
       security: [{ bearerToken: [] }]
-      responses: { "200": { description: Best-effort, idempotent, never 500. } }
+      responses:
+        "200": { description: "Signed out; also for a missing, unknown or non-access bearer (idempotent). The Synapse device delete is best-effort." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store failed while resolving the bearer or revoking the device's tokens. Nothing is reported as signed out, and the bearer stays valid so the retry tears the session down." }
 
   /_matrix/client/v3/logout/all:
     post:
       tags: [Matrix compatibility]
       operationId: matrixLogoutAll
       summary: End every session
-      description: Session invalidation, NOT deactivation — the account stays active and can sign in again. The bearer must be an access token; any other token is a no-op, like an unknown one.
+      description: Session invalidation, NOT deactivation — the account stays active and can sign in again. Ends every grant of the user (setting the user epoch), deletes every Synapse device (best-effort), and ends the user's own sessions on this provider (`siwx_user` picker hints, `acct_session` account sessions). The bearer must be an access token; any other token is a no-op, like an unknown one.
       security: [{ bearerToken: [] }]
-      responses: { "200": { description: Best-effort, idempotent, never 500. } }
+      responses:
+        "200": { description: "Every session ended; also for a missing, unknown or non-access bearer (idempotent)." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store failed while resolving the bearer, revoking the user's tokens or ending the own sessions. Nothing is reported as signed out; the retry finishes the job." }
 
   /_matrix/client/v3/devices/{device_id}:
     delete:

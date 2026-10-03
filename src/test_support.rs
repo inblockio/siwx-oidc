@@ -68,6 +68,22 @@ pub async fn redis() -> Option<RedisClient> {
     )
 }
 
+/// [`redis`] on database `db` of the same server, for a test that must not
+/// share a database with the others (one that claims every due outbox entry
+/// in it, say). Each such test takes its own number.
+pub async fn redis_db(db: u8) -> Option<RedisClient> {
+    let mut url = redis_url();
+    url.set_path(&format!("/{db}"));
+    if let Err(reason) = probe(&url).await {
+        return skip_or_fail(&format!("no Redis at {} ({reason})", redacted(&url)));
+    }
+    Some(
+        RedisClient::new(&url)
+            .await
+            .unwrap_or_else(|e| panic!("{REDIS_URL_VAR}: cannot build a client: {e:#}")),
+    )
+}
+
 /// One bounded `PING` on a fresh connection, proving a Redis answers at `url`.
 ///
 /// `RedisClient::new` cannot answer this: it never connects (bb8 builds the
