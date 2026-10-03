@@ -374,13 +374,17 @@ doc; read it before changing the code the rule covers.
   keeps refreshing unless the request names another client or presents a secret;
   `POST /_matrix/client/v3/refresh` carries no client identity and is not bound. Read the
   `Authorization` header with `HeaderMap::typed_get`, never as two typed-header extractors, which
-  reject each other's scheme and turn every request that has the header into a 400. Pin: unit
+  reject each other's scheme and turn every request that has the header into a 400. A Basic user
+  name and password are form-urldecoded before they are compared (RFC 6749 §2.3.1: a secret with
+  a space, `+` or `%` arrives escaped); a Bearer token is taken as sent. Pin: unit
   `a_refresh_token_is_refused_to_a_client_it_was_not_issued_to`,
   `a_confidential_client_must_authenticate_to_refresh`,
   `a_public_client_refreshes_with_or_without_naming_itself`,
   `an_unset_authentication_method_follows_require_secret`,
   `a_token_outlives_its_clients_registration_but_not_its_binding`,
   `the_grace_replay_is_bound_to_the_client_too`, `a_basic_header_names_the_client_like_the_form_does`,
+  `basic_credentials_are_form_urldecoded_before_they_are_compared`,
+  `a_plain_basic_secret_and_a_bearer_token_are_taken_as_sent`,
   `the_code_exchange_and_the_refresh_grant_authenticate_clients_identically`,
   `invalid_client_is_a_401_and_every_other_token_error_a_400`; mock stack:
   `a_refresh_token_is_refused_to_another_client`, `a_confidential_client_must_authenticate_to_refresh`,

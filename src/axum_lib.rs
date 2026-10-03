@@ -255,19 +255,35 @@ impl IntoResponse for TokenEndpointError {
 /// request that carries the header with a 400 ("invalid HTTP header"), because
 /// each extractor rejects a header of the other scheme instead of yielding
 /// `None`. That is how `client_secret_basic` never worked here.
+///
+/// A Basic user name and password are form-urldecoded (`form_urldecode`); a
+/// Bearer token is an opaque string and is taken as sent.
 fn client_credentials(headers: &HeaderMap) -> (oidc::ClientCredentials, bool) {
     let basic = headers.typed_get::<Authorization<Basic>>();
     let bearer = headers.typed_get::<Authorization<Bearer>>();
     let basic_attempted = basic.is_some();
     let credentials = oidc::ClientCredentials {
-        basic_client_id: basic.as_ref().map(|b| b.username().to_string()),
+        basic_client_id: basic.as_ref().map(|b| form_urldecode(b.username())),
         secret: if let Some(b) = bearer {
             Some(b.token().to_string())
         } else {
-            basic.map(|b| b.password().to_string())
+            basic.map(|b| form_urldecode(b.password()))
         },
     };
     (credentials, basic_attempted)
+}
+
+/// Undo the `application/x-www-form-urlencoded` encoding RFC 6749 section 2.3.1
+/// applies to a client id and a secret before they go into a Basic header:
+/// `+` is a space and `%XX` a byte. Without it a secret that contains a
+/// character that encodes never matches its registration. Bytes that are not
+/// UTF-8 once decoded are kept as the `+`-expanded text, which then simply fails
+/// the comparison.
+fn form_urldecode(value: &str) -> String {
+    let spaced = value.replace('+', " ");
+    urlencoding::decode(&spaced)
+        .map(std::borrow::Cow::into_owned)
+        .unwrap_or(spaced)
 }
 
 async fn token(
