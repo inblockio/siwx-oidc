@@ -4029,18 +4029,20 @@ async fn redis_del(url: &str, key: &str) {
         .unwrap();
 }
 
-/// `login`'s refresh token is refused at both refresh endpoints and its access
-/// token is inactive at introspection. The Matrix endpoint is asked first: a
-/// refusal by an epoch deletes the grant, and `/token` must refuse it too.
+/// `login`'s access token is inactive at introspection and its refresh token is
+/// refused at both refresh endpoints. Introspection is asked first, while the
+/// grant still exists: a refusal by an epoch at a refresh deletes the grant, so
+/// only an introspection before it shows the access check's own epoch check.
+/// Then the Matrix endpoint, and `/token` must refuse the deleted grant too.
 async fn assert_login_refused(c: &Client, base: &str, login: &LoginResult, what: &str) {
-    for at in [RefreshAt::Matrix, RefreshAt::Token] {
-        let (status, body, _) = refresh_at(c, base, at, &login.refresh_token, login).await;
-        assert_refused_as_unknown(at, status, &body, what);
-    }
     assert!(
         !token_active(c, &login.access_token).await,
         "{what}: the access token is still active at introspection"
     );
+    for at in [RefreshAt::Matrix, RefreshAt::Token] {
+        let (status, body, _) = refresh_at(c, base, at, &login.refresh_token, login).await;
+        assert_refused_as_unknown(at, status, &body, what);
+    }
 }
 
 /// `login` refreshes at `/token`, then its successor at the Matrix endpoint.
@@ -4120,12 +4122,13 @@ async fn e1_a_global_epoch_refuses_every_older_grant() {
     // left behind it would refuse nothing newer, but the stack is shared.
     let mut refused = Vec::new();
     for login in &older {
+        // Introspection first, before a refresh deletes the grant.
+        let active = token_active(&c, &login.access_token).await;
         let mut outcome = Vec::new();
         for at in [RefreshAt::Matrix, RefreshAt::Token] {
             let (status, body, _) = refresh_at(&c, &base, at, &login.refresh_token, login).await;
             outcome.push((at, status, body));
         }
-        let active = token_active(&c, &login.access_token).await;
         refused.push((outcome, active));
     }
     let later = wallet_login(&c, &base, &new_wallet()).await;
