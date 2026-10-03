@@ -714,6 +714,7 @@ doc; read it before changing the code the rule covers.
   guessed or expired token is a Redis miss and yields usernameless login with zero credential
   ids. Never accept a client-supplied DID or identifier as the scope. Pin:
   `forged_user_cookie_yields_usernameless_empty_allow_credentials`,
+  `a_did_shaped_forged_user_cookie_yields_usernameless_empty_allow_credentials`,
   `user_session_create_lookup_roundtrip_and_forged_miss`.
 - **`webauthn:by_did` is advisory**; `get_passkeys_for_did` self-heals by scanning. Pin:
   `get_passkeys_for_did_scan_fallback_equals_index`.

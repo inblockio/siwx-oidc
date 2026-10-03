@@ -2081,6 +2081,94 @@ mod unknown_credential_response_tests {
 
         redis.del_raw(&key).await.ok();
     }
+
+    /// Enumeration safety with a DID-shaped forged value: a `siwx_user` cookie
+    /// whose value is the DID of an account with a registered passkey (a
+    /// `did:key`, and a `did:pkh` address) is a miss like any other forged
+    /// value. The picker stays usernameless with zero credential ids and no
+    /// `detected_mxid`, so a client can never name the account it wants listed.
+    /// The control: a genuine session for the same DID does scope the picker to
+    /// the seeded passkey, so the empty answer is not an empty index.
+    #[tokio::test]
+    async fn a_did_shaped_forged_user_cookie_yields_usernameless_empty_allow_credentials() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let base = url::Url::parse("http://localhost:8000").unwrap();
+        let cfg = wa::build_webauthn(&base, None, None).expect("build webauthn");
+        let cookie_of = |value: &str| {
+            let header = format!("siwx_user={value}");
+            let hv = axum::http::HeaderValue::from_str(&header).expect("header value");
+            Some(TypedHeader(
+                headers::Cookie::decode(&mut std::iter::once(&hv)).expect("decode cookie"),
+            ))
+        };
+        let n = uuid::Uuid::new_v4().simple().to_string();
+        let dids = [
+            format!("did:key:zDnaeForged{n}"),
+            format!("did:pkh:eip155:1:0x{n}00000000"),
+        ];
+        for (i, did) in dids.iter().enumerate() {
+            let cred = URL_SAFE_NO_PAD.encode(format!("cred-{n}-{i}").as_bytes());
+            redis.index_add_passkey(did, &cred).await.expect("seed");
+
+            let genuine = redis.create_user_session(did).await.expect("mint");
+            let scope = user_session_scope_did(&redis, &cookie_of(&genuine), false).await;
+            assert_eq!(scope.as_deref(), Some(did.as_str()), "control: {did}");
+            let rcr = wa::authenticate_start(
+                &cfg.webauthn,
+                &redis,
+                &format!("didgenuine{n}{i}"),
+                scope.as_deref(),
+            )
+            .await
+            .expect("authenticate_start");
+            assert_eq!(
+                rcr.public_key.allow_credentials.len(),
+                1,
+                "control: a genuine session offers the seeded passkey of {did}"
+            );
+
+            let forged = cookie_of(did);
+            assert_eq!(
+                user_session_token(&forged, false),
+                Some(did.as_str()),
+                "the forged value reaches the lookup"
+            );
+            let scope = user_session_scope_did(&redis, &forged, false).await;
+            assert_eq!(
+                scope, None,
+                "a DID as the cookie value scopes nothing: {did}"
+            );
+            let rcr = wa::authenticate_start(
+                &cfg.webauthn,
+                &redis,
+                &format!("didforged{n}{i}"),
+                scope.as_deref(),
+            )
+            .await
+            .expect("authenticate_start");
+            assert!(
+                rcr.public_key.allow_credentials.is_empty(),
+                "a DID-shaped forged cookie lists no credential id: {did}"
+            );
+            assert_eq!(
+                detected_mxid_for(None, Some("matrix.example.com"), scope.as_deref()).await,
+                None,
+                "and detects no account: {did}"
+            );
+
+            redis.revoke_own_sessions(did).await.ok();
+            redis
+                .del_raw(&format!(
+                    "{}/{did}",
+                    siwx_oidc::db::KV_WEBAUTHN_BY_DID_PREFIX
+                ))
+                .await
+                .ok();
+        }
+    }
 }
 
 #[cfg(test)]
