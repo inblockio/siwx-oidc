@@ -1262,11 +1262,27 @@ async fn sid_index(client: &RedisClient, sid: &str) -> Option<String> {
     .await
 }
 
+/// Whether `sid` and `other` share a run of [`SID_WINDOW`] characters: a sid
+/// cut from (or embedding) a credential or identifier shares one with it,
+/// while a random 22-character base62 sid does so with odds below 1e-9.
+const SID_WINDOW: usize = 8;
+fn shares_a_window(sid: &str, other: &str) -> bool {
+    sid.len() >= SID_WINDOW
+        && (0..=sid.len() - SID_WINDOW).any(|i| other.contains(&sid[i..i + SID_WINDOW]))
+}
+
 /// Every grant that comes with an ID token (`matrix_device`, `oidc`) gets its
-/// own random `sid`: 22 base62 characters, never derived from the device id,
-/// different per grant, indexed `idx:grants:sid/{sid}` -> grant id for no
-/// longer than the grant lives. A `service` grant (an admin token, no ID token)
-/// has none.
+/// own random `sid`: 22 base62 characters, different per grant, indexed
+/// `idx:grants:sid/{sid}` -> grant id for no longer than the grant lives. A
+/// `service` grant (an admin token, no ID token) has none.
+///
+/// Randomness itself is not observable from outside; what is pinned is its
+/// consequence: across many grants every sid is distinct, and no sid shares
+/// an 8-character run with anything an RP or another user could learn or
+/// that names the grant (the grant handle and id, the access and refresh
+/// tokens and their digests, the device id, the username, the DID). A sid
+/// derived from any of them (a prefix, a substring, a slice of a digest)
+/// fails here.
 #[tokio::test]
 async fn every_grant_with_an_id_token_has_its_own_random_sid() {
     let Some(client) = crate::test_support::redis().await else {
@@ -1309,6 +1325,53 @@ async fn every_grant_with_an_id_token_has_its_own_random_sid() {
         );
         seen.push(sid);
     }
+
+    // Many grants: every sid distinct, none sharing a run with what names the
+    // grant or with any credential or identifier of it.
+    let mut sids: std::collections::HashSet<String> = seen.into_iter().collect();
+    for i in 0..40 {
+        let mut new = matrix_grant(&format!("{user}m{i}"), &format!("SIWX_{}", nonce()));
+        if i % 2 == 0 {
+            new.kind = GrantKind::Oidc;
+            new.device_id = String::new();
+        }
+        let issued = issue(&client, &new).await;
+        let sid = sid_of(&client, &issued.grant_id)
+            .await
+            .expect("a grant with an ID token carries a sid");
+        assert!(sids.insert(sid.clone()), "sid {sid:?} issued twice");
+        let refresh = issued
+            .refresh_token
+            .clone()
+            .expect("a grant with an ID token here has a refresh token");
+        let handle = refresh
+            .strip_prefix(tokens::REFRESH_TOKEN_PREFIX)
+            .and_then(|rest| rest.split('_').next())
+            .expect("mcr_{handle}_{secret}")
+            .to_string();
+        assert_eq!(GrantId::of_handle(&handle), issued.grant_id);
+        let named = [
+            ("the grant handle", handle.clone()),
+            ("the grant id", issued.grant_id.as_str().to_string()),
+            ("the access token", issued.access_token.clone()),
+            (
+                "the access token digest",
+                tokens::digest(&issued.access_token),
+            ),
+            ("the refresh token", refresh.clone()),
+            ("the refresh token digest", tokens::digest(&refresh)),
+            ("the device id", new.device_id),
+            ("the username", new.username),
+            ("the DID", new.did),
+        ];
+        for (what, value) in named {
+            assert!(
+                !shares_a_window(&sid, &value),
+                "sid {sid:?} shares an {SID_WINDOW}-character run with {what}"
+            );
+        }
+    }
+    assert_eq!(sids.len(), 43, "every grant gets its own sid");
 
     let admin = issue(
         &client,
