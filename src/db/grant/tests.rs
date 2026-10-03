@@ -70,6 +70,32 @@ fn rotated(outcome: RotateOutcome) -> RotatedPair {
     }
 }
 
+/// `pair` without the instant it was answered at. `at` (the Redis second
+/// `expires_in` counts from) belongs to each answer, so a rotation and its
+/// replay, or two concurrent answers, that straddle a second differ there;
+/// everything else (the grant, the generation and the pair, byte for byte)
+/// must still be equal.
+fn timeless_pair(pair: RotatedPair) -> RotatedPair {
+    RotatedPair { at: 0, ..pair }
+}
+
+/// `outcome` with the instant of its answer cleared ([`timeless_pair`]).
+fn timeless(outcome: RotateOutcome) -> RotateOutcome {
+    match outcome {
+        RotateOutcome::Rotated(p) => RotateOutcome::Rotated(timeless_pair(p)),
+        RotateOutcome::Replayed(p) => RotateOutcome::Replayed(timeless_pair(p)),
+        other => other,
+    }
+}
+
+/// Waits until Redis `TIME` has passed the second `at`, so that the next
+/// answer is given in a later second than one stamped `at`.
+async fn after_second(client: &RedisClient, at: i64) {
+    while client.redis_time().await.expect("TIME") <= at {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 fn reuse_branch(outcome: &RotateOutcome) -> Option<ReuseBranch> {
     match outcome {
         RotateOutcome::Reuse(e) => Some(e.branch),
@@ -307,10 +333,17 @@ async fn a_replay_returns_the_same_pair_until_the_successor_is_used() {
     let issued = issue(&client, &matrix_grant(&user, "DEV1")).await;
     let t0 = issued.refresh_token.clone().unwrap();
     let first = rotated(rotate(&client, &t0).await);
+    // Replays answered in a later second than the rotation: only `at` differs.
+    after_second(&client, first.at).await;
     for _ in 0..2 {
+        let replay = rotate(&client, &t0).await;
+        assert!(
+            matches!(&replay, RotateOutcome::Replayed(p) if p.at > first.at),
+            "answered in a later second: {replay:?}"
+        );
         assert_eq!(
-            rotate(&client, &t0).await,
-            RotateOutcome::Replayed(first.clone())
+            timeless(replay),
+            timeless(RotateOutcome::Replayed(first.clone()))
         );
     }
 
@@ -319,8 +352,8 @@ async fn a_replay_returns_the_same_pair_until_the_successor_is_used() {
     let _: i64 = raw(&client, &["HINCRBY", &key, "last_used", "-3600"]).await;
     let _: i64 = raw(&client, &["HINCRBY", &key, "auth_time", "-3600"]).await;
     assert_eq!(
-        rotate(&client, &t0).await,
-        RotateOutcome::Replayed(first.clone())
+        timeless(rotate(&client, &t0).await),
+        timeless(RotateOutcome::Replayed(first.clone()))
     );
 
     // The successor's access token is accepted once: from now on, reuse.
@@ -358,8 +391,8 @@ async fn an_access_token_of_an_older_generation_does_not_use_the_successor() {
         .expect("still valid until it expires");
     assert_eq!(old.generation, 0);
     assert_eq!(
-        rotate(&client, &t0).await,
-        RotateOutcome::Replayed(first.clone())
+        timeless(rotate(&client, &t0).await),
+        timeless(RotateOutcome::Replayed(first.clone()))
     );
 }
 
@@ -385,8 +418,8 @@ async fn rotating_the_successor_counts_as_its_use_and_older_tokens_are_reuse() {
     assert_eq!(reuse.grant_fp, issued.grant_id.fingerprint());
     // t1 is now the previous token and t2 is unused: t1 replays t2's pair.
     assert_eq!(
-        rotate(&client, &p1.pair.refresh_token).await,
-        RotateOutcome::Replayed(p2.clone())
+        timeless(rotate(&client, &p1.pair.refresh_token).await),
+        timeless(RotateOutcome::Replayed(p2.clone()))
     );
     // A secret this grant never issued, under its live handle, is reuse too.
     let handle = tokens::parse_refresh_token(&t0).unwrap().handle.to_string();
@@ -430,7 +463,9 @@ async fn concurrent_rotations_of_one_token_converge_on_one_pair() {
     assert_eq!(rotations, 1, "exactly one request rotates");
     assert_eq!(pairs.len(), 50);
     assert!(
-        pairs.iter().all(|p| p == &pairs[0]),
+        pairs
+            .iter()
+            .all(|p| timeless_pair(p.clone()) == timeless_pair(pairs[0].clone())),
         "all carry the same pair"
     );
     let g = hgetall(&client, &grant_key(&issued.grant_id)).await;
