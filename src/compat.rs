@@ -663,6 +663,7 @@ mod tests {
     use axum::extract::{Form, State};
     use axum::response::IntoResponse;
     use siwx_oidc::db::grant::{GrantKind, IssuedGrant, NewGrant};
+    use siwx_oidc::db::tokens;
     use siwx_oidc::db::{DBClient, TokenMetadata};
 
     /// The test Redis, or `None` after a loud skip (`siwx_oidc::test_support`).
@@ -892,6 +893,16 @@ mod tests {
 
     /// A grant with a refresh token, for the refresh and revoke tests.
     async fn seed_grant(client: &RedisClient, user: &str, dev: &str) -> IssuedGrant {
+        seed_grant_for(client, user, dev, false).await
+    }
+
+    /// A grant with a refresh token issued to a public or a confidential client.
+    async fn seed_grant_for(
+        client: &RedisClient,
+        user: &str,
+        dev: &str,
+        confidential_client: bool,
+    ) -> IssuedGrant {
         client
             .issue_grant(&NewGrant {
                 kind: if dev.is_empty() {
@@ -902,7 +913,7 @@ mod tests {
                 username: user.to_string(),
                 did: format!("did:key:z{user}"),
                 client_id: "compat-test".into(),
-                confidential_client: false,
+                confidential_client,
                 device_id: dev.to_string(),
                 scope: "openid".into(),
                 name: user.to_string(),
@@ -912,6 +923,52 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    /// `POST /_matrix/client/v3/refresh` carries no client identity, so it
+    /// cannot authenticate a confidential client (I7): it refuses that client's
+    /// refresh token exactly like an unknown token and leaves it untouched, so
+    /// the client can still refresh at `POST /token` with its secret. A public
+    /// client's token rotates there as before.
+    #[tokio::test]
+    async fn the_matrix_endpoint_refuses_a_confidential_clients_refresh_token() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("conf-user-{n}");
+        let dev = format!("CONF_{n}");
+        let state = standalone_state(client.clone());
+
+        let (_, unknown) = matrix_refresh(&state, &tokens::new_refresh_token("nogrant")).await;
+        let confidential = seed_grant_for(&client, &user, &dev, true)
+            .await
+            .refresh_token
+            .unwrap();
+        let (status, body) = matrix_refresh(&state, &confidential).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a confidential client's refresh token is refused: {body}"
+        );
+        assert_eq!(body, unknown, "refused exactly like an unknown token");
+        let grant = client
+            .resolve_refresh_token(&confidential)
+            .await
+            .unwrap()
+            .expect("the refused token is still the grant's current refresh token");
+        assert_eq!(grant.generation, 0, "the refusal rotated nothing");
+
+        let public = seed_grant_for(&client, &user, &dev, false)
+            .await
+            .refresh_token
+            .unwrap();
+        let (status, body) = matrix_refresh(&state, &public).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a public client's token rotates: {body}"
+        );
+
+        client.revoke_grants_for_device(&user, &dev).await.ok();
     }
 
     /// The Matrix endpoint's replay follows the rule of the OAuth grant (I4):

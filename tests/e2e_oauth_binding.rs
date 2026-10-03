@@ -2295,6 +2295,55 @@ async fn a_refresh_token_is_refused_to_another_client() {
     );
 }
 
+/// `POST /_matrix/client/v3/refresh` carries no client identity, so it cannot
+/// authenticate a confidential client: it refuses that client's refresh token
+/// exactly like an unknown token (I7), and the refusal consumes nothing, so the
+/// client still refreshes at `POST /token` with its secret. A public client,
+/// registered the way Element Web and Element X register, refreshes there as
+/// before.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn the_matrix_endpoint_refuses_a_confidential_clients_refresh_token() {
+    let base = oidc();
+    let c = Client::new();
+    let nrc = no_redirect_client();
+    let rc = register_client(&c, &base).await;
+    let (_access, refresh) = tokens_for_client(&c, &nrc, &base, &rc, true).await;
+
+    assert_refused_by_matrix_refresh(
+        &c,
+        &base,
+        &refresh,
+        "a confidential client's refresh token (no secret can be presented here)",
+    )
+    .await;
+    let by_secret = refresh_as(
+        &c,
+        &base,
+        &refresh,
+        &[
+            ("client_id", rc.client_id.as_str()),
+            ("client_secret", rc.client_secret.as_str()),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(
+        by_secret.status(),
+        StatusCode::OK,
+        "the refusal consumed nothing: the token refreshes at /token with the secret"
+    );
+
+    let public = register_public_client(&c, &base).await;
+    let (_access, refresh) = tokens_for_client(&c, &nrc, &base, &public, false).await;
+    let resp = matrix_refresh(&c, &base, &refresh).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a public client's refresh token rotates at the Matrix endpoint"
+    );
+}
+
 /// A confidential client authenticates at the refresh grant: no credentials
 /// and a wrong secret are `invalid_client` with a 401, and a request that
 /// attempted HTTP Basic is answered with the matching challenge. The secret
