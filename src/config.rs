@@ -263,7 +263,11 @@ pub struct Config {
     #[serde(default)]
     pub backchannel_logout_required_for_refresh: bool,
     /// Revoke the grant when a superseded refresh token is presented (I5
-    /// phase B). Default off.
+    /// phase B): the rotation script that detects the reuse deletes the grant
+    /// (never the Synapse device), so its current holder is refused too. Off
+    /// (the default, phase A): reuse is refused and logged, nothing revoked.
+    /// Stays off until the maintainers decide (design decision D2: 30 days of
+    /// phase-A telemetry with every reuse event explained). Read once at startup.
     /// Env: `SIWXOIDC_REUSE_REVOKES_GRANT`
     #[serde(default)]
     pub reuse_revokes_grant: bool,

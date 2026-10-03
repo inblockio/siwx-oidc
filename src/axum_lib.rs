@@ -1472,10 +1472,14 @@ pub async fn main() {
             "absolute grant lifetime configured"
         );
     }
+    if config.reuse_revokes_grant {
+        info!("refresh token reuse enforcement on: a reuse event revokes its grant");
+    }
     let redis_client = RedisClient::new(&config.redis_url)
         .await
         .expect("Could not build Redis client")
-        .with_grant_lifetime(grant_lifetime);
+        .with_grant_lifetime(grant_lifetime)
+        .with_reuse_enforcement(config.reuse_revokes_grant);
 
     store_default_clients(&config, &redis_client)
         .await
