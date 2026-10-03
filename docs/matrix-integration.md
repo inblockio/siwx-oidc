@@ -616,8 +616,8 @@ sign-out deletes the device, token hygiene does not.
 - All teardown is best-effort and idempotent, and never returns 500. Revoke,
   logout and `logout/all` always answer 200 (`{}` for the Matrix routes), even
   for an unknown token. Without a Synapse client or server name, teardown
-  revokes Redis tokens only. Revocation is keyed on the localpart
-  (`TokenMetadata.username`), not the raw DID.
+  revokes Redis tokens only. Revocation is keyed on the localpart (the grant's
+  `username`, and `TokenMetadata.username` for a legacy entry), not the raw DID.
 - In standalone mode tokens have no device, so revoke and logout remove only the
   presented credential: an access token alone, or, for a refresh token, its whole
   grant, the grant's live access token included (RFC 7009 §2.1). The second half
@@ -625,7 +625,8 @@ sign-out deletes the device, token hygiene does not.
   revoked refresh token left its access token alive for up to 300 s.
 - The legacy device-deletion routes accept the bearer token as authorization,
   with no user-interactive auth step, as MAS does for delegated device deletion.
-  An unknown token answers 401 `M_UNKNOWN_TOKEN`.
+  An unknown token answers 401 `M_UNKNOWN_TOKEN`; a token-store fault answers a
+  retryable 503 `M_UNKNOWN` (see above), never a refusal.
 
 ## Account management (MSC4191)
 
