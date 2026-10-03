@@ -96,14 +96,19 @@ rather than as a new `did:key`:
 
 | Key | TTL | Content |
 |---|---|---|
-| `webauthn:challenge/{session_id}` | 120 s | ceremony state (registration state or assertion challenge) |
+| `webauthn:ceremony/{sha256(ceremony id)}` | 120 s | ceremony state (registration state or assertion challenge), read and deleted in one step |
 | `webauthn:credential/{cred_id_b64}` | none | the stored passkey (serialised `webauthn_rs::Passkey`, including its counter) |
 | `webauthn:link/{cred_id_b64}` | none | `{primary_did, label}` for a linked passkey |
-| `webauthn:link_challenge/{session_id}` | 120 s | link ceremony state and the wallet DID |
+| `webauthn:link_ceremony/{sha256(session id)}` | 120 s | link ceremony state and the wallet DID |
 | `webauthn:by_did/{did}` | none | set of credential IDs that resolve to the DID |
 | `user:session/{token}` | 30 days | opaque login user session: token → DID |
-| `device_codes/{device_code}` | 1800 s | device-code grant state |
-| `user_codes/{user_code}` | 1800 s | user code → device code |
+| `device_code/{sha256(device code)}` | 1800 s | device-code grant state (with the user code's digest) |
+| `user_code/{sha256(user code)}` | 1800 s | user code → the device code's digest |
+
+Ceremony, device and user codes are keyed by their digest so the store never holds a value a
+client presents; entries a build before digest keys wrote under `webauthn:challenge/`,
+`webauthn:link_challenge/`, `device_codes/` and `user_codes/` are read until they expire. See
+[architecture.md](architecture.md#redis-keyspace).
 
 For login and linking, `{session_id}` is the OIDC session. The device-approval
 flow uses `device_passkey_{user_code}`, and the account page uses
