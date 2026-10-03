@@ -7277,6 +7277,47 @@ mod client_binding_tests {
         );
     }
 
+    /// A grace replay returns the successor pair only while the successor
+    /// refresh token is live. Once it has been rotated away or revoked, the
+    /// recorded pair is dead (the next rotation or the revocation took its
+    /// access token with it), so handing it out would answer a lost-response
+    /// retry with tokens that do not work. The replay is `invalid_grant`, like
+    /// any unknown token.
+    #[tokio::test]
+    async fn a_replay_whose_successor_has_been_rotated_or_revoked_is_refused() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Public).await;
+
+        // Rotated: the client received the successor and has since used it.
+        let old = seed_refresh_token(&db, &client).await;
+        let successor = refresh_token_of(refresh(&db, &config, &old, NOTHING).await);
+        assert_eq!(
+            refresh_token_of(refresh(&db, &config, &old, NOTHING).await),
+            successor,
+            "while the successor is live the replay returns it"
+        );
+        let next = refresh_token_of(refresh(&db, &config, &successor, NOTHING).await);
+        assert_ne!(next, successor);
+        assert_eq!(
+            outcome(&refresh(&db, &config, &old, NOTHING).await),
+            "invalid_grant",
+            "a replay whose successor was rotated gets no pair"
+        );
+
+        // Revoked: the successor was deleted before the client used it.
+        let old = seed_refresh_token(&db, &client).await;
+        let successor = refresh_token_of(refresh(&db, &config, &old, NOTHING).await);
+        db.delete_token(&successor).await.unwrap();
+        assert_eq!(
+            outcome(&refresh(&db, &config, &old, NOTHING).await),
+            "invalid_grant",
+            "a replay whose successor was revoked gets no pair"
+        );
+    }
+
     /// One helper authenticates the client for both grants, so the two cannot
     /// drift: every way a request can present itself gets the same answer from
     /// the code exchange and the refresh grant.
