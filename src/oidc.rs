@@ -39,7 +39,9 @@ use urlencoding::decode;
 use uuid::Uuid;
 
 use aqua_auth::find_did_method;
-use siwx_oidc::db::grant::{GrantKind, InvalidReason, NewGrant, RotateOutcome, RotateRequest};
+use siwx_oidc::db::grant::{
+    GrantKind, InvalidReason, NewGrant, RefreshPeek, RotateOutcome, RotateRequest,
+};
 use siwx_oidc::db::*;
 use subtle::ConstantTimeEq;
 
@@ -1011,7 +1013,7 @@ fn check_client_secret(
             Err(CustomError::Unauthorized("Bad secret.".to_string()))
         }
         Some(_) => Ok(()),
-        None if client_is_confidential(Some(client_entry), config) => {
+        None if client_is_confidential(Some(client_entry), config.require_secret) => {
             Err(CustomError::Unauthorized("Secret required.".to_string()))
         }
         None => Ok(()),
@@ -1075,12 +1077,12 @@ async fn authenticate_refresh_client(
 /// at issuance, so `POST /_matrix/client/v3/refresh`, which cannot
 /// authenticate a client, refuses exactly the grants whose client
 /// `POST /token` would ask for a secret.
-fn client_is_confidential(client: Option<&ClientEntry>, config: &crate::config::Config) -> bool {
+pub(crate) fn client_is_confidential(client: Option<&ClientEntry>, require_secret: bool) -> bool {
     match client.map(|c| c.metadata.token_endpoint_auth_method()) {
         None => false,
         Some(Some(CoreClientAuthMethod::None)) => false,
         Some(Some(_)) => true,
-        Some(None) => config.require_secret,
+        Some(None) => require_secret,
     }
 }
 
@@ -1099,14 +1101,15 @@ async fn token_refresh(
         })
     })?;
 
-    // The grant the token's handle names. Only a refresh token in the grant
-    // format has one: an access or admin token, garbage, and a token of a grant
-    // that is gone are all answered exactly like an unknown token.
-    let Some(grant) = db_client.peek_refresh_grant(&rt).await? else {
-        // TODO(M3): a legacy refresh token (`token/{raw}`, written before the
-        // grant record) is lifted into a grant here (design 5.8). Until then it
-        // is an unknown token.
-        return Err(unknown_refresh_token());
+    // What the token names: the grant its handle names (or that a legacy token
+    // was lifted into), or a legacy refresh token (`token/{raw}`, written
+    // before the grant record) not lifted yet. An access or admin token,
+    // garbage, and a token of a grant that is gone are all answered exactly
+    // like an unknown token.
+    let (bound_client, legacy) = match db_client.peek_refresh_token(&rt).await? {
+        RefreshPeek::Grant(grant) => (grant.client_id, None),
+        RefreshPeek::Legacy(legacy) => (legacy.meta.client_id.clone(), Some(legacy)),
+        RefreshPeek::Unknown => return Err(unknown_refresh_token()),
     };
 
     // A refresh token belongs to the client it was issued to (I7): before the
@@ -1115,7 +1118,7 @@ async fn token_refresh(
     // carries no client identity, so it refuses a confidential client's grant
     // instead (`compat::refresh`).
     authenticate_refresh_client(
-        &grant.client_id,
+        &bound_client,
         named_client.as_deref(),
         presented_secret.as_deref(),
         config,
@@ -1125,14 +1128,25 @@ async fn token_refresh(
 
     // The one rotation script (I3) decides everything else atomically: rotate,
     // replay the unused successor of a lost response (I4), or refuse. The
-    // script checks the named client again; it can only agree here.
-    let outcome = db_client
-        .rotate_refresh_token(&RotateRequest {
-            presented: &rt,
-            client_id: named_client.as_deref(),
-            refuse_confidential: false,
-        })
-        .await?;
+    // script checks the named client again; it can only agree here. A legacy
+    // refresh token is lifted into a grant instead (design 5.8): answered with
+    // a pair in the current format, so no user signs in again; its grant
+    // records the client's confidentiality by the rule every issuance uses.
+    let request = RotateRequest {
+        presented: &rt,
+        client_id: named_client.as_deref(),
+        refuse_confidential: false,
+    };
+    let outcome = match &legacy {
+        Some(legacy) => {
+            let client = db_client.get_client(legacy.meta.client_id.clone()).await?;
+            let confidential = client_is_confidential(client.as_ref(), config.require_secret);
+            db_client
+                .lift_legacy_refresh_token(&request, legacy, confidential)
+                .await?
+        }
+        None => db_client.rotate_refresh_token(&request).await?,
+    };
     let (pair, expires_in) = match outcome {
         RotateOutcome::Rotated(rotated) => (rotated.pair, ACCESS_TOKEN_TTL),
         RotateOutcome::Replayed(replayed) => {
@@ -1362,7 +1376,10 @@ async fn token_device_code(
                     username,
                     did: did.clone(),
                     client_id: client_id.clone(),
-                    confidential_client: client_is_confidential(client_entry.as_ref(), config),
+                    confidential_client: client_is_confidential(
+                        client_entry.as_ref(),
+                        config.require_secret,
+                    ),
                     device_id: dev_id.clone(),
                     scope: scope.clone(),
                     name: display_name,
@@ -1634,7 +1651,7 @@ async fn token_authorization_code(
             username,
             did: code_entry.did.clone(),
             client_id: client_id.clone(),
-            confidential_client: client_is_confidential(Some(&client_entry), config),
+            confidential_client: client_is_confidential(Some(&client_entry), config.require_secret),
             device_id: code_entry.device_id.clone().unwrap_or_default(),
             scope: scope.clone(),
             name: display_name,
@@ -6952,6 +6969,111 @@ mod client_binding_tests {
         )
         .await;
         assert_eq!(outcome(&with_header_secret), "ok");
+    }
+
+    /// A refresh token written before the grant record (`token/{raw}`), as the
+    /// previous build left it for `client_id`. Returns the raw token.
+    async fn seed_legacy_refresh_token(db: &RedisClient, client_id: &str) -> String {
+        let raw = format!("mcr_{}", Uuid::new_v4().simple());
+        let now = Utc::now().timestamp();
+        db.set_token(
+            &raw,
+            &TokenMetadata {
+                username: unique("localpart"),
+                device_id: String::new(),
+                scope: "openid".into(),
+                client_id: client_id.into(),
+                iat: now,
+                exp: now + REFRESH_TOKEN_TTL as i64,
+                did: "did:key:zDnBINDING".into(),
+                name: "did:key:zDnBINDING".into(),
+                kind: Some(TokenKind::Refresh),
+            },
+            REFRESH_TOKEN_TTL,
+        )
+        .await
+        .unwrap();
+        raw
+    }
+
+    /// Item 10 at `POST /token`: a legacy refresh token is lifted into a grant
+    /// and answered with a pair in the current format, but only for its own
+    /// client, authenticated exactly like any refresh; a refused request leaves
+    /// the legacy entry alone. The lifted grant records whether its client is
+    /// confidential by the one rule (`client_is_confidential`), so the Matrix
+    /// endpoint refuses its tokens exactly when this endpoint demands a secret.
+    #[tokio::test]
+    async fn a_legacy_refresh_token_is_lifted_for_its_own_client_with_its_confidentiality() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let other = seed_client(&db, Registration::Public).await;
+        for registration in [Registration::Confidential, Registration::Public] {
+            let client = seed_client(&db, registration).await;
+            let legacy = seed_legacy_refresh_token(&db, &client).await;
+            let named_other = refresh(
+                &db,
+                &config,
+                &legacy,
+                Presented {
+                    client_id: Some(&other),
+                    ..NOTHING
+                },
+            )
+            .await;
+            assert_eq!(
+                outcome(&named_other),
+                "invalid_grant",
+                "{registration:?}: another client"
+            );
+            let confidential = matches!(registration, Registration::Confidential);
+            if confidential {
+                let no_secret = refresh(
+                    &db,
+                    &config,
+                    &legacy,
+                    Presented {
+                        client_id: Some(&client),
+                        ..NOTHING
+                    },
+                )
+                .await;
+                assert_eq!(outcome(&no_secret), "invalid_client: Secret required.");
+            }
+            assert!(
+                db.get_token(&legacy).await.unwrap().is_some(),
+                "{registration:?}: a refused request leaves the legacy entry"
+            );
+
+            let lifted = refresh(
+                &db,
+                &config,
+                &legacy,
+                Presented {
+                    client_id: Some(&client),
+                    form_secret: confidential.then_some(SECRET),
+                    ..NOTHING
+                },
+            )
+            .await;
+            let new_rt = refresh_token_of(lifted);
+            assert!(
+                siwx_oidc::db::tokens::parse_refresh_token(&new_rt).is_some(),
+                "{registration:?}: the answer is in the current format"
+            );
+            assert!(
+                db.get_token(&legacy).await.unwrap().is_none(),
+                "{registration:?}: the legacy entry is gone"
+            );
+            let grant = db.peek_refresh_grant(&new_rt).await.unwrap().unwrap();
+            assert_eq!(grant.client_id, client);
+            assert_eq!(
+                grant.confidential_client, confidential,
+                "{registration:?}: the lifted grant records the client's confidentiality"
+            );
+            assert_eq!(grant.generation, 1);
+        }
     }
 
     /// A public client authenticates nothing: it may name itself or not. Naming

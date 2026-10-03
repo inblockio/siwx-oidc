@@ -2525,3 +2525,295 @@ async fn no_token_the_client_holds_is_stored_in_the_clear() {
     );
     assert_nothing_stored_in_the_clear(&url, &held, "after revocation").await;
 }
+
+// ===========================================================================
+// R1: the tokens a build before the grant record wrote keep working after the
+// upgrade (design 5.8, item 10 of Phase 2a).
+// ===========================================================================
+
+/// A session as a build before the grant record left it in the store: raw
+/// `token/{raw}` entries for its access and refresh token.
+struct LegacySession {
+    at: RefreshAt,
+    client_id: String,
+    access_token: String,
+    refresh_token: String,
+}
+
+impl LegacySession {
+    fn login(&self) -> LoginResult {
+        LoginResult {
+            access_token: self.access_token.clone(),
+            refresh_token: self.refresh_token.clone(),
+            device_id: String::new(),
+            client_id: self.client_id.clone(),
+        }
+    }
+}
+
+/// Whether `token` is a refresh token in the grant format,
+/// `mcr_{22 base62}_{32 base62}`.
+fn is_grant_refresh_token(token: &str) -> bool {
+    let alnum = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_alphanumeric());
+    token
+        .strip_prefix("mcr_")
+        .and_then(|rest| rest.split_once('_'))
+        .is_some_and(|(handle, secret)| alnum(handle, 22) && alnum(secret, 32))
+}
+
+async fn stack_redis(url: &str) -> bb8_redis::redis::aio::MultiplexedConnection {
+    bb8_redis::redis::Client::open(url)
+        .unwrap_or_else(|e| panic!("stack Redis URL: {e}"))
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap_or_else(|e| panic!("stack Redis at {url} is unreachable: {e}"))
+}
+
+/// A legacy token entry exactly as 3547bd2 wrote it (`set_token` before token
+/// kinds: no `kind` field, the lifetime says which kind it is), with its member
+/// in the legacy device index.
+async fn seed_legacy_entry(url: &str, token: &str, meta: &Value, lifetime: i64) {
+    use bb8_redis::redis;
+    let mut conn = stack_redis(url).await;
+    let key = format!("token/{token}");
+    let _: () = redis::cmd("SET")
+        .arg(&key)
+        .arg(meta.to_string())
+        .arg("EX")
+        .arg(lifetime)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let device = meta["device_id"].as_str().unwrap_or_default();
+    if !device.is_empty() {
+        let idx = format!(
+            "idx:user_device/{}/{device}",
+            meta["username"].as_str().unwrap()
+        );
+        let _: () = redis::cmd("SADD")
+            .arg(&idx)
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+}
+
+fn random_base62(n: usize) -> String {
+    use rand::Rng;
+    const B62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut rng = rand::thread_rng();
+    (0..n).map(|_| B62[rng.gen_range(0..62)] as char).collect()
+}
+
+/// A legacy session for `at`, written into the store in the 3547bd2 layout for
+/// an account and device a real sign-in created, so everything around the
+/// tokens (client registration, Synapse device) is what the old build left.
+async fn seed_legacy_session(c: &Client, base: &str, url: &str, at: RefreshAt) -> LegacySession {
+    let login = wallet_login(c, base, &new_wallet()).await;
+    let claims = introspect(c, &login.access_token).await;
+    assert_eq!(
+        claims["active"], true,
+        "the sign-in's access token: {claims}"
+    );
+    let now = chrono_now();
+    let session = LegacySession {
+        at,
+        client_id: login.client_id.clone(),
+        access_token: format!("mat_{}", random_base62(32)),
+        refresh_token: format!("mcr_{}", random_base62(32)),
+    };
+    for (token, lifetime) in [
+        (&session.access_token, 300),
+        (&session.refresh_token, 7_776_000),
+    ] {
+        let meta = json!({
+            "username": claims["username"],
+            "device_id": login.device_id,
+            "scope": claims["scope"],
+            "client_id": login.client_id,
+            "iat": now,
+            "exp": now + lifetime,
+            "did": claims["sub"],
+            "name": claims["sub"],
+        });
+        seed_legacy_entry(url, token, &meta, lifetime).await;
+    }
+    session
+}
+
+fn chrono_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+fn r1_sessions_file() -> String {
+    std::env::var("E2E_R1_SESSIONS").unwrap_or_else(|_| {
+        panic!("E2E_R1_SESSIONS names the file the mint stage writes and the check stage reads")
+    })
+}
+
+/// R1, a real upgrade or its seeded stand-in. Legacy sessions come from one of
+/// three places, chosen by `E2E_R1_STAGE`:
+///
+/// - `mint`: run against the PREVIOUS build (3547bd2 or the integration build
+///   before the grant record). Signs in once per endpoint, asserts that the
+///   server wrote the legacy layout (`token/{raw}`), saves the sessions to
+///   `E2E_R1_SESSIONS`, and stops. Then swap the binary, keeping Redis.
+/// - `check`: reads those sessions back and runs the checks below against the
+///   new build, within the legacy access tokens' 300 s.
+/// - unset (CI and every regular run): signs in on the server under test and
+///   writes the legacy entries itself, exactly as 3547bd2 wrote them.
+///
+/// The checks, at `POST /token` and at `POST /_matrix/client/v3/refresh`: a
+/// legacy access token introspects active; the legacy refresh token is lifted
+/// and answered with tokens in the grant format; a replay before first use
+/// returns the same pair; the legacy access token is still active; no key or
+/// value holds the legacy refresh token or the lifted pair (H4); once the new
+/// access token is used, the replay is refused as reuse; the new refresh token
+/// rotates.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn legacy_tokens_keep_working_after_the_upgrade() {
+    let Some(url) = stack_redis_url() else {
+        let marker = "E2E_SKIP: legacy_tokens_keep_working_after_the_upgrade: no stack Redis URL \
+                      (E2E_REDIS_URL, SIWXOIDC_REDIS_URL, SIWEOIDC_REDIS_URL or \
+                      REDIS_HOST/REDIS_PORT); the upgrade was NOT exercised";
+        assert!(
+            std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+            "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+        );
+        eprintln!("{marker}");
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    let stage = std::env::var("E2E_R1_STAGE").unwrap_or_default();
+    let sessions: Vec<LegacySession> = match stage.as_str() {
+        "mint" => {
+            let mut minted = Vec::new();
+            for at in [RefreshAt::Token, RefreshAt::Matrix] {
+                mock_reset(&c).await;
+                let login = wallet_login(&c, &base, &new_wallet()).await;
+                let mut conn = stack_redis(&url).await;
+                let legacy: bool = bb8_redis::redis::cmd("EXISTS")
+                    .arg(format!("token/{}", login.refresh_token))
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap();
+                assert!(
+                    legacy,
+                    "mint: the server under test did not store its refresh token as \
+                     token/{{raw}}: run the mint stage against the previous build"
+                );
+                minted.push(json!({
+                    "at": format!("{at:?}"),
+                    "client_id": login.client_id,
+                    "access_token": login.access_token,
+                    "refresh_token": login.refresh_token,
+                }));
+            }
+            std::fs::write(r1_sessions_file(), Value::Array(minted).to_string()).unwrap();
+            eprintln!(
+                "R1 mint: legacy sessions written; swap the binary and run E2E_R1_STAGE=check"
+            );
+            return;
+        }
+        "check" => {
+            let saved: Vec<Value> =
+                serde_json::from_str(&std::fs::read_to_string(r1_sessions_file()).unwrap())
+                    .unwrap();
+            saved
+                .iter()
+                .map(|s| LegacySession {
+                    at: if s["at"] == "Token" {
+                        RefreshAt::Token
+                    } else {
+                        RefreshAt::Matrix
+                    },
+                    client_id: s["client_id"].as_str().unwrap().to_string(),
+                    access_token: s["access_token"].as_str().unwrap().to_string(),
+                    refresh_token: s["refresh_token"].as_str().unwrap().to_string(),
+                })
+                .collect()
+        }
+        "" => {
+            let mut seeded = Vec::new();
+            for at in [RefreshAt::Token, RefreshAt::Matrix] {
+                mock_reset(&c).await;
+                seeded.push(seed_legacy_session(&c, &base, &url, at).await);
+            }
+            seeded
+        }
+        other => panic!("E2E_R1_STAGE={other}: expected mint, check or unset"),
+    };
+    assert_eq!(sessions.len(), 2, "one legacy session per refresh endpoint");
+
+    for session in &sessions {
+        let at = session.at;
+        let login = session.login();
+        assert!(
+            token_active(&c, &session.access_token).await,
+            "{at:?}: a legacy access token introspects active after the upgrade"
+        );
+
+        let (status, body, pair) = refresh_at(&c, &base, at, &session.refresh_token, &login).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{at:?}: the legacy refresh token is lifted: {body}"
+        );
+        let (access, refresh) = pair.unwrap();
+        assert!(
+            access.starts_with("mat_") && is_grant_refresh_token(&refresh),
+            "{at:?}: the lifted pair is in the grant format: {body}"
+        );
+
+        let (status, body, replay) =
+            refresh_at(&c, &base, at, &session.refresh_token, &login).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{at:?}: a replay of the legacy token before first use: {body}"
+        );
+        assert_eq!(
+            replay.unwrap(),
+            (access.clone(), refresh.clone()),
+            "{at:?}: the replay returns the SAME pair"
+        );
+        assert!(
+            token_active(&c, &session.access_token).await,
+            "{at:?}: the legacy access token stays active until it expires"
+        );
+
+        // H4 for the lifted session. The legacy ACCESS token stays stored as
+        // token/{raw} until it expires (the read fallback), so it is not listed.
+        let mut held = ClientHeld::default();
+        held.add_token("legacy refresh token", &session.refresh_token);
+        held.add_token("lifted access token", &access);
+        held.add_token("lifted refresh token", &refresh);
+        assert_nothing_stored_in_the_clear(&url, &held, &format!("{at:?}: after the lift")).await;
+
+        assert!(
+            token_active(&c, &access).await,
+            "{at:?}: the lifted access token is active"
+        );
+        let (status, body, _) = refresh_at(&c, &base, at, &session.refresh_token, &login).await;
+        assert_refused_as_unknown(
+            at,
+            status,
+            &body,
+            "the legacy token after the lifted pair was used",
+        );
+
+        let (status, body, next) = refresh_at(&c, &base, at, &refresh, &login).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{at:?}: the lifted refresh token rotates: {body}"
+        );
+        assert!(is_grant_refresh_token(&next.unwrap().1));
+    }
+}

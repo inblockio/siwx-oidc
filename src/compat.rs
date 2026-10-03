@@ -50,7 +50,7 @@ use tracing::{debug, info, warn};
 // `siwx_oidc::synapse_client`, which was a *distinct* type here; it no longer
 // does (see the note in `src/lib.rs`).
 use crate::synapse_client::SynapseClient;
-use siwx_oidc::db::grant::{InvalidReason, RotateOutcome, RotateRequest};
+use siwx_oidc::db::grant::{InvalidReason, RefreshPeek, RotateOutcome, RotateRequest};
 use siwx_oidc::db::{DBClient, RedisClient, TokenKind, ACCESS_TOKEN_TTL};
 
 // -- Shared state for compat endpoints ----------------------------------------
@@ -64,6 +64,10 @@ pub struct CompatState {
     /// Matrix `server_name` (e.g. `matrix.inblock.io`), needed to build the
     /// mxid for Synapse admin-API device calls. `None` in standalone mode.
     pub server_name: Option<String>,
+    /// `config.require_secret`: whether a client registered without a
+    /// `token_endpoint_auth_method` is confidential
+    /// (`oidc::client_is_confidential`), for lifting a legacy refresh token.
+    pub require_secret: bool,
 }
 
 // -- Request/response types ---------------------------------------------------
@@ -258,8 +262,11 @@ struct PresentedToken {
 /// token the refresh endpoints would accept (a superseded one is unknown), or a
 /// legacy entry.
 ///
-/// TODO(M3): the legacy read stays while legacy refresh tokens (90 days) can
-/// still be presented; the migration decides when it goes.
+/// A legacy refresh token already lifted counts as its grant's previous token
+/// (`resolve_refresh_token` follows the `legacy_rt/…` pointer). The legacy read
+/// stays while legacy entries can still be presented: access entries for at
+/// most 900 s after the upgrade, refresh entries never presented for up to 90
+/// days (`REFRESH_TOKEN_TTL`); remove it one release after that.
 async fn resolve_presented(
     state: &CompatState,
     token: &str,
@@ -618,15 +625,42 @@ pub async fn refresh(
     // The one rotation script (I3) decides atomically: rotate, replay the
     // unused successor of a lost response (I4), or refuse. No client is named
     // (this endpoint has none), and a confidential client's grant is refused
-    // (see above).
-    let outcome = state
+    // (see above). A legacy refresh token (`token/{raw}`, written before the
+    // grant record) is lifted into a grant instead (design 5.8), unless its
+    // client is confidential: the same rule, decided by `client_is_confidential`
+    // as at every issuance, and the legacy token is left for `POST /token`.
+    let request = RotateRequest {
+        presented: &body.refresh_token,
+        client_id: None,
+        refuse_confidential: true,
+    };
+    let outcome = match state
         .redis_client
-        .rotate_refresh_token(&RotateRequest {
-            presented: &body.refresh_token,
-            client_id: None,
-            refuse_confidential: true,
-        })
-        .await;
+        .peek_refresh_token(&body.refresh_token)
+        .await
+    {
+        Ok(RefreshPeek::Legacy(legacy)) => {
+            match state
+                .redis_client
+                .get_client(legacy.meta.client_id.clone())
+                .await
+            {
+                Ok(client) => {
+                    let confidential =
+                        crate::oidc::client_is_confidential(client.as_ref(), state.require_secret);
+                    state
+                        .redis_client
+                        .lift_legacy_refresh_token(&request, &legacy, confidential)
+                        .await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Ok(RefreshPeek::Grant(_)) | Ok(RefreshPeek::Unknown) => {
+            state.redis_client.rotate_refresh_token(&request).await
+        }
+        Err(e) => Err(e),
+    };
     let (pair, expires_in) = match outcome {
         Ok(RotateOutcome::Rotated(rotated)) => (rotated.pair, ACCESS_TOKEN_TTL),
         Ok(RotateOutcome::Replayed(replayed)) => {
@@ -642,10 +676,9 @@ pub async fn refresh(
             debug!("refresh refused: device/account torn down");
             return invalid_refresh_token("Session has been revoked");
         }
-        // TODO(M3): a legacy refresh token (`NotCurrentFormat`: `token/{raw}`,
-        // written before the grant record) is lifted into a grant (design 5.8).
-        // Until then it is an unknown token.
-        // `ConfidentialClient`: a client this endpoint cannot authenticate
+        // `NotCurrentFormat`: neither a token in the current format, nor a
+        // legacy refresh token (lifted above), nor one already lifted: garbage
+        // or another kind of token. `ConfidentialClient`: a client this endpoint cannot authenticate
         // (see above), answered like an unknown token. `ClientMismatch` cannot
         // happen: no client is named.
         Ok(RotateOutcome::Invalid(_))
@@ -694,7 +727,7 @@ mod tests {
     use axum::response::IntoResponse;
     use siwx_oidc::db::grant::{GrantKind, IssuedGrant, NewGrant};
     use siwx_oidc::db::tokens;
-    use siwx_oidc::db::{DBClient, TokenMetadata};
+    use siwx_oidc::db::{DBClient, TokenMetadata, REFRESH_TOKEN_TTL};
 
     /// The test Redis, or `None` after a loud skip (`siwx_oidc::test_support`).
     async fn redis() -> Option<RedisClient> {
@@ -742,6 +775,7 @@ mod tests {
     fn standalone_state(redis_client: RedisClient) -> CompatState {
         CompatState {
             redis_client,
+            require_secret: true,
             synapse_client: None,
             server_name: None,
         }
@@ -1000,6 +1034,83 @@ mod tests {
         );
 
         client.revoke_grants_for_device(&user, &dev).await.ok();
+    }
+
+    /// Item 10 at the Matrix endpoint: a legacy refresh token (`token/{raw}`,
+    /// written before the grant record) of a public client is lifted into a
+    /// grant and answered in the current format; a confidential client's is
+    /// refused like an unknown token and left as it was, for `POST /token`
+    /// (the client registered without a method under `require_secret`).
+    #[tokio::test]
+    async fn the_matrix_endpoint_lifts_a_public_clients_legacy_token_but_not_a_confidential_ones() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let state = standalone_state(client.clone());
+        let confidential_client = format!("legacy-conf-{n}");
+        client
+            .set_client(
+                confidential_client.clone(),
+                siwx_oidc::db::ClientEntry {
+                    secret: "s".into(),
+                    metadata: openidconnect::core::CoreClientMetadata::new(
+                        vec![
+                            openidconnect::RedirectUrl::new("https://example.com/cb".into())
+                                .unwrap(),
+                        ],
+                        openidconnect::registration::EmptyAdditionalClientMetadata {},
+                    ),
+                    access_token: None,
+                },
+            )
+            .await
+            .unwrap();
+        let seed = |client_id: String| {
+            let client = client.clone();
+            async move {
+                let raw = format!("mcr_legacy{n}{client_id}");
+                let mut meta = refresh_meta(&format!("legacy-user-{n}"), "");
+                meta.client_id = client_id;
+                meta.iat = Utc::now().timestamp();
+                meta.exp = meta.iat + REFRESH_TOKEN_TTL as i64;
+                client
+                    .set_token(&raw, &meta, REFRESH_TOKEN_TTL)
+                    .await
+                    .unwrap();
+                raw
+            }
+        };
+        let (_, unknown) = matrix_refresh(&state, "mcr_never_issued_legacy").await;
+
+        let refused = seed(confidential_client).await;
+        let (status, body) = matrix_refresh(&state, &refused).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body, unknown, "refused exactly like an unknown token");
+        assert!(
+            client.get_token(&refused).await.unwrap().is_some(),
+            "the refused legacy token is left for POST /token"
+        );
+
+        let public = seed(format!("legacy-unregistered-{n}")).await;
+        let (status, body) = matrix_refresh(&state, &public).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a public client's legacy token is lifted: {body}"
+        );
+        let new_rt = body["refresh_token"].as_str().unwrap();
+        assert!(
+            tokens::parse_refresh_token(new_rt).is_some(),
+            "current format: {body}"
+        );
+        assert!(
+            client.get_token(&public).await.unwrap().is_none(),
+            "legacy entry gone"
+        );
+        let grant = client.peek_refresh_grant(new_rt).await.unwrap().unwrap();
+        assert!(
+            !grant.confidential_client,
+            "an unregistered client is public"
+        );
     }
 
     /// A store fault: Redis answers the operation that reads `key` with an
