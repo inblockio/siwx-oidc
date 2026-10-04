@@ -1,6 +1,6 @@
 Add a new cipher suite to the did:pkh DID method.
 
-Cipher suites live in aqua-auth (https://github.com/inblockio/aqua-rs-auth, crate
+Cipher suites live in aqua-auth (https://github.com/inblockio/aqua-auth, crate
 `aqua-auth`), which siwx-oidc pins by git tag. Paths below are relative to an
 aqua-auth checkout.
 

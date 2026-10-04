@@ -24,7 +24,7 @@ notice. There are no tagged releases yet; `main` is what runs.
 
 Workspace: the root package `siwx-oidc` (library crate `siwx_oidc` in `src/lib.rs`, binaries
 `siwx-oidc` and `migrate-credentials`) plus `siwx-oidc-auth/`. Crypto comes from the external
-crate [aqua-auth](https://github.com/inblockio/aqua-rs-auth), pinned by tag in both manifests.
+crate [aqua-auth](https://github.com/inblockio/aqua-auth), pinned by tag in both manifests.
 Modules marked **lib** are compiled into the library crate, so `tests/*.rs` can link them;
 everything else exists only in the binary crate.
 
@@ -880,7 +880,7 @@ in [SECURITY.md](SECURITY.md).
 
 | Repo | Role |
 |---|---|
-| [inblockio/aqua-rs-auth](https://github.com/inblockio/aqua-rs-auth) (crate `aqua-auth`) | Layer 1: `DIDMethod`/`CipherSuite`, CAIP-122 verification, WebAuthn assertion verification, credential store. Pinned by tag in both `Cargo.toml` files; bump both together. |
+| [inblockio/aqua-auth](https://github.com/inblockio/aqua-auth) (crate `aqua-auth`) | Layer 1: `DIDMethod`/`CipherSuite`, CAIP-122 verification, WebAuthn assertion verification, credential store. Pinned by tag in both `Cargo.toml` files; bump both together. |
 | [inblockio/siwx-oidc-matrix-server](https://github.com/inblockio/siwx-oidc-matrix-server) | Synapse + Element Web deployment, the Synapse patch registry (`patches/synapse/README.md`) and the `io.inblock.did` denylist. |
 | [spruceid/siwe-oidc](https://github.com/spruceid/siwe-oidc) | The Ethereum-only predecessor this project was forked from. Lineage: [docs/architecture.md](docs/architecture.md#lineage). |
 

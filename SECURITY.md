@@ -43,7 +43,7 @@ Out of scope here:
 - the bundled Matrix deployment (Synapse configuration and patches, Element Web patches, reverse
   proxy): report to [siwx-oidc-matrix-server](https://github.com/inblockio/siwx-oidc-matrix-server);
 - CAIP-122 and DID verification inside the aqua-auth crate: report to
-  [aqua-rs-auth](https://github.com/inblockio/aqua-rs-auth) (if unsure, report here and we
+  [aqua-auth](https://github.com/inblockio/aqua-auth) (if unsure, report here and we
   will route it);
 - vulnerabilities in Synapse, Element or other upstream projects: report to those projects.
 
