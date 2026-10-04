@@ -239,6 +239,18 @@ fn build_scope(device_id: Option<&str>) -> String {
     scope
 }
 
+/// The `scope` [`authenticate_with_device`] requests at `/authorize` for
+/// `device_id` (and [`authenticate`] for `None`).
+///
+/// A Matrix-mode server records the Matrix scope whatever was requested and
+/// never echoes the request, so a live check cannot read the scope off the
+/// server; it reads it here. The unit test
+/// `the_code_flow_sends_the_scope_it_relies_on` pins that this is exactly the
+/// value on the wire.
+pub fn code_flow_scope(device_id: Option<&str>) -> String {
+    build_scope(device_id)
+}
+
 /// The `scope` the device flow requests at `/device_authorization`:
 /// `openid` plus [`RELIED_ON_SCOPES`].
 fn build_device_flow_scope() -> String {
@@ -847,6 +859,11 @@ mod tests {
             let (path, query) = target.split_once('?').expect("a query");
             assert_eq!(path, "/authorize");
             assert_eq!(scope_in(query), expected, "device {device:?}");
+            assert_eq!(
+                scope_in(query),
+                code_flow_scope(device),
+                "device {device:?}"
+            );
         }
     }
 

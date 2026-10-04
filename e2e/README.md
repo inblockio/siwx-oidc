@@ -177,3 +177,22 @@ than rubber-stamps.
 - The legacy in-client session-manager delete endpoints work.
 - An admin-token rejection fails legibly (400 naming the admin token), never a
   misleading "device not found" or a 500.
+
+## The headless client against a live deployment
+
+`siwx-oidc-auth/tests/live_deployment.rs` is one `#[ignore]`d test that drives the
+`siwx-oidc-auth` library against a real deployment (siwx-oidc in Matrix mode and its
+homeserver), not the mock stack. With a freshly generated key it registers a public client,
+signs in with a proposed device, uses the access token at `whoami`, rotates the refresh token,
+replays the previous one before and after the successor's first use (same pair, then
+refused), verifies the published DID binding, and deactivates the account it created. Each
+run creates one throwaway account; the deactivation runs even when a check failed.
+
+```bash
+SIWX_SERVER=https://siwx.example.org SIWX_HOMESERVER=https://matrix.example.org \
+  cargo test -p siwx-oidc-auth --test live_deployment -- --ignored --nocapture
+```
+
+The targets come only from these two variables; a missing one fails the test unless
+`E2E_STRICT_SKIPS=0`. Every check prints `ok` or `FAILED`, so a run against an older server
+names each property it lacks.

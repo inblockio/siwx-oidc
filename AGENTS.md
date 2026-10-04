@@ -124,7 +124,10 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 - **Live suites** need a real Synapse and run in no CI job: `e2e_did_field_live` (a patched
   Synapse), `e2e_account_lifecycle_live`, five of the six `e2e_msc4191_live` tests,
   `e2e_msc3861::msc4191_metadata_advertised_and_forwarded` and `e2e_messaging`. Set
-  `E2E_STRICT_SKIPS=1` so a skipped assertion fails instead of passing.
+  `E2E_STRICT_SKIPS=1` so a skipped assertion fails instead of passing. The headless client's
+  `siwx-oidc-auth/tests/live_deployment.rs` runs against a whole deployment named by
+  `SIWX_SERVER` and `SIWX_HOMESERVER`, and creates and deactivates a throwaway account; see
+  e2e/README.md.
 - **Browser suites:** `e2e/browser/` (self-contained, runs in CI) and `e2e/element/` (needs
   Element Web, a real Synapse and the proxy from siwx-oidc-matrix-server).
 - **aqua-auth's own tests** run in that repository, not here.
