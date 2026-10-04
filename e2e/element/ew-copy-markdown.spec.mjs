@@ -1,19 +1,21 @@
 /**
- * CM1-CM5: the message context menu's "Copy Markdown" entry on hosted Element
+ * CM1-CM7: the message context menu's "Copy Markdown" entry on hosted Element
  * Web (siwx-oidc-matrix-server issue #24). Right-click a message, choose "Copy
- * Markdown", and the clipboard holds the message as clean CommonMark + GFM,
- * converted from the message's HTML (`formatted_body`), or from the plain `body`
- * with its Markdown metacharacters escaped when there is no HTML. A message
- * composed in Element as Markdown copies back as exactly what its sender typed.
+ * Markdown", and the clipboard holds the message as clean CommonMark + GFM:
+ * the sender's own `body` whenever that is provably the Markdown source of what
+ * is displayed (whoever sent it: Element, a Rust SDK agent, a plain-body bot),
+ * otherwise the message's HTML (`formatted_body`) converted to Markdown, or the
+ * plain `body` with its Markdown metacharacters escaped when there is no HTML
+ * and the body is not Markdown the leg can know about (CM4).
  *
- * CM1-CM4 send their events through the logged-in client in the page; CM5 types
- * into the real composer. Everything goes into a private ENCRYPTED room
- * (asserted: the room carries an `m.room.encryption` state event, and each sent
- * event is fetched back from the homeserver and must be `m.room.encrypted`), so
- * the menu is exercised on events that were decrypted locally, like real
- * traffic. Clipboard access is granted to the browser context (`clipboard-read`,
- * `clipboard-write`; localhost is a secure context) and read back with
- * `navigator.clipboard.readText()` in the page.
+ * CM1-CM4, CM6 and CM7 send their events through the logged-in client in the
+ * page; CM5 types into the real composer. Everything goes into a private
+ * ENCRYPTED room (asserted: the room carries an `m.room.encryption` state event,
+ * and each client-sent event is fetched back from the homeserver and must be
+ * `m.room.encrypted`), so the menu is exercised on events that were decrypted
+ * locally, like real traffic. Clipboard access is granted to the browser context
+ * (`clipboard-read`, `clipboard-write`; localhost is a secure context) and read
+ * back with `navigator.clipboard.readText()` in the page.
  *
  * WHAT WOULD TURN EACH LEG RED:
  *
@@ -32,7 +34,9 @@
  *       so on its own it proves nothing about the feature: it guards the
  *       opposite direction.
  *   CM4 (plain body escaped): the entry is missing, or a message with no HTML is
- *       copied without escaping its Markdown and HTML metacharacters.
+ *       copied without escaping its Markdown and HTML metacharacters. The body
+ *       holds raw HTML, which is the reason it must stay escaped: the copy of a
+ *       plain body is the body itself only when it is safe Markdown (CM7).
  *   CM5 (round trip of typed Markdown): a synthetic Markdown message (heading,
  *       bold, nested task list, GFM table, soft line breaks, fenced code) is
  *       put on the clipboard, pasted into the room's message composer and sent
@@ -47,13 +51,37 @@
  *       rows come back as `| a | b |\` with escaped pipes, soft breaks as `\`
  *       hard breaks, `- [ ]` as `- \[ \]` and `### 1.` as `### 1\.`. The
  *       clipboard text is logged as "[CM5] clipboard".
+ *   CM6 (Rust SDK sender): an event whose `body` is Markdown and whose
+ *       `formatted_body` is the REAL rendering of that body by the Rust SDK's
+ *       ruma (`RoomMessageEventContent::text_markdown`, see CM6_HTML), sent
+ *       through the client API: it is not Element's rendering of the text, so
+ *       Element's own composer pipeline cannot be what vouches for it. "Copy
+ *       Markdown" must return exactly the body. It fails when the copy is a
+ *       conversion of the displayed HTML instead of the sender's source: ruma
+ *       renders soft line breaks as `<br />` and the table with a `<thead>`, so
+ *       the converter returns a `\` hard break at the end of each soft-broken
+ *       line and a re-spaced table delimiter row (`| --- | --- | --- |` for
+ *       `|---|---|---|`); nothing else differs. The clipboard text is logged as
+ *       "[CM6] clipboard".
+ *   CM7 (plain Markdown bot): an `m.text` event with only a `body` (Markdown,
+ *       the same text as CM5) and no `format` or `formatted_body`, as bots that
+ *       send Markdown as plain text do. "Copy Markdown" must return exactly the
+ *       body. It fails when the plain-body path escapes the message: every
+ *       metacharacter comes back backslash-escaped (`\#`, `\*\*`, `\``, `\-`,
+ *       `\[ \]`, `\|`, so the table and the fenced code are no longer Markdown),
+ *       and each line followed by another line of its block ends in a `\` hard
+ *       break. The clipboard text is logged as "[CM7] clipboard".
  *
  * Discrimination: run this spec against an Element without the entry (the
- * baseline image); CM1, CM2, CM4 and CM5 must fail on the missing "Copy
- * Markdown" menu item while CM3 passes. Against an Element that has the entry
- * but converts only the displayed HTML (the image deployed before the
- * sender-source fix) CM1-CM4 pass and CM5 fails on the clipboard comparison,
- * with the symptoms above visible in the diff. With the fix, all five pass.
+ * baseline image); CM1, CM2, CM4, CM5, CM6 and CM7 must fail on the missing
+ * "Copy Markdown" menu item while CM3 passes. Against an Element that has the
+ * entry but converts only the displayed HTML (the image deployed before the
+ * sender-source fix) CM1-CM4 pass and CM5, CM6 and CM7 fail on the clipboard
+ * comparison, with the symptoms above visible in the diff. With the fix, all
+ * seven pass. CM5 alone cannot tell a general rule from a special case: it only
+ * proves the copy for a message Element composed itself. CM6 and CM7 prove the
+ * rule holds for senders that are not Element, and CM4 proves it stops where the
+ * body is not safe Markdown.
  *
  * WHY NOT serial MODE: in serial mode the first failure skips every later leg,
  * so a red run would show one failure instead of the full picture. The legs
@@ -151,6 +179,88 @@ const CM5_INPUT = [
   'cell  = max(0, value(status) - min(0.05 * flags, 0.15))',
   '```',
 ].join('\n');
+
+/**
+ * CM6: an event as the Rust SDK sends it. Both strings are the fields of
+ * `RoomMessageEventContent::text_markdown(md)` for the synthetic Markdown
+ * report below, byte for byte, generated with ruma-events 0.33.0 (feature
+ * "markdown", which renders with pulldown-cmark 0.13.4). `text_markdown` is given
+ * the Markdown without a trailing newline, and so is the `body` it returns.
+ * The text has what Element's renderer and ruma disagree on: soft line breaks
+ * (ruma renders them as `<br />`), a GFM table (`<thead>`, `|---|` delimiter
+ * row), a fenced code block with a language and a pipe in it, a quote and an
+ * ordered list. The expected copy is the body itself, no re-rendering.
+ */
+const CM6_BODY = [
+  '# Weekly status report',
+  '',
+  'Summary of the build and deploy state for the sample project.',
+  '',
+  '## Findings',
+  '',
+  'The nightly run finished without errors.',
+  'Two services restarted after the config change.',
+  'No data was lost.',
+  '',
+  '- **core-client**: pinned to `v1.2.3`',
+  '- **sample-bot**: needs `cargo update -p sample-lib`',
+  '- Plain item without markup',
+  '',
+  '| service | state | notes |',
+  '|---|---|---|',
+  '| `core-client` | ok | see [docs](https://example.org/docs) |',
+  '| `sample-bot` | stale | run `make deploy` |',
+  '',
+  '```rust',
+  'fn main() {',
+  '    println!("hello | world");',
+  '}',
+  '```',
+  '',
+  '> Quoted advice: restart only after the backup finished.',
+  '',
+  '1. Cut the tag.',
+  '2. Update the pin.',
+  '3. Redeploy.',
+].join('\n');
+
+const CM6_HTML = [
+  '<h1>Weekly status report</h1>',
+  '<p>Summary of the build and deploy state for the sample project.</p>',
+  '<h2>Findings</h2>',
+  '<p>The nightly run finished without errors.<br />',
+  'Two services restarted after the config change.<br />',
+  'No data was lost.</p>',
+  '<ul>',
+  '<li><strong>core-client</strong>: pinned to <code>v1.2.3</code></li>',
+  '<li><strong>sample-bot</strong>: needs <code>cargo update -p sample-lib</code></li>',
+  '<li>Plain item without markup</li>',
+  '</ul>',
+  '<table><thead><tr><th>service</th><th>state</th><th>notes</th></tr></thead><tbody>',
+  '<tr><td><code>core-client</code></td><td>ok</td><td>see <a href="https://example.org/docs">docs</a></td></tr>',
+  '<tr><td><code>sample-bot</code></td><td>stale</td><td>run <code>make deploy</code></td></tr>',
+  '</tbody></table>',
+  '<pre><code class="language-rust">fn main() {',
+  '    println!("hello | world");',
+  '}',
+  '</code></pre>',
+  '<blockquote>',
+  '<p>Quoted advice: restart only after the backup finished.</p>',
+  '</blockquote>',
+  '<ol>',
+  '<li>Cut the tag.</li>',
+  '<li>Update the pin.</li>',
+  '<li>Redeploy.</li>',
+  '</ol>',
+  '',
+].join('\n');
+
+/**
+ * CM7: a bot that sends Markdown as a plain body, with no `format` and no
+ * `formatted_body`. The text is CM5's, which is plain, safe Markdown (no raw
+ * HTML, no unsafe link or image), so the expected copy is the body itself.
+ */
+const CM7_BODY = CM5_INPUT;
 
 test.describe('Copy Markdown context-menu entry (encrypted room)', () => {
   test.describe.configure({ timeout: 240_000 });
@@ -424,5 +534,43 @@ test.describe('Copy Markdown context-menu entry (encrypted room)', () => {
     // eslint-disable-next-line no-console
     console.log(`[CM5] clipboard:\n${copied}`);
     expect(copied, 'clipboard after "Copy Markdown" must equal the text that was typed').toBe(CM5_INPUT);
+  });
+
+  /**
+   * Click "Copy Markdown" on the event's tile and return what is on the clipboard
+   * afterwards. The sentinel is written first (clickCopyMarkdown), so a copy that
+   * wrote nothing fails here instead of passing on a stale clipboard.
+   */
+  async function copyMarkdownOf(eventId, tag) {
+    await clickCopyMarkdown(eventId);
+    await expect
+      .poll(readClipboard, {
+        timeout: 10_000,
+        message: 'the clipboard still holds the sentinel: "Copy Markdown" copied nothing',
+      })
+      .not.toBe(SENTINEL);
+    const copied = await readClipboard();
+    // eslint-disable-next-line no-console
+    console.log(`[${tag}] clipboard:\n${copied}`);
+    return copied;
+  }
+
+  test('CM6 Rust SDK sender: the body of a ruma Markdown message is copied back exactly', async () => {
+    const id = await sendMessage({
+      msgtype: 'm.text',
+      body: CM6_BODY,
+      format: 'org.matrix.custom.html',
+      formatted_body: CM6_HTML,
+    });
+    await expect(tileOf(id)).toContainText('Weekly status report', { timeout: 30_000 });
+    const copied = await copyMarkdownOf(id, 'CM6');
+    expect(copied, 'clipboard after "Copy Markdown" must equal the body the SDK sender wrote').toBe(CM6_BODY);
+  });
+
+  test('CM7 plain Markdown bot: a body with no HTML is copied back exactly', async () => {
+    const id = await sendMessage({ msgtype: 'm.text', body: CM7_BODY });
+    await expect(tileOf(id)).toContainText('overall, driver Alice', { timeout: 30_000 });
+    const copied = await copyMarkdownOf(id, 'CM7');
+    expect(copied, 'clipboard after "Copy Markdown" must equal the plain Markdown body the bot sent').toBe(CM7_BODY);
   });
 });
