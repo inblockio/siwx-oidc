@@ -402,6 +402,45 @@ test.describe('Copy Markdown context-menu entry (encrypted room)', () => {
 
   const tileOf = (eventId) => page.locator(`[data-event-id="${eventId}"]`).first();
 
+  /**
+   * Bring the open context menu to rest, so that a press on an entry cannot move
+   * the menu from under the pointer.
+   *
+   * Element lays the message menu out at the cursor with 8 entries and adds
+   * "Pin" and "Remove" when MessageContextMenu's permission check answers (311 to
+   * 389 px). ContextMenu keeps the menu inside the window only in a render that
+   * reads the menu's height (top = min(top, innerHeight - 10 - height)), and
+   * nothing renders it again after the growth until focus moves to another entry.
+   * A menu opened low on a tall tile, as CM6's is when it runs alone (cursor at
+   * y=356 in a 1280x720 window, menu 389 px tall), therefore hangs off the bottom
+   * until the first press. That press focuses the entry (mousedown), the menu
+   * jumps up by the overflow (35 px), and mouseup lands on the entry now below
+   * the pointer ("Pin"). The click event goes to the two targets' common ancestor,
+   * no entry sees it, and the menu stays open: the failure was `toBeHidden()` on
+   * a menu whose "Copy Markdown" had been pressed. Moving the focus here makes
+   * the menu take its final place first, and the frame count then guards against
+   * any later move.
+   */
+  async function settleMenu(menu) {
+    await menu.getByRole('menuitem', { name: 'View source', exact: true }).focus();
+    await menu.evaluate(
+      (el) =>
+        new Promise((resolve) => {
+          let last = '';
+          let still = 0;
+          const tick = () => {
+            const r = el.getBoundingClientRect();
+            const box = `${r.x},${r.y},${r.width},${r.height}`;
+            still = box === last ? still + 1 : 0;
+            last = box;
+            if (still >= 5) resolve();
+            else requestAnimationFrame(tick);
+          };
+          tick();
+        }),
+    );
+  }
+
   /** Right-click the tile (empty right edge of its line, clear of links and media); return the open menu. */
   async function openContextMenu(eventId) {
     const tile = tileOf(eventId);
@@ -420,6 +459,7 @@ test.describe('Copy Markdown context-menu entry (encrypted room)', () => {
       menu.getByRole('menuitem', { name: 'View source', exact: true }),
       'the message context menu did not open',
     ).toBeVisible();
+    await settleMenu(menu);
     return menu;
   }
 
