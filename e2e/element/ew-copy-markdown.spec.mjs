@@ -80,8 +80,13 @@
  * comparison, with the symptoms above visible in the diff. With the fix, all
  * seven pass. CM5 alone cannot tell a general rule from a special case: it only
  * proves the copy for a message Element composed itself. CM6 and CM7 prove the
- * rule holds for senders that are not Element, and CM4 proves it stops where the
- * body is not safe Markdown.
+ * rule holds for content that Element did not compose, and CM4 proves it stops
+ * where the body is not safe Markdown. CM6 and CM7 are sent from the test's own
+ * account on purpose: the rule reads the event content only (never the sender,
+ * the sending device or the client that sent it), so another account would add
+ * a second login and no coverage. What makes them other senders' messages is
+ * the content, byte for byte what a ruma sender and a plain-body bot put on the
+ * wire.
  *
  * WHY NOT serial MODE: in serial mode the first failure skips every later leg,
  * so a red run would show one failure instead of the full picture. The legs
@@ -595,7 +600,7 @@ test.describe('Copy Markdown context-menu entry (encrypted room)', () => {
     return copied;
   }
 
-  test('CM6 Rust SDK sender: the body of a ruma Markdown message is copied back exactly', async () => {
+  test('CM6 Rust SDK content: the body of a ruma Markdown message is copied back exactly', async () => {
     const id = await sendMessage({
       msgtype: 'm.text',
       body: CM6_BODY,
@@ -607,7 +612,7 @@ test.describe('Copy Markdown context-menu entry (encrypted room)', () => {
     expect(copied, 'clipboard after "Copy Markdown" must equal the body the SDK sender wrote').toBe(CM6_BODY);
   });
 
-  test('CM7 plain Markdown bot: a body with no HTML is copied back exactly', async () => {
+  test('CM7 plain Markdown bot content: a body with no HTML is copied back exactly', async () => {
     const id = await sendMessage({ msgtype: 'm.text', body: CM7_BODY });
     await expect(tileOf(id)).toContainText('overall, driver Alice', { timeout: 30_000 });
     const copied = await copyMarkdownOf(id, 'CM7');
