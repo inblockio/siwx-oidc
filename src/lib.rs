@@ -8,6 +8,10 @@ pub mod db;
 /// binary's `src/localpart.rs`.
 pub mod mxid;
 
+/// What a log line may say about a credential: a fingerprint, never the value.
+/// In the library crate so `tests/log_hygiene.rs` can pin it.
+pub mod redact;
+
 /// Tier 1 of the identity model: the human-readable alias a new account is
 /// seeded with, derived deterministically from the DID. Pure (`sha2` only),
 /// and in the library crate for the same reason as `mxid` — `tests/*.rs` link

@@ -51,7 +51,8 @@ after a deployment.
 | `/sign_in returned 401 …: Signature verification failed` | the signature does not match the DID in the message | check the key file; do not edit the generated message |
 | `/sign_in returned 401 …: This account has been deactivated …` | the account was deactivated | a deactivated account cannot sign in |
 | `/sign_in returned 503 …` | the deactivation check could not reach Synapse | check Synapse and the shared secret; retry |
-| `/token returned 400 …: {"error":"invalid_client","error_description":"Secret required."}` | the client was registered as a confidential client | register it with `token_endpoint_auth_method: "none"` |
+| `/token returned 401 …: {"error":"invalid_client","error_description":"Secret required."}` | the client was registered as a confidential client | register it with `token_endpoint_auth_method: "none"` |
+| `/token refresh returned 400 …: invalid_grant` with "client_id does not match the refresh token." | the refresh names another client than the one the tokens were issued to | refresh with the `client_id` used at sign-in |
 | `/token refresh returned 400 …: invalid_grant` | the refresh token was already rotated (more than 60 s ago), expired, or its session was revoked | sign in again with the key; always store the newest refresh token |
 | `/token error: unsupported_grant_type: device_code grant requires MSC3861 mode.` with `--device-flow` | the server is not in delegated-auth mode ("MSC3861 mode" is the older name) | the device flow needs a Synapse-backed deployment |
 | every run shows a different DID | no key was given, so an ephemeral key was generated | pass `--key-file` or set `SIWX_KEY_FILE` |
@@ -101,7 +102,8 @@ after a deployment.
    ([passkeys.md](passkeys.md#migration-notes)).
 7. **The picker shows only one account's passkeys**: the `siwx_user` cookie
    scoped it to the last signed-in user. "Use a different passkey" (`all: true`)
-   shows all of them ([passkeys.md](passkeys.md#scoping-the-passkey-picker)).
+   shows all of them ([passkeys.md](passkeys.md#scoping-the-passkey-picker)), and
+   **Sign out** on the account page ends the hint in this browser.
 8. **"User Verification flag not set"** or **"Sign count regression"**: the
    authenticator did not verify the user, or reported a counter lower than the
    stored one (a possible cloned authenticator).
@@ -249,20 +251,31 @@ redis-cli GET 'webauthn:credential/<cred_id_b64>'
 redis-cli --scan --pattern 'webauthn:link/*'
 redis-cli SMEMBERS 'webauthn:by_did/<did>'
 
+# Session ids, codes and ceremony ids are stored as SHA-256 digests only:
+# hash the value you hold to find its entry.
+digest() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+
 # Ceremony challenges in flight (120 s)
-redis-cli --scan --pattern 'webauthn:challenge/*'
+redis-cli --scan --pattern 'webauthn:ceremony/*'
 
 # OIDC sessions (5 minutes); a passkey sign-in stores verified_did here
-redis-cli --scan --pattern 'sessions/*'
-redis-cli GET 'sessions/<session_id>' | python3 -m json.tool
+redis-cli --scan --pattern 'session/*'
+redis-cli GET "session/$(digest '<session cookie value>')" | python3 -m json.tool
 
 # Device-code grants (30 minutes)
-redis-cli --scan --pattern 'device_codes/*'
-redis-cli GET 'device_codes/<device_code>' | python3 -m json.tool
-redis-cli --scan --pattern 'user_codes/*'
+redis-cli --scan --pattern 'device_code/*'
+redis-cli GET "device_code/$(digest '<device_code>')" | python3 -m json.tool
+redis-cli GET "user_code/$(digest '<user_code>')"   # the device code's digest
 
-# Tokens and their metadata (username = localpart, device_id, scope, DID)
+# Grants (username = localpart, device_id, scope, DID). Tokens are stored as
+# SHA-256 digests only: hash a token you hold to find its entry.
+redis-cli HGETALL "at/$(printf %s '<access token>' | sha256sum | cut -d' ' -f1)"
+redis-cli HGETALL 'grant/<grant id from the access entry>'
+redis-cli SMEMBERS 'idx:grants:user/<localpart>'
+# Tokens written before the grant record (legacy, until they expire or, for a
+# refresh token, until it is presented and lifted into a grant)
 redis-cli GET 'token/<access or refresh token>' | python3 -m json.tool
+redis-cli GET "legacy_rt/$(printf %s '<legacy refresh token>' | sha256sum | cut -d' ' -f1)"
 ```
 
 Values can contain tokens and DIDs. Treat the output as sensitive.

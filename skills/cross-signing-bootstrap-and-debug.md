@@ -163,8 +163,8 @@ curl -X POST https://SYNAPSE_URL/_synapse/mas/allow_cross_signing_reset \
 # List stored credentials (passkey users)
 redis-cli KEYS 'webauthn:credential/*'
 
-# Check if sessions have verified_did
-redis-cli KEYS 'sessions/*'
+# Check if sessions have verified_did (keyed by the SHA-256 of the session cookie)
+redis-cli KEYS 'session/*'
 ```
 
 ## QR Code Login (Element X) Specific

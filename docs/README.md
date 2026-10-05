@@ -44,6 +44,8 @@ describe the current behaviour.
 | [design/2026-06-19-passkey-offer-scoping-minimal-behavior.md](design/2026-06-19-passkey-offer-scoping-minimal-behavior.md) | The minimal behaviour for which passkeys are offered in each flow |
 | [design/2026-07-25-webauthn-prf-4s-unlock-evaluation.md](design/2026-07-25-webauthn-prf-4s-unlock-evaluation.md) | Evaluation of WebAuthn PRF as a Matrix secret-storage unlock (rejected as proposed) |
 | [design/2026-09-09-did-profile-field-feasibility.md](design/2026-09-09-did-profile-field-feasibility.md) | Feasibility of publishing the DID as an MSC4133 profile field on Synapse 1.159.0 |
+| [design/2026-10-02-token-handling-prior-art.md](design/2026-10-02-token-handling-prior-art.md) | Standards (RFC 9700, OAuth 2.1, browser-based apps BCP), other authorization servers and Matrix client behaviour for refresh-token rotation, reuse detection and storage; the principles adopted |
+| [design/2026-10-02-token-lifecycle-rework.md](design/2026-10-02-token-lifecycle-rework.md) | Security-first plan for the token lifecycle in Matrix and generic OIDC mode: threat model, invariants, the grant record and atomic rotation script, lifetime, revocation propagation, phases and open decisions (issue #30) |
 
 ## Audits and findings
 

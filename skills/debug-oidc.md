@@ -66,7 +66,8 @@ configured and an ephemeral one is generated (see docs/configuration.md).
 curl -s http://localhost:8000/client/{client_id} \
   -H "Authorization: Bearer {registration_access_token}" | python3 -m json.tool
 
-# Or read it straight from Redis
+# Or read it straight from Redis (it holds the digests of the secret and the
+# registration access token, never the values)
 redis-cli GET 'clients/{client_id}' | python3 -m json.tool
 ```
 

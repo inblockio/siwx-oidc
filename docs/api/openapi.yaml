@@ -122,6 +122,21 @@ paths:
         `op_policy_uri` are present only when the operator configured them
         (`SIWXOIDC_OP_TOS_URI`, `SIWXOIDC_OP_POLICY_URI`); there is no
         default. The login page reads them here for its footer.
+
+        `subject_types_supported` is `["public"]`: the `sub` is the user's DID,
+        the same value for every client, so a relying party must not expect a
+        pairwise identifier.
+
+        `response_types_supported` is exactly `["code"]`: the
+        authorization-code flow is the only one `/authorize` accepts.
+
+        `end_session_endpoint` (`{issuer}/end_session`) advertises
+        RP-initiated logout, in both modes.
+
+        `backchannel_logout_supported` and `backchannel_logout_session_supported`
+        (both `true`) advertise OpenID Connect Back-Channel Logout 1.0 in
+        generic mode only (no MAS shared secret): logout tokens are sent for
+        `oidc` grants, and in Matrix mode every grant is a Matrix device grant.
       responses:
         "200":
           description: Provider metadata.
@@ -167,18 +182,34 @@ paths:
       operationId: authorize
       summary: Begin an authorization-code flow
       description: |
-        Standard OIDC authorization request. Issues the `siwx` session cookie
-        and the CAIP-122 nonce the client signs, then renders the login page.
+        Standard OIDC authorization request, authorization-code flow only.
+        Issues the `session` cookie and the CAIP-122 nonce the client signs,
+        then redirects to the login page.
+
+        - `response_type` must be `code`. Any other value is answered by a
+          redirect to the (validated) `redirect_uri` with
+          `error=unsupported_response_type` and the `state`.
+        - PKCE is required: `code_challenge` with `code_challenge_method=S256`
+          (the default). A missing challenge or another method is a 400.
+        - `redirect_uri` must equal one of the client's registered redirect
+          URIs exactly, query included (RFC 9700 §4.1.3); otherwise the browser
+          is sent to `/error?message=unregistered_redirect_uri`.
+
+        The validated request (client, redirect URI, state, response mode,
+        PKCE challenge) is bound to the session; `/sign_in` issues the code for
+        exactly that request.
       parameters:
         - { name: client_id, in: query, required: true, schema: { type: string } }
         - { name: redirect_uri, in: query, required: true, schema: { type: string, format: uri } }
-        - { name: response_type, in: query, required: true, schema: { type: string } }
-        - { name: scope, in: query, required: false, schema: { type: string } }
-        - { name: state, in: query, required: false, schema: { type: string } }
+        - { name: response_type, in: query, required: true, schema: { type: string, enum: [code] } }
+        - { name: scope, in: query, required: true, schema: { type: string } }
+        - { name: state, in: query, required: true, schema: { type: string } }
         - { name: nonce, in: query, required: false, schema: { type: string } }
+        - { name: code_challenge, in: query, required: true, schema: { type: string } }
+        - { name: code_challenge_method, in: query, required: false, schema: { type: string, enum: [S256] } }
+        - { name: response_mode, in: query, required: false, schema: { type: string, enum: [query, fragment] } }
       responses:
-        "200": { description: The login page. }
-        "302": { description: Redirect back to the relying party. }
+        "303": { description: Redirect to the login page, or back to the relying party with an OAuth error. }
         "400": { $ref: "#/components/responses/BadRequest" }
 
   /sign_in:
@@ -189,7 +220,16 @@ paths:
       description: |
         Reads the verified DID — from the `siwx` cookie's CAIP-122 signature, or
         from the server-side session a WebAuthn ceremony wrote — and redirects
-        to the relying party with an authorization code.
+        to the relying party with an authorization code for the request
+        `/authorize` bound to the session: its client, redirect URI, state,
+        response mode and PKCE challenge.
+
+        No query parameter is read. The login page still appends the
+        authorization parameters (`redirect_uri`, `state`, `client_id`,
+        `oidc_nonce`, `code_challenge`, `code_challenge_method`,
+        `response_mode`) to its link; they are ignored. A session started
+        before the request was bound (an older server build) is refused with
+        a restart-sign-in error.
 
         This is also the single point where a Matrix account is provisioned: the
         localpart is resolved (honouring grandfathering), the alias is seeded on
@@ -200,7 +240,8 @@ paths:
       security:
         - sessionCookie: []
       responses:
-        "302": { description: Redirect to `redirect_uri` with `code` and `state`. }
+        "303": { description: Redirect to the bound `redirect_uri` with `code` and the bound `state`. }
+        "400": { description: The session has no bound request, or the CAIP-122 proof is invalid. }
         "401": { description: The account is deactivated, or the ceremony did not verify. }
 
   /token:
@@ -212,9 +253,46 @@ paths:
         Supports `authorization_code`, `refresh_token` and
         `urn:ietf:params:oauth:grant-type:device_code`.
 
-        Refresh rotates both tokens. A bounded grace pointer (60s) lets a client
-        that LOST the rotation response — common on mobile — replay the old
-        refresh token once instead of being signed out.
+        `authorization_code`: the code is single use (deleted on exchange) and
+        needs the PKCE `code_verifier` for the challenge bound at `/authorize`.
+        `refresh_token`: accepts only a refresh token; an access token (a
+        minted admin token included) is `invalid_grant`, like an unknown one.
+
+        Refresh rotates both tokens, atomically: concurrent refreshes of one
+        token all receive the same new pair. A client that LOST the rotation
+        response — common on mobile — can replay the previous refresh token and
+        receive the same successor pair, however late, for as long as that pair
+        is unused (its access token not yet accepted by introspection or
+        `/userinfo`, its refresh token not yet rotated). A replay after that, or
+        after the successor was rotated or revoked, is `invalid_grant`; reuse of
+        a superseded token is logged as a security event and, when the operator
+        enables `reuse_revokes_grant` (off by default), also revokes the grant,
+        so its current refresh token is refused too. A refresh token issued
+        by a build before the grant record is answered with tokens in the current
+        format (`mcr_{handle}_{secret}`), and its replays follow the same rule.
+
+        In a standalone deployment (no MAS shared secret) the code exchange
+        grants the requested scope among `openid`, `profile` and `offline_access`
+        and issues a refresh token only for `offline_access` to a client whose
+        registration allows the refresh grant; a delegated-auth deployment always
+        records the Matrix scope and issues one.
+
+        **Client authentication.** `authorization_code` and `refresh_token` are
+        bound to the client the code or token was issued to, and share one rule.
+        The client named in the request, in `client_id` or as the user name of an
+        `Authorization: Basic` header (both, if present, must agree), must be that
+        client: otherwise `invalid_grant`. A confidential client (registered with
+        a `token_endpoint_auth_method` other than `none`, or with none while
+        `SIWXOIDC_REQUIRE_SECRET` is on) must also present its secret, as
+        `client_secret` in the form or as the `Authorization` password (the Basic
+        user name and password are form-urldecoded, RFC 6749 §2.3.1): otherwise
+        `invalid_client`. A public client authenticates nothing and may omit
+        `client_id` at the refresh grant. The replay of a lost response is bound to
+        the client like a rotation. A refresh token whose client registration has expired
+        (a registration lasts 30 days) still refreshes when the request names that
+        client or none, and is refused when it presents a secret. The Matrix
+        refresh endpoint `POST /_matrix/client/v3/refresh` has no client identity
+        to carry, so it refuses a confidential client's refresh token.
       requestBody:
         required: true
         content:
@@ -230,6 +308,7 @@ paths:
                 redirect_uri: { type: string, format: uri }
                 client_id: { type: string }
                 client_secret: { type: string }
+                code_verifier: { type: string, description: PKCE verifier; required with `authorization_code`. }
       responses:
         "200":
           description: Tokens.
@@ -240,12 +319,21 @@ paths:
           description: |
             OAuth error. `authorization_pending` and `slow_down` are the normal
             polling answers on the device-code grant, not failures.
+            `invalid_grant` includes a code or refresh token presented by a
+            client it was not issued to.
+        "401":
+          description: |
+            `invalid_client`: the client did not authenticate (RFC 6749 §5.2). A
+            request that tried HTTP Basic gets `WWW-Authenticate: Basic`.
 
   /userinfo:
     get:
       tags: [OIDC]
       operationId: userinfo
       summary: Claims about the authenticated user
+      description: |
+        Accepts an access token only. A refresh token, an authorization code
+        (before or after its exchange) or an unknown string is a 400.
       security: [{ bearerToken: [] }]
       responses:
         "200":
@@ -260,6 +348,7 @@ paths:
       tags: [OIDC]
       operationId: userinfoPost
       summary: Claims about the authenticated user (form-encoded token)
+      description: Accepts an access token only, like `GET /userinfo`.
       security: [{ bearerToken: [] }]
       requestBody:
         content:
@@ -289,13 +378,44 @@ paths:
               properties:
                 redirect_uris: { type: array, items: { type: string, format: uri } }
                 client_name: { type: string }
+                post_logout_redirect_uris:
+                  type: array
+                  items: { type: string, format: uri }
+                  description: |
+                    Where `/end_session` may send the user back (OpenID Connect
+                    RP-Initiated Logout 1.0 §3.1). Matched exactly, query
+                    included. Echoed in the response.
+                backchannel_logout_uri:
+                  type: string
+                  format: uri
+                  description: |
+                    Where a logout token (`logout_token=…`, a form POST) is sent
+                    when one of the client's grants is deleted (OpenID Connect
+                    Back-Channel Logout 1.0 §2.2; generic mode). No fragment;
+                    `https`, and every address its host resolves to must be
+                    public (not loopback, private, CGNAT, link-local,
+                    multicast, unspecified or reserved), unless the operator
+                    allowlisted the host. Checked again at every delivery.
+                    Echoed in the response.
+                backchannel_logout_session_required:
+                  type: boolean
+                  description: |
+                    The client requires a `sid` in every logout token; a grant
+                    without one sends it none. Echoed in the response.
       responses:
         "201":
           description: The registered client, with its secret and registration access token.
           content:
             application/json:
               schema: { type: object }
-        "400": { description: "Invalid metadata — a `redirect_uri` carrying a fragment is rejected." }
+        "400":
+          description: |
+            Invalid metadata: a `redirect_uri` carrying a fragment is
+            `invalid_redirect_uri`; a `post_logout_redirect_uri` carrying one,
+            a `backchannel_logout_uri` the SSRF guard refuses, and (with the
+            operator's `backchannel_logout_required_for_refresh`, generic
+            mode) a client that may refresh without a `backchannel_logout_uri`
+            are `invalid_client_metadata`.
 
   /client/{id}:
     parameters:
@@ -314,6 +434,10 @@ paths:
       security: [{ registrationAccessToken: [] }]
       responses:
         "200": { description: Updated client metadata. }
+        "400":
+          description: |
+            `invalid_client_metadata`, as at registration (the same logout
+            metadata checks, the SSRF guard included).
     delete:
       tags: [OIDC]
       operationId: deleteClient
@@ -412,6 +536,56 @@ paths:
           description: This deployment has no homeserver configured and cannot answer.
           content: { application/json: { schema: { $ref: "#/components/schemas/ResolveError" } } }
 
+  /end_session:
+    get:
+      tags: [OIDC]
+      operationId: endSession
+      summary: RP-initiated logout (OpenID Connect RP-Initiated Logout 1.0)
+      description: |
+        Ends the grant whose `sid` the `id_token_hint` carries, if the grant
+        belongs to the hint's client (`aud`) and subject (`sub`): its access
+        token is inactive at once and its refresh token is refused. Only that
+        grant ends; a Matrix device is never deleted here (the Matrix `logout`
+        is the device sign-out). The hint must be an ID token this provider
+        signed, with the live or a retired key (an expired one is accepted).
+        A hint without a `sid`, or no hint, ends nothing.
+
+        Everything is checked before anything ends: a hint that does not
+        verify, a `client_id` that is not the hint's audience, or a
+        `post_logout_redirect_uri` that is not registered for the client
+        (exact match, query included) is a 400 that ends nothing and never
+        redirects.
+      parameters:
+        - { name: id_token_hint, in: query, schema: { type: string } }
+        - { name: client_id, in: query, schema: { type: string } }
+        - { name: post_logout_redirect_uri, in: query, schema: { type: string, format: uri } }
+        - { name: state, in: query, schema: { type: string } }
+      responses:
+        "200": { description: "The signed-out page (no `post_logout_redirect_uri`)." }
+        "303": { description: "To the registered `post_logout_redirect_uri`, with `state` appended when one was sent." }
+        "400": { description: "The hint, the `client_id` or the `post_logout_redirect_uri` was refused; nothing ended." }
+        "503": { description: "The token store is unavailable; nothing ended, retry." }
+    post:
+      tags: [OIDC]
+      operationId: endSessionPost
+      summary: RP-initiated logout, form-encoded
+      description: The same as `GET /end_session`, with the parameters in the body.
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                id_token_hint: { type: string }
+                client_id: { type: string }
+                post_logout_redirect_uri: { type: string, format: uri }
+                state: { type: string }
+      responses:
+        "200": { description: "The signed-out page (no `post_logout_redirect_uri`)." }
+        "303": { description: "To the registered `post_logout_redirect_uri`, with `state` appended when one was sent." }
+        "400": { description: "The hint, the `client_id` or the `post_logout_redirect_uri` was refused; nothing ended." }
+        "503": { description: "The token store is unavailable; nothing ended, retry." }
+
   /oauth2/introspect:
     post:
       tags: [Homeserver]
@@ -426,6 +600,9 @@ paths:
 
         `device_id` is rendered as JSON `null`, never `""`: Synapse 1.159
         rejects a present-but-empty device id with a 500.
+
+        Only an access token (a minted admin token included) can be active. A
+        refresh token is `{"active": false}`, exactly like an unknown token.
       security: [{ masSharedSecret: [] }]
       requestBody:
         required: true
@@ -438,8 +615,9 @@ paths:
       responses:
         "200":
           description: |
-            Token metadata, or `{"active": false}`. An UNKNOWN token is
-            `{"active": false}` with HTTP 200 — never a 4xx.
+            Token metadata, or `{"active": false}`. An UNKNOWN token, or one
+            that is not an access token, is `{"active": false}` with HTTP 200 —
+            never a 4xx.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Introspection" }
@@ -474,8 +652,12 @@ paths:
       operationId: revoke
       summary: Revoke a token (RFC 7009)
       description: |
-        Token hygiene only. It revokes the access token and its paired refresh
-        token and **never deletes the Synapse device** — clients fire this on
+        Token hygiene only. Accepts either an access or a refresh token. For a
+        Matrix device it revokes the device's grant (the access token and its
+        paired refresh token). For a token with no device, an access token is
+        revoked alone, and a refresh token revokes its whole grant, the grant's
+        live access token included (RFC 7009 §2.1; provisional). It **never
+        deletes the Synapse device** — clients fire this on
         rotation and on dialog dismissals, and deleting the device there raced
         in-flight key uploads and wedged users' cross-signing identity.
       requestBody:
@@ -700,6 +882,25 @@ paths:
         "400": { description: "Missing, unknown, or unavailable action, or reactivation of an erased account." }
         "503": { description: "A required check (Synapse, or the erasure marker) could not run; nothing was changed." }
 
+  /account/sign_out:
+    post:
+      tags: [Account management]
+      operationId: accountSignOut
+      summary: Sign this browser out of the account page
+      description: |
+        Ends the account session (`acct_session` cookie) and the passkey-picker
+        hint (`siwx_user` cookie) this browser presents, each found by the digest
+        of the cookie value, and clears both cookies. Sessions of other browsers
+        stay; `logout/all`, deactivation and erasure end every session of the
+        user. Idempotent: without cookies it answers 200 and clears them all the
+        same. Needs no CSRF token: both cookies are `SameSite=Strict`, and a
+        forged request could only sign the browser out.
+      responses:
+        "200":
+          description: Signed out; both cookies cleared.
+          content: { application/json: { schema: { type: object, properties: { signed_out: { type: boolean, enum: [true] } } } } }
+        "503": { description: "Retryable: the session store could not end a session; the cookies are not cleared." }
+
   /account/passkey/start:
     post:
       tags: [Account management]
@@ -734,43 +935,59 @@ paths:
     post:
       tags: [Matrix compatibility]
       operationId: matrixRefresh
-      summary: Matrix-shaped refresh, with the same rotation grace window as `/token`
-      responses: { "200": { description: New tokens. } }
+      summary: Matrix-shaped refresh, with the same rotation and lost-response rule as `/token`
+      description: Accepts only a refresh token; an access token (a minted admin token included) is `M_UNKNOWN_TOKEN`, like an unknown one. A replay of the previous refresh token returns the same successor pair while that pair is unused, and is `M_UNKNOWN_TOKEN` once it was used, rotated or revoked. The endpoint carries no client identity, so unlike `/token` it cannot bind the replay to a client, and it refuses the refresh token of a confidential client (one that must authenticate at `/token`) exactly like an unknown token, leaving it untouched for `/token`. A public client's refresh token issued by a build before the grant record is answered with tokens in the current format, and its replays follow the same rule.
+      responses:
+        "200": { description: New tokens. }
+        "401": { description: "`M_UNKNOWN_TOKEN`: the refresh token is unknown, expired, reused, revoked, of another kind, or a confidential client's." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store could not answer. Never reported as `M_UNKNOWN_TOKEN`, which a Matrix client takes for \"signed out\" (it clears its crypto store). The rotation either ran entirely or not at all, so retrying with the same refresh token is safe." }
 
   /_matrix/client/v3/logout:
     post:
       tags: [Matrix compatibility]
       operationId: matrixLogout
       summary: End this session
-      description: Revokes the session's tokens **and** deletes its Synapse device — explicit intent, unlike `/oauth2/revoke`.
+      description: Revokes the session's tokens **and** deletes its Synapse device — explicit intent, unlike `/oauth2/revoke`. The bearer must be an access token; any other token is a no-op, like an unknown one.
       security: [{ bearerToken: [] }]
-      responses: { "200": { description: Best-effort, idempotent, never 500. } }
+      responses:
+        "200": { description: "Signed out; also for a missing, unknown or non-access bearer (idempotent). The Synapse device delete is best-effort." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store failed while resolving the bearer or revoking the device's tokens. Nothing is reported as signed out, and the bearer stays valid so the retry tears the session down." }
 
   /_matrix/client/v3/logout/all:
     post:
       tags: [Matrix compatibility]
       operationId: matrixLogoutAll
       summary: End every session
-      description: Session invalidation, NOT deactivation — the account stays active and can sign in again.
+      description: Session invalidation, NOT deactivation — the account stays active and can sign in again. Ends every grant of the user (setting the user epoch), deletes every Synapse device (best-effort), and ends the user's own sessions on this provider (`siwx_user` picker hints, `acct_session` account sessions). The bearer must be an access token; any other token is a no-op, like an unknown one.
       security: [{ bearerToken: [] }]
-      responses: { "200": { description: Best-effort, idempotent, never 500. } }
+      responses:
+        "200": { description: "Every session ended; also for a missing, unknown or non-access bearer (idempotent)." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store failed while resolving the bearer, revoking the user's tokens or ending the own sessions. Nothing is reported as signed out; the retry finishes the job." }
 
   /_matrix/client/v3/devices/{device_id}:
     delete:
       tags: [Matrix compatibility]
       operationId: matrixDeleteDevice
       summary: Sign out one device
+      description: The bearer must be an access token; any other token is a 401 `M_UNKNOWN_TOKEN`.
       security: [{ bearerToken: [] }]
       parameters: [{ name: device_id, in: path, required: true, schema: { type: string } }]
-      responses: { "200": { description: Deleted. } }
+      responses:
+        "200": { description: Deleted. }
+        "401": { description: "`M_UNKNOWN_TOKEN`: the bearer is missing, unknown, or not an access token." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store could not resolve the bearer. Never reported as `M_UNKNOWN_TOKEN`; nothing was deleted." }
 
   /_matrix/client/v3/delete_devices:
     post:
       tags: [Matrix compatibility]
       operationId: matrixDeleteDevices
       summary: Sign out several devices
+      description: The bearer must be an access token; any other token is a 401 `M_UNKNOWN_TOKEN`.
       security: [{ bearerToken: [] }]
-      responses: { "200": { description: Deleted. } }
+      responses:
+        "200": { description: Deleted. }
+        "401": { description: "`M_UNKNOWN_TOKEN`: the bearer is missing, unknown, or not an access token." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store could not resolve the bearer. Never reported as `M_UNKNOWN_TOKEN`; nothing was deleted." }
 
   /health:
     get:
@@ -831,9 +1048,9 @@ components:
         access_token: { type: string }
         token_type: { type: string }
         expires_in: { type: integer, description: 300 seconds. }
-        refresh_token: { type: string, description: 90-day TTL, rotated on every use. }
+        refresh_token: { type: string, description: "90-day TTL, rotated on every use. In a standalone deployment the code exchange issues one only for `offline_access`, to a client whose registration allows the `refresh_token` grant." }
         id_token: { type: string, description: "ES256 JWT. `sub` is the DID." }
-        scope: { type: string, description: "Carries `urn:matrix:client:device:{id}` so a client can discover its provisioned device." }
+        scope: { type: string, description: "The granted scope. In the device-code grant it carries `urn:matrix:client:device:{id}` so a client can discover its provisioned device. In a standalone (generic-mode) code exchange it is present when the granted scope differs from the request. A Matrix-mode code exchange omits it." }
 
     UserInfo:
       type: object

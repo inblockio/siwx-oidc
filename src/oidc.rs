@@ -11,20 +11,19 @@ use headers::{self, authorization::Bearer};
 use openidconnect::{
     core::{
         CoreAuthErrorResponseType, CoreAuthPrompt, CoreClaimName, CoreClientAuthMethod,
-        CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType, CoreGenderClaim,
-        CoreGrantType, CoreIdToken, CoreIdTokenClaims, CoreIdTokenFields, CoreJsonWebKey,
-        CoreJsonWebKeySet, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm,
-        CoreProviderMetadata, CoreRegisterErrorResponseType, CoreResponseType,
-        CoreSubjectIdentifierType, CoreTokenResponse, CoreTokenType,
+        CoreErrorResponseType, CoreGenderClaim, CoreGrantType, CoreJsonWebKey, CoreJsonWebKeySet,
+        CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm, CoreProviderMetadata,
+        CoreRegisterErrorResponseType, CoreResponseType, CoreSubjectIdentifierType, CoreTokenType,
     },
-    registration::{EmptyAdditionalClientMetadata, EmptyAdditionalClientRegistrationResponse},
+    registration::EmptyAdditionalClientRegistrationResponse,
     url::Url,
     AccessToken, AdditionalClaims, Audience, AuthUrl, ClientConfigUrl, ClientId, ClientSecret,
-    EmptyAdditionalClaims, EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserName,
-    EndUserUsername, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl, LocalizedClaim, Nonce, OpPolicyUrl,
-    OpTosUrl, PrivateSigningKey, RedirectUrl, RefreshToken, RegistrationAccessToken,
+    EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserName, EndUserUsername, IdToken,
+    IdTokenClaims, IdTokenFields, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl, LocalizedClaim, Nonce,
+    OpPolicyUrl, OpTosUrl, PrivateSigningKey, RedirectUrl, RefreshToken, RegistrationAccessToken,
     RegistrationUrl, RequestUrl, ResponseTypes, Scope, SigningError, StandardClaims,
-    SubjectIdentifier, TokenUrl, UserInfoClaims, UserInfoJsonWebToken, UserInfoUrl,
+    StandardTokenResponse, SubjectIdentifier, TokenUrl, UserInfoClaims, UserInfoJsonWebToken,
+    UserInfoUrl,
 };
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
@@ -39,13 +38,14 @@ use urlencoding::decode;
 use uuid::Uuid;
 
 use aqua_auth::find_did_method;
+use siwx_oidc::db::grant::{
+    EndedGrant, GrantKind, InvalidReason, NewGrant, RefreshPeek, RotateOutcome, RotateRequest,
+};
 use siwx_oidc::db::*;
 use subtle::ConstantTimeEq;
 
 use crate::did_assertion::DidPublication;
 use crate::synapse_client::{DeviceUpsert, PublishOutcome, SynapseClient};
-
-use crate::introspect::generate_opaque_token;
 
 /// Constant-time string comparison to prevent timing attacks on secrets.
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -62,6 +62,9 @@ lazy_static::lazy_static! {
     static ref SCOPES: Vec<Scope> = vec![
         Scope::new("openid".to_string()),
         Scope::new("profile".to_string()),
+        // A refresh token for a generic client is issued only when this was
+        // requested and the registration allows the refresh grant (I10).
+        Scope::new("offline_access".to_string()),
         // Stable Matrix scopes (MSC2967 graduated)
         Scope::new("urn:matrix:client:api:*".to_string()),
         Scope::new("urn:matrix:client:device:*".to_string()),
@@ -79,11 +82,15 @@ pub const REGISTER_PATH: &str = "/register";
 pub const CLIENT_PATH: &str = "/client";
 pub const USERINFO_PATH: &str = "/userinfo";
 pub const SIGNIN_PATH: &str = "/sign_in";
+/// OpenID Connect RP-Initiated Logout 1.0 `end_session_endpoint`.
+pub const END_SESSION_PATH: &str = "/end_session";
 pub const SIWX_COOKIE_KEY: &str = "siwx";
 /// RFC 8628 grant type of the device-code grant (`POST /token`).
 pub const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-type DBClientType = dyn DBClient + Sync;
+/// The token store. Concrete because the grant record (`siwx_oidc::db::grant`)
+/// is implemented on `RedisClient` itself, outside the `DBClient` trait.
+type DBClientType = RedisClient;
 
 // -- ES256 key wrapper implementing openidconnect's PrivateSigningKey ------
 
@@ -290,6 +297,37 @@ fn verification_jwk(verifying_key: &p256::ecdsa::VerifyingKey, kid: &str) -> Cor
     jwk_value["kid"] = serde_json::Value::String(kid.to_string());
     serde_json::from_value(jwk_value).expect("Failed to construct EC JWK")
 }
+
+// -- ID tokens ---------------------------------------------------------------
+
+/// The claims this provider adds to an ID token: the session id of the grant
+/// the token was issued with (I8; OpenID Connect Front-/Back-Channel Logout
+/// and RP-Initiated Logout name a session by it). Omitted, never `null`, when
+/// a grant has none (a `service` grant never comes with an ID token).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SidClaims {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+}
+
+impl AdditionalClaims for SidClaims {}
+
+/// The ID token claim set: the OIDC Core claims plus [`SidClaims`].
+pub type SiwxIdTokenClaims = IdTokenClaims<SidClaims, CoreGenderClaim>;
+/// A signed ID token of [`SiwxIdTokenClaims`].
+pub type SiwxIdToken =
+    IdToken<SidClaims, CoreGenderClaim, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm>;
+/// The token response fields carrying a [`SiwxIdToken`].
+pub type SiwxIdTokenFields = IdTokenFields<
+    SidClaims,
+    EmptyExtraTokenFields,
+    CoreGenderClaim,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJwsSigningAlgorithm,
+>;
+/// `POST /token`'s response: `CoreTokenResponse` with [`SidClaims`] in the ID
+/// token. The JSON shape is unchanged apart from the `sid` claim inside it.
+pub type SiwxTokenResponse = StandardTokenResponse<SiwxIdTokenFields, CoreTokenType>;
 
 // -- Error types -----------------------------------------------------------
 
@@ -542,12 +580,11 @@ pub fn metadata(config: &crate::config::Config) -> Result<CoreProviderMetadata, 
                 .join(JWK_PATH)
                 .map_err(|e| anyhow!("Unable to join URL: {}", e))?,
         ),
-        vec![
-            ResponseTypes::new(vec![CoreResponseType::Code]),
-            ResponseTypes::new(vec![CoreResponseType::IdToken]),
-            ResponseTypes::new(vec![CoreResponseType::Token, CoreResponseType::IdToken]),
-        ],
-        vec![CoreSubjectIdentifierType::Pairwise],
+        // Exactly what `authorize` accepts: the authorization-code flow.
+        vec![ResponseTypes::new(vec![CoreResponseType::Code])],
+        // The `sub` is the user's DID, the same for every client
+        // (docs/identity-model.md), which is what `public` means.
+        vec![CoreSubjectIdentifierType::Public],
         SIGNING_ALG.to_vec(),
         EmptyAdditionalProviderMetadata {},
     )
@@ -706,8 +743,16 @@ pub fn provider_metadata_value(
     }
     value["grant_types_supported"] = serde_json::json!(grant_types);
     value["revocation_endpoint"] = serde_json::json!(format!("{}/oauth2/revoke", base));
+    // RP-initiated logout ends the grant an ID token's `sid` names, in both modes.
+    value["end_session_endpoint"] = serde_json::json!(format!("{base}{END_SESSION_PATH}"));
+    // Back-channel logout is sent for `oidc` grants only, and only generic mode
+    // issues them: in Matrix mode every grant is a Matrix device grant.
+    if !delegated_auth_enabled(config) {
+        value["backchannel_logout_supported"] = serde_json::json!(true);
+        value["backchannel_logout_session_supported"] = serde_json::json!(true);
+    }
     value["token_endpoint_auth_methods_supported"] =
-        serde_json::json!(["client_secret_post", "none"]);
+        serde_json::json!(["client_secret_basic", "client_secret_post", "none"]);
     value["prompt_values_supported"] = serde_json::json!(["login", "create"]);
     // Both advertised ONLY when this deployment can answer them: a client that
     // finds a key will use it, and a route that answers 503 (`/resolve`) or an
@@ -897,20 +942,32 @@ pub struct TokenForm {
     pub device_code: Option<String>,
 }
 
+/// What the HTTP request says about the calling client outside the form: the
+/// `Authorization` header, which carries a client secret as `Basic` (with the
+/// client id as the user name, RFC 6749 §2.3.1) or, for some clients, as `Bearer`.
+#[derive(Default)]
+pub struct ClientCredentials {
+    /// The user name of an `Authorization: Basic` header: the client id.
+    pub basic_client_id: Option<String>,
+    /// The secret from the `Authorization` header (the Basic password or the
+    /// Bearer token). It wins over `client_secret` in the form.
+    pub secret: Option<String>,
+}
+
 pub async fn token(
     form: TokenForm,
-    secret: Option<String>,
+    credentials: ClientCredentials,
     signing_key: &EcdsaSigningKey,
     config: &crate::config::Config,
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
-) -> Result<CoreTokenResponse, CustomError> {
+) -> Result<SiwxTokenResponse, CustomError> {
     match form.grant_type {
         CoreGrantType::AuthorizationCode => {
-            token_authorization_code(form, secret, signing_key, config, db_client).await
+            token_authorization_code(form, credentials, signing_key, config, db_client).await
         }
         CoreGrantType::RefreshToken => {
-            token_refresh(form, config, db_client).await
+            token_refresh(form, credentials, config, db_client).await
         }
         CoreGrantType::DeviceCode => {
             token_device_code(form, signing_key, config, db_client, synapse_client).await
@@ -923,11 +980,160 @@ pub async fn token(
     }
 }
 
-async fn token_refresh(
-    form: TokenForm,
+/// The client a request names, from the form and from an HTTP Basic header.
+/// They name the same client or only one of them is present: a request that
+/// names two different clients is malformed (RFC 6749 §2.3 allows one
+/// authentication method per request).
+fn named_client_id(
+    form: &TokenForm,
+    credentials: &ClientCredentials,
+) -> Result<Option<String>, CustomError> {
+    match (
+        form.client_id.as_deref(),
+        credentials.basic_client_id.as_deref(),
+    ) {
+        (Some(in_form), Some(in_header)) if !constant_time_eq(in_form, in_header) => {
+            Err(CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::InvalidRequest,
+                error_description:
+                    "client_id differs between the request body and the Authorization header."
+                        .to_string(),
+            }))
+        }
+        (Some(client_id), _) | (None, Some(client_id)) => Ok(Some(client_id.to_string())),
+        (None, None) => Ok(None),
+    }
+}
+
+// Client authentication at `POST /token`, for the two grants bound to a client:
+// the authorization code (`authenticate_code_client`, strict) and the refresh
+// token (`authenticate_refresh_client`, which tolerates a registration that has
+// expired). Both apply the same three steps through the same helpers, so they
+// cannot drift:
+//
+// 1. The client the request names (`named_client_id`, form or Basic header)
+//    must be the client the grant was issued to: `invalid_grant` otherwise. A
+//    request that names none is fine here (`check_named_client`).
+// 2. A secret the request presents is checked against the registration
+//    (`invalid_client`: "Bad secret."), whether the client is confidential or
+//    not (`check_client_secret`).
+// 3. A request that presents none must come from a public client
+//    (`invalid_client`: "Secret required."); which clients are confidential is
+//    decided in one place, `client_is_confidential`, which also sets the flag a
+//    grant records at issuance for the endpoint that cannot authenticate a
+//    client (`POST /_matrix/client/v3/refresh`).
+
+/// Step 1: the client the request names, if any, is the grant's client.
+/// `credential` names the grant in the error text.
+fn check_named_client(
+    bound_client_id: &str,
+    named_client_id: Option<&str>,
+    credential: &str,
+) -> Result<(), CustomError> {
+    match named_client_id {
+        Some(named) if !bound_client_id.is_empty() && !constant_time_eq(named, bound_client_id) => {
+            Err(CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::InvalidGrant,
+                error_description: format!("client_id does not match the {credential}."),
+            }))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Steps 2 and 3 against the client's registration: a presented secret must
+/// match it, and a request without one must come from a public client.
+fn check_client_secret(
+    client_entry: &ClientEntry,
+    presented_secret: Option<&str>,
+    config: &crate::config::Config,
+) -> Result<(), CustomError> {
+    match presented_secret {
+        Some(secret) if !client_entry.secret_matches(secret) => {
+            Err(CustomError::Unauthorized("Bad secret.".to_string()))
+        }
+        Some(_) => Ok(()),
+        None if client_is_confidential(Some(client_entry), config.require_secret) => {
+            Err(CustomError::Unauthorized("Secret required.".to_string()))
+        }
+        None => Ok(()),
+    }
+}
+
+/// Authenticate the client of an authorization code: the three steps above,
+/// and the registration must exist (a code was issued minutes ago to a
+/// registered client, so its absence is a fault: `invalid_client`). Returns
+/// the registration.
+async fn authenticate_code_client(
+    bound_client_id: &str,
+    named_client_id: Option<&str>,
+    presented_secret: Option<&str>,
     config: &crate::config::Config,
     db_client: &DBClientType,
-) -> Result<CoreTokenResponse, CustomError> {
+) -> Result<ClientEntry, CustomError> {
+    check_named_client(bound_client_id, named_client_id, "authorization code")?;
+    let client_entry = db_client
+        .get_client(bound_client_id.to_string())
+        .await?
+        .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
+    check_client_secret(&client_entry, presented_secret, config)?;
+    Ok(client_entry)
+}
+
+/// Authenticate the client of a refresh token: the three steps above, except
+/// that a registration that is gone is tolerated when the request presents no
+/// secret. A refresh token outlives its client's registration (30 days against
+/// 90), and refusing every such token would sign out every session older than a
+/// registration. Nothing is lost against the status quo: a secret cannot be
+/// checked against a registration that is gone, and a request that presents
+/// one is still refused (`invalid_client`).
+///
+/// This runs before the rotation script, as RFC 6749 orders it (client
+/// authentication first, §3.2.1 and §6). A consequence, kept on purpose: a
+/// superseded refresh token presented with a wrong secret is answered
+/// `invalid_client`, not like an unknown token. Telling the two apart needs a
+/// real token of the grant and reveals nothing about the token's state.
+async fn authenticate_refresh_client(
+    bound_client_id: &str,
+    named_client_id: Option<&str>,
+    presented_secret: Option<&str>,
+    config: &crate::config::Config,
+    db_client: &DBClientType,
+) -> Result<(), CustomError> {
+    check_named_client(bound_client_id, named_client_id, "refresh token")?;
+    match db_client.get_client(bound_client_id.to_string()).await? {
+        Some(client_entry) => check_client_secret(&client_entry, presented_secret, config),
+        None if presented_secret.is_none() => Ok(()),
+        None => Err(CustomError::Unauthorized(
+            "Unrecognised client id.".to_string(),
+        )),
+    }
+}
+
+/// Whether a client must authenticate with a secret: a registered
+/// `token_endpoint_auth_method` other than `none`, or none registered while
+/// `require_secret`. A client with no registration counts as public. The one
+/// rule behind step 3 above and behind the `confidential` flag a grant records
+/// at issuance, so `POST /_matrix/client/v3/refresh`, which cannot
+/// authenticate a client, refuses exactly the grants whose client
+/// `POST /token` would ask for a secret.
+pub(crate) fn client_is_confidential(client: Option<&ClientEntry>, require_secret: bool) -> bool {
+    match client.map(|c| c.metadata.token_endpoint_auth_method()) {
+        None => false,
+        Some(Some(CoreClientAuthMethod::None)) => false,
+        Some(Some(_)) => true,
+        Some(None) => require_secret,
+    }
+}
+
+async fn token_refresh(
+    form: TokenForm,
+    credentials: ClientCredentials,
+    config: &crate::config::Config,
+    db_client: &DBClientType,
+) -> Result<SiwxTokenResponse, CustomError> {
+    let named_client = named_client_id(&form, &credentials)?;
+    let presented_secret = credentials.secret.or(form.client_secret);
     let rt = form.refresh_token.ok_or_else(|| {
         CustomError::BadRequestToken(TokenError {
             error: CoreErrorResponseType::InvalidRequest,
@@ -935,153 +1141,98 @@ async fn token_refresh(
         })
     })?;
 
-    let metadata = match db_client.get_token(&rt).await? {
-        Some(m) => m,
-        None => {
-            // Grace replay (lost-response recovery): a rotated refresh token is
-            // deleted, but its successor pair is recorded under a short grace
-            // window. If the client lost the rotation response and retries with the
-            // old token, return the SAME successor instead of signing it out.
-            // Bounded by REFRESH_GRACE_TTL; genuinely unknown/expired tokens (no
-            // grace record) still fail closed below.
-            if let Some(succ) = db_client.get_rotated_token(&rt).await? {
-                let expires_in = (succ.access_exp - Utc::now().timestamp()).max(0) as u64;
-                let mut response = CoreTokenResponse::new(
-                    AccessToken::new(succ.access_token),
-                    CoreTokenType::Bearer,
-                    CoreIdTokenFields::new(None, EmptyExtraTokenFields {}),
-                );
-                response.set_expires_in(Some(&time::Duration::from_secs(expires_in)));
-                response.set_refresh_token(Some(RefreshToken::new(succ.refresh_token)));
-                return Ok(response);
-            }
+    // What the token names: the grant its handle names (or that a legacy token
+    // was lifted into), or a legacy refresh token (`token/{raw}`, written
+    // before the grant record) not lifted yet. An access or admin token,
+    // garbage, and a token of a grant that is gone are all answered exactly
+    // like an unknown token.
+    let (bound_client, legacy) = match db_client.peek_refresh_token(&rt).await? {
+        RefreshPeek::Grant(grant) => (grant.client_id, None),
+        RefreshPeek::Legacy(legacy) => (legacy.meta.client_id.clone(), Some(legacy)),
+        RefreshPeek::Unknown => return Err(unknown_refresh_token()),
+    };
+
+    // A refresh token belongs to the client it was issued to (I7): before the
+    // rotation script runs, the request must be that client, and a
+    // confidential client must authenticate. `POST /_matrix/client/v3/refresh`
+    // carries no client identity, so it refuses a confidential client's grant
+    // instead (`compat::refresh`).
+    authenticate_refresh_client(
+        &bound_client,
+        named_client.as_deref(),
+        presented_secret.as_deref(),
+        config,
+        db_client,
+    )
+    .await?;
+
+    // The one rotation script (I3) decides everything else atomically: rotate,
+    // replay the unused successor of a lost response (I4), or refuse. The
+    // script checks the named client again; it can only agree here. A legacy
+    // refresh token is lifted into a grant instead (design 5.8): answered with
+    // a pair in the current format, so no user signs in again; its grant
+    // records the client's confidentiality by the rule every issuance uses.
+    let request = RotateRequest {
+        presented: &rt,
+        client_id: named_client.as_deref(),
+        refuse_confidential: false,
+    };
+    let outcome = match &legacy {
+        Some(legacy) => {
+            let client = db_client.get_client(legacy.meta.client_id.clone()).await?;
+            let confidential = client_is_confidential(client.as_ref(), config.require_secret);
+            db_client
+                .lift_legacy_refresh_token(&request, legacy, confidential)
+                .await?
+        }
+        None => db_client.rotate_refresh_token(&request).await?,
+    };
+    let (pair, expires_in) = match outcome {
+        RotateOutcome::Rotated(pair) | RotateOutcome::Replayed(pair) => {
+            let expires_in = pair.expires_in(ACCESS_TOKEN_TTL);
+            (pair.pair, expires_in)
+        }
+        // Reuse (I5, phase A): recorded, and answered like an unknown token.
+        RotateOutcome::Reuse(event) => {
+            event.emit();
+            return Err(unknown_refresh_token());
+        }
+        RotateOutcome::Invalid(InvalidReason::Revoked) => {
             return Err(CustomError::BadRequestToken(TokenError {
                 error: CoreErrorResponseType::InvalidGrant,
-                error_description: "Unknown or expired refresh token.".to_string(),
+                error_description: "Session has been revoked.".to_string(),
+            }));
+        }
+        RotateOutcome::Invalid(_) | RotateOutcome::ConfidentialClient => {
+            return Err(unknown_refresh_token());
+        }
+        // The same answer `check_named_client` gives a request that names
+        // another client.
+        RotateOutcome::ClientMismatch => {
+            return Err(CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::InvalidGrant,
+                error_description: "client_id does not match the refresh token.".to_string(),
             }));
         }
     };
 
-    if metadata.exp <= Utc::now().timestamp() {
-        return Err(CustomError::BadRequestToken(TokenError {
-            error: CoreErrorResponseType::InvalidGrant,
-            error_description: "Refresh token has expired.".to_string(),
-        }));
-    }
-
-    // Race guard (S3-3 / H3 + S3-4 / H6): refuse to rotate if this device was just
-    // signed out or the user was just deactivated/erased. Mirrors the same check
-    // in compat::refresh so neither refresh entry point can resurrect access for a
-    // torn-down device / terminated account.
-    let device_revoked = !metadata.device_id.is_empty()
-        && db_client
-            .is_device_revoked(&metadata.username, &metadata.device_id)
-            .await?;
-    if device_revoked || db_client.is_user_deactivated(&metadata.username).await? {
-        let _ = db_client.delete_token(&rt).await;
-        return Err(CustomError::BadRequestToken(TokenError {
-            error: CoreErrorResponseType::InvalidGrant,
-            error_description: "Session has been revoked.".to_string(),
-        }));
-    }
-
-    let (access_prefix, refresh_prefix) = if config.mas_shared_secret.is_some() {
-        ("mat_", "mcr_")
-    } else {
-        ("", "")
-    };
-
-    let now = Utc::now().timestamp();
-
-    let new_access = generate_opaque_token(access_prefix);
-    let access_meta = TokenMetadata {
-        username: metadata.username.clone(),
-        device_id: metadata.device_id.clone(),
-        scope: metadata.scope.clone(),
-        client_id: metadata.client_id.clone(),
-        iat: now,
-        exp: now + ACCESS_TOKEN_TTL as i64,
-        did: metadata.did.clone(),
-        name: metadata.name.clone(),
-    };
-    db_client
-        .set_token(&new_access, &access_meta, ACCESS_TOKEN_TTL)
-        .await?;
-
-    let new_refresh = generate_opaque_token(refresh_prefix);
-    let refresh_meta = TokenMetadata {
-        username: metadata.username.clone(),
-        device_id: metadata.device_id.clone(),
-        scope: metadata.scope.clone(),
-        client_id: metadata.client_id.clone(),
-        iat: now,
-        exp: now + REFRESH_TOKEN_TTL as i64,
-        did: metadata.did.clone(),
-        name: metadata.name.clone(),
-    };
-    db_client
-        .set_token(&new_refresh, &refresh_meta, REFRESH_TOKEN_TTL)
-        .await?;
-
-    let _ = db_client.delete_token(&rt).await;
-
-    // Check-mint-recheck (S3-3 / H3 + S3-4 / H6): if a revoke/deactivate sweep
-    // tombstoned this device/user in the gap between our pre-mint check and our
-    // writes, roll back the just-minted tokens so none can be resurrected.
-    //
-    // Fail OPEN on an indeterminate probe (Redis I/O error), CLOSED only on a
-    // definite tombstone. By this point `rt` has already been deleted and the
-    // grace pointer is not yet written, so a rollback here leaves the client
-    // holding neither the old nor the new refresh token — an unrecoverable
-    // sign-out. Treating an I/O error as a tombstone would convert a transient
-    // fault into permanent session loss; the tombstone TTL bounds the opposite
-    // risk to one access-token cycle (see `RevocationState`).
-    let revoked_now = db_client
-        .probe_revocation(&metadata.username, &metadata.device_id)
-        .await;
-    if revoked_now == RevocationState::Indeterminate {
-        warn!(
-            username = %metadata.username,
-            device_id = %metadata.device_id,
-            "refresh: revocation probe indeterminate after mint; committing \
-             (fail-open, bounded by tombstone TTL)"
-        );
-    }
-    if revoked_now.must_refuse() {
-        let _ = db_client.delete_token(&new_access).await;
-        let _ = db_client.delete_token(&new_refresh).await;
-        return Err(CustomError::BadRequestToken(TokenError {
-            error: CoreErrorResponseType::InvalidGrant,
-            error_description: "Session has been revoked.".to_string(),
-        }));
-    }
-
-    // Grace window: record old refresh token -> the successor pair we just minted,
-    // so a client that LOSES this rotation response (common on mobile) can replay
-    // the old token once within REFRESH_GRACE_TTL and recover instead of being
-    // signed out. Written only here, on the committed success path (after the
-    // H3/H6 check-mint-recheck), so it can never resolve to rolled-back tokens.
-    // Best-effort: a failure must not fail the rotation the client will observe.
-    let _ = db_client
-        .set_rotated_token(
-            &rt,
-            &RotatedToken {
-                access_token: new_access.clone(),
-                refresh_token: new_refresh.clone(),
-                access_exp: now + ACCESS_TOKEN_TTL as i64,
-            },
-            REFRESH_GRACE_TTL,
-        )
-        .await;
-
-    let mut response = CoreTokenResponse::new(
-        AccessToken::new(new_access),
+    let mut response = SiwxTokenResponse::new(
+        AccessToken::new(pair.access_token),
         CoreTokenType::Bearer,
-        CoreIdTokenFields::new(None, EmptyExtraTokenFields {}),
+        SiwxIdTokenFields::new(None, EmptyExtraTokenFields {}),
     );
-    response.set_expires_in(Some(&time::Duration::from_secs(ACCESS_TOKEN_TTL)));
-    response.set_refresh_token(Some(RefreshToken::new(new_refresh)));
+    response.set_expires_in(Some(&time::Duration::from_secs(expires_in)));
+    response.set_refresh_token(Some(RefreshToken::new(pair.refresh_token)));
     Ok(response)
+}
+
+/// The answer to a refresh token that is unknown, expired, of another kind, or
+/// reused: one answer, so a refusal reveals nothing about which it was.
+fn unknown_refresh_token() -> CustomError {
+    CustomError::BadRequestToken(TokenError {
+        error: CoreErrorResponseType::InvalidGrant,
+        error_description: "Unknown or expired refresh token.".to_string(),
+    })
 }
 
 fn device_code_error(error: &str, description: &str) -> CustomError {
@@ -1097,7 +1248,7 @@ async fn token_device_code(
     config: &crate::config::Config,
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
-) -> Result<CoreTokenResponse, CustomError> {
+) -> Result<SiwxTokenResponse, CustomError> {
     if !delegated_auth_enabled(config) {
         return Err(device_grant_unsupported());
     }
@@ -1115,7 +1266,7 @@ async fn token_device_code(
         })
     })?;
 
-    let mut entry = db_client
+    let (device_ref, mut entry) = db_client
         .get_device_code(&dc)
         .await?
         .ok_or_else(|| device_code_error("expired_token", "Device code expired or not found."))?;
@@ -1133,7 +1284,7 @@ async fn token_device_code(
         if now_ts - last < DEVICE_CODE_INTERVAL as i64 {
             entry.last_poll = Some(now_ts);
             let _ = db_client
-                .update_device_code(&dc, &entry, DEVICE_CODE_LIFETIME)
+                .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
                 .await;
             return Err(device_code_error(
                 "slow_down",
@@ -1143,7 +1294,7 @@ async fn token_device_code(
     }
     entry.last_poll = Some(now_ts);
     let _ = db_client
-        .update_device_code(&dc, &entry, DEVICE_CODE_LIFETIME)
+        .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
         .await;
 
     match entry.status {
@@ -1152,8 +1303,8 @@ async fn token_device_code(
             "User has not yet approved.",
         )),
         DeviceCodeStatus::Denied => {
-            let _ = db_client.delete_device_code(&dc).await;
-            let _ = db_client.delete_user_code_mapping(&entry.user_code).await;
+            let _ = db_client.delete_device_code(&device_ref).await;
+            let _ = db_client.delete_user_code_mapping(&entry).await;
             Err(device_code_error(
                 "access_denied",
                 "User denied the request.",
@@ -1168,7 +1319,7 @@ async fn token_device_code(
             // winner deletes the device_code at the end, so a subsequent poll then
             // gets expired_token — same as a normal completed flow).
             if !db_client.try_claim_device_code(&dc).await? {
-                debug!(device_code = %dc, "device_code already claimed by a concurrent poll");
+                debug!(device_code_fp = %siwx_oidc::redact::fingerprint(&dc), "device_code already claimed by a concurrent poll");
                 return Err(device_code_error(
                     "authorization_pending",
                     "Device code is being processed.",
@@ -1242,7 +1393,6 @@ async fn token_device_code(
             .unwrap_or_else(|| resolve_device_id(proposed_device_id.as_deref()));
 
             let now = Utc::now();
-            let iat = now.timestamp();
             let username = resolved.localpart;
             let scope = format!(
                 "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
@@ -1256,46 +1406,43 @@ async fn token_device_code(
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| did.clone());
 
-            let access_token = generate_opaque_token("mat_");
-            let access_meta = TokenMetadata {
-                username: username.clone(),
-                device_id: dev_id.clone(),
-                scope: scope.clone(),
-                client_id: client_id.clone(),
-                iat,
-                exp: iat + ACCESS_TOKEN_TTL as i64,
-                did: did.clone(),
-                name: display_name.clone(),
-            };
-            db_client
-                .set_token(&access_token, &access_meta, ACCESS_TOKEN_TTL)
+            // One Matrix-device grant per approved device code (I2).
+            let client_entry = db_client.get_client(client_id.clone()).await?;
+            let issued = db_client
+                .issue_grant(&NewGrant {
+                    kind: GrantKind::MatrixDevice,
+                    username,
+                    did: did.clone(),
+                    client_id: client_id.clone(),
+                    confidential_client: client_is_confidential(
+                        client_entry.as_ref(),
+                        config.require_secret,
+                    ),
+                    device_id: dev_id.clone(),
+                    scope: scope.clone(),
+                    name: display_name,
+                    // The approval, recorded from Redis `TIME`; an entry an
+                    // older build approved counts from this poll.
+                    auth_ms: entry.auth_ms,
+                    access_ttl: ACCESS_TOKEN_TTL,
+                    refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+                })
                 .await?;
+            let access_token = issued.access_token;
+            let refresh_token = issued.refresh_token.ok_or_else(|| {
+                anyhow!("device_code grant: issue_grant returned no refresh token")
+            })?;
 
-            let refresh_token = generate_opaque_token("mcr_");
-            let refresh_meta = TokenMetadata {
-                username,
-                device_id: dev_id.clone(),
-                scope: scope.clone(),
-                client_id: client_id.clone(),
-                iat,
-                exp: iat + REFRESH_TOKEN_TTL as i64,
-                did: did.clone(),
-                name: display_name,
-            };
-            db_client
-                .set_token(&refresh_token, &refresh_meta, REFRESH_TOKEN_TTL)
-                .await?;
-
-            let core_id_token = CoreIdTokenClaims::new(
+            let core_id_token = SiwxIdTokenClaims::new(
                 IssuerUrl::from_url(config.base_url.clone()),
                 vec![Audience::new(client_id)],
                 now + Duration::seconds(config.id_token_ttl_secs as i64),
                 now,
                 claims,
-                EmptyAdditionalClaims {},
+                SidClaims { sid: issued.sid },
             );
 
-            let id_token = CoreIdToken::new(
+            let id_token = SiwxIdToken::new(
                 core_id_token,
                 signing_key,
                 CoreJwsSigningAlgorithm::EcdsaP256Sha256,
@@ -1305,15 +1452,15 @@ async fn token_device_code(
             .map_err(|e| anyhow!("{}", e))?;
 
             // Cleanup
-            let _ = db_client.delete_device_code(&dc).await;
-            let _ = db_client.delete_user_code_mapping(&entry.user_code).await;
+            let _ = db_client.delete_device_code(&device_ref).await;
+            let _ = db_client.delete_user_code_mapping(&entry).await;
 
             info!(did = %did, device_id = %dev_id, "device_code grant: tokens issued");
 
-            let mut response = CoreTokenResponse::new(
+            let mut response = SiwxTokenResponse::new(
                 AccessToken::new(access_token),
                 CoreTokenType::Bearer,
-                CoreIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
+                SiwxIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
             );
             response.set_expires_in(Some(&time::Duration::from_secs(ACCESS_TOKEN_TTL)));
             response.set_refresh_token(Some(RefreshToken::new(refresh_token)));
@@ -1328,13 +1475,86 @@ async fn token_device_code(
     }
 }
 
+/// The scopes generic mode can grant, in the order they are issued.
+const GENERIC_GRANTABLE_SCOPES: [&str; 3] = ["openid", "profile", "offline_access"];
+
+/// What a generic-mode code exchange issues for the scope the authorization
+/// request asked for.
+#[derive(Debug, PartialEq, Eq)]
+struct GenericGrant {
+    /// The scope recorded on the tokens: the requested scopes among
+    /// [`GENERIC_GRANTABLE_SCOPES`] that the registration allows, in that order.
+    scope: String,
+    /// Whether a refresh token is issued.
+    refresh_token: bool,
+    /// Whether the token response must name the scope, because it differs from
+    /// the request (RFC 6749 §5.1).
+    report_scope: bool,
+}
+
+/// The grant for a generic-mode (no MAS shared secret) code exchange (I10):
+/// least privilege for a relying party that is not a Matrix client.
+///
+/// - The scope granted is what was requested, limited to `openid`, `profile`
+///   and `offline_access`. Matrix scopes mean nothing here and are not granted.
+///   If nothing grantable was requested the grant is `openid`: the exchange
+///   issues an ID token regardless, so that is what is being granted
+///   (provisional).
+/// - `offline_access`, and with it a refresh token, is granted only when the
+///   client's registration allows the refresh grant. A registration that lists
+///   no `grant_types` is not a restriction (provisional): refusing it would
+///   withhold refresh tokens from clients that registered before this rule
+///   existed and never listed any.
+/// - `requested == None` is a code written by a build from before the scope
+///   travelled with it. Such a code lives 300 s, and for that window it is
+///   exchanged as it always was: `openid profile` and a refresh token.
+fn generic_grant(requested: Option<&str>, registration: &ClientEntry) -> GenericGrant {
+    let Some(requested) = requested else {
+        return GenericGrant {
+            scope: "openid profile".to_string(),
+            refresh_token: true,
+            report_scope: false,
+        };
+    };
+    let asked: Vec<&str> = requested.split_whitespace().collect();
+    let may_refresh = registration_may_refresh(&registration.metadata);
+    let granted: Vec<&str> = GENERIC_GRANTABLE_SCOPES
+        .iter()
+        .copied()
+        .filter(|scope| asked.contains(scope))
+        .filter(|scope| *scope != "offline_access" || may_refresh)
+        .collect();
+    let refresh_token = granted.contains(&"offline_access");
+    let scope = if granted.is_empty() {
+        "openid".to_string()
+    } else {
+        granted.join(" ")
+    };
+    let report_scope = {
+        let mut requested_set = asked.clone();
+        requested_set.sort_unstable();
+        requested_set.dedup();
+        let mut granted_set: Vec<&str> = scope.split(' ').collect();
+        granted_set.sort_unstable();
+        requested_set != granted_set
+    };
+    GenericGrant {
+        scope,
+        refresh_token,
+        report_scope,
+    }
+}
+
 async fn token_authorization_code(
     form: TokenForm,
-    secret: Option<String>,
+    credentials: ClientCredentials,
     signing_key: &EcdsaSigningKey,
     config: &crate::config::Config,
     db_client: &DBClientType,
-) -> Result<CoreTokenResponse, CustomError> {
+) -> Result<SiwxTokenResponse, CustomError> {
+    // A malformed request is refused before the code is touched.
+    let named_client = named_client_id(&form, &credentials)?;
+    let presented_secret = credentials.secret.or(form.client_secret);
     let code = form.code.ok_or_else(|| {
         CustomError::BadRequestToken(TokenError {
             error: CoreErrorResponseType::InvalidRequest,
@@ -1349,101 +1569,75 @@ async fn token_authorization_code(
         })
     })?;
 
-    // C2 Step 1: bind the auth code to the client it was issued to. A correct
-    // client presents the same `client_id` at /authorize and /token. If the code
-    // carries a client_id (always set by `sign_in`), the request's client_id —
-    // when present — must match it, and the rest of the function runs against the
-    // code's client (never the request's). This prevents a leaked confidential
-    // client's code from being redeemed by a different (public) client.
-    if !code_entry.client_id.is_empty() {
-        if let Some(ref req_client_id) = form.client_id {
-            if !constant_time_eq(req_client_id, &code_entry.client_id) {
-                return Err(CustomError::BadRequestToken(TokenError {
-                    error: CoreErrorResponseType::InvalidGrant,
-                    error_description: "client_id does not match the authorization code."
-                        .to_string(),
-                }));
-            }
-        }
-    }
+    // Bind the code to the client it was issued to, and authenticate that
+    // client, through the helpers the refresh grant uses too. A correct client
+    // presents the same `client_id` at /authorize and /token; a code carries its
+    // client_id (always set by `sign_in`), and the rest of the function runs
+    // against the code's client, never the request's. This stops a leaked
+    // confidential client's code from being redeemed by a different (public)
+    // client.
     let client_id = if !code_entry.client_id.is_empty() {
         code_entry.client_id.clone()
-    } else if let Some(c) = form.client_id.clone() {
-        c
     } else {
-        code_entry.client_id.clone()
+        named_client.clone().unwrap_or_default()
     };
+    let client_entry = authenticate_code_client(
+        &client_id,
+        named_client.as_deref(),
+        presented_secret.as_deref(),
+        config,
+        db_client,
+    )
+    .await?;
 
-    if let Some(secret) = if let Some(b) = secret {
-        Some(b)
-    } else {
-        form.client_secret.clone()
-    } {
-        let client_entry = db_client
-            .get_client(client_id.clone())
-            .await?
-            .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
-        if !constant_time_eq(&secret, &client_entry.secret) {
-            return Err(CustomError::Unauthorized("Bad secret.".to_string()));
+    // PKCE: every code carries the challenge `/authorize` bound to its session,
+    // and the verifier must match it. A code without a challenge (only an older
+    // build wrote those) is refused.
+    let challenge = code_entry.code_challenge.as_ref().ok_or_else(|| {
+        CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description:
+                "This authorization code carries no PKCE challenge; restart the sign-in."
+                    .to_string(),
+        })
+    })?;
+    let verifier = form.code_verifier.as_ref().ok_or_else(|| {
+        CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "code_verifier required (PKCE).".to_string(),
+        })
+    })?;
+    let method = code_entry
+        .code_challenge_method
+        .as_deref()
+        .unwrap_or("S256");
+    // C2 Step 4b: reject the `plain` PKCE method. Discovery advertises S256
+    // only (`code_challenge_methods_supported = ["S256"]`); no compliant
+    // client sends `plain`, and the downgrade weakens the PKCE binding.
+    let computed = match method {
+        "S256" => {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(verifier.as_bytes());
+            URL_SAFE_NO_PAD.encode(hash)
         }
-    } else {
-        let client_entry = db_client
-            .get_client(client_id.clone())
-            .await?
-            .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
-        match client_entry.metadata.token_endpoint_auth_method() {
-            Some(CoreClientAuthMethod::None) => {}
-            Some(_) => {
-                return Err(CustomError::Unauthorized("Secret required.".to_string()));
-            }
-            None if config.require_secret => {
-                return Err(CustomError::Unauthorized("Secret required.".to_string()));
-            }
-            None => {}
-        }
-    }
-
-    // PKCE: validate code_verifier if a code_challenge was issued.
-    if let Some(ref challenge) = code_entry.code_challenge {
-        let verifier = form.code_verifier.as_ref().ok_or_else(|| {
-            CustomError::BadRequestToken(TokenError {
-                error: CoreErrorResponseType::InvalidGrant,
-                error_description: "code_verifier required (PKCE).".to_string(),
-            })
-        })?;
-        let method = code_entry
-            .code_challenge_method
-            .as_deref()
-            .unwrap_or("S256");
-        // C2 Step 4b: reject the `plain` PKCE method. Discovery advertises S256
-        // only (`code_challenge_methods_supported = ["S256"]`); no compliant
-        // client sends `plain`, and the downgrade weakens the PKCE binding.
-        let computed = match method {
-            "S256" => {
-                use sha2::{Digest, Sha256};
-                let hash = Sha256::digest(verifier.as_bytes());
-                URL_SAFE_NO_PAD.encode(hash)
-            }
-            _ => {
-                return Err(CustomError::BadRequestToken(TokenError {
-                    error: CoreErrorResponseType::InvalidGrant,
-                    error_description: "Unsupported code_challenge_method (only S256 is allowed)."
-                        .to_string(),
-                }));
-            }
-        };
-        if !constant_time_eq(&computed, challenge) {
+        _ => {
             return Err(CustomError::BadRequestToken(TokenError {
                 error: CoreErrorResponseType::InvalidGrant,
-                error_description: "code_verifier mismatch.".to_string(),
+                error_description: "Unsupported code_challenge_method (only S256 is allowed)."
+                    .to_string(),
             }));
         }
+    };
+    if !constant_time_eq(&computed, challenge) {
+        return Err(CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "code_verifier mismatch.".to_string(),
+        }));
     }
 
     let msc3861_mode = config.mas_shared_secret.is_some();
 
     let now = Utc::now();
-    let iat = now.timestamp();
     // This request is DIFFERENT from the sign_in that provisioned the account,
     // so the resolved localpart travels via `CodeEntry.localpart` (set at
     // sign_in) rather than being recomputed here. `None` means the entry was
@@ -1461,67 +1655,63 @@ async fn token_authorization_code(
         .map(|n| n.to_string())
         .unwrap_or_else(|| code_entry.did.clone());
 
-    let (access_prefix, refresh_prefix, scope) = if msc3861_mode {
+    // Matrix mode records the Matrix scope for the device and always issues a
+    // refresh token, whatever was requested: Synapse, Element Web and Element X
+    // depend on exactly that. Generic mode grants what was requested and
+    // allowed, and issues a refresh token only for `offline_access` (I10).
+    let (kind, scope, issue_refresh_token, report_scope) = if msc3861_mode {
         let device_id = code_entry.device_id.clone().unwrap_or_default();
         (
-            "mat_",
-            "mcr_",
+            GrantKind::MatrixDevice,
             format!(
                 "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
                 device_id
             ),
+            true,
+            false,
         )
     } else {
-        ("", "", "openid profile".to_string())
+        let grant = generic_grant(code_entry.scope.as_deref(), &client_entry);
+        (
+            GrantKind::Oidc,
+            grant.scope,
+            grant.refresh_token,
+            grant.report_scope,
+        )
     };
 
-    let device_id = code_entry.device_id.clone().unwrap_or_default();
-
-    let opaque = generate_opaque_token(access_prefix);
-    let access_metadata = TokenMetadata {
-        username: username.clone(),
-        device_id: device_id.clone(),
-        scope: scope.clone(),
-        client_id: client_id.clone(),
-        iat,
-        exp: iat + ACCESS_TOKEN_TTL as i64,
-        did: code_entry.did.clone(),
-        name: display_name.clone(),
-    };
-    db_client
-        .set_token(&opaque, &access_metadata, ACCESS_TOKEN_TTL)
+    // One grant per code exchange (I2): its first access token, its refresh
+    // token when one is issued, and its index entries, written in one step.
+    let issued = db_client
+        .issue_grant(&NewGrant {
+            kind,
+            username,
+            did: code_entry.did.clone(),
+            client_id: client_id.clone(),
+            confidential_client: client_is_confidential(Some(&client_entry), config.require_secret),
+            device_id: code_entry.device_id.clone().unwrap_or_default(),
+            scope: scope.clone(),
+            name: display_name,
+            auth_ms: Some(code_entry.auth_time.timestamp_millis()),
+            access_ttl: ACCESS_TOKEN_TTL,
+            refresh_inactivity_secs: issue_refresh_token.then_some(REFRESH_TOKEN_TTL),
+        })
         .await?;
+    let refresh_token = issued.refresh_token.map(RefreshToken::new);
+    let access_token = AccessToken::new(issued.access_token);
 
-    let refresh_opaque = generate_opaque_token(refresh_prefix);
-    let refresh_metadata = TokenMetadata {
-        username,
-        device_id,
-        scope,
-        client_id: client_id.clone(),
-        iat,
-        exp: iat + REFRESH_TOKEN_TTL as i64,
-        did: code_entry.did.clone(),
-        name: display_name,
-    };
-    db_client
-        .set_token(&refresh_opaque, &refresh_metadata, REFRESH_TOKEN_TTL)
-        .await?;
-
-    let access_token = AccessToken::new(opaque);
-    let refresh_token = Some(RefreshToken::new(refresh_opaque));
-
-    let core_id_token = CoreIdTokenClaims::new(
+    let core_id_token = SiwxIdTokenClaims::new(
         IssuerUrl::from_url(config.base_url.clone()),
         vec![Audience::new(client_id.clone())],
         now + Duration::seconds(config.id_token_ttl_secs as i64),
         now,
         claims,
-        EmptyAdditionalClaims {},
+        SidClaims { sid: issued.sid },
     )
     .set_nonce(code_entry.nonce)
     .set_auth_time(Some(code_entry.auth_time));
 
-    let id_token = CoreIdToken::new(
+    let id_token = SiwxIdToken::new(
         core_id_token,
         signing_key,
         CoreJwsSigningAlgorithm::EcdsaP256Sha256,
@@ -1532,13 +1722,23 @@ async fn token_authorization_code(
 
     let expires_in_secs = ACCESS_TOKEN_TTL;
 
-    let mut response = CoreTokenResponse::new(
+    let mut response = SiwxTokenResponse::new(
         access_token,
         CoreTokenType::Bearer,
-        CoreIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
+        SiwxIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
     );
     response.set_expires_in(Some(&time::Duration::from_secs(expires_in_secs)));
     response.set_refresh_token(refresh_token);
+    // RFC 6749 §5.1: the response says the granted scope when it differs from
+    // the request. Only generic mode can differ; Matrix mode never put one here.
+    if report_scope {
+        response.set_scopes(Some(
+            scope
+                .split_whitespace()
+                .map(|s| Scope::new(s.to_string()))
+                .collect(),
+        ));
+    }
     Ok(response)
 }
 
@@ -1574,11 +1774,6 @@ pub async fn authorize(
         .get_client(params.client_id.clone())
         .await
         .map_err(|e| anyhow!("Failed to get kv: {}", e))?;
-    if client_entry.is_none() {
-        return Err(CustomError::Unauthorized(
-            "Unrecognised client id.".to_string(),
-        ));
-    }
 
     let nonce: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -1586,18 +1781,12 @@ pub async fn authorize(
         .map(char::from)
         .collect();
 
-    let mut r_u = params.redirect_uri.clone().url().clone();
-    r_u.set_query(None);
-    let mut r_us: Vec<Url> = client_entry
-        .unwrap()
-        .metadata
-        .redirect_uris()
-        .clone()
-        .iter_mut()
-        .map(|u| u.url().clone())
-        .collect();
-    r_us.iter_mut().for_each(|u| u.set_query(None));
-    if !r_us.contains(&r_u) {
+    let Some(client_entry) = client_entry else {
+        return Err(CustomError::Unauthorized(
+            "Unrecognised client id.".to_string(),
+        ));
+    };
+    if !redirect_uri_is_registered(&client_entry, &params.redirect_uri) {
         return Err(CustomError::Redirect(
             "/error?message=unregistered_redirect_uri".to_string(),
         ));
@@ -1638,7 +1827,7 @@ pub async fn authorize(
         return Err(CustomError::Redirect(url.to_string()));
     }
 
-    if params.response_type.is_none() {
+    let Some(response_type) = params.response_type.as_ref() else {
         let mut url = params.redirect_uri.url().clone();
         url.query_pairs_mut().append_pair("state", &state);
         url.query_pairs_mut()
@@ -1646,8 +1835,22 @@ pub async fn authorize(
         url.query_pairs_mut()
             .append_pair("error_description", "Missing response_type");
         return Err(CustomError::Redirect(url.to_string()));
+    };
+    // Only the authorization-code flow is implemented, and discovery advertises
+    // only `code`. Any other response type goes back to the (validated)
+    // redirect URI as `unsupported_response_type` (RFC 6749 §4.1.2.1), and no
+    // login session is started.
+    if !matches!(response_type, CoreResponseType::Code) {
+        let mut url = params.redirect_uri.url().clone();
+        url.query_pairs_mut().append_pair("state", &state);
+        url.query_pairs_mut().append_pair(
+            "error",
+            CoreAuthErrorResponseType::UnsupportedResponseType.as_ref(),
+        );
+        url.query_pairs_mut()
+            .append_pair("error_description", "Only response_type=code is supported.");
+        return Err(CustomError::Redirect(url.to_string()));
     }
-    let _response_type = params.response_type.as_ref().unwrap();
 
     let scope_str = params.scope.as_str().trim();
     let scopes: Vec<&str> = scope_str.split(' ').filter(|s| !s.is_empty()).collect();
@@ -1659,6 +1862,43 @@ pub async fn authorize(
         );
     }
 
+    // Validate response_mode strictly (invalid_request semantics): discovery
+    // advertises exactly {"query","fragment"}, so anything else is a 400 rather
+    // than a silently-ignored param the client then waits on.
+    if let Some(rm) = &params.response_mode {
+        if rm != "query" && rm != "fragment" {
+            return Err(CustomError::BadRequest(format!(
+                "Unsupported response_mode '{rm}' (only 'query' and 'fragment' are supported)."
+            )));
+        }
+    }
+    // C2 Step 4b: reject `code_challenge_method=plain` up front. Discovery
+    // advertises S256 only. A missing method defaults to S256.
+    if let Some(ccm) = &params.code_challenge_method {
+        if ccm != "S256" {
+            return Err(CustomError::BadRequest(
+                "Unsupported code_challenge_method (only S256 is allowed).".to_string(),
+            ));
+        }
+    }
+    // C2 Step 4a: require S256 PKCE on every authorization request (the code
+    // flow is the only one). PKCE binds a redeemed code to the client that
+    // started the request. Every real client already sends S256 (Element X per
+    // the Matrix OAuth 2.0 profile, the in-house `siwx-oidc-auth` lib, and all
+    // e2e flows). Scope: ALL clients — every registered `ClientEntry` carries a
+    // server-issued secret regardless of `token_endpoint_auth_method`, so there
+    // is no client class that legitimately omits PKCE to exempt. The
+    // device-code grant (RFC 8628) does NOT pass through /authorize.
+    let Some(code_challenge) = params.code_challenge.clone() else {
+        return Err(CustomError::BadRequest(
+            "code_challenge is required (S256 PKCE) for the authorization-code flow.".to_string(),
+        ));
+    };
+
+    // Bind the request validated above to the login session. `sign_in` issues
+    // the code for exactly this request (client, redirect URI, state, response
+    // mode, PKCE challenge) and never for parameters it receives on the front
+    // channel, which may repeat it but not change it.
     let session_id = Uuid::new_v4();
     let session_secret: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -1670,11 +1910,18 @@ pub async fn authorize(
             session_id.to_string(),
             SessionEntry {
                 siwe_nonce: nonce.clone(),
-                oidc_nonce: params.nonce.clone(),
                 secret: session_secret.clone(),
                 signin_count: 0,
                 verified_did: None,
-                scope: Some(params.scope.as_str().to_string()),
+                request: Some(AuthorizationRequest {
+                    client_id: params.client_id.clone(),
+                    redirect_uri: params.redirect_uri.as_str().to_string(),
+                    state: state.clone(),
+                    response_mode: params.response_mode.clone(),
+                    code_challenge: code_challenge.clone(),
+                    scope: Some(params.scope.as_str().to_string()),
+                    nonce: params.nonce.clone(),
+                }),
             },
         )
         .await?;
@@ -1694,73 +1941,28 @@ pub async fn authorize(
         .host()
         .map(|h| h.to_string())
         .unwrap_or_else(|| params.redirect_uri.url().scheme().to_string());
-    let oidc_nonce_param = if let Some(n) = &params.nonce {
-        format!("&oidc_nonce={}", n.secret())
-    } else {
-        "".to_string()
-    };
-    // Validate response_mode strictly (invalid_request semantics): discovery
-    // advertises exactly {"query","fragment"}, so anything else is a 400 rather
-    // than a silently-ignored param the client then waits on.
-    if let Some(rm) = &params.response_mode {
-        if rm != "query" && rm != "fragment" {
-            return Err(CustomError::BadRequest(format!(
-                "Unsupported response_mode '{rm}' (only 'query' and 'fragment' are supported)."
-            )));
-        }
+    // The login page reads these values to build its CAIP-122 message (which
+    // binds `redirect_uri` in its `Resources:`) and its link to /sign_in. Each
+    // value is percent-encoded so the page reads it back exactly: a redirect
+    // URI with several query parameters, or a state with `&` or `+`, would
+    // otherwise be cut or altered. /sign_in itself reads none of them; it
+    // takes the request from the session.
+    let mut page = url::form_urlencoded::Serializer::new(String::new());
+    page.append_pair("nonce", &nonce)
+        .append_pair("domain", &domain)
+        .append_pair("redirect_uri", params.redirect_uri.as_str())
+        .append_pair("state", &state)
+        .append_pair("client_id", &params.client_id);
+    if let Some(n) = &params.nonce {
+        page.append_pair("oidc_nonce", n.secret());
     }
-    // Round-trip the non-default mode through the login SPA to /sign_in (same
-    // client-side round-trip as the PKCE params). Absent/"query" appends
-    // nothing, keeping the SPA URL byte-identical for existing clients.
-    let response_mode_param = if params.response_mode.as_deref() == Some("fragment") {
-        "&response_mode=fragment".to_string()
-    } else {
-        "".to_string()
-    };
-    // C2 Step 4b: reject `code_challenge_method=plain` up front so a `plain`
-    // challenge is never carried into /sign_in or stored on the CodeEntry.
-    // Discovery advertises S256 only. A missing method defaults to S256.
-    if let Some(ccm) = &params.code_challenge_method {
-        if ccm != "S256" {
-            return Err(CustomError::BadRequest(
-                "Unsupported code_challenge_method (only S256 is allowed).".to_string(),
-            ));
-        }
+    page.append_pair("code_challenge", &code_challenge)
+        .append_pair("code_challenge_method", "S256");
+    // Absent/"query" appends nothing.
+    if params.response_mode.as_deref() == Some("fragment") {
+        page.append_pair("response_mode", "fragment");
     }
-    // C2 Step 4a: require S256 PKCE for the authorization-code flow. PKCE is the
-    // only backstop that binds a redeemed code to the browser that initiated the
-    // request; without it, a leaked or stolen code is freely redeemable. Every
-    // real client already sends S256 (Element X per the Matrix OAuth 2.0 profile,
-    // the in-house `siwx-oidc-auth` lib, and all e2e flows), so requiring it is a
-    // spec-compliance tightening that breaks no compliant client. Scope: ALL
-    // code-flow clients — every registered `ClientEntry` carries a server-issued
-    // secret regardless of `token_endpoint_auth_method`, so there is no client
-    // class that legitimately omits PKCE to exempt. The device-code grant (RFC
-    // 8628) does NOT pass through /authorize and is unaffected.
-    if matches!(_response_type, CoreResponseType::Code) && params.code_challenge.is_none() {
-        return Err(CustomError::BadRequest(
-            "code_challenge is required (S256 PKCE) for the authorization-code flow.".to_string(),
-        ));
-    }
-    let pkce_params = match (&params.code_challenge, &params.code_challenge_method) {
-        (Some(cc), Some(ccm)) => format!("&code_challenge={cc}&code_challenge_method={ccm}"),
-        (Some(cc), None) => format!("&code_challenge={cc}&code_challenge_method=S256"),
-        _ => "".to_string(),
-    };
-    Ok((
-        format!(
-            "/?nonce={}&domain={}&redirect_uri={}&state={}&client_id={}{}{}{}",
-            nonce,
-            domain,
-            *params.redirect_uri,
-            state,
-            params.client_id,
-            oidc_nonce_param,
-            pkce_params,
-            response_mode_param
-        ),
-        Box::new(session_cookie),
-    ))
+    Ok((format!("/?{}", page.finish()), Box::new(session_cookie)))
 }
 
 // -- SiwX sign-in ----------------------------------------------------------
@@ -1915,11 +2117,41 @@ pub fn validate_caip122_envelope(
     Ok(())
 }
 
+/// Whether `redirect_uri` is one of the client's registered redirect URIs.
+///
+/// The match is exact (RFC 9700 §4.1.3): the whole URL, query included,
+/// compared after URL parsing. A registration that carries a query (Element Web
+/// registers `…/?no_universal_links=true`) matches only that exact query, and
+/// an extra or missing query component is a different URI. This is the one
+/// matcher for both `authorize` and `sign_in`, so the two cannot disagree.
+fn redirect_uri_is_registered(client: &ClientEntry, redirect_uri: &RedirectUrl) -> bool {
+    client
+        .metadata
+        .redirect_uris()
+        .iter()
+        .any(|registered| registered.url() == redirect_uri.url())
+}
+
+/// Whether `uri` is one of the client's registered `post_logout_redirect_uris`,
+/// matched exactly like [`redirect_uri_is_registered`] (RFC 9700 §4.1.3: the
+/// whole URL, query included, after URL parsing). The one matcher for
+/// RP-initiated logout, so a URI that is not registered never redirects.
+fn post_logout_redirect_uri_is_registered(client: &ClientEntry, uri: &Url) -> bool {
+    client
+        .metadata
+        .additional_metadata()
+        .post_logout_redirect_uris
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|registered| registered.url() == uri)
+}
+
 /// C2 Step 3: re-validate a `redirect_uri` against the client's *registered*
-/// redirect_uris, mirroring the exact check in `authorize` (query-stripped exact
-/// match). Used by `sign_in` so a code is never appended to an unregistered (e.g.
-/// attacker-controlled) redirect_uri — closing the open-redirect on BOTH the
-/// wallet (Path B) and WebAuthn (Path A) login paths.
+/// redirect_uris with the same exact match as `authorize`
+/// ([`redirect_uri_is_registered`]). Used by `sign_in` so a code is never
+/// appended to an unregistered redirect_uri, on BOTH the wallet (Path B) and
+/// WebAuthn (Path A) login paths.
 /// Returns the client's entry, so the caller can use its registration (the
 /// device name in `sign_in`) without a second read.
 async fn validate_registered_redirect_uri(
@@ -1933,17 +2165,7 @@ async fn validate_registered_redirect_uri(
         .map_err(|e| anyhow!("Failed to get kv: {}", e))?
         .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
 
-    let mut r_u = redirect_uri.url().clone();
-    r_u.set_query(None);
-    let mut r_us: Vec<Url> = client_entry
-        .metadata
-        .redirect_uris()
-        .clone()
-        .iter_mut()
-        .map(|u| u.url().clone())
-        .collect();
-    r_us.iter_mut().for_each(|u| u.set_query(None));
-    if !r_us.contains(&r_u) {
+    if !redirect_uri_is_registered(&client_entry, redirect_uri) {
         return Err(CustomError::BadRequest(
             "redirect_uri is not registered for this client.".to_string(),
         ));
@@ -2024,19 +2246,36 @@ pub fn verify_siwx_cookie(
     Ok(siwx_cookie.did)
 }
 
-#[derive(Deserialize)]
-pub struct SignInParams {
-    pub redirect_uri: RedirectUrl,
-    pub state: String,
-    pub oidc_nonce: Option<Nonce>,
-    pub client_id: String,
-    /// PKCE code_challenge (passed through from /authorize).
-    pub code_challenge: Option<String>,
-    /// PKCE code_challenge_method. Only "S256" is accepted; "plain" is
-    /// rejected at /authorize.
-    pub code_challenge_method: Option<String>,
-    /// OAuth response_mode (passed through from /authorize; validated there).
-    pub response_mode: Option<String>,
+/// A bound request for `client_id` at `https://example.com/callback`, as
+/// `authorize` would store it. For tests that drive `sign_in` directly.
+#[cfg(test)]
+pub(crate) fn bound_test_request(client_id: &str) -> AuthorizationRequest {
+    AuthorizationRequest {
+        client_id: client_id.to_string(),
+        redirect_uri: "https://example.com/callback".to_string(),
+        state: "state".to_string(),
+        response_mode: None,
+        code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
+        scope: None,
+        nonce: None,
+    }
+}
+
+/// The authorization request this sign-in completes: the one `/authorize`
+/// validated and bound to the session. It is the only source of the client,
+/// redirect URI, state, response mode, PKCE challenge and nonce: `sign_in`
+/// reads no authorization parameter from its own query. The login page still
+/// appends them to its `/sign_in` link (encoded with `encodeURI`, which alters
+/// `&`, `+` and other characters in a state or redirect URI); they are never
+/// parsed.
+fn bound_request(session: &SessionEntry) -> Result<AuthorizationRequest, CustomError> {
+    session.request.clone().ok_or_else(|| {
+        CustomError::BadRequest(
+            "This sign-in has no bound authorization request (it was started before a \
+             server update). Restart the sign-in from the application."
+                .to_string(),
+        )
+    })
 }
 
 /// Extract a device_id from a scope string containing `urn:matrix:client:device:XXX`.
@@ -2489,7 +2728,6 @@ pub async fn sign_in(
     _base_url: &Url,
     allowed_did_methods: &[String],
     allowed_pkh_namespaces: &[String],
-    params: SignInParams,
     cookies: headers::Cookie,
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
@@ -2508,6 +2746,12 @@ pub async fn sign_in(
     } else {
         return Err(CustomError::BadRequest("Session not found".to_string()));
     };
+
+    // The request this sign-in completes, as `/authorize` bound it. Checked
+    // before the session is spent.
+    let request = bound_request(&session_entry)?;
+    let redirect_uri = RedirectUrl::new(request.redirect_uri.clone())
+        .map_err(|e| anyhow!("bound redirect_uri does not parse: {}", e))?;
 
     // Atomically mark session as signed-in (prevents race-condition double sign-in).
     if !db_client
@@ -2610,12 +2854,16 @@ pub async fn sign_in(
             return Err(CustomError::BadRequest("Nonce mismatch".to_string()));
         }
 
-        let redirect_url = params.redirect_uri.url();
+        let redirect_url = redirect_uri.url();
         if !extract_resources(&siwx_cookie.message)
             .iter()
             .any(|r| Url::parse(r).ok().as_ref() == Some(redirect_url))
         {
-            return Err(anyhow!("Missing or mismatched resource in CAIP-122 message").into());
+            // The client signed a message that binds no (or another) redirect
+            // URI: its mistake, not a server fault.
+            return Err(CustomError::BadRequest(
+                "Missing or mismatched resource in CAIP-122 message".to_string(),
+            ));
         }
 
         // C1 (login path): enforce the message Expiration Time. The login
@@ -2672,20 +2920,18 @@ pub async fn sign_in(
     // `axum_lib::detected_mxid_for` and `webauthn_authenticate_finish`.
     crate::webauthn::reject_if_deactivated(synapse_client, &did).await?;
 
-    // C2 Step 3: re-validate the request redirect_uri against the client's
-    // registered set before issuing the code. `authorize` checks this, but
-    // `sign_in` re-receives `redirect_uri` as a query param and previously
-    // appended the code to whatever URL was supplied. This closes the open
-    // redirect on BOTH the wallet (Path B) and WebAuthn (Path A) paths. Path B
-    // additionally binds the redirect via the signed `Resources:` list above;
-    // this is the only redirect binding Path A has.
+    // C2 Step 3: re-validate the bound redirect_uri against the client's
+    // registered set before issuing the code. `authorize` matched it when it
+    // bound the request; this re-check covers a registration that changed or
+    // expired since, on BOTH the wallet (Path B) and WebAuthn (Path A) paths.
+    // Path B additionally binds the redirect via the signed `Resources:` list
+    // above.
     let client =
-        validate_registered_redirect_uri(&params.client_id, &params.redirect_uri, db_client)
-            .await?;
-    let device_name = device_display_name(&params.client_id, Some(&client));
+        validate_registered_redirect_uri(&request.client_id, &redirect_uri, db_client).await?;
+    let device_name = device_display_name(&request.client_id, Some(&client));
 
-    // Extract client-proposed device_id from the session's stored scope (if any).
-    let proposed_device_id = session_entry
+    // Extract a client-proposed device_id from the bound request's scope (if any).
+    let proposed_device_id = request
         .scope
         .as_deref()
         .and_then(extract_device_id_from_scope);
@@ -2717,21 +2963,27 @@ pub async fn sign_in(
 
     let code_entry = CodeEntry {
         did: did.clone(),
-        nonce: params.oidc_nonce.clone(),
+        nonce: request.nonce.clone(),
         exchange_count: 0,
-        client_id: params.client_id.clone(),
-        auth_time: Utc::now(),
-        code_challenge: params.code_challenge.clone(),
-        code_challenge_method: params.code_challenge_method.clone(),
+        client_id: request.client_id.clone(),
+        // The authentication, from Redis `TIME` like every lifetime deadline
+        // (I6); the grant's absolute expiry counts from it.
+        auth_time: chrono::DateTime::<Utc>::from_timestamp_millis(
+            db_client.server_time_ms().await?,
+        )
+        .ok_or_else(|| anyhow!("Redis TIME out of range"))?,
+        code_challenge: Some(request.code_challenge.clone()),
+        code_challenge_method: Some("S256".to_string()),
         localpart: Some(resolved.localpart.clone()),
         device_id,
+        scope: request.scope.clone(),
     };
 
     let code = Uuid::new_v4();
     db_client.set_code(code.to_string(), code_entry).await?;
 
-    let mut url = params.redirect_uri.url().clone();
-    if params.response_mode.as_deref() == Some("fragment") {
+    let mut url = redirect_uri.url().clone();
+    if request.response_mode.as_deref() == Some("fragment") {
         // matrix-js-sdk v42 requested `response_mode=fragment` on /authorize
         // (round-tripped here via the login SPA) and reads the authorization
         // response ONLY from the URL fragment. ALL response params go in the
@@ -2739,12 +2991,12 @@ pub async fn sign_in(
         // untouched with nothing appended to it.
         let fragment = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("code", &code.to_string())
-            .append_pair("state", &params.state)
+            .append_pair("state", &request.state)
             .finish();
         url.set_fragment(Some(&fragment));
     } else {
         url.query_pairs_mut().append_pair("code", &code.to_string());
-        url.query_pairs_mut().append_pair("state", &params.state);
+        url.query_pairs_mut().append_pair("state", &request.state);
     }
     // Surface the resolved DID alongside the redirect so the HTTP handler can mint
     // the opaque login user-session cookie ONLY on this success path (a real login
@@ -2759,11 +3011,32 @@ pub struct RegisterError {
     error: CoreRegisterErrorResponseType,
 }
 
+/// What dynamic registration checks beyond the metadata's own form: the SSRF
+/// guard on `backchannel_logout_uri` (D3) and the D4 switch.
+#[derive(Clone, Debug, Default)]
+pub struct RegistrationPolicy {
+    pub guard: crate::backchannel::UriGuard,
+    /// D4 (provisional): a client that may receive refresh tokens must register
+    /// a `backchannel_logout_uri`. Off by default, and never in Matrix mode.
+    pub require_backchannel_for_refresh: bool,
+}
+
+impl RegistrationPolicy {
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            guard: crate::backchannel::UriGuard::new(&config.backchannel_logout_allowed_hosts),
+            require_backchannel_for_refresh: config.backchannel_logout_required_for_refresh
+                && !delegated_auth_enabled(config),
+        }
+    }
+}
+
 pub async fn register(
-    payload: CoreClientMetadata,
+    payload: SiwxClientMetadata,
     base_url: Url,
     db_client: &DBClientType,
-) -> Result<CoreClientRegistrationResponse, CustomError> {
+    policy: &RegistrationPolicy,
+) -> Result<SiwxClientRegistrationResponse, CustomError> {
     let id = Uuid::new_v4();
     let secret: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -2779,6 +3052,8 @@ pub async fn register(
             }));
         }
     }
+    check_logout_metadata(&payload, policy).await?;
+    let logout_metadata = payload.additional_metadata().clone();
 
     let access_token = RegistrationAccessToken::new(
         thread_rng()
@@ -2788,17 +3063,15 @@ pub async fn register(
             .collect(),
     );
 
-    let entry = ClientEntry {
-        secret: secret.clone(),
-        metadata: payload,
-        access_token: Some(access_token.clone()),
-    };
+    // The response below is the only place the secret and the registration
+    // access token appear: the entry keeps their digests.
+    let entry = ClientEntry::new(&secret, payload, Some(access_token.secret()));
     db_client.set_client(id.to_string(), entry).await?;
 
-    Ok(CoreClientRegistrationResponse::new(
+    Ok(SiwxClientRegistrationResponse::new(
         ClientId::new(id.to_string()),
         redirect_uris,
-        EmptyAdditionalClientMetadata::default(),
+        logout_metadata,
         EmptyAdditionalClientRegistrationResponse::default(),
     )
     .set_client_secret(Some(ClientSecret::new(secret)))
@@ -2808,6 +3081,301 @@ pub async fn register(
             .map_err(|e| anyhow!("Unable to join URL: {}", e))?,
     )))
     .set_registration_access_token(Some(access_token)))
+}
+
+/// The logout metadata a registration may carry, else
+/// `invalid_client_metadata` (RFC 7591 §3.2.2): every
+/// `post_logout_redirect_uris` entry is an absolute URI without a fragment
+/// (as `redirect_uris`); a `backchannel_logout_uri` passes the SSRF guard
+/// ([`crate::backchannel::UriGuard::check`]: no fragment, `https`, every
+/// resolved address outside the refused classes, unless the host is
+/// allowlisted); and with the D4 switch on, a client that may receive refresh
+/// tokens registers one.
+async fn check_logout_metadata(
+    payload: &SiwxClientMetadata,
+    policy: &RegistrationPolicy,
+) -> Result<(), CustomError> {
+    let invalid = || {
+        CustomError::BadRequestRegister(RegisterError {
+            error: CoreRegisterErrorResponseType::InvalidClientMetadata,
+        })
+    };
+    let extra = payload.additional_metadata();
+    let uris = extra
+        .post_logout_redirect_uris
+        .as_deref()
+        .unwrap_or_default();
+    if uris.iter().any(|uri| uri.url().fragment().is_some()) {
+        return Err(invalid());
+    }
+    match &extra.backchannel_logout_uri {
+        Some(uri) => {
+            if let Err(refusal) = policy.guard.check(uri).await {
+                warn!(
+                    host = uri.host_str().unwrap_or_default(),
+                    refusal = ?refusal,
+                    "registration: backchannel_logout_uri refused"
+                );
+                return Err(invalid());
+            }
+        }
+        None if policy.require_backchannel_for_refresh && registration_may_refresh(payload) => {
+            return Err(invalid());
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// Whether a registration allows the refresh grant: it lists `refresh_token`
+/// in `grant_types`, or lists no `grant_types` at all (provisional).
+fn registration_may_refresh(metadata: &SiwxClientMetadata) -> bool {
+    metadata
+        .grant_types()
+        .is_none_or(|grants| grants.contains(&CoreGrantType::RefreshToken))
+}
+
+// -- RP-initiated logout (OpenID Connect RP-Initiated Logout 1.0) -------------
+
+/// The parameters of `GET`/`POST` [`END_SESSION_PATH`]. `logout_hint` and
+/// `ui_locales` are accepted by being ignored.
+#[derive(Debug, Default, Deserialize)]
+pub struct EndSessionParams {
+    pub id_token_hint: Option<String>,
+    pub client_id: Option<String>,
+    pub post_logout_redirect_uri: Option<String>,
+    pub state: Option<String>,
+}
+
+/// The claims end-session reads from a verified `id_token_hint`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HintClaims {
+    pub sub: String,
+    pub aud: Vec<String>,
+    pub sid: Option<String>,
+}
+
+/// Why an `id_token_hint` was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HintError {
+    /// Not a compact JWS with a JSON header and payload carrying `sub` and `aud`.
+    Malformed,
+    /// `alg` is not ES256 (`none` and `HS*` included).
+    Algorithm,
+    /// No `kid`, or one that is neither the live key's nor a retired key's.
+    UnknownKid,
+    /// The signature does not verify over the received bytes.
+    Signature,
+    /// `iss` is not this provider.
+    Issuer,
+}
+
+/// Verify an `id_token_hint`: an ID token this provider signed, with the live
+/// key or a retired one, named by its `kid`, over the received bytes, and
+/// issued by this provider. Its expiry is NOT checked: RP-Initiated Logout
+/// §2 lets an RP send an expired ID token, which still names the session.
+pub fn verify_id_token_hint(
+    hint: &str,
+    signing_key: &EcdsaSigningKey,
+    retired: &[CoreJsonWebKey],
+    issuer: &IssuerUrl,
+) -> Result<HintClaims, HintError> {
+    use openidconnect::JsonWebKey;
+
+    let mut parts = hint.split('.');
+    let (Some(header), Some(payload), Some(signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(HintError::Malformed);
+    };
+    let decode = |part: &str| {
+        URL_SAFE_NO_PAD
+            .decode(part)
+            .map_err(|_| HintError::Malformed)
+    };
+    let header: serde_json::Value =
+        serde_json::from_slice(&decode(header)?).map_err(|_| HintError::Malformed)?;
+    if header["alg"] != "ES256" {
+        return Err(HintError::Algorithm);
+    }
+    let kid = header["kid"].as_str().ok_or(HintError::UnknownKid)?;
+    let live = signing_key.as_verification_key();
+    let key = std::iter::once(&live)
+        .chain(retired.iter())
+        .find(|k| k.key_id().map(|id| id.as_str()) == Some(kid))
+        .ok_or(HintError::UnknownKid)?;
+    let signing_input_len = hint.len() - signature.len() - 1;
+    key.verify_signature(
+        &CoreJwsSigningAlgorithm::EcdsaP256Sha256,
+        &hint.as_bytes()[..signing_input_len],
+        &decode(signature)?,
+    )
+    .map_err(|_| HintError::Signature)?;
+    let claims: serde_json::Value =
+        serde_json::from_slice(&decode(payload)?).map_err(|_| HintError::Malformed)?;
+    if claims["iss"].as_str() != Some(issuer.as_str()) {
+        return Err(HintError::Issuer);
+    }
+    let sub = claims["sub"]
+        .as_str()
+        .ok_or(HintError::Malformed)?
+        .to_string();
+    let aud = match &claims["aud"] {
+        serde_json::Value::String(one) => vec![one.clone()],
+        serde_json::Value::Array(many) => many
+            .iter()
+            .map(|a| a.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(HintError::Malformed)?,
+        _ => return Err(HintError::Malformed),
+    };
+    let sid = claims["sid"].as_str().map(str::to_string);
+    Ok(HintClaims { sub, aud, sid })
+}
+
+/// What end-session answers.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EndSessionOutcome {
+    /// Back to the registered `post_logout_redirect_uri`, `state` appended.
+    Redirect(Url),
+    /// The signed-out page; `ended` says whether a grant was ended.
+    SignedOut { ended: bool },
+}
+
+/// A store fault on a sign-out path: retryable, never a pretended success.
+pub(crate) fn store_unavailable(e: anyhow::Error) -> CustomError {
+    warn!(error = %e, "sign-out: the token store is unavailable");
+    CustomError::ServiceUnavailable("The session store is unavailable; retry.".to_string())
+}
+
+/// OpenID Connect RP-Initiated Logout 1.0 at [`END_SESSION_PATH`].
+///
+/// Everything is checked before anything is ended: an `id_token_hint` must be
+/// an ID token this provider signed ([`verify_id_token_hint`]; expired is
+/// fine); a `client_id` must be the hint's audience; a
+/// `post_logout_redirect_uri` must be registered for that client, matched
+/// exactly ([`post_logout_redirect_uri_is_registered`]). Any failure is a 400
+/// that ends nothing and never redirects, so no unregistered URI is ever a
+/// redirect target. Then the grant the hint's `sid` names is ended, if it
+/// belongs to the hint's client and `sub` ([`RedisClient::end_grant_by_sid`]):
+/// only that grant, never a Matrix device (a device sign-out is the Matrix
+/// `logout`; see `compat::TeardownPolicy`). A hint without a `sid` (an ID
+/// token issued before grants had one) ends nothing. Back-channel logout of an
+/// ended `oidc` grant is enqueued by the deletion script itself (`drop_grant`).
+pub async fn end_session(
+    params: EndSessionParams,
+    signing_key: &EcdsaSigningKey,
+    retired: &[CoreJsonWebKey],
+    config: &crate::config::Config,
+    db_client: &DBClientType,
+) -> Result<EndSessionOutcome, CustomError> {
+    let issuer = IssuerUrl::from_url(config.base_url.clone());
+    let hint = match params.id_token_hint.as_deref().filter(|h| !h.is_empty()) {
+        Some(raw) => Some(
+            verify_id_token_hint(raw, signing_key, retired, &issuer).map_err(|reason| {
+                warn!(?reason, "end_session: id_token_hint refused");
+                CustomError::BadRequest(
+                    "id_token_hint is not an ID token this provider issued.".to_string(),
+                )
+            })?,
+        ),
+        None => None,
+    };
+    let named_client = params.client_id.as_deref().filter(|c| !c.is_empty());
+    let client_id = match (&hint, named_client) {
+        (Some(hint), Some(named)) => {
+            if !hint.aud.iter().any(|aud| aud == named) {
+                warn!(
+                    client_id = named,
+                    "end_session: client_id is not the hint's audience"
+                );
+                return Err(CustomError::BadRequest(
+                    "client_id does not match the id_token_hint.".to_string(),
+                ));
+            }
+            Some(named.to_string())
+        }
+        (Some(hint), None) => match hint.aud.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        },
+        (None, named) => named.map(str::to_string),
+    };
+
+    let redirect = match params
+        .post_logout_redirect_uri
+        .as_deref()
+        .filter(|u| !u.is_empty())
+    {
+        None => None,
+        Some(raw) => {
+            let refused = || {
+                warn!("end_session: post_logout_redirect_uri is not registered for the client");
+                CustomError::BadRequest(
+                    "post_logout_redirect_uri is not registered for this client.".to_string(),
+                )
+            };
+            let mut uri = Url::parse(raw).map_err(|_| refused())?;
+            let client_id = client_id.as_deref().ok_or_else(refused)?;
+            let client = db_client
+                .get_client(client_id.to_string())
+                .await
+                .map_err(store_unavailable)?
+                .ok_or_else(refused)?;
+            if !post_logout_redirect_uri_is_registered(&client, &uri) {
+                return Err(refused());
+            }
+            if let Some(state) = params.state.as_deref() {
+                uri.query_pairs_mut().append_pair("state", state);
+            }
+            Some(uri)
+        }
+    };
+
+    let mut ended = false;
+    if let (Some(hint), Some(client_id)) = (&hint, client_id.as_deref()) {
+        if let Some(sid) = hint.sid.as_deref() {
+            match db_client
+                .end_grant_by_sid(sid, client_id, &hint.sub)
+                .await
+                .map_err(store_unavailable)?
+            {
+                EndedGrant::Ended { grant_id, kind } => {
+                    ended = true;
+                    info!(grant_fp = %grant_id.fingerprint(), grant_kind = kind.as_str(),
+                        client_id, "end_session: grant ended");
+                }
+                EndedGrant::NotFound => {
+                    debug!(client_id, "end_session: no live grant carries the sid")
+                }
+                EndedGrant::Mismatch => warn!(
+                    client_id,
+                    "end_session: the sid names a grant of another client or subject; nothing ended"
+                ),
+            }
+        } else {
+            debug!(
+                client_id,
+                "end_session: the hint carries no sid; nothing ended"
+            );
+        }
+    }
+    Ok(match redirect {
+        Some(uri) => EndSessionOutcome::Redirect(uri),
+        None => EndSessionOutcome::SignedOut { ended },
+    })
+}
+
+/// The page end-session shows when it does not redirect. Reflects no input.
+pub fn signed_out_page(ended: bool) -> String {
+    let message = if ended {
+        "You are signed out: the session has ended."
+    } else {
+        "Nothing to sign out: no session was named, or it had already ended."
+    };
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Signed out</title></head><body><p>{message}</p></body></html>"
+    )
 }
 
 // -- Client info / update / delete -----------------------------------------
@@ -2826,11 +3394,7 @@ async fn client_access(
         .get_client(client_id)
         .await?
         .ok_or(CustomError::NotFound)?;
-    let stored_access_token = client_entry.access_token.clone();
-    let stored = stored_access_token
-        .as_ref()
-        .ok_or_else(|| CustomError::Unauthorized("Bad access token.".to_string()))?;
-    if !constant_time_eq(stored.secret(), &access_token) {
+    if !client_entry.access_token_matches(&access_token) {
         return Err(CustomError::Unauthorized("Bad access token.".to_string()));
     }
     Ok(client_entry)
@@ -2839,7 +3403,7 @@ async fn client_access(
 pub async fn clientinfo(
     client_id: String,
     db_client: &DBClientType,
-) -> Result<CoreClientMetadata, CustomError> {
+) -> Result<SiwxClientMetadata, CustomError> {
     Ok(db_client
         .get_client(client_id)
         .await?
@@ -2858,11 +3422,13 @@ pub async fn client_delete(
 
 pub async fn client_update(
     client_id: String,
-    payload: CoreClientMetadata,
+    payload: SiwxClientMetadata,
     bearer: Option<Bearer>,
     db_client: &DBClientType,
+    policy: &RegistrationPolicy,
 ) -> Result<(), CustomError> {
     let mut client_entry = client_access(client_id.clone(), bearer, db_client).await?;
+    check_logout_metadata(&payload, policy).await?;
     client_entry.metadata = payload;
     Ok(db_client.set_client(client_id, client_entry).await?)
 }
@@ -2964,29 +3530,27 @@ pub enum UserInfoResponse {
 /// put a network call on a hot, read-only endpoint to recompute a value the
 /// struct already carries.
 ///
-/// # Both `None` cases mean "omit", and both are honest
+/// # Both "omit" cases are honest
 ///
 /// - `server_name = None` — a standalone deployment. There is no homeserver, so
 ///   there is no Matrix ID; a guessed one would name an account on a server that
 ///   does not exist.
-/// - `localpart = None` — the legacy `CodeEntry` fallback path, for an entry
-///   written before `CodeEntry.localpart` existed. That field's own doc blesses
-///   `legacy_localpart(did)` as the fallback for PROVISIONING continuity, where
-///   the alternative is severing a user from their account. This is not that:
-///   a userinfo claim is a statement of fact to a relying party, and the honest
-///   answer to "which localpart did we resolve for this session" is "this entry
-///   does not record one". An omitted claim degrades a consumer to the lookup it
-///   would have done anyway (`GET /resolve?did=…`, see [`crate::resolve`]); a
-///   derived one could quietly name the wrong account.
-fn mxid_claim(config: &crate::config::Config, localpart: Option<&str>) -> SiwxAdditionalClaims {
-    let mxid = match (config.matrix_server_name.as_deref(), localpart) {
-        // An empty localpart is treated as absent rather than rendered as
-        // `@:server`. Deviceless/admin-minted tokens are the shape that can
-        // carry one, and `@:server` is not a Matrix ID, it is a parse error
-        // waiting at the consumer.
-        (Some(server_name), Some(localpart)) if !localpart.is_empty() => Some(
-            crate::synapse_client::matrix_user_id(localpart, server_name),
-        ),
+/// - an empty `localpart` — the token records no localpart. The claim is then
+///   omitted, never derived from the DID: `legacy_localpart(did)` is a fallback
+///   for PROVISIONING continuity, where the alternative is severing a user from
+///   their account. This is not that: a userinfo claim is a statement of fact
+///   to a relying party, and the honest answer to "which localpart did we
+///   resolve for this session" is "this token does not record one". An omitted
+///   claim degrades a consumer to the lookup it would have done anyway
+///   (`GET /resolve?did=…`, see [`crate::resolve`]); a derived one could quietly
+///   name the wrong account. `@:server` would not be a Matrix ID either, but a
+///   parse error waiting at the consumer.
+fn mxid_claim(config: &crate::config::Config, localpart: &str) -> SiwxAdditionalClaims {
+    let mxid = match config.matrix_server_name.as_deref() {
+        Some(server_name) if !localpart.is_empty() => Some(crate::synapse_client::matrix_user_id(
+            localpart,
+            server_name,
+        )),
         _ => None,
     };
     SiwxAdditionalClaims { mxid }
@@ -3019,53 +3583,27 @@ pub async fn userinfo(
         return Err(CustomError::BadRequest("Missing access token.".to_string()));
     };
 
-    // Try TokenMetadata first (covers both MSC3861 mat_ tokens and standalone tokens).
-    if let Some(metadata) = db_client.get_token(&token_str).await? {
-        if metadata.exp <= Utc::now().timestamp() {
-            return Err(CustomError::BadRequest("Token expired.".to_string()));
-        }
-        let client_entry = db_client
-            .get_client(metadata.client_id.clone())
-            .await?
-            .ok_or_else(|| CustomError::BadRequest("Unknown client.".to_string()))?;
-        // `metadata.username` IS the localpart (see `TokenMetadata::username`),
-        // already resolved through the grandfathering rule at sign-in.
-        let additional = mxid_claim(config, Some(metadata.username.as_str()));
-        let response =
-            SiwxUserInfoClaims::new(resolve_claims(config, &metadata.did).await, additional)
-                .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
-                .set_audiences(Some(vec![Audience::new(metadata.client_id)]));
-        return match client_entry.metadata.userinfo_signed_response_alg() {
-            None => Ok(UserInfoResponse::Json(response)),
-            Some(alg) => Ok(UserInfoResponse::Jwt(
-                SiwxUserInfoJsonWebToken::new(response, signing_key, alg.clone())
-                    .map_err(|_| anyhow!("Error signing response."))?,
-            )),
-        };
+    // Only an access token is a bearer credential (MSC3861 `mat_` tokens and
+    // standalone tokens alike). An authorization code, a refresh token and an
+    // unknown string all get the same answer: a code is redeemable only at the
+    // token endpoint, with its PKCE verifier.
+    let metadata = db_client
+        .check_access_token(&token_str)
+        .await?
+        .ok_or_else(|| CustomError::BadRequest("Unknown token.".to_string()))?;
+    if metadata.exp <= Utc::now().timestamp() {
+        return Err(CustomError::BadRequest("Token expired.".to_string()));
     }
-
-    // Legacy fallback: UUID-based access token backed by code entry (pre-refresh-token deployments).
-    let code_entry = if let Some(c) = db_client.get_code(token_str).await? {
-        c
-    } else {
-        return Err(CustomError::BadRequest("Unknown token.".to_string()));
-    };
-
-    let client_entry = if let Some(c) = db_client.get_client(code_entry.client_id.clone()).await? {
-        c
-    } else {
-        return Err(CustomError::BadRequest("Unknown client.".to_string()));
-    };
-
-    // The legacy path's localpart is an `Option`: a `CodeEntry` written before
-    // that field existed carries `None`, and `mxid_claim` then OMITS the claim
-    // rather than deriving one — see its doc for why a derivation would be a
-    // worse answer than silence here.
-    let additional = mxid_claim(config, code_entry.localpart.as_deref());
-    let response =
-        SiwxUserInfoClaims::new(resolve_claims(config, &code_entry.did).await, additional)
-            .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
-            .set_audiences(Some(vec![Audience::new(code_entry.client_id)]));
+    let client_entry = db_client
+        .get_client(metadata.client_id.clone())
+        .await?
+        .ok_or_else(|| CustomError::BadRequest("Unknown client.".to_string()))?;
+    // `metadata.username` IS the localpart (see `TokenMetadata::username`),
+    // already resolved through the grandfathering rule at sign-in.
+    let additional = mxid_claim(config, &metadata.username);
+    let response = SiwxUserInfoClaims::new(resolve_claims(config, &metadata.did).await, additional)
+        .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
+        .set_audiences(Some(vec![Audience::new(metadata.client_id)]));
     match client_entry.metadata.userinfo_signed_response_alg() {
         None => Ok(UserInfoResponse::Json(response)),
         Some(alg) => Ok(UserInfoResponse::Jwt(
@@ -3358,14 +3896,14 @@ mod tests {
         db_client
             .set_client(
                 "client".into(),
-                ClientEntry {
-                    secret: "secret".into(),
-                    metadata: CoreClientMetadata::new(
+                ClientEntry::new(
+                    "secret",
+                    SiwxClientMetadata::new(
                         vec![RedirectUrl::new("https://example.com".into()).unwrap()],
-                        EmptyAdditionalClientMetadata {},
+                        LogoutClientMetadata::default(),
                     ),
-                    access_token: None,
-                },
+                    None,
+                ),
             )
             .await
             .unwrap();
@@ -3411,6 +3949,276 @@ mod tests {
         nonce: String,
     }
 
+    /// The PKCE example pair from RFC 7636, Appendix B.
+    const RFC7636_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const RFC7636_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+    fn code_request(response_type: CoreResponseType) -> AuthorizeParams {
+        AuthorizeParams {
+            client_id: "client".into(),
+            redirect_uri: RedirectUrl::new("https://example.com".into()).unwrap(),
+            scope: Scope::new("openid".to_string()),
+            response_type: Some(response_type),
+            state: Some("state".into()),
+            nonce: Some(Nonce::new("oidc-nonce".into())),
+            prompt: None,
+            request_uri: None,
+            request: None,
+            code_challenge: Some(RFC7636_CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
+            response_mode: None,
+        }
+    }
+
+    /// `authorize` refuses every response type but `code`, back to the
+    /// validated redirect URI with `unsupported_response_type` and the state.
+    #[tokio::test]
+    async fn authorize_refuses_every_response_type_but_code() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        for response_type in [
+            CoreResponseType::IdToken,
+            CoreResponseType::Token,
+            CoreResponseType::None,
+        ] {
+            match authorize(code_request(response_type.clone()), &db_client).await {
+                Err(CustomError::Redirect(url)) => {
+                    let url = Url::parse(&url).unwrap();
+                    let q: std::collections::HashMap<_, _> = url.query_pairs().collect();
+                    assert_eq!(url.host_str(), Some("example.com"), "{url}");
+                    assert_eq!(
+                        q.get("error").map(|v| v.as_ref()),
+                        Some("unsupported_response_type"),
+                        "{url}"
+                    );
+                    assert_eq!(q.get("state").map(|v| v.as_ref()), Some("state"), "{url}");
+                }
+                other => panic!("{response_type:?} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// `authorize` binds the validated request to the session it starts.
+    #[tokio::test]
+    async fn authorize_binds_the_request_to_the_session() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        let mut params = code_request(CoreResponseType::Code);
+        params.response_mode = Some("fragment".into());
+        let (_url, cookie) = authorize(params, &db_client).await.unwrap();
+        let session = db_client
+            .get_session(cookie.value().to_string())
+            .await
+            .unwrap()
+            .expect("authorize stores the session");
+        assert_eq!(
+            session.request,
+            Some(AuthorizationRequest {
+                client_id: "client".into(),
+                redirect_uri: "https://example.com".into(),
+                state: "state".into(),
+                response_mode: Some("fragment".into()),
+                code_challenge: RFC7636_CHALLENGE.into(),
+                scope: Some("openid".into()),
+                nonce: Some(Nonce::new("oidc-nonce".into())),
+            })
+        );
+    }
+
+    fn session_with(request: Option<AuthorizationRequest>) -> SessionEntry {
+        SessionEntry {
+            siwe_nonce: "n".into(),
+            secret: "s".into(),
+            signin_count: 0,
+            verified_did: None,
+            request,
+        }
+    }
+
+    const ROUND_TRIP_REDIRECT: &str = "https://example.com/callback?a=1&b=2";
+    const ROUND_TRIP_STATE: &str = "st+a&b c";
+
+    async fn seed_round_trip_client(db: &RedisClient, client_id: &str) {
+        db.set_client(
+            client_id.to_string(),
+            ClientEntry::new(
+                "secret",
+                SiwxClientMetadata::new(
+                    vec![RedirectUrl::new(ROUND_TRIP_REDIRECT.into()).unwrap()],
+                    LogoutClientMetadata::default(),
+                ),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `authorize` hands the login page every value percent-encoded, so the
+    /// page reads back the exact redirect URI (which its CAIP-122 message
+    /// binds) and state, even with several query parameters or `&` and `+`.
+    #[tokio::test]
+    async fn authorize_hands_the_login_page_the_exact_values() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        let client_id = format!("round-trip-{}", Uuid::new_v4().simple());
+        seed_round_trip_client(&db_client, &client_id).await;
+        let mut params = code_request(CoreResponseType::Code);
+        params.client_id = client_id.clone();
+        params.redirect_uri = RedirectUrl::new(ROUND_TRIP_REDIRECT.into()).unwrap();
+        params.state = Some(ROUND_TRIP_STATE.into());
+        let (page_url, _cookie) = authorize(params, &db_client).await.unwrap();
+        let page = Url::parse(&format!("https://login.example{page_url}")).unwrap();
+        let q: std::collections::HashMap<_, _> = page.query_pairs().into_owned().collect();
+        assert_eq!(
+            q.get("redirect_uri").map(String::as_str),
+            Some(ROUND_TRIP_REDIRECT)
+        );
+        assert_eq!(q.get("state").map(String::as_str), Some(ROUND_TRIP_STATE));
+        assert_eq!(q.get("client_id"), Some(&client_id));
+        assert_eq!(q.get("oidc_nonce").map(String::as_str), Some("oidc-nonce"));
+        assert_eq!(
+            q.get("code_challenge").map(String::as_str),
+            Some(RFC7636_CHALLENGE)
+        );
+        assert_eq!(
+            q.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert!(
+            !q.contains_key("response_mode"),
+            "query mode is not forwarded"
+        );
+    }
+
+    /// `sign_in` reads no authorization parameter from its query (it takes
+    /// none): the code goes to the bound redirect URI with the bound state, and
+    /// the stored code carries the bound client, challenge, nonce and scope.
+    #[tokio::test]
+    async fn sign_in_issues_the_code_for_the_bound_request() {
+        sign_in_round_trip(false).await;
+    }
+
+    /// The same for a session a build before Phase 2b started (it lives 300 s):
+    /// stored under its raw id, with the scope and the OIDC nonce beside the
+    /// bound request. Its code carries both, as before the upgrade.
+    #[tokio::test]
+    async fn a_session_the_previous_build_bound_issues_its_code_with_its_scope_and_nonce() {
+        sign_in_round_trip(true).await;
+    }
+
+    async fn sign_in_round_trip(previous_build: bool) {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        let nonce = Uuid::new_v4().simple().to_string();
+        let client_id = format!("round-trip-{nonce}");
+        seed_round_trip_client(&db_client, &client_id).await;
+        let session_id = format!("round-trip-{nonce}");
+        if previous_build {
+            // Exactly the JSON 88027dc serialized for this session.
+            let stored = serde_json::json!({
+                "siwe_nonce": nonce,
+                "oidc_nonce": "oidc-nonce",
+                "secret": "secret",
+                "signin_count": 0,
+                "verified_did": "did:key:zDnaeBOUNDREQUEST",
+                "scope": "openid profile offline_access",
+                "request": {
+                    "client_id": client_id,
+                    "redirect_uri": ROUND_TRIP_REDIRECT,
+                    "state": ROUND_TRIP_STATE,
+                    "response_mode": null,
+                    "code_challenge": RFC7636_CHALLENGE,
+                },
+            });
+            db_client
+                .set_ex_raw(&format!("sessions/{session_id}"), &stored.to_string(), 300)
+                .await
+                .unwrap();
+        } else {
+            db_client
+                .set_session(
+                    session_id.clone(),
+                    SessionEntry {
+                        siwe_nonce: nonce.clone(),
+                        secret: "secret".into(),
+                        signin_count: 0,
+                        verified_did: Some("did:key:zDnaeBOUNDREQUEST".into()),
+                        request: Some(AuthorizationRequest {
+                            client_id: client_id.clone(),
+                            redirect_uri: ROUND_TRIP_REDIRECT.into(),
+                            state: ROUND_TRIP_STATE.into(),
+                            response_mode: None,
+                            code_challenge: RFC7636_CHALLENGE.into(),
+                            scope: Some("openid profile offline_access".into()),
+                            nonce: Some(Nonce::new("oidc-nonce".into())),
+                        }),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
+        );
+        let (url, _did) = sign_in(
+            &Url::parse("https://example.com").unwrap(),
+            &["key".to_string()],
+            &[],
+            headers.typed_get::<headers::Cookie>().unwrap(),
+            &db_client,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            url.as_str()
+                .starts_with(&format!("{ROUND_TRIP_REDIRECT}&code=")),
+            "the code goes to the bound redirect URI: {url}"
+        );
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q.get("a").map(String::as_str), Some("1"));
+        assert_eq!(q.get("b").map(String::as_str), Some("2"));
+        assert_eq!(q.get("state").map(String::as_str), Some(ROUND_TRIP_STATE));
+        let entry = db_client
+            .try_consume_code(q["code"].clone())
+            .await
+            .unwrap()
+            .expect("the code is stored");
+        assert_eq!(entry.client_id, client_id);
+        assert_eq!(entry.code_challenge.as_deref(), Some(RFC7636_CHALLENGE));
+        assert_eq!(entry.code_challenge_method.as_deref(), Some("S256"));
+        assert_eq!(
+            entry.nonce.as_ref().map(|n| n.secret().as_str()),
+            Some("oidc-nonce")
+        );
+        assert_eq!(
+            entry.scope.as_deref(),
+            Some("openid profile offline_access"),
+            "the scope /authorize bound to the session travels into the code, \
+             where the token endpoint reads what was requested"
+        );
+    }
+
+    /// A session written by an older build carries no bound request; the
+    /// sign-in is refused with a clear "restart" error.
+    #[test]
+    fn a_session_without_a_bound_request_is_refused() {
+        match bound_request(&session_with(None)) {
+            Err(CustomError::BadRequest(msg)) => assert!(msg.contains("Restart"), "{msg}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     #[derive(Deserialize)]
     struct SignInQueryParams {
         code: String,
@@ -3450,20 +4258,19 @@ mod tests {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(base_url.clone()),
             scope: Scope::new("openid".to_string()),
-            response_type: Some(CoreResponseType::IdToken),
+            response_type: Some(CoreResponseType::Code),
             state: Some("state".into()),
             nonce: None,
             prompt: None,
             request_uri: None,
             request: None,
-            code_challenge: None,
-            code_challenge_method: None,
+            code_challenge: Some(RFC7636_CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
             response_mode: None,
         };
         let (redirect_url, cookie) = authorize(params, &db_client).await.unwrap();
         let authorize_params: AuthorizeQueryParams =
             serde_urlencoded::from_str(redirect_url.split("/?").collect::<Vec<&str>>()[1]).unwrap();
-        let params: SignInParams = serde_urlencoded::from_str(&redirect_url).unwrap();
 
         // Build the CAIP-122 message (EIP-4361 format for eip155). The login
         // path now enforces the Expiration Time (C1 safe subset), so include a
@@ -3508,7 +4315,6 @@ mod tests {
             &base_url,
             &default_methods,
             &default_namespaces,
-            params,
             cookie,
             &db_client,
             None, // no synapse_client in tests
@@ -3525,12 +4331,51 @@ mod tests {
         let signin_params: SignInQueryParams =
             serde_urlencoded::from_str(redirect_url.query().unwrap()).unwrap();
         let oidc_signing_key = EcdsaSigningKey::generate();
+        // The code is not a bearer token: /userinfo refuses it.
+        assert!(
+            userinfo(
+                &config,
+                &oidc_signing_key,
+                None,
+                UserInfoPayload {
+                    access_token: Some(signin_params.code.clone()),
+                },
+                &db_client,
+            )
+            .await
+            .is_err(),
+            "/userinfo must refuse an authorization code"
+        );
+        // It is exchanged at the token endpoint, and the access token from the
+        // exchange is accepted at /userinfo.
+        let tokens = token(
+            TokenForm {
+                code: Some(signin_params.code),
+                client_id: Some("client".into()),
+                client_secret: Some("secret".into()),
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(RFC7636_VERIFIER.into()),
+                refresh_token: None,
+                device_code: None,
+            },
+            ClientCredentials::default(),
+            &oidc_signing_key,
+            &config,
+            &db_client,
+            None,
+        )
+        .await
+        .unwrap();
         let _ = userinfo(
             &config,
             &oidc_signing_key,
             None,
             UserInfoPayload {
-                access_token: Some(signin_params.code),
+                access_token: Some(
+                    openidconnect::OAuth2TokenResponse::access_token(&tokens)
+                        .secret()
+                        .clone(),
+                ),
             },
             &db_client,
         )
@@ -3558,14 +4403,14 @@ mod tests {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(base_url.clone()),
             scope: Scope::new("openid".to_string()),
-            response_type: Some(CoreResponseType::IdToken),
+            response_type: Some(CoreResponseType::Code),
             state: Some("state".into()),
             nonce: None,
             prompt: None,
             request_uri: None,
             request: None,
-            code_challenge: None,
-            code_challenge_method: None,
+            code_challenge: Some(RFC7636_CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
             response_mode: Some("fragment".into()),
         };
         let (redirect_url, cookie) = authorize(params, &db_client).await.unwrap();
@@ -3575,10 +4420,6 @@ mod tests {
         );
         let authorize_params: AuthorizeQueryParams =
             serde_urlencoded::from_str(redirect_url.split("/?").collect::<Vec<&str>>()[1]).unwrap();
-        // Same client round-trip as the real SPA: SignInParams reads
-        // response_mode back out of the forwarded URL.
-        let params: SignInParams = serde_urlencoded::from_str(&redirect_url).unwrap();
-        assert_eq!(params.response_mode.as_deref(), Some("fragment"));
 
         let expiration_time =
             (Utc::now() + Duration::hours(48)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -3614,7 +4455,6 @@ mod tests {
             &base_url,
             &["pkh".to_string()],
             &["eip155".to_string()],
-            params,
             cookie,
             &db_client,
             None,
@@ -3638,6 +4478,54 @@ mod tests {
             fragment.contains("state=state"),
             "fragment must carry the state: {redirect_url}"
         );
+    }
+
+    /// Redirect URIs match the registration exactly, query included.
+    #[test]
+    fn redirect_uri_matching_is_exact() {
+        let client = |registered: &str| {
+            ClientEntry::new(
+                "secret",
+                SiwxClientMetadata::new(
+                    vec![RedirectUrl::new(registered.into()).unwrap()],
+                    LogoutClientMetadata::default(),
+                ),
+                None,
+            )
+        };
+        let uri = |u: &str| RedirectUrl::new(u.into()).unwrap();
+
+        let plain = client("https://example.com/cb");
+        assert!(redirect_uri_is_registered(
+            &plain,
+            &uri("https://example.com/cb")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &plain,
+            &uri("https://example.com/cb?x=1")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &plain,
+            &uri("https://example.com/cb/x")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &plain,
+            &uri("https://example.com/cb#x")
+        ));
+
+        let with_query = client("https://example.com/?no_universal_links=true");
+        assert!(redirect_uri_is_registered(
+            &with_query,
+            &uri("https://example.com/?no_universal_links=true")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &with_query,
+            &uri("https://example.com/")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &with_query,
+            &uri("https://example.com/?no_universal_links=true&x=1")
+        ));
     }
 
     #[tokio::test]
@@ -3784,6 +4672,34 @@ mod tests {
         );
     }
 
+    /// The OIDC `sub` is the user's DID, the same value for every client
+    /// (`docs/identity-model.md`), which is the definition of a *public*
+    /// subject type. Discovery used to say `pairwise`, which promises a
+    /// different `sub` per client and would lead a relying party to expect one.
+    #[test]
+    fn discovery_advertises_public_subjects_only() {
+        let value = provider_metadata_value(&discovery_config(), true).unwrap();
+        assert_eq!(
+            value["subject_types_supported"],
+            serde_json::json!(["public"]),
+            "the sub is the DID, identical for every client"
+        );
+    }
+
+    /// `POST /token` reads the client secret from an `Authorization: Basic`
+    /// header (`client_secret_basic`), from the form (`client_secret_post`), and
+    /// accepts a public client with no secret (`none`). Discovery lists what
+    /// the endpoint implements, so a client that picks the RFC 8414 default
+    /// (`client_secret_basic`) finds it.
+    #[test]
+    fn discovery_advertises_every_client_authentication_method_the_token_endpoint_accepts() {
+        let value = provider_metadata_value(&discovery_config(), true).unwrap();
+        assert_eq!(
+            value["token_endpoint_auth_methods_supported"],
+            serde_json::json!(["client_secret_basic", "client_secret_post", "none"]),
+        );
+    }
+
     #[test]
     fn provider_metadata_advertises_msc4191_account_management() {
         // AC1: served metadata must include account_management_uri and an
@@ -3837,6 +4753,18 @@ mod tests {
             off.get(RESOLVE_ENDPOINT_METADATA_KEY).is_none(),
             "a deployment that would answer 503 must not advertise the route"
         );
+    }
+
+    /// Discovery advertises exactly the response types `authorize` accepts.
+    #[test]
+    fn discovery_advertises_only_the_code_response_type() {
+        for matrix_ready in [true, false] {
+            let value = provider_metadata_value(&discovery_config(), matrix_ready).unwrap();
+            assert_eq!(
+                value["response_types_supported"],
+                serde_json::json!(["code"])
+            );
+        }
     }
 
     #[test]
@@ -4010,7 +4938,11 @@ mod tests {
         db.set_device_code(
             &device_code,
             &DeviceCodeEntry {
-                user_code: format!("SA-{}", Uuid::new_v4().simple()),
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!(
+                    "SA-{}",
+                    Uuid::new_v4().simple()
+                )),
+                legacy_user_code: None,
                 client_id: "client".to_string(),
                 scope: "openid".to_string(),
                 status: DeviceCodeStatus::Approved,
@@ -4018,6 +4950,7 @@ mod tests {
                 device_id: None,
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
+                auth_ms: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -4034,7 +4967,7 @@ mod tests {
                 refresh_token: None,
                 device_code: Some(device_code.clone()),
             },
-            None,
+            ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
             &config,
             &db,
@@ -4048,13 +4981,96 @@ mod tests {
             Err(other) => panic!("expected unsupported_grant_type, got {other:?}"),
             Ok(_) => panic!("a standalone deployment must not redeem a device code"),
         }
-        let entry = db
+        let (device_ref, entry) = db
             .get_device_code(&device_code)
             .await
             .unwrap()
             .expect("the refused code must be left in place");
         assert_eq!(entry.status, DeviceCodeStatus::Approved);
-        db.delete_device_code(&device_code).await.ok();
+        db.delete_device_code(&device_ref).await.ok();
+    }
+
+    /// A device-code poll that loses the claim to a concurrent poll logs that at
+    /// `debug!`. The device code is the credential the device polls with, so the
+    /// line names its fingerprint, never the code. Needs Redis.
+    #[tokio::test]
+    async fn a_device_poll_that_loses_the_claim_logs_the_code_only_as_a_fingerprint() {
+        use siwx_oidc::redact::fingerprint;
+
+        let Some((config, db)) = default_config().await else {
+            return;
+        };
+        let config = Config {
+            mas_shared_secret: Some("shared-secret".to_string()),
+            ..config
+        };
+        let device_code = format!("dvc_claimlost-{}", Uuid::new_v4().simple());
+        db.set_device_code(
+            &device_code,
+            &DeviceCodeEntry {
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!(
+                    "CL-{}",
+                    Uuid::new_v4().simple()
+                )),
+                legacy_user_code: None,
+                client_id: "client".to_string(),
+                scope: "openid".to_string(),
+                status: DeviceCodeStatus::Approved,
+                did: Some("did:key:zDnCLAIMLOST".to_string()),
+                device_id: None,
+                last_poll: None,
+                created_at: Utc::now().timestamp(),
+                auth_ms: None,
+            },
+            DEVICE_CODE_LIFETIME,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.try_claim_device_code(&device_code).await.unwrap(),
+            "the winning poll claims the code"
+        );
+
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let losing = token(
+            TokenForm {
+                code: None,
+                client_id: Some("client".to_string()),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code.clone()),
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &config,
+            &db,
+            None,
+        )
+        .await;
+        let output = logs.output();
+        match losing {
+            Err(CustomError::BadRequestToken(e)) => assert_eq!(
+                e.error,
+                CoreErrorResponseType::Extension("authorization_pending".to_string())
+            ),
+            other => panic!(
+                "the losing poll must be told to wait: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        assert!(
+            output.contains(&fingerprint(&device_code)),
+            "the claim-lost line names the code's fingerprint; captured:\n{output}"
+        );
+        assert!(
+            !output.contains(&device_code),
+            "the device code appears in the logs in the clear:\n{output}"
+        );
+        if let Ok(Some((device_ref, _))) = db.get_device_code(&device_code).await {
+            db.delete_device_code(&device_ref).await.ok();
+        }
     }
 
     #[tokio::test]
@@ -4944,8 +5960,8 @@ mod provision_synapse_device_tests {
 /// (see [`userinfo`]'s doc).
 ///
 /// Redis-backed, like the rest of this file's token tests: `userinfo` resolves
-/// its caller through `get_token`/`get_code`, and stubbing that out would test a
-/// different function than the one that ships.
+/// its caller through `get_token`, and stubbing that out would test a different
+/// function than the one that ships.
 #[cfg(test)]
 mod userinfo_mxid_claim_tests {
     use super::*;
@@ -4983,9 +5999,9 @@ mod userinfo_mxid_claim_tests {
 
     /// Register a client, optionally one that wants a SIGNED userinfo response.
     async fn seed_client(db: &RedisClient, client_id: &str, signed: bool) -> anyhow::Result<()> {
-        let mut metadata = CoreClientMetadata::new(
+        let mut metadata = SiwxClientMetadata::new(
             vec![RedirectUrl::new("https://example.com".into()).unwrap()],
-            EmptyAdditionalClientMetadata {},
+            LogoutClientMetadata::default(),
         );
         if signed {
             metadata = metadata
@@ -4993,11 +6009,7 @@ mod userinfo_mxid_claim_tests {
         }
         db.set_client(
             client_id.to_string(),
-            ClientEntry {
-                secret: "secret".into(),
-                metadata,
-                access_token: None,
-            },
+            ClientEntry::new("secret", metadata, None),
         )
         .await
     }
@@ -5012,6 +6024,7 @@ mod userinfo_mxid_claim_tests {
             exp: i64::MAX,
             did: DID.to_string(),
             name: "n".to_string(),
+            kind: Some(TokenKind::Access),
         }
     }
 
@@ -5102,53 +6115,95 @@ mod userinfo_mxid_claim_tests {
         );
     }
 
-    /// The legacy `CodeEntry` fallback path (`get_code`, pre-refresh-token
-    /// deployments) carries an `Option<String>` localpart. Both spellings are
-    /// pinned here because the `None` arm is the one that must NOT derive a
-    /// localpart from the DID — see `mxid_claim`'s doc.
+    /// A token that records no localpart omits the claim; it is never derived
+    /// from the DID, which could name a different account than the one this
+    /// session was provisioned under. See `mxid_claim`'s doc.
     #[tokio::test]
-    async fn legacy_code_entry_path_reports_a_recorded_localpart_and_omits_an_absent_one() {
+    async fn a_token_without_a_recorded_localpart_omits_the_claim_rather_than_deriving_one() {
         let Some(db) = db().await else {
             return;
         };
-        let client_id = format!("mxid-claim-legacy-{}", nonce());
+        let client_id = format!("mxid-claim-no-localpart-{}", nonce());
         seed_client(&db, &client_id, false).await.unwrap();
-        let config = config_with_server_name(Some(SERVER_NAME));
-
-        let entry = |localpart: Option<&str>| CodeEntry {
-            exchange_count: 0,
-            did: DID.to_string(),
-            nonce: None,
-            client_id: client_id.clone(),
-            auth_time: Utc::now(),
-            code_challenge: None,
-            code_challenge_method: None,
-            device_id: None,
-            localpart: localpart.map(str::to_string),
-        };
-
-        let with_localpart = format!("code_{}", nonce());
-        db.set_code(with_localpart.clone(), entry(Some(LOCALPART)))
+        let token = format!("tok_{}", nonce());
+        db.set_token(&token, &token_meta(&client_id, ""), 120)
             .await
             .unwrap();
-        let body = userinfo_json(&config, &db, &with_localpart).await;
-        assert_eq!(
-            body.get(CLAIM).and_then(|v| v.as_str()),
-            Some(format!("@{LOCALPART}:{SERVER_NAME}").as_str()),
-            "a CodeEntry that RECORDS a localpart reports it: {body}"
-        );
 
-        let without_localpart = format!("code_{}", nonce());
-        db.set_code(without_localpart.clone(), entry(None))
-            .await
-            .unwrap();
-        let body = userinfo_json(&config, &db, &without_localpart).await;
+        let body = userinfo_json(&config_with_server_name(Some(SERVER_NAME)), &db, &token).await;
+
         assert!(
             body.get(CLAIM).is_none(),
-            "a pre-migration CodeEntry records no localpart, and userinfo must say \
-             nothing rather than DERIVE one — a derived value could name a different \
-             account than the one this session was provisioned under: {body}"
+            "a token with no recorded localpart must not carry a derived Matrix ID: {body}"
         );
+        assert_eq!(
+            body.get("sub").and_then(|v| v.as_str()),
+            Some(DID),
+            "`sub` is still the exact-case DID"
+        );
+    }
+
+    /// Only an access token is a bearer credential at `/userinfo`: an
+    /// authorization code and a refresh token are refused like unknown tokens.
+    #[tokio::test]
+    async fn userinfo_accepts_only_an_access_token() {
+        let Some(db) = db().await else {
+            return;
+        };
+        let client_id = format!("mxid-claim-kinds-{}", nonce());
+        seed_client(&db, &client_id, false).await.unwrap();
+        let config = config_with_server_name(Some(SERVER_NAME));
+        let key = EcdsaSigningKey::generate();
+
+        let code = format!("code_{}", nonce());
+        db.set_code(
+            code.clone(),
+            CodeEntry {
+                exchange_count: 0,
+                did: DID.to_string(),
+                nonce: None,
+                client_id: client_id.clone(),
+                auth_time: Utc::now(),
+                code_challenge: None,
+                code_challenge_method: None,
+                device_id: None,
+                localpart: Some(LOCALPART.to_string()),
+                scope: None,
+            },
+        )
+        .await
+        .unwrap();
+        let refresh = format!("tok_{}", nonce());
+        db.set_token(
+            &refresh,
+            &TokenMetadata {
+                kind: Some(TokenKind::Refresh),
+                ..token_meta(&client_id, LOCALPART)
+            },
+            120,
+        )
+        .await
+        .unwrap();
+
+        for (what, token) in [
+            ("an authorization code", code),
+            ("a refresh token", refresh),
+        ] {
+            let out = userinfo(
+                &config,
+                &key,
+                None,
+                UserInfoPayload {
+                    access_token: Some(token),
+                },
+                &db,
+            )
+            .await;
+            assert!(
+                matches!(out, Err(CustomError::BadRequest(ref m)) if m == "Unknown token."),
+                "/userinfo must refuse {what} like an unknown token"
+            );
+        }
     }
 
     /// The signed-JWT variant must carry the same claim. See this module's doc,
@@ -5372,14 +6427,14 @@ mod sign_in_deactivation_order_tests {
         let client_id = format!("deactivation-order-{nonce}");
         db.set_client(
             client_id.clone(),
-            ClientEntry {
-                secret: "secret".into(),
-                metadata: CoreClientMetadata::new(
+            ClientEntry::new(
+                "secret",
+                SiwxClientMetadata::new(
                     vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
-                    EmptyAdditionalClientMetadata {},
+                    LogoutClientMetadata::default(),
                 ),
-                access_token: None,
-            },
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -5390,11 +6445,10 @@ mod sign_in_deactivation_order_tests {
             session_id.clone(),
             SessionEntry {
                 siwe_nonce: nonce.clone(),
-                oidc_nonce: None,
                 secret: "secret".into(),
                 signin_count: 0,
                 verified_did: Some(DID.to_string()),
-                scope: None,
+                request: Some(bound_test_request(&client_id)),
             },
         )
         .await
@@ -5405,21 +6459,11 @@ mod sign_in_deactivation_order_tests {
             HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
         );
         let cookies = headers.typed_get::<headers::Cookie>().unwrap();
-        let params = SignInParams {
-            redirect_uri: RedirectUrl::new(REDIRECT.into()).unwrap(),
-            state: "state".into(),
-            oidc_nonce: None,
-            client_id,
-            code_challenge: None,
-            code_challenge_method: None,
-            response_mode: None,
-        };
 
         let result = sign_in(
             &Url::parse("https://example.com").unwrap(),
             &["key".to_string()],
             &[],
-            params,
             cookies,
             &db,
             Some(&synapse),
@@ -5652,20 +6696,16 @@ mod device_display_name_tests {
     }
 
     fn client_entry(client_name: Option<&str>) -> ClientEntry {
-        let mut metadata = CoreClientMetadata::new(
+        let mut metadata = SiwxClientMetadata::new(
             vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
-            EmptyAdditionalClientMetadata {},
+            LogoutClientMetadata::default(),
         );
         if let Some(name) = client_name {
             let mut names = LocalizedClaim::new();
             names.insert(None, ClientName::new(name.to_string()));
             metadata = metadata.set_client_name(Some(names));
         }
-        ClientEntry {
-            secret: "secret".into(),
-            metadata,
-            access_token: None,
-        }
+        ClientEntry::new("secret", metadata, None)
     }
 
     /// Asserts that exactly one device was upserted, that the upsert carried
@@ -5712,11 +6752,10 @@ mod device_display_name_tests {
             session_id.clone(),
             SessionEntry {
                 siwe_nonce: nonce.clone(),
-                oidc_nonce: None,
                 secret: "secret".into(),
                 signin_count: 0,
                 verified_did: Some(DID.to_string()),
-                scope: None,
+                request: Some(bound_test_request(&client_id)),
             },
         )
         .await
@@ -5726,20 +6765,10 @@ mod device_display_name_tests {
             "cookie",
             HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
         );
-        let params = SignInParams {
-            redirect_uri: RedirectUrl::new(REDIRECT.into()).unwrap(),
-            state: "state".into(),
-            oidc_nonce: None,
-            client_id: client_id.clone(),
-            code_challenge: None,
-            code_challenge_method: None,
-            response_mode: None,
-        };
         sign_in(
             &Url::parse("https://example.com").unwrap(),
             &["key".to_string()],
             &[],
-            params,
             headers.typed_get::<headers::Cookie>().unwrap(),
             &db,
             Some(&synapse),
@@ -5933,30 +6962,35 @@ mod device_display_name_tests {
         );
     }
 
-    /// The QR / device-code path used to name every device "Element X".
+    /// The grant of an approved device code counts from the approval, the
+    /// authentication, which the approval records on the entry from Redis
+    /// `TIME`; not from the poll that redeems it (I6).
     #[tokio::test]
-    async fn the_device_code_grant_names_the_device_after_its_client() {
+    async fn a_device_grant_counts_its_lifetime_from_the_approval() {
         let Some(db) = siwx_oidc::test_support::redis().await else {
             return;
         };
-        let (synapse, hs, server) = spawn(&[]).await;
+        let (synapse, _hs, server) = spawn(&[]).await;
         let nonce = Uuid::new_v4().simple().to_string();
-        let client_id = format!("device-name-dc-{nonce}");
+        let client_id = format!("device-auth-time-{nonce}");
         db.set_client(client_id.clone(), client_entry(Some("Pocket Client")))
             .await
             .unwrap();
-        let device_code = format!("dvc_device-name-{nonce}");
+        let device_code = format!("dvc_auth-time-{nonce}");
+        let approved_at = Utc::now().timestamp() - 1_000;
         db.set_device_code(
             &device_code,
             &DeviceCodeEntry {
-                user_code: format!("DN-{nonce}"),
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!("AT-{nonce}")),
+                legacy_user_code: None,
                 client_id: client_id.clone(),
                 scope: "openid".to_string(),
                 status: DeviceCodeStatus::Approved,
                 did: Some(DID.to_string()),
                 device_id: None,
                 last_poll: None,
-                created_at: Utc::now().timestamp(),
+                created_at: approved_at - 10,
+                auth_ms: Some(approved_at * 1000),
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -5977,7 +7011,73 @@ mod device_display_name_tests {
                 refresh_token: None,
                 device_code: Some(device_code),
             },
-            None,
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &config,
+            &db,
+            Some(&synapse),
+        )
+        .await
+        .expect("an approved device code must be redeemed");
+        server.abort();
+        let access = openidconnect::OAuth2TokenResponse::access_token(&response);
+        let grant = db
+            .lookup_access_token(access.secret())
+            .await
+            .unwrap()
+            .expect("the issued access token is live")
+            .grant;
+        assert_eq!(grant.auth_time, approved_at, "auth_time is the approval");
+        assert_eq!(grant.auth_ms, approved_at * 1000, "auth_ms is the approval");
+    }
+
+    /// The QR / device-code path used to name every device "Element X".
+    #[tokio::test]
+    async fn the_device_code_grant_names_the_device_after_its_client() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (synapse, hs, server) = spawn(&[]).await;
+        let nonce = Uuid::new_v4().simple().to_string();
+        let client_id = format!("device-name-dc-{nonce}");
+        db.set_client(client_id.clone(), client_entry(Some("Pocket Client")))
+            .await
+            .unwrap();
+        let device_code = format!("dvc_device-name-{nonce}");
+        db.set_device_code(
+            &device_code,
+            &DeviceCodeEntry {
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!("DN-{nonce}")),
+                legacy_user_code: None,
+                client_id: client_id.clone(),
+                scope: "openid".to_string(),
+                status: DeviceCodeStatus::Approved,
+                did: Some(DID.to_string()),
+                device_id: None,
+                last_poll: None,
+                created_at: Utc::now().timestamp(),
+                auth_ms: None,
+            },
+            DEVICE_CODE_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let config = Config {
+            mas_shared_secret: Some("secret".to_string()),
+            matrix_server_name: Some(SERVER_NAME.to_string()),
+            ..Config::default()
+        };
+        let response = token(
+            TokenForm {
+                code: None,
+                client_id: Some(client_id),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code),
+            },
+            ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
             &config,
             &db,
@@ -5996,6 +7096,2155 @@ mod device_display_name_tests {
         assert!(
             scopes.contains(&format!("urn:matrix:client:device:{device_id}")),
             "the token must be scoped to the device that was provisioned: {scopes:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod client_binding_tests {
+    //! A refresh token belongs to the client it was issued to (I7), and the
+    //! token endpoint authenticates a client the same way for the code exchange
+    //! and the refresh grant. Needs Redis.
+    use super::*;
+    use crate::config::Config;
+    use openidconnect::core::CoreClientAuthMethod;
+
+    pub(super) const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    pub(super) const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    pub(super) const SECRET: &str = "the-registered-secret";
+
+    pub(super) fn unique(prefix: &str) -> String {
+        format!("{prefix}{}", Uuid::new_v4().simple())
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum Registration {
+        /// `token_endpoint_auth_method: none`, as Element Web and Element X register.
+        Public,
+        /// `client_secret_post`.
+        Confidential,
+        /// No `token_endpoint_auth_method`: confidential when `require_secret`.
+        Unset,
+    }
+
+    async fn seed_client(db: &RedisClient, registration: Registration) -> String {
+        seed_client_with(db, registration, None).await
+    }
+
+    /// A client registered with the given grant types (`None`: the registration
+    /// names none).
+    pub(super) async fn seed_client_with(
+        db: &RedisClient,
+        registration: Registration,
+        grant_types: Option<Vec<CoreGrantType>>,
+    ) -> String {
+        let id = unique("bind-");
+        let mut metadata = SiwxClientMetadata::new(
+            vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
+            LogoutClientMetadata::default(),
+        );
+        metadata = match registration {
+            Registration::Public => {
+                metadata.set_token_endpoint_auth_method(Some(CoreClientAuthMethod::None))
+            }
+            Registration::Confidential => metadata
+                .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::ClientSecretPost)),
+            Registration::Unset => metadata,
+        };
+        if let Some(grants) = grant_types {
+            metadata = metadata.set_grant_types(Some(grants));
+        }
+        db.set_client(id.clone(), ClientEntry::new(SECRET, metadata, None))
+            .await
+            .unwrap();
+        id
+    }
+
+    /// A deviceless grant of `client_id` with a refresh token; returns the token.
+    async fn seed_refresh_token(db: &RedisClient, client_id: &str) -> String {
+        db.issue_grant(&NewGrant {
+            kind: GrantKind::Oidc,
+            username: unique("localpart"),
+            did: "did:key:zDnBINDING".into(),
+            client_id: client_id.into(),
+            confidential_client: false,
+            device_id: String::new(),
+            scope: "openid".into(),
+            name: "did:key:zDnBINDING".into(),
+            auth_ms: Some(Utc::now().timestamp_millis()),
+            access_ttl: ACCESS_TOKEN_TTL,
+            refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+        })
+        .await
+        .unwrap()
+        .refresh_token
+        .expect("the grant carries a refresh token")
+    }
+
+    async fn seed_code(db: &RedisClient, client_id: &str) -> String {
+        seed_code_with_scope(db, client_id, None).await
+    }
+
+    /// A code `sign_in` issued for an authorization request that asked for `scope`.
+    pub(super) async fn seed_code_with_scope(
+        db: &RedisClient,
+        client_id: &str,
+        scope: Option<&str>,
+    ) -> String {
+        let code = unique("code-");
+        db.set_code(
+            code.clone(),
+            CodeEntry {
+                exchange_count: 0,
+                did: "did:key:zDnBINDING".into(),
+                nonce: None,
+                client_id: client_id.into(),
+                auth_time: Utc::now(),
+                code_challenge: Some(CHALLENGE.into()),
+                code_challenge_method: Some("S256".into()),
+                device_id: None,
+                localpart: Some(unique("localpart")),
+                scope: scope.map(str::to_string),
+            },
+        )
+        .await
+        .unwrap();
+        code
+    }
+
+    /// What the caller says about itself: the `client_id` of the form, the
+    /// `client_secret` of the form, and a secret from an `Authorization` header.
+    #[derive(Clone, Copy)]
+    struct Presented<'a> {
+        client_id: Option<&'a str>,
+        form_secret: Option<&'a str>,
+        /// The user name of an `Authorization: Basic` header.
+        header_client_id: Option<&'a str>,
+        header_secret: Option<&'a str>,
+    }
+
+    const NOTHING: Presented<'static> = Presented {
+        client_id: None,
+        form_secret: None,
+        header_client_id: None,
+        header_secret: None,
+    };
+
+    async fn refresh(
+        db: &RedisClient,
+        config: &Config,
+        refresh_token: &str,
+        who: Presented<'_>,
+    ) -> Result<SiwxTokenResponse, CustomError> {
+        token(
+            TokenForm {
+                code: None,
+                client_id: who.client_id.map(str::to_string),
+                client_secret: who.form_secret.map(str::to_string),
+                grant_type: CoreGrantType::RefreshToken,
+                code_verifier: None,
+                refresh_token: Some(refresh_token.to_string()),
+                device_code: None,
+            },
+            ClientCredentials {
+                basic_client_id: who.header_client_id.map(str::to_string),
+                secret: who.header_secret.map(str::to_string),
+            },
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            None,
+        )
+        .await
+    }
+
+    async fn exchange(
+        db: &RedisClient,
+        config: &Config,
+        code: &str,
+        who: Presented<'_>,
+    ) -> Result<SiwxTokenResponse, CustomError> {
+        token(
+            TokenForm {
+                code: Some(code.to_string()),
+                client_id: who.client_id.map(str::to_string),
+                client_secret: who.form_secret.map(str::to_string),
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(VERIFIER.to_string()),
+                refresh_token: None,
+                device_code: None,
+            },
+            ClientCredentials {
+                basic_client_id: who.header_client_id.map(str::to_string),
+                secret: who.header_secret.map(str::to_string),
+            },
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            None,
+        )
+        .await
+    }
+
+    /// The answer, reduced to what a client sees: success, `invalid_grant`
+    /// (the grant does not belong to this client), or `invalid_client` (the
+    /// client did not authenticate).
+    fn outcome(result: &Result<SiwxTokenResponse, CustomError>) -> String {
+        match result {
+            Ok(_) => "ok".to_string(),
+            Err(CustomError::BadRequestToken(e)) => match e.error {
+                CoreErrorResponseType::InvalidGrant => "invalid_grant".to_string(),
+                CoreErrorResponseType::InvalidRequest => "invalid_request".to_string(),
+                ref other => format!("{other:?}"),
+            },
+            Err(CustomError::Unauthorized(message)) => format!("invalid_client: {message}"),
+            Err(other) => format!("unexpected: {other:?}"),
+        }
+    }
+
+    fn refresh_token_of(result: Result<SiwxTokenResponse, CustomError>) -> String {
+        use openidconnect::OAuth2TokenResponse;
+        result
+            .unwrap_or_else(|e| panic!("the refresh must succeed: {e:?}"))
+            .refresh_token()
+            .expect("a rotation returns a refresh token")
+            .secret()
+            .clone()
+    }
+
+    /// The token's grant exists and was never rotated: a refusal consumed nothing.
+    async fn still_exists(db: &RedisClient, refresh_token: &str) -> bool {
+        db.peek_refresh_grant(refresh_token)
+            .await
+            .unwrap()
+            .is_some_and(|grant| grant.generation == 0)
+    }
+
+    /// Another client, even one that authenticates correctly as itself, cannot
+    /// refresh the token. A refusal leaves the token alone.
+    #[tokio::test]
+    async fn a_refresh_token_is_refused_to_a_client_it_was_not_issued_to() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let owner = seed_client(&db, Registration::Public).await;
+        let other = seed_client(&db, Registration::Confidential).await;
+        let rt = seed_refresh_token(&db, &owner).await;
+
+        let stolen = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&other),
+                form_secret: Some(SECRET),
+                header_client_id: None,
+                header_secret: None,
+            },
+        )
+        .await;
+        assert_eq!(outcome(&stolen), "invalid_grant");
+        assert!(
+            still_exists(&db, &rt).await,
+            "a refusal never deletes the token"
+        );
+
+        let own = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&owner),
+                ..NOTHING
+            },
+        )
+        .await;
+        assert_eq!(outcome(&own), "ok", "the owner still refreshes it");
+    }
+
+    /// Every path that authenticates a client compares digests: the code
+    /// exchange and the refresh grant (the secret) and `/client/{id}`
+    /// management (the registration access token). A client entry the previous
+    /// build stored in the clear authenticates with its secret and token, and
+    /// a digest read out of Redis is refused everywhere.
+    #[tokio::test]
+    async fn every_client_authentication_compares_digests_of_what_is_presented() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let id = unique("prev-client-");
+        let metadata = SiwxClientMetadata::new(
+            vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
+            LogoutClientMetadata::default(),
+        )
+        .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::ClientSecretBasic));
+        let previous_build = serde_json::json!({
+            "secret": SECRET,
+            "metadata": metadata,
+            "access_token": "the-registration-token",
+        });
+        db.set_ex_raw(&format!("clients/{id}"), &previous_build.to_string(), 600)
+            .await
+            .unwrap();
+        let bearer = |token: &str| Some(headers::Authorization::bearer(token).unwrap().0);
+        let outcome = |r: Result<(), CustomError>| match r {
+            Ok(()) => "ok".to_string(),
+            Err(CustomError::Unauthorized(message)) => format!("invalid_client: {message}"),
+            Err(other) => format!("{other:?}"),
+        };
+
+        // The previous build's entry: the plaintext credentials authenticate.
+        let code = authenticate_code_client(&id, None, Some(SECRET), &config, &db).await;
+        assert_eq!(outcome(code.map(|_| ())), "ok");
+        let stored = db.get_client(id.clone()).await.unwrap().unwrap();
+        assert!(!db
+            .get_raw(&format!("clients/{id}"))
+            .await
+            .unwrap()
+            .unwrap()
+            .contains(SECRET));
+        let refresh = authenticate_refresh_client(&id, None, Some(SECRET), &config, &db).await;
+        assert_eq!(outcome(refresh), "ok");
+        let manage = client_access(id.clone(), bearer("the-registration-token"), &db).await;
+        assert_eq!(outcome(manage.map(|_| ())), "ok");
+
+        // What Redis holds is no credential.
+        let secret_digest = stored.secret_digest.as_str();
+        let token_digest = stored.access_token_digest.clone().unwrap();
+        let code = authenticate_code_client(&id, None, Some(secret_digest), &config, &db).await;
+        assert_eq!(outcome(code.map(|_| ())), "invalid_client: Bad secret.");
+        let refresh =
+            authenticate_refresh_client(&id, None, Some(secret_digest), &config, &db).await;
+        assert_eq!(outcome(refresh), "invalid_client: Bad secret.");
+        let manage = client_access(id.clone(), bearer(&token_digest), &db).await;
+        assert_eq!(
+            outcome(manage.map(|_| ())),
+            "invalid_client: Bad access token."
+        );
+        db.del_raw(&format!("clients/{id}")).await.unwrap();
+    }
+
+    /// A confidential client authenticates at the refresh grant exactly as it
+    /// does at the code exchange: with the secret in the form or in a header.
+    #[tokio::test]
+    async fn a_confidential_client_must_authenticate_to_refresh() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Confidential).await;
+        let rt = seed_refresh_token(&db, &client).await;
+
+        for (what, who, expected) in [
+            (
+                "no credentials",
+                NOTHING,
+                "invalid_client: Secret required.",
+            ),
+            (
+                "a client_id and no secret",
+                Presented {
+                    client_id: Some(&client),
+                    ..NOTHING
+                },
+                "invalid_client: Secret required.",
+            ),
+            (
+                "a wrong form secret",
+                Presented {
+                    client_id: Some(&client),
+                    form_secret: Some("wrong"),
+                    header_client_id: None,
+                    header_secret: None,
+                },
+                "invalid_client: Bad secret.",
+            ),
+            (
+                "a wrong header secret",
+                Presented {
+                    header_secret: Some("wrong"),
+                    ..NOTHING
+                },
+                "invalid_client: Bad secret.",
+            ),
+        ] {
+            let result = refresh(&db, &config, &rt, who).await;
+            assert_eq!(outcome(&result), expected, "{what}");
+            assert!(
+                still_exists(&db, &rt).await,
+                "{what}: the token is untouched"
+            );
+        }
+
+        let with_form_secret = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&client),
+                form_secret: Some(SECRET),
+                header_client_id: None,
+                header_secret: None,
+            },
+        )
+        .await;
+        let rt2 = refresh_token_of(with_form_secret);
+        let with_header_secret = refresh(
+            &db,
+            &config,
+            &rt2,
+            Presented {
+                header_secret: Some(SECRET),
+                ..NOTHING
+            },
+        )
+        .await;
+        assert_eq!(outcome(&with_header_secret), "ok");
+    }
+
+    /// A refresh token written before the grant record (`token/{raw}`), as the
+    /// previous build left it for `client_id`. Returns the raw token.
+    async fn seed_legacy_refresh_token(db: &RedisClient, client_id: &str) -> String {
+        let raw = format!("mcr_{}", Uuid::new_v4().simple());
+        let now = Utc::now().timestamp();
+        db.set_token(
+            &raw,
+            &TokenMetadata {
+                username: unique("localpart"),
+                device_id: String::new(),
+                scope: "openid".into(),
+                client_id: client_id.into(),
+                iat: now,
+                exp: now + REFRESH_TOKEN_TTL as i64,
+                did: "did:key:zDnBINDING".into(),
+                name: "did:key:zDnBINDING".into(),
+                kind: Some(TokenKind::Refresh),
+            },
+            REFRESH_TOKEN_TTL,
+        )
+        .await
+        .unwrap();
+        raw
+    }
+
+    /// Item 10 at `POST /token`: a legacy refresh token is lifted into a grant
+    /// and answered with a pair in the current format, but only for its own
+    /// client, authenticated exactly like any refresh; a refused request leaves
+    /// the legacy entry alone. The lifted grant records whether its client is
+    /// confidential by the one rule (`client_is_confidential`), so the Matrix
+    /// endpoint refuses its tokens exactly when this endpoint demands a secret.
+    #[tokio::test]
+    async fn a_legacy_refresh_token_is_lifted_for_its_own_client_with_its_confidentiality() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let other = seed_client(&db, Registration::Public).await;
+        for registration in [Registration::Confidential, Registration::Public] {
+            let client = seed_client(&db, registration).await;
+            let legacy = seed_legacy_refresh_token(&db, &client).await;
+            let named_other = refresh(
+                &db,
+                &config,
+                &legacy,
+                Presented {
+                    client_id: Some(&other),
+                    ..NOTHING
+                },
+            )
+            .await;
+            assert_eq!(
+                outcome(&named_other),
+                "invalid_grant",
+                "{registration:?}: another client"
+            );
+            let confidential = matches!(registration, Registration::Confidential);
+            if confidential {
+                let no_secret = refresh(
+                    &db,
+                    &config,
+                    &legacy,
+                    Presented {
+                        client_id: Some(&client),
+                        ..NOTHING
+                    },
+                )
+                .await;
+                assert_eq!(outcome(&no_secret), "invalid_client: Secret required.");
+            }
+            assert!(
+                db.get_token(&legacy).await.unwrap().is_some(),
+                "{registration:?}: a refused request leaves the legacy entry"
+            );
+
+            let lifted = refresh(
+                &db,
+                &config,
+                &legacy,
+                Presented {
+                    client_id: Some(&client),
+                    form_secret: confidential.then_some(SECRET),
+                    ..NOTHING
+                },
+            )
+            .await;
+            let new_rt = refresh_token_of(lifted);
+            assert!(
+                siwx_oidc::db::tokens::parse_refresh_token(&new_rt).is_some(),
+                "{registration:?}: the answer is in the current format"
+            );
+            assert!(
+                db.get_token(&legacy).await.unwrap().is_none(),
+                "{registration:?}: the legacy entry is gone"
+            );
+            let grant = db.peek_refresh_grant(&new_rt).await.unwrap().unwrap();
+            assert_eq!(grant.client_id, client);
+            assert_eq!(
+                grant.confidential_client, confidential,
+                "{registration:?}: the lifted grant records the client's confidentiality"
+            );
+            assert_eq!(grant.generation, 1);
+        }
+    }
+
+    /// A public client authenticates nothing: it may name itself or not. Naming
+    /// is optional because `siwx-oidc-auth` and Matrix clients send the id but
+    /// an older agent may not (provisional: see docs/matrix-integration.md).
+    #[tokio::test]
+    async fn a_public_client_refreshes_with_or_without_naming_itself() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Public).await;
+        let rt = seed_refresh_token(&db, &client).await;
+
+        let named = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&client),
+                ..NOTHING
+            },
+        )
+        .await;
+        let rt2 = refresh_token_of(named);
+        let anonymous = refresh(&db, &config, &rt2, NOTHING).await;
+        assert_eq!(outcome(&anonymous), "ok");
+    }
+
+    /// A client registered without an authentication method is confidential
+    /// when `require_secret` is on and public when it is off, the same rule the
+    /// code exchange applies.
+    #[tokio::test]
+    async fn an_unset_authentication_method_follows_require_secret() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client = seed_client(&db, Registration::Unset).await;
+        let strict = Config {
+            require_secret: true,
+            ..Config::default()
+        };
+        let lax = Config {
+            require_secret: false,
+            ..Config::default()
+        };
+
+        let rt = seed_refresh_token(&db, &client).await;
+        assert_eq!(
+            outcome(&refresh(&db, &strict, &rt, NOTHING).await),
+            "invalid_client: Secret required."
+        );
+        assert_eq!(outcome(&refresh(&db, &lax, &rt, NOTHING).await), "ok");
+    }
+
+    /// A refresh token outlives its client's registration (a registration lasts
+    /// 30 days, a refresh token 90 days from its last use). Refusing every such
+    /// token would sign out every session older than a registration, so the
+    /// token keeps refreshing when the request names the same client or none.
+    /// What cannot be done: name another client, or present a secret that can
+    /// no longer be checked. Provisional: a deployment decision for the
+    /// maintainers (see docs/matrix-integration.md).
+    #[tokio::test]
+    async fn a_token_outlives_its_clients_registration_but_not_its_binding() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let gone = seed_client(&db, Registration::Public).await;
+        let other = seed_client(&db, Registration::Public).await;
+        let rt = seed_refresh_token(&db, &gone).await;
+        db.delete_client(gone.clone()).await.unwrap();
+
+        assert_eq!(
+            outcome(
+                &refresh(
+                    &db,
+                    &config,
+                    &rt,
+                    Presented {
+                        client_id: Some(&other),
+                        ..NOTHING
+                    }
+                )
+                .await
+            ),
+            "invalid_grant",
+            "another client is refused"
+        );
+        assert_eq!(
+            outcome(
+                &refresh(
+                    &db,
+                    &config,
+                    &rt,
+                    Presented {
+                        client_id: Some(&gone),
+                        form_secret: Some(SECRET),
+                        header_client_id: None,
+                        header_secret: None
+                    }
+                )
+                .await
+            ),
+            "invalid_client: Unrecognised client id.",
+            "a secret that cannot be checked is refused"
+        );
+        let named = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&gone),
+                ..NOTHING
+            },
+        )
+        .await;
+        let rt2 = refresh_token_of(named);
+        assert_eq!(
+            outcome(&refresh(&db, &config, &rt2, NOTHING).await),
+            "ok",
+            "the same client, or none, still refreshes"
+        );
+    }
+
+    /// An HTTP Basic header names the client in its user name, and that is
+    /// checked exactly like a `client_id` in the form, at both grants. A form
+    /// and a header that name different clients are a malformed request.
+    #[tokio::test]
+    async fn a_basic_header_names_the_client_like_the_form_does() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let owner = seed_client(&db, Registration::Confidential).await;
+        let other = seed_client(&db, Registration::Confidential).await;
+        let rt = seed_refresh_token(&db, &owner).await;
+
+        let someone_else = Presented {
+            header_client_id: Some(&other),
+            header_secret: Some(SECRET),
+            ..NOTHING
+        };
+        assert_eq!(
+            outcome(&refresh(&db, &config, &rt, someone_else).await),
+            "invalid_grant"
+        );
+        let spent = seed_code(&db, &owner).await;
+        assert_eq!(
+            outcome(&exchange(&db, &config, &spent, someone_else).await),
+            "invalid_grant"
+        );
+
+        // A form and a header that name different clients are malformed, and
+        // refused before the code is spent.
+        let split = Presented {
+            client_id: Some(&owner),
+            header_client_id: Some(&other),
+            header_secret: Some(SECRET),
+            ..NOTHING
+        };
+        let intact = seed_code(&db, &owner).await;
+        assert_eq!(
+            outcome(&refresh(&db, &config, &rt, split).await),
+            "invalid_request"
+        );
+        assert_eq!(
+            outcome(&exchange(&db, &config, &intact, split).await),
+            "invalid_request"
+        );
+        assert!(
+            still_exists(&db, &rt).await,
+            "refusals leave the token alone"
+        );
+
+        let own = Presented {
+            header_client_id: Some(&owner),
+            header_secret: Some(SECRET),
+            ..NOTHING
+        };
+        assert_eq!(
+            outcome(&exchange(&db, &config, &intact, own).await),
+            "ok",
+            "the malformed request did not spend the code"
+        );
+        assert_eq!(outcome(&refresh(&db, &config, &rt, own).await), "ok");
+    }
+
+    /// The replay of a lost response (I4) hands out the successor pair, so it
+    /// needs the same client binding as a fresh rotation: anyone holding the old
+    /// token must not get the new pair without the client's credentials.
+    #[tokio::test]
+    async fn a_replay_is_bound_to_the_client_too() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Confidential).await;
+        let other = seed_client(&db, Registration::Confidential).await;
+        let old = seed_refresh_token(&db, &client).await;
+        let credentials = Presented {
+            client_id: Some(&client),
+            form_secret: Some(SECRET),
+            header_client_id: None,
+            header_secret: None,
+        };
+
+        let successor = refresh_token_of(refresh(&db, &config, &old, credentials).await);
+        assert_eq!(
+            outcome(&refresh(&db, &config, &old, NOTHING).await),
+            "invalid_client: Secret required.",
+            "a replay without credentials gets no successor pair"
+        );
+        assert_eq!(
+            outcome(
+                &refresh(
+                    &db,
+                    &config,
+                    &old,
+                    Presented {
+                        client_id: Some(&other),
+                        form_secret: Some(SECRET),
+                        header_client_id: None,
+                        header_secret: None
+                    }
+                )
+                .await
+            ),
+            "invalid_grant",
+            "a replay by another client gets no successor pair"
+        );
+        let replay = refresh_token_of(refresh(&db, &config, &old, credentials).await);
+        assert_eq!(
+            replay, successor,
+            "the client itself still recovers the same pair while it is unused"
+        );
+    }
+
+    /// A replay returns the successor pair only while that pair is live and
+    /// unused. Once the successor has been rotated away or its grant revoked,
+    /// handing the pair out would answer a lost-response retry with tokens that
+    /// do not work. The replay is `invalid_grant`, like any unknown token.
+    #[tokio::test]
+    async fn a_replay_whose_successor_has_been_rotated_or_revoked_is_refused() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Public).await;
+
+        // Rotated: the client received the successor and has since used it.
+        let old = seed_refresh_token(&db, &client).await;
+        let successor = refresh_token_of(refresh(&db, &config, &old, NOTHING).await);
+        assert_eq!(
+            refresh_token_of(refresh(&db, &config, &old, NOTHING).await),
+            successor,
+            "while the successor is live the replay returns it"
+        );
+        let next = refresh_token_of(refresh(&db, &config, &successor, NOTHING).await);
+        assert_ne!(next, successor);
+        assert_eq!(
+            outcome(&refresh(&db, &config, &old, NOTHING).await),
+            "invalid_grant",
+            "a replay whose successor was rotated gets no pair"
+        );
+
+        // Revoked: the successor was deleted before the client used it.
+        let old = seed_refresh_token(&db, &client).await;
+        let successor = refresh_token_of(refresh(&db, &config, &old, NOTHING).await);
+        db.revoke_grant_of_token(&successor)
+            .await
+            .unwrap()
+            .expect("the successor's grant is revoked");
+        assert_eq!(
+            outcome(&refresh(&db, &config, &old, NOTHING).await),
+            "invalid_grant",
+            "a replay whose successor was revoked gets no pair"
+        );
+    }
+
+    /// H2 (I4, I5 phase A): the lost-response decision reads state, never a
+    /// clock. With the grant's recorded timestamps moved an hour into the past,
+    /// a replay of the previous refresh token still returns the same pair; once
+    /// the new access token has been accepted (as introspection or `/userinfo`
+    /// accepts it), the same replay is reuse: `invalid_grant`, one security
+    /// event with fingerprints only, and nothing revoked.
+    #[tokio::test]
+    async fn a_replay_an_hour_later_returns_the_same_pair_and_after_use_is_reuse() {
+        use bb8_redis::redis::AsyncCommands;
+        use openidconnect::OAuth2TokenResponse;
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Public).await;
+        let old = seed_refresh_token(&db, &client).await;
+        let first = refresh(&db, &config, &old, NOTHING).await.unwrap();
+        let pair = (
+            first.access_token().secret().clone(),
+            refresh_token_of(Ok(first)),
+        );
+
+        let grant = db.peek_refresh_grant(&old).await.unwrap().unwrap();
+        let key = format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_GRANT_PREFIX,
+            grant.grant_id.as_str()
+        );
+        let raw =
+            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
+        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        for field in ["last_used", "auth_time"] {
+            let _: i64 = conn.hincr(&key, field, -3600).await.unwrap();
+        }
+
+        let replay = refresh(&db, &config, &old, NOTHING).await.unwrap();
+        assert_eq!(
+            (
+                replay.access_token().secret().clone(),
+                refresh_token_of(Ok(replay))
+            ),
+            pair,
+            "an hour later the replay returns the SAME pair"
+        );
+
+        assert!(
+            db.lookup_access_token(&pair.0).await.unwrap().is_some(),
+            "the new access token is accepted"
+        );
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        assert_eq!(
+            outcome(&refresh(&db, &config, &old, NOTHING).await),
+            "invalid_grant",
+            "after first use the replay is reuse, answered like an unknown token"
+        );
+        let output = logs.output();
+        let events: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains(siwx_oidc::db::grant::REUSE_EVENT_MESSAGE))
+            .collect();
+        assert_eq!(events.len(), 1, "exactly one reuse event: {output}");
+        let event = events[0];
+        for field in [
+            "security_event=\"refresh_token_reuse\"",
+            "branch=\"previous_after_use\"",
+            "grant_kind=oidc",
+            "generation=1",
+            "grant_revoked=false",
+        ] {
+            assert!(event.contains(field), "the event carries {field}: {event}");
+        }
+        assert!(
+            event.contains(grant.grant_id.fingerprint()),
+            "the event names the grant by its fingerprint: {event}"
+        );
+        for secret in [&old, &pair.0, &pair.1] {
+            assert!(
+                !output.contains(secret.as_str()),
+                "no token in the logs: {output}"
+            );
+        }
+        assert_eq!(
+            outcome(&refresh(&db, &config, &pair.1, NOTHING).await),
+            "ok",
+            "phase A revokes nothing: the live chain keeps working"
+        );
+    }
+
+    /// I5 phase B at `POST /token`, with `reuse_revokes_grant` on: a superseded
+    /// refresh token gets exactly the answer an unknown token gets, the reuse
+    /// event records that the grant was revoked, and the grant is gone, so the
+    /// current holder's refresh token is refused too and the RP is sent one
+    /// back-channel logout token.
+    #[tokio::test]
+    async fn with_reuse_enforcement_a_superseded_token_at_the_token_endpoint_ends_its_grant() {
+        let Some(base) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let db = base.clone().with_reuse_enforcement(true);
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Public).await;
+        let first = seed_refresh_token(&db, &client).await;
+        let grant = db.peek_refresh_grant(&first).await.unwrap().unwrap();
+        let second = refresh_token_of(refresh(&db, &config, &first, NOTHING).await);
+        let current = refresh_token_of(refresh(&db, &config, &second, NOTHING).await);
+
+        let unknown = refresh(&db, &config, "mcr_not_a_token", NOTHING).await;
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let reused = refresh(&db, &config, &first, NOTHING).await;
+        assert_eq!(outcome(&reused), "invalid_grant");
+        assert_eq!(
+            format!("{reused:?}"),
+            format!("{unknown:?}"),
+            "reuse is answered exactly like an unknown token"
+        );
+        let output = logs.output();
+        let events: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains(siwx_oidc::db::grant::REUSE_EVENT_MESSAGE))
+            .collect();
+        assert_eq!(events.len(), 1, "exactly one reuse event: {output}");
+        assert!(
+            events[0].contains("grant_revoked=true"),
+            "the event records the revocation: {}",
+            events[0]
+        );
+
+        assert!(
+            db.peek_refresh_grant(&current).await.unwrap().is_none(),
+            "the grant is gone"
+        );
+        assert_eq!(
+            outcome(&refresh(&db, &config, &current, NOTHING).await),
+            "invalid_grant",
+            "the current holder is refused at its next refresh"
+        );
+        let queued = db
+            .pending_logout_entries()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|(e, _)| e.grant == grant.grant_id.as_str())
+            .count();
+        assert_eq!(queued, 1, "one back-channel logout entry for the RP");
+    }
+
+    /// A grant records its client as confidential exactly when `POST /token`
+    /// demands that client's secret: the one rule (`client_is_confidential`)
+    /// behind both, so `POST /_matrix/client/v3/refresh`, which refuses a
+    /// confidential client's grant, refuses exactly the grants it could not
+    /// authenticate.
+    #[tokio::test]
+    async fn a_grant_records_its_client_as_confidential_exactly_when_token_demands_a_secret() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let strict = Config {
+            require_secret: true,
+            ..Config::default()
+        };
+        let lax = Config {
+            require_secret: false,
+            ..Config::default()
+        };
+        for (registration, config, label, confidential) in [
+            (Registration::Public, &strict, "public", false),
+            (Registration::Confidential, &lax, "confidential", true),
+            (Registration::Unset, &strict, "unset, secret required", true),
+            (Registration::Unset, &lax, "unset, secret optional", false),
+        ] {
+            let client = seed_client(&db, registration).await;
+            let code = seed_code_with_scope(&db, &client, Some("openid offline_access")).await;
+            let with_secret = Presented {
+                client_id: Some(&client),
+                form_secret: Some(SECRET),
+                header_client_id: None,
+                header_secret: None,
+            };
+            let rt = refresh_token_of(exchange(&db, config, &code, with_secret).await);
+            let grant = db.peek_refresh_grant(&rt).await.unwrap().unwrap();
+            assert_eq!(
+                grant.confidential_client, confidential,
+                "{label}: the flag the grant records"
+            );
+            let named_only = Presented {
+                client_id: Some(&client),
+                ..NOTHING
+            };
+            let demanded = outcome(&refresh(&db, config, &rt, named_only).await)
+                == "invalid_client: Secret required.";
+            assert_eq!(
+                grant.confidential_client, demanded,
+                "{label}: the recorded flag and the secret /token demands agree"
+            );
+        }
+    }
+
+    /// The two grants authenticate the client through the same helpers, so
+    /// they cannot drift: every way a request can present itself gets the same
+    /// answer from the code exchange and the refresh grant.
+    #[tokio::test]
+    async fn the_code_exchange_and_the_refresh_grant_authenticate_clients_identically() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let strict = Config {
+            require_secret: true,
+            ..Config::default()
+        };
+        let lax = Config {
+            require_secret: false,
+            ..Config::default()
+        };
+        let other = seed_client(&db, Registration::Confidential).await;
+
+        for (registration, config, label) in [
+            (Registration::Public, &strict, "public"),
+            (Registration::Confidential, &strict, "confidential"),
+            (Registration::Unset, &strict, "unset, secret required"),
+            (Registration::Unset, &lax, "unset, secret optional"),
+        ] {
+            let client = seed_client(&db, registration).await;
+            for (what, who) in [
+                ("nothing", NOTHING),
+                (
+                    "its id",
+                    Presented {
+                        client_id: Some(&client),
+                        ..NOTHING
+                    },
+                ),
+                (
+                    "its id and secret",
+                    Presented {
+                        client_id: Some(&client),
+                        form_secret: Some(SECRET),
+                        header_client_id: None,
+                        header_secret: None,
+                    },
+                ),
+                (
+                    "its id and a wrong secret",
+                    Presented {
+                        client_id: Some(&client),
+                        form_secret: Some("wrong"),
+                        header_client_id: None,
+                        header_secret: None,
+                    },
+                ),
+                (
+                    "a header secret",
+                    Presented {
+                        header_secret: Some(SECRET),
+                        ..NOTHING
+                    },
+                ),
+                (
+                    "another client's id and secret",
+                    Presented {
+                        client_id: Some(&other),
+                        form_secret: Some(SECRET),
+                        header_client_id: None,
+                        header_secret: None,
+                    },
+                ),
+            ] {
+                let code = seed_code(&db, &client).await;
+                let rt = seed_refresh_token(&db, &client).await;
+                let by_code = outcome(&exchange(&db, config, &code, who).await);
+                let by_refresh = outcome(&refresh(&db, config, &rt, who).await);
+                assert_eq!(
+                    by_refresh, by_code,
+                    "{label} client presenting {what}: the refresh grant answered \
+                     `{by_refresh}`, the code exchange `{by_code}`"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scope_grant_tests {
+    //! What the code exchange issues for the scope that was requested.
+    //!
+    //! Generic mode (no MAS shared secret) grants only what was asked for and
+    //! allowed, and issues a refresh token only for `offline_access` to a client
+    //! whose registration allows the refresh grant (I10). Matrix mode is
+    //! unchanged: the Matrix scope for the device and a refresh token, whatever
+    //! was requested. Needs Redis.
+    use super::client_binding_tests::{
+        seed_client_with, seed_code_with_scope, unique, Registration, VERIFIER,
+    };
+    use super::*;
+    use crate::config::Config;
+    use openidconnect::OAuth2TokenResponse;
+
+    fn generic() -> Config {
+        Config::default()
+    }
+
+    fn matrix() -> Config {
+        Config {
+            mas_shared_secret: Some("shared-secret".to_string()),
+            ..Config::default()
+        }
+    }
+
+    fn may_refresh() -> Option<Vec<CoreGrantType>> {
+        Some(vec![
+            CoreGrantType::AuthorizationCode,
+            CoreGrantType::RefreshToken,
+        ])
+    }
+
+    fn code_grant_only() -> Option<Vec<CoreGrantType>> {
+        Some(vec![CoreGrantType::AuthorizationCode])
+    }
+
+    /// Redeem a code for a public client that sends no secret.
+    async fn exchange(
+        db: &RedisClient,
+        config: &Config,
+        client_id: &str,
+        code: &str,
+    ) -> SiwxTokenResponse {
+        token(
+            TokenForm {
+                code: Some(code.to_string()),
+                client_id: Some(client_id.to_string()),
+                client_secret: None,
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(VERIFIER.to_string()),
+                refresh_token: None,
+                device_code: None,
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the exchange must succeed: {e:?}"))
+    }
+
+    /// A public client, a code that asked for `scope`, and the exchange.
+    async fn issue(
+        db: &RedisClient,
+        config: &Config,
+        grants: Option<Vec<CoreGrantType>>,
+        scope: Option<&str>,
+    ) -> SiwxTokenResponse {
+        let client = seed_client_with(db, Registration::Public, grants).await;
+        let code = seed_code_with_scope(db, &client, scope).await;
+        exchange(db, config, &client, &code).await
+    }
+
+    fn scope_of(response: &SiwxTokenResponse) -> Option<String> {
+        response.scopes().map(|scopes| {
+            scopes
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+    }
+
+    async fn recorded_scope(db: &RedisClient, response: &SiwxTokenResponse) -> String {
+        db.check_access_token(response.access_token().secret())
+            .await
+            .unwrap()
+            .expect("the access token is stored")
+            .scope
+    }
+
+    /// Without `offline_access` there is no refresh token: a client that did
+    /// not ask for one does not hold a credential that outlives its session.
+    #[tokio::test]
+    async fn generic_mode_issues_a_refresh_token_only_for_offline_access() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+
+        let without = issue(&db, &generic(), may_refresh(), Some("openid profile")).await;
+        assert!(
+            without.refresh_token().is_none(),
+            "no offline_access, no refresh token"
+        );
+        assert_eq!(recorded_scope(&db, &without).await, "openid profile");
+        assert_eq!(
+            scope_of(&without),
+            None,
+            "the granted scope equals the requested one, so the response omits it"
+        );
+
+        let with = issue(
+            &db,
+            &generic(),
+            may_refresh(),
+            Some("openid profile offline_access"),
+        )
+        .await;
+        assert!(with.refresh_token().is_some(), "offline_access asked for");
+        assert_eq!(
+            recorded_scope(&db, &with).await,
+            "openid profile offline_access"
+        );
+        assert_eq!(scope_of(&with), None, "granted as requested");
+    }
+
+    /// `offline_access` also needs the client's registration to allow the
+    /// refresh grant. The scope that is not granted is not in the issued scope,
+    /// and the response says what was granted because it differs.
+    #[tokio::test]
+    async fn generic_mode_grants_offline_access_only_to_a_client_that_may_refresh() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+
+        let refused = issue(
+            &db,
+            &generic(),
+            code_grant_only(),
+            Some("openid offline_access"),
+        )
+        .await;
+        assert!(
+            refused.refresh_token().is_none(),
+            "the registration lists no refresh_token grant"
+        );
+        assert_eq!(recorded_scope(&db, &refused).await, "openid");
+        assert_eq!(
+            scope_of(&refused).as_deref(),
+            Some("openid"),
+            "the response names the granted scope, which differs from the request"
+        );
+
+        // Provisional: a registration that names no grant types is not a
+        // restriction. A client that never listed any would otherwise lose
+        // refresh tokens it was entitled to under the registration it made.
+        let unspecified = issue(&db, &generic(), None, Some("openid offline_access")).await;
+        assert!(unspecified.refresh_token().is_some());
+        assert_eq!(
+            recorded_scope(&db, &unspecified).await,
+            "openid offline_access"
+        );
+    }
+
+    /// The issued scope reflects the request intersected with what generic mode
+    /// supports; Matrix scopes mean nothing there and are not granted.
+    #[tokio::test]
+    async fn generic_mode_issues_the_scope_that_was_requested_and_supported() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+
+        let openid_only = issue(&db, &generic(), may_refresh(), Some("openid")).await;
+        assert_eq!(recorded_scope(&db, &openid_only).await, "openid");
+
+        let mixed = issue(
+            &db,
+            &generic(),
+            may_refresh(),
+            Some("openid email urn:matrix:client:api:* profile"),
+        )
+        .await;
+        assert_eq!(
+            recorded_scope(&db, &mixed).await,
+            "openid profile",
+            "supported scopes only, in a fixed order"
+        );
+        assert_eq!(
+            scope_of(&mixed).as_deref(),
+            Some("openid profile"),
+            "the granted scope differs from the request, so the response says so"
+        );
+
+        // Nothing supported was asked for: the exchange still issues an ID
+        // token, so `openid` is what is granted (provisional).
+        let matrix_only = issue(
+            &db,
+            &generic(),
+            may_refresh(),
+            Some("urn:matrix:client:api:*"),
+        )
+        .await;
+        assert_eq!(recorded_scope(&db, &matrix_only).await, "openid");
+    }
+
+    /// A code written before the scope travelled with it (an earlier build, for
+    /// the 300 s a code lives) is exchanged as it was then: `openid profile`
+    /// and a refresh token.
+    #[tokio::test]
+    async fn generic_mode_exchanges_a_code_with_no_recorded_scope_as_before() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let legacy = issue(&db, &generic(), may_refresh(), None).await;
+        assert!(legacy.refresh_token().is_some());
+        assert_eq!(recorded_scope(&db, &legacy).await, "openid profile");
+        assert_eq!(scope_of(&legacy), None);
+    }
+
+    /// Matrix mode is unchanged: whatever the request asked for, the code grant
+    /// records the Matrix scope for the device and issues a refresh token, and
+    /// the response carries no `scope`.
+    /// The claims of a response's ID token, decoded without verification.
+    pub(super) fn id_token_claims(response: &SiwxTokenResponse) -> serde_json::Value {
+        let jws = response
+            .extra_fields()
+            .id_token()
+            .expect("the code exchange returns an ID token")
+            .to_string();
+        let payload = jws.split('.').nth(1).expect("a compact JWS");
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap()
+    }
+
+    /// One raw `GET` on the test Redis.
+    pub(super) async fn raw_get(key: &str) -> Option<String> {
+        let url = siwx_oidc::test_support::redis_url();
+        let client = bb8_redis::redis::Client::open(url.as_str()).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        bb8_redis::redis::cmd("GET")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    /// The grant id an access token belongs to, read from the store.
+    async fn grant_of_access_token(access: &str) -> Option<String> {
+        let url = siwx_oidc::test_support::redis_url();
+        let client = bb8_redis::redis::Client::open(url.as_str()).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let key = format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_ACCESS_TOKEN_PREFIX,
+            siwx_oidc::db::tokens::digest(access)
+        );
+        bb8_redis::redis::cmd("HGET")
+            .arg(key)
+            .arg("grant")
+            .query_async(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    /// Every ID token carries the `sid` of the grant the exchange created (I8),
+    /// in both modes, and two exchanges get two different sids.
+    #[tokio::test]
+    async fn every_id_token_carries_the_sid_of_its_grant() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let mut sids = Vec::new();
+        for config in [generic(), generic(), matrix()] {
+            let response = issue(&db, &config, may_refresh(), Some("openid offline_access")).await;
+            let claims = id_token_claims(&response);
+            let sid = claims["sid"]
+                .as_str()
+                .unwrap_or_else(|| panic!("the ID token carries a sid: {claims}"))
+                .to_string();
+            let grant = grant_of_access_token(response.access_token().secret())
+                .await
+                .expect("the access token names its grant");
+            assert_eq!(
+                raw_get(&format!(
+                    "{}/{sid}",
+                    siwx_oidc::db::grant::KV_GRANT_SID_IDX_PREFIX
+                ))
+                .await
+                .as_deref(),
+                Some(grant.as_str()),
+                "the sid names the grant of this exchange"
+            );
+            assert!(!sids.contains(&sid), "each grant has its own sid");
+            sids.push(sid);
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_mode_issues_the_matrix_scope_and_a_refresh_token_whatever_was_requested() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        for requested in [
+            None,
+            Some("openid"),
+            Some("openid profile"),
+            Some("openid offline_access"),
+            Some("urn:matrix:client:api:*"),
+        ] {
+            let client = seed_client_with(&db, Registration::Public, code_grant_only()).await;
+            let code = seed_code_with_scope(&db, &client, requested).await;
+            // Give the code a device, as provisioning does.
+            let mut entry = db.try_consume_code(code).await.unwrap().unwrap();
+            entry.device_id = Some("SIWX_ABCD1234".to_string());
+            let code = unique("code-");
+            db.set_code(code.clone(), entry).await.unwrap();
+
+            let response = exchange(&db, &matrix(), &client, &code).await;
+            assert!(
+                response.refresh_token().is_some(),
+                "Matrix mode issues a refresh token (requested {requested:?})"
+            );
+            assert_eq!(
+                recorded_scope(&db, &response).await,
+                "openid urn:matrix:client:api:* urn:matrix:client:device:SIWX_ABCD1234",
+                "requested {requested:?}"
+            );
+            assert_eq!(
+                scope_of(&response),
+                None,
+                "Matrix mode never put a scope in the token response (requested {requested:?})"
+            );
+            assert!(
+                response.access_token().secret().starts_with("mat_")
+                    && response
+                        .refresh_token()
+                        .unwrap()
+                        .secret()
+                        .starts_with("mcr_"),
+                "Matrix token prefixes are unchanged"
+            );
+        }
+    }
+
+    fn registration(grants: Option<Vec<CoreGrantType>>) -> ClientEntry {
+        let mut metadata = SiwxClientMetadata::new(
+            vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
+            LogoutClientMetadata::default(),
+        );
+        if let Some(grants) = grants {
+            metadata = metadata.set_grant_types(Some(grants));
+        }
+        ClientEntry::new("secret", metadata, None)
+    }
+
+    /// The pure decision, without Redis: ordering and duplicates do not matter,
+    /// the response names the scope only when it differs from the request.
+    #[test]
+    fn the_generic_grant_follows_the_request_and_the_registration() {
+        let grant =
+            |requested: Option<&str>, grants| generic_grant(requested, &registration(grants));
+        let expect = |scope: &str, refresh_token: bool, report_scope: bool| GenericGrant {
+            scope: scope.to_string(),
+            refresh_token,
+            report_scope,
+        };
+
+        assert_eq!(
+            grant(Some("profile  openid openid"), None),
+            expect("openid profile", false, false),
+            "order, spacing and repeats of the request are immaterial"
+        );
+        assert_eq!(
+            grant(Some("offline_access openid"), may_refresh()),
+            expect("openid offline_access", true, false)
+        );
+        assert_eq!(
+            grant(Some("openid offline_access"), code_grant_only()),
+            expect("openid", false, true),
+            "offline_access needs the refresh grant in the registration"
+        );
+        assert_eq!(
+            grant(Some("openid email"), None),
+            expect("openid", false, true),
+            "a scope generic mode does not know is not granted"
+        );
+        assert_eq!(
+            grant(Some(""), None),
+            expect("openid", false, true),
+            "nothing requested: openid, because an ID token is issued"
+        );
+        assert_eq!(
+            grant(None, code_grant_only()),
+            expect("openid profile", true, false),
+            "a code with no recorded scope is exchanged as it was before the scope travelled"
+        );
+    }
+
+    /// Discovery says `offline_access` is a scope this provider honours.
+    #[test]
+    fn discovery_advertises_offline_access() {
+        let value = provider_metadata_value(&Config::default(), false).unwrap();
+        let scopes: Vec<&str> = value["scopes_supported"]
+            .as_array()
+            .expect("scopes_supported is an array")
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        assert!(scopes.contains(&"offline_access"), "{scopes:?}");
+        for kept in ["openid", "profile", "urn:matrix:client:api:*"] {
+            assert!(scopes.contains(&kept), "{kept} is still advertised");
+        }
+    }
+}
+
+#[cfg(test)]
+mod end_session_tests {
+    //! RP-initiated logout (OpenID Connect RP-Initiated Logout 1.0): the
+    //! `id_token_hint` check, the exact `post_logout_redirect_uri` match, the
+    //! registration metadata and discovery. Redis-backed tests skip without it.
+    use super::client_binding_tests::{unique, VERIFIER};
+    use super::scope_grant_tests::id_token_claims;
+    use super::*;
+    use crate::config::Config;
+    use openidconnect::{OAuth2TokenResponse, PostLogoutRedirectUrl};
+
+    fn issuer() -> IssuerUrl {
+        IssuerUrl::from_url(Config::default().base_url)
+    }
+
+    /// An ID token for `client_id` and `did` carrying `sid`, signed by `key`,
+    /// issued `age` seconds ago and valid for `ttl` seconds from then.
+    fn id_token(
+        key: &EcdsaSigningKey,
+        client_id: &str,
+        did: &str,
+        sid: Option<&str>,
+        age: i64,
+        ttl: i64,
+    ) -> String {
+        let iat = Utc::now() - Duration::seconds(age);
+        let claims = SiwxIdTokenClaims::new(
+            issuer(),
+            vec![Audience::new(client_id.to_string())],
+            iat + Duration::seconds(ttl),
+            iat,
+            StandardClaims::new(SubjectIdentifier::new(did.to_string())),
+            SidClaims {
+                sid: sid.map(str::to_string),
+            },
+        );
+        SiwxIdToken::new(
+            claims,
+            key,
+            CoreJwsSigningAlgorithm::EcdsaP256Sha256,
+            None,
+            None,
+        )
+        .unwrap()
+        .to_string()
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    #[test]
+    fn an_id_token_hint_verifies_with_the_live_or_a_retired_key_expired_or_not() {
+        let live = EcdsaSigningKey::generate();
+        let fresh = id_token(&live, "rp", "did:key:zDnLive", Some("SID1"), 0, 300);
+        let expired = id_token(&live, "rp", "did:key:zDnLive", Some("SID1"), 7200, 300);
+        for hint in [&fresh, &expired] {
+            assert_eq!(
+                verify_id_token_hint(hint, &live, &[], &issuer()),
+                Ok(HintClaims {
+                    sub: "did:key:zDnLive".into(),
+                    aud: vec!["rp".into()],
+                    sid: Some("SID1".into()),
+                })
+            );
+        }
+        let old = EcdsaSigningKey::generate();
+        let by_old = id_token(&old, "rp", "did:key:zDnOld", None, 0, 300);
+        assert_eq!(
+            verify_id_token_hint(&by_old, &live, &[old.as_verification_key()], &issuer())
+                .map(|c| c.sid),
+            Ok(None),
+            "a retired key still verifies; a hint without a sid names nothing"
+        );
+        assert_eq!(
+            verify_id_token_hint(&by_old, &live, &[], &issuer()),
+            Err(HintError::UnknownKid)
+        );
+    }
+
+    #[test]
+    fn a_tampered_foreign_unsigned_or_misissued_hint_is_refused() {
+        let live = EcdsaSigningKey::generate();
+        let hint = id_token(&live, "rp", "did:key:zDnLive", Some("SID1"), 0, 300);
+        let parts: Vec<&str> = hint.split('.').collect();
+        let mut claims: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        claims["sid"] = serde_json::json!("SID2");
+        let tampered = format!(
+            "{}.{}.{}",
+            parts[0],
+            b64(claims.to_string().as_bytes()),
+            parts[2]
+        );
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+        let foreign_key = EcdsaSigningKey::generate();
+        let input = format!("{}.{}", parts[0], parts[1]);
+        let foreign = format!("{input}.{}", b64(&foreign_key.sign_es256(input.as_bytes())));
+        let with_alg = |alg: &str| {
+            let mut h = header.clone();
+            h["alg"] = serde_json::json!(alg);
+            format!(
+                "{}.{}.{}",
+                b64(h.to_string().as_bytes()),
+                parts[1],
+                parts[2]
+            )
+        };
+        let mut no_kid = header.clone();
+        no_kid.as_object_mut().unwrap().remove("kid");
+        let no_kid = format!(
+            "{}.{}.{}",
+            b64(no_kid.to_string().as_bytes()),
+            parts[1],
+            parts[2]
+        );
+        let other_issuer = IssuerUrl::new("https://other.example.org/".into()).unwrap();
+        for (what, hint, issuer, expected) in [
+            (
+                "a tampered payload",
+                tampered,
+                issuer(),
+                HintError::Signature,
+            ),
+            (
+                "another key under our kid",
+                foreign,
+                issuer(),
+                HintError::Signature,
+            ),
+            ("alg none", with_alg("none"), issuer(), HintError::Algorithm),
+            (
+                "alg HS256",
+                with_alg("HS256"),
+                issuer(),
+                HintError::Algorithm,
+            ),
+            ("no kid", no_kid, issuer(), HintError::UnknownKid),
+            (
+                "another issuer",
+                hint.clone(),
+                other_issuer,
+                HintError::Issuer,
+            ),
+            (
+                "four parts",
+                format!("{hint}.x"),
+                issuer(),
+                HintError::Malformed,
+            ),
+            (
+                "garbage",
+                "garbage".to_string(),
+                issuer(),
+                HintError::Malformed,
+            ),
+        ] {
+            assert_eq!(
+                verify_id_token_hint(&hint, &live, &[], &issuer),
+                Err(expected),
+                "{what}"
+            );
+        }
+    }
+
+    fn client_metadata(post_logout: &[&str]) -> SiwxClientMetadata {
+        SiwxClientMetadata::new(
+            vec![RedirectUrl::new("https://rp.example.org/cb".into()).unwrap()],
+            LogoutClientMetadata {
+                post_logout_redirect_uris: Some(
+                    post_logout
+                        .iter()
+                        .map(|u| PostLogoutRedirectUrl::new(u.to_string()).unwrap())
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+        )
+        .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::None))
+        .set_grant_types(Some(vec![
+            CoreGrantType::AuthorizationCode,
+            CoreGrantType::RefreshToken,
+        ]))
+    }
+
+    #[test]
+    fn post_logout_redirect_uri_matching_is_exact() {
+        let client = ClientEntry::new(
+            "s",
+            client_metadata(&["https://rp.example.org/bye?x=1"]),
+            None,
+        );
+        let is = |u: &str| post_logout_redirect_uri_is_registered(&client, &Url::parse(u).unwrap());
+        assert!(is("https://rp.example.org/bye?x=1"));
+        for other in [
+            "https://rp.example.org/bye",
+            "https://rp.example.org/bye?x=1&y=2",
+            "https://rp.example.org/bye?x=2",
+            "https://rp.example.org/bye/?x=1",
+            "http://rp.example.org/bye?x=1",
+            "https://rp.example.org.evil.example/bye?x=1",
+        ] {
+            assert!(!is(other), "{other}");
+        }
+        let none = ClientEntry::new("s", client_metadata(&[]), None);
+        assert!(!post_logout_redirect_uri_is_registered(
+            &none,
+            &Url::parse("https://rp.example.org/bye?x=1").unwrap()
+        ));
+    }
+
+    #[test]
+    fn discovery_advertises_the_end_session_endpoint() {
+        for config in [
+            Config::default(),
+            Config {
+                mas_shared_secret: Some("s".into()),
+                ..Config::default()
+            },
+        ] {
+            let value = provider_metadata_value(&config, false).unwrap();
+            assert_eq!(
+                value["end_session_endpoint"],
+                "http://127.0.0.1:8000/end_session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_stores_and_echoes_post_logout_redirect_uris_and_refuses_a_fragment() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let base = Config::default().base_url;
+        let response = register(
+            client_metadata(&["https://rp.example.org/bye"]),
+            base.clone(),
+            &db,
+            &RegistrationPolicy::default(),
+        )
+        .await
+        .expect("registration succeeds");
+        let echoed = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            echoed["post_logout_redirect_uris"],
+            serde_json::json!(["https://rp.example.org/bye"])
+        );
+        let stored = db
+            .get_client(response.client_id().to_string())
+            .await
+            .unwrap()
+            .expect("stored");
+        assert!(post_logout_redirect_uri_is_registered(
+            &stored,
+            &Url::parse("https://rp.example.org/bye").unwrap()
+        ));
+        let refused = register(
+            client_metadata(&["https://rp.example.org/bye#f"]),
+            base,
+            &db,
+            &RegistrationPolicy::default(),
+        )
+        .await;
+        match refused {
+            Err(CustomError::BadRequestRegister(e)) => assert_eq!(
+                serde_json::to_value(&e).unwrap()["error"],
+                "invalid_client_metadata"
+            ),
+            other => panic!("a fragment must be refused, got {other:?}"),
+        }
+    }
+
+    /// End-to-end in process, generic mode: an `oidc` grant from a real code
+    /// exchange is ended by its ID token, and the RP is sent back to its exact
+    /// registered URI with `state`; an expired hint naming another grant ends
+    /// that one; nothing else ends.
+    #[tokio::test]
+    async fn end_session_ends_the_named_oidc_grant_and_redirects_with_state() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let key = EcdsaSigningKey::generate();
+        let client_id = unique("endsess-");
+        db.set_client(
+            client_id.clone(),
+            ClientEntry::new("s", client_metadata(&["https://rp.example.org/bye"]), None),
+        )
+        .await
+        .unwrap();
+        let code = super::client_binding_tests::seed_code_with_scope(
+            &db,
+            &client_id,
+            Some("openid offline_access"),
+        )
+        .await;
+        let response = token(
+            TokenForm {
+                code: Some(code),
+                client_id: Some(client_id.clone()),
+                client_secret: None,
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(VERIFIER.to_string()),
+                refresh_token: None,
+                device_code: None,
+            },
+            ClientCredentials::default(),
+            &key,
+            &config,
+            &db,
+            None,
+        )
+        .await
+        .expect("the exchange succeeds");
+        let hint = response.extra_fields().id_token().unwrap().to_string();
+        let did = id_token_claims(&response)["sub"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let access = response.access_token().secret().clone();
+        let refresh = response
+            .refresh_token()
+            .expect("offline_access")
+            .secret()
+            .clone();
+
+        // A second grant of the same client and user, named by an expired hint.
+        let other = db
+            .issue_grant(&NewGrant {
+                kind: GrantKind::Oidc,
+                username: unique("lp"),
+                did: did.clone(),
+                client_id: client_id.clone(),
+                confidential_client: false,
+                device_id: String::new(),
+                scope: "openid".into(),
+                name: did.clone(),
+                auth_ms: None,
+                access_ttl: ACCESS_TOKEN_TTL,
+                refresh_inactivity_secs: None,
+            })
+            .await
+            .unwrap();
+        let expired = id_token(&key, &client_id, &did, other.sid.as_deref(), 7200, 300);
+
+        let params = |hint: &str, uri: Option<&str>| EndSessionParams {
+            id_token_hint: Some(hint.to_string()),
+            client_id: None,
+            post_logout_redirect_uri: uri.map(str::to_string),
+            state: Some("s 1&2".into()),
+        };
+        let refused = end_session(
+            params(&hint, Some("https://rp.example.org/bye/")),
+            &key,
+            &[],
+            &config,
+            &db,
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(CustomError::BadRequest(_))),
+            "{refused:?}"
+        );
+        assert!(
+            db.check_access_token(&access).await.unwrap().is_some(),
+            "a refused request ends nothing"
+        );
+
+        let outcome = end_session(
+            params(&hint, Some("https://rp.example.org/bye")),
+            &key,
+            &[],
+            &config,
+            &db,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            EndSessionOutcome::Redirect(
+                Url::parse("https://rp.example.org/bye?state=s+1%262").unwrap()
+            )
+        );
+        assert!(
+            db.check_access_token(&access).await.unwrap().is_none(),
+            "the access token is inactive"
+        );
+        assert!(
+            matches!(
+                db.peek_refresh_token(&refresh).await.unwrap(),
+                RefreshPeek::Unknown
+            ),
+            "the refresh token names nothing"
+        );
+        assert!(
+            db.check_access_token(&other.access_token)
+                .await
+                .unwrap()
+                .is_some(),
+            "only the named grant ended"
+        );
+
+        let outcome = end_session(params(&expired, None), &key, &[], &config, &db)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            EndSessionOutcome::SignedOut { ended: true },
+            "an expired hint still names its grant"
+        );
+        assert!(db
+            .check_access_token(&other.access_token)
+            .await
+            .unwrap()
+            .is_none());
+        let again = end_session(params(&expired, None), &key, &[], &config, &db)
+            .await
+            .unwrap();
+        assert_eq!(again, EndSessionOutcome::SignedOut { ended: false });
+    }
+
+    /// A store fault on the way is a retryable 503, never an answer about the
+    /// request: a fault while ending the grant the hint's `sid` names is not
+    /// "nothing to end" (200), and a fault while reading the client for its
+    /// `post_logout_redirect_uri` is not "not registered" (400). Each fault is a
+    /// value of the wrong type at the key the step reads.
+    #[tokio::test]
+    async fn a_store_fault_while_ending_the_grant_or_reading_the_client_is_a_503() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let key = EcdsaSigningKey::generate();
+        let did = "did:key:zDnEndSessionFault";
+        let params = |hint: String, uri: Option<&str>| EndSessionParams {
+            id_token_hint: Some(hint),
+            client_id: None,
+            post_logout_redirect_uri: uri.map(str::to_string),
+            state: None,
+        };
+
+        // Ending the grant: the sid index is not a string.
+        let client_id = unique("endsess-fault-grant-");
+        let sid = unique("SIDFAULT");
+        let sid_idx = format!("{}/{sid}", siwx_oidc::db::grant::KV_GRANT_SID_IDX_PREFIX);
+        db.sadd_raw(&sid_idx, "x").await.unwrap();
+        let hint = id_token(&key, &client_id, did, Some(&sid), 0, 300);
+        let outcome = end_session(params(hint, None), &key, &[], &config, &db).await;
+        db.del_raw(&sid_idx).await.ok();
+        assert!(
+            matches!(outcome, Err(CustomError::ServiceUnavailable(_))),
+            "a fault ending the grant is a 503, got {outcome:?}"
+        );
+
+        // Reading the client: its registration is not a string.
+        let client_id = unique("endsess-fault-client-");
+        let client_key = format!("clients/{client_id}");
+        db.sadd_raw(&client_key, "x").await.unwrap();
+        let hint = id_token(&key, &client_id, did, Some(&unique("SID")), 0, 300);
+        let outcome = end_session(
+            params(hint, Some("https://rp.example.org/bye")),
+            &key,
+            &[],
+            &config,
+            &db,
+        )
+        .await;
+        db.del_raw(&client_key).await.ok();
+        assert!(
+            matches!(outcome, Err(CustomError::ServiceUnavailable(_))),
+            "a fault reading the client is a 503, got {outcome:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod backchannel_registration_tests {
+    //! OpenID Connect Back-Channel Logout 1.0: the registration metadata, the
+    //! SSRF guard at registration, the D4 switch and discovery.
+    use super::*;
+    use crate::config::Config;
+
+    fn payload(extra: serde_json::Value) -> SiwxClientMetadata {
+        let mut doc = serde_json::json!({ "redirect_uris": ["https://rp.example.org/cb"] });
+        for (k, v) in extra.as_object().unwrap() {
+            doc[k] = v.clone();
+        }
+        serde_json::from_value(doc).unwrap()
+    }
+
+    fn refused_as_metadata(result: Result<impl std::fmt::Debug, CustomError>, what: &str) {
+        match result {
+            Err(CustomError::BadRequestRegister(e)) => assert_eq!(
+                serde_json::to_value(&e).unwrap()["error"],
+                "invalid_client_metadata",
+                "{what}"
+            ),
+            other => panic!("{what} must be refused as invalid_client_metadata, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_stores_backchannel_logout_metadata_and_refuses_an_unsafe_uri() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let base = Config::default().base_url;
+        let open = RegistrationPolicy::default();
+        let response = register(
+            payload(serde_json::json!({
+                "backchannel_logout_uri": "https://192.0.2.10/bcl?rp=1",
+                "backchannel_logout_session_required": true,
+            })),
+            base.clone(),
+            &db,
+            &open,
+        )
+        .await
+        .expect("a public https URI is accepted");
+        let echoed = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            echoed["backchannel_logout_uri"],
+            "https://192.0.2.10/bcl?rp=1"
+        );
+        assert_eq!(echoed["backchannel_logout_session_required"], true);
+        let stored = db
+            .get_client(response.client_id().to_string())
+            .await
+            .unwrap()
+            .expect("stored");
+        let extra = stored.metadata.additional_metadata();
+        assert_eq!(
+            extra.backchannel_logout_uri.as_ref().map(Url::as_str),
+            Some("https://192.0.2.10/bcl?rp=1")
+        );
+        assert_eq!(extra.backchannel_logout_session_required, Some(true));
+
+        for uri in [
+            "http://192.0.2.10/bcl",
+            "https://192.0.2.10/bcl#f",
+            "https://127.0.0.1/bcl",
+            "https://[::1]/bcl",
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.1/bcl",
+            "https://[fd00::1]/bcl",
+            "https://100.64.0.1/bcl",
+            "https://localhost/bcl",
+        ] {
+            let result = register(
+                payload(serde_json::json!({ "backchannel_logout_uri": uri })),
+                base.clone(),
+                &db,
+                &open,
+            )
+            .await;
+            refused_as_metadata(result, uri);
+        }
+
+        let listed = RegistrationPolicy {
+            guard: crate::backchannel::UriGuard::new(&["localhost".to_string()]),
+            ..RegistrationPolicy::default()
+        };
+        register(
+            payload(serde_json::json!({ "backchannel_logout_uri": "http://localhost:9/bcl" })),
+            base.clone(),
+            &db,
+            &listed,
+        )
+        .await
+        .expect("an allowlisted host is accepted");
+
+        let id = response.client_id().to_string();
+        let token = response
+            .registration_access_token()
+            .unwrap()
+            .secret()
+            .clone();
+        let update = client_update(
+            id,
+            payload(serde_json::json!({ "backchannel_logout_uri": "https://127.0.0.1/bcl" })),
+            Some(headers::Authorization::bearer(&token).unwrap().0),
+            &db,
+            &open,
+        )
+        .await;
+        refused_as_metadata(update, "an update to a loopback URI");
+    }
+
+    #[tokio::test]
+    async fn the_d4_switch_requires_a_backchannel_uri_from_a_client_that_may_refresh() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let generic_on = Config {
+            backchannel_logout_required_for_refresh: true,
+            ..Config::default()
+        };
+        let matrix_on = Config {
+            mas_shared_secret: Some("s".into()),
+            ..generic_on.clone()
+        };
+        let base = Config::default().base_url;
+        let required = RegistrationPolicy::from_config(&generic_on);
+        assert!(required.require_backchannel_for_refresh);
+        for (what, extra) in [
+            ("no grant_types (refresh allowed)", serde_json::json!({})),
+            (
+                "grant_types with refresh_token",
+                serde_json::json!({"grant_types": ["authorization_code", "refresh_token"]}),
+            ),
+        ] {
+            let result = register(payload(extra), base.clone(), &db, &required).await;
+            refused_as_metadata(result, what);
+        }
+        for (what, extra, policy) in [
+            (
+                "a client that may not refresh",
+                serde_json::json!({"grant_types": ["authorization_code"]}),
+                required.clone(),
+            ),
+            (
+                "a client with a back-channel URI",
+                serde_json::json!({"backchannel_logout_uri": "https://192.0.2.10/bcl"}),
+                required.clone(),
+            ),
+            (
+                "the switch off",
+                serde_json::json!({}),
+                RegistrationPolicy::from_config(&Config::default()),
+            ),
+            (
+                "Matrix mode",
+                serde_json::json!({}),
+                RegistrationPolicy::from_config(&matrix_on),
+            ),
+        ] {
+            register(payload(extra), base.clone(), &db, &policy)
+                .await
+                .unwrap_or_else(|e| panic!("{what} registers: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn discovery_advertises_backchannel_logout_only_in_generic_mode() {
+        let generic = provider_metadata_value(&Config::default(), false).unwrap();
+        assert_eq!(generic["backchannel_logout_supported"], true);
+        assert_eq!(generic["backchannel_logout_session_supported"], true);
+        let matrix = provider_metadata_value(
+            &Config {
+                mas_shared_secret: Some("s".into()),
+                ..Config::default()
+            },
+            true,
+        )
+        .unwrap();
+        assert!(
+            matrix.get("backchannel_logout_supported").is_none()
+                && matrix.get("backchannel_logout_session_supported").is_none(),
+            "Matrix mode sends no logout token, so it advertises none: {matrix}"
         );
     }
 }

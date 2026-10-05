@@ -67,23 +67,14 @@ use axum_extra::{
     headers::{authorization::Bearer, Authorization},
     TypedHeader,
 };
-use chrono::Utc;
 use serde_json::json;
 use tracing::{error, info, warn};
 
-use siwx_oidc::db::{DBClient, TokenMetadata};
+use siwx_oidc::db::grant::{GrantKind, NewGrant};
 
 use super::axum_lib::AdminTokenState;
-use super::introspect::{generate_opaque_token, verify_shared_secret};
+use super::introspect::verify_shared_secret;
 use super::synapse_client::SynapseClient;
-
-/// Prefix for minted admin tokens.
-///
-/// Deliberately distinct from the `mat_`/`mcr_` user tokens so an admin
-/// credential is identifiable at a glance in logs, in Redis and during incident
-/// triage. Nothing in the codebase looks a token up by prefix — the prefix is
-/// purely an observability affordance.
-pub const ADMIN_TOKEN_PREFIX: &str = "msa_";
 
 /// Scope granted to a minted admin token.
 ///
@@ -92,12 +83,13 @@ pub const ADMIN_TOKEN_PREFIX: &str = "msa_";
 /// being accepted at all (see the module docs, requirement 2).
 pub const ADMIN_SCOPE: &str = "urn:matrix:client:api:* urn:synapse:admin:*";
 
-/// The stable scope token Synapse tests in `is_server_admin()`.
+/// The stable scope token Synapse tests in `is_server_admin()`. Defined in the
+/// library, where `db::legacy_token_kind` also reads it.
 ///
 /// Referenced by the tests that pin [`ADMIN_SCOPE`]'s composition rather than by
 /// the request path, which uses the pre-joined [`ADMIN_SCOPE`] directly.
 #[allow(dead_code)]
-pub const SYNAPSE_ADMIN_SCOPE: &str = "urn:synapse:admin:*";
+pub const SYNAPSE_ADMIN_SCOPE: &str = siwx_oidc::db::SYNAPSE_ADMIN_SCOPE;
 
 /// The stable MSC2967 C-S API scope Synapse requires before it will accept the
 /// token at all.
@@ -118,7 +110,7 @@ const ADMIN_SUBJECT: &str = "urn:siwx:service:admin";
 /// Display name set on the admin service user when it is first provisioned.
 pub const ADMIN_DISPLAY_NAME: &str = "siwx-oidc service admin";
 
-/// Build the `TokenMetadata` for an admin-scoped token.
+/// Build the `service` grant behind an admin-scoped token.
 ///
 /// This is the SINGLE definition of the admin credential's claims. It is shared
 /// by the HTTP mint endpoint ([`admin_token`], used by shell callers such as
@@ -130,19 +122,26 @@ pub const ADMIN_DISPLAY_NAME: &str = "siwx-oidc service admin";
 /// drop one.
 ///
 /// In particular `device_id` is the empty string, which `introspect` renders as
-/// JSON `null` — see requirement 4. Do not set it to a placeholder.
-pub fn admin_token_metadata(localpart: &str, ttl: u64, now: i64) -> TokenMetadata {
-    TokenMetadata {
+/// JSON `null` — see requirement 4. Do not set it to a placeholder. The grant
+/// carries no refresh token and lives exactly as long as its one access token
+/// (`ttl`, already clamped by the caller); `issue_grant` mints the `msa_` token.
+pub fn admin_service_grant(localpart: &str, ttl: u64) -> NewGrant {
+    NewGrant {
+        kind: GrantKind::Service,
         username: localpart.to_string(),
+        did: ADMIN_SUBJECT.to_string(),
+        client_id: ADMIN_CLIENT_ID.to_string(),
+        confidential_client: false,
         // No device. Rendered as JSON `null` by `introspect` — see module docs
         // requirement 4; an empty string on the wire would make Synapse 500.
         device_id: String::new(),
         scope: ADMIN_SCOPE.to_string(),
-        client_id: ADMIN_CLIENT_ID.to_string(),
-        iat: now,
-        exp: now + ttl as i64,
-        did: ADMIN_SUBJECT.to_string(),
         name: ADMIN_DISPLAY_NAME.to_string(),
+        // Authenticated by this request: the grant store takes Redis `TIME`.
+        auth_ms: None,
+        access_ttl: ttl,
+        // A bearer credential: no refresh token, so no refresh endpoint accepts it.
+        refresh_inactivity_secs: None,
     }
 }
 
@@ -155,6 +154,11 @@ pub const ADMIN_TOKEN_TTL_MIN: u64 = 30;
 /// deployment cannot promote the mint into a long-lived standing admin key by
 /// setting a large TTL in its environment.
 pub const ADMIN_TOKEN_TTL_MAX: u64 = 900;
+
+// An admin token entry written before token kinds were recorded is classified
+// by its lifetime (`db::legacy_token_kind`), so the longest admin TTL must stay
+// within the access-token lifetimes that function recognises.
+const _: () = assert!(ADMIN_TOKEN_TTL_MAX as i64 <= siwx_oidc::db::ACCESS_TOKEN_MAX_LIFETIME);
 
 /// Clamp a configured admin-token TTL into the permitted window.
 pub fn clamp_admin_token_ttl(configured: u64) -> u64 {
@@ -275,15 +279,11 @@ pub async fn admin_token(
     })?;
 
     let ttl = state.admin_token_ttl_secs;
-    let now = Utc::now().timestamp();
-    let token = generate_opaque_token(ADMIN_TOKEN_PREFIX);
     // Shared with the in-process mint in `crate::synapse_client` — see
-    // `admin_token_metadata`. Do not inline these fields again here.
-    let metadata = admin_token_metadata(localpart, ttl, now);
-
-    state
+    // `admin_service_grant`. Do not inline these fields again here.
+    let issued = state
         .redis_client
-        .set_token(&token, &metadata, ttl)
+        .issue_grant(&admin_service_grant(localpart, ttl))
         .await
         .map_err(|e| {
             error!(error = %e, "admin_token: failed to store the minted token");
@@ -293,6 +293,7 @@ pub async fn admin_token(
                 "failed to store the minted token",
             )
         })?;
+    let token = issued.access_token;
 
     info!(
         localpart,
@@ -369,12 +370,25 @@ mod tests {
         );
     }
 
+    /// An admin token is the access token of a `service` grant with no refresh
+    /// token, so no refresh endpoint accepts it, and its grant has no device.
+    #[test]
+    fn an_admin_token_is_an_access_token() {
+        let grant = admin_service_grant("svc", ADMIN_TOKEN_TTL_MAX);
+        assert_eq!(grant.kind, GrantKind::Service);
+        assert_eq!(grant.refresh_inactivity_secs, None);
+        assert_eq!(grant.access_ttl, ADMIN_TOKEN_TTL_MAX);
+        assert_eq!(grant.device_id, "", "no device: rendered as JSON null");
+        assert_eq!(grant.scope, ADMIN_SCOPE);
+    }
+
     /// Admin tokens must be distinguishable from user tokens at a glance.
     #[test]
     fn admin_token_prefix_is_distinct_from_user_token_prefixes() {
+        use siwx_oidc::db::tokens::{self, ADMIN_TOKEN_PREFIX};
         assert_ne!(ADMIN_TOKEN_PREFIX, "mat_");
         assert_ne!(ADMIN_TOKEN_PREFIX, "mcr_");
-        let token = generate_opaque_token(ADMIN_TOKEN_PREFIX);
+        let token = tokens::new_admin_token();
         assert!(token.starts_with(ADMIN_TOKEN_PREFIX));
         assert!(!token.starts_with("mat_"));
     }

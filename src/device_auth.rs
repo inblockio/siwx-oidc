@@ -7,7 +7,9 @@ use crate::config::Config;
 use crate::introspect::generate_opaque_token;
 use crate::oidc::CustomError;
 use crate::synapse_client::SynapseClient;
+use siwx_oidc::db::tokens::digest;
 use siwx_oidc::db::*;
+use siwx_oidc::redact::fingerprint;
 
 /// CAIP-122 nonce-store category for device-approval nonces (C1). The stored
 /// binding is the `user_code` the nonce was minted for.
@@ -92,16 +94,12 @@ pub async fn device_authorization(
     let scope = form.scope.unwrap_or_else(|| "openid".to_string());
 
     // 3. Build entry
-    let entry = DeviceCodeEntry {
-        user_code: user_code.clone(),
-        client_id: form.client_id,
-        scope: scope.clone(),
-        status: DeviceCodeStatus::Pending,
-        did: None,
-        device_id: None,
-        last_poll: None,
-        created_at: chrono::Utc::now().timestamp(),
-    };
+    let entry = DeviceCodeEntry::new(
+        &user_code,
+        form.client_id,
+        scope.clone(),
+        chrono::Utc::now().timestamp(),
+    );
 
     // 4. Store device code and user_code -> device_code mapping
     db_client
@@ -117,8 +115,8 @@ pub async fn device_authorization(
     let verification_uri_complete = format!("{}?user_code={}", verification_uri, user_code);
 
     info!(
-        device_code_prefix = &device_code[..8],
-        user_code = %user_code,
+        device_code_fp = %fingerprint(&device_code),
+        user_code_fp = %fingerprint(&user_code),
         scope = %scope,
         "device_authorization issued"
     );
@@ -899,10 +897,11 @@ pub async fn device_nonce(
     db_client: &(dyn DBClient + Sync),
     user_code: &str,
 ) -> Result<DeviceNonceResponse, CustomError> {
-    // Only mint a nonce for a real, still-pending code.
+    // Only mint a nonce for a real, still-pending code. The nonce is bound to
+    // the user code's digest: the user code is not stored in the clear.
     device_verify(db_client, user_code).await?;
     let nonce = db_client
-        .mint_caip122_nonce(CAIP122_NONCE_CATEGORY_DEVICE, user_code)
+        .mint_caip122_nonce(CAIP122_NONCE_CATEGORY_DEVICE, &digest(user_code))
         .await?;
     let exp = chrono::Utc::now() + chrono::Duration::seconds(CAIP122_NONCE_TTL_SECS as i64);
     Ok(DeviceNonceResponse {
@@ -928,7 +927,7 @@ pub async fn device_approve(
     req: DeviceApproveRequest,
     synapse_client: Option<&SynapseClient>,
 ) -> Result<DeviceApproveResponse, CustomError> {
-    let (device_code, mut entry) = db_client
+    let (device_ref, mut entry) = db_client
         .get_device_code_by_user_code(&req.user_code)
         .await?
         .ok_or_else(|| CustomError::BadRequest("User code not found or expired".to_string()))?;
@@ -940,9 +939,9 @@ pub async fn device_approve(
     if req.action == "deny" {
         entry.status = DeviceCodeStatus::Denied;
         let _ = db_client
-            .update_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
+            .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
             .await;
-        info!(user_code = %req.user_code, "device denied");
+        info!(user_code_fp = %fingerprint(&req.user_code), "device denied");
         return Ok(DeviceApproveResponse {
             status: "denied".to_string(),
             warning: None,
@@ -1007,7 +1006,11 @@ pub async fn device_approve(
                 "Invalid, expired, or replayed device-approval nonce".to_string(),
             )
         })?;
-    if bound_user_code != req.user_code {
+    // A nonce the previous build minted is bound to the user code in the clear.
+    // A digest can never pass that comparison: the user code was looked up
+    // above, and no user code is 64 hex characters.
+    // TODO(remove the raw comparison one release after Phase 2b).
+    if bound_user_code != digest(&req.user_code) && bound_user_code != req.user_code {
         return Err(CustomError::Unauthorized(
             "Device-approval nonce was issued for a different device login".to_string(),
         ));
@@ -1038,10 +1041,12 @@ pub async fn device_approve(
 
     entry.status = DeviceCodeStatus::Approved;
     entry.did = Some(did.clone());
+    // The authentication, from Redis `TIME`: the grant's `auth_time` (I6).
+    entry.auth_ms = Some(db_client.server_time_ms().await?);
     let _ = db_client
-        .update_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
+        .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
         .await;
-    info!(user_code = %req.user_code, did = %did, "device approved");
+    info!(user_code_fp = %fingerprint(&req.user_code), did = %did, "device approved");
 
     Ok(DeviceApproveResponse {
         status: "approved".to_string(),
@@ -1058,7 +1063,7 @@ pub async fn device_approve_passkey(
     synapse_client: Option<&SynapseClient>,
     matrix_server_name: Option<&str>,
 ) -> Result<DeviceApproveResponse, CustomError> {
-    let (device_code, mut entry) = db_client
+    let (device_ref, mut entry) = db_client
         .get_device_code_by_user_code(user_code)
         .await?
         .ok_or_else(|| CustomError::BadRequest("User code not found or expired".to_string()))?;
@@ -1083,10 +1088,11 @@ pub async fn device_approve_passkey(
 
     entry.status = DeviceCodeStatus::Approved;
     entry.did = Some(verified_did.to_string());
+    entry.auth_ms = Some(db_client.server_time_ms().await?);
     let _ = db_client
-        .update_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
+        .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
         .await;
-    info!(user_code = %user_code, did = %verified_did, "device approved via passkey");
+    info!(user_code_fp = %fingerprint(user_code), did = %verified_did, "device approved via passkey");
 
     Ok(DeviceApproveResponse {
         status: "approved".to_string(),
@@ -1128,8 +1134,7 @@ mod tests {
     /// served. Needs Redis for the served half.
     #[tokio::test]
     async fn device_authorization_is_refused_outside_delegated_auth_mode() {
-        use openidconnect::core::{CoreClientMetadata, CoreErrorResponseType};
-        use openidconnect::registration::EmptyAdditionalClientMetadata;
+        use openidconnect::core::CoreErrorResponseType;
         use openidconnect::RedirectUrl;
 
         let Some(db) = siwx_oidc::test_support::redis().await else {
@@ -1138,14 +1143,14 @@ mod tests {
         let client_id = format!("device-auth-{}", uuid::Uuid::new_v4().simple());
         db.set_client(
             client_id.clone(),
-            ClientEntry {
-                secret: "secret".into(),
-                metadata: CoreClientMetadata::new(
+            ClientEntry::new(
+                "secret",
+                SiwxClientMetadata::new(
                     vec![RedirectUrl::new("https://example.com".into()).unwrap()],
-                    EmptyAdditionalClientMetadata {},
+                    LogoutClientMetadata::default(),
                 ),
-                access_token: None,
-            },
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -1173,6 +1178,89 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("delegated-auth mode must issue a code: {e:?}"));
         assert!(issued.device_code.starts_with("dvc_"));
+    }
+
+    /// The device flow handles three secrets: the device code (what the device
+    /// polls with), the user code (what the person types) and, in the page link,
+    /// the same user code. Issuing and denying log at `info!`; the logs may name
+    /// each only by fingerprint, so a reader of the logs cannot approve a device
+    /// or poll for its tokens. Needs Redis.
+    #[tokio::test]
+    async fn the_device_flow_logs_fingerprints_never_its_codes() {
+        use openidconnect::RedirectUrl;
+        use siwx_oidc::redact::fingerprint;
+
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = format!("device-log-{}", uuid::Uuid::new_v4().simple());
+        db.set_client(
+            client_id.clone(),
+            ClientEntry::new(
+                "secret",
+                SiwxClientMetadata::new(
+                    vec![RedirectUrl::new("https://example.com".into()).unwrap()],
+                    LogoutClientMetadata::default(),
+                ),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        let delegated = Config {
+            mas_shared_secret: Some("shared-secret".to_string()),
+            ..Config::default()
+        };
+
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let issued = device_authorization(
+            &delegated,
+            &db,
+            DeviceAuthRequest {
+                client_id,
+                scope: Some("openid".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        device_approve(
+            &delegated,
+            &db,
+            DeviceApproveRequest {
+                user_code: issued.user_code.clone(),
+                action: "deny".to_string(),
+                did: None,
+                message: None,
+                signature: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let output = logs.output();
+
+        for (what, value) in [
+            ("device code", issued.device_code.as_str()),
+            ("user code", issued.user_code.as_str()),
+        ] {
+            assert!(
+                !output.contains(value),
+                "the {what} appears in the logs in the clear:\n{}",
+                output
+                    .lines()
+                    .filter(|l| l.contains(value))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            assert!(
+                output.contains(&fingerprint(value)),
+                "the logs never name the fingerprint of the {what}; captured:\n{output}"
+            );
+        }
+        assert!(
+            !output.contains(&issued.device_code[..8]),
+            "no part of the device code is logged either:\n{output}"
+        );
     }
 
     #[test]

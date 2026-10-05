@@ -191,6 +191,13 @@ jobs:
       SIWXOIDC_ADDRESS: 127.0.0.1
       SIWXOIDC_PORT: "18080"
       SIWXOIDC_BASE_URL: http://localhost:18080
+      # Also read by e2e_race_teardown's keyspace scans
+      # (no_token_the_client_holds_is_stored_in_the_clear,
+      # no_code_or_session_the_client_holds_is_stored_in_the_clear,
+      # no_client_secret_or_registration_token_is_stored_in_the_clear) and by its
+      # upgrade tests, which seed the legacy layouts there
+      # (legacy_tokens_keep_working_after_the_upgrade,
+      # in_flight_codes_and_sessions_survive_the_upgrade).
       SIWXOIDC_REDIS_URL: redis://localhost:6379
       SIWXOIDC_MAS_SHARED_SECRET: testsecret
       SIWXOIDC_SYNAPSE_ENDPOINT: http://localhost:8090
@@ -258,11 +265,35 @@ jobs:
           cat /tmp/siwx-oidc.log >&2
           exit 1
 
-      # MSC4191 account-management protocol flows (6/6 promoted).
+      # A second siwx-oidc in GENERIC mode (no MAS shared secret, no Synapse), on
+      # its own port and Redis database: only there is a code grant an `oidc`
+      # grant, the kind that sends back-channel logout tokens. `localhost` is
+      # allowlisted so the stub RP in the Synapse mock may receive them.
+      - name: Start siwx-oidc (generic mode)
+        run: |
+          nohup env -u SIWEOIDC_HOST -u SIWXOIDC_MAS_SHARED_SECRET -u SIWXOIDC_SYNAPSE_ENDPOINT \
+            -u SIWXOIDC_MATRIX_SERVER_NAME \
+            SIWXOIDC_PORT=18081 SIWXOIDC_BASE_URL=http://localhost:18081 \
+            SIWXOIDC_REDIS_URL=redis://localhost:6379/1 \
+            SIWXOIDC_BACKCHANNEL_LOGOUT_ALLOWED_HOSTS='["localhost"]' \
+            ./target/debug/siwx-oidc > /tmp/siwx-oidc-generic.log 2>&1 &
+          for _ in $(seq 1 60); do
+            if curl -sf "http://localhost:18081/health" >/dev/null 2>&1; then
+              echo "generic siwx-oidc healthy"; exit 0
+            fi
+            sleep 0.5
+          done
+          echo "generic siwx-oidc did not become healthy on :18081" >&2
+          cat /tmp/siwx-oidc-generic.log >&2
+          exit 1
+
+      # MSC4191 account-management protocol flows (8/8 promoted).
       - name: E2E account management
         run: cargo test --test e2e_account_management -- --ignored --test-threads=1
 
-      # C1/C2 OAuth + CAIP-122 signature-binding hardening (11/11 promoted).
+      # OAuth + CAIP-122 binding: authorization request bound at /authorize, exact
+      # redirect URIs, single-use codes, one token kind per endpoint, refresh tokens bound to
+      # their client (28/28 promoted).
       - name: E2E OAuth binding
         run: cargo test --test e2e_oauth_binding -- --ignored --test-threads=1
 
@@ -276,6 +307,16 @@ jobs:
       # now asserted too, and `e2e_device_code` below is its independent twin.
       - name: E2E race and teardown
         run: cargo test --test e2e_race_teardown -- --ignored --test-threads=1
+
+      # H7: OpenID Connect Back-Channel Logout against the generic-mode server and
+      # the stub RP in the Synapse mock (/__rp/*): a verifiable logout token for
+      # every oidc-grant deletion, bounded retries, no delivery to a refused
+      # address class.
+      - name: E2E back-channel logout
+        env:
+          SIWX_GENERIC_HOST: http://localhost:18081
+          E2E_GENERIC_REDIS_URL: redis://localhost:6379/1
+        run: cargo test --test e2e_backchannel_logout -- --ignored --test-threads=1
 
       # GET /resolve is a PUBLIC, unauthenticated route, and its 15 unit tests all
       # call `resolve::resolve()` with a hand-built `ResolveQuery` -- so the Axum

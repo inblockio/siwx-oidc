@@ -263,27 +263,89 @@ authentication to siwx-oidc.
 
 ## Token model
 
-Both modes store token metadata (`TokenMetadata`) in Redis. Tokens are opaque
-random strings.
+Both modes issue the same token formats and keep every token in a **grant**
+(`src/db/grant.rs`), the one Redis record that owns a session's access and
+refresh tokens:
+
+| Token | Format |
+|---|---|
+| access | `mat_` + 32 base62 characters |
+| minted admin token (a `service` grant's access token) | `msa_` + 32 base62 characters |
+| refresh | `mcr_` + handle (22 base62 characters, about 131 random bits) + `_` + secret (32 base62 characters) |
+
+The handle names the grant, so every refresh token of a chain, current or
+superseded, leads to its grant; it is random and never derived from the device
+ID. **No token is stored**: an access token is kept as the SHA-256 digest of the
+token (`at/{digest}`), a refresh token as the digest in its grant's `current_rt`
+or `previous_rt`, and the one value that must be handed back later, the
+successor pair of a rotation, is encrypted under a key derived from the previous
+refresh token (AES-256-GCM, HKDF-SHA256), which only its presenter holds. Log
+lines name tokens by fingerprint only. The keyspace is in
+[architecture.md](architecture.md#redis-keyspace).
 
 | | Delegated auth | Standalone |
 |---|---|---|
-| Access token prefix | `mat_` | none |
-| Refresh token prefix | `mcr_` | none |
-| Scope recorded | `openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}` | `openid profile` |
+| Grant kind | `matrix_device` | `oidc` |
+| Refresh token issued | always | only for `offline_access`, to a client whose registration allows the `refresh_token` grant |
+| Scope recorded | `openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}` | the requested scopes among `openid`, `profile` and `offline_access`, as far as the client may have them (`openid` if none) |
 | Access token TTL | 300 s | 300 s |
 | Refresh token TTL | 7,776,000 s (90 days), renewed by each rotation | same |
+| Absolute lifetime | none by default; with `grant_absolute_lifetime_secs` (or the per-client map) the grant ends at its authentication plus the cap, and no access token outlives that ([configuration.md](configuration.md#grant-lifetime)) | same |
 | ID token TTL | 300 s by default (`id_token_ttl_secs`) | same |
 | Introspection | active | 404 |
 | Device ID | `SIWX_` + 8 hex characters, or the ID the client requested | empty |
 
-Minted admin tokens use the prefix `msa_`. Device codes use `dvc_`.
+Minted admin tokens (`service` grants, no refresh token) use the prefix
+`msa_`. Device codes use `dvc_`.
 
-The authorization-code grant records the Matrix scope above regardless of the
-scopes requested. Clients request the Matrix scopes in either the stable form
+In delegated-auth mode the authorization-code grant records the Matrix scope
+above regardless of the scopes requested, and always issues a refresh token. In
+standalone mode ("generic mode": no `mas_shared_secret`) it grants least
+privilege: the scope the request asked for, limited to `openid`, `profile` and
+`offline_access`, and a refresh token only when `offline_access` was requested and
+the client's registration allows the `refresh_token` grant (a registration that
+lists no `grant_types` allows it). When the granted scope differs from the
+request, the token response says so in `scope` (RFC 6749 §5.1). The requested scope
+travels from `/authorize` through the session into the stored code. A code
+written by the previous build has none, and is exchanged as it always was
+(`openid profile` and a refresh token) for the 300 s it lives.
+
+Clients request the Matrix scopes in either the stable form
 (`urn:matrix:client:api:*`, `urn:matrix:client:device:{id}`) or the MSC2967
 unstable form (`urn:matrix:org.matrix.msc2967.client:…`); both are advertised.
-PKCE is required with `S256`; `plain` is rejected.
+
+`/authorize` accepts only `response_type=code`, the only response type
+discovery advertises, and requires PKCE with `S256` (`plain` is rejected). The
+redirect URI must equal a registered one exactly, query included. `/authorize`
+binds the validated request (client, redirect URI, state, response mode, PKCE
+challenge) to the login session, and `/sign_in` issues the code for that
+request. `/sign_in` reads no authorization parameter from its query: the login
+page still appends them to its link, and they are ignored. A code is single use,
+is deleted when it is exchanged, and is redeemable only at `POST /token` with
+its verifier.
+
+### Token kinds
+
+Every token is either an **access token** or a **refresh token**: an access
+token has an `at/…` entry that says so, a refresh token is known only to its
+grant, and a legacy entry (`token/{raw}`, written before the grant record)
+records its kind in its `TokenMetadata`. A minted admin token is an access
+token. Each endpoint accepts exactly one kind:
+
+| Endpoint | Accepts |
+|---|---|
+| `POST /token` (`grant_type=refresh_token`), `POST /_matrix/client/v3/refresh` | refresh token |
+| `POST /oauth2/introspect`, `GET`/`POST /userinfo` | access token |
+| `POST /_matrix/client/v3/logout`, `logout/all`, `DELETE /_matrix/client/v3/devices/{id}`, `POST /_matrix/client/v3/delete_devices` (bearer) | access token |
+| `POST /oauth2/revoke` (RFC 7009) | either |
+
+A token of the other kind is answered exactly like an unknown token
+(`invalid_grant`, `M_UNKNOWN_TOKEN`, `{"active": false}`, or a no-op `200` for
+logout), and is left untouched. Token entries written before the kind was
+recorded are classified by their lifetime, which every earlier writer fixed:
+at most 900 s is an access token (300 s user tokens, 30–900 s admin tokens),
+90 days a refresh token. A long-lived entry that carries the admin scope fits
+no earlier writer and is accepted nowhere; revocation still removes it.
 
 ### An empty `device_id` is JSON `null`
 
@@ -297,38 +359,294 @@ token.
 
 ### Lifecycle
 
-1. `POST /token` with `grant_type=authorization_code` consumes the code and
-   stores an access token and a refresh token.
-2. `POST /token` with `grant_type=refresh_token` **rotates both**: a new access
-   token, a new refresh token, and the old refresh token is deleted. The
-   `device_id` and scope are carried over. The refresh response has no ID
-   token.
-3. **Lost-response grace.** On a successful rotation, siwx-oidc records the old
-   refresh token → the successor pair for `REFRESH_GRACE_TTL` (60 s). A client
-   that lost the response (common on mobile) and retries with the old refresh
-   token within that window receives the **same** successor pair instead of
-   `invalid_grant`. Nothing new is minted and the refresh lifetime does not
-   grow. The same mechanism applies to `POST /_matrix/client/v3/refresh`. See
+1. `POST /token` with `grant_type=authorization_code` consumes the code (reads
+   and deletes it in one atomic step), checks the PKCE verifier against the
+   challenge bound at `/authorize`, and creates a **grant**: one record that
+   owns the access token and the refresh token (generic mode: a refresh token
+   only for `offline_access`). Every token belongs to exactly one grant, and
+   deleting the grant makes all its tokens inert at once.
+2. `POST /token` with `grant_type=refresh_token` and `POST
+   /_matrix/client/v3/refresh` **rotate both** through one atomic Redis script
+   (`RedisClient::rotate_refresh_token`): a new access token and a new refresh
+   token, after which the presented refresh token is the grant's previous one.
+   The `device_id` and scope are carried over. The refresh response has no ID
+   token. At `POST /token` the refresh is bound to the client it was issued
+   to, see [Client binding](#client-binding). Concurrent refreshes of one
+   token all receive the same new pair; the grant keeps one live chain.
+3. **Lost responses.** A client that lost a rotation response (common on
+   mobile) and retries with the previous refresh token receives the **same**
+   successor pair, however late it retries, as long as that pair is unused.
+   The pair counts as used once its access token is first accepted by
+   introspection or `/userinfo`, or once its refresh token rotates. A replay
+   after that, or of any older token of the grant, is **reuse**: it is answered
+   like an unknown token (`invalid_grant`, `M_UNKNOWN_TOKEN`) and logged as one
+   `warn!` security event, message `refresh token reuse detected`, fields
+   `security_event="refresh_token_reuse"`, `grant_fp`, `generation`,
+   `client_id`, `grant_kind`, `branch`, `grant_revoked` (fingerprints only).
+   By default reuse revokes nothing (`grant_revoked=false`). With
+   [`reuse_revokes_grant`](configuration.md#refresh-token-reuse) on, the same
+   script also deletes the grant, as revoking its refresh token would: its
+   access tokens are inactive at once, whoever holds its current refresh token
+   is refused at the next refresh (the point of enforcement: one of the two
+   holders is not the client), a generic RP is sent a back-channel logout
+   token, and the Synapse device is not deleted; the answer is still the
+   unknown-token answer and the event says `grant_revoked=true`. A replay of
+   the previous token while its pair is unused is a lost response, never reuse,
+   so it never revokes. The switch is off until the maintainers decide (design
+   decision D2). Nothing new is minted for a replay and the refresh lifetime
+   does not grow. `POST /_matrix/client/v3/refresh` applies the same rule; it
+   carries no client identity, so it cannot bind the replay to a client. See
    [the 2026-06-23 audit](audits/2026-06-23-elementx-refresh-rotation-signout.md).
 4. `POST /token` with the device-code grant provisions the Synapse device and
    issues tokens (see [below](#device-code-and-qr-login)).
-5. `/userinfo` looks the token up, and falls back to the older authorization-code
-   record for deployments that predate refresh tokens.
+5. `/userinfo` accepts an access token only. An authorization code is not a
+   bearer token, before or after its exchange.
+6. **RP-initiated logout.** Every grant issued with an ID token has a random
+   session id, `sid`, which its ID token carries (both modes). `GET` or `POST
+   /end_session` (OpenID Connect RP-Initiated Logout 1.0, advertised as
+   `end_session_endpoint`) with an `id_token_hint` ends exactly the grant that
+   `sid` names, if it belongs to the hint's client and subject: its access
+   token is inactive at once and its refresh token is refused at both
+   endpoints. The hint must be an ID token this provider signed, with the live
+   or a retired key; an expired one is accepted. A `client_id` must be the
+   hint's audience. A `post_logout_redirect_uri` is honoured only when the
+   client registered it (`post_logout_redirect_uris`, matched exactly, query
+   included), with `state` appended; without one the answer is a signed-out
+   page. Any refusal is a 400 that ends nothing and never redirects; a store
+   fault is a 503. End-session never deletes a Synapse device: in Matrix mode
+   it ends the device's grant and leaves the device to the Matrix `logout` or
+   the account page, like `/oauth2/revoke`. A grant issued before `sid`
+   existed has none and ends by revocation, expiry or an epoch instead.
+7. **Back-channel logout** (OpenID Connect Back-Channel Logout 1.0, generic
+   mode). A client may register `backchannel_logout_uri` and
+   `backchannel_logout_session_required`. Every active deletion of one of its
+   `oidc` grants sends it a logout token: revocation of the refresh token,
+   end-session, a refresh refused for an epoch, inactivity or the absolute
+   expiry (the refusal deletes the grant), and the revocation of all of a
+   user's grants (`logout/all`, deactivation, erasure). The deleting script
+   queues the entry in a Redis outbox; a worker in every instance delivers it
+   apart from the request, signing a fresh ES256 token per attempt (`typ`
+   `logout+jwt`, `aud` the client, `sub` the DID, the grant's `sid`, `exp`
+   two minutes after `iat`), and retries a failing RP five times in all with
+   2 s doubling backoff before dropping the entry with a warning. **A grant
+   whose Redis key simply expires sends nothing:** no script runs, nothing
+   observes it, and the RP's own refresh token expired with it, so the RP
+   learns of it at its next refresh (`invalid_grant`). Likewise an epoch that
+   so far only refused an access token sends nothing until a refresh deletes
+   the grant. A Matrix device grant never sends a logout token (Synapse is not
+   a relying party here), so Matrix mode does not advertise
+   `backchannel_logout_supported`. The URI passes an SSRF guard at
+   registration and at every delivery (`https`, public addresses only, no
+   redirects; an operator allowlist exempts named hosts): see
+   [configuration.md](configuration.md#back-channel-logout).
+
+**What Element Web sends on sign-out.** Element Web signed in through the
+OAuth 2.0 API does not call `POST /_matrix/client/v3/logout`; it revokes both
+tokens at `/oauth2/revoke` in parallel, each with `client_id` and
+`token_type_hint` (matrix-js-sdk 42.4, `Lifecycle.ts` `doLogout`). In Matrix
+mode either revocation ends the device's grants (the first one wins, the
+second finds nothing and answers 200), and neither deletes the Synapse device
+(`TeardownPolicy::TokensOnly`): the device stays until it is removed from the
+session list or the account page. Grant-level RFC 7009 (provisional): for a
+token with no device, a refresh token ends its grant and an access token only
+itself. Pin: `h1_revoke_does_not_delete_device_but_logout_does`,
+`teardown_policy_only_deletes_device_on_explicit_signout`,
+`revoking_a_deviceless_refresh_token_revokes_its_grant_an_access_token_only_itself`,
+`revoking_by_token_deletes_the_grant_of_an_accepted_token_only`.
+
+**Lifetime.** A grant ends 90 days after its last refresh and, when an
+absolute lifetime is configured (`grant_absolute_lifetime_secs`, per client
+`grant_absolute_lifetime_secs_by_client`; none by default), at its
+authentication plus that cap. The authentication is the sign-in or the
+device approval, stamped from Redis `TIME`; a grant lifted from a legacy
+refresh token counts from that token's issue time, the last refresh under the
+previous build (the true sign-in was never recorded). Past either deadline
+both refresh endpoints answer as for an unknown token (`invalid_grant`,
+`M_UNKNOWN_TOKEN`) and delete the grant, and introspection answers inactive.
+No access token's `exp` passes the absolute expiry. The deadline only moves
+earlier: a lowered cap reaches a grant at its next refresh, a raised or
+removed one extends nothing. For an Element user the end of a grant is a
+sign-out, and signing in again usually means a new device with key-backup
+restore, so choose a short cap with care.
 
 A refresh is refused (`invalid_grant`, "Session has been revoked.") when the
-device was just signed out or the account just deactivated. Short-lived Redis
-tombstones (15 minutes) close the race between a refresh and a concurrent
-teardown.
+device was just signed out (a short-lived device tombstone, 15 minutes, closes
+the race between a refresh and the teardown) or when an epoch refuses the
+grant.
+
+### Epochs
+
+An epoch is a persistent not-before timestamp (Unix milliseconds, Redis
+`TIME`) for one scope: `epoch:global`, `epoch:client/{client_id}` or
+`epoch:user/{username}`. Every grant authenticated at or before the largest
+epoch that applies to it is refused at both refresh endpoints and is inactive
+at introspection at once (Synapse may still answer from its two-minute
+introspection cache); a grant authenticated later is untouched. One write
+revokes a whole scope, with no enumeration.
+
+`logout/all`, deactivation and erasure set the user epoch (and still delete
+the user's grants). A sign-in right after `logout/all` therefore refreshes at
+once; the user tombstone the epoch replaced refused that for 15 minutes. A
+user tombstone planted by the previous build is still honoured until it
+expires.
+
+Global and client epochs have no HTTP endpoint. An operator sets one with a
+single script that takes the time from Redis `TIME` and never moves an epoch
+earlier (provisional; it is what `RedisClient::set_epoch` runs):
+
+```bash
+redis-cli -u "$REDIS_URL" EVAL "local t = redis.call('TIME') \
+  local ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000) \
+  local cur = tonumber(redis.call('GET', KEYS[1]) or '0') \
+  if ms > cur then redis.call('SET', KEYS[1], string.format('%.0f', ms)) cur = ms end \
+  return string.format('%.0f', cur)" 1 epoch:global      # or epoch:client/<client_id>
+```
+
+Every user of the scope signs in again; for Matrix clients that usually
+means a new device with key-backup restore. An epoch has no TTL: deleting the
+key lifts it for grants not yet refused (a grant refused at a refresh
+endpoint is already deleted).
+
+### Upgrading from a build before the grant record
+
+Builds before the grant record stored each token as `token/{raw}` with its
+`TokenMetadata`. After the upgrade no user signs in again:
+
+- A legacy **access** token stays valid until it expires (at most 900 s): the
+  access check reads the legacy entry when no `at/…` entry exists. This read
+  fallback is removed one release after the upgrade.
+- A legacy **refresh** token presented at either refresh endpoint is **lifted**
+  into a new grant and answered with a pair in the current format. One script
+  deletes the legacy entry, creates the grant with the legacy token as its
+  previous refresh token and the new pair sealed under it, and writes a pointer
+  `legacy_rt/{digest(legacy token)}` to the grant. A concurrent or later
+  presentation of the same legacy token follows the pointer and gets the rule
+  above: the same pair while it is unused, reuse after. `POST /token`
+  authenticates the legacy entry's client as for any refresh; the Matrix endpoint
+  lifts only a public client's token and leaves a confidential client's for
+  `POST /token`. The grant records the client's confidentiality by the same rule
+  as every issuance.
+- Legacy grace pointers (`token_rotated/{raw}`, 60 s) are not read. A client
+  that lost a refresh response in the minute before the upgrade signs in again.
+- Legacy refresh tokens never presented expire on their own within 90 days;
+  revocation sweeps them in the meantime.
+- `siwx_user` hints and account sessions the previous build wrote by raw token
+  (`user:session/…`, 30 days; `account_session/…`, 600 s) keep working until
+  they expire; the build writes only the digest layout. `logout/all`,
+  deactivation and erasure end the old entries too, by a prefix scan that goes
+  with the legacy read.
+- A rollback to a build before the grant record signs out every session that
+  refreshed on the new build: the old build knows neither the grant tokens nor
+  the lifted legacy tokens, whose entries are gone.
+- A rollback to a build before digest-keyed credentials cannot read a client
+  entry the new build wrote or upgraded (it has no `secret` member): those
+  clients fail until they register again or the entry expires (30 days). The
+  old build writes `default_clients` in the clear again at its start, and
+  in-flight codes, sessions and device codes are lost.
+- A rollback to a build before epochs and the absolute lifetime honours
+  neither. Only a refresh deletes a grant an epoch refuses; the access check
+  only refuses it, so after a rollback every grant under a global or client
+  epoch that has not refreshed since is accepted again, and so is a grant issued
+  after an epoch from an earlier code or approval. Under a user epoch only such
+  a late grant comes back, because `logout/all`, deactivation and erasure delete
+  the grants the user has when they run. Caps stop applying: the old rotation
+  extends a grant to 90 days of inactivity again. The epoch keys outlive the
+  rollback, so after rolling forward the same grants are refused again; to keep
+  them refused during the rollback, delete them before rolling back.
+- A rollback to a build before `sid` serves no `/end_session` (404) and issues
+  ID tokens without `sid`. It ignores the grants' `sid` field and the
+  `idx:grants:sid/*` keys: its rotation extends a grant but not the index
+  entry, and its deletions leave the entry behind (it names a grant that is
+  gone, and expires on its own). After rolling forward, end-session ends
+  nothing for a grant whose index entry expired during the rollback; that grant
+  still ends by revocation, expiry or an epoch. Its client registration reads
+  `post_logout_redirect_uris` without knowing it, and a client update through
+  the old build drops it.
+- A rollback to a build before digest-keyed own sessions reads neither
+  `siwx_user/…` nor `acct_session/…`: account pages ask for a new re-auth and
+  passkey pickers are unscoped until the next sign-in. Nothing is lost that a
+  sign-in does not restore; `logout/all` on the old build does not end the
+  sessions written by the new one (they expire on their own, at most 30 days for
+  a hint, which scopes a picker and authorizes nothing). Rolling forward reads the
+  old build's raw-keyed sessions again for their remaining lifetime.
+- A rollback to a build before back-channel logout sends no logout tokens and
+  queues none. Entries queued before the rollback stay in
+  `outbox:backchannel_logout` and are delivered when a build with the worker
+  runs again, with fresh tokens; a deletion made during the rollback is never
+  sent. Client registrations keep `backchannel_logout_uri` without the old build
+  knowing it, and a client update through the old build drops it.
+
+A token-store fault is never answered as a refusal. `POST
+/_matrix/client/v3/refresh` and the device-deletion routes (`DELETE
+/_matrix/client/v3/devices/{id}`, `POST /_matrix/client/v3/delete_devices`)
+answer it with a retryable 503 `M_UNKNOWN`: a Matrix client takes
+`M_UNKNOWN_TOKEN` for "signed out" and clears its crypto store, so reporting a
+transient Redis fault that way would cost the session and its cryptographic
+identity. The rotation script runs entirely or not at all, so a retry with the
+same refresh token is safe.
+
+### Client binding
+
+An authorization code and a refresh token belong to the client they were issued
+to, and `POST /token` authenticates that client by one rule for both grants
+(`oidc::authenticate_code_client` and `oidc::authenticate_refresh_client`, which
+share their checks and differ only in tolerating an expired registration, below):
+
+1. The client named in the request must be the grant's client, else
+   `invalid_grant`. It is named by `client_id` in the form or by the user name
+   of an `Authorization: Basic` header; when both are present they must agree
+   (else `invalid_request`).
+2. A secret the request presents (`client_secret` in the form, or the
+   `Authorization` password or Bearer value, which wins) must match the
+   registration, else `invalid_client`. The registration holds only the
+   secret's SHA-256 digest; the presented secret is digested and compared in
+   constant time.
+3. A request that presents none must come from a public client: registered
+   with `token_endpoint_auth_method: none`, or with no method while
+   `SIWXOIDC_REQUIRE_SECRET` is off. Otherwise `invalid_client`
+   ("Secret required."). Element Web and Element X register as public clients and send
+   `client_id` on refresh.
+
+`invalid_client` is a 401 (RFC 6749 §5.2), with `WWW-Authenticate: Basic` when
+the request attempted Basic. It used to be a 400. The replay of a lost response
+is bound the same way, to the grant's client.
+
+`POST /_matrix/client/v3/refresh` serves public clients only. The Matrix
+client-server API gives a refresh request no client identity, so the endpoint
+cannot authenticate a client: it refuses the refresh token of a grant whose
+client is confidential exactly like an unknown token (`M_UNKNOWN_TOKEN`) and
+leaves it untouched, so the client still refreshes at `POST /token` with its
+secret. Each grant records at issuance whether its client is confidential, by
+rule 3 above (a client without a registration counts as public). A public
+client's token needs no authentication there; rule 1 cannot apply, since no
+client is named.
+
+Provisional choices, open for the maintainers:
+
+- **A registration without `grant_types` allows the refresh grant**, and a
+  generic-mode request that asks for no grantable scope is granted `openid`.
+- **A public client may omit `client_id` at the refresh grant.** `siwx-oidc-auth`
+  and the Matrix clients send it, an older agent may not; requiring it would
+  sign those out.
+- **A token outlives its client's registration.** A registration lasts 30 days
+  and a refresh token 90 days from its last use, so a session can outlast the
+  registration it was issued under. Such a token keeps refreshing when the
+  request names that client or none, and is refused when the request names
+  another client or presents a secret (which can no longer be checked). Refusing
+  it outright would sign out every session older than a registration.
+
+An `Authorization` header at `/token` used to be answered with a 400 on every
+request (two header extractors rejecting each other's scheme), so
+`client_secret_basic` never worked. It is read now, and discovery advertises
+`client_secret_basic`, `client_secret_post` and `none`.
 
 ### Introspection never turns a storage error into a logout
 
 If Redis cannot be read, introspection answers **500**, never
 `{"active": false}`. Synapse caches a negative result for two minutes, and an
 inactive token is a hard logout that makes the client discard its crypto store.
-Only a token that is genuinely absent or expired is inactive.
-
-When upgrading from a release that predates refresh tokens, flushing Redis is
-recommended; old sessions still work through the fallback path.
+Only a token that is genuinely absent, expired, or not an access token is
+inactive.
 
 ## Admin-scoped token mint
 
@@ -439,7 +757,7 @@ sign-out deletes the device, token hygiene does not.
 
 | Endpoint | Policy | Synapse | Tokens |
 |---|---|---|---|
-| `POST /oauth2/revoke` (RFC 7009) | `TokensOnly` | nothing; the device is **never** deleted | all tokens of this `(user, device)`: the access token and its paired refresh token |
+| `POST /oauth2/revoke` (RFC 7009) | `TokensOnly` | nothing; the device is **never** deleted | the grants of this `(user, device)`: the access token and its paired refresh token |
 | `POST /_matrix/client/v3/logout` | `DeleteDevice` | deletes this session's device | same as revoke |
 | `POST /_matrix/client/v3/logout/all` | bulk | lists the user's devices and deletes each (best-effort per device) | all of the user's tokens |
 | `DELETE /_matrix/client/v3/devices/{id}`, `POST …/delete_devices` | delete | deletes the named devices of the bearer's own account | tokens of each device |
@@ -449,17 +767,29 @@ sign-out deletes the device, token hygiene does not.
   rotation and when dialogs are dismissed. Deleting the device there raced
   in-flight key uploads and broke users' cross-signing identity in a June 2026
   incident.
-- `logout/all` ends sessions; it does **not** deactivate the account.
-- All teardown is best-effort and idempotent, and never returns 500. Revoke,
-  logout and `logout/all` always answer 200 (`{}` for the Matrix routes), even
-  for an unknown token. Without a Synapse client or server name, teardown
-  revokes Redis tokens only. Revocation is keyed on the localpart
-  (`TokenMetadata.username`), not the raw DID.
+- `logout/all` ends sessions; it does **not** deactivate the account. It also
+  ends the user's own sessions at this provider: every `siwx_user` picker hint
+  and `acct_session` account session of the DID (deactivation and erasure do
+  too).
+- All teardown is idempotent and never returns 500. Revoke always answers 200;
+  logout and `logout/all` answer 200 (`{}`), also for an unknown token, unless
+  the token store fails: then they answer the retryable 503 (`M_UNKNOWN`) of the
+  refresh and device-deletion routes, never a success that revoked nothing. A
+  failed logout leaves the bearer valid, so the client's retry tears the whole
+  session down; the Synapse device deletes stay best-effort. Revoke keeps its
+  best-effort fallback (it deletes the presented token where it can) and its
+  200. Without a Synapse client or server name, teardown
+  revokes Redis tokens only. Revocation is keyed on the localpart (the grant's
+  `username`, and `TokenMetadata.username` for a legacy entry), not the raw DID.
 - In standalone mode tokens have no device, so revoke and logout remove only the
-  presented token.
+  presented credential: an access token alone, or, for a refresh token, its whole
+  grant, the grant's live access token included (RFC 7009 §2.1). The second half
+  is provisional, for the maintainers to confirm; before the grant record a
+  revoked refresh token left its access token alive for up to 300 s.
 - The legacy device-deletion routes accept the bearer token as authorization,
   with no user-interactive auth step, as MAS does for delegated device deletion.
-  An unknown token answers 401 `M_UNKNOWN_TOKEN`.
+  An unknown token answers 401 `M_UNKNOWN_TOKEN`; a token-store fault answers a
+  retryable 503 `M_UNKNOWN` (see above), never a refusal.
 
 ## Account management (MSC4191)
 
@@ -500,7 +830,11 @@ included, to the action it dispatches.
   (`Path=/account`, `HttpOnly`, `SameSite=Strict`, 10 minutes) bound to the
   verified DID, and returns a CSRF token. Further actions go to
   `POST /account/action` with the cookie and the CSRF token, without a new
-  signature. Deactivate and erase clear the cookie.
+  signature. Deactivate and erase clear the cookie and end every account
+  session and `siwx_user` hint of the user. The session is stored under the
+  digest of the cookie value (`acct_session/{sha256}`), and the page's
+  **Sign out** button (`POST /account/sign_out`) ends it together with this
+  browser's `siwx_user` hint.
 - **No action given.** `GET /account` with no or an empty `action` shows a menu
   (profile, sessions, deactivate, erase, reactivate). Element Web's generic
   "Manage account" opens the bare URL, and the menu is the only way an Element
@@ -536,8 +870,8 @@ included, to the action it dispatches.
 - **Standalone.** Every action requires `SIWXOIDC_MATRIX_SERVER_NAME`, and all
   but `profile` require a Synapse client. Without them the action answers 400
   with a clear message, never 500.
-- Deactivation and erasure plant a deactivation tombstone first, so a refresh
-  racing the sweep cannot restore access.
+- Deactivation and erasure set the user epoch first, so a refresh racing the
+  sweep cannot restore access, and every grant from before is refused at once.
 - Erasure removes the DID's `webauthn:link/*` entries and credentials, and
   standalone passkeys whose key derives to that `did:key`, so the DID cannot be
   signed into again from a leftover passkey.
@@ -575,6 +909,10 @@ Rules:
 - **Existing accounts only.** Approval rejects a DID with no account (400) and a
   deactivated account (401). See [Gates](#gates-that-protect-accounts).
 - The tokens belong to the **approving** user's DID, not to the device.
+- The device code, the user code and the approval nonce are stored only as
+  digests (`device_code/`, `user_code/`, `caip122/` in the
+  [Redis keyspace](architecture.md#redis-keyspace)); the user code is hashed
+  exactly as presented, which the approval page sends trimmed and upper-cased.
 
 ### MSC4108 and Secure Backup
 

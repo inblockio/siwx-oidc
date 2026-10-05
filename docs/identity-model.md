@@ -30,7 +30,8 @@ spelling is still accepted; see [configuration.md](configuration.md).
 
 The DID is also the OIDC `sub` claim of every ID token this provider issues.
 That is the identity an application authorizes on (see the
-[trust model](#trust-model-a-discovery-hint-never-an-authorization-source)).
+[trust model](#trust-model-a-discovery-hint-never-an-authorization-source)). It is the same for
+every client, so discovery advertises `subject_types_supported: ["public"]`, never `pairwise`.
 
 ### The boundary is structural
 

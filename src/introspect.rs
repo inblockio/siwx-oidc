@@ -3,9 +3,9 @@
 //! This module provides:
 //! - `POST /oauth2/introspect` for Synapse to validate opaque access tokens
 //!   (active only when `mas_shared_secret` is configured; a 404 otherwise)
-//! - `generate_opaque_token`, used for every opaque token this provider issues
-//!   (`mat_`/`mcr_` in MSC3861 mode, unprefixed in standalone mode, `msa_` for
-//!   minted admin tokens)
+//! - `generate_opaque_token`, the random opaque string behind the RFC 8628
+//!   device code (`dvc_`). Access, refresh and admin tokens have their own
+//!   formats in `siwx_oidc::db::tokens`.
 
 use axum::{
     extract::{Form, State},
@@ -16,13 +16,12 @@ use axum_extra::{
     headers::{authorization::Bearer, Authorization},
     TypedHeader,
 };
-use chrono::Utc;
 use rand::{thread_rng, Rng};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use tracing::warn;
 
-use siwx_oidc::db::{DBClient, TokenMetadata};
+use siwx_oidc::db::{TokenKind, TokenMetadata};
 
 use super::axum_lib::IntrospectState;
 
@@ -106,8 +105,14 @@ pub async fn introspect(
     }
 
     // Look up the token in Redis.
-    let lookup = state.redis_client.get_token(&form.token).await;
-    render_introspection(lookup, Utc::now().timestamp())
+    // Judged and rendered on the store's Redis `TIME` (I6), never this
+    // instance's clock.
+    let lookup = state.redis_client.check_access_token_at(&form.token).await;
+    let now = match &lookup {
+        Ok(Some((_, now))) => *now,
+        _ => 0,
+    };
+    render_introspection(lookup.map(|found| found.map(|(meta, _)| meta)), now)
 }
 
 /// Render an introspection lookup outcome.
@@ -138,7 +143,9 @@ fn render_introspection(
     };
 
     match metadata {
-        Some(m) if m.exp > now => {
+        // Only an access token is a bearer credential. A refresh token, or an
+        // entry of no known kind, renders exactly like an unknown token.
+        Some(m) if m.exp > now && m.is_kind(TokenKind::Access) => {
             let device_id = render_device_id(&m.device_id);
             Ok(Json(serde_json::json!({
             "active": true,
@@ -154,8 +161,9 @@ fn render_introspection(
             "iat": m.iat,
             })))
         }
-        // A genuinely absent or expired token IS inactive. This is the only path
-        // allowed to produce `active:false`.
+        // A genuinely absent or expired token, or one that is not an access
+        // token, IS inactive. This is the only path allowed to produce
+        // `active:false`.
         _ => Ok(Json(serde_json::json!({"active": false}))),
     }
 }
@@ -227,7 +235,37 @@ mod tests {
             exp,
             did: "did:key:zDnTest".into(),
             name: String::new(),
+            kind: Some(TokenKind::Access),
         }
+    }
+
+    #[test]
+    fn a_refresh_token_is_inactive() {
+        let mut m = meta(2_000);
+        m.kind = Some(TokenKind::Refresh);
+        let out = render_introspection(Ok(Some(m)), 1_000).expect("a refresh token is a 200");
+        assert_eq!(
+            out.0,
+            serde_json::json!({"active": false}),
+            "a refresh token renders exactly like an unknown token"
+        );
+    }
+
+    #[test]
+    fn a_legacy_entry_is_classified_by_lifetime() {
+        // Written before kinds were recorded: a 300 s entry is an access token,
+        // a 90-day entry a refresh token.
+        let mut access = meta(1_300);
+        access.iat = 1_000;
+        access.kind = None;
+        let out = render_introspection(Ok(Some(access)), 1_000).unwrap();
+        assert_eq!(out.0["active"], serde_json::json!(true));
+
+        let mut refresh = meta(1_000 + 7_776_000);
+        refresh.iat = 1_000;
+        refresh.kind = None;
+        let out = render_introspection(Ok(Some(refresh)), 1_000).unwrap();
+        assert_eq!(out.0, serde_json::json!({"active": false}));
     }
 
     #[test]

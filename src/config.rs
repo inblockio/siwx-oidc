@@ -234,6 +234,81 @@ pub struct Config {
     /// first mint. Default: `siwx-admin`.
     /// Env: `SIWEOIDC_ADMIN_TOKEN_LOCALPART`
     pub admin_token_localpart: String,
+    /// Absolute lifetime of every grant, in seconds, counted from the
+    /// original authentication (I6): past it the refresh token and every
+    /// access token of the grant are refused, however recently it was used.
+    /// Unset (the default): no cap, a grant ends only after 90 days without a
+    /// refresh. At least [`MIN_GRANT_ABSOLUTE_LIFETIME_SECS`]. Provisional (D1).
+    /// Env: `SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS`
+    #[serde(default)]
+    pub grant_absolute_lifetime_secs: Option<u64>,
+    /// The same per client id, overriding the global value for that client,
+    /// longer or shorter (D1, provisional).
+    /// Env: `SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS_BY_CLIENT__<client id>`
+    #[serde(default)]
+    pub grant_absolute_lifetime_secs_by_client: HashMap<String, u64>,
+    /// Hosts a `backchannel_logout_uri` may name without the address check
+    /// (OIDC Back-Channel Logout; the SSRF guard): a listed host may resolve
+    /// to a loopback or private address and may use `http`. Matched against
+    /// the URI's host, case-insensitively, any port. Empty (the default):
+    /// every URI must be `https` and resolve only to public addresses.
+    /// Env: `SIWXOIDC_BACKCHANNEL_LOGOUT_ALLOWED_HOSTS='["rp.internal"]'`
+    #[serde(default)]
+    pub backchannel_logout_allowed_hosts: Vec<String>,
+    /// Refuse the dynamic registration of a client that may receive refresh
+    /// tokens unless it registers a `backchannel_logout_uri` (D4,
+    /// provisional). Enforced in generic mode only: in Matrix mode every grant
+    /// is a Matrix device grant, which never sends a logout token. Default off.
+    /// Env: `SIWXOIDC_BACKCHANNEL_LOGOUT_REQUIRED_FOR_REFRESH`
+    #[serde(default)]
+    pub backchannel_logout_required_for_refresh: bool,
+    /// Revoke the grant when a superseded refresh token is presented (I5
+    /// phase B): the rotation script that detects the reuse deletes the grant
+    /// (never the Synapse device), so its current holder is refused too. Off
+    /// (the default, phase A): reuse is refused and logged, nothing revoked.
+    /// Stays off until the maintainers decide (design decision D2: 30 days of
+    /// phase-A telemetry with every reuse event explained). Read once at startup.
+    /// Env: `SIWXOIDC_REUSE_REVOKES_GRANT`
+    #[serde(default)]
+    pub reuse_revokes_grant: bool,
+}
+
+/// The shortest configurable absolute grant lifetime: a device code's
+/// lifetime, the longest a client may legitimately take between the
+/// authentication and the grant (the code flow takes at most 300 s). A shorter
+/// cap would refuse grants before their first token.
+pub const MIN_GRANT_ABSOLUTE_LIFETIME_SECS: u64 = siwx_oidc::db::DEVICE_CODE_LIFETIME;
+
+impl Config {
+    /// The absolute-lifetime caps the grant store enforces (I6), or the
+    /// reason the configured values are refused.
+    pub fn grant_lifetime(&self) -> Result<siwx_oidc::db::grant::GrantLifetime, String> {
+        let check = |name: String, secs: u64| {
+            if secs < MIN_GRANT_ABSOLUTE_LIFETIME_SECS {
+                Err(format!(
+                    "{name} = {secs}: an absolute grant lifetime must be at least \
+                     {MIN_GRANT_ABSOLUTE_LIFETIME_SECS} s (a device code's lifetime)"
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        if let Some(secs) = self.grant_absolute_lifetime_secs {
+            check("grant_absolute_lifetime_secs".to_string(), secs)?;
+        }
+        for (client_id, secs) in &self.grant_absolute_lifetime_secs_by_client {
+            check(
+                format!("grant_absolute_lifetime_secs_by_client.{client_id}"),
+                *secs,
+            )?;
+        }
+        Ok(siwx_oidc::db::grant::GrantLifetime {
+            global_secs: self.grant_absolute_lifetime_secs,
+            per_client_secs: std::sync::Arc::new(
+                self.grant_absolute_lifetime_secs_by_client.clone(),
+            ),
+        })
+    }
 }
 
 impl Default for Config {
@@ -267,6 +342,11 @@ impl Default for Config {
             account_management_uri: None,
             admin_token_ttl_secs: 300,
             admin_token_localpart: "siwx-admin".to_string(),
+            grant_absolute_lifetime_secs: None,
+            grant_absolute_lifetime_secs_by_client: HashMap::new(),
+            backchannel_logout_allowed_hosts: Vec::new(),
+            backchannel_logout_required_for_refresh: false,
+            reuse_revokes_grant: false,
         }
     }
 }
@@ -599,5 +679,99 @@ mod tests {
             );
             Ok(())
         });
+    }
+
+    #[test]
+    fn no_absolute_grant_lifetime_is_configured_by_default() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            let config = figment().extract::<Config>()?;
+            assert_eq!(config.grant_absolute_lifetime_secs, None);
+            assert!(config.grant_absolute_lifetime_secs_by_client.is_empty());
+            let lifetime = config.grant_lifetime().expect("defaults are valid");
+            assert!(!lifetime.is_configured());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn absolute_grant_lifetimes_are_read_under_both_prefixes() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWEOIDC_GRANT_ABSOLUTE_LIFETIME_SECS", 86_400);
+            jail.set_env(
+                "SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS_BY_CLIENT__ALPHA",
+                3_600,
+            );
+            jail.set_env(
+                "SIWEOIDC_GRANT_ABSOLUTE_LIFETIME_SECS_BY_CLIENT__BETA",
+                172_800,
+            );
+            let lifetime = figment().extract::<Config>()?.grant_lifetime().unwrap();
+            assert_eq!(lifetime.cap_for("alpha"), Some(3_600));
+            assert_eq!(
+                lifetime.cap_for("beta"),
+                Some(172_800),
+                "a per-client value overrides the global one"
+            );
+            assert_eq!(lifetime.cap_for("gamma"), Some(86_400));
+            jail.set_env("SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS", 7_200);
+            let config = figment().extract::<Config>()?;
+            assert_eq!(
+                config.grant_absolute_lifetime_secs,
+                Some(7_200),
+                "new beats legacy"
+            );
+            Ok(())
+        });
+    }
+
+    /// Reuse enforcement (I5 phase B) is off unless an operator turns it on,
+    /// under either prefix; the new prefix beats the legacy one.
+    #[test]
+    fn reuse_enforcement_is_off_by_default_and_read_under_both_prefixes() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            assert!(!figment().extract::<Config>()?.reuse_revokes_grant);
+            assert!(!Config::default().reuse_revokes_grant);
+            jail.set_env("SIWEOIDC_REUSE_REVOKES_GRANT", "true");
+            assert!(figment().extract::<Config>()?.reuse_revokes_grant);
+            jail.set_env("SIWXOIDC_REUSE_REVOKES_GRANT", "false");
+            assert!(
+                !figment().extract::<Config>()?.reuse_revokes_grant,
+                "new beats legacy"
+            );
+            jail.set_env("SIWEOIDC_REUSE_REVOKES_GRANT", "false");
+            jail.set_env("SIWXOIDC_REUSE_REVOKES_GRANT", "true");
+            assert!(figment().extract::<Config>()?.reuse_revokes_grant);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn an_absolute_grant_lifetime_shorter_than_a_device_code_is_refused() {
+        let global = Config {
+            grant_absolute_lifetime_secs: Some(MIN_GRANT_ABSOLUTE_LIFETIME_SECS - 1),
+            ..Config::default()
+        };
+        let err = global.grant_lifetime().unwrap_err();
+        assert!(err.contains("grant_absolute_lifetime_secs"), "{err}");
+        let per_client = Config {
+            grant_absolute_lifetime_secs_by_client: HashMap::from([("a".to_string(), 0)]),
+            ..Config::default()
+        };
+        let err = per_client.grant_lifetime().unwrap_err();
+        assert!(
+            err.contains("grant_absolute_lifetime_secs_by_client.a"),
+            "{err}"
+        );
+        let shortest = Config {
+            grant_absolute_lifetime_secs: Some(MIN_GRANT_ABSOLUTE_LIFETIME_SECS),
+            ..Config::default()
+        };
+        assert_eq!(
+            shortest.grant_lifetime().unwrap().cap_for("a"),
+            Some(MIN_GRANT_ABSOLUTE_LIFETIME_SECS)
+        );
     }
 }

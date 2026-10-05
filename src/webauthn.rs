@@ -14,6 +14,7 @@ use aqua_auth::{verify_webauthn_assertion, WebAuthnAssertionParams};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use p256::ecdsa::Signature;
 use serde::{Deserialize, Serialize};
+use siwx_oidc::db::{Ceremony, DBClient};
 use thiserror::Error;
 use tracing::{info, warn};
 use url::Url;
@@ -24,14 +25,12 @@ use siwx_oidc::db::RedisClient;
 
 // -- Redis key prefixes for WebAuthn state --
 
-const CHALLENGE_PREFIX: &str = "webauthn:challenge";
 const CREDENTIAL_PREFIX: &str = siwx_oidc::db::KV_WEBAUTHN_CREDENTIAL_PREFIX;
 // The same constant the library's credential-identity resolver and the backfill
 // read, so a reader and this writer cannot drift onto different key spellings.
 // Ownership of the namespace is unchanged: `link_finish` is still the only
 // writer.
 const LINK_PREFIX: &str = siwx_oidc::db::KV_WEBAUTHN_LINK_PREFIX;
-const LINK_CHALLENGE_PREFIX: &str = "webauthn:link_challenge";
 const CHALLENGE_TTL: u64 = 120; // 2 min
 
 // -- DID derivation from P-256 public key --
@@ -314,9 +313,10 @@ pub const DEACTIVATION_CHECK_UNAVAILABLE_MSG: &str =
 /// auth path (`synapse/api/auth/mas.py`, 1.159.0) contains **zero** references
 /// to `deactivated` — under MSC3861 Synapse does not own the tokens, so it
 /// trusts our introspection response and never consults `users.deactivated`.
-/// On our side the Redis tombstone (`DBClient::is_user_deactivated`) is a
-/// bounded-TTL race guard for the refresh/mint path (S3-4 / H6), not a durable
-/// authority, and nothing consulted it at sign-in. The net effect was that
+/// On our side the user epoch (`epoch:user/{username}`, which replaced the
+/// bounded-TTL user tombstone) refuses grants authenticated BEFORE the
+/// deactivation (S3-4 / H6, I9), and by design nothing newer: it is no
+/// authority over a sign-in made after it. The net effect was that
 /// `account_deactivate` and `account_erase` were undone by simply signing in
 /// again: `is_localpart_available` reports a deactivated user's localpart as
 /// *taken*, so the new-identity gate classified them as a normal returning
@@ -526,14 +526,13 @@ pub async fn register_start(
     let state_json = serde_json::to_string(&reg_state)
         .map_err(|e| anyhow!("Failed to serialize registration state: {}", e))?;
     redis
-        .set_ex_raw(
-            &format!("{}/{}", CHALLENGE_PREFIX, session_id),
-            &state_json,
-            CHALLENGE_TTL,
-        )
+        .put_ceremony_state(Ceremony::Challenge, session_id, &state_json, CHALLENGE_TTL)
         .await?;
 
-    info!("webauthn register_start: session={}", session_id);
+    info!(
+        "webauthn register_start: session={}",
+        siwx_oidc::redact::fingerprint(session_id)
+    );
     Ok(ccr)
 }
 
@@ -544,12 +543,10 @@ pub async fn register_finish(
     reg_response: RegisterPublicKeyCredential,
 ) -> Result<RegisterFinishResponse> {
     // Retrieve and consume the registration state.
-    let challenge_key = format!("{}/{}", CHALLENGE_PREFIX, session_id);
     let state_json = redis
-        .get_raw(&challenge_key)
+        .take_ceremony_state(Ceremony::Challenge, session_id)
         .await?
         .ok_or_else(|| anyhow!("No registration challenge found (expired or already used)"))?;
-    redis.del_raw(&challenge_key).await?;
 
     let reg_state: PasskeyRegistration = serde_json::from_str(&state_json)
         .map_err(|e| anyhow!("Failed to deserialize registration state: {}", e))?;
@@ -591,7 +588,8 @@ pub async fn register_finish(
 
     info!(
         "webauthn register_finish: did={} cred_id={}",
-        did, cred_id_b64
+        did,
+        siwx_oidc::redact::fingerprint(&cred_id_b64)
     );
     Ok(RegisterFinishResponse {
         did,
@@ -677,28 +675,33 @@ pub async fn authenticate_start(
             rcr.public_key.allow_credentials = allow_list;
             info!(
                 "webauthn authenticate_start: session={} scoped did={} creds={}",
-                session_id,
+                siwx_oidc::redact::fingerprint(session_id),
                 did,
                 rcr.public_key.allow_credentials.len()
             );
         } else {
             info!(
                 "webauthn authenticate_start: session={} scope did={} resolved 0 creds -> discoverable fallback",
-                session_id, did
+                siwx_oidc::redact::fingerprint(session_id),
+                did
             );
         }
     }
 
     let challenge_b64 = URL_SAFE_NO_PAD.encode(&*rcr.public_key.challenge);
     redis
-        .set_ex_raw(
-            &format!("{}/{}", CHALLENGE_PREFIX, session_id),
+        .put_ceremony_state(
+            Ceremony::Challenge,
+            session_id,
             &challenge_b64,
             CHALLENGE_TTL,
         )
         .await?;
 
-    info!("webauthn authenticate_start: session={}", session_id);
+    info!(
+        "webauthn authenticate_start: session={}",
+        siwx_oidc::redact::fingerprint(session_id)
+    );
     Ok(rcr)
 }
 
@@ -712,12 +715,10 @@ pub async fn verify_credential(
     rp_origin: &str,
     auth_response: &PublicKeyCredential,
 ) -> Result<AuthenticateFinishResponse, VerifyError> {
-    let challenge_key = format!("{}/{}", CHALLENGE_PREFIX, session_id);
     let challenge_b64 = redis
-        .get_raw(&challenge_key)
+        .take_ceremony_state(Ceremony::Challenge, session_id)
         .await?
         .ok_or_else(|| anyhow!("No auth challenge found (expired or already used)"))?;
-    redis.del_raw(&challenge_key).await?;
 
     let challenge_bytes = URL_SAFE_NO_PAD
         .decode(&challenge_b64)
@@ -824,7 +825,8 @@ pub async fn verify_credential(
 
     info!(
         "webauthn verify_credential: did={} cred={}",
-        did, cred_id_b64
+        did,
+        siwx_oidc::redact::fingerprint(&cred_id_b64)
     );
     Ok(AuthenticateFinishResponse { ok: true, did })
 }
@@ -840,23 +842,12 @@ pub async fn authenticate_finish(
 ) -> Result<AuthenticateFinishResponse, VerifyError> {
     let resp = verify_credential(redis, session_id, rp_id, rp_origin, &auth_response).await?;
 
-    let session_key = format!("sessions/{}", session_id);
-    let session_json = redis
-        .get_raw(&session_key)
+    let mut session = redis
+        .get_session(session_id.to_string())
         .await?
         .ok_or_else(|| anyhow!("Session not found"))?;
-    let mut session: siwx_oidc::db::SessionEntry = serde_json::from_str(&session_json)
-        .map_err(|e| anyhow!("Failed to deserialize session: {}", e))?;
     session.verified_did = Some(resp.did.clone());
-    let updated_session = serde_json::to_string(&session)
-        .map_err(|e| anyhow!("Failed to serialize session: {}", e))?;
-    redis
-        .set_ex_raw(
-            &session_key,
-            &updated_session,
-            siwx_oidc::db::SESSION_LIFETIME,
-        )
-        .await?;
+    redis.set_session(session_id.to_string(), session).await?;
 
     Ok(resp)
 }
@@ -888,16 +879,13 @@ pub async fn link_start(
     let state_json = serde_json::to_string(&link_state)
         .map_err(|e| anyhow!("Failed to serialize link challenge state: {}", e))?;
     redis
-        .set_ex_raw(
-            &format!("{}/{}", LINK_CHALLENGE_PREFIX, session_id),
-            &state_json,
-            CHALLENGE_TTL,
-        )
+        .put_ceremony_state(Ceremony::Link, session_id, &state_json, CHALLENGE_TTL)
         .await?;
 
     info!(
         "webauthn link_start: session={} primary_did={}",
-        session_id, primary_did
+        siwx_oidc::redact::fingerprint(session_id),
+        primary_did
     );
     Ok(ccr)
 }
@@ -909,12 +897,10 @@ pub async fn link_finish(
     reg_response: RegisterPublicKeyCredential,
 ) -> Result<LinkFinishResponse> {
     // Retrieve and consume the link challenge state.
-    let challenge_key = format!("{}/{}", LINK_CHALLENGE_PREFIX, session_id);
     let state_json = redis
-        .get_raw(&challenge_key)
+        .take_ceremony_state(Ceremony::Link, session_id)
         .await?
         .ok_or_else(|| anyhow!("No link challenge found (expired or already used)"))?;
-    redis.del_raw(&challenge_key).await?;
 
     let link_state: LinkChallengeState = serde_json::from_str(&state_json)
         .map_err(|e| anyhow!("Failed to deserialize link challenge state: {}", e))?;
@@ -974,7 +960,8 @@ pub async fn link_finish(
 
     info!(
         "webauthn link_finish: cred_id={} primary_did={}",
-        cred_id_b64, link_state.primary_did
+        siwx_oidc::redact::fingerprint(&cred_id_b64),
+        link_state.primary_did
     );
     Ok(LinkFinishResponse {
         credential_id: cred_id_b64,
@@ -1740,6 +1727,70 @@ mod tests {
         assert!(
             rcr.public_key.allow_credentials.is_empty(),
             "forged cookie -> usernameless -> allowCredentials MUST be empty (no enumeration)"
+        );
+    }
+
+    /// A ceremony's session id is the key to its challenge in Redis and arrives
+    /// as a cookie, so it is a credential for the ceremony's duration. The start
+    /// of each ceremony logs at `info!`; the logs may name the session only by
+    /// fingerprint. Needs Redis (`siwx_oidc::test_support::redis`).
+    #[tokio::test]
+    async fn the_ceremony_starts_log_session_ids_only_as_fingerprints() {
+        use siwx_oidc::redact::fingerprint;
+
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let base = Url::parse("http://localhost:8000").unwrap();
+        let cfg = build_webauthn(&base, None, None).expect("build webauthn");
+        let nonce = Uuid::new_v4().simple().to_string();
+        let did = format!("did:key:zDnLOG{nonce}");
+        let cred = URL_SAFE_NO_PAD.encode(format!("cred-{nonce}").as_bytes());
+        redis.index_add_passkey(&did, &cred).await.expect("seed");
+
+        let register_session = format!("regsess{nonce}");
+        let scoped_session = format!("scopedsess{nonce}");
+        let open_session = format!("opensess{nonce}");
+        let link_session = format!("linksess{nonce}");
+
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        register_start(&cfg.webauthn, &redis, &register_session, None)
+            .await
+            .expect("register_start");
+        authenticate_start(&cfg.webauthn, &redis, &scoped_session, Some(&did))
+            .await
+            .expect("scoped authenticate_start");
+        authenticate_start(&cfg.webauthn, &redis, &open_session, None)
+            .await
+            .expect("usernameless authenticate_start");
+        link_start(&cfg.webauthn, &redis, &link_session, &did, None)
+            .await
+            .expect("link_start");
+        let output = logs.output();
+
+        for session in [
+            &register_session,
+            &scoped_session,
+            &open_session,
+            &link_session,
+        ] {
+            assert!(
+                !output.contains(session.as_str()),
+                "session id {session} appears in the logs in the clear:\n{}",
+                output
+                    .lines()
+                    .filter(|l| l.contains(session.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            assert!(
+                output.contains(&fingerprint(session)),
+                "the logs never name the fingerprint of session {session}; captured:\n{output}"
+            );
+        }
+        assert!(
+            !output.contains(&cred),
+            "a credential id appears in the logs in the clear:\n{output}"
         );
     }
 

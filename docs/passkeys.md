@@ -96,14 +96,19 @@ rather than as a new `did:key`:
 
 | Key | TTL | Content |
 |---|---|---|
-| `webauthn:challenge/{session_id}` | 120 s | ceremony state (registration state or assertion challenge) |
+| `webauthn:ceremony/{sha256(ceremony id)}` | 120 s | ceremony state (registration state or assertion challenge), read and deleted in one step |
 | `webauthn:credential/{cred_id_b64}` | none | the stored passkey (serialised `webauthn_rs::Passkey`, including its counter) |
 | `webauthn:link/{cred_id_b64}` | none | `{primary_did, label}` for a linked passkey |
-| `webauthn:link_challenge/{session_id}` | 120 s | link ceremony state and the wallet DID |
+| `webauthn:link_ceremony/{sha256(session id)}` | 120 s | link ceremony state and the wallet DID |
 | `webauthn:by_did/{did}` | none | set of credential IDs that resolve to the DID |
-| `user:session/{token}` | 30 days | opaque login user session: token → DID |
-| `device_codes/{device_code}` | 1800 s | device-code grant state |
-| `user_codes/{user_code}` | 1800 s | user code → device code |
+| `siwx_user/{sha256(token)}` | 30 days | opaque login user session: token → DID (indexed under `idx:own_sessions/…`; a legacy `user:session/{token}` is read until it expires) |
+| `device_code/{sha256(device code)}` | 1800 s | device-code grant state (with the user code's digest) |
+| `user_code/{sha256(user code)}` | 1800 s | user code → the device code's digest |
+
+Ceremony, device and user codes are keyed by their digest so the store never holds a value a
+client presents; entries a build before digest keys wrote under `webauthn:challenge/`,
+`webauthn:link_challenge/`, `device_codes/` and `user_codes/` are read until they expire. See
+[architecture.md](architecture.md#redis-keyspace).
 
 For login and linking, `{session_id}` is the OIDC session. The device-approval
 flow uses `device_passkey_{user_code}`, and the account page uses
@@ -138,9 +143,15 @@ never with an identifier the client supplies.
 
 - **The `siwx_user` cookie.** Set after a successful `/sign_in` and after an
   account re-auth: `Path=/`, `HttpOnly`, `SameSite=Strict`, `Secure` on https,
-  `Max-Age` 30 days. Its value is a random token; the DID lives only in Redis at
-  `user:session/{token}`. It is separate from the `acct_session` cookie of the
-  account page (`Path=/account`).
+  `Max-Age` 30 days. Its value is a random token; the DID lives only in Redis, under
+  the token's digest (`siwx_user/{sha256(token)}`). It is separate from the
+  `acct_session` cookie of the account page (`Path=/account`).
+- **Ending it.** The account page's **Sign out** (`POST /account/sign_out`) ends this
+  browser's hint and account session and clears both cookies. `logout/all`,
+  deactivation and erasure end every hint and account session of the user. RP-initiated
+  logout (`/end_session`) leaves the hint alone: it ends an RP's grant, the hint is not
+  a session at this provider (it authorizes nothing), and a navigation to `/end_session`
+  from an RP on another site does not carry the `SameSite=Strict` cookie anyway.
 - **Scoping.** `authenticate_start` looks up the token, and sets
   `allowCredentials` to exactly the credentials of that DID: its own passkeys
   plus any linked to it. The response adds `detected_mxid`

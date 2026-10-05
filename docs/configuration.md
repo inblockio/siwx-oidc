@@ -112,16 +112,104 @@ abused, leave it out of the list and let its proofs fail; the next sign-in re-as
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
 | `default_clients` | `SIWXOIDC_DEFAULT_CLIENTS` | none | Map of client id to a JSON client entry, written to Redis at every start. |
-| `require_secret` | `SIWXOIDC_REQUIRE_SECRET` | `true` | Whether `POST /token` demands a client secret from a client whose metadata names no `token_endpoint_auth_method`. A client registered with `"none"` never needs one. |
+| `require_secret` | `SIWXOIDC_REQUIRE_SECRET` | `true` | Whether `POST /token` demands a client secret, at the code exchange and at the refresh grant alike, from a client whose metadata names no `token_endpoint_auth_method`. A client registered with `"none"` never needs one. |
 
 A client entry is `{"secret": "…", "metadata": {…}}`, where `metadata` is RFC 7591 client
-metadata (at least `redirect_uris`). Clients can also register themselves through
+metadata (at least `redirect_uris`); an optional `"access_token"` is the registration access
+token that manages the client at `/client/{id}`. Clients can also register themselves through
 `POST /register` (dynamic client registration), which is what Matrix clients do.
+
+Redis holds only the SHA-256 digests of the secret and of the registration access token, never
+the values, for configured and registered clients alike. A registered client's secret is random;
+a configured one is whatever you chose, and an unsalted digest of a weak secret can be guessed
+offline by someone who can read Redis. Such a reader on the same host can usually read this
+configuration too, where the secret is in the clear, so choose a long random secret and protect
+the configuration as you would the secret.
 
 ```toml
 [default.default_clients]
 my-app = '{"secret":"change-me","metadata":{"redirect_uris":["https://app.example.org/callback"]}}'
 ```
+
+### Grant lifetime
+
+| Key | Environment | Default | Meaning |
+|---|---|---|---|
+| `grant_absolute_lifetime_secs` | `SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS` | none: no cap | Absolute lifetime of every grant, in seconds, counted from the authentication (the sign-in or the device approval). Past it the refresh token and every access token of the grant are refused, however recently it was refreshed. At least 1800. |
+| `grant_absolute_lifetime_secs_by_client` | `SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS_BY_CLIENT__<client id>` | none | Map of client id to seconds, the same cap for one client. A per-client value overrides the global one for that client, longer or shorter, so a client (say Element) can get a longer cap than a short global default. At least 1800. |
+
+With neither set, lifetimes are as before: an access token lives 300 s and a grant ends 90 days
+after its last refresh. With a cap, a grant also ends at its authentication plus the cap, and no
+access token lives past that moment. The deadline is written into the grant when it is issued
+and only ever moves earlier: lowering a cap reaches an existing grant at its next refresh (its
+access tokens then live at most 300 s more), raising or removing one never extends a grant. A
+grant issued while no cap applied counts from its authentication once one is configured. All
+of it runs on the Redis clock, so instances with skewed clocks agree. A value below 1800 s (a
+device code's lifetime) is refused at startup: it could refuse a grant before its first token.
+
+These defaults, and the rule that a per-client value overrides the global one rather than only
+shortening it, are provisional (decision D1 in the token lifecycle design). Weigh the cost for
+Matrix clients before setting a short cap: when a grant ends, Element signs out, and signing in
+again usually creates a new device, which must be verified again and restore its key backup.
+Agents that hold their own key (`siwx-oidc-auth`) re-authenticate without a person, so a short
+cap costs them nothing.
+
+The environment form lowercases the client id (`…_BY_CLIENT__MY-APP` names `my-app`); use the
+file for a client id with capitals. Registered client ids are random, so the per-client map is
+for configured clients (`default_clients`) and other ids you know; a client cannot yet ask for a
+shorter cap in its own registration.
+
+```toml
+[default]
+grant_absolute_lifetime_secs = 2592000   # 30 days
+
+[default.grant_absolute_lifetime_secs_by_client]
+my-app = 86400                           # 1 day
+```
+
+### Back-channel logout
+
+A client may register a `backchannel_logout_uri` (OpenID Connect Back-Channel Logout 1.0). In
+generic mode (no `mas_shared_secret`), every active deletion of one of its grants (revocation of
+the refresh token, `/end_session`, a refresh refused for an epoch or expiry, revocation of all
+of a user's grants) POSTs a signed logout token there, from a Redis outbox, with five attempts
+and 2 s doubling backoff. A grant that simply expires sends nothing. Matrix mode sends none.
+
+Because registration is open, the URI is checked at registration and at every delivery: it must
+use `https` and every address its host resolves to must be public (not loopback, private,
+CGNAT, link-local such as the cloud metadata address, multicast, unspecified or reserved).
+Delivery connects only to the addresses it checked and follows no redirect.
+
+| Key | Environment | Default | Meaning |
+|---|---|---|---|
+| `backchannel_logout_allowed_hosts` | `SIWXOIDC_BACKCHANNEL_LOGOUT_ALLOWED_HOSTS` | `[]` | Hosts exempt from the address check: a listed host may resolve to a private or loopback address and may use `http`. Matched against the URI's host, case-insensitively, on any port. For relying parties on a private network and for test stubs; every listed host is trusted with logout tokens for its clients. |
+| `backchannel_logout_required_for_refresh` | `SIWXOIDC_BACKCHANNEL_LOGOUT_REQUIRED_FOR_REFRESH` | `false` | Refuse the dynamic registration (`400 invalid_client_metadata`) of a client that may receive refresh tokens (its `grant_types` lists `refresh_token` or is absent) unless it registers a `backchannel_logout_uri`. Generic mode only; ignored in Matrix mode. Provisional. |
+
+```toml
+[default]
+backchannel_logout_allowed_hosts = ["rp.internal.example.org"]
+backchannel_logout_required_for_refresh = true
+```
+
+### Refresh token reuse
+
+A refresh token that was already rotated away (an older token of the chain, or the previous one
+after its successor was used) is reuse: someone besides the client holds the chain, or the client
+lost track of it. Reuse is always refused exactly like an unknown token and logged as one
+`warn!` security event (`refresh token reuse detected`, `security_event="refresh_token_reuse"`,
+with `grant_revoked` saying whether the grant was revoked). A retry with the previous token
+while its successor is still unused is a lost response, answered with the same pair, and is
+never reuse.
+
+| Key | Environment | Default | Meaning |
+|---|---|---|---|
+| `reuse_revokes_grant` | `SIWXOIDC_REUSE_REVOKES_GRANT` | `false` | Off: reuse is refused and logged, nothing is revoked. On: reuse also revokes the grant, in the same atomic step that detected it, as revoking its refresh token would: its access tokens are inactive at once, the holder of its current refresh token is refused at its next refresh, a generic RP gets a back-channel logout token, and the Synapse device is not deleted (an Element user is signed out and usually signs in again as a new device). Read once at startup. |
+
+Leave it off. Turning it on is decision D2 for the maintainers, with these exit criteria: at
+least 30 days of reuse telemetry with the switch off from Element Web and Element X, every reuse
+event explained, and no unexplained event for a session with a single holder (hypothesis H6 of
+the token lifecycle design). A client that presents an older token on its own, for example a
+second process refreshing beside the app without a shared lock, would otherwise be signed out.
 
 ### Legal documents
 
@@ -190,7 +278,11 @@ Logs go to stdout through `tracing`. `RUST_LOG` sets the filter (default
 `siwx_oidc=info,tower_http=info,warn`; for example `RUST_LOG=siwx_oidc=debug,tower_http=debug`).
 `SIWXOIDC_LOG_FORMAT=json` switches to one JSON object per line for log aggregation. Secrets,
 tokens and key material are never logged; the signing key appears only as its `kid` (and, for
-a generated key, a public-key fingerprint).
+a generated key, a public-key fingerprint). A credential that a log line has to refer to (a
+token, authorization code, device code, user code, session id, passkey credential id) appears
+as a fingerprint, the first eight hex characters of its SHA-256, which you can compute for a
+value you hold to find the lines about it: `printf %s "$value" | sha256sum | cut -c1-8`. A
+request is logged by method and path, never by query.
 
 ## Running locally
 

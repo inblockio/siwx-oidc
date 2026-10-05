@@ -120,7 +120,10 @@ fn eip55_checksum(addr: &[u8; 20]) -> String {
 }
 
 fn new_wallet() -> Wallet {
-    let key = SigningKey::random(&mut OsRng);
+    wallet_from_key(SigningKey::random(&mut OsRng))
+}
+
+fn wallet_from_key(key: SigningKey) -> Wallet {
     let addr = address_from_key(key.verifying_key());
     let address = eip55_checksum(&addr);
     let did = format!("did:pkh:eip155:1:{address}");
@@ -268,19 +271,23 @@ fn parse_query(url: &str) -> HashMap<String, String> {
 }
 
 /// A registered OAuth client (id + secret) for the wallet auth-code flow.
+#[derive(Clone)]
 struct RegisteredClient {
     client_id: String,
-    client_secret: String,
     redirect_uri: String,
 }
 
+/// A client registered the way Element Web and Element X register: public
+/// (`token_endpoint_auth_method: none`). The sessions in this suite are Matrix
+/// device sessions, refreshed at both endpoints, and
+/// `POST /_matrix/client/v3/refresh` refuses a confidential client's token.
 async fn register_client(c: &Client, base: &str) -> RegisteredClient {
     let redirect_uri = format!("{base}/callback");
     let reg: Value = c
         .post(format!("{base}/register"))
         .json(&json!({
             "redirect_uris": [&redirect_uri],
-            "token_endpoint_auth_method": "client_secret_post",
+            "token_endpoint_auth_method": "none",
             "grant_types": ["authorization_code"],
             "response_types": ["code"],
         }))
@@ -292,7 +299,6 @@ async fn register_client(c: &Client, base: &str) -> RegisteredClient {
         .unwrap();
     RegisteredClient {
         client_id: reg["client_id"].as_str().unwrap().to_string(),
-        client_secret: reg["client_secret"].as_str().unwrap().to_string(),
         redirect_uri,
     }
 }
@@ -302,12 +308,22 @@ struct LoginResult {
     access_token: String,
     refresh_token: String,
     device_id: String,
+    /// The public client the login was made with. The refresh grant at
+    /// `/token` binds a token to this client.
+    client_id: String,
+    /// The ID token of the code exchange (empty for a seeded legacy session).
+    id_token: String,
 }
 
 /// Drive a full wallet auth-code login for `w` and return the issued tokens +
 /// the `SIWX_*` device id provisioned in the mock. One fresh client per call.
 async fn wallet_login(c: &Client, base: &str, w: &Wallet) -> LoginResult {
     let rc = register_client(c, base).await;
+    wallet_login_as(c, base, w, rc).await
+}
+
+/// [`wallet_login`] with a client the caller registered.
+async fn wallet_login_as(c: &Client, base: &str, w: &Wallet, rc: RegisteredClient) -> LoginResult {
     let (verifier, challenge) = pkce_pair();
     let state = "race_state";
     let nrc = no_redirect_client();
@@ -405,6 +421,7 @@ async fn wallet_login(c: &Client, base: &str, w: &Wallet) -> LoginResult {
         .expect("token exchange must succeed");
     let access_token = token["access_token"].as_str().unwrap().to_string();
     let refresh_token = token["refresh_token"].as_str().unwrap().to_string();
+    let id_token = token["id_token"].as_str().unwrap_or_default().to_string();
     let device_id = introspect(c, &access_token).await["device_id"]
         .as_str()
         .unwrap()
@@ -413,6 +430,8 @@ async fn wallet_login(c: &Client, base: &str, w: &Wallet) -> LoginResult {
         access_token,
         refresh_token,
         device_id,
+        client_id: rc.client_id.clone(),
+        id_token,
     }
 }
 
@@ -523,7 +542,6 @@ async fn exchange_code(
         .form(&[
             ("code", code),
             ("client_id", rc.client_id.as_str()),
-            ("client_secret", rc.client_secret.as_str()),
             ("grant_type", "authorization_code"),
             ("code_verifier", verifier),
         ])
@@ -1278,10 +1296,11 @@ async fn h14_synapse_delete_failure_is_surfaced_not_500() {
 // fresh access+refresh) throughout the delete window and require that, once the
 // dust settles, EVERY minted token is inactive.
 // REGRESSION GUARD (was repro S3-3 / H3): device_delete TOCTOU + KEYS-scan revoke
-// races a refresh and a stale token survived. Fixed by the per-(user,device) token
-// index + atomic Lua revoke + device-revoked tombstone (check-mint-recheck in the
-// refresh paths). See fix commit for S3-3/H3. Now runs unconditionally with the
-// live stack (no RUN_REPRO gate), asserting survivors == 0.
+// races a refresh and a stale token survived. Fixed by the per-(user,device) grant
+// index + atomic Lua revoke + device-revoked tombstone, which the rotation script
+// both refresh endpoints run checks in the same atomic step as the mint. See fix
+// commit for S3-3/H3. Now runs unconditionally with the live stack (no RUN_REPRO
+// gate), asserting survivors == 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn h3_concurrent_same_device_delete_revokes_all_tokens() {
@@ -1441,7 +1460,8 @@ async fn h3_concurrent_same_device_delete_revokes_all_tokens() {
 // --- H6 / S3-4: account_deactivate (revoke ALL) vs. a refresh pump ----------
 // REGRESSION GUARD (was repro S3-4 / H6): account_deactivate's non-atomic sweep let
 // an in-flight refresh resurrect access. Fixed by planting a per-user deactivation
-// tombstone BEFORE the sweep (checked + check-mint-rechecked by the refresh paths).
+// tombstone BEFORE the sweep, which the rotation script both refresh endpoints run
+// checks in the same atomic step as the mint.
 //
 // WHAT THIS TEST ACTUALLY PROVES — AND WHAT IT DOES NOT.
 //
@@ -1463,11 +1483,12 @@ async fn h3_concurrent_same_device_delete_revokes_all_tokens() {
 // The deactivate wins because it is BUILT to win: `account.rs` plants the
 // deactivation tombstone as the first thing the handler does, before the Synapse
 // call and before the sweep ("Plant the deactivation tombstone FIRST (S3-4/H6)").
-// That is one cheap Redis SET after session validation, while a refresh is a
-// multi-step read-mint-write. A client cannot reliably get its tombstone check in
-// first, and the resurrection window it would then need — check before the plant,
-// WRITE after the sweep ~70ms later — is closed a second time by the
-// check-mint-recheck rollback. So the race is not merely hard to hit here: the
+// That is one cheap Redis SET after session validation, while a refresh is a read
+// followed by the rotation script. A client cannot reliably get its tombstone
+// check in first, and the resurrection window it would then need — check before
+// the plant, WRITE after the sweep ~70ms later — does not exist: the rotation
+// script checks the tombstone and writes the successor in one atomic step. So the
+// race is not merely hard to hit here: the
 // fix is what makes it unhittable, and a test that demanded a post-barrier mint
 // would be permanently red against correct code.
 //
@@ -1632,10 +1653,11 @@ async fn h6_deactivate_revokes_every_minted_token_and_the_tombstone_wins() {
         // ANTI-VACUITY, PART 2: the post-barrier half must have a LEGIBLE
         // outcome. Either the refresh won the race and minted (checked for
         // survival just above), or it was refused BY THE DEACTIVATION TOMBSTONE
-        // — 401 M_UNKNOWN_TOKEN, from either `compat::refresh`'s pre-check or
-        // its check-mint-recheck rollback. Any other answer means the pump broke
-        // for a reason unrelated to deactivation, which is precisely the state
-        // this test spent two remediations silently sitting in.
+        // — 401 M_UNKNOWN_TOKEN, from the rotation script's tombstone check,
+        // which runs in the same atomic step as the mint. Any other answer
+        // means the pump broke for a reason unrelated to deactivation, which is
+        // precisely the state this test spent two remediations silently
+        // sitting in.
         match (post_barrier.len(), &first_post_refusal) {
             (0, None) => panic!(
                 "round {round}: the post-barrier pump neither minted nor was \
@@ -1884,30 +1906,33 @@ async fn h9_device_code_approved_no_double_redemption() {
 }
 
 // ===========================================================================
-// Refresh-token rotation GRACE WINDOW (Element-X mobile sign-out fix)
+// Refresh rotation: one live chain (H1, I3) and lost-response recovery (H2, I4)
 //
-// Root cause (see docs/audits/2026-06-23-elementx-refresh-rotation-signout.md):
-// rotation hard-deletes the old refresh token with NO grace, so a client that
-// LOSES the rotation response (mobile: radio handoff, app suspension,
-// cross-process refresh) replays the old token, gets `invalid_grant`, and is
-// signed out. Desired: a replay within REFRESH_GRACE_TTL returns the SAME
-// successor pair. Covers BOTH refresh entry points (OAuth /token = the path
-// Element-X uses, and the compat /_matrix/client/v3/refresh CS-API path). A
-// never-issued token still fails closed (grace must not blanket-accept).
-//
-// This is a normal #[ignore] guard (not RUN_REPRO-gated): it is RED against the
-// pre-fix server (replay -> invalid_grant / M_UNKNOWN_TOKEN) and GREEN once the
-// grace window lands.
+// Both refresh endpoints run the same rotation script. H1: concurrent
+// refreshes of one token converge on ONE successor pair, and exactly one chain
+// stays live. H2: a replay of the immediately previous refresh token returns
+// the same successor pair for as long as that pair is unused, whatever the
+// delay (no timer), and is refused as reuse once its access token has been
+// accepted. The audit behind the recovery requirement (mobile clients that lose
+// a rotation response) is docs/audits/2026-06-23-elementx-refresh-rotation-signout.md.
 // ===========================================================================
 
 /// Refresh via the OAuth /token endpoint (grant_type=refresh_token) — the path
-/// Element-X's matrix-rust-sdk OAuth client uses. Returns (status, json|null).
-async fn oauth_refresh(c: &Client, base: &str, refresh_token: &str) -> (StatusCode, Value) {
+/// Element-X's matrix-rust-sdk OAuth client uses. The login's client is
+/// public, so the request names it and presents no secret: the refresh grant
+/// binds a token to its client. Returns (status, json|null).
+async fn oauth_refresh(
+    c: &Client,
+    base: &str,
+    refresh_token: &str,
+    login: &LoginResult,
+) -> (StatusCode, Value) {
     let resp = c
         .post(format!("{base}/token"))
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
+            ("client_id", login.client_id.as_str()),
         ])
         .send()
         .await
@@ -1930,72 +1955,228 @@ async fn compat_refresh(c: &Client, base: &str, refresh_token: &str) -> (StatusC
     (status, body)
 }
 
-#[tokio::test]
-#[ignore = "requires live e2e stack (e2e/up.sh)"]
-async fn refresh_grace_window_tolerates_replay() {
+/// Which refresh endpoint a test drives.
+#[derive(Clone, Copy, Debug)]
+enum RefreshAt {
+    /// `POST /token`, `grant_type=refresh_token`, as the login's client.
+    Token,
+    /// `POST /_matrix/client/v3/refresh`.
+    Matrix,
+}
+
+/// Refresh at `at`; returns the status and the `(access, refresh)` pair on a 200.
+async fn refresh_at(
+    c: &Client,
+    base: &str,
+    at: RefreshAt,
+    refresh_token: &str,
+    login: &LoginResult,
+) -> (StatusCode, Value, Option<(String, String)>) {
+    let (status, body) = match at {
+        RefreshAt::Token => oauth_refresh(c, base, refresh_token, login).await,
+        RefreshAt::Matrix => compat_refresh(c, base, refresh_token).await,
+    };
+    let pair = (status == StatusCode::OK).then(|| {
+        (
+            body["access_token"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            body["refresh_token"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        )
+    });
+    (status, body, pair)
+}
+
+/// The refusal each endpoint gives an unknown (or reused) refresh token.
+fn assert_refused_as_unknown(at: RefreshAt, status: StatusCode, body: &Value, what: &str) {
+    match at {
+        RefreshAt::Token => {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{what} at /token: {body}");
+            assert_eq!(body["error"], "invalid_grant", "{what} at /token: {body}");
+        }
+        RefreshAt::Matrix => {
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{what} at the Matrix endpoint: {body}"
+            );
+            assert_eq!(
+                body["errcode"], "M_UNKNOWN_TOKEN",
+                "{what} at the Matrix endpoint: {body}"
+            );
+        }
+    }
+}
+
+const H1_PARALLEL: usize = 50;
+
+/// H1: `H1_PARALLEL` concurrent refreshes of one refresh token all succeed and
+/// all carry the SAME new pair; afterwards exactly one chain is live.
+async fn concurrent_refreshes_converge(at: RefreshAt) {
     let base = oidc();
     let c = Client::new();
-
-    // ---- OAuth /token path (the path Element-X uses) ----
     mock_reset(&c).await;
-    let w = new_wallet();
-    let login = wallet_login(&c, &base, &w).await;
+    let login = Arc::new(wallet_login(&c, &base, &new_wallet()).await);
 
-    // First refresh rotates: login.refresh_token is consumed; rt1/at1 are minted.
-    let (s1, v1) = oauth_refresh(&c, &base, &login.refresh_token).await;
-    assert_eq!(s1, StatusCode::OK, "first /token refresh must succeed");
-    let rt1 = v1["refresh_token"].as_str().unwrap().to_string();
-    assert!(
-        token_active(&c, v1["access_token"].as_str().unwrap()).await,
-        "freshly rotated access token must be active"
-    );
-
-    // Replay the OLD (just-rotated) refresh token within the grace window.
-    // PRE-FIX: invalid_grant (400). POST-FIX: 200 with the SAME successor pair.
-    let (s2, v2) = oauth_refresh(&c, &base, &login.refresh_token).await;
-    assert_eq!(
-        s2,
-        StatusCode::OK,
-        "grace replay of a just-rotated refresh token must succeed (got {s2}); \
-         this is the Element-X mobile sign-out bug"
-    );
-    assert!(
-        token_active(&c, v2["access_token"].as_str().unwrap()).await,
-        "the access token returned on grace replay must be active"
-    );
-    assert_eq!(
-        v2["refresh_token"].as_str().unwrap(),
-        rt1,
-        "grace replay must return the SAME successor refresh token (idempotent)"
-    );
-
-    // Negative: a well-formed but never-issued refresh token still fails closed.
-    let (sbad, _) = oauth_refresh(&c, &base, "mcr_never_issued_grace_probe").await;
+    let barrier = Arc::new(Barrier::new(H1_PARALLEL));
+    let mut tasks = Vec::new();
+    for _ in 0..H1_PARALLEL {
+        let cc = Client::new();
+        let base = base.clone();
+        let login = login.clone();
+        let b = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            b.wait().await;
+            let (status, body, pair) =
+                refresh_at(&cc, &base, at, &login.refresh_token, &login).await;
+            (status, body, pair)
+        }));
+    }
+    let mut pairs = Vec::new();
+    for t in tasks {
+        let (status, body, pair) = t.await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{at:?}: every concurrent refresh succeeds: {body}"
+        );
+        pairs.push(pair.unwrap());
+    }
+    let first = pairs[0].clone();
     assert_ne!(
-        sbad,
-        StatusCode::OK,
-        "an unknown refresh token must be rejected, never graced"
+        first.1, login.refresh_token,
+        "{at:?}: the refresh token rotated"
+    );
+    let distinct: std::collections::HashSet<_> = pairs.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        1,
+        "{at:?}: all {H1_PARALLEL} responses carry the same pair, got {} distinct",
+        distinct.len()
     );
 
-    // ---- Compat /_matrix/client/v3/refresh path ----
-    mock_reset(&c).await;
-    let w2 = new_wallet();
-    let login2 = wallet_login(&c, &base, &w2).await;
-
-    let (cs1, _) = compat_refresh(&c, &base, &login2.refresh_token).await;
-    assert_eq!(cs1, StatusCode::OK, "compat first refresh must succeed");
-
-    // Replay the OLD refresh token on the compat endpoint -> grace.
-    let (cs2, cv2) = compat_refresh(&c, &base, &login2.refresh_token).await;
+    // Exactly one chain: the returned refresh token rotates once, and once that
+    // pair is in use neither the original token nor the first successor
+    // refreshes any more.
+    let (status, body, second) = refresh_at(&c, &base, at, &first.1, &login).await;
     assert_eq!(
-        cs2,
+        status,
         StatusCode::OK,
-        "compat grace replay of a just-rotated refresh token must succeed (got {cs2})"
+        "{at:?}: the returned refresh token rotates: {body}"
+    );
+    let second = second.unwrap();
+    assert_ne!(
+        second.1, first.1,
+        "{at:?}: the second rotation mints a new token"
     );
     assert!(
-        token_active(&c, cv2["access_token"].as_str().unwrap()).await,
-        "compat grace replay access token must be active"
+        token_active(&c, &second.0).await,
+        "{at:?}: the new access token is active"
     );
+    for (old, what) in [
+        (&login.refresh_token, "the original token"),
+        (&first.1, "the first successor"),
+    ] {
+        let (status, body, _) = refresh_at(&c, &base, at, old, &login).await;
+        assert_refused_as_unknown(at, status, &body, what);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn concurrent_refreshes_at_the_token_endpoint_converge_on_one_pair() {
+    concurrent_refreshes_converge(RefreshAt::Token).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn concurrent_refreshes_at_the_matrix_endpoint_converge_on_one_pair() {
+    concurrent_refreshes_converge(RefreshAt::Matrix).await;
+}
+
+/// H2: a replay of the previous refresh token returns the same pair while the
+/// pair is unused, and is reuse (refused like an unknown token) once its access
+/// token has been introspected. Reuse is logged, never acted on (phase A): the
+/// live chain keeps working. A never-issued token is refused.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn a_replay_returns_the_same_pair_until_the_new_access_token_is_used() {
+    let base = oidc();
+    let c = Client::new();
+    for at in [RefreshAt::Token, RefreshAt::Matrix] {
+        mock_reset(&c).await;
+        let login = wallet_login(&c, &base, &new_wallet()).await;
+        let (status, body, pair) = refresh_at(&c, &base, at, &login.refresh_token, &login).await;
+        assert_eq!(status, StatusCode::OK, "{at:?}: first refresh: {body}");
+        let pair = pair.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let (status, body, replay) = refresh_at(&c, &base, at, &login.refresh_token, &login).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{at:?}: a replay before first use recovers: {body}"
+        );
+        assert_eq!(
+            replay.unwrap(),
+            pair,
+            "{at:?}: the replay returns the SAME pair"
+        );
+
+        assert!(
+            token_active(&c, &pair.0).await,
+            "{at:?}: the new access token is active"
+        );
+        let (status, body, _) = refresh_at(&c, &base, at, &login.refresh_token, &login).await;
+        assert_refused_as_unknown(at, status, &body, "a replay after the new pair was used");
+
+        let (status, body, _) = refresh_at(&c, &base, at, &pair.1, &login).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{at:?}: reuse revokes nothing in phase A: {body}"
+        );
+
+        let (status, body, _) =
+            refresh_at(&c, &base, at, "mcr_never_issued_replay_probe", &login).await;
+        assert_refused_as_unknown(at, status, &body, "a never-issued token");
+    }
+}
+
+/// H2: the recovery has no timer. A replay more than a minute after the
+/// rotation (the old grace window was 60 s) still returns the same pair, at
+/// both endpoints. One real wait covers both.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn a_replay_after_more_than_a_minute_still_returns_the_same_pair() {
+    let base = oidc();
+    let c = Client::new();
+    mock_reset(&c).await;
+    let mut rotated = Vec::new();
+    for at in [RefreshAt::Token, RefreshAt::Matrix] {
+        let login = wallet_login(&c, &base, &new_wallet()).await;
+        let (status, body, pair) = refresh_at(&c, &base, at, &login.refresh_token, &login).await;
+        assert_eq!(status, StatusCode::OK, "{at:?}: first refresh: {body}");
+        rotated.push((at, login, pair.unwrap()));
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(65)).await;
+    for (at, login, pair) in &rotated {
+        let (status, body, replay) = refresh_at(&c, &base, *at, &login.refresh_token, login).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{at:?}: a replay after 65 s recovers: {body}"
+        );
+        assert_eq!(
+            replay.as_ref(),
+            Some(pair),
+            "{at:?}: the replay returns the SAME pair"
+        );
+    }
 }
 
 // ===========================================================================
@@ -2098,5 +2279,2609 @@ async fn did_field_is_published_at_signin_and_a_rowless_account_still_signs_in()
     assert!(
         device_ids(&state, &w2.mxid).contains(&second.device_id),
         "device provisioning must still happen for a row-less account"
+    );
+}
+
+// ===========================================================================
+// H4 (I1 for tokens): no client-held secret is stored in the clear.
+// ===========================================================================
+
+/// The strings a client holds that the server must never store in the clear
+/// (I1): every key and every value of the stack Redis is searched for each of
+/// them. Add a new kind of client-held secret (authorization codes, session
+/// ids, client secrets) with [`ClientHeld::add`] under its own label.
+#[derive(Default)]
+struct ClientHeld(Vec<(String, String)>);
+
+impl ClientHeld {
+    fn add(&mut self, label: impl Into<String>, value: &str) {
+        assert!(
+            !value.is_empty(),
+            "a client-held string to search for is empty"
+        );
+        self.0.push((label.into(), value.to_string()));
+    }
+
+    /// A token and the parts a store could keep without the whole: the body
+    /// after its `mat_` / `msa_` / `mcr_` prefix and, for a refresh token
+    /// (`mcr_{handle}_{secret}`), the handle and the secret.
+    fn add_token(&mut self, label: &str, token: &str) {
+        self.add(label, token);
+        if let Some((_prefix, body)) = token.split_once('_') {
+            self.add(format!("{label} without its prefix"), body);
+            if token.starts_with("mcr_") {
+                if let Some((handle, secret)) = body.split_once('_') {
+                    self.add(format!("{label} handle"), handle);
+                    self.add(format!("{label} secret part"), secret);
+                }
+            }
+        }
+    }
+}
+
+/// The stack's Redis, for a test that inspects what the server stored:
+/// `E2E_REDIS_URL`, else the server's own `SIWXOIDC_REDIS_URL` (the CI job sets
+/// it for the server and the tests alike), else the legacy `SIWEOIDC_REDIS_URL`
+/// (`e2e/env.sh`), else `REDIS_HOST`/`REDIS_PORT`. `None` when none is set.
+fn stack_redis_url() -> Option<String> {
+    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    var("E2E_REDIS_URL")
+        .or_else(|| var("SIWXOIDC_REDIS_URL"))
+        .or_else(|| var("SIWEOIDC_REDIS_URL"))
+        .or_else(|| {
+            Some(format!(
+                "redis://{}:{}",
+                var("REDIS_HOST")?,
+                var("REDIS_PORT")?
+            ))
+        })
+}
+
+/// Every string inside a Redis reply, whatever its shape.
+fn reply_strings(value: &bb8_redis::redis::Value, out: &mut Vec<String>) {
+    use bb8_redis::redis::Value;
+    match value {
+        Value::BulkString(bytes) => out.push(String::from_utf8_lossy(bytes).into_owned()),
+        Value::SimpleString(s) => out.push(s.clone()),
+        Value::VerbatimString { text, .. } => out.push(text.clone()),
+        Value::Array(items) | Value::Set(items) => {
+            items.iter().for_each(|item| reply_strings(item, out));
+        }
+        Value::Map(pairs) => pairs.iter().for_each(|(k, v)| {
+            reply_strings(k, out);
+            reply_strings(v, out);
+        }),
+        Value::Push { data, .. } => data.iter().for_each(|item| reply_strings(item, out)),
+        _ => {}
+    }
+}
+
+/// What a scan of the whole stack Redis found.
+struct RedisScan {
+    /// One line per place a client-held string appears: label, database, key.
+    hits: Vec<String>,
+    /// Every key, as `{db}:{key}`, for positive controls.
+    keys: Vec<String>,
+}
+
+/// Scan every database of the Redis at `url`: every key, and every value of
+/// every type, searched for each client-held string.
+async fn scan_redis_for(url: &str, held: &ClientHeld) -> RedisScan {
+    use bb8_redis::redis;
+    let client = redis::Client::open(url).unwrap_or_else(|e| panic!("stack Redis URL: {e}"));
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap_or_else(|e| panic!("stack Redis at {url} is unreachable: {e}"));
+    let databases: (String, u32) = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("databases")
+        .query_async(&mut conn)
+        .await
+        .expect("CONFIG GET databases");
+    let mut scan = RedisScan {
+        hits: Vec::new(),
+        keys: Vec::new(),
+    };
+    for db in 0..databases.1 {
+        let _: () = redis::cmd("SELECT")
+            .arg(db)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let mut cursor: u64 = 0;
+        loop {
+            let (next, keys): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("COUNT")
+                .arg(1000)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            for raw_key in keys {
+                let key = String::from_utf8_lossy(&raw_key).into_owned();
+                let kind: String = redis::cmd("TYPE")
+                    .arg(&raw_key)
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap();
+                let read = match kind.as_str() {
+                    "string" => redis::cmd("GET").arg(&raw_key).clone(),
+                    "hash" => redis::cmd("HGETALL").arg(&raw_key).clone(),
+                    "list" => redis::cmd("LRANGE").arg(&raw_key).arg(0).arg(-1).clone(),
+                    "set" => redis::cmd("SMEMBERS").arg(&raw_key).clone(),
+                    "zset" => redis::cmd("ZRANGE").arg(&raw_key).arg(0).arg(-1).clone(),
+                    "stream" => redis::cmd("XRANGE").arg(&raw_key).arg("-").arg("+").clone(),
+                    // Expired between SCAN and TYPE.
+                    "none" => continue,
+                    other => panic!("key {key}: Redis type `{other}` is not searched"),
+                };
+                let value: redis::Value = read.query_async(&mut conn).await.unwrap();
+                let mut strings = Vec::new();
+                reply_strings(&value, &mut strings);
+                for (label, secret) in &held.0 {
+                    if key.contains(secret.as_str()) {
+                        scan.hits
+                            .push(format!("{label}: in the key of db {db} `{key}`"));
+                    }
+                    if strings.iter().any(|s| s.contains(secret.as_str())) {
+                        scan.hits.push(format!(
+                            "{label}: in the {kind} value of db {db} key `{key}`"
+                        ));
+                    }
+                }
+                scan.keys.push(format!("{db}:{key}"));
+            }
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+    }
+    scan
+}
+
+/// Scan, and fail on any client-held string found; returns the scan.
+async fn assert_nothing_stored_in_the_clear(
+    url: &str,
+    held: &ClientHeld,
+    stage: &str,
+) -> RedisScan {
+    let scan = scan_redis_for(url, held).await;
+    assert!(
+        scan.hits.is_empty(),
+        "{stage}: client-held strings stored in the clear (I1):\n  {}",
+        scan.hits.join("\n  ")
+    );
+    scan
+}
+
+/// H4 for tokens: after sign-in, refresh at both endpoints, the replay of a
+/// lost response (which stores the sealed successor), introspection and RFC
+/// 7009 revocation, no key and no value anywhere in the stack Redis contains
+/// any access or refresh token the client received, or any part of one. The
+/// first scan's positive control (the digest key of the live access token)
+/// proves it searched the stack's Redis.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn no_token_the_client_holds_is_stored_in_the_clear() {
+    let Some(url) = stack_redis_url() else {
+        let marker = "E2E_SKIP: no_token_the_client_holds_is_stored_in_the_clear: no stack \
+                      Redis URL (E2E_REDIS_URL, SIWXOIDC_REDIS_URL, SIWEOIDC_REDIS_URL or \
+                      REDIS_HOST/REDIS_PORT); the keyspace was NOT searched";
+        assert!(
+            std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+            "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+        );
+        eprintln!("{marker}");
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    let mut held = ClientHeld::default();
+
+    let login = wallet_login(&c, &base, &new_wallet()).await;
+    held.add_token("sign-in access token", &login.access_token);
+    held.add_token("sign-in refresh token", &login.refresh_token);
+
+    let (status, body, pair) =
+        refresh_at(&c, &base, RefreshAt::Token, &login.refresh_token, &login).await;
+    let (access1, refresh1) = pair.unwrap_or_else(|| panic!("refresh at /token: {status} {body}"));
+    held.add_token("first refreshed access token", &access1);
+    held.add_token("first refreshed refresh token", &refresh1);
+
+    // A lost response replayed: the server keeps the successor pair, sealed.
+    let (status, body, replayed) =
+        refresh_at(&c, &base, RefreshAt::Matrix, &login.refresh_token, &login).await;
+    let (replayed_access, replayed_refresh) =
+        replayed.unwrap_or_else(|| panic!("replay at the Matrix endpoint: {status} {body}"));
+    held.add_token("replayed access token", &replayed_access);
+    held.add_token("replayed refresh token", &replayed_refresh);
+
+    let scan =
+        assert_nothing_stored_in_the_clear(&url, &held, "after a refresh and a replay").await;
+    let live_access_key = format!("at/{}", hex::encode(Sha256::digest(access1.as_bytes())));
+    assert!(
+        scan.keys
+            .iter()
+            .any(|k| k.ends_with(&format!(":{live_access_key}"))),
+        "positive control: the scan of {url} finds the live access token's digest key \
+         {live_access_key} ({} keys scanned); is this the stack's Redis?",
+        scan.keys.len()
+    );
+
+    assert!(
+        token_active(&c, &access1).await,
+        "the refreshed access token is active"
+    );
+    let (status, body, pair) = refresh_at(&c, &base, RefreshAt::Matrix, &refresh1, &login).await;
+    let (access2, refresh2) =
+        pair.unwrap_or_else(|| panic!("refresh at the Matrix endpoint: {status} {body}"));
+    held.add_token("second refreshed access token", &access2);
+    held.add_token("second refreshed refresh token", &refresh2);
+    assert!(
+        token_active(&c, &access2).await,
+        "the second access token is active"
+    );
+    assert_nothing_stored_in_the_clear(&url, &held, "after introspection").await;
+
+    let r = c
+        .post(format!("{base}/oauth2/revoke"))
+        .form(&[("token", refresh2.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "revoke is always 200 (RFC 7009)"
+    );
+    assert!(
+        !token_active(&c, &access2).await,
+        "the revoked session's access token is inactive"
+    );
+    assert_nothing_stored_in_the_clear(&url, &held, "after revocation").await;
+}
+
+// ===========================================================================
+// R1: the tokens a build before the grant record wrote keep working after the
+// upgrade (design 5.8, item 10 of Phase 2a).
+// ===========================================================================
+
+/// A session as a build before the grant record left it in the store: raw
+/// `token/{raw}` entries for its access and refresh token.
+struct LegacySession {
+    at: RefreshAt,
+    client_id: String,
+    access_token: String,
+    refresh_token: String,
+}
+
+impl LegacySession {
+    fn login(&self) -> LoginResult {
+        LoginResult {
+            access_token: self.access_token.clone(),
+            refresh_token: self.refresh_token.clone(),
+            device_id: String::new(),
+            client_id: self.client_id.clone(),
+            id_token: String::new(),
+        }
+    }
+}
+
+/// Whether `token` is a refresh token in the grant format,
+/// `mcr_{22 base62}_{32 base62}`.
+fn is_grant_refresh_token(token: &str) -> bool {
+    let alnum = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_alphanumeric());
+    token
+        .strip_prefix("mcr_")
+        .and_then(|rest| rest.split_once('_'))
+        .is_some_and(|(handle, secret)| alnum(handle, 22) && alnum(secret, 32))
+}
+
+async fn stack_redis(url: &str) -> bb8_redis::redis::aio::MultiplexedConnection {
+    bb8_redis::redis::Client::open(url)
+        .unwrap_or_else(|e| panic!("stack Redis URL: {e}"))
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap_or_else(|e| panic!("stack Redis at {url} is unreachable: {e}"))
+}
+
+/// A legacy token entry exactly as 3547bd2 wrote it (`set_token` before token
+/// kinds: no `kind` field, the lifetime says which kind it is), with its member
+/// in the legacy device index.
+async fn seed_legacy_entry(url: &str, token: &str, meta: &Value, lifetime: i64) {
+    use bb8_redis::redis;
+    let mut conn = stack_redis(url).await;
+    let key = format!("token/{token}");
+    let _: () = redis::cmd("SET")
+        .arg(&key)
+        .arg(meta.to_string())
+        .arg("EX")
+        .arg(lifetime)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let device = meta["device_id"].as_str().unwrap_or_default();
+    if !device.is_empty() {
+        let idx = format!(
+            "idx:user_device/{}/{device}",
+            meta["username"].as_str().unwrap()
+        );
+        let _: () = redis::cmd("SADD")
+            .arg(&idx)
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+}
+
+fn random_base62(n: usize) -> String {
+    use rand::Rng;
+    const B62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut rng = rand::thread_rng();
+    (0..n).map(|_| B62[rng.gen_range(0..62)] as char).collect()
+}
+
+/// A legacy session for `at`, written into the store in the 3547bd2 layout for
+/// an account and device a real sign-in created, so everything around the
+/// tokens (client registration, Synapse device) is what the old build left.
+async fn seed_legacy_session(c: &Client, base: &str, url: &str, at: RefreshAt) -> LegacySession {
+    let login = wallet_login(c, base, &new_wallet()).await;
+    let claims = introspect(c, &login.access_token).await;
+    assert_eq!(
+        claims["active"], true,
+        "the sign-in's access token: {claims}"
+    );
+    let now = chrono_now();
+    let session = LegacySession {
+        at,
+        client_id: login.client_id.clone(),
+        access_token: format!("mat_{}", random_base62(32)),
+        refresh_token: format!("mcr_{}", random_base62(32)),
+    };
+    for (token, lifetime) in [
+        (&session.access_token, 300),
+        (&session.refresh_token, 7_776_000),
+    ] {
+        let meta = json!({
+            "username": claims["username"],
+            "device_id": login.device_id,
+            "scope": claims["scope"],
+            "client_id": login.client_id,
+            "iat": now,
+            "exp": now + lifetime,
+            "did": claims["sub"],
+            "name": claims["sub"],
+        });
+        seed_legacy_entry(url, token, &meta, lifetime).await;
+    }
+    session
+}
+
+fn chrono_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+fn r1_sessions_file() -> String {
+    std::env::var("E2E_R1_SESSIONS").unwrap_or_else(|_| {
+        panic!("E2E_R1_SESSIONS names the file the mint stage writes and the check stage reads")
+    })
+}
+
+/// R1, a real upgrade or its seeded stand-in. Legacy sessions come from one of
+/// three places, chosen by `E2E_R1_STAGE`:
+///
+/// - `mint`: run against the PREVIOUS build (3547bd2 or the integration build
+///   before the grant record). Signs in once per endpoint, asserts that the
+///   server wrote the legacy layout (`token/{raw}`), saves the sessions to
+///   `E2E_R1_SESSIONS`, and stops. Then swap the binary, keeping Redis.
+/// - `check`: reads those sessions back and runs the checks below against the
+///   new build, within the legacy access tokens' 300 s.
+/// - unset (CI and every regular run): signs in on the server under test and
+///   writes the legacy entries itself, exactly as 3547bd2 wrote them.
+///
+/// The checks, at `POST /token` and at `POST /_matrix/client/v3/refresh`: a
+/// legacy access token introspects active; the legacy refresh token is lifted
+/// and answered with tokens in the grant format; a replay before first use
+/// returns the same pair; the legacy access token is still active; no key or
+/// value holds the legacy refresh token or the lifted pair (H4); once the new
+/// access token is used, the replay is refused as reuse; the new refresh token
+/// rotates.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn legacy_tokens_keep_working_after_the_upgrade() {
+    let Some(url) = stack_redis_url() else {
+        let marker = "E2E_SKIP: legacy_tokens_keep_working_after_the_upgrade: no stack Redis URL \
+                      (E2E_REDIS_URL, SIWXOIDC_REDIS_URL, SIWEOIDC_REDIS_URL or \
+                      REDIS_HOST/REDIS_PORT); the upgrade was NOT exercised";
+        assert!(
+            std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+            "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+        );
+        eprintln!("{marker}");
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    let stage = std::env::var("E2E_R1_STAGE").unwrap_or_default();
+    let sessions: Vec<LegacySession> = match stage.as_str() {
+        "mint" => {
+            let mut minted = Vec::new();
+            for at in [RefreshAt::Token, RefreshAt::Matrix] {
+                mock_reset(&c).await;
+                let login = wallet_login(&c, &base, &new_wallet()).await;
+                let mut conn = stack_redis(&url).await;
+                let legacy: bool = bb8_redis::redis::cmd("EXISTS")
+                    .arg(format!("token/{}", login.refresh_token))
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap();
+                assert!(
+                    legacy,
+                    "mint: the server under test did not store its refresh token as \
+                     token/{{raw}}: run the mint stage against the previous build"
+                );
+                minted.push(json!({
+                    "at": format!("{at:?}"),
+                    "client_id": login.client_id,
+                    "access_token": login.access_token,
+                    "refresh_token": login.refresh_token,
+                }));
+            }
+            std::fs::write(r1_sessions_file(), Value::Array(minted).to_string()).unwrap();
+            eprintln!(
+                "R1 mint: legacy sessions written; swap the binary and run E2E_R1_STAGE=check"
+            );
+            return;
+        }
+        "check" => {
+            let saved: Vec<Value> =
+                serde_json::from_str(&std::fs::read_to_string(r1_sessions_file()).unwrap())
+                    .unwrap();
+            saved
+                .iter()
+                .map(|s| LegacySession {
+                    at: if s["at"] == "Token" {
+                        RefreshAt::Token
+                    } else {
+                        RefreshAt::Matrix
+                    },
+                    client_id: s["client_id"].as_str().unwrap().to_string(),
+                    access_token: s["access_token"].as_str().unwrap().to_string(),
+                    refresh_token: s["refresh_token"].as_str().unwrap().to_string(),
+                })
+                .collect()
+        }
+        "" => {
+            let mut seeded = Vec::new();
+            for at in [RefreshAt::Token, RefreshAt::Matrix] {
+                mock_reset(&c).await;
+                seeded.push(seed_legacy_session(&c, &base, &url, at).await);
+            }
+            seeded
+        }
+        other => panic!("E2E_R1_STAGE={other}: expected mint, check or unset"),
+    };
+    assert_eq!(sessions.len(), 2, "one legacy session per refresh endpoint");
+
+    for session in &sessions {
+        let at = session.at;
+        let login = session.login();
+        assert!(
+            token_active(&c, &session.access_token).await,
+            "{at:?}: a legacy access token introspects active after the upgrade"
+        );
+
+        let (status, body, pair) = refresh_at(&c, &base, at, &session.refresh_token, &login).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{at:?}: the legacy refresh token is lifted: {body}"
+        );
+        let (access, refresh) = pair.unwrap();
+        assert!(
+            access.starts_with("mat_") && is_grant_refresh_token(&refresh),
+            "{at:?}: the lifted pair is in the grant format: {body}"
+        );
+
+        let (status, body, replay) =
+            refresh_at(&c, &base, at, &session.refresh_token, &login).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{at:?}: a replay of the legacy token before first use: {body}"
+        );
+        assert_eq!(
+            replay.unwrap(),
+            (access.clone(), refresh.clone()),
+            "{at:?}: the replay returns the SAME pair"
+        );
+        assert!(
+            token_active(&c, &session.access_token).await,
+            "{at:?}: the legacy access token stays active until it expires"
+        );
+
+        // H4 for the lifted session. The legacy ACCESS token stays stored as
+        // token/{raw} until it expires (the read fallback), so it is not listed.
+        let mut held = ClientHeld::default();
+        held.add_token("legacy refresh token", &session.refresh_token);
+        held.add_token("lifted access token", &access);
+        held.add_token("lifted refresh token", &refresh);
+        assert_nothing_stored_in_the_clear(&url, &held, &format!("{at:?}: after the lift")).await;
+
+        assert!(
+            token_active(&c, &access).await,
+            "{at:?}: the lifted access token is active"
+        );
+        let (status, body, _) = refresh_at(&c, &base, at, &session.refresh_token, &login).await;
+        assert_refused_as_unknown(
+            at,
+            status,
+            &body,
+            "the legacy token after the lifted pair was used",
+        );
+
+        let (status, body, next) = refresh_at(&c, &base, at, &refresh, &login).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{at:?}: the lifted refresh token rotates: {body}"
+        );
+        assert!(is_grant_refresh_token(&next.unwrap().1));
+    }
+}
+
+// ===========================================================================
+// H4 (I1) for every other credential a client holds: authorization codes,
+// device and user codes, login session ids, the ids of the WebAuthn ceremonies
+// and the CAIP-122 nonces the server hands out (Phase 2b).
+// ===========================================================================
+
+/// Lowercase hex SHA-256: the form a credential is stored under.
+fn digest_hex(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+/// A login started at `/authorize`: the session the cookie names and what the
+/// login page reads to build its CAIP-122 message.
+struct StartedLogin {
+    rc: RegisteredClient,
+    verifier: String,
+    session_id: String,
+    nonce: String,
+    domain: String,
+}
+
+impl StartedLogin {
+    fn cookie(&self) -> String {
+        format!("session={}", self.session_id)
+    }
+}
+
+/// `GET /authorize` for a fresh public client with an S256 challenge.
+async fn start_login(c: &Client, base: &str) -> StartedLogin {
+    let rc = register_client(c, base).await;
+    start_login_for(base, rc).await
+}
+
+/// `GET /authorize` for the registered client `rc` with an S256 challenge.
+async fn start_login_for(base: &str, rc: RegisteredClient) -> StartedLogin {
+    let (verifier, challenge) = pkce_pair();
+    let authorize_url = format!(
+        "{base}/authorize?client_id={}&redirect_uri={}&scope=openid&response_type=code&state=h4_state&code_challenge={}&code_challenge_method=S256",
+        urlencoding::encode(&rc.client_id),
+        urlencoding::encode(&rc.redirect_uri),
+        urlencoding::encode(&challenge),
+    );
+    let resp = no_redirect_client()
+        .get(&authorize_url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "authorize 303");
+    let session_id = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok()?.strip_prefix("session="))
+        .map(|rest| rest.split(';').next().unwrap_or("").to_string())
+        .find(|v| !v.is_empty())
+        .expect("authorize sets the session cookie");
+    let q = parse_query(resp.headers().get("location").unwrap().to_str().unwrap());
+    StartedLogin {
+        rc,
+        verifier,
+        session_id,
+        nonce: q["nonce"].clone(),
+        domain: q["domain"].clone(),
+    }
+}
+
+/// The `siwx` cookie value (URL-encoded) the login page sets after `w` signed
+/// the CAIP-122 message for `login`.
+fn siwx_cookie_for(base: &str, w: &Wallet, login: &StartedLogin) -> String {
+    let now = chrono::Utc::now();
+    let issued_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let expiration_time =
+        (now + chrono::Duration::hours(48)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let message = format!(
+        "{domain} wants you to sign in with your Ethereum account:\n\
+         {addr}\n\n\
+         You are signing-in to {domain}.\n\n\
+         URI: {base}\n\
+         Version: 1\n\
+         Chain ID: 1\n\
+         Nonce: {nonce}\n\
+         Issued At: {issued_at}\n\
+         Expiration Time: {expiration_time}\n\
+         Resources:\n\
+         - {redirect}",
+        domain = login.domain,
+        addr = w.address,
+        nonce = login.nonce,
+        redirect = login.rc.redirect_uri,
+    );
+    let signature = eip191_sign(&w.key, &message);
+    let value =
+        serde_json::to_string(&json!({ "did": w.did, "message": message, "signature": signature }))
+            .unwrap();
+    urlencoding::encode(&value).into_owned()
+}
+
+/// `GET /sign_in` for a started login; returns the authorization code.
+async fn sign_in_to_code(base: &str, w: &Wallet, login: &StartedLogin) -> String {
+    let resp = no_redirect_client()
+        .get(format!("{base}/sign_in"))
+        .header(
+            "cookie",
+            format!(
+                "{}; siwx={}",
+                login.cookie(),
+                siwx_cookie_for(base, w, login)
+            ),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "sign_in 303");
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    parse_query(location)
+        .get("code")
+        .unwrap_or_else(|| panic!("sign_in redirect carries no code: {location}"))
+        .clone()
+}
+
+/// `POST /device_authorization` for `client_id`: `(device_code, user_code)`.
+async fn request_device_code(c: &Client, base: &str, client_id: &str) -> (String, String) {
+    let da: Value = c
+        .post(format!("{base}/device_authorization"))
+        .form(&[("client_id", client_id), ("scope", "openid")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    (
+        da["device_code"].as_str().unwrap().to_string(),
+        da["user_code"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Approve `user_code` with `w`'s wallet over a fresh server-issued nonce;
+/// returns the nonce the approval consumed.
+async fn approve_device(c: &Client, base: &str, w: &Wallet, user_code: &str) -> String {
+    let (message, signature) = sign_device_message(c, w, base, user_code).await;
+    let r = c
+        .post(format!("{base}/device"))
+        .json(&json!({
+            "user_code": user_code, "action": "approve",
+            "did": w.did, "message": message, "signature": signature
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "device approval: {}",
+        r.text().await.unwrap_or_default()
+    );
+    message
+        .lines()
+        .find_map(|l| l.strip_prefix("Nonce: "))
+        .expect("the device message carries a nonce")
+        .to_string()
+}
+
+/// One device-code poll at `/token`: `(status, body)`.
+async fn poll_device_code(
+    c: &Client,
+    base: &str,
+    device_code: &str,
+    client_id: &str,
+) -> (StatusCode, Value) {
+    let r = c
+        .post(format!("{base}/token"))
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", device_code),
+            ("client_id", client_id),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    (status, r.json().await.unwrap_or(Value::Null))
+}
+
+/// `POST {path}` with a JSON body and optional cookie; asserts a 200 and
+/// returns the body.
+async fn post_ok(c: &Client, base: &str, path: &str, cookie: Option<&str>, body: Value) -> Value {
+    let mut req = c.post(format!("{base}{path}")).json(&body);
+    if let Some(cookie) = cookie {
+        req = req.header("cookie", cookie);
+    }
+    let r = req.send().await.unwrap();
+    let status = r.status();
+    let text = r.text().await.unwrap_or_default();
+    assert_eq!(status, StatusCode::OK, "POST {path}: {text}");
+    serde_json::from_str(&text).unwrap_or(Value::Null)
+}
+
+/// Whether the scan saw `key` in any database.
+fn scanned(scan: &RedisScan, key: &str) -> bool {
+    scan.keys.iter().any(|k| k.ends_with(&format!(":{key}")))
+}
+
+/// H4 for codes, device and user codes, session ids and nonces: a login
+/// session with every WebAuthn ceremony started under it, an issued and then
+/// an exchanged authorization code, an account re-auth ceremony and nonce, and
+/// a device-code flow through a passkey ceremony start, approval and
+/// redemption. After each stage no key and no value of the stack Redis holds
+/// any of these strings. The positive controls (the digest keys of the
+/// session, the code, the device code and its redemption claim) prove the scan
+/// searched the stack's Redis and the credentials were stored by digest.
+///
+/// WebAuthn ceremonies are only started here: finishing one needs an
+/// authenticator, which this suite does not drive (the browser suite does).
+/// Starting one is what stores its state under the ceremony id; finishing
+/// reads and deletes it, and the session update it makes goes through the
+/// same session store the login uses.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn no_code_or_session_the_client_holds_is_stored_in_the_clear() {
+    let Some(url) = stack_redis_url() else {
+        let marker = "E2E_SKIP: no_code_or_session_the_client_holds_is_stored_in_the_clear: no \
+                      stack Redis URL (E2E_REDIS_URL, SIWXOIDC_REDIS_URL, SIWEOIDC_REDIS_URL or \
+                      REDIS_HOST/REDIS_PORT); the keyspace was NOT searched";
+        assert!(
+            std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+            "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+        );
+        eprintln!("{marker}");
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    let mut held = ClientHeld::default();
+
+    // A login session, and the ceremonies keyed by its id.
+    let login = start_login(&c, &base).await;
+    held.add("login session id", &login.session_id);
+    let cookie = login.cookie();
+    post_ok(
+        &c,
+        &base,
+        "/webauthn/authenticate/start",
+        Some(&cookie),
+        json!({}),
+    )
+    .await;
+    post_ok(
+        &c,
+        &base,
+        "/webauthn/register/start",
+        Some(&cookie),
+        json!({}),
+    )
+    .await;
+    let link_cookie = format!("{cookie}; siwx={}", siwx_cookie_for(&base, &w, &login));
+    post_ok(
+        &c,
+        &base,
+        "/link/webauthn/start",
+        Some(&link_cookie),
+        json!({}),
+    )
+    .await;
+    // The account re-auth ceremony hands its id to the client in the body.
+    let started = post_ok(
+        &c,
+        &base,
+        "/account/passkey/start",
+        None,
+        json!({ "action": "org.matrix.profile" }),
+    )
+    .await;
+    held.add(
+        "account passkey ceremony id",
+        started["session_id"]
+            .as_str()
+            .expect("start returns session_id"),
+    );
+    let account_nonce: Value = c
+        .get(format!("{base}/account/nonce?action=org.matrix.profile"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    held.add(
+        "account CAIP-122 nonce",
+        account_nonce["nonce"].as_str().expect("account nonce"),
+    );
+    let scan =
+        assert_nothing_stored_in_the_clear(&url, &held, "with a login session and its ceremonies")
+            .await;
+    let session_key = format!("session/{}", digest_hex(&login.session_id));
+    assert!(
+        scanned(&scan, &session_key),
+        "positive control: the login session is stored under its digest key {session_key} \
+         ({} keys scanned in {url})",
+        scan.keys.len()
+    );
+
+    // An issued, unconsumed authorization code.
+    let code = sign_in_to_code(&base, &w, &login).await;
+    held.add("authorization code", &code);
+    let scan = assert_nothing_stored_in_the_clear(&url, &held, "with an unconsumed code").await;
+    let code_key = format!("code/{}", digest_hex(&code));
+    assert!(
+        scanned(&scan, &code_key),
+        "positive control: the code is stored under its digest key {code_key}"
+    );
+
+    // The code exchanged.
+    let tokens = exchange_code(&c, &base, &login.rc, &code, &login.verifier)
+        .await
+        .expect("the code exchanges");
+    held.add_token("access token", tokens["access_token"].as_str().unwrap());
+    held.add_token("refresh token", tokens["refresh_token"].as_str().unwrap());
+    let scan = assert_nothing_stored_in_the_clear(&url, &held, "after the code exchange").await;
+    assert!(
+        !scanned(&scan, &code_key),
+        "an exchanged code leaves no entry"
+    );
+
+    // A device-code flow: a pending code, its user code, a passkey ceremony
+    // keyed by the user code, approval over a server-issued nonce, redemption.
+    let device_client = register_client(&c, &base).await;
+    let (device_code, user_code) = request_device_code(&c, &base, &device_client.client_id).await;
+    held.add("device code", &device_code);
+    held.add("user code", &user_code);
+    post_ok(
+        &c,
+        &base,
+        "/device/passkey/start",
+        None,
+        json!({ "user_code": user_code }),
+    )
+    .await;
+    let scan = assert_nothing_stored_in_the_clear(&url, &held, "with a pending device code").await;
+    let device_key = format!("device_code/{}", digest_hex(&device_code));
+    assert!(
+        scanned(&scan, &device_key),
+        "positive control: the device code is stored under its digest key {device_key}"
+    );
+    assert!(
+        scanned(&scan, &format!("user_code/{}", digest_hex(&user_code))),
+        "positive control: the user code is stored under its digest key"
+    );
+
+    let device_nonce = approve_device(&c, &base, &w, &user_code).await;
+    held.add("device CAIP-122 nonce", &device_nonce);
+    assert_nothing_stored_in_the_clear(&url, &held, "after the device approval").await;
+
+    let (status, body) = poll_device_code(&c, &base, &device_code, &device_client.client_id).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the approved device code redeems: {body}"
+    );
+    held.add_token(
+        "device access token",
+        body["access_token"].as_str().unwrap(),
+    );
+    held.add_token(
+        "device refresh token",
+        body["refresh_token"].as_str().unwrap(),
+    );
+    let scan = assert_nothing_stored_in_the_clear(&url, &held, "after redemption").await;
+    let claim_key = format!("{device_key}/redeemed");
+    assert!(
+        scanned(&scan, &claim_key),
+        "positive control: the redemption claim is keyed by the digest, {claim_key}"
+    );
+}
+
+/// A confidential client (`client_secret_basic`) and the two credentials its
+/// registration response returned.
+struct ConfidentialClient {
+    rc: RegisteredClient,
+    secret: String,
+    registration_token: String,
+}
+
+/// The registration metadata of a confidential client, for `POST /register`
+/// and the RFC 7592 update; `client_name` tells the two apart.
+fn confidential_metadata(redirect_uri: &str, client_name: &str) -> Value {
+    json!({
+        "redirect_uris": [redirect_uri],
+        "client_name": client_name,
+        "token_endpoint_auth_method": "client_secret_basic",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+    })
+}
+
+async fn register_confidential_client(c: &Client, base: &str) -> ConfidentialClient {
+    let redirect_uri = format!("{base}/callback");
+    let reg: Value = c
+        .post(format!("{base}/register"))
+        .json(&confidential_metadata(&redirect_uri, "registered"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let field = |k: &str| {
+        reg[k]
+            .as_str()
+            .unwrap_or_else(|| panic!("the registration response carries {k}: {reg}"))
+            .to_string()
+    };
+    ConfidentialClient {
+        rc: RegisteredClient {
+            client_id: field("client_id"),
+            redirect_uri,
+        },
+        secret: field("client_secret"),
+        registration_token: field("registration_access_token"),
+    }
+}
+
+/// `POST /token` authenticated with `secret` in an HTTP Basic header
+/// (`client_secret_basic`): `(status, json|null)`.
+async fn token_with_secret(
+    c: &Client,
+    base: &str,
+    rc: &RegisteredClient,
+    secret: &str,
+    form: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let resp = c
+        .post(format!("{base}/token"))
+        .basic_auth(&rc.client_id, Some(secret))
+        .form(form)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, resp.json::<Value>().await.unwrap_or(Value::Null))
+}
+
+/// RFC 7592 update (`POST /client/{id}`) with `token` as the bearer: the status.
+async fn update_client(c: &Client, base: &str, rc: &RegisteredClient, token: &str) -> StatusCode {
+    c.post(format!("{base}/client/{}", rc.client_id))
+        .bearer_auth(token)
+        .json(&confidential_metadata(&rc.redirect_uri, "updated"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+/// H4 for clients: a confidential client's secret and registration access
+/// token, after its registration, after it updated its registration with the
+/// token, and after it authenticated with the secret at the code exchange and
+/// the refresh grant. No key and no value of the stack Redis holds either. The
+/// positive control (the registration's key in the scan) proves the scan read
+/// the entry that would hold them. `default_clients` entries are covered in
+/// process (`axum_lib` tests): the mock stack configures none.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn no_client_secret_or_registration_token_is_stored_in_the_clear() {
+    let Some(url) = stack_redis_url() else {
+        let marker = "E2E_SKIP: no_client_secret_or_registration_token_is_stored_in_the_clear: \
+                      no stack Redis URL (E2E_REDIS_URL, SIWXOIDC_REDIS_URL, SIWEOIDC_REDIS_URL \
+                      or REDIS_HOST/REDIS_PORT); the keyspace was NOT searched";
+        assert!(
+            std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+            "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+        );
+        eprintln!("{marker}");
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let client = register_confidential_client(&c, &base).await;
+    let mut held = ClientHeld::default();
+    held.add("client secret", &client.secret);
+    held.add("registration access token", &client.registration_token);
+    let key = format!("clients/{}", client.rc.client_id);
+    let scan = assert_nothing_stored_in_the_clear(&url, &held, "after the registration").await;
+    assert!(
+        scanned(&scan, &key),
+        "positive control: the scan read the registration, {key}"
+    );
+
+    // The client manages itself with its registration access token, and only
+    // with it.
+    assert_eq!(
+        update_client(&c, &base, &client.rc, "not-the-registration-token").await,
+        StatusCode::UNAUTHORIZED,
+        "a wrong registration access token is refused"
+    );
+    assert_eq!(
+        update_client(&c, &base, &client.rc, &client.registration_token).await,
+        StatusCode::OK,
+        "the registration access token updates the registration"
+    );
+    assert_nothing_stored_in_the_clear(&url, &held, "after the client updated itself").await;
+
+    // It authenticates with its secret at the code exchange and the refresh
+    // grant, and a wrong secret is refused.
+    let login = start_login_for(&base, client.rc.clone()).await;
+    let code = sign_in_to_code(&base, &new_wallet(), &login).await;
+    let (status, tokens) = token_with_secret(
+        &c,
+        &base,
+        &client.rc,
+        &client.secret,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("code_verifier", &login.verifier),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the code exchanges: {tokens}");
+    let refresh_token = tokens["refresh_token"].as_str().expect("a refresh token");
+    let refresh = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+    ];
+    let (status, body) = token_with_secret(&c, &base, &client.rc, "not-the-secret", &refresh).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "a wrong secret: {body}");
+    let (status, body) = token_with_secret(&c, &base, &client.rc, &client.secret, &refresh).await;
+    assert_eq!(status, StatusCode::OK, "the refresh grant: {body}");
+    assert_nothing_stored_in_the_clear(
+        &url,
+        &held,
+        "after the code exchange and the refresh grant",
+    )
+    .await;
+}
+
+// ===========================================================================
+// R2: codes, device and user codes and login sessions a build before digest
+// keys wrote keep working after the upgrade, within their lifetimes (Phase 2b).
+// ===========================================================================
+
+/// The credentials a previous build left in flight, as the client holds them.
+struct InFlight {
+    /// An issued, unconsumed authorization code, its client and verifier.
+    code_client: RegisteredClient,
+    code: String,
+    code_verifier: String,
+    /// A login session started at `/authorize`, not yet signed in.
+    session: StartedLogin,
+    /// An approved, unredeemed device code.
+    approved_client: String,
+    approved_device_code: String,
+    approved_user_code: String,
+    /// A pending device code and its user code.
+    pending_client: String,
+    pending_device_code: String,
+    pending_user_code: String,
+    /// A confidential client and an issued, unconsumed code for it: its
+    /// registration is first read again when the code is exchanged with its
+    /// secret.
+    secret_client: ConfidentialClient,
+    secret_code: String,
+    secret_code_verifier: String,
+    /// A confidential client whose registration is first read again when it
+    /// updates itself with its registration access token.
+    managed_client: ConfidentialClient,
+}
+
+impl ConfidentialClient {
+    fn to_json(&self) -> Value {
+        json!({
+            "client_id": self.rc.client_id,
+            "redirect_uri": self.rc.redirect_uri,
+            "secret": self.secret,
+            "registration_token": self.registration_token,
+        })
+    }
+
+    fn from_json(v: &Value) -> Self {
+        let s = |k: &str| {
+            v[k].as_str()
+                .unwrap_or_else(|| panic!("R2 file lacks the client's {k}"))
+                .to_string()
+        };
+        ConfidentialClient {
+            rc: RegisteredClient {
+                client_id: s("client_id"),
+                redirect_uri: s("redirect_uri"),
+            },
+            secret: s("secret"),
+            registration_token: s("registration_token"),
+        }
+    }
+}
+
+impl InFlight {
+    fn to_json(&self) -> Value {
+        json!({
+            "code_client": self.code_client.client_id,
+            "code_redirect_uri": self.code_client.redirect_uri,
+            "code": self.code,
+            "code_verifier": self.code_verifier,
+            "session_client": self.session.rc.client_id,
+            "session_redirect_uri": self.session.rc.redirect_uri,
+            "session_verifier": self.session.verifier,
+            "session_id": self.session.session_id,
+            "session_nonce": self.session.nonce,
+            "session_domain": self.session.domain,
+            "approved_client": self.approved_client,
+            "approved_device_code": self.approved_device_code,
+            "approved_user_code": self.approved_user_code,
+            "pending_client": self.pending_client,
+            "pending_device_code": self.pending_device_code,
+            "pending_user_code": self.pending_user_code,
+            "secret_client": self.secret_client.to_json(),
+            "secret_code": self.secret_code,
+            "secret_code_verifier": self.secret_code_verifier,
+            "managed_client": self.managed_client.to_json(),
+        })
+    }
+
+    fn from_json(v: &Value) -> Self {
+        let s = |k: &str| {
+            v[k].as_str()
+                .unwrap_or_else(|| panic!("R2 file lacks {k}"))
+                .to_string()
+        };
+        InFlight {
+            code_client: RegisteredClient {
+                client_id: s("code_client"),
+                redirect_uri: s("code_redirect_uri"),
+            },
+            code: s("code"),
+            code_verifier: s("code_verifier"),
+            session: StartedLogin {
+                rc: RegisteredClient {
+                    client_id: s("session_client"),
+                    redirect_uri: s("session_redirect_uri"),
+                },
+                verifier: s("session_verifier"),
+                session_id: s("session_id"),
+                nonce: s("session_nonce"),
+                domain: s("session_domain"),
+            },
+            approved_client: s("approved_client"),
+            approved_device_code: s("approved_device_code"),
+            approved_user_code: s("approved_user_code"),
+            pending_client: s("pending_client"),
+            pending_device_code: s("pending_device_code"),
+            pending_user_code: s("pending_user_code"),
+            secret_client: ConfidentialClient::from_json(&v["secret_client"]),
+            secret_code: s("secret_code"),
+            secret_code_verifier: s("secret_code_verifier"),
+            managed_client: ConfidentialClient::from_json(&v["managed_client"]),
+        }
+    }
+}
+
+/// Drive every flow to the point where its credential is in flight: a code
+/// issued, a session started, a device code approved, another pending.
+async fn put_in_flight(c: &Client, base: &str) -> InFlight {
+    let w = new_wallet();
+    let login = start_login(c, base).await;
+    let code = sign_in_to_code(base, &w, &login).await;
+    let session = start_login(c, base).await;
+
+    let approver = new_wallet();
+    mock_seed_user(c, &approver.localpart).await;
+    let approved = register_client(c, base).await;
+    let (approved_device_code, approved_user_code) =
+        request_device_code(c, base, &approved.client_id).await;
+    approve_device(c, base, &approver, &approved_user_code).await;
+
+    let pending = register_client(c, base).await;
+    let (pending_device_code, pending_user_code) =
+        request_device_code(c, base, &pending.client_id).await;
+
+    let secret_client = register_confidential_client(c, base).await;
+    let secret_login = start_login_for(base, secret_client.rc.clone()).await;
+    let secret_code = sign_in_to_code(base, &new_wallet(), &secret_login).await;
+    let managed_client = register_confidential_client(c, base).await;
+    InFlight {
+        code_client: login.rc,
+        code,
+        code_verifier: login.verifier,
+        session,
+        approved_client: approved.client_id,
+        approved_device_code,
+        approved_user_code,
+        pending_client: pending.client_id,
+        pending_device_code,
+        pending_user_code,
+        secret_client,
+        secret_code,
+        secret_code_verifier: secret_login.verifier,
+        managed_client,
+    }
+}
+
+/// A device-code entry exactly as a build before digest keys serialized it:
+/// the user code in the clear in the entry.
+fn legacy_device_entry(user_code: &str, client_id: &str, status: &str, did: Option<&str>) -> Value {
+    json!({
+        "user_code": user_code,
+        "client_id": client_id,
+        "scope": "openid",
+        "status": status,
+        "did": did,
+        "device_id": null,
+        "last_poll": null,
+        "created_at": chrono_now(),
+    })
+}
+
+/// Rewrite what the server under test stored for `flight` into the layout a
+/// build before digest keys wrote: `codes/{raw}`, `sessions/{raw}`,
+/// `device_codes/{raw}` with the user code in the entry, `user_codes/{raw}` ->
+/// the raw device code. The code and session entries keep their values (their
+/// format did not change); the device entries are rewritten whole.
+async fn rewrite_as_legacy(url: &str, flight: &InFlight) {
+    use bb8_redis::redis;
+    let mut conn = stack_redis(url).await;
+    for (digest_key, legacy_key) in [
+        (
+            format!("code/{}", digest_hex(&flight.code)),
+            format!("codes/{}", flight.code),
+        ),
+        (
+            format!("session/{}", digest_hex(&flight.session.session_id)),
+            format!("sessions/{}", flight.session.session_id),
+        ),
+        (
+            format!("code/{}", digest_hex(&flight.secret_code)),
+            format!("codes/{}", flight.secret_code),
+        ),
+    ] {
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(&digest_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        if exists {
+            let _: () = redis::cmd("RENAME")
+                .arg(&digest_key)
+                .arg(&legacy_key)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+        }
+        let legacy: bool = redis::cmd("EXISTS")
+            .arg(&legacy_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(legacy, "the stand-in wrote {legacy_key}");
+    }
+    let approver_did = {
+        // The approved entry's DID, from whichever layout holds it.
+        let mut did = None;
+        for key in [
+            format!("device_code/{}", digest_hex(&flight.approved_device_code)),
+            format!("device_codes/{}", flight.approved_device_code),
+        ] {
+            let raw: Option<String> = redis::cmd("GET")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            if let Some(raw) = raw {
+                let entry: Value = serde_json::from_str(&raw).unwrap();
+                did = entry["did"].as_str().map(str::to_string);
+            }
+        }
+        did.expect("the approved device code's entry names its approver")
+    };
+    for (device_code, user_code, client, status, did) in [
+        (
+            &flight.approved_device_code,
+            flight.approved_user_code.as_str(),
+            &flight.approved_client,
+            "Approved",
+            Some(approver_did.as_str()),
+        ),
+        (
+            &flight.pending_device_code,
+            flight.pending_user_code.as_str(),
+            &flight.pending_client,
+            "Pending",
+            None,
+        ),
+    ] {
+        let _: () = redis::cmd("DEL")
+            .arg(format!("device_code/{}", digest_hex(device_code)))
+            .arg(format!("device_codes/{device_code}"))
+            .arg(format!("user_code/{}", digest_hex(user_code)))
+            .arg(format!("user_codes/{user_code}"))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let entry = legacy_device_entry(user_code, client, status, did);
+        let _: () = redis::cmd("SET")
+            .arg(format!("device_codes/{device_code}"))
+            .arg(entry.to_string())
+            .arg("EX")
+            .arg(1800)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("SET")
+            .arg(format!("user_codes/{user_code}"))
+            .arg(device_code)
+            .arg("EX")
+            .arg(1800)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+    for client in [&flight.secret_client, &flight.managed_client] {
+        rewrite_client_as_legacy(&mut conn, client).await;
+    }
+}
+
+/// Rewrite a client's registration into the entry a build before digest keys
+/// wrote, `{secret, metadata, access_token}` with both credentials in the
+/// clear, keeping its metadata and its expiry.
+async fn rewrite_client_as_legacy(
+    conn: &mut bb8_redis::redis::aio::MultiplexedConnection,
+    client: &ConfidentialClient,
+) {
+    use bb8_redis::redis;
+    let key = format!("clients/{}", client.rc.client_id);
+    let stored: String = redis::cmd("GET").arg(&key).query_async(conn).await.unwrap();
+    let stored: Value = serde_json::from_str(&stored).unwrap();
+    let legacy = json!({
+        "secret": client.secret,
+        "metadata": stored["metadata"],
+        "access_token": client.registration_token,
+    });
+    let _: () = redis::cmd("SET")
+        .arg(&key)
+        .arg(legacy.to_string())
+        .arg("KEEPTTL")
+        .query_async(conn)
+        .await
+        .unwrap();
+}
+
+/// Whether the registration of `client` holds its secret and its
+/// registration access token in the clear, as a build before digest keys
+/// stored them.
+async fn client_stored_in_the_clear(url: &str, client: &ConfidentialClient) -> bool {
+    let mut conn = stack_redis(url).await;
+    let stored: Option<String> = bb8_redis::redis::cmd("GET")
+        .arg(format!("clients/{}", client.rc.client_id))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    stored.is_some_and(|v| v.contains(&client.secret) && v.contains(&client.registration_token))
+}
+
+fn r2_file() -> String {
+    std::env::var("E2E_R2_FILE").unwrap_or_else(|_| {
+        panic!("E2E_R2_FILE names the file the mint stage writes and the check stage reads")
+    })
+}
+
+/// R2, a real upgrade or its seeded stand-in. In-flight credentials come from
+/// one of three places, chosen by `E2E_R2_STAGE`:
+///
+/// - `mint`: run against the PREVIOUS build. Puts a code, a session and two
+///   device codes in flight and registers two confidential clients, asserts
+///   the server stored them in the clear (`codes/{raw}`, `sessions/{raw}`,
+///   `device_codes/{raw}`, `user_codes/{raw}`, and each client's secret and
+///   registration access token in its entry), saves them to `E2E_R2_FILE`
+///   and stops. Then swap the binary, keeping
+///   Redis and the mock, and run `check` within 300 s.
+/// - `check`: reads them back and runs the checks below against the new build.
+/// - unset (CI and every regular run): puts them in flight on the server under
+///   test and rewrites what it stored into the previous build's layout.
+///
+/// The checks: the code redeems once and only once; the session signs in and
+/// its code exchanges; the approved device code redeems once; the pending
+/// user code is still found, approved and redeemed; one client authenticates
+/// with its secret at the code exchange and the refresh grant, the other
+/// updates itself with its registration access token. Afterwards no key or
+/// value holds the legacy code, device codes or user codes (each was deleted
+/// on use), or a client's secret or registration access token (each entry was
+/// upgraded to digests when it was first read). The legacy session entry stays until it expires (300 s): the new
+/// build reads it in place and writes nothing in the clear. After a real
+/// upgrade, the nonce the previous build consumed for its approval also keeps
+/// the approved user code until it expires (300 s).
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn in_flight_codes_and_sessions_survive_the_upgrade() {
+    let Some(url) = stack_redis_url() else {
+        let marker = "E2E_SKIP: in_flight_codes_and_sessions_survive_the_upgrade: no stack Redis \
+                      URL (E2E_REDIS_URL, SIWXOIDC_REDIS_URL, SIWEOIDC_REDIS_URL or \
+                      REDIS_HOST/REDIS_PORT); the upgrade was NOT exercised";
+        assert!(
+            std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+            "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+        );
+        eprintln!("{marker}");
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    let stage = std::env::var("E2E_R2_STAGE").unwrap_or_default();
+    let flight = match stage.as_str() {
+        "mint" => {
+            mock_reset(&c).await;
+            let flight = put_in_flight(&c, &base).await;
+            let mut conn = stack_redis(&url).await;
+            for key in [
+                format!("codes/{}", flight.code),
+                format!("codes/{}", flight.secret_code),
+                format!("sessions/{}", flight.session.session_id),
+                format!("device_codes/{}", flight.approved_device_code),
+                format!("device_codes/{}", flight.pending_device_code),
+                format!("user_codes/{}", flight.pending_user_code),
+            ] {
+                let legacy: bool = bb8_redis::redis::cmd("EXISTS")
+                    .arg(&key)
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap();
+                assert!(
+                    legacy,
+                    "mint: the server under test did not store {key}: run the mint stage \
+                     against the previous build"
+                );
+            }
+            for client in [&flight.secret_client, &flight.managed_client] {
+                assert!(
+                    client_stored_in_the_clear(&url, client).await,
+                    "mint: the server under test stored a client's credentials as digests: run \
+                     the mint stage against the previous build"
+                );
+            }
+            std::fs::write(r2_file(), flight.to_json().to_string()).unwrap();
+            eprintln!("R2 mint: in-flight credentials written; swap the binary and run E2E_R2_STAGE=check");
+            return;
+        }
+        "check" => InFlight::from_json(
+            &serde_json::from_str(&std::fs::read_to_string(r2_file()).unwrap()).unwrap(),
+        ),
+        "" => {
+            mock_reset(&c).await;
+            let flight = put_in_flight(&c, &base).await;
+            rewrite_as_legacy(&url, &flight).await;
+            flight
+        }
+        other => panic!("E2E_R2_STAGE={other}: expected mint, check or unset"),
+    };
+
+    // The issued code redeems once and only once.
+    let tokens = exchange_code(
+        &c,
+        &base,
+        &flight.code_client,
+        &flight.code,
+        &flight.code_verifier,
+    )
+    .await
+    .expect("a code the previous build issued redeems after the upgrade");
+    assert!(token_active(&c, tokens["access_token"].as_str().unwrap()).await);
+    assert_eq!(
+        exchange_code(
+            &c,
+            &base,
+            &flight.code_client,
+            &flight.code,
+            &flight.code_verifier
+        )
+        .await
+        .err(),
+        Some(StatusCode::BAD_REQUEST),
+        "the code redeems only once"
+    );
+
+    // The session started on the previous build signs in, and its code exchanges.
+    let w = new_wallet();
+    let code = sign_in_to_code(&base, &w, &flight.session).await;
+    let session_tokens = exchange_code(
+        &c,
+        &base,
+        &flight.session.rc,
+        &code,
+        &flight.session.verifier,
+    )
+    .await
+    .expect("the session's code exchanges");
+    assert!(token_active(&c, session_tokens["access_token"].as_str().unwrap()).await);
+
+    // The approved device code redeems once.
+    let (status, body) = poll_device_code(
+        &c,
+        &base,
+        &flight.approved_device_code,
+        &flight.approved_client,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an approved device code redeems: {body}"
+    );
+    assert!(token_active(&c, body["access_token"].as_str().unwrap()).await);
+    let (status, body) = poll_device_code(
+        &c,
+        &base,
+        &flight.approved_device_code,
+        &flight.approved_client,
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("expired_token")),
+        "the approved device code redeems only once: {body}"
+    );
+
+    // The pending user code is still found and can be approved.
+    let r = c
+        .get(format!(
+            "{base}/device/verify?user_code={}",
+            flight.pending_user_code
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "the pending user code is found");
+    let approver = new_wallet();
+    mock_seed_user(&c, &approver.localpart).await;
+    approve_device(&c, &base, &approver, &flight.pending_user_code).await;
+    let (status, body) = poll_device_code(
+        &c,
+        &base,
+        &flight.pending_device_code,
+        &flight.pending_client,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the device code approved after the upgrade redeems: {body}"
+    );
+
+    // The confidential client registered on the previous build authenticates
+    // with its secret: first at the exchange of its code, then at the refresh
+    // grant, where a wrong secret is still refused.
+    let secret_client = &flight.secret_client;
+    if stage != "check" {
+        assert!(
+            client_stored_in_the_clear(&url, secret_client).await,
+            "the stand-in stored the client as the previous build did"
+        );
+    }
+    let (status, tokens) = token_with_secret(
+        &c,
+        &base,
+        &secret_client.rc,
+        &secret_client.secret,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &flight.secret_code),
+            ("code_verifier", &flight.secret_code_verifier),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a client registered on the previous build authenticates at /token: {tokens}"
+    );
+    let refresh = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", tokens["refresh_token"].as_str().unwrap()),
+    ];
+    let (status, body) =
+        token_with_secret(&c, &base, &secret_client.rc, "not-the-secret", &refresh).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "a wrong secret: {body}");
+    let (status, body) = token_with_secret(
+        &c,
+        &base,
+        &secret_client.rc,
+        &secret_client.secret,
+        &refresh,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the refresh grant: {body}");
+
+    // The other one manages itself with its registration access token, and
+    // only with it.
+    let managed = &flight.managed_client.rc;
+    assert_eq!(
+        update_client(
+            &c,
+            &base,
+            managed,
+            &flight.managed_client.registration_token
+        )
+        .await,
+        StatusCode::OK,
+        "a client registered on the previous build updates itself"
+    );
+    assert_eq!(
+        update_client(&c, &base, managed, "not-the-registration-token").await,
+        StatusCode::UNAUTHORIZED,
+        "a wrong registration access token is refused"
+    );
+    assert_eq!(
+        update_client(
+            &c,
+            &base,
+            managed,
+            &flight.managed_client.registration_token
+        )
+        .await,
+        StatusCode::OK,
+        "the registration access token still works after the upgrade of the entry"
+    );
+
+    let mut held = ClientHeld::default();
+    for client in [&flight.secret_client, &flight.managed_client] {
+        held.add("previous build's client secret", &client.secret);
+        held.add(
+            "previous build's registration access token",
+            &client.registration_token,
+        );
+    }
+    held.add("legacy authorization code", &flight.code);
+    held.add("legacy confidential client's code", &flight.secret_code);
+    held.add("legacy approved device code", &flight.approved_device_code);
+    // After a real upgrade the previous build's approval nonce still holds the
+    // approved user code in the clear: that build consumed it with a
+    // `/consumed` flag and left the entry, which expires within 300 s and which
+    // the new build cannot find without the nonce. The stand-in approves on the
+    // build under test, so there the user code must be gone.
+    if stage != "check" {
+        held.add("legacy approved user code", &flight.approved_user_code);
+    }
+    held.add("legacy pending device code", &flight.pending_device_code);
+    held.add("legacy pending user code", &flight.pending_user_code);
+    assert_nothing_stored_in_the_clear(&url, &held, "after every legacy credential was used").await;
+}
+
+// ===========================================================================
+// E1 (I9): epochs. `logout/all` sets the user epoch, which refuses every grant
+// of the user authenticated before it at both refresh endpoints and makes its
+// access tokens inactive at introspection, while a sign-in right after it
+// refreshes at once (the user tombstone it replaced refused that for 900 s).
+// A client epoch refuses that client's older grants only, a global epoch every
+// older grant. A user tombstone a previous build wrote still refuses for its
+// lifetime. The client and global epochs have no HTTP endpoint (an operator
+// sets them), so these tests write them into the stack Redis from Redis `TIME`
+// exactly as the server's `set_epoch` does.
+// ===========================================================================
+
+/// The stack Redis URL, or a loud skip (a failure under `E2E_STRICT_SKIPS=1`).
+fn stack_redis_or_skip(test: &str) -> Option<String> {
+    let url = stack_redis_url();
+    if url.is_none() {
+        let marker = format!(
+            "E2E_SKIP: {test}: no stack Redis URL (E2E_REDIS_URL, SIWXOIDC_REDIS_URL, \
+             SIWEOIDC_REDIS_URL or REDIS_HOST/REDIS_PORT); nothing was checked"
+        );
+        assert!(
+            std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+            "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+        );
+        eprintln!("{marker}");
+    }
+    url
+}
+
+/// Write `key` = Redis `TIME` in milliseconds, as `set_epoch` does.
+async fn write_epoch(url: &str, key: &str) {
+    let mut conn = stack_redis(url).await;
+    let _: String = bb8_redis::redis::cmd("EVAL")
+        .arg(
+            "local t = redis.call('TIME') \
+             local ms = string.format('%.0f', tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)) \
+             redis.call('SET', KEYS[1], ms) return ms",
+        )
+        .arg(1)
+        .arg(key)
+        .query_async(&mut conn)
+        .await
+        .unwrap_or_else(|e| panic!("write {key}: {e}"));
+}
+
+async fn redis_del(url: &str, key: &str) {
+    let mut conn = stack_redis(url).await;
+    let _: i64 = bb8_redis::redis::cmd("DEL")
+        .arg(key)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+}
+
+/// `login`'s access token is inactive at introspection and its refresh token is
+/// refused at both refresh endpoints. Introspection is asked first, while the
+/// grant still exists: a refusal by an epoch at a refresh deletes the grant, so
+/// only an introspection before it shows the access check's own epoch check.
+/// Then the Matrix endpoint, and `/token` must refuse the deleted grant too.
+async fn assert_login_refused(c: &Client, base: &str, login: &LoginResult, what: &str) {
+    assert!(
+        !token_active(c, &login.access_token).await,
+        "{what}: the access token is still active at introspection"
+    );
+    for at in [RefreshAt::Matrix, RefreshAt::Token] {
+        let (status, body, _) = refresh_at(c, base, at, &login.refresh_token, login).await;
+        assert_refused_as_unknown(at, status, &body, what);
+    }
+}
+
+/// `login` refreshes at `/token`, then its successor at the Matrix endpoint.
+async fn assert_login_refreshes(c: &Client, base: &str, login: &LoginResult, what: &str) {
+    assert!(
+        token_active(c, &login.access_token).await,
+        "{what}: the access token is inactive"
+    );
+    let (status, body, pair) =
+        refresh_at(c, base, RefreshAt::Token, &login.refresh_token, login).await;
+    let (_, refresh) = pair.unwrap_or_else(|| panic!("{what}: /token refused: {status} {body}"));
+    let (status, body, pair) = refresh_at(c, base, RefreshAt::Matrix, &refresh, login).await;
+    assert!(
+        pair.is_some(),
+        "{what}: the Matrix endpoint refused the successor: {status} {body}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn e1_after_logout_all_older_grants_are_refused_and_a_new_sign_in_refreshes_at_once() {
+    let c = Client::new();
+    let base = oidc();
+    let w = new_wallet();
+    let first = wallet_login(&c, &base, &w).await;
+    let second = wallet_login(&c, &base, &w).await;
+    let resp = c
+        .post(format!("{base}/_matrix/client/v3/logout/all"))
+        .bearer_auth(&first.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "logout/all");
+    for (login, what) in [
+        (&first, "the grant that called logout/all"),
+        (&second, "another grant of the user"),
+    ] {
+        assert_login_refused(&c, &base, login, what).await;
+    }
+    let after = wallet_login(&c, &base, &w).await;
+    assert_login_refreshes(&c, &base, &after, "a sign-in right after logout/all").await;
+}
+
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn e1_a_client_epoch_refuses_that_clients_older_grants_only() {
+    let Some(url) = stack_redis_or_skip("e1_a_client_epoch_refuses_that_clients_older_grants_only")
+    else {
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    let w = new_wallet();
+    let target = wallet_login(&c, &base, &w).await;
+    let other = wallet_login(&c, &base, &w).await;
+    let key = format!("epoch:client/{}", target.client_id);
+    write_epoch(&url, &key).await;
+    assert_login_refused(&c, &base, &target, "the client's grant").await;
+    assert_login_refreshes(&c, &base, &other, "the same user's grant at another client").await;
+    redis_del(&url, &key).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn e1_a_global_epoch_refuses_every_older_grant() {
+    let Some(url) = stack_redis_or_skip("e1_a_global_epoch_refuses_every_older_grant") else {
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    let older = [
+        wallet_login(&c, &base, &new_wallet()).await,
+        wallet_login(&c, &base, &new_wallet()).await,
+    ];
+    write_epoch(&url, "epoch:global").await;
+    // Collected, so the global epoch is removed before any assertion fails:
+    // left behind it would refuse nothing newer, but the stack is shared.
+    let mut refused = Vec::new();
+    for login in &older {
+        // Introspection first, before a refresh deletes the grant.
+        let active = token_active(&c, &login.access_token).await;
+        let mut outcome = Vec::new();
+        for at in [RefreshAt::Matrix, RefreshAt::Token] {
+            let (status, body, _) = refresh_at(&c, &base, at, &login.refresh_token, login).await;
+            outcome.push((at, status, body));
+        }
+        refused.push((outcome, active));
+    }
+    let later = wallet_login(&c, &base, &new_wallet()).await;
+    let (status, body, later_pair) =
+        refresh_at(&c, &base, RefreshAt::Token, &later.refresh_token, &later).await;
+    redis_del(&url, "epoch:global").await;
+    for (i, (outcome, active)) in refused.iter().enumerate() {
+        for (at, status, body) in outcome {
+            assert_refused_as_unknown(*at, *status, body, &format!("older grant {i}"));
+        }
+        assert!(!active, "older grant {i}: the access token is still active");
+    }
+    assert!(
+        later_pair.is_some(),
+        "a sign-in after the global epoch refreshes: {status} {body}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn e1_a_user_tombstone_written_by_the_previous_build_still_refuses_refresh() {
+    let Some(url) = stack_redis_or_skip(
+        "e1_a_user_tombstone_written_by_the_previous_build_still_refuses_refresh",
+    ) else {
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    let login = wallet_login(&c, &base, &new_wallet()).await;
+    let username = introspect(&c, &login.access_token).await["username"]
+        .as_str()
+        .expect("introspection names the user")
+        .to_string();
+    let key = format!("tombstone:user/{username}");
+    {
+        // Exactly as the previous build planted it: `SET … 1 EX 900`.
+        let mut conn = stack_redis(&url).await;
+        let _: () = bb8_redis::redis::cmd("SET")
+            .arg(&key)
+            .arg("1")
+            .arg("EX")
+            .arg(900)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+    let mut outcome = Vec::new();
+    for at in [RefreshAt::Matrix, RefreshAt::Token] {
+        let (status, body, _) = refresh_at(&c, &base, at, &login.refresh_token, &login).await;
+        outcome.push((at, status, body));
+    }
+    redis_del(&url, &key).await;
+    for (at, status, body) in &outcome {
+        assert_refused_as_unknown(*at, *status, body, "a tombstoned user's grant");
+    }
+}
+
+// ===========================================================================
+// RP-initiated logout (OpenID Connect RP-Initiated Logout 1.0, Phase 4, B4)
+// ===========================================================================
+
+/// A public client like [`register_client`] that also registers
+/// `post_logout_redirect_uris`.
+async fn register_client_with_post_logout(
+    c: &Client,
+    base: &str,
+    uris: &[&str],
+) -> RegisteredClient {
+    let redirect_uri = format!("{base}/callback");
+    let resp = c
+        .post(format!("{base}/register"))
+        .json(&json!({
+            "redirect_uris": [&redirect_uri],
+            "post_logout_redirect_uris": uris,
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "setup: registration");
+    let reg: Value = resp.json().await.unwrap();
+    RegisteredClient {
+        client_id: reg["client_id"].as_str().unwrap().to_string(),
+        redirect_uri,
+    }
+}
+
+/// The claims of a compact JWS, decoded without verification.
+fn jws_claims(jws: &str) -> Value {
+    use base64::Engine;
+    let payload = jws.split('.').nth(1).expect("a compact JWS");
+    serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("base64url payload"),
+    )
+    .expect("JSON claims")
+}
+
+fn b64url(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// `GET /end_session` with the given query parameters, redirects not followed.
+async fn end_session_get(base: &str, params: &[(&str, &str)]) -> reqwest::Response {
+    no_redirect_client()
+        .get(format!("{base}/end_session"))
+        .query(params)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// `POST /end_session` with the given form, redirects not followed.
+async fn end_session_post(base: &str, params: &[(&str, &str)]) -> reqwest::Response {
+    no_redirect_client()
+        .post(format!("{base}/end_session"))
+        .form(params)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Whether both refresh endpoints refuse `login`'s refresh token like an
+/// unknown one.
+async fn assert_refresh_refused_at_both(c: &Client, base: &str, login: &LoginResult, what: &str) {
+    for at in [RefreshAt::Token, RefreshAt::Matrix] {
+        let (status, body, pair) = refresh_at(c, base, at, &login.refresh_token, login).await;
+        assert!(pair.is_none(), "{what}: the refresh token must not refresh");
+        assert_refused_as_unknown(at, status, &body, what);
+    }
+}
+
+/// B4: end-session deletes exactly the grant its `id_token_hint` names (by its
+/// `sid`): that grant's access token is inactive at once, its refresh token is
+/// refused at both endpoints, another grant of the same user lives on, and no
+/// Synapse device is deleted (RP-initiated logout is not a device sign-out).
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn end_session_deletes_exactly_the_grant_its_hint_names_and_never_a_device() {
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    let a = wallet_login(&c, &base, &w).await;
+    let b = wallet_login(&c, &base, &w).await;
+    let (sid_a, sid_b) = (
+        jws_claims(&a.id_token)["sid"].clone(),
+        jws_claims(&b.id_token)["sid"].clone(),
+    );
+    assert!(
+        sid_a.is_string() && sid_b.is_string(),
+        "every ID token carries a sid: {sid_a} {sid_b}"
+    );
+    assert_ne!(sid_a, sid_b, "two grants, two sids");
+
+    let resp = end_session_get(&base, &[("id_token_hint", a.id_token.as_str())]).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "no post_logout_redirect_uri: a signed-out page"
+    );
+    assert!(
+        resp.headers().get("location").is_none(),
+        "no redirect without a registered URI"
+    );
+
+    assert!(
+        !token_active(&c, &a.access_token).await,
+        "the named grant's access token is inactive at once"
+    );
+    assert_refresh_refused_at_both(&c, &base, &a, "the ended grant's refresh token").await;
+    assert!(
+        token_active(&c, &b.access_token).await,
+        "another grant of the same user lives on"
+    );
+
+    let state = mock_state(&c).await;
+    assert_eq!(
+        count_calls(&state, DELETE_DEVICE_CALL),
+        0,
+        "end-session never deletes a Synapse device"
+    );
+    assert!(
+        device_ids(&state, &w.mxid).contains(&a.device_id),
+        "the ended grant's device stays"
+    );
+
+    // Ending it again is a no-op that still answers.
+    let again = end_session_get(&base, &[("id_token_hint", a.id_token.as_str())]).await;
+    assert_eq!(again.status(), StatusCode::OK);
+    assert!(token_active(&c, &b.access_token).await);
+}
+
+/// B4: the RP is sent back only to a `post_logout_redirect_uri` registered for
+/// the hint's client, matched exactly (query included), with `state` appended.
+/// Anything else is refused without a redirect and ends nothing.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn end_session_redirects_only_to_an_exactly_registered_uri_with_state() {
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let registered = format!("{base}/signed-out?from=rp");
+    let rc = register_client_with_post_logout(&c, &base, &[registered.as_str()]).await;
+    let login = wallet_login_as(&c, &base, &new_wallet(), rc).await;
+
+    for unregistered in [
+        format!("{base}/signed-out"),
+        format!("{base}/signed-out?from=rp&x=1"),
+        format!("{base}/signed-out/?from=rp"),
+        "https://attacker.example/signed-out?from=rp".to_string(),
+    ] {
+        let resp = end_session_get(
+            &base,
+            &[
+                ("id_token_hint", login.id_token.as_str()),
+                ("post_logout_redirect_uri", unregistered.as_str()),
+                ("state", "s1"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "unregistered {unregistered}"
+        );
+        assert!(
+            resp.headers().get("location").is_none(),
+            "never a redirect to {unregistered}"
+        );
+        assert!(
+            token_active(&c, &login.access_token).await,
+            "a refused request ends nothing ({unregistered})"
+        );
+    }
+    // A client_id that is not the hint's audience is refused too.
+    let resp = end_session_get(
+        &base,
+        &[
+            ("id_token_hint", login.id_token.as_str()),
+            ("client_id", "another-client"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "client_id must match the hint's aud"
+    );
+    assert!(token_active(&c, &login.access_token).await);
+
+    let resp = end_session_post(
+        &base,
+        &[
+            ("id_token_hint", login.id_token.as_str()),
+            ("client_id", login.client_id.as_str()),
+            ("post_logout_redirect_uri", registered.as_str()),
+            ("state", "st 1&2"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::SEE_OTHER,
+        "a registered URI is honoured"
+    );
+    let location = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        location.starts_with(&format!("{base}/signed-out?")),
+        "{location}"
+    );
+    let q = parse_query(&location);
+    assert_eq!(
+        q.get("from").map(String::as_str),
+        Some("rp"),
+        "the registered query stays: {location}"
+    );
+    assert_eq!(
+        q.get("state").map(String::as_str),
+        Some("st 1&2"),
+        "state comes back: {location}"
+    );
+    assert_eq!(q.len(), 2, "nothing else is added: {location}");
+    assert!(
+        !token_active(&c, &login.access_token).await,
+        "the grant is ended"
+    );
+}
+
+/// B4: a hint this provider did not sign as presented is refused (400), ends
+/// nothing, and never redirects: a tampered payload, a signature by another
+/// key under our `kid`, `alg: none`, an unknown `kid`.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn end_session_refuses_a_foreign_or_tampered_hint() {
+    use p256::ecdsa::{signature::Signer, Signature as P256Signature, SigningKey as P256Key};
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let login = wallet_login(&c, &base, &new_wallet()).await;
+    let other = wallet_login(&c, &base, &new_wallet()).await;
+    let parts: Vec<&str> = login.id_token.split('.').collect();
+    assert_eq!(parts.len(), 3, "a compact JWS");
+    let header: Value = {
+        use base64::Engine;
+        serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(parts[0])
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let mut claims = jws_claims(&login.id_token);
+
+    // The other login's sid in this login's signed token.
+    claims["sid"] = jws_claims(&other.id_token)["sid"].clone();
+    let tampered = format!(
+        "{}.{}.{}",
+        parts[0],
+        b64url(claims.to_string().as_bytes()),
+        parts[2]
+    );
+    // Our claims, our kid, someone else's key.
+    let foreign_key = P256Key::random(&mut OsRng);
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let sig: P256Signature = foreign_key.sign(signing_input.as_bytes());
+    let foreign = format!("{signing_input}.{}", b64url(&sig.to_bytes()));
+    let none = format!("{}.{}.", b64url(br#"{"alg":"none"}"#), parts[1]);
+    let mut unknown_header = header.clone();
+    unknown_header["kid"] = json!("0000000000000000");
+    let unknown_kid = format!(
+        "{}.{}.{}",
+        b64url(unknown_header.to_string().as_bytes()),
+        parts[1],
+        parts[2]
+    );
+
+    for (what, hint) in [
+        ("a tampered payload", tampered),
+        ("another key under our kid", foreign),
+        ("alg none", none),
+        ("an unknown kid", unknown_kid),
+        ("garbage", "not-a-jwt".to_string()),
+    ] {
+        let resp = end_session_get(&base, &[("id_token_hint", hint.as_str())]).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{what} must be refused"
+        );
+        assert!(
+            resp.headers().get("location").is_none(),
+            "{what}: no redirect"
+        );
+        assert!(
+            token_active(&c, &login.access_token).await,
+            "{what} ends nothing"
+        );
+        assert!(
+            token_active(&c, &other.access_token).await,
+            "{what} ends nothing"
+        );
+    }
+}
+
+// ===========================================================================
+// Own sessions (design 5.7): the `siwx_user` picker hint and the `acct_session`
+// account-page session are digest-keyed (I1) and end at `logout/all`,
+// deactivation, erasure and the account page's sign-out.
+// ===========================================================================
+
+/// The value a response's Set-Cookie headers give `name`, if non-empty.
+fn set_cookie_value(resp: &reqwest::Response, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    resp.headers().get_all("set-cookie").iter().find_map(|v| {
+        let rest = v.to_str().ok()?.strip_prefix(prefix.as_str())?;
+        let value = rest.split(';').next().unwrap_or("");
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// Whether a response's Set-Cookie headers clear `name` (empty, `Max-Age=0`).
+fn set_cookie_clears(resp: &reqwest::Response, name: &str) -> bool {
+    let prefix = format!("{name}=;");
+    resp.headers().get_all("set-cookie").iter().any(|v| {
+        v.to_str()
+            .is_ok_and(|s| s.starts_with(prefix.as_str()) && s.contains("Max-Age=0"))
+    })
+}
+
+/// `GET /sign_in` for a started login: the authorization code and the
+/// `siwx_user` picker hint the response sets.
+async fn sign_in_with_hint(base: &str, w: &Wallet, login: &StartedLogin) -> (String, String) {
+    let resp = no_redirect_client()
+        .get(format!("{base}/sign_in"))
+        .header(
+            "cookie",
+            format!(
+                "{}; siwx={}",
+                login.cookie(),
+                siwx_cookie_for(base, w, login)
+            ),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "sign_in 303");
+    let hint = set_cookie_value(&resp, "siwx_user").expect("sign_in sets the siwx_user hint");
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    let code = parse_query(location)
+        .get("code")
+        .unwrap_or_else(|| panic!("sign_in redirect carries no code: {location}"))
+        .clone();
+    (code, hint)
+}
+
+/// The sessions one account re-auth gives a browser: the account session, its
+/// CSRF token, and a second picker hint.
+struct AccountSession {
+    cookie: String,
+    csrf: String,
+    hint: String,
+}
+
+/// One wallet re-auth for `action` (`POST /account/wallet`).
+async fn account_reauth_with_hint(
+    c: &Client,
+    base: &str,
+    w: &Wallet,
+    action: &str,
+) -> AccountSession {
+    let (message, signature) = sign_account_message(c, w, base, action).await;
+    let resp = c
+        .post(format!("{base}/account/wallet"))
+        .json(&json!({
+            "action": action,
+            "did": w.did, "message": message, "signature": signature, "device_id": null
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "account re-auth ({action}) must succeed"
+    );
+    let cookie = set_cookie_value(&resp, "acct_session").expect("re-auth sets acct_session");
+    let hint = set_cookie_value(&resp, "siwx_user").expect("re-auth sets the siwx_user hint");
+    let body: Value = resp.json().await.unwrap();
+    let csrf = body["csrf"]
+        .as_str()
+        .expect("re-auth carries csrf")
+        .to_string();
+    AccountSession { cookie, csrf, hint }
+}
+
+/// Whether the picker hint still scopes a login's passkey picker: the start of
+/// a passkey login names the account it detected (`detected_mxid`) exactly when
+/// the server resolves the hint (`detected_mxid_for` always answers for a
+/// resolved hint, deactivated and erased accounts included).
+async fn hint_scopes(c: &Client, base: &str, hint: &str) -> bool {
+    let login = start_login(c, base).await;
+    let cookie = format!("{}; siwx_user={hint}", login.cookie());
+    let started = post_ok(
+        c,
+        base,
+        "/webauthn/authenticate/start",
+        Some(&cookie),
+        json!({}),
+    )
+    .await;
+    started.get("detected_mxid").is_some_and(Value::is_string)
+}
+
+/// Whether an account session still authorizes an action: an ended session is
+/// a 401, a live one runs the action (whatever the action then answers).
+async fn account_session_live(c: &Client, base: &str, s: &AccountSession) -> bool {
+    let resp = account_action(c, base, &s.cookie, "org.matrix.devices_list", None, &s.csrf).await;
+    resp.status() != StatusCode::UNAUTHORIZED
+}
+
+/// H4 for own sessions: the `siwx_user` hints of a sign-in and an account
+/// re-auth and the `acct_session` cookie appear in no key and no value of the
+/// stack Redis; the positive controls find them under their digest keys.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn no_own_session_the_client_holds_is_stored_in_the_clear() {
+    let Some(url) = stack_redis_url() else {
+        let marker = "E2E_SKIP: no_own_session_the_client_holds_is_stored_in_the_clear: no \
+                      stack Redis URL (E2E_REDIS_URL, SIWXOIDC_REDIS_URL, SIWEOIDC_REDIS_URL or \
+                      REDIS_HOST/REDIS_PORT); the keyspace was NOT searched";
+        assert!(
+            std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+            "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+        );
+        eprintln!("{marker}");
+        return;
+    };
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    let mut held = ClientHeld::default();
+
+    let login = start_login(&c, &base).await;
+    let (_code, hint) = sign_in_with_hint(&base, &w, &login).await;
+    held.add("siwx_user hint set by sign_in", &hint);
+    let account = account_reauth_with_hint(&c, &base, &w, "org.matrix.profile").await;
+    held.add("acct_session cookie", &account.cookie);
+    held.add("siwx_user hint set by the account re-auth", &account.hint);
+
+    let scan = assert_nothing_stored_in_the_clear(&url, &held, "with both own sessions").await;
+    for (what, key) in [
+        (
+            "the sign-in hint",
+            format!("siwx_user/{}", digest_hex(&hint)),
+        ),
+        (
+            "the re-auth hint",
+            format!("siwx_user/{}", digest_hex(&account.hint)),
+        ),
+        (
+            "the account session",
+            format!("acct_session/{}", digest_hex(&account.cookie)),
+        ),
+    ] {
+        assert!(
+            scanned(&scan, &key),
+            "positive control: {what} is stored under its digest key {key} ({} keys scanned \
+             in {url})",
+            scan.keys.len()
+        );
+    }
+    assert!(
+        hint_scopes(&c, &base, &hint).await,
+        "the digest-keyed hint still scopes the picker"
+    );
+    assert!(
+        account_session_live(&c, &base, &account).await,
+        "the digest-keyed account session still authorizes"
+    );
+}
+
+/// `logout/all` ends every own session of the user (both picker hints and the
+/// account session) and none of another user's.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn logout_all_ends_every_own_session_of_the_user() {
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let (w, other) = (new_wallet(), new_wallet());
+
+    let login = start_login(&c, &base).await;
+    let (code, signin_hint) = sign_in_with_hint(&base, &w, &login).await;
+    let tokens = exchange_code(&c, &base, &login.rc, &code, &login.verifier)
+        .await
+        .expect("the code exchanges");
+    let access = tokens["access_token"].as_str().unwrap().to_string();
+    let account = account_reauth_with_hint(&c, &base, &w, "org.matrix.profile").await;
+    let other_login = start_login(&c, &base).await;
+    let (_code, other_hint) = sign_in_with_hint(&base, &other, &other_login).await;
+
+    for (what, hint) in [
+        ("sign-in hint", &signin_hint),
+        ("re-auth hint", &account.hint),
+        ("other user's hint", &other_hint),
+    ] {
+        assert!(
+            hint_scopes(&c, &base, hint).await,
+            "before: the {what} scopes"
+        );
+    }
+    assert!(
+        account_session_live(&c, &base, &account).await,
+        "before: the account session authorizes"
+    );
+
+    let resp = c
+        .post(format!("{base}/_matrix/client/v3/logout/all"))
+        .bearer_auth(&access)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "logout/all");
+
+    assert!(
+        !hint_scopes(&c, &base, &signin_hint).await,
+        "after logout/all the sign-in hint scopes nothing"
+    );
+    assert!(
+        !hint_scopes(&c, &base, &account.hint).await,
+        "after logout/all the re-auth hint scopes nothing"
+    );
+    assert!(
+        !account_session_live(&c, &base, &account).await,
+        "after logout/all the account session is a 401"
+    );
+    assert!(
+        hint_scopes(&c, &base, &other_hint).await,
+        "logout/all leaves another user's hint alone"
+    );
+}
+
+/// A terminal account action (deactivation or erasure) through one account
+/// session ends every own session of the user: the sign-in hint, the hints of
+/// both re-auths and the second account session.
+async fn terminal_action_ends_every_own_session(action: &str) {
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    let login = start_login(&c, &base).await;
+    let (_code, signin_hint) = sign_in_with_hint(&base, &w, &login).await;
+    // A re-auth for a terminal action runs it at once; the acting session is
+    // a re-auth for a view, which then runs the action without a signature.
+    let acting = account_reauth_with_hint(&c, &base, &w, "org.matrix.profile").await;
+    let second = account_reauth_with_hint(&c, &base, &w, "org.matrix.profile").await;
+
+    for (what, hint) in [
+        ("sign-in hint", &signin_hint),
+        ("acting re-auth hint", &acting.hint),
+        ("second re-auth hint", &second.hint),
+    ] {
+        assert!(
+            hint_scopes(&c, &base, hint).await,
+            "before {action}: the {what} scopes"
+        );
+    }
+    assert!(
+        account_session_live(&c, &base, &second).await,
+        "before {action}: the second account session authorizes"
+    );
+
+    let resp = account_action(&c, &base, &acting.cookie, action, None, &acting.csrf).await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(status, StatusCode::OK, "{action}: {body}");
+
+    for (what, hint) in [
+        ("sign-in hint", &signin_hint),
+        ("acting re-auth hint", &acting.hint),
+        ("second re-auth hint", &second.hint),
+    ] {
+        assert!(
+            !hint_scopes(&c, &base, hint).await,
+            "after {action} the {what} scopes nothing"
+        );
+    }
+    assert!(
+        !account_session_live(&c, &base, &second).await,
+        "after {action} the second account session is a 401"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn deactivation_ends_every_own_session_of_the_user() {
+    terminal_action_ends_every_own_session("org.matrix.account_deactivate").await;
+}
+
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn erasure_ends_every_own_session_of_the_user() {
+    terminal_action_ends_every_own_session("io.inblock.account_erase").await;
+}
+
+/// The account page's sign-out (`POST /account/sign_out`) ends this browser's
+/// account session and picker hint, clears both cookies, and leaves the hint
+/// another browser holds alone. Without cookies it is an idempotent 200.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn account_sign_out_ends_this_browsers_account_session_and_picker_hint() {
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    let login = start_login(&c, &base).await;
+    let (_code, other_browser_hint) = sign_in_with_hint(&base, &w, &login).await;
+    let account = account_reauth_with_hint(&c, &base, &w, "org.matrix.profile").await;
+    assert!(
+        account_session_live(&c, &base, &account).await,
+        "before: the account session authorizes"
+    );
+    assert!(
+        hint_scopes(&c, &base, &account.hint).await,
+        "before: this browser's hint scopes"
+    );
+
+    let resp = c
+        .post(format!("{base}/account/sign_out"))
+        .header(
+            "cookie",
+            format!(
+                "acct_session={}; siwx_user={}",
+                account.cookie, account.hint
+            ),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "POST /account/sign_out");
+    assert!(
+        set_cookie_clears(&resp, "acct_session"),
+        "the sign-out clears the acct_session cookie"
+    );
+    assert!(
+        set_cookie_clears(&resp, "siwx_user"),
+        "the sign-out clears the siwx_user cookie"
+    );
+
+    assert!(
+        !account_session_live(&c, &base, &account).await,
+        "after the sign-out the account session is a 401"
+    );
+    assert!(
+        !hint_scopes(&c, &base, &account.hint).await,
+        "after the sign-out this browser's hint scopes nothing"
+    );
+    assert!(
+        hint_scopes(&c, &base, &other_browser_hint).await,
+        "the sign-out ends only this browser's sessions"
+    );
+
+    let resp = c
+        .post(format!("{base}/account/sign_out"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a sign-out without cookies is a 200"
     );
 }

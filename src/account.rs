@@ -19,7 +19,7 @@ use crate::localpart::resolve_identity;
 use crate::oidc::{constant_time_eq, CustomError};
 use crate::synapse_client::{DeviceInfo, SynapseClient};
 use crate::webauthn as wa;
-use siwx_oidc::db::{DBClient, RedisClient, CAIP122_NONCE_TTL_SECS};
+use siwx_oidc::db::{DBClient, OwnSession, RedisClient, CAIP122_NONCE_TTL_SECS};
 
 // -- Authenticated account-management session ---------------------------------
 //
@@ -54,8 +54,6 @@ fn account_action_resource(config: &Config, action: &str) -> String {
 
 /// Cookie name for the authenticated account-management session.
 pub const ACCOUNT_SESSION_COOKIE: &str = "acct_session";
-/// Redis key prefix for stored account sessions.
-const ACCOUNT_SESSION_PREFIX: &str = "account_session";
 /// How long one re-auth keeps the account page authenticated (seconds).
 pub const ACCOUNT_SESSION_TTL: u64 = 600; // 10 minutes
 
@@ -70,13 +68,13 @@ pub struct AccountSession {
     pub exp: i64,
 }
 
-/// Mint a fresh account session bound to `did`, store it in Redis (TTL
-/// [`ACCOUNT_SESSION_TTL`]), and return `(session_token, csrf_token)`.
+/// Mint a fresh account session bound to `did`, store it under the digest of
+/// its token ([`OwnSession::Account`], TTL [`ACCOUNT_SESSION_TTL`]), and return
+/// `(session_token, csrf_token)`.
 pub async fn create_account_session(
     db: &RedisClient,
     did: &str,
 ) -> Result<(String, String), CustomError> {
-    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let csrf = Uuid::new_v4().simple().to_string();
     let session = AccountSession {
         did: did.to_string(),
@@ -85,12 +83,9 @@ pub async fn create_account_session(
     };
     let json = serde_json::to_string(&session)
         .map_err(|e| anyhow::anyhow!("serialize account session: {e}"))?;
-    db.set_ex_raw(
-        &format!("{}/{}", ACCOUNT_SESSION_PREFIX, token),
-        &json,
-        ACCOUNT_SESSION_TTL,
-    )
-    .await?;
+    let token = db
+        .create_own_session(OwnSession::Account, did, &json, ACCOUNT_SESSION_TTL)
+        .await?;
     Ok((token, csrf))
 }
 
@@ -98,7 +93,7 @@ pub async fn create_account_session(
 /// or unreadable (fail-safe: any failure forces a fresh re-auth).
 pub async fn lookup_account_session(db: &RedisClient, token: &str) -> Option<AccountSession> {
     let raw = db
-        .get_raw(&format!("{}/{}", ACCOUNT_SESSION_PREFIX, token))
+        .lookup_own_session(OwnSession::Account, token)
         .await
         .ok()??;
     let session: AccountSession = serde_json::from_str(&raw).ok()?;
@@ -111,9 +106,7 @@ pub async fn lookup_account_session(db: &RedisClient, token: &str) -> Option<Acc
 /// Delete an account session (used after a terminal action like erase/deactivate
 /// invalidates the identity it was bound to). Best-effort.
 pub async fn destroy_account_session(db: &RedisClient, token: &str) {
-    let _ = db
-        .del_raw(&format!("{}/{}", ACCOUNT_SESSION_PREFIX, token))
-        .await;
+    let _ = db.end_own_session(OwnSession::Account, token).await;
 }
 
 // -- Request/response types ---------------------------------------------------
@@ -662,12 +655,13 @@ async fn execute_action(
         Action::AccountDeactivate => {
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
-            // Plant the deactivation tombstone FIRST (S3-4 / H6): from now on any
-            // concurrent refresh/mint for this user refuses to issue tokens, so a
-            // refresh racing the sweep below cannot resurrect access. Best-effort:
-            // the sweep itself re-plants it, so a transient error here is not fatal.
-            if let Err(e) = db_client.mark_user_deactivated(&localpart).await {
-                warn!(error = %e, "mark_user_deactivated failed (pre-deactivate)");
+            // Set the user epoch FIRST (S3-4 / H6, I9): from now on every grant
+            // of this user authenticated until now is refused by both refresh
+            // endpoints and the access check, so a refresh racing the sweep
+            // below cannot resurrect access. Best-effort: the sweep sets it
+            // again, so a transient error here is not fatal.
+            if let Err(e) = db_client.set_user_epoch(&localpart).await {
+                warn!(error = %e, "set_user_epoch failed (pre-deactivate)");
             }
             synapse
                 .deactivate_user(&localpart, server, false)
@@ -685,7 +679,16 @@ async fn execute_action(
                     warn!(error = %e, "revoke_all_user_tokens failed during account deactivation");
                     0
                 });
-            info!(did = %did, revoked = revoked as u64, "account deactivated via account management");
+            // End the user's own sessions on this provider too: every `siwx_user`
+            // picker hint and `acct_session` account session of the DID.
+            let ended = db_client
+                .revoke_own_sessions(did)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "revoke_own_sessions failed during account deactivation");
+                    0
+                });
+            info!(did = %did, revoked = revoked as u64, own_sessions = ended as u64, "account deactivated via account management");
             Ok(ActionOutcome::Deactivated)
         }
         Action::AccountErase => {
@@ -705,11 +708,11 @@ async fn execute_action(
                     warn!(error = %e, "could not record the erasure; nothing was erased");
                     CustomError::ServiceUnavailable(ERASURE_NOT_RECORDED_MSG.to_string())
                 })?;
-            // Then plant the deactivation tombstone (S3-4 / H6), still before
-            // Synapse, so a concurrent refresh/mint cannot resurrect access
-            // during the erase sweep.
-            if let Err(e) = db_client.mark_user_deactivated(&localpart).await {
-                warn!(error = %e, "mark_user_deactivated failed (pre-erase)");
+            // Then set the user epoch (S3-4 / H6, I9), still before Synapse, so
+            // a concurrent refresh cannot resurrect access during the erase
+            // sweep.
+            if let Err(e) = db_client.set_user_epoch(&localpart).await {
+                warn!(error = %e, "set_user_epoch failed (pre-erase)");
             }
             // Irreversible: GDPR erasure removes profile, media, and room
             // memberships in addition to deactivating the account.
@@ -729,6 +732,15 @@ async fn execute_action(
                     warn!(error = %e, "revoke_all_user_tokens failed during account erasure");
                     0
                 });
+            // End the user's own sessions on this provider too: every `siwx_user`
+            // picker hint and `acct_session` account session of the DID.
+            let ended = db_client
+                .revoke_own_sessions(did)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "revoke_own_sessions failed during account erasure");
+                    0
+                });
             // Purge WebAuthn identity artifacts (best-effort) so the erased DID
             // cannot be silently re-derived from a leftover passkey/link. The
             // standalone-credential pass reuses the webauthn layer's single
@@ -743,6 +755,7 @@ async fn execute_action(
             info!(
                 did = %did,
                 revoked = revoked as u64,
+                own_sessions = ended as u64,
                 purged = purged as u64,
                 "account erased via account management"
             );
@@ -1363,6 +1376,8 @@ pub fn account_page_inner(
 
       <div id="result-section" class="result-section hidden"></div>
 
+      <button class="btn btn-secondary hidden" id="btn-sign-out" onclick="signOut()">Sign out</button>
+
       <div id="status" class="error-msg hidden">
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="error-icon">
           <path fill-rule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-8-5a.75.75 0 0 1 .75.75v4.5a.75.75 0 0 1-1.5 0v-4.5A.75.75 0 0 1 10 5Zm0 10a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" clip-rule="evenodd"/>
@@ -1784,7 +1799,7 @@ async function authWallet() {
     });
     if (r.ok) {
       const data = await r.json();
-      AUTHED = true; if (data.csrf) CSRF = data.csrf;
+      AUTHED = true; syncSignOut(); if (data.csrf) CSRF = data.csrf;
       renderOutcome(data);
     } else {
       const t = await r.text();
@@ -1844,7 +1859,7 @@ async function authPasskey(forceAll) {
     });
     if (finishR.ok) {
       const data = await finishR.json();
-      AUTHED = true; if (data.csrf) CSRF = data.csrf;
+      AUTHED = true; syncSignOut(); if (data.csrf) CSRF = data.csrf;
       renderOutcome(data);
     } else {
       const errBody = await finishR.clone().json().catch(() => null);
@@ -2074,6 +2089,26 @@ function bufferToBase64(buf) {
   cb.addEventListener('change', sync);
   sync();
 })();
+
+// Explicit sign-out (POST /account/sign_out): ends this browser's account
+// session and passkey-picker hint and clears both cookies. Shown while the page
+// is authenticated.
+function syncSignOut() {
+  const b = $('btn-sign-out');
+  if (b) b.classList.toggle('hidden', !AUTHED);
+}
+async function signOut() {
+  hideStatus();
+  try {
+    const r = await fetch(BASE + '/account/sign_out', { method: 'POST' });
+    if (!r.ok) { showStatus('Sign-out failed — please try again.'); return; }
+    AUTHED = false; CSRF = ''; syncSignOut();
+    showTerminal('Signed out', 'This browser is signed out of account management.', false);
+  } catch (_) {
+    showStatus('Sign-out failed — please try again.');
+  }
+}
+syncSignOut();
 
 // In-page session actions: device View/Sign out buttons and the "back to
 // sessions" button carry data-act/data-dev and run against the live session

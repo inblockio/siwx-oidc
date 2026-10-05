@@ -58,9 +58,15 @@ registration token or application service is involved.
     -H 'Content-Type: application/json' \
     -d '{"redirect_uris": ["https://agent.example.org/callback"],
          "token_endpoint_auth_method": "none",
+         "grant_types": ["authorization_code", "refresh_token"],
          "client_name": "Example Agent"}'
   # -> {"client_id": "…", "client_secret": "…", "registration_access_token": "…", …}
   ```
+
+  List `refresh_token` among the `grant_types`: a standalone (non-Matrix)
+  server issues a refresh token only to a client that asked for
+  `offline_access`, which the client does, and whose registration allows the
+  refresh grant.
 
   Keep the returned `client_id`. The redirect URI must be registered, but
   nothing needs to listen on it: the client reads the authorization code from
@@ -107,7 +113,9 @@ It prints the tokens as JSON on stdout (diagnostics go to stderr):
   "expires_in": 300, "refresh_token": "mcr_…", "did": "did:key:z6Mk…" }
 ```
 
-What happens: `GET /authorize` with PKCE (S256) returns a session cookie and a
+What happens: `GET /authorize` with PKCE (S256), asking for the scope
+`openid profile offline_access urn:matrix:client:api:*` (plus the device scope
+when `--device-id` is given), returns a session cookie and a
 nonce; the client builds a CAIP-122 message for the server's host with that
 nonce and the redirect URI in `Resources:`, signs it with the key, sends it to
 `GET /sign_in`, and exchanges the returned code at `POST /token`.
@@ -215,15 +223,17 @@ Token lifetimes:
 |---|---|
 | Access token | 300 s |
 | Refresh token | 90 days from its issue; every refresh issues a new one |
-| Lost-response grace | 60 s |
+| Lost-response recovery | until the new pair is first used |
 
-- **Refresh tokens rotate.** Each refresh returns a new refresh token and
-  deletes the old one. Persist the new one before using the new access token,
-  ideally with an atomic write.
-- **Grace window.** If a refresh response is lost, retrying with the old refresh
-  token within 60 seconds returns the **same** new pair instead of an error. Two
-  processes that refresh with the same token within that window also both get
-  the same pair. After 60 seconds the old token is `invalid_grant`.
+- **Refresh tokens rotate.** Each refresh returns a new refresh token, and the
+  old one stops working once the new pair is used. Persist the new one before
+  using the new access token, ideally with an atomic write.
+- **Lost responses.** If a refresh response is lost, retrying with the old
+  refresh token returns the **same** new pair instead of an error, however late,
+  as long as the new pair has not been used. Two processes that refresh with
+  the same token at once also both get the same pair. Once the new access token
+  has been used (or the new refresh token refreshed), the old token is
+  `invalid_grant`, and presenting it is logged as a possible token theft.
 - **Keep refreshing.** An agent that refreshes at least once every 90 days keeps
   its session indefinitely. After that, sign in again with the key (and the same
   pinned device ID).
@@ -256,6 +266,7 @@ siwx-oidc-auth --device-flow --server https://auth.example.org --client-id "$CLI
 ```
 
 The approval URL and code go to stderr; the tokens go to stdout once approved.
+The client asks for the scope `openid offline_access urn:matrix:client:api:*`.
 The flow requires the server's delegated-auth mode, and the approving DID must
 already have an account (the device flow never creates one).
 

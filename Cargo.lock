@@ -4670,6 +4670,7 @@ dependencies = [
 name = "siwx-oidc"
 version = "0.2.0"
 dependencies = [
+ "aes-gcm",
  "alloy",
  "alloy-primitives",
  "anyhow",
@@ -4687,6 +4688,7 @@ dependencies = [
  "figment",
  "headers",
  "hex",
+ "hkdf",
  "k256",
  "lazy_static",
  "openidconnect",
