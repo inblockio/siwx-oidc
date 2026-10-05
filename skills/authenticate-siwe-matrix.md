@@ -92,7 +92,7 @@ Injected JS shims in Element Web (`siwx-gate.js`, `siwx-redirect.js`):
      (`mxid::localpart_for`); accounts created under the older colons-to-dashes shape
      keep it (`localpart::resolve_identity_or_legacy`, grandfathering)
    - Publishes the provider-signed `io.inblock.did` profile field (best-effort)
-4. Creates `CodeEntry` in Redis (UUID key, 300s TTL)
+4. Creates `CodeEntry` in Redis under `code/{sha256(code)}` (the code is a UUID; 300s TTL)
 5. Redirects to `redirect_uri?code={uuid}&state={state}`
 
 ### Step 5: Token exchange
@@ -108,9 +108,11 @@ Injected JS shims in Element Web (`siwx-gate.js`, `siwx-redirect.js`):
 1. Atomically consumes code (`try_consume_code`)
 2. Validates PKCE: SHA-256(code_verifier) == stored code_challenge
 3. **Matrix mode** (`mas_shared_secret` set): issues opaque tokens stored in Redis:
-   - Access: `mat_{32 base62}` (300s TTL)
-   - Refresh: `mcr_{32 base62}` (7_776_000s TTL / 90 days)
-   - `TokenMetadata`: `{ username, device_id, scope, client_id, iat, exp, did, name }`
+   - One grant `grant/{sha256(handle)}` per exchange (`src/db/grant.rs`): kind, owner
+     (username, DID), client, device id, scope, `auth_time`, digests of the current and
+     previous refresh token; 90 days after the last rotation. No token is stored
+   - Access: `mat_{32 base62}` (300s TTL), stored only as `at/{sha256(token)}` -> grant
+   - Refresh: `mcr_{handle}_{secret}` (22 + 32 base62); the handle names the grant
    - Scope: `openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}`
 4. Signs ES256 ID token: `sub`=DID, `preferred_username`=DID, `name`=ENS name when one resolves (omitted otherwise)
 5. Returns `{ access_token, token_type, id_token, expires_in, refresh_token }`
@@ -166,13 +168,13 @@ Steps 5-8 identical.
 
 | Pattern | TTL | Purpose |
 |---------|-----|---------|
-| `sessions/{uuid}` | 300s | Session (siwe_nonce, verified_did, signin_count) |
-| `codes/{uuid}` | 300s | Auth code (did, client_id, code_challenge, device_id) |
+| `session/{sha256(id)}` | 300s | Session (CAIP-122 nonce, verified_did, signin_count, the request bound at `/authorize`) |
+| `code/{sha256(code)}` | 300s | Auth code (did, client_id, code_challenge, device_id, scope) |
 | `grant/{sha256(handle)}` | 90d after the last rotation | Grant: owner, client, device, scope, refresh-token digests |
 | `at/{sha256(mat_...)}` | 300s | Access token -> grant, generation, iat, exp |
 | `legacy_rt/{sha256(legacy refresh token)}` | 90d from the lift | Grant a pre-grant refresh token was lifted into |
 | `clients/{uuid}` | 30d | Client registration |
-| `webauthn:challenge/{session_id}` | 120s | Ceremony state |
+| `webauthn:ceremony/{sha256(ceremony id)}` | 120s | Ceremony state |
 | `webauthn:credential/{cred_id_b64}` | none | Stored passkey |
 | `webauthn:link/{cred_id_b64}` | none | Account linking map |
 
