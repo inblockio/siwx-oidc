@@ -1300,8 +1300,10 @@ impl RedisClient {
                 _ => return Err(anyhow!("grant store: unexpected access-check reply")),
             };
             let fields: HashMap<String, String> = reply[2..]
-                .chunks_exact(2)
-                .map(|kv| (kv[0].clone(), kv[1].clone()))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[key, value]| (key.clone(), value.clone()))
                 .collect();
             let Some(view) = view_or_none(grant_id.clone(), &fields)? else {
                 return Ok(None);
