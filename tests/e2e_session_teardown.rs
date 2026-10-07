@@ -4,9 +4,15 @@
 //! `/_matrix/client/v3/logout/all` must be a registered route that leaves the
 //! account active. A rejected token proves the session ended; it does not by
 //! itself prove a Synapse device was deleted, so the logout test also reads the
-//! device list, from the Synapse mock (`SYNAPSE_MOCK`, as in CI). Against a
-//! real Synapse that list needs an admin token this suite does not have, and
-//! the device half is a loud skip (a failure under `E2E_STRICT_SKIPS=1`).
+//! device list: from the Synapse mock's state when `SYNAPSE_MOCK` is set (as in
+//! CI), otherwise from the homeserver itself (`GET /_matrix/client/v3/devices`)
+//! through a second session of the same identity, signed in after the logout.
+//!
+//! Each test signs in as a fresh throwaway identity, which creates an account
+//! on the target homeserver, and deactivates that account at the end, also when
+//! the test failed (`with_throwaway`): against a real deployment the account's
+//! key exists only in this process, so an account left active is a leftover
+//! nobody can clean up afterwards.
 //!
 //! Self-contained: copies the auth-flow helpers from `e2e_msc3861.rs` (the same
 //! pattern `e2e_msc4191_live.rs` uses) so this file runs on its own and never
@@ -14,7 +20,8 @@
 //!
 //! `#[ignore]`d, like the other e2e suites. CI runs it against the mock stack
 //! (job `rust-e2e-mock`, with `MATRIX_HOST` pointed at `e2e/synapse_mock.py`).
-//! Against a real deployment:
+//! Against a real deployment (set `E2E_STRICT_SKIPS=1` so a skipped assertion
+//! fails):
 //!
 //!   SIWEOIDC_HOST=https://siwx.example.org MATRIX_HOST=https://matrix.example.org \
 //!     cargo test --test e2e_session_teardown -- --ignored --nocapture
@@ -380,6 +387,165 @@ async fn mock_device_ids(mxid: &str) -> Option<Vec<String>> {
     )
 }
 
+/// The device ids the homeserver lists for the user `token` belongs to, read
+/// through the client-server API as that user (`GET /_matrix/client/v3/devices`).
+///
+/// Panics on anything but a 200 with a `devices` array: this is the assertion's
+/// only source on a real homeserver, and an unreadable list must never read as
+/// "the device is gone".
+async fn homeserver_device_ids(token: &str) -> Vec<String> {
+    let resp = Client::new()
+        .get(format!("{}/_matrix/client/v3/devices", matrix_host()))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("MATRIX_HOST={} is unreachable: {e}", matrix_host()));
+    let status = resp.status();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "GET /_matrix/client/v3/devices must answer 200 for a live session"
+    );
+    let body: Value = resp.json().await.expect("the device list must be JSON");
+    body["devices"]
+        .as_array()
+        .expect("the device list must carry a `devices` array")
+        .iter()
+        .filter_map(|d| d["device_id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// `POST /_matrix/client/v3/logout` at siwx-oidc with the session's token.
+async fn logout(token: &str) -> StatusCode {
+    Client::new()
+        .post(format!("{}/_matrix/client/v3/logout", siweoidc_host()))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup: every throwaway account is deactivated, also after a failure
+// ---------------------------------------------------------------------------
+
+/// CAIP-122 message for an MSC4191 account action, as the account page builds
+/// it: a server-issued single-use nonce bound to the action, its expiration
+/// time and the action's audience in Resources (copied from
+/// `account_action_message` in `e2e_msc4191_live.rs`).
+async fn account_action_message(address: &str, action: &str) -> Result<String, String> {
+    let base = siweoidc_host();
+    let domain = reqwest::Url::parse(&base)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| base.clone());
+    let np: Value = Client::new()
+        .get(format!("{base}/account/nonce?action={action}"))
+        .send()
+        .await
+        .map_err(|e| format!("account/nonce: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("account/nonce body: {e}"))?;
+    let field = |k: &str| {
+        np[k]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("account/nonce carries no {k}"))
+    };
+    let nonce = field("nonce")?;
+    let expiration_time = field("expiration_time")?;
+    let resources: String = np["resources"]
+        .as_array()
+        .ok_or("account/nonce carries no resources")?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|r| format!("\n- {r}"))
+        .collect();
+    let issued_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    Ok(format!(
+        "{domain} wants you to sign in with your Ethereum account:\n\
+         {address}\n\n\
+         Confirm account action.\n\n\
+         URI: {base}\n\
+         Version: 1\n\
+         Chain ID: 1\n\
+         Nonce: {nonce}\n\
+         Issued At: {issued_at}\n\
+         Expiration Time: {expiration_time}\n\
+         Resources:{resources}"
+    ))
+}
+
+/// Deactivate the identity's account through the account page's signed
+/// re-authentication (`org.matrix.account_deactivate`), the mechanism the
+/// cleanup in `e2e_msc4191_live.rs` and in the headless client's
+/// `live_deployment.rs` uses. `Ok` only when siwx-oidc answers that the
+/// account is deactivated.
+async fn deactivate_account(key: &SigningKey, address: &str, did: &str) -> Result<(), String> {
+    const ACTION: &str = "org.matrix.account_deactivate";
+    let message = account_action_message(address, ACTION).await?;
+    let signature = eip191_sign(key, &message);
+    let resp = Client::new()
+        .post(format!("{}/account/wallet", siweoidc_host()))
+        .json(&serde_json::json!({
+            "action": ACTION,
+            "did": did,
+            "message": message,
+            "signature": signature,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("account/wallet: {e}"))?;
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or_default();
+    if status == StatusCode::OK && body["kind"] == "deactivated" {
+        Ok(())
+    } else {
+        Err(format!("deactivation answered {status} {body}"))
+    }
+}
+
+/// Run one test with a fresh throwaway identity, then deactivate the account
+/// its sign-in created, also when the test panicked.
+///
+/// The body runs as its own task, so a failed assertion comes back here as a
+/// `JoinError` instead of unwinding past the cleanup; it is re-raised after the
+/// cleanup, so the test still fails with its own message. A cleanup that fails
+/// after a passing body fails the test: an account left active breaks the
+/// live suites' contract. After a failing body the cleanup's outcome is
+/// printed (a body that failed before its first sign-in left no account).
+async fn with_throwaway<F, Fut>(test: &str, body: F)
+where
+    F: FnOnce(SigningKey, String, String) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (key, address, did) = fresh_identity();
+    let outcome = tokio::spawn(body(key.clone(), address.clone(), did.clone())).await;
+    let cleanup = deactivate_account(&key, &address, &did).await;
+    match outcome {
+        Ok(()) => {
+            if let Err(e) = cleanup {
+                panic!("{test}: the throwaway account was not deactivated: {e}");
+            }
+            eprintln!("[e2e] {test}: the throwaway account is deactivated");
+        }
+        Err(join) => {
+            match &cleanup {
+                Ok(()) => eprintln!("[e2e] {test} failed; its throwaway account is deactivated"),
+                Err(e) => {
+                    eprintln!("[e2e] {test} failed; its throwaway account was not deactivated: {e}")
+                }
+            }
+            match join.try_into_panic() {
+                Ok(payload) => std::panic::resume_unwind(payload),
+                Err(join) => panic!("{test}: the test task did not complete: {join}"),
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // H1: logout tears down the ending session's Synapse device + tokens
 // ---------------------------------------------------------------------------
@@ -419,74 +585,91 @@ fn skip_or_fail(test: &str, whoami_status: StatusCode) {
 
 /// After `POST /_matrix/client/v3/logout` with the session's bearer token, the
 /// token must no longer authenticate against Matrix, and the ending session's
-/// Synapse device must be gone from the user's device list (read from the
-/// Synapse mock; see the module docs for a real Synapse). One-time deletion of
-/// the *ending* session is the safe teardown; no device id is recycled.
+/// Synapse device must be gone from the user's device list. One-time deletion
+/// of the *ending* session is the safe teardown; no device id is recycled.
+///
+/// The device list comes from the Synapse mock when `SYNAPSE_MOCK` is set.
+/// Otherwise it comes from the homeserver: listed with the session's own token
+/// before the logout (the device must be there), and after it through a second
+/// session of the same identity, whose own device must be listed (so the list
+/// can show a live device) while the ended one must not.
 #[tokio::test]
 #[ignore]
 async fn logout_deletes_ending_session_device() {
-    let oidc = siweoidc_host();
-    let http = Client::new();
+    with_throwaway(
+        "logout_deletes_ending_session_device",
+        |key, address, did| async move {
+            let (token, device_id, whoami_st) = login_with_key(&key, &address, &did).await;
+            eprintln!("[e2e] logged in: device={:?}", device_id);
 
-    let (key, address, did) = fresh_identity();
-    let (token, device_id, whoami_st) = login_with_key(&key, &address, &did).await;
-    eprintln!("[e2e] logged in: device={:?}", device_id);
-
-    let Some(device_id) = device_id else {
-        skip_or_fail("logout_deletes_ending_session_device", whoami_st);
-        return;
-    };
-    assert_eq!(
-        whoami_status(&token).await,
-        StatusCode::OK,
-        "fresh token must work before logout"
-    );
-    let mxid = whoami_user_id(&token)
-        .await
-        .expect("whoami answered 200, so it names the user");
-    let before = mock_device_ids(&mxid).await;
-    if let Some(before) = &before {
-        assert!(
-            before.contains(&device_id),
-            "sign-in must have created the session's device: {before:?}"
-        );
-    }
-
-    let logout_resp = http
-        .post(format!("{}/_matrix/client/v3/logout", oidc))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        logout_resp.status(),
-        StatusCode::OK,
-        "logout must return 200"
-    );
-
-    assert_eq!(
-        poll_whoami_rejected(&token).await,
-        StatusCode::UNAUTHORIZED,
-        "after logout the session token must be rejected"
-    );
-
-    match mock_device_ids(&mxid).await {
-        Some(after) => assert!(
-            !after.contains(&device_id),
-            "logout must delete the ending session's Synapse device: {after:?}"
-        ),
-        None => {
-            let marker = "E2E_SKIP: logout_deletes_ending_session_device: no Synapse mock \
-                          (SYNAPSE_MOCK) to read the device list from; the device-deletion \
-                          half is NOT exercised";
-            assert!(
-                std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
-                "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+            let Some(device_id) = device_id else {
+                skip_or_fail("logout_deletes_ending_session_device", whoami_st);
+                return;
+            };
+            assert_eq!(
+                whoami_status(&token).await,
+                StatusCode::OK,
+                "fresh token must work before logout"
             );
-            eprintln!("{marker}");
-        }
-    }
-    eprintln!("[e2e] logout tore down the ending session's device + tokens");
+            let mxid = whoami_user_id(&token)
+                .await
+                .expect("whoami answered 200, so it names the user");
+            let before = match mock_device_ids(&mxid).await {
+                Some(ids) => ids,
+                None => homeserver_device_ids(&token).await,
+            };
+            assert!(
+                before.contains(&device_id),
+                "sign-in must have created the session's device: {before:?}"
+            );
+
+            assert_eq!(
+                logout(&token).await,
+                StatusCode::OK,
+                "logout must return 200"
+            );
+
+            assert_eq!(
+                poll_whoami_rejected(&token).await,
+                StatusCode::UNAUTHORIZED,
+                "after logout the session token must be rejected"
+            );
+
+            match mock_device_ids(&mxid).await {
+                Some(after) => assert!(
+                    !after.contains(&device_id),
+                    "logout must delete the ending session's Synapse device: {after:?}"
+                ),
+                None => {
+                    // A real homeserver lists devices only to a live session of
+                    // the user, and the ended one is gone: sign in again.
+                    let (token2, device2, whoami_st2) = login_with_key(&key, &address, &did).await;
+                    let device2 = device2.unwrap_or_else(|| {
+                        panic!("the second sign-in must provision a device (whoami {whoami_st2})")
+                    });
+                    let after = homeserver_device_ids(&token2).await;
+                    let logout2 = logout(&token2).await;
+                    assert!(
+                        after.contains(&device2),
+                        "the homeserver must list the second session's live device {device2}: \
+                         {after:?}"
+                    );
+                    assert!(
+                        !after.contains(&device_id),
+                        "logout must delete the ending session's Synapse device {device_id}: \
+                         {after:?}"
+                    );
+                    assert_eq!(
+                        logout2,
+                        StatusCode::OK,
+                        "the second session's logout must return 200"
+                    );
+                }
+            }
+            eprintln!("[e2e] logout tore down the ending session's device + tokens");
+        },
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -507,33 +690,35 @@ async fn logout_deletes_ending_session_device() {
 #[tokio::test]
 #[ignore]
 async fn revoke_invalidates_session_token() {
-    let oidc = siweoidc_host();
-    let http = Client::new();
+    with_throwaway(
+        "revoke_invalidates_session_token",
+        |key, address, did| async move {
+            let (token, device_id, whoami_st) = login_with_key(&key, &address, &did).await;
+            if device_id.is_none() {
+                skip_or_fail("revoke_invalidates_session_token", whoami_st);
+                return;
+            }
 
-    let (key, address, did) = fresh_identity();
-    let (token, device_id, whoami_st) = login_with_key(&key, &address, &did).await;
-    if device_id.is_none() {
-        skip_or_fail("revoke_invalidates_session_token", whoami_st);
-        return;
-    }
+            let revoke_resp = Client::new()
+                .post(format!("{}/oauth2/revoke", siweoidc_host()))
+                .form(&[("token", token.as_str())])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                revoke_resp.status(),
+                StatusCode::OK,
+                "revoke must return 200"
+            );
 
-    let revoke_resp = http
-        .post(format!("{}/oauth2/revoke", oidc))
-        .form(&[("token", token.as_str())])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        revoke_resp.status(),
-        StatusCode::OK,
-        "revoke must return 200"
-    );
-
-    assert_eq!(
-        poll_whoami_rejected(&token).await,
-        StatusCode::UNAUTHORIZED,
-        "after revoke the session token must be rejected"
-    );
+            assert_eq!(
+                poll_whoami_rejected(&token).await,
+                StatusCode::UNAUTHORIZED,
+                "after revoke the session token must be rejected"
+            );
+        },
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -546,68 +731,73 @@ async fn revoke_invalidates_session_token() {
 #[tokio::test]
 #[ignore]
 async fn logout_all_invalidates_all_sessions_without_deactivating() {
-    let oidc = siweoidc_host();
-    let http = Client::new();
+    with_throwaway(
+        "logout_all_invalidates_all_sessions_without_deactivating",
+        |key, address, did| async move {
+            let oidc = siweoidc_host();
+            let http = Client::new();
 
-    // Same identity, two independent sessions (two devices).
-    let (key, address, did) = fresh_identity();
-    let (token1, device1, whoami_st1) = login_with_key(&key, &address, &did).await;
-    let (token2, device2, whoami_st2) = login_with_key(&key, &address, &did).await;
-    eprintln!("[e2e] two sessions: d1={:?} d2={:?}", device1, device2);
+            // Same identity, two independent sessions (two devices).
+            let (token1, device1, whoami_st1) = login_with_key(&key, &address, &did).await;
+            let (token2, device2, whoami_st2) = login_with_key(&key, &address, &did).await;
+            eprintln!("[e2e] two sessions: d1={:?} d2={:?}", device1, device2);
 
-    // Route-wiring assertion works even without a healthy introspection path:
-    // a registered route returns 200, an unregistered one returns 404.
-    let bulk = http
-        .post(format!("{}/_matrix/client/v3/logout/all", oidc))
-        .bearer_auth(&token1)
-        .send()
-        .await
-        .unwrap();
-    assert_ne!(
-        bulk.status(),
-        StatusCode::NOT_FOUND,
-        "/_matrix/client/v3/logout/all must be a registered route"
-    );
-    assert_eq!(bulk.status(), StatusCode::OK, "logout/all must return 200");
+            // Route-wiring assertion works even without a healthy introspection path:
+            // a registered route returns 200, an unregistered one returns 404.
+            let bulk = http
+                .post(format!("{}/_matrix/client/v3/logout/all", oidc))
+                .bearer_auth(&token1)
+                .send()
+                .await
+                .unwrap();
+            assert_ne!(
+                bulk.status(),
+                StatusCode::NOT_FOUND,
+                "/_matrix/client/v3/logout/all must be a registered route"
+            );
+            assert_eq!(bulk.status(), StatusCode::OK, "logout/all must return 200");
 
-    if device1.is_none() || device2.is_none() {
-        let st = if device1.is_none() {
-            whoami_st1
-        } else {
-            whoami_st2
-        };
-        skip_or_fail(
-            "logout_all_invalidates_all_sessions_without_deactivating",
-            st,
-        );
-        return;
-    }
+            if device1.is_none() || device2.is_none() {
+                let st = if device1.is_none() {
+                    whoami_st1
+                } else {
+                    whoami_st2
+                };
+                skip_or_fail(
+                    "logout_all_invalidates_all_sessions_without_deactivating",
+                    st,
+                );
+                return;
+            }
 
-    // Both sessions must now be rejected (poll past the introspection cache).
-    assert_eq!(
-        poll_whoami_rejected(&token1).await,
-        StatusCode::UNAUTHORIZED,
-        "session 1 must be invalidated by logout/all"
-    );
-    assert_eq!(
-        poll_whoami_rejected(&token2).await,
-        StatusCode::UNAUTHORIZED,
-        "session 2 (other device) must be invalidated by logout/all"
-    );
+            // Both sessions must now be rejected (poll past the introspection cache).
+            assert_eq!(
+                poll_whoami_rejected(&token1).await,
+                StatusCode::UNAUTHORIZED,
+                "session 1 must be invalidated by logout/all"
+            );
+            assert_eq!(
+                poll_whoami_rejected(&token2).await,
+                StatusCode::UNAUTHORIZED,
+                "session 2 (other device) must be invalidated by logout/all"
+            );
 
-    // The account must remain ACTIVE: a fresh sign-in with the same identity
-    // must still succeed (logout/all must never deactivate).
-    let (token3, _device3, _whoami_st3) = login_with_key(&key, &address, &did).await;
-    assert!(
-        token3.starts_with("mat_"),
-        "the account must stay active: re-login after logout/all must succeed"
-    );
-    eprintln!("[e2e] logout/all invalidated all sessions and the account stayed active");
+            // The account must remain ACTIVE: a fresh sign-in with the same identity
+            // must still succeed (logout/all must never deactivate).
+            let (token3, _device3, _whoami_st3) = login_with_key(&key, &address, &did).await;
+            assert!(
+                token3.starts_with("mat_"),
+                "the account must stay active: re-login after logout/all must succeed"
+            );
+            eprintln!("[e2e] logout/all invalidated all sessions and the account stayed active");
 
-    // Cleanup: tear down the re-login session too.
-    let _ = http
-        .post(format!("{}/_matrix/client/v3/logout/all", oidc))
-        .bearer_auth(&token3)
-        .send()
-        .await;
+            // Cleanup: tear down the re-login session too.
+            let _ = http
+                .post(format!("{}/_matrix/client/v3/logout/all", oidc))
+                .bearer_auth(&token3)
+                .send()
+                .await;
+        },
+    )
+    .await;
 }
