@@ -130,6 +130,9 @@ impl IntoResponse for CustomError {
             CustomError::Unauthorized(msg) => {
                 warn!(error = %msg, "unauthorized");
             }
+            CustomError::InvalidToken(msg) => {
+                warn!(error = %msg, "invalid_token");
+            }
             CustomError::UnknownCredential(cred_id) => {
                 // Expected user condition (stale/revoked passkey), NOT a server fault.
                 warn!(credential_fp = %fingerprint(cred_id), "unknown_credential");
@@ -167,6 +170,15 @@ impl IntoResponse for CustomError {
             CustomError::Unauthorized(_) => {
                 (StatusCode::UNAUTHORIZED, self.to_string()).into_response()
             }
+            // RFC 6750 section 3: a rejected bearer token is answered with the Bearer
+            // challenge naming `invalid_token`, so a resource server can tell a dead
+            // credential from a malformed request.
+            CustomError::InvalidToken(_) => (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, r#"Bearer error="invalid_token""#)],
+                self.to_string(),
+            )
+                .into_response(),
             // 401 + machine-readable discriminator. The client keys on `error` to
             // call `signalUnknownCredential` and shows `message` to the user. The
             // echoed `credential_id` is the exact id the client just presented, so
@@ -2696,5 +2708,54 @@ mod static_client_prune_tests {
             waits.iter().all(|wait| *wait <= Duration::from_secs(60)),
             "{waits:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod invalid_token_response_tests {
+    //! The RFC 6750 answer to a bearer token that cannot be used. No Redis and no network: the
+    //! variant `oidc::userinfo` returns for such a token, rendered as the endpoint sends it.
+    use super::*;
+
+    fn challenges(response: &Response) -> Vec<&str> {
+        response
+            .headers()
+            .get_all(header::WWW_AUTHENTICATE)
+            .iter()
+            .map(|value| value.to_str().expect("an ASCII challenge"))
+            .collect()
+    }
+
+    /// A resource server reads the status and the challenge, not the body: a 401 with
+    /// `error="invalid_token"` says the credential is dead, where a 400 reads as a fault in the
+    /// server's own request and may be retried as a temporary failure.
+    #[tokio::test]
+    async fn an_invalid_token_is_a_401_with_the_rfc_6750_challenge() {
+        let response = CustomError::InvalidToken("Unknown token.".to_string()).into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(challenges(&response), [r#"Bearer error="invalid_token""#]);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"Unknown token.");
+    }
+
+    /// Only a rejected bearer token is a Bearer challenge. A client that fails to
+    /// authenticate (`Unauthorized`) and a malformed request keep the answers they had.
+    #[test]
+    fn no_other_error_carries_a_bearer_challenge() {
+        let others = [
+            CustomError::BadRequest("Missing access token.".to_string()),
+            CustomError::Unauthorized("Bad secret.".to_string()),
+            CustomError::NotFound,
+        ];
+        for other in others {
+            let what = other.to_string();
+            let response = other.into_response();
+            assert!(
+                challenges(&response).is_empty(),
+                "{what}: no Bearer challenge on this answer"
+            );
+        }
     }
 }

@@ -113,7 +113,7 @@ abused, leave it out of the list and let its proofs fail; the next sign-in re-as
 |---|---|---|---|
 | `default_clients` | `SIWXOIDC_DEFAULT_CLIENTS` | none | Map of client id to a JSON client entry, written to Redis at every start with no expiry. An id removed from the map is deleted at the next start. |
 | `require_secret` | `SIWXOIDC_REQUIRE_SECRET` | `true` | Whether `POST /token` demands a client secret, at the code exchange and at the refresh grant alike, from a client whose metadata names no `token_endpoint_auth_method`. A client registered with `"none"` never needs one. |
-| `mail_domain` | `SIWXOIDC_MAIL_DOMAIN` | none | Domain of the mailbox address (`<localpart>@<mail_domain>`) of an account that signs in to a generic client. A lowercase DNS name (at most 63 characters per label and 253 in all) that is not an IP address; required when a static client allows `io.inblock.mail`. |
+| `mail_domain` | `SIWXOIDC_MAIL_DOMAIN` | none | Domain of the mailbox address (`<localpart>@<mail_domain>`) of an account that signs in to a generic client. A lowercase DNS name (at most 63 characters per label and 253 in all) that is not an IP address; required when a static client allows `io.inblock.mail`. With it set, `/userinfo` carries the `io.inblock.mailbox` claim where the rules in [identity-model.md](identity-model.md#the-ioinblockmailbox-userinfo-claim) allow it, and discovery lists the `io.inblock.mail` scope and that claim; without it, neither is listed. |
 
 A client entry is `{"secret": "…", "metadata": {…}}`, where `metadata` is RFC 7591 client
 metadata (at least `redirect_uris`); an optional `"access_token"` is the registration access

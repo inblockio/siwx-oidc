@@ -52,7 +52,7 @@ everything else exists only in the binary crate.
 | `credential_identity.rs` (lib) | Which identity a stored passkey authenticates: a `webauthn:link/*` entry overrides the derived `did:key`. |
 | `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL`. |
 | `credential_migration.rs` (lib) | Additive backfill of passkey credentials into the aqua-auth store. |
-| `client_policy.rs` (lib) | Pure rules for generic-class clients: `grant_for` (the scopes a client is granted), `mailbox_for` (the one place the mailbox claim value is built), `validate_mail_domain`, `validate_static_client`, and `parse_static_clients`, which start-up runs on `default_clients` before anything is written. |
+| `client_policy.rs` (lib) | Pure rules for generic-class clients: `grant_for` (the scopes a client is granted), `mailbox_claim` (what userinfo asks: every condition of the mailbox claim) and `mailbox_for` (the one place its value is built), `validate_mail_domain`, `validate_static_client`, and `parse_static_clients`, which start-up runs on `default_clients` before anything is written. |
 | `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry` with the digests of its secret and registration access token, its `ClientClass` and scope policy, and `client_entry_without_plaintext`, `DeviceCodeEntry` and the `DeviceCodeRef` naming its layout, `TokenMetadata` with its `TokenKind` and the `GrantKind` of its grant, `grant_kind`, which only `AccessGrant::metadata` sets and which is never stored), `Ceremony`, `OwnSession` (the `siwx_user` and `acct_session` layouts), `legacy_token_kind`, Redis key prefixes and TTLs. |
 | `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, the own sessions (`create_own_session`, `lookup_own_session`, `end_own_session`, `revoke_own_sessions`; `lookup_user_session` for the picker), `purge_identity`. |
 | `db/outbox.rs` (lib) | The back-channel logout outbox (`outbox:backchannel_logout`): `LogoutEntry`, claim under a lease, retry, complete. Entries are queued by `drop_grant` in `db/grant.rs`. |
@@ -370,7 +370,10 @@ doc; read it before changing the code the rule covers.
 - **Discovery advertises only what is implemented.** `subject_types_supported` is `["public"]`
   because the `sub` is the user's DID, identical for every client; advertising `pairwise` would
   promise a per-client identifier. `scopes_supported` lists `offline_access` because generic mode
-  honours it (next bullet). Pin: `discovery_advertises_public_subjects_only`,
+  honours it (next bullet), and `io.inblock.mail` only when `mail_domain` is set, as
+  `claims_supported` lists `io.inblock.mailbox` (same condition) and `io.inblock.mxid` (only with a
+  Matrix server name): discovery never names a claim userinfo would omit. Pin:
+  `discovery_advertises_public_subjects_only`, `discovery_lists_only_what_is_served`,
   `discovery_advertises_offline_access`; the response types are pinned by
   `discovery_advertises_only_the_code_response_type`, and the client authentication methods
   (`client_secret_basic`, `client_secret_post`, `none`: what `POST /token` reads) by
@@ -905,6 +908,42 @@ doc; read it before changing the code the rule covers.
   `without_a_matrix_server_name_the_claim_is_omitted_not_null`,
   `the_claim_name_on_the_wire_is_io_inblock_mxid`, `the_signed_jwt_variant_carries_the_claim_too`,
   `a_token_without_a_recorded_localpart_omits_the_claim_rather_than_deriving_one`.
+- **`io.inblock.mailbox` in userinfo is omitted, never `null`, and every condition is checked
+  where it is issued** (`client_policy::mailbox_claim`, the one place that decides and, through
+  `mailbox_for`, builds it): the token belongs to an `oidc` grant and its client is generic-class
+  now, the grant's scope has `io.inblock.mail` and the client may still have it, the recorded
+  localpart is the opaque one derived from the token's DID, and `mail_domain` is set. Any other
+  grant kind, a legacy token with no grant, and a grant kind added later get no claim. It is
+  built from the recorded localpart and never re-derived. Pin: `mailbox_claim_opaque_only`,
+  `the_mailbox_claim_needs_every_condition`, `the_mailbox_claim_decision_needs_every_condition`,
+  `the_signed_jwt_variant_carries_the_mailbox_claim`.
+- **The mailbox claim carries only a 16-character lowercase base36 localpart**
+  (`client_policy::is_opaque_localpart`, checked next to the derivation check in `mailbox_for`).
+  A mail server accepts a mailbox name of any case and length, so this provider is the only gate
+  on the address. The shape is stated apart from `mxid::localpart_for`, so that changing one
+  without the other removes the claim instead of changing the address. Pin:
+  `only_sixteen_lowercase_base36_characters_are_an_opaque_localpart`,
+  `every_localpart_the_derivation_produces_passes_the_mailbox_gate`, and one test per malformed
+  form: `an_upper_case_localpart_gets_no_mailbox_claim`,
+  `a_15_character_localpart_gets_no_mailbox_claim`,
+  `a_17_character_localpart_gets_no_mailbox_claim`, `the_legacy_localpart_gets_no_mailbox_claim`,
+  `a_localpart_with_non_base36_characters_gets_no_mailbox_claim`.
+- **Userinfo never carries `email`.** A mail server that finds no mailbox claim may fall back to
+  the standard `email` claim, so an `email` in any userinfo response would let that token open a
+  mailbox. The only address claim is `io.inblock.mailbox`. Pin:
+  `userinfo_never_carries_an_email_claim` (both client classes, the JSON and the signed response,
+  every combination of the scopes a client can request).
+- **Userinfo answers a token it cannot use with 401 and `WWW-Authenticate: Bearer
+  error="invalid_token"`** (`CustomError::InvalidToken`): an unknown or expired token, a refresh
+  token, an authorization code, a token an epoch refuses, or the token of a client that is gone.
+  A 400 reads to a resource server as a fault in its own request, and a mail server may retry it
+  as a temporary failure. A request with no token at all stays a 400, and no other error gains a
+  Bearer challenge. Pin: `an_unknown_token_is_an_invalid_token`,
+  `an_expired_token_is_an_invalid_token`, `a_refresh_token_is_an_invalid_token`,
+  `a_token_whose_client_is_gone_is_an_invalid_token`,
+  `a_request_without_a_token_is_still_a_bad_request`,
+  `an_invalid_token_is_a_401_with_the_rfc_6750_challenge`,
+  `no_other_error_carries_a_bearer_challenge`.
 - **`io.inblock.resolve_endpoint` in discovery is read by an Element Web patch**; it is advertised
   only when `/resolve` can answer; account management likewise, and the device grant only in
   delegated-auth mode, where `/device_authorization` is also the only place it is served. Pin:

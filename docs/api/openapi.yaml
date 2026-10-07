@@ -356,8 +356,17 @@ paths:
       operationId: userinfo
       summary: Claims about the authenticated user
       description: |
-        Accepts an access token only. A refresh token, an authorization code
-        (before or after its exchange) or an unknown string is a 400.
+        Accepts an access token only. A token that cannot be used is answered
+        **401** with `WWW-Authenticate: Bearer error="invalid_token"` (RFC 6750
+        section 3.1), so a resource server can tell a dead credential from a
+        malformed request: an unknown or expired token, a refresh token
+        presented as a bearer token (it goes only to the refresh grants and to
+        revocation), an authorization code (before or after its exchange; a
+        code is a single-use grant, not a credential), a token an epoch refuses,
+        and the token of a client that no longer exists. A request that presents
+        no token at all is a 400.
+
+        The response never carries an `email` claim.
       security: [{ bearerToken: [] }]
       responses:
         "200":
@@ -368,11 +377,12 @@ paths:
             application/jwt:
               schema: { type: string, description: Returned when the client registered a `userinfo_signed_response_alg`. }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/InvalidBearerToken" }
     post:
       tags: [OIDC]
       operationId: userinfoPost
       summary: Claims about the authenticated user (form-encoded token)
-      description: Accepts an access token only, like `GET /userinfo`.
+      description: Answers exactly as `GET /userinfo` does.
       security: [{ bearerToken: [] }]
       requestBody:
         content:
@@ -386,6 +396,10 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/UserInfo" }
+            application/jwt:
+              schema: { type: string, description: Returned when the client registered a `userinfo_signed_response_alg`. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/InvalidBearerToken" }
 
   /register:
     post:
@@ -1059,6 +1073,15 @@ components:
     BadRequest:
       description: Malformed request.
       content: { application/json: { schema: { type: object } } }
+    InvalidBearerToken:
+      description: |
+        The bearer token cannot be used (RFC 6750 section 3.1). The body is a
+        plain-text reason.
+      headers:
+        WWW-Authenticate:
+          description: The Bearer challenge naming `invalid_token`.
+          schema: { type: string, const: 'Bearer error="invalid_token"' }
+      content: { text/plain: { schema: { type: string } } }
     UnknownCredential:
       description: |
         The presented passkey is not one this server stores. A machine-readable
@@ -1099,6 +1122,16 @@ components:
             a present key asserts that the thing exists. Namespaced because no
             registered OIDC claim for a Matrix ID exists.
           example: "@1vo8g4vofiha69ua:matrix.example.org"
+        io.inblock.mailbox:
+          type: string
+          description: |
+            The caller's mailbox address, `<localpart>@<mail_domain>`. Present only
+            for an access token of an `oidc` grant with the `io.inblock.mail` scope,
+            issued to a generic-class client that is still allowed that scope, for an
+            opaque localpart (exactly 16 lowercase base36 characters, the one derived
+            from the DID), with `mail_domain` configured. **Omitted entirely, never
+            null,** otherwise. There is no `email` claim, whatever the scope.
+          example: "1vo8g4vofiha69ua@matrix.example.org"
 
     ResolveResponse:
       type: object
