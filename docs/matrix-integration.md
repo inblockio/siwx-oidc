@@ -295,11 +295,16 @@ lines name tokens by fingerprint only. The keyspace is in
 | Introspection | active | 404 |
 | Device ID | `SIWX_` + 8 hex characters, or the ID the client requested | empty |
 
+The table describes a Matrix-class client. A generic-class client is issued an
+`oidc` grant with no device even in delegated-auth mode (the table of code
+exchanges below).
+
 Minted admin tokens (`service` grants, no refresh token) use the prefix
 `msa_`. Device codes use `dvc_`.
 
-In delegated-auth mode the authorization-code grant records the Matrix scope
-above regardless of the scopes requested, and always issues a refresh token. In
+In delegated-auth mode the authorization-code grant of a Matrix-class client
+records the Matrix scope above regardless of the scopes requested, and always
+issues a refresh token. In
 standalone mode ("generic mode": no `mas_shared_secret`) it grants least
 privilege: the scope the request asked for, limited to `openid`, `profile` and
 `offline_access`, and a refresh token only when `offline_access` was requested and
@@ -309,6 +314,25 @@ request, the token response says so in `scope` (RFC 6749 §5.1). The requested s
 travels from `/authorize` through the session into the stored code. A code
 written by the previous build has none, and is exchanged as it always was
 (`openid profile` and a refresh token) for the 300 s it lives.
+
+What a code exchange issues is decided by the deployment mode and by the class
+of the client (`exchange_issuance`), and the code must be redeemed by a client of
+the class it was issued to:
+
+| Delegated auth | Client class | Issues |
+|---|---|---|
+| yes | Matrix | a `matrix_device` grant, as above |
+| yes | generic | an `oidc` grant with no device: the scopes the client's entry allows of the scope the request bound (`client_policy::grant_for`, the call `/authorize` and `/sign_in` made), then the entry's `always_granted_scopes`; a refresh token only when `offline_access` is part of that and the registration allows the `refresh_token` grant; the granted scope in the response when it differs from the request |
+| no | Matrix | an `oidc` grant, as above |
+| no | generic | refused: start-up refuses such a client, which has no Synapse to supply its localpart |
+
+The `oidc` grant of a generic-class client gets its own `sid` like any other, so
+`/end_session` and back-channel logout apply to it. No ENS lookup runs for it:
+the claims of a generic-class client would otherwise send the user's address to
+a third party at every exchange and every userinfo call. A code redeemed by a
+client of the other class (the client changed class after `sign_in` ran; a code
+written before the class was recorded counts as Matrix) is `invalid_grant`,
+and so is a generic-class code whose request grants no `openid`.
 
 Clients request the Matrix scopes in either the stable form
 (`urn:matrix:client:api:*`, `urn:matrix:client:device:{id}`) or the MSC2967
@@ -739,8 +763,8 @@ fails the sign-in.
    replacement keys (see [Cross-signing](#cross-signing)).
 
 The device-code grant returns the scope in its token response, so a client can
-learn the device ID it was given. The authorization-code response does not
-include `scope`.
+learn the device ID it was given. The authorization-code response of a Matrix
+session does not include `scope`.
 
 **Generic-class clients** (`default_clients` entries with `"class": "generic"`)
 get the account half only: the Synapse account is created for a new identity and
@@ -751,7 +775,8 @@ instead of guessing, because a generic client's localpart can become a permanent
 mail address. `/authorize` refuses a request that would grant the client no
 `openid` (an `invalid_scope` redirect), `/sign_in` checks it again before it
 provisions anything, and the authorization code records the class of the client
-it was issued to.
+it was issued to. The code exchange then issues an `oidc` grant with no device,
+as the table of code exchanges above describes.
 
 ### No device recycling
 
@@ -922,6 +947,10 @@ Rules:
 
 - The grant needs delegated-auth mode. Without the shared secret, the token
   endpoint refuses it (`unsupported_grant_type`).
+- **A generic-class client never gets it** (`unauthorized_client`): the grant
+  mints a Matrix session. It is refused at `/device_authorization` and again at
+  the poll, before anything is recorded or claimed, so a code issued while the
+  client was Matrix-class cannot be redeemed after it became generic.
 - **Existing accounts only.** Approval rejects a DID with no account (400) and a
   deactivated account (401). See [Gates](#gates-that-protect-accounts).
 - The tokens belong to the **approving** user's DID, not to the device.

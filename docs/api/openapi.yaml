@@ -286,8 +286,20 @@ paths:
         In a standalone deployment (no MAS shared secret) the code exchange
         grants the requested scope among `openid`, `profile` and `offline_access`
         and issues a refresh token only for `offline_access` to a client whose
-        registration allows the refresh grant; a delegated-auth deployment always
-        records the Matrix scope and issues one.
+        registration allows the refresh grant; a delegated-auth deployment records
+        the Matrix scope for a Matrix-class client and always issues one.
+
+        A generic-class client (a `default_clients` entry with `"class":
+        "generic"`, served in delegated-auth deployments only) is issued an
+        `oidc` grant with no Matrix device. Its scope is the requested scopes
+        its entry allows, then the scopes the entry always grants; a refresh
+        token is issued only when `offline_access` is part of it and the client's
+        registration allows the refresh grant. The response names the scope when
+        it differs from the request, and the ID token carries the grant's `sid`.
+        A code is redeemed only by a client of the class it was issued to, and a
+        request that grants no `openid` has no grant to issue: both are
+        `invalid_grant`. The device-code grant mints a Matrix session, so a
+        generic-class client is refused it with `unauthorized_client`.
 
         **Client authentication.** `authorization_code` and `refresh_token` are
         bound to the client the code or token was issued to, and share one rule.
@@ -694,7 +706,9 @@ paths:
         redeems the device code. Without it the request is refused before
         anything is stored, with the same RFC 6749 §5.2 error the token
         endpoint gives the grant (RFC 8628 §3.2), so no code is issued that a
-        user could approve but a client never redeem.
+        user could approve but a client never redeem. A generic-class client is
+        refused the same way with `unauthorized_client`: the grant mints a Matrix
+        session, which such a client never gets.
       requestBody:
         content:
           application/x-www-form-urlencoded:
@@ -710,8 +724,9 @@ paths:
         "400":
           description: |
             `{"error": "unsupported_grant_type", "error_description": …}` when
-            the deployment is not in delegated-auth mode; a plain 400 for an
-            unknown `client_id`.
+            the deployment is not in delegated-auth mode;
+            `{"error": "unauthorized_client", "error_description": …}` for a
+            generic-class client; a plain 400 for an unknown `client_id`.
 
   /device:
     get:
@@ -1061,9 +1076,9 @@ components:
         access_token: { type: string }
         token_type: { type: string }
         expires_in: { type: integer, description: 300 seconds. }
-        refresh_token: { type: string, description: "90-day TTL, rotated on every use. In a standalone deployment the code exchange issues one only for `offline_access`, to a client whose registration allows the `refresh_token` grant." }
+        refresh_token: { type: string, description: "90-day TTL, rotated on every use. In a standalone deployment, and for a generic-class client, the code exchange issues one only for a granted `offline_access`, to a client whose registration allows the `refresh_token` grant." }
         id_token: { type: string, description: "ES256 JWT. `sub` is the DID." }
-        scope: { type: string, description: "The granted scope. In the device-code grant it carries `urn:matrix:client:device:{id}` so a client can discover its provisioned device. In a standalone (generic-mode) code exchange it is present when the granted scope differs from the request. A Matrix-mode code exchange omits it." }
+        scope: { type: string, description: "The granted scope. In the device-code grant it carries `urn:matrix:client:device:{id}` so a client can discover its provisioned device. In a standalone (generic-mode) or generic-class code exchange it is present when the granted scope differs from the request. A Matrix-class code exchange in a delegated-auth deployment omits it." }
 
     UserInfo:
       type: object
