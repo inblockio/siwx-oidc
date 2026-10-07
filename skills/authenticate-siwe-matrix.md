@@ -173,7 +173,7 @@ Steps 5-8 identical.
 | `grant/{sha256(handle)}` | 90d after the last rotation | Grant: owner, client, device, scope, refresh-token digests |
 | `at/{sha256(mat_...)}` | 300s | Access token -> grant, generation, iat, exp |
 | `legacy_rt/{sha256(legacy refresh token)}` | 90d from the lift | Grant a pre-grant refresh token was lifted into |
-| `clients/{uuid}` | 30d | Client registration |
+| `clients/{client_id}` | none (static), 30d from last use (dynamic) | Client registration |
 | `webauthn:ceremony/{sha256(ceremony id)}` | 120s | Ceremony state |
 | `webauthn:credential/{cred_id_b64}` | none | Stored passkey |
 | `webauthn:link/{cred_id_b64}` | none | Account linking map |
