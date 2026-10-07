@@ -951,6 +951,16 @@ doc; read it before changing the code the rule covers.
 - **`/resolve` answers exactly four fields** (`did`, `mxid`, `exists`, `attested`). Adding one
   breaks the "nothing a caller could not compute" argument for leaving it unauthenticated.
   Pin: `a_successful_lookup_returns_all_four_keys_with_null_where_unknown` (mock stack).
+- **`exists` means an ACTIVE account.** A deactivated or erased account answers `exists: false`,
+  decided by `query_user`, because Synapse keeps those `users` rows and `is_localpart_available`
+  reports them as taken for good. Nothing else is read from such an account: `did` is `null` on
+  the `?mxid=` path and `attested` is `false`. That deactivation bit is the one deliberate
+  exception to "nothing a caller could not compute": the public profile route still serves a
+  plain deactivation's profile, so a caller reading both can tell it from "never existed". A
+  failed `query_user`, or a localpart reported taken that has no user, is a 502, never an
+  answer. Pin: `a_deactivated_account_resolves_as_not_existing_by_mxid`,
+  `a_failed_activity_check_is_a_502_never_a_guess`,
+  `deactivated_and_erased_accounts_resolve_as_not_existing` (mock stack).
 - **`/resolve` never guesses.** A probe failure is a 502 with whatever was resolved; no Synapse
   or server name is a 503; a repeated parameter is a 400 in the error envelope. Pin:
   `an_unreachable_homeserver_is_a_502_never_a_guessed_mxid`,
