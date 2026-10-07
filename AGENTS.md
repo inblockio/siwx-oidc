@@ -670,10 +670,13 @@ doc; read it before changing the code the rule covers.
   pair and leave one live chain. The successor counts as used once its access token is first
   accepted by introspection or `/userinfo`, or once its refresh token rotates; after that the
   replay is reuse, answered like an unknown token (`invalid_grant` at `/token`, `M_UNKNOWN_TOKEN`
-  at `/_matrix/client/v3/refresh`). No timer decides it: the decision reads grant state, never a
-  clock. A replay whose successor was rotated away or whose grant was revoked is refused the same
-  way. At `/token` the replay is also bound to the client (next invariant); the Matrix endpoint
-  carries no client and cannot bind it to one. Pin (mock stack):
+  at `/_matrix/client/v3/refresh`). Presenting the access token of an `oidc` grant counts as its
+  use even where the route then refuses it (introspection, the Matrix bearer routes): a later
+  replay of the previous refresh token is reuse, and with `reuse_revokes_grant` on it revokes the
+  grant; only the holder of the access token can cause this. No timer decides it: the decision
+  reads grant state, never a clock. A replay whose successor was rotated away or whose grant was
+  revoked is refused the same way. At `/token` the replay is also bound to the client (next
+  invariant); the Matrix endpoint carries no client and cannot bind it to one. Pin (mock stack):
   `concurrent_refreshes_at_the_token_endpoint_converge_on_one_pair`,
   `concurrent_refreshes_at_the_matrix_endpoint_converge_on_one_pair`,
   `a_replay_returns_the_same_pair_until_the_new_access_token_is_used`,
