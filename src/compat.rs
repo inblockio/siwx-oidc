@@ -721,11 +721,18 @@ pub async fn refresh(
         client_id: None,
         refuse_confidential: true,
     };
-    let outcome = match state
+    let peeked = state
         .redis_client
         .peek_refresh_token(&body.refresh_token)
-        .await
-    {
+        .await;
+    // The client the token belongs to, for the lifetime touch after an accepted refresh:
+    // never a request field, which this endpoint does not have.
+    let bound_client = match &peeked {
+        Ok(RefreshPeek::Grant(grant)) => Some(grant.client_id.clone()),
+        Ok(RefreshPeek::Legacy(legacy)) => Some(legacy.meta.client_id.clone()),
+        Ok(RefreshPeek::Unknown) | Err(_) => None,
+    };
+    let outcome = match peeked {
         Ok(RefreshPeek::Legacy(legacy)) => {
             match state
                 .redis_client
@@ -785,6 +792,9 @@ pub async fn refresh(
     };
 
     debug!("refresh: tokens rotated successfully");
+    if let Some(client_id) = &bound_client {
+        crate::oidc::touch_client_after_use(&state.redis_client, client_id).await;
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2233,5 +2243,73 @@ mod tests {
             "D2 token must be revoked"
         );
         client.delete_token(&bearer_tok).await.ok();
+    }
+
+    /// A refresh through the Matrix compat route is a use of the grant's client, so it
+    /// restores a dynamic client's lifetime, like the refresh grant at `/token`. The
+    /// replay of a lost response is a use too.
+    #[tokio::test]
+    async fn a_successful_refresh_extends_a_dynamic_client() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let client_id = format!("touch-compat-refresh-{n}");
+        let client_key = format!("clients/{client_id}");
+        client
+            .set_client(
+                client_id.clone(),
+                siwx_oidc::db::ClientEntry::new(
+                    "not-a-secret-test-fixture",
+                    siwx_oidc::db::SiwxClientMetadata::new(
+                        vec![
+                            openidconnect::RedirectUrl::new("https://example.com/cb".into())
+                                .unwrap(),
+                        ],
+                        siwx_oidc::db::LogoutClientMetadata::default(),
+                    ),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        let user = format!("refresh-user-{n}");
+        let dev = format!("DEV_{n}");
+        let refresh_token = client
+            .issue_grant(&NewGrant {
+                kind: GrantKind::MatrixDevice,
+                username: user.clone(),
+                did: format!("did:key:z{user}"),
+                client_id: client_id.clone(),
+                confidential_client: false,
+                device_id: dev.clone(),
+                scope: "openid".into(),
+                name: user.clone(),
+                auth_ms: None,
+                access_ttl: ACCESS_TOKEN_TTL,
+                refresh_inactivity_secs: Some(120),
+            })
+            .await
+            .unwrap()
+            .refresh_token
+            .expect("the grant carries a refresh token");
+        let state = standalone_state(client.clone());
+
+        client.expire_raw(&client_key, 60).await.unwrap();
+        let (status, first) = matrix_refresh(&state, &refresh_token).await;
+        assert_eq!(status, StatusCode::OK, "the rotation succeeds: {first}");
+        assert!(
+            client.ttl_raw(&client_key).await.unwrap() > 60,
+            "a refreshed session's dynamic client gets its lifetime back"
+        );
+
+        client.expire_raw(&client_key, 60).await.unwrap();
+        let (status, replay) = matrix_refresh(&state, &refresh_token).await;
+        assert_eq!(status, StatusCode::OK, "the replay is answered: {replay}");
+        assert!(
+            client.ttl_raw(&client_key).await.unwrap() > 60,
+            "the replay of a lost response is a use of the client too"
+        );
+
+        client.revoke_device_tokens(&user, &dev).await.ok();
+        client.del_raw(&client_key).await.ok();
     }
 }

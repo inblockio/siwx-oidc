@@ -116,6 +116,18 @@ end
 return 1
 "#;
 
+/// Extend a client entry's expiry, and only while it has one. `KEYS[1]` the entry,
+/// `ARGV[1]` the lifetime in seconds. `TTL` answers -1 for a key without an expiry (a
+/// static client) and -2 for an absent key, and only a positive TTL is extended, so a
+/// client that turns static or disappears between a check and the write is never given
+/// an expiry. Returns 1 when it extended the entry.
+const TOUCH_CLIENT_SCRIPT: &str = r#"
+if redis.call('TTL', KEYS[1]) > 0 then
+  return redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+end
+return 0
+"#;
+
 fn code_key(code: &str) -> String {
     format!("{KV_CODE_DIGEST_PREFIX}/{}", digest(code))
 }
@@ -1221,6 +1233,23 @@ impl DBClient for RedisClient {
     async fn sync_static_clients(&self, clients: Vec<(String, ClientEntry)>) -> Result<usize> {
         self.sync_static_clients_in(KV_STATIC_CLIENTS_KEY, clients)
             .await
+    }
+
+    async fn touch_client(&self, client_id: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+        let _extended: i64 = bb8_redis::redis::cmd("EVAL")
+            .arg(TOUCH_CLIENT_SCRIPT)
+            .arg(1)
+            .arg(format!("{}/{}", KV_CLIENT_PREFIX, client_id))
+            .arg(CLIENT_LIFETIME)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("Failed to extend a client's lifetime: {}", e))?;
+        Ok(())
     }
 
     async fn set_code(&self, code: String, code_entry: CodeEntry) -> Result<()> {
@@ -2961,5 +2990,52 @@ mod tests {
 
         client.del_raw(&kept_key).await.ok();
         client.del_raw(&set_key).await.ok();
+    }
+
+    #[tokio::test]
+    async fn touching_extends_a_dynamic_client_and_never_a_static_one() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let n = unique_nonce();
+        let dynamic = format!("dynamic-{n}");
+        let dynamic_key = format!("clients/{dynamic}");
+        client
+            .set_client(dynamic.clone(), lifetime_test_entry())
+            .await
+            .unwrap();
+        client.expire_raw(&dynamic_key, 60).await.unwrap(); // close to its end
+        client.touch_client(&dynamic).await.unwrap();
+        let ttl = client.ttl_raw(&dynamic_key).await.unwrap();
+        assert!(
+            ttl > crate::db::CLIENT_LIFETIME as i64 - 60,
+            "a used dynamic client gets its full lifetime back, got {ttl}"
+        );
+
+        let set_key = format!("clients:static:test-{n}");
+        let fixed = format!("static-{n}");
+        let fixed_key = format!("clients/{fixed}");
+        client
+            .sync_static_clients_in(&set_key, vec![(fixed.clone(), lifetime_test_entry())])
+            .await
+            .unwrap();
+        client.touch_client(&fixed).await.unwrap();
+        assert_eq!(
+            client.ttl_raw(&fixed_key).await.unwrap(),
+            -1,
+            "touching must never give a static client a TTL"
+        );
+
+        let unknown = format!("unknown-{n}");
+        client.touch_client(&unknown).await.unwrap();
+        assert_eq!(
+            client.ttl_raw(&format!("clients/{unknown}")).await.unwrap(),
+            -2,
+            "touching an unknown id creates nothing"
+        );
+
+        for key in [dynamic_key, fixed_key, set_key] {
+            client.del_raw(&key).await.ok();
+        }
     }
 }

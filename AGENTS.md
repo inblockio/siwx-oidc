@@ -569,7 +569,7 @@ doc; read it before changing the code the rule covers.
   `none`, or none while `require_secret`) must present its secret, else `invalid_client`, a 401
   (RFC 6749 §5.2, with `WWW-Authenticate: Basic` after a Basic attempt). The replay of a lost
   response is bound to the grant's client like a rotation. Provisional, recorded in docs/matrix-integration.md: a public
-  client may omit `client_id`; a token whose client registration has expired (30 days against 90)
+  client may omit `client_id`; a token whose client registration is gone (30 days without a use, or removed)
   keeps refreshing unless the request names another client or presents a secret.
   `POST /_matrix/client/v3/refresh` carries no client identity, so it refuses a confidential
   client's refresh token exactly like an unknown token, leaving it untouched for `/token`; the
