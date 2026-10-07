@@ -879,9 +879,9 @@ pub trait DBClient {
     /// `clients` no longer names is deleted. Returns how many were deleted.
     ///
     /// Before it overwrites or deletes the stored entry of a client whose grants the change
-    /// ends ([`crate::client_policy::grant_end`]: a generic client removed, reclassified or given
-    /// other allowed scopes), it sets that client's epoch, so none of its older grants
-    /// survives the change.
+    /// ends ([`crate::client_policy::grant_end`]: a generic client removed, reclassified, given
+    /// other allowed scopes or no longer allowed to refresh), it sets that client's epoch, so
+    /// none of its older grants survives the change.
     async fn sync_static_clients(&self, clients: Vec<(String, ClientEntry)>) -> Result<usize>;
     /// Extend a DYNAMIC client's lifetime to [`CLIENT_LIFETIME`] from now. A client without
     /// a TTL (a static one) and an unknown id are left as they are. Call sites treat it as

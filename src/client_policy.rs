@@ -4,8 +4,10 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use openidconnect::core::CoreGrantType;
+
 use crate::db::grant::GrantKind;
-use crate::db::{ClientClass, ClientEntry, TokenMetadata};
+use crate::db::{ClientClass, ClientEntry, SiwxClientMetadata, TokenMetadata};
 use crate::mxid::localpart_for;
 
 /// The scope that unlocks the mailbox claim.
@@ -327,6 +329,8 @@ pub enum GrantEnd {
     ClassChanged,
     /// The scopes the client may be granted are not the ones its grants were issued under.
     ScopesChanged,
+    /// The registration no longer allows the refresh grant its refresh tokens were issued under.
+    RefreshWithdrawn,
 }
 
 impl GrantEnd {
@@ -336,8 +340,19 @@ impl GrantEnd {
             GrantEnd::Removed => "removed",
             GrantEnd::ClassChanged => "class_changed",
             GrantEnd::ScopesChanged => "scopes_changed",
+            GrantEnd::RefreshWithdrawn => "refresh_withdrawn",
         }
     }
+}
+
+/// Whether a registration allows the refresh grant: it lists `refresh_token` in
+/// `grant_types`, or lists no `grant_types` at all (provisional). The one place the answer is
+/// decided: the code exchange asks it before it issues a refresh token, and
+/// [`grant_end`] asks it to end the refresh tokens of a client that lost the permission.
+pub fn registration_may_refresh(metadata: &SiwxClientMetadata) -> bool {
+    metadata
+        .grant_types()
+        .is_none_or(|grants| grants.contains(&CoreGrantType::RefreshToken))
 }
 
 /// The set of scopes `entry` may be granted: a list with a scope twice, or in another order,
@@ -364,6 +379,12 @@ fn allowed_set(entry: &ClientEntry) -> BTreeSet<&str> {
 /// inside what the client may have. The secret and the redirect URIs are not part of it
 /// either.
 ///
+/// A refresh token is issued only while the registration allows the refresh grant
+/// ([`registration_may_refresh`]), so a registration that stops allowing it ends the grants
+/// too: their refresh tokens would keep rotating under a registration that forbids them.
+/// Allowing it again ends nothing, because no grant holds more than the registration now
+/// permits. When the scopes changed as well, the reason is the scopes.
+///
 /// A Matrix-class client never ends its grants here: they are Matrix sessions, which keep
 /// refreshing after the client's removal, as they always did. The classes are matched
 /// exhaustively, so a class added later fails to compile here instead of falling through.
@@ -378,7 +399,15 @@ pub fn grant_end(before: &ClientEntry, after: Option<&ClientEntry>) -> Option<Gr
         (ClientClass::Generic, Some(after)) => match after.class {
             ClientClass::Matrix => Some(GrantEnd::ClassChanged),
             ClientClass::Generic => {
-                (allowed_set(before) != allowed_set(after)).then_some(GrantEnd::ScopesChanged)
+                if allowed_set(before) != allowed_set(after) {
+                    Some(GrantEnd::ScopesChanged)
+                } else if registration_may_refresh(&before.metadata)
+                    && !registration_may_refresh(&after.metadata)
+                {
+                    Some(GrantEnd::RefreshWithdrawn)
+                } else {
+                    None
+                }
             }
         },
     }
@@ -1121,6 +1150,111 @@ mod tests {
         entry
     }
 
+    /// `entry`, its registration listing exactly `grants`.
+    fn registering(mut entry: ClientEntry, grants: &[CoreGrantType]) -> ClientEntry {
+        entry.metadata = entry.metadata.set_grant_types(Some(grants.to_vec()));
+        entry
+    }
+
+    #[test]
+    fn a_registration_may_refresh_unless_it_lists_grant_types_without_the_refresh_grant() {
+        use CoreGrantType::{AuthorizationCode, RefreshToken};
+        let cases: [(&str, ClientEntry, bool); 4] = [
+            ("lists no grant types (provisional)", generic(MAIL), true),
+            (
+                "lists the refresh grant",
+                registering(generic(MAIL), &[AuthorizationCode, RefreshToken]),
+                true,
+            ),
+            (
+                "lists the code grant only",
+                registering(generic(MAIL), &[AuthorizationCode]),
+                false,
+            ),
+            (
+                "lists no grant at all",
+                registering(generic(MAIL), &[]),
+                false,
+            ),
+        ];
+        for (what, entry, expected) in cases {
+            assert_eq!(
+                registration_may_refresh(&entry.metadata),
+                expected,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn grants_end_when_a_generic_client_loses_the_permission_to_refresh() {
+        use CoreGrantType::{AuthorizationCode, RefreshToken};
+        let refreshing = || registering(generic(MAIL), &[AuthorizationCode, RefreshToken]);
+        let code_only = || registering(generic(MAIL), &[AuthorizationCode]);
+        let cases: Vec<(&str, ClientEntry, Option<ClientEntry>, Option<GrantEnd>)> = vec![
+            (
+                "the refresh grant withdrawn",
+                refreshing(),
+                Some(code_only()),
+                Some(GrantEnd::RefreshWithdrawn),
+            ),
+            (
+                "the refresh grant withdrawn from a registration that listed no grant types",
+                generic(MAIL),
+                Some(code_only()),
+                Some(GrantEnd::RefreshWithdrawn),
+            ),
+            (
+                "the refresh grant withdrawn with the scopes changed too",
+                refreshing(),
+                Some(registering(generic(&["openid"]), &[AuthorizationCode])),
+                Some(GrantEnd::ScopesChanged),
+            ),
+            (
+                "offline_access removed from the allowed scopes",
+                generic(&["openid", "io.inblock.mail", "offline_access"]),
+                Some(generic(MAIL)),
+                Some(GrantEnd::ScopesChanged),
+            ),
+            (
+                "the refresh grant allowed again",
+                code_only(),
+                Some(refreshing()),
+                None,
+            ),
+            (
+                "grant types no longer listed (refresh allowed by default)",
+                code_only(),
+                Some(generic(MAIL)),
+                None,
+            ),
+            (
+                "grant types reordered, refresh still allowed",
+                refreshing(),
+                Some(registering(
+                    generic(MAIL),
+                    &[RefreshToken, AuthorizationCode],
+                )),
+                None,
+            ),
+            (
+                "grant types listed, refresh still allowed",
+                generic(MAIL),
+                Some(registering(generic(MAIL), &[RefreshToken])),
+                None,
+            ),
+            (
+                "a Matrix client withdrawn from refreshing",
+                registering(matrix(), &[AuthorizationCode, RefreshToken]),
+                Some(registering(matrix(), &[AuthorizationCode])),
+                None,
+            ),
+        ];
+        for (what, before, after, expected) in cases {
+            assert_eq!(grant_end(&before, after.as_ref()), expected, "{what}");
+        }
+    }
+
     #[test]
     fn grants_end_when_a_generic_client_is_removed_reclassified_or_rescoped() {
         let cases: Vec<(&str, ClientEntry, Option<ClientEntry>, Option<GrantEnd>)> = vec![
@@ -1200,6 +1334,7 @@ mod tests {
             (GrantEnd::Removed, "removed"),
             (GrantEnd::ClassChanged, "class_changed"),
             (GrantEnd::ScopesChanged, "scopes_changed"),
+            (GrantEnd::RefreshWithdrawn, "refresh_withdrawn"),
         ];
         for (end, word) in reasons {
             assert_eq!(end.as_str(), word);

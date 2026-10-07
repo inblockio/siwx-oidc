@@ -1605,7 +1605,7 @@ fn generic_grant(requested: Option<&str>, registration: &ClientEntry) -> Generic
         };
     };
     let asked: Vec<&str> = requested.split_whitespace().collect();
-    let may_refresh = registration_may_refresh(&registration.metadata);
+    let may_refresh = client_policy::registration_may_refresh(&registration.metadata);
     let granted: Vec<&str> = GENERIC_GRANTABLE_SCOPES
         .iter()
         .copied()
@@ -1627,7 +1627,7 @@ fn generic_grant(requested: Option<&str>, registration: &ClientEntry) -> Generic
 /// grants no `openid`.
 fn class_grant(requested: &str, client: &ClientEntry) -> Option<GenericGrant> {
     let granted = client_policy::grant_for(client, requested)?;
-    let may_refresh = registration_may_refresh(&client.metadata);
+    let may_refresh = client_policy::registration_may_refresh(&client.metadata);
     let scope = granted
         .split(' ')
         .filter(|scope| may_refresh || *scope != "offline_access")
@@ -3403,20 +3403,14 @@ async fn check_logout_metadata(
                 return Err(invalid());
             }
         }
-        None if policy.require_backchannel_for_refresh && registration_may_refresh(payload) => {
+        None if policy.require_backchannel_for_refresh
+            && client_policy::registration_may_refresh(payload) =>
+        {
             return Err(invalid());
         }
         None => {}
     }
     Ok(())
-}
-
-/// Whether a registration allows the refresh grant: it lists `refresh_token`
-/// in `grant_types`, or lists no `grant_types` at all (provisional).
-fn registration_may_refresh(metadata: &SiwxClientMetadata) -> bool {
-    metadata
-        .grant_types()
-        .is_none_or(|grants| grants.contains(&CoreGrantType::RefreshToken))
 }
 
 // -- RP-initiated logout (OpenID Connect RP-Initiated Logout 1.0) -------------
@@ -11528,6 +11522,76 @@ mod generic_client_tests {
             "the new grant is held to the narrower policy"
         );
         assert_grant_works(&db, &client_id, &newer, "a sign-in after the narrowing").await;
+    }
+
+    /// A generic-class client whose registration lists exactly `grants`.
+    fn generic_registered_for(grants: Vec<CoreGrantType>) -> ClientEntry {
+        let mut entry = generic_allowing(&MAIL_CLIENT_SCOPES);
+        entry.metadata = entry.metadata.set_grant_types(Some(grants));
+        entry
+    }
+
+    /// A registration that stops allowing the refresh grant ends the grants issued while it
+    /// did: their refresh tokens would otherwise keep rotating under a registration that no
+    /// longer allows them. A sign-in afterwards gets an access token and no refresh token.
+    #[tokio::test]
+    async fn an_older_generic_grant_is_refused_after_the_refresh_grant_is_withdrawn() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = static_id();
+        let refreshing = generic_registered_for(vec![
+            CoreGrantType::AuthorizationCode,
+            CoreGrantType::RefreshToken,
+        ]);
+        let code_only = generic_registered_for(vec![CoreGrantType::AuthorizationCode]);
+        start_server_with(&db, vec![(&client_id, refreshing)]).await;
+        let older = sign_in_at(&db, &client_id, ClientClass::Generic, MAIL_CLIENT_REQUEST).await;
+        assert!(
+            older.refresh_token().is_some(),
+            "precondition: the grant carries a refresh token"
+        );
+
+        start_server_with(&db, vec![(&client_id, code_only)]).await;
+        assert_grant_ended(
+            &db,
+            &client_id,
+            &older,
+            "after the refresh grant was withdrawn",
+        )
+        .await;
+
+        let newer =
+            sign_in_after_the_epoch(&db, &client_id, ClientClass::Generic, MAIL_CLIENT_REQUEST)
+                .await;
+        assert!(
+            newer.refresh_token().is_none(),
+            "the registration no longer allows a refresh token"
+        );
+        if let Err(e) = userinfo_of(&db, &newer).await {
+            panic!("a sign-in after the withdrawal gets a working access token: {e:?}");
+        }
+    }
+
+    /// A restart that lists the same refresh permission, in another form, ends nothing.
+    #[tokio::test]
+    async fn a_restart_that_keeps_the_refresh_permission_keeps_a_generic_grant_working() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = static_id();
+        start_server_with(
+            &db,
+            vec![(&client_id, generic_allowing(&MAIL_CLIENT_SCOPES))],
+        )
+        .await;
+        let older = sign_in_at(&db, &client_id, ClientClass::Generic, MAIL_CLIENT_REQUEST).await;
+
+        let listing_it = generic_registered_for(vec![CoreGrantType::RefreshToken]);
+        start_server_with(&db, vec![(&client_id, listing_it)]).await;
+
+        assert_eq!(client_epoch(&db, &client_id).await, None);
+        assert_grant_works(&db, &client_id, &older, "after listing the refresh grant").await;
     }
 
     /// A Matrix-class client's sessions are Matrix sessions: removing the client from the

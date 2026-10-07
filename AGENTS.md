@@ -552,8 +552,11 @@ doc; read it before changing the code the rule covers.
   start-up sync of `default_clients` (`DBClient::sync_static_clients`; the background prune
   runs it with an empty map) sets `epoch:client/{id}` before it overwrites or deletes a stored
   entry whose change `client_policy::grant_end` says ends grants: a generic client that is
-  removed, that changes class in either direction, or whose SET of `allowed_scopes` changes
-  (order and repeats do not count, no list is the empty list, a widening counts). Without it a
+  removed, that changes class in either direction, whose SET of `allowed_scopes` changes
+  (order and repeats do not count, no list is the empty list, a widening counts), or whose
+  registration stops allowing the refresh grant (`client_policy::registration_may_refresh`,
+  the one place that decides it, also asked before a refresh token is issued; allowing it
+  again ends nothing). Without it a
   generic grant outlives its client: a public client's refresh token keeps rotating at `/token`
   once the registration is gone (`authenticate_refresh_client` tolerates that), and after a class
   flip or a narrowed policy an old `oidc` grant keeps its scope, refreshes and is served at
@@ -567,12 +570,15 @@ doc; read it before changing the code the rule covers.
   and a client id configured again keeps its epoch, so what was issued before stays refused and
   a sign-in after it works (a grant authenticated in the epoch's own millisecond is refused, so
   a test gives the new grant the next one). Each epoch is one `warn!` with `client_id`, `reason`
-  (`removed`, `class_changed`, `scopes_changed`) and `epoch_ms`. Observe the epoch at `/token`,
+  (`removed`, `class_changed`, `scopes_changed`, `refresh_withdrawn`) and `epoch_ms`. Observe
+  the epoch at `/token`,
   at userinfo and in the library: `compat::refresh` refuses an `oidc` grant before it reads any
   epoch. Never set the global or the user epoch from the sync. A test syncs through a
   `test_support` client, which tracks static clients in a set of its own, so it never ends the
   grants of a running stack's clients. Pin:
   `grants_end_when_a_generic_client_is_removed_reclassified_or_rescoped` (the rule, a table),
+  `grants_end_when_a_generic_client_loses_the_permission_to_refresh` (the refresh rule, a
+  table), `a_registration_may_refresh_unless_it_lists_grant_types_without_the_refresh_grant`,
   `a_grant_end_names_its_reason_for_the_log`,
   `a_restart_with_an_unchanged_configuration_sets_no_epoch`,
   `removing_a_generic_static_client_ends_its_grants`,
@@ -586,6 +592,8 @@ doc; read it before changing the code the rule covers.
   `an_older_generic_grant_is_refused_after_its_client_is_removed`,
   `an_older_grant_is_refused_after_a_class_change_in_either_direction`,
   `an_older_generic_grant_is_refused_after_the_allowed_scopes_change`,
+  `an_older_generic_grant_is_refused_after_the_refresh_grant_is_withdrawn`,
+  `a_restart_that_keeps_the_refresh_permission_keeps_a_generic_grant_working`,
   `removing_a_matrix_class_static_client_leaves_its_sessions_refreshing`.
 - **No credential a client holds is stored in the clear** (I1): tokens, authorization codes,
   device and user codes, session identifiers (the login `session` cookie, the WebAuthn,

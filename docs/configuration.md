@@ -207,17 +207,21 @@ with no `default_clients` at all):
 - the client is removed;
 - its class changes, from `generic` to `matrix` or the other way round;
 - its `allowed_scopes` change as a set: a scope added or removed counts, the order and a scope
-  listed twice do not.
+  listed twice do not;
+- its registration stops allowing the refresh grant: it listed no `grant_types` or listed
+  `refresh_token`, and now lists `grant_types` without `refresh_token`. A refresh token is issued
+  only while the registration allows it, so the sessions that hold one must not keep rotating
+  under a registration that forbids it. Allowing the refresh grant again ends nothing.
 
 It writes the client's epoch (`epoch:client/{client_id}`, see
 [Epochs](matrix-integration.md#epochs)) before it overwrites or deletes the entry, and logs each
 one as a warning that names the client and the reason (`removed`, `class_changed`,
-`scopes_changed`). From then on every session of the client that was authenticated before that
-moment is refused at the token endpoint's refresh grant and at `/userinfo`; the user signs in
-again, and a sign-in after it works at once. Nothing else ends a session: not a restart with the
-configuration unchanged, not a new secret or redirect URI, not a change to
-`always_granted_scopes` alone, and not a change to a Matrix-class client (above). A stored entry
-that is missing, or that this build cannot read, sets no epoch.
+`scopes_changed`, `refresh_withdrawn`). From then on every session of the client that was
+authenticated before that moment is refused at the token endpoint's refresh grant and at
+`/userinfo`; the user signs in again, and a sign-in after it works at once. Nothing else ends a
+session: not a restart with the configuration unchanged, not a new secret or redirect URI, not a
+change to `always_granted_scopes` alone, and not a change to a Matrix-class client (above). A
+stored entry that is missing, or that this build cannot read, sets no epoch.
 
 An instance started with another map, or without the generic client, therefore ends every
 session of that client for good, and so does a rollback that carries an older map. The epoch has
