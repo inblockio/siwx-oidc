@@ -637,6 +637,138 @@ async fn revoking_a_device_deletes_its_grants_only_and_plants_the_tombstone() {
     assert_eq!(members, vec![b.grant_id.as_str().to_string()]);
 }
 
+/// The shape of an Element X device id: 43 base64 characters, with `/` and
+/// `+`. A deployment holds such ids in its grants and legacy tokens.
+const ELEMENT_X_DEVICE: &str = "q8Zr/Hk+2vN0xLc7WmJ4pT9sY1bQ+fG6dR3eUo5a/Ki";
+
+/// Element X device ids (R3 of the promotion plan) survive the grant layer.
+/// The id is part of the device index key
+/// (`idx:grants:user_device/{username}/{device_id}`), of the legacy device
+/// index and of the device tombstone, so a `/` inside it must never make one
+/// device's key another's. Issue, rotation and the lift of a legacy token keep
+/// the id byte for byte; `revoke_device_tokens` ends the device's grants, its
+/// legacy access token and its index, plants its tombstone, and touches no
+/// other device, not even the one whose id is its prefix up to the `/`.
+#[tokio::test]
+async fn an_element_x_device_id_with_slash_and_plus_survives_issue_rotation_and_revocation() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let ex = ELEMENT_X_DEVICE;
+    assert!(ex.len() == 43 && ex.contains('/') && ex.contains('+'));
+    let prefix = ex.split('/').next().unwrap();
+    let user = format!("exdev{}", nonce());
+
+    let issued = issue(&client, &matrix_grant(&user, ex)).await;
+    assert_eq!(
+        hgetall(&client, &grant_key(&issued.grant_id)).await["device_id"],
+        ex
+    );
+    let members: Vec<String> = raw(&client, &["SMEMBERS", &device_idx_key(&user, ex)]).await;
+    assert_eq!(members, vec![issued.grant_id.as_str().to_string()]);
+    let meta = client
+        .check_access_token(&issued.access_token)
+        .await
+        .unwrap()
+        .expect("the issued access token is active");
+    assert_eq!(meta.device_id, ex);
+
+    let pair = rotated(rotate(&client, issued.refresh_token.as_deref().unwrap()).await);
+    assert_eq!(
+        hgetall(&client, &grant_key(&issued.grant_id)).await["device_id"],
+        ex,
+        "rotation keeps the device id"
+    );
+    let meta = client
+        .check_access_token(&pair.pair.access_token)
+        .await
+        .unwrap()
+        .expect("the rotated access token is active");
+    assert_eq!(meta.device_id, ex);
+
+    // The previous build's tokens of the same device: a refresh token, lifted,
+    // and an access token, read in place until it expires.
+    let (legacy_rt, _) = seed_legacy(&client, &user, ex, REFRESH_TOKEN_TTL as i64, false).await;
+    let legacy = peek_legacy(&client, &legacy_rt).await;
+    let lifted = rotated(
+        client
+            .lift_legacy_refresh_token(&request(&legacy_rt), &legacy, false)
+            .await
+            .expect("lift"),
+    );
+    assert_eq!(
+        hgetall(&client, &grant_key(&lifted.grant_id)).await["device_id"],
+        ex,
+        "the lift keeps the device id"
+    );
+    let mut members: Vec<String> = raw(&client, &["SMEMBERS", &device_idx_key(&user, ex)]).await;
+    members.sort();
+    let mut expected = vec![
+        issued.grant_id.as_str().to_string(),
+        lifted.grant_id.as_str().to_string(),
+    ];
+    expected.sort();
+    assert_eq!(members, expected, "the device index holds both grants");
+    let (legacy_at, _) = seed_legacy(&client, &user, ex, 300, false).await;
+    assert_eq!(
+        client
+            .check_access_token(&legacy_at)
+            .await
+            .unwrap()
+            .expect("the legacy access token is read")
+            .device_id,
+        ex
+    );
+
+    let neighbour = issue(&client, &matrix_grant(&user, prefix)).await;
+
+    client.revoke_device_tokens(&user, ex).await.unwrap();
+    for (what, token) in [
+        ("the rotated access token", pair.pair.access_token.as_str()),
+        ("the lifted access token", lifted.pair.access_token.as_str()),
+        ("the legacy access token", legacy_at.as_str()),
+    ] {
+        assert!(
+            client.check_access_token(token).await.unwrap().is_none(),
+            "{what} is revoked"
+        );
+    }
+    for (what, presented) in [
+        (
+            "the rotated refresh token",
+            pair.pair.refresh_token.as_str(),
+        ),
+        (
+            "the lifted refresh token",
+            lifted.pair.refresh_token.as_str(),
+        ),
+    ] {
+        let outcome = rotate(&client, presented).await;
+        assert!(
+            matches!(outcome, RotateOutcome::Invalid(_)),
+            "{what} is refused: {outcome:?}"
+        );
+    }
+    let exists: i64 = raw(&client, &["EXISTS", &device_idx_key(&user, ex)]).await;
+    assert_eq!(exists, 0, "the device index is gone");
+    let exists: i64 = raw(&client, &["EXISTS", &format!("token/{legacy_at}")]).await;
+    assert_eq!(exists, 0, "the legacy access entry is gone");
+    assert!(tombstone(&client, &device_tombstone_key(&user, ex)).await);
+
+    assert!(
+        client
+            .check_access_token(&neighbour.access_token)
+            .await
+            .unwrap()
+            .is_some(),
+        "the device whose id is the prefix is untouched"
+    );
+    assert!(!tombstone(&client, &device_tombstone_key(&user, prefix)).await);
+    let members: Vec<String> = raw(&client, &["SMEMBERS", &device_idx_key(&user, prefix)]).await;
+    assert_eq!(members, vec![neighbour.grant_id.as_str().to_string()]);
+    client.revoke_device_tokens(&user, prefix).await.unwrap();
+}
+
 #[tokio::test]
 async fn revoking_a_user_deletes_every_grant_of_the_user() {
     let Some(client) = crate::test_support::redis().await else {
