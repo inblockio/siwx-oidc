@@ -30,6 +30,8 @@ pub use self::redis::RedisClient;
 const KV_CLIENT_PREFIX: &str = "clients";
 /// Redis SET of the client ids written from `default_clients`, so the next start can
 /// delete the ones the configuration no longer names. A plain key, outside `clients/`.
+/// Every client records in it except a test's, which names a set of its own
+/// ([`RedisClient::with_static_clients_key`]).
 const KV_STATIC_CLIENTS_KEY: &str = "clients:static";
 
 // Credentials a client holds are stored only as their SHA-256 digest
@@ -875,6 +877,11 @@ pub trait DBClient {
     /// Make the static clients in Redis equal `clients`: every entry is written with NO
     /// TTL and its id recorded in the static-client set, and every recorded id that
     /// `clients` no longer names is deleted. Returns how many were deleted.
+    ///
+    /// Before it overwrites or deletes the stored entry of a client whose grants the change
+    /// ends ([`crate::client_policy::grant_end`]: a generic client removed, reclassified or given
+    /// other allowed scopes), it sets that client's epoch, so none of its older grants
+    /// survives the change.
     async fn sync_static_clients(&self, clients: Vec<(String, ClientEntry)>) -> Result<usize>;
     /// Extend a DYNAMIC client's lifetime to [`CLIENT_LIFETIME`] from now. A client without
     /// a TTL (a static one) and an unknown id are left as they are. Call sites treat it as

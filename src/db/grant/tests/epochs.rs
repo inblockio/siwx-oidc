@@ -442,8 +442,10 @@ fn the_scripts_name_the_epoch_keys_the_library_writes() {
 
 // -- The start-up sync of static clients ---------------------------------------------------
 //
-// Every test names its own tracking set and its own client ids, so none prunes or ends the
-// grants of a stack that shares this Redis.
+// Every test syncs through a client from `test_support`, which records static clients in a
+// set of its own, and names its own client ids, so none prunes or ends the grants of a stack
+// that shares this Redis. A client carries one set: a test that needs the starts of several
+// independent clients takes a fresh client for each.
 
 const MAIL: [&str; 2] = ["openid", "io.inblock.mail"];
 
@@ -471,10 +473,6 @@ fn matrix_client() -> ClientEntry {
     static_client(ClientClass::Matrix, None)
 }
 
-fn tracking_set() -> String {
-    format!("clients:static:test-{}", nonce())
-}
-
 /// The client epoch of `id`; `None` when none was ever set.
 async fn client_epoch(client: &RedisClient, id: &str) -> Option<i64> {
     client
@@ -486,27 +484,23 @@ async fn client_epoch(client: &RedisClient, id: &str) -> Option<i64> {
 
 /// One start of the server: the static clients in Redis become `clients`. Returns how many
 /// clients the start deleted.
-async fn start_with(
-    client: &RedisClient,
-    tracking: &str,
-    clients: Vec<(&str, ClientEntry)>,
-) -> usize {
+async fn start_with(client: &RedisClient, clients: Vec<(&str, ClientEntry)>) -> usize {
     let clients = clients
         .into_iter()
         .map(|(id, entry)| (id.to_string(), entry))
         .collect();
     client
-        .sync_static_clients_in(tracking, clients)
+        .sync_static_clients(clients)
         .await
         .expect("the sync succeeds")
 }
 
-async fn forget(client: &RedisClient, tracking: &str, ids: &[&str]) {
+async fn forget(client: &RedisClient, ids: &[&str]) {
     for id in ids {
         client.del_raw(&format!("clients/{id}")).await.ok();
         client.del_raw(&EpochScope::Client(id).key()).await.ok();
     }
-    client.del_raw(tracking).await.ok();
+    client.del_raw(&client.static_clients_key).await.ok();
 }
 
 /// A start that finds the configuration it left behind sets no epoch, whatever order the
@@ -517,14 +511,13 @@ async fn a_restart_with_an_unchanged_configuration_sets_no_epoch() {
         return;
     };
     let id = format!("sync-same-{}", nonce());
-    let tracking = tracking_set();
     let user = format!("sync{}", nonce());
-    start_with(&client, &tracking, vec![(&id, generic_client(&MAIL))]).await;
+    start_with(&client, vec![(&id, generic_client(&MAIL))]).await;
     let older = issue(&client, &grant_of(&user, &id, "", None)).await;
 
     let reordered = ["io.inblock.mail", "openid", "io.inblock.mail"];
     for scopes in [&MAIL[..], &reordered[..]] {
-        let deleted = start_with(&client, &tracking, vec![(&id, generic_client(scopes))]).await;
+        let deleted = start_with(&client, vec![(&id, generic_client(scopes))]).await;
         assert_eq!(deleted, 0);
     }
 
@@ -534,7 +527,7 @@ async fn a_restart_with_an_unchanged_configuration_sets_no_epoch() {
         "a restart with the same configuration must not end a session"
     );
     accepted(&client, &older, "a grant issued before the restarts").await;
-    forget(&client, &tracking, &[&id]).await;
+    forget(&client, &[&id]).await;
 }
 
 /// Removing a generic client from the configuration ends every grant it holds, and no
@@ -547,13 +540,12 @@ async fn removing_a_generic_static_client_ends_its_grants() {
     };
     let id = format!("sync-removed-{}", nonce());
     let other = format!("sync-other-{}", nonce());
-    let tracking = tracking_set();
     let user = format!("sync{}", nonce());
-    start_with(&client, &tracking, vec![(&id, generic_client(&MAIL))]).await;
+    start_with(&client, vec![(&id, generic_client(&MAIL))]).await;
     let older = issue(&client, &grant_of(&user, &id, "", None)).await;
     let bystander = issue(&client, &grant_of(&user, &other, "", None)).await;
 
-    let deleted = start_with(&client, &tracking, Vec::new()).await;
+    let deleted = start_with(&client, Vec::new()).await;
 
     assert_eq!(deleted, 1);
     assert!(client.get_client(id.clone()).await.unwrap().is_none());
@@ -564,7 +556,7 @@ async fn removing_a_generic_static_client_ends_its_grants() {
     refresh_revoked(&client, older.refresh_token.as_deref().unwrap(), "removed").await;
     accepted(&client, &bystander, "another client's grant").await;
 
-    start_with(&client, &tracking, vec![(&id, generic_client(&MAIL))]).await;
+    start_with(&client, vec![(&id, generic_client(&MAIL))]).await;
     assert_eq!(
         client_epoch(&client, &id).await,
         Some(epoch),
@@ -572,7 +564,7 @@ async fn removing_a_generic_static_client_ends_its_grants() {
     );
     let later = issue(&client, &grant_of(&user, &id, "", Some(epoch + 1))).await;
     accepted(&client, &later, "a sign-in after the removal").await;
-    forget(&client, &tracking, &[&id, &other]).await;
+    forget(&client, &[&id, &other]).await;
 }
 
 /// A Matrix-class client's sessions are Matrix sessions: removing the client ends none.
@@ -582,29 +574,25 @@ async fn removing_a_matrix_class_static_client_sets_no_epoch() {
         return;
     };
     let id = format!("sync-matrix-{}", nonce());
-    let tracking = tracking_set();
-    start_with(&client, &tracking, vec![(&id, matrix_client())]).await;
+    start_with(&client, vec![(&id, matrix_client())]).await;
     let session = issue(
         &client,
         &grant_of(&format!("sync{}", nonce()), &id, "DEVA", None),
     )
     .await;
 
-    let deleted = start_with(&client, &tracking, Vec::new()).await;
+    let deleted = start_with(&client, Vec::new()).await;
 
     assert_eq!(deleted, 1);
     assert!(client.get_client(id.clone()).await.unwrap().is_none());
     assert_eq!(client_epoch(&client, &id).await, None);
     accepted(&client, &session, "a Matrix session of the removed client").await;
-    forget(&client, &tracking, &[&id]).await;
+    forget(&client, &[&id]).await;
 }
 
 /// A client that changes class ends its grants, in either direction.
 #[tokio::test]
 async fn a_class_change_ends_the_grants_in_either_direction() {
-    let Some(client) = crate::test_support::redis().await else {
-        return;
-    };
     let cases = [
         (
             "generic to Matrix",
@@ -620,22 +608,24 @@ async fn a_class_change_ends_the_grants_in_either_direction() {
         ),
     ];
     for (what, before, after, device_id) in cases {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
         let id = format!("sync-class-{}", nonce());
-        let tracking = tracking_set();
-        start_with(&client, &tracking, vec![(&id, before)]).await;
+        start_with(&client, vec![(&id, before)]).await;
         let older = issue(
             &client,
             &grant_of(&format!("sync{}", nonce()), &id, device_id, None),
         )
         .await;
 
-        let deleted = start_with(&client, &tracking, vec![(&id, after)]).await;
+        let deleted = start_with(&client, vec![(&id, after)]).await;
 
         assert_eq!(deleted, 0, "{what}");
         assert!(client_epoch(&client, &id).await.is_some(), "{what}");
         access_refused(&client, &older, what).await;
         refresh_revoked(&client, older.refresh_token.as_deref().unwrap(), what).await;
-        forget(&client, &tracking, &[&id]).await;
+        forget(&client, &[&id]).await;
     }
 }
 
@@ -643,9 +633,6 @@ async fn a_class_change_ends_the_grants_in_either_direction() {
 /// another, ends its grants; a change to nothing but its secret and redirect URI does not.
 #[tokio::test]
 async fn a_change_of_the_allowed_scopes_ends_the_grants_and_nothing_else_does() {
-    let Some(client) = crate::test_support::redis().await else {
-        return;
-    };
     let cases = [
         ("narrowed", generic_client(&["openid"]), true),
         (
@@ -668,16 +655,18 @@ async fn a_change_of_the_allowed_scopes_ends_the_grants_and_nothing_else_does() 
         ),
     ];
     for (what, after, ends) in cases {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
         let id = format!("sync-scopes-{}", nonce());
-        let tracking = tracking_set();
-        start_with(&client, &tracking, vec![(&id, generic_client(&MAIL))]).await;
+        start_with(&client, vec![(&id, generic_client(&MAIL))]).await;
         let older = issue(
             &client,
             &grant_of(&format!("sync{}", nonce()), &id, "", None),
         )
         .await;
 
-        start_with(&client, &tracking, vec![(&id, after)]).await;
+        start_with(&client, vec![(&id, after)]).await;
 
         assert_eq!(client_epoch(&client, &id).await.is_some(), ends, "{what}");
         if ends {
@@ -686,7 +675,7 @@ async fn a_change_of_the_allowed_scopes_ends_the_grants_and_nothing_else_does() 
         } else {
             accepted(&client, &older, what).await;
         }
-        forget(&client, &tracking, &[&id]).await;
+        forget(&client, &[&id]).await;
     }
 }
 
@@ -699,18 +688,17 @@ async fn the_sync_logs_each_epoch_it_sets_with_the_client_and_the_reason() {
         return;
     };
     let id = format!("sync-log-{}", nonce());
-    let tracking = tracking_set();
     let log = crate::test_support::LogCapture::start();
 
-    start_with(&client, &tracking, vec![(&id, generic_client(&MAIL))]).await;
-    start_with(&client, &tracking, vec![(&id, generic_client(&MAIL))]).await;
+    start_with(&client, vec![(&id, generic_client(&MAIL))]).await;
+    start_with(&client, vec![(&id, generic_client(&MAIL))]).await;
     assert!(
         !log.output().contains(&id),
         "a start that changes nothing logs nothing about the client: {}",
         log.output()
     );
-    start_with(&client, &tracking, vec![(&id, generic_client(&["openid"]))]).await;
-    start_with(&client, &tracking, Vec::new()).await;
+    start_with(&client, vec![(&id, generic_client(&["openid"]))]).await;
+    start_with(&client, Vec::new()).await;
 
     let output = log.output();
     let ended: Vec<&str> = output.lines().filter(|l| l.contains(&id)).collect();
@@ -720,7 +708,7 @@ async fn the_sync_logs_each_epoch_it_sets_with_the_client_and_the_reason() {
         assert!(line.contains(&format!("client_id={id}")), "{line}");
         assert!(line.contains(&format!("reason=\"{reason}\"")), "{line}");
     }
-    forget(&client, &tracking, &[&id]).await;
+    forget(&client, &[&id]).await;
 }
 
 /// The stored entry says which class a client's grants were issued under. One that is
@@ -728,9 +716,6 @@ async fn the_sync_logs_each_epoch_it_sets_with_the_client_and_the_reason() {
 /// Matrix sessions is the worse error: no epoch. The sync still replaces or deletes it.
 #[tokio::test]
 async fn a_missing_or_unreadable_stored_entry_sets_no_epoch() {
-    let Some(client) = crate::test_support::redis().await else {
-        return;
-    };
     let unreadable = [
         ("not json", "not json".to_string()),
         (
@@ -744,19 +729,21 @@ async fn a_missing_or_unreadable_stored_entry_sets_no_epoch() {
         ),
     ];
     for (what, stored) in unreadable {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
         let replaced = format!("sync-unreadable-{}", nonce());
         let removed = format!("sync-unreadable-{}", nonce());
-        let tracking = tracking_set();
         for id in [&replaced, &removed] {
             client
                 .set_raw(&format!("clients/{id}"), &stored)
                 .await
                 .unwrap();
         }
+        let tracking = client.static_clients_key.clone();
         let _: i64 = raw(&client, &["SADD", &tracking, &removed]).await;
 
-        let deleted =
-            start_with(&client, &tracking, vec![(&replaced, generic_client(&MAIL))]).await;
+        let deleted = start_with(&client, vec![(&replaced, generic_client(&MAIL))]).await;
 
         assert_eq!(deleted, 1, "{what}");
         assert!(client.get_client(replaced.clone()).await.unwrap().is_some());
@@ -764,15 +751,18 @@ async fn a_missing_or_unreadable_stored_entry_sets_no_epoch() {
         for id in [&replaced, &removed] {
             assert_eq!(client_epoch(&client, id).await, None, "{what}");
         }
-        forget(&client, &tracking, &[&replaced, &removed]).await;
+        forget(&client, &[&replaced, &removed]).await;
     }
 
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
     let missing = format!("sync-missing-{}", nonce());
-    let tracking = tracking_set();
+    let tracking = client.static_clients_key.clone();
     let _: i64 = raw(&client, &["SADD", &tracking, &missing]).await;
-    assert_eq!(start_with(&client, &tracking, Vec::new()).await, 1);
+    assert_eq!(start_with(&client, Vec::new()).await, 1);
     assert_eq!(client_epoch(&client, &missing).await, None);
-    forget(&client, &tracking, &[&missing]).await;
+    forget(&client, &[&missing]).await;
 }
 
 /// The epoch is written BEFORE the entry is replaced or deleted. When it cannot be written
@@ -785,9 +775,8 @@ async fn a_failed_epoch_write_leaves_the_old_entry_so_the_next_start_repeats_it(
         return;
     };
     let id = format!("sync-order-{}", nonce());
-    let tracking = tracking_set();
     let narrowed = generic_client(&["openid"]);
-    start_with(&client, &tracking, vec![(&id, generic_client(&MAIL))]).await;
+    start_with(&client, vec![(&id, generic_client(&MAIL))]).await;
     let older = issue(
         &client,
         &grant_of(&format!("sync{}", nonce()), &id, "", None),
@@ -798,7 +787,7 @@ async fn a_failed_epoch_write_leaves_the_old_entry_so_the_next_start_repeats_it(
     let _: i64 = raw(&client, &["LPUSH", &epoch_key, "not-an-epoch"]).await;
 
     let failed = client
-        .sync_static_clients_in(&tracking, vec![(id.clone(), narrowed.clone())])
+        .sync_static_clients(vec![(id.clone(), narrowed.clone())])
         .await;
     assert!(failed.is_err(), "a start that cannot end the grants fails");
     let stored = client.get_client(id.clone()).await.unwrap().unwrap();
@@ -808,19 +797,20 @@ async fn a_failed_epoch_write_leaves_the_old_entry_so_the_next_start_repeats_it(
         "the old entry is still in place"
     );
     let _: i64 = raw(&client, &["DEL", &epoch_key]).await;
-    start_with(&client, &tracking, vec![(&id, narrowed)]).await;
+    start_with(&client, vec![(&id, narrowed)]).await;
     assert!(client_epoch(&client, &id).await.is_some());
     access_refused(&client, &older, "after the repeated start").await;
 
     let _: i64 = raw(&client, &["DEL", &epoch_key]).await;
     let _: i64 = raw(&client, &["LPUSH", &epoch_key, "not-an-epoch"]).await;
-    let failed = client.sync_static_clients_in(&tracking, Vec::new()).await;
+    let failed = client.sync_static_clients(Vec::new()).await;
     assert!(failed.is_err(), "so does a removal");
     assert!(
         client.get_client(id.clone()).await.unwrap().is_some(),
         "the client is still registered"
     );
+    let tracking = client.static_clients_key.clone();
     let still_tracked: i64 = raw(&client, &["SISMEMBER", &tracking, &id]).await;
     assert_eq!(still_tracked, 1, "and still tracked, for the next start");
-    forget(&client, &tracking, &[&id]).await;
+    forget(&client, &[&id]).await;
 }

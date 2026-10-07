@@ -11211,32 +11211,27 @@ mod generic_client_tests {
 
     // -- A static client's configuration changes at start-up ------------------------------
     //
-    // Each test names its own tracking set and client ids, so none prunes or ends the grants
-    // of a stack that shares this Redis.
+    // Each test syncs through a client from `test_support`, which records static clients in a
+    // set of its own, and names its own client ids, so none prunes or ends the grants of a
+    // stack that shares this Redis. A client carries one set: a test that needs the starts of
+    // several independent clients takes a fresh client for each.
 
     const MAIL_CLIENT_SCOPES: [&str; 3] = ["openid", "io.inblock.mail", "offline_access"];
     const MAIL_CLIENT_REQUEST: &str = "openid io.inblock.mail offline_access";
 
     /// One start of the server: the static clients in Redis become `clients`.
-    async fn start_server_with(
-        db: &RedisClient,
-        tracking: &str,
-        clients: Vec<(&str, ClientEntry)>,
-    ) {
+    async fn start_server_with(db: &RedisClient, clients: Vec<(&str, ClientEntry)>) {
         let clients = clients
             .into_iter()
             .map(|(id, entry)| (id.to_string(), entry))
             .collect();
-        db.sync_static_clients_in(tracking, clients)
+        db.sync_static_clients(clients)
             .await
             .expect("the start-up sync succeeds");
     }
 
-    fn static_ids() -> (String, String) {
-        (
-            format!("static-{}", nonce()),
-            format!("clients:static:test-{}", nonce()),
-        )
+    fn static_id() -> String {
+        format!("static-{}", nonce())
     }
 
     /// The tokens of a sign-in at `client_id`, as the class its code was issued to.
@@ -11379,10 +11374,9 @@ mod generic_client_tests {
         let Some(db) = siwx_oidc::test_support::redis().await else {
             return;
         };
-        let (client_id, tracking) = static_ids();
+        let client_id = static_id();
         start_server_with(
             &db,
-            &tracking,
             vec![(&client_id, generic_allowing(&MAIL_CLIENT_SCOPES))],
         )
         .await;
@@ -11391,12 +11385,7 @@ mod generic_client_tests {
         let mut reordered = MAIL_CLIENT_SCOPES;
         reordered.reverse();
         for scopes in [MAIL_CLIENT_SCOPES, reordered] {
-            start_server_with(
-                &db,
-                &tracking,
-                vec![(&client_id, generic_allowing(&scopes))],
-            )
-            .await;
+            start_server_with(&db, vec![(&client_id, generic_allowing(&scopes))]).await;
         }
 
         assert_eq!(client_epoch(&db, &client_id).await, None);
@@ -11411,18 +11400,18 @@ mod generic_client_tests {
         let Some(db) = siwx_oidc::test_support::redis().await else {
             return;
         };
-        let (client_id, tracking) = static_ids();
+        let client_id = static_id();
         let mail = generic_allowing(&MAIL_CLIENT_SCOPES);
-        start_server_with(&db, &tracking, vec![(&client_id, mail.clone())]).await;
+        start_server_with(&db, vec![(&client_id, mail.clone())]).await;
         let older = sign_in_at(&db, &client_id, ClientClass::Generic, MAIL_CLIENT_REQUEST).await;
         if let Err(e) = userinfo_of(&db, &older).await {
             panic!("precondition: userinfo serves the grant: {e:?}");
         }
 
-        start_server_with(&db, &tracking, Vec::new()).await;
+        start_server_with(&db, Vec::new()).await;
         assert_grant_ended(&db, &client_id, &older, "after the removal").await;
 
-        start_server_with(&db, &tracking, vec![(&client_id, mail)]).await;
+        start_server_with(&db, vec![(&client_id, mail)]).await;
         let newer =
             sign_in_after_the_epoch(&db, &client_id, ClientClass::Generic, MAIL_CLIENT_REQUEST)
                 .await;
@@ -11433,9 +11422,6 @@ mod generic_client_tests {
     /// sign-in as the new class works at once.
     #[tokio::test]
     async fn an_older_grant_is_refused_after_a_class_change_in_either_direction() {
-        let Some(db) = siwx_oidc::test_support::redis().await else {
-            return;
-        };
         let cases = [
             (
                 "generic to Matrix",
@@ -11451,11 +11437,14 @@ mod generic_client_tests {
             ),
         ];
         for (what, (before, was), (after, becomes), (old_scope, new_scope)) in cases {
-            let (client_id, tracking) = static_ids();
-            start_server_with(&db, &tracking, vec![(&client_id, before)]).await;
+            let Some(db) = siwx_oidc::test_support::redis().await else {
+                return;
+            };
+            let client_id = static_id();
+            start_server_with(&db, vec![(&client_id, before)]).await;
             let older = sign_in_at(&db, &client_id, was, old_scope).await;
 
-            start_server_with(&db, &tracking, vec![(&client_id, after)]).await;
+            start_server_with(&db, vec![(&client_id, after)]).await;
             assert_grant_ended(&db, &client_id, &older, what).await;
 
             let newer = sign_in_after_the_epoch(&db, &client_id, becomes, new_scope).await;
@@ -11470,22 +11459,16 @@ mod generic_client_tests {
         let Some(db) = siwx_oidc::test_support::redis().await else {
             return;
         };
-        let (client_id, tracking) = static_ids();
+        let client_id = static_id();
         start_server_with(
             &db,
-            &tracking,
             vec![(&client_id, generic_allowing(&MAIL_CLIENT_SCOPES))],
         )
         .await;
         let older = sign_in_at(&db, &client_id, ClientClass::Generic, MAIL_CLIENT_REQUEST).await;
 
         let narrower = ["openid", "offline_access"];
-        start_server_with(
-            &db,
-            &tracking,
-            vec![(&client_id, generic_allowing(&narrower))],
-        )
-        .await;
+        start_server_with(&db, vec![(&client_id, generic_allowing(&narrower))]).await;
         assert_grant_ended(&db, &client_id, &older, "after the narrowing").await;
 
         let newer =
@@ -11506,11 +11489,11 @@ mod generic_client_tests {
         let Some(db) = siwx_oidc::test_support::redis().await else {
             return;
         };
-        let (client_id, tracking) = static_ids();
-        start_server_with(&db, &tracking, vec![(&client_id, matrix_client())]).await;
+        let client_id = static_id();
+        start_server_with(&db, vec![(&client_id, matrix_client())]).await;
         let session = sign_in_at(&db, &client_id, ClientClass::Matrix, "openid").await;
 
-        start_server_with(&db, &tracking, Vec::new()).await;
+        start_server_with(&db, Vec::new()).await;
 
         assert_eq!(client_epoch(&db, &client_id).await, None);
         refresh_at_the_token_endpoint(&db, &client_id, &session)

@@ -54,7 +54,7 @@ everything else exists only in the binary crate.
 | `credential_migration.rs` (lib) | Additive backfill of passkey credentials into the aqua-auth store. |
 | `client_policy.rs` (lib) | Pure rules for generic-class clients: `grant_for` (the scopes a client is granted), `mailbox_claim` (what userinfo asks: every condition of the mailbox claim) and `mailbox_for` (the one place its value is built), `validate_mail_domain`, `validate_static_client`, and `parse_static_clients`, which start-up runs on `default_clients` before anything is written, and `grant_end` (whether replacing or deleting a static client's stored entry ends its grants, and why). |
 | `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry` with the digests of its secret and registration access token, its `ClientClass` and scope policy, and `client_entry_without_plaintext`, `DeviceCodeEntry` and the `DeviceCodeRef` naming its layout, `TokenMetadata` with its `TokenKind` and the `GrantKind` of its grant, `grant_kind`, which only `AccessGrant::metadata` sets and which is never stored), `Ceremony`, `OwnSession` (the `siwx_user` and `acct_session` layouts), `legacy_token_kind`, Redis key prefixes and TTLs. |
-| `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, the own sessions (`create_own_session`, `lookup_own_session`, `end_own_session`, `revoke_own_sessions`; `lookup_user_session` for the picker), `purge_identity`, `sync_static_clients_in` (the start-up sync of `default_clients` against a tracking set the caller names; it sets a generic client's epoch when its change ends its grants). |
+| `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, the own sessions (`create_own_session`, `lookup_own_session`, `end_own_session`, `revoke_own_sessions`; `lookup_user_session` for the picker), `purge_identity`, `sync_static_clients` (the start-up sync of `default_clients`, against the tracking set the client carries; it sets a generic client's epoch when its change ends its grants). |
 | `db/outbox.rs` (lib) | The back-channel logout outbox (`outbox:backchannel_logout`): `LogoutEntry`, claim under a lease, retry, complete. Entries are queued by `drop_grant` in `db/grant.rs`. |
 | `db/grant.rs` (lib) | The grant record and its Lua scripts: `issue_grant`, the access check `check_access_token` (with the legacy read fallback), `is_matrix_credential` (which grants the Matrix side acts on), `rotate_refresh_token` (the one rotation script), `ReuseEvent`, grant revocation, and the legacy migration (`peek_refresh_token`, `lift_legacy_refresh_token`). Keyspace and decision table in its module docs. |
 | `db/tokens.rs` (lib) | Token formats (`mat_`, `msa_`, `mcr_{handle}_{secret}`), `parse_refresh_token` (never panics), `digest` (the SHA-256 every credential a client holds is stored as). |
@@ -113,6 +113,17 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   CI sets both. Use the helper in any new Redis-backed test: `RedisClient::new` never connects
   (bb8 builds the pool with `min_idle` 0), so a `RedisClient::new(..).ok()` guard never skips,
   and without Redis the test fails after bb8's 30-second timeout.
+- **A test never prunes a static client it did not write.** The start-up sync
+  (`store_default_clients`, `DBClient::sync_static_clients`) deletes every client its tracking
+  set records that the configured map no longer names, and the default `redis://localhost` can
+  be a running stack's Redis or a developer's deployment's. Every client the helper returns
+  therefore records static clients in a set of its own (`RedisClient::with_static_clients_key`,
+  a fresh `clients:static:test-…` key per client), never the real `clients:static`; only a
+  production client records there. A test that syncs static clients uses the helper's client,
+  never `RedisClient::new` on the test Redis, and one that needs the real set, as a deployment
+  would write it, claims a database of its own through `redis_db` (the numbers taken are in its
+  doc). Pin: `the_start_up_write_of_a_test_leaves_a_foreign_static_client_alone`,
+  `static_clients_never_expire`.
 - **Tests that pin what is logged** use `siwx_oidc::test_support::LogCapture`, which records the
   calling thread's log output at debug level (use it in a current-thread `#[tokio::test]`). The
   checks that apply to every log site live in `tests/log_hygiene.rs`.
@@ -509,7 +520,7 @@ doc; read it before changing the code the rule covers.
   `e1_a_global_epoch_refuses_every_older_grant`,
   `e1_a_user_tombstone_written_by_the_previous_build_still_refuses_refresh`.
 - **A generic-class client's grants end with the configuration that justified them.** The
-  start-up sync of `default_clients` (`RedisClient::sync_static_clients_in`; the background prune
+  start-up sync of `default_clients` (`DBClient::sync_static_clients`; the background prune
   runs it with an empty map) sets `epoch:client/{id}` before it overwrites or deletes a stored
   entry whose change `client_policy::grant_end` says ends grants: a generic client that is
   removed, that changes class in either direction, or whose SET of `allowed_scopes` changes
@@ -529,7 +540,9 @@ doc; read it before changing the code the rule covers.
   a test gives the new grant the next one). Each epoch is one `warn!` with `client_id`, `reason`
   (`removed`, `class_changed`, `scopes_changed`) and `epoch_ms`. Observe the epoch at `/token`,
   at userinfo and in the library: `compat::refresh` refuses an `oidc` grant before it reads any
-  epoch. Never set the global or the user epoch from the sync. Pin:
+  epoch. Never set the global or the user epoch from the sync. A test syncs through a
+  `test_support` client, which tracks static clients in a set of its own, so it never ends the
+  grants of a running stack's clients. Pin:
   `grants_end_when_a_generic_client_is_removed_reclassified_or_rescoped` (the rule, a table),
   `a_grant_end_names_its_reason_for_the_log`,
   `a_restart_with_an_unchanged_configuration_sets_no_epoch`,
