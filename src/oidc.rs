@@ -6052,6 +6052,7 @@ mod userinfo_mxid_claim_tests {
             did: DID.to_string(),
             name: "n".to_string(),
             kind: Some(TokenKind::Access),
+            grant_kind: None,
         }
     }
 
@@ -7596,6 +7597,7 @@ mod client_binding_tests {
                 did: "did:key:zDnBINDING".into(),
                 name: "did:key:zDnBINDING".into(),
                 kind: Some(TokenKind::Refresh),
+                grant_kind: None,
             },
             REFRESH_TOKEN_TTL,
         )

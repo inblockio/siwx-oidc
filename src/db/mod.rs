@@ -835,6 +835,12 @@ pub struct TokenMetadata {
     /// through [`TokenMetadata::is_kind`], never this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<TokenKind>,
+    /// The kind of the grant behind the token, set by [`grant::AccessGrant::metadata`] from
+    /// the grant record. `None` for an entry read from a legacy `token/{raw}` key, which has
+    /// no grant. Never stored (`#[serde(skip)]`): the grant record is its only source, so
+    /// no writer can contradict it.
+    #[serde(skip)]
+    pub grant_kind: Option<grant::GrantKind>,
 }
 
 impl TokenMetadata {
@@ -1081,12 +1087,35 @@ mod token_kind_tests {
             did: "did:key:zDnaeRecorded".into(),
             name: "n".into(),
             kind: Some(TokenKind::Refresh),
+            grant_kind: None,
         };
         assert!(meta.is_kind(TokenKind::Refresh), "recorded kind wins");
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains(r#""kind":"refresh""#), "{json}");
         let back: TokenMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(back.kind, Some(TokenKind::Refresh));
+    }
+
+    /// The grant's kind comes from the grant record alone: it is not written into a
+    /// stored entry, and a stored entry reads without one.
+    #[test]
+    fn the_grant_kind_is_never_stored_and_a_stored_entry_reads_without_one() {
+        let meta = TokenMetadata {
+            username: "u".into(),
+            device_id: String::new(),
+            scope: "openid".into(),
+            client_id: "c".into(),
+            iat: 0,
+            exp: 60,
+            did: "did:key:zDnaeGrantKind".into(),
+            name: "n".into(),
+            kind: Some(TokenKind::Access),
+            grant_kind: Some(grant::GrantKind::Oidc),
+        };
+        let stored = serde_json::to_value(&meta).unwrap();
+        assert!(stored.get("grant_kind").is_none(), "{stored}");
+        let back: TokenMetadata = serde_json::from_value(stored).unwrap();
+        assert_eq!(back.grant_kind, None);
     }
 }
 
