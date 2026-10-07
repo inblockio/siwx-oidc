@@ -49,7 +49,9 @@ use tracing::{debug, info, warn};
 // `siwx_oidc::synapse_client`, which was a *distinct* type here; it no longer
 // does (see the note in `src/lib.rs`).
 use crate::synapse_client::SynapseClient;
-use siwx_oidc::db::grant::{InvalidReason, RefreshPeek, RotateOutcome, RotateRequest};
+use siwx_oidc::db::grant::{
+    self, GrantKind, InvalidReason, RefreshPeek, RotateOutcome, RotateRequest,
+};
 use siwx_oidc::db::{DBClient, RedisClient, TokenKind, ACCESS_TOKEN_TTL};
 
 // -- Shared state for compat endpoints ----------------------------------------
@@ -67,6 +69,42 @@ pub struct CompatState {
     /// `token_endpoint_auth_method` is confidential
     /// (`oidc::client_is_confidential`), for lifting a legacy refresh token.
     pub require_secret: bool,
+    /// `oidc::delegated_auth_enabled(config)`: Matrix clients are this
+    /// deployment's relying parties, so these routes act on Matrix credentials
+    /// only (see [`CompatState::acts_on`]).
+    pub delegated_auth: bool,
+}
+
+impl CompatState {
+    /// The state of a deployment configured as `config`: the one place the
+    /// configuration decides what these routes do.
+    pub fn new(
+        redis_client: RedisClient,
+        synapse_client: Option<Arc<SynapseClient>>,
+        config: &crate::config::Config,
+    ) -> Self {
+        Self {
+            redis_client,
+            synapse_client,
+            server_name: config.matrix_server_name.clone(),
+            require_secret: config.require_secret,
+            delegated_auth: crate::oidc::delegated_auth_enabled(config),
+        }
+    }
+
+    /// Whether the Matrix client-server routes act on a token whose grant is
+    /// of `kind` (`None`: no grant record to judge).
+    ///
+    /// With delegated auth they act on Matrix credentials only
+    /// ([`grant::is_matrix_credential`]): the grant of a generic-class client
+    /// (an `oidc` grant) is not a Matrix session, so a mail token can neither
+    /// sign the user's Matrix devices out, nor end the user's other sessions,
+    /// nor refresh at the Matrix endpoint. Without delegated auth every client
+    /// is a relying party and holds `oidc` grants, so there is nothing to
+    /// refuse and these routes serve every grant, as they always did.
+    fn acts_on(&self, kind: Option<GrantKind>) -> bool {
+        !self.delegated_auth || grant::is_matrix_credential(kind)
+    }
 }
 
 // -- Request/response types ---------------------------------------------------
@@ -137,6 +175,10 @@ impl TeardownPolicy {
 /// accepts either kind. A token of another kind is answered like an unknown
 /// token: nothing is torn down and the token itself is left untouched.
 ///
+/// `grants` is whose sessions the route ends: [`Grants::Matrix`] refuses a token
+/// of a grant the Matrix routes do not act on ([`CompatState::acts_on`]) with
+/// [`Teardown::Refused`], after the kind check and before anything is touched.
+///
 /// A token-store fault is returned, not swallowed: logout answers it with the
 /// retryable 503 and leaves the bearer in place for the retry, while RFC 7009
 /// revocation still deletes what it can ([`TeardownFault::fallback`]) and
@@ -149,11 +191,12 @@ async fn teardown_session(
     ctx: &str,
     policy: TeardownPolicy,
     required: Option<TokenKind>,
-) -> Result<(), TeardownFault> {
+    grants: Grants,
+) -> Result<Teardown, TeardownFault> {
     let meta = match resolve_presented(state, token).await {
         Ok(Some(m)) => m,
         // Unknown token: an idempotent no-op.
-        Ok(None) => return Ok(()),
+        Ok(None) => return Ok(Teardown::Done),
         Err(error) => {
             return Err(TeardownFault {
                 error: error.context("token lookup"),
@@ -166,7 +209,18 @@ async fn teardown_session(
             ctx,
             "teardown_session: token of another kind; nothing to tear down"
         );
-        return Ok(());
+        return Ok(Teardown::Done);
+    }
+    let acts = match grants {
+        Grants::Matrix => state.acts_on(meta.grant_kind),
+        Grants::Any => true,
+    };
+    if !acts {
+        debug!(
+            ctx,
+            "teardown_session: grant of another relying party; nothing to tear down"
+        );
+        return Ok(Teardown::Refused);
     }
     // Phase 1: delete the ending session's Synapse device (best-effort) — only for
     // explicit-sign-out callers. A bare RFC 7009 revoke (TokensOnly) must never
@@ -208,7 +262,7 @@ async fn teardown_session(
                     username = %meta.username,
                     "session torn down (standalone, presented token only)"
                 );
-                Ok(())
+                Ok(Teardown::Done)
             }
             Err(error) => Err(TeardownFault {
                 error: error.context("deleting the presented token"),
@@ -230,13 +284,34 @@ async fn teardown_session(
                 revoked = revoked as u64,
                 "session torn down"
             );
-            Ok(())
+            Ok(Teardown::Done)
         }
         Err(error) => Err(TeardownFault {
             error: error.context("revoke_device_tokens"),
             fallback: Fallback::Presented(meta.source),
         }),
     }
+}
+
+/// Whose sessions a teardown route ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Grants {
+    /// A Matrix route: the grants [`CompatState::acts_on`] allows.
+    Matrix,
+    /// RFC 7009 revocation: the holder of any token may end it, whatever grant
+    /// it belongs to.
+    Any,
+}
+
+/// What a [`teardown_session`] that found no fault did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Teardown {
+    /// The session was ended, or there was nothing to end: an unknown token, or
+    /// one of a kind the route does not take.
+    Done,
+    /// The token belongs to a grant the route does not act on
+    /// ([`Grants::Matrix`]); nothing was touched.
+    Refused,
 }
 
 /// A token-store fault during [`teardown_session`].
@@ -295,6 +370,8 @@ struct PresentedToken {
     username: String,
     device_id: String,
     kind: Option<TokenKind>,
+    /// The kind of the grant behind the token; `None` for a legacy entry.
+    grant_kind: Option<GrantKind>,
     source: TokenSource,
 }
 
@@ -316,6 +393,7 @@ async fn resolve_presented(
             username: access.grant.username,
             device_id: access.grant.device_id,
             kind: Some(TokenKind::Access),
+            grant_kind: Some(access.grant.kind),
             source: TokenSource::GrantAccess,
         }));
     }
@@ -324,6 +402,7 @@ async fn resolve_presented(
             username: grant.username,
             device_id: grant.device_id,
             kind: Some(TokenKind::Refresh),
+            grant_kind: Some(grant.kind),
             source: TokenSource::GrantRefresh,
         }));
     }
@@ -335,6 +414,7 @@ async fn resolve_presented(
             username: m.username,
             device_id: m.device_id,
             kind,
+            grant_kind: None,
             source: TokenSource::Legacy,
         }
     }))
@@ -371,13 +451,15 @@ pub async fn revoke(
 ) -> StatusCode {
     // RFC 7009 is token hygiene, not a device sign-out: revoke tokens only, never
     // delete the Synapse device (see TeardownPolicy).
-    // Either kind of token may be revoked.
+    // Either kind of token may be revoked, of any grant: the holder of a token
+    // may always end it.
     if let Err(fault) = teardown_session(
         &state,
         &form.token,
         "revoke",
         TeardownPolicy::TokensOnly,
         None,
+        Grants::Any,
     )
     .await
     {
@@ -406,7 +488,11 @@ pub async fn login_flows() -> Json<serde_json::Value> {
 /// (Synapse device + Redis tokens). Returns 200 with `{}` (Matrix expects an
 /// empty object), also with no bearer or an unknown token, and the retryable
 /// 503 of the refresh and device-deletion routes when the token store fails:
-/// a sign-out never reports success while revoking nothing.
+/// a sign-out never reports success while revoking nothing. The same goes for
+/// a bearer that is the grant of another relying party
+/// ([`CompatState::acts_on`]: a generic-class client's, with delegated auth):
+/// it is not a Matrix session, so it is a 401 `M_UNKNOWN_TOKEN` and nothing is
+/// torn down; `POST /oauth2/revoke` is where such a token is ended.
 pub async fn logout(
     State(state): State<CompatState>,
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
@@ -414,17 +500,22 @@ pub async fn logout(
     if let Some(TypedHeader(auth)) = bearer {
         // Explicit single-session sign-out: revoke tokens AND delete the device.
         // The bearer must be an access token.
-        if let Err(fault) = teardown_session(
+        match teardown_session(
             &state,
             auth.token(),
             "logout",
             TeardownPolicy::DeleteDevice,
             Some(TokenKind::Access),
+            Grants::Matrix,
         )
         .await
         {
-            warn!(error = %fault.error, "logout: token store failed (infrastructure); returning retryable 503");
-            return token_store_unavailable();
+            Ok(Teardown::Done) => {}
+            Ok(Teardown::Refused) => return unknown_token_response(),
+            Err(fault) => {
+                warn!(error = %fault.error, "logout: token store failed (infrastructure); returning retryable 503");
+                return token_store_unavailable();
+            }
         }
     }
     (StatusCode::OK, Json(serde_json::json!({})))
@@ -445,7 +536,11 @@ pub async fn logout(
 /// active and the user can sign in again. It therefore must NEVER call
 /// `deactivate_user`. Degrades to Redis-only revocation in standalone mode, is
 /// an idempotent 200 no-op when the bearer token is missing or unknown, and
-/// answers a token-store fault with the retryable 503.
+/// answers a token-store fault with the retryable 503. A bearer that is the
+/// grant of another relying party ([`CompatState::acts_on`]: a generic-class
+/// client's, with delegated auth) is not the user's Matrix session and may not
+/// end it: it is a 401 `M_UNKNOWN_TOKEN`, not the 200 of a sign-out that
+/// happened, and nothing is touched.
 ///
 /// The order is what makes that 503 retryable: every step is idempotent, and
 /// the grants, and with them the bearer, go last. A fault ending the own
@@ -475,7 +570,8 @@ pub async fn logout_all(
     let meta = match state.redis_client.check_access_token(auth.token()).await {
         // The bearer must be an access token; any other entry is a no-op like an
         // unknown token.
-        Ok(Some(m)) => m,
+        Ok(Some(m)) if state.acts_on(m.grant_kind) => m,
+        Ok(Some(_)) => return unknown_token_response(),
         Ok(None) => return (StatusCode::OK, Json(serde_json::json!({}))), // idempotent no-op
         Err(e) => {
             warn!(error = %e, "logout_all: token lookup failed (infrastructure); returning retryable 503");
@@ -562,10 +658,12 @@ pub struct DeleteDevicesRequest {
 
 /// Resolve the bearer token to its owning localpart (`TokenMetadata.username`).
 ///
-/// `Ok(None)` when the token is missing, unknown, or not an access token: the
-/// route answers `M_UNKNOWN_TOKEN`. `Err` when the store could not answer: the
-/// route answers the retryable 503 (`token_store_unavailable`), never
-/// `M_UNKNOWN_TOKEN`, which a Matrix client takes for "signed out".
+/// `Ok(None)` when the token is missing, unknown, not an access token, or the
+/// grant of a relying party these routes do not act for
+/// ([`CompatState::acts_on`]): the route answers `M_UNKNOWN_TOKEN`. `Err` when
+/// the store could not answer: the route answers the retryable 503
+/// (`token_store_unavailable`), never `M_UNKNOWN_TOKEN`, which a Matrix client
+/// takes for "signed out".
 async fn username_from_bearer(
     state: &CompatState,
     bearer: &Option<TypedHeader<Authorization<Bearer>>>,
@@ -577,6 +675,7 @@ async fn username_from_bearer(
         .redis_client
         .check_access_token(auth.token())
         .await?
+        .filter(|m| state.acts_on(m.grant_kind))
         .map(|m| m.username))
 }
 
@@ -702,6 +801,14 @@ fn token_store_unavailable() -> (StatusCode, Json<serde_json::Value>) {
 /// X) register as public clients. Do not "fix" the rest by demanding a client
 /// here: no Matrix client can send one.
 ///
+/// **Matrix sessions only, with delegated auth.** The refresh token of a grant
+/// that is not a Matrix credential ([`CompatState::acts_on`]: a generic-class
+/// client's `oidc` grant, or a legacy token the lift would turn into one) is
+/// refused exactly like an unknown token before any script runs, and left as it
+/// was for `POST /token`, where its client is authenticated and its grant
+/// rotates. It is a decision on the kind the grant was issued with, which never
+/// changes, so it needs no place in the rotation script.
+///
 /// Rotation, the replay of a lost response and the refusals are the rotation
 /// script's (`RedisClient::rotate_refresh_token`), the same one `POST /token`
 /// runs.
@@ -725,6 +832,12 @@ pub async fn refresh(
         .redis_client
         .peek_refresh_token(&body.refresh_token)
         .await;
+    if let Ok(peek) = &peeked {
+        if !state.acts_on(peek.grant_kind()) {
+            debug!("refresh refused: grant of another relying party");
+            return invalid_refresh_token("Invalid refresh token");
+        }
+    }
     // The client the token belongs to, for the lifetime touch after an accepted refresh:
     // never a request field, which this endpoint does not have.
     let bound_client = match &peeked {
@@ -876,6 +989,7 @@ mod tests {
             require_secret: true,
             synapse_client: None,
             server_name: None,
+            delegated_auth: false,
         }
     }
 
@@ -1223,6 +1337,7 @@ mod tests {
                 "secret",
             ))),
             server_name: Some("example.org".to_string()),
+            delegated_auth: true,
         };
 
         let grant = seed_grant(&client, &user, &dev).await;
@@ -2312,5 +2427,447 @@ mod tests {
 
         client.revoke_device_tokens(&user, &dev).await.ok();
         client.del_raw(&client_key).await.ok();
+    }
+
+    // -- The grant of another relying party at the Matrix routes ---------------------------
+
+    /// Delegated-auth state: Redis only, no Synapse client.
+    fn matrix_state(redis_client: RedisClient) -> CompatState {
+        CompatState {
+            delegated_auth: true,
+            ..standalone_state(redis_client)
+        }
+    }
+
+    /// The configuration decides whether the Matrix routes refuse the grant of another
+    /// relying party: with a MAS shared secret (delegated auth) they do, without one they
+    /// serve every grant. A Matrix session, a minted admin token and a token with no grant
+    /// record are served either way.
+    #[tokio::test]
+    async fn the_routes_refuse_other_relying_parties_exactly_when_auth_is_delegated() {
+        let Some(client) = redis().await else { return };
+        let config = |secret: Option<&str>| crate::config::Config {
+            mas_shared_secret: secret.map(str::to_string),
+            ..crate::config::Config::default()
+        };
+        let delegated = CompatState::new(client.clone(), None, &config(Some("mas-secret")));
+        let generic_mode = CompatState::new(client.clone(), None, &config(None));
+
+        assert!(delegated.delegated_auth && !generic_mode.delegated_auth);
+        for kind in [
+            Some(GrantKind::MatrixDevice),
+            Some(GrantKind::Service),
+            None,
+        ] {
+            assert!(delegated.acts_on(kind), "{kind:?}, delegated auth");
+            assert!(generic_mode.acts_on(kind), "{kind:?}, generic mode");
+        }
+        assert!(
+            !delegated.acts_on(Some(GrantKind::Oidc)),
+            "an oidc grant is refused with delegated auth"
+        );
+        assert!(
+            generic_mode.acts_on(Some(GrantKind::Oidc)),
+            "and served without it"
+        );
+    }
+
+    /// A grant of `kind` for `user`, with a refresh token unless it is a `service` grant.
+    async fn seed_kind(
+        client: &RedisClient,
+        kind: GrantKind,
+        user: &str,
+        device_id: &str,
+    ) -> IssuedGrant {
+        client
+            .issue_grant(&NewGrant {
+                kind,
+                username: user.to_string(),
+                did: format!("did:key:z{user}"),
+                client_id: "compat-test".into(),
+                confidential_client: false,
+                device_id: device_id.to_string(),
+                scope: "openid".into(),
+                name: user.to_string(),
+                auth_ms: None,
+                access_ttl: ACCESS_TOKEN_TTL,
+                refresh_inactivity_secs: match kind {
+                    GrantKind::Service => None,
+                    GrantKind::MatrixDevice | GrantKind::Oidc => Some(120),
+                },
+            })
+            .await
+            .unwrap()
+    }
+
+    /// The four bearer-authenticated Matrix routes in turn, each answering for `token`.
+    async fn at_every_bearer_route(
+        state: &CompatState,
+        token: &str,
+        device_id: &str,
+    ) -> Vec<(&'static str, StatusCode, serde_json::Value)> {
+        let mut answers = Vec::new();
+        for route in [
+            "logout",
+            "logout/all",
+            "DELETE /devices/{id}",
+            "POST /delete_devices",
+        ] {
+            let response = match route {
+                "logout" => logout(State(state.clone()), bearer(token))
+                    .await
+                    .into_response(),
+                "logout/all" => logout_all(State(state.clone()), bearer(token))
+                    .await
+                    .into_response(),
+                "DELETE /devices/{id}" => delete_device(
+                    State(state.clone()),
+                    Path(device_id.to_string()),
+                    bearer(token),
+                )
+                .await
+                .into_response(),
+                _ => delete_devices(
+                    State(state.clone()),
+                    bearer(token),
+                    Json(DeleteDevicesRequest {
+                        devices: vec![device_id.to_string()],
+                    }),
+                )
+                .await
+                .into_response(),
+            };
+            let (status, body) = status_and_json(response).await;
+            answers.push((route, status, body));
+        }
+        answers
+    }
+
+    /// In a delegated-auth deployment the grant of a generic-class client (an `oidc` grant)
+    /// is not a Matrix session: every bearer route answers it `M_UNKNOWN_TOKEN` and tears
+    /// nothing down, neither the Matrix session beside it nor the grant itself.
+    #[tokio::test]
+    async fn an_oidc_grant_cannot_drive_the_matrix_bearer_routes() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("rp-user-{n}");
+        let device = format!("RP_{n}");
+        let state = matrix_state(client.clone());
+        let session = seed_kind(&client, GrantKind::MatrixDevice, &user, &device).await;
+        let mail = seed_kind(&client, GrantKind::Oidc, &user, "").await;
+
+        let unknown = delete_device(
+            State(state.clone()),
+            Path(device.clone()),
+            bearer(&format!("mat_unknown_{n}")),
+        )
+        .await
+        .into_response();
+        let (unknown_status, unknown_body) = status_and_json(unknown).await;
+        assert_eq!(unknown_status, StatusCode::UNAUTHORIZED);
+
+        for (route, status, body) in
+            at_every_bearer_route(&state, &mail.access_token, &device).await
+        {
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{route}: {body}");
+            assert_eq!(
+                body, unknown_body,
+                "{route}: M_UNKNOWN_TOKEN, as for an unknown bearer"
+            );
+        }
+
+        assert!(
+            client
+                .lookup_access_token(&session.access_token)
+                .await
+                .unwrap()
+                .is_some(),
+            "the user's Matrix session survives"
+        );
+        assert!(
+            client
+                .lookup_access_token(&mail.access_token)
+                .await
+                .unwrap()
+                .is_some(),
+            "the refused token survives"
+        );
+        let grant = client
+            .resolve_refresh_token(mail.refresh_token.as_deref().unwrap())
+            .await
+            .unwrap()
+            .expect("the grant's refresh token is still current");
+        assert_eq!(grant.generation, 0, "nothing rotated it");
+
+        client.revoke_grants_for_device(&user, &device).await.ok();
+    }
+
+    /// The refusal costs a Matrix session nothing: in a delegated-auth deployment the
+    /// bearer routes act for `matrix_device` grants and minted admin tokens as before, and
+    /// `logout/all` ends the generic client's grant with the rest, as any sign-out of every
+    /// session does.
+    #[tokio::test]
+    async fn a_matrix_session_still_drives_the_bearer_routes_in_a_delegated_deployment() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("rp-matrix-{n}");
+        let (d1, d2, d3) = (format!("ONE_{n}"), format!("TWO_{n}"), format!("THREE_{n}"));
+        let state = matrix_state(client.clone());
+        let s1 = seed_kind(&client, GrantKind::MatrixDevice, &user, &d1).await;
+        let s2 = seed_kind(&client, GrantKind::MatrixDevice, &user, &d2).await;
+        let s3 = seed_kind(&client, GrantKind::MatrixDevice, &user, &d3).await;
+        let mail = seed_kind(&client, GrantKind::Oidc, &user, "").await;
+        let admin = seed_kind(&client, GrantKind::Service, &format!("rp-admin-{n}"), "").await;
+        let alive = |token: String| {
+            let client = client.clone();
+            async move { client.lookup_access_token(&token).await.unwrap().is_some() }
+        };
+
+        let response = delete_device(
+            State(state.clone()),
+            Path(d1.clone()),
+            bearer(&s1.access_token),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK, "device deletion");
+        assert!(!alive(s1.access_token.clone()).await, "the device is gone");
+        assert!(alive(s2.access_token.clone()).await, "another device stays");
+        assert!(
+            alive(mail.access_token.clone()).await,
+            "so does the mail client"
+        );
+
+        let response = delete_device(
+            State(state.clone()),
+            Path(format!("NOSUCH_{n}")),
+            bearer(&admin.access_token),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a minted admin token is served"
+        );
+
+        let response = logout(State(state.clone()), bearer(&s2.access_token))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK, "logout");
+        assert!(
+            !alive(s2.access_token.clone()).await,
+            "logout ends this session"
+        );
+        assert!(alive(s3.access_token.clone()).await, "and no other");
+        assert!(alive(mail.access_token.clone()).await);
+
+        let response = logout_all(State(state.clone()), bearer(&s3.access_token))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK, "logout/all");
+        assert!(!alive(s3.access_token.clone()).await);
+        assert!(
+            !alive(mail.access_token.clone()).await,
+            "signing out of every session ends the mail client's grant too"
+        );
+        assert!(
+            client
+                .resolve_refresh_token(mail.refresh_token.as_deref().unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "with its refresh token"
+        );
+    }
+
+    /// Without delegated auth every client is a relying party and holds `oidc` grants, so
+    /// the Matrix routes keep serving them: the refusal belongs to a deployment whose
+    /// clients are Matrix clients.
+    #[tokio::test]
+    async fn without_delegated_auth_the_matrix_routes_still_serve_an_oidc_grant() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("rp-generic-{n}");
+        let state = standalone_state(client.clone());
+        let a = seed_kind(&client, GrantKind::Oidc, &user, "").await;
+        let b = seed_kind(&client, GrantKind::Oidc, &user, "").await;
+        let c = seed_kind(&client, GrantKind::Oidc, &user, "").await;
+
+        let response = delete_device(
+            State(state.clone()),
+            Path(format!("ANY_{n}")),
+            bearer(&a.access_token),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK, "device deletion");
+
+        let response = logout(State(state.clone()), bearer(&a.access_token))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK, "logout");
+        assert!(
+            client
+                .lookup_access_token(&a.access_token)
+                .await
+                .unwrap()
+                .is_none(),
+            "logout ends the presented token"
+        );
+
+        let (status, body) = matrix_refresh(&state, c.refresh_token.as_deref().unwrap()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the Matrix refresh endpoint: {body}"
+        );
+
+        let response = logout_all(State(state.clone()), bearer(&b.access_token))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK, "logout/all");
+        assert!(
+            client
+                .resolve_refresh_token(b.refresh_token.as_deref().unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "logout/all ends the user's grants"
+        );
+    }
+
+    /// RFC 7009 revocation is not a Matrix route: the holder of an `oidc` grant's token may
+    /// end it in every deployment.
+    #[tokio::test]
+    async fn revocation_still_ends_an_oidc_grant_in_a_delegated_deployment() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let state = matrix_state(client.clone());
+        let mail = seed_kind(&client, GrantKind::Oidc, &format!("rp-revoke-{n}"), "").await;
+        let refresh_token = mail.refresh_token.clone().unwrap();
+
+        let form = RevokeForm {
+            token: refresh_token.clone(),
+            token_type_hint: None,
+        };
+        assert_eq!(revoke(State(state), Form(form)).await, StatusCode::OK);
+        assert!(
+            client
+                .resolve_refresh_token(&refresh_token)
+                .await
+                .unwrap()
+                .is_none(),
+            "the grant is revoked"
+        );
+        assert!(
+            client
+                .lookup_access_token(&mail.access_token)
+                .await
+                .unwrap()
+                .is_none(),
+            "with its access token"
+        );
+    }
+
+    /// The Matrix refresh endpoint refuses the refresh token of an `oidc` grant in a
+    /// delegated-auth deployment exactly like an unknown token and leaves the grant as it
+    /// was, for `POST /token`. A legacy token that the lift would turn into one is refused
+    /// the same way and stays a legacy entry; one that carries the Matrix API is lifted.
+    #[tokio::test]
+    async fn the_matrix_refresh_endpoint_leaves_an_oidc_grants_refresh_token_alone() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let user = format!("rp-refresh-{n}");
+        let state = matrix_state(client.clone());
+        let never_issued = tokens::new_refresh_token(&tokens::new_grant_handle());
+        let (_, unknown) = matrix_refresh(&state, &never_issued).await;
+
+        let mail = seed_kind(&client, GrantKind::Oidc, &user, "").await;
+        let refresh_token = mail.refresh_token.clone().unwrap();
+        let (status, body) = matrix_refresh(&state, &refresh_token).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body, unknown, "refused exactly like an unknown token");
+        let grant = client
+            .resolve_refresh_token(&refresh_token)
+            .await
+            .unwrap()
+            .expect("the refused token is still the grant's current refresh token");
+        assert_eq!(grant.generation, 0, "the refusal rotated nothing");
+
+        let legacy = |raw: String, scope: &str| {
+            let client = client.clone();
+            let scope = scope.to_string();
+            let user = user.clone();
+            async move {
+                let mut meta = refresh_meta(&user, "");
+                meta.scope = scope;
+                meta.iat = Utc::now().timestamp();
+                meta.exp = meta.iat + REFRESH_TOKEN_TTL as i64;
+                client
+                    .set_token(&raw, &meta, REFRESH_TOKEN_TTL)
+                    .await
+                    .unwrap();
+                raw
+            }
+        };
+        let mail_legacy = legacy(format!("mcr_legacymail{n}"), "openid io.inblock.mail").await;
+        let (status, body) = matrix_refresh(&state, &mail_legacy).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body, unknown, "refused exactly like an unknown token");
+        assert!(
+            client.get_token(&mail_legacy).await.unwrap().is_some(),
+            "the refused legacy token is left for POST /token"
+        );
+
+        let matrix_legacy = legacy(
+            format!("mcr_legacymatrix{n}"),
+            "openid urn:matrix:client:api:*",
+        )
+        .await;
+        let (status, body) = matrix_refresh(&state, &matrix_legacy).await;
+        assert_eq!(status, StatusCode::OK, "a Matrix session is lifted: {body}");
+        assert!(
+            client.get_token(&matrix_legacy).await.unwrap().is_none(),
+            "legacy entry gone"
+        );
+    }
+
+    /// A store fault on the way to each refusal is the retryable 503, never the
+    /// `M_UNKNOWN_TOKEN` a Matrix client takes for "signed out": the refusal is a decision
+    /// about a grant the store could read, and a store that could not read it decides
+    /// nothing.
+    #[tokio::test]
+    async fn a_store_fault_where_an_oidc_grant_is_refused_is_a_retryable_503() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let state = matrix_state(client.clone());
+
+        let bearer_grant =
+            seed_kind(&client, GrantKind::Oidc, &format!("rp-fault-a-{n}"), "").await;
+        plant_store_fault(&format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_ACCESS_TOKEN_PREFIX,
+            tokens::digest(&bearer_grant.access_token)
+        ))
+        .await;
+        for (route, status, body) in
+            at_every_bearer_route(&state, &bearer_grant.access_token, "ANY").await
+        {
+            assert_retryable_503(status, &body, route);
+        }
+
+        let refresh_grant =
+            seed_kind(&client, GrantKind::Oidc, &format!("rp-fault-b-{n}"), "").await;
+        let refresh_token = refresh_grant.refresh_token.clone().unwrap();
+        let handle = tokens::parse_refresh_token(&refresh_token).unwrap().handle;
+        plant_store_fault(&format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_GRANT_PREFIX,
+            siwx_oidc::db::grant::GrantId::of_handle(handle).as_str()
+        ))
+        .await;
+        let (status, body) = matrix_refresh(&state, &refresh_token).await;
+        assert_retryable_503(status, &body, "POST /_matrix/client/v3/refresh");
     }
 }

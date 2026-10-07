@@ -371,6 +371,35 @@ at most 900 s is an access token (300 s user tokens, 30–900 s admin tokens),
 90 days a refresh token. A long-lived entry that carries the admin scope fits
 no earlier writer and is accepted nowhere; revocation still removes it.
 
+### Grants of other relying parties at the Matrix side
+
+In delegated-auth mode an `oidc` grant is a generic-class client's (a mail
+client, say). It is not a Matrix session, whatever scope string it carries, so
+the Matrix side does not act on it, and every refusal leaves the grant as it was:
+
+| Endpoint | Answer for the token of an `oidc` grant |
+|---|---|
+| `POST /oauth2/introspect` | `{"active": false}`, exactly like an unknown token (the endpoint exists only in this mode) |
+| `POST /_matrix/client/v3/logout`, `logout/all`, `DELETE /_matrix/client/v3/devices/{id}`, `POST /_matrix/client/v3/delete_devices` (access token as the bearer) | 401 `M_UNKNOWN_TOKEN`, and nothing is torn down. An unknown bearer is still the idempotent 200 at `logout` and `logout/all`; a token that is alive for its own client is not answered as a sign-out that happened |
+| `POST /_matrix/client/v3/refresh` (refresh token) | `M_UNKNOWN_TOKEN`, exactly like an unknown token, before any script runs. The grant stays current for `POST /token`, where its client is authenticated. A legacy refresh token whose scope has no Matrix API, which the lift would turn into an `oidc` grant, is refused the same way and stays a legacy entry |
+
+`POST /oauth2/revoke`, `POST /token`, `/userinfo` and `/end_session` serve
+`oidc` grants as ever: the holder may always end its own token, and these are
+the endpoints a relying party uses. `logout/all` by a Matrix session ends every
+grant of the user, the generic-class client's included, as any sign-out of every
+session does. Without a MAS shared secret (generic mode) every client holds
+`oidc` grants, and the Matrix routes serve them unchanged. A token-store fault
+on any of these paths is still the retryable 503 `M_UNKNOWN` (introspection:
+500), never a refusal. Presenting the access token counts it as used for the
+replay rule ([Lifecycle](#lifecycle)), as every presentation does.
+
+One function decides all of it, `grant::is_matrix_credential`, an exhaustive
+`match` over the grant kind: `matrix_device` and `service` (minted admin tokens)
+grants, and tokens with no grant record (legacy entries), are Matrix credentials;
+`oidc` grants are not. The bearer routes ask it through `CompatState::acts_on`,
+which holds the refusal back unless `delegated_auth` is set (`CompatState::new`
+reads it from the configuration, the same predicate as discovery).
+
 ### An empty `device_id` is JSON `null`
 
 Introspection renders an empty `device_id` as `null`, never `""`. Synapse
@@ -819,7 +848,11 @@ sign-out deletes the device, token hygiene does not.
   failed logout leaves the bearer valid, so the client's retry tears the whole
   session down; the Synapse device deletes stay best-effort. Revoke keeps its
   best-effort fallback (it deletes the presented token where it can) and its
-  200. Without a Synapse client or server name, teardown
+  200. In delegated-auth mode the access token of an `oidc` grant is the one
+  bearer `logout` and `logout/all` do not answer 200: it is not a Matrix
+  session, so it is a 401 `M_UNKNOWN_TOKEN` and nothing is torn down (see
+  [Grants of other relying parties](#grants-of-other-relying-parties-at-the-matrix-side)).
+  Without a Synapse client or server name, teardown
   revokes Redis tokens only. Revocation is keyed on the localpart (the grant's
   `username`, and `TokenMetadata.username` for a legacy entry), not the raw DID.
 - In standalone mode tokens have no device, so revoke and logout remove only the

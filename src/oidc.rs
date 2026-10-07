@@ -10880,6 +10880,183 @@ mod generic_client_tests {
         assert_eq!(after.device_id, "");
     }
 
+    /// What the exchange issues to a generic-class client is not a Matrix session. In a
+    /// delegated-auth deployment introspection answers inactive for its access token (a
+    /// Matrix client's stays active), every Matrix bearer route and the Matrix refresh
+    /// endpoint refuse it and touch nothing, and the token endpoint still rotates its
+    /// refresh token.
+    #[tokio::test]
+    async fn a_generic_clients_tokens_are_refused_by_the_matrix_side_and_rotate_at_the_token_endpoint(
+    ) {
+        use crate::compat::{self, CompatState, DeleteDevicesRequest, RefreshRequest};
+        use axum_extra::headers::Authorization;
+        use axum_extra::TypedHeader;
+
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let did = format!("did:key:zRelyingParty{}", nonce());
+        let exchange = |client: ClientEntry, class: ClientClass, scope: &'static str| {
+            let (db, did) = (db.clone(), did.clone());
+            async move {
+                let client_id = store_client(&db, client).await;
+                let code = store_code(
+                    &db,
+                    code_entry_for(&did, &client_id, Some(class), None, Some(scope)),
+                )
+                .await;
+                let response = redeem(&db, &delegated(), &client_id, &code)
+                    .await
+                    .expect("the exchange succeeds");
+                (client_id, response)
+            }
+        };
+        let (mail_id, mail) = exchange(
+            generic_allowing(&["openid", "io.inblock.mail", "offline_access"]),
+            ClientClass::Generic,
+            "openid io.inblock.mail offline_access",
+        )
+        .await;
+        let (_, matrix) = exchange(
+            client_entry(ClientClass::Matrix, None),
+            ClientClass::Matrix,
+            "openid",
+        )
+        .await;
+        let mail_access = mail.access_token().secret().clone();
+        let mail_refresh = mail
+            .refresh_token()
+            .expect("offline_access was granted")
+            .secret()
+            .clone();
+        let matrix_access = matrix.access_token().secret().clone();
+
+        let introspect = |token: String| {
+            let db = db.clone();
+            async move {
+                crate::introspect::introspect(
+                    State(crate::axum_lib::IntrospectState {
+                        mas_shared_secret: delegated().mas_shared_secret,
+                        redis_client: db,
+                    }),
+                    Some(TypedHeader(Authorization::bearer("mas-secret").unwrap())),
+                    axum::extract::Form(crate::introspect::IntrospectForm {
+                        token,
+                        token_type_hint: None,
+                        client_id: None,
+                        client_secret: None,
+                    }),
+                )
+                .await
+                .expect("a 200")
+                .0
+            }
+        };
+        assert_eq!(
+            introspect(mail_access.clone()).await,
+            serde_json::json!({"active": false}),
+            "the access token of a generic-class client is not a Matrix session"
+        );
+        assert_eq!(
+            introspect(matrix_access.clone()).await["active"],
+            true,
+            "a Matrix client's access token stays active"
+        );
+
+        let matrix_side = CompatState::new(db.clone(), None, &delegated());
+        let bearer = |token: &str| Some(TypedHeader(Authorization::bearer(token).unwrap()));
+        let answers = [
+            (
+                "logout",
+                compat::logout(State(matrix_side.clone()), bearer(&mail_access))
+                    .await
+                    .into_response()
+                    .status(),
+            ),
+            (
+                "logout/all",
+                compat::logout_all(State(matrix_side.clone()), bearer(&mail_access))
+                    .await
+                    .into_response()
+                    .status(),
+            ),
+            (
+                "DELETE /devices/{id}",
+                compat::delete_device(
+                    State(matrix_side.clone()),
+                    axum::extract::Path("ANY".to_string()),
+                    bearer(&mail_access),
+                )
+                .await
+                .into_response()
+                .status(),
+            ),
+            (
+                "POST /delete_devices",
+                compat::delete_devices(
+                    State(matrix_side.clone()),
+                    bearer(&mail_access),
+                    Json(DeleteDevicesRequest {
+                        devices: vec!["ANY".to_string()],
+                    }),
+                )
+                .await
+                .into_response()
+                .status(),
+            ),
+            (
+                "POST /_matrix/client/v3/refresh",
+                compat::refresh(
+                    State(matrix_side.clone()),
+                    Json(RefreshRequest {
+                        refresh_token: mail_refresh.clone(),
+                    }),
+                )
+                .await
+                .into_response()
+                .status(),
+            ),
+        ];
+        for (route, status) in answers {
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{route}");
+        }
+        assert!(
+            db.lookup_access_token(&matrix_access)
+                .await
+                .unwrap()
+                .is_some(),
+            "no refusal ended the Matrix client's session"
+        );
+        let untouched = db
+            .resolve_refresh_token(&mail_refresh)
+            .await
+            .unwrap()
+            .expect("the refusals left the refresh token current");
+        assert_eq!(untouched.generation, 0, "and rotated nothing");
+
+        let rotated = token(
+            TokenForm {
+                code: None,
+                client_id: Some(mail_id.clone()),
+                client_secret: None,
+                grant_type: CoreGrantType::RefreshToken,
+                code_verifier: None,
+                refresh_token: Some(mail_refresh),
+                device_code: None,
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &delegated(),
+            &db,
+            None,
+        )
+        .await
+        .expect("the token endpoint still rotates the refused refresh token");
+        let after = grant_of(&db, &rotated).await;
+        assert_eq!(after.grant_id, untouched.grant_id, "the same grant");
+        assert_eq!(after.kind, GrantKind::Oidc);
+    }
+
     /// RFC 6749 section 5.1: the `scope` of a token response is the grant when it differs
     /// from the request. This client asked for `openid profile`, may not have `profile`, and
     /// is always given the mail scope, from the sign-in that bound the request to the

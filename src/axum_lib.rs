@@ -1721,12 +1721,11 @@ pub async fn main() {
 
     let introspect_state = IntrospectState::from(&state);
     let admin_token_state = AdminTokenState::from(&state);
-    let compat_state = compat::CompatState {
-        redis_client: state.redis_client.clone(),
-        synapse_client: state.synapse_client.clone(),
-        server_name: state.config.matrix_server_name.clone(),
-        require_secret: state.config.require_secret,
-    };
+    let compat_state = compat::CompatState::new(
+        state.redis_client.clone(),
+        state.synapse_client.clone(),
+        &state.config,
+    );
 
     let app = Router::new()
         .nest_service("/build", ServeDir::new("./static/build"))
