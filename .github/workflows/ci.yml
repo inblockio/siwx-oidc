@@ -255,7 +255,14 @@ jobs:
           cat /tmp/synapse-mock.log >&2
           exit 1
 
+      # The generic-class static client `maile2e` and its mail domain belong to this
+      # server only, so they are set on this step and not on the job: a generic-class
+      # client needs a Synapse, and the generic-mode server below refuses to start with
+      # one. e2e/env.sh configures the same client for e2e/up.sh.
       - name: Start siwx-oidc
+        env:
+          SIWXOIDC_MAIL_DOMAIN: matrix.test
+          SIWXOIDC_DEFAULT_CLIENTS__MAILE2E: '{"secret":"not-a-secret-e2e-fixture","class":"generic","allowed_scopes":["openid","io.inblock.mail","offline_access"],"metadata":{"redirect_uris":["http://localhost:0/callback"],"token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"]}}'
         run: |
           nohup env -u SIWEOIDC_HOST ./target/debug/siwx-oidc > /tmp/siwx-oidc.log 2>&1 &
           for _ in $(seq 1 60); do
@@ -275,7 +282,8 @@ jobs:
       - name: Start siwx-oidc (generic mode)
         run: |
           nohup env -u SIWEOIDC_HOST -u SIWXOIDC_MAS_SHARED_SECRET -u SIWXOIDC_SYNAPSE_ENDPOINT \
-            -u SIWXOIDC_MATRIX_SERVER_NAME \
+            -u SIWXOIDC_MATRIX_SERVER_NAME -u SIWXOIDC_MAIL_DOMAIN \
+            -u SIWXOIDC_DEFAULT_CLIENTS__MAILE2E \
             SIWXOIDC_PORT=18081 SIWXOIDC_BASE_URL=http://localhost:18081 \
             SIWXOIDC_REDIS_URL=redis://localhost:6379/1 \
             SIWXOIDC_BACKCHANNEL_LOGOUT_ALLOWED_HOSTS='["localhost"]' \
@@ -304,6 +312,12 @@ jobs:
       # a dynamic client's next use restores its 30-day lifetime.
       - name: E2E client lifetimes
         run: cargo test --test e2e_client_lifetime -- --ignored --test-threads=1
+
+      # A generic-class client (a mail client) against the Matrix-mode server, through the
+      # headless client: the mailbox claim, no `email`, no Matrix scope or session, and
+      # every Matrix surface refusing its tokens.
+      - name: E2E generic client
+        run: cargo test --test e2e_generic_client -- --ignored --test-threads=1
 
       # Race/teardown hazard register H1..H14 (14/14 promoted -- this said 12/12
       # for two suites' worth of growth; the count is now checked, not recited).

@@ -63,7 +63,7 @@ everything else exists only in the binary crate.
 
 | `siwx-oidc-auth/src/` | Role |
 |---|---|
-| `lib.rs` | `SiwxKey` (PEM, hex, generated), `authenticate`, `authenticate_with_device`, `refresh`, `authenticate_device_flow`, `AuthTokens`. |
+| `lib.rs` | `SiwxKey` (PEM, hex, generated), `authenticate`, `authenticate_with_device`, `authenticate_with_scope`, `authenticate_with_scope_using`, `refresh`, `authenticate_device_flow`, `AuthTokens`. |
 | `did_assertion.rs` | The shipped verifier: `fetch_and_verify_did`, `verify_did_assertion`, `VerifiedDid`, `DidAssertionError`, `DID_PROFILE_FIELD`. |
 | `main.rs` | CLI: `--key-file`, `--print-did`, `--server`, `--refresh-token`, `--device-flow`, `--verify-did <MXID> --homeserver <url>`. |
 
@@ -133,6 +133,9 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   `e2e_backchannel_logout` needs a second siwx-oidc in generic mode (no MAS shared secret, its
   own port and Redis database, `localhost` in `SIWXOIDC_BACKCHANNEL_LOGOUT_ALLOWED_HOSTS`) and
   uses the stub relying party in the Synapse mock (`/__rp/*`); see e2e/README.md.
+  `e2e_generic_client` needs the generic-class static client `maile2e` and
+  `SIWXOIDC_MAIL_DOMAIN` on the Matrix-mode server only (`e2e/env.sh` and the CI step set them);
+  the generic-mode server starts without both, because it refuses a generic-class client.
 - **Live suites** need a real Synapse and run in no CI job: `e2e_did_field_live` (a patched
   Synapse), `e2e_account_lifecycle_live`, five of the six `e2e_msc4191_live` tests,
   `e2e_msc3861::msc4191_metadata_advertised_and_forwarded` and `e2e_messaging`. Set
@@ -439,6 +442,19 @@ doc; read it before changing the code the rule covers.
   `build_scope_none_asks_for_what_the_client_relies_on`, `build_scope_some_requests_stable_device`,
   and on the wire `the_code_flow_sends_the_scope_it_relies_on`,
   `the_device_flow_sends_the_scope_it_relies_on`.
+- **A caller that is not a Matrix client names its own scope, and it is sent verbatim.**
+  `authenticate_with_scope` and `authenticate_with_scope_using` (the second takes the caller's
+  `reqwest::Client`) send exactly the scope they are given: nothing is added, `RELIED_ON_SCOPES`
+  included, and nothing is checked, so a generic-class client (a mail client) never asks for the
+  Matrix API, which `authenticate` always does. All four code-flow entry points run one private
+  `code_flow`. The client handed to `authenticate_with_scope_using` must not follow redirects,
+  because the flow reads the `Location` header of the `/authorize` and `/sign_in` redirects
+  itself; a 2xx where the 303 is due is an error that names `Policy::none()`. Pin:
+  `the_scope_entry_points_send_the_scope_exactly_as_given`,
+  `the_caller_chosen_client_sends_the_flow`,
+  `a_client_that_follows_redirects_gets_an_error_naming_the_redirect_policy`,
+  `a_sign_in_that_answers_with_a_page_names_the_redirect_policy_too`,
+  `an_error_status_at_authorize_is_not_blamed_on_the_redirect_policy`.
 - **An empty `device_id` is JSON `null` on the wire, never `""`.** Synapse rejects `""`. Pin:
   `empty_device_id_renders_as_json_null`, `deviceless_token_body_carries_device_id_null`.
 - **The grant is the unit** (I2). Every access and refresh token belongs to exactly one grant

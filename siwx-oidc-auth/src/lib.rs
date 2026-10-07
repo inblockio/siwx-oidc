@@ -343,7 +343,8 @@ struct TokenErrorResponse {
 /// This is the backward-compatible entry point: it requests no device, so the
 /// server mints a fresh `SIWX_<uuid>` Synapse device on each login. To pin a
 /// stable device_id, use [`authenticate_with_device`]. The scope it requests is
-/// `openid profile offline_access urn:matrix:client:api:*`.
+/// `openid profile offline_access urn:matrix:client:api:*`; a client that is not
+/// a Matrix client chooses its own with [`authenticate_with_scope`].
 pub async fn authenticate(
     server_url: &str,
     client_id: &str,
@@ -371,12 +372,128 @@ pub async fn authenticate_with_device(
     key: &SiwxKey,
     device_id: Option<&str>,
 ) -> Result<AuthTokens> {
-    let scope = build_scope(device_id);
-    let base = Url::parse(server_url).context("invalid server_url")?;
-    let client = reqwest::Client::builder()
+    let client = flow_client()?;
+    code_flow(
+        &client,
+        server_url,
+        client_id,
+        redirect_uri,
+        key,
+        &build_scope(device_id),
+    )
+    .await
+}
+
+/// Perform the authorization code flow for a scope the caller chooses.
+///
+/// Same flow as [`authenticate`], except for `scope`, which is sent to
+/// `/authorize` exactly as given: nothing is added (the scopes the other entry
+/// points rely on, [`RELIED_ON_SCOPES`], are not appended), nothing is removed,
+/// and nothing is checked. An empty scope, or one without `openid`, is for the
+/// server to refuse.
+///
+/// This is the entry point for a client that is not a Matrix client. A
+/// generic-class client (a mail client, say) is granted only the scopes its
+/// registration allows, and a Matrix scope in its request is dropped, so
+/// [`authenticate`], which always asks for `urn:matrix:client:api:*`, is the
+/// wrong choice for it:
+///
+/// ```no_run
+/// # async fn demo(key: &siwx_oidc_auth::SiwxKey) -> anyhow::Result<()> {
+/// let tokens = siwx_oidc_auth::authenticate_with_scope(
+///     "https://siwx.example.com",
+///     "my-mail-client",
+///     "https://mail.example.com/callback",
+///     key,
+///     "openid io.inblock.mail offline_access",
+/// ).await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The returned [`AuthTokens`] does not say which scope the server granted.
+/// A refresh token is present only when the server issued one, which for a
+/// generic-class client takes `offline_access` in the scope.
+///
+/// Builds its own HTTP client, which does not follow redirects. To use your own
+/// (a proxy, a timeout, a root certificate), call
+/// [`authenticate_with_scope_using`].
+pub async fn authenticate_with_scope(
+    server_url: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    key: &SiwxKey,
+    scope: &str,
+) -> Result<AuthTokens> {
+    let client = flow_client()?;
+    authenticate_with_scope_using(&client, server_url, client_id, redirect_uri, key, scope).await
+}
+
+/// [`authenticate_with_scope`] over a `client` the caller built.
+///
+/// **`client` must not follow redirects**: build it with
+/// `reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())`.
+/// The flow reads the `Location` header of the redirects from `/authorize` and
+/// `/sign_in` itself, and a client that follows them hands it a page instead.
+/// A 2xx where a 303 is due is reported as an error that names the redirect
+/// policy. Reqwest cannot tell the flow which policy a client has, so this is
+/// the only check.
+///
+/// The flow sends its cookies itself, so `client` should carry no cookie store.
+/// Timeouts, proxies and root certificates set on `client` apply to every
+/// request of the flow.
+pub async fn authenticate_with_scope_using(
+    client: &reqwest::Client,
+    server_url: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    key: &SiwxKey,
+    scope: &str,
+) -> Result<AuthTokens> {
+    code_flow(client, server_url, client_id, redirect_uri, key, scope).await
+}
+
+/// The HTTP client the flows build for themselves. It must not follow
+/// redirects: the code flow reads the `Location` header of two of them.
+fn flow_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
         .redirect(Policy::none())
         .build()
-        .context("failed to build HTTP client")?;
+        .context("failed to build HTTP client")
+}
+
+/// The error for a response from `endpoint` that is not the 303 redirect the
+/// code flow is waiting for.
+///
+/// A success status gets its own message, because it is what a client that
+/// follows redirects sees at the end of the redirect: the login page, a 200.
+fn not_the_redirect(endpoint: &str, status: StatusCode, body: Option<&str>) -> anyhow::Error {
+    if status.is_success() {
+        return anyhow!(
+            "{endpoint} returned {status} where a 303 redirect was expected: either the HTTP \
+             client followed the redirect, or the server did not redirect. The flow reads the \
+             Location header itself, so the client must be built with \
+             `reqwest::redirect::Policy::none()`"
+        );
+    }
+    match body {
+        Some(body) => anyhow!("{endpoint} returned {status}: {body}"),
+        None => anyhow!("{endpoint} returned {status} instead of 303"),
+    }
+}
+
+/// The authorization code flow every code-flow entry point runs: PKCE,
+/// `/authorize`, the CAIP-122 signature at `/sign_in`, and the code exchange at
+/// `/token`. `scope` is sent as given; the callers decide what it is.
+async fn code_flow(
+    client: &reqwest::Client,
+    server_url: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    key: &SiwxKey,
+    scope: &str,
+) -> Result<AuthTokens> {
+    let base = Url::parse(server_url).context("invalid server_url")?;
 
     // -----------------------------------------------------------------------
     // PKCE: generate code_verifier and code_challenge (S256)
@@ -403,7 +520,7 @@ pub async fn authenticate_with_device(
         .query(&[
             ("client_id", client_id),
             ("redirect_uri", redirect_uri),
-            ("scope", scope.as_str()),
+            ("scope", scope),
             ("response_type", "code"),
             ("state", "headless"),
             ("code_challenge", code_challenge.as_str()),
@@ -414,7 +531,7 @@ pub async fn authenticate_with_device(
         .context("GET /authorize failed")?;
 
     if resp.status() != StatusCode::SEE_OTHER {
-        bail!("/authorize returned {} instead of 303", resp.status());
+        return Err(not_the_redirect("/authorize", resp.status(), None));
     }
 
     let session_cookie = resp
@@ -479,7 +596,7 @@ pub async fn authenticate_with_device(
     if resp.status() != StatusCode::SEE_OTHER {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        bail!("/sign_in returned {status}: {body}");
+        return Err(not_the_redirect("/sign_in", status, Some(&body)));
     }
 
     let code_location = resp
@@ -553,10 +670,7 @@ pub async fn refresh(
     did: &str,
 ) -> Result<AuthTokens> {
     let base = Url::parse(server_url).context("invalid server_url")?;
-    let client = reqwest::Client::builder()
-        .redirect(Policy::none())
-        .build()
-        .context("failed to build HTTP client")?;
+    let client = flow_client()?;
 
     let token_url = base.join("/token")?;
     let resp = client
@@ -739,7 +853,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
 
     /// What the client asks for in the code flow, in the order it asks.
     const CODE_FLOW_SCOPE: &str = "openid profile offline_access urn:matrix:client:api:*";
@@ -784,6 +898,89 @@ mod tests {
         assert_eq!(build_device_flow_scope(), DEVICE_FLOW_SCOPE);
     }
 
+    /// One request a stub server received.
+    struct Received {
+        /// The request line and the headers.
+        head: String,
+        body: String,
+    }
+
+    impl Received {
+        fn request_line(&self) -> &str {
+            self.head.lines().next().unwrap_or("")
+        }
+
+        fn header(&self, name: &str) -> Option<String> {
+            self.head.lines().skip(1).find_map(|line| {
+                let (field, value) = line.split_once(':')?;
+                field
+                    .eq_ignore_ascii_case(name)
+                    .then(|| value.trim().to_string())
+            })
+        }
+    }
+
+    fn read_request(stream: &mut TcpStream) -> Received {
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let (head_end, content_length) = loop {
+            let n = stream.read(&mut chunk).unwrap();
+            received.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&received).to_string();
+            if let Some(end) = text.find("\r\n\r\n") {
+                let length = text[..end]
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                break (end + 4, length);
+            }
+        };
+        while received.len() < head_end + content_length {
+            let n = stream.read(&mut chunk).unwrap();
+            received.extend_from_slice(&chunk[..n]);
+        }
+        let text = String::from_utf8_lossy(&received).to_string();
+        Received {
+            head: text[..head_end].to_string(),
+            body: text[head_end..].to_string(),
+        }
+    }
+
+    /// A raw HTTP response with an empty body that closes the connection.
+    fn raw_response(status: &str, headers: &[&str]) -> String {
+        let mut response =
+            format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n");
+        for header in headers {
+            response.push_str(header);
+            response.push_str("\r\n");
+        }
+        response.push_str("\r\n");
+        response
+    }
+
+    /// Answer one connection per entry of `responses`, in order, and hand back
+    /// what each one sent.
+    fn serve_in_order(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<Received>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            responses
+                .into_iter()
+                .map(|response| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request = read_request(&mut stream);
+                    let _ = stream.write_all(response.as_bytes());
+                    request
+                })
+                .collect()
+        });
+        (base, handle)
+    }
+
     /// Answer the first request with a 500 and hand back the request line and
     /// body. Enough server to see what a flow sends first.
     fn capture_first_request() -> (String, std::thread::JoinHandle<(String, String)>) {
@@ -791,35 +988,11 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut received = Vec::new();
-            let mut chunk = [0u8; 4096];
-            let (head_end, content_length) = loop {
-                let n = stream.read(&mut chunk).unwrap();
-                received.extend_from_slice(&chunk[..n]);
-                let text = String::from_utf8_lossy(&received).to_string();
-                if let Some(end) = text.find("\r\n\r\n") {
-                    let length = text[..end]
-                        .lines()
-                        .find_map(|l| {
-                            l.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(|v| v.trim().parse::<usize>().unwrap())
-                        })
-                        .unwrap_or(0);
-                    break (end + 4, length);
-                }
-            };
-            while received.len() < head_end + content_length {
-                let n = stream.read(&mut chunk).unwrap();
-                received.extend_from_slice(&chunk[..n]);
-            }
+            let request = read_request(&mut stream);
             let _ = stream.write_all(
                 b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
             );
-            let text = String::from_utf8_lossy(&received).to_string();
-            let request_line = text.lines().next().unwrap_or("").to_string();
-            let body = text[head_end..].to_string();
-            (request_line, body)
+            (request.request_line().to_string(), request.body)
         });
         (base, handle)
     }
@@ -879,5 +1052,183 @@ mod tests {
             "{request_line}"
         );
         assert_eq!(scope_in(&body), DEVICE_FLOW_SCOPE);
+    }
+
+    const REDIRECT_URI: &str = "https://agent.example.org/callback";
+
+    /// A client built the way [`authenticate_with_scope_using`] asks a caller to.
+    fn caller_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    /// The `scope` of the `/authorize` request a stub received.
+    fn authorize_scope(request: std::thread::JoinHandle<(String, String)>) -> String {
+        let (request_line, _) = request.join().unwrap();
+        let target = request_line.split(' ').nth(1).unwrap();
+        let (path, query) = target.split_once('?').expect("a query");
+        assert_eq!(path, "/authorize");
+        scope_in(query)
+    }
+
+    /// The scope a caller names is the scope on the wire: nothing is added (the
+    /// Matrix scopes the other entry points rely on included), removed,
+    /// normalised or checked.
+    #[tokio::test]
+    async fn the_scope_entry_points_send_the_scope_exactly_as_given() {
+        let key = SiwxKey::generate_ed25519();
+        for scope in [
+            "openid io.inblock.mail",
+            "openid",
+            "openid io.inblock.mail offline_access",
+            "openid urn:matrix:client:api:*",
+            "openid  io.inblock.mail ",
+            "",
+        ] {
+            let (base, request) = capture_first_request();
+            let outcome = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, scope).await;
+            assert!(outcome.is_err(), "the stub answers 500");
+            assert_eq!(authorize_scope(request), scope, "authenticate_with_scope");
+
+            let (base, request) = capture_first_request();
+            let outcome = authenticate_with_scope_using(
+                &caller_client(),
+                &base,
+                "client",
+                REDIRECT_URI,
+                &key,
+                scope,
+            )
+            .await;
+            assert!(outcome.is_err(), "the stub answers 500");
+            assert_eq!(
+                authorize_scope(request),
+                scope,
+                "authenticate_with_scope_using"
+            );
+        }
+    }
+
+    /// `authenticate_with_scope_using` runs the flow through the client it is
+    /// given, not through one of its own.
+    #[tokio::test]
+    async fn the_caller_chosen_client_sends_the_flow() {
+        let key = SiwxKey::generate_ed25519();
+        let caller = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .user_agent("caller-client/1")
+            .build()
+            .unwrap();
+        let (base, served) = serve_in_order(vec![raw_response("500 Internal Server Error", &[])]);
+        let outcome = authenticate_with_scope_using(
+            &caller,
+            &base,
+            "client",
+            REDIRECT_URI,
+            &key,
+            "openid io.inblock.mail",
+        )
+        .await;
+        assert!(outcome.is_err(), "the stub answers 500");
+        let requests = served.join().unwrap();
+        assert_eq!(
+            requests[0].header("user-agent").as_deref(),
+            Some("caller-client/1")
+        );
+    }
+
+    /// A client that follows redirects ends the flow on the login page, a 200
+    /// where the 303 is due, and the error says why.
+    #[tokio::test]
+    async fn a_client_that_follows_redirects_gets_an_error_naming_the_redirect_policy() {
+        let key = SiwxKey::generate_ed25519();
+        let (base, served) = serve_in_order(vec![
+            raw_response(
+                "303 See Other",
+                &["location: /login", "set-cookie: session=abc; Path=/"],
+            ),
+            raw_response("200 OK", &[]),
+        ]);
+        let following = reqwest::Client::new();
+        let error = authenticate_with_scope_using(
+            &following,
+            &base,
+            "client",
+            REDIRECT_URI,
+            &key,
+            "openid io.inblock.mail",
+        )
+        .await
+        .expect_err("the login page is not a redirect");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("/authorize returned 200 OK where a 303 redirect was expected"),
+            "{message}"
+        );
+        assert!(
+            message.contains("reqwest::redirect::Policy::none()"),
+            "{message}"
+        );
+        let requests = served.join().unwrap();
+        assert_eq!(requests.len(), 2, "the client did follow the redirect");
+        assert!(requests[1].request_line().starts_with("GET /login"));
+    }
+
+    /// The same error at the second redirect, when a server answers `/sign_in`
+    /// with a page instead.
+    #[tokio::test]
+    async fn a_sign_in_that_answers_with_a_page_names_the_redirect_policy_too() {
+        let key = SiwxKey::generate_ed25519();
+        let authorize_redirect = format!(
+            "location: /login?nonce=n1&state=headless&client_id=client&redirect_uri={}",
+            urlencoding::encode(REDIRECT_URI)
+        );
+        let (base, served) = serve_in_order(vec![
+            raw_response(
+                "303 See Other",
+                &[&authorize_redirect, "set-cookie: session=abc; Path=/"],
+            ),
+            raw_response("200 OK", &[]),
+        ]);
+        let error = authenticate_with_scope(
+            &base,
+            "client",
+            REDIRECT_URI,
+            &key,
+            "openid io.inblock.mail",
+        )
+        .await
+        .expect_err("a page is not a redirect");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("/sign_in returned 200 OK where a 303 redirect was expected"),
+            "{message}"
+        );
+        assert!(
+            message.contains("reqwest::redirect::Policy::none()"),
+            "{message}"
+        );
+        let requests = served.join().unwrap();
+        assert!(requests[1].request_line().starts_with("GET /sign_in"));
+        assert!(requests[1]
+            .header("cookie")
+            .is_some_and(|cookie| cookie.starts_with("session=abc; siwx=")));
+    }
+
+    /// A status that is neither a 303 nor a success keeps the plain message.
+    #[tokio::test]
+    async fn an_error_status_at_authorize_is_not_blamed_on_the_redirect_policy() {
+        let key = SiwxKey::generate_ed25519();
+        let (base, request) = capture_first_request();
+        let error = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "openid")
+            .await
+            .expect_err("the stub answers 500");
+        request.join().unwrap();
+        assert_eq!(
+            format!("{error:#}"),
+            "/authorize returned 500 Internal Server Error instead of 303"
+        );
     }
 }
