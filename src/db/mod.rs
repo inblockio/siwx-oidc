@@ -796,6 +796,9 @@ impl TokenMetadata {
 
 #[async_trait]
 pub trait DBClient {
+    /// Store `client_entry` under `client_id`, replacing any earlier entry. The client lives
+    /// [`CLIENT_LIFETIME`] from now, except that a client that currently has no expiry (a
+    /// static one) is rewritten without one: no caller can give a static client a TTL.
     async fn set_client(&self, client_id: String, client_entry: ClientEntry) -> Result<()>;
     async fn get_client(&self, client_id: String) -> Result<Option<ClientEntry>>;
     async fn delete_client(&self, client_id: String) -> Result<()>;
