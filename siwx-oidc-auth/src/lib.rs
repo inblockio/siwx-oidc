@@ -415,6 +415,10 @@ pub async fn authenticate_with_device(
 /// A refresh token is present only when the server issued one, which for a
 /// generic-class client takes `offline_access` in the scope.
 ///
+/// A server that refuses the request (a scope the client may not have, for
+/// one) is reported with the reason it gave:
+/// `/authorize refused the request: invalid_scope: ...`.
+///
 /// Builds its own HTTP client, which does not follow redirects. To use your own
 /// (a proxy, a timeout, a root certificate), call
 /// [`authenticate_with_scope_using`].
@@ -482,6 +486,31 @@ fn not_the_redirect(endpoint: &str, status: StatusCode, body: Option<&str>) -> a
     }
 }
 
+/// What the server says when it refuses the authorization request.
+///
+/// `/authorize` refuses a request it can still answer, an unsupported scope for
+/// one, with a 303 to the redirect URI whose query carries `error` and
+/// `error_description`. That redirect sets no session cookie, so a flow that read
+/// the cookie first would report a missing cookie and hide the reason. `None`
+/// when `location` is no refusal.
+fn authorize_refusal(base: &Url, location: &str) -> Option<String> {
+    let redirect = base.join(location).ok()?;
+    let mut error = None;
+    let mut description = None;
+    for (name, value) in redirect.query_pairs() {
+        match name.as_ref() {
+            "error" => error = Some(value.into_owned()),
+            "error_description" => description = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    let error = error?;
+    Some(match description {
+        Some(description) => format!("{error}: {description}"),
+        None => error,
+    })
+}
+
 /// The authorization code flow every code-flow entry point runs: PKCE,
 /// `/authorize`, the CAIP-122 signature at `/sign_in`, and the code exchange at
 /// `/token`. `scope` is sent as given; the callers decide what it is.
@@ -534,6 +563,14 @@ async fn code_flow(
         return Err(not_the_redirect("/authorize", resp.status(), None));
     }
 
+    let location = resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok());
+    if let Some(reason) = location.and_then(|location| authorize_refusal(&base, location)) {
+        return Err(anyhow!("/authorize refused the request: {reason}"));
+    }
+
     let session_cookie = resp
         .headers()
         .get_all(header::SET_COOKIE)
@@ -548,11 +585,8 @@ async fn code_flow(
         })
         .ok_or_else(|| anyhow!("/authorize response missing session cookie"))?;
 
-    let location = resp
-        .headers()
-        .get(header::LOCATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| anyhow!("/authorize response missing Location header"))?;
+    let location =
+        location.ok_or_else(|| anyhow!("/authorize response missing Location header"))?;
 
     let redirect_url = base.join(location).context("invalid Location header")?;
     let params: AuthorizeRedirectParams =
@@ -1230,5 +1264,83 @@ mod tests {
             format!("{error:#}"),
             "/authorize returned 500 Internal Server Error instead of 303"
         );
+    }
+
+    /// A server that refuses the scope answers `/authorize` with a 303 to the
+    /// redirect URI, `error` and `error_description` in its query and no session
+    /// cookie. The error carries what the server said, through both entry points
+    /// that take a scope.
+    #[tokio::test]
+    async fn a_refused_scope_is_reported_with_the_servers_reason() {
+        let key = SiwxKey::generate_ed25519();
+        let refusal = format!(
+            "location: {REDIRECT_URI}?state=headless&error=invalid_scope&error_description={}",
+            urlencoding::encode("the openid scope is required")
+        );
+        let expected =
+            "/authorize refused the request: invalid_scope: the openid scope is required";
+
+        let (base, served) = serve_in_order(vec![raw_response("303 See Other", &[&refusal])]);
+        let error = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "io.inblock.mail")
+            .await
+            .expect_err("the server refused the scope");
+        assert_eq!(format!("{error:#}"), expected);
+        assert_eq!(
+            served.join().unwrap().len(),
+            1,
+            "the flow stops at the refusal"
+        );
+
+        let (base, served) = serve_in_order(vec![raw_response("303 See Other", &[&refusal])]);
+        let error = authenticate_with_scope_using(
+            &caller_client(),
+            &base,
+            "client",
+            REDIRECT_URI,
+            &key,
+            "io.inblock.mail",
+        )
+        .await
+        .expect_err("the server refused the scope");
+        assert_eq!(format!("{error:#}"), expected);
+        served.join().unwrap();
+    }
+
+    /// A refusal without a description still names its error, and a redirect
+    /// with an `error` but also a cookie is a refusal all the same.
+    #[tokio::test]
+    async fn a_refusal_without_a_description_still_names_the_error() {
+        let key = SiwxKey::generate_ed25519();
+        let refusal = format!("location: {REDIRECT_URI}?state=headless&error=invalid_scope");
+        let (base, served) = serve_in_order(vec![raw_response(
+            "303 See Other",
+            &[&refusal, "set-cookie: session=abc; Path=/"],
+        )]);
+        let error = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "io.inblock.mail")
+            .await
+            .expect_err("the server refused the scope");
+        assert_eq!(
+            format!("{error:#}"),
+            "/authorize refused the request: invalid_scope"
+        );
+        served.join().unwrap();
+    }
+
+    /// A redirect that is no refusal and sets no cookie keeps its own message.
+    #[tokio::test]
+    async fn a_redirect_without_a_cookie_or_an_error_still_reports_the_missing_cookie() {
+        let key = SiwxKey::generate_ed25519();
+        let (base, served) = serve_in_order(vec![raw_response(
+            "303 See Other",
+            &["location: /login?nonce=n1&state=headless"],
+        )]);
+        let error = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "openid")
+            .await
+            .expect_err("no session cookie");
+        assert_eq!(
+            format!("{error:#}"),
+            "/authorize response missing session cookie"
+        );
+        served.join().unwrap();
     }
 }
