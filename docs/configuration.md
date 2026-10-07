@@ -111,7 +111,7 @@ abused, leave it out of the list and let its proofs fail; the next sign-in re-as
 
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
-| `default_clients` | `SIWXOIDC_DEFAULT_CLIENTS` | none | Map of client id to a JSON client entry, written to Redis at every start. |
+| `default_clients` | `SIWXOIDC_DEFAULT_CLIENTS` | none | Map of client id to a JSON client entry, written to Redis at every start with no expiry. An id removed from the map is deleted at the next start. |
 | `require_secret` | `SIWXOIDC_REQUIRE_SECRET` | `true` | Whether `POST /token` demands a client secret, at the code exchange and at the refresh grant alike, from a client whose metadata names no `token_endpoint_auth_method`. A client registered with `"none"` never needs one. |
 
 A client entry is `{"secret": "…", "metadata": {…}}`, where `metadata` is RFC 7591 client
@@ -133,6 +133,25 @@ the configuration as you would the secret.
 [default.default_clients]
 my-app = '{"secret":"change-me","metadata":{"redirect_uris":["https://app.example.org/callback"]}}'
 ```
+
+Every start makes the static clients in Redis equal that instance's `default_clients`: it writes
+each entry, with no expiry, and deletes each client an earlier start wrote that the map no longer
+names. Every instance that shares one Redis must therefore carry the same `default_clients` map,
+because the last start wins: an instance with a different map overwrites or deletes the clients
+of the others.
+
+With no `default_clients` there is nothing to write, so the server starts without Redis and
+deletes the clients an earlier configuration left behind in the background. If Redis cannot be
+reached it retries, after 1 s and then at doubling intervals up to 60 s, until one attempt
+succeeds; until then those clients stay registered.
+
+Removing a client, whether by dropping its id from `default_clients` or by `DELETE` on a
+dynamically registered one, stops new authorizations and code exchanges for it. It does not end
+the sessions that already exist: a refresh token of a removed client still refreshes (a request
+that presents a secret is refused, because the client can no longer be checked), and each refresh
+issues a new refresh token, so a session keeps refreshing until it is revoked (token revocation,
+sign-out or account deactivation), its refresh token goes unused for 90 days, or its absolute
+lifetime ends when one is set.
 
 ### Grant lifetime
 
