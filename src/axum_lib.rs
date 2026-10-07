@@ -43,6 +43,7 @@ use super::resolve;
 use super::synapse_client::SynapseClient;
 use super::webauthn as wa;
 use aqua_auth::{all_cipher_suites, all_did_methods};
+use siwx_oidc::client_policy;
 use siwx_oidc::db::*;
 use siwx_oidc::redact::fingerprint;
 
@@ -1376,18 +1377,16 @@ async fn account_passkey_finish_handler(
 
 /// The configured `default_clients`, each as the entry [`ClientEntry`] keeps: configured
 /// with its secret (and registration access token, if any) in the clear, held as their
-/// digests.
+/// digests. Every entry passes `client_policy::validate_static_client` for this
+/// deployment, so a client the server could not honour safely stops start-up, naming the
+/// client and the rule, before anything is written.
 fn parse_default_clients(config: &config::Config) -> anyhow::Result<Vec<(String, ClientEntry)>> {
-    config
-        .default_clients
-        .iter()
-        .map(|(id, raw)| {
-            let entry = serde_json::from_str(raw).map_err(|e| {
-                anyhow::anyhow!("default_clients.{id} is not a valid client entry: {e}")
-            })?;
-            Ok((id.clone(), entry))
-        })
-        .collect()
+    let deployment = client_policy::Deployment {
+        mail_domain: config.mail_domain.as_deref(),
+        delegated_auth: oidc::delegated_auth_enabled(config),
+    };
+    client_policy::parse_static_clients(&config.default_clients, deployment)
+        .map_err(anyhow::Error::msg)
 }
 
 fn log_pruned_static_clients(pruned: usize) {
@@ -1559,6 +1558,9 @@ pub async fn main() {
     if config.reuse_revokes_grant {
         info!("refresh token reuse enforcement on: a reuse event revokes its grant");
     }
+    // Checked whether or not a static client uses it, before anything reads Redis.
+    client_policy::validate_mail_domain(config.mail_domain.as_deref())
+        .unwrap_or_else(|e| panic!("FATAL: {e}"));
     let redis_client = RedisClient::new(&config.redis_url)
         .await
         .expect("Could not build Redis client")
@@ -2492,6 +2494,44 @@ mod default_clients_tests {
         assert!(entry.access_token_matches(&token));
         assert!(!entry.secret_matches(&entry.secret_digest));
         redis.del_raw(&key).await.unwrap();
+    }
+
+    /// The start-up parse hands the policy this deployment's settings: a generic client
+    /// needs the MAS shared secret (a Synapse), and the mail scope needs the mail domain.
+    /// No Redis: the parse reads none.
+    #[test]
+    fn a_generic_static_client_is_checked_against_the_deployment_it_runs_in() {
+        let entry = r#"{"secret":"not-a-secret-test-fixture","metadata":{"redirect_uris":["https://mail.example.org/cb"]},"class":"generic","allowed_scopes":["openid","io.inblock.mail"]}"#;
+        let mut config = config::Config::default();
+        config.default_clients.insert("mailer".into(), entry.into());
+        let refusal = |config: &config::Config| match parse_default_clients(config) {
+            Ok(_) => panic!("the configuration must be refused"),
+            Err(refusal) => refusal.to_string(),
+        };
+
+        let without_synapse = refusal(&config);
+        assert!(
+            without_synapse.starts_with("default_clients.mailer:")
+                && without_synapse.contains("SIWXOIDC_MAS_SHARED_SECRET"),
+            "{without_synapse}"
+        );
+
+        config.mas_shared_secret = Some("not-a-secret-test-fixture".into());
+        let without_domain = refusal(&config);
+        assert!(
+            without_domain.starts_with("default_clients.mailer:")
+                && without_domain.contains("SIWXOIDC_MAIL_DOMAIN"),
+            "{without_domain}"
+        );
+
+        config.mail_domain = Some("matrix.example.org".into());
+        let parsed = match parse_default_clients(&config) {
+            Ok(parsed) => parsed,
+            Err(refusal) => panic!("the deployment serves the client: {refusal}"),
+        };
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "mailer");
+        assert_eq!(parsed[0].1.class, ClientClass::Generic);
     }
 }
 

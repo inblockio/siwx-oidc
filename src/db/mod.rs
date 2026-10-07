@@ -296,6 +296,11 @@ pub struct CodeEntry {
     /// answers as it did before the scope travelled.
     #[serde(default)]
     pub scope: Option<String>,
+    /// The class of the client the code was issued to. `None` for a code written before
+    /// the class was recorded, which a new build reads for up to [`ENTRY_LIFETIME`], so
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub client_class: Option<ClientClass>,
 }
 
 /// Registration metadata this provider reads beyond OIDC Core client
@@ -1116,6 +1121,31 @@ mod code_entry_tests {
         let round_trip: CodeEntry =
             serde_json::from_str(&serde_json::to_string(&with_scope).unwrap()).unwrap();
         assert_eq!(round_trip.scope.as_deref(), Some("openid offline_access"));
+    }
+
+    /// A code written before the class was recorded reads without one, and a recorded
+    /// class survives storage in every form.
+    #[test]
+    fn a_code_written_before_the_class_was_recorded_reads_without_one() {
+        let before = r#"{
+            "exchange_count": 0,
+            "did": "did:key:zDnaeOLD",
+            "nonce": null,
+            "client_id": "client",
+            "auth_time": "2026-10-02T00:00:00Z"
+        }"#;
+        let entry: CodeEntry = serde_json::from_str(before).expect("an old code still reads");
+        assert_eq!(entry.client_class, None);
+
+        for class in [ClientClass::Matrix, ClientClass::Generic] {
+            let recorded = CodeEntry {
+                client_class: Some(class),
+                ..entry.clone()
+            };
+            let round_trip: CodeEntry =
+                serde_json::from_str(&serde_json::to_string(&recorded).unwrap()).unwrap();
+            assert_eq!(round_trip.client_class, Some(class));
+        }
     }
 }
 

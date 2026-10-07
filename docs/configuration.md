@@ -113,6 +113,7 @@ abused, leave it out of the list and let its proofs fail; the next sign-in re-as
 |---|---|---|---|
 | `default_clients` | `SIWXOIDC_DEFAULT_CLIENTS` | none | Map of client id to a JSON client entry, written to Redis at every start with no expiry. An id removed from the map is deleted at the next start. |
 | `require_secret` | `SIWXOIDC_REQUIRE_SECRET` | `true` | Whether `POST /token` demands a client secret, at the code exchange and at the refresh grant alike, from a client whose metadata names no `token_endpoint_auth_method`. A client registered with `"none"` never needs one. |
+| `mail_domain` | `SIWXOIDC_MAIL_DOMAIN` | none | Domain of the mailbox address (`<localpart>@<mail_domain>`) of an account that signs in to a generic client. A lowercase DNS name (at most 63 characters per label and 253 in all) that is not an IP address; required when a static client allows `io.inblock.mail`. |
 
 A client entry is `{"secret": "…", "metadata": {…}}`, where `metadata` is RFC 7591 client
 metadata (at least `redirect_uris`); an optional `"access_token"` is the registration access
@@ -129,9 +130,34 @@ offline by someone who can read Redis. Such a reader on the same host can usuall
 configuration too, where the secret is in the clear, so choose a long random secret and protect
 the configuration as you would the secret.
 
+A `default_clients` entry may also set `"class": "generic"` with `"allowed_scopes": ["openid", …]`,
+for a client that is not a Matrix client. `POST /register` always creates the `matrix` class, and
+an entry without a class is `matrix`. A generic entry may add `"always_granted_scopes"`, scopes
+the client receives even when it does not request them, for a client that cannot ask for them; it
+defaults to empty. Start-up refuses an entry that:
+
+- is generic in a deployment without `mas_shared_secret`: a generic client's account and
+  localpart come from Synapse;
+- is generic without `openid` in `allowed_scopes`, with a scope that starts with `urn:matrix:` or
+  `urn:synapse:`, with a registration access token, or allowing `io.inblock.mail` without
+  `mail_domain`;
+- is Matrix-class and sets `allowed_scopes` or `always_granted_scopes`;
+- lists an `always_granted_scopes` entry that is not in `allowed_scopes`, or lists `openid`
+  there (a client requests `openid`, it is never implied);
+- names a scope that is not a single word of printable characters (RFC 6749 section 3.3).
+
+`mail_domain` is checked as strictly, whether or not a client uses it. Each refusal is a fatal
+error that names the client id (or the setting) and the rule, and it comes before anything is
+written to Redis. A build that predates these members ignores them and reads a generic client
+as a Matrix client, so every instance that shares one Redis must run a build that knows them.
+
 ```toml
+[default]
+mail_domain = "matrix.example.org"
+
 [default.default_clients]
 my-app = '{"secret":"change-me","metadata":{"redirect_uris":["https://app.example.org/callback"]}}'
+webmail = '{"secret":"change-me","metadata":{"redirect_uris":["https://mail.example.org/callback"]},"class":"generic","allowed_scopes":["openid","profile","io.inblock.mail"],"always_granted_scopes":["io.inblock.mail"]}'
 ```
 
 Every start makes the static clients in Redis equal that instance's `default_clients`: it writes

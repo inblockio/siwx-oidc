@@ -3002,6 +3002,7 @@ pub async fn sign_in(
         localpart: Some(resolved.localpart.clone()),
         device_id,
         scope: request.scope.clone(),
+        client_class: None,
     };
 
     let code = Uuid::new_v4();
@@ -6241,6 +6242,7 @@ mod userinfo_mxid_claim_tests {
                 device_id: None,
                 localpart: Some(LOCALPART.to_string()),
                 scope: None,
+                client_class: None,
             },
         )
         .await
@@ -7277,6 +7279,7 @@ mod client_binding_tests {
                 device_id: None,
                 localpart: Some(unique("localpart")),
                 scope: scope.map(str::to_string),
+                client_class: None,
             },
         )
         .await

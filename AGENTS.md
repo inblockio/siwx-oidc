@@ -52,6 +52,7 @@ everything else exists only in the binary crate.
 | `credential_identity.rs` (lib) | Which identity a stored passkey authenticates: a `webauthn:link/*` entry overrides the derived `did:key`. |
 | `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL`. |
 | `credential_migration.rs` (lib) | Additive backfill of passkey credentials into the aqua-auth store. |
+| `client_policy.rs` (lib) | Pure rules for generic-class clients: `grant_for` (the scopes a client is granted), `mailbox_for` (the one place the mailbox claim value is built), `validate_mail_domain`, `validate_static_client`, and `parse_static_clients`, which start-up runs on `default_clients` before anything is written. |
 | `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry` with the digests of its secret and registration access token, its `ClientClass` and scope policy, and `client_entry_without_plaintext`, `DeviceCodeEntry` and the `DeviceCodeRef` naming its layout, `TokenMetadata` with its `TokenKind`), `Ceremony`, `OwnSession` (the `siwx_user` and `acct_session` layouts), `legacy_token_kind`, Redis key prefixes and TTLs. |
 | `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, the own sessions (`create_own_session`, `lookup_own_session`, `end_own_session`, `revoke_own_sessions`; `lookup_user_session` for the picker), `purge_identity`. |
 | `db/outbox.rs` (lib) | The back-channel logout outbox (`outbox:backchannel_logout`): `LogoutEntry`, claim under a lease, retry, complete. Entries are queued by `drop_grant` in `db/grant.rs`. |
@@ -97,9 +98,9 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 27 tests in eleven files:
+  `cargo test --workspace` runs the unit tests of both crates plus 33 tests in eleven files:
   `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (5),
-  `static_client_startup` (3), `log_hygiene_credential_store` (1) and
+  `static_client_startup` (9), `log_hygiene_credential_store` (1) and
   `log_capture_callsite_interest` (1), which need nothing; `account_linking_dual_write` (6), which needs the test Redis, and `log_hygiene`
   (4, one of them needs it);
   `credential_migration_live` (2), which needs its own disposable, empty Redis named by

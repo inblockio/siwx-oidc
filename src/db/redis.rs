@@ -2286,6 +2286,7 @@ mod tests {
             device_id: None,
             localpart: None,
             scope: None,
+            client_class: None,
         }
     }
 
@@ -3159,6 +3160,49 @@ mod tests {
             "the upgrade must not give a static client an expiry"
         );
         client.del_raw(&key).await.ok();
+    }
+
+    /// The start-up sync stores a generic static client as it is, class and scope policy
+    /// included, with no expiry.
+    #[tokio::test]
+    async fn the_static_client_sync_stores_the_class_and_scope_policy() {
+        use crate::db::{ClientClass, ClientEntry, SiwxClientMetadata};
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let id = format!("sync-generic-{}", unique_nonce());
+        let key = format!("clients/{id}");
+        let tracking = format!("sync-test-tracking-{}", unique_nonce());
+        let metadata = SiwxClientMetadata::new(
+            vec![openidconnect::RedirectUrl::new("https://mail.example.org/cb".into()).unwrap()],
+            Default::default(),
+        );
+        let entry = ClientEntry {
+            class: ClientClass::Generic,
+            allowed_scopes: Some(vec!["openid".into(), "io.inblock.mail".into()]),
+            always_granted_scopes: vec!["io.inblock.mail".into()],
+            ..ClientEntry::new("not-a-secret-test-fixture", metadata, None)
+        };
+
+        client
+            .sync_static_clients_in(&tracking, vec![(id.clone(), entry)])
+            .await
+            .unwrap();
+
+        let read = client.get_client(id).await.unwrap().unwrap();
+        let ttl = client.ttl_raw(&key).await.unwrap();
+        client.del_raw(&key).await.ok();
+        client.del_raw(&tracking).await.ok();
+        assert_eq!(read.class, ClientClass::Generic);
+        assert_eq!(
+            read.allowed_scopes,
+            Some(vec!["openid".to_string(), "io.inblock.mail".to_string()])
+        );
+        assert_eq!(
+            read.always_granted_scopes,
+            vec!["io.inblock.mail".to_string()]
+        );
+        assert_eq!(ttl, -1, "a static client has no expiry");
     }
 
     /// The first read of a plaintext generic client replaces the entry by its digest-only
