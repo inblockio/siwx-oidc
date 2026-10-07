@@ -122,6 +122,9 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   `e2e_backchannel_logout` needs a second siwx-oidc in generic mode (no MAS shared secret, its
   own port and Redis database, `localhost` in `SIWXOIDC_BACKCHANNEL_LOGOUT_ALLOWED_HOSTS`) and
   uses the stub relying party in the Synapse mock (`/__rp/*`); see e2e/README.md.
+  `e2e_generic_client` needs the generic-class static client `maile2e` and
+  `SIWXOIDC_MAIL_DOMAIN` on the Matrix-mode server only (`e2e/env.sh` and the CI step set them);
+  the generic-mode server starts without both, because it refuses a generic-class client.
 - **Live suites** need a real Synapse and run in no CI job: `e2e_did_field_live` (a patched
   Synapse), `e2e_account_lifecycle_live`, five of the six `e2e_msc4191_live` tests,
   `e2e_msc3861::msc4191_metadata_advertised_and_forwarded` and `e2e_messaging`. Set
