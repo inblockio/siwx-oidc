@@ -296,9 +296,10 @@ pub struct CodeEntry {
     /// answers as it did before the scope travelled.
     #[serde(default)]
     pub scope: Option<String>,
-    /// The class of the client the code was issued to. `None` for a code written before
-    /// the class was recorded, which a new build reads for up to [`ENTRY_LIFETIME`], so
-    /// `#[serde(default)]`.
+    /// The class of the client the code was issued to: the branch `sign_in` took (a
+    /// Matrix-class sign-in provisions a device, a generic-class one does not). `None` for a
+    /// code written before the class was recorded, which a new build reads for up to
+    /// [`ENTRY_LIFETIME`], so `#[serde(default)]`.
     #[serde(default)]
     pub client_class: Option<ClientClass>,
 }
