@@ -98,9 +98,9 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 33 tests in eleven files:
+  `cargo test --workspace` runs the unit tests of both crates plus 34 tests in eleven files:
   `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (5),
-  `static_client_startup` (9), `log_hygiene_credential_store` (1) and
+  `static_client_startup` (10), `log_hygiene_credential_store` (1) and
   `log_capture_callsite_interest` (1), which need nothing; `account_linking_dual_write` (6), which needs the test Redis, and `log_hygiene`
   (4, one of them needs it);
   `credential_migration_live` (2), which needs its own disposable, empty Redis named by

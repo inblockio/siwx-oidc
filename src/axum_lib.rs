@@ -1384,6 +1384,7 @@ fn parse_default_clients(config: &config::Config) -> anyhow::Result<Vec<(String,
     let deployment = client_policy::Deployment {
         mail_domain: config.mail_domain.as_deref(),
         delegated_auth: oidc::delegated_auth_enabled(config),
+        synapse_configured: config.synapse_endpoint.is_some(),
     };
     client_policy::parse_static_clients(&config.default_clients, deployment)
         .map_err(anyhow::Error::msg)
@@ -2497,8 +2498,8 @@ mod default_clients_tests {
     }
 
     /// The start-up parse hands the policy this deployment's settings: a generic client
-    /// needs the MAS shared secret (a Synapse), and the mail scope needs the mail domain.
-    /// No Redis: the parse reads none.
+    /// needs the MAS shared secret and the Synapse endpoint (the Synapse client exists only
+    /// with both), and the mail scope needs the mail domain. No Redis: the parse reads none.
     #[test]
     fn a_generic_static_client_is_checked_against_the_deployment_it_runs_in() {
         let entry = r#"{"secret":"not-a-secret-test-fixture","metadata":{"redirect_uris":["https://mail.example.org/cb"]},"class":"generic","allowed_scopes":["openid","io.inblock.mail"]}"#;
@@ -2517,6 +2518,14 @@ mod default_clients_tests {
         );
 
         config.mas_shared_secret = Some("not-a-secret-test-fixture".into());
+        let without_endpoint = refusal(&config);
+        assert!(
+            without_endpoint.starts_with("default_clients.mailer:")
+                && without_endpoint.contains("SIWXOIDC_SYNAPSE_ENDPOINT"),
+            "{without_endpoint}"
+        );
+
+        config.synapse_endpoint = Some("http://synapse.example.org:8008".parse().unwrap());
         let without_domain = refusal(&config);
         assert!(
             without_domain.starts_with("default_clients.mailer:")

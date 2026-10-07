@@ -24,6 +24,10 @@ pub struct Deployment<'a> {
     /// Whether `mas_shared_secret` is set (delegated-auth mode): the deployment has a
     /// Synapse that supplies the account and the localpart of a signed-in user.
     pub delegated_auth: bool,
+    /// Whether `synapse_endpoint` is set. The Synapse client exists only when this and
+    /// `mas_shared_secret` both are; without it a sign-in provisions no account and
+    /// resolves no localpart.
+    pub synapse_configured: bool,
 }
 
 /// What a generic client is granted: every requested scope that is in `allowed`, in
@@ -201,6 +205,13 @@ pub fn validate_static_client(
                         .into(),
                 );
             }
+            if !deployment.synapse_configured {
+                return refuse(
+                    "a generic client needs `synapse_endpoint` (SIWXOIDC_SYNAPSE_ENDPOINT): \
+                     without it no account is provisioned and no localpart is resolved"
+                        .into(),
+                );
+            }
             let Some(allowed) = entry.allowed_scopes.as_deref() else {
                 return refuse("a generic client needs `allowed_scopes`".into());
             };
@@ -281,6 +292,7 @@ mod tests {
         Deployment {
             mail_domain,
             delegated_auth: true,
+            synapse_configured: true,
         }
     }
 
@@ -598,9 +610,13 @@ mod tests {
         )
         .is_ok());
         let without_domain = deployment(None);
-        let without_synapse = Deployment {
-            mail_domain: domain,
+        let without_secret = Deployment {
             delegated_auth: false,
+            ..deployment(domain)
+        };
+        let without_endpoint = Deployment {
+            synapse_configured: false,
+            ..deployment(domain)
         };
         let refused = [
             (
@@ -658,10 +674,16 @@ mod tests {
                 "`` is not a scope",
             ),
             (
-                "generic-without-a-synapse",
+                "generic-without-a-mas-secret",
                 entry(ClientClass::Generic, Some(&["openid"])),
-                without_synapse,
+                without_secret,
                 "needs `mas_shared_secret`",
+            ),
+            (
+                "generic-without-a-synapse-endpoint",
+                entry(ClientClass::Generic, Some(&["openid"])),
+                without_endpoint,
+                "needs `synapse_endpoint`",
             ),
         ];
         for (id, e, d, rule) in refused {
@@ -690,16 +712,22 @@ mod tests {
     /// class needs a Synapse.
     #[test]
     fn a_matrix_class_client_is_valid_without_a_synapse() {
-        let without_synapse = Deployment {
-            mail_domain: None,
-            delegated_auth: false,
-        };
-        assert!(validate_static_client(
-            "element",
-            &entry(ClientClass::Matrix, None),
-            without_synapse
-        )
-        .is_ok());
+        for (delegated_auth, synapse_configured) in [(false, false), (true, false), (false, true)] {
+            let without_synapse = Deployment {
+                mail_domain: None,
+                delegated_auth,
+                synapse_configured,
+            };
+            assert!(
+                validate_static_client(
+                    "element",
+                    &entry(ClientClass::Matrix, None),
+                    without_synapse
+                )
+                .is_ok(),
+                "delegated_auth {delegated_auth}, synapse_configured {synapse_configured}"
+            );
+        }
     }
 
     #[test]
@@ -815,20 +843,36 @@ mod tests {
         );
         assert!(no_domain.contains("SIWXOIDC_MAIL_DOMAIN"), "{no_domain}");
 
-        let no_synapse = refusal(
+        let no_secret = refusal(
             &[("mail", MAIL_ENTRY)],
             Deployment {
-                mail_domain: Some("matrix.example.org"),
                 delegated_auth: false,
+                ..served
             },
         );
         assert!(
-            no_synapse.starts_with("default_clients.mail:"),
-            "{no_synapse}"
+            no_secret.starts_with("default_clients.mail:"),
+            "{no_secret}"
         );
         assert!(
-            no_synapse.contains("SIWXOIDC_MAS_SHARED_SECRET"),
-            "{no_synapse}"
+            no_secret.contains("SIWXOIDC_MAS_SHARED_SECRET"),
+            "{no_secret}"
+        );
+
+        let no_endpoint = refusal(
+            &[("mail", MAIL_ENTRY)],
+            Deployment {
+                synapse_configured: false,
+                ..served
+            },
+        );
+        assert!(
+            no_endpoint.starts_with("default_clients.mail:"),
+            "{no_endpoint}"
+        );
+        assert!(
+            no_endpoint.contains("SIWXOIDC_SYNAPSE_ENDPOINT"),
+            "{no_endpoint}"
         );
 
         let both = refusal(&[("zeta", "{}"), ("alpha", "{}")], served);
