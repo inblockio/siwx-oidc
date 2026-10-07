@@ -9131,6 +9131,44 @@ mod end_session_tests {
         }
     }
 
+    /// `/register` is the only client-creation path a caller without credentials can reach,
+    /// so no member of the request may select the generic class or grant scopes.
+    #[tokio::test]
+    async fn a_dynamically_registered_client_is_always_matrix_class() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let payload: SiwxClientMetadata = serde_json::from_value(serde_json::json!({
+            "redirect_uris": ["https://app.example.org/callback"],
+            "class": "generic",
+            "allowed_scopes": ["openid", "io.inblock.mail"],
+            "always_granted_scopes": ["io.inblock.mail"],
+        }))
+        .unwrap();
+        let response = register(
+            payload,
+            Config::default().base_url,
+            &db,
+            &RegistrationPolicy::default(),
+        )
+        .await
+        .unwrap();
+        let id = response.client_id().to_string();
+        let entry = db
+            .get_client(id.clone())
+            .await
+            .unwrap()
+            .expect("registered");
+        db.delete_client(id).await.ok();
+        assert_eq!(
+            entry.class,
+            ClientClass::Matrix,
+            "/register can never create a generic client"
+        );
+        assert_eq!(entry.allowed_scopes, None);
+        assert!(entry.always_granted_scopes.is_empty());
+    }
+
     /// End-to-end in process, generic mode: an `oidc` grant from a real code
     /// exchange is ended by its ID token, and the RP is sent back to its exact
     /// registered URI with `state`; an expired hint naming another grant ends

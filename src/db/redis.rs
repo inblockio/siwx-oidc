@@ -3160,4 +3160,54 @@ mod tests {
         );
         client.del_raw(&key).await.ok();
     }
+
+    /// The first read of a plaintext generic client replaces the entry by its digest-only
+    /// form and keeps its class and scope policy, in the entry it returns, in the stored
+    /// value and in every later read.
+    #[tokio::test]
+    async fn an_upgraded_plaintext_client_keeps_its_class_and_scope_policy() {
+        use crate::db::ClientClass;
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let id = format!("plaintext-generic-{}", unique_nonce());
+        let key = format!("clients/{id}");
+        let secret = "not-a-secret-test-fixture";
+        let scopes = ["openid", "profile", "io.inblock.mail"];
+        let plaintext = serde_json::json!({
+            "secret": secret,
+            "metadata": {"redirect_uris": ["https://mail.example.org/callback"]},
+            "class": "generic",
+            "allowed_scopes": scopes,
+            "always_granted_scopes": ["io.inblock.mail"],
+        })
+        .to_string();
+        client.set_raw(&key, &plaintext).await.unwrap();
+
+        let first = client.get_client(id.clone()).await.unwrap().unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_str(&client.get_raw(&key).await.unwrap().unwrap()).unwrap();
+        let second = client.get_client(id).await.unwrap().unwrap();
+        client.del_raw(&key).await.ok();
+
+        assert!(stored.get("secret").is_none(), "upgraded: {stored}");
+        assert_eq!(stored["class"], "generic");
+        assert_eq!(stored["allowed_scopes"], serde_json::json!(scopes));
+        assert_eq!(
+            stored["always_granted_scopes"],
+            serde_json::json!(["io.inblock.mail"])
+        );
+        for entry in [first, second] {
+            assert!(entry.secret_matches(secret));
+            assert_eq!(entry.class, ClientClass::Generic);
+            assert_eq!(
+                entry.allowed_scopes,
+                Some(scopes.iter().map(|s| s.to_string()).collect())
+            );
+            assert_eq!(
+                entry.always_granted_scopes,
+                vec!["io.inblock.mail".to_string()]
+            );
+        }
+    }
 }

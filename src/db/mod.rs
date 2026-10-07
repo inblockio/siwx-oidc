@@ -347,6 +347,23 @@ pub type SiwxClientRegistrationResponse = ClientRegistrationResponse<
     CoreSubjectIdentifierType,
 >;
 
+/// The class a client is registered with; `client_policy` holds the rules for each.
+///
+/// `Matrix` is the default for every client, dynamic registrations included, and is
+/// what every client was before classes existed. `Generic` is settable only through
+/// `default_clients`: it needs [`ClientEntry::allowed_scopes`], and start-up refuses a
+/// Matrix or Synapse scope in them.
+///
+/// Test a class with an exhaustive `match`, never `==` or `!=`: a class added later must
+/// make every such decision fail to compile instead of falling into the `else`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientClass {
+    #[default]
+    Matrix,
+    Generic,
+}
+
 /// A client's registration. The client secret and the registration access
 /// token are stored only as their SHA-256 digests ([`tokens::digest`]), and a
 /// presented value is compared with them digest against digest
@@ -361,12 +378,32 @@ pub type SiwxClientRegistrationResponse = ClientRegistrationResponse<
 /// on the way in; it serializes only the digests. The member names differ on
 /// purpose: a stored digest presented as the secret is digested again and
 /// never matches.
+///
+/// The class and the scope policy are not credentials and are stored as they
+/// are. An entry written before they existed reads as a [`ClientClass::Matrix`]
+/// client with no scope policy, so no existing client changes. A build that
+/// predates the members ignores them and reads a generic client as a Matrix
+/// client, so every instance that shares one Redis must run a build that knows
+/// them.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(try_from = "StoredClientEntry")]
 pub struct ClientEntry {
     pub secret_digest: String,
     pub metadata: SiwxClientMetadata,
     pub access_token_digest: Option<String>,
+    /// See [`ClientClass`]. `Matrix` for every dynamic registration: `POST /register`
+    /// builds its entry with [`ClientEntry::new`], so nothing in a request can reach
+    /// the class or the scope policy.
+    pub class: ClientClass,
+    /// The scopes a generic client may be granted. Meaningful only for
+    /// [`ClientClass::Generic`]; start-up refuses it on any other static client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_scopes: Option<Vec<String>>,
+    /// Scopes a generic client is granted even when it does not request them, for a
+    /// client that cannot ask for a scope it needs. Start-up requires them to be a
+    /// subset of `allowed_scopes` and refuses `openid`; empty for every other client.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub always_granted_scopes: Vec<String>,
 }
 
 /// Every form a client entry is read in; see [`ClientEntry`].
@@ -381,6 +418,12 @@ struct StoredClientEntry {
     access_token_digest: Option<String>,
     #[serde(default)]
     access_token: Option<RegistrationAccessToken>,
+    #[serde(default)]
+    class: ClientClass,
+    #[serde(default)]
+    allowed_scopes: Option<Vec<String>>,
+    #[serde(default)]
+    always_granted_scopes: Vec<String>,
 }
 
 impl TryFrom<StoredClientEntry> for ClientEntry {
@@ -408,18 +451,26 @@ impl TryFrom<StoredClientEntry> for ClientEntry {
             secret_digest,
             metadata: stored.metadata,
             access_token_digest,
+            class: stored.class,
+            allowed_scopes: stored.allowed_scopes,
+            always_granted_scopes: stored.always_granted_scopes,
         })
     }
 }
 
 impl ClientEntry {
-    /// The registration of a client with `secret` and, if it has one, the
-    /// registration access token `access_token`; it keeps their digests.
+    /// The registration of a [`ClientClass::Matrix`] client with no scope policy,
+    /// with `secret` and, if it has one, the registration access token
+    /// `access_token`; it keeps their digests. The only constructor `POST /register`
+    /// uses.
     pub fn new(secret: &str, metadata: SiwxClientMetadata, access_token: Option<&str>) -> Self {
         ClientEntry {
             secret_digest: tokens::digest(secret),
             metadata,
             access_token_digest: access_token.map(tokens::digest),
+            class: ClientClass::Matrix,
+            allowed_scopes: None,
+            always_granted_scopes: Vec::new(),
         }
     }
 
@@ -447,7 +498,8 @@ fn digests_match(a: &str, b: &str) -> bool {
 /// The digest-only form of a stored client entry that holds its secret or its
 /// registration access token in the clear (written by a build before digest
 /// keys), or `None` when it holds neither. Only those two members change, so
-/// nothing else the entry holds is lost.
+/// nothing else the entry holds is lost: not the class, not the scope policy, not a
+/// member this build does not know.
 /// TODO(remove once no entry a build before Phase 2b wrote can be alive:
 /// [`CLIENT_LIFETIME`] after the deploy).
 pub fn client_entry_without_plaintext(stored: &serde_json::Value) -> Option<serde_json::Value> {
@@ -1177,6 +1229,114 @@ mod client_entry_tests {
         let mut none = plaintext_entry();
         none.as_object_mut().unwrap().remove("secret");
         assert!(serde_json::from_value::<ClientEntry>(none).is_err());
+    }
+
+    const MAIL_SCOPES: [&str; 3] = ["openid", "profile", "io.inblock.mail"];
+
+    /// A generic client as `default_clients` configures it.
+    fn generic_plaintext_entry() -> serde_json::Value {
+        serde_json::json!({
+            "secret": "the-client-secret",
+            "metadata": metadata(),
+            "class": "generic",
+            "allowed_scopes": MAIL_SCOPES,
+            "always_granted_scopes": ["io.inblock.mail"],
+        })
+    }
+
+    fn scopes(scopes: &[&str]) -> Vec<String> {
+        scopes.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_client_class_is_stored_under_its_lowercase_name() {
+        for class in [ClientClass::Matrix, ClientClass::Generic] {
+            let name = match class {
+                ClientClass::Matrix => "matrix",
+                ClientClass::Generic => "generic",
+            };
+            assert_eq!(serde_json::to_value(class).unwrap(), name);
+            assert_eq!(
+                serde_json::from_value::<ClientClass>(serde_json::json!(name)).unwrap(),
+                class
+            );
+        }
+        assert_eq!(ClientClass::default(), ClientClass::Matrix);
+    }
+
+    /// Both the stored form and the configured form an earlier build wrote carry no
+    /// class; they read as the behaviour every client had.
+    #[test]
+    fn a_client_entry_written_before_client_classes_reads_as_matrix() {
+        let stored_by_the_previous_build = serde_json::json!({
+            "secret_digest": tokens::digest("the-client-secret"),
+            "metadata": metadata(),
+            "access_token_digest": null,
+        });
+        for old in [plaintext_entry(), stored_by_the_previous_build] {
+            let entry: ClientEntry = serde_json::from_value(old).unwrap();
+            assert_eq!(entry.class, ClientClass::Matrix);
+            assert_eq!(entry.allowed_scopes, None);
+            assert!(entry.always_granted_scopes.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_generic_client_entry_parses_from_default_clients_json() {
+        let entry: ClientEntry = serde_json::from_value(generic_plaintext_entry()).unwrap();
+        assert_eq!(entry.class, ClientClass::Generic);
+        assert_eq!(entry.allowed_scopes, Some(scopes(&MAIL_SCOPES)));
+        assert_eq!(entry.always_granted_scopes, scopes(&["io.inblock.mail"]));
+        assert!(entry.secret_matches("the-client-secret"));
+        assert_eq!(entry.access_token_digest, None);
+
+        let mut without_always_granted = generic_plaintext_entry();
+        without_always_granted
+            .as_object_mut()
+            .unwrap()
+            .remove("always_granted_scopes");
+        let entry: ClientEntry = serde_json::from_value(without_always_granted).unwrap();
+        assert!(entry.always_granted_scopes.is_empty());
+    }
+
+    #[test]
+    fn a_client_entry_survives_a_storage_round_trip() {
+        let generic: ClientEntry = serde_json::from_value(generic_plaintext_entry()).unwrap();
+        let stored = serde_json::to_string(&generic).unwrap();
+        assert!(!stored.contains("the-client-secret"), "{stored}");
+        let read: ClientEntry = serde_json::from_str(&stored).unwrap();
+        assert_eq!(read.class, ClientClass::Generic);
+        assert_eq!(read.allowed_scopes, Some(scopes(&MAIL_SCOPES)));
+        assert_eq!(read.always_granted_scopes, scopes(&["io.inblock.mail"]));
+        assert!(read.secret_matches("the-client-secret"));
+
+        let matrix = serde_json::to_value(ClientEntry::new("s", metadata(), None)).unwrap();
+        assert_eq!(matrix["class"], "matrix");
+        assert!(
+            matrix.get("allowed_scopes").is_none() && matrix.get("always_granted_scopes").is_none(),
+            "a Matrix-class entry stores no scope policy: {matrix}"
+        );
+    }
+
+    /// The upgrade of a plaintext entry rewrites it in place; a configured generic client
+    /// must come out of it as the same generic client.
+    #[test]
+    fn an_upgraded_plaintext_entry_keeps_its_class_and_scope_policy() {
+        let upgraded =
+            client_entry_without_plaintext(&generic_plaintext_entry()).expect("a plaintext entry");
+        assert_eq!(upgraded["class"], "generic");
+        assert_eq!(upgraded["allowed_scopes"], serde_json::json!(MAIL_SCOPES));
+        assert_eq!(
+            upgraded["always_granted_scopes"],
+            serde_json::json!(["io.inblock.mail"])
+        );
+        assert!(upgraded.get("secret").is_none(), "{upgraded}");
+
+        let read: ClientEntry = serde_json::from_value(upgraded).unwrap();
+        assert_eq!(read.class, ClientClass::Generic);
+        assert_eq!(read.allowed_scopes, Some(scopes(&MAIL_SCOPES)));
+        assert_eq!(read.always_granted_scopes, scopes(&["io.inblock.mail"]));
+        assert!(read.secret_matches("the-client-secret"));
     }
 }
 
