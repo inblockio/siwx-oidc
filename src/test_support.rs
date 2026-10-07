@@ -7,6 +7,11 @@
 //!   a machine without Redis.
 //! - With `SIWX_TEST_REQUIRE_REDIS=1` the same test panics instead. CI sets it,
 //!   so a CI run can never report an unexercised Redis test as a pass.
+//! - Every client it returns records static clients in a set of its own, never the
+//!   real `clients:static`. The start-up sync deletes each client its set records
+//!   that the configured map no longer names, and the Redis a test reaches can be a
+//!   running stack's or a developer's deployment's: a sync through the real set
+//!   would delete that stack's static clients.
 //!
 //! Not `#[cfg(test)]`, on purpose: the binary crate's unit tests and every
 //! `tests/*.rs` file link this library compiled *without* `cfg(test)`, so a
@@ -54,34 +59,40 @@ fn required_from(value: Option<&str>) -> bool {
     }
 }
 
+/// The test Redis's URL on database `db` of the same server.
+pub fn redis_db_url(db: u8) -> Url {
+    let mut url = redis_url();
+    url.set_path(&format!("/{db}"));
+    url
+}
+
 /// A client for the test Redis, or `None` after [`skip_or_fail`] when it is
-/// unreachable.
+/// unreachable. It records static clients in a set of its own (see the module
+/// docs), so a start-up sync through it prunes only what it wrote itself.
 pub async fn redis() -> Option<RedisClient> {
-    let url = redis_url();
-    if let Err(reason) = probe(&url).await {
-        return skip_or_fail(&format!("no Redis at {} ({reason})", redacted(&url)));
-    }
-    Some(
-        RedisClient::new(&url)
-            .await
-            .unwrap_or_else(|e| panic!("{REDIS_URL_VAR}: cannot build a client: {e:#}")),
-    )
+    connect(redis_url()).await
 }
 
 /// [`redis`] on database `db` of the same server, for a test that must not
 /// share a database with the others (one that claims every due outbox entry
-/// in it, say). Each such test takes its own number.
+/// in it, say). Each such test takes its own number; taken so far: 9 (the
+/// outbox), 10 (back-channel logout), 11 (static-client isolation).
 pub async fn redis_db(db: u8) -> Option<RedisClient> {
-    let mut url = redis_url();
-    url.set_path(&format!("/{db}"));
+    connect(redis_db_url(db)).await
+}
+
+/// The one way a test client is built, so none can come without its own set.
+async fn connect(url: Url) -> Option<RedisClient> {
     if let Err(reason) = probe(&url).await {
         return skip_or_fail(&format!("no Redis at {} ({reason})", redacted(&url)));
     }
-    Some(
-        RedisClient::new(&url)
-            .await
-            .unwrap_or_else(|e| panic!("{REDIS_URL_VAR}: cannot build a client: {e:#}")),
-    )
+    let client = RedisClient::new(&url)
+        .await
+        .unwrap_or_else(|e| panic!("{REDIS_URL_VAR}: cannot build a client: {e:#}"));
+    Some(client.with_static_clients_key(format!(
+        "clients:static:test-{}",
+        uuid::Uuid::new_v4().simple()
+    )))
 }
 
 /// One bounded `PING` on a fresh connection, proving a Redis answers at `url`.

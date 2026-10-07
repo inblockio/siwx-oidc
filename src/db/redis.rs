@@ -30,6 +30,10 @@ pub struct RedisClient {
     /// Whether a reuse event revokes its grant (I5 phase B); off by default.
     /// Set with [`RedisClient::with_reuse_enforcement`].
     pub(super) reuse_revokes_grant: bool,
+    /// The Redis SET that records the static clients this client syncs
+    /// ([`DBClient::sync_static_clients`]): `clients:static` unless
+    /// [`RedisClient::with_static_clients_key`] names another.
+    pub(super) static_clients_key: String,
 }
 
 /// Redis key for the per-`(username, device_id)` token index SET.
@@ -367,7 +371,17 @@ impl RedisClient {
             pool,
             lifetime: Default::default(),
             reuse_revokes_grant: false,
+            static_clients_key: KV_STATIC_CLIENTS_KEY.to_string(),
         })
+    }
+
+    /// Record the static clients this client syncs in the SET `key` instead of the real
+    /// `clients:static`. A sync deletes every client its set records that the new map no
+    /// longer names, so a client that must never reach the static clients of a deployment
+    /// sharing its Redis (the tests' own, `test_support`) records them in a set of its own.
+    pub(crate) fn with_static_clients_key(mut self, key: impl Into<String>) -> Self {
+        self.static_clients_key = key.into();
+        self
     }
 }
 
@@ -1122,54 +1136,6 @@ impl RedisClient {
     }
 }
 
-impl RedisClient {
-    /// [`DBClient::sync_static_clients`] against an explicit tracking set, so a test can
-    /// use its own set and never prune the static clients of a running stack.
-    async fn sync_static_clients_in(
-        &self,
-        set_key: &str,
-        clients: Vec<(String, ClientEntry)>,
-    ) -> Result<usize> {
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
-        let previous: Vec<String> = conn
-            .smembers(set_key)
-            .await
-            .map_err(|e| anyhow!("Failed to read the static client set: {}", e))?;
-        for (id, entry) in &clients {
-            let value = serde_json::to_string(entry)
-                .map_err(|e| anyhow!("Failed to serialize client entry: {}", e))?;
-            // Tracked before it is written: a failure between the two commands then leaves a
-            // tracked id without a client, which pruning handles, and never a client without
-            // a TTL that nothing tracks.
-            conn.sadd::<_, _, ()>(set_key, id)
-                .await
-                .map_err(|e| anyhow!("Failed to record a static client: {}", e))?;
-            // A plain SET also clears a TTL that an older build wrote on this key.
-            conn.set::<_, _, ()>(format!("{}/{}", KV_CLIENT_PREFIX, id), value)
-                .await
-                .map_err(|e| anyhow!("Failed to set kv: {}", e))?;
-        }
-        let mut pruned = 0;
-        for id in previous
-            .iter()
-            .filter(|id| !clients.iter().any(|(kept, _)| kept == *id))
-        {
-            conn.del::<_, ()>(format!("{}/{}", KV_CLIENT_PREFIX, id))
-                .await
-                .map_err(|e| anyhow!("Failed to delete a removed static client: {}", e))?;
-            conn.srem::<_, _, ()>(set_key, id)
-                .await
-                .map_err(|e| anyhow!("Failed to untrack a removed static client: {}", e))?;
-            pruned += 1;
-        }
-        Ok(pruned)
-    }
-}
-
 #[async_trait]
 impl DBClient for RedisClient {
     async fn server_time_ms(&self) -> Result<i64> {
@@ -1249,8 +1215,44 @@ impl DBClient for RedisClient {
     }
 
     async fn sync_static_clients(&self, clients: Vec<(String, ClientEntry)>) -> Result<usize> {
-        self.sync_static_clients_in(KV_STATIC_CLIENTS_KEY, clients)
+        let set_key = self.static_clients_key.as_str();
+        let mut conn = self
+            .pool
+            .get()
             .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+        let previous: Vec<String> = conn
+            .smembers(set_key)
+            .await
+            .map_err(|e| anyhow!("Failed to read the static client set: {}", e))?;
+        for (id, entry) in &clients {
+            let value = serde_json::to_string(entry)
+                .map_err(|e| anyhow!("Failed to serialize client entry: {}", e))?;
+            // Tracked before it is written: a failure between the two commands then leaves a
+            // tracked id without a client, which pruning handles, and never a client without
+            // a TTL that nothing tracks.
+            conn.sadd::<_, _, ()>(set_key, id)
+                .await
+                .map_err(|e| anyhow!("Failed to record a static client: {}", e))?;
+            // A plain SET also clears a TTL that an older build wrote on this key.
+            conn.set::<_, _, ()>(format!("{}/{}", KV_CLIENT_PREFIX, id), value)
+                .await
+                .map_err(|e| anyhow!("Failed to set kv: {}", e))?;
+        }
+        let mut pruned = 0;
+        for id in previous
+            .iter()
+            .filter(|id| !clients.iter().any(|(kept, _)| kept == *id))
+        {
+            conn.del::<_, ()>(format!("{}/{}", KV_CLIENT_PREFIX, id))
+                .await
+                .map_err(|e| anyhow!("Failed to delete a removed static client: {}", e))?;
+            conn.srem::<_, _, ()>(set_key, id)
+                .await
+                .map_err(|e| anyhow!("Failed to untrack a removed static client: {}", e))?;
+            pruned += 1;
+        }
+        Ok(pruned)
     }
 
     async fn touch_client(&self, client_id: &str) -> Result<()> {
@@ -2955,15 +2957,14 @@ mod tests {
 
     /// A static client carries no TTL after start-up, a TTL an older build wrote is
     /// cleared, and a static client removed from the configuration is deleted at the
-    /// next sync. Uses its own tracking set, so it can never prune the static clients of
-    /// a stack that shares this Redis.
+    /// next sync. The test client tracks static clients in a set of its own, so it can
+    /// never prune the static clients of a stack that shares this Redis.
     #[tokio::test]
     async fn static_clients_never_expire() {
         let Some(client) = crate::test_support::redis().await else {
             return;
         };
         let n = unique_nonce();
-        let set_key = format!("clients:static:test-{n}");
         let kept = format!("static-kept-{n}");
         let removed = format!("static-removed-{n}");
         let kept_key = format!("clients/{kept}");
@@ -2980,13 +2981,10 @@ mod tests {
         );
 
         let pruned = client
-            .sync_static_clients_in(
-                &set_key,
-                vec![
-                    (kept.clone(), lifetime_test_entry()),
-                    (removed.clone(), lifetime_test_entry()),
-                ],
-            )
+            .sync_static_clients(vec![
+                (kept.clone(), lifetime_test_entry()),
+                (removed.clone(), lifetime_test_entry()),
+            ])
             .await
             .unwrap();
         assert_eq!(pruned, 0);
@@ -2999,7 +2997,7 @@ mod tests {
 
         // The next start no longer configures `removed`.
         let pruned = client
-            .sync_static_clients_in(&set_key, vec![(kept.clone(), lifetime_test_entry())])
+            .sync_static_clients(vec![(kept.clone(), lifetime_test_entry())])
             .await
             .unwrap();
         assert_eq!(pruned, 1, "exactly the removed client is pruned");
@@ -3011,7 +3009,7 @@ mod tests {
         assert_eq!(client.ttl_raw(&kept_key).await.unwrap(), -1);
 
         client.del_raw(&kept_key).await.ok();
-        client.del_raw(&set_key).await.ok();
+        client.del_raw(&client.static_clients_key).await.ok();
     }
 
     #[tokio::test]
@@ -3034,11 +3032,10 @@ mod tests {
             "a used dynamic client gets its full lifetime back, got {ttl}"
         );
 
-        let set_key = format!("clients:static:test-{n}");
         let fixed = format!("static-{n}");
         let fixed_key = format!("clients/{fixed}");
         client
-            .sync_static_clients_in(&set_key, vec![(fixed.clone(), lifetime_test_entry())])
+            .sync_static_clients(vec![(fixed.clone(), lifetime_test_entry())])
             .await
             .unwrap();
         client.touch_client(&fixed).await.unwrap();
@@ -3056,7 +3053,7 @@ mod tests {
             "touching an unknown id creates nothing"
         );
 
-        for key in [dynamic_key, fixed_key, set_key] {
+        for key in [dynamic_key, fixed_key, client.static_clients_key.clone()] {
             client.del_raw(&key).await.ok();
         }
     }
@@ -3070,11 +3067,10 @@ mod tests {
             return;
         };
         let n = unique_nonce();
-        let set_key = format!("clients:static:test-{n}");
         let fixed = format!("static-{n}");
         let fixed_key = format!("clients/{fixed}");
         client
-            .sync_static_clients_in(&set_key, vec![(fixed.clone(), lifetime_test_entry())])
+            .sync_static_clients(vec![(fixed.clone(), lifetime_test_entry())])
             .await
             .unwrap();
 
@@ -3114,7 +3110,7 @@ mod tests {
             "a rewritten dynamic client gets its full lifetime back, got {ttl}"
         );
 
-        for key in [fixed_key, dynamic_key, set_key] {
+        for key in [fixed_key, dynamic_key, client.static_clients_key.clone()] {
             client.del_raw(&key).await.ok();
         }
     }

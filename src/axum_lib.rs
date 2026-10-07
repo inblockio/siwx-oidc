@@ -2444,6 +2444,77 @@ mod client_credentials_tests {
 }
 
 #[cfg(test)]
+mod start_up_write_isolation_tests {
+    //! The start-up write deletes every client the real set `clients:static` records and
+    //! the configured map no longer names. The Redis a test reaches can be a running
+    //! stack's or a developer's deployment's, so a test's start-up write must never go
+    //! through that set. Needs Redis.
+    use super::*;
+
+    /// The database this test claims, so the real set it writes there is its own.
+    const OWN_DB: u8 = 11;
+
+    fn config_naming(id: &str) -> config::Config {
+        let mut config = config::Config::default();
+        config.default_clients.insert(
+            id.to_string(),
+            serde_json::json!({
+                "secret": "not-a-secret-test-fixture",
+                "metadata": {"redirect_uris": ["https://rp.example.org/cb"]},
+            })
+            .to_string(),
+        );
+        config
+    }
+
+    /// A deployment records its static client in the real set. The start-up write a test
+    /// makes through `test_support` records its own client in a set of its own, so it
+    /// deletes nothing it did not write. The deployment is a plain client on the database
+    /// this test claims: the test never writes to the real set of any other database.
+    #[tokio::test]
+    async fn the_start_up_write_of_a_test_leaves_a_foreign_static_client_alone() {
+        let Some(test_redis) = siwx_oidc::test_support::redis_db(OWN_DB).await else {
+            return;
+        };
+        let deployment = RedisClient::new(&siwx_oidc::test_support::redis_db_url(OWN_DB))
+            .await
+            .unwrap();
+        // Whatever an earlier failed run left in this database's real set.
+        deployment.sync_static_clients(Vec::new()).await.unwrap();
+
+        let foreign = format!("foreign-{}", uuid::Uuid::new_v4().simple());
+        store_default_clients(&config_naming(&foreign), &deployment)
+            .await
+            .unwrap();
+        let ours = format!("default-{}", uuid::Uuid::new_v4().simple());
+        store_default_clients(&config_naming(&ours), &test_redis)
+            .await
+            .unwrap();
+
+        assert!(
+            deployment
+                .get_client(foreign.clone())
+                .await
+                .unwrap()
+                .is_some(),
+            "a test's start-up write deleted a static client it never wrote"
+        );
+        assert_eq!(
+            deployment.sync_static_clients(Vec::new()).await.unwrap(),
+            1,
+            "the real set still records the foreign client, and only it"
+        );
+        assert!(deployment.get_client(foreign).await.unwrap().is_none());
+        assert_eq!(
+            test_redis.sync_static_clients(Vec::new()).await.unwrap(),
+            1,
+            "the test client's own set records exactly the client it wrote"
+        );
+        assert!(test_redis.get_client(ours).await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
 mod default_clients_tests {
     //! `default_clients` are configured in the clear and stored as digests.
     //! In process, because the one static client the mock stack configures has no

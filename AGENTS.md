@@ -112,6 +112,17 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   CI sets both. Use the helper in any new Redis-backed test: `RedisClient::new` never connects
   (bb8 builds the pool with `min_idle` 0), so a `RedisClient::new(..).ok()` guard never skips,
   and without Redis the test fails after bb8's 30-second timeout.
+- **A test never prunes a static client it did not write.** The start-up sync
+  (`store_default_clients`, `DBClient::sync_static_clients`) deletes every client its tracking
+  set records that the configured map no longer names, and the default `redis://localhost` can
+  be a running stack's Redis or a developer's deployment's. Every client the helper returns
+  therefore records static clients in a set of its own (`RedisClient::with_static_clients_key`,
+  a fresh `clients:static:test-…` key per client), never the real `clients:static`; only a
+  production client records there. A test that syncs static clients uses the helper's client,
+  never `RedisClient::new` on the test Redis, and one that needs the real set, as a deployment
+  would write it, claims a database of its own through `redis_db` (the numbers taken are in its
+  doc). Pin: `the_start_up_write_of_a_test_leaves_a_foreign_static_client_alone`,
+  `static_clients_never_expire`.
 - **Tests that pin what is logged** use `siwx_oidc::test_support::LogCapture`, which records the
   calling thread's log output at debug level (use it in a current-thread `#[tokio::test]`). The
   checks that apply to every log site live in `tests/log_hygiene.rs`.

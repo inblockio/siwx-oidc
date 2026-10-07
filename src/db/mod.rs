@@ -30,6 +30,8 @@ pub use self::redis::RedisClient;
 const KV_CLIENT_PREFIX: &str = "clients";
 /// Redis SET of the client ids written from `default_clients`, so the next start can
 /// delete the ones the configuration no longer names. A plain key, outside `clients/`.
+/// Every client records in it except a test's, which names a set of its own
+/// ([`RedisClient::with_static_clients_key`]).
 const KV_STATIC_CLIENTS_KEY: &str = "clients:static";
 
 // Credentials a client holds are stored only as their SHA-256 digest
