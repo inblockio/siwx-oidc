@@ -1553,8 +1553,10 @@ mod tests {
 
         server.abort();
         homeserver.abort();
-        for (user, device) in [(format!("ex-logout-{n}"), prefix), (user.clone(), prefix)] {
-            client.revoke_grants_for_device(&user, device).await.ok();
+        for user in [format!("ex-logout-{n}"), format!("ex-delete-{n}")] {
+            for device in [EX, prefix] {
+                client.revoke_grants_for_device(&user, device).await.ok();
+            }
         }
     }
 

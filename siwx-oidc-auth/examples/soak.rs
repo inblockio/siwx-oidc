@@ -54,6 +54,9 @@ const CLIENT_NAME: &str = "siwx-oidc-auth soak";
 const REFRESH_LEAD: Duration = Duration::from_secs(15);
 const PROBE_EVERY: Duration = Duration::from_secs(60);
 const RETRY_AFTER: Duration = Duration::from_secs(5);
+/// A probe needs this much of the access token's lifetime left: the deadline
+/// is counted from the answer, a little after the server counted it.
+const PROBE_MARGIN: Duration = Duration::from_secs(5);
 /// Unavailability for longer than this, in a row, is a failure.
 const UNAVAILABLE_LIMIT: Duration = Duration::from_secs(120);
 /// Every session is in the current format this long after the first one is.
@@ -124,7 +127,10 @@ struct Session {
     mxid: String,
     access_token: String,
     refresh_token: String,
+    /// When the access token expires (counted from the answer that issued it).
     access_deadline: Instant,
+    /// When to retry a refresh that found the service unavailable.
+    retry_at: Option<Instant>,
     since: Option<String>,
     unavailable_since: Option<Instant>,
     dead: bool,
@@ -154,6 +160,7 @@ async fn refresh_session(target: &Target, client_id: &str, s: &mut Session, shar
     match token_refresh(target, client_id, &s.refresh_token).await {
         Ok(pair) => {
             s.unavailable_since = None;
+            s.retry_at = None;
             s.access_token = pair.access_token;
             s.refresh_token = pair.refresh_token;
             s.access_deadline =
@@ -168,7 +175,7 @@ async fn refresh_session(target: &Target, client_id: &str, s: &mut Session, shar
         }
         Err(Failure::Unavailable(why)) => {
             unavailable(shared, s, "refresh", &why);
-            s.access_deadline = Instant::now() + REFRESH_LEAD + RETRY_AFTER;
+            s.retry_at = Some(Instant::now() + RETRY_AFTER);
         }
         Err(Failure::Refused { status, code }) => {
             let reason = if code.is_empty() {
@@ -258,16 +265,18 @@ async fn run_session(
         if *stop.borrow() {
             break;
         }
-        let refresh_at = s
-            .access_deadline
-            .checked_sub(REFRESH_LEAD)
-            .unwrap_or(s.access_deadline);
+        let refresh_at = s.retry_at.unwrap_or_else(|| {
+            s.access_deadline
+                .checked_sub(REFRESH_LEAD)
+                .unwrap_or(s.access_deadline)
+        });
         let wake = if s.dead {
             Instant::now() + Duration::from_secs(3600)
         } else {
             let now = Instant::now();
-            // A probe due while the access token has expired waits for the refresh.
-            let probe_at = if next_probe <= now && now >= s.access_deadline {
+            // A probe due while the access token has (nearly) expired waits
+            // for the refresh.
+            let probe_at = if next_probe <= now && now + PROBE_MARGIN >= s.access_deadline {
                 refresh_at
             } else {
                 next_probe
@@ -286,7 +295,8 @@ async fn run_session(
         }
         // A probe waits for a refresh that is still being retried: an expired
         // access token would read as a 401 that the outage, not the server, caused.
-        if !s.dead && Instant::now() >= next_probe && Instant::now() < s.access_deadline {
+        let now = Instant::now();
+        if !s.dead && now >= next_probe && now + PROBE_MARGIN < s.access_deadline {
             probe_session(&target, &mut s, &shared).await;
             next_probe = (next_probe + PROBE_EVERY).max(Instant::now());
         }
@@ -328,6 +338,7 @@ async fn sign_in(target: &Target, client_id: &str, index: usize) -> anyhow::Resu
         refresh_token,
         access_deadline: Instant::now()
             + Duration::from_secs(tokens.expires_in.unwrap_or(ACCESS_TTL_DEFAULT)),
+        retry_at: None,
         since: None,
         unavailable_since: None,
         dead: false,
