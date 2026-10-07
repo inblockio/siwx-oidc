@@ -9,6 +9,10 @@
 //!   bash e2e/up.sh
 //!   source e2e/env.sh && SIWEOIDC_HOST="$SIWEOIDC_BASE_URL" \
 //!     cargo test --test e2e_generic_client -- --ignored --test-threads=1
+//!
+//! `no_credential_a_generic_client_holds_is_stored_in_the_clear` also searches the stack's Redis
+//! (`E2E_REDIS_URL`, else `SIWXOIDC_REDIS_URL`, else `SIWEOIDC_REDIS_URL`, which `env.sh` sets).
+//! Without one it skips loudly, and fails under `E2E_STRICT_SKIPS=1`.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signer, SigningKey};
@@ -133,9 +137,20 @@ async fn assert_matrix_refusal(resp: Response, error: &str, what: &str) {
     );
 }
 
-/// The `/token` response to one authorization code flow driven by hand, because the headless
-/// client does not hand back the scope a server names.
-async fn code_exchange(scope: &str) -> Value {
+/// What one authorization code flow driven by hand left in the client's hands.
+struct ByHand {
+    did: String,
+    /// The value of the `session` cookie that `/authorize` set.
+    session_id: String,
+    code: String,
+    verifier: String,
+    /// The `/token` response.
+    token: Value,
+}
+
+/// One authorization code flow driven by hand, because the headless client does not hand back
+/// the scope a server names, the code or the session cookie.
+async fn by_hand(scope: &str) -> ByHand {
     let c = client();
     let base = oidc();
     let seed: [u8; 32] = rand::random();
@@ -225,7 +240,18 @@ async fn code_exchange(scope: &str) -> Value {
         .await
         .unwrap();
     assert_eq!(token.status(), StatusCode::OK, "POST /token");
-    token.json().await.unwrap()
+    ByHand {
+        did,
+        session_id: session.trim_start_matches("session=").to_string(),
+        code,
+        verifier,
+        token: token.json().await.unwrap(),
+    }
+}
+
+/// The `/token` response to one flow driven by hand.
+async fn code_exchange(scope: &str) -> Value {
+    by_hand(scope).await.token
 }
 
 #[tokio::test]
@@ -598,4 +624,234 @@ async fn userinfo_answers_an_unusable_token_with_the_invalid_token_challenge() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert!(resp.headers().get("www-authenticate").is_none());
     assert_eq!(resp.text().await.unwrap(), "Missing access token.");
+}
+
+/// The secret `e2e/env.sh` and the CI job give their static clients.
+const STATIC_CLIENT_SECRET: &str = "not-a-secret-e2e-fixture";
+
+/// The stack's Redis, found the way the I1 scans of `e2e_race_teardown` find it.
+fn stack_redis_url() -> Option<String> {
+    ["E2E_REDIS_URL", "SIWXOIDC_REDIS_URL", "SIWEOIDC_REDIS_URL"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+}
+
+/// Searches every key and every value of the selected database for each string in `ARGV` and
+/// answers `{position} key {key}` or `{position} value of {key}` for each place one appears.
+const FIND_HELD_STRINGS: &str = r#"
+local hits = {}
+local cursor = '0'
+repeat
+  local page = redis.call('SCAN', cursor, 'COUNT', 1000)
+  cursor = page[1]
+  for _, key in ipairs(page[2]) do
+    local kind = redis.call('TYPE', key)['ok']
+    local values = {}
+    if kind == 'string' then values = { redis.call('GET', key) }
+    elseif kind == 'hash' then values = redis.call('HGETALL', key)
+    elseif kind == 'list' then values = redis.call('LRANGE', key, 0, -1)
+    elseif kind == 'set' then values = redis.call('SMEMBERS', key)
+    elseif kind == 'zset' then values = redis.call('ZRANGE', key, 0, -1)
+    elseif kind ~= 'none' then error('a key of type ' .. kind .. ' is not searched') end
+    for position, needle in ipairs(ARGV) do
+      if string.find(key, needle, 1, true) then
+        hits[#hits + 1] = position .. ' key ' .. key
+      end
+      for _, value in ipairs(values) do
+        if type(value) == 'string' and string.find(value, needle, 1, true) then
+          hits[#hits + 1] = position .. ' value of ' .. key
+          break
+        end
+      end
+    end
+  end
+until cursor == '0'
+return hits
+"#;
+
+type StackRedis = bb8_redis::redis::aio::MultiplexedConnection;
+
+async fn connect_to_the_stack_redis(url: &str) -> StackRedis {
+    bb8_redis::redis::Client::open(url)
+        .unwrap_or_else(|e| panic!("stack Redis URL: {e}"))
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap_or_else(|e| panic!("stack Redis at {url} is unreachable: {e}"))
+}
+
+/// Every place in any database of the Redis behind `conn` where one of `held` (label, string)
+/// appears in a key or a value, one line per place.
+async fn find_held_strings(conn: &mut StackRedis, held: &[(String, String)]) -> Vec<String> {
+    use bb8_redis::redis;
+    let (_, databases): (String, u32) = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("databases")
+        .query_async(conn)
+        .await
+        .expect("CONFIG GET databases");
+    let mut hits = Vec::new();
+    for database in 0..databases {
+        let _: () = redis::cmd("SELECT")
+            .arg(database)
+            .query_async(conn)
+            .await
+            .unwrap();
+        let mut invocation = redis::cmd("EVAL");
+        invocation.arg(FIND_HELD_STRINGS).arg(0);
+        for (_, secret) in held {
+            invocation.arg(secret.as_str());
+        }
+        let found: Vec<String> = invocation
+            .query_async(conn)
+            .await
+            .unwrap_or_else(|e| panic!("searching database {database}: {e}"));
+        for line in found {
+            let (position, place) = line.split_once(' ').expect("a position and a place");
+            let (label, _) = &held[position.parse::<usize>().unwrap() - 1];
+            hits.push(format!("{label}: in the {place} (database {database})"));
+        }
+    }
+    hits
+}
+
+/// Holds a token and every part of it that the store must not contain either.
+fn hold_token(held: &mut Vec<(String, String)>, label: &str, token: &str) {
+    held.push((label.to_string(), token.to_string()));
+    if let Some((_, body)) = token.split_once('_') {
+        held.push((format!("{label} without its prefix"), body.to_string()));
+        if token.starts_with("mcr_") {
+            if let Some((handle, secret)) = body.split_once('_') {
+                held.push((format!("{label} handle"), handle.to_string()));
+                held.push((format!("{label} secret part"), secret.to_string()));
+            }
+        }
+    }
+}
+
+/// I1 for a generic-class client: after its sign-in, a refresh, the replay of the lost response,
+/// userinfo and revocation, nothing it holds appears in any key or value of the stack's Redis,
+/// in any database: not its login session id, code, PKCE verifier, ID token, access and refresh
+/// tokens, nor the secret of its registration. The search is proved on planted strings, so an
+/// empty result cannot come from a search that finds nothing.
+#[tokio::test]
+#[ignore = "requires the mock stack (e2e/up.sh)"]
+async fn no_credential_a_generic_client_holds_is_stored_in_the_clear() {
+    use bb8_redis::redis;
+    let Some(url) = stack_redis_url() else {
+        let marker = "E2E_SKIP: no_credential_a_generic_client_holds_is_stored_in_the_clear: no \
+                      stack Redis URL (E2E_REDIS_URL, SIWXOIDC_REDIS_URL or SIWEOIDC_REDIS_URL); \
+                      the keyspace was NOT searched";
+        assert!(
+            std::env::var("E2E_STRICT_SKIPS").as_deref() != Ok("1"),
+            "{marker} -- E2E_STRICT_SKIPS=1: an unexercised assertion is a failure"
+        );
+        eprintln!("{marker}");
+        return;
+    };
+
+    let flow = by_hand(MAIL_REFRESH_SCOPE).await;
+    let text = |name: &str| {
+        flow.token[name]
+            .as_str()
+            .unwrap_or_else(|| panic!("the token response has `{name}`: {}", flow.token))
+            .to_string()
+    };
+    let mut held: Vec<(String, String)> = vec![
+        ("login session id".into(), flow.session_id.clone()),
+        ("authorization code".into(), flow.code.clone()),
+        ("PKCE verifier".into(), flow.verifier.clone()),
+        ("ID token".into(), text("id_token")),
+        ("client secret".into(), STATIC_CLIENT_SECRET.into()),
+    ];
+    let refresh_token = text("refresh_token");
+    hold_token(&mut held, "sign-in access token", &text("access_token"));
+    hold_token(&mut held, "sign-in refresh token", &refresh_token);
+
+    let rotated = refresh(&oidc(), MAIL_CLIENT, &refresh_token, &flow.did)
+        .await
+        .expect("the refresh grant rotates");
+    let rotated_refresh = rotated
+        .refresh_token
+        .clone()
+        .expect("a rotated refresh token");
+    hold_token(&mut held, "rotated access token", &rotated.access_token);
+    hold_token(&mut held, "rotated refresh token", &rotated_refresh);
+    let replayed = refresh(&oidc(), MAIL_CLIENT, &refresh_token, &flow.did)
+        .await
+        .expect("the previous token replays while its successor is unused");
+    assert_eq!(
+        replayed.access_token, rotated.access_token,
+        "the replay of a lost response returns the same pair"
+    );
+
+    let mut conn = connect_to_the_stack_redis(&url).await;
+    let live_access_key = format!(
+        "at/{}",
+        hex::encode(Sha256::digest(rotated.access_token.as_bytes()))
+    );
+    let live: bool = redis::cmd("EXISTS")
+        .arg(&live_access_key)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        live,
+        "positive control: {url} holds the digest key of the live access token \
+         {live_access_key}; is this the stack's Redis?"
+    );
+    assert_eq!(
+        find_held_strings(&mut conn, &held).await,
+        Vec::<String>::new(),
+        "after a refresh and a replay: client-held strings stored in the clear (I1)"
+    );
+
+    assert_eq!(
+        userinfo(&rotated.access_token).await.status(),
+        StatusCode::OK,
+        "the rotated access token is usable"
+    );
+    let revoked = client()
+        .post(format!("{}/oauth2/revoke", oidc()))
+        .form(&[("token", rotated_refresh.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK, "revocation is always 200");
+    assert_eq!(
+        userinfo(&rotated.access_token).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "the revoked grant's access token is dead"
+    );
+    assert_eq!(
+        find_held_strings(&mut conn, &held).await,
+        Vec::<String>::new(),
+        "after userinfo and revocation: client-held strings stored in the clear (I1)"
+    );
+
+    let needle = format!("scan-canary-{}", rand::random::<u32>());
+    let _: () = redis::cmd("SET")
+        .arg("e2e:scan-canary:string")
+        .arg(&needle)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("HSET")
+        .arg("e2e:scan-canary:hash")
+        .arg("member")
+        .arg(&needle)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let planted = find_held_strings(&mut conn, &[("canary".into(), needle)]).await;
+    let _: () = redis::cmd("DEL")
+        .arg("e2e:scan-canary:string")
+        .arg("e2e:scan-canary:hash")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        planted.len(),
+        2,
+        "the search finds a string planted in a string value and in a hash value: {planted:?}"
+    );
 }
