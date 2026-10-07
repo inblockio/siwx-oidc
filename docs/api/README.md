@@ -157,6 +157,12 @@ should code to them:
 - **`io.inblock.mxid` on `/userinfo` is omitted entirely, never null**, when the
   deployment has no homeserver. A present key asserts the thing exists — the
   same rule the `io.inblock.did` profile field follows with its `proof`.
+  `io.inblock.mailbox` follows the same rule, and `/userinfo` never carries `email`.
+- **`/userinfo` answers a token it cannot use with a 401 and the challenge
+  `WWW-Authenticate: Bearer error="invalid_token"`** (RFC 6750): an unknown or
+  expired token, a refresh token, an authorization code, a token an epoch
+  refuses, or the token of a client that no longer exists. A request with no
+  token at all is a 400.
 
 Breaking changes against the `siwe-oidc` predecessor are listed in
 [architecture.md, "Lineage"](../architecture.md#lineage).

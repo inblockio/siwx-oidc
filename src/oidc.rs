@@ -366,6 +366,15 @@ pub enum CustomError {
     BadRequestToken(TokenError),
     #[error("{0}")]
     Unauthorized(String),
+    /// A bearer token that cannot be used: unknown, expired, a refresh token presented as a
+    /// bearer token, or the token of a client that no longer exists. Renders as HTTP 401 with
+    /// `WWW-Authenticate: Bearer error="invalid_token"` (RFC 6750 section 3.1).
+    ///
+    /// Not a 400: a 400 reads as a fault in the caller's own request, which a resource server
+    /// may treat as temporary and retry, for a credential that can never work again. The
+    /// payload is the message for the log and the body; it never carries the token.
+    #[error("{0}")]
+    InvalidToken(String),
     /// A presented passkey credential is not registered on this server (a stale or
     /// revoked key chosen from the platform picker). Renders as HTTP 401 with a
     /// machine-readable JSON discriminator so the client can prune it via
@@ -585,6 +594,41 @@ pub fn jwks(
     Ok(CoreJsonWebKeySet::new(keys))
 }
 
+/// The scopes discovery lists. The mail scope appears only where the mailbox claim it
+/// unlocks can be issued, that is, when a mail domain is configured.
+fn scopes_supported(config: &crate::config::Config) -> Vec<Scope> {
+    let mut scopes = SCOPES.clone();
+    if config.mail_domain.is_some() {
+        scopes.push(Scope::new(client_policy::MAIL_SCOPE.to_string()));
+    }
+    scopes
+}
+
+/// The claims discovery lists. The two provider-specific ones appear only where userinfo can
+/// carry them: the Matrix ID needs a server name, the mailbox address a mail domain.
+fn claims_supported(config: &crate::config::Config) -> Vec<CoreClaimName> {
+    let mut claims: Vec<CoreClaimName> = [
+        "sub",
+        "aud",
+        "exp",
+        "iat",
+        "iss",
+        "preferred_username",
+        "name",
+        "picture",
+    ]
+    .into_iter()
+    .map(|claim| CoreClaimName::new(claim.to_string()))
+    .collect();
+    if config.matrix_server_name.is_some() {
+        claims.push(CoreClaimName::new("io.inblock.mxid".to_string()));
+    }
+    if config.mail_domain.is_some() {
+        claims.push(CoreClaimName::new(client_policy::MAILBOX_CLAIM.to_string()));
+    }
+    claims
+}
+
 pub fn metadata(config: &crate::config::Config) -> Result<CoreProviderMetadata, CustomError> {
     let base_url = &config.base_url;
     let pm = CoreProviderMetadata::new(
@@ -618,17 +662,8 @@ pub fn metadata(config: &crate::config::Config) -> Result<CoreProviderMetadata, 
             .map_err(|e| anyhow!("Unable to join URL: {}", e))?,
     )))
     .set_userinfo_signing_alg_values_supported(Some(SIGNING_ALG.to_vec()))
-    .set_scopes_supported(Some(SCOPES.clone()))
-    .set_claims_supported(Some(vec![
-        CoreClaimName::new("sub".to_string()),
-        CoreClaimName::new("aud".to_string()),
-        CoreClaimName::new("exp".to_string()),
-        CoreClaimName::new("iat".to_string()),
-        CoreClaimName::new("iss".to_string()),
-        CoreClaimName::new("preferred_username".to_string()),
-        CoreClaimName::new("name".to_string()),
-        CoreClaimName::new("picture".to_string()),
-    ]))
+    .set_scopes_supported(Some(scopes_supported(config)))
+    .set_claims_supported(Some(claims_supported(config)))
     .set_registration_endpoint(Some(RegistrationUrl::from_url(
         base_url
             .join(REGISTER_PATH)
@@ -3690,8 +3725,8 @@ pub struct UserInfoPayload {
 }
 
 /// The provider-specific claims siwx-oidc adds to the standard OIDC userinfo
-/// set: today, exactly one — the caller's Matrix ID, on the wire as
-/// `io.inblock.mxid`.
+/// set: the caller's Matrix ID, on the wire as `io.inblock.mxid`, and, for a
+/// generic mail client only, the caller's mailbox address, `io.inblock.mailbox`.
 ///
 /// # Why the claim is namespaced, and why it is not called `mxid`
 ///
@@ -3721,6 +3756,12 @@ pub struct UserInfoPayload {
 /// `SIWEOIDC_MATRIX_SERVER_NAME`) has no Matrix ID to report, and saying
 /// `"io.inblock.mxid": null` would make a consumer's `if "io.inblock.mxid" in
 /// claims` branch take the wrong turn while looking correct.
+///
+/// # `io.inblock.mailbox` follows the same rules
+///
+/// Omitted, never null, and present in the JSON and the signed-JWT variants alike. Every
+/// condition that gates it is in [`client_policy::mailbox_claim`], and its wire name is
+/// pinned by `userinfo_mailbox_claim_tests::mailbox_claim_opaque_only`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SiwxAdditionalClaims {
     /// The caller's fully-qualified Matrix ID, `@localpart:server_name`.
@@ -3730,6 +3771,14 @@ pub struct SiwxAdditionalClaims {
         skip_serializing_if = "Option::is_none"
     )]
     pub mxid: Option<String>,
+    /// The caller's mailbox address, `<opaque localpart>@<mail_domain>`. Present only under
+    /// the rule in [`client_policy::mailbox_claim`]; omitted, never null, otherwise.
+    #[serde(
+        rename = "io.inblock.mailbox",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mailbox: Option<String>,
 }
 
 impl AdditionalClaims for SiwxAdditionalClaims {}
@@ -3794,15 +3843,14 @@ pub enum UserInfoResponse {
 ///   (`GET /resolve?did=…`, see [`crate::resolve`]); a derived one could quietly
 ///   name the wrong account. `@:server` would not be a Matrix ID either, but a
 ///   parse error waiting at the consumer.
-fn mxid_claim(config: &crate::config::Config, localpart: &str) -> SiwxAdditionalClaims {
-    let mxid = match config.matrix_server_name.as_deref() {
+fn mxid_claim(config: &crate::config::Config, localpart: &str) -> Option<String> {
+    match config.matrix_server_name.as_deref() {
         Some(server_name) if !localpart.is_empty() => Some(crate::synapse_client::matrix_user_id(
             localpart,
             server_name,
         )),
         _ => None,
-    };
-    SiwxAdditionalClaims { mxid }
+    }
 }
 
 /// `GET|POST /userinfo`.
@@ -3817,6 +3865,20 @@ fn mxid_claim(config: &crate::config::Config, localpart: &str) -> SiwxAdditional
 /// identity model (see `docs/identity-model.md`) exists precisely because a consumer that
 /// reads a Matrix identifier where it expected a DID, or the reverse, resolves
 /// the wrong account.
+///
+/// # What a refusal looks like
+///
+/// A token that cannot be used (unknown, expired, a refresh token or an authorization code
+/// presented as a bearer token, one an epoch refuses, or the token of a client that no
+/// longer exists) is [`CustomError::InvalidToken`]: a 401 with an RFC 6750 `invalid_token`
+/// challenge, so a resource server can tell a dead credential from a malformed request. A
+/// request that presents no token at all is a 400.
+///
+/// # No `email` claim, ever
+///
+/// A mail server that finds no mailbox claim may fall back to the standard `email` claim,
+/// so an `email` in any userinfo response would let that token open a mailbox. The only
+/// address claim is `io.inblock.mailbox`.
 pub async fn userinfo(
     config: &crate::config::Config,
     signing_key: &EcdsaSigningKey,
@@ -3839,18 +3901,25 @@ pub async fn userinfo(
     let metadata = db_client
         .check_access_token(&token_str)
         .await?
-        .ok_or_else(|| CustomError::BadRequest("Unknown token.".to_string()))?;
+        .ok_or_else(|| CustomError::InvalidToken("Unknown token.".to_string()))?;
     if metadata.exp <= Utc::now().timestamp() {
-        return Err(CustomError::BadRequest("Token expired.".to_string()));
+        return Err(CustomError::InvalidToken("Token expired.".to_string()));
     }
     let client_entry = db_client
         .get_client(metadata.client_id.clone())
         .await?
-        .ok_or_else(|| CustomError::BadRequest("Unknown client.".to_string()))?;
+        .ok_or_else(|| CustomError::InvalidToken("Unknown client.".to_string()))?;
     touch_client_after_use(db_client, &metadata.client_id).await;
     // `metadata.username` IS the localpart (see `TokenMetadata::username`),
     // already resolved through the grandfathering rule at sign-in.
-    let additional = mxid_claim(config, &metadata.username);
+    let additional = SiwxAdditionalClaims {
+        mxid: mxid_claim(config, &metadata.username),
+        mailbox: client_policy::mailbox_claim(
+            &metadata,
+            &client_entry,
+            config.mail_domain.as_deref(),
+        ),
+    };
     let response = SiwxUserInfoClaims::new(
         resolve_claims(config, &metadata.did, client_entry.class).await,
         additional,
@@ -4937,6 +5006,86 @@ mod tests {
             serde_json::json!(["public"]),
             "the sub is the DID, identical for every client"
         );
+    }
+
+    /// Discovery says what this deployment serves: the one response type and the one subject
+    /// type that exist, and the provider-specific scope and claims only where userinfo can
+    /// carry them (the Matrix ID needs a server name, the mailbox address a mail domain).
+    #[test]
+    fn discovery_lists_only_what_is_served() {
+        let both = Config {
+            mail_domain: Some("matrix.example.org".into()),
+            matrix_server_name: Some("matrix.example.org".into()),
+            ..discovery_config()
+        };
+        let value = provider_metadata_value(&both, true).unwrap();
+        assert_eq!(
+            value["response_types_supported"],
+            serde_json::json!(["code"]),
+            "the implicit flows are not implemented"
+        );
+        assert_eq!(
+            value["subject_types_supported"],
+            serde_json::json!(["public"]),
+            "sub is the same DID for every client"
+        );
+
+        let listed = |value: &serde_json::Value, key: &str, item: &str| {
+            value[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} must be an array"))
+                .iter()
+                .any(|s| s.as_str() == Some(item))
+        };
+        assert!(listed(&value, "scopes_supported", "io.inblock.mail"));
+        for claim in ["io.inblock.mailbox", "io.inblock.mxid"] {
+            assert!(listed(&value, "claims_supported", claim), "{claim} missing");
+        }
+
+        let cases = [
+            (
+                "a mail domain alone",
+                Some("matrix.example.org"),
+                None,
+                true,
+                false,
+            ),
+            (
+                "a server name alone",
+                None,
+                Some("matrix.example.org"),
+                false,
+                true,
+            ),
+            ("neither", None, None, false, false),
+        ];
+        for (what, mail_domain, server_name, mail, mxid) in cases {
+            let config = Config {
+                mail_domain: mail_domain.map(str::to_string),
+                matrix_server_name: server_name.map(str::to_string),
+                ..discovery_config()
+            };
+            let value = provider_metadata_value(&config, true).unwrap();
+            assert_eq!(
+                listed(&value, "scopes_supported", "io.inblock.mail"),
+                mail,
+                "{what}: the mail scope"
+            );
+            assert_eq!(
+                listed(&value, "claims_supported", "io.inblock.mailbox"),
+                mail,
+                "{what}: the mailbox claim"
+            );
+            assert_eq!(
+                listed(&value, "claims_supported", "io.inblock.mxid"),
+                mxid,
+                "{what}: the Matrix ID claim"
+            );
+            assert!(
+                listed(&value, "scopes_supported", "urn:matrix:client:api:*"),
+                "{what}: the Matrix scopes are listed whatever else is"
+            );
+        }
     }
 
     /// `POST /token` reads the client secret from an `Authorization: Basic`
@@ -6501,7 +6650,7 @@ mod userinfo_mxid_claim_tests {
             )
             .await;
             assert!(
-                matches!(out, Err(CustomError::BadRequest(ref m)) if m == "Unknown token."),
+                matches!(out, Err(CustomError::InvalidToken(ref m)) if m == "Unknown token."),
                 "/userinfo must refuse {what} like an unknown token"
             );
         }
@@ -6571,6 +6720,9 @@ mod userinfo_mxid_claim_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod userinfo_mailbox_claim_tests;
 
 /// `sign_in` decides deactivation BEFORE it resolves the login localpart.
 ///

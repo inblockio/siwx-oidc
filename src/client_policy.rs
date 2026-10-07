@@ -4,7 +4,8 @@
 
 use std::collections::HashMap;
 
-use crate::db::{ClientClass, ClientEntry};
+use crate::db::grant::GrantKind;
+use crate::db::{ClientClass, ClientEntry, TokenMetadata};
 use crate::mxid::localpart_for;
 
 /// The scope that unlocks the mailbox claim.
@@ -115,6 +116,42 @@ pub fn mailbox_for(username: &str, did: &str, mail_domain: Option<&str>) -> Opti
     let domain = mail_domain?;
     (is_opaque_localpart(username) && username == localpart_for(did))
         .then(|| format!("{username}@{domain}"))
+}
+
+/// The `io.inblock.mailbox` claim `/userinfo` carries for one access token, or `None`.
+///
+/// Every condition is checked here, for this request, from the token and from the client
+/// entry as it is now, so a client that changed class or lost the scope stops getting the
+/// claim for tokens it already holds:
+///
+/// 1. the token belongs to an `oidc` grant, the grant a code exchange issues to a client that
+///    holds no Matrix session, and the client is generic-class now. An `oidc` grant alone
+///    does not decide it: a deployment without a MAS shared secret issues them to every
+///    client;
+/// 2. the grant's scope contains [`MAIL_SCOPE`], and the client is still allowed it;
+/// 3. the recorded localpart is the opaque one derived from the token's DID ([`mailbox_for`]);
+/// 4. a mail domain is configured.
+///
+/// Any other kind of grant, and a legacy token with no grant record, gets no claim, so a
+/// grant kind added later gets none until it is named here.
+pub fn mailbox_claim(
+    token: &TokenMetadata,
+    client: &ClientEntry,
+    mail_domain: Option<&str>,
+) -> Option<String> {
+    let oidc_grant = matches!(token.grant_kind, Some(GrantKind::Oidc));
+    let still_allowed = client
+        .allowed_scopes
+        .as_deref()
+        .is_some_and(|allowed| allowed.iter().any(|scope| scope == MAIL_SCOPE));
+    if !(oidc_grant
+        && client.class == ClientClass::Generic
+        && still_allowed
+        && has_scope(&token.scope, MAIL_SCOPE))
+    {
+        return None;
+    }
+    mailbox_for(&token.username, &token.did, mail_domain)
 }
 
 /// The longest DNS name, and the longest label in one, in characters (RFC 1035 section
@@ -532,6 +569,118 @@ mod tests {
                 is_opaque_localpart(&localpart),
                 "the localpart derived for {did:?} fails the gate: {localpart:?}"
             );
+        }
+    }
+
+    const CLAIM_DID: &str = "did:key:zDnaeUKTWUXc1mxSoRrEfV6wPWmQyHrKuTHLZgAkyUKfSbeMB";
+    const CLAIM_DOMAIN: &str = "matrix.example.org";
+
+    fn access_token(grant_kind: Option<GrantKind>, scope: &str, username: &str) -> TokenMetadata {
+        TokenMetadata {
+            username: username.to_string(),
+            device_id: String::new(),
+            scope: scope.to_string(),
+            client_id: "mail".to_string(),
+            iat: 0,
+            exp: i64::MAX,
+            did: CLAIM_DID.to_string(),
+            name: CLAIM_DID.to_string(),
+            kind: Some(crate::db::TokenKind::Access),
+            grant_kind,
+        }
+    }
+
+    /// The claim is what lets a mail server create a mailbox, so each condition has a case
+    /// that goes wrong when only that condition is dropped, and the case that meets them all
+    /// is asserted too: a claim that is never emitted would pass every absence check.
+    #[test]
+    fn the_mailbox_claim_decision_needs_every_condition() {
+        let opaque = localpart_for(CLAIM_DID);
+        let mail_client = entry(ClientClass::Generic, Some(&["openid", MAIL_SCOPE]));
+        let issued = access_token(Some(GrantKind::Oidc), "openid io.inblock.mail", &opaque);
+        assert_eq!(
+            mailbox_claim(&issued, &mail_client, Some(CLAIM_DOMAIN)),
+            Some(format!("{opaque}@{CLAIM_DOMAIN}")),
+            "every condition met"
+        );
+
+        let legacy = crate::mxid::legacy_localpart(CLAIM_DID);
+        let narrowed = entry(ClientClass::Generic, Some(&["openid"]));
+        let without_policy = entry(ClientClass::Generic, None);
+        let matrix_now = entry(ClientClass::Matrix, Some(&["openid", MAIL_SCOPE]));
+        let cases = [
+            (
+                "a Matrix device grant",
+                access_token(
+                    Some(GrantKind::MatrixDevice),
+                    "openid io.inblock.mail",
+                    &opaque,
+                ),
+                &mail_client,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "a service grant",
+                access_token(Some(GrantKind::Service), "openid io.inblock.mail", &opaque),
+                &mail_client,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "a legacy token with no grant",
+                access_token(None, "openid io.inblock.mail", &opaque),
+                &mail_client,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "no mail scope",
+                access_token(Some(GrantKind::Oidc), "openid", &opaque),
+                &mail_client,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "a scope that only starts with the mail scope",
+                access_token(Some(GrantKind::Oidc), "openid io.inblock.mailx", &opaque),
+                &mail_client,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "a client that no longer allows the mail scope",
+                issued.clone(),
+                &narrowed,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "a client with no scope policy",
+                issued.clone(),
+                &without_policy,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "a client that is Matrix-class now",
+                issued.clone(),
+                &matrix_now,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "a legacy localpart",
+                access_token(Some(GrantKind::Oidc), "openid io.inblock.mail", &legacy),
+                &mail_client,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "an opaque localpart that is another DID's",
+                access_token(
+                    Some(GrantKind::Oidc),
+                    "openid io.inblock.mail",
+                    &localpart_for("did:key:zDnotThisAccount"),
+                ),
+                &mail_client,
+                Some(CLAIM_DOMAIN),
+            ),
+            ("no mail domain", issued.clone(), &mail_client, None),
+        ];
+        for (why, token, client, domain) in cases {
+            assert_eq!(mailbox_claim(&token, client, domain), None, "{why}");
         }
     }
 
