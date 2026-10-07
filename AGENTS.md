@@ -139,7 +139,11 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   sessions in every shape a deployment holds before the switch and checks them after it,
   in stages (`QUALIFY_STAGE=mint|check|cleanup`, state in a 0700 `QUALIFY_STATE_DIR`),
   against a real deployment or the mock; `siwx-oidc-auth/examples/soak.rs` holds a population
-  of sessions across the switch. Each creates and deactivates throwaway accounts; see
+  of sessions across the switch. `e2e/element/upgrade-survival.sh` (T2) does the same for a
+  person in Element Web: on the siwx-oidc-matrix-server lab pinned by image digest it signs in
+  through Element in a persistent browser profile before the switch, replaces only siwx-oidc,
+  and checks the session, the crypto, the history, the Sessions manager, a second tab, a
+  passkey and a token refresh after it. Each creates and deactivates throwaway accounts; see
   e2e/README.md.
 - **Browser suites:** `e2e/browser/` (self-contained, runs in CI) and `e2e/element/` (needs
   Element Web, a real Synapse and the proxy from siwx-oidc-matrix-server).

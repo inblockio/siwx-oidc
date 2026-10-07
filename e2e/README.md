@@ -27,6 +27,7 @@ probe → headless browser E2E (wallet + passkey).
 | `../tests/e2e_account_management.rs` | Drives the exact HTTP requests the page JS makes — real EIP-191 wallet signatures, the account-session cookie, `/account/action`. Run: `cargo test --test e2e_account_management -- --ignored --test-threads=1` |
 | `../tests/e2e_backchannel_logout.rs` | H7, OpenID Connect Back-Channel Logout against a **generic-mode** siwx-oidc and the stub RP below. Run (see "Back-channel logout" below): `SIWX_GENERIC_HOST=… E2E_GENERIC_REDIS_URL=… cargo test --test e2e_backchannel_logout -- --ignored --test-threads=1` |
 | `upgrade-from.sh` | Mock upgrade from a previous image to this tree's build, Redis kept: see "Upgrade qualification" below |
+| `element/upgrade-survival.sh` | Element Web upgrade continuity (T2) on the pinned lab: capture on the baseline image, switch only siwx-oidc, assert in the same browser profile: see "Upgrade qualification" below |
 | `legacy-cs-api-probe.sh` | `DELETE /_matrix/client/v3/devices/{id}` + `/delete_devices` with Redis-seeded bearers: a grant's access token and a legacy `token/{raw}` access entry (`REDIS_CONTAINER` names the Redis container) |
 | `browser/account.spec.mjs` | Playwright: mock `window.ethereum` (real ethers signing) + CDP WebAuthn virtual authenticator, driving the real `/account` DOM. Run: `bash browser/run.sh` |
 
@@ -200,7 +201,7 @@ names each property it lacks.
 
 ## Upgrade qualification
 
-Three suites prove that what a deployment holds survives a switch of the siwx-oidc build. They
+Four suites prove that what a deployment holds survives a switch of the siwx-oidc build. They
 run before a promotion, not in CI. Each creates throwaway accounts and deactivates them.
 
 ### Mock upgrade from an image (`upgrade-from.sh`)
@@ -268,6 +269,71 @@ a skip all fail unless `E2E_STRICT_SKIPS=0`. `DELETE /_matrix/client/v3/devices/
 `SIWX_DEVICE_DELETE_BASE`, by default the homeserver: the edge must route it to siwx-oidc
 (Synapse answers `404 M_UNRECOGNIZED` under delegated authentication). On a deployment whose
 edge does not, set it to the siwx-oidc URL; the check then proves siwx-oidc's handling only.
+
+### Element Web upgrade continuity (`element/upgrade-survival.sh`)
+
+What a person in Element Web notices across the switch, on the lab stack of
+siwx-oidc-matrix-server pinned by image digest (`docker-compose.local.yml` plus
+`docker-compose.qualify.yml`, see that repository's README):
+
+```bash
+# the lab, every image by digest (the overlay refuses to start without them)
+export REDIS_IMAGE_REF=redis:<version>@sha256:<digest>
+export SYNAPSE_IMAGE_REF=registry.example.org/synapse@sha256:<digest>
+export ELEMENT_IMAGE_REF=registry.example.org/element-web@sha256:<digest>
+export BASELINE_IMAGE=registry.example.org/siwx-oidc@sha256:<the deployed build>
+export CANDIDATE_IMAGE=registry.example.org/siwx-oidc@sha256:<the build to promote>
+export LAB_COMPOSE_DIR=<siwx-oidc-matrix-server checkout> LAB_PROJECT=<compose project> LAB_ENV_FILE=.env.qualify
+(cd "$LAB_COMPOSE_DIR" && SIWX_OIDC_IMAGE_REF=$BASELINE_IMAGE docker compose -p "$LAB_PROJECT" \
+  -f docker-compose.local.yml -f docker-compose.qualify.yml --env-file "$LAB_ENV_FILE" up -d)
+
+export ELEMENT_URL=http://localhost:28088 MATRIX_URL=http://localhost:28080 SIWX_URL=http://localhost:28081
+export QUALIFY_STATE_DIR=$HOME/.cache/qualify/<run-id>/t2      # fresh, mode 0700
+export CTRF_OUTPUT=$HOME/.cache/qualify/<run-id>/t2/ctrf/playwright-ctrf.json
+bash e2e/element/upgrade-survival.sh                 # QUALIFY_STAGE=mint|switch|check, default all three
+```
+
+`mint` checks that the lab's siwx-oidc runs `BASELINE_IMAGE` (by image id, the container
+resolved by compose service) and runs `ew-upgrade-capture.spec.mjs` in a persistent Chromium
+profile (`launchPersistentContext`, so Element's session and its IndexedDB crypto store live on
+disk like a user's): user A signs in with a wallet through Element and sets the recovery key
+(cross-signing, secret storage, key backup); user B signs in in a second browser; A creates an
+encrypted room, B joins, each sends a message and decrypts the other's; a second device of A is
+signed in headlessly; a passkey account is registered in A's browser (a CDP virtual
+authenticator, whose credential is exported to the state, since it dies with the browser); and
+Spotlight resolves B's DID to B's MXID. `switch` runs
+`SIWX_OIDC_IMAGE_REF=$CANDIDATE_IMAGE docker compose … up -d --no-deps siwx-oidc`, waits for
+health, checks the candidate runs, and that every other service kept its `StartedAt`.
+`check` reopens the profile on the candidate (`ew-upgrade-assert.spec.mjs`), one test per check:
+
+| Test | Passes when |
+|---|---|
+| EW-UA1 | Element opens signed in: no login screen, no trip to the provider |
+| EW-UA2 | same account and device id; the candidate's own `/userinfo` accepts the token Element holds (Synapse caches introspection for two minutes, so a whoami alone could pass on a forgotten token) |
+| EW-UA3 | no "verify this session" or recovery-key prompt; cross-signing, secret storage, key backup and this device's verification are what they were |
+| EW-UA4 | both messages from before the switch decrypt and show in the timeline |
+| EW-UA5 | a message typed into the composer reaches the homeserver, encrypted |
+| EW-UA6 | Spotlight still turns B's DID into B's MXID |
+| EW-UA7 | the passkey from the baseline signs in to the same account, and the picker is scoped by the hint cookie the baseline set |
+| EW-UA8 | the Sessions manager signs out the second device (Element hands it to the provider's account page under delegated authentication: wallet re-auth, "Sign out this session"); the device leaves the homeserver and its refresh token, issued by the baseline, is refused |
+| EW-UA9 | a second tab takes the session over and the first gets it back, still accepted by the candidate, with no sign-out call |
+| EW-UA10 | Element refreshed its token at the candidate within `T2_REFRESH_WAIT_S` (default 420 s): every refresh answered 200, the first one with a current-format refresh token |
+| EW-UZ | cleanup: A, B and the passkey account are deactivated |
+
+The targets come only from `ELEMENT_URL`, `MATRIX_URL` and `SIWX_URL`; the image references must
+be digests. `QUALIFY_STATE_DIR` holds the browser profile, the throwaway accounts' wallet keys,
+a refresh token and the passkey (files 0600); `mint` refuses a directory that already holds a
+profile, and `check` refuses state older than `T2_MAX_STATE_AGE_S` (default 3600). Each phase
+writes a CTRF report (`playwright-ctrf-json-reporter`) next to `CTRF_OUTPUT`, and the driver
+merges them with its own steps into `CTRF_OUTPUT`. When the qualification driver switches the
+image itself, run `QUALIFY_STAGE=mint`, switch, then `QUALIFY_STAGE=check`; without
+`LAB_PROJECT` the image checks are reported as skipped and left to the caller.
+
+Negative control: `T2_NEGATIVE=flush-redis` flushes the lab's Redis between the switch and the
+check, and the check must fail. It does: EW-UA2, EW-UA7, EW-UA9, EW-UA10 and EW-UZ fail; the
+checks that only read Element's own storage, Synapse or the account page (EW-UA1, UA3 to UA6,
+UA8) pass inside Synapse's two-minute introspection cache, which is why EW-UA2 asks the
+provider itself.
 
 ### Population soak (`examples/soak.rs`)
 
