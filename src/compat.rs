@@ -858,6 +858,7 @@ mod tests {
             did: format!("did:pkh:eip155:1:0X{}", username.to_uppercase()),
             name: "n".to_string(),
             kind: Some(TokenKind::Access),
+            grant_kind: None,
         }
     }
 

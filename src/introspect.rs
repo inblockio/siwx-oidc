@@ -236,6 +236,7 @@ mod tests {
             did: "did:key:zDnTest".into(),
             name: String::new(),
             kind: Some(TokenKind::Access),
+            grant_kind: None,
         }
     }
 

@@ -467,6 +467,7 @@ impl AccessGrant {
             did: self.grant.did.clone(),
             name: self.grant.name.clone(),
             kind: Some(TokenKind::Access),
+            grant_kind: Some(self.grant.kind),
         }
     }
 }
