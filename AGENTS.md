@@ -401,6 +401,19 @@ doc; read it before changing the code the rule covers.
   `matrix_mode_issues_the_matrix_scope_and_a_refresh_token_whatever_was_requested`,
   `sign_in_issues_the_code_for_the_bound_request` (the scope reaches the code),
   `a_code_written_before_the_scope_travelled_has_none`.
+- **The kind of a grant is the class of its client, derived and never stored.** With
+  `mas_shared_secret` a Matrix-class client holds `matrix_device` grants and a generic-class
+  client holds `oidc` grants, because the code exchange picks the kind from the pair (mode,
+  class) and nothing else issues an `oidc` grant there. A reader learns the kind from the grant
+  record behind the access token (`AccessGrant::metadata` sets `TokenMetadata.grant_kind`,
+  `#[serde(skip)]`), so no token entry can claim a kind, and a legacy token with no grant record
+  has none and counts as a Matrix credential. Decide on it with an exhaustive `match`, never
+  `== Oidc`. Outside that mode `oidc` does not mean generic-class: generic mode issues it to
+  every client, which is why the Matrix-side refusals below hold back unless auth is delegated.
+  Pin: `the_access_metadata_reports_the_kind_of_the_grant_behind_the_token`,
+  `the_grant_kind_is_never_stored_and_a_stored_entry_reads_without_one`,
+  `a_generic_exchange_writes_an_oidc_grant_with_a_sid_no_device_index_and_the_granted_scope`,
+  `matrix_code_exchange_keeps_the_matrix_scope`.
 - **The code exchange decides by deployment mode and by client class, in one table with no
   fall-through** (`exchange_issuance`). With `mas_shared_secret`, a Matrix-class client gets a
   `matrix_device` grant and a generic-class client gets an `oidc` grant with no device: the
@@ -539,8 +552,11 @@ doc; read it before changing the code the rule covers.
   start-up sync of `default_clients` (`DBClient::sync_static_clients`; the background prune
   runs it with an empty map) sets `epoch:client/{id}` before it overwrites or deletes a stored
   entry whose change `client_policy::grant_end` says ends grants: a generic client that is
-  removed, that changes class in either direction, or whose SET of `allowed_scopes` changes
-  (order and repeats do not count, no list is the empty list, a widening counts). Without it a
+  removed, that changes class in either direction, whose SET of `allowed_scopes` changes
+  (order and repeats do not count, no list is the empty list, a widening counts), or whose
+  registration stops allowing the refresh grant (`client_policy::registration_may_refresh`,
+  the one place that decides it, also asked before a refresh token is issued; allowing it
+  again ends nothing). Without it a
   generic grant outlives its client: a public client's refresh token keeps rotating at `/token`
   once the registration is gone (`authenticate_refresh_client` tolerates that), and after a class
   flip or a narrowed policy an old `oidc` grant keeps its scope, refreshes and is served at
@@ -554,12 +570,15 @@ doc; read it before changing the code the rule covers.
   and a client id configured again keeps its epoch, so what was issued before stays refused and
   a sign-in after it works (a grant authenticated in the epoch's own millisecond is refused, so
   a test gives the new grant the next one). Each epoch is one `warn!` with `client_id`, `reason`
-  (`removed`, `class_changed`, `scopes_changed`) and `epoch_ms`. Observe the epoch at `/token`,
+  (`removed`, `class_changed`, `scopes_changed`, `refresh_withdrawn`) and `epoch_ms`. Observe
+  the epoch at `/token`,
   at userinfo and in the library: `compat::refresh` refuses an `oidc` grant before it reads any
   epoch. Never set the global or the user epoch from the sync. A test syncs through a
   `test_support` client, which tracks static clients in a set of its own, so it never ends the
   grants of a running stack's clients. Pin:
   `grants_end_when_a_generic_client_is_removed_reclassified_or_rescoped` (the rule, a table),
+  `grants_end_when_a_generic_client_loses_the_permission_to_refresh` (the refresh rule, a
+  table), `a_registration_may_refresh_unless_it_lists_grant_types_without_the_refresh_grant`,
   `a_grant_end_names_its_reason_for_the_log`,
   `a_restart_with_an_unchanged_configuration_sets_no_epoch`,
   `removing_a_generic_static_client_ends_its_grants`,
@@ -573,6 +592,8 @@ doc; read it before changing the code the rule covers.
   `an_older_generic_grant_is_refused_after_its_client_is_removed`,
   `an_older_grant_is_refused_after_a_class_change_in_either_direction`,
   `an_older_generic_grant_is_refused_after_the_allowed_scopes_change`,
+  `an_older_generic_grant_is_refused_after_the_refresh_grant_is_withdrawn`,
+  `a_restart_that_keeps_the_refresh_permission_keeps_a_generic_grant_working`,
   `removing_a_matrix_class_static_client_leaves_its_sessions_refreshing`.
 - **No credential a client holds is stored in the clear** (I1): tokens, authorization codes,
   device and user codes, session identifiers (the login `session` cookie, the WebAuthn,
@@ -612,7 +633,10 @@ doc; read it before changing the code the rule covers.
   the session id and a signature. Pin (mock stack, each scans the whole stack Redis):
   `no_token_the_client_holds_is_stored_in_the_clear`,
   `no_code_or_session_the_client_holds_is_stored_in_the_clear`,
-  `no_client_secret_or_registration_token_is_stored_in_the_clear`,
+  `no_client_secret_or_registration_token_is_stored_in_the_clear`, and for a generic-class
+  client's own credentials (login session id, code, PKCE verifier, ID token, both token pairs,
+  the static client's secret; the search is proved on planted strings)
+  `no_credential_a_generic_client_holds_is_stored_in_the_clear`,
   `legacy_tokens_keep_working_after_the_upgrade`, `in_flight_codes_and_sessions_survive_the_upgrade`;
   unit: `a_stored_digest_presented_as_a_code_is_not_a_code`,
   `a_stored_digest_presented_as_a_credential_matches_nothing`,
