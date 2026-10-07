@@ -1336,6 +1336,230 @@ mod tests {
         );
     }
 
+    /// R2 of the promotion plan at the Matrix endpoint: a LEGACY refresh
+    /// token of an agent device whose client registered as public and whose
+    /// registration is gone (registrations expire after 30 days, refresh
+    /// tokens after 90 days unused) is lifted into a grant and answered in the
+    /// current format; the grant keeps the device and the client and is
+    /// public; the lifted token rotates again here.
+    #[tokio::test]
+    async fn a_legacy_token_whose_registration_is_gone_is_lifted_at_the_matrix_endpoint() {
+        use openidconnect::core::CoreClientAuthMethod;
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let state = standalone_state(client.clone());
+        let gone = format!("legacy-gone-{n}");
+        let device = format!("AQUA_GONE{n}");
+        client
+            .set_client(
+                gone.clone(),
+                siwx_oidc::db::ClientEntry::new(
+                    "s",
+                    siwx_oidc::db::SiwxClientMetadata::new(
+                        vec![
+                            openidconnect::RedirectUrl::new("https://example.com/cb".into())
+                                .unwrap(),
+                        ],
+                        siwx_oidc::db::LogoutClientMetadata::default(),
+                    )
+                    .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::None)),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        let legacy = format!("mcr_legacygone{n}");
+        let mut meta = refresh_meta(&format!("legacy-gone-user-{n}"), &device);
+        meta.client_id = gone.clone();
+        meta.scope = format!("openid urn:matrix:client:api:* urn:matrix:client:device:{device}");
+        meta.iat = Utc::now().timestamp();
+        meta.exp = meta.iat + REFRESH_TOKEN_TTL as i64;
+        client
+            .set_token(&legacy, &meta, REFRESH_TOKEN_TTL)
+            .await
+            .unwrap();
+        client.delete_client(gone.clone()).await.unwrap();
+
+        let (status, body) = matrix_refresh(&state, &legacy).await;
+        assert_eq!(status, StatusCode::OK, "the legacy token is lifted: {body}");
+        let new_rt = body["refresh_token"].as_str().unwrap().to_string();
+        assert!(
+            tokens::parse_refresh_token(&new_rt).is_some(),
+            "current format: {body}"
+        );
+        assert!(
+            client.get_token(&legacy).await.unwrap().is_none(),
+            "legacy entry gone"
+        );
+        let grant = client.peek_refresh_grant(&new_rt).await.unwrap().unwrap();
+        assert_eq!(grant.client_id, gone, "still bound to its client");
+        assert_eq!(grant.device_id, device, "the device is kept");
+        assert!(
+            !grant.confidential_client,
+            "a registration that is gone is public"
+        );
+        let (status, body) = matrix_refresh(&state, &new_rt).await;
+        assert_eq!(status, StatusCode::OK, "the lifted token rotates: {body}");
+        client
+            .revoke_grants_for_device(&meta.username, &device)
+            .await
+            .ok();
+    }
+
+    /// A homeserver that answers `POST /_synapse/mas/delete_device` with 200
+    /// and records each request body. Returns its base URL.
+    async fn recording_homeserver() -> (
+        String,
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = bodies.clone();
+        let app = axum::Router::new().route(
+            "/_synapse/mas/delete_device",
+            axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded.lock().unwrap().push(body);
+                    Json(serde_json::json!({}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), bodies, server)
+    }
+
+    /// R3 of the promotion plan at the Matrix routes. An Element X device id
+    /// is 43 base64 characters with `/` and `+`; it survives a rotation at
+    /// `POST /_matrix/client/v3/refresh`, and it is torn down by a sign-out
+    /// with the device's own access token and by `DELETE /devices/{id}` from
+    /// another device of the user, sent percent-encoded through the route as
+    /// the router declares it. Synapse is asked to delete exactly that id,
+    /// byte for byte; the device's grants are refused afterwards; the device
+    /// whose id is the Element X id's prefix up to the `/` is untouched.
+    #[tokio::test]
+    async fn an_element_x_device_id_survives_rotation_logout_and_device_deletion() {
+        const EX: &str = "Wd3k+P0/rTq9LmZ8xV2cN7bH1yF6gJ4sA5eU+oQ/iRt";
+        let Some(client) = redis().await else { return };
+        let (endpoint, deleted, homeserver) = recording_homeserver().await;
+        let state = CompatState {
+            redis_client: client.clone(),
+            require_secret: true,
+            synapse_client: Some(Arc::new(SynapseClient::new(&endpoint, "secret"))),
+            server_name: Some("example.org".to_string()),
+        };
+        let prefix = EX.split('/').next().unwrap();
+        let n = nonce();
+        let rotate_at_matrix = |rt: String| {
+            let state = state.clone();
+            async move {
+                let (status, body) = matrix_refresh(&state, &rt).await;
+                assert_eq!(status, StatusCode::OK, "the device's token rotates: {body}");
+                (
+                    body["access_token"].as_str().unwrap().to_string(),
+                    body["refresh_token"].as_str().unwrap().to_string(),
+                )
+            }
+        };
+
+        // A sign-out with the device's own access token, after a rotation.
+        let user = format!("ex-logout-{n}");
+        let grant = seed_grant(&client, &user, EX).await;
+        let (access, refresh_rt) = rotate_at_matrix(grant.refresh_token.unwrap()).await;
+        assert_eq!(
+            client
+                .peek_refresh_grant(&refresh_rt)
+                .await
+                .unwrap()
+                .unwrap()
+                .device_id,
+            EX,
+            "rotation keeps the device id"
+        );
+        let neighbour = seed_grant(&client, &user, prefix).await;
+        let resp = logout(State(state.clone()), bearer(&access))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            *deleted.lock().unwrap(),
+            vec![serde_json::json!({"localpart": user, "device_id": EX})],
+            "Synapse is asked to delete exactly the Element X device"
+        );
+        assert!(client.check_access_token(&access).await.unwrap().is_none());
+        let (status, _) = matrix_refresh(&state, &refresh_rt).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the refresh token is refused"
+        );
+        assert!(
+            client
+                .check_access_token(&neighbour.access_token)
+                .await
+                .unwrap()
+                .is_some(),
+            "the device whose id is the prefix is untouched"
+        );
+
+        // DELETE /devices/{id} from the user's other device, over HTTP through
+        // the route as `axum_lib` declares it: `/` and `+` percent-encoded.
+        deleted.lock().unwrap().clear();
+        let user = format!("ex-delete-{n}");
+        let target = seed_grant(&client, &user, EX).await;
+        let own = seed_grant(&client, &user, prefix).await;
+        let (_, target_rt) = rotate_at_matrix(target.refresh_token.unwrap()).await;
+        let app = axum::Router::new().route(
+            "/_matrix/client/v3/devices/{device_id}",
+            axum::routing::delete(delete_device).with_state(state.clone()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let encoded = EX.replace('/', "%2F").replace('+', "%2B");
+        let resp = reqwest::Client::new()
+            .delete(format!("http://{addr}/_matrix/client/v3/devices/{encoded}"))
+            .bearer_auth(&own.access_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            *deleted.lock().unwrap(),
+            vec![serde_json::json!({"localpart": user, "device_id": EX})],
+            "the percent-encoded path names exactly the Element X device"
+        );
+        let (status, _) = matrix_refresh(&state, &target_rt).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the deleted device's token is refused"
+        );
+        assert!(
+            client
+                .check_access_token(&own.access_token)
+                .await
+                .unwrap()
+                .is_some(),
+            "the bearer's own device is untouched"
+        );
+        rotate_at_matrix(own.refresh_token.unwrap()).await;
+
+        server.abort();
+        homeserver.abort();
+        for user in [format!("ex-logout-{n}"), format!("ex-delete-{n}")] {
+            for device in [EX, prefix] {
+                client.revoke_grants_for_device(&user, device).await.ok();
+            }
+        }
+    }
+
     /// A store fault: Redis answers the operation that reads `key` with an
     /// error (`WRONGTYPE`: a string planted where a hash is read). The handler
     /// gets the same `Err` from the store that a lost connection, a timeout or

@@ -73,8 +73,17 @@ nondeterministic, so every admin request introspects.
   GET    /_matrix/client/v3/account/whoami        tests/e2e_msc3861.rs,
                                                   tests/e2e_session_teardown.rs
   GET    /_matrix/client/v3/devices               tests/e2e_device_code.rs
+  GET    /_matrix/client/v3/sync                  siwx-oidc-auth/examples/soak.rs (an
+                                                  empty sync: no rooms, a next_batch)
          siwx-oidc itself calls NEITHER: these are the Synapse->siwx-oidc
          introspection leg, driven by the e2e suites as the user would.
+
+  -- the edge's split (NOT Synapse surface: forwarded to siwx-oidc) ---------
+  POST   /_matrix/client/v3/refresh               forwarded as a deployment's edge
+  DELETE /_matrix/client/v3/devices/{id}          does (Synapse under delegated auth
+                                                  does not serve them), so a client
+                                                  can use this mock as its homeserver
+                                                  (siwx-oidc-auth/tests/live_upgrade.rs)
 
   -- unauthenticated C-S API -------------------------------------------------
   GET    /_matrix/client/v3/profile/{mxid}        synapse_client::has_profile_row
@@ -121,6 +130,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse, parse_qs, urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 SECRET = os.environ.get("SYNAPSE_MOCK_SECRET", "testsecret")
@@ -354,6 +364,27 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _forward_to_oidc(self, method, raw):
+        """Forward this request to siwx-oidc, as a deployment's edge does for the
+        client-server routes siwx-oidc owns. The raw path keeps its percent-encoding
+        (a device id may carry `/` and `+`)."""
+        req = Request(f"{OIDC_BASE}{self.path}", data=raw if raw else None, method=method)
+        for h in ("Authorization", "Content-Type"):
+            if self.headers.get(h):
+                req.add_header(h, self.headers.get(h))
+        try:
+            with urlopen(req, timeout=30) as resp:
+                status, payload = resp.status, resp.read()
+        except HTTPError as e:
+            status, payload = e.code, e.read()
+        except OSError:
+            status, payload = 502, b'{"errcode": "M_UNKNOWN", "error": "siwx-oidc unreachable"}'
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def _send(self, code, obj=None):
         payload = json.dumps(obj if obj is not None else {}).encode()
         self.send_response(code)
@@ -573,6 +604,15 @@ class Handler(BaseHTTPRequestHandler):
             # No `total`: that key belongs to the admin v2 route, not this one.
             return self._send(200, {"devices": devs})
 
+        # GET /_matrix/client/v3/sync -- the population soak's per-minute call.
+        # An account with no rooms: authenticated by the same introspection,
+        # answered with an empty sync and a next_batch.
+        if path == "/_matrix/client/v3/sync":
+            introspection, denied = self._cs_api_auth()
+            if denied:
+                return self._send(*denied)
+            return self._send(200, {"next_batch": "s0", "rooms": {}})
+
         # -- unauthenticated C-S API ---------------------------------------
         # GET /_matrix/client/v3/profile/{mxid}/{field}  (read_did_field; test read-back)
         m = re.match(r"^/_matrix/client/v3/profile/([^/]+)/(.+)$", path)
@@ -753,6 +793,10 @@ class Handler(BaseHTTPRequestHandler):
         if rp:
             n = int(self.headers.get("Content-Length", 0) or 0)
             return self._stub_rp(rp.group(1), rp.group(2), self.rfile.read(n) if n else b"")
+        if path == "/_matrix/client/v3/refresh":
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            self._log("POST", path)
+            return self._forward_to_oidc("POST", self.rfile.read(n) if n else b"")
         body = self._body()
         # test helpers (no auth, never call-logged) ------------------------
         if path == "/__seed_device":
@@ -997,6 +1041,9 @@ class Handler(BaseHTTPRequestHandler):
         p = urlparse(self.path)
         path = unquote(p.path)
         self._log("DELETE", path)
+        if re.match(r"^/_matrix/client/v3/devices/[^/]+$", p.path):
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            return self._forward_to_oidc("DELETE", self.rfile.read(n) if n else b"")
         if re.match(r"^/_synapse/admin/v2/users/(.+)/devices/(.+)$", path):
             return self._ported_away("POST /_synapse/mas/delete_device")
         return self._send(404, {"errcode": "M_NOT_FOUND", "error": path})
