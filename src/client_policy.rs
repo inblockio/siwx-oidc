@@ -132,23 +132,27 @@ pub fn mailbox_for(username: &str, did: &str, mail_domain: Option<&str>) -> Opti
 /// 3. the recorded localpart is the opaque one derived from the token's DID ([`mailbox_for`]);
 /// 4. a mail domain is configured.
 ///
-/// Any other kind of grant, and a legacy token with no grant record, gets no claim, so a
-/// grant kind added later gets none until it is named here.
+/// Any other kind of grant, and a legacy token with no grant record, gets no claim. Both the
+/// kind and the class are decided by an exhaustive `match`, so a grant kind or a client class
+/// added later does not compile until it is named here.
 pub fn mailbox_claim(
     token: &TokenMetadata,
     client: &ClientEntry,
     mail_domain: Option<&str>,
 ) -> Option<String> {
-    let oidc_grant = matches!(token.grant_kind, Some(GrantKind::Oidc));
+    let oidc_grant = match token.grant_kind {
+        Some(GrantKind::Oidc) => true,
+        Some(GrantKind::MatrixDevice | GrantKind::Service) | None => false,
+    };
+    let generic_client = match client.class {
+        ClientClass::Generic => true,
+        ClientClass::Matrix => false,
+    };
     let still_allowed = client
         .allowed_scopes
         .as_deref()
         .is_some_and(|allowed| allowed.iter().any(|scope| scope == MAIL_SCOPE));
-    if !(oidc_grant
-        && client.class == ClientClass::Generic
-        && still_allowed
-        && has_scope(&token.scope, MAIL_SCOPE))
-    {
+    if !(oidc_grant && generic_client && still_allowed && has_scope(&token.scope, MAIL_SCOPE)) {
         return None;
     }
     mailbox_for(&token.username, &token.did, mail_domain)
