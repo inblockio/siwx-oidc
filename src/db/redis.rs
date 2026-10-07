@@ -9,8 +9,9 @@ use bb8_redis::{
     redis::AsyncCommands,
     RedisConnectionManager,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
+use crate::client_policy;
 use crate::redact::{fingerprint, redact_key};
 use url::Url;
 
@@ -1136,6 +1137,59 @@ impl RedisClient {
     }
 }
 
+impl RedisClient {
+    /// Set the client epoch of `client_id` when replacing its stored entry with `after`
+    /// (`None`: deleting it) ends the grants it holds ([`client_policy::grant_end`]), so every
+    /// grant authenticated before now is refused at both refresh endpoints and at userinfo.
+    /// The start-up sync ([`DBClient::sync_static_clients`]) calls it for every client whose
+    /// entry it overwrites or deletes.
+    ///
+    /// Call it BEFORE the entry is written or deleted. A failure in between leaves the old
+    /// entry in place, so the next start decides again and repeats the epoch, which is
+    /// harmless; the other order could lose the change for good, because the next start
+    /// would find the new entry and see no change.
+    ///
+    /// An entry that is missing, or that this build cannot read, says nothing about the class
+    /// its grants were issued under, and ending sessions that may be Matrix sessions is the
+    /// worse error: it sets no epoch.
+    async fn end_grants_of_changed_client(
+        &self,
+        client_id: &str,
+        after: Option<&ClientEntry>,
+    ) -> Result<()> {
+        let stored = self
+            .get_raw(&format!("{}/{}", KV_CLIENT_PREFIX, client_id))
+            .await?;
+        let Some(stored) = stored else {
+            return Ok(());
+        };
+        let before: ClientEntry = match serde_json::from_str(&stored) {
+            Ok(before) => before,
+            Err(e) => {
+                warn!(
+                    client_id = %client_id,
+                    error = %e,
+                    "the stored entry of a static client cannot be read, so its grants are not ended"
+                );
+                return Ok(());
+            }
+        };
+        let Some(reason) = client_policy::grant_end(&before, after) else {
+            return Ok(());
+        };
+        let epoch_ms = self
+            .set_epoch(super::grant::EpochScope::Client(client_id))
+            .await?;
+        warn!(
+            client_id = %client_id,
+            reason = reason.as_str(),
+            epoch_ms,
+            "ended every grant of a static client, which the configuration no longer matches"
+        );
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl DBClient for RedisClient {
     async fn server_time_ms(&self) -> Result<i64> {
@@ -1228,6 +1282,7 @@ impl DBClient for RedisClient {
         for (id, entry) in &clients {
             let value = serde_json::to_string(entry)
                 .map_err(|e| anyhow!("Failed to serialize client entry: {}", e))?;
+            self.end_grants_of_changed_client(id, Some(entry)).await?;
             // Tracked before it is written: a failure between the two commands then leaves a
             // tracked id without a client, which pruning handles, and never a client without
             // a TTL that nothing tracks.
@@ -1244,6 +1299,7 @@ impl DBClient for RedisClient {
             .iter()
             .filter(|id| !clients.iter().any(|(kept, _)| kept == *id))
         {
+            self.end_grants_of_changed_client(id, None).await?;
             conn.del::<_, ()>(format!("{}/{}", KV_CLIENT_PREFIX, id))
                 .await
                 .map_err(|e| anyhow!("Failed to delete a removed static client: {}", e))?;

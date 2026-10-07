@@ -543,9 +543,13 @@ once; the user tombstone the epoch replaced refused that for 15 minutes. A
 user tombstone planted by the previous build is still honoured until it
 expires.
 
-Global and client epochs have no HTTP endpoint. An operator sets one with a
-single script that takes the time from Redis `TIME` and never moves an epoch
-earlier (provisional; it is what `RedisClient::set_epoch` runs):
+Global and client epochs have no HTTP endpoint. The start-up sync of static
+clients sets the client epoch of a generic-class client that was removed,
+changed class or changed its allowed scopes, and nothing else sets one on its
+own ([Configuration](configuration.md#changes-that-end-a-generic-clients-sessions)).
+An operator sets any epoch with a single script that takes the time from Redis
+`TIME` and never moves an epoch earlier (provisional; it is what
+`RedisClient::set_epoch` runs):
 
 ```bash
 redis-cli -u "$REDIS_URL" EVAL "local t = redis.call('TIME') \
@@ -689,7 +693,9 @@ Provisional choices, open for the maintainers:
   client can be removed. A token whose client is gone keeps refreshing when the
   request names that client or none, and is refused when the request names
   another client or presents a secret (which can no longer be checked). Refusing
-  it outright would sign out every session older than a registration.
+  it outright would sign out every session older than a registration. A
+  generic-class static client is the exception: removing it sets its client
+  epoch, so its grants end with it (see [Epochs](#epochs)).
 
 An `Authorization` header at `/token` used to be answered with a 400 on every
 request (two header extractors rejecting each other's scheme), so
