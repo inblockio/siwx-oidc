@@ -47,7 +47,7 @@ Env names are shown with the `SIWXOIDC_` prefix; each also works as `SIWEOIDC_â€
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
 | `address` | `SIWXOIDC_ADDRESS` | `127.0.0.1` (image: `0.0.0.0`) | IP address to bind. |
-| `port` | `SIWXOIDC_PORT` | `8000` | Port to bind. |
+| `port` | `SIWXOIDC_PORT` | `8000` | Port to bind. `0` lets the system pick a free port; the `Listening on` log line names the one bound. |
 | `base_url` | `SIWXOIDC_BASE_URL` | `http://127.0.0.1:8000` | Issuer URL, advertised in discovery and used in every endpoint URL. Also the default WebAuthn RP ID (its host) and origin. **Must have a hostname**, see below. |
 | `redis_url` | `SIWXOIDC_REDIS_URL` | `redis://localhost` | Redis holding sessions, codes, tokens, clients and passkeys. |
 | `log_format` | `SIWXOIDC_LOG_FORMAT` | `pretty` | `pretty` or `json`. See [Logging](#logging). |

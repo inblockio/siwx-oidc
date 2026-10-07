@@ -97,8 +97,8 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 22 tests in ten files:
-  `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (3),
+  `cargo test --workspace` runs the unit tests of both crates plus 23 tests in ten files:
+  `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (4),
   `log_hygiene_credential_store` (1) and `log_capture_callsite_interest` (1), which
   need nothing; `account_linking_dual_write` (6), which needs the test Redis, and `log_hygiene`
   (4, one of them needs it);
@@ -806,10 +806,15 @@ doc; read it before changing the code the rule covers.
 - **aqua-auth has no logging** and no knowledge of ceremonies.
 - **SIGTERM and SIGINT shut the server down gracefully**, answering requests already in flight.
   In the image it is PID 1, which ignores a signal it has no handler for, so without
-  `shutdown_signal` `docker stop` waits 10 s and SIGKILLs. Pin:
+  `shutdown_signal` `docker stop` waits 10 s and SIGKILLs. The `Listening on` line is logged
+  after the bind and after the handlers are installed, and names the address actually bound:
+  the tests start the server on port 0 and wait for that line, because a port picked in the
+  test and passed on can be handed to another listener before the server binds it. Do not log
+  it before the bind. Pin:
   `sigterm_finishes_and_exits_zero_with_an_idle_connection_open`,
   `sigint_finishes_and_exits_zero_with_an_idle_connection_open`,
-  `a_request_in_flight_when_sigterm_arrives_is_still_answered`.
+  `a_request_in_flight_when_sigterm_arrives_is_still_answered`,
+  `a_server_that_cannot_bind_says_which_address`.
 - **Credential store: dual-write, not cut-over.** The legacy `webauthn:credential/*` namespace
   stays authoritative; mirror writes are best-effort; the backfill is additive and idempotent.
   Pin: `backfill_is_additive_link_aware_counter_preserving_and_idempotent` (needs its own
