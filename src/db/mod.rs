@@ -28,6 +28,9 @@ pub mod tokens;
 pub use self::redis::RedisClient;
 
 const KV_CLIENT_PREFIX: &str = "clients";
+/// Redis SET of the client ids written from `default_clients`, so the next start can
+/// delete the ones the configuration no longer names. A plain key, outside `clients/`.
+const KV_STATIC_CLIENTS_KEY: &str = "clients:static";
 
 // Credentials a client holds are stored only as their SHA-256 digest
 // ([`tokens::digest`]): authorization codes `code/{digest}`, login sessions
@@ -796,6 +799,10 @@ pub trait DBClient {
     async fn set_client(&self, client_id: String, client_entry: ClientEntry) -> Result<()>;
     async fn get_client(&self, client_id: String) -> Result<Option<ClientEntry>>;
     async fn delete_client(&self, client_id: String) -> Result<()>;
+    /// Make the static clients in Redis equal `clients`: every entry is written with NO
+    /// TTL and its id recorded in the static-client set, and every recorded id that
+    /// `clients` no longer names is deleted. Returns how many were deleted.
+    async fn sync_static_clients(&self, clients: Vec<(String, ClientEntry)>) -> Result<usize>;
     async fn set_code(&self, code: String, code_entry: CodeEntry) -> Result<()>;
     async fn set_session(&self, id: String, entry: SessionEntry) -> Result<()>;
     async fn get_session(&self, id: String) -> Result<Option<SessionEntry>>;
