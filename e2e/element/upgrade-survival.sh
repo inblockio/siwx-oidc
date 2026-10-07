@@ -59,7 +59,10 @@ CTRF_OUTPUT="${CTRF_OUTPUT:-$QUALIFY_STATE_DIR/ctrf/ctrf-report.json}"
 CTRF_DIR="$(dirname "$CTRF_OUTPUT")"
 mkdir -p "$CTRF_DIR"
 STEPS="$CTRF_DIR/t2-driver-steps.tsv"   # name<TAB>passed|failed<TAB>ms<TAB>message
-[ "$STAGE" = "check" ] || : > "$STEPS"
+# A new run starts with mint; switch and check append to its steps.
+case "$STAGE" in
+  mint|all) : > "$STEPS"; rm -f "$CTRF_DIR"/t2-capture.ctrf.json "$CTRF_DIR"/t2-assert.ctrf.json "$CTRF_DIR"/t2-cleanup.ctrf.json ;;
+esac
 touch "$STEPS"
 
 lab_needed=0
@@ -85,20 +88,20 @@ step() { # name status started_ms message
 }
 
 # The siwx-oidc the lab runs must be $1 (an image ref); resolved by service, never by name.
-expect_running() { # ref label
+expect_running() { # ref label stage
   local t0 cid want got
   t0=$(now_ms)
   if [ "${#COMPOSE[@]}" -eq 0 ]; then
-    step "driver: siwx-oidc runs the $2 image" skipped "$t0" "LAB_PROJECT not set: the caller switches and checks the image"
+    step "driver ($3): siwx-oidc runs the $2 image" skipped "$t0" "LAB_PROJECT not set: the caller switches and checks the image"
     return 0
   fi
   cid=$(cid_of "$1" siwx-oidc)
   want=$(image_id "$1")
   got=$( [ -n "$cid" ] && running_image_id "$cid" || true)
   if [ -n "$cid" ] && [ -n "$want" ] && [ "$want" = "$got" ]; then
-    step "driver: siwx-oidc runs the $2 image" passed "$t0" "revision $(label_rev "$cid")"
+    step "driver ($3): siwx-oidc runs the $2 image" passed "$t0" "revision $(label_rev "$cid")"
   else
-    step "driver: siwx-oidc runs the $2 image" failed "$t0" "running image ${got:-none}, expected ${want:-unknown}"
+    step "driver ($3): siwx-oidc runs the $2 image" failed "$t0" "running image ${got:-none}, expected ${want:-unknown}"
     return 1
   fi
 }
@@ -143,7 +146,7 @@ T_START=$(date +%s)
 
 # ------------------------------------------------------------------ mint
 if [ "$STAGE" = "mint" ] || [ "$STAGE" = "all" ]; then
-  expect_running "$BASELINE_IMAGE" baseline
+  expect_running "$BASELINE_IMAGE" baseline mint
   echo "[t2] mint: ew-upgrade-capture.spec.mjs on the baseline"
   t=$(date +%s)
   if ! run_spec ew-upgrade-capture.spec.mjs "$CTRF_DIR/t2-capture.ctrf.json"; then
@@ -156,7 +159,7 @@ fi
 
 # ------------------------------------------------------------------ switch
 if [ "$STAGE" = "switch" ] || [ "$STAGE" = "all" ]; then
-  expect_running "$BASELINE_IMAGE" baseline
+  expect_running "$BASELINE_IMAGE" baseline "switch, before"
   t0=$(now_ms)
   declare -A started=()
   others=$(compose "$BASELINE_IMAGE" ps --services | grep -vx 'siwx-oidc' || true)
@@ -173,12 +176,12 @@ if [ "$STAGE" = "switch" ] || [ "$STAGE" = "all" ]; then
   done
   echo "[t2] switch-to-healthy took $(( $(date +%s) - t ))s"
   if [ "$healthy" = "1" ]; then
-    step "driver: the candidate siwx-oidc is healthy after up -d --no-deps" passed "$t0" ""
+    step "driver (switch): the candidate siwx-oidc is healthy after up -d --no-deps" passed "$t0" ""
   else
-    step "driver: the candidate siwx-oidc is healthy after up -d --no-deps" failed "$t0" "not healthy within 180 s"
+    step "driver (switch): the candidate siwx-oidc is healthy after up -d --no-deps" failed "$t0" "not healthy within 180 s"
     exit 1
   fi
-  expect_running "$CANDIDATE_IMAGE" candidate
+  expect_running "$CANDIDATE_IMAGE" candidate "switch, after"
   t0=$(now_ms)
   moved=""
   for s in $others; do
@@ -186,22 +189,22 @@ if [ "$STAGE" = "switch" ] || [ "$STAGE" = "all" ]; then
     [ "$now" = "${started[$s]}" ] || moved="$moved $s"
   done
   if [ -z "$moved" ]; then
-    step "driver: every other service kept running (StartedAt unchanged)" passed "$t0" "$(echo $others | tr '\n' ' ')"
+    step "driver (switch): every other service kept running (StartedAt unchanged)" passed "$t0" "$(echo $others | tr '\n' ' ')"
   else
-    step "driver: every other service kept running (StartedAt unchanged)" failed "$t0" "restarted:$moved"
+    step "driver (switch): every other service kept running (StartedAt unchanged)" failed "$t0" "restarted:$moved"
     exit 1
   fi
 fi
 
 # ------------------------------------------------------------------ check
 if [ "$STAGE" = "check" ] || [ "$STAGE" = "all" ]; then
-  expect_running "$CANDIDATE_IMAGE" candidate
+  expect_running "$CANDIDATE_IMAGE" candidate check
   if [ "${T2_NEGATIVE:-}" = "flush-redis" ]; then
     t0=$(now_ms)
     rcid=$(cid_of "$CANDIDATE_IMAGE" redis)
     [ -n "$rcid" ] || { echo "[t2] no redis container in project $LAB_PROJECT" >&2; exit 2; }
     docker exec "$rcid" redis-cli FLUSHALL >/dev/null
-    step "driver: NEGATIVE CONTROL: the lab's Redis was flushed before the check" passed "$t0" "the check below must fail"
+    step "driver (check): NEGATIVE CONTROL: the lab's Redis was flushed before the check" passed "$t0" "the check below must fail"
   elif [ -n "${T2_NEGATIVE:-}" ]; then
     echo "[t2] unknown T2_NEGATIVE=${T2_NEGATIVE}" >&2; exit 2
   fi
