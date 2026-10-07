@@ -121,7 +121,9 @@ token that manages the client at `/client/{id}`. Clients can also register thems
 `POST /register` (dynamic client registration), which is what Matrix clients do.
 A dynamically registered client is kept for 30 days after its last use (an authorization
 request, a code, device-code or refresh exchange, or a userinfo call); after that it must
-register again.
+register again. An authorization request counts only once it passed every check, the redirect
+URI exactly as registered included, so whoever knows a client's id and one of its registered
+redirect URIs can keep that registration from lapsing; it gives them nothing else.
 
 Redis holds only the SHA-256 digests of the secret and of the registration access token, never
 the values, for configured and registered clients alike. A registered client's secret is random;

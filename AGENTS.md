@@ -720,9 +720,15 @@ doc; read it before changing the code the rule covers.
   and the first-read upgrade of a plaintext entry keeps the expiry the entry had. A dynamic
   client's lifetime is restored by `touch_client` after an authorization request, an accepted
   code or device-code exchange, an accepted refresh at either endpoint (a replay included) and a
-  userinfo call, always for the client the grant, code or token belongs to and never for one a
-  request names; the touch extends only a key that has a TTL, never changes the answer, and
-  a failure is a `warn!` naming the client. Pin: `static_clients_never_expire`,
+  userinfo call. A code or device-code exchange, a refresh and userinfo touch the client the
+  code, grant or token belongs to, never one the request names. `authorize` is the one
+  exception: it has no grant yet, so it touches the client its request names, once the request
+  passed every check (the redirect URI exactly as registered included), so that a sign-in begun
+  in the client's last minutes can finish. Whoever knows a dynamic client's id and one of its
+  registered redirect URIs can therefore keep that registration from lapsing; it gives them
+  nothing else, since registration is open anyway. The touch extends only a key that has a TTL,
+  never changes the answer, and a failure is a `warn!` naming the client. Pin:
+  `static_clients_never_expire`,
   `touching_extends_a_dynamic_client_and_never_a_static_one`,
   `rewriting_a_client_keeps_a_static_client_without_expiry`,
   `an_upgraded_plaintext_static_client_keeps_no_ttl`,
@@ -730,6 +736,7 @@ doc; read it before changing the code the rule covers.
   `an_accepted_refresh_extends_a_dynamic_client`, `a_refused_refresh_extends_no_client`,
   `a_successful_refresh_extends_a_dynamic_client` (the Matrix endpoint),
   `a_code_exchange_extends_a_dynamic_client`, `a_device_code_exchange_extends_a_dynamic_client`,
+  `an_authorization_request_extends_the_client_it_names_only_once_accepted`,
   `a_successful_userinfo_call_extends_a_dynamic_client`,
   `a_failed_lifetime_extension_is_logged_at_warn_with_the_client_id`,
   `a_prune_that_fails_is_retried_until_it_succeeds`; mock stack:
