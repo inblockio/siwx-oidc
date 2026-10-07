@@ -70,6 +70,10 @@ lab_needed=0
 COMPOSE=()
 if [ "$lab_needed" = "1" ] || [ -n "${LAB_PROJECT:-}" ]; then
   need LAB_COMPOSE_DIR LAB_PROJECT LAB_ENV_FILE REDIS_IMAGE_REF SYNAPSE_IMAGE_REF ELEMENT_IMAGE_REF
+  # The overlay can only check that a reference is set; a tag could move under the rehearsal.
+  for v in REDIS_IMAGE_REF SYNAPSE_IMAGE_REF ELEMENT_IMAGE_REF; do
+    case "${!v}" in *@sha256:*) ;; *) echo "[t2] $v must be pinned by digest (name@sha256:...)" >&2; exit 2 ;; esac
+  done
   [ -f "$LAB_COMPOSE_DIR/docker-compose.qualify.yml" ] || { echo "[t2] no docker-compose.qualify.yml in $LAB_COMPOSE_DIR" >&2; exit 2; }
   export REDIS_IMAGE_REF SYNAPSE_IMAGE_REF ELEMENT_IMAGE_REF
   COMPOSE=(docker compose -p "$LAB_PROJECT" -f docker-compose.local.yml -f docker-compose.qualify.yml --env-file "$LAB_ENV_FILE")

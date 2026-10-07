@@ -78,6 +78,9 @@ test.beforeAll(async () => {
     const now = { element: T2.elementUrl, matrix: T2.matrixUrl, siwx: T2.siwxUrl }[k];
     if (state.targets[k] !== now) throw new Error(`the capture ran against another ${k} target`);
   }
+  // Cleanup needs no browser profile (EW-UZ uses a fresh context), so a profile that cannot
+  // be opened after a failed capture never stands between the accounts and their deactivation.
+  if (process.env.T2_CLEANUP_ONLY === '1') return;
   profile = await launchProfile();
   launchedAt = Date.now();
   const tokenUrl = `${T2.siwxUrl}/token`;
@@ -323,24 +326,38 @@ test('EW-UA10: candidate: Element refreshed its token against the candidate', as
   expect(signOuts, 'something called a sign-out endpoint').toEqual([]);
 });
 
-test('EW-UZ: cleanup: the throwaway accounts are deactivated', async () => {
+test('EW-UZ: cleanup: the throwaway accounts are deactivated', async ({ browser }) => {
   test.setTimeout(180_000);
+  // Each account on its own, in a fresh browser context (not A's profile): one failure must
+  // not leave the others active.
   const out = {};
+  const attempt = async (k, fn) => {
+    try {
+      out[k] = await fn();
+    } catch (e) {
+      out[k] = `error ${String(e?.message || e).slice(0, 120)}`;
+    }
+  };
   for (const k of ['a', 'b']) {
     if (!state.accounts[k]?.private_key) continue;
-    out[k] = await deactivateWalletAccount(makeWallet(state.accounts[k].private_key, serverName()).wallet, T2.siwxUrl);
+    await attempt(k, () =>
+      deactivateWalletAccount(makeWallet(state.accounts[k].private_key, serverName()).wallet, T2.siwxUrl),
+    );
   }
   const saved = await readJson(passkeyPath()).catch(() => null);
   if (state.accounts.passkey && saved) {
-    const p = await profile.newPage();
-    try {
-      const auth = await addVirtualAuthenticator(p);
-      await importPasskeys(auth, saved.credentials, saved.rp_id);
-      await p.goto(`${T2.siwxUrl}/account`, { waitUntil: 'domcontentloaded' });
-      out.passkey = await deactivatePasskeyAccount(p);
-    } finally {
-      await closeTab(p);
-    }
+    await attempt('passkey', async () => {
+      const ctx = await browser.newContext();
+      try {
+        const p = await ctx.newPage();
+        const auth = await addVirtualAuthenticator(p);
+        await importPasskeys(auth, saved.credentials, saved.rp_id);
+        await p.goto(`${T2.siwxUrl}/account`, { waitUntil: 'domcontentloaded' });
+        return await deactivatePasskeyAccount(p);
+      } finally {
+        await ctx.close();
+      }
+    });
   }
   test.info().annotations.push({ type: 'deactivated', description: JSON.stringify(out) });
   for (const [k, v] of Object.entries(out)) expect(v, `account ${k}`).toBe('deactivated');
