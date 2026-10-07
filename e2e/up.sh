@@ -83,6 +83,8 @@ podman run -d --name siwx-e2e-oidc --network host -w /app -v "$REPO:/app:z" \
   -e SIWEOIDC_MATRIX_SERVER_NAME="$SIWEOIDC_MATRIX_SERVER_NAME" \
   -e SIWEOIDC_REQUIRE_SECRET="$SIWEOIDC_REQUIRE_SECRET" \
   -e SIWXOIDC_DEFAULT_CLIENTS__E2ESTATIC="$SIWXOIDC_DEFAULT_CLIENTS__E2ESTATIC" \
+  -e SIWXOIDC_DEFAULT_CLIENTS__MAILE2E="$SIWXOIDC_DEFAULT_CLIENTS__MAILE2E" \
+  -e SIWXOIDC_MAIL_DOMAIN="$SIWXOIDC_MAIL_DOMAIN" \
   -e RUST_LOG="$RUST_LOG" \
   docker.io/library/ubuntu:rolling /app/target/debug/siwx-oidc >/dev/null
 
