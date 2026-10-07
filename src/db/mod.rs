@@ -803,6 +803,10 @@ pub trait DBClient {
     /// TTL and its id recorded in the static-client set, and every recorded id that
     /// `clients` no longer names is deleted. Returns how many were deleted.
     async fn sync_static_clients(&self, clients: Vec<(String, ClientEntry)>) -> Result<usize>;
+    /// Extend a DYNAMIC client's lifetime to [`CLIENT_LIFETIME`] from now. A client without
+    /// a TTL (a static one) and an unknown id are left as they are. Call sites treat it as
+    /// best-effort: its result never changes the outcome of a request.
+    async fn touch_client(&self, client_id: &str) -> Result<()>;
     async fn set_code(&self, code: String, code_entry: CodeEntry) -> Result<()>;
     async fn set_session(&self, id: String, entry: SessionEntry) -> Result<()>;
     async fn get_session(&self, id: String) -> Result<Option<SessionEntry>>;

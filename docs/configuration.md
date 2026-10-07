@@ -118,6 +118,9 @@ A client entry is `{"secret": "…", "metadata": {…}}`, where `metadata` is RF
 metadata (at least `redirect_uris`); an optional `"access_token"` is the registration access
 token that manages the client at `/client/{id}`. Clients can also register themselves through
 `POST /register` (dynamic client registration), which is what Matrix clients do.
+A dynamically registered client is kept for 30 days after its last use (an authorization
+request, a code, device-code or refresh exchange, or a userinfo call); after that it must
+register again.
 
 Redis holds only the SHA-256 digests of the secret and of the registration access token, never
 the values, for configured and registered clients alike. A registered client's secret is random;

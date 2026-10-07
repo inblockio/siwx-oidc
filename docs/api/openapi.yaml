@@ -289,7 +289,7 @@ paths:
         `invalid_client`. A public client authenticates nothing and may omit
         `client_id` at the refresh grant. The replay of a lost response is bound to
         the client like a rotation. A refresh token whose client registration has expired
-        (a registration lasts 30 days) still refreshes when the request names that
+        (a dynamic registration lasts 30 days from its last use) still refreshes when the request names that
         client or none, and is refused when it presents a secret. The Matrix
         refresh endpoint `POST /_matrix/client/v3/refresh` has no client identity
         to carry, so it refuses a confidential client's refresh token.
@@ -368,6 +368,7 @@ paths:
       tags: [OIDC]
       operationId: registerClient
       summary: Dynamic client registration (RFC 7591)
+      description: The client is kept for 30 days after its last use (an authorization request, a code, device-code or refresh exchange, or a userinfo call). Registering again is the recovery after that.
       requestBody:
         required: true
         content:
