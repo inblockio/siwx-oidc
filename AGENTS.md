@@ -35,9 +35,9 @@ everything else exists only in the binary crate.
 | `axum_lib.rs` | Startup: loads config through `config::figment()`, validates it (DID methods and pkh namespaces against the aqua-auth registries, signing key, retired keys, WebAuthn), `store_default_clients` (digested, no expiry, prunes the clients the map no longer names), `AppState`, the router, handler glue, the `siwx_user` / `acct_session` cookies, the CORS layer. |
 | `config.rs` | `Config`, its defaults, and `figment()`: the one place config names and precedence are defined. Reference: [docs/configuration.md](docs/configuration.md). |
 | `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_code_client` and `authenticate_refresh_client` authenticate the client for the first two, and `client_is_confidential` decides which clients must present a secret; `exchange_issuance` decides what a code exchange issues, by deployment mode and client class), `userinfo`, client registration, RP-initiated logout (`end_session`, `verify_id_token_hint`), `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, `provision_synapse_account` (the account half of provisioning and the single DID-publication site) and `provision_synapse_device` (calls it, then adds the device half). |
-| `introspect.rs` | `POST /oauth2/introspect` (RFC 7662) for Synapse; opaque `mat_`/`mcr_` token generation. |
+| `introspect.rs` | `POST /oauth2/introspect` (RFC 7662) for Synapse, inactive for an `oidc` grant's token; opaque `mat_`/`mcr_` token generation. |
 | `admin_token.rs` | `POST /oauth2/admin_token`: short-TTL token whose scope carries `urn:synapse:admin:*`. |
-| `compat.rs` | `POST /oauth2/revoke` (RFC 7009) and the Matrix client-server endpoints siwx-oidc answers (login flows, logout, logout/all, refresh, device deletion); `TeardownPolicy`. |
+| `compat.rs` | `POST /oauth2/revoke` (RFC 7009) and the Matrix client-server endpoints siwx-oidc answers (login flows, logout, logout/all, refresh, device deletion); `TeardownPolicy`, and `CompatState` (`new`, `acts_on`) with which grants the Matrix routes act on. |
 | `device_auth.rs` | RFC 8628 device authorization: `/device_authorization`, the `/device` approval page (wallet and passkey), server-issued CAIP-122 nonces. |
 | `account.rs` | MSC4191 `/account` page and actions, MSC4312 cross-signing reset, and the two non-spec actions `io.inblock.account_erase` / `io.inblock.account_reactivate`. `SUPPORTED_ACTIONS` is the single source of truth for discovery and dispatch; `canonical_action` maps `session_*` aliases to `device_*` and the legacy `org.matrix.account_erase` / `org.matrix.account_reactivate` names to the new ones. The account session (`create_account_session`) lives in the `OwnSession::Account` layout; the page's sign-out is `POST /account/sign_out` (handler in `axum_lib.rs`). |
 | `webauthn.rs` | Passkey ceremonies (register, authenticate, link), the new-identity and deactivation gates (`reject_if_new_identity`, `reject_if_deactivated`), picker scoping. |
@@ -56,7 +56,7 @@ everything else exists only in the binary crate.
 | `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry` with the digests of its secret and registration access token, its `ClientClass` and scope policy, and `client_entry_without_plaintext`, `DeviceCodeEntry` and the `DeviceCodeRef` naming its layout, `TokenMetadata` with its `TokenKind` and the `GrantKind` of its grant, `grant_kind`, which only `AccessGrant::metadata` sets and which is never stored), `Ceremony`, `OwnSession` (the `siwx_user` and `acct_session` layouts), `legacy_token_kind`, Redis key prefixes and TTLs. |
 | `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, the own sessions (`create_own_session`, `lookup_own_session`, `end_own_session`, `revoke_own_sessions`; `lookup_user_session` for the picker), `purge_identity`. |
 | `db/outbox.rs` (lib) | The back-channel logout outbox (`outbox:backchannel_logout`): `LogoutEntry`, claim under a lease, retry, complete. Entries are queued by `drop_grant` in `db/grant.rs`. |
-| `db/grant.rs` (lib) | The grant record and its Lua scripts: `issue_grant`, the access check `check_access_token` (with the legacy read fallback), `rotate_refresh_token` (the one rotation script), `ReuseEvent`, grant revocation, and the legacy migration (`peek_refresh_token`, `lift_legacy_refresh_token`). Keyspace and decision table in its module docs. |
+| `db/grant.rs` (lib) | The grant record and its Lua scripts: `issue_grant`, the access check `check_access_token` (with the legacy read fallback), `is_matrix_credential` (which grants the Matrix side acts on), `rotate_refresh_token` (the one rotation script), `ReuseEvent`, grant revocation, and the legacy migration (`peek_refresh_token`, `lift_legacy_refresh_token`). Keyspace and decision table in its module docs. |
 | `db/tokens.rs` (lib) | Token formats (`mat_`, `msa_`, `mcr_{handle}_{secret}`), `parse_refresh_token` (never panics), `digest` (the SHA-256 every credential a client holds is stored as). |
 | `db/seal.rs` (lib) | The sealed successor pair: AES-256-GCM under a key HKDF-derived from the previous refresh token, so only its presenter can open it. |
 | `bin/migrate-credentials.rs` | Operator tool for the credential backfill. Dry run unless `--apply`. |
@@ -704,6 +704,31 @@ doc; read it before changing the code the rule covers.
   returns the store error instead of folding it into "unknown"). Pin:
   `a_store_fault_at_the_matrix_refresh_endpoint_is_a_retryable_503`,
   `a_store_fault_on_a_bearer_route_is_a_retryable_503`.
+- **In delegated-auth mode the Matrix side acts on Matrix credentials only; an `oidc` grant (a
+  generic-class client's) is not one.** Introspection answers `{"active": false}` for its access
+  token (the endpoint exists only in that mode); the bearer routes (`logout`, `logout/all`,
+  `DELETE /devices/{id}`, `POST /delete_devices`) answer 401 `M_UNKNOWN_TOKEN` and tear nothing
+  down; `POST /_matrix/client/v3/refresh` answers its refresh token like an unknown token before
+  any script runs and leaves the grant current for `POST /token` (a legacy refresh token the lift
+  would turn into an `oidc` grant is refused the same way). One function decides, an exhaustive
+  `match` over the grant kind (`grant::is_matrix_credential`: `matrix_device`, `service` and a token
+  with no grant record are Matrix credentials), so a new `GrantKind` must be placed there, and any
+  other decision on a kind or class is an exhaustive `match` too, never a `== Generic` deny-list.
+  The bearer routes ask it through `CompatState::acts_on`, which holds the refusal back unless
+  `delegated_auth` is set (`CompatState::new`, from `oidc::delegated_auth_enabled`): generic mode,
+  where every client holds `oidc` grants, keeps the behaviour its tests pin. `/oauth2/revoke`
+  (`Grants::Any`), `/token`, `/userinfo` and `/end_session` still serve `oidc` grants, and a store
+  fault on these paths stays the retryable 503 (introspection: 500). Pin:
+  `an_oidc_grant_cannot_drive_the_matrix_bearer_routes`,
+  `a_matrix_session_still_drives_the_bearer_routes_in_a_delegated_deployment`,
+  `without_delegated_auth_the_matrix_routes_still_serve_an_oidc_grant`,
+  `revocation_still_ends_an_oidc_grant_in_a_delegated_deployment`,
+  `the_matrix_refresh_endpoint_leaves_an_oidc_grants_refresh_token_alone`,
+  `a_store_fault_where_an_oidc_grant_is_refused_is_a_retryable_503`,
+  `the_routes_refuse_other_relying_parties_exactly_when_auth_is_delegated`,
+  `only_the_access_token_of_an_oidc_grant_is_inactive`,
+  `the_handler_answers_inactive_for_an_oidc_grant_and_active_for_the_rest`,
+  `a_generic_clients_tokens_are_refused_by_the_matrix_side_and_rotate_at_the_token_endpoint`.
 - **Never infer token validity from Synapse**: it caches introspection for two minutes. Our
   introspection answer is the authority.
 - **No device-id recycling.** Sign-in upserts a fresh `SIWX_…` id and never deletes. Pin:

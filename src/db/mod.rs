@@ -858,6 +858,12 @@ impl TokenMetadata {
     pub fn is_kind(&self, kind: TokenKind) -> bool {
         self.effective_kind() == Some(kind)
     }
+
+    /// Whether Synapse and the Matrix routes of a delegated-auth deployment act
+    /// on this token: [`grant::is_matrix_credential`] of its grant's kind.
+    pub fn is_matrix_credential(&self) -> bool {
+        grant::is_matrix_credential(self.grant_kind)
+    }
 }
 
 #[async_trait]

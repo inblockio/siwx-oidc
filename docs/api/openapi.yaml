@@ -627,7 +627,9 @@ paths:
         rejects a present-but-empty device id with a 500.
 
         Only an access token (a minted admin token included) can be active. A
-        refresh token is `{"active": false}`, exactly like an unknown token.
+        refresh token is `{"active": false}`, exactly like an unknown token. So
+        is the access token of an `oidc` grant, which here is a generic-class
+        client's: it is not a Matrix session, whatever its scope says.
       security: [{ masSharedSecret: [] }]
       requestBody:
         required: true
@@ -640,9 +642,9 @@ paths:
       responses:
         "200":
           description: |
-            Token metadata, or `{"active": false}`. An UNKNOWN token, or one
-            that is not an access token, is `{"active": false}` with HTTP 200 —
-            never a 4xx.
+            Token metadata, or `{"active": false}`. An UNKNOWN token, one
+            that is not an access token, or an `oidc` grant's access token is
+            `{"active": false}` with HTTP 200, never a 4xx.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Introspection" }
@@ -964,10 +966,10 @@ paths:
       tags: [Matrix compatibility]
       operationId: matrixRefresh
       summary: Matrix-shaped refresh, with the same rotation and lost-response rule as `/token`
-      description: Accepts only a refresh token; an access token (a minted admin token included) is `M_UNKNOWN_TOKEN`, like an unknown one. A replay of the previous refresh token returns the same successor pair while that pair is unused, and is `M_UNKNOWN_TOKEN` once it was used, rotated or revoked. The endpoint carries no client identity, so unlike `/token` it cannot bind the replay to a client, and it refuses the refresh token of a confidential client (one that must authenticate at `/token`) exactly like an unknown token, leaving it untouched for `/token`. A public client's refresh token issued by a build before the grant record is answered with tokens in the current format, and its replays follow the same rule.
+      description: Accepts only a refresh token; an access token (a minted admin token included) is `M_UNKNOWN_TOKEN`, like an unknown one. A replay of the previous refresh token returns the same successor pair while that pair is unused, and is `M_UNKNOWN_TOKEN` once it was used, rotated or revoked. The endpoint carries no client identity, so unlike `/token` it cannot bind the replay to a client, and it refuses the refresh token of a confidential client (one that must authenticate at `/token`) exactly like an unknown token, leaving it untouched for `/token`. A public client's refresh token issued by a build before the grant record is answered with tokens in the current format, and its replays follow the same rule. With delegated auth the refresh token of an `oidc` grant (a generic-class client's) is refused exactly like an unknown token, before any rotation, and left untouched for `/token`.
       responses:
         "200": { description: New tokens. }
-        "401": { description: "`M_UNKNOWN_TOKEN`: the refresh token is unknown, expired, reused, revoked, of another kind, or a confidential client's." }
+        "401": { description: "`M_UNKNOWN_TOKEN`: the refresh token is unknown, expired, reused, revoked, of another kind, a confidential client's, or (with delegated auth) a generic-class client's." }
         "503": { description: "`M_UNKNOWN`, retryable: the token store could not answer. Never reported as `M_UNKNOWN_TOKEN`, which a Matrix client takes for \"signed out\" (it clears its crypto store). The rotation either ran entirely or not at all, so retrying with the same refresh token is safe." }
 
   /_matrix/client/v3/logout:
@@ -975,10 +977,11 @@ paths:
       tags: [Matrix compatibility]
       operationId: matrixLogout
       summary: End this session
-      description: Revokes the session's tokens **and** deletes its Synapse device — explicit intent, unlike `/oauth2/revoke`. The bearer must be an access token; any other token is a no-op, like an unknown one.
+      description: Revokes the session's tokens **and** deletes its Synapse device (explicit intent, unlike `/oauth2/revoke`). The bearer must be an access token; any other token is a no-op, like an unknown one. With delegated auth the access token of an `oidc` grant (a generic-class client's) is not a Matrix session: it is a 401 and nothing is torn down.
       security: [{ bearerToken: [] }]
       responses:
         "200": { description: "Signed out; also for a missing, unknown or non-access bearer (idempotent). The Synapse device delete is best-effort." }
+        "401": { description: "`M_UNKNOWN_TOKEN`, with delegated auth only: the bearer is the access token of an `oidc` grant. Nothing was torn down." }
         "503": { description: "`M_UNKNOWN`, retryable: the token store failed while resolving the bearer or revoking the device's tokens. Nothing is reported as signed out, and the bearer stays valid so the retry tears the session down." }
 
   /_matrix/client/v3/logout/all:
@@ -986,10 +989,11 @@ paths:
       tags: [Matrix compatibility]
       operationId: matrixLogoutAll
       summary: End every session
-      description: Session invalidation, NOT deactivation — the account stays active and can sign in again. Ends every grant of the user (setting the user epoch), deletes every Synapse device (best-effort), and ends the user's own sessions on this provider (`siwx_user` picker hints, `acct_session` account sessions). The bearer must be an access token; any other token is a no-op, like an unknown one.
+      description: Session invalidation, NOT deactivation: the account stays active and can sign in again. Ends every grant of the user (setting the user epoch), deletes every Synapse device (best-effort), and ends the user's own sessions on this provider (`siwx_user` picker hints, `acct_session` account sessions). The bearer must be an access token; any other token is a no-op, like an unknown one. With delegated auth the access token of an `oidc` grant (a generic-class client's) is not a Matrix session: it is a 401 and nothing is touched.
       security: [{ bearerToken: [] }]
       responses:
         "200": { description: "Every session ended; also for a missing, unknown or non-access bearer (idempotent)." }
+        "401": { description: "`M_UNKNOWN_TOKEN`, with delegated auth only: the bearer is the access token of an `oidc` grant. Nothing was touched." }
         "503": { description: "`M_UNKNOWN`, retryable: the token store failed while resolving the bearer, revoking the user's tokens or ending the own sessions. Nothing is reported as signed out; the retry finishes the job." }
 
   /_matrix/client/v3/devices/{device_id}:
@@ -997,12 +1001,12 @@ paths:
       tags: [Matrix compatibility]
       operationId: matrixDeleteDevice
       summary: Sign out one device
-      description: The bearer must be an access token; any other token is a 401 `M_UNKNOWN_TOKEN`.
+      description: The bearer must be an access token; any other token is a 401 `M_UNKNOWN_TOKEN`. With delegated auth so is the access token of an `oidc` grant (a generic-class client's), which is not a Matrix session.
       security: [{ bearerToken: [] }]
       parameters: [{ name: device_id, in: path, required: true, schema: { type: string } }]
       responses:
         "200": { description: Deleted. }
-        "401": { description: "`M_UNKNOWN_TOKEN`: the bearer is missing, unknown, or not an access token." }
+        "401": { description: "`M_UNKNOWN_TOKEN`: the bearer is missing, unknown, not an access token, or (with delegated auth) an `oidc` grant's." }
         "503": { description: "`M_UNKNOWN`, retryable: the token store could not resolve the bearer. Never reported as `M_UNKNOWN_TOKEN`; nothing was deleted." }
 
   /_matrix/client/v3/delete_devices:
@@ -1010,11 +1014,11 @@ paths:
       tags: [Matrix compatibility]
       operationId: matrixDeleteDevices
       summary: Sign out several devices
-      description: The bearer must be an access token; any other token is a 401 `M_UNKNOWN_TOKEN`.
+      description: The bearer must be an access token; any other token is a 401 `M_UNKNOWN_TOKEN`. With delegated auth so is the access token of an `oidc` grant (a generic-class client's), which is not a Matrix session.
       security: [{ bearerToken: [] }]
       responses:
         "200": { description: Deleted. }
-        "401": { description: "`M_UNKNOWN_TOKEN`: the bearer is missing, unknown, or not an access token." }
+        "401": { description: "`M_UNKNOWN_TOKEN`: the bearer is missing, unknown, not an access token, or (with delegated auth) an `oidc` grant's." }
         "503": { description: "`M_UNKNOWN`, retryable: the token store could not resolve the bearer. Never reported as `M_UNKNOWN_TOKEN`; nothing was deleted." }
 
   /health:

@@ -157,7 +157,9 @@ pub const REUSE_EVENT_MESSAGE: &str = "refresh token reuse detected";
 pub enum GrantKind {
     /// A Matrix-mode code or device-code grant: one per Synapse device.
     MatrixDevice,
-    /// A generic-mode code grant.
+    /// A code grant for a relying party that is not a Matrix client: every
+    /// grant of a generic-mode deployment, and a generic-class client's in a
+    /// delegated-auth one.
     Oidc,
     /// A minted admin token: no refresh token, lives as long as its token.
     Service,
@@ -186,6 +188,25 @@ impl GrantKind {
 impl std::fmt::Display for GrantKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// Whether Synapse and the Matrix routes of a delegated-auth deployment act on
+/// a token whose grant is of `kind`: the sessions of Matrix clients
+/// (`matrix_device`) and the admin tokens this provider mints for Synapse
+/// (`service`). The grant of any other relying party (`oidc`: a generic-class
+/// client's) is not a Matrix session, whatever its scope string says.
+///
+/// `None` is a token with no grant record to judge: a legacy `token/{raw}`
+/// entry, written before generic-class clients existed, or a token the caller
+/// already knows to be unknown.
+///
+/// This is the one decision, and the `match` is exhaustive on purpose: a new
+/// [`GrantKind`] does not compile until it is placed here.
+pub fn is_matrix_credential(kind: Option<GrantKind>) -> bool {
+    match kind {
+        None | Some(GrantKind::MatrixDevice) | Some(GrantKind::Service) => true,
+        Some(GrantKind::Oidc) => false,
     }
 }
 
@@ -616,6 +637,19 @@ pub enum RefreshPeek {
     Legacy(LegacyRefresh),
     /// Nothing: answer like an unknown token.
     Unknown,
+}
+
+impl RefreshPeek {
+    /// The kind of the grant the token belongs to, or, for a legacy token not
+    /// lifted yet, of the grant it would be lifted into; `None` for an unknown
+    /// token.
+    pub fn grant_kind(&self) -> Option<GrantKind> {
+        match self {
+            RefreshPeek::Grant(grant) => Some(grant.kind),
+            RefreshPeek::Legacy(legacy) => Some(legacy_grant_kind(&legacy.meta)),
+            RefreshPeek::Unknown => None,
+        }
+    }
 }
 
 /// The kind of the grant a legacy refresh token is lifted into: `matrix_device`
