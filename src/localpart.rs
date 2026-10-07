@@ -72,7 +72,7 @@ pub(crate) struct ResolvedIdentity {
     /// and keys forever, and Synapse has no rename API. But the DID-publication
     /// feature added a way for that benign guess to become permanent damage:
     /// when the fallback fires for a user whose real account IS modern-shaped,
-    /// `oidc::provision_synapse_device` re-probes, finds the legacy shape free,
+    /// `oidc::provision_synapse_account` re-probes, finds the legacy shape free,
     /// provisions it, and publishes a **fully valid, correctly-verifying**
     /// `{did, proof}` assertion binding that DID to the new, WRONG mxid. Two
     /// Matrix accounts then carry provider-signed assertions for one DID and no
@@ -83,7 +83,7 @@ pub(crate) struct ResolvedIdentity {
     /// So this flag is threaded to the publication decision and suppresses it.
     /// Publishing nothing costs one login's worth of freshness; the next
     /// healthy sign-in re-asserts (the write is idempotent and unconditional —
-    /// see `provision_synapse_device`'s "why re-assert every time" note).
+    /// see `provision_synapse_account`'s "why re-assert every time" note).
     ///
     /// **Not a general "degraded" flag.** It says one thing: *this localpart
     /// came from the error path.* Do not overload it with "Synapse was slow" or
@@ -745,7 +745,7 @@ pub(crate) mod resolve_identity_tests {
         assert!(
             resolved.degraded,
             "a fallback must ANNOUNCE that it guessed — this flag is what stops \
-             oidc::provision_synapse_device publishing a signed assertion for a \
+             oidc::provision_synapse_account publishing a signed assertion for a \
              localpart nobody resolved (2026-09-10 audit, D4)"
         );
     }
@@ -920,7 +920,7 @@ OmV4YW1wbGU6c29tZW1lZGlhdG9yI3NvbWVrZXkiXSwiYSI6WyJkaWRjb21tL3YyIl19";
     /// the answer is that returning account — modern localpart, `is_new: false`.
     ///
     /// Without this, a second sign-in by a long-DID user would read as a first
-    /// sign-in, and `oidc::provision_synapse_device` would treat an established
+    /// sign-in, and `oidc::provision_synapse_account` would treat an established
     /// account as brand-new (re-seeding the displayname alias over a name the
     /// user chose).
     #[tokio::test]
@@ -1104,7 +1104,7 @@ OmV4YW1wbGU6c29tZW1lZGlhdG9yI3NvbWVrZXkiXSwiYSI6WyJkaWRjb21tL3YyIl19";
         );
         assert!(
             resolved.degraded,
-            "and the guess must ANNOUNCE itself, or `provision_synapse_device` will publish \
+            "and the guess must ANNOUNCE itself, or `provision_synapse_account` will publish \
              a second, fully-verifying `io.inblock.did` assertion under it (D4)"
         );
         assert!(

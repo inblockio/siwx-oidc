@@ -326,10 +326,11 @@ leave every stored assertion failing as a silent "bad signature"; with a derived
 
 ## Publication
 
-- **One call site.** The field is written by `oidc::provision_synapse_device`,
-  which both sign-in paths use: `/sign_in` (wallet, passkey, headless key) and
-  the device-code grant (QR login). The issuer written into `iss` is
-  `SIWXOIDC_BASE_URL`, the value discovery reports.
+- **One call site.** The field is written by `oidc::provision_synapse_account`,
+  the account half of provisioning, which `oidc::provision_synapse_device` calls
+  before its device half. Both sign-in paths use that: `/sign_in` (wallet,
+  passkey, headless key) and the device-code grant (QR login). The issuer
+  written into `iss` is `SIWXOIDC_BASE_URL`, the value discovery reports.
 - **Best-effort.** A publication failure never fails a sign-in. Every outcome is
   logged, the same contract as device provisioning and the cross-signing reset
   grant next to it.

@@ -705,8 +705,10 @@ shared secret), 401 `unauthorized`, 503 `synapse_unavailable` or
 ### Provisioning at sign-in
 
 Every sign-in (wallet, passkey, headless key, device-code grant) goes through
-`oidc::provision_synapse_device`. It is best-effort: a Synapse failure is
-logged and never fails the sign-in.
+`oidc::provision_synapse_device`. It runs the account half first
+(`oidc::provision_synapse_account`: steps 1 to 3 below) and then the device
+half (steps 4 and 5). It is best-effort: a Synapse failure is logged and never
+fails the sign-in.
 
 1. **Account.** If the resolved localpart is free, the account is created with
    `provision_user`, seeded with the generated alias as displayname (never the

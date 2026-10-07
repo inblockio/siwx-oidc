@@ -43,7 +43,7 @@
 //! at will, so a consumer treating displayname-as-DID can be handed someone
 //! else's DID. Separating the provider-owned DID from the user-owned alias is
 //! the security fix; see the three-tier identity table on the server's
-//! `oidc::provision_synapse_device`.
+//! `oidc::provision_synapse_account`.
 //!
 //! # The field is world-readable and it federates
 //!

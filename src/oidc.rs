@@ -1378,8 +1378,9 @@ async fn token_device_code(
             // Same DID publication as the wallet/passkey login path: the QR
             // flow provisions a real session for a real identity, so it must
             // publish (and re-assert) the same attested field. Both call sites
-            // route through the ONE `provision_synapse_device`, so there is no
-            // third place this could be forgotten.
+            // route through `provision_synapse_device`, which publishes through
+            // `provision_synapse_account`, so there is no other place this could
+            // be forgotten.
             let publication = DidPublication {
                 key: signing_key,
                 issuer: config.base_url.as_str(),
@@ -2379,27 +2380,14 @@ fn provider_written_displayname(current: &str, did: &str, localpart: &str) -> bo
     current == did || current == localpart
 }
 
-/// Provision a Synapse user+device for a DID. Best-effort: failures are logged
-/// but never fail the auth flow. Idempotent: re-provisioning the same device_id
-/// is a plain upsert that preserves the device's E2EE keys. Never deletes an
-/// existing device (device teardown is explicit — see `compat` / account actions).
+/// The ACCOUNT half of sign-in provisioning: create the Synapse account for a new identity
+/// (with its alias), heal a row-less profile, migrate a provider-written displayname, and
+/// publish the attested `io.inblock.did` field. It creates no device and arms no
+/// cross-signing reset.
 ///
-/// **Cross-signing reset arm (product 3B, 2026-07-25):** after upsert, always
-/// best-effort `allow_cross_signing_reset` so a half-reset client can publish
-/// replacement public keys without requiring a separate `/account` visit on
-/// every recovery path. First-time bootstrap still relies on MSC3967 when no
-/// master exists; this call is a no-op or soft-fail in that case and must not
-/// fail sign-in. Explicit MSC4312 account reauth remains available and still
-/// uses the honesty gate in `account.rs`.
-///
-/// `proposed_device_id`: the client-supplied device_id from the OAuth scope
-/// (stable for Element Web and Element X). When `None`, a fresh `SIWX_{uuid}`
-/// is minted.
-///
-/// `display_name` is the name a device CREATED by this sign-in gets
-/// ([`device_display_name`]). An existing device keeps its name: the device is
-/// upserted without one and named only when Synapse reports it created it (see
-/// the upsert below).
+/// This is the ONE place the DID tier is published. [`provision_synapse_device`] calls it
+/// before its device half; a generic-class sign-in calls it alone. Best-effort: it never
+/// fails a sign-in.
 ///
 /// **Loud failure + self-heal (2026-08-01 incident, discriminator corrected
 /// 2026-08-02):** a `provision_user` failure at first sign-in used to be
@@ -2464,23 +2452,18 @@ fn provider_written_displayname(current: &str, did: &str, localpart: &str) -> bo
 /// scenario. Taking the whole struct makes it impossible to call this with a
 /// localpart whose origin nobody stated, which is the only structural way to
 /// stop a future third call site from reintroducing the bug.
-pub async fn provision_synapse_device(
+pub async fn provision_synapse_account(
     did: &str,
     identity: &crate::localpart::ResolvedIdentity,
-    synapse_client: Option<&SynapseClient>,
-    display_name: &str,
-    proposed_device_id: Option<&str>,
+    synapse: &SynapseClient,
     server_name: Option<&str>,
     did_publication: Option<&DidPublication<'_>>,
-) -> Option<String> {
-    let synapse = synapse_client?;
+) {
     let localpart = identity.localpart.as_str();
-    let dev_id = resolve_device_id(proposed_device_id);
     // Tier 1. Derived here once and used by all three write paths below (first
     // sign-in, row-absent self-heal, provider-written migration) so they cannot
     // seed three different names for one account.
     let alias = siwx_oidc::alias::alias_for(did);
-    debug!("provisioning device_id={} for did={}", dev_id, did);
 
     match synapse.is_localpart_available(localpart).await {
         Ok(true) => {
@@ -2632,7 +2615,7 @@ pub async fn provision_synapse_device(
     // Plan invariant 1: sign-in NEVER fails because of this feature. Every
     // outcome — including a 500 from a row-less account (#19702) — is logged
     // and dropped, the same contract `upsert_device` and
-    // `allow_cross_signing_reset` have immediately below.
+    // `allow_cross_signing_reset` have in `provision_synapse_device`.
     //
     // # No `server_name`, no publication
     //
@@ -2706,6 +2689,49 @@ pub async fn provision_synapse_device(
             ),
         }
     }
+}
+
+/// Provision a Synapse user+device for a DID. Best-effort: failures are logged
+/// but never fail the auth flow. Idempotent: re-provisioning the same device_id
+/// is a plain upsert that preserves the device's E2EE keys. Never deletes an
+/// existing device (device teardown is explicit, see `compat` / account actions).
+///
+/// The account comes first: [`provision_synapse_account`] creates it, heals its profile and
+/// publishes the attested DID field, and its doc holds the tier model and the self-heal
+/// rules. `identity`, `server_name` and `did_publication` are handed to it unchanged. This
+/// function adds the device half.
+///
+/// **Cross-signing reset arm (product 3B, 2026-07-25):** after upsert, always
+/// best-effort `allow_cross_signing_reset` so a half-reset client can publish
+/// replacement public keys without requiring a separate `/account` visit on
+/// every recovery path. First-time bootstrap still relies on MSC3967 when no
+/// master exists; this call is a no-op or soft-fail in that case and must not
+/// fail sign-in. Explicit MSC4312 account reauth remains available and still
+/// uses the honesty gate in `account.rs`.
+///
+/// `proposed_device_id`: the client-supplied device_id from the OAuth scope
+/// (stable for Element Web and Element X). When `None`, a fresh `SIWX_{uuid}`
+/// is minted.
+///
+/// `display_name` is the name a device CREATED by this sign-in gets
+/// ([`device_display_name`]). An existing device keeps its name: the device is
+/// upserted without one and named only when Synapse reports it created it (see
+/// the upsert below).
+pub async fn provision_synapse_device(
+    did: &str,
+    identity: &crate::localpart::ResolvedIdentity,
+    synapse_client: Option<&SynapseClient>,
+    display_name: &str,
+    proposed_device_id: Option<&str>,
+    server_name: Option<&str>,
+    did_publication: Option<&DidPublication<'_>>,
+) -> Option<String> {
+    let synapse = synapse_client?;
+    let localpart = identity.localpart.as_str();
+    let dev_id = resolve_device_id(proposed_device_id);
+    debug!("provisioning device_id={} for did={}", dev_id, did);
+
+    provision_synapse_account(did, identity, synapse, server_name, did_publication).await;
 
     // Upsert WITHOUT a name, then name the device only if this upsert created
     // it. Synapse overwrites an existing device's name whenever one is sent,
@@ -2745,7 +2771,7 @@ pub async fn provision_synapse_device(
 
 /// `did_publication` carries the provider's signing key + issuer for the
 /// attested `io.inblock.did` profile field (see
-/// [`provision_synapse_device`]). It is built by the axum handler, which is the
+/// [`provision_synapse_account`]). It is built by the axum handler, which is the
 /// one place that holds both `AppState::signing_key` and `config.base_url`;
 /// `None` disables publication.
 #[allow(clippy::too_many_arguments)]
@@ -9606,5 +9632,153 @@ mod backchannel_registration_tests {
                 && matrix.get("backchannel_logout_session_supported").is_none(),
             "Matrix mode sends no logout token, so it advertises none: {matrix}"
         );
+    }
+}
+
+/// The generic client class: what a generic-class sign-in does, and that a Matrix-class
+/// client still does exactly what it did before classes existed. The recording homeserver
+/// extends the one in `sign_in_deactivation_order_tests` with a fault that starts at a
+/// given call, which is the only way to hit the window between the deactivation gate's
+/// probe and the sign-in's own resolution.
+#[cfg(test)]
+mod generic_client_tests {
+    use super::*;
+    use axum::extract::{Query, State};
+    use axum::http::{Method, StatusCode, Uri};
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+
+    /// Synthetic: `find_did_method` checks only the `did:key:` prefix, and nothing here
+    /// parses the key.
+    const DID: &str = "did:key:zDnGENERICCLIENTCLASSTEST";
+    const SERVER_NAME: &str = "example.org";
+    const DEVICE_CALLS: [&str; 3] = [
+        "POST /_synapse/mas/upsert_device",
+        "POST /_synapse/mas/update_device_display_name",
+        "POST /_synapse/mas/allow_cross_signing_reset",
+    ];
+
+    #[derive(Default)]
+    struct Homeserver {
+        /// `is_localpart_available` answers `400 M_USER_IN_USE`.
+        taken: HashSet<String>,
+        /// `is_localpart_available` answers 500 for this localpart from its Nth call on
+        /// (1-based); earlier calls are answered normally.
+        fault_from_call: HashMap<String, usize>,
+        calls: Mutex<HashMap<String, usize>>,
+        log: Mutex<Vec<String>>,
+    }
+
+    async fn is_localpart_available(
+        State(hs): State<Arc<Homeserver>>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> axum::response::Response {
+        let lp = q.get("localpart").cloned().unwrap_or_default();
+        hs.log
+            .lock()
+            .unwrap()
+            .push(format!("is_localpart_available {lp}"));
+        let n = {
+            let mut calls = hs.calls.lock().unwrap();
+            let count = calls.entry(lp.clone()).or_insert(0);
+            *count += 1;
+            *count
+        };
+        if hs.fault_from_call.get(&lp).is_some_and(|from| n >= *from) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
+        }
+        if hs.taken.contains(&lp) {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"errcode": "M_USER_IN_USE", "error": "in use"})),
+            )
+                .into_response()
+        } else {
+            (StatusCode::OK, Json(serde_json::json!({"available": true}))).into_response()
+        }
+    }
+
+    /// No account here is deactivated: `query_user` answers 404, which the deactivation
+    /// gate reads as "no such account, nothing to reject".
+    async fn query_user(
+        State(hs): State<Arc<Homeserver>>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> axum::response::Response {
+        let lp = q.get("localpart").cloned().unwrap_or_default();
+        hs.log.lock().unwrap().push(format!("query_user {lp}"));
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"errcode": "M_NOT_FOUND", "error": "User not found"})),
+        )
+            .into_response()
+    }
+
+    /// Everything else (provisioning, profile reads) is recorded and answered `200 {}`.
+    async fn anything_else(
+        State(hs): State<Arc<Homeserver>>,
+        method: Method,
+        uri: Uri,
+    ) -> axum::response::Response {
+        hs.log
+            .lock()
+            .unwrap()
+            .push(format!("{method} {}", uri.path()));
+        (StatusCode::OK, Json(serde_json::json!({}))).into_response()
+    }
+
+    async fn spawn(
+        hs: Homeserver,
+    ) -> (Arc<Homeserver>, SynapseClient, tokio::task::JoinHandle<()>) {
+        let hs = Arc::new(hs);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral homeserver port");
+        let addr = listener.local_addr().expect("homeserver local_addr");
+        let app = Router::new()
+            .route(
+                "/_synapse/mas/is_localpart_available",
+                get(is_localpart_available),
+            )
+            .route("/_synapse/mas/query_user", get(query_user))
+            .fallback(anything_else)
+            .with_state(hs.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("homeserver");
+        });
+        (
+            hs,
+            SynapseClient::new(&format!("http://{addr}"), "secret"),
+            server,
+        )
+    }
+
+    /// The account half provisions a NEW identity's Synapse account and touches no device
+    /// and no cross-signing state.
+    #[tokio::test]
+    async fn the_account_half_provisions_the_account_and_creates_no_device() {
+        let (hs, synapse, server) = spawn(Homeserver::default()).await;
+        let resolved = crate::localpart::resolve_identity(DID, Some(&synapse))
+            .await
+            .expect("a healthy homeserver resolves");
+        assert!(resolved.is_new);
+
+        provision_synapse_account(DID, &resolved, &synapse, Some(SERVER_NAME), None).await;
+
+        server.abort();
+        let log = hs.log.lock().unwrap().clone();
+        assert!(
+            log.iter().any(|l| l == "POST /_synapse/mas/provision_user"),
+            "{log:?}"
+        );
+        for forbidden in DEVICE_CALLS {
+            assert!(
+                !log.iter().any(|l| l == forbidden),
+                "{forbidden} must not run: {log:?}"
+            );
+        }
     }
 }
