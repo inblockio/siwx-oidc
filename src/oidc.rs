@@ -8437,6 +8437,50 @@ mod client_binding_tests {
                 "a client whose device code was exchanged gets its lifetime back"
             );
         }
+
+        /// `authorize` is the one touch that names the client the request carries, because
+        /// the request has no grant yet. It follows every check the request must pass: a
+        /// refused request extends no client, an accepted one extends the client it names.
+        #[tokio::test]
+        async fn an_authorization_request_extends_the_client_it_names_only_once_accepted() {
+            let Some(db) = siwx_oidc::test_support::redis().await else {
+                return;
+            };
+            let client = seed_client(&db, Registration::Public).await;
+            let key = aged(&db, &client).await;
+            let request = |redirect_uri: &str, challenge: Option<&str>| AuthorizeParams {
+                client_id: client.clone(),
+                redirect_uri: RedirectUrl::new(redirect_uri.into()).unwrap(),
+                scope: Scope::new("openid".to_string()),
+                response_type: Some(CoreResponseType::Code),
+                state: Some("state".into()),
+                nonce: None,
+                prompt: None,
+                request_uri: None,
+                request: None,
+                code_challenge: challenge.map(Into::into),
+                code_challenge_method: Some("S256".into()),
+                response_mode: None,
+            };
+
+            let unregistered = request("https://other.example.org/cb", Some(CHALLENGE));
+            assert!(authorize(unregistered, &db).await.is_err());
+            assert!(!restored(&db, &key).await, "an unregistered redirect URI");
+
+            let no_challenge = request("https://example.com/cb", None);
+            assert!(authorize(no_challenge, &db).await.is_err());
+            assert!(
+                !restored(&db, &key).await,
+                "a request without a PKCE challenge"
+            );
+
+            let accepted = request("https://example.com/cb", Some(CHALLENGE));
+            authorize(accepted, &db).await.unwrap();
+            assert!(
+                restored(&db, &key).await,
+                "an accepted request extends the client it names"
+            );
+        }
     }
 }
 
