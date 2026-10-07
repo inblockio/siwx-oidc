@@ -130,6 +130,11 @@ paths:
         `response_types_supported` is exactly `["code"]`: the
         authorization-code flow is the only one `/authorize` accepts.
 
+        `scopes_supported` lists `io.inblock.mail`, and `claims_supported` lists
+        `io.inblock.mailbox`, only when `mail_domain` is configured, the one
+        case in which `/userinfo` can carry the mailbox claim. `claims_supported`
+        lists `io.inblock.mxid` only when a Matrix server name is configured.
+
         `end_session_endpoint` (`{issuer}/end_session`) advertises
         RP-initiated logout, in both modes.
 
@@ -282,6 +287,10 @@ paths:
         so its current refresh token is refused too. A refresh token issued
         by a build before the grant record is answered with tokens in the current
         format (`mcr_{handle}_{secret}`), and its replays follow the same rule.
+        A refresh response carries no `scope`: a grant's scope is fixed when it
+        is issued and a rotation copies it (RFC 6749 section 5.1 lets an
+        unchanged scope go unnamed), so a client reads the granted scope from
+        its code exchange.
 
         In a standalone deployment (no MAS shared secret) the code exchange
         grants the requested scope among `openid`, `profile` and `offline_access`
@@ -1105,7 +1114,7 @@ components:
         expires_in: { type: integer, description: 300 seconds. }
         refresh_token: { type: string, description: "90-day TTL, rotated on every use. In a standalone deployment, and for a generic-class client, the code exchange issues one only for a granted `offline_access`, to a client whose registration allows the `refresh_token` grant." }
         id_token: { type: string, description: "ES256 JWT. `sub` is the DID." }
-        scope: { type: string, description: "The granted scope. In the device-code grant it carries `urn:matrix:client:device:{id}` so a client can discover its provisioned device. In a standalone (generic-mode) or generic-class code exchange it is present when the granted scope differs from the request. A Matrix-class code exchange in a delegated-auth deployment omits it." }
+        scope: { type: string, description: "The granted scope. In the device-code grant it carries `urn:matrix:client:device:{id}` so a client can discover its provisioned device. In a standalone (generic-mode) or generic-class code exchange it is present when the granted scope differs from the request. A Matrix-class code exchange in a delegated-auth deployment omits it, and so does every refresh response: a grant's scope is fixed when it is issued." }
 
     UserInfo:
       type: object

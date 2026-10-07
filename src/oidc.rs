@@ -11074,6 +11074,10 @@ mod generic_client_tests {
         assert_eq!(after.kind, GrantKind::Oidc);
         assert_eq!(after.scope, "openid io.inblock.mail offline_access");
         assert_eq!(after.device_id, "");
+        assert!(
+            rotated.scopes().is_none(),
+            "a refresh response names no scope: the grant's scope is fixed at issuance"
+        );
     }
 
     /// What the exchange issues to a generic-class client is not a Matrix session. In a

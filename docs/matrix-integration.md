@@ -989,7 +989,11 @@ Rules:
 - **A generic-class client never gets it** (`unauthorized_client`): the grant
   mints a Matrix session. It is refused at `/device_authorization` and again at
   the poll, before anything is recorded or claimed, so a code issued while the
-  client was Matrix-class cannot be redeemed after it became generic.
+  client was Matrix-class cannot be redeemed after it became generic. The poll
+  reads the client entry with `?`: an unreadable entry is a store fault answered
+  as one, never a client served without its class, and the code stays as it
+  was. A client that is gone (an expired dynamic registration) was never
+  generic and is still served.
 - **Existing accounts only.** Approval rejects a DID with no account (400) and a
   deactivated account (401). See [Gates](#gates-that-protect-accounts).
 - The tokens belong to the **approving** user's DID, not to the device.
