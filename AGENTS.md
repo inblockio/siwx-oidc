@@ -401,6 +401,19 @@ doc; read it before changing the code the rule covers.
   `matrix_mode_issues_the_matrix_scope_and_a_refresh_token_whatever_was_requested`,
   `sign_in_issues_the_code_for_the_bound_request` (the scope reaches the code),
   `a_code_written_before_the_scope_travelled_has_none`.
+- **The kind of a grant is the class of its client, derived and never stored.** With
+  `mas_shared_secret` a Matrix-class client holds `matrix_device` grants and a generic-class
+  client holds `oidc` grants, because the code exchange picks the kind from the pair (mode,
+  class) and nothing else issues an `oidc` grant there. A reader learns the kind from the grant
+  record behind the access token (`AccessGrant::metadata` sets `TokenMetadata.grant_kind`,
+  `#[serde(skip)]`), so no token entry can claim a kind, and a legacy token with no grant record
+  has none and counts as a Matrix credential. Decide on it with an exhaustive `match`, never
+  `== Oidc`. Outside that mode `oidc` does not mean generic-class: generic mode issues it to
+  every client, which is why the Matrix-side refusals below hold back unless auth is delegated.
+  Pin: `the_access_metadata_reports_the_kind_of_the_grant_behind_the_token`,
+  `the_grant_kind_is_never_stored_and_a_stored_entry_reads_without_one`,
+  `a_generic_exchange_writes_an_oidc_grant_with_a_sid_no_device_index_and_the_granted_scope`,
+  `matrix_code_exchange_keeps_the_matrix_scope`.
 - **The code exchange decides by deployment mode and by client class, in one table with no
   fall-through** (`exchange_issuance`). With `mas_shared_secret`, a Matrix-class client gets a
   `matrix_device` grant and a generic-class client gets an `oidc` grant with no device: the
@@ -620,7 +633,10 @@ doc; read it before changing the code the rule covers.
   the session id and a signature. Pin (mock stack, each scans the whole stack Redis):
   `no_token_the_client_holds_is_stored_in_the_clear`,
   `no_code_or_session_the_client_holds_is_stored_in_the_clear`,
-  `no_client_secret_or_registration_token_is_stored_in_the_clear`,
+  `no_client_secret_or_registration_token_is_stored_in_the_clear`, and for a generic-class
+  client's own credentials (login session id, code, PKCE verifier, ID token, both token pairs,
+  the static client's secret; the search is proved on planted strings)
+  `no_credential_a_generic_client_holds_is_stored_in_the_clear`,
   `legacy_tokens_keep_working_after_the_upgrade`, `in_flight_codes_and_sessions_survive_the_upgrade`;
   unit: `a_stored_digest_presented_as_a_code_is_not_a_code`,
   `a_stored_digest_presented_as_a_credential_matches_nothing`,
