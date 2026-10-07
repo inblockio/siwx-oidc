@@ -596,6 +596,30 @@ doc; read it before changing the code the rule covers.
   `a_public_client_refreshes_without_client_credentials`,
   `a_basic_authorization_header_authenticates_the_code_exchange`,
   `the_matrix_endpoint_refuses_a_confidential_clients_refresh_token` (unit and mock stack).
+- **A static client never expires; a dynamic client lives 30 days from its last use.** Every
+  start makes the static clients in Redis equal `default_clients` (`sync_static_clients`): each
+  is written with no TTL and its id recorded in `clients:static`, and each recorded id the map no
+  longer names is deleted. With no `default_clients` that prune runs in the background and is
+  retried until it succeeds once, so start-up still needs no Redis. `set_client` decides the
+  lifetime on the key as it is, in one script, so an update never gives a static client a TTL,
+  and the first-read upgrade of a plaintext entry keeps the expiry the entry had. A dynamic
+  client's lifetime is restored by `touch_client` after an authorization request, an accepted
+  code or device-code exchange, an accepted refresh at either endpoint (a replay included) and a
+  userinfo call, always for the client the grant, code or token belongs to and never for one a
+  request names; the touch extends only a key that has a TTL, never changes the answer, and
+  a failure is a `warn!` naming the client. Pin: `static_clients_never_expire`,
+  `touching_extends_a_dynamic_client_and_never_a_static_one`,
+  `rewriting_a_client_keeps_a_static_client_without_expiry`,
+  `an_upgraded_plaintext_static_client_keeps_no_ttl`,
+  `updating_a_static_client_leaves_it_without_an_expiry`,
+  `an_accepted_refresh_extends_a_dynamic_client`, `a_refused_refresh_extends_no_client`,
+  `a_successful_refresh_extends_a_dynamic_client` (the Matrix endpoint),
+  `a_code_exchange_extends_a_dynamic_client`, `a_device_code_exchange_extends_a_dynamic_client`,
+  `a_successful_userinfo_call_extends_a_dynamic_client`,
+  `a_failed_lifetime_extension_is_logged_at_warn_with_the_client_id`,
+  `a_prune_that_fails_is_retried_until_it_succeeds`; mock stack:
+  `a_static_client_has_no_ttl_and_still_authorizes`,
+  `a_dynamic_client_near_the_end_of_its_lifetime_is_extended_by_its_next_use`.
 - **A token-store fault is a retryable 503 `M_UNKNOWN` at the Matrix routes, never
   `M_UNKNOWN_TOKEN`**, which a Matrix client takes for "signed out" (it clears its crypto store):
   `POST /_matrix/client/v3/refresh` and the device-deletion routes (`username_from_bearer`

@@ -138,7 +138,9 @@ Every start makes the static clients in Redis equal that instance's `default_cli
 each entry, with no expiry, and deletes each client an earlier start wrote that the map no longer
 names. Every instance that shares one Redis must therefore carry the same `default_clients` map,
 because the last start wins: an instance with a different map overwrites or deletes the clients
-of the others.
+of the others. A static client whose entry carries an `access_token` can still be changed
+through its registration endpoint, but that change lasts only until the next start writes the
+entry again, and it never gives the client an expiry.
 
 With no `default_clients` there is nothing to write, so the server starts without Redis and
 deletes the clients an earlier configuration left behind in the background. If Redis cannot be

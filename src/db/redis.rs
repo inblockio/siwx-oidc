@@ -128,6 +128,20 @@ end
 return 0
 "#;
 
+/// Write a client entry, deciding its lifetime on the key as it is. `KEYS[1]` the entry,
+/// `ARGV[1]` the value, `ARGV[2]` the lifetime in seconds. `TTL` answers -1 for a key
+/// without an expiry, which is a static client and stays that way; every other write, a
+/// new key included, gets the full lifetime. One script, so the decision and the write
+/// see the same key.
+const SET_CLIENT_SCRIPT: &str = r#"
+if redis.call('TTL', KEYS[1]) == -1 then
+  redis.call('SET', KEYS[1], ARGV[1])
+else
+  redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+end
+return 1
+"#;
+
 fn code_key(code: &str) -> String {
     format!("{KV_CODE_DIGEST_PREFIX}/{}", digest(code))
 }
@@ -1169,14 +1183,18 @@ impl DBClient for RedisClient {
             .await
             .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
 
-        conn.set_ex::<_, _, ()>(
-            format!("{}/{}", KV_CLIENT_PREFIX, client_id),
-            serde_json::to_string(&client_entry)
-                .map_err(|e| anyhow!("Failed to serialize client entry: {}", e))?,
-            CLIENT_LIFETIME,
-        )
-        .await
-        .map_err(|e| anyhow!("Failed to set kv: {}", e))?;
+        let _written: i64 = bb8_redis::redis::cmd("EVAL")
+            .arg(SET_CLIENT_SCRIPT)
+            .arg(1)
+            .arg(format!("{}/{}", KV_CLIENT_PREFIX, client_id))
+            .arg(
+                serde_json::to_string(&client_entry)
+                    .map_err(|e| anyhow!("Failed to serialize client entry: {}", e))?,
+            )
+            .arg(CLIENT_LIFETIME)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("Failed to set kv: {}", e))?;
         Ok(())
     }
 
@@ -2921,14 +2939,18 @@ mod tests {
         client.del_raw(&key).await.unwrap();
     }
 
-    fn lifetime_test_entry() -> crate::db::ClientEntry {
+    fn lifetime_test_entry_with_secret(secret: &str) -> crate::db::ClientEntry {
         let metadata = crate::db::SiwxClientMetadata::new(
             vec![
                 openidconnect::RedirectUrl::new("https://app.example.org/callback".into()).unwrap(),
             ],
             crate::db::LogoutClientMetadata::default(),
         );
-        crate::db::ClientEntry::new("not-a-secret-test-fixture", metadata, None)
+        crate::db::ClientEntry::new(secret, metadata, None)
+    }
+
+    fn lifetime_test_entry() -> crate::db::ClientEntry {
+        lifetime_test_entry_with_secret("not-a-secret-test-fixture")
     }
 
     /// A static client carries no TTL after start-up, a TTL an older build wrote is
@@ -3037,5 +3059,105 @@ mod tests {
         for key in [dynamic_key, fixed_key, set_key] {
             client.del_raw(&key).await.ok();
         }
+    }
+
+    /// Rewriting a client's entry (a registration-management update) never changes whether
+    /// it expires: a static client stays without an expiry, and a dynamic client gets its
+    /// full lifetime back, as it does on every other use.
+    #[tokio::test]
+    async fn rewriting_a_client_keeps_a_static_client_without_expiry() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let n = unique_nonce();
+        let set_key = format!("clients:static:test-{n}");
+        let fixed = format!("static-{n}");
+        let fixed_key = format!("clients/{fixed}");
+        client
+            .sync_static_clients_in(&set_key, vec![(fixed.clone(), lifetime_test_entry())])
+            .await
+            .unwrap();
+
+        client
+            .set_client(fixed.clone(), lifetime_test_entry_with_secret("rewritten"))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.ttl_raw(&fixed_key).await.unwrap(),
+            -1,
+            "a rewrite must not give a static client an expiry"
+        );
+        assert!(
+            client
+                .get_client(fixed)
+                .await
+                .unwrap()
+                .unwrap()
+                .secret_matches("rewritten"),
+            "the entry itself is replaced"
+        );
+
+        let dynamic = format!("dynamic-{n}");
+        let dynamic_key = format!("clients/{dynamic}");
+        client
+            .set_client(dynamic.clone(), lifetime_test_entry())
+            .await
+            .unwrap();
+        client.expire_raw(&dynamic_key, 60).await.unwrap(); // close to its end
+        client
+            .set_client(dynamic, lifetime_test_entry())
+            .await
+            .unwrap();
+        let ttl = client.ttl_raw(&dynamic_key).await.unwrap();
+        assert!(
+            ttl > crate::db::CLIENT_LIFETIME as i64 - 60,
+            "a rewritten dynamic client gets its full lifetime back, got {ttl}"
+        );
+
+        for key in [fixed_key, dynamic_key, set_key] {
+            client.del_raw(&key).await.ok();
+        }
+    }
+
+    /// A static client an earlier build wrote in the clear and without an expiry is
+    /// replaced by its digest-only form on its first read, and keeps having no expiry:
+    /// the upgrade rewrites the entry in place and must not give it one.
+    #[tokio::test]
+    async fn an_upgraded_plaintext_static_client_keeps_no_ttl() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let id = format!("plaintext-static-{}", unique_nonce());
+        let key = format!("clients/{id}");
+        let secret = "not-a-secret-test-fixture";
+        let plaintext = serde_json::json!({
+            "secret": secret,
+            "metadata": {"redirect_uris": ["https://app.example.org/callback"]},
+        })
+        .to_string();
+        client.set_raw(&key, &plaintext).await.unwrap();
+        assert_eq!(
+            client.ttl_raw(&key).await.unwrap(),
+            -1,
+            "precondition: a static client has no expiry"
+        );
+
+        let entry = client.get_client(id).await.unwrap().unwrap();
+
+        assert!(
+            entry.secret_matches(secret),
+            "the plaintext entry authenticates"
+        );
+        let stored = client.get_raw(&key).await.unwrap().unwrap();
+        assert!(
+            !stored.contains(secret),
+            "the first read replaced the entry by its digest-only form: {stored}"
+        );
+        assert_eq!(
+            client.ttl_raw(&key).await.unwrap(),
+            -1,
+            "the upgrade must not give a static client an expiry"
+        );
+        client.del_raw(&key).await.ok();
     }
 }

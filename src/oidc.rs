@@ -8306,6 +8306,64 @@ mod client_binding_tests {
             );
         }
 
+        /// A registration-management update must not give a static client an expiry. A
+        /// static client is a client key with no TTL, and the update rewrites the entry in
+        /// place.
+        #[tokio::test]
+        async fn updating_a_static_client_leaves_it_without_an_expiry() {
+            let Some(db) = siwx_oidc::test_support::redis().await else {
+                return;
+            };
+            let metadata_for = |redirect: &str| {
+                SiwxClientMetadata::new(
+                    vec![RedirectUrl::new(redirect.into()).unwrap()],
+                    LogoutClientMetadata::default(),
+                )
+            };
+            let client_id = unique("update-static-");
+            let key = format!("clients/{client_id}");
+            let entry = ClientEntry::new(
+                SECRET,
+                metadata_for("https://example.com/cb"),
+                Some("registration-token"),
+            );
+            db.set_raw(&key, &serde_json::to_string(&entry).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                db.ttl_raw(&key).await.unwrap(),
+                -1,
+                "precondition: a static client has no expiry"
+            );
+
+            client_update(
+                client_id.clone(),
+                metadata_for("https://updated.example.org/cb"),
+                Some(
+                    headers::Authorization::bearer("registration-token")
+                        .unwrap()
+                        .0,
+                ),
+                &db,
+                &RegistrationPolicy::default(),
+            )
+            .await
+            .expect("the update is accepted");
+
+            assert_eq!(
+                db.ttl_raw(&key).await.unwrap(),
+                -1,
+                "an update must not give a static client an expiry"
+            );
+            let stored = db.get_client(client_id).await.unwrap().unwrap();
+            assert_eq!(
+                stored.metadata.redirect_uris()[0].as_str(),
+                "https://updated.example.org/cb",
+                "the update itself is stored"
+            );
+            db.del_raw(&key).await.ok();
+        }
+
         #[tokio::test]
         async fn a_code_exchange_extends_a_dynamic_client() {
             let Some(db) = siwx_oidc::test_support::redis().await else {
