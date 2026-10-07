@@ -194,6 +194,11 @@ paths:
         - `redirect_uri` must equal one of the client's registered redirect
           URIs exactly, query included (RFC 9700 §4.1.3); otherwise the browser
           is sent to `/error?message=unregistered_redirect_uri`.
+        - A generic-class client (a `default_clients` entry with
+          `"class": "generic"`) is granted only the requested scopes its entry
+          allows. A request that would grant it no `openid` is answered by a
+          redirect to the `redirect_uri` with `error=invalid_scope` and the
+          `state`.
 
         The validated request (client, redirect URI, state, response mode,
         PKCE challenge) is bound to the session; `/sign_in` issues the code for
@@ -237,12 +242,19 @@ paths:
         named after the OAuth client's `client_name`, else its `client_id`; an
         existing one keeps its name), and the attested DID is re-published. Every one of those is best-effort and never fails the
         sign-in.
+
+        A generic-class client's sign-in provisions the account and publishes
+        the DID, but upserts no device and arms no cross-signing reset. It never
+        guesses a localpart: when the homeserver cannot confirm the account the
+        answer is a 503, and a request that grants the client no `openid` is a
+        400. The code records the class of the client it was issued to.
       security:
         - sessionCookie: []
       responses:
         "303": { description: Redirect to the bound `redirect_uri` with `code` and the bound `state`. }
-        "400": { description: The session has no bound request, or the CAIP-122 proof is invalid. }
+        "400": { description: The session has no bound request, the CAIP-122 proof is invalid, or a generic-class client's request grants it no `openid`. }
         "401": { description: The account is deactivated, or the ceremony did not verify. }
+        "503": { description: The homeserver could not be asked: the deactivation check failed, or a generic-class sign-in could not confirm the account. }
 
   /token:
     post:

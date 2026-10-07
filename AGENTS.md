@@ -239,8 +239,9 @@ doc; read it before changing the code the rule covers.
 ### Publication and the Synapse client ([docs/matrix-integration.md](docs/matrix-integration.md))
 
 - **One call site.** Publication happens only in `oidc::provision_synapse_account`, the account
-  half that `oidc::provision_synapse_device` calls before its device half, so both sign-in paths
-  reach it. It is best-effort and never fails sign-in. Pin:
+  half that `oidc::provision_synapse_device` calls before its device half and that a
+  generic-class sign-in calls alone, so every sign-in path reaches it. It is best-effort and
+  never fails sign-in. Pin:
   `the_account_half_provisions_the_account_and_creates_no_device`,
   `publication_is_wired_into_the_shared_signin_path`.
 - **Re-asserted on every sign-in.** That is how a clobbered value self-heals; do not optimise
@@ -274,7 +275,8 @@ doc; read it before changing the code the rule covers.
 - **The fail-safe direction is LEGACY, never modern.** `resolve_identity_or_legacy` falls back to
   the legacy localpart so an existing user is never severed from their account. Pin:
   `fail_safe_fallback_is_legacy_never_modern`,
-  `a_proxy_404_never_severs_a_grandfathered_account_onto_the_modern_localpart`.
+  `a_proxy_404_never_severs_a_grandfathered_account_onto_the_modern_localpart`. A generic-class
+  sign-in is the one exception: it refuses instead of guessing (see "Sign-in gates").
 - **Read-only lookups use the fallible `resolve_identity`**, never the guessing variant.
 - **Alias word lists are append-only.** An index is `digest mod len`; reordering renames future
   accounts. Pin: `vectors_are_pinned`.
@@ -301,6 +303,25 @@ doc; read it before changing the code the rule covers.
   `a_partial_probe_fault_fails_sign_in_closed_before_any_legacy_guess` (they drive `sign_in`
   against a recording homeserver); rationale at the call site.
 - **Standalone deployments degrade, never 500.** No Synapse client means the gates are no-ops.
+- **A generic-class sign-in never guesses a localpart.** It resolves with the fallible
+  `resolve_identity` and answers 503 on a fault, because its localpart can become a mail address
+  that cannot be taken back; a Matrix-class sign-in keeps the legacy fail-safe. It provisions the
+  account and publishes the DID (`provision_synapse_account`), and never upserts a device or arms
+  a cross-signing reset. The code records the class that was served (`CodeEntry.client_class`).
+  Pin: `generic_client_fails_closed`, `generic_sign_in_creates_no_device_and_arms_no_reset`,
+  `a_generic_sign_in_still_publishes_the_did_field`,
+  `matrix_sign_in_still_provisions_a_device_and_arms_the_reset`,
+  `matrix_sign_in_still_degrades_to_the_legacy_guess_on_the_same_fault`.
+- **A generic client's request must grant `openid`, and `/authorize` and `/sign_in` both ask
+  `client_policy::grant_for`.** The grant is the requested scopes the client may have, then its
+  `always_granted_scopes`; an always-granted scope never stands in for a missing `openid`. A
+  request without it is refused before a session exists (an `invalid_scope` redirect) and again
+  at `/sign_in` before anything is provisioned (a 400), and no code is stored. A Matrix-class
+  client's scope is not checked. Pin: `authorize_refuses_a_generic_request_that_grants_no_openid`,
+  `authorize_accepts_a_generic_request_that_grants_openid`,
+  `authorize_leaves_a_matrix_client_request_without_openid_alone`,
+  `a_generic_sign_in_without_openid_is_refused`,
+  `an_always_granted_scope_does_not_make_up_for_a_missing_openid`.
 
 ### Tokens, sessions and devices ([docs/matrix-integration.md](docs/matrix-integration.md))
 

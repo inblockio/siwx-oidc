@@ -742,6 +742,17 @@ The device-code grant returns the scope in its token response, so a client can
 learn the device ID it was given. The authorization-code response does not
 include `scope`.
 
+**Generic-class clients** (`default_clients` entries with `"class": "generic"`)
+get the account half only: the Synapse account is created for a new identity and
+the `io.inblock.did` field is published (steps 1 to 3), but no device is upserted
+and no cross-signing reset is armed. Their localpart comes from the fallible
+`resolve_identity`; when the homeserver cannot be asked, the sign-in answers 503
+instead of guessing, because a generic client's localpart can become a permanent
+mail address. `/authorize` refuses a request that would grant the client no
+`openid` (an `invalid_scope` redirect), `/sign_in` checks it again before it
+provisions anything, and the authorization code records the class of the client
+it was issued to.
+
 ### No device recycling
 
 Sign-in never deletes a device, and never deletes and then reuses a device ID.

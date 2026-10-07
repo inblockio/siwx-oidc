@@ -153,6 +153,13 @@ error that names the client id (or the setting) and the rule, and it comes befor
 written to Redis. A build that predates these members ignores them and reads a generic client
 as a Matrix client, so every instance that shares one Redis must run a build that knows them.
 
+A generic client is granted the scopes it requests that are in `allowed_scopes` (any other is
+dropped), followed by its `always_granted_scopes`. A request that would grant it no `openid` is
+refused: `/authorize` redirects back with `error=invalid_scope`, and an always-granted scope
+never makes up for the missing `openid`. A generic sign-in provisions no Synapse device and
+answers 503 when the homeserver cannot confirm the account; see
+[Provisioning at sign-in](matrix-integration.md#provisioning-at-sign-in).
+
 ```toml
 [default]
 mail_domain = "matrix.example.org"

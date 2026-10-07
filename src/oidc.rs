@@ -1884,6 +1884,27 @@ pub async fn authorize(
             anyhow!("The 'openid' scope or a Matrix scope (urn:matrix:*) is required.").into(),
         );
     }
+    // A generic-class client is granted only the scopes it may have, and the code exchange
+    // computes that grant from the scope bound below with the same `grant_for`. Refusing a
+    // request that would grant no `openid` here, before a session exists, spares the user
+    // a sign-in that could only fail. The string checked is the one the session carries,
+    // untrimmed, so every later reader sees the same words. A Matrix-class client's scope
+    // is not decided by `grant_for`, so it is not asked.
+    let scope_is_grantable = match client_entry.class {
+        ClientClass::Matrix => true,
+        ClientClass::Generic => {
+            siwx_oidc::client_policy::grant_for(&client_entry, params.scope.as_str()).is_some()
+        }
+    };
+    if !scope_is_grantable {
+        let mut url = params.redirect_uri.url().clone();
+        url.query_pairs_mut().append_pair("state", &state);
+        url.query_pairs_mut()
+            .append_pair("error", CoreAuthErrorResponseType::InvalidScope.as_ref());
+        url.query_pairs_mut()
+            .append_pair("error_description", GENERIC_OPENID_REQUIRED_MSG);
+        return Err(CustomError::Redirect(url.to_string()));
+    }
 
     // Validate response_mode strictly (invalid_request semantics): discovery
     // advertises exactly {"query","fragment"}, so anything else is a 400 rather
@@ -2769,6 +2790,36 @@ pub async fn provision_synapse_device(
     Some(dev_id)
 }
 
+/// What `/authorize` (as an `invalid_scope` redirect) and `/sign_in` (as a 400) tell a
+/// generic-class client whose request grants it no `openid`.
+const GENERIC_OPENID_REQUIRED_MSG: &str = "This client must request the openid scope.";
+
+/// The 503 a generic-class sign-in answers when the homeserver cannot confirm the account.
+const GENERIC_IDENTITY_UNAVAILABLE_MSG: &str = "Sign-in is temporarily unavailable \
+     because the homeserver could not confirm this account. Please try again shortly.";
+
+/// The localpart for a generic-class sign-in: the FALLIBLE `resolve_identity`, never the
+/// legacy guess. A Matrix sign-in degrades to the guess so an existing user is never
+/// severed from their account; a generic client's localpart becomes a mailbox address
+/// that can never be taken back, so there the guess is the worse failure, and a fault is
+/// a 503. With no homeserver configured there is nothing to ask: `resolve_identity` then
+/// answers the legacy localpart, which never gets a mailbox address.
+async fn resolve_generic_identity(
+    did: &str,
+    synapse_client: Option<&SynapseClient>,
+) -> Result<crate::localpart::ResolvedIdentity, CustomError> {
+    crate::localpart::resolve_identity(did, synapse_client)
+        .await
+        .map_err(|e| {
+            warn!(
+                did = %did,
+                error = %e,
+                "generic sign-in: identity resolution failed; refusing instead of guessing"
+            );
+            CustomError::ServiceUnavailable(GENERIC_IDENTITY_UNAVAILABLE_MSG.to_string())
+        })
+}
+
 /// `did_publication` carries the provider's signing key + issuer for the
 /// attested `io.inblock.did` profile field (see
 /// [`provision_synapse_account`]). It is built by the axum handler, which is the
@@ -2931,8 +2982,8 @@ pub async fn sign_in(
     // trusts our introspection — and `is_localpart_available` reports a
     // deactivated user's localpart as *taken*, so without this a deactivated or
     // erased account signed straight back in and got a full session. Placed
-    // after the DID is proven but BEFORE `provision_synapse_device`, so a
-    // rejected sign-in leaves no Synapse state behind.
+    // after the DID is proven but BEFORE any provisioning, so a rejected
+    // sign-in leaves no Synapse state behind.
     //
     // # This runs BEFORE `resolve_identity_or_legacy` below, DELIBERATELY
     //
@@ -2943,7 +2994,7 @@ pub async fn sign_in(
     // audit, D4) — making that guard look like near-dead code on the login path.
     // The observation is correct and the ordering is still right. Do not swap
     // them to "make the guard reachable". `sign_in_deactivation_order_tests`
-    // (end of this file) fails if the gate moves anywhere later in `sign_in`.
+    // (a test module of this file) fails if the gate moves anywhere later in `sign_in`.
     //
     // Swapping them would not trade coverage for safety, it would build a live
     // deactivation BYPASS. `resolve_identity_or_legacy` is infallible by
@@ -2969,6 +3020,10 @@ pub async fn sign_in(
     // at APPROVAL time, in a different request, possibly minutes earlier), and
     // the cosmetic `detected_mxid` / `new_user` displays in
     // `axum_lib::detected_mxid_for` and `webauthn_authenticate_finish`.
+    //
+    // That window exists for a Matrix-class client only: a generic-class sign-in
+    // resolves with the fallible `resolve_identity` and answers a fault in it
+    // with a 503 (see the class match below).
     crate::webauthn::reject_if_deactivated(synapse_client, &did).await?;
 
     // C2 Step 3: re-validate the bound redirect_uri against the client's
@@ -2979,38 +3034,61 @@ pub async fn sign_in(
     // above.
     let client =
         validate_registered_redirect_uri(&request.client_id, &redirect_uri, db_client).await?;
-    let device_name = device_display_name(&request.client_id, Some(&client));
 
-    // Extract a client-proposed device_id from the bound request's scope (if any).
-    let proposed_device_id = request
-        .scope
-        .as_deref()
-        .and_then(extract_device_id_from_scope);
-    // Resolve ONCE (grandfathering decision), and reuse the result as the
-    // single source of truth for both provisioning and the CodeEntry the
-    // eventual /token exchange reads back. Best-effort: a Synapse hiccup here
-    // must not fail sign-in, so an error degrades to the legacy localpart
-    // (never the modern one — see resolve_identity_or_legacy's fail-safe
-    // direction) exactly like the pre-existing degraded-provisioning path.
-    //
-    // ORDERING (2026-09-13 audit): `reject_if_deactivated` above has already
-    // failed closed on a persistent probe error, so on THIS path the `degraded`
-    // fallback covers only the residual window — a fault arriving between that
-    // gate's probe and this one. That is deliberate and must not be "fixed" by
-    // reordering: the full argument, including the deactivation bypass a swap
-    // would open and the paths that do exercise `degraded` freely, is at the
-    // gate's call site above.
-    let resolved = crate::localpart::resolve_identity_or_legacy(&did, synapse_client).await;
-    let device_id = provision_synapse_device(
-        &did,
-        &resolved,
-        synapse_client,
-        &device_name,
-        proposed_device_id.as_deref(),
-        server_name,
-        did_publication,
-    )
-    .await;
+    let (resolved, device_id) = match client.class {
+        ClientClass::Matrix => {
+            let device_name = device_display_name(&request.client_id, Some(&client));
+
+            // Extract a client-proposed device_id from the bound request's scope (if any).
+            let proposed_device_id = request
+                .scope
+                .as_deref()
+                .and_then(extract_device_id_from_scope);
+            // Resolve ONCE (grandfathering decision), and reuse the result as the
+            // single source of truth for both provisioning and the CodeEntry the
+            // eventual /token exchange reads back. Best-effort: a Synapse hiccup here
+            // must not fail sign-in, so an error degrades to the legacy localpart
+            // (never the modern one; see resolve_identity_or_legacy's fail-safe
+            // direction) exactly like the pre-existing degraded-provisioning path.
+            //
+            // ORDERING (2026-09-13 audit): `reject_if_deactivated` above has already
+            // failed closed on a persistent probe error, so on THIS path the `degraded`
+            // fallback covers only the residual window: a fault arriving between that
+            // gate's probe and this one. That is deliberate and must not be "fixed" by
+            // reordering: the full argument, including the deactivation bypass a swap
+            // would open and the paths that do exercise `degraded` freely, is at the
+            // gate's call site above.
+            let resolved = crate::localpart::resolve_identity_or_legacy(&did, synapse_client).await;
+            let device_id = provision_synapse_device(
+                &did,
+                &resolved,
+                synapse_client,
+                &device_name,
+                proposed_device_id.as_deref(),
+                server_name,
+                did_publication,
+            )
+            .await;
+            (resolved, device_id)
+        }
+        ClientClass::Generic => {
+            // The scope first: checking it has no side effects. `/authorize` asked the
+            // same of the request, so this catches only a client whose policy changed
+            // since, before an account is created that no code will ever redeem.
+            siwx_oidc::client_policy::grant_for(&client, request.scope.as_deref().unwrap_or(""))
+                .ok_or_else(|| CustomError::BadRequest(GENERIC_OPENID_REQUIRED_MSG.to_string()))?;
+            // The gate above covers a fault it sees; the fallible resolver here covers one
+            // that arrives after it, which the Matrix branch answers with the legacy guess.
+            let resolved = resolve_generic_identity(&did, synapse_client).await?;
+            if let Some(synapse) = synapse_client {
+                provision_synapse_account(&did, &resolved, synapse, server_name, did_publication)
+                    .await;
+            }
+            // No device and no cross-signing reset: a generic client's token is not a
+            // Matrix session, so there is nothing for either to belong to.
+            (resolved, None)
+        }
+    };
 
     let code_entry = CodeEntry {
         did: did.clone(),
@@ -3028,7 +3106,7 @@ pub async fn sign_in(
         localpart: Some(resolved.localpart.clone()),
         device_id,
         scope: request.scope.clone(),
-        client_class: None,
+        client_class: Some(client.class),
     };
 
     let code = Uuid::new_v4();
@@ -9643,11 +9721,13 @@ mod backchannel_registration_tests {
 #[cfg(test)]
 mod generic_client_tests {
     use super::*;
+    use crate::localpart::{legacy_localpart, localpart_for};
     use axum::extract::{Query, State};
     use axum::http::{Method, StatusCode, Uri};
     use axum::response::IntoResponse;
     use axum::routing::get;
     use axum::{Json, Router};
+    use headers::{HeaderMap, HeaderMapExt, HeaderValue};
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
@@ -9656,6 +9736,9 @@ mod generic_client_tests {
     /// parses the key.
     const DID: &str = "did:key:zDnGENERICCLIENTCLASSTEST";
     const SERVER_NAME: &str = "example.org";
+    const REDIRECT: &str = "https://mail.example.org/callback";
+    /// What a mail client asks for, including a Matrix scope it must never get.
+    const MAIL_REQUEST: &str = "openid io.inblock.mail urn:matrix:client:api:*";
     const DEVICE_CALLS: [&str; 3] = [
         "POST /_synapse/mas/upsert_device",
         "POST /_synapse/mas/update_device_display_name",
@@ -9780,5 +9863,376 @@ mod generic_client_tests {
                 "{forbidden} must not run: {log:?}"
             );
         }
+    }
+
+    fn nonce() -> String {
+        Uuid::new_v4().simple().to_string()
+    }
+
+    /// A client registered for [`REDIRECT`] as `class`, with `allowed` as its scope policy.
+    fn client_entry(class: ClientClass, allowed: Option<&[&str]>) -> ClientEntry {
+        ClientEntry {
+            class,
+            allowed_scopes: allowed.map(|a| a.iter().map(|s| s.to_string()).collect()),
+            ..ClientEntry::new(
+                "client-secret",
+                SiwxClientMetadata::new(
+                    vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
+                    LogoutClientMetadata::default(),
+                ),
+                None,
+            )
+        }
+    }
+
+    fn generic_client() -> ClientEntry {
+        client_entry(ClientClass::Generic, Some(&["openid", "io.inblock.mail"]))
+    }
+
+    /// A generic client that cannot ask for the mail scope and is always given it.
+    fn generic_client_always_granted_mail() -> ClientEntry {
+        ClientEntry {
+            always_granted_scopes: vec!["io.inblock.mail".to_string()],
+            ..generic_client()
+        }
+    }
+
+    fn matrix_client() -> ClientEntry {
+        client_entry(ClientClass::Matrix, None)
+    }
+
+    /// Whether the homeserver was asked to change anything.
+    fn wrote_anything(log: &[String]) -> bool {
+        log.iter()
+            .any(|l| l.starts_with("POST ") || l.starts_with("PUT "))
+    }
+
+    /// Whether the log holds the write of the `io.inblock.did` profile field of `localpart`.
+    fn published_the_did_field_of(log: &[String], localpart: &str) -> bool {
+        log.iter().any(|l| {
+            l.starts_with("PUT /_matrix/client/v3/profile/")
+                && l.contains(localpart)
+                && l.ends_with("/io.inblock.did")
+        })
+    }
+
+    /// One passkey-path `sign_in` for [`DID`] through `client`, for a session that `/authorize`
+    /// bound to a request for `scope`, on a provider that publishes the DID field. Returns the
+    /// outcome, the stored `CodeEntry` (when a code was issued) and the homeserver's request
+    /// log; `None` after a loud skip without Redis.
+    async fn sign_in_with(
+        client: ClientEntry,
+        scope: &str,
+        hs: Homeserver,
+    ) -> Option<(
+        Result<(Url, String), CustomError>,
+        Option<CodeEntry>,
+        Vec<String>,
+    )> {
+        let (hs, synapse, server) = spawn(hs).await;
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            server.abort();
+            return None;
+        };
+        let synapse = synapse.with_admin_mint(db.clone(), "siwx-admin".to_string(), 300);
+        let n = nonce();
+        let client_id = format!("generic-class-{n}");
+        db.set_client(client_id.clone(), client).await.unwrap();
+        let session_id = format!("generic-class-{n}");
+        db.set_session(
+            session_id.clone(),
+            SessionEntry {
+                siwe_nonce: n.clone(),
+                secret: "secret".into(),
+                signin_count: 0,
+                verified_did: Some(DID.to_string()),
+                request: Some(AuthorizationRequest {
+                    redirect_uri: REDIRECT.to_string(),
+                    scope: Some(scope.to_string()),
+                    ..bound_test_request(&client_id)
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
+        );
+        let cookies = headers.typed_get::<headers::Cookie>().unwrap();
+        let key = EcdsaSigningKey::from_pem(&crate::did_assertion::test_p256_pem())
+            .expect("test PEM must load");
+        let publication = DidPublication {
+            key: &key,
+            issuer: "https://siwx.example.org",
+        };
+        let result = sign_in(
+            &Url::parse("https://siwx.example.org").unwrap(),
+            &["key".to_string()],
+            &[],
+            cookies,
+            &db,
+            Some(&synapse),
+            Some(SERVER_NAME),
+            Some(&publication),
+        )
+        .await;
+        server.abort();
+        let code_entry = match &result {
+            Ok((url, _)) => {
+                let code = url
+                    .query_pairs()
+                    .find(|(k, _)| k == "code")
+                    .map(|(_, v)| v.into_owned())
+                    .expect("a successful sign_in redirects with a code");
+                db.try_consume_code(code).await.unwrap()
+            }
+            Err(_) => None,
+        };
+        let log = hs.log.lock().unwrap().clone();
+        Some((result, code_entry, log))
+    }
+
+    /// `/authorize` for a client registered as `client`, requesting `scope`: the login page
+    /// URL on success. `None` after a loud skip without Redis.
+    async fn authorize_with(
+        client: ClientEntry,
+        scope: &str,
+    ) -> Option<Result<String, CustomError>> {
+        let db = siwx_oidc::test_support::redis().await?;
+        let client_id = format!("generic-authorize-{}", nonce());
+        db.set_client(client_id.clone(), client).await.unwrap();
+        let params = AuthorizeParams {
+            client_id,
+            redirect_uri: RedirectUrl::new(REDIRECT.into()).unwrap(),
+            scope: Scope::new(scope.into()),
+            response_type: Some(CoreResponseType::Code),
+            state: Some("state".into()),
+            nonce: None,
+            prompt: None,
+            request_uri: None,
+            request: None,
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
+            response_mode: None,
+        };
+        Some(authorize(params, &db).await.map(|(url, _cookie)| url))
+    }
+
+    fn assert_invalid_scope_redirect(outcome: Result<String, CustomError>) {
+        match outcome {
+            Err(CustomError::Redirect(url)) => {
+                assert!(url.contains("error=invalid_scope"), "{url}");
+                assert!(url.contains("state=state"), "{url}");
+            }
+            other => panic!("expected an invalid_scope redirect, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_sign_in_creates_no_device_and_arms_no_reset() {
+        let Some((result, code, log)) =
+            sign_in_with(generic_client(), MAIL_REQUEST, Homeserver::default()).await
+        else {
+            return;
+        };
+        result.expect("a healthy generic sign-in succeeds");
+        let code = code.expect("the code entry is stored");
+        assert_eq!(
+            code.device_id, None,
+            "a generic sign-in provisions no Synapse device"
+        );
+        assert_eq!(code.localpart.as_deref(), Some(localpart_for(DID).as_str()));
+        assert_eq!(
+            code.client_class,
+            Some(ClientClass::Generic),
+            "the code records the branch sign-in took"
+        );
+        assert_eq!(
+            code.scope.as_deref(),
+            Some(MAIL_REQUEST),
+            "the code carries the bound scope, from which the exchange decides the grant"
+        );
+        assert!(
+            log.iter().any(|l| l == "POST /_synapse/mas/provision_user"),
+            "a new identity still gets its Synapse account: {log:?}"
+        );
+        for forbidden in DEVICE_CALLS {
+            assert!(
+                !log.iter().any(|l| l == forbidden),
+                "{forbidden} must not run for a generic client: {log:?}"
+            );
+        }
+    }
+
+    /// The device half is skipped; the DID tier is not. A generic account carries the same
+    /// provider-signed binding as any other, written for the localpart the sign-in resolved.
+    #[tokio::test]
+    async fn a_generic_sign_in_still_publishes_the_did_field() {
+        let Some((result, _code, log)) =
+            sign_in_with(generic_client(), MAIL_REQUEST, Homeserver::default()).await
+        else {
+            return;
+        };
+        result.expect("a healthy generic sign-in succeeds");
+        assert!(
+            published_the_did_field_of(&log, &localpart_for(DID)),
+            "{log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_sign_in_still_provisions_a_device_and_arms_the_reset() {
+        let Some((result, code, log)) =
+            sign_in_with(matrix_client(), "openid", Homeserver::default()).await
+        else {
+            return;
+        };
+        result.expect("a healthy Matrix sign-in succeeds");
+        let code = code.expect("the code entry is stored");
+        assert!(code.device_id.is_some());
+        assert_eq!(code.client_class, Some(ClientClass::Matrix));
+        for expected in [
+            "POST /_synapse/mas/provision_user",
+            "POST /_synapse/mas/upsert_device",
+            "POST /_synapse/mas/allow_cross_signing_reset",
+        ] {
+            assert!(
+                log.iter().any(|l| l == expected),
+                "{expected} must still run: {log:?}"
+            );
+        }
+        assert!(
+            published_the_did_field_of(&log, &localpart_for(DID)),
+            "{log:?}"
+        );
+    }
+
+    /// The modern localpart's probe answers the deactivation gate (call 1) and faults from
+    /// call 2 on: the residual window `sign_in`'s ordering note describes. A generic
+    /// sign-in must fail closed there, without provisioning or publishing anything.
+    #[tokio::test]
+    async fn generic_client_fails_closed() {
+        let hs = Homeserver {
+            fault_from_call: HashMap::from([(localpart_for(DID), 2)]),
+            ..Homeserver::default()
+        };
+        let Some((result, code, log)) = sign_in_with(generic_client(), MAIL_REQUEST, hs).await
+        else {
+            return;
+        };
+        match result {
+            Err(CustomError::ServiceUnavailable(msg)) => {
+                assert_eq!(msg, GENERIC_IDENTITY_UNAVAILABLE_MSG)
+            }
+            other => {
+                panic!("a fault after the gate must fail a generic sign-in closed, got {other:?}")
+            }
+        }
+        assert!(code.is_none(), "no code may be issued");
+        assert!(
+            !wrote_anything(&log),
+            "nothing may be provisioned or published on an unconfirmed localpart: {log:?}"
+        );
+    }
+
+    /// The contrast that gives the test above its meaning: the same fault lets a Matrix
+    /// sign-in through on the legacy guess, the documented fail-safe for Matrix accounts.
+    #[tokio::test]
+    async fn matrix_sign_in_still_degrades_to_the_legacy_guess_on_the_same_fault() {
+        let hs = Homeserver {
+            fault_from_call: HashMap::from([(localpart_for(DID), 2)]),
+            ..Homeserver::default()
+        };
+        let Some((result, code, _log)) = sign_in_with(matrix_client(), "openid", hs).await else {
+            return;
+        };
+        result.expect("a Matrix sign-in degrades instead of failing");
+        assert_eq!(
+            code.expect("the code entry is stored").localpart.as_deref(),
+            Some(legacy_localpart(DID).as_str())
+        );
+    }
+
+    /// `/authorize` refuses such a request first; this is the second check, for a session
+    /// bound before the client's policy changed. It runs before anything is provisioned.
+    #[tokio::test]
+    async fn a_generic_sign_in_without_openid_is_refused() {
+        let Some((result, code, log)) =
+            sign_in_with(generic_client(), "io.inblock.mail", Homeserver::default()).await
+        else {
+            return;
+        };
+        assert!(
+            matches!(result, Err(CustomError::BadRequest(_))),
+            "{result:?}"
+        );
+        assert!(code.is_none());
+        assert!(!wrote_anything(&log), "{log:?}");
+    }
+
+    /// An always-granted scope is added to a grant, never a grant of its own: a request
+    /// that names no `openid` is refused at /authorize and again at /sign_in, and no code
+    /// is stored for it.
+    #[tokio::test]
+    async fn an_always_granted_scope_does_not_make_up_for_a_missing_openid() {
+        let Some(outcome) = authorize_with(
+            generic_client_always_granted_mail(),
+            "urn:matrix:client:api:*",
+        )
+        .await
+        else {
+            return;
+        };
+        assert_invalid_scope_redirect(outcome);
+
+        let Some((result, code, log)) = sign_in_with(
+            generic_client_always_granted_mail(),
+            "urn:matrix:client:api:*",
+            Homeserver::default(),
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(
+            matches!(result, Err(CustomError::BadRequest(_))),
+            "{result:?}"
+        );
+        assert!(code.is_none());
+        assert!(!wrote_anything(&log), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn authorize_refuses_a_generic_request_that_grants_no_openid() {
+        // Passes the "openid or a Matrix scope" check, and grants nothing a generic client
+        // may have.
+        let Some(outcome) =
+            authorize_with(generic_client(), "urn:matrix:client:api:* io.inblock.mail").await
+        else {
+            return;
+        };
+        assert_invalid_scope_redirect(outcome);
+    }
+
+    #[tokio::test]
+    async fn authorize_accepts_a_generic_request_that_grants_openid() {
+        let Some(outcome) = authorize_with(generic_client(), MAIL_REQUEST).await else {
+            return;
+        };
+        let url = outcome.expect("a request that grants openid reaches the login page");
+        assert!(url.starts_with("/?nonce="), "{url}");
+    }
+
+    /// A Matrix-class client never had its scope checked against an allowed list: a request
+    /// with a Matrix scope and no `openid` still reaches the login page.
+    #[tokio::test]
+    async fn authorize_leaves_a_matrix_client_request_without_openid_alone() {
+        let Some(outcome) = authorize_with(matrix_client(), "urn:matrix:client:api:*").await else {
+            return;
+        };
+        let url = outcome.expect("a Matrix-class request is accepted as before");
+        assert!(url.starts_with("/?nonce="), "{url}");
     }
 }
