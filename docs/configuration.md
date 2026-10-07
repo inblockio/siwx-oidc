@@ -153,6 +153,11 @@ defaults to empty. Start-up refuses an entry that:
 error that names the client id (or the setting) and the rule, and it comes before anything is
 written to Redis. A build that predates these members ignores them and reads a generic client
 as a Matrix client, so every instance that shares one Redis must run a build that knows them.
+Never roll back to such a build while a generic client is configured or stored: roll back only
+after this build has started once without the generic client in `default_clients` (the sync
+deletes the entry and ends its sessions) and the older build starts with a map that does not name
+it, because otherwise the older build reads the entry as a Matrix client and the mail client's
+next sign-in gets a Synapse device and the Matrix API scope.
 
 A generic client is granted the scopes it requests that are in `allowed_scopes` (any other is
 dropped), followed by its `always_granted_scopes`. A request that would grant it no `openid` is
