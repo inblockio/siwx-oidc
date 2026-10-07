@@ -138,8 +138,9 @@ an entry without a class is `matrix`. A generic entry may add `"always_granted_s
 the client receives even when it does not request them, for a client that cannot ask for them; it
 defaults to empty. Start-up refuses an entry that:
 
-- is generic in a deployment without `mas_shared_secret`: a generic client's account and
-  localpart come from Synapse;
+- is generic in a deployment without `mas_shared_secret` or without `synapse_endpoint`: a
+  generic client's account and localpart come from Synapse, and the Synapse client exists only
+  when both are set (without it a sign-in provisions no account and resolves no localpart);
 - is generic without `openid` in `allowed_scopes`, with a scope that starts with `urn:matrix:` or
   `urn:synapse:`, with a registration access token, or allowing `io.inblock.mail` without
   `mail_domain`;
@@ -307,7 +308,7 @@ lookup.
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
 | `mas_shared_secret` | `SIWXOIDC_MAS_SHARED_SECRET` | none | Secret shared with Synapse (its `matrix_authentication_service.secret`). Enables Matrix mode: `mat_`/`mcr_` token prefixes and Matrix scopes, `POST /oauth2/introspect`, `POST /oauth2/admin_token`, and the device-code grant. Without it those endpoints answer 404, the grant is refused, and discovery advertises neither introspection nor the device-code grant. |
-| `synapse_endpoint` | `SIWXOIDC_SYNAPSE_ENDPOINT` | none | Synapse base URL as reachable from siwx-oidc (e.g. `http://synapse:8008`). With `mas_shared_secret` it enables the Synapse client: provisioning, devices, deactivation, DID publication, the sign-in gates. |
+| `synapse_endpoint` | `SIWXOIDC_SYNAPSE_ENDPOINT` | none | Synapse base URL as reachable from siwx-oidc (e.g. `http://synapse:8008`). With `mas_shared_secret` it enables the Synapse client: provisioning, devices, deactivation, DID publication, the sign-in gates. A generic-class `default_clients` entry needs both: start-up refuses it without either. |
 | `matrix_server_name` | `SIWXOIDC_MATRIX_SERVER_NAME` | none | The homeserver's `server_name`. Needed to build MXIDs: DID publication, `GET /resolve`, the `io.inblock.mxid` userinfo claim, `/account` device actions and the passkey picker's account hint. Without it those degrade (skipped, omitted or 503), never 500. |
 | `account_management_uri` | `SIWXOIDC_ACCOUNT_MANAGEMENT_URI` | `{base_url}/account` | MSC4191 account-management URL advertised in discovery; advertised only when a Synapse client and `matrix_server_name` are configured. |
 | `admin_token_ttl_secs` | `SIWXOIDC_ADMIN_TOKEN_TTL_SECS` | `300` | Lifetime of a minted admin-scoped token. Clamped in code to 30–900 s. |

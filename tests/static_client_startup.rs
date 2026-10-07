@@ -108,13 +108,16 @@ fn generic_entry(scopes: &str, extra: &str) -> String {
     )
 }
 
+const MAS_SECRET: (&str, &str) = ("SIWXOIDC_MAS_SHARED_SECRET", "not-a-secret-test-fixture");
+
 /// The environment of a deployment that has a Synapse, which a generic client needs, and
 /// one generic client.
-fn with_a_synapse(entry: String) -> [(&'static str, String); 2] {
+fn with_a_synapse(entry: String) -> [(&'static str, String); 3] {
     [
+        (MAS_SECRET.0, MAS_SECRET.1.to_string()),
         (
-            "SIWXOIDC_MAS_SHARED_SECRET",
-            "not-a-secret-test-fixture".to_string(),
+            "SIWXOIDC_SYNAPSE_ENDPOINT",
+            "http://synapse.example.org:8008".to_string(),
         ),
         ("SIWXOIDC_DEFAULT_CLIENTS__MAILER", entry),
     ]
@@ -161,6 +164,23 @@ fn a_generic_client_in_a_deployment_without_a_synapse_stops_start_up() {
     )]);
     assert!(
         stderr.contains("default_clients.mailer:") && stderr.contains("SIWXOIDC_MAS_SHARED_SECRET"),
+        "the refusal names the client and the setting it needs:\n{stderr}"
+    );
+}
+
+/// The MAS secret alone builds no Synapse client: without the endpoint a generic sign-in
+/// would provision nothing and could only record a legacy localpart.
+#[test]
+fn a_generic_client_without_a_synapse_endpoint_stops_start_up() {
+    let stderr = refused_start(&[
+        (MAS_SECRET.0, MAS_SECRET.1.to_string()),
+        (
+            "SIWXOIDC_DEFAULT_CLIENTS__MAILER",
+            generic_entry(r#"["openid"]"#, ""),
+        ),
+    ]);
+    assert!(
+        stderr.contains("default_clients.mailer:") && stderr.contains("SIWXOIDC_SYNAPSE_ENDPOINT"),
         "the refusal names the client and the setting it needs:\n{stderr}"
     );
 }
