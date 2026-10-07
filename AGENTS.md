@@ -52,9 +52,9 @@ everything else exists only in the binary crate.
 | `credential_identity.rs` (lib) | Which identity a stored passkey authenticates: a `webauthn:link/*` entry overrides the derived `did:key`. |
 | `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL`. |
 | `credential_migration.rs` (lib) | Additive backfill of passkey credentials into the aqua-auth store. |
-| `client_policy.rs` (lib) | Pure rules for generic-class clients: `grant_for` (the scopes a client is granted), `mailbox_claim` (what userinfo asks: every condition of the mailbox claim) and `mailbox_for` (the one place its value is built), `validate_mail_domain`, `validate_static_client`, and `parse_static_clients`, which start-up runs on `default_clients` before anything is written. |
+| `client_policy.rs` (lib) | Pure rules for generic-class clients: `grant_for` (the scopes a client is granted), `mailbox_claim` (what userinfo asks: every condition of the mailbox claim) and `mailbox_for` (the one place its value is built), `validate_mail_domain`, `validate_static_client`, and `parse_static_clients`, which start-up runs on `default_clients` before anything is written, and `grant_end` (whether replacing or deleting a static client's stored entry ends its grants, and why). |
 | `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry` with the digests of its secret and registration access token, its `ClientClass` and scope policy, and `client_entry_without_plaintext`, `DeviceCodeEntry` and the `DeviceCodeRef` naming its layout, `TokenMetadata` with its `TokenKind` and the `GrantKind` of its grant, `grant_kind`, which only `AccessGrant::metadata` sets and which is never stored), `Ceremony`, `OwnSession` (the `siwx_user` and `acct_session` layouts), `legacy_token_kind`, Redis key prefixes and TTLs. |
-| `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, the own sessions (`create_own_session`, `lookup_own_session`, `end_own_session`, `revoke_own_sessions`; `lookup_user_session` for the picker), `purge_identity`. |
+| `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, the own sessions (`create_own_session`, `lookup_own_session`, `end_own_session`, `revoke_own_sessions`; `lookup_user_session` for the picker), `purge_identity`, `sync_static_clients_in` (the start-up sync of `default_clients` against a tracking set the caller names; it sets a generic client's epoch when its change ends its grants). |
 | `db/outbox.rs` (lib) | The back-channel logout outbox (`outbox:backchannel_logout`): `LogoutEntry`, claim under a lease, retry, complete. Entries are queued by `drop_grant` in `db/grant.rs`. |
 | `db/grant.rs` (lib) | The grant record and its Lua scripts: `issue_grant`, the access check `check_access_token` (with the legacy read fallback), `is_matrix_credential` (which grants the Matrix side acts on), `rotate_refresh_token` (the one rotation script), `ReuseEvent`, grant revocation, and the legacy migration (`peek_refresh_token`, `lift_legacy_refresh_token`). Keyspace and decision table in its module docs. |
 | `db/tokens.rs` (lib) | Token formats (`mat_`, `msa_`, `mcr_{handle}_{secret}`), `parse_refresh_token` (never panics), `digest` (the SHA-256 every credential a client holds is stored as). |
@@ -488,7 +488,8 @@ doc; read it before changing the code the rule covers.
   after Phase 3: one a previous build planted must still refuse for its 900 s. The device
   tombstone stays: it closes the race between a device sweep and the lift of a legacy refresh
   token. Global and client epochs have no HTTP endpoint, to add no remote surface: an operator
-  sets them ([docs/matrix-integration.md](docs/matrix-integration.md#epochs)). An unset epoch
+  sets them ([docs/matrix-integration.md](docs/matrix-integration.md#epochs)), and the start-up
+  sync of static clients sets a generic-class client's (next bullet). An unset epoch
   is none, never 0. Teardown's resolver (`resolve_refresh_token`) treats a refused refresh token as
   unknown, so revoking it tears nothing down. The comparisons made in Rust (a legacy access
   token, teardown) follow the scripts' rule to the millisecond. Pin:
@@ -507,6 +508,43 @@ doc; read it before changing the code the rule covers.
   `e1_a_client_epoch_refuses_that_clients_older_grants_only`,
   `e1_a_global_epoch_refuses_every_older_grant`,
   `e1_a_user_tombstone_written_by_the_previous_build_still_refuses_refresh`.
+- **A generic-class client's grants end with the configuration that justified them.** The
+  start-up sync of `default_clients` (`RedisClient::sync_static_clients_in`; the background prune
+  runs it with an empty map) sets `epoch:client/{id}` before it overwrites or deletes a stored
+  entry whose change `client_policy::grant_end` says ends grants: a generic client that is
+  removed, that changes class in either direction, or whose SET of `allowed_scopes` changes
+  (order and repeats do not count, no list is the empty list, a widening counts). Without it a
+  generic grant outlives its client: a public client's refresh token keeps rotating at `/token`
+  once the registration is gone (`authenticate_refresh_client` tolerates that), and after a class
+  flip or a narrowed policy an old `oidc` grant keeps its scope, refreshes and is served at
+  userinfo. Not part of the rule: `always_granted_scopes` (kept inside `allowed_scopes`), the
+  secret, the redirect URIs, and any change to a Matrix-class client, whose removal leaves its
+  Matrix sessions refreshing, as before. An entry that is missing or that this build cannot read
+  sets no epoch: its class is unknown, and ending Matrix sessions is the worse error. The epoch
+  comes BEFORE the write or the delete: a failure between the two leaves the old entry in place
+  and the next start repeats it, while the other order could lose the change for good (the next
+  start would see old equal to new). A restart with the configuration it left behind sets none,
+  and a client id configured again keeps its epoch, so what was issued before stays refused and
+  a sign-in after it works (a grant authenticated in the epoch's own millisecond is refused, so
+  a test gives the new grant the next one). Each epoch is one `warn!` with `client_id`, `reason`
+  (`removed`, `class_changed`, `scopes_changed`) and `epoch_ms`. Observe the epoch at `/token`,
+  at userinfo and in the library: `compat::refresh` refuses an `oidc` grant before it reads any
+  epoch. Never set the global or the user epoch from the sync. Pin:
+  `grants_end_when_a_generic_client_is_removed_reclassified_or_rescoped` (the rule, a table),
+  `a_grant_end_names_its_reason_for_the_log`,
+  `a_restart_with_an_unchanged_configuration_sets_no_epoch`,
+  `removing_a_generic_static_client_ends_its_grants`,
+  `removing_a_matrix_class_static_client_sets_no_epoch`,
+  `a_class_change_ends_the_grants_in_either_direction`,
+  `a_change_of_the_allowed_scopes_ends_the_grants_and_nothing_else_does`,
+  `a_missing_or_unreadable_stored_entry_sets_no_epoch`,
+  `a_failed_epoch_write_leaves_the_old_entry_so_the_next_start_repeats_it`,
+  `the_sync_logs_each_epoch_it_sets_with_the_client_and_the_reason`; at the endpoints:
+  `a_restart_with_an_unchanged_configuration_keeps_a_generic_grant_working`,
+  `an_older_generic_grant_is_refused_after_its_client_is_removed`,
+  `an_older_grant_is_refused_after_a_class_change_in_either_direction`,
+  `an_older_generic_grant_is_refused_after_the_allowed_scopes_change`,
+  `removing_a_matrix_class_static_client_leaves_its_sessions_refreshing`.
 - **No credential a client holds is stored in the clear** (I1): tokens, authorization codes,
   device and user codes, session identifiers (the login `session` cookie, the WebAuthn,
   account re-auth and device-approval ceremony ids, the `siwx_user` picker hint and the
@@ -633,7 +671,8 @@ doc; read it before changing the code the rule covers.
   (RFC 6749 §5.2, with `WWW-Authenticate: Basic` after a Basic attempt). The replay of a lost
   response is bound to the grant's client like a rotation. Provisional, recorded in docs/matrix-integration.md: a public
   client may omit `client_id`; a token whose client registration is gone (30 days without a use, or removed)
-  keeps refreshing unless the request names another client or presents a secret.
+  keeps refreshing unless the request names another client or presents a secret; the one exception
+  is a generic-class static client, whose grants end when it is removed (the epoch bullets above).
   `POST /_matrix/client/v3/refresh` carries no client identity, so it refuses a confidential
   client's refresh token exactly like an unknown token, leaving it untouched for `/token`; the
   grant records at issuance whether its client is confidential, by the same rule

@@ -111,7 +111,7 @@ abused, leave it out of the list and let its proofs fail; the next sign-in re-as
 
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
-| `default_clients` | `SIWXOIDC_DEFAULT_CLIENTS` | none | Map of client id to a JSON client entry, written to Redis at every start with no expiry. An id removed from the map is deleted at the next start. |
+| `default_clients` | `SIWXOIDC_DEFAULT_CLIENTS` | none | Map of client id to a JSON client entry, written to Redis at every start with no expiry. An id removed from the map is deleted at the next start; for a generic-class client that also ends its sessions, as does a change of its class or `allowed_scopes` ([details](#changes-that-end-a-generic-clients-sessions)). |
 | `require_secret` | `SIWXOIDC_REQUIRE_SECRET` | `true` | Whether `POST /token` demands a client secret, at the code exchange and at the refresh grant alike, from a client whose metadata names no `token_endpoint_auth_method`. A client registered with `"none"` never needs one. |
 | `mail_domain` | `SIWXOIDC_MAIL_DOMAIN` | none | Domain of the mailbox address (`<localpart>@<mail_domain>`) of an account that signs in to a generic client. A lowercase DNS name (at most 63 characters per label and 253 in all) that is not an IP address; required when a static client allows `io.inblock.mail`. With it set, `/userinfo` carries the `io.inblock.mailbox` claim where the rules in [identity-model.md](identity-model.md#the-ioinblockmailbox-userinfo-claim) allow it, and discovery lists the `io.inblock.mail` scope and that claim; without it, neither is listed. |
 
@@ -186,12 +186,42 @@ reached it retries, after 1 s and then at doubling intervals up to 60 s, until o
 succeeds; until then those clients stay registered.
 
 Removing a client, whether by dropping its id from `default_clients` or by `DELETE` on a
-dynamically registered one, stops new authorizations and code exchanges for it. It does not end
-the sessions that already exist: a refresh token of a removed client still refreshes (a request
-that presents a secret is refused, because the client can no longer be checked), and each refresh
-issues a new refresh token, so a session keeps refreshing until it is revoked (token revocation,
-sign-out or account deactivation), its refresh token goes unused for 90 days, or its absolute
-lifetime ends when one is set.
+dynamically registered one, stops new authorizations and code exchanges for it. For a Matrix-class
+client it does not end the sessions that already exist: a refresh token of a removed client still
+refreshes (a request that presents a secret is refused, because the client can no longer be
+checked), and each refresh issues a new refresh token, so a session keeps refreshing until it is
+revoked (token revocation, sign-out or account deactivation), its refresh token goes unused for 90
+days, or its absolute lifetime ends when one is set. A generic-class client's sessions do end; see
+the next section.
+
+### Changes that end a generic client's sessions
+
+A generic client's session carries a scope this provider decided from the client's entry, so it
+must not outlive that entry. The start-up sync therefore ends every session of a generic client,
+for good, when the entry it finds in Redis and the configured one differ in one of these ways, or
+when nothing is configured for the id any more (it was dropped from the map, or the server started
+with no `default_clients` at all):
+
+- the client is removed;
+- its class changes, from `generic` to `matrix` or the other way round;
+- its `allowed_scopes` change as a set: a scope added or removed counts, the order and a scope
+  listed twice do not.
+
+It writes the client's epoch (`epoch:client/{client_id}`, see
+[Epochs](matrix-integration.md#epochs)) before it overwrites or deletes the entry, and logs each
+one as a warning that names the client and the reason (`removed`, `class_changed`,
+`scopes_changed`). From then on every session of the client that was authenticated before that
+moment is refused at the token endpoint's refresh grant and at `/userinfo`; the user signs in
+again, and a sign-in after it works at once. Nothing else ends a session: not a restart with the
+configuration unchanged, not a new secret or redirect URI, not a change to
+`always_granted_scopes` alone, and not a change to a Matrix-class client (above). A stored entry
+that is missing, or that this build cannot read, sets no epoch.
+
+An instance started with another map, or without the generic client, therefore ends every
+session of that client for good, and so does a rollback that carries an older map. The epoch has
+no expiry and stays when the id is configured again: sessions from before it stay refused,
+sessions from after it work. Deleting the `epoch:client/{client_id}` key lifts it for sessions
+that no request has refused yet.
 
 ### Grant lifetime
 
