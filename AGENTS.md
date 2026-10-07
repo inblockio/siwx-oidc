@@ -52,7 +52,7 @@ everything else exists only in the binary crate.
 | `credential_identity.rs` (lib) | Which identity a stored passkey authenticates: a `webauthn:link/*` entry overrides the derived `did:key`. |
 | `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL`. |
 | `credential_migration.rs` (lib) | Additive backfill of passkey credentials into the aqua-auth store. |
-| `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry` with the digests of its secret and registration access token and `client_entry_without_plaintext`, `DeviceCodeEntry` and the `DeviceCodeRef` naming its layout, `TokenMetadata` with its `TokenKind`), `Ceremony`, `OwnSession` (the `siwx_user` and `acct_session` layouts), `legacy_token_kind`, Redis key prefixes and TTLs. |
+| `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry` with the digests of its secret and registration access token, its `ClientClass` and scope policy, and `client_entry_without_plaintext`, `DeviceCodeEntry` and the `DeviceCodeRef` naming its layout, `TokenMetadata` with its `TokenKind`), `Ceremony`, `OwnSession` (the `siwx_user` and `acct_session` layouts), `legacy_token_kind`, Redis key prefixes and TTLs. |
 | `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, the own sessions (`create_own_session`, `lookup_own_session`, `end_own_session`, `revoke_own_sessions`; `lookup_user_session` for the picker), `purge_identity`. |
 | `db/outbox.rs` (lib) | The back-channel logout outbox (`outbox:backchannel_logout`): `LogoutEntry`, claim under a lease, retry, complete. Entries are queued by `drop_grant` in `db/grant.rs`. |
 | `db/grant.rs` (lib) | The grant record and its Lua scripts: `issue_grant`, the access check `check_access_token` (with the legacy read fallback), `rotate_refresh_token` (the one rotation script), `ReuseEvent`, grant revocation, and the legacy migration (`peek_refresh_token`, `lift_legacy_refresh_token`). Keyspace and decision table in its module docs. |
@@ -473,8 +473,8 @@ doc; read it before changing the code the rule covers.
   "unify" them. Entries an earlier build wrote are read for their remaining lifetime and used
   once: `token/{raw}` (lifted), `codes/`, `sessions/`, `device_codes/`, `user_codes/`,
   `caip122_nonce/`, `webauthn:challenge/`, `webauthn:link_challenge/`, and a plaintext client entry,
-  upgraded atomically on first read without losing a field (marked
-  `TODO(remove one release after Phase 2b)`; plaintext clients live 30 days); and the own
+  upgraded atomically on first read without losing a field, its class and scope policy included
+  (marked `TODO(remove one release after Phase 2b)`; plaintext clients live 30 days); and the own
   sessions `user:session/` (30 days) and `account_session/` (600 s), read, ended by the account
   page's sign-out and swept by prefix when the user's sessions are revoked (marked `TODO(remove`
   at `KV_USER_SESSION_PREFIX` and `KV_LEGACY_ACCOUNT_SESSION_PREFIX`). Accepted deploy
@@ -502,6 +502,8 @@ doc; read it before changing the code the rule covers.
   `every_client_authentication_compares_digests_of_what_is_presented`,
   `concurrent_first_reads_of_a_plaintext_client_all_authenticate_and_leave_one_digested_entry`,
   `an_upgrade_never_overwrites_an_entry_that_changed_since_it_was_read`,
+  `an_upgraded_plaintext_entry_keeps_its_class_and_scope_policy`,
+  `an_upgraded_plaintext_client_keeps_its_class_and_scope_policy`,
   `default_clients_are_stored_only_as_digests_and_authenticate`,
   `device_and_user_codes_are_stored_only_as_digests`, `ceremony_state_is_digest_keyed_and_taken_once`,
   `caip122_nonces_are_stored_by_digest_and_used_once`, `a_wrong_token_cannot_open_the_successor`,
