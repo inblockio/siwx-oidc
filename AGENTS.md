@@ -104,7 +104,9 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   (4, one of them needs it);
   `credential_migration_live` (2), which needs its own disposable, empty Redis named by
   `MIGRATION_TEST_REDIS_URL`; and the pure check `an_absent_strict_skips_variable_means_strict`
-  in `e2e_account_lifecycle_live` and in `e2e_did_field_live` (1 each).
+  in `e2e_account_lifecycle_live` and in `e2e_did_field_live` (1 each). In the headless
+  client's crate it also runs the three pure checks of `siwx-oidc-auth/tests/live_upgrade.rs`'s
+  helpers.
 - **Redis-backed tests** get their Redis from `siwx_oidc::test_support` (`src/test_support.rs`):
   `SIWX_TEST_REDIS_URL`, default `redis://localhost`. When it is unreachable each test prints
   one `SKIP <test>: …` line to stderr and passes; with `SIWX_TEST_REQUIRE_REDIS=1` it fails
@@ -127,6 +129,17 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   `E2E_STRICT_SKIPS=1` so a skipped assertion fails instead of passing. The headless client's
   `siwx-oidc-auth/tests/live_deployment.rs` runs against a whole deployment named by
   `SIWX_SERVER` and `SIWX_HOMESERVER`, and creates and deactivates a throwaway account; see
+  e2e/README.md.
+- **Upgrade qualification suites** prove that what a deployment holds survives a switch of
+  the siwx-oidc build, and run before every promotion (none in CI). `e2e/upgrade-from.sh
+  <old-image> [<new>]` runs a mock upgrade from an image to this tree's build, Redis kept: the
+  R1/R2 stages of `e2e_race_teardown` and the live suite below, with the Synapse mock as the
+  homeserver (it forwards `POST /_matrix/client/v3/refresh` and `DELETE …/devices/{id}` to
+  siwx-oidc, as a deployment's edge does). `siwx-oidc-auth/tests/live_upgrade.rs` mints
+  sessions in every shape a deployment holds before the switch and checks them after it,
+  in stages (`QUALIFY_STAGE=mint|check|cleanup`, state in a 0700 `QUALIFY_STATE_DIR`),
+  against a real deployment or the mock; `siwx-oidc-auth/examples/soak.rs` holds a population
+  of sessions across the switch. Each creates and deactivates throwaway accounts; see
   e2e/README.md.
 - **Browser suites:** `e2e/browser/` (self-contained, runs in CI) and `e2e/element/` (needs
   Element Web, a real Synapse and the proxy from siwx-oidc-matrix-server).
