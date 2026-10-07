@@ -38,6 +38,7 @@ use urlencoding::decode;
 use uuid::Uuid;
 
 use aqua_auth::find_did_method;
+use siwx_oidc::client_policy;
 use siwx_oidc::db::grant::{
     EndedGrant, GrantKind, InvalidReason, NewGrant, RefreshPeek, RotateOutcome, RotateRequest,
 };
@@ -716,6 +717,22 @@ pub fn device_grant_unsupported() -> CustomError {
     })
 }
 
+/// The refusal of the RFC 8628 device-code grant for a generic-class client: that grant
+/// mints a Matrix session (a device, the Matrix scope), which a generic-class client
+/// never gets. `unauthorized_client` (RFC 6749 §5.2: the client may not use this grant
+/// type). Asked at `/device_authorization` and again before a device code is redeemed, so
+/// a code issued while the client was Matrix-class cannot be exchanged for a Matrix
+/// session after it became generic.
+pub fn refuse_device_grant_for(client: &ClientEntry) -> Result<(), CustomError> {
+    match client.class {
+        ClientClass::Matrix => Ok(()),
+        ClientClass::Generic => Err(CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::UnauthorizedClient,
+            error_description: "This client may not use the device-code grant.".to_string(),
+        })),
+    }
+}
+
 /// Build the full OIDC provider-metadata document served at [`METADATA_PATH`],
 /// including the non-standard Matrix/MSC extensions that the `openidconnect`
 /// crate cannot represent natively (introspection, device authorization,
@@ -900,9 +917,15 @@ async fn resolve_name(
     None
 }
 
+/// The claims about `did` that every ID token and userinfo response carries.
+///
+/// `class` is the class of the client the claims are for. A generic-class client gets no
+/// ENS lookup: its claims need no display name, and the lookup would send the user's
+/// address to a third party on every exchange and every userinfo call.
 async fn resolve_claims(
     config: &crate::config::Config,
     did: &str,
+    class: ClientClass,
 ) -> StandardClaims<CoreGenderClaim> {
     // canonical_subject is the OIDC sub claim — full DID string for did:pkh.
     let subject = find_did_method(did)
@@ -914,8 +937,12 @@ async fn resolve_claims(
         .and_then(|m| m.address_for_message(did).ok())
         .unwrap_or_else(|| did.to_string());
 
+    let looks_up_ens = match class {
+        ClientClass::Matrix => true,
+        ClientClass::Generic => false,
+    };
     // ENS resolution only for eip155 DIDs.
-    let ens_name = if did.starts_with("did:pkh:eip155:") {
+    let ens_name = if looks_up_ens && did.starts_with("did:pkh:eip155:") {
         if let Ok(addr) = address_str.parse::<Address>() {
             resolve_name(
                 config.ens_api_url.as_ref(),
@@ -1298,6 +1325,17 @@ async fn token_device_code(
         }));
     }
 
+    // This grant mints a Matrix session, so a generic-class client never redeems one, not
+    // even a code issued before the client changed class. Read before anything is recorded
+    // or claimed, so a refusal leaves the code as it was, and read with `?`, so a store
+    // fault is a fault and never a client served without its class. A client that is gone
+    // (an expired dynamic registration) was never generic and is still served, named after
+    // its id.
+    let client = db_client.get_client(client_id.clone()).await?;
+    if let Some(client) = &client {
+        refuse_device_grant_for(client)?;
+    }
+
     // Rate limiting: reject if polling faster than the interval.
     let now_ts = Utc::now().timestamp();
     if let Some(last) = entry.last_poll {
@@ -1386,15 +1424,6 @@ async fn token_device_code(
                 issuer: config.base_url.as_str(),
             };
             // Named after the client that started the grant, like sign_in.
-            // The name is cosmetic, so a failed client read falls back to the
-            // client id instead of failing a grant the user already approved.
-            let client = db_client
-                .get_client(client_id.clone())
-                .await
-                .unwrap_or_else(|e| {
-                    warn!(error = %e, "device_code grant: client read failed; naming the device after its client id");
-                    None
-                });
             let device_name = device_display_name(&client_id, client.as_ref());
             // The client's proposal goes in as is, so provisioning mints the id
             // when there is none and can tell a minted id (new, so it is named)
@@ -1420,7 +1449,9 @@ async fn token_device_code(
                 dev_id
             );
 
-            let claims = resolve_claims(config, &did).await;
+            // The device grant is a Matrix session by construction, and a generic-class
+            // client was refused above.
+            let claims = resolve_claims(config, &did, ClientClass::Matrix).await;
             let display_name = claims
                 .name()
                 .and_then(|n| n.get(None))
@@ -1428,7 +1459,6 @@ async fn token_device_code(
                 .unwrap_or_else(|| did.clone());
 
             // One Matrix-device grant per approved device code (I2).
-            let client_entry = db_client.get_client(client_id.clone()).await?;
             let issued = db_client
                 .issue_grant(&NewGrant {
                     kind: GrantKind::MatrixDevice,
@@ -1436,7 +1466,7 @@ async fn token_device_code(
                     did: did.clone(),
                     client_id: client_id.clone(),
                     confidential_client: client_is_confidential(
-                        client_entry.as_ref(),
+                        client.as_ref(),
                         config.require_secret,
                     ),
                     device_id: dev_id.clone(),
@@ -1500,8 +1530,9 @@ async fn token_device_code(
 /// The scopes generic mode can grant, in the order they are issued.
 const GENERIC_GRANTABLE_SCOPES: [&str; 3] = ["openid", "profile", "offline_access"];
 
-/// What a generic-mode code exchange issues for the scope the authorization
-/// request asked for.
+/// What a code exchange issues, when the grant is not a Matrix session, for the
+/// scope the authorization request asked for: [`generic_grant`] in generic mode,
+/// [`class_grant`] for a generic-class client.
 #[derive(Debug, PartialEq, Eq)]
 struct GenericGrant {
     /// The scope recorded on the tokens: the requested scopes among
@@ -1546,24 +1577,134 @@ fn generic_grant(requested: Option<&str>, registration: &ClientEntry) -> Generic
         .filter(|scope| asked.contains(scope))
         .filter(|scope| *scope != "offline_access" || may_refresh)
         .collect();
-    let refresh_token = granted.contains(&"offline_access");
     let scope = if granted.is_empty() {
         "openid".to_string()
     } else {
         granted.join(" ")
     };
-    let report_scope = {
-        let mut requested_set = asked.clone();
-        requested_set.sort_unstable();
-        requested_set.dedup();
-        let mut granted_set: Vec<&str> = scope.split(' ').collect();
-        granted_set.sort_unstable();
-        requested_set != granted_set
-    };
-    GenericGrant {
-        scope,
-        refresh_token,
-        report_scope,
+    GenericGrant::recording(scope, requested)
+}
+
+/// The grant for a generic-class client's code exchange in delegated-auth mode: what
+/// [`client_policy::grant_for`] allows for the scope the request bound, under the same
+/// refresh rule as [`generic_grant`] (I10): `offline_access`, and with it a refresh token,
+/// only when the client's registration allows the refresh grant. `None` when the request
+/// grants no `openid`.
+fn class_grant(requested: &str, client: &ClientEntry) -> Option<GenericGrant> {
+    let granted = client_policy::grant_for(client, requested)?;
+    let may_refresh = registration_may_refresh(&client.metadata);
+    let scope = granted
+        .split(' ')
+        .filter(|scope| may_refresh || *scope != "offline_access")
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(GenericGrant::recording(scope, requested))
+}
+
+impl GenericGrant {
+    /// The grant that records `scope` for a request that asked for `requested`. The one
+    /// place the two rules that follow from a granted scope are written: a refresh token
+    /// goes with `offline_access` and with nothing else (I10), and the response names the
+    /// scope when it is not the set that was asked for.
+    fn recording(scope: String, requested: &str) -> Self {
+        let refresh_token = client_policy::has_scope(&scope, "offline_access");
+        let report_scope = {
+            let mut requested_set: Vec<&str> = requested.split_whitespace().collect();
+            requested_set.sort_unstable();
+            requested_set.dedup();
+            let mut granted_set: Vec<&str> = scope.split(' ').collect();
+            granted_set.sort_unstable();
+            requested_set != granted_set
+        };
+        GenericGrant {
+            scope,
+            refresh_token,
+            report_scope,
+        }
+    }
+}
+
+/// What a code exchange issues: the kind of grant and what goes with it.
+#[derive(Debug, PartialEq, Eq)]
+struct Issuance {
+    kind: GrantKind,
+    /// The Matrix device the grant belongs to; empty for a grant with none.
+    device_id: String,
+    /// The scope recorded on the grant and its tokens.
+    scope: String,
+    /// Whether a refresh token is issued.
+    refresh_token: bool,
+    /// Whether the token response must name the scope, because it differs from the
+    /// request (RFC 6749 §5.1).
+    report_scope: bool,
+}
+
+impl Issuance {
+    /// An `oidc` grant for `device_id` (empty: none) with the scope decisions of `grant`.
+    fn oidc(device_id: String, grant: GenericGrant) -> Self {
+        Issuance {
+            kind: GrantKind::Oidc,
+            device_id,
+            scope: grant.scope,
+            refresh_token: grant.refresh_token,
+            report_scope: grant.report_scope,
+        }
+    }
+}
+
+/// The refusal for every code the exchange will not honour for the client that presents it.
+fn code_not_issued_for_client() -> CustomError {
+    CustomError::BadRequestToken(TokenError {
+        error: CoreErrorResponseType::InvalidGrant,
+        error_description: "This code was not issued for this client.".to_string(),
+    })
+}
+
+/// What a code exchange issues, decided by the deployment mode, the class of the client
+/// the code was issued to (the sign-in branch it took) and the class of the client
+/// presenting it now. One table, no fall-through:
+///
+/// | delegated auth | issued to | client now | issues |
+/// |---|---|---|---|
+/// | yes | Matrix  | Matrix  | a `matrix_device` grant: the Matrix scope for the device `sign_in` provisioned, and always a refresh token, because Synapse and the Matrix clients depend on exactly that |
+/// | yes | generic | generic | an `oidc` grant with no device: what [`client_policy::grant_for`] allows for the bound scope, and a refresh token only for a granted `offline_access` (I10) |
+/// | no  | Matrix  | Matrix  | an `oidc` grant as [`generic_grant`] decides (I10) |
+/// | no  | generic | generic | refused: start-up refuses such a client, which has no Synapse to supply its localpart; this is the same refusal for an entry that did not come through start-up |
+/// | any | one class | the other | refused: the client changed class after `sign_in` ran, and a grant must never come from the other branch (a Matrix session for a mail client, or a deviceless grant for a Matrix one) |
+///
+/// A code written before the class was recorded came from the only sign-in branch there
+/// was, the Matrix one.
+fn exchange_issuance(
+    delegated_auth: bool,
+    client: &ClientEntry,
+    code: &CodeEntry,
+) -> Result<Issuance, CustomError> {
+    let issued_to = code.client_class.unwrap_or(ClientClass::Matrix);
+    match (delegated_auth, issued_to, client.class) {
+        (true, ClientClass::Matrix, ClientClass::Matrix) => {
+            let device_id = code.device_id.clone().unwrap_or_default();
+            Ok(Issuance {
+                kind: GrantKind::MatrixDevice,
+                scope: format!(
+                    "openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}"
+                ),
+                device_id,
+                refresh_token: true,
+                report_scope: false,
+            })
+        }
+        (false, ClientClass::Matrix, ClientClass::Matrix) => Ok(Issuance::oidc(
+            code.device_id.clone().unwrap_or_default(),
+            generic_grant(code.scope.as_deref(), client),
+        )),
+        (true, ClientClass::Generic, ClientClass::Generic) => {
+            let grant = class_grant(code.scope.as_deref().unwrap_or(""), client)
+                .ok_or_else(code_not_issued_for_client)?;
+            Ok(Issuance::oidc(String::new(), grant))
+        }
+        (false, ClientClass::Generic, ClientClass::Generic)
+        | (_, ClientClass::Matrix, ClientClass::Generic)
+        | (_, ClientClass::Generic, ClientClass::Matrix) => Err(code_not_issued_for_client()),
     }
 }
 
@@ -1657,7 +1798,8 @@ async fn token_authorization_code(
         }));
     }
 
-    let msc3861_mode = config.mas_shared_secret.is_some();
+    // Decided before any claim is looked up, so a refusal costs no ENS call.
+    let issuance = exchange_issuance(delegated_auth_enabled(config), &client_entry, &code_entry)?;
 
     let now = Utc::now();
     // This request is DIFFERENT from the sign_in that provisioned the account,
@@ -1670,53 +1812,28 @@ async fn token_authorization_code(
         .localpart
         .clone()
         .unwrap_or_else(|| crate::localpart::legacy_localpart(&code_entry.did));
-    let claims = resolve_claims(config, &code_entry.did).await;
+    let claims = resolve_claims(config, &code_entry.did, client_entry.class).await;
     let display_name = claims
         .name()
         .and_then(|n| n.get(None))
         .map(|n| n.to_string())
         .unwrap_or_else(|| code_entry.did.clone());
 
-    // Matrix mode records the Matrix scope for the device and always issues a
-    // refresh token, whatever was requested: Synapse, Element Web and Element X
-    // depend on exactly that. Generic mode grants what was requested and
-    // allowed, and issues a refresh token only for `offline_access` (I10).
-    let (kind, scope, issue_refresh_token, report_scope) = if msc3861_mode {
-        let device_id = code_entry.device_id.clone().unwrap_or_default();
-        (
-            GrantKind::MatrixDevice,
-            format!(
-                "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
-                device_id
-            ),
-            true,
-            false,
-        )
-    } else {
-        let grant = generic_grant(code_entry.scope.as_deref(), &client_entry);
-        (
-            GrantKind::Oidc,
-            grant.scope,
-            grant.refresh_token,
-            grant.report_scope,
-        )
-    };
-
     // One grant per code exchange (I2): its first access token, its refresh
     // token when one is issued, and its index entries, written in one step.
     let issued = db_client
         .issue_grant(&NewGrant {
-            kind,
+            kind: issuance.kind,
             username,
             did: code_entry.did.clone(),
             client_id: client_id.clone(),
             confidential_client: client_is_confidential(Some(&client_entry), config.require_secret),
-            device_id: code_entry.device_id.clone().unwrap_or_default(),
-            scope: scope.clone(),
+            device_id: issuance.device_id,
+            scope: issuance.scope.clone(),
             name: display_name,
             auth_ms: Some(code_entry.auth_time.timestamp_millis()),
             access_ttl: ACCESS_TOKEN_TTL,
-            refresh_inactivity_secs: issue_refresh_token.then_some(REFRESH_TOKEN_TTL),
+            refresh_inactivity_secs: issuance.refresh_token.then_some(REFRESH_TOKEN_TTL),
         })
         .await?;
     touch_client_after_use(db_client, &client_id).await;
@@ -1753,10 +1870,12 @@ async fn token_authorization_code(
     response.set_expires_in(Some(&time::Duration::from_secs(expires_in_secs)));
     response.set_refresh_token(refresh_token);
     // RFC 6749 §5.1: the response says the granted scope when it differs from
-    // the request. Only generic mode can differ; Matrix mode never put one here.
-    if report_scope {
+    // the request. A Matrix session never differs: it records a fixed scope the
+    // client did not choose, and has never put one here.
+    if issuance.report_scope {
         response.set_scopes(Some(
-            scope
+            issuance
+                .scope
                 .split_whitespace()
                 .map(|s| Scope::new(s.to_string()))
                 .collect(),
@@ -1893,7 +2012,7 @@ pub async fn authorize(
     let scope_is_grantable = match client_entry.class {
         ClientClass::Matrix => true,
         ClientClass::Generic => {
-            siwx_oidc::client_policy::grant_for(&client_entry, params.scope.as_str()).is_some()
+            client_policy::grant_for(&client_entry, params.scope.as_str()).is_some()
         }
     };
     if !scope_is_grantable {
@@ -3075,7 +3194,7 @@ pub async fn sign_in(
             // The scope first: checking it has no side effects. `/authorize` asked the
             // same of the request, so this catches only a client whose policy changed
             // since, before an account is created that no code will ever redeem.
-            siwx_oidc::client_policy::grant_for(&client, request.scope.as_deref().unwrap_or(""))
+            client_policy::grant_for(&client, request.scope.as_deref().unwrap_or(""))
                 .ok_or_else(|| CustomError::BadRequest(GENERIC_OPENID_REQUIRED_MSG.to_string()))?;
             // The gate above covers a fault it sees; the fallible resolver here covers one
             // that arrives after it, which the Matrix branch answers with the legacy guess.
@@ -3732,9 +3851,12 @@ pub async fn userinfo(
     // `metadata.username` IS the localpart (see `TokenMetadata::username`),
     // already resolved through the grandfathering rule at sign-in.
     let additional = mxid_claim(config, &metadata.username);
-    let response = SiwxUserInfoClaims::new(resolve_claims(config, &metadata.did).await, additional)
-        .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
-        .set_audiences(Some(vec![Audience::new(metadata.client_id)]));
+    let response = SiwxUserInfoClaims::new(
+        resolve_claims(config, &metadata.did, client_entry.class).await,
+        additional,
+    )
+    .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
+    .set_audiences(Some(vec![Audience::new(metadata.client_id)]));
     match client_entry.metadata.userinfo_signed_response_alg() {
         None => Ok(UserInfoResponse::Json(response)),
         Some(alg) => Ok(UserInfoResponse::Jwt(
@@ -4054,7 +4176,7 @@ mod tests {
         // Without ENS config, preferred_username is always the full DID.
         let did = "did:pkh:eip155:1:0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
         let config = config_no_ens();
-        let res = resolve_claims(&config, did).await;
+        let res = resolve_claims(&config, did, ClientClass::Matrix).await;
         assert_eq!(
             res.preferred_username().map(|u| u.to_string()),
             Some(did.to_string())
@@ -4068,7 +4190,7 @@ mod tests {
         // Non-eip155 DID — preferred_username is the full DID, no ENS attempt.
         let did = "did:pkh:ed25519:0xabcdef1234567890";
         let config = config_no_ens();
-        let res = resolve_claims(&config, did).await;
+        let res = resolve_claims(&config, did, ClientClass::Matrix).await;
         assert_eq!(
             res.preferred_username().map(|u| u.to_string()),
             Some(did.to_string())
@@ -9676,7 +9798,10 @@ mod backchannel_registration_tests {
 /// probe and the sign-in's own resolution.
 #[cfg(test)]
 mod generic_client_tests {
+    use super::client_binding_tests::{CHALLENGE, VERIFIER};
+    use super::scope_grant_tests::{id_token_claims, raw_get};
     use super::*;
+    use crate::config::Config;
     use crate::localpart::{legacy_localpart, localpart_for};
     use axum::extract::{Query, State};
     use axum::http::{Method, StatusCode, Uri};
@@ -9684,6 +9809,7 @@ mod generic_client_tests {
     use axum::routing::get;
     use axum::{Json, Router};
     use headers::{HeaderMap, HeaderMapExt, HeaderValue};
+    use openidconnect::OAuth2TokenResponse;
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
@@ -9825,7 +9951,8 @@ mod generic_client_tests {
         Uuid::new_v4().simple().to_string()
     }
 
-    /// A client registered for [`REDIRECT`] as `class`, with `allowed` as its scope policy.
+    /// A public client (no secret at the token endpoint) registered for [`REDIRECT`] as
+    /// `class`, with `allowed` as its scope policy.
     fn client_entry(class: ClientClass, allowed: Option<&[&str]>) -> ClientEntry {
         ClientEntry {
             class,
@@ -9835,7 +9962,8 @@ mod generic_client_tests {
                 SiwxClientMetadata::new(
                     vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
                     LogoutClientMetadata::default(),
-                ),
+                )
+                .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::None)),
                 None,
             )
         }
@@ -10190,5 +10318,974 @@ mod generic_client_tests {
         };
         let url = outcome.expect("a Matrix-class request is accepted as before");
         assert!(url.starts_with("/?nonce="), "{url}");
+    }
+
+    // -- The code exchange ----------------------------------------------------------------
+
+    /// Delegated-auth mode (a MAS shared secret): the only mode that serves a generic-class
+    /// client.
+    fn delegated() -> Config {
+        Config {
+            mas_shared_secret: Some("mas-secret".into()),
+            ens_api_url: None,
+            eth_provider: None,
+            ..Config::default()
+        }
+    }
+
+    /// Generic mode: no MAS shared secret.
+    fn standalone() -> Config {
+        Config {
+            ens_api_url: None,
+            eth_provider: None,
+            ..Config::default()
+        }
+    }
+
+    /// A generic-class client whose policy allows exactly `allowed`.
+    fn generic_allowing(allowed: &[&str]) -> ClientEntry {
+        client_entry(ClientClass::Generic, Some(allowed))
+    }
+
+    /// The entry `sign_in` stores for `did` and a client of class `issued_to` (`None`: a
+    /// code written before the class was recorded).
+    fn code_entry_for(
+        did: &str,
+        client_id: &str,
+        issued_to: Option<ClientClass>,
+        device_id: Option<&str>,
+        scope: Option<&str>,
+    ) -> CodeEntry {
+        CodeEntry {
+            exchange_count: 0,
+            did: did.to_string(),
+            nonce: None,
+            client_id: client_id.to_string(),
+            auth_time: Utc::now(),
+            code_challenge: Some(CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
+            device_id: device_id.map(str::to_string),
+            localpart: Some(localpart_for(did)),
+            scope: scope.map(str::to_string),
+            client_class: issued_to,
+        }
+    }
+
+    async fn store_client(db: &RedisClient, client: ClientEntry) -> String {
+        let client_id = format!("exchange-{}", nonce());
+        db.set_client(client_id.clone(), client).await.unwrap();
+        client_id
+    }
+
+    async fn store_code(db: &RedisClient, entry: CodeEntry) -> String {
+        let code = format!("code-{}", nonce());
+        db.set_code(code.clone(), entry).await.unwrap();
+        code
+    }
+
+    async fn redeem(
+        db: &RedisClient,
+        config: &Config,
+        client_id: &str,
+        code: &str,
+    ) -> Result<SiwxTokenResponse, CustomError> {
+        token(
+            TokenForm {
+                code: Some(code.to_string()),
+                client_id: Some(client_id.to_string()),
+                client_secret: None,
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(VERIFIER.to_string()),
+                refresh_token: None,
+                device_code: None,
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            None,
+        )
+        .await
+    }
+
+    /// Register `client`, store the code `sign_in` would have issued to a client of class
+    /// `issued_to` for a request that asked for `scope`, and redeem it.
+    async fn exchange_for(
+        db: &RedisClient,
+        config: &Config,
+        client: ClientEntry,
+        issued_to: Option<ClientClass>,
+        scope: Option<&str>,
+    ) -> Result<SiwxTokenResponse, CustomError> {
+        let client_id = store_client(db, client).await;
+        let code = store_code(db, code_entry_for(DID, &client_id, issued_to, None, scope)).await;
+        redeem(db, config, &client_id, &code).await
+    }
+
+    /// The grant behind the access token of `response`, as stored.
+    async fn grant_of(
+        db: &RedisClient,
+        response: &SiwxTokenResponse,
+    ) -> siwx_oidc::db::grant::GrantView {
+        db.lookup_access_token(response.access_token().secret())
+            .await
+            .unwrap()
+            .expect("the access token resolves to its grant")
+            .grant
+    }
+
+    /// The scope the token response names, when it names one.
+    fn reported_scope(response: &SiwxTokenResponse) -> Option<Vec<String>> {
+        response
+            .scopes()
+            .map(|scopes| scopes.iter().map(|s| s.as_str().to_string()).collect())
+    }
+
+    fn assert_invalid_grant<T: std::fmt::Debug>(outcome: Result<T, CustomError>) {
+        match outcome {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error, CoreErrorResponseType::InvalidGrant)
+            }
+            other => panic!("expected invalid_grant, got {other:?}"),
+        }
+    }
+
+    /// Whether the test Redis holds `key`: one `EXISTS` on a key the caller computed.
+    async fn raw_exists(key: &str) -> bool {
+        let url = siwx_oidc::test_support::redis_url();
+        let client = bb8_redis::redis::Client::open(url.as_str()).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        bb8_redis::redis::cmd("EXISTS")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    /// `sign_in` for `client` asking for `scope`, then the exchange of the code it stored.
+    /// `None` after a loud skip without Redis.
+    async fn sign_in_then_exchange(
+        client: ClientEntry,
+        scope: &str,
+    ) -> Option<(SiwxTokenResponse, siwx_oidc::db::grant::GrantView)> {
+        let (result, code_entry, _log) = sign_in_with(client, scope, Homeserver::default()).await?;
+        result.expect("a healthy generic sign-in succeeds");
+        let entry = code_entry.expect("the code entry is stored");
+        let db = siwx_oidc::test_support::redis()
+            .await
+            .expect("Redis answered a moment ago");
+        let client_id = entry.client_id.clone();
+        let code = store_code(&db, entry).await;
+        let response = redeem(&db, &delegated(), &client_id, &code)
+            .await
+            .expect("the exchange succeeds");
+        let grant = grant_of(&db, &response).await;
+        Some((response, grant))
+    }
+
+    /// Every combination of deployment mode, the class a code was issued to and the class of
+    /// the client presenting it, in one place.
+    #[test]
+    fn the_exchange_decides_by_mode_and_by_the_class_of_the_code_and_the_client() {
+        let issued = |class: Option<ClientClass>, device: Option<&str>, scope: Option<&str>| {
+            code_entry_for(DID, "c", class, device, scope)
+        };
+        let matrix = Some(ClientClass::Matrix);
+        let generic = Some(ClientClass::Generic);
+
+        let session = exchange_issuance(
+            true,
+            &matrix_client(),
+            &issued(matrix, Some("SIWX_X"), None),
+        )
+        .expect("a Matrix client redeeming a Matrix code");
+        assert_eq!(
+            session,
+            Issuance {
+                kind: GrantKind::MatrixDevice,
+                device_id: "SIWX_X".into(),
+                scope: "openid urn:matrix:client:api:* urn:matrix:client:device:SIWX_X".into(),
+                refresh_token: true,
+                report_scope: false,
+            }
+        );
+        assert_eq!(
+            exchange_issuance(true, &matrix_client(), &issued(None, Some("SIWX_X"), None)).unwrap(),
+            session,
+            "a code written before the class was recorded came from the Matrix branch"
+        );
+
+        let standalone_grant = exchange_issuance(
+            false,
+            &matrix_client(),
+            &issued(matrix, None, Some("openid profile offline_access")),
+        )
+        .expect("a Matrix client redeeming a Matrix code in generic mode");
+        assert_eq!(
+            standalone_grant,
+            Issuance {
+                kind: GrantKind::Oidc,
+                device_id: String::new(),
+                scope: "openid profile offline_access".into(),
+                refresh_token: true,
+                report_scope: false,
+            }
+        );
+
+        let mail = exchange_issuance(
+            true,
+            &generic_client(),
+            &issued(generic, Some("SIWX_STRAY"), Some(MAIL_REQUEST)),
+        )
+        .expect("a generic client redeeming a generic code");
+        assert_eq!(
+            mail,
+            Issuance {
+                kind: GrantKind::Oidc,
+                device_id: String::new(),
+                scope: "openid io.inblock.mail".into(),
+                refresh_token: false,
+                report_scope: true,
+            },
+            "no device, and only what the policy allows of what the request bound"
+        );
+
+        assert_invalid_grant(exchange_issuance(
+            false,
+            &generic_client(),
+            &issued(generic, None, Some("openid")),
+        ));
+        for delegated in [true, false] {
+            // A generic code redeemed after the client became Matrix-class.
+            assert_invalid_grant(exchange_issuance(
+                delegated,
+                &matrix_client(),
+                &issued(generic, None, Some("openid io.inblock.mail")),
+            ));
+            // A Matrix code, or one from before the class, redeemed after the client became
+            // generic. The request grants `openid`, so the class is the only reason to refuse.
+            assert_invalid_grant(exchange_issuance(
+                delegated,
+                &generic_client(),
+                &issued(matrix, Some("SIWX_X"), Some("openid")),
+            ));
+            assert_invalid_grant(exchange_issuance(
+                delegated,
+                &generic_client(),
+                &issued(None, Some("SIWX_X"), Some("openid")),
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_generic_exchange_writes_an_oidc_grant_with_a_sid_no_device_index_and_the_granted_scope(
+    ) {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = store_client(&db, generic_client()).await;
+        // An identity of its own, so that no other grant is indexed under this localpart
+        // and the absence of a device index below means this grant has none.
+        let did = format!("did:key:zDnEXCHANGE{}", nonce());
+        // The request names a Matrix scope the client may never have, and the code carries
+        // a stray device: the class decides, not the code.
+        let code = store_code(
+            &db,
+            code_entry_for(
+                &did,
+                &client_id,
+                Some(ClientClass::Generic),
+                Some("SIWX_STRAY"),
+                Some(MAIL_REQUEST),
+            ),
+        )
+        .await;
+
+        let response = redeem(&db, &delegated(), &client_id, &code)
+            .await
+            .expect("the exchange succeeds");
+
+        let grant = grant_of(&db, &response).await;
+        assert_eq!(grant.kind, GrantKind::Oidc);
+        assert_eq!(grant.scope, "openid io.inblock.mail");
+        assert_eq!(grant.device_id, "");
+        assert_eq!(grant.client_id, client_id);
+        assert_eq!(grant.username, localpart_for(&did));
+        let sid = grant.sid.clone().expect("an oidc grant has a session id");
+        assert_eq!(id_token_claims(&response)["sid"], sid.as_str());
+        assert_eq!(
+            raw_get(&format!(
+                "{}/{sid}",
+                siwx_oidc::db::grant::KV_GRANT_SID_IDX_PREFIX
+            ))
+            .await
+            .as_deref(),
+            Some(grant.grant_id.as_str()),
+            "the sid names the grant of this exchange"
+        );
+        let device_index = siwx_oidc::db::grant::KV_GRANT_DEVICE_IDX_PREFIX;
+        for device in ["", "SIWX_STRAY"] {
+            assert!(
+                !raw_exists(&format!("{device_index}/{}/{device}", grant.username)).await,
+                "a generic grant is indexed under no device ({device:?})"
+            );
+        }
+        assert!(
+            raw_exists(&format!(
+                "{}/{}",
+                siwx_oidc::db::grant::KV_GRANT_USER_IDX_PREFIX,
+                grant.username
+            ))
+            .await,
+            "the user index still names it"
+        );
+        let metadata = db
+            .check_access_token(response.access_token().secret())
+            .await
+            .unwrap()
+            .expect("the access token is stored");
+        assert_eq!(metadata.grant_kind, Some(GrantKind::Oidc));
+        assert!(
+            response.refresh_token().is_none(),
+            "no offline_access was granted, so no refresh token"
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_code_exchange_grants_only_the_allowed_scope() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let response = exchange_for(
+            &db,
+            &delegated(),
+            generic_client(),
+            Some(ClientClass::Generic),
+            Some(MAIL_REQUEST),
+        )
+        .await
+        .expect("the exchange succeeds");
+
+        assert_eq!(
+            grant_of(&db, &response).await.scope,
+            "openid io.inblock.mail"
+        );
+        assert_eq!(
+            reported_scope(&response),
+            Some(vec!["openid".to_string(), "io.inblock.mail".to_string()]),
+            "the granted scope differs from the request, so the response names it"
+        );
+    }
+
+    /// The grant is computed from the scope the request bound, never from everything the
+    /// client's policy would allow: a client that asked for less than it may have gets less.
+    #[tokio::test]
+    async fn a_generic_grant_follows_the_bound_request_not_the_clients_allowed_scopes() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let response = exchange_for(
+            &db,
+            &delegated(),
+            generic_client(),
+            Some(ClientClass::Generic),
+            Some("openid"),
+        )
+        .await
+        .expect("the exchange succeeds");
+
+        assert_eq!(grant_of(&db, &response).await.scope, "openid");
+        assert_eq!(reported_scope(&response), None, "granted as requested");
+    }
+
+    /// Whether a token has a Synapse device is the class's decision, not the code's.
+    #[tokio::test]
+    async fn a_generic_token_never_carries_a_device() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = store_client(&db, generic_client()).await;
+        let code = store_code(
+            &db,
+            code_entry_for(
+                DID,
+                &client_id,
+                Some(ClientClass::Generic),
+                Some("SIWX_STRAY"),
+                Some("openid"),
+            ),
+        )
+        .await;
+
+        let response = redeem(&db, &delegated(), &client_id, &code)
+            .await
+            .expect("the exchange succeeds");
+
+        let grant = grant_of(&db, &response).await;
+        assert_eq!(grant.device_id, "");
+        assert!(!grant.scope.contains("SIWX_STRAY"), "{}", grant.scope);
+    }
+
+    /// A refresh token goes with a granted `offline_access` and with nothing else, however
+    /// the scope came to be granted.
+    #[tokio::test]
+    async fn a_generic_grant_issues_a_refresh_token_only_for_a_granted_offline_access() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let all = ["openid", "io.inblock.mail", "offline_access"];
+        let generic = Some(ClientClass::Generic);
+
+        let with = exchange_for(
+            &db,
+            &delegated(),
+            generic_allowing(&all),
+            generic,
+            Some("openid io.inblock.mail offline_access"),
+        )
+        .await
+        .expect("the exchange succeeds");
+        assert!(
+            with.refresh_token().is_some(),
+            "offline_access asked for and allowed"
+        );
+        assert_eq!(
+            grant_of(&db, &with).await.scope,
+            "openid io.inblock.mail offline_access"
+        );
+        assert_eq!(reported_scope(&with), None, "granted as requested");
+
+        let without = exchange_for(
+            &db,
+            &delegated(),
+            generic_allowing(&all),
+            generic,
+            Some("openid io.inblock.mail"),
+        )
+        .await
+        .expect("the exchange succeeds");
+        assert!(
+            without.refresh_token().is_none(),
+            "allowed but not asked for: the client holds no credential that outlives its session"
+        );
+
+        let not_allowed = exchange_for(
+            &db,
+            &delegated(),
+            generic_client(),
+            generic,
+            Some("openid offline_access"),
+        )
+        .await
+        .expect("the exchange succeeds");
+        assert!(
+            not_allowed.refresh_token().is_none(),
+            "asked for, not allowed"
+        );
+        assert_eq!(
+            reported_scope(&not_allowed),
+            Some(vec!["openid".to_string()]),
+            "the response names what was granted, which differs from the request"
+        );
+
+        let always_granted = ClientEntry {
+            always_granted_scopes: vec!["offline_access".to_string()],
+            ..generic_allowing(&all)
+        };
+        let always = exchange_for(&db, &delegated(), always_granted, generic, Some("openid"))
+            .await
+            .expect("the exchange succeeds");
+        assert!(
+            always.refresh_token().is_some(),
+            "granted without being asked for"
+        );
+        assert_eq!(grant_of(&db, &always).await.scope, "openid offline_access");
+
+        let mut code_grant_only = generic_allowing(&all);
+        code_grant_only.metadata = code_grant_only
+            .metadata
+            .set_grant_types(Some(vec![CoreGrantType::AuthorizationCode]));
+        let refused = exchange_for(
+            &db,
+            &delegated(),
+            code_grant_only,
+            generic,
+            Some("openid offline_access"),
+        )
+        .await
+        .expect("the exchange succeeds");
+        assert!(
+            refused.refresh_token().is_none(),
+            "the registration lists no refresh_token grant"
+        );
+        assert_eq!(grant_of(&db, &refused).await.scope, "openid");
+    }
+
+    /// What the exchange issues for a generic-class client is an ordinary `oidc` grant: its
+    /// refresh token rotates at the token endpoint, for the client it was issued to.
+    #[tokio::test]
+    async fn a_generic_grants_refresh_token_rotates_at_the_token_endpoint() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = store_client(
+            &db,
+            generic_allowing(&["openid", "io.inblock.mail", "offline_access"]),
+        )
+        .await;
+        let code = store_code(
+            &db,
+            code_entry_for(
+                DID,
+                &client_id,
+                Some(ClientClass::Generic),
+                None,
+                Some("openid io.inblock.mail offline_access"),
+            ),
+        )
+        .await;
+        let issued = redeem(&db, &delegated(), &client_id, &code)
+            .await
+            .expect("the exchange succeeds");
+        let refresh_token = issued
+            .refresh_token()
+            .expect("offline_access was granted")
+            .secret()
+            .clone();
+
+        let rotated = token(
+            TokenForm {
+                code: None,
+                client_id: Some(client_id.clone()),
+                client_secret: None,
+                grant_type: CoreGrantType::RefreshToken,
+                code_verifier: None,
+                refresh_token: Some(refresh_token),
+                device_code: None,
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &delegated(),
+            &db,
+            None,
+        )
+        .await
+        .expect("the refresh token rotates");
+
+        let before = grant_of(&db, &issued).await;
+        let after = grant_of(&db, &rotated).await;
+        assert_eq!(after.grant_id, before.grant_id, "the same grant");
+        assert_eq!(after.kind, GrantKind::Oidc);
+        assert_eq!(after.scope, "openid io.inblock.mail offline_access");
+        assert_eq!(after.device_id, "");
+    }
+
+    /// RFC 6749 section 5.1: the `scope` of a token response is the grant when it differs
+    /// from the request. This client asked for `openid profile`, may not have `profile`, and
+    /// is always given the mail scope, from the sign-in that bound the request to the
+    /// exchange that issued the grant.
+    #[tokio::test]
+    async fn the_token_response_reports_a_grant_that_differs_from_the_request() {
+        let Some((response, _grant)) =
+            sign_in_then_exchange(generic_client_always_granted_mail(), "openid profile").await
+        else {
+            return;
+        };
+
+        assert_eq!(
+            reported_scope(&response),
+            Some(vec!["openid".to_string(), "io.inblock.mail".to_string()])
+        );
+    }
+
+    /// A client that cannot ask for the mail scope still gets it: the scopes its
+    /// configuration always grants are appended to what it requested and is allowed. The
+    /// request below names `profile`, which this client may not have, so that is dropped.
+    #[tokio::test]
+    async fn a_generic_sign_in_is_granted_its_always_granted_scopes_without_requesting_them() {
+        let Some((_response, grant)) =
+            sign_in_then_exchange(generic_client_always_granted_mail(), "openid profile").await
+        else {
+            return;
+        };
+
+        assert_eq!(grant.scope, "openid io.inblock.mail");
+        assert_eq!(grant.kind, GrantKind::Oidc);
+        assert_eq!(grant.device_id, "");
+    }
+
+    #[tokio::test]
+    async fn matrix_code_exchange_keeps_the_matrix_scope() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        for issued_to in [Some(ClientClass::Matrix), None] {
+            let client_id = store_client(&db, matrix_client()).await;
+            let code = store_code(
+                &db,
+                code_entry_for(DID, &client_id, issued_to, Some("SIWX_KEEP"), None),
+            )
+            .await;
+
+            let response = redeem(&db, &delegated(), &client_id, &code)
+                .await
+                .expect("the exchange succeeds");
+
+            let grant = grant_of(&db, &response).await;
+            assert_eq!(grant.kind, GrantKind::MatrixDevice);
+            assert_eq!(
+                grant.scope,
+                "openid urn:matrix:client:api:* urn:matrix:client:device:SIWX_KEEP"
+            );
+            assert_eq!(grant.device_id, "SIWX_KEEP");
+            assert!(
+                response.refresh_token().is_some(),
+                "a Matrix session always carries a refresh token"
+            );
+            assert!(
+                reported_scope(&response).is_none(),
+                "the Matrix token response is unchanged"
+            );
+        }
+    }
+
+    /// Without delegated auth a Matrix-class client gets generic mode's grant, and a
+    /// generic-class client is refused: it has no Synapse to supply its localpart.
+    #[tokio::test]
+    async fn code_exchange_outside_delegated_auth_follows_the_class_too() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let response = exchange_for(
+            &db,
+            &standalone(),
+            matrix_client(),
+            Some(ClientClass::Matrix),
+            Some("openid profile"),
+        )
+        .await
+        .expect("the Matrix-class exchange succeeds");
+        let grant = grant_of(&db, &response).await;
+        assert_eq!(grant.kind, GrantKind::Oidc);
+        assert_eq!(grant.scope, "openid profile");
+
+        assert_invalid_grant(
+            exchange_for(
+                &db,
+                &standalone(),
+                generic_client(),
+                Some(ClientClass::Generic),
+                Some("openid"),
+            )
+            .await,
+        );
+    }
+
+    /// A request that grants no `openid` has no grant to issue, whatever the sign-in did
+    /// when the request was bound.
+    #[tokio::test]
+    async fn a_generic_code_whose_request_grants_no_openid_is_refused() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        for scope in [
+            Some("io.inblock.mail"),
+            Some("urn:matrix:client:api:*"),
+            None,
+        ] {
+            assert_invalid_grant(
+                exchange_for(
+                    &db,
+                    &delegated(),
+                    generic_client(),
+                    Some(ClientClass::Generic),
+                    scope,
+                )
+                .await,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_generic_code_redeemed_after_the_client_became_matrix_class_is_refused() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        assert_invalid_grant(
+            exchange_for(
+                &db,
+                &delegated(),
+                matrix_client(),
+                Some(ClientClass::Generic),
+                Some("openid io.inblock.mail"),
+            )
+            .await,
+        );
+    }
+
+    /// The other direction, and the code of a build from before the class was recorded.
+    #[tokio::test]
+    async fn a_matrix_code_redeemed_after_the_client_became_generic_is_refused() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        for issued_to in [Some(ClientClass::Matrix), None] {
+            assert_invalid_grant(
+                exchange_for(
+                    &db,
+                    &delegated(),
+                    generic_client(),
+                    issued_to,
+                    Some("openid"),
+                )
+                .await,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_generic_client_that_allows_no_scopes_is_refused_at_exchange() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        assert_invalid_grant(
+            exchange_for(
+                &db,
+                &delegated(),
+                client_entry(ClientClass::Generic, None),
+                Some(ClientClass::Generic),
+                Some("openid"),
+            )
+            .await,
+        );
+    }
+
+    // -- ENS lookups ----------------------------------------------------------------------
+
+    /// An ENS HTTP API stand-in that counts lookups and names every address `alice.eth`.
+    async fn spawn_ens() -> (
+        Arc<std::sync::atomic::AtomicUsize>,
+        Url,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new().fallback(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({ "ens_primary": "alice.eth" }))
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (hits, url, server)
+    }
+
+    /// An EIP-55 specification test vector, not anyone's wallet.
+    const EIP155_DID: &str = "did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+
+    #[tokio::test]
+    async fn generic_clients_trigger_no_ens_lookup() {
+        use std::sync::atomic::Ordering;
+        let (hits, url, server) = spawn_ens().await;
+        let config = Config {
+            ens_api_url: Some(url),
+            eth_provider: None,
+            ..Config::default()
+        };
+
+        let generic = resolve_claims(&config, EIP155_DID, ClientClass::Generic).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a generic client's claims must not send the address to an ENS API"
+        );
+        assert!(generic.name().is_none());
+
+        let matrix = resolve_claims(&config, EIP155_DID, ClientClass::Matrix).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a Matrix client keeps the configured lookup"
+        );
+        assert!(matrix.name().is_some());
+        server.abort();
+    }
+
+    /// The two endpoints a generic client's claims come from, each with an ENS API
+    /// configured: the code exchange (ID token claims, and the `name` stored on the grant)
+    /// and userinfo. A Matrix-class client's exchange is the control: it does look up.
+    #[tokio::test]
+    async fn a_generic_clients_exchange_and_userinfo_trigger_no_ens_lookup() {
+        use std::sync::atomic::Ordering;
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (hits, url, server) = spawn_ens().await;
+        let config = Config {
+            ens_api_url: Some(url),
+            ..delegated()
+        };
+        let generic_id = store_client(&db, generic_client()).await;
+        let matrix_id = store_client(&db, matrix_client()).await;
+
+        let code = store_code(
+            &db,
+            code_entry_for(
+                EIP155_DID,
+                &generic_id,
+                Some(ClientClass::Generic),
+                None,
+                Some("openid io.inblock.mail"),
+            ),
+        )
+        .await;
+        let response = redeem(&db, &config, &generic_id, &code)
+            .await
+            .expect("the generic exchange succeeds");
+        userinfo(
+            &config,
+            &EcdsaSigningKey::generate(),
+            None,
+            UserInfoPayload {
+                access_token: Some(response.access_token().secret().clone()),
+            },
+            &db,
+        )
+        .await
+        .map(|_| ())
+        .unwrap_or_else(|e| panic!("userinfo succeeds for the generic token: {e}"));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "neither the exchange nor userinfo may send a generic client's address to an ENS API"
+        );
+
+        let code = store_code(
+            &db,
+            code_entry_for(
+                EIP155_DID,
+                &matrix_id,
+                Some(ClientClass::Matrix),
+                Some("SIWX_ENS"),
+                None,
+            ),
+        )
+        .await;
+        redeem(&db, &config, &matrix_id, &code)
+            .await
+            .expect("the Matrix exchange succeeds");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a Matrix-class exchange keeps the configured lookup"
+        );
+        server.abort();
+    }
+
+    // -- The device-code grant ------------------------------------------------------------
+
+    async fn device_authorization_for(
+        db: &RedisClient,
+        client_id: String,
+    ) -> Result<crate::device_auth::DeviceAuthResponse, CustomError> {
+        crate::device_auth::device_authorization(
+            &delegated(),
+            db,
+            crate::device_auth::DeviceAuthRequest {
+                client_id,
+                scope: Some("openid".into()),
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn generic_client_cannot_start_a_device_grant() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = store_client(&db, generic_client()).await;
+        match device_authorization_for(&db, client_id).await {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error, CoreErrorResponseType::UnauthorizedClient)
+            }
+            other => panic!("expected unauthorized_client, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_matrix_class_client_still_starts_a_device_grant() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = store_client(&db, matrix_client()).await;
+        device_authorization_for(&db, client_id)
+            .await
+            .map(|_| ())
+            .expect("a Matrix-class client starts the device-code grant as before");
+    }
+
+    /// The second way into the device grant: a code issued while the client was Matrix-class
+    /// and redeemed after it became generic. The poll refuses it before recording or
+    /// claiming anything, so no generic client is handed a Matrix session and the code stays
+    /// as it was.
+    #[tokio::test]
+    async fn a_device_code_of_a_generic_client_is_never_redeemed() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = store_client(&db, generic_client()).await;
+        let device_code = format!("dvc_generic-redeem-{}", nonce());
+        let mut entry = DeviceCodeEntry::new(
+            &format!("GR-{}", nonce()),
+            client_id.clone(),
+            "openid".to_string(),
+            Utc::now().timestamp(),
+        );
+        entry.status = DeviceCodeStatus::Approved;
+        entry.did = Some(DID.to_string());
+        db.set_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
+            .await
+            .unwrap();
+
+        let outcome = token(
+            TokenForm {
+                code: None,
+                client_id: Some(client_id),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code.clone()),
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &delegated(),
+            &db,
+            None,
+        )
+        .await;
+
+        match outcome {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error, CoreErrorResponseType::UnauthorizedClient)
+            }
+            Err(other) => panic!("expected unauthorized_client, got {other:?}"),
+            Ok(_) => panic!("a generic client must never be handed a Matrix session"),
+        }
+        let (device_ref, stored) = db
+            .get_device_code(&device_code)
+            .await
+            .unwrap()
+            .expect("the refused code is left in place");
+        assert_eq!(stored.status, DeviceCodeStatus::Approved);
+        assert_eq!(stored.last_poll, None, "the refused poll recorded nothing");
+        db.delete_device_code(&device_ref).await.ok();
     }
 }

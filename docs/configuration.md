@@ -157,7 +157,11 @@ dropped), followed by its `always_granted_scopes`. A request that would grant it
 refused: `/authorize` redirects back with `error=invalid_scope`, and an always-granted scope
 never makes up for the missing `openid`. A generic sign-in provisions no Synapse device and
 answers 503 when the homeserver cannot confirm the account; see
-[Provisioning at sign-in](matrix-integration.md#provisioning-at-sign-in).
+[Provisioning at sign-in](matrix-integration.md#provisioning-at-sign-in). The token endpoint
+then issues the client an `oidc` grant with no device and exactly that scope, and a refresh token
+only when `offline_access` is part of it and the client's registration allows the
+`refresh_token` grant (list `offline_access` in `allowed_scopes` for a client that must refresh);
+it never gets the device-code grant, and no ENS lookup runs for its claims.
 
 ```toml
 [default]

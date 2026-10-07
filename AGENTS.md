@@ -34,7 +34,7 @@ everything else exists only in the binary crate.
 | `lib.rs` | Library crate root. `synapse_client` is deliberately not re-exported (see Invariants). |
 | `axum_lib.rs` | Startup: loads config through `config::figment()`, validates it (DID methods and pkh namespaces against the aqua-auth registries, signing key, retired keys, WebAuthn), `store_default_clients` (digested, no expiry, prunes the clients the map no longer names), `AppState`, the router, handler glue, the `siwx_user` / `acct_session` cookies, the CORS layer. |
 | `config.rs` | `Config`, its defaults, and `figment()`: the one place config names and precedence are defined. Reference: [docs/configuration.md](docs/configuration.md). |
-| `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_code_client` and `authenticate_refresh_client` authenticate the client for the first two, and `client_is_confidential` decides which clients must present a secret), `userinfo`, client registration, RP-initiated logout (`end_session`, `verify_id_token_hint`), `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, `provision_synapse_account` (the account half of provisioning and the single DID-publication site) and `provision_synapse_device` (calls it, then adds the device half). |
+| `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_code_client` and `authenticate_refresh_client` authenticate the client for the first two, and `client_is_confidential` decides which clients must present a secret; `exchange_issuance` decides what a code exchange issues, by deployment mode and client class), `userinfo`, client registration, RP-initiated logout (`end_session`, `verify_id_token_hint`), `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, `provision_synapse_account` (the account half of provisioning and the single DID-publication site) and `provision_synapse_device` (calls it, then adds the device half). |
 | `introspect.rs` | `POST /oauth2/introspect` (RFC 7662) for Synapse; opaque `mat_`/`mcr_` token generation. |
 | `admin_token.rs` | `POST /oauth2/admin_token`: short-TTL token whose scope carries `urn:synapse:admin:*`. |
 | `compat.rs` | `POST /oauth2/revoke` (RFC 7009) and the Matrix client-server endpoints siwx-oidc answers (login flows, logout, logout/all, refresh, device deletion); `TeardownPolicy`. |
@@ -371,8 +371,10 @@ doc; read it before changing the code the rule covers.
   client's registration allows the `refresh_token` grant, and says the granted scope in the
   response when it differs from the request. The request's scope travels `/authorize` → session →
   `CodeEntry.scope`; a code written by the previous build has none and is exchanged as it always
-  was for its 300 s. **Matrix mode is untouched**: the Matrix scope for the device and a refresh
-  token whatever was requested, because Synapse and the Matrix clients depend on exactly that.
+  was for its 300 s. **Matrix mode is untouched for a Matrix-class client**: the Matrix scope for
+  the device and a refresh token whatever was requested, because Synapse and the Matrix clients
+  depend on exactly that (a generic-class client in Matrix mode gets the grant of the next
+  bullet).
   Provisional: a registration without `grant_types` allows the refresh grant; a request that asks
   for nothing grantable is granted `openid`. Pin: `generic_mode_issues_a_refresh_token_only_for_offline_access`,
   `generic_mode_grants_offline_access_only_to_a_client_that_may_refresh`,
@@ -382,6 +384,37 @@ doc; read it before changing the code the rule covers.
   `matrix_mode_issues_the_matrix_scope_and_a_refresh_token_whatever_was_requested`,
   `sign_in_issues_the_code_for_the_bound_request` (the scope reaches the code),
   `a_code_written_before_the_scope_travelled_has_none`.
+- **The code exchange decides by deployment mode and by client class, in one table with no
+  fall-through** (`exchange_issuance`). With `mas_shared_secret`, a Matrix-class client gets a
+  `matrix_device` grant and a generic-class client gets an `oidc` grant with no device: the
+  scope is `client_policy::grant_for` of the scope the request bound (the call `/authorize` and
+  `/sign_in` made), a refresh token only for a granted `offline_access` and only when the
+  registration allows the `refresh_token` grant (the rule of the bullet above, written once in
+  `GenericGrant::recording`), and the granted scope named in the response when it differs from
+  the request. Without it a Matrix-class client gets generic mode's grant and a generic-class
+  client is refused, as start-up refuses it (and refuses it without `synapse_endpoint` too, for
+  the Synapse client needs both). A code is redeemed only by a client of the class it was issued
+  to (`CodeEntry.client_class`; a code written before the class was recorded counts as Matrix):
+  every other pairing is `invalid_grant`, so a class change between `sign_in` and the exchange
+  never yields a Matrix session for a mail client or a deviceless grant for a Matrix one. The
+  class decides the device, never the code: a stray `device_id` on a generic code is ignored.
+  No ENS lookup runs for a generic-class client's claims (`resolve_claims`; at the exchange and
+  at userinfo): it would send the user's address to a third party on every call. The device-code
+  grant mints a Matrix session, so a generic-class client is refused it (`unauthorized_client`)
+  at `/device_authorization` and again at the poll, before anything is recorded or claimed.
+  Pin: `the_exchange_decides_by_mode_and_by_the_class_of_the_code_and_the_client`,
+  `a_generic_exchange_writes_an_oidc_grant_with_a_sid_no_device_index_and_the_granted_scope`,
+  `a_generic_grant_issues_a_refresh_token_only_for_a_granted_offline_access`,
+  `a_generic_grants_refresh_token_rotates_at_the_token_endpoint`,
+  `a_generic_token_never_carries_a_device`, `matrix_code_exchange_keeps_the_matrix_scope`,
+  `code_exchange_outside_delegated_auth_follows_the_class_too`,
+  `a_generic_code_redeemed_after_the_client_became_matrix_class_is_refused`,
+  `a_matrix_code_redeemed_after_the_client_became_generic_is_refused`,
+  `a_generic_code_whose_request_grants_no_openid_is_refused`,
+  `generic_clients_trigger_no_ens_lookup`,
+  `a_generic_clients_exchange_and_userinfo_trigger_no_ens_lookup`,
+  `generic_client_cannot_start_a_device_grant`, `a_device_code_of_a_generic_client_is_never_redeemed`,
+  `a_generic_client_without_a_synapse_endpoint_stops_start_up`.
 - **The headless client asks for what it relies on, in every flow.** `siwx-oidc-auth` requests
   `offline_access` (it refreshes, and a generic-mode server issues a refresh token only for it)
   and `urn:matrix:client:api:*` (its access token is used against the Matrix client-server API)
