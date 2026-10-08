@@ -836,8 +836,13 @@ paths:
         "200": { description: "`{did, credential_id}`: the derived DID." }
         "400":
           description: |
-            The credential id is already registered. A fixed body that names no
-            reason and echoes no id.
+            Two different answers share this status; tell them apart by the body.
+            A refused registration (the credential id is already registered, has
+            link state, or is held by the enabled credential store) is JSON with
+            exactly `{"error":"registration failed"}`, a fixed body that names no
+            reason and echoes no id. A request the ceremony never started on
+            (no `session` cookie, no `Cookie` header, a body that is not JSON)
+            is a plain-text 400 instead.
           content:
             application/json:
               schema:
