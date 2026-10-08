@@ -26,6 +26,7 @@ probe → headless browser E2E (wallet + passkey).
 | `../tests/e2e_race_teardown.rs` | The race/teardown hazard register (H1..H14), the grandfathered-localpart invariant, and the attested-DID sign-in path. Run: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1` |
 | `../tests/e2e_account_management.rs` | Drives the exact HTTP requests the page JS makes — real EIP-191 wallet signatures, the account-session cookie, `/account/action`. Run: `cargo test --test e2e_account_management -- --ignored --test-threads=1` |
 | `../tests/e2e_client_lifetime.rs` | Static clients carry no TTL and still authorize; a dynamic client's next use restores its 30-day lifetime. Needs the static client `e2estatic` that `env.sh` and the CI job configure. Run: `cargo test --test e2e_client_lifetime -- --ignored --test-threads=1` |
+| `../tests/e2e_generic_client.rs` | A generic-class client (the kind a mail client is) against the Matrix-mode server, signed in through the headless client's `authenticate_with_scope_using`: the mailbox claim, no `email`, no Matrix scope or device, introspection inactive, the Matrix routes refusing its tokens, the `invalid_token` challenge, and nothing the client holds stored in the clear in the stack's Redis (the search of the I1 scans below, for this client's session, code, verifier, tokens and secret; it reads `E2E_REDIS_URL` like them and skips loudly without one). Needs the static client `maile2e` and `SIWXOIDC_MAIL_DOMAIN`, which `env.sh` and the CI job set on the Matrix-mode server only (see "Back-channel logout" for why). Run: `cargo test --test e2e_generic_client -- --ignored --test-threads=1` |
 | `../tests/e2e_backchannel_logout.rs` | H7, OpenID Connect Back-Channel Logout against a **generic-mode** siwx-oidc and the stub RP below. Run (see "Back-channel logout" below): `SIWX_GENERIC_HOST=… E2E_GENERIC_REDIS_URL=… cargo test --test e2e_backchannel_logout -- --ignored --test-threads=1` |
 | `upgrade-from.sh` | Mock upgrade from a previous image to this tree's build, Redis kept: see "Upgrade qualification" below |
 | `element/upgrade-survival.sh` | Element Web upgrade continuity (T2) on the pinned lab: capture on the baseline image, switch only siwx-oidc, assert in the same browser profile: see "Upgrade qualification" below |
@@ -97,11 +98,14 @@ only for `oidc` grants, which only a generic-mode server issues, so the suite
 needs a second siwx-oidc next to the stack: no MAS shared secret, no Synapse
 endpoint or server name, its own port and Redis database, and `localhost` in
 `SIWXOIDC_BACKCHANNEL_LOGOUT_ALLOWED_HOSTS` so it may deliver to the stub on
-loopback (the SSRF guard refuses loopback otherwise). CI starts it on :18081
-with Redis database 1:
+loopback (the SSRF guard refuses loopback otherwise). It also starts without the
+mail client `maile2e` and the mail domain that `env.sh` exports for the first
+server: a generic-class client needs a Synapse, so a generic-mode server refuses
+to start with one. CI starts it on :18081 with Redis database 1:
 
 ```bash
 env -u SIWXOIDC_MAS_SHARED_SECRET -u SIWXOIDC_SYNAPSE_ENDPOINT -u SIWXOIDC_MATRIX_SERVER_NAME \
+  -u SIWXOIDC_MAIL_DOMAIN -u SIWXOIDC_DEFAULT_CLIENTS__MAILE2E \
   SIWXOIDC_PORT=18081 SIWXOIDC_BASE_URL=http://localhost:18081 \
   SIWXOIDC_REDIS_URL=redis://localhost:6379/1 \
   SIWXOIDC_BACKCHANNEL_LOGOUT_ALLOWED_HOSTS='["localhost"]' ./target/debug/siwx-oidc &

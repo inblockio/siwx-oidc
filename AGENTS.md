@@ -34,10 +34,10 @@ everything else exists only in the binary crate.
 | `lib.rs` | Library crate root. `synapse_client` is deliberately not re-exported (see Invariants). |
 | `axum_lib.rs` | Startup: loads config through `config::figment()`, validates it (DID methods and pkh namespaces against the aqua-auth registries, signing key, retired keys, WebAuthn), `store_default_clients` (digested, no expiry, prunes the clients the map no longer names), `AppState`, the router, handler glue, the `siwx_user` / `acct_session` cookies, the CORS layer. |
 | `config.rs` | `Config`, its defaults, and `figment()`: the one place config names and precedence are defined. Reference: [docs/configuration.md](docs/configuration.md). |
-| `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_code_client` and `authenticate_refresh_client` authenticate the client for the first two, and `client_is_confidential` decides which clients must present a secret), `userinfo`, client registration, RP-initiated logout (`end_session`, `verify_id_token_hint`), `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, and `provision_synapse_device`, the single provisioning and DID-publication path. |
-| `introspect.rs` | `POST /oauth2/introspect` (RFC 7662) for Synapse; opaque `mat_`/`mcr_` token generation. |
+| `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_code_client` and `authenticate_refresh_client` authenticate the client for the first two, and `client_is_confidential` decides which clients must present a secret; `exchange_issuance` decides what a code exchange issues, by deployment mode and client class), `userinfo`, client registration, RP-initiated logout (`end_session`, `verify_id_token_hint`), `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, `provision_synapse_account` (the account half of provisioning and the single DID-publication site) and `provision_synapse_device` (calls it, then adds the device half). |
+| `introspect.rs` | `POST /oauth2/introspect` (RFC 7662) for Synapse, inactive for an `oidc` grant's token; opaque `mat_`/`mcr_` token generation. |
 | `admin_token.rs` | `POST /oauth2/admin_token`: short-TTL token whose scope carries `urn:synapse:admin:*`. |
-| `compat.rs` | `POST /oauth2/revoke` (RFC 7009) and the Matrix client-server endpoints siwx-oidc answers (login flows, logout, logout/all, refresh, device deletion); `TeardownPolicy`. |
+| `compat.rs` | `POST /oauth2/revoke` (RFC 7009) and the Matrix client-server endpoints siwx-oidc answers (login flows, logout, logout/all, refresh, device deletion); `TeardownPolicy`, and `CompatState` (`new`, `acts_on`) with which grants the Matrix routes act on. |
 | `device_auth.rs` | RFC 8628 device authorization: `/device_authorization`, the `/device` approval page (wallet and passkey), server-issued CAIP-122 nonces. |
 | `account.rs` | MSC4191 `/account` page and actions, MSC4312 cross-signing reset, and the two non-spec actions `io.inblock.account_erase` / `io.inblock.account_reactivate`. `SUPPORTED_ACTIONS` is the single source of truth for discovery and dispatch; `canonical_action` maps `session_*` aliases to `device_*` and the legacy `org.matrix.account_erase` / `org.matrix.account_reactivate` names to the new ones. The account session (`create_account_session`) lives in the `OwnSession::Account` layout; the page's sign-out is `POST /account/sign_out` (handler in `axum_lib.rs`). |
 | `webauthn.rs` | Passkey ceremonies (register, authenticate, link), the new-identity and deactivation gates (`reject_if_new_identity`, `reject_if_deactivated`), picker scoping. |
@@ -52,17 +52,18 @@ everything else exists only in the binary crate.
 | `credential_identity.rs` (lib) | Which identity a stored passkey authenticates: a `webauthn:link/*` entry overrides the derived `did:key`. |
 | `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL`. |
 | `credential_migration.rs` (lib) | Additive backfill of passkey credentials into the aqua-auth store. |
-| `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry` with the digests of its secret and registration access token and `client_entry_without_plaintext`, `DeviceCodeEntry` and the `DeviceCodeRef` naming its layout, `TokenMetadata` with its `TokenKind`), `Ceremony`, `OwnSession` (the `siwx_user` and `acct_session` layouts), `legacy_token_kind`, Redis key prefixes and TTLs. |
-| `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, the own sessions (`create_own_session`, `lookup_own_session`, `end_own_session`, `revoke_own_sessions`; `lookup_user_session` for the picker), `purge_identity`. |
+| `client_policy.rs` (lib) | Pure rules for generic-class clients: `grant_for` (the scopes a client is granted), `mailbox_claim` (what userinfo asks: every condition of the mailbox claim) and `mailbox_for` (the one place its value is built), `validate_mail_domain`, `validate_static_client`, and `parse_static_clients`, which start-up runs on `default_clients` before anything is written, and `grant_end` (whether replacing or deleting a static client's stored entry ends its grants, and why). |
+| `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry` with the digests of its secret and registration access token, its `ClientClass` and scope policy, and `client_entry_without_plaintext`, `DeviceCodeEntry` and the `DeviceCodeRef` naming its layout, `TokenMetadata` with its `TokenKind` and the `GrantKind` of its grant, `grant_kind`, which only `AccessGrant::metadata` sets and which is never stored), `Ceremony`, `OwnSession` (the `siwx_user` and `acct_session` layouts), `legacy_token_kind`, Redis key prefixes and TTLs. |
+| `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, the own sessions (`create_own_session`, `lookup_own_session`, `end_own_session`, `revoke_own_sessions`; `lookup_user_session` for the picker), `purge_identity`, `sync_static_clients` (the start-up sync of `default_clients`, against the tracking set the client carries; it sets a generic client's epoch when its change ends its grants). |
 | `db/outbox.rs` (lib) | The back-channel logout outbox (`outbox:backchannel_logout`): `LogoutEntry`, claim under a lease, retry, complete. Entries are queued by `drop_grant` in `db/grant.rs`. |
-| `db/grant.rs` (lib) | The grant record and its Lua scripts: `issue_grant`, the access check `check_access_token` (with the legacy read fallback), `rotate_refresh_token` (the one rotation script), `ReuseEvent`, grant revocation, and the legacy migration (`peek_refresh_token`, `lift_legacy_refresh_token`). Keyspace and decision table in its module docs. |
+| `db/grant.rs` (lib) | The grant record and its Lua scripts: `issue_grant`, the access check `check_access_token` (with the legacy read fallback), `is_matrix_credential` (which grants the Matrix side acts on), `rotate_refresh_token` (the one rotation script), `ReuseEvent`, grant revocation, and the legacy migration (`peek_refresh_token`, `lift_legacy_refresh_token`). Keyspace and decision table in its module docs. |
 | `db/tokens.rs` (lib) | Token formats (`mat_`, `msa_`, `mcr_{handle}_{secret}`), `parse_refresh_token` (never panics), `digest` (the SHA-256 every credential a client holds is stored as). |
 | `db/seal.rs` (lib) | The sealed successor pair: AES-256-GCM under a key HKDF-derived from the previous refresh token, so only its presenter can open it. |
 | `bin/migrate-credentials.rs` | Operator tool for the credential backfill. Dry run unless `--apply`. |
 
 | `siwx-oidc-auth/src/` | Role |
 |---|---|
-| `lib.rs` | `SiwxKey` (PEM, hex, generated), `authenticate`, `authenticate_with_device`, `refresh`, `authenticate_device_flow`, `AuthTokens`. |
+| `lib.rs` | `SiwxKey` (PEM, hex, generated), `authenticate`, `authenticate_with_device`, `authenticate_with_scope`, `authenticate_with_scope_using`, `refresh`, `authenticate_device_flow`, `AuthTokens`. |
 | `did_assertion.rs` | The shipped verifier: `fetch_and_verify_did`, `verify_did_assertion`, `VerifiedDid`, `DidAssertionError`, `DID_PROFILE_FIELD`. |
 | `main.rs` | CLI: `--key-file`, `--print-did`, `--server`, `--refresh-token`, `--device-flow`, `--verify-did <MXID> --homeserver <url>`. |
 
@@ -97,9 +98,9 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 28 tests in eleven files:
+  `cargo test --workspace` runs the unit tests of both crates plus 35 tests in eleven files:
   `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (6),
-  `static_client_startup` (3), `log_hygiene_credential_store` (1) and
+  `static_client_startup` (10), `log_hygiene_credential_store` (1) and
   `log_capture_callsite_interest` (1), which need nothing; `account_linking_dual_write` (6), which needs the test Redis, and `log_hygiene`
   (4, one of them needs it);
   `credential_migration_live` (2), which needs its own disposable, empty Redis named by
@@ -134,6 +135,9 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   `e2e_backchannel_logout` needs a second siwx-oidc in generic mode (no MAS shared secret, its
   own port and Redis database, `localhost` in `SIWXOIDC_BACKCHANNEL_LOGOUT_ALLOWED_HOSTS`) and
   uses the stub relying party in the Synapse mock (`/__rp/*`); see e2e/README.md.
+  `e2e_generic_client` needs the generic-class static client `maile2e` and
+  `SIWXOIDC_MAIL_DOMAIN` on the Matrix-mode server only (`e2e/env.sh` and the CI step set them);
+  the generic-mode server starts without both, because it refuses a generic-class client.
 - **Live suites** need a real Synapse and run in no CI job: `e2e_did_field_live` (a patched
   Synapse), `e2e_account_lifecycle_live`, five of the six `e2e_msc4191_live` tests,
   `e2e_msc3861::msc4191_metadata_advertised_and_forwarded` and `e2e_messaging`. Set
@@ -259,8 +263,12 @@ doc; read it before changing the code the rule covers.
 
 ### Publication and the Synapse client ([docs/matrix-integration.md](docs/matrix-integration.md))
 
-- **One call site.** Publication happens only in `oidc::provision_synapse_device`, reached by
-  both sign-in paths. It is best-effort and never fails sign-in.
+- **One call site.** Publication happens only in `oidc::provision_synapse_account`, the account
+  half that `oidc::provision_synapse_device` calls before its device half and that a
+  generic-class sign-in calls alone, so every sign-in path reaches it. It is best-effort and
+  never fails sign-in. Pin:
+  `the_account_half_provisions_the_account_and_creates_no_device`,
+  `publication_is_wired_into_the_shared_signin_path`.
 - **Re-asserted on every sign-in.** That is how a clobbered value self-heals; do not optimise
   it away. Pin: `clobbered_did_field_is_restored_at_next_signin_live` (live).
 - **No server name, or a degraded identity, publishes nothing.** Pin:
@@ -292,7 +300,8 @@ doc; read it before changing the code the rule covers.
 - **The fail-safe direction is LEGACY, never modern.** `resolve_identity_or_legacy` falls back to
   the legacy localpart so an existing user is never severed from their account. Pin:
   `fail_safe_fallback_is_legacy_never_modern`,
-  `a_proxy_404_never_severs_a_grandfathered_account_onto_the_modern_localpart`.
+  `a_proxy_404_never_severs_a_grandfathered_account_onto_the_modern_localpart`. A generic-class
+  sign-in is the one exception: it refuses instead of guessing (see "Sign-in gates").
 - **Read-only lookups use the fallible `resolve_identity`**, never the guessing variant.
 - **Alias word lists are append-only.** An index is `digest mod len`; reordering renames future
   accounts. Pin: `vectors_are_pinned`.
@@ -319,6 +328,25 @@ doc; read it before changing the code the rule covers.
   `a_partial_probe_fault_fails_sign_in_closed_before_any_legacy_guess` (they drive `sign_in`
   against a recording homeserver); rationale at the call site.
 - **Standalone deployments degrade, never 500.** No Synapse client means the gates are no-ops.
+- **A generic-class sign-in never guesses a localpart.** It resolves with the fallible
+  `resolve_identity` and answers 503 on a fault, because its localpart can become a mail address
+  that cannot be taken back; a Matrix-class sign-in keeps the legacy fail-safe. It provisions the
+  account and publishes the DID (`provision_synapse_account`), and never upserts a device or arms
+  a cross-signing reset. The code records the class that was served (`CodeEntry.client_class`).
+  Pin: `generic_client_fails_closed`, `generic_sign_in_creates_no_device_and_arms_no_reset`,
+  `a_generic_sign_in_still_publishes_the_did_field`,
+  `matrix_sign_in_still_provisions_a_device_and_arms_the_reset`,
+  `matrix_sign_in_still_degrades_to_the_legacy_guess_on_the_same_fault`.
+- **A generic client's request must grant `openid`, and `/authorize` and `/sign_in` both ask
+  `client_policy::grant_for`.** The grant is the requested scopes the client may have, then its
+  `always_granted_scopes`; an always-granted scope never stands in for a missing `openid`. A
+  request without it is refused before a session exists (an `invalid_scope` redirect) and again
+  at `/sign_in` before anything is provisioned (a 400), and no code is stored. A Matrix-class
+  client's scope is not checked. Pin: `authorize_refuses_a_generic_request_that_grants_no_openid`,
+  `authorize_accepts_a_generic_request_that_grants_openid`,
+  `authorize_leaves_a_matrix_client_request_without_openid_alone`,
+  `a_generic_sign_in_without_openid_is_refused`,
+  `an_always_granted_scope_does_not_make_up_for_a_missing_openid`.
 
 ### Tokens, sessions and devices ([docs/matrix-integration.md](docs/matrix-integration.md))
 
@@ -367,7 +395,10 @@ doc; read it before changing the code the rule covers.
 - **Discovery advertises only what is implemented.** `subject_types_supported` is `["public"]`
   because the `sub` is the user's DID, identical for every client; advertising `pairwise` would
   promise a per-client identifier. `scopes_supported` lists `offline_access` because generic mode
-  honours it (next bullet). Pin: `discovery_advertises_public_subjects_only`,
+  honours it (next bullet), and `io.inblock.mail` only when `mail_domain` is set, as
+  `claims_supported` lists `io.inblock.mailbox` (same condition) and `io.inblock.mxid` (only with a
+  Matrix server name): discovery never names a claim userinfo would omit. Pin:
+  `discovery_advertises_public_subjects_only`, `discovery_lists_only_what_is_served`,
   `discovery_advertises_offline_access`; the response types are pinned by
   `discovery_advertises_only_the_code_response_type`, and the client authentication methods
   (`client_secret_basic`, `client_secret_post`, `none`: what `POST /token` reads) by
@@ -379,8 +410,10 @@ doc; read it before changing the code the rule covers.
   client's registration allows the `refresh_token` grant, and says the granted scope in the
   response when it differs from the request. The request's scope travels `/authorize` → session →
   `CodeEntry.scope`; a code written by the previous build has none and is exchanged as it always
-  was for its 300 s. **Matrix mode is untouched**: the Matrix scope for the device and a refresh
-  token whatever was requested, because Synapse and the Matrix clients depend on exactly that.
+  was for its 300 s. **Matrix mode is untouched for a Matrix-class client**: the Matrix scope for
+  the device and a refresh token whatever was requested, because Synapse and the Matrix clients
+  depend on exactly that (a generic-class client in Matrix mode gets the grant of the next
+  bullet).
   Provisional: a registration without `grant_types` allows the refresh grant; a request that asks
   for nothing grantable is granted `openid`. Pin: `generic_mode_issues_a_refresh_token_only_for_offline_access`,
   `generic_mode_grants_offline_access_only_to_a_client_that_may_refresh`,
@@ -390,6 +423,50 @@ doc; read it before changing the code the rule covers.
   `matrix_mode_issues_the_matrix_scope_and_a_refresh_token_whatever_was_requested`,
   `sign_in_issues_the_code_for_the_bound_request` (the scope reaches the code),
   `a_code_written_before_the_scope_travelled_has_none`.
+- **The kind of a grant is the class of its client, derived and never stored.** With
+  `mas_shared_secret` a Matrix-class client holds `matrix_device` grants and a generic-class
+  client holds `oidc` grants, because the code exchange picks the kind from the pair (mode,
+  class) and nothing else issues an `oidc` grant there. A reader learns the kind from the grant
+  record behind the access token (`AccessGrant::metadata` sets `TokenMetadata.grant_kind`,
+  `#[serde(skip)]`), so no token entry can claim a kind, and a legacy token with no grant record
+  has none and counts as a Matrix credential. Decide on it with an exhaustive `match`, never
+  `== Oidc`. Outside that mode `oidc` does not mean generic-class: generic mode issues it to
+  every client, which is why the Matrix-side refusals below hold back unless auth is delegated.
+  Pin: `the_access_metadata_reports_the_kind_of_the_grant_behind_the_token`,
+  `the_grant_kind_is_never_stored_and_a_stored_entry_reads_without_one`,
+  `a_generic_exchange_writes_an_oidc_grant_with_a_sid_no_device_index_and_the_granted_scope`,
+  `matrix_code_exchange_keeps_the_matrix_scope`.
+- **The code exchange decides by deployment mode and by client class, in one table with no
+  fall-through** (`exchange_issuance`). With `mas_shared_secret`, a Matrix-class client gets a
+  `matrix_device` grant and a generic-class client gets an `oidc` grant with no device: the
+  scope is `client_policy::grant_for` of the scope the request bound (the call `/authorize` and
+  `/sign_in` made), a refresh token only for a granted `offline_access` and only when the
+  registration allows the `refresh_token` grant (the rule of the bullet above, written once in
+  `GenericGrant::recording`), and the granted scope named in the response when it differs from
+  the request. Without it a Matrix-class client gets generic mode's grant and a generic-class
+  client is refused, as start-up refuses it (and refuses it without `synapse_endpoint` too, for
+  the Synapse client needs both). A code is redeemed only by a client of the class it was issued
+  to (`CodeEntry.client_class`; a code written before the class was recorded counts as Matrix):
+  every other pairing is `invalid_grant`, so a class change between `sign_in` and the exchange
+  never yields a Matrix session for a mail client or a deviceless grant for a Matrix one. The
+  class decides the device, never the code: a stray `device_id` on a generic code is ignored.
+  No ENS lookup runs for a generic-class client's claims (`resolve_claims`; at the exchange and
+  at userinfo): it would send the user's address to a third party on every call. The device-code
+  grant mints a Matrix session, so a generic-class client is refused it (`unauthorized_client`)
+  at `/device_authorization` and again at the poll, before anything is recorded or claimed.
+  Pin: `the_exchange_decides_by_mode_and_by_the_class_of_the_code_and_the_client`,
+  `a_generic_exchange_writes_an_oidc_grant_with_a_sid_no_device_index_and_the_granted_scope`,
+  `a_generic_grant_issues_a_refresh_token_only_for_a_granted_offline_access`,
+  `a_generic_grants_refresh_token_rotates_at_the_token_endpoint`,
+  `a_generic_token_never_carries_a_device`, `matrix_code_exchange_keeps_the_matrix_scope`,
+  `code_exchange_outside_delegated_auth_follows_the_class_too`,
+  `a_generic_code_redeemed_after_the_client_became_matrix_class_is_refused`,
+  `a_matrix_code_redeemed_after_the_client_became_generic_is_refused`,
+  `a_generic_code_whose_request_grants_no_openid_is_refused`,
+  `generic_clients_trigger_no_ens_lookup`,
+  `a_generic_clients_exchange_and_userinfo_trigger_no_ens_lookup`,
+  `generic_client_cannot_start_a_device_grant`, `a_device_code_of_a_generic_client_is_never_redeemed`,
+  `a_generic_client_without_a_synapse_endpoint_stops_start_up`.
 - **The headless client asks for what it relies on, in every flow.** `siwx-oidc-auth` requests
   `offline_access` (it refreshes, and a generic-mode server issues a refresh token only for it)
   and `urn:matrix:client:api:*` (its access token is used against the Matrix client-server API)
@@ -400,6 +477,19 @@ doc; read it before changing the code the rule covers.
   `build_scope_none_asks_for_what_the_client_relies_on`, `build_scope_some_requests_stable_device`,
   and on the wire `the_code_flow_sends_the_scope_it_relies_on`,
   `the_device_flow_sends_the_scope_it_relies_on`.
+- **A caller that is not a Matrix client names its own scope, and it is sent verbatim.**
+  `authenticate_with_scope` and `authenticate_with_scope_using` (the second takes the caller's
+  `reqwest::Client`) send exactly the scope they are given: nothing is added, `RELIED_ON_SCOPES`
+  included, and nothing is checked, so a generic-class client (a mail client) never asks for the
+  Matrix API, which `authenticate` always does. All four code-flow entry points run one private
+  `code_flow`. The client handed to `authenticate_with_scope_using` must not follow redirects,
+  because the flow reads the `Location` header of the `/authorize` and `/sign_in` redirects
+  itself; a 2xx where the 303 is due is an error that names `Policy::none()`. Pin:
+  `the_scope_entry_points_send_the_scope_exactly_as_given`,
+  `the_caller_chosen_client_sends_the_flow`,
+  `a_client_that_follows_redirects_gets_an_error_naming_the_redirect_policy`,
+  `a_sign_in_that_answers_with_a_page_names_the_redirect_policy_too`,
+  `an_error_status_at_authorize_is_not_blamed_on_the_redirect_policy`.
 - **An empty `device_id` is JSON `null` on the wire, never `""`.** Synapse rejects `""`. Pin:
   `empty_device_id_renders_as_json_null`, `deviceless_token_body_carries_device_id_null`.
 - **The grant is the unit** (I2). Every access and refresh token belongs to exactly one grant
@@ -460,7 +550,8 @@ doc; read it before changing the code the rule covers.
   after Phase 3: one a previous build planted must still refuse for its 900 s. The device
   tombstone stays: it closes the race between a device sweep and the lift of a legacy refresh
   token. Global and client epochs have no HTTP endpoint, to add no remote surface: an operator
-  sets them ([docs/matrix-integration.md](docs/matrix-integration.md#epochs)). An unset epoch
+  sets them ([docs/matrix-integration.md](docs/matrix-integration.md#epochs)), and the start-up
+  sync of static clients sets a generic-class client's (next bullet). An unset epoch
   is none, never 0. Teardown's resolver (`resolve_refresh_token`) treats a refused refresh token as
   unknown, so revoking it tears nothing down. The comparisons made in Rust (a legacy access
   token, teardown) follow the scripts' rule to the millisecond. Pin:
@@ -479,6 +570,53 @@ doc; read it before changing the code the rule covers.
   `e1_a_client_epoch_refuses_that_clients_older_grants_only`,
   `e1_a_global_epoch_refuses_every_older_grant`,
   `e1_a_user_tombstone_written_by_the_previous_build_still_refuses_refresh`.
+- **A generic-class client's grants end with the configuration that justified them.** The
+  start-up sync of `default_clients` (`DBClient::sync_static_clients`; the background prune
+  runs it with an empty map) sets `epoch:client/{id}` before it overwrites or deletes a stored
+  entry whose change `client_policy::grant_end` says ends grants: a generic client that is
+  removed, that changes class in either direction, whose SET of `allowed_scopes` changes
+  (order and repeats do not count, no list is the empty list, a widening counts), or whose
+  registration stops allowing the refresh grant (`client_policy::registration_may_refresh`,
+  the one place that decides it, also asked before a refresh token is issued; allowing it
+  again ends nothing). Without it a
+  generic grant outlives its client: a public client's refresh token keeps rotating at `/token`
+  once the registration is gone (`authenticate_refresh_client` tolerates that), and after a class
+  flip or a narrowed policy an old `oidc` grant keeps its scope, refreshes and is served at
+  userinfo. Not part of the rule: `always_granted_scopes` (kept inside `allowed_scopes`), the
+  secret, the redirect URIs, and any change to a Matrix-class client, whose removal leaves its
+  Matrix sessions refreshing, as before. An entry that is missing or that this build cannot read
+  sets no epoch: its class is unknown, and ending Matrix sessions is the worse error. The epoch
+  comes BEFORE the write or the delete: a failure between the two leaves the old entry in place
+  and the next start repeats it, while the other order could lose the change for good (the next
+  start would see old equal to new). A restart with the configuration it left behind sets none,
+  and a client id configured again keeps its epoch, so what was issued before stays refused and
+  a sign-in after it works (a grant authenticated in the epoch's own millisecond is refused, so
+  a test gives the new grant the next one). Each epoch is one `warn!` with `client_id`, `reason`
+  (`removed`, `class_changed`, `scopes_changed`, `refresh_withdrawn`) and `epoch_ms`. Observe
+  the epoch at `/token`,
+  at userinfo and in the library: `compat::refresh` refuses an `oidc` grant before it reads any
+  epoch. Never set the global or the user epoch from the sync. A test syncs through a
+  `test_support` client, which tracks static clients in a set of its own, so it never ends the
+  grants of a running stack's clients. Pin:
+  `grants_end_when_a_generic_client_is_removed_reclassified_or_rescoped` (the rule, a table),
+  `grants_end_when_a_generic_client_loses_the_permission_to_refresh` (the refresh rule, a
+  table), `a_registration_may_refresh_unless_it_lists_grant_types_without_the_refresh_grant`,
+  `a_grant_end_names_its_reason_for_the_log`,
+  `a_restart_with_an_unchanged_configuration_sets_no_epoch`,
+  `removing_a_generic_static_client_ends_its_grants`,
+  `removing_a_matrix_class_static_client_sets_no_epoch`,
+  `a_class_change_ends_the_grants_in_either_direction`,
+  `a_change_of_the_allowed_scopes_ends_the_grants_and_nothing_else_does`,
+  `a_missing_or_unreadable_stored_entry_sets_no_epoch`,
+  `a_failed_epoch_write_leaves_the_old_entry_so_the_next_start_repeats_it`,
+  `the_sync_logs_each_epoch_it_sets_with_the_client_and_the_reason`; at the endpoints:
+  `a_restart_with_an_unchanged_configuration_keeps_a_generic_grant_working`,
+  `an_older_generic_grant_is_refused_after_its_client_is_removed`,
+  `an_older_grant_is_refused_after_a_class_change_in_either_direction`,
+  `an_older_generic_grant_is_refused_after_the_allowed_scopes_change`,
+  `an_older_generic_grant_is_refused_after_the_refresh_grant_is_withdrawn`,
+  `a_restart_that_keeps_the_refresh_permission_keeps_a_generic_grant_working`,
+  `removing_a_matrix_class_static_client_leaves_its_sessions_refreshing`.
 - **No credential a client holds is stored in the clear** (I1): tokens, authorization codes,
   device and user codes, session identifiers (the login `session` cookie, the WebAuthn,
   account re-auth and device-approval ceremony ids, the `siwx_user` picker hint and the
@@ -495,8 +633,8 @@ doc; read it before changing the code the rule covers.
   "unify" them. Entries an earlier build wrote are read for their remaining lifetime and used
   once: `token/{raw}` (lifted), `codes/`, `sessions/`, `device_codes/`, `user_codes/`,
   `caip122_nonce/`, `webauthn:challenge/`, `webauthn:link_challenge/`, and a plaintext client entry,
-  upgraded atomically on first read without losing a field (marked
-  `TODO(remove one release after Phase 2b)`; plaintext clients live 30 days); and the own
+  upgraded atomically on first read without losing a field, its class and scope policy included
+  (marked `TODO(remove one release after Phase 2b)`; plaintext clients live 30 days); and the own
   sessions `user:session/` (30 days) and `account_session/` (600 s), read, ended by the account
   page's sign-out and swept by prefix when the user's sessions are revoked (marked `TODO(remove`
   at `KV_USER_SESSION_PREFIX` and `KV_LEGACY_ACCOUNT_SESSION_PREFIX`). Accepted deploy
@@ -517,13 +655,18 @@ doc; read it before changing the code the rule covers.
   the session id and a signature. Pin (mock stack, each scans the whole stack Redis):
   `no_token_the_client_holds_is_stored_in_the_clear`,
   `no_code_or_session_the_client_holds_is_stored_in_the_clear`,
-  `no_client_secret_or_registration_token_is_stored_in_the_clear`,
+  `no_client_secret_or_registration_token_is_stored_in_the_clear`, and for a generic-class
+  client's own credentials (login session id, code, PKCE verifier, ID token, both token pairs,
+  the static client's secret; the search is proved on planted strings)
+  `no_credential_a_generic_client_holds_is_stored_in_the_clear`,
   `legacy_tokens_keep_working_after_the_upgrade`, `in_flight_codes_and_sessions_survive_the_upgrade`;
   unit: `a_stored_digest_presented_as_a_code_is_not_a_code`,
   `a_stored_digest_presented_as_a_credential_matches_nothing`,
   `every_client_authentication_compares_digests_of_what_is_presented`,
   `concurrent_first_reads_of_a_plaintext_client_all_authenticate_and_leave_one_digested_entry`,
   `an_upgrade_never_overwrites_an_entry_that_changed_since_it_was_read`,
+  `an_upgraded_plaintext_entry_keeps_its_class_and_scope_policy`,
+  `an_upgraded_plaintext_client_keeps_its_class_and_scope_policy`,
   `default_clients_are_stored_only_as_digests_and_authenticate`,
   `device_and_user_codes_are_stored_only_as_digests`, `ceremony_state_is_digest_keyed_and_taken_once`,
   `caip122_nonces_are_stored_by_digest_and_used_once`, `a_wrong_token_cannot_open_the_successor`,
@@ -581,10 +724,13 @@ doc; read it before changing the code the rule covers.
   pair and leave one live chain. The successor counts as used once its access token is first
   accepted by introspection or `/userinfo`, or once its refresh token rotates; after that the
   replay is reuse, answered like an unknown token (`invalid_grant` at `/token`, `M_UNKNOWN_TOKEN`
-  at `/_matrix/client/v3/refresh`). No timer decides it: the decision reads grant state, never a
-  clock. A replay whose successor was rotated away or whose grant was revoked is refused the same
-  way. At `/token` the replay is also bound to the client (next invariant); the Matrix endpoint
-  carries no client and cannot bind it to one. Pin (mock stack):
+  at `/_matrix/client/v3/refresh`). Presenting the access token of an `oidc` grant counts as its
+  use even where the route then refuses it (introspection, the Matrix bearer routes): a later
+  replay of the previous refresh token is reuse, and with `reuse_revokes_grant` on it revokes the
+  grant; only the holder of the access token can cause this. No timer decides it: the decision
+  reads grant state, never a clock. A replay whose successor was rotated away or whose grant was
+  revoked is refused the same way. At `/token` the replay is also bound to the client (next
+  invariant); the Matrix endpoint carries no client and cannot bind it to one. Pin (mock stack):
   `concurrent_refreshes_at_the_token_endpoint_converge_on_one_pair`,
   `concurrent_refreshes_at_the_matrix_endpoint_converge_on_one_pair`,
   `a_replay_returns_the_same_pair_until_the_new_access_token_is_used`,
@@ -603,7 +749,8 @@ doc; read it before changing the code the rule covers.
   (RFC 6749 §5.2, with `WWW-Authenticate: Basic` after a Basic attempt). The replay of a lost
   response is bound to the grant's client like a rotation. Provisional, recorded in docs/matrix-integration.md: a public
   client may omit `client_id`; a token whose client registration is gone (30 days without a use, or removed)
-  keeps refreshing unless the request names another client or presents a secret.
+  keeps refreshing unless the request names another client or presents a secret; the one exception
+  is a generic-class static client, whose grants end when it is removed (the epoch bullets above).
   `POST /_matrix/client/v3/refresh` carries no client identity, so it refuses a confidential
   client's refresh token exactly like an unknown token, leaving it untouched for `/token`; the
   grant records at issuance whether its client is confidential, by the same rule
@@ -666,6 +813,31 @@ doc; read it before changing the code the rule covers.
   returns the store error instead of folding it into "unknown"). Pin:
   `a_store_fault_at_the_matrix_refresh_endpoint_is_a_retryable_503`,
   `a_store_fault_on_a_bearer_route_is_a_retryable_503`.
+- **In delegated-auth mode the Matrix side acts on Matrix credentials only; an `oidc` grant (a
+  generic-class client's) is not one.** Introspection answers `{"active": false}` for its access
+  token (the endpoint exists only in that mode); the bearer routes (`logout`, `logout/all`,
+  `DELETE /devices/{id}`, `POST /delete_devices`) answer 401 `M_UNKNOWN_TOKEN` and tear nothing
+  down; `POST /_matrix/client/v3/refresh` answers its refresh token like an unknown token before
+  any script runs and leaves the grant current for `POST /token` (a legacy refresh token the lift
+  would turn into an `oidc` grant is refused the same way). One function decides, an exhaustive
+  `match` over the grant kind (`grant::is_matrix_credential`: `matrix_device`, `service` and a token
+  with no grant record are Matrix credentials), so a new `GrantKind` must be placed there, and any
+  other decision on a kind or class is an exhaustive `match` too, never a `== Generic` deny-list.
+  The bearer routes ask it through `CompatState::acts_on`, which holds the refusal back unless
+  `delegated_auth` is set (`CompatState::new`, from `oidc::delegated_auth_enabled`): generic mode,
+  where every client holds `oidc` grants, keeps the behaviour its tests pin. `/oauth2/revoke`
+  (`Grants::Any`), `/token`, `/userinfo` and `/end_session` still serve `oidc` grants, and a store
+  fault on these paths stays the retryable 503 (introspection: 500). Pin:
+  `an_oidc_grant_cannot_drive_the_matrix_bearer_routes`,
+  `a_matrix_session_still_drives_the_bearer_routes_in_a_delegated_deployment`,
+  `without_delegated_auth_the_matrix_routes_still_serve_an_oidc_grant`,
+  `revocation_still_ends_an_oidc_grant_in_a_delegated_deployment`,
+  `the_matrix_refresh_endpoint_leaves_an_oidc_grants_refresh_token_alone`,
+  `a_store_fault_where_an_oidc_grant_is_refused_is_a_retryable_503`,
+  `the_routes_refuse_other_relying_parties_exactly_when_auth_is_delegated`,
+  `only_the_access_token_of_an_oidc_grant_is_inactive`,
+  `the_handler_answers_inactive_for_an_oidc_grant_and_active_for_the_rest`,
+  `a_generic_clients_tokens_are_refused_by_the_matrix_side_and_rotate_at_the_token_endpoint`.
 - **Never infer token validity from Synapse**: it caches introspection for two minutes. Our
   introspection answer is the authority.
 - **No device-id recycling.** Sign-in upserts a fresh `SIWX_…` id and never deletes. Pin:
@@ -852,6 +1024,42 @@ doc; read it before changing the code the rule covers.
   `without_a_matrix_server_name_the_claim_is_omitted_not_null`,
   `the_claim_name_on_the_wire_is_io_inblock_mxid`, `the_signed_jwt_variant_carries_the_claim_too`,
   `a_token_without_a_recorded_localpart_omits_the_claim_rather_than_deriving_one`.
+- **`io.inblock.mailbox` in userinfo is omitted, never `null`, and every condition is checked
+  where it is issued** (`client_policy::mailbox_claim`, the one place that decides and, through
+  `mailbox_for`, builds it): the token belongs to an `oidc` grant and its client is generic-class
+  now, the grant's scope has `io.inblock.mail` and the client may still have it, the recorded
+  localpart is the opaque one derived from the token's DID, and `mail_domain` is set. Any other
+  grant kind, a legacy token with no grant, and a grant kind added later get no claim. It is
+  built from the recorded localpart and never re-derived. Pin: `mailbox_claim_opaque_only`,
+  `the_mailbox_claim_needs_every_condition`, `the_mailbox_claim_decision_needs_every_condition`,
+  `the_signed_jwt_variant_carries_the_mailbox_claim`.
+- **The mailbox claim carries only a 16-character lowercase base36 localpart**
+  (`client_policy::is_opaque_localpart`, checked next to the derivation check in `mailbox_for`).
+  A mail server accepts a mailbox name of any case and length, so this provider is the only gate
+  on the address. The shape is stated apart from `mxid::localpart_for`, so that changing one
+  without the other removes the claim instead of changing the address. Pin:
+  `only_sixteen_lowercase_base36_characters_are_an_opaque_localpart`,
+  `every_localpart_the_derivation_produces_passes_the_mailbox_gate`, and one test per malformed
+  form: `an_upper_case_localpart_gets_no_mailbox_claim`,
+  `a_15_character_localpart_gets_no_mailbox_claim`,
+  `a_17_character_localpart_gets_no_mailbox_claim`, `the_legacy_localpart_gets_no_mailbox_claim`,
+  `a_localpart_with_non_base36_characters_gets_no_mailbox_claim`.
+- **Userinfo never carries `email`.** A mail server that finds no mailbox claim may fall back to
+  the standard `email` claim, so an `email` in any userinfo response would let that token open a
+  mailbox. The only address claim is `io.inblock.mailbox`. Pin:
+  `userinfo_never_carries_an_email_claim` (both client classes, the JSON and the signed response,
+  every combination of the scopes a client can request).
+- **Userinfo answers a token it cannot use with 401 and `WWW-Authenticate: Bearer
+  error="invalid_token"`** (`CustomError::InvalidToken`): an unknown or expired token, a refresh
+  token, an authorization code, a token an epoch refuses, or the token of a client that is gone.
+  A 400 reads to a resource server as a fault in its own request, and a mail server may retry it
+  as a temporary failure. A request with no token at all stays a 400, and no other error gains a
+  Bearer challenge. Pin: `an_unknown_token_is_an_invalid_token`,
+  `an_expired_token_is_an_invalid_token`, `a_refresh_token_is_an_invalid_token`,
+  `a_token_whose_client_is_gone_is_an_invalid_token`,
+  `a_request_without_a_token_is_still_a_bad_request`,
+  `an_invalid_token_is_a_401_with_the_rfc_6750_challenge`,
+  `no_other_error_carries_a_bearer_challenge`.
 - **`io.inblock.resolve_endpoint` in discovery is read by an Element Web patch**; it is advertised
   only when `/resolve` can answer; account management likewise, and the device grant only in
   delegated-auth mode, where `/device_authorization` is also the only place it is served. Pin:

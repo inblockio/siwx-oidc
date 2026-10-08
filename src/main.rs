@@ -12,7 +12,7 @@ mod device_auth;
 // Provider-attested DID assertions: the field name, the `{did, proof}` value
 // builder, and the ES256 minter behind the `io.inblock.did` profile object.
 //
-// The write channel that calls it is `oidc::provision_synapse_device` ->
+// The write channel that calls it is `oidc::provision_synapse_account` ->
 // `synapse_client::publish_did_field`, reached from BOTH sign-in paths. The
 // `#[allow(dead_code)]` that sat here while only the minter existed is gone;
 // if it ever needs to come back, that means the publication call site was

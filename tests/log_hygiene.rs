@@ -65,6 +65,7 @@ fn access_metadata(did: &str) -> TokenMetadata {
         did: did.to_string(),
         name: did.to_string(),
         kind: Some(TokenKind::Access),
+        grant_kind: None,
     }
 }
 
@@ -96,6 +97,7 @@ async fn the_redis_code_and_token_paths_log_fingerprints_never_values() {
             device_id: None,
             localpart: None,
             scope: None,
+            client_class: None,
         },
     )
     .await

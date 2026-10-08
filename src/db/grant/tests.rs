@@ -245,6 +245,41 @@ async fn a_refresh_less_grant_and_a_service_grant_live_as_long_as_their_access_t
     );
 }
 
+/// What a reader of an accepted access token learns about its grant: the kind, for every
+/// kind, read from the grant record.
+#[tokio::test]
+async fn the_access_metadata_reports_the_kind_of_the_grant_behind_the_token() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    for kind in [GrantKind::MatrixDevice, GrantKind::Oidc, GrantKind::Service] {
+        let mut new = matrix_grant(&format!("kind{}", nonce()), "");
+        new.kind = kind;
+        match kind {
+            GrantKind::MatrixDevice | GrantKind::Oidc => {}
+            GrantKind::Service => {
+                new.confidential_client = true;
+                new.auth_ms = None;
+                new.access_ttl = 120;
+                new.refresh_inactivity_secs = None;
+            }
+        }
+        let issued = issue(&client, &new).await;
+        let found = client
+            .lookup_access_token(&issued.access_token)
+            .await
+            .unwrap()
+            .expect("the access token is accepted");
+        assert_eq!(found.grant.kind, kind);
+        assert_eq!(
+            found.metadata().grant_kind,
+            Some(kind),
+            "the metadata names the kind of the grant behind a {kind} token"
+        );
+        assert_eq!(found.metadata().kind, Some(TokenKind::Access));
+    }
+}
+
 #[tokio::test]
 async fn an_access_token_resolves_to_its_grant_until_the_grant_is_gone() {
     let Some(client) = crate::test_support::redis().await else {
@@ -1024,6 +1059,7 @@ async fn seed_legacy(
         } else {
             TokenKind::Refresh
         }),
+        grant_kind: None,
     };
     let key = format!("token/{raw_token}");
     let json = serde_json::to_string(&meta).unwrap();
@@ -1356,6 +1392,7 @@ fn a_lifted_grant_is_a_matrix_device_grant_exactly_when_its_scope_carries_the_ma
         did: "did:key:z".into(),
         name: "n".into(),
         kind: None,
+        grant_kind: None,
     };
     for (scope, kind) in [
         (

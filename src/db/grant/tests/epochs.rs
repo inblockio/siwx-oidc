@@ -1,9 +1,12 @@
 //! Epochs (I9, E1): one write refuses every grant of a scope authenticated at
 //! or before it, at the rotation script and at the access check, while a later
 //! authentication is unaffected; `logout/all` sets the user epoch instead of
-//! planting the user tombstone.
+//! planting the user tombstone. The last section pins the other writer of client
+//! epochs: the start-up sync of static clients.
 
 use super::*;
+use crate::db::{ClientClass, ClientEntry, DBClient, SiwxClientMetadata};
+use openidconnect::RedirectUrl;
 
 /// Redis `TIME` in milliseconds.
 async fn redis_ms(client: &RedisClient) -> i64 {
@@ -435,4 +438,379 @@ fn the_scripts_name_the_epoch_keys_the_library_writes() {
     ] {
         assert!(LUA_EPOCH.contains(&name), "LUA_EPOCH must read {name}");
     }
+}
+
+// -- The start-up sync of static clients ---------------------------------------------------
+//
+// Every test syncs through a client from `test_support`, which records static clients in a
+// set of its own, and names its own client ids, so none prunes or ends the grants of a stack
+// that shares this Redis. A client carries one set: a test that needs the starts of several
+// independent clients takes a fresh client for each.
+
+const MAIL: [&str; 2] = ["openid", "io.inblock.mail"];
+
+/// A static client as `default_clients` configures it.
+fn static_client(class: ClientClass, allowed: Option<&[&str]>) -> ClientEntry {
+    ClientEntry {
+        class,
+        allowed_scopes: allowed.map(|a| a.iter().map(|s| s.to_string()).collect()),
+        ..ClientEntry::new(
+            "not-a-secret-test-fixture",
+            SiwxClientMetadata::new(
+                vec![RedirectUrl::new("https://mail.example.org/cb".into()).unwrap()],
+                Default::default(),
+            ),
+            None,
+        )
+    }
+}
+
+fn generic_client(allowed: &[&str]) -> ClientEntry {
+    static_client(ClientClass::Generic, Some(allowed))
+}
+
+fn matrix_client() -> ClientEntry {
+    static_client(ClientClass::Matrix, None)
+}
+
+/// The client epoch of `id`; `None` when none was ever set.
+async fn client_epoch(client: &RedisClient, id: &str) -> Option<i64> {
+    client
+        .get_raw(&EpochScope::Client(id).key())
+        .await
+        .unwrap()
+        .map(|epoch| epoch.parse().expect("an epoch is a number"))
+}
+
+/// One start of the server: the static clients in Redis become `clients`. Returns how many
+/// clients the start deleted.
+async fn start_with(client: &RedisClient, clients: Vec<(&str, ClientEntry)>) -> usize {
+    let clients = clients
+        .into_iter()
+        .map(|(id, entry)| (id.to_string(), entry))
+        .collect();
+    client
+        .sync_static_clients(clients)
+        .await
+        .expect("the sync succeeds")
+}
+
+async fn forget(client: &RedisClient, ids: &[&str]) {
+    for id in ids {
+        client.del_raw(&format!("clients/{id}")).await.ok();
+        client.del_raw(&EpochScope::Client(id).key()).await.ok();
+    }
+    client.del_raw(&client.static_clients_key).await.ok();
+}
+
+/// A start that finds the configuration it left behind sets no epoch, whatever order the
+/// scopes are listed in, and every grant issued before it keeps working.
+#[tokio::test]
+async fn a_restart_with_an_unchanged_configuration_sets_no_epoch() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let id = format!("sync-same-{}", nonce());
+    let user = format!("sync{}", nonce());
+    start_with(&client, vec![(&id, generic_client(&MAIL))]).await;
+    let older = issue(&client, &grant_of(&user, &id, "", None)).await;
+
+    let reordered = ["io.inblock.mail", "openid", "io.inblock.mail"];
+    for scopes in [&MAIL[..], &reordered[..]] {
+        let deleted = start_with(&client, vec![(&id, generic_client(scopes))]).await;
+        assert_eq!(deleted, 0);
+    }
+
+    assert_eq!(
+        client_epoch(&client, &id).await,
+        None,
+        "a restart with the same configuration must not end a session"
+    );
+    accepted(&client, &older, "a grant issued before the restarts").await;
+    forget(&client, &[&id]).await;
+}
+
+/// Removing a generic client from the configuration ends every grant it holds, and no
+/// other client's. The id keeps its epoch when it is configured again: what was issued
+/// before stays refused, and a sign-in after it works at once.
+#[tokio::test]
+async fn removing_a_generic_static_client_ends_its_grants() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let id = format!("sync-removed-{}", nonce());
+    let other = format!("sync-other-{}", nonce());
+    let user = format!("sync{}", nonce());
+    start_with(&client, vec![(&id, generic_client(&MAIL))]).await;
+    let older = issue(&client, &grant_of(&user, &id, "", None)).await;
+    let bystander = issue(&client, &grant_of(&user, &other, "", None)).await;
+
+    let deleted = start_with(&client, Vec::new()).await;
+
+    assert_eq!(deleted, 1);
+    assert!(client.get_client(id.clone()).await.unwrap().is_none());
+    let epoch = client_epoch(&client, &id)
+        .await
+        .expect("the removal set the client epoch");
+    access_refused(&client, &older, "a grant of the removed client").await;
+    refresh_revoked(&client, older.refresh_token.as_deref().unwrap(), "removed").await;
+    accepted(&client, &bystander, "another client's grant").await;
+
+    start_with(&client, vec![(&id, generic_client(&MAIL))]).await;
+    assert_eq!(
+        client_epoch(&client, &id).await,
+        Some(epoch),
+        "configuring the id again neither moves nor clears its epoch"
+    );
+    let later = issue(&client, &grant_of(&user, &id, "", Some(epoch + 1))).await;
+    accepted(&client, &later, "a sign-in after the removal").await;
+    forget(&client, &[&id, &other]).await;
+}
+
+/// A Matrix-class client's sessions are Matrix sessions: removing the client ends none.
+#[tokio::test]
+async fn removing_a_matrix_class_static_client_sets_no_epoch() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let id = format!("sync-matrix-{}", nonce());
+    start_with(&client, vec![(&id, matrix_client())]).await;
+    let session = issue(
+        &client,
+        &grant_of(&format!("sync{}", nonce()), &id, "DEVA", None),
+    )
+    .await;
+
+    let deleted = start_with(&client, Vec::new()).await;
+
+    assert_eq!(deleted, 1);
+    assert!(client.get_client(id.clone()).await.unwrap().is_none());
+    assert_eq!(client_epoch(&client, &id).await, None);
+    accepted(&client, &session, "a Matrix session of the removed client").await;
+    forget(&client, &[&id]).await;
+}
+
+/// A client that changes class ends its grants, in either direction.
+#[tokio::test]
+async fn a_class_change_ends_the_grants_in_either_direction() {
+    let cases = [
+        (
+            "generic to Matrix",
+            generic_client(&MAIL),
+            matrix_client(),
+            "",
+        ),
+        (
+            "Matrix to generic",
+            matrix_client(),
+            generic_client(&MAIL),
+            "DEVA",
+        ),
+    ];
+    for (what, before, after, device_id) in cases {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let id = format!("sync-class-{}", nonce());
+        start_with(&client, vec![(&id, before)]).await;
+        let older = issue(
+            &client,
+            &grant_of(&format!("sync{}", nonce()), &id, device_id, None),
+        )
+        .await;
+
+        let deleted = start_with(&client, vec![(&id, after)]).await;
+
+        assert_eq!(deleted, 0, "{what}");
+        assert!(client_epoch(&client, &id).await.is_some(), "{what}");
+        access_refused(&client, &older, what).await;
+        refresh_revoked(&client, older.refresh_token.as_deref().unwrap(), what).await;
+        forget(&client, &[&id]).await;
+    }
+}
+
+/// A generic client whose allowed scopes change, narrowed or widened or one swapped for
+/// another, ends its grants; a change to nothing but its secret and redirect URI does not.
+#[tokio::test]
+async fn a_change_of_the_allowed_scopes_ends_the_grants_and_nothing_else_does() {
+    let cases = [
+        ("narrowed", generic_client(&["openid"]), true),
+        (
+            "widened",
+            generic_client(&["openid", "io.inblock.mail", "offline_access"]),
+            true,
+        ),
+        ("one swapped", generic_client(&["openid", "profile"]), true),
+        (
+            "another secret and redirect URI",
+            ClientEntry {
+                secret_digest: crate::db::tokens::digest("another-secret"),
+                metadata: SiwxClientMetadata::new(
+                    vec![RedirectUrl::new("https://other.example.org/cb".into()).unwrap()],
+                    Default::default(),
+                ),
+                ..generic_client(&MAIL)
+            },
+            false,
+        ),
+    ];
+    for (what, after, ends) in cases {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let id = format!("sync-scopes-{}", nonce());
+        start_with(&client, vec![(&id, generic_client(&MAIL))]).await;
+        let older = issue(
+            &client,
+            &grant_of(&format!("sync{}", nonce()), &id, "", None),
+        )
+        .await;
+
+        start_with(&client, vec![(&id, after)]).await;
+
+        assert_eq!(client_epoch(&client, &id).await.is_some(), ends, "{what}");
+        if ends {
+            access_refused(&client, &older, what).await;
+            refresh_revoked(&client, older.refresh_token.as_deref().unwrap(), what).await;
+        } else {
+            accepted(&client, &older, what).await;
+        }
+        forget(&client, &[&id]).await;
+    }
+}
+
+/// Each epoch the sync sets is a warning that names the client and the reason, so an
+/// operator who started an instance with another map sees what it ended; a start that
+/// changes nothing says nothing of the kind.
+#[tokio::test]
+async fn the_sync_logs_each_epoch_it_sets_with_the_client_and_the_reason() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let id = format!("sync-log-{}", nonce());
+    let log = crate::test_support::LogCapture::start();
+
+    start_with(&client, vec![(&id, generic_client(&MAIL))]).await;
+    start_with(&client, vec![(&id, generic_client(&MAIL))]).await;
+    assert!(
+        !log.output().contains(&id),
+        "a start that changes nothing logs nothing about the client: {}",
+        log.output()
+    );
+    start_with(&client, vec![(&id, generic_client(&["openid"]))]).await;
+    start_with(&client, Vec::new()).await;
+
+    let output = log.output();
+    let ended: Vec<&str> = output.lines().filter(|l| l.contains(&id)).collect();
+    assert_eq!(ended.len(), 2, "one line per epoch: {output}");
+    for (line, reason) in ended.iter().zip(["scopes_changed", "removed"]) {
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains(&format!("client_id={id}")), "{line}");
+        assert!(line.contains(&format!("reason=\"{reason}\"")), "{line}");
+    }
+    forget(&client, &[&id]).await;
+}
+
+/// The stored entry says which class a client's grants were issued under. One that is
+/// missing, or that this build cannot read, says nothing, and ending sessions that may be
+/// Matrix sessions is the worse error: no epoch. The sync still replaces or deletes it.
+#[tokio::test]
+async fn a_missing_or_unreadable_stored_entry_sets_no_epoch() {
+    let unreadable = [
+        ("not json", "not json".to_string()),
+        (
+            "a class this build does not know",
+            serde_json::json!({
+                "secret_digest": "d",
+                "metadata": {"redirect_uris": ["https://mail.example.org/cb"]},
+                "class": "from-a-later-build",
+            })
+            .to_string(),
+        ),
+    ];
+    for (what, stored) in unreadable {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let replaced = format!("sync-unreadable-{}", nonce());
+        let removed = format!("sync-unreadable-{}", nonce());
+        for id in [&replaced, &removed] {
+            client
+                .set_raw(&format!("clients/{id}"), &stored)
+                .await
+                .unwrap();
+        }
+        let tracking = client.static_clients_key.clone();
+        let _: i64 = raw(&client, &["SADD", &tracking, &removed]).await;
+
+        let deleted = start_with(&client, vec![(&replaced, generic_client(&MAIL))]).await;
+
+        assert_eq!(deleted, 1, "{what}");
+        assert!(client.get_client(replaced.clone()).await.unwrap().is_some());
+        assert!(client.get_client(removed.clone()).await.unwrap().is_none());
+        for id in [&replaced, &removed] {
+            assert_eq!(client_epoch(&client, id).await, None, "{what}");
+        }
+        forget(&client, &[&replaced, &removed]).await;
+    }
+
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let missing = format!("sync-missing-{}", nonce());
+    let tracking = client.static_clients_key.clone();
+    let _: i64 = raw(&client, &["SADD", &tracking, &missing]).await;
+    assert_eq!(start_with(&client, Vec::new()).await, 1);
+    assert_eq!(client_epoch(&client, &missing).await, None);
+    forget(&client, &[&missing]).await;
+}
+
+/// The epoch is written BEFORE the entry is replaced or deleted. When it cannot be written
+/// the start fails with the old entry in place and its id still tracked, so the next start
+/// decides again and sets it. The other order could lose the change for good: the next
+/// start would find the new entry and see no change.
+#[tokio::test]
+async fn a_failed_epoch_write_leaves_the_old_entry_so_the_next_start_repeats_it() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let id = format!("sync-order-{}", nonce());
+    let narrowed = generic_client(&["openid"]);
+    start_with(&client, vec![(&id, generic_client(&MAIL))]).await;
+    let older = issue(
+        &client,
+        &grant_of(&format!("sync{}", nonce()), &id, "", None),
+    )
+    .await;
+    // A list where the epoch belongs: the script that writes it fails.
+    let epoch_key = EpochScope::Client(&id).key();
+    let _: i64 = raw(&client, &["LPUSH", &epoch_key, "not-an-epoch"]).await;
+
+    let failed = client
+        .sync_static_clients(vec![(id.clone(), narrowed.clone())])
+        .await;
+    assert!(failed.is_err(), "a start that cannot end the grants fails");
+    let stored = client.get_client(id.clone()).await.unwrap().unwrap();
+    assert_eq!(
+        stored.allowed_scopes,
+        Some(MAIL.iter().map(|s| s.to_string()).collect()),
+        "the old entry is still in place"
+    );
+    let _: i64 = raw(&client, &["DEL", &epoch_key]).await;
+    start_with(&client, vec![(&id, narrowed)]).await;
+    assert!(client_epoch(&client, &id).await.is_some());
+    access_refused(&client, &older, "after the repeated start").await;
+
+    let _: i64 = raw(&client, &["DEL", &epoch_key]).await;
+    let _: i64 = raw(&client, &["LPUSH", &epoch_key, "not-an-epoch"]).await;
+    let failed = client.sync_static_clients(Vec::new()).await;
+    assert!(failed.is_err(), "so does a removal");
+    assert!(
+        client.get_client(id.clone()).await.unwrap().is_some(),
+        "the client is still registered"
+    );
+    let tracking = client.static_clients_key.clone();
+    let still_tracked: i64 = raw(&client, &["SISMEMBER", &tracking, &id]).await;
+    assert_eq!(still_tracked, 1, "and still tracked, for the next start");
+    forget(&client, &[&id]).await;
 }

@@ -43,6 +43,7 @@ use super::resolve;
 use super::synapse_client::SynapseClient;
 use super::webauthn as wa;
 use aqua_auth::{all_cipher_suites, all_did_methods};
+use siwx_oidc::client_policy;
 use siwx_oidc::db::*;
 use siwx_oidc::redact::fingerprint;
 
@@ -129,6 +130,9 @@ impl IntoResponse for CustomError {
             CustomError::Unauthorized(msg) => {
                 warn!(error = %msg, "unauthorized");
             }
+            CustomError::InvalidToken(msg) => {
+                warn!(error = %msg, "invalid_token");
+            }
             CustomError::UnknownCredential(cred_id) => {
                 // Expected user condition (stale/revoked passkey), NOT a server fault.
                 warn!(credential_fp = %fingerprint(cred_id), "unknown_credential");
@@ -166,6 +170,15 @@ impl IntoResponse for CustomError {
             CustomError::Unauthorized(_) => {
                 (StatusCode::UNAUTHORIZED, self.to_string()).into_response()
             }
+            // RFC 6750 section 3: a rejected bearer token is answered with the Bearer
+            // challenge naming `invalid_token`, so a resource server can tell a dead
+            // credential from a malformed request.
+            CustomError::InvalidToken(_) => (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, r#"Bearer error="invalid_token""#)],
+                self.to_string(),
+            )
+                .into_response(),
             // 401 + machine-readable discriminator. The client keys on `error` to
             // call `signalUnknownCredential` and shows `message` to the user. The
             // echoed `credential_id` is the exact id the client just presented, so
@@ -1376,18 +1389,17 @@ async fn account_passkey_finish_handler(
 
 /// The configured `default_clients`, each as the entry [`ClientEntry`] keeps: configured
 /// with its secret (and registration access token, if any) in the clear, held as their
-/// digests.
+/// digests. Every entry passes `client_policy::validate_static_client` for this
+/// deployment, so a client the server could not honour safely stops start-up, naming the
+/// client and the rule, before anything is written.
 fn parse_default_clients(config: &config::Config) -> anyhow::Result<Vec<(String, ClientEntry)>> {
-    config
-        .default_clients
-        .iter()
-        .map(|(id, raw)| {
-            let entry = serde_json::from_str(raw).map_err(|e| {
-                anyhow::anyhow!("default_clients.{id} is not a valid client entry: {e}")
-            })?;
-            Ok((id.clone(), entry))
-        })
-        .collect()
+    let deployment = client_policy::Deployment {
+        mail_domain: config.mail_domain.as_deref(),
+        delegated_auth: oidc::delegated_auth_enabled(config),
+        synapse_configured: config.synapse_endpoint.is_some(),
+    };
+    client_policy::parse_static_clients(&config.default_clients, deployment)
+        .map_err(anyhow::Error::msg)
 }
 
 fn log_pruned_static_clients(pruned: usize) {
@@ -1559,6 +1571,9 @@ pub async fn main() {
     if config.reuse_revokes_grant {
         info!("refresh token reuse enforcement on: a reuse event revokes its grant");
     }
+    // Checked whether or not a static client uses it, before anything reads Redis.
+    client_policy::validate_mail_domain(config.mail_domain.as_deref())
+        .unwrap_or_else(|e| panic!("FATAL: {e}"));
     let redis_client = RedisClient::new(&config.redis_url)
         .await
         .expect("Could not build Redis client")
@@ -1718,12 +1733,11 @@ pub async fn main() {
 
     let introspect_state = IntrospectState::from(&state);
     let admin_token_state = AdminTokenState::from(&state);
-    let compat_state = compat::CompatState {
-        redis_client: state.redis_client.clone(),
-        synapse_client: state.synapse_client.clone(),
-        server_name: state.config.matrix_server_name.clone(),
-        require_secret: state.config.require_secret,
-    };
+    let compat_state = compat::CompatState::new(
+        state.redis_client.clone(),
+        state.synapse_client.clone(),
+        &state.config,
+    );
 
     let app = Router::new()
         .nest_service("/build", ServeDir::new("./static/build"))
@@ -2572,6 +2586,52 @@ mod default_clients_tests {
         assert!(!entry.secret_matches(&entry.secret_digest));
         redis.del_raw(&key).await.unwrap();
     }
+
+    /// The start-up parse hands the policy this deployment's settings: a generic client
+    /// needs the MAS shared secret and the Synapse endpoint (the Synapse client exists only
+    /// with both), and the mail scope needs the mail domain. No Redis: the parse reads none.
+    #[test]
+    fn a_generic_static_client_is_checked_against_the_deployment_it_runs_in() {
+        let entry = r#"{"secret":"not-a-secret-test-fixture","metadata":{"redirect_uris":["https://mail.example.org/cb"]},"class":"generic","allowed_scopes":["openid","io.inblock.mail"]}"#;
+        let mut config = config::Config::default();
+        config.default_clients.insert("mailer".into(), entry.into());
+        let refusal = |config: &config::Config| match parse_default_clients(config) {
+            Ok(_) => panic!("the configuration must be refused"),
+            Err(refusal) => refusal.to_string(),
+        };
+
+        let without_synapse = refusal(&config);
+        assert!(
+            without_synapse.starts_with("default_clients.mailer:")
+                && without_synapse.contains("SIWXOIDC_MAS_SHARED_SECRET"),
+            "{without_synapse}"
+        );
+
+        config.mas_shared_secret = Some("not-a-secret-test-fixture".into());
+        let without_endpoint = refusal(&config);
+        assert!(
+            without_endpoint.starts_with("default_clients.mailer:")
+                && without_endpoint.contains("SIWXOIDC_SYNAPSE_ENDPOINT"),
+            "{without_endpoint}"
+        );
+
+        config.synapse_endpoint = Some("http://synapse.example.org:8008".parse().unwrap());
+        let without_domain = refusal(&config);
+        assert!(
+            without_domain.starts_with("default_clients.mailer:")
+                && without_domain.contains("SIWXOIDC_MAIL_DOMAIN"),
+            "{without_domain}"
+        );
+
+        config.mail_domain = Some("matrix.example.org".into());
+        let parsed = match parse_default_clients(&config) {
+            Ok(parsed) => parsed,
+            Err(refusal) => panic!("the deployment serves the client: {refusal}"),
+        };
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "mailer");
+        assert_eq!(parsed[0].1.class, ClientClass::Generic);
+    }
 }
 
 #[cfg(test)]
@@ -2656,5 +2716,54 @@ mod static_client_prune_tests {
             waits.iter().all(|wait| *wait <= Duration::from_secs(60)),
             "{waits:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod invalid_token_response_tests {
+    //! The RFC 6750 answer to a bearer token that cannot be used. No Redis and no network: the
+    //! variant `oidc::userinfo` returns for such a token, rendered as the endpoint sends it.
+    use super::*;
+
+    fn challenges(response: &Response) -> Vec<&str> {
+        response
+            .headers()
+            .get_all(header::WWW_AUTHENTICATE)
+            .iter()
+            .map(|value| value.to_str().expect("an ASCII challenge"))
+            .collect()
+    }
+
+    /// A resource server reads the status and the challenge, not the body: a 401 with
+    /// `error="invalid_token"` says the credential is dead, where a 400 reads as a fault in the
+    /// server's own request and may be retried as a temporary failure.
+    #[tokio::test]
+    async fn an_invalid_token_is_a_401_with_the_rfc_6750_challenge() {
+        let response = CustomError::InvalidToken("Unknown token.".to_string()).into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(challenges(&response), [r#"Bearer error="invalid_token""#]);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"Unknown token.");
+    }
+
+    /// Only a rejected bearer token is a Bearer challenge. A client that fails to
+    /// authenticate (`Unauthorized`) and a malformed request keep the answers they had.
+    #[test]
+    fn no_other_error_carries_a_bearer_challenge() {
+        let others = [
+            CustomError::BadRequest("Missing access token.".to_string()),
+            CustomError::Unauthorized("Bad secret.".to_string()),
+            CustomError::NotFound,
+        ];
+        for other in others {
+            let what = other.to_string();
+            let response = other.into_response();
+            assert!(
+                challenges(&response).is_empty(),
+                "{what}: no Bearer challenge on this answer"
+            );
+        }
     }
 }

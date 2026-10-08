@@ -295,11 +295,16 @@ lines name tokens by fingerprint only. The keyspace is in
 | Introspection | active | 404 |
 | Device ID | `SIWX_` + 8 hex characters, or the ID the client requested | empty |
 
+The table describes a Matrix-class client. A generic-class client is issued an
+`oidc` grant with no device even in delegated-auth mode (the table of code
+exchanges below).
+
 Minted admin tokens (`service` grants, no refresh token) use the prefix
 `msa_`. Device codes use `dvc_`.
 
-In delegated-auth mode the authorization-code grant records the Matrix scope
-above regardless of the scopes requested, and always issues a refresh token. In
+In delegated-auth mode the authorization-code grant of a Matrix-class client
+records the Matrix scope above regardless of the scopes requested, and always
+issues a refresh token. In
 standalone mode ("generic mode": no `mas_shared_secret`) it grants least
 privilege: the scope the request asked for, limited to `openid`, `profile` and
 `offline_access`, and a refresh token only when `offline_access` was requested and
@@ -309,6 +314,25 @@ request, the token response says so in `scope` (RFC 6749 §5.1). The requested s
 travels from `/authorize` through the session into the stored code. A code
 written by the previous build has none, and is exchanged as it always was
 (`openid profile` and a refresh token) for the 300 s it lives.
+
+What a code exchange issues is decided by the deployment mode and by the class
+of the client (`exchange_issuance`), and the code must be redeemed by a client of
+the class it was issued to:
+
+| Delegated auth | Client class | Issues |
+|---|---|---|
+| yes | Matrix | a `matrix_device` grant, as above |
+| yes | generic | an `oidc` grant with no device: the scopes the client's entry allows of the scope the request bound (`client_policy::grant_for`, the call `/authorize` and `/sign_in` made), then the entry's `always_granted_scopes`; a refresh token only when `offline_access` is part of that and the registration allows the `refresh_token` grant; the granted scope in the response when it differs from the request |
+| no | Matrix | an `oidc` grant, as above |
+| no | generic | refused: start-up refuses such a client, which has no Synapse to supply its localpart |
+
+The `oidc` grant of a generic-class client gets its own `sid` like any other, so
+`/end_session` and back-channel logout apply to it. No ENS lookup runs for it:
+the claims of a generic-class client would otherwise send the user's address to
+a third party at every exchange and every userinfo call. A code redeemed by a
+client of the other class (the client changed class after `sign_in` ran; a code
+written before the class was recorded counts as Matrix) is `invalid_grant`,
+and so is a generic-class code whose request grants no `openid`.
 
 Clients request the Matrix scopes in either the stable form
 (`urn:matrix:client:api:*`, `urn:matrix:client:device:{id}`) or the MSC2967
@@ -346,6 +370,35 @@ recorded are classified by their lifetime, which every earlier writer fixed:
 at most 900 s is an access token (300 s user tokens, 30–900 s admin tokens),
 90 days a refresh token. A long-lived entry that carries the admin scope fits
 no earlier writer and is accepted nowhere; revocation still removes it.
+
+### Grants of other relying parties at the Matrix side
+
+In delegated-auth mode an `oidc` grant is a generic-class client's (a mail
+client, say). It is not a Matrix session, whatever scope string it carries, so
+the Matrix side does not act on it, and every refusal leaves the grant as it was:
+
+| Endpoint | Answer for the token of an `oidc` grant |
+|---|---|
+| `POST /oauth2/introspect` | `{"active": false}`, exactly like an unknown token (the endpoint exists only in this mode) |
+| `POST /_matrix/client/v3/logout`, `logout/all`, `DELETE /_matrix/client/v3/devices/{id}`, `POST /_matrix/client/v3/delete_devices` (access token as the bearer) | 401 `M_UNKNOWN_TOKEN`, and nothing is torn down. An unknown bearer is still the idempotent 200 at `logout` and `logout/all`; a token that is alive for its own client is not answered as a sign-out that happened |
+| `POST /_matrix/client/v3/refresh` (refresh token) | `M_UNKNOWN_TOKEN`, exactly like an unknown token, before any script runs. The grant stays current for `POST /token`, where its client is authenticated. A legacy refresh token whose scope has no Matrix API, which the lift would turn into an `oidc` grant, is refused the same way and stays a legacy entry |
+
+`POST /oauth2/revoke`, `POST /token`, `/userinfo` and `/end_session` serve
+`oidc` grants as ever: the holder may always end its own token, and these are
+the endpoints a relying party uses. `logout/all` by a Matrix session ends every
+grant of the user, the generic-class client's included, as any sign-out of every
+session does. Without a MAS shared secret (generic mode) every client holds
+`oidc` grants, and the Matrix routes serve them unchanged. A token-store fault
+on any of these paths is still the retryable 503 `M_UNKNOWN` (introspection:
+500), never a refusal. Presenting the access token counts it as used for the
+replay rule ([Lifecycle](#lifecycle)), as every presentation does.
+
+One function decides all of it, `grant::is_matrix_credential`, an exhaustive
+`match` over the grant kind: `matrix_device` and `service` (minted admin tokens)
+grants, and tokens with no grant record (legacy entries), are Matrix credentials;
+`oidc` grants are not. The bearer routes ask it through `CompatState::acts_on`,
+which holds the refusal back unless `delegated_auth` is set (`CompatState::new`
+reads it from the configuration, the same predicate as discovery).
 
 ### An empty `device_id` is JSON `null`
 
@@ -490,9 +543,13 @@ once; the user tombstone the epoch replaced refused that for 15 minutes. A
 user tombstone planted by the previous build is still honoured until it
 expires.
 
-Global and client epochs have no HTTP endpoint. An operator sets one with a
-single script that takes the time from Redis `TIME` and never moves an epoch
-earlier (provisional; it is what `RedisClient::set_epoch` runs):
+Global and client epochs have no HTTP endpoint. The start-up sync of static
+clients sets the client epoch of a generic-class client that was removed,
+changed class or changed its allowed scopes, and nothing else sets one on its
+own ([Configuration](configuration.md#changes-that-end-a-generic-clients-sessions)).
+An operator sets any epoch with a single script that takes the time from Redis
+`TIME` and never moves an epoch earlier (provisional; it is what
+`RedisClient::set_epoch` runs):
 
 ```bash
 redis-cli -u "$REDIS_URL" EVAL "local t = redis.call('TIME') \
@@ -636,7 +693,9 @@ Provisional choices, open for the maintainers:
   client can be removed. A token whose client is gone keeps refreshing when the
   request names that client or none, and is refused when the request names
   another client or presents a secret (which can no longer be checked). Refusing
-  it outright would sign out every session older than a registration.
+  it outright would sign out every session older than a registration. A
+  generic-class static client is the exception: removing it sets its client
+  epoch, so its grants end with it (see [Epochs](#epochs)).
 
 An `Authorization` header at `/token` used to be answered with a 400 on every
 request (two header extractors rejecting each other's scheme), so
@@ -705,8 +764,10 @@ shared secret), 401 `unauthorized`, 503 `synapse_unavailable` or
 ### Provisioning at sign-in
 
 Every sign-in (wallet, passkey, headless key, device-code grant) goes through
-`oidc::provision_synapse_device`. It is best-effort: a Synapse failure is
-logged and never fails the sign-in.
+`oidc::provision_synapse_device`. It runs the account half first
+(`oidc::provision_synapse_account`: steps 1 to 3 below) and then the device
+half (steps 4 and 5). It is best-effort: a Synapse failure is logged and never
+fails the sign-in.
 
 1. **Account.** If the resolved localpart is free, the account is created with
    `provision_user`, seeded with the generated alias as displayname (never the
@@ -737,8 +798,20 @@ logged and never fails the sign-in.
    replacement keys (see [Cross-signing](#cross-signing)).
 
 The device-code grant returns the scope in its token response, so a client can
-learn the device ID it was given. The authorization-code response does not
-include `scope`.
+learn the device ID it was given. The authorization-code response of a Matrix
+session does not include `scope`.
+
+**Generic-class clients** (`default_clients` entries with `"class": "generic"`)
+get the account half only: the Synapse account is created for a new identity and
+the `io.inblock.did` field is published (steps 1 to 3), but no device is upserted
+and no cross-signing reset is armed. Their localpart comes from the fallible
+`resolve_identity`; when the homeserver cannot be asked, the sign-in answers 503
+instead of guessing, because a generic client's localpart can become a permanent
+mail address. `/authorize` refuses a request that would grant the client no
+`openid` (an `invalid_scope` redirect), `/sign_in` checks it again before it
+provisions anything, and the authorization code records the class of the client
+it was issued to. The code exchange then issues an `oidc` grant with no device,
+as the table of code exchanges above describes.
 
 ### No device recycling
 
@@ -781,7 +854,11 @@ sign-out deletes the device, token hygiene does not.
   failed logout leaves the bearer valid, so the client's retry tears the whole
   session down; the Synapse device deletes stay best-effort. Revoke keeps its
   best-effort fallback (it deletes the presented token where it can) and its
-  200. Without a Synapse client or server name, teardown
+  200. In delegated-auth mode the access token of an `oidc` grant is the one
+  bearer `logout` and `logout/all` do not answer 200: it is not a Matrix
+  session, so it is a 401 `M_UNKNOWN_TOKEN` and nothing is torn down (see
+  [Grants of other relying parties](#grants-of-other-relying-parties-at-the-matrix-side)).
+  Without a Synapse client or server name, teardown
   revokes Redis tokens only. Revocation is keyed on the localpart (the grant's
   `username`, and `TokenMetadata.username` for a legacy entry), not the raw DID.
 - In standalone mode tokens have no device, so revoke and logout remove only the
@@ -909,6 +986,14 @@ Rules:
 
 - The grant needs delegated-auth mode. Without the shared secret, the token
   endpoint refuses it (`unsupported_grant_type`).
+- **A generic-class client never gets it** (`unauthorized_client`): the grant
+  mints a Matrix session. It is refused at `/device_authorization` and again at
+  the poll, before anything is recorded or claimed, so a code issued while the
+  client was Matrix-class cannot be redeemed after it became generic. The poll
+  reads the client entry with `?`: an unreadable entry is a store fault answered
+  as one, never a client served without its class, and the code stays as it
+  was. A client that is gone (an expired dynamic registration) was never
+  generic and is still served.
 - **Existing accounts only.** Approval rejects a DID with no account (400) and a
   deactivated account (401). See [Gates](#gates-that-protect-accounts).
 - The tokens belong to the **approving** user's DID, not to the device.

@@ -8,6 +8,11 @@ pub mod db;
 /// binary's `src/localpart.rs`.
 pub mod mxid;
 
+/// Policy for generic-class clients: the scopes they are granted, the static entries
+/// start-up refuses, and which accounts get a mailbox address. Pure functions, in the
+/// library crate so the binary and the tests read one set of rules.
+pub mod client_policy;
+
 /// What a log line may say about a credential: a fingerprint, never the value.
 /// In the library crate so `tests/log_hygiene.rs` can pin it.
 pub mod redact;

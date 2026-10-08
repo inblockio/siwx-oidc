@@ -192,9 +192,22 @@ let tokens = refresh(
 | `SiwxKey::did` | the `did:key:z…` DID |
 | `authenticate(server, client_id, redirect_uri, key)` | sign in; new device each time |
 | `authenticate_with_device(…, key, Some(device_id))` | sign in with a pinned device ID |
+| `authenticate_with_scope(server, client_id, redirect_uri, key, scope)` | sign in for exactly `scope`, for a client that is not a Matrix client |
+| `authenticate_with_scope_using(&client, server, client_id, redirect_uri, key, scope)` | the same over your own `reqwest::Client`, which must not follow redirects |
 | `refresh(server, client_id, refresh_token, did)` | rotate tokens; `did` is only carried into the result |
 | `authenticate_device_flow(server, client_id)` | RFC 8628 device flow (a human approves) |
 | `fetch_and_verify_did`, `verify_did_assertion` | verify another account's published DID |
+
+`authenticate` and `authenticate_with_device` ask for what a Matrix client relies
+on (`offline_access urn:matrix:client:api:*`). A client of another kind, a mail
+client for example, passes its own scope to `authenticate_with_scope`, which
+sends it as given and adds nothing. The server grants only what the client's
+registration allows, and a refresh token comes only with `offline_access`;
+`AuthTokens` does not carry the granted scope. `authenticate_with_scope_using`
+takes your own `reqwest::Client`. Build it with
+`redirect(reqwest::redirect::Policy::none())`: the flow reads the `Location`
+headers of two redirects itself, and a client that follows them ends on the
+login page and gets an error that names the redirect policy.
 
 All sign-in functions return `AuthTokens { access_token, token_type, id_token,
 expires_in, refresh_token, did }`. A refresh returns no `id_token`.

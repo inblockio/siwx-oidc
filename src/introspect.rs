@@ -143,9 +143,13 @@ fn render_introspection(
     };
 
     match metadata {
-        // Only an access token is a bearer credential. A refresh token, or an
-        // entry of no known kind, renders exactly like an unknown token.
-        Some(m) if m.exp > now && m.is_kind(TokenKind::Access) => {
+        // Only an access token is a bearer credential, and only one Synapse may
+        // act on: the sessions of Matrix clients and minted admin tokens. The
+        // access token of an `oidc` grant (a generic-class client's, the only
+        // one there is when this endpoint exists) is not a Matrix session,
+        // whatever its scope string says. A refresh token, an entry of no known
+        // kind and such a token all render exactly like an unknown token.
+        Some(m) if m.exp > now && m.is_kind(TokenKind::Access) && m.is_matrix_credential() => {
             let device_id = render_device_id(&m.device_id);
             Ok(Json(serde_json::json!({
             "active": true,
@@ -162,8 +166,8 @@ fn render_introspection(
             })))
         }
         // A genuinely absent or expired token, or one that is not an access
-        // token, IS inactive. This is the only path allowed to produce
-        // `active:false`.
+        // token Synapse may act on, IS inactive. This is the only path allowed
+        // to produce `active:false`.
         _ => Ok(Json(serde_json::json!({"active": false}))),
     }
 }
@@ -236,6 +240,7 @@ mod tests {
             did: "did:key:zDnTest".into(),
             name: String::new(),
             kind: Some(TokenKind::Access),
+            grant_kind: None,
         }
     }
 
@@ -357,5 +362,134 @@ mod tests {
     fn device_bound_token_body_carries_the_device_id() {
         let out = render_introspection(Ok(Some(meta(2_000))), 1_000).expect("live token is a 200");
         assert_eq!(out.0["device_id"], serde_json::json!("SIWX_test"));
+    }
+
+    // -- Guard: the grant of another relying party is not a Matrix session -----
+    // Synapse asks this endpoint about every bearer it is shown. The access token
+    // of an `oidc` grant (a generic-class client's) must never answer active,
+    // whatever its scope string says; a Matrix session and a minted admin token
+    // must keep answering active.
+
+    #[test]
+    fn only_the_access_token_of_an_oidc_grant_is_inactive() {
+        use siwx_oidc::db::grant::GrantKind;
+
+        let active = |grant_kind: Option<GrantKind>| {
+            let mut m = meta(2_000);
+            m.scope = "openid urn:matrix:client:api:*".into();
+            m.grant_kind = grant_kind;
+            render_introspection(Ok(Some(m)), 1_000).expect("a 200").0["active"] == true
+        };
+        assert!(active(Some(GrantKind::MatrixDevice)), "a Matrix session");
+        assert!(active(Some(GrantKind::Service)), "a minted admin token");
+        assert!(active(None), "a legacy entry has no grant");
+        assert!(
+            !active(Some(GrantKind::Oidc)),
+            "the grant of another relying party, even with the Matrix scope in its string"
+        );
+    }
+
+    #[test]
+    fn an_oidc_grants_access_token_renders_exactly_like_an_unknown_token() {
+        let mut m = meta(2_000);
+        m.grant_kind = Some(siwx_oidc::db::grant::GrantKind::Oidc);
+        let refused = render_introspection(Ok(Some(m)), 1_000).expect("a 200");
+        let unknown = render_introspection(Ok(None), 1_000).expect("a 200");
+        assert_eq!(refused.0, unknown.0);
+    }
+
+    /// The handler over real tokens: a Matrix session, a minted admin token and a legacy
+    /// entry are active; the access token of an `oidc` grant, and its refresh token, are not.
+    #[tokio::test]
+    async fn the_handler_answers_inactive_for_an_oidc_grant_and_active_for_the_rest() {
+        use siwx_oidc::db::grant::{GrantKind, NewGrant};
+        use siwx_oidc::db::{DBClient, ACCESS_TOKEN_TTL};
+
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let tag = generate_opaque_token("");
+        let issue = |kind: GrantKind, device_id: &str| {
+            let redis = redis.clone();
+            let user = format!("introspect-{tag}");
+            let device_id = device_id.to_string();
+            async move {
+                redis
+                    .issue_grant(&NewGrant {
+                        kind,
+                        username: user.clone(),
+                        did: format!("did:key:z{user}"),
+                        client_id: "introspect-test".into(),
+                        confidential_client: false,
+                        device_id,
+                        scope: "openid".into(),
+                        name: user,
+                        auth_ms: None,
+                        access_ttl: ACCESS_TOKEN_TTL,
+                        refresh_inactivity_secs: match kind {
+                            GrantKind::Service => None,
+                            GrantKind::MatrixDevice | GrantKind::Oidc => Some(120),
+                        },
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        let session = issue(GrantKind::MatrixDevice, "SIWX_introspect").await;
+        let admin = issue(GrantKind::Service, "").await;
+        let mail = issue(GrantKind::Oidc, "").await;
+        let legacy = format!("introspect_legacy_{tag}");
+        let mut legacy_meta = meta(i64::MAX);
+        legacy_meta.username = format!("introspect-legacy-{tag}");
+        redis.set_token(&legacy, &legacy_meta, 120).await.unwrap();
+
+        let state = IntrospectState {
+            mas_shared_secret: Some("shared-secret".into()),
+            redis_client: redis.clone(),
+        };
+        let ask = |token: String| {
+            let state = state.clone();
+            async move {
+                introspect(
+                    State(state),
+                    Some(TypedHeader(Authorization::bearer("shared-secret").unwrap())),
+                    Form(IntrospectForm {
+                        token,
+                        token_type_hint: None,
+                        client_id: None,
+                        client_secret: None,
+                    }),
+                )
+                .await
+                .expect("a 200")
+                .0
+            }
+        };
+
+        let answer = ask(session.access_token.clone()).await;
+        assert_eq!(answer["active"], true, "a Matrix session: {answer}");
+        assert_eq!(answer["device_id"], "SIWX_introspect");
+        let answer = ask(admin.access_token.clone()).await;
+        assert_eq!(answer["active"], true, "a minted admin token: {answer}");
+        assert!(answer["device_id"].is_null());
+        assert_eq!(ask(legacy.clone()).await["active"], true, "a legacy entry");
+        assert_eq!(
+            ask(mail.access_token.clone()).await,
+            serde_json::json!({"active": false}),
+            "the access token of an oidc grant"
+        );
+        assert_eq!(
+            ask(mail.refresh_token.clone().unwrap()).await,
+            serde_json::json!({"active": false}),
+            "its refresh token"
+        );
+        assert!(
+            redis
+                .lookup_access_token(&mail.access_token)
+                .await
+                .unwrap()
+                .is_some(),
+            "the refusal deletes nothing: the grant's own endpoints still serve it"
+        );
     }
 }

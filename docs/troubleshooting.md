@@ -47,6 +47,7 @@ after a deployment.
 |---|---|---|
 | `/authorize returned 401 Unauthorized instead of 303` | the `client_id` is not registered | register a client ([agents.md](agents.md#prerequisites)) |
 | `/authorize response missing session cookie` | the `redirect_uri` is not registered for that client; the server answered with a 303 to `/error?message=unregistered_redirect_uri`, which sets no session cookie | pass exactly a registered redirect URI (query strings are ignored in the comparison) |
+| `/authorize refused the request: invalid_scope: …` | the scope passed to `authenticate_with_scope` asks for nothing the server will grant this client; the server answered with a 303 to the redirect URI carrying `error` and `error_description`, and the client reports both | read the description; ask for a scope the client may have, or change the client's allowed scopes |
 | `/sign_in returned 400 …: DID method 'key' is not enabled on this server` | `supported_did_methods` does not contain `"key"` | add it (it is in the default) |
 | `/sign_in returned 401 …: Signature verification failed` | the signature does not match the DID in the message | check the key file; do not edit the generated message |
 | `/sign_in returned 401 …: This account has been deactivated …` | the account was deactivated | a deactivated account cannot sign in |

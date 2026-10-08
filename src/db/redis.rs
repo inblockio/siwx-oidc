@@ -9,8 +9,9 @@ use bb8_redis::{
     redis::AsyncCommands,
     RedisConnectionManager,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
+use crate::client_policy;
 use crate::redact::{fingerprint, redact_key};
 use url::Url;
 
@@ -1136,6 +1137,59 @@ impl RedisClient {
     }
 }
 
+impl RedisClient {
+    /// Set the client epoch of `client_id` when replacing its stored entry with `after`
+    /// (`None`: deleting it) ends the grants it holds ([`client_policy::grant_end`]), so every
+    /// grant authenticated before now is refused at both refresh endpoints and at userinfo.
+    /// The start-up sync ([`DBClient::sync_static_clients`]) calls it for every client whose
+    /// entry it overwrites or deletes.
+    ///
+    /// Call it BEFORE the entry is written or deleted. A failure in between leaves the old
+    /// entry in place, so the next start decides again and repeats the epoch, which is
+    /// harmless; the other order could lose the change for good, because the next start
+    /// would find the new entry and see no change.
+    ///
+    /// An entry that is missing, or that this build cannot read, says nothing about the class
+    /// its grants were issued under, and ending sessions that may be Matrix sessions is the
+    /// worse error: it sets no epoch.
+    async fn end_grants_of_changed_client(
+        &self,
+        client_id: &str,
+        after: Option<&ClientEntry>,
+    ) -> Result<()> {
+        let stored = self
+            .get_raw(&format!("{}/{}", KV_CLIENT_PREFIX, client_id))
+            .await?;
+        let Some(stored) = stored else {
+            return Ok(());
+        };
+        let before: ClientEntry = match serde_json::from_str(&stored) {
+            Ok(before) => before,
+            Err(e) => {
+                warn!(
+                    client_id = %client_id,
+                    error = %e,
+                    "the stored entry of a static client cannot be read, so its grants are not ended"
+                );
+                return Ok(());
+            }
+        };
+        let Some(reason) = client_policy::grant_end(&before, after) else {
+            return Ok(());
+        };
+        let epoch_ms = self
+            .set_epoch(super::grant::EpochScope::Client(client_id))
+            .await?;
+        warn!(
+            client_id = %client_id,
+            reason = reason.as_str(),
+            epoch_ms,
+            "ended every grant of a static client, which the configuration no longer matches"
+        );
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl DBClient for RedisClient {
     async fn server_time_ms(&self) -> Result<i64> {
@@ -1228,6 +1282,7 @@ impl DBClient for RedisClient {
         for (id, entry) in &clients {
             let value = serde_json::to_string(entry)
                 .map_err(|e| anyhow!("Failed to serialize client entry: {}", e))?;
+            self.end_grants_of_changed_client(id, Some(entry)).await?;
             // Tracked before it is written: a failure between the two commands then leaves a
             // tracked id without a client, which pruning handles, and never a client without
             // a TTL that nothing tracks.
@@ -1244,6 +1299,7 @@ impl DBClient for RedisClient {
             .iter()
             .filter(|id| !clients.iter().any(|(kept, _)| kept == *id))
         {
+            self.end_grants_of_changed_client(id, None).await?;
             conn.del::<_, ()>(format!("{}/{}", KV_CLIENT_PREFIX, id))
                 .await
                 .map_err(|e| anyhow!("Failed to delete a removed static client: {}", e))?;
@@ -1616,6 +1672,7 @@ mod tests {
             did: format!("did:pkh:eip155:1:0X{}", username.to_uppercase()),
             name: "n".to_string(),
             kind: Some(TokenKind::Access),
+            grant_kind: None,
         }
     }
 
@@ -2288,6 +2345,7 @@ mod tests {
             device_id: None,
             localpart: None,
             scope: None,
+            client_class: None,
         }
     }
 
@@ -3155,5 +3213,97 @@ mod tests {
             "the upgrade must not give a static client an expiry"
         );
         client.del_raw(&key).await.ok();
+    }
+
+    /// The start-up sync stores a generic static client as it is, class and scope policy
+    /// included, with no expiry.
+    #[tokio::test]
+    async fn the_static_client_sync_stores_the_class_and_scope_policy() {
+        use crate::db::{ClientClass, ClientEntry, SiwxClientMetadata};
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let id = format!("sync-generic-{}", unique_nonce());
+        let key = format!("clients/{id}");
+        let metadata = SiwxClientMetadata::new(
+            vec![openidconnect::RedirectUrl::new("https://mail.example.org/cb".into()).unwrap()],
+            Default::default(),
+        );
+        let entry = ClientEntry {
+            class: ClientClass::Generic,
+            allowed_scopes: Some(vec!["openid".into(), "io.inblock.mail".into()]),
+            always_granted_scopes: vec!["io.inblock.mail".into()],
+            ..ClientEntry::new("not-a-secret-test-fixture", metadata, None)
+        };
+
+        client
+            .sync_static_clients(vec![(id.clone(), entry)])
+            .await
+            .unwrap();
+
+        let read = client.get_client(id).await.unwrap().unwrap();
+        let ttl = client.ttl_raw(&key).await.unwrap();
+        client.del_raw(&key).await.ok();
+        client.del_raw(&client.static_clients_key).await.ok();
+        assert_eq!(read.class, ClientClass::Generic);
+        assert_eq!(
+            read.allowed_scopes,
+            Some(vec!["openid".to_string(), "io.inblock.mail".to_string()])
+        );
+        assert_eq!(
+            read.always_granted_scopes,
+            vec!["io.inblock.mail".to_string()]
+        );
+        assert_eq!(ttl, -1, "a static client has no expiry");
+    }
+
+    /// The first read of a plaintext generic client replaces the entry by its digest-only
+    /// form and keeps its class and scope policy, in the entry it returns, in the stored
+    /// value and in every later read.
+    #[tokio::test]
+    async fn an_upgraded_plaintext_client_keeps_its_class_and_scope_policy() {
+        use crate::db::ClientClass;
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let id = format!("plaintext-generic-{}", unique_nonce());
+        let key = format!("clients/{id}");
+        let secret = "not-a-secret-test-fixture";
+        let scopes = ["openid", "profile", "io.inblock.mail"];
+        let plaintext = serde_json::json!({
+            "secret": secret,
+            "metadata": {"redirect_uris": ["https://mail.example.org/callback"]},
+            "class": "generic",
+            "allowed_scopes": scopes,
+            "always_granted_scopes": ["io.inblock.mail"],
+        })
+        .to_string();
+        client.set_raw(&key, &plaintext).await.unwrap();
+
+        let first = client.get_client(id.clone()).await.unwrap().unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_str(&client.get_raw(&key).await.unwrap().unwrap()).unwrap();
+        let second = client.get_client(id).await.unwrap().unwrap();
+        client.del_raw(&key).await.ok();
+
+        assert!(stored.get("secret").is_none(), "upgraded: {stored}");
+        assert_eq!(stored["class"], "generic");
+        assert_eq!(stored["allowed_scopes"], serde_json::json!(scopes));
+        assert_eq!(
+            stored["always_granted_scopes"],
+            serde_json::json!(["io.inblock.mail"])
+        );
+        for entry in [first, second] {
+            assert!(entry.secret_matches(secret));
+            assert_eq!(entry.class, ClientClass::Generic);
+            assert_eq!(
+                entry.allowed_scopes,
+                Some(scopes.iter().map(|s| s.to_string()).collect())
+            );
+            assert_eq!(
+                entry.always_granted_scopes,
+                vec!["io.inblock.mail".to_string()]
+            );
+        }
     }
 }

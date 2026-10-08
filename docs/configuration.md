@@ -111,8 +111,9 @@ abused, leave it out of the list and let its proofs fail; the next sign-in re-as
 
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
-| `default_clients` | `SIWXOIDC_DEFAULT_CLIENTS` | none | Map of client id to a JSON client entry, written to Redis at every start with no expiry. An id removed from the map is deleted at the next start. |
+| `default_clients` | `SIWXOIDC_DEFAULT_CLIENTS` | none | Map of client id to a JSON client entry, written to Redis at every start with no expiry. An id removed from the map is deleted at the next start; for a generic-class client that also ends its sessions, as does a change of its class or `allowed_scopes` ([details](#changes-that-end-a-generic-clients-sessions)). |
 | `require_secret` | `SIWXOIDC_REQUIRE_SECRET` | `true` | Whether `POST /token` demands a client secret, at the code exchange and at the refresh grant alike, from a client whose metadata names no `token_endpoint_auth_method`. A client registered with `"none"` never needs one. |
+| `mail_domain` | `SIWXOIDC_MAIL_DOMAIN` | none | Domain of the mailbox address (`<localpart>@<mail_domain>`) of an account that signs in to a generic client. A lowercase DNS name (at most 63 characters per label and 253 in all) that is not an IP address; required when a static client allows `io.inblock.mail`. With it set, `/userinfo` carries the `io.inblock.mailbox` claim where the rules in [identity-model.md](identity-model.md#the-ioinblockmailbox-userinfo-claim) allow it, and discovery lists the `io.inblock.mail` scope and that claim; without it, neither is listed. |
 
 A client entry is `{"secret": "…", "metadata": {…}}`, where `metadata` is RFC 7591 client
 metadata (at least `redirect_uris`); an optional `"access_token"` is the registration access
@@ -131,9 +132,51 @@ offline by someone who can read Redis. Such a reader on the same host can usuall
 configuration too, where the secret is in the clear, so choose a long random secret and protect
 the configuration as you would the secret.
 
+A `default_clients` entry may also set `"class": "generic"` with `"allowed_scopes": ["openid", …]`,
+for a client that is not a Matrix client. `POST /register` always creates the `matrix` class, and
+an entry without a class is `matrix`. A generic entry may add `"always_granted_scopes"`, scopes
+the client receives even when it does not request them, for a client that cannot ask for them; it
+defaults to empty. Start-up refuses an entry that:
+
+- is generic in a deployment without `mas_shared_secret` or without `synapse_endpoint`: a
+  generic client's account and localpart come from Synapse, and the Synapse client exists only
+  when both are set (without it a sign-in provisions no account and resolves no localpart);
+- is generic without `openid` in `allowed_scopes`, with a scope that starts with `urn:matrix:` or
+  `urn:synapse:`, with a registration access token, or allowing `io.inblock.mail` without
+  `mail_domain`;
+- is Matrix-class and sets `allowed_scopes` or `always_granted_scopes`;
+- lists an `always_granted_scopes` entry that is not in `allowed_scopes`, or lists `openid`
+  there (a client requests `openid`, it is never implied);
+- names a scope that is not a single word of printable characters (RFC 6749 section 3.3).
+
+`mail_domain` is checked as strictly, whether or not a client uses it. Each refusal is a fatal
+error that names the client id (or the setting) and the rule, and it comes before anything is
+written to Redis. A build that predates these members ignores them and reads a generic client
+as a Matrix client, so every instance that shares one Redis must run a build that knows them.
+Never roll back to such a build while a generic client is configured or stored: roll back only
+after this build has started once without the generic client in `default_clients` (the sync
+deletes the entry and ends its sessions) and the older build starts with a map that does not name
+it, because otherwise the older build reads the entry as a Matrix client and the mail client's
+next sign-in gets a Synapse device and the Matrix API scope.
+
+A generic client is granted the scopes it requests that are in `allowed_scopes` (any other is
+dropped), followed by its `always_granted_scopes`. A request that would grant it no `openid` is
+refused: `/authorize` redirects back with `error=invalid_scope`, and an always-granted scope
+never makes up for the missing `openid`. A generic sign-in provisions no Synapse device and
+answers 503 when the homeserver cannot confirm the account; see
+[Provisioning at sign-in](matrix-integration.md#provisioning-at-sign-in). The token endpoint
+then issues the client an `oidc` grant with no device and exactly that scope, and a refresh token
+only when `offline_access` is part of it and the client's registration allows the
+`refresh_token` grant (list `offline_access` in `allowed_scopes` for a client that must refresh);
+it never gets the device-code grant, and no ENS lookup runs for its claims.
+
 ```toml
+[default]
+mail_domain = "matrix.example.org"
+
 [default.default_clients]
 my-app = '{"secret":"change-me","metadata":{"redirect_uris":["https://app.example.org/callback"]}}'
+webmail = '{"secret":"change-me","metadata":{"redirect_uris":["https://mail.example.org/callback"]},"class":"generic","allowed_scopes":["openid","profile","io.inblock.mail"],"always_granted_scopes":["io.inblock.mail"]}'
 ```
 
 Every start makes the static clients in Redis equal that instance's `default_clients`: it writes
@@ -150,12 +193,46 @@ reached it retries, after 1 s and then at doubling intervals up to 60 s, until o
 succeeds; until then those clients stay registered.
 
 Removing a client, whether by dropping its id from `default_clients` or by `DELETE` on a
-dynamically registered one, stops new authorizations and code exchanges for it. It does not end
-the sessions that already exist: a refresh token of a removed client still refreshes (a request
-that presents a secret is refused, because the client can no longer be checked), and each refresh
-issues a new refresh token, so a session keeps refreshing until it is revoked (token revocation,
-sign-out or account deactivation), its refresh token goes unused for 90 days, or its absolute
-lifetime ends when one is set.
+dynamically registered one, stops new authorizations and code exchanges for it. For a Matrix-class
+client it does not end the sessions that already exist: a refresh token of a removed client still
+refreshes (a request that presents a secret is refused, because the client can no longer be
+checked), and each refresh issues a new refresh token, so a session keeps refreshing until it is
+revoked (token revocation, sign-out or account deactivation), its refresh token goes unused for 90
+days, or its absolute lifetime ends when one is set. A generic-class client's sessions do end; see
+the next section.
+
+### Changes that end a generic client's sessions
+
+A generic client's session carries a scope this provider decided from the client's entry, so it
+must not outlive that entry. The start-up sync therefore ends every session of a generic client,
+for good, when the entry it finds in Redis and the configured one differ in one of these ways, or
+when nothing is configured for the id any more (it was dropped from the map, or the server started
+with no `default_clients` at all):
+
+- the client is removed;
+- its class changes, from `generic` to `matrix` or the other way round;
+- its `allowed_scopes` change as a set: a scope added or removed counts, the order and a scope
+  listed twice do not;
+- its registration stops allowing the refresh grant: it listed no `grant_types` or listed
+  `refresh_token`, and now lists `grant_types` without `refresh_token`. A refresh token is issued
+  only while the registration allows it, so the sessions that hold one must not keep rotating
+  under a registration that forbids it. Allowing the refresh grant again ends nothing.
+
+It writes the client's epoch (`epoch:client/{client_id}`, see
+[Epochs](matrix-integration.md#epochs)) before it overwrites or deletes the entry, and logs each
+one as a warning that names the client and the reason (`removed`, `class_changed`,
+`scopes_changed`, `refresh_withdrawn`). From then on every session of the client that was
+authenticated before that moment is refused at the token endpoint's refresh grant and at
+`/userinfo`; the user signs in again, and a sign-in after it works at once. Nothing else ends a
+session: not a restart with the configuration unchanged, not a new secret or redirect URI, not a
+change to `always_granted_scopes` alone, and not a change to a Matrix-class client (above). A
+stored entry that is missing, or that this build cannot read, sets no epoch.
+
+An instance started with another map, or without the generic client, therefore ends every
+session of that client for good, and so does a rollback that carries an older map. The epoch has
+no expiry and stays when the id is configured again: sessions from before it stay refused,
+sessions from after it work. Deleting the `epoch:client/{client_id}` key lifts it for sessions
+that no request has refused yet.
 
 ### Grant lifetime
 
@@ -274,7 +351,7 @@ lookup.
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
 | `mas_shared_secret` | `SIWXOIDC_MAS_SHARED_SECRET` | none | Secret shared with Synapse (its `matrix_authentication_service.secret`). Enables Matrix mode: `mat_`/`mcr_` token prefixes and Matrix scopes, `POST /oauth2/introspect`, `POST /oauth2/admin_token`, and the device-code grant. Without it those endpoints answer 404, the grant is refused, and discovery advertises neither introspection nor the device-code grant. |
-| `synapse_endpoint` | `SIWXOIDC_SYNAPSE_ENDPOINT` | none | Synapse base URL as reachable from siwx-oidc (e.g. `http://synapse:8008`). With `mas_shared_secret` it enables the Synapse client: provisioning, devices, deactivation, DID publication, the sign-in gates. |
+| `synapse_endpoint` | `SIWXOIDC_SYNAPSE_ENDPOINT` | none | Synapse base URL as reachable from siwx-oidc (e.g. `http://synapse:8008`). With `mas_shared_secret` it enables the Synapse client: provisioning, devices, deactivation, DID publication, the sign-in gates. A generic-class `default_clients` entry needs both: start-up refuses it without either. |
 | `matrix_server_name` | `SIWXOIDC_MATRIX_SERVER_NAME` | none | The homeserver's `server_name`. Needed to build MXIDs: DID publication, `GET /resolve`, the `io.inblock.mxid` userinfo claim, `/account` device actions and the passkey picker's account hint. Without it those degrade (skipped, omitted or 503), never 500. |
 | `account_management_uri` | `SIWXOIDC_ACCOUNT_MANAGEMENT_URI` | `{base_url}/account` | MSC4191 account-management URL advertised in discovery; advertised only when a Synapse client and `matrix_server_name` are configured. |
 | `admin_token_ttl_secs` | `SIWXOIDC_ADMIN_TOKEN_TTL_SECS` | `300` | Lifetime of a minted admin-scoped token. Clamped in code to 30–900 s. |

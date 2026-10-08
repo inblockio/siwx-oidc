@@ -204,6 +204,13 @@ pub struct Config {
     /// userinfo claim and `GET /resolve`. Without it those degrade or are skipped.
     /// Env: `SIWEOIDC_MATRIX_SERVER_NAME`
     pub matrix_server_name: Option<String>,
+    /// The domain of the mailbox address (`<localpart>@<mail_domain>`) of an account that
+    /// signs in to a generic-class client. Unset: no account gets one. Must be a lowercase
+    /// DNS name that is not an IP address, and is required when a static client allows
+    /// `io.inblock.mail`; start-up refuses anything else.
+    /// Env: `SIWXOIDC_MAIL_DOMAIN`
+    #[serde(default)]
+    pub mail_domain: Option<String>,
     /// This deployment's terms of service, advertised as `op_tos_uri` in
     /// discovery. Unset or empty (the default): the field is omitted, because
     /// no deployment should advertise terms it did not write. An absolute
@@ -337,6 +344,7 @@ impl Default for Config {
             synapse_endpoint: None,
             log_format: "pretty".to_string(),
             matrix_server_name: None,
+            mail_domain: None,
             op_tos_uri: None,
             op_policy_uri: None,
             account_management_uri: None,
@@ -386,6 +394,20 @@ mod tests {
             scrub_config_env(jail);
             jail.set_env("SIWXOIDC_PORT", 4101);
             assert_eq!(figment().extract::<Config>()?.port, 4101);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_mail_domain_is_unset_by_default_and_read_from_the_environment() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            assert_eq!(figment().extract::<Config>()?.mail_domain, None);
+            jail.set_env("SIWXOIDC_MAIL_DOMAIN", "matrix.example.org");
+            assert_eq!(
+                figment().extract::<Config>()?.mail_domain.as_deref(),
+                Some("matrix.example.org")
+            );
             Ok(())
         });
     }

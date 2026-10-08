@@ -71,7 +71,9 @@ pub struct DeviceAuthResponse {
 ///
 /// Outside delegated-auth mode it refuses before anything is stored, with the
 /// same `unsupported_grant_type` the token endpoint gives the grant: a code
-/// issued there could be approved by the user but never redeemed.
+/// issued there could be approved by the user but never redeemed. A generic-class
+/// client is refused the same way with `unauthorized_client`, because the grant mints
+/// a Matrix session ([`crate::oidc::refuse_device_grant_for`]).
 pub async fn device_authorization(
     config: &Config,
     db_client: &(dyn DBClient + Sync),
@@ -82,10 +84,11 @@ pub async fn device_authorization(
     }
 
     // 1. Validate client_id
-    let _client = db_client
+    let client = db_client
         .get_client(form.client_id.clone())
         .await?
         .ok_or_else(|| CustomError::BadRequest("Unknown client_id".to_string()))?;
+    crate::oidc::refuse_device_grant_for(&client)?;
 
     // 2. Generate codes
     let device_code = generate_opaque_token("dvc_");

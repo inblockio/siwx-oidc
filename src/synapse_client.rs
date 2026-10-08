@@ -113,7 +113,7 @@ pub struct DeviceInfo {
 
 /// Build a fully-qualified Matrix user id (`@localpart:server_name`).
 ///
-/// `pub(crate)` so `oidc::provision_synapse_device` can build the `mxid` claim
+/// `pub(crate)` so `oidc::provision_synapse_account` can build the `mxid` claim
 /// of a DID assertion with the SAME function that builds the URL the assertion
 /// is published to. A second `format!("@{localpart}:{server_name}")` elsewhere
 /// would be a second definition of the binding this whole feature is about, and
@@ -231,7 +231,7 @@ struct AdminMint {
 /// KERNEL gave up: Linux's `tcp_syn_retries` defaults to 6, i.e. ~127 seconds
 /// per connect. "Best-effort, never fails sign-in" was true of Synapse *errors*
 /// and false of Synapse *hangs*, and this branch made that much worse by
-/// putting new awaits on the login path (`provision_synapse_device`'s profile
+/// putting new awaits on the login path (`provision_synapse_account`'s profile
 /// PUT, and `detected_mxid_for` — which turned
 /// `POST /webauthn/authenticate/start`, a route with no Synapse dependency at
 /// all before, into one with two `is_localpart_available` probes).
@@ -696,7 +696,7 @@ impl SynapseClient {
     /// modern localpart" — so an indeterminate 4xx made a **grandfathered**
     /// user, whose legacy account genuinely exists, fall through to a
     /// brand-new empty modern account, under which
-    /// `oidc::provision_synapse_device` then published a second,
+    /// `oidc::provision_synapse_account` then published a second,
     /// independently-verifying `io.inblock.did` assertion. Two provider-signed
     /// assertions for one DID, with no way for a consumer to tell which is
     /// canonical, and Synapse has no rename API to undo it: finding **D4** of
@@ -876,7 +876,7 @@ impl SynapseClient {
     /// one is available, otherwise with no credential; see [`Self::read_profile`]).
     ///
     /// This is the half-provisioning discriminator behind the self-heal in
-    /// [`crate::oidc::provision_synapse_device`]: the 2026-08-01 dev incident
+    /// [`crate::oidc::provision_synapse_account`]: the 2026-08-01 dev incident
     /// found an account with a Synapse `users` row but no `profiles` row (because
     /// `provision_user` failed transiently at first sign-in), which then silently
     /// failed every subsequent displayname write.
@@ -922,7 +922,7 @@ impl SynapseClient {
     /// The same read as [`Self::has_profile_row`], returning the displayname it
     /// already fetched alongside the presence verdict.
     ///
-    /// Split out for the alias-tier migration (`oidc::provision_synapse_device`):
+    /// Split out for the alias-tier migration (`oidc::provision_synapse_account`):
     /// deciding whether a displayname was written by US or chosen by the USER
     /// requires seeing its value, and doing that with a second GET would double
     /// the login-path probe count for a value this request already has in hand.
