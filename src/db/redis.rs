@@ -414,6 +414,25 @@ impl RedisClient {
         Ok(())
     }
 
+    /// Store a key-value pair with no TTL, only if `key` does not exist yet
+    /// (`SET NX`, one atomic step). Returns `false`, having written nothing,
+    /// when the key already existed.
+    pub async fn set_nx_raw(&self, key: &str, value: &str) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+        let reply: Option<String> = bb8_redis::redis::cmd("SET")
+            .arg(key)
+            .arg(value)
+            .arg("NX")
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("Redis SET NX: {}", e))?;
+        Ok(reply.is_some())
+    }
+
     /// Get a value by key.
     pub async fn get_raw(&self, key: &str) -> Result<Option<String>> {
         let mut conn = self

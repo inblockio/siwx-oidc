@@ -536,12 +536,34 @@ pub async fn register_start(
     Ok(ccr)
 }
 
+/// Typed outcome of a failed registration finish.
+///
+/// `AlreadyRegistered` is the one case a handler renders differently: the
+/// credential id is already stored, so the registration was refused and nothing
+/// was written. Every other failure (missing or expired challenge, attestation
+/// verification, I/O) stays `Other`.
+#[derive(Debug, Error)]
+pub enum RegisterFinishError {
+    /// A passkey with this credential id is already stored; nothing was written.
+    #[error("credential id already registered")]
+    AlreadyRegistered,
+    /// Any other registration failure.
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// Verify a registration and store its passkey.
+///
+/// Create-only: the passkey is written with an atomic set-if-absent, before any
+/// index or mirror write, so an id that is already stored is refused with
+/// [`RegisterFinishError::AlreadyRegistered`] and the stored passkey, the
+/// `by_did` index and the credential-store mirror stay exactly as they were.
 pub async fn register_finish(
     webauthn: &Webauthn,
     redis: &RedisClient,
     session_id: &str,
     reg_response: RegisterPublicKeyCredential,
-) -> Result<RegisterFinishResponse> {
+) -> Result<RegisterFinishResponse, RegisterFinishError> {
     // Retrieve and consume the registration state.
     let state_json = redis
         .take_ceremony_state(Ceremony::Challenge, session_id)
@@ -558,15 +580,22 @@ pub async fn register_finish(
     let did = did_from_passkey(&passkey)?;
     let cred_id_b64 = URL_SAFE_NO_PAD.encode(passkey.cred_id());
 
-    // Store the credential persistently (no TTL).
+    // Store the credential persistently (no TTL), only if the id is new.
     let cred_json = serde_json::to_string(&passkey)
         .map_err(|e| anyhow!("Failed to serialize passkey: {}", e))?;
-    redis
-        .set_raw(
+    let created = redis
+        .set_nx_raw(
             &format!("{}/{}", CREDENTIAL_PREFIX, cred_id_b64),
             &cred_json,
         )
         .await?;
+    if !created {
+        info!(
+            "webauthn register_finish: credential id already registered, refused: cred_id={}",
+            siwx_oidc::redact::fingerprint(&cred_id_b64)
+        );
+        return Err(RegisterFinishError::AlreadyRegistered);
+    }
 
     // Maintain the webauthn:by_did reverse index so a returning login can scope
     // the passkey picker to this DID's keys without a credential keyspace scan.
@@ -1855,5 +1884,236 @@ mod tests {
         redis.index_remove_passkey(&did_a, &cred_a).await.ok();
         redis.index_remove_passkey(&did_b, &cred_b).await.ok();
         redis.destroy_user_session(&token).await.ok();
+    }
+
+    // -- Registration through a software authenticator ------------------------
+    //
+    // These helpers answer `register_start`'s options for the
+    // `http://localhost:8000` RP the way a browser authenticator would, with a
+    // `none` attestation built by a minimal CBOR writer instead of a
+    // software-authenticator dependency.
+
+    const REG_TEST_ORIGIN: &str = "http://localhost:8000";
+
+    /// One CBOR head: major type `major`, argument `n` (RFC 8949 section 3).
+    fn cbor_head(out: &mut Vec<u8>, major: u8, n: u64) {
+        let m = major << 5;
+        match n {
+            0..=23 => out.push(m | n as u8),
+            24..=0xff => out.extend_from_slice(&[m | 24, n as u8]),
+            0x100..=0xffff => {
+                out.push(m | 25);
+                out.extend_from_slice(&(n as u16).to_be_bytes());
+            }
+            _ => {
+                out.push(m | 26);
+                out.extend_from_slice(
+                    &u32::try_from(n)
+                        .expect("test CBOR stays small")
+                        .to_be_bytes(),
+                );
+            }
+        }
+    }
+
+    fn cbor_int(out: &mut Vec<u8>, v: i64) {
+        if v >= 0 {
+            cbor_head(out, 0, v as u64);
+        } else {
+            cbor_head(out, 1, (-1 - v) as u64);
+        }
+    }
+
+    fn cbor_bytes(out: &mut Vec<u8>, b: &[u8]) {
+        cbor_head(out, 2, b.len() as u64);
+        out.extend_from_slice(b);
+    }
+
+    fn cbor_text(out: &mut Vec<u8>, s: &str) {
+        cbor_head(out, 3, s.len() as u64);
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    /// The did:key a registration of `key` resolves to.
+    fn did_of(key: &p256::ecdsa::SigningKey) -> String {
+        let point = key.verifying_key().to_encoded_point(true);
+        let compressed: [u8; 33] = point.as_bytes().try_into().expect("compressed P-256");
+        aqua_auth::did_key_from_p256_compressed(&compressed)
+    }
+
+    /// The authenticator's answer to `challenge`: a `none` attestation of a
+    /// user-verified ES256 credential `cred_id` holding `key`'s public key.
+    fn none_attestation(
+        challenge: &[u8],
+        cred_id: &[u8],
+        key: &p256::ecdsa::SigningKey,
+    ) -> RegisterPublicKeyCredential {
+        use sha2::{Digest, Sha256};
+
+        let client_data_json = serde_json::json!({
+            "type": "webauthn.create",
+            "challenge": URL_SAFE_NO_PAD.encode(challenge),
+            "origin": REG_TEST_ORIGIN,
+            "crossOrigin": false,
+        })
+        .to_string()
+        .into_bytes();
+
+        let point = key.verifying_key().to_encoded_point(false);
+        let mut cose_key = Vec::new();
+        cbor_head(&mut cose_key, 5, 5);
+        cbor_int(&mut cose_key, 1); // kty
+        cbor_int(&mut cose_key, 2); // EC2
+        cbor_int(&mut cose_key, 3); // alg
+        cbor_int(&mut cose_key, -7); // ES256
+        cbor_int(&mut cose_key, -1); // crv
+        cbor_int(&mut cose_key, 1); // P-256
+        cbor_int(&mut cose_key, -2);
+        cbor_bytes(&mut cose_key, point.x().expect("x"));
+        cbor_int(&mut cose_key, -3);
+        cbor_bytes(&mut cose_key, point.y().expect("y"));
+
+        let mut auth_data = Sha256::digest(b"localhost").to_vec();
+        auth_data.push(0x45); // UP | UV | AT
+        auth_data.extend_from_slice(&0u32.to_be_bytes()); // signCount
+        auth_data.extend_from_slice(&[0u8; 16]); // AAGUID
+        auth_data.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());
+        auth_data.extend_from_slice(cred_id);
+        auth_data.extend_from_slice(&cose_key);
+
+        let mut attestation_object = Vec::new();
+        cbor_head(&mut attestation_object, 5, 3);
+        cbor_text(&mut attestation_object, "fmt");
+        cbor_text(&mut attestation_object, "none");
+        cbor_text(&mut attestation_object, "attStmt");
+        cbor_head(&mut attestation_object, 5, 0);
+        cbor_text(&mut attestation_object, "authData");
+        cbor_bytes(&mut attestation_object, &auth_data);
+
+        RegisterPublicKeyCredential {
+            id: URL_SAFE_NO_PAD.encode(cred_id),
+            raw_id: cred_id.to_vec(),
+            response: webauthn_rs_proto::AuthenticatorAttestationResponseRaw {
+                attestation_object,
+                client_data_json,
+                transports: None,
+            },
+            type_: "public-key".to_string(),
+            extensions: Default::default(),
+        }
+    }
+
+    /// `register_start` then `register_finish` for credential `cred_id` holding `key`.
+    async fn register_with(
+        webauthn: &Webauthn,
+        redis: &RedisClient,
+        cred_id: &[u8],
+        key: &p256::ecdsa::SigningKey,
+    ) -> Result<RegisterFinishResponse, RegisterFinishError> {
+        let session_id = format!("regtest{}", Uuid::new_v4().simple());
+        let ccr = register_start(webauthn, redis, &session_id, None)
+            .await
+            .expect("register_start");
+        let reg = none_attestation(&ccr.public_key.challenge, cred_id, key);
+        register_finish(webauthn, redis, &session_id, reg).await
+    }
+
+    fn reg_test_webauthn() -> WebauthnConfig {
+        build_webauthn(&Url::parse(REG_TEST_ORIGIN).unwrap(), None, None).expect("build webauthn")
+    }
+
+    fn by_did_key(did: &str) -> String {
+        format!("{}/{}", siwx_oidc::db::KV_WEBAUTHN_BY_DID_PREFIX, did)
+    }
+
+    /// Registration is create-only: a second registration under a credential id
+    /// that is already stored is refused, and leaves the stored passkey and the
+    /// second key's DID index exactly as they were. Needs Redis
+    /// (`siwx_oidc::test_support::redis`).
+    #[tokio::test]
+    async fn registering_an_existing_credential_id_is_refused_and_the_stored_blob_is_unchanged() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let cfg = reg_test_webauthn();
+        let cred_id = Uuid::new_v4().as_bytes().to_vec();
+        let cred_b64 = URL_SAFE_NO_PAD.encode(&cred_id);
+        let cred_key = format!("{CREDENTIAL_PREFIX}/{cred_b64}");
+        let key_a = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let key_b = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let (did_a, did_b) = (did_of(&key_a), did_of(&key_b));
+
+        let first = register_with(&cfg.webauthn, &redis, &cred_id, &key_a)
+            .await
+            .expect("the first registration of a fresh id succeeds");
+        assert_eq!(first.did, did_a);
+        let stored = redis
+            .get_raw(&cred_key)
+            .await
+            .expect("GET")
+            .expect("the first registration stored the passkey");
+
+        let second = register_with(&cfg.webauthn, &redis, &cred_id, &key_b).await;
+        let after = redis.get_raw(&cred_key).await.expect("GET");
+        let index_b = redis
+            .smembers_raw(&by_did_key(&did_b))
+            .await
+            .expect("SMEMBERS");
+
+        // Cleanup before asserting, so a failing run leaves nothing behind.
+        redis.del_raw(&cred_key).await.ok();
+        redis.index_remove_passkey(&did_a, &cred_b64).await.ok();
+        redis.index_remove_passkey(&did_b, &cred_b64).await.ok();
+
+        assert_eq!(
+            after.as_deref(),
+            Some(stored.as_str()),
+            "the stored passkey for an existing credential id was replaced"
+        );
+        assert!(
+            matches!(second, Err(RegisterFinishError::AlreadyRegistered)),
+            "a second registration under an existing credential id must be refused as \
+             AlreadyRegistered, got {:?}",
+            second.as_ref().map(|r| &r.did)
+        );
+        assert!(
+            !index_b.contains(&cred_b64),
+            "the second key's DID index lists the existing credential id"
+        );
+    }
+
+    /// Control: a credential id never seen before registers, is stored, and is
+    /// indexed under the DID of its key. Needs Redis.
+    #[tokio::test]
+    async fn a_fresh_credential_id_still_registers() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let cfg = reg_test_webauthn();
+        let cred_id = Uuid::new_v4().as_bytes().to_vec();
+        let cred_b64 = URL_SAFE_NO_PAD.encode(&cred_id);
+        let cred_key = format!("{CREDENTIAL_PREFIX}/{cred_b64}");
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let did = did_of(&key);
+
+        let resp = register_with(&cfg.webauthn, &redis, &cred_id, &key).await;
+        let stored = redis.get_raw(&cred_key).await.expect("GET");
+        let index = redis
+            .smembers_raw(&by_did_key(&did))
+            .await
+            .expect("SMEMBERS");
+
+        redis.del_raw(&cred_key).await.ok();
+        redis.index_remove_passkey(&did, &cred_b64).await.ok();
+
+        let resp = resp.expect("a fresh credential id registers");
+        assert_eq!(resp.did, did);
+        assert_eq!(resp.credential_id, cred_b64);
+        let stored = stored.expect("the passkey is stored");
+        assert_eq!(
+            derive_did_from_credential_json(&stored).as_deref(),
+            Some(did.as_str())
+        );
+        assert_eq!(index, vec![cred_b64]);
     }
 }

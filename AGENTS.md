@@ -987,6 +987,12 @@ doc; read it before changing the code the rule covers.
 - **Only `VerifyError::UnknownCredential` becomes a 401** with the `unknown_credential`
   discriminator, and only that triggers `signalUnknownCredential`. Pin:
   `unknown_credential_maps_to_401_discriminator`, `other_verify_error_stays_internal_error`.
+- **Registration is create-only.** `register_finish` stores the passkey with an atomic
+  set-if-absent (`set_nx_raw`) before the `by_did` index and the mirror; never a plain SET
+  there, and never an index or mirror write before it. An id already stored is refused with a
+  fixed 400 and nothing changes. Pin:
+  `registering_an_existing_credential_id_is_refused_and_the_stored_blob_is_unchanged`,
+  `an_already_registered_credential_id_renders_400_with_a_fixed_body`.
 - **No server-side method prediction.** The login page does not grey out a method from a server hint.
 - **A link overrides the derived DID**, for every reader (`credential_identity`); the credential
   store mirror never writes `webauthn:link/*`. Pin: `a_link_still_overrides_the_derived_did`,
