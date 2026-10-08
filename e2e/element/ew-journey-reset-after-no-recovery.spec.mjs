@@ -225,7 +225,7 @@ async function driveToShell(page, tag, { maxSteps = 24, stallLimit = 4 } = {}) {
   return { screens, outcome: 'MAX_STEPS', stall };
 }
 
-test('EW-R1: cancel recovery setup → logout → re-login → reset identity — does the user get in?', async ({
+test('EW-R1: cancel recovery setup → logout → re-login → reset identity — does the user get in?', { tag: '@ew-p1' }, async ({
   browser,
 }) => {
   test.setTimeout(1_500_000);

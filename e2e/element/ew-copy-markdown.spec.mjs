@@ -267,7 +267,7 @@ const CM6_HTML = [
  */
 const CM7_BODY = CM5_INPUT;
 
-test.describe('Copy Markdown context-menu entry (encrypted room)', () => {
+test.describe('Copy Markdown context-menu entry (encrypted room)', { tag: '@ew-p11' }, () => {
   test.describe.configure({ timeout: 240_000 });
 
   let context;

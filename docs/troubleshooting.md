@@ -234,6 +234,11 @@ MAS deployment before looking anywhere else.
 - **`/resolve` answers 503**: the deployment has no server name or no Synapse
   client. **502**: Synapse could not be asked; the body says what failed. **504**:
   the lookup took more than 10 seconds.
+- **`/resolve` says `exists: false` for an account that signed in before**: the
+  account is deactivated or erased. Synapse keeps such an account's localpart
+  reserved, and `/resolve` reports it as gone and reads nothing else from it
+  (`did: null` on the `?mxid=` path). A deactivated account that is reactivated
+  reads `exists: true` again.
 - **A 500 from Synapse on a profile read or write for one account**: that
   account has no profile row (element-hq/synapse#19702; affected: Synapse 1.160
   and earlier; 1.161 fixes some of the paths (#20149, #20172); #19702 remains

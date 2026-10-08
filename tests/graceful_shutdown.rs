@@ -16,123 +16,223 @@
 //! delay listening nor hold up shutdown. The in-flight request (`GET /resolve`
 //! for an unregistered DID) asks only the homeserver, which the test plays
 //! itself.
+//!
+//! The server is started on port 0 and the test reads the port it got from the
+//! server's `Listening on` line. The server logs that line after the bind and
+//! after the signal handlers are installed, so once it appears the port accepts
+//! and a signal is handled, and the test cannot be talking to anything but the
+//! server. Picking a free port in the test and passing the number on gives
+//! neither: between the test releasing the port and the server binding it, any
+//! other listener on the machine can be handed the same number, and the test
+//! then connects to that listener, signals a server that is still starting, or
+//! finds the server dead with "address already in use".
 
 #![cfg(unix)]
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::process::{Child, Command, ExitStatus};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+/// How long a server may take to log where it listens, or to refuse to start.
+const START_UP: Duration = Duration::from_secs(30);
 
 /// A Redis address nothing listens on: port 1 refuses at once. The spawned server is pointed
 /// here so that it cannot reach a real Redis, whatever the caller's environment names.
 const UNREACHABLE_REDIS_URL: &str = "redis://127.0.0.1:1";
 
-/// Start the server on a free port with `env` added; return it and its port.
-///
-/// The server gets only the environment set here, never the caller's: a caller's
-/// `SIWXOIDC_REDIS_URL` (or the default `redis://localhost`) could name a Redis that holds
-/// static clients, which a server started with no `default_clients` deletes.
-fn spawn_server(env: &[(&str, String)]) -> (Child, u16) {
-    let port = free_port();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_siwx-oidc"));
-    command
-        .env_clear()
-        .env("SIWXOIDC_ADDRESS", "127.0.0.1")
-        .env("SIWXOIDC_PORT", port.to_string())
-        .env("SIWXOIDC_BASE_URL", format!("http://localhost:{port}"))
-        .env("SIWXOIDC_REDIS_URL", UNREACHABLE_REDIS_URL)
-        .env("RUST_LOG", "siwx_oidc=info")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    for (key, value) in env {
-        command.env(key, value);
+/// The port named by a `Listening on <address>` log line.
+fn listening_port(line: &str) -> Option<u16> {
+    let (_, rest) = line.split_once("Listening on ")?;
+    let address = rest
+        .split(|c: char| c.is_whitespace() || c == '\u{1b}')
+        .next()?;
+    address.parse::<SocketAddr>().ok().map(|a| a.port())
+}
+
+/// A running server. Dropping it kills the process, so a failed assertion leaves none behind.
+struct Server {
+    child: Child,
+    port: u16,
+    /// What the server prints, stdout and stderr in the order it wrote them.
+    lines: mpsc::Receiver<String>,
+    printed: Vec<String>,
+}
+
+impl Server {
+    /// Start the server on port 0 with `env` added, without waiting for it to listen.
+    ///
+    /// The server gets only the environment set here, never the caller's: a caller's
+    /// `SIWXOIDC_REDIS_URL` (or the default `redis://localhost`) could name a Redis that holds
+    /// static clients, which a server started with no `default_clients` deletes.
+    fn spawn(env: &[(&str, String)]) -> Server {
+        let (reader, writer) = std::io::pipe().expect("create the server's output pipe");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_siwx-oidc"));
+        command
+            .env_clear()
+            .env("SIWXOIDC_ADDRESS", "127.0.0.1")
+            .env("SIWXOIDC_PORT", "0")
+            .env("SIWXOIDC_BASE_URL", "http://localhost")
+            .env("SIWXOIDC_REDIS_URL", UNREACHABLE_REDIS_URL)
+            .env("RUST_LOG", "siwx_oidc=info")
+            .env("RUST_BACKTRACE", "1")
+            .stdout(writer.try_clone().expect("share the output pipe"))
+            .stderr(writer);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let child = command.spawn().expect("spawn the siwx-oidc binary");
+
+        let (sender, lines) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(reader).lines().map_while(Result::ok) {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Server {
+            child,
+            port: 0,
+            lines,
+            printed: Vec::new(),
+        }
     }
-    (command.spawn().expect("spawn the siwx-oidc binary"), port)
-}
 
-/// Wait until the server accepts a connection, and return that connection.
-fn connect_when_listening(server: &mut Child, port: u16) -> TcpStream {
-    let started = Instant::now();
-    loop {
-        if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) {
-            return stream;
+    /// Start the server and wait until it says where it listens.
+    fn start(env: &[(&str, String)]) -> Server {
+        let mut server = Server::spawn(env);
+        server.port = server.wait_until_listening();
+        server
+    }
+
+    fn wait_until_listening(&mut self) -> u16 {
+        let deadline = Instant::now() + START_UP;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) => {
+                    let port = listening_port(&line);
+                    self.printed.push(line);
+                    if let Some(port) = port {
+                        assert_ne!(
+                            port,
+                            0,
+                            "the server named the address it was asked for, not the one it bound; output:\n{}",
+                            self.output()
+                        );
+                        return port;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!(
+                        "siwx-oidc did not say where it listens within {START_UP:?}; output:\n{}",
+                        self.output()
+                    );
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.child.kill().ok();
+                    let status = self.child.wait().expect("wait for the server");
+                    panic!(
+                        "siwx-oidc exited before it listened: {status}; output:\n{}",
+                        self.output()
+                    );
+                }
+            }
         }
-        if let Some(status) = server.try_wait().unwrap() {
-            panic!("siwx-oidc exited before it listened: {status}");
+    }
+
+    /// A connection the server has accepted and answered once, now idle: the keep-alive
+    /// connection of a client between two requests.
+    fn idle_connection(&self) -> TcpStream {
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", self.port)).expect("connect to the server");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream
+                .read_exact(&mut byte)
+                .expect("the server answers /health");
+            head.push(byte[0]);
         }
-        if started.elapsed() > Duration::from_secs(30) {
-            server.kill().ok();
-            panic!("siwx-oidc did not listen on {port} within 30 s");
+        assert!(
+            head.starts_with(b"HTTP/1.1 200"),
+            "unexpected answer from /health: {}",
+            String::from_utf8_lossy(&head)
+        );
+        stream.set_read_timeout(None).unwrap();
+        stream
+    }
+
+    fn send_signal(&self, signal: &str) {
+        let kill = Command::new("kill")
+            .args([&format!("-{signal}"), &self.child.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(kill.success(), "kill -{signal} failed: {kill}");
+    }
+
+    /// Wait for the server to exit, at most `within` from now; `after` says what it was waiting for.
+    fn wait_exit(&mut self, after: &str, within: Duration) -> ExitStatus {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                started.elapsed() <= within,
+                "siwx-oidc still running {within:?} after {after}; output:\n{}",
+                self.output()
+            );
+            sleep(Duration::from_millis(20));
         }
-        sleep(Duration::from_millis(50));
+    }
+
+    /// Everything the server has printed so far.
+    fn output(&mut self) -> String {
+        while let Ok(line) = self.lines.recv_timeout(Duration::from_millis(500)) {
+            self.printed.push(line);
+        }
+        self.printed.join("\n")
     }
 }
 
-fn send_signal(server: &Child, signal: &str) {
-    let kill = Command::new("kill")
-        .args([&format!("-{signal}"), &server.id().to_string()])
-        .status()
-        .expect("run kill");
-    assert!(kill.success(), "kill -{signal} failed: {kill}");
-}
-
-/// Wait for the server to exit, at most `within` after the signal.
-fn wait_exit(server: &mut Child, signal: &str, within: Duration) -> ExitStatus {
-    let signalled = Instant::now();
-    loop {
-        if let Some(status) = server.try_wait().unwrap() {
-            return status;
-        }
-        if signalled.elapsed() > within {
-            server.kill().ok();
-            panic!("siwx-oidc still running {within:?} after SIG{signal}");
-        }
-        sleep(Duration::from_millis(20));
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.child.kill().ok();
+        self.child.wait().ok();
     }
-}
-
-fn log_of(server: &mut Child) -> String {
-    let mut log = String::new();
-    server
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut log)
-        .unwrap();
-    log
 }
 
 /// Signal the server while a client holds an idle connection open, and
 /// require a prompt exit with status 0 and a shutdown line naming the signal.
 fn stops_cleanly_on(signal: &str) {
-    let (mut server, port) = spawn_server(&[]);
+    let mut server = Server::start(&[]);
     // Held open and silent across the signal: a client's idle keep-alive
-    // connection must not keep the server alive until the SIGKILL.
-    let idle = connect_when_listening(&mut server, port);
+    // connection must not keep the server alive until the SIGKILL. The server
+    // has answered it, so it has accepted it.
+    let idle = server.idle_connection();
 
-    send_signal(&server, signal);
-    let status = wait_exit(&mut server, signal, Duration::from_secs(5));
+    server.send_signal(signal);
+    let status = server.wait_exit(&format!("SIG{signal}"), Duration::from_secs(5));
     drop(idle);
 
-    let log = log_of(&mut server);
+    let log = server.output();
     assert!(
         status.success(),
-        "expected exit status 0 after SIG{signal}, got {status}; log:\n{log}"
+        "expected exit status 0 after SIG{signal}, got {status}; output:\n{log}"
     );
     assert!(
         log.contains("shutting down") && log.contains(&format!("SIG{signal}")),
-        "no shutdown line naming SIG{signal} in the log:\n{log}"
+        "no shutdown line naming SIG{signal} in the output:\n{log}"
     );
 }
 
@@ -145,6 +245,28 @@ fn sigterm_finishes_and_exits_zero_with_an_idle_connection_open() {
 #[test]
 fn sigint_finishes_and_exits_zero_with_an_idle_connection_open() {
     stops_cleanly_on("INT");
+}
+
+/// The server logs where it listens only after it has bound, so a server that cannot bind must
+/// say which address it tried: that is all an operator has to go on.
+#[test]
+fn a_server_that_cannot_bind_says_which_address() {
+    let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let mut server = Server::spawn(&[("SIWXOIDC_PORT", port.to_string())]);
+
+    let status = server.wait_exit("start-up", START_UP);
+    let log = server.output();
+    drop(taken);
+
+    assert!(
+        !status.success(),
+        "a server whose port is taken must not start; output:\n{log}"
+    );
+    assert!(
+        log.contains(&format!("could not bind 127.0.0.1:{port}")),
+        "the failure must name the address; output:\n{log}"
+    );
 }
 
 /// A listener nothing answers on, and the `redis://` URL that names it.
@@ -192,11 +314,6 @@ impl Drop for CallerEnv {
     }
 }
 
-fn stop(mut server: Child) {
-    server.kill().ok();
-    server.wait().ok();
-}
-
 /// With no `default_clients`, the one thing the server does with Redis at start-up is prune
 /// the static clients an earlier configuration left there. A test server that inherited a
 /// developer's `SIWXOIDC_REDIS_URL` (or the default `redis://localhost`) would delete the
@@ -206,10 +323,9 @@ fn stop(mut server: Child) {
 #[test]
 fn a_spawned_server_never_reaches_the_redis_the_callers_environment_names() {
     let (told, told_url) = redis_trap();
-    let (mut server, port) = spawn_server(&[("SIWXOIDC_REDIS_URL", told_url)]);
-    drop(connect_when_listening(&mut server, port));
+    let server = Server::start(&[("SIWXOIDC_REDIS_URL", told_url)]);
     let reached = connection_arrives(&told, Duration::from_secs(10));
-    stop(server);
+    drop(server);
     assert!(
         reached,
         "control: a server given a Redis URL connects to it at start-up"
@@ -217,10 +333,9 @@ fn a_spawned_server_never_reaches_the_redis_the_callers_environment_names() {
 
     let (trap, trap_url) = redis_trap();
     let _caller = CallerEnv::set("SIWXOIDC_REDIS_URL", &trap_url);
-    let (mut server, port) = spawn_server(&[]);
-    drop(connect_when_listening(&mut server, port));
+    let server = Server::start(&[]);
     let reached = connection_arrives(&trap, Duration::from_secs(2));
-    stop(server);
+    drop(server);
     assert!(
         !reached,
         "the spawned server inherited the caller's SIWXOIDC_REDIS_URL and connected to it"
@@ -237,9 +352,7 @@ fn a_spawned_server_ignores_the_static_clients_in_the_callers_environment() {
         "SIWXOIDC_DEFAULT_CLIENTS__LEAKED",
         r#"{"secret":"not-a-secret-test-fixture","metadata":{"redirect_uris":["https://app.example.org/cb"]}}"#,
     );
-    let (mut server, port) = spawn_server(&[]);
-    drop(connect_when_listening(&mut server, port));
-    stop(server);
+    let _server = Server::start(&[]);
 }
 
 /// A homeserver that answers every request with 200 `{}` after `delay`, and
@@ -284,7 +397,7 @@ fn slow_homeserver(delay: Duration) -> (u16, mpsc::Receiver<String>) {
 #[test]
 fn a_request_in_flight_when_sigterm_arrives_is_still_answered() {
     let (homeserver, requests) = slow_homeserver(Duration::from_secs(1));
-    let (mut server, port) = spawn_server(&[
+    let mut server = Server::start(&[
         (
             "SIWXOIDC_SYNAPSE_ENDPOINT",
             format!("http://127.0.0.1:{homeserver}"),
@@ -292,7 +405,7 @@ fn a_request_in_flight_when_sigterm_arrives_is_still_answered() {
         ("SIWXOIDC_MAS_SHARED_SECRET", "secret".to_string()),
         ("SIWXOIDC_MATRIX_SERVER_NAME", "example.org".to_string()),
     ]);
-    drop(connect_when_listening(&mut server, port));
+    let port = server.port;
 
     // An unregistered DID: the lookup probes the homeserver twice (legacy,
     // then modern localpart), a second each, and needs nothing else.
@@ -315,14 +428,14 @@ fn a_request_in_flight_when_sigterm_arrives_is_still_answered() {
         .expect("the lookup must reach the homeserver");
     assert!(first.contains("is_localpart_available"), "{first}");
 
-    send_signal(&server, "TERM");
-    let status = wait_exit(&mut server, "TERM", Duration::from_secs(10));
+    server.send_signal("TERM");
+    let status = server.wait_exit("SIGTERM", Duration::from_secs(10));
     let response = lookup.join().expect("the lookup thread");
-    let log = log_of(&mut server);
+    let log = server.output();
 
     assert!(
         response.starts_with("HTTP/1.1 200"),
-        "the request in flight must get its full answer, got:\n{response}\nlog:\n{log}"
+        "the request in flight must get its full answer, got:\n{response}\noutput:\n{log}"
     );
     assert!(
         response.contains(r#""exists":false"#),
@@ -330,6 +443,6 @@ fn a_request_in_flight_when_sigterm_arrives_is_still_answered() {
     );
     assert!(
         status.success(),
-        "expected exit status 0 after SIGTERM, got {status}; log:\n{log}"
+        "expected exit status 0 after SIGTERM, got {status}; output:\n{log}"
     );
 }

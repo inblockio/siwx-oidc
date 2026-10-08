@@ -141,8 +141,9 @@ conventions are worth knowing because they look like bugs and are not:
   guess an answer.
 - **`/resolve?did=` is a 400 for anything that is not a DID a sign-in here
   accepts** (`kenn`, `did:pkh:garbage`, `did:web:…`), decided before the
-  homeserver is asked. So `exists: false` always means a real DID that has never
-  signed in here, never a typo.
+  homeserver is asked. So `exists: false` always means a real DID with no active
+  account here (it never signed in, or its account was deactivated or erased),
+  never a typo.
 
 ## Stability
 

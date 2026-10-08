@@ -37,11 +37,11 @@
 //!   defaults to False, 1.159.0 `config/server.py:561`) and which **federates**
 //!   via `handlers/profile.py::on_profile_query`. The live probe read it back
 //!   with no `Authorization` header at all.
-//! - The one thing this server adds is `exists`, which is
-//!   `SynapseClient::localpart_status` — whether a localpart is taken. That is
-//!   already observable without this server through the same unauthenticated,
-//!   federated profile route the bullet above describes: an account that does
-//!   not exist cannot answer it.
+//! - The one thing this server adds is `exists`: whether an ACTIVE account
+//!   holds the localpart. The "holds the localpart" half is
+//!   `SynapseClient::localpart_status`, and that is already observable without
+//!   this server through the same unauthenticated, federated profile route the
+//!   bullet above describes: an account that does not exist cannot answer it.
 //!
 //!   (This used to cite `GET /_matrix/client/v3/register/available` as "the
 //!   same answer any client gets". That route does not exist on this
@@ -50,16 +50,30 @@
 //!   route; the mechanism originally cited did not, and citing a mechanism
 //!   that is not there is how a privacy argument quietly stops being true.)
 //!
-//! So authentication would buy **rate-limiting, not secrecy**, and it is not
-//! implemented here: a rate limiter belongs at the reverse proxy that already
-//! fronts this service (Caddy), where it can be shaped per-deployment without a
-//! release. Do not add an in-process one here on the theory that it protects
-//! privacy — it would protect nothing that is not already public, while making
-//! the endpoint useless to the unauthenticated consumers it exists for.
+//!   The "active" half is `SynapseClient::query_user`, and that half is NOT
+//!   observable there. Synapse keeps the `users` row of an account it
+//!   deactivates or erases, so the localpart stays taken for good, and a plain
+//!   deactivation leaves the profile readable as before. So `exists` also
+//!   reflects deactivation, which `query_user` reports and the public profile
+//!   route does not show, and a caller who reads both can tell a deactivated
+//!   account from one that never existed. That one fact is deliberate: a
+//!   deactivated account must not read as a live Matrix account to a consumer
+//!   that acts on `exists`. An erasure deletes the profile too, so an erased
+//!   account looks like one that never existed on the profile route, and reads
+//!   `exists: false` here exactly like a deactivated one.
+//!
+//! So authentication would buy **rate-limiting, not secrecy**, apart from that
+//! one deliberate fact, and it is not implemented here: a rate limiter belongs
+//! at the reverse proxy that already fronts this service (Caddy), where it can
+//! be shaped per-deployment without a release. Do not add an in-process one
+//! here on the theory that it protects privacy: it would protect nothing that
+//! is not already public, while making the endpoint useless to the
+//! unauthenticated consumers it exists for.
 //!
 //! This is also why nothing beyond the four documented fields may ever be added
-//! to the response. The moment it carries something a caller could not have
-//! computed or fetched themselves, the paragraph above stops being true.
+//! to the response. Apart from the deactivation fact above, which stops at
+//! `exists`, the response carries nothing a caller could not have computed or
+//! fetched themselves, and the paragraph above is true only while that holds.
 //!
 //! # Degrade, never 500
 //!
@@ -102,13 +116,14 @@ const MAX_DID_LEN: usize = 2048;
 /// # Why a per-request deadline exists at all
 ///
 /// `synapse_client::SYNAPSE_REQUEST_TIMEOUT` (8s) bounds each *call*, not the
-/// request, and this endpoint makes up to four of them in sequence: the legacy
-/// availability probe, the modern one, the profile-field read, and — on a
-/// homeserver that demands authentication — one authenticated retry of that
-/// read. Against an upstream answering in 7.5s the 2026-09-13 audit measured
-/// **22.55s for a single `GET /resolve`**, with a worst case near **4 × 8s =
-/// 32s**. On a public, unauthenticated route that is not a slow answer, it is a
-/// free way to pin a connection per request.
+/// request, and this endpoint makes up to five of them in sequence: the legacy
+/// availability probe, the modern one, the activity read (`query_user`), the
+/// profile-field read, and, on a homeserver that demands authentication, one
+/// authenticated retry of that read. Against an upstream answering in 7.5s the
+/// 2026-09-13 audit measured **22.55s for a single `GET /resolve`** (three
+/// calls then; the activity read is a fourth), with a worst case near **5 × 8s
+/// = 40s**. On a public, unauthenticated route that is not a slow answer, it is
+/// a free way to pin a connection per request.
 ///
 /// # Why ten seconds
 ///
@@ -116,13 +131,13 @@ const MAX_DID_LEN: usize = 2048;
 /// nothing:
 ///
 /// - **A healthy request is milliseconds.** Against the in-process mock one
-///   full `?did=` lookup — two probes plus the field read — completes in
-///   ~1-3ms, and the test
+///   full `?did=` lookup (two probes, the activity read and the field read)
+///   completes in ~1-3ms, and the test
 ///   `a_healthy_lookup_finishes_far_inside_the_deadline` pins that it stays
 ///   under a second. Ten seconds is three orders of magnitude of headroom, so
 ///   this can only fire on a genuinely sick upstream.
-/// - **The worst case it is bounding is ~32s.** Ten seconds cuts that to under
-///   a third, and turns an unbounded-feeling stall into one honest status code.
+/// - **The worst case it is bounding is ~40s.** Ten seconds cuts that to a
+///   quarter, and turns an unbounded-feeling stall into one honest status code.
 ///
 /// The lower bound is sharper than "comfortably above healthy", though: it is
 /// deliberately **above `SYNAPSE_REQUEST_TIMEOUT` (8s)**, so a single slow call
@@ -185,11 +200,16 @@ pub struct ResolveResponse {
     /// grandfathering rule, so a pre-2026-09 account gets its legacy shape, not
     /// the shape a naive `localpart_for(did)` would compute.
     pub mxid: Option<String>,
-    /// Whether an account exists on this homeserver for that identity.
+    /// Whether an ACTIVE account exists on this homeserver for that identity.
     ///
     /// `false` on the `?did=` path means neither the legacy nor the modern
-    /// localpart is taken — the DID has never signed in here. It is NOT a
-    /// statement about any other homeserver.
+    /// localpart is taken (the DID has never signed in here), or that the
+    /// account holding it is deactivated or erased. On the `?mxid=` path it
+    /// means the localpart is free, or that its account is deactivated or
+    /// erased: Synapse keeps such an account's localpart reserved, and this
+    /// field reports the account as gone. A `false` caused by deactivation
+    /// carries no `did` on the `?mxid=` path and `attested: false`: nothing is
+    /// read from the account. It is NOT a statement about any other homeserver.
     pub exists: bool,
     /// Whether the account's `io.inblock.did` profile field is present AND binds
     /// to this identity.
@@ -233,7 +253,8 @@ pub enum ResolveError {
     /// deployment would answer it.
     Unavailable(String),
     /// The homeserver could not be asked, or gave an answer that could not be
-    /// read. `502`: the state is UNKNOWN, and reporting a guess as fact is the
+    /// read, or contradicted itself (a localpart reported as taken that has no
+    /// user). `502`: the state is UNKNOWN, and reporting a guess as fact is the
     /// one thing this endpoint must never do.
     Upstream {
         /// The mxid already resolved before the failure, when there is one. A
@@ -328,9 +349,11 @@ const NO_SYNAPSE: &str =
 ///
 /// # What it does to the homeserver
 ///
-/// It answers from reads: up to two `is_localpart_available` probes and one
-/// `GET …/profile/{mxid}/io.inblock.did`. It creates no account, writes no
-/// profile, stores no session, and issues the caller nothing.
+/// It answers from reads: up to two `is_localpart_available` probes, one
+/// `query_user` read that tells an active account from a deactivated one, and
+/// one `GET …/profile/{mxid}/io.inblock.did` that is skipped for a deactivated
+/// account. It creates no account, writes no profile, stores no session, and
+/// issues the caller nothing.
 ///
 /// One honest caveat, because the previous wording here ("never provisions,
 /// never writes, and never mints anything") was measured FALSE and is audit
@@ -637,6 +660,18 @@ async fn resolve_did(
         });
     }
 
+    // The probes cannot tell a deactivated account from a live one: its
+    // localpart stays taken. Report it as not existing, and read nothing else
+    // about it. Its profile still carries the DID it published.
+    if !account_is_active(synapse, &resolved.localpart, &mxid).await? {
+        return Ok(ResolveResponse {
+            did: Some(did.to_string()),
+            mxid: Some(mxid),
+            exists: false,
+            attested: false,
+        });
+    }
+
     let published = synapse
         .read_did_field(&resolved.localpart, server_name)
         .await
@@ -732,6 +767,17 @@ async fn resolve_mxid(
         });
     }
 
+    // A deactivated account is not one a caller can reach: report it as not
+    // existing, and read nothing else about it.
+    if !account_is_active(synapse, localpart, mxid).await? {
+        return Ok(ResolveResponse {
+            did: None,
+            mxid: Some(mxid.to_string()),
+            exists: false,
+            attested: false,
+        });
+    }
+
     let published = synapse
         .read_did_field(localpart, server_name)
         .await
@@ -764,6 +810,33 @@ async fn resolve_mxid(
         exists: true,
         attested,
     })
+}
+
+/// Whether an account the homeserver reports as IN USE is active.
+///
+/// `localpart_status` answers from Synapse's `users` table, which keeps every
+/// row it ever created: a deactivated or GDPR-erased account is `InUse` there
+/// for good (Synapse 1.161.0, `RegistrationHandler.check_username`). `exists`
+/// means an ACTIVE account, so the MAS `query_user` read decides. `Ok(None)`
+/// after `InUse` is a homeserver contradicting itself, and like every failure
+/// here it is a 502, never a guess: reading it as "no such account" would let
+/// one misrouted MAS route turn every account into a missing one.
+async fn account_is_active(
+    synapse: &SynapseClient,
+    localpart: &str,
+    mxid: &str,
+) -> Result<bool, ResolveError> {
+    match synapse.query_user(localpart).await {
+        Ok(Some(info)) => Ok(!info.is_deactivated),
+        Ok(None) => Err(ResolveError::Upstream {
+            mxid: Some(mxid.to_string()),
+            message: format!("the homeserver reports {mxid} as taken but has no such user"),
+        }),
+        Err(e) => Err(ResolveError::Upstream {
+            mxid: Some(mxid.to_string()),
+            message: format!("could not ask the homeserver whether {mxid} is active: {e}"),
+        }),
+    }
 }
 
 /// Split `@localpart:server` into its two halves.
@@ -838,7 +911,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::localpart::resolve_identity_tests::{
-        spawn_mock_synapse_configured, spawn_mock_synapse_with_did_fields,
+        spawn_mock_synapse_configured, spawn_mock_synapse_with_did_fields, MockSynapseConfig,
     };
     use crate::synapse_client::SynapseClient;
     use std::collections::{HashMap, HashSet};
@@ -1473,6 +1546,176 @@ mod tests {
         }
     }
 
+    // -- Deactivated and erased accounts ----------------------------------
+
+    /// One account that Synapse reports as taken and as deactivated, and whose
+    /// profile still publishes `published_did`: the state a plain deactivation
+    /// leaves behind, because Synapse never deletes the `users` row or the
+    /// profile row of a deactivated account.
+    fn deactivated_homeserver(localpart: &str, published_did: &str) -> MockSynapseConfig {
+        MockSynapseConfig {
+            existing: HashSet::from([localpart.to_string()]),
+            deactivated: HashSet::from([localpart.to_string()]),
+            did_fields: HashMap::from([(
+                format!("@{localpart}:{SERVER_NAME}"),
+                published(published_did),
+            )]),
+            ..MockSynapseConfig::default()
+        }
+    }
+
+    /// Availability alone reports a deactivated account as taken, with its DID
+    /// still attested (Synapse keeps the `users` row for good). `exists` means
+    /// an ACTIVE account, so the account reads as not existing, and nothing
+    /// about it is read: neither its published DID nor its attestation.
+    #[tokio::test]
+    async fn a_deactivated_account_resolves_as_not_existing_by_mxid() {
+        let localpart = localpart_for(DID);
+        let mxid = format!("@{localpart}:{SERVER_NAME}");
+        let (synapse, handle) =
+            spawn_mock_synapse_configured(deactivated_homeserver(&localpart, DID)).await;
+
+        let out = resolve(
+            &config(Some(SERVER_NAME)),
+            Some(&synapse),
+            query(None, Some(&mxid)),
+        )
+        .await
+        .expect("a reachable homeserver must answer");
+
+        assert_eq!(
+            out,
+            ResolveResponse {
+                did: None,
+                mxid: Some(mxid),
+                exists: false,
+                attested: false,
+            }
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_deactivated_account_resolves_as_not_existing_by_did() {
+        let localpart = localpart_for(DID);
+        let (synapse, handle) =
+            spawn_mock_synapse_configured(deactivated_homeserver(&localpart, DID)).await;
+
+        let out = resolve(
+            &config(Some(SERVER_NAME)),
+            Some(&synapse),
+            query(Some(DID), None),
+        )
+        .await
+        .expect("a reachable homeserver must answer");
+
+        assert_eq!(
+            out,
+            ResolveResponse {
+                did: Some(DID.to_string()),
+                mxid: Some(format!("@{localpart}:{SERVER_NAME}")),
+                exists: false,
+                attested: false,
+            }
+        );
+        handle.abort();
+    }
+
+    /// The activity check asks about the localpart the grandfathering rule
+    /// chose, never about the modern shape of the DID. A pre-2026-09 account
+    /// keeps its legacy localpart, so asking about the modern one would find no
+    /// user row at all.
+    #[tokio::test]
+    async fn a_deactivated_grandfathered_account_resolves_as_not_existing_under_its_legacy_mxid() {
+        let legacy = legacy_localpart(DID);
+        let (synapse, handle) = spawn_mock_synapse_configured(MockSynapseConfig {
+            existing: HashSet::from([legacy.clone()]),
+            deactivated: HashSet::from([legacy.clone()]),
+            ..MockSynapseConfig::default()
+        })
+        .await;
+
+        let out = resolve(
+            &config(Some(SERVER_NAME)),
+            Some(&synapse),
+            query(Some(DID), None),
+        )
+        .await
+        .expect("a reachable homeserver must answer");
+
+        assert_eq!(
+            out,
+            ResolveResponse {
+                did: Some(DID.to_string()),
+                mxid: Some(format!("@{legacy}:{SERVER_NAME}")),
+                exists: false,
+                attested: false,
+            }
+        );
+        handle.abort();
+    }
+
+    /// An activity state that could not be read is unknown, and unknown is a
+    /// 502 on both selectors, carrying the mxid that was already resolved. It
+    /// is never an `exists` answer in either direction.
+    #[tokio::test]
+    async fn a_failed_activity_check_is_a_502_never_a_guess() {
+        let localpart = localpart_for(DID);
+        let mxid = format!("@{localpart}:{SERVER_NAME}");
+        let (synapse, handle) = spawn_mock_synapse_configured(MockSynapseConfig {
+            existing: HashSet::from([localpart.clone()]),
+            query_user_status: HashMap::from([(
+                localpart.clone(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            )]),
+            ..MockSynapseConfig::default()
+        })
+        .await;
+
+        for q in [query(None, Some(&mxid)), query(Some(DID), None)] {
+            let err = resolve(&config(Some(SERVER_NAME)), Some(&synapse), q)
+                .await
+                .expect_err("an unknown activity state must not be answered as a fact");
+            let (status, body) = rendered(err).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                body["mxid"].as_str(),
+                Some(mxid.as_str()),
+                "the mxid was resolved before the failure and is reported with it: {body}"
+            );
+        }
+        handle.abort();
+    }
+
+    /// `is_localpart_available` and `query_user` read the same `users` table.
+    /// When the first reports a localpart as taken and the second finds no such
+    /// user, the homeserver, or a proxy in front of one of its two routes, is
+    /// inconsistent. That is a 502: answering `exists: false` would let a
+    /// misrouted `query_user` turn every account on the homeserver into a
+    /// missing one.
+    #[tokio::test]
+    async fn a_taken_localpart_without_a_user_row_is_a_502() {
+        let localpart = localpart_for(DID);
+        let mxid = format!("@{localpart}:{SERVER_NAME}");
+        let (synapse, handle) = spawn_mock_synapse_configured(MockSynapseConfig {
+            existing: HashSet::from([localpart.clone()]),
+            query_user_status: HashMap::from([(
+                localpart.clone(),
+                axum::http::StatusCode::NOT_FOUND,
+            )]),
+            ..MockSynapseConfig::default()
+        })
+        .await;
+
+        for q in [query(None, Some(&mxid)), query(Some(DID), None)] {
+            let err = resolve(&config(Some(SERVER_NAME)), Some(&synapse), q)
+                .await
+                .expect_err("an inconsistent homeserver must not be answered as a fact");
+            assert_eq!(status_of(err), axum::http::StatusCode::BAD_GATEWAY);
+        }
+        handle.abort();
+    }
+
     // -- Selector validation ----------------------------------------------
 
     #[tokio::test]
@@ -1669,10 +1912,11 @@ mod tests {
     /// orders of magnitude inside it.
     ///
     /// The other half of the bound: a deadline that fires on healthy traffic
-    /// is an outage. This runs the SHIPPED [`RESOLVE_DEADLINE`] — not an
-    /// injected one — over the full `?did=` path (two availability probes plus
-    /// the profile-field read), which is also where the "a healthy request is
-    /// milliseconds" number in that constant's doc comes from.
+    /// is an outage. This runs the SHIPPED [`RESOLVE_DEADLINE`], not an
+    /// injected one, over the full `?did=` path (two availability probes, the
+    /// activity read and the profile-field read), which is also where the "a
+    /// healthy request is milliseconds" number in that constant's doc comment
+    /// comes from.
     #[tokio::test]
     async fn a_healthy_lookup_finishes_far_inside_the_deadline() {
         let localpart = localpart_for(DID);

@@ -98,14 +98,16 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 34 tests in eleven files:
-  `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (5),
+  `cargo test --workspace` runs the unit tests of both crates plus 35 tests in eleven files:
+  `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (6),
   `static_client_startup` (10), `log_hygiene_credential_store` (1) and
   `log_capture_callsite_interest` (1), which need nothing; `account_linking_dual_write` (6), which needs the test Redis, and `log_hygiene`
   (4, one of them needs it);
   `credential_migration_live` (2), which needs its own disposable, empty Redis named by
   `MIGRATION_TEST_REDIS_URL`; and the pure check `an_absent_strict_skips_variable_means_strict`
-  in `e2e_account_lifecycle_live` and in `e2e_did_field_live` (1 each).
+  in `e2e_account_lifecycle_live` and in `e2e_did_field_live` (1 each). In the headless
+  client's crate it also runs the three pure checks of `siwx-oidc-auth/tests/live_upgrade.rs`'s
+  helpers.
 - **Redis-backed tests** get their Redis from `siwx_oidc::test_support` (`src/test_support.rs`):
   `SIWX_TEST_REDIS_URL`, default `redis://localhost`. When it is unreachable each test prints
   one `SKIP <test>: …` line to stderr and passes; with `SIWX_TEST_REQUIRE_REDIS=1` it fails
@@ -143,8 +145,28 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   `siwx-oidc-auth/tests/live_deployment.rs` runs against a whole deployment named by
   `SIWX_SERVER` and `SIWX_HOMESERVER`, and creates and deactivates a throwaway account; see
   e2e/README.md.
+- **Upgrade qualification suites** prove that what a deployment holds survives a switch of
+  the siwx-oidc build, and run before every promotion (none in CI). `e2e/upgrade-from.sh
+  <old-image> [<new>]` runs a mock upgrade from an image to this tree's build, Redis kept: the
+  R1/R2 stages of `e2e_race_teardown` and the live suite below, with the Synapse mock as the
+  homeserver (it forwards `POST /_matrix/client/v3/refresh` and `DELETE …/devices/{id}` to
+  siwx-oidc, as a deployment's edge does). `siwx-oidc-auth/tests/live_upgrade.rs` mints
+  sessions in every shape a deployment holds before the switch and checks them after it,
+  in stages (`QUALIFY_STAGE=mint|check|cleanup`, state in a 0700 `QUALIFY_STATE_DIR`),
+  against a real deployment or the mock; `siwx-oidc-auth/examples/soak.rs` holds a population
+  of sessions across the switch. `e2e/element/upgrade-survival.sh` (T2) does the same for a
+  person in Element Web: on the siwx-oidc-matrix-server lab pinned by image digest it signs in
+  through Element in a persistent browser profile before the switch, replaces only siwx-oidc,
+  and checks the session, the crypto, the history, the Sessions manager, a second tab, a
+  passkey and a token refresh after it. With `T2_SWAP=element-web` (T2-EW) it replaces only
+  Element Web instead and checks the session, the device and the browser EventIndex (not
+  reset, edits and redactions honoured); `T2_DIRECTION=rollback` runs candidate -> baseline.
+  Each creates and deactivates throwaway accounts; see e2e/README.md.
 - **Browser suites:** `e2e/browser/` (self-contained, runs in CI) and `e2e/element/` (needs
-  Element Web, a real Synapse and the proxy from siwx-oidc-matrix-server).
+  Element Web, a real Synapse and the proxy from siwx-oidc-matrix-server). Tests in
+  `e2e/element/` that exercise a vendored Element Web patch carry the Playwright tag
+  `@ew-p<N>` (registry entry N), runtime/config deltas `@ew-delta-<name>`; a promotion selects
+  them with `--grep` (e2e/element/README.md).
 - **aqua-auth's own tests** run in that repository, not here.
 - **Running the server locally** needs `SIWXOIDC_BASE_URL` with a hostname
   (`http://localhost:8000`): the default `http://127.0.0.1:8000` makes WebAuthn refuse the IP
@@ -975,6 +997,16 @@ doc; read it before changing the code the rule covers.
 - **`/resolve` answers exactly four fields** (`did`, `mxid`, `exists`, `attested`). Adding one
   breaks the "nothing a caller could not compute" argument for leaving it unauthenticated.
   Pin: `a_successful_lookup_returns_all_four_keys_with_null_where_unknown` (mock stack).
+- **`exists` means an ACTIVE account.** A deactivated or erased account answers `exists: false`,
+  decided by `query_user`, because Synapse keeps those `users` rows and `is_localpart_available`
+  reports them as taken for good. Nothing else is read from such an account: `did` is `null` on
+  the `?mxid=` path and `attested` is `false`. That deactivation bit is the one deliberate
+  exception to "nothing a caller could not compute": the public profile route still serves a
+  plain deactivation's profile, so a caller reading both can tell it from "never existed". A
+  failed `query_user`, or a localpart reported taken that has no user, is a 502, never an
+  answer. Pin: `a_deactivated_account_resolves_as_not_existing_by_mxid`,
+  `a_failed_activity_check_is_a_502_never_a_guess`,
+  `deactivated_and_erased_accounts_resolve_as_not_existing` (mock stack).
 - **`/resolve` never guesses.** A probe failure is a 502 with whatever was resolved; no Synapse
   or server name is a 503; a repeated parameter is a 400 in the error envelope. Pin:
   `an_unreachable_homeserver_is_a_502_never_a_guessed_mxid`,
@@ -1056,10 +1088,15 @@ doc; read it before changing the code the rule covers.
 - **aqua-auth has no logging** and no knowledge of ceremonies.
 - **SIGTERM and SIGINT shut the server down gracefully**, answering requests already in flight.
   In the image it is PID 1, which ignores a signal it has no handler for, so without
-  `shutdown_signal` `docker stop` waits 10 s and SIGKILLs. Pin:
+  `shutdown_signal` `docker stop` waits 10 s and SIGKILLs. The `Listening on` line is logged
+  after the bind and after the handlers are installed, and names the address actually bound:
+  the tests start the server on port 0 and wait for that line, because a port picked in the
+  test and passed on can be handed to another listener before the server binds it. Do not log
+  it before the bind. Pin:
   `sigterm_finishes_and_exits_zero_with_an_idle_connection_open`,
   `sigint_finishes_and_exits_zero_with_an_idle_connection_open`,
-  `a_request_in_flight_when_sigterm_arrives_is_still_answered`.
+  `a_request_in_flight_when_sigterm_arrives_is_still_answered`,
+  `a_server_that_cannot_bind_says_which_address`.
 - **Credential store: dual-write, not cut-over.** The legacy `webauthn:credential/*` namespace
   stays authoritative; mirror writes are best-effort; the backfill is additive and idempotent.
   Pin: `backfill_is_additive_link_aware_counter_preserving_and_idempotent` (needs its own
