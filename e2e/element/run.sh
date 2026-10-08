@@ -9,7 +9,8 @@
 #                     mounted at the same path
 #   E2E_STRICT_SKIPS, T2_*, EW_* and MAS_SHARED_SECRET are passed through unchanged; an EW_*
 #                     value that is an absolute path to a file (EW_THEME_OVERRIDES_CSS,
-#                     EW_SW_OVERRIDE) has its directory mounted read-only at the same path
+#                     EW_SW_OVERRIDE) has its directory mounted read-only at the same path,
+#                     and one that is a directory (EW_AV_DIR) is mounted writable at its path
 # Arguments go to `playwright test` unchanged, e.g. a patch selection:
 #   ./run.sh --grep '@ew-p|@ew-delta' ew-attested-did.spec.mjs ew-copy-markdown.spec.mjs
 set -euo pipefail
@@ -42,11 +43,14 @@ if [ -n "${QUALIFY_STATE_DIR:-}" ]; then
   extra+=(-e "QUALIFY_STATE_DIR=$QUALIFY_STATE_DIR")
 fi
 # Names only: podman reads each value from this environment, so no value is on a command line.
-for v in $(compgen -e | grep -E '^(T2_[A-Z0-9_]+|EW_[A-Z0-9_]+|E2E_STRICT_SKIPS|MAS_SHARED_SECRET)$' || true); do
-  extra+=(-e "$v")
-  case "$v" in EW_*)
-    if [[ "${!v}" == /* ]] && [ -f "${!v}" ]; then mount_same "$(dirname "${!v}")" ro,z; fi ;;
-  esac
+vars=$(compgen -e | grep -E '^(T2_[A-Z0-9_]+|EW_[A-Z0-9_]+|E2E_STRICT_SKIPS|MAS_SHARED_SECRET)$' || true)
+for v in $vars; do extra+=(-e "$v"); done
+# Writable EW_* directories first, so a read-only mount for a file's directory never takes their place.
+for v in $vars; do
+  case "$v" in EW_*) if [[ "${!v}" == /* ]] && [ -d "${!v}" ]; then mount_same "${!v}"; fi ;; esac
+done
+for v in $vars; do
+  case "$v" in EW_*) if [[ "${!v}" == /* ]] && [ -f "${!v}" ]; then mount_same "$(dirname "${!v}")" ro,z; fi ;; esac
 done
 
 exec podman run --rm --network host --userns=keep-id \
