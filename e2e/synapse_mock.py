@@ -187,10 +187,11 @@ LIFECYCLE = {}
 #
 # PRESENCE OF THE KEY IS THE `profiles` ROW. Synapse's `users` row and its
 # `profiles` row are separate, and an account can have the first without the
-# second — that is element-hq/synapse#19702, still unfixed in 1.159.0, and the
-# condition `has_profile_row` / `publish_did_field` discriminate on. So
-# `localpart in EXISTING_USERS` (users row) and `user_id in PROFILES` (profiles
-# row) are modelled as two INDEPENDENT facts. Do not collapse them.
+# second (element-hq/synapse#19702), which is the condition `has_profile_row` /
+# `publish_did_field` discriminate on. So `localpart in EXISTING_USERS` (users
+# row) and `user_id in PROFILES` (profiles row) are modelled as two INDEPENDENT
+# facts. Do not collapse them. What each route answers for such an account is
+# listed at `POST /__profile`.
 PROFILES = {}
 # user_id -> {field_name: json value} — MSC4133 custom profile fields, which is
 # where `publish_did_field` writes `io.inblock.did`.
@@ -204,9 +205,9 @@ STATE = {"secret": SECRET, "reject_admin": False}
 # siwx-oidc reqwest client times out. Cleared by /__reset.
 #   POST /__fail {"endpoint": "delete_device", "mode": "500"|"timeout"|"off"}
 # Recognized endpoints: delete_device, list_devices, deactivate, query_user,
-# publish_did_field. ("get_device" is gone as a fault target because
-# `synapse_client::get_device` no longer has a route of its own — since the 1.157
-# port it is `list_devices` plus a client-side filter, so fault it via
+# publish_did_field, read_did_field. ("get_device" is gone as a fault target
+# because `synapse_client::get_device` no longer has a route of its own: since
+# the 1.157 port it is `list_devices` plus a client-side filter, so fault it via
 # "list_devices".)
 FAIL = {}
 # How long a "timeout" fault sleeps before (not) responding, in seconds. Must
@@ -232,6 +233,10 @@ RP_PATH = re.compile(r"^/__rp/([A-Za-z0-9_.-]+)/(backchannel_logout|mode|receive
 # (audit finding D1). Emitting the real generic body here is what makes that
 # distinction testable at all.
 GENERIC_500 = {"errcode": "M_UNKNOWN", "error": "Internal server error"}
+
+# The 404 Synapse 1.161.0's `ProfileHandler` raises when a profile read finds
+# nothing to return: `SynapseError(404, "Profile was not found", Codes.NOT_FOUND)`.
+PROFILE_NOT_FOUND = {"errcode": "M_NOT_FOUND", "error": "Profile was not found"}
 
 
 def _localpart_of(user_id):
@@ -724,7 +729,7 @@ class Handler(BaseHTTPRequestHandler):
         if displayname is None and avatar_url is None:
             # PRESENT BUT EMPTY. Synapse also 404s this — with a DIFFERENT
             # errcode, which is the only thing separating it from the case above.
-            return self._send(404, {"errcode": "M_NOT_FOUND", "error": "Profile was not found"})
+            return self._send(404, PROFILE_NOT_FOUND)
         out = {}
         if displayname is not None:
             out["displayname"] = displayname
@@ -739,18 +744,26 @@ class Handler(BaseHTTPRequestHandler):
         that endpoint's read path (`synapse_client::read_did_field`), which since
         2026-09-13 reads ANONYMOUSLY first and only mints a token if the
         homeserver answers 401/403. Tests also call it, to read back what
-        `publish_did_field` wrote. A row-less account 500s here rather than
-        404ing because element-hq/synapse#19702 bites on READS too:
-        `get_profile_field` subscripts an unguarded `txn.fetchone()`.
+        `publish_did_field` wrote.
+
+        Synapse 1.161.0 answers ONE 404 for an account with no `profiles` row
+        and for a row without the field: the store raises its own 404 in both
+        cases and `ProfileHandler.get_profile_field` turns it into
+        `PROFILE_NOT_FOUND`. Releases before 1.161 answered a generic 500 for
+        the row-less account (element-hq/synapse#19702, an unguarded
+        `txn.fetchone()`). `read_did_field` reads a 404 as an unset field and
+        any other failure as an unreadable one, so only a fault reaches that
+        branch on this mock: arm it with
+        `POST /__fail {"endpoint": "read_did_field", "mode": "500"}`.
         """
+        if self._maybe_fail("read_did_field"):
+            return
         user_id = unquote(raw_user_id)
         with LOCK:
             has_row = user_id in PROFILES
             value = PROFILE_FIELDS.get(user_id, {}).get(field, KeyError)
-        if not has_row:
-            return self._send(500, GENERIC_500)
-        if value is KeyError:
-            return self._send(404, {"errcode": "M_NOT_FOUND", "error": "Profile field not found"})
+        if not has_row or value is KeyError:
+            return self._send(404, PROFILE_NOT_FOUND)
         return self._send(200, {field: value})
 
     def _stub_rp(self, name, action, raw):
@@ -823,7 +836,10 @@ class Handler(BaseHTTPRequestHandler):
         #   "present" — a row with a displayname            -> GET 200
         #   "empty"   — a row with displayname+avatar null  -> GET 404 M_NOT_FOUND
         #   "absent"  — NO row (element-hq/synapse#19702)   -> GET 404 M_UNKNOWN,
-        #                                                      field PUT/GET 500
+        #                                                      field GET 404 M_NOT_FOUND,
+        #                                                      field PUT 500,
+        #                                                      provision_user with a
+        #                                                      displayname 500
         # Deliberately independent of EXISTING_USERS: the whole bug class is a
         # `users` row without a `profiles` row.
         if path == "/__profile":

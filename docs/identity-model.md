@@ -526,8 +526,16 @@ All four keys are always present, `null` where unknown.
 |---|---|---|
 | `did` | the queried DID, or the published spelling when the account publishes the same DID | the DID the account publishes, or `null` |
 | `mxid` | the MXID the grandfathering rule resolves (legacy for pre-2026-09 accounts) | the queried MXID |
-| `exists` | an account exists under the legacy or the modern localpart | the localpart is taken on this homeserver |
+| `exists` | an ACTIVE account exists under the legacy or the modern localpart | an ACTIVE account holds the localpart on this homeserver |
 | `attested` | the account's `io.inblock.did` field is present and binds to this DID | the published DID derives to this localpart, under either scheme |
+
+**`exists` means an active account.** A deactivated or erased account answers
+`exists: false` on both paths, with `attested: false` and, on the `?mxid=` path,
+`did: null`. Synapse keeps the `users` row of such an account, so the
+availability probe alone reports its localpart as taken for good; the MAS
+`query_user` read is what tells a deactivated account from a live one. Nothing
+else is read from a deactivated account, so the DID its profile still carries is
+not reported. If the account is reactivated it reads `exists: true` again.
 
 **`attested` verifies no signature.** It compares the field's `did` member,
 under `mxid::canonicalize` on the `?did=` path and by re-deriving the localpart
@@ -544,7 +552,7 @@ one was already resolved. The route never returns 500.
 | Status | `error` | Meaning |
 |---|---|---|
 | 400 | `invalid_request` | the request is wrong (selectors, a malformed or foreign MXID, over-length input, a localpart Synapse refuses) |
-| 502 | `upstream_error` | the homeserver could not be asked or gave an unreadable answer; the state is unknown |
+| 502 | `upstream_error` | the homeserver could not be asked, gave an unreadable answer, or contradicted itself (a localpart reported as taken that has no user); the state is unknown |
 | 503 | `unavailable` | this deployment cannot answer: no `SIWXOIDC_MATRIX_SERVER_NAME`, or no Synapse client (standalone) |
 | 504 | `upstream_timeout` | the whole lookup exceeded 10 seconds |
 
@@ -570,11 +578,17 @@ Authentication would buy rate limiting, not secrecy:
   offline.
 - MXID → DID reads a profile field that Synapse serves without authentication
   by default and that federates.
-- `exists` is already observable through the same public profile route.
+- `exists` is observable through the same public profile route, apart from one
+  fact: that an account is deactivated. Synapse keeps serving a deactivated
+  account's profile, so only `/resolve` shows the deactivation, and a caller who
+  reads both can tell a deactivated account from one that never existed. That is
+  deliberate: a deactivated account must not read as a live one to a consumer
+  that acts on `exists`. An erased account's profile is deleted, so it looks
+  like one that never existed on the profile route.
 
 Rate limiting belongs at the reverse proxy. The response stays at four fields:
-adding anything a caller could not compute or fetch themselves would break this
-argument.
+adding anything else a caller could not compute or fetch themselves would break
+this argument.
 
 One side effect exists only on homeservers that set
 `require_auth_for_profile_requests: true`: the anonymous profile read is
