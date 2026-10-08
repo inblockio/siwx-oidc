@@ -539,12 +539,13 @@ pub async fn register_start(
 /// Typed outcome of a failed registration finish.
 ///
 /// `AlreadyRegistered` is the one case a handler renders differently: the
-/// credential id is already stored, so the registration was refused and nothing
-/// was written. Every other failure (missing or expired challenge, attestation
-/// verification, I/O) stays `Other`.
+/// credential id is already in use (a stored passkey or link state), so the
+/// registration was refused and nothing was written. Every other failure
+/// (missing or expired challenge, attestation verification, I/O) stays `Other`.
 #[derive(Debug, Error)]
 pub enum RegisterFinishError {
-    /// A passkey with this credential id is already stored; nothing was written.
+    /// A passkey or link state already exists under this credential id; nothing
+    /// was written.
     #[error("credential id already registered")]
     AlreadyRegistered,
     /// Any other registration failure.
@@ -555,9 +556,10 @@ pub enum RegisterFinishError {
 /// Verify a registration and store its passkey.
 ///
 /// Create-only: the passkey is written with an atomic set-if-absent, before any
-/// index or mirror write, so an id that is already stored is refused with
-/// [`RegisterFinishError::AlreadyRegistered`] and the stored passkey, the
-/// `by_did` index and the credential-store mirror stay exactly as they were.
+/// index or mirror write, so an id that already has a stored passkey or link
+/// state is refused with [`RegisterFinishError::AlreadyRegistered`] and the
+/// stored passkey, the link entry, the `by_did` index and the credential-store
+/// mirror stay exactly as they were.
 pub async fn register_finish(
     webauthn: &Webauthn,
     redis: &RedisClient,
@@ -580,12 +582,15 @@ pub async fn register_finish(
     let did = did_from_passkey(&passkey)?;
     let cred_id_b64 = URL_SAFE_NO_PAD.encode(passkey.cred_id());
 
-    // Store the credential persistently (no TTL), only if the id is new.
+    // Store the credential persistently (no TTL), only if the id is new: neither
+    // a stored passkey nor link state may exist under it. Link state is only
+    // read here; `link_finish` stays its only writer.
     let cred_json = serde_json::to_string(&passkey)
         .map_err(|e| anyhow!("Failed to serialize passkey: {}", e))?;
     let created = redis
-        .set_nx_raw(
+        .set_nx_raw_guarded(
             &format!("{}/{}", CREDENTIAL_PREFIX, cred_id_b64),
+            &format!("{}/{}", LINK_PREFIX, cred_id_b64),
             &cred_json,
         )
         .await?;
@@ -2079,6 +2084,59 @@ mod tests {
         assert!(
             !index_b.contains(&cred_b64),
             "the second key's DID index lists the existing credential id"
+        );
+    }
+
+    /// A credential id that has link state (`webauthn:link/{id}`) but no stored
+    /// passkey is refused too: no passkey is stored, the key's DID index is
+    /// untouched, and the link entry stays as it was. Needs Redis.
+    #[tokio::test]
+    async fn registering_an_id_with_existing_link_state_is_refused() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let cfg = reg_test_webauthn();
+        let cred_id = Uuid::new_v4().as_bytes().to_vec();
+        let cred_b64 = URL_SAFE_NO_PAD.encode(&cred_id);
+        let cred_key = format!("{CREDENTIAL_PREFIX}/{cred_b64}");
+        let link_key = format!("{LINK_PREFIX}/{cred_b64}");
+        let link_json = serde_json::to_string(&LinkEntry {
+            primary_did: format!("did:pkh:eip155:1:0x{}", Uuid::new_v4().simple()),
+            label: "test".to_string(),
+        })
+        .unwrap();
+        redis
+            .set_raw(&link_key, &link_json)
+            .await
+            .expect("seed link");
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let did = did_of(&key);
+
+        let resp = register_with(&cfg.webauthn, &redis, &cred_id, &key).await;
+        let stored = redis.get_raw(&cred_key).await.expect("GET");
+        let link_after = redis.get_raw(&link_key).await.expect("GET");
+        let index = redis
+            .smembers_raw(&by_did_key(&did))
+            .await
+            .expect("SMEMBERS");
+
+        redis.del_raw(&cred_key).await.ok();
+        redis.del_raw(&link_key).await.ok();
+        redis.index_remove_passkey(&did, &cred_b64).await.ok();
+
+        assert!(
+            matches!(resp, Err(RegisterFinishError::AlreadyRegistered)),
+            "an id with existing link state must be refused as AlreadyRegistered, got {:?}",
+            resp.as_ref().map(|r| &r.did)
+        );
+        assert_eq!(
+            stored, None,
+            "a passkey was stored for an id with link state"
+        );
+        assert_eq!(link_after.as_deref(), Some(link_json.as_str()));
+        assert!(
+            !index.contains(&cred_b64),
+            "the key's DID index lists the id"
         );
     }
 

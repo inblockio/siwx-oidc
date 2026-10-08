@@ -147,6 +147,17 @@ end
 return 1
 "#;
 
+/// Set `KEYS[1]` to `ARGV[1]` (no TTL) only while neither `KEYS[1]` nor the
+/// guard `KEYS[2]` exists, checked and written in one step. Returns 1 when it
+/// wrote, 0 when either key existed.
+const SET_NX_GUARDED_SCRIPT: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 1 or redis.call('EXISTS', KEYS[2]) == 1 then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[1])
+return 1
+"#;
+
 fn code_key(code: &str) -> String {
     format!("{KV_CODE_DIGEST_PREFIX}/{}", digest(code))
 }
@@ -414,23 +425,25 @@ impl RedisClient {
         Ok(())
     }
 
-    /// Store a key-value pair with no TTL, only if `key` does not exist yet
-    /// (`SET NX`, one atomic step). Returns `false`, having written nothing,
-    /// when the key already existed.
-    pub async fn set_nx_raw(&self, key: &str, value: &str) -> Result<bool> {
+    /// Store a key-value pair with no TTL, only if neither `key` nor `guard`
+    /// exists yet ([`SET_NX_GUARDED_SCRIPT`], one atomic step). Returns `false`,
+    /// having written nothing, when either already existed.
+    pub async fn set_nx_raw_guarded(&self, key: &str, guard: &str, value: &str) -> Result<bool> {
         let mut conn = self
             .pool
             .get()
             .await
             .map_err(|e| anyhow!("Redis pool: {}", e))?;
-        let reply: Option<String> = bb8_redis::redis::cmd("SET")
+        let written: i64 = bb8_redis::redis::cmd("EVAL")
+            .arg(SET_NX_GUARDED_SCRIPT)
+            .arg(2)
             .arg(key)
+            .arg(guard)
             .arg(value)
-            .arg("NX")
             .query_async(&mut *conn)
             .await
-            .map_err(|e| anyhow!("Redis SET NX: {}", e))?;
-        Ok(reply.is_some())
+            .map_err(|e| anyhow!("Redis guarded SET NX: {}", e))?;
+        Ok(written == 1)
     }
 
     /// Get a value by key.

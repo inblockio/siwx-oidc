@@ -33,10 +33,12 @@ aqua-auth's `DIDMethod` trait (see [architecture.md](architecture.md) and the
   authenticator can offer the user's own passkey without the server listing
   credential IDs. Registration is **create-only**: the passkey is stored with
   an atomic set-if-absent before any index or mirror write, so a credential ID
-  that is already registered is refused (HTTP 400,
-  `{"error":"registration failed"}`) and the stored passkey, the
-  `webauthn:by_did` index and the credential-store mirror stay as they were
-  (`registering_an_existing_credential_id_is_refused_and_the_stored_blob_is_unchanged`).
+  that is already registered, or that has `webauthn:link/{id}` state, is
+  refused (HTTP 400, `{"error":"registration failed"}`) and the stored
+  passkey, the link entry, the `webauthn:by_did` index and the
+  credential-store mirror stay as they were
+  (`registering_an_existing_credential_id_is_refused_and_the_stored_blob_is_unchanged`,
+  `registering_an_id_with_existing_link_state_is_refused`).
 - **Assertion** is verified with aqua-auth's `verify_webauthn_assertion`
   (P-256), against the challenge stored for the session. The server also
   requires the **user-verification** flag and rejects a **signature-counter
@@ -71,7 +73,7 @@ linked to the other's identity.
 | Endpoint | Purpose |
 |---|---|
 | `POST /webauthn/register/start` | registration options (`CreationChallengeResponse`) |
-| `POST /webauthn/register/finish` | verify the attestation, store the credential if its id is new; returns `{did, credential_id}`, or 400 `{"error":"registration failed"}` for an id already registered |
+| `POST /webauthn/register/finish` | verify the attestation, store the credential if its id is new; returns `{did, credential_id}`, or 400 `{"error":"registration failed"}` for an id already registered or with link state |
 | `POST /webauthn/authenticate/start` | assertion options, scoped by the `siwx_user` cookie (below), plus `detected_mxid` |
 | `POST /webauthn/authenticate/finish` | verify the assertion, store the verified DID; returns `{ok, did, new_user, mxid}` |
 | `POST /link/webauthn/start` | begin registering a passkey for the caller's wallet DID |

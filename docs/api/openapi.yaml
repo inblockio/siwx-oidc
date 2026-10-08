@@ -829,8 +829,8 @@ paths:
       summary: Finish passkey registration
       description: |
         The resulting P-256 public key derives the user's `did:key:zDn…`.
-        Registration is create-only: a credential id that is already registered
-        is refused and nothing is written.
+        Registration is create-only: a credential id that is already registered,
+        or that has link state, is refused and nothing is written.
       responses:
         "200": { description: "`{did, credential_id}`: the derived DID." }
         "400":
