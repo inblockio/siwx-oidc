@@ -54,6 +54,7 @@ import { makeWallet, injectMockWallet } from '../browser/wallet-helper.mjs';
 import { settle, assertExit } from './helpers/journey.mjs';
 import {
   advanceVerification,
+  isSasStart,
   clickTheyMatch,
   cryptoProbe,
   describeSurface,
@@ -499,10 +500,13 @@ test('H3-C: B-initiated "Use another device" on the new device gate reaches a ve
 
     // Drive both sides with the closed whitelist until the SAS emoji appears.
     const sasDeadline = Date.now() + 240_000;
+    let sasStarter = null; // only the side that started the SAS may start it (two starts collide)
     while (Date.now() < sasDeadline) {
       if ((await emojiVisible(pageA)) && (await emojiVisible(pageB))) break;
-      const a = await advanceVerification(pageA);
-      const b = await advanceVerification(pageB);
+      const a = await advanceVerification(pageA, { allowSasStart: sasStarter === null || sasStarter === 'A' });
+      if (a && isSasStart(a)) sasStarter ??= 'A';
+      const b = await advanceVerification(pageB, { allowSasStart: sasStarter === null || sasStarter === 'B' });
+      if (b && isSasStart(b)) sasStarter ??= 'B';
       if (a || b) {
         // eslint-disable-next-line no-console
         console.log(`[H3-C] advance A=${a ?? '-'} B=${b ?? '-'}`);
