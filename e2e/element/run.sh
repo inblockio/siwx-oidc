@@ -43,12 +43,14 @@ if [ -n "${QUALIFY_STATE_DIR:-}" ]; then
   extra+=(-e "QUALIFY_STATE_DIR=$QUALIFY_STATE_DIR")
 fi
 # Names only: podman reads each value from this environment, so no value is on a command line.
-for v in $(compgen -e | grep -E '^(T2_[A-Z0-9_]+|EW_[A-Z0-9_]+|E2E_STRICT_SKIPS|MAS_SHARED_SECRET)$' || true); do
-  extra+=(-e "$v")
-  case "$v" in EW_*)
-    if [[ "${!v}" == /* ]] && [ -f "${!v}" ]; then mount_same "$(dirname "${!v}")" ro,z; fi
-    if [[ "${!v}" == /* ]] && [ -d "${!v}" ]; then mount_same "${!v}"; fi ;;
-  esac
+vars=$(compgen -e | grep -E '^(T2_[A-Z0-9_]+|EW_[A-Z0-9_]+|E2E_STRICT_SKIPS|MAS_SHARED_SECRET)$' || true)
+for v in $vars; do extra+=(-e "$v"); done
+# Writable EW_* directories first, so a read-only mount for a file's directory never takes their place.
+for v in $vars; do
+  case "$v" in EW_*) if [[ "${!v}" == /* ]] && [ -d "${!v}" ]; then mount_same "${!v}"; fi ;; esac
+done
+for v in $vars; do
+  case "$v" in EW_*) if [[ "${!v}" == /* ]] && [ -f "${!v}" ]; then mount_same "$(dirname "${!v}")" ro,z; fi ;; esac
 done
 
 exec podman run --rm --network host --userns=keep-id \

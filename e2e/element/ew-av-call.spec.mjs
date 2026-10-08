@@ -223,6 +223,9 @@ test('EW-AV1: a call through the served Element Web sends and receives audio and
     expect(outcome.delta.sent_video, 'browser sent no video').toBeGreaterThan(0);
     expect(outcome.delta.received_audio, 'browser received no audio from the agent').toBeGreaterThan(0);
     expect(outcome.delta.received_video, 'browser received no video from the agent').toBeGreaterThan(0);
+    // Bytes can arrive while nothing decodes (a media key that never arrived): only decoded
+    // frames show the agent's video got through the call's E2EE.
+    expect(outcome.delta.frames_decoded, 'Chromium decoded no video frame from the agent').toBeGreaterThan(0);
 
     const leave = frame.getByRole('button', { name: /leave|hang up|end call/i }).first();
     await leave.click({ timeout: 10_000 }).then(
@@ -242,4 +245,6 @@ test('EW-AV1: a call through the served Element Web sends and receives audio and
     await write('outcome.json', outcome).catch(() => {});
     await context.close();
   }
+  // Reached only when the call passed, so a cleanup failure never hides the call's own.
+  expect(outcome.deactivate, 'the throwaway account is still active').toBe('deactivated');
 });
