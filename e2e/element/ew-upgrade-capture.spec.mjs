@@ -223,7 +223,7 @@ test('EW-U4: baseline: a passkey account registered in the same browser', async 
   }
 });
 
-test('EW-U5: baseline: Spotlight resolves a DID to its MXID', async () => {
+test('EW-U5: baseline: Spotlight resolves a DID to its MXID', { tag: '@ew-p8' }, async () => {
   test.setTimeout(120_000);
   await page.bringToFront();
   const r = await spotlightFindsDid(page, state.accounts.b.did, state.accounts.b.user_id);

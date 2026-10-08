@@ -253,7 +253,7 @@ test.afterAll(async () => {
   await swProxy?.close();
 });
 
-test('SW-1: an authenticated /versions 401 is retried anonymously, media stays authenticated', async () => {
+test('SW-1: an authenticated /versions 401 is retried anonymously, media stays authenticated', { tag: '@ew-p9' }, async () => {
   let injected = 0;
   const handler = (route) => {
     const req = route.request();
@@ -287,7 +287,7 @@ test('SW-1: an authenticated /versions 401 is retried anonymously, media stays a
   }
 });
 
-test('SW-2: a failed /versions check is not cached', async () => {
+test('SW-2: a failed /versions check is not cached', { tag: '@ew-p9' }, async () => {
   let failing = true;
   let injected = 0;
   const handler = (route) => {
@@ -329,7 +329,7 @@ test('SW-2: a failed /versions check is not cached', async () => {
   }
 });
 
-test('SW-3: a media 401 is retried once the app has refreshed its token', async () => {
+test('SW-3: a media 401 is retried once the app has refreshed its token', { tag: '@ew-p10' }, async () => {
   let mediaInjected = 0;
   const mediaHandler = (route) => {
     const req = route.request();

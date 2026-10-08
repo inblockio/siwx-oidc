@@ -186,7 +186,7 @@ test('EW-UA5: candidate: a new message sends from the composer, encrypted', asyn
   expect(await wireType(page, state.room_id, id)).toBe('m.room.encrypted');
 });
 
-test('EW-UA6: candidate: Spotlight resolves a DID to its MXID', async () => {
+test('EW-UA6: candidate: Spotlight resolves a DID to its MXID', { tag: '@ew-p8' }, async () => {
   await app();
   await page.bringToFront();
   const r = await spotlightFindsDid(page, state.accounts.b.did, state.accounts.b.user_id);

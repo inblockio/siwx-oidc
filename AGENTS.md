@@ -143,10 +143,15 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   person in Element Web: on the siwx-oidc-matrix-server lab pinned by image digest it signs in
   through Element in a persistent browser profile before the switch, replaces only siwx-oidc,
   and checks the session, the crypto, the history, the Sessions manager, a second tab, a
-  passkey and a token refresh after it. Each creates and deactivates throwaway accounts; see
-  e2e/README.md.
+  passkey and a token refresh after it. With `T2_SWAP=element-web` (T2-EW) it replaces only
+  Element Web instead and checks the session, the device and the browser EventIndex (not
+  reset, edits and redactions honoured); `T2_DIRECTION=rollback` runs candidate -> baseline.
+  Each creates and deactivates throwaway accounts; see e2e/README.md.
 - **Browser suites:** `e2e/browser/` (self-contained, runs in CI) and `e2e/element/` (needs
-  Element Web, a real Synapse and the proxy from siwx-oidc-matrix-server).
+  Element Web, a real Synapse and the proxy from siwx-oidc-matrix-server). Tests in
+  `e2e/element/` that exercise a vendored Element Web patch carry the Playwright tag
+  `@ew-p<N>` (registry entry N), runtime/config deltas `@ew-delta-<name>`; a promotion selects
+  them with `--grep` (e2e/element/README.md).
 - **aqua-auth's own tests** run in that repository, not here.
 - **Running the server locally** needs `SIWXOIDC_BASE_URL` with a hostname
   (`http://localhost:8000`): the default `http://127.0.0.1:8000` makes WebAuthn refuse the IP

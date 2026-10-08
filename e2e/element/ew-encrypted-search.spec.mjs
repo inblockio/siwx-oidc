@@ -122,7 +122,7 @@ function storageHasPlaintext(dump, needles) {
   return needles.filter((n) => blob.includes(n.toLowerCase()));
 }
 
-test('UX1-UX8 encrypted search on hosted Element Web', async ({ page, context }) => {
+test('UX1-UX8 encrypted search on hosted Element Web', { tag: '@ew-p6' }, async ({ page, context }) => {
   test.setTimeout(420_000);
   const w = makeWallet();
 

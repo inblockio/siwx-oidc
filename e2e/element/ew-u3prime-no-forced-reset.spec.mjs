@@ -553,7 +553,7 @@ function diagnose(label, { before, after, wire, logs, samples, mode }) {
 // at all — a different, equally bad failure.
 // ---------------------------------------------------------------------------
 
-test('EW-U3P-0: a genuine M_NOT_FOUND still takes the CREATE path (control)', async ({ page }) => {
+test('EW-U3P-0: a genuine M_NOT_FOUND still takes the CREATE path (control)', { tag: '@ew-p1' }, async ({ page }) => {
   test.setTimeout(420_000);
 
   const logs = attachConsoleCapture(page);
@@ -854,14 +854,14 @@ async function runIndeterminateProbeLeg(page, mode, label) {
   ).toBe(true);
 }
 
-test('EW-U3P-1: a probe that fails with a NETWORK error must UNLOCK, never reset', async ({
+test('EW-U3P-1: a probe that fails with a NETWORK error must UNLOCK, never reset', { tag: '@ew-p1' }, async ({
   page,
 }) => {
   test.setTimeout(600_000);
   await runIndeterminateProbeLeg(page, 'abort', 'EW-U3P-1 net-abort');
 });
 
-test('EW-U3P-2: a probe that fails with 5xx (errcode !== M_NOT_FOUND) must UNLOCK, never reset', async ({
+test('EW-U3P-2: a probe that fails with 5xx (errcode !== M_NOT_FOUND) must UNLOCK, never reset', { tag: '@ew-p1' }, async ({
   page,
 }) => {
   test.setTimeout(600_000);
