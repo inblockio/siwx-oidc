@@ -191,6 +191,9 @@ jobs:
       SIWXOIDC_ADDRESS: 127.0.0.1
       SIWXOIDC_PORT: "18080"
       SIWXOIDC_BASE_URL: http://localhost:18080
+      # The static client e2e_client_lifetime checks; e2e/env.sh configures the
+      # same one for e2e/up.sh.
+      SIWXOIDC_DEFAULT_CLIENTS__E2ESTATIC: '{"secret":"not-a-secret-e2e-fixture","metadata":{"redirect_uris":["http://localhost:0/callback"],"token_endpoint_auth_method":"none"}}'
       # Also read by e2e_race_teardown's keyspace scans
       # (no_token_the_client_holds_is_stored_in_the_clear,
       # no_code_or_session_the_client_holds_is_stored_in_the_clear,
@@ -296,6 +299,11 @@ jobs:
       # their client (28/28 promoted).
       - name: E2E OAuth binding
         run: cargo test --test e2e_oauth_binding -- --ignored --test-threads=1
+
+      # Client lifetimes: the static client carries no TTL and still authorizes, and
+      # a dynamic client's next use restores its 30-day lifetime.
+      - name: E2E client lifetimes
+        run: cargo test --test e2e_client_lifetime -- --ignored --test-threads=1
 
       # Race/teardown hazard register H1..H14 (14/14 promoted -- this said 12/12
       # for two suites' worth of growth; the count is now checked, not recited).

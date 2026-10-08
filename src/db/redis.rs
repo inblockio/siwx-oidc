@@ -30,6 +30,10 @@ pub struct RedisClient {
     /// Whether a reuse event revokes its grant (I5 phase B); off by default.
     /// Set with [`RedisClient::with_reuse_enforcement`].
     pub(super) reuse_revokes_grant: bool,
+    /// The Redis SET that records the static clients this client syncs
+    /// ([`DBClient::sync_static_clients`]): `clients:static` unless
+    /// [`RedisClient::with_static_clients_key`] names another.
+    pub(super) static_clients_key: String,
 }
 
 /// Redis key for the per-`(username, device_id)` token index SET.
@@ -112,6 +116,32 @@ if ttl > 0 then
   redis.call('SET', KEYS[1], ARGV[2], 'PX', ttl)
 else
   redis.call('SET', KEYS[1], ARGV[2])
+end
+return 1
+"#;
+
+/// Extend a client entry's expiry, and only while it has one. `KEYS[1]` the entry,
+/// `ARGV[1]` the lifetime in seconds. `TTL` answers -1 for a key without an expiry (a
+/// static client) and -2 for an absent key, and only a positive TTL is extended, so a
+/// client that turns static or disappears between a check and the write is never given
+/// an expiry. Returns 1 when it extended the entry.
+const TOUCH_CLIENT_SCRIPT: &str = r#"
+if redis.call('TTL', KEYS[1]) > 0 then
+  return redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+end
+return 0
+"#;
+
+/// Write a client entry, deciding its lifetime on the key as it is. `KEYS[1]` the entry,
+/// `ARGV[1]` the value, `ARGV[2]` the lifetime in seconds. `TTL` answers -1 for a key
+/// without an expiry, which is a static client and stays that way; every other write, a
+/// new key included, gets the full lifetime. One script, so the decision and the write
+/// see the same key.
+const SET_CLIENT_SCRIPT: &str = r#"
+if redis.call('TTL', KEYS[1]) == -1 then
+  redis.call('SET', KEYS[1], ARGV[1])
+else
+  redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
 end
 return 1
 "#;
@@ -341,7 +371,17 @@ impl RedisClient {
             pool,
             lifetime: Default::default(),
             reuse_revokes_grant: false,
+            static_clients_key: KV_STATIC_CLIENTS_KEY.to_string(),
         })
+    }
+
+    /// Record the static clients this client syncs in the SET `key` instead of the real
+    /// `clients:static`. A sync deletes every client its set records that the new map no
+    /// longer names, so a client that must never reach the static clients of a deployment
+    /// sharing its Redis (the tests' own, `test_support`) records them in a set of its own.
+    pub(crate) fn with_static_clients_key(mut self, key: impl Into<String>) -> Self {
+        self.static_clients_key = key.into();
+        self
     }
 }
 
@@ -412,6 +452,32 @@ impl RedisClient {
             .await
             .map_err(|e| anyhow!("Redis DEL: {}", e))?;
         Ok(())
+    }
+
+    /// Remaining TTL of a key in seconds: `-1` when it has none, `-2` when it is absent.
+    pub async fn ttl_raw(&self, key: &str) -> Result<i64> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+        bb8_redis::redis::cmd("TTL")
+            .arg(key)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("Redis TTL: {}", e))
+    }
+
+    /// Set a key's TTL in seconds. Tests use it to age an entry.
+    pub async fn expire_raw(&self, key: &str, ttl_secs: i64) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+        conn.expire::<_, ()>(key, ttl_secs)
+            .await
+            .map_err(|e| anyhow!("Redis EXPIRE: {}", e))
     }
 
     /// Add `member` to the Redis SET at `key` (idempotent; SADD of an existing
@@ -1083,14 +1149,18 @@ impl DBClient for RedisClient {
             .await
             .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
 
-        conn.set_ex::<_, _, ()>(
-            format!("{}/{}", KV_CLIENT_PREFIX, client_id),
-            serde_json::to_string(&client_entry)
-                .map_err(|e| anyhow!("Failed to serialize client entry: {}", e))?,
-            CLIENT_LIFETIME,
-        )
-        .await
-        .map_err(|e| anyhow!("Failed to set kv: {}", e))?;
+        let _written: i64 = bb8_redis::redis::cmd("EVAL")
+            .arg(SET_CLIENT_SCRIPT)
+            .arg(1)
+            .arg(format!("{}/{}", KV_CLIENT_PREFIX, client_id))
+            .arg(
+                serde_json::to_string(&client_entry)
+                    .map_err(|e| anyhow!("Failed to serialize client entry: {}", e))?,
+            )
+            .arg(CLIENT_LIFETIME)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("Failed to set kv: {}", e))?;
         Ok(())
     }
 
@@ -1141,6 +1211,64 @@ impl DBClient for RedisClient {
         conn.del::<_, ()>(format!("{}/{}", KV_CLIENT_PREFIX, client_id))
             .await
             .map_err(|e| anyhow!("Failed to delete kv: {}", e))?;
+        Ok(())
+    }
+
+    async fn sync_static_clients(&self, clients: Vec<(String, ClientEntry)>) -> Result<usize> {
+        let set_key = self.static_clients_key.as_str();
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+        let previous: Vec<String> = conn
+            .smembers(set_key)
+            .await
+            .map_err(|e| anyhow!("Failed to read the static client set: {}", e))?;
+        for (id, entry) in &clients {
+            let value = serde_json::to_string(entry)
+                .map_err(|e| anyhow!("Failed to serialize client entry: {}", e))?;
+            // Tracked before it is written: a failure between the two commands then leaves a
+            // tracked id without a client, which pruning handles, and never a client without
+            // a TTL that nothing tracks.
+            conn.sadd::<_, _, ()>(set_key, id)
+                .await
+                .map_err(|e| anyhow!("Failed to record a static client: {}", e))?;
+            // A plain SET also clears a TTL that an older build wrote on this key.
+            conn.set::<_, _, ()>(format!("{}/{}", KV_CLIENT_PREFIX, id), value)
+                .await
+                .map_err(|e| anyhow!("Failed to set kv: {}", e))?;
+        }
+        let mut pruned = 0;
+        for id in previous
+            .iter()
+            .filter(|id| !clients.iter().any(|(kept, _)| kept == *id))
+        {
+            conn.del::<_, ()>(format!("{}/{}", KV_CLIENT_PREFIX, id))
+                .await
+                .map_err(|e| anyhow!("Failed to delete a removed static client: {}", e))?;
+            conn.srem::<_, _, ()>(set_key, id)
+                .await
+                .map_err(|e| anyhow!("Failed to untrack a removed static client: {}", e))?;
+            pruned += 1;
+        }
+        Ok(pruned)
+    }
+
+    async fn touch_client(&self, client_id: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+        let _extended: i64 = bb8_redis::redis::cmd("EVAL")
+            .arg(TOUCH_CLIENT_SCRIPT)
+            .arg(1)
+            .arg(format!("{}/{}", KV_CLIENT_PREFIX, client_id))
+            .arg(CLIENT_LIFETIME)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("Failed to extend a client's lifetime: {}", e))?;
         Ok(())
     }
 
@@ -2811,5 +2939,221 @@ mod tests {
         assert_eq!(replaced, 0);
         assert_eq!(client.get_raw(&key).await.unwrap().unwrap(), updated);
         client.del_raw(&key).await.unwrap();
+    }
+
+    fn lifetime_test_entry_with_secret(secret: &str) -> crate::db::ClientEntry {
+        let metadata = crate::db::SiwxClientMetadata::new(
+            vec![
+                openidconnect::RedirectUrl::new("https://app.example.org/callback".into()).unwrap(),
+            ],
+            crate::db::LogoutClientMetadata::default(),
+        );
+        crate::db::ClientEntry::new(secret, metadata, None)
+    }
+
+    fn lifetime_test_entry() -> crate::db::ClientEntry {
+        lifetime_test_entry_with_secret("not-a-secret-test-fixture")
+    }
+
+    /// A static client carries no TTL after start-up, a TTL an older build wrote is
+    /// cleared, and a static client removed from the configuration is deleted at the
+    /// next sync. The test client tracks static clients in a set of its own, so it can
+    /// never prune the static clients of a stack that shares this Redis.
+    #[tokio::test]
+    async fn static_clients_never_expire() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let n = unique_nonce();
+        let kept = format!("static-kept-{n}");
+        let removed = format!("static-removed-{n}");
+        let kept_key = format!("clients/{kept}");
+        let removed_key = format!("clients/{removed}");
+
+        // An older build wrote the kept client with the 30-day lifetime.
+        client
+            .set_client(kept.clone(), lifetime_test_entry())
+            .await
+            .unwrap();
+        assert!(
+            client.ttl_raw(&kept_key).await.unwrap() > 0,
+            "precondition: the old write carries a TTL"
+        );
+
+        let pruned = client
+            .sync_static_clients(vec![
+                (kept.clone(), lifetime_test_entry()),
+                (removed.clone(), lifetime_test_entry()),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(pruned, 0);
+        assert_eq!(
+            client.ttl_raw(&kept_key).await.unwrap(),
+            -1,
+            "a static client must never expire"
+        );
+        assert_eq!(client.ttl_raw(&removed_key).await.unwrap(), -1);
+
+        // The next start no longer configures `removed`.
+        let pruned = client
+            .sync_static_clients(vec![(kept.clone(), lifetime_test_entry())])
+            .await
+            .unwrap();
+        assert_eq!(pruned, 1, "exactly the removed client is pruned");
+        assert!(
+            client.get_client(removed.clone()).await.unwrap().is_none(),
+            "a client removed from default_clients must not stay registered"
+        );
+        assert!(client.get_client(kept.clone()).await.unwrap().is_some());
+        assert_eq!(client.ttl_raw(&kept_key).await.unwrap(), -1);
+
+        client.del_raw(&kept_key).await.ok();
+        client.del_raw(&client.static_clients_key).await.ok();
+    }
+
+    #[tokio::test]
+    async fn touching_extends_a_dynamic_client_and_never_a_static_one() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let n = unique_nonce();
+        let dynamic = format!("dynamic-{n}");
+        let dynamic_key = format!("clients/{dynamic}");
+        client
+            .set_client(dynamic.clone(), lifetime_test_entry())
+            .await
+            .unwrap();
+        client.expire_raw(&dynamic_key, 60).await.unwrap(); // close to its end
+        client.touch_client(&dynamic).await.unwrap();
+        let ttl = client.ttl_raw(&dynamic_key).await.unwrap();
+        assert!(
+            ttl > crate::db::CLIENT_LIFETIME as i64 - 60,
+            "a used dynamic client gets its full lifetime back, got {ttl}"
+        );
+
+        let fixed = format!("static-{n}");
+        let fixed_key = format!("clients/{fixed}");
+        client
+            .sync_static_clients(vec![(fixed.clone(), lifetime_test_entry())])
+            .await
+            .unwrap();
+        client.touch_client(&fixed).await.unwrap();
+        assert_eq!(
+            client.ttl_raw(&fixed_key).await.unwrap(),
+            -1,
+            "touching must never give a static client a TTL"
+        );
+
+        let unknown = format!("unknown-{n}");
+        client.touch_client(&unknown).await.unwrap();
+        assert_eq!(
+            client.ttl_raw(&format!("clients/{unknown}")).await.unwrap(),
+            -2,
+            "touching an unknown id creates nothing"
+        );
+
+        for key in [dynamic_key, fixed_key, client.static_clients_key.clone()] {
+            client.del_raw(&key).await.ok();
+        }
+    }
+
+    /// Rewriting a client's entry (a registration-management update) never changes whether
+    /// it expires: a static client stays without an expiry, and a dynamic client gets its
+    /// full lifetime back, as it does on every other use.
+    #[tokio::test]
+    async fn rewriting_a_client_keeps_a_static_client_without_expiry() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let n = unique_nonce();
+        let fixed = format!("static-{n}");
+        let fixed_key = format!("clients/{fixed}");
+        client
+            .sync_static_clients(vec![(fixed.clone(), lifetime_test_entry())])
+            .await
+            .unwrap();
+
+        client
+            .set_client(fixed.clone(), lifetime_test_entry_with_secret("rewritten"))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.ttl_raw(&fixed_key).await.unwrap(),
+            -1,
+            "a rewrite must not give a static client an expiry"
+        );
+        assert!(
+            client
+                .get_client(fixed)
+                .await
+                .unwrap()
+                .unwrap()
+                .secret_matches("rewritten"),
+            "the entry itself is replaced"
+        );
+
+        let dynamic = format!("dynamic-{n}");
+        let dynamic_key = format!("clients/{dynamic}");
+        client
+            .set_client(dynamic.clone(), lifetime_test_entry())
+            .await
+            .unwrap();
+        client.expire_raw(&dynamic_key, 60).await.unwrap(); // close to its end
+        client
+            .set_client(dynamic, lifetime_test_entry())
+            .await
+            .unwrap();
+        let ttl = client.ttl_raw(&dynamic_key).await.unwrap();
+        assert!(
+            ttl > crate::db::CLIENT_LIFETIME as i64 - 60,
+            "a rewritten dynamic client gets its full lifetime back, got {ttl}"
+        );
+
+        for key in [fixed_key, dynamic_key, client.static_clients_key.clone()] {
+            client.del_raw(&key).await.ok();
+        }
+    }
+
+    /// A static client an earlier build wrote in the clear and without an expiry is
+    /// replaced by its digest-only form on its first read, and keeps having no expiry:
+    /// the upgrade rewrites the entry in place and must not give it one.
+    #[tokio::test]
+    async fn an_upgraded_plaintext_static_client_keeps_no_ttl() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let id = format!("plaintext-static-{}", unique_nonce());
+        let key = format!("clients/{id}");
+        let secret = "not-a-secret-test-fixture";
+        let plaintext = serde_json::json!({
+            "secret": secret,
+            "metadata": {"redirect_uris": ["https://app.example.org/callback"]},
+        })
+        .to_string();
+        client.set_raw(&key, &plaintext).await.unwrap();
+        assert_eq!(
+            client.ttl_raw(&key).await.unwrap(),
+            -1,
+            "precondition: a static client has no expiry"
+        );
+
+        let entry = client.get_client(id).await.unwrap().unwrap();
+
+        assert!(
+            entry.secret_matches(secret),
+            "the plaintext entry authenticates"
+        );
+        let stored = client.get_raw(&key).await.unwrap().unwrap();
+        assert!(
+            !stored.contains(secret),
+            "the first read replaced the entry by its digest-only form: {stored}"
+        );
+        assert_eq!(
+            client.ttl_raw(&key).await.unwrap(),
+            -1,
+            "the upgrade must not give a static client an expiry"
+        );
+        client.del_raw(&key).await.ok();
     }
 }

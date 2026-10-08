@@ -52,6 +52,24 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
+/// Extend a dynamic client's lifetime after a successful use. Best-effort: an error is
+/// logged and never changes the answer the caller gets.
+pub(crate) async fn touch_client_after_use(db_client: &DBClientType, client_id: &str) {
+    if let Err(e) = db_client.touch_client(client_id).await {
+        log_failed_touch(client_id, &e);
+    }
+}
+
+/// A failed touch leaves the client's lifetime as it was, so a dynamic client can expire
+/// while sessions still use it. That is an unexpected-but-handled condition: `warn`.
+fn log_failed_touch(client_id: &str, error: &anyhow::Error) {
+    warn!(
+        client_id = %client_id,
+        error = %error,
+        "touch_client failed (best-effort); the client's lifetime was not extended"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // ES256 signing key (replaces RSA signing, so this provider performs no RSA
 // private-key operation — the surface of the RUSTSEC-2023-0071 Marvin attack;
@@ -1223,6 +1241,8 @@ async fn token_refresh(
     );
     response.set_expires_in(Some(&time::Duration::from_secs(expires_in)));
     response.set_refresh_token(Some(RefreshToken::new(pair.refresh_token)));
+    // An accepted rotation or replay is a use of the client the grant belongs to.
+    touch_client_after_use(db_client, &bound_client).await;
     Ok(response)
 }
 
@@ -1428,6 +1448,7 @@ async fn token_device_code(
                     refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
                 })
                 .await?;
+            touch_client_after_use(db_client, &client_id).await;
             let access_token = issued.access_token;
             let refresh_token = issued.refresh_token.ok_or_else(|| {
                 anyhow!("device_code grant: issue_grant returned no refresh token")
@@ -1697,6 +1718,7 @@ async fn token_authorization_code(
             refresh_inactivity_secs: issue_refresh_token.then_some(REFRESH_TOKEN_TTL),
         })
         .await?;
+    touch_client_after_use(db_client, &client_id).await;
     let refresh_token = issued.refresh_token.map(RefreshToken::new);
     let access_token = AccessToken::new(issued.access_token);
 
@@ -1925,6 +1947,9 @@ pub async fn authorize(
             },
         )
         .await?;
+    // The request passed every check above, so the client is registered and the sign-in
+    // that follows may outlast the last of its lifetime.
+    touch_client_after_use(db_client, &params.client_id).await;
     let is_https = params.redirect_uri.url().scheme() == "https";
     let session_cookie = Cookie::build((SESSION_COOKIE_NAME, session_id.to_string()))
         .same_site(SameSite::Strict)
@@ -3598,6 +3623,7 @@ pub async fn userinfo(
         .get_client(metadata.client_id.clone())
         .await?
         .ok_or_else(|| CustomError::BadRequest("Unknown client.".to_string()))?;
+    touch_client_after_use(db_client, &metadata.client_id).await;
     // `metadata.username` IS the localpart (see `TokenMetadata::username`),
     // already resolved through the grandfathering rule at sign-in.
     let additional = mxid_claim(config, &metadata.username);
@@ -6053,6 +6079,52 @@ mod userinfo_mxid_claim_tests {
         }
     }
 
+    /// A successful userinfo call is a use, so it restores a dynamic client's lifetime.
+    #[tokio::test]
+    async fn a_successful_userinfo_call_extends_a_dynamic_client() {
+        let Some(db) = db().await else {
+            return;
+        };
+        let client_id = format!("touch-userinfo-{}", nonce());
+        seed_client(&db, &client_id, false).await.unwrap();
+        let key = format!("clients/{client_id}");
+        db.expire_raw(&key, 60).await.unwrap();
+        let token = format!("tok_{}", nonce());
+        db.set_token(&token, &token_meta(&client_id, LOCALPART), 120)
+            .await
+            .unwrap();
+
+        let _ = userinfo_json(&config_with_server_name(Some(SERVER_NAME)), &db, &token).await;
+
+        assert!(
+            db.ttl_raw(&key).await.unwrap() > 60,
+            "a used dynamic client gets its lifetime back"
+        );
+    }
+
+    /// A failed touch is the only sign that a dynamic client may expire while it is in
+    /// use, so it is a warning that names the client, not a debug line nobody reads.
+    #[test]
+    fn a_failed_lifetime_extension_is_logged_at_warn_with_the_client_id() {
+        let logs = siwx_oidc::test_support::LogCapture::start();
+
+        log_failed_touch("client-42", &anyhow!("redis went away"));
+
+        let log = logs.output();
+        assert!(
+            log.contains("WARN"),
+            "a failed touch must log at warn: {log}"
+        );
+        assert!(
+            log.contains("client-42"),
+            "the line names the client: {log}"
+        );
+        assert!(
+            log.contains("redis went away"),
+            "the line carries the error: {log}"
+        );
+    }
+
     /// The happy path, and the only place the claim NAME is asserted.
     #[tokio::test]
     async fn the_claim_name_on_the_wire_is_io_inblock_mxid() {
@@ -8279,6 +8351,251 @@ mod client_binding_tests {
                      `{by_refresh}`, the code exchange `{by_code}`"
                 );
             }
+        }
+    }
+
+    /// Every accepted use of a dynamic client restores its lifetime, and only the client
+    /// the grant or the code belongs to is touched. The store tests pin that a static
+    /// client never gets an expiry; these pin the call sites.
+    mod client_lifetime {
+        use super::*;
+
+        /// The client's registration key, with one minute of lifetime left.
+        async fn aged(db: &RedisClient, client_id: &str) -> String {
+            let key = format!("clients/{client_id}");
+            db.expire_raw(&key, 60).await.unwrap();
+            key
+        }
+
+        async fn restored(db: &RedisClient, key: &str) -> bool {
+            db.ttl_raw(key).await.unwrap() > 60
+        }
+
+        #[tokio::test]
+        async fn an_accepted_refresh_extends_a_dynamic_client() {
+            let Some(db) = siwx_oidc::test_support::redis().await else {
+                return;
+            };
+            let client = seed_client(&db, Registration::Public).await;
+            let rt = seed_refresh_token(&db, &client).await;
+            let key = aged(&db, &client).await;
+
+            refresh_token_of(refresh(&db, &Config::default(), &rt, NOTHING).await);
+
+            assert!(
+                restored(&db, &key).await,
+                "a refreshed session's dynamic client gets its lifetime back"
+            );
+        }
+
+        /// The touch follows an accepted refresh and names the grant's client: a refusal
+        /// touches nobody, and neither does a request that names another client.
+        #[tokio::test]
+        async fn a_refused_refresh_extends_no_client() {
+            let Some(db) = siwx_oidc::test_support::redis().await else {
+                return;
+            };
+            let owner = seed_client(&db, Registration::Public).await;
+            let other = seed_client(&db, Registration::Confidential).await;
+            let rt = seed_refresh_token(&db, &owner).await;
+            let owner_key = aged(&db, &owner).await;
+            let other_key = aged(&db, &other).await;
+
+            let refused = refresh(
+                &db,
+                &Config::default(),
+                &rt,
+                Presented {
+                    client_id: Some(&other),
+                    form_secret: Some(SECRET),
+                    header_client_id: None,
+                    header_secret: None,
+                },
+            )
+            .await;
+
+            assert_eq!(outcome(&refused), "invalid_grant");
+            assert!(!restored(&db, &owner_key).await, "the grant's client");
+            assert!(
+                !restored(&db, &other_key).await,
+                "the client the request named"
+            );
+        }
+
+        /// A registration-management update must not give a static client an expiry. A
+        /// static client is a client key with no TTL, and the update rewrites the entry in
+        /// place.
+        #[tokio::test]
+        async fn updating_a_static_client_leaves_it_without_an_expiry() {
+            let Some(db) = siwx_oidc::test_support::redis().await else {
+                return;
+            };
+            let metadata_for = |redirect: &str| {
+                SiwxClientMetadata::new(
+                    vec![RedirectUrl::new(redirect.into()).unwrap()],
+                    LogoutClientMetadata::default(),
+                )
+            };
+            let client_id = unique("update-static-");
+            let key = format!("clients/{client_id}");
+            let entry = ClientEntry::new(
+                SECRET,
+                metadata_for("https://example.com/cb"),
+                Some("registration-token"),
+            );
+            db.set_raw(&key, &serde_json::to_string(&entry).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                db.ttl_raw(&key).await.unwrap(),
+                -1,
+                "precondition: a static client has no expiry"
+            );
+
+            client_update(
+                client_id.clone(),
+                metadata_for("https://updated.example.org/cb"),
+                Some(
+                    headers::Authorization::bearer("registration-token")
+                        .unwrap()
+                        .0,
+                ),
+                &db,
+                &RegistrationPolicy::default(),
+            )
+            .await
+            .expect("the update is accepted");
+
+            assert_eq!(
+                db.ttl_raw(&key).await.unwrap(),
+                -1,
+                "an update must not give a static client an expiry"
+            );
+            let stored = db.get_client(client_id).await.unwrap().unwrap();
+            assert_eq!(
+                stored.metadata.redirect_uris()[0].as_str(),
+                "https://updated.example.org/cb",
+                "the update itself is stored"
+            );
+            db.del_raw(&key).await.ok();
+        }
+
+        #[tokio::test]
+        async fn a_code_exchange_extends_a_dynamic_client() {
+            let Some(db) = siwx_oidc::test_support::redis().await else {
+                return;
+            };
+            let client = seed_client(&db, Registration::Public).await;
+            let code = seed_code(&db, &client).await;
+            let key = aged(&db, &client).await;
+
+            let exchanged = exchange(&db, &Config::default(), &code, NOTHING).await;
+
+            assert_eq!(outcome(&exchanged), "ok");
+            assert!(
+                restored(&db, &key).await,
+                "a client whose code was exchanged gets its lifetime back"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_device_code_exchange_extends_a_dynamic_client() {
+            let Some(db) = siwx_oidc::test_support::redis().await else {
+                return;
+            };
+            let client = seed_client(&db, Registration::Public).await;
+            let device_code = unique("dvc_");
+            db.set_device_code(
+                &device_code,
+                &DeviceCodeEntry {
+                    user_code_digest: siwx_oidc::db::tokens::digest(&unique("UC-")),
+                    legacy_user_code: None,
+                    client_id: client.clone(),
+                    scope: "openid".to_string(),
+                    status: DeviceCodeStatus::Approved,
+                    did: Some("did:key:zDnBINDING".to_string()),
+                    device_id: None,
+                    last_poll: None,
+                    created_at: Utc::now().timestamp(),
+                    auth_ms: None,
+                },
+                DEVICE_CODE_LIFETIME,
+            )
+            .await
+            .unwrap();
+            let key = aged(&db, &client).await;
+            let config = Config {
+                mas_shared_secret: Some("not-a-secret-test-fixture".to_string()),
+                ..Config::default()
+            };
+
+            let exchanged = token(
+                TokenForm {
+                    code: None,
+                    client_id: Some(client.clone()),
+                    client_secret: None,
+                    grant_type: CoreGrantType::DeviceCode,
+                    code_verifier: None,
+                    refresh_token: None,
+                    device_code: Some(device_code),
+                },
+                ClientCredentials::default(),
+                &EcdsaSigningKey::generate(),
+                &config,
+                &db,
+                None,
+            )
+            .await;
+
+            assert_eq!(outcome(&exchanged), "ok");
+            assert!(
+                restored(&db, &key).await,
+                "a client whose device code was exchanged gets its lifetime back"
+            );
+        }
+
+        /// `authorize` is the one touch that names the client the request carries, because
+        /// the request has no grant yet. It follows every check the request must pass: a
+        /// refused request extends no client, an accepted one extends the client it names.
+        #[tokio::test]
+        async fn an_authorization_request_extends_the_client_it_names_only_once_accepted() {
+            let Some(db) = siwx_oidc::test_support::redis().await else {
+                return;
+            };
+            let client = seed_client(&db, Registration::Public).await;
+            let key = aged(&db, &client).await;
+            let request = |redirect_uri: &str, challenge: Option<&str>| AuthorizeParams {
+                client_id: client.clone(),
+                redirect_uri: RedirectUrl::new(redirect_uri.into()).unwrap(),
+                scope: Scope::new("openid".to_string()),
+                response_type: Some(CoreResponseType::Code),
+                state: Some("state".into()),
+                nonce: None,
+                prompt: None,
+                request_uri: None,
+                request: None,
+                code_challenge: challenge.map(Into::into),
+                code_challenge_method: Some("S256".into()),
+                response_mode: None,
+            };
+
+            let unregistered = request("https://other.example.org/cb", Some(CHALLENGE));
+            assert!(authorize(unregistered, &db).await.is_err());
+            assert!(!restored(&db, &key).await, "an unregistered redirect URI");
+
+            let no_challenge = request("https://example.com/cb", None);
+            assert!(authorize(no_challenge, &db).await.is_err());
+            assert!(
+                !restored(&db, &key).await,
+                "a request without a PKCE challenge"
+            );
+
+            let accepted = request("https://example.com/cb", Some(CHALLENGE));
+            authorize(accepted, &db).await.unwrap();
+            assert!(
+                restored(&db, &key).await,
+                "an accepted request extends the client it names"
+            );
         }
     }
 }

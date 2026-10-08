@@ -1374,16 +1374,100 @@ async fn account_passkey_finish_handler(
 
 // -- Application entry point -----------------------------------------------
 
-/// Write the configured `default_clients` to Redis, at every start. Each is
-/// configured with its secret (and registration access token, if any) in the
-/// clear; [`ClientEntry`] keeps only their digests, so that is what is stored.
-async fn store_default_clients(config: &config::Config, db: &RedisClient) -> anyhow::Result<()> {
-    for (id, entry) in &config.default_clients {
-        let entry: ClientEntry = serde_json::from_str(entry)
-            .map_err(|e| anyhow::anyhow!("Deserialisation of ClientEntry {id} failed: {e}"))?;
-        db.set_client(id.to_string(), entry).await?;
+/// The configured `default_clients`, each as the entry [`ClientEntry`] keeps: configured
+/// with its secret (and registration access token, if any) in the clear, held as their
+/// digests.
+fn parse_default_clients(config: &config::Config) -> anyhow::Result<Vec<(String, ClientEntry)>> {
+    config
+        .default_clients
+        .iter()
+        .map(|(id, raw)| {
+            let entry = serde_json::from_str(raw).map_err(|e| {
+                anyhow::anyhow!("default_clients.{id} is not a valid client entry: {e}")
+            })?;
+            Ok((id.clone(), entry))
+        })
+        .collect()
+}
+
+fn log_pruned_static_clients(pruned: usize) {
+    if pruned > 0 {
+        info!(
+            pruned,
+            "deleted static clients that default_clients no longer names"
+        );
     }
+}
+
+/// Make the static clients in Redis equal the configured `default_clients`, at every
+/// start: each is written with no expiry, and each client an earlier start wrote that the
+/// map no longer names is deleted. Every instance that shares one Redis must carry the
+/// same map: the last start wins.
+async fn store_default_clients(config: &config::Config, db: &RedisClient) -> anyhow::Result<()> {
+    let pruned = db
+        .sync_static_clients(parse_default_clients(config)?)
+        .await?;
+    log_pruned_static_clients(pruned);
     Ok(())
+}
+
+/// How long the start-up prune waits before its first retry, and the longest it ever waits.
+const PRUNE_FIRST_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+const PRUNE_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `prune` until it succeeds once, and return how many clients it deleted.
+///
+/// A failure is logged and retried after `first_wait`, then after twice as long each time,
+/// up to `cap`: a Redis that is only slow to come up is found quickly, and one that stays
+/// down is asked about once per `cap`. `pause` is how the task waits (`tokio::time::sleep`
+/// in the server; the tests record the waits instead of sitting through them).
+async fn prune_until_done<Prune, PruneFut, Pause, PauseFut>(
+    mut prune: Prune,
+    mut pause: Pause,
+    first_wait: std::time::Duration,
+    cap: std::time::Duration,
+) -> usize
+where
+    Prune: FnMut() -> PruneFut,
+    PruneFut: std::future::Future<Output = anyhow::Result<usize>>,
+    Pause: FnMut(std::time::Duration) -> PauseFut,
+    PauseFut: std::future::Future<Output = ()>,
+{
+    let mut wait = first_wait.min(cap);
+    loop {
+        match prune().await {
+            Ok(pruned) => return pruned,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    retry_in_secs = wait.as_secs_f64(),
+                    "could not prune removed static clients; they stay registered until a prune succeeds"
+                );
+                pause(wait).await;
+                wait = wait.saturating_mul(2).min(cap);
+            }
+        }
+    }
+}
+
+/// With no `default_clients` there is nothing to write, and start-up must keep needing no
+/// Redis, as it does for every deployment without static clients
+/// (`tests/graceful_shutdown.rs` pins that). The clients an earlier configuration named
+/// are pruned in a background task that keeps retrying until one prune succeeds: a removed
+/// client with no expiry must not stay registered because Redis was briefly unreachable at
+/// start-up.
+fn prune_static_clients_in_background(redis_client: &RedisClient) {
+    let redis_client = redis_client.clone();
+    tokio::spawn(async move {
+        let pruned = prune_until_done(
+            || redis_client.sync_static_clients(Vec::new()),
+            tokio::time::sleep,
+            PRUNE_FIRST_RETRY,
+            PRUNE_RETRY_CAP,
+        )
+        .await;
+        log_pruned_static_clients(pruned);
+    });
 }
 
 pub async fn main() {
@@ -1481,9 +1565,15 @@ pub async fn main() {
         .with_grant_lifetime(grant_lifetime)
         .with_reuse_enforcement(config.reuse_revokes_grant);
 
-    store_default_clients(&config, &redis_client)
-        .await
-        .expect("Could not store default_clients");
+    // Configured clients are written before the server listens, and a failure stops
+    // start-up.
+    if config.default_clients.is_empty() {
+        prune_static_clients_in_background(&redis_client);
+    } else {
+        store_default_clients(&config, &redis_client)
+            .await
+            .expect("Could not store default_clients");
+    }
 
     // The `kid` is NOT chosen here. Both branches let `EcdsaSigningKey` derive
     // it from the public key, because this used to stamp the literal `"key1"` on
@@ -2362,10 +2452,81 @@ mod client_credentials_tests {
 }
 
 #[cfg(test)]
+mod start_up_write_isolation_tests {
+    //! The start-up write deletes every client the real set `clients:static` records and
+    //! the configured map no longer names. The Redis a test reaches can be a running
+    //! stack's or a developer's deployment's, so a test's start-up write must never go
+    //! through that set. Needs Redis.
+    use super::*;
+
+    /// The database this test claims, so the real set it writes there is its own.
+    const OWN_DB: u8 = 11;
+
+    fn config_naming(id: &str) -> config::Config {
+        let mut config = config::Config::default();
+        config.default_clients.insert(
+            id.to_string(),
+            serde_json::json!({
+                "secret": "not-a-secret-test-fixture",
+                "metadata": {"redirect_uris": ["https://rp.example.org/cb"]},
+            })
+            .to_string(),
+        );
+        config
+    }
+
+    /// A deployment records its static client in the real set. The start-up write a test
+    /// makes through `test_support` records its own client in a set of its own, so it
+    /// deletes nothing it did not write. The deployment is a plain client on the database
+    /// this test claims: the test never writes to the real set of any other database.
+    #[tokio::test]
+    async fn the_start_up_write_of_a_test_leaves_a_foreign_static_client_alone() {
+        let Some(test_redis) = siwx_oidc::test_support::redis_db(OWN_DB).await else {
+            return;
+        };
+        let deployment = RedisClient::new(&siwx_oidc::test_support::redis_db_url(OWN_DB))
+            .await
+            .unwrap();
+        // Whatever an earlier failed run left in this database's real set.
+        deployment.sync_static_clients(Vec::new()).await.unwrap();
+
+        let foreign = format!("foreign-{}", uuid::Uuid::new_v4().simple());
+        store_default_clients(&config_naming(&foreign), &deployment)
+            .await
+            .unwrap();
+        let ours = format!("default-{}", uuid::Uuid::new_v4().simple());
+        store_default_clients(&config_naming(&ours), &test_redis)
+            .await
+            .unwrap();
+
+        assert!(
+            deployment
+                .get_client(foreign.clone())
+                .await
+                .unwrap()
+                .is_some(),
+            "a test's start-up write deleted a static client it never wrote"
+        );
+        assert_eq!(
+            deployment.sync_static_clients(Vec::new()).await.unwrap(),
+            1,
+            "the real set still records the foreign client, and only it"
+        );
+        assert!(deployment.get_client(foreign).await.unwrap().is_none());
+        assert_eq!(
+            test_redis.sync_static_clients(Vec::new()).await.unwrap(),
+            1,
+            "the test client's own set records exactly the client it wrote"
+        );
+        assert!(test_redis.get_client(ours).await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
 mod default_clients_tests {
     //! `default_clients` are configured in the clear and stored as digests.
-    //! In process, because neither the CI mock stack nor any e2e harness
-    //! configures one. Needs Redis.
+    //! In process, because the one static client the mock stack configures has no
+    //! registration access token. Needs Redis.
     use super::*;
 
     /// The configured secret and registration access token appear in no key
@@ -2410,5 +2571,90 @@ mod default_clients_tests {
         assert!(entry.access_token_matches(&token));
         assert!(!entry.secret_matches(&entry.secret_digest));
         redis.del_raw(&key).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod static_client_prune_tests {
+    //! The start-up prune keeps trying until one attempt succeeds. No Redis and no sleeping:
+    //! the attempt is a closure and the pause records the wait it was asked for.
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Run `prune_until_done` with an attempt that fails `failures` times and then deletes
+    /// `pruned` clients. Returns the result, how many attempts ran, and every wait requested.
+    async fn run(
+        failures: usize,
+        pruned: usize,
+        first_wait: Duration,
+        cap: Duration,
+    ) -> (usize, usize, Vec<Duration>) {
+        let attempts = Mutex::new(0usize);
+        let waits = Mutex::new(Vec::new());
+        let result = prune_until_done(
+            || {
+                let mut count = attempts.lock().unwrap();
+                *count += 1;
+                let attempt = *count;
+                async move {
+                    if attempt <= failures {
+                        Err(anyhow::anyhow!("redis is unreachable"))
+                    } else {
+                        Ok(pruned)
+                    }
+                }
+            },
+            |wait| {
+                waits.lock().unwrap().push(wait);
+                std::future::ready(())
+            },
+            first_wait,
+            cap,
+        )
+        .await;
+        let attempts = *attempts.lock().unwrap();
+        let waits = waits.into_inner().unwrap();
+        (result, attempts, waits)
+    }
+
+    #[tokio::test]
+    async fn a_prune_that_works_at_once_runs_once_and_never_waits() {
+        let (result, attempts, waits) = run(0, 3, PRUNE_FIRST_RETRY, PRUNE_RETRY_CAP).await;
+        assert_eq!(result, 3);
+        assert_eq!(attempts, 1);
+        assert!(waits.is_empty(), "no failure, so no wait: {waits:?}");
+    }
+
+    /// The prune is retried until Redis answers once, and what the successful attempt
+    /// deleted is what comes back.
+    #[tokio::test]
+    async fn a_prune_that_fails_is_retried_until_it_succeeds() {
+        let (result, attempts, waits) =
+            run(3, 5, Duration::from_secs(1), Duration::from_secs(60)).await;
+        assert_eq!(result, 5, "the successful attempt's count is returned");
+        assert_eq!(attempts, 4, "three failures, then the success");
+        assert_eq!(waits.len(), 3, "one wait after each failure: {waits:?}");
+    }
+
+    /// The wait doubles after every failure and stops growing at the cap, so an outage of
+    /// any length is polled about once per cap and never gives up.
+    #[tokio::test]
+    async fn the_wait_doubles_up_to_the_cap_and_stays_there() {
+        let (_, attempts, waits) = run(8, 0, Duration::from_secs(1), Duration::from_secs(60)).await;
+        let seconds: Vec<u64> = waits.iter().map(Duration::as_secs).collect();
+        assert_eq!(seconds, [1, 2, 4, 8, 16, 32, 60, 60]);
+        assert_eq!(attempts, 9);
+    }
+
+    /// A first wait above the cap is clamped to it, so `cap` is a true upper bound.
+    #[tokio::test]
+    async fn no_wait_ever_exceeds_the_cap() {
+        let (_, _, waits) = run(3, 0, Duration::from_secs(90), Duration::from_secs(60)).await;
+        assert_eq!(waits.len(), 3);
+        assert!(
+            waits.iter().all(|wait| *wait <= Duration::from_secs(60)),
+            "{waits:?}"
+        );
     }
 }

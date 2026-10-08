@@ -111,13 +111,18 @@ abused, leave it out of the list and let its proofs fail; the next sign-in re-as
 
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
-| `default_clients` | `SIWXOIDC_DEFAULT_CLIENTS` | none | Map of client id to a JSON client entry, written to Redis at every start. |
+| `default_clients` | `SIWXOIDC_DEFAULT_CLIENTS` | none | Map of client id to a JSON client entry, written to Redis at every start with no expiry. An id removed from the map is deleted at the next start. |
 | `require_secret` | `SIWXOIDC_REQUIRE_SECRET` | `true` | Whether `POST /token` demands a client secret, at the code exchange and at the refresh grant alike, from a client whose metadata names no `token_endpoint_auth_method`. A client registered with `"none"` never needs one. |
 
 A client entry is `{"secret": "…", "metadata": {…}}`, where `metadata` is RFC 7591 client
 metadata (at least `redirect_uris`); an optional `"access_token"` is the registration access
 token that manages the client at `/client/{id}`. Clients can also register themselves through
 `POST /register` (dynamic client registration), which is what Matrix clients do.
+A dynamically registered client is kept for 30 days after its last use (an authorization
+request, a code, device-code or refresh exchange, or a userinfo call); after that it must
+register again. An authorization request counts only once it passed every check, the redirect
+URI exactly as registered included, so whoever knows a client's id and one of its registered
+redirect URIs can keep that registration from lapsing; it gives them nothing else.
 
 Redis holds only the SHA-256 digests of the secret and of the registration access token, never
 the values, for configured and registered clients alike. A registered client's secret is random;
@@ -130,6 +135,27 @@ the configuration as you would the secret.
 [default.default_clients]
 my-app = '{"secret":"change-me","metadata":{"redirect_uris":["https://app.example.org/callback"]}}'
 ```
+
+Every start makes the static clients in Redis equal that instance's `default_clients`: it writes
+each entry, with no expiry, and deletes each client an earlier start wrote that the map no longer
+names. Every instance that shares one Redis must therefore carry the same `default_clients` map,
+because the last start wins: an instance with a different map overwrites or deletes the clients
+of the others. A static client whose entry carries an `access_token` can still be changed
+through its registration endpoint, but that change lasts only until the next start writes the
+entry again, and it never gives the client an expiry.
+
+With no `default_clients` there is nothing to write, so the server starts without Redis and
+deletes the clients an earlier configuration left behind in the background. If Redis cannot be
+reached it retries, after 1 s and then at doubling intervals up to 60 s, until one attempt
+succeeds; until then those clients stay registered.
+
+Removing a client, whether by dropping its id from `default_clients` or by `DELETE` on a
+dynamically registered one, stops new authorizations and code exchanges for it. It does not end
+the sessions that already exist: a refresh token of a removed client still refreshes (a request
+that presents a secret is refused, because the client can no longer be checked), and each refresh
+issues a new refresh token, so a session keeps refreshing until it is revoked (token revocation,
+sign-out or account deactivation), its refresh token goes unused for 90 days, or its absolute
+lifetime ends when one is set.
 
 ### Grant lifetime
 

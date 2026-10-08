@@ -9,10 +9,13 @@
 //!
 //! These tests run the real binary. On the host it is not PID 1, so without the
 //! handler a signal still ends it, but by the signal, not by `main` returning:
-//! the exit-status assertion is what fails then. They need no Redis: startup
-//! opens no connection until a request needs one, and the in-flight request
-//! (`GET /resolve` for an unregistered DID) asks only the homeserver, which the
-//! test plays itself.
+//! the exit-status assertion is what fails then. They need no Redis: the server
+//! is pointed at an address nothing listens on, with the caller's environment
+//! cleared, so no test can touch a real Redis. With no `default_clients` the
+//! start-up prune runs against that address in the background and must neither
+//! delay listening nor hold up shutdown. The in-flight request (`GET /resolve`
+//! for an unregistered DID) asks only the homeserver, which the test plays
+//! itself.
 //!
 //! The server is started on port 0 and the test reads the port it got from the
 //! server's `Listening on` line. The server logs that line after the bind and
@@ -36,6 +39,10 @@ use std::time::{Duration, Instant};
 /// How long a server may take to log where it listens, or to refuse to start.
 const START_UP: Duration = Duration::from_secs(30);
 
+/// A Redis address nothing listens on: port 1 refuses at once. The spawned server is pointed
+/// here so that it cannot reach a real Redis, whatever the caller's environment names.
+const UNREACHABLE_REDIS_URL: &str = "redis://127.0.0.1:1";
+
 /// The port named by a `Listening on <address>` log line.
 fn listening_port(line: &str) -> Option<u16> {
     let (_, rest) = line.split_once("Listening on ")?;
@@ -56,13 +63,19 @@ struct Server {
 
 impl Server {
     /// Start the server on port 0 with `env` added, without waiting for it to listen.
+    ///
+    /// The server gets only the environment set here, never the caller's: a caller's
+    /// `SIWXOIDC_REDIS_URL` (or the default `redis://localhost`) could name a Redis that holds
+    /// static clients, which a server started with no `default_clients` deletes.
     fn spawn(env: &[(&str, String)]) -> Server {
         let (reader, writer) = std::io::pipe().expect("create the server's output pipe");
         let mut command = Command::new(env!("CARGO_BIN_EXE_siwx-oidc"));
         command
+            .env_clear()
             .env("SIWXOIDC_ADDRESS", "127.0.0.1")
             .env("SIWXOIDC_PORT", "0")
             .env("SIWXOIDC_BASE_URL", "http://localhost")
+            .env("SIWXOIDC_REDIS_URL", UNREACHABLE_REDIS_URL)
             .env("RUST_LOG", "siwx_oidc=info")
             .env("RUST_BACKTRACE", "1")
             .stdout(writer.try_clone().expect("share the output pipe"))
@@ -254,6 +267,92 @@ fn a_server_that_cannot_bind_says_which_address() {
         log.contains(&format!("could not bind 127.0.0.1:{port}")),
         "the failure must name the address; output:\n{log}"
     );
+}
+
+/// A listener nothing answers on, and the `redis://` URL that names it.
+fn redis_trap() -> (TcpListener, String) {
+    let trap = TcpListener::bind("127.0.0.1:0").unwrap();
+    trap.set_nonblocking(true).unwrap();
+    let url = format!("redis://127.0.0.1:{}", trap.local_addr().unwrap().port());
+    (trap, url)
+}
+
+/// Whether anything connects to `trap` within `within`.
+fn connection_arrives(trap: &TcpListener, within: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        if trap.accept().is_ok() {
+            return true;
+        }
+        if started.elapsed() > within {
+            return false;
+        }
+        sleep(Duration::from_millis(20));
+    }
+}
+
+/// A variable set in this process, put back on drop.
+struct CallerEnv {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl CallerEnv {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for CallerEnv {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+/// With no `default_clients`, the one thing the server does with Redis at start-up is prune
+/// the static clients an earlier configuration left there. A test server that inherited a
+/// developer's `SIWXOIDC_REDIS_URL` (or the default `redis://localhost`) would delete the
+/// static clients of that Redis, so the spawned server must never read the caller's
+/// environment. The control makes "no connection" mean something: a server that is told a
+/// Redis address does connect to it at start-up.
+#[test]
+fn a_spawned_server_never_reaches_the_redis_the_callers_environment_names() {
+    let (told, told_url) = redis_trap();
+    let server = Server::start(&[("SIWXOIDC_REDIS_URL", told_url)]);
+    let reached = connection_arrives(&told, Duration::from_secs(10));
+    drop(server);
+    assert!(
+        reached,
+        "control: a server given a Redis URL connects to it at start-up"
+    );
+
+    let (trap, trap_url) = redis_trap();
+    let _caller = CallerEnv::set("SIWXOIDC_REDIS_URL", &trap_url);
+    let server = Server::start(&[]);
+    let reached = connection_arrives(&trap, Duration::from_secs(2));
+    drop(server);
+    assert!(
+        !reached,
+        "the spawned server inherited the caller's SIWXOIDC_REDIS_URL and connected to it"
+    );
+}
+
+/// `e2e/env.sh` exports a `default_clients` entry for the mock stack. A server that inherited
+/// it would have to write it to Redis before listening, and the Redis it is pointed at is
+/// unreachable, so it would exit after the pool's 30 s connection timeout and every test in
+/// this file would fail. The spawned server must not see the caller's configuration at all.
+#[test]
+fn a_spawned_server_ignores_the_static_clients_in_the_callers_environment() {
+    let _caller = CallerEnv::set(
+        "SIWXOIDC_DEFAULT_CLIENTS__LEAKED",
+        r#"{"secret":"not-a-secret-test-fixture","metadata":{"redirect_uris":["https://app.example.org/cb"]}}"#,
+    );
+    let _server = Server::start(&[]);
 }
 
 /// A homeserver that answers every request with 200 `{}` after `delay`, and

@@ -628,9 +628,12 @@ Provisional choices, open for the maintainers:
 - **A public client may omit `client_id` at the refresh grant.** `siwx-oidc-auth`
   and the Matrix clients send it, an older agent may not; requiring it would
   sign those out.
-- **A token outlives its client's registration.** A registration lasts 30 days
-  and a refresh token 90 days from its last use, so a session can outlast the
-  registration it was issued under. Such a token keeps refreshing when the
+- **A token can outlive its client's registration.** A dynamic registration
+  lasts 30 days from its last use and a refresh token 90 days from its last use.
+  An authorization request, a code or device-code exchange, an accepted refresh
+  and a userinfo call each restore the registration, so a session in use keeps
+  its client; a registration still lapses after 30 days without a use, and a
+  client can be removed. A token whose client is gone keeps refreshing when the
   request names that client or none, and is refused when the request names
   another client or presents a secret (which can no longer be checked). Refusing
   it outright would sign out every session older than a registration.

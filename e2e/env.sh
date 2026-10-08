@@ -36,3 +36,8 @@ export SYNAPSE_MOCK_OIDC_BASE="${SYNAPSE_MOCK_OIDC_BASE:-$SIWEOIDC_BASE_URL}"
 # drive (GET account/whoami, GET devices) through a real introspection against
 # siwx-oidc. Overridable, because a real-stack run must still point at Synapse.
 export MATRIX_HOST="${MATRIX_HOST:-http://localhost:${SYNAPSE_MOCK_PORT}}"
+# A static client for tests/e2e_client_lifetime.rs. The `if` form is needed because a
+# `${VAR:-...}` default cannot contain the JSON's closing brace.
+if [ -z "${SIWXOIDC_DEFAULT_CLIENTS__E2ESTATIC:-}" ]; then
+  export SIWXOIDC_DEFAULT_CLIENTS__E2ESTATIC='{"secret":"not-a-secret-e2e-fixture","metadata":{"redirect_uris":["http://localhost:0/callback"],"token_endpoint_auth_method":"none"}}'
+fi

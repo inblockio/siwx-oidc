@@ -32,7 +32,7 @@ everything else exists only in the binary crate.
 |---|---|
 | `main.rs` | Binary entry point. Declares the binary-only modules and calls `axum_lib::main`. |
 | `lib.rs` | Library crate root. `synapse_client` is deliberately not re-exported (see Invariants). |
-| `axum_lib.rs` | Startup: loads config through `config::figment()`, validates it (DID methods and pkh namespaces against the aqua-auth registries, signing key, retired keys, WebAuthn), `store_default_clients` (digested), `AppState`, the router, handler glue, the `siwx_user` / `acct_session` cookies, the CORS layer. |
+| `axum_lib.rs` | Startup: loads config through `config::figment()`, validates it (DID methods and pkh namespaces against the aqua-auth registries, signing key, retired keys, WebAuthn), `store_default_clients` (digested, no expiry, prunes the clients the map no longer names), `AppState`, the router, handler glue, the `siwx_user` / `acct_session` cookies, the CORS layer. |
 | `config.rs` | `Config`, its defaults, and `figment()`: the one place config names and precedence are defined. Reference: [docs/configuration.md](docs/configuration.md). |
 | `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_code_client` and `authenticate_refresh_client` authenticate the client for the first two, and `client_is_confidential` decides which clients must present a secret), `userinfo`, client registration, RP-initiated logout (`end_session`, `verify_id_token_hint`), `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, and `provision_synapse_device`, the single provisioning and DID-publication path. |
 | `introspect.rs` | `POST /oauth2/introspect` (RFC 7662) for Synapse; opaque `mat_`/`mcr_` token generation. |
@@ -97,10 +97,10 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 23 tests in ten files:
-  `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (4),
-  `log_hygiene_credential_store` (1) and `log_capture_callsite_interest` (1), which
-  need nothing; `account_linking_dual_write` (6), which needs the test Redis, and `log_hygiene`
+  `cargo test --workspace` runs the unit tests of both crates plus 28 tests in eleven files:
+  `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (6),
+  `static_client_startup` (3), `log_hygiene_credential_store` (1) and
+  `log_capture_callsite_interest` (1), which need nothing; `account_linking_dual_write` (6), which needs the test Redis, and `log_hygiene`
   (4, one of them needs it);
   `credential_migration_live` (2), which needs its own disposable, empty Redis named by
   `MIGRATION_TEST_REDIS_URL`; and the pure check `an_absent_strict_skips_variable_means_strict`
@@ -114,6 +114,17 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   CI sets both. Use the helper in any new Redis-backed test: `RedisClient::new` never connects
   (bb8 builds the pool with `min_idle` 0), so a `RedisClient::new(..).ok()` guard never skips,
   and without Redis the test fails after bb8's 30-second timeout.
+- **A test never prunes a static client it did not write.** The start-up sync
+  (`store_default_clients`, `DBClient::sync_static_clients`) deletes every client its tracking
+  set records that the configured map no longer names, and the default `redis://localhost` can
+  be a running stack's Redis or a developer's deployment's. Every client the helper returns
+  therefore records static clients in a set of its own (`RedisClient::with_static_clients_key`,
+  a fresh `clients:static:test-…` key per client), never the real `clients:static`; only a
+  production client records there. A test that syncs static clients uses the helper's client,
+  never `RedisClient::new` on the test Redis, and one that needs the real set, as a deployment
+  would write it, claims a database of its own through `redis_db` (the numbers taken are in its
+  doc). Pin: `the_start_up_write_of_a_test_leaves_a_foreign_static_client_alone`,
+  `static_clients_never_expire`.
 - **Tests that pin what is logged** use `siwx_oidc::test_support::LogCapture`, which records the
   calling thread's log output at debug level (use it in a current-thread `#[tokio::test]`). The
   checks that apply to every log site live in `tests/log_hygiene.rs`.
@@ -591,7 +602,7 @@ doc; read it before changing the code the rule covers.
   `none`, or none while `require_secret`) must present its secret, else `invalid_client`, a 401
   (RFC 6749 §5.2, with `WWW-Authenticate: Basic` after a Basic attempt). The replay of a lost
   response is bound to the grant's client like a rotation. Provisional, recorded in docs/matrix-integration.md: a public
-  client may omit `client_id`; a token whose client registration has expired (30 days against 90)
+  client may omit `client_id`; a token whose client registration is gone (30 days without a use, or removed)
   keeps refreshing unless the request names another client or presents a secret.
   `POST /_matrix/client/v3/refresh` carries no client identity, so it refuses a confidential
   client's refresh token exactly like an unknown token, leaving it untouched for `/token`; the
@@ -618,6 +629,37 @@ doc; read it before changing the code the rule covers.
   `a_public_client_refreshes_without_client_credentials`,
   `a_basic_authorization_header_authenticates_the_code_exchange`,
   `the_matrix_endpoint_refuses_a_confidential_clients_refresh_token` (unit and mock stack).
+- **A static client never expires; a dynamic client lives 30 days from its last use.** Every
+  start makes the static clients in Redis equal `default_clients` (`sync_static_clients`): each
+  is written with no TTL and its id recorded in `clients:static`, and each recorded id the map no
+  longer names is deleted. With no `default_clients` that prune runs in the background and is
+  retried until it succeeds once, so start-up still needs no Redis. `set_client` decides the
+  lifetime on the key as it is, in one script, so an update never gives a static client a TTL,
+  and the first-read upgrade of a plaintext entry keeps the expiry the entry had. A dynamic
+  client's lifetime is restored by `touch_client` after an authorization request, an accepted
+  code or device-code exchange, an accepted refresh at either endpoint (a replay included) and a
+  userinfo call. A code or device-code exchange, a refresh and userinfo touch the client the
+  code, grant or token belongs to, never one the request names. `authorize` is the one
+  exception: it has no grant yet, so it touches the client its request names, once the request
+  passed every check (the redirect URI exactly as registered included), so that a sign-in begun
+  in the client's last minutes can finish. Whoever knows a dynamic client's id and one of its
+  registered redirect URIs can therefore keep that registration from lapsing; it gives them
+  nothing else, since registration is open anyway. The touch extends only a key that has a TTL,
+  never changes the answer, and a failure is a `warn!` naming the client. Pin:
+  `static_clients_never_expire`,
+  `touching_extends_a_dynamic_client_and_never_a_static_one`,
+  `rewriting_a_client_keeps_a_static_client_without_expiry`,
+  `an_upgraded_plaintext_static_client_keeps_no_ttl`,
+  `updating_a_static_client_leaves_it_without_an_expiry`,
+  `an_accepted_refresh_extends_a_dynamic_client`, `a_refused_refresh_extends_no_client`,
+  `a_successful_refresh_extends_a_dynamic_client` (the Matrix endpoint),
+  `a_code_exchange_extends_a_dynamic_client`, `a_device_code_exchange_extends_a_dynamic_client`,
+  `an_authorization_request_extends_the_client_it_names_only_once_accepted`,
+  `a_successful_userinfo_call_extends_a_dynamic_client`,
+  `a_failed_lifetime_extension_is_logged_at_warn_with_the_client_id`,
+  `a_prune_that_fails_is_retried_until_it_succeeds`; mock stack:
+  `a_static_client_has_no_ttl_and_still_authorizes`,
+  `a_dynamic_client_near_the_end_of_its_lifetime_is_extended_by_its_next_use`.
 - **A token-store fault is a retryable 503 `M_UNKNOWN` at the Matrix routes, never
   `M_UNKNOWN_TOKEN`**, which a Matrix client takes for "signed out" (it clears its crypto store):
   `POST /_matrix/client/v3/refresh` and the device-deletion routes (`username_from_bearer`
