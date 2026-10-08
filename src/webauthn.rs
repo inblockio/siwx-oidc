@@ -539,13 +539,14 @@ pub async fn register_start(
 /// Typed outcome of a failed registration finish.
 ///
 /// `AlreadyRegistered` is the one case a handler renders differently: the
-/// credential id is already in use (a stored passkey or link state), so the
-/// registration was refused and nothing was written. Every other failure
-/// (missing or expired challenge, attestation verification, I/O) stays `Other`.
+/// credential id is already in use (a stored passkey, link state, or, with the
+/// shared credential store enabled, a row in that store), so the registration
+/// was refused and nothing was written. Every other failure (missing or expired
+/// challenge, attestation verification, I/O) stays `Other`.
 #[derive(Debug, Error)]
 pub enum RegisterFinishError {
-    /// A passkey or link state already exists under this credential id; nothing
-    /// was written.
+    /// A passkey, link state or shared-store row already exists under this
+    /// credential id; nothing was written.
     #[error("credential id already registered")]
     AlreadyRegistered,
     /// Any other registration failure.
@@ -559,7 +560,10 @@ pub enum RegisterFinishError {
 /// index or mirror write, so an id that already has a stored passkey or link
 /// state is refused with [`RegisterFinishError::AlreadyRegistered`] and the
 /// stored passkey, the link entry, the `by_did` index and the credential-store
-/// mirror stay exactly as they were.
+/// mirror stay exactly as they were. With the shared credential store enabled,
+/// an id that store already holds is refused the same way, checked first
+/// ([`siwx_oidc::credential_store::shared_store_holds`]); that check and the
+/// mirror write are not one atomic step (see there).
 pub async fn register_finish(
     webauthn: &Webauthn,
     redis: &RedisClient,
@@ -581,6 +585,17 @@ pub async fn register_finish(
 
     let did = did_from_passkey(&passkey)?;
     let cred_id_b64 = URL_SAFE_NO_PAD.encode(passkey.cred_id());
+
+    // With the shared credential store enabled, the mirror write below inserts
+    // or replaces, so an id the store already holds is refused before anything
+    // is written. A no-op when the flag is off.
+    if siwx_oidc::credential_store::shared_store_holds(&cred_id_b64).await? {
+        info!(
+            "webauthn register_finish: credential id held by the shared credential store, refused: cred_id={}",
+            siwx_oidc::redact::fingerprint(&cred_id_b64)
+        );
+        return Err(RegisterFinishError::AlreadyRegistered);
+    }
 
     // Store the credential persistently (no TTL), only if the id is new: neither
     // a stored passkey nor link state may exist under it. Link state is only
@@ -2173,5 +2188,171 @@ mod tests {
             Some(did.as_str())
         );
         assert_eq!(index, vec![cred_b64]);
+    }
+
+    // -- Registration with the shared credential store enabled ---------------
+    //
+    // `credential_store::shared_store` reads `AQUA_WEBAUTHN_REDIS_URL` once per
+    // process and memoises the answer, so the store-enabled mode cannot be
+    // switched on inside this test process. The test below therefore runs in
+    // two roles: as a normal test it re-runs itself as a child process of this
+    // test binary with the flag set, and checks that the child ran exactly one
+    // test and passed it.
+
+    /// Set in the child process; selects the child role.
+    const SHARED_STORE_CHILD_VAR: &str = "SIWX_TEST_SHARED_STORE_CHILD";
+
+    /// The Redis database the child's shared credential store lives in: the
+    /// test Redis server, a database of its own, so the store and the legacy
+    /// namespace are as separate as two deployments' stores would be.
+    const SHARED_STORE_TEST_DB: u8 = 11;
+
+    const SHARED_STORE_TEST_NAME: &str =
+        "webauthn::tests::a_credential_id_held_only_by_the_shared_store_is_refused";
+
+    /// With the shared credential store enabled, a credential id the store
+    /// already holds is refused even when the legacy namespace has no entry for
+    /// it (the store is shared with another service, or the legacy entry is
+    /// gone): the store row keeps its DID and key, nothing is written to the
+    /// legacy namespace, and the second key's DID index is untouched. A fresh
+    /// id still registers and is mirrored into the store (control). Needs Redis.
+    #[tokio::test]
+    async fn a_credential_id_held_only_by_the_shared_store_is_refused() {
+        if std::env::var_os(SHARED_STORE_CHILD_VAR).is_some() {
+            return shared_store_child().await;
+        }
+        if siwx_oidc::test_support::redis().await.is_none() {
+            return;
+        }
+        let mut store_url = siwx_oidc::test_support::redis_url();
+        store_url.set_path(&format!("/{SHARED_STORE_TEST_DB}"));
+        let out = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                SHARED_STORE_TEST_NAME,
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SHARED_STORE_CHILD_VAR, "1")
+            .env(siwx_oidc::credential_store::ENABLE_ENV, store_url.as_str())
+            // The parent reached Redis, so the child must not skip.
+            .env(siwx_oidc::test_support::REQUIRE_REDIS_VAR, "1")
+            .output()
+            .await
+            .expect("run the child test");
+        // Indented, so no line of the child's report starts with `test result:`
+        // in this process's output.
+        let indent = |b: &[u8]| {
+            String::from_utf8_lossy(b)
+                .lines()
+                .map(|l| format!("  | {l}\n"))
+                .collect::<String>()
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed"),
+            "the store-enabled child run failed or did not run exactly one test ({}):\n{}{}",
+            out.status,
+            indent(&out.stdout),
+            indent(&out.stderr)
+        );
+    }
+
+    /// The child role of [`a_credential_id_held_only_by_the_shared_store_is_refused`].
+    async fn shared_store_child() {
+        use aqua_auth::webauthn_store::{CredentialId, NewCredential, WebauthnCredentialBackend};
+
+        let redis = siwx_oidc::test_support::redis()
+            .await
+            .expect("Redis is required in the child");
+        let store = siwx_oidc::credential_store::shared_store()
+            .await
+            .expect("the child runs with the shared credential store enabled");
+        let cfg = reg_test_webauthn();
+
+        // Control: a fresh id registers, and the mirror writes it to the store
+        // under its key's did:key. This also proves the store is live.
+        let fresh_id = Uuid::new_v4().as_bytes().to_vec();
+        let fresh_b64 = URL_SAFE_NO_PAD.encode(&fresh_id);
+        let key_c = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let did_c = did_of(&key_c);
+        let fresh = register_with(&cfg.webauthn, &redis, &fresh_id, &key_c).await;
+        let mirrored = store.get_by_id(&CredentialId(fresh_id.clone())).await;
+        redis
+            .del_raw(&format!("{CREDENTIAL_PREFIX}/{fresh_b64}"))
+            .await
+            .ok();
+        redis.index_remove_passkey(&did_c, &fresh_b64).await.ok();
+        store.delete(&did_c, &CredentialId(fresh_id)).await.ok();
+        assert_eq!(fresh.expect("a fresh id registers").did, did_c);
+        assert_eq!(
+            mirrored
+                .expect("store lookup")
+                .expect("the fresh id is mirrored into the store")
+                .did,
+            did_c
+        );
+
+        // An id that only the store holds.
+        let cred_id = Uuid::new_v4().as_bytes().to_vec();
+        let cred_b64 = URL_SAFE_NO_PAD.encode(&cred_id);
+        let cred_key = format!("{CREDENTIAL_PREFIX}/{cred_b64}");
+        let key_a = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let key_b = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let (did_a, did_b) = (did_of(&key_a), did_of(&key_b));
+        let blob_a = format!(r#"{{"held_by":"another service","did":"{did_a}"}}"#);
+        store
+            .insert(NewCredential {
+                did: did_a.clone(),
+                credential_id: CredentialId(cred_id.clone()),
+                public_key: blob_a.clone().into_bytes(),
+                sign_count: 0,
+                transports: Vec::new(),
+                label: None,
+            })
+            .await
+            .expect("seed the store row");
+
+        let second = register_with(&cfg.webauthn, &redis, &cred_id, &key_b).await;
+        let row_after = store.get_by_id(&CredentialId(cred_id.clone())).await;
+        let legacy_after = redis.get_raw(&cred_key).await.expect("GET");
+        let index_b = redis
+            .smembers_raw(&by_did_key(&did_b))
+            .await
+            .expect("SMEMBERS");
+
+        // Cleanup before asserting, so a failing run leaves nothing behind.
+        store
+            .delete(&did_a, &CredentialId(cred_id.clone()))
+            .await
+            .ok();
+        store
+            .delete(&did_b, &CredentialId(cred_id.clone()))
+            .await
+            .ok();
+        redis.del_raw(&cred_key).await.ok();
+        redis.index_remove_passkey(&did_b, &cred_b64).await.ok();
+
+        let row_after = row_after
+            .expect("store lookup")
+            .expect("the store row still exists");
+        assert_eq!(
+            (row_after.did.as_str(), row_after.public_key.as_slice()),
+            (did_a.as_str(), blob_a.as_bytes()),
+            "the store row for an id it already held was replaced"
+        );
+        assert!(
+            matches!(second, Err(RegisterFinishError::AlreadyRegistered)),
+            "an id the shared store holds must be refused as AlreadyRegistered, got {:?}",
+            second.as_ref().map(|r| &r.did)
+        );
+        assert_eq!(
+            legacy_after, None,
+            "a passkey was stored in the legacy namespace for an id the store holds"
+        );
+        assert!(
+            !index_b.contains(&cred_b64),
+            "the second key's DID index lists the id"
+        );
     }
 }

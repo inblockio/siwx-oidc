@@ -830,7 +830,8 @@ paths:
       description: |
         The resulting P-256 public key derives the user's `did:key:zDn…`.
         Registration is create-only: a credential id that is already registered,
-        or that has link state, is refused and nothing is written.
+        that has link state, or that the enabled aqua-auth credential store
+        already holds, is refused and nothing is written.
       responses:
         "200": { description: "`{did, credential_id}`: the derived DID." }
         "400":
