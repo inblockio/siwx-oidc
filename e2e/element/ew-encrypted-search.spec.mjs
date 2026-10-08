@@ -44,7 +44,8 @@
  *   UX8 (siwx login unchanged): either login fails to get through the siwx UI
  *       and the Secure Backup wizard, the first account is not the Matrix user
  *       derived from its DID, or an uncaught page error mentioning CORS,
- *       issuer or OIDC fires after the first login.
+ *       issuer or OIDC fires after the first login (in either tab: the second
+ *       tab, which carries UX6's second login, has the same listener).
  *
  * TARGET: ELEMENT_URL / MATRIX_URL / SIWX_URL (defaults: local lab). Against a
  * remote (non-production) deployment: ELEMENT_URL=https://element.example.org
