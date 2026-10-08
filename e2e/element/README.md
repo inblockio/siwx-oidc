@@ -58,7 +58,7 @@ same test names and list the tags separately. Today's legs:
 
 | Tag | Tests (spec file) |
 |---|---|
-| `@ew-p1` force-first-device-recovery | EW-C1 (clickpath), EW-J1, EW-J2, EW-J4, EW-J5 (journey-exits), EW-L1b (login), EW-R1 (journey-reset-after-no-recovery), EW-R1-0, EW-R1-1 (recovery-entry), EW-U3P-0, EW-U3P-1, EW-U3P-2 (u3prime-no-forced-reset) |
+| `@ew-p1` force-first-device-recovery | EW-C1 (clickpath), EW-J1, EW-J2, EW-J4, EW-J5 (journey-exits), EW-L1b (login), EW-R1 (journey-reset-after-no-recovery), EW-R1-0, EW-R1-1 (recovery-entry), EW-U3P-0 (u3prime-no-forced-reset). Untagged: EW-U3P-1, EW-U3P-2 (inconclusive on every build; see the spec) |
 | `@ew-p2` setup-encryption-busy-wedge | EW-V1 (verify-sas, its assertion 8), H3-C (h3-second-device-walk), EW-R1-2 (recovery-entry) and EW-D1 (journey-add-device), which assert the ceremony never sits in the zero-control `Phase.Busy` wedge |
 | `@ew-p3` honest-qr-disabled-reason | PH-0, PH-1 (patch-honesty) |
 | `@ew-p4` offer-verify-current-session | PH-0, PH-2 (patch-honesty) |
