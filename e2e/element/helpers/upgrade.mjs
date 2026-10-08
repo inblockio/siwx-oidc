@@ -442,3 +442,100 @@ export async function refreshOutcome(siwxUrl, refreshToken, clientId) {
   const body = await r.json().catch(() => ({}));
   return { status: r.status, error: body.error || null, new_format: /^mcr_/.test(body.refresh_token || '') };
 }
+
+/*
+ * T2-EW (the Element Web swap, ew-upgrade-ew-*.spec.mjs): reads of the browser EventIndex
+ * (siwx-oidc-matrix-server patches/element-web entry 6). None of them returns message text:
+ * a search answers with a count and event ids, the database with counts and a fingerprint.
+ */
+
+/** The IndexedDB database the browser EventIndex keeps (schema v3: stores meta, chunks, checkpoints). */
+export const EVENTINDEX_DB = 'element-eventindex';
+
+/**
+ * Search the running EventIndex for `term` the way Element's search UI does.
+ * Returns { noIndex, count, ids } (the event ids of the hits, never their text).
+ */
+export async function indexSearch(page, term) {
+  return page.evaluate(async (term) => {
+    const idx = window.mxEventIndexPeg?.get?.();
+    if (!idx) return { noIndex: true, count: 0, ids: [] };
+    const r = await idx.search({
+      search_term: term,
+      before_limit: 0,
+      after_limit: 0,
+      order_by_recency: true,
+      limit: 10,
+    });
+    return {
+      noIndex: false,
+      count: r?.count ?? 0,
+      ids: (r?.results ?? []).map((x) => x?.result?.event_id ?? null),
+    };
+  }, term);
+}
+
+/** The manager's own statistics (counts and sizes, no content). */
+export async function eventIndexStats(page) {
+  return page.evaluate(async () => {
+    const mgr = window.mxPlatformPeg?.get?.()?.getEventIndexingManager?.();
+    if (!mgr) return null;
+    const s = await mgr.getStats();
+    return { eventCount: s?.eventCount ?? null, roomCount: s?.roomCount ?? null, size: s?.size ?? null, loading: s?.loading ?? null };
+  });
+}
+
+/**
+ * What identifies this user's index on disk, read straight from IndexedDB without decrypting
+ * anything: whether the database exists, its version and stores, a SHA-256 fingerprint of the
+ * per-index HKDF salt in the user's `meta` row (a random value, cleartext by design, written once
+ * when the index is created and kept until the index is deleted, so a reset index has a new
+ * one), and the record counts of the user's chunks and crawler checkpoints.
+ *
+ * The database is opened only when it exists and without a version, so this read can neither
+ * create it nor trigger an upgrade.
+ */
+export async function eventIndexFingerprint(page, userId) {
+  return page.evaluate(
+    async ({ name, uid }) => {
+      const dbs = indexedDB.databases ? await indexedDB.databases() : [];
+      if (!dbs.some((d) => d.name === name)) return { exists: false };
+      const db = await new Promise((resolve, reject) => {
+        const r = indexedDB.open(name);
+        r.onsuccess = () => resolve(r.result);
+        r.onerror = () => reject(r.error);
+      });
+      try {
+        const stores = [...db.objectStoreNames];
+        const req = (q) =>
+          new Promise((resolve, reject) => {
+            q.onsuccess = () => resolve(q.result);
+            q.onerror = () => reject(q.error);
+          });
+        const out = { exists: true, version: db.version, stores };
+        if (stores.includes('meta')) {
+          const meta = await req(db.transaction('meta', 'readonly').objectStore('meta').get(uid));
+          if (meta?.salt) {
+            const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(meta.salt)));
+            out.salt_fp = [...new Uint8Array(digest)].slice(0, 8).map((b) => b.toString(16).padStart(2, '0')).join('');
+          } else {
+            out.salt_fp = null;
+          }
+        }
+        if (stores.includes('chunks')) {
+          out.chunks = await req(
+            db.transaction('chunks', 'readonly').objectStore('chunks').count(IDBKeyRange.bound([uid], [uid + ' '])),
+          );
+        }
+        if (stores.includes('checkpoints')) {
+          const s = db.transaction('checkpoints', 'readonly').objectStore('checkpoints');
+          out.checkpoints = s.indexNames.contains('byUser') ? await req(s.index('byUser').count(uid)) : await req(s.count());
+        }
+        return out;
+      } finally {
+        db.close();
+      }
+    },
+    { name: EVENTINDEX_DB, uid: userId },
+  );
+}

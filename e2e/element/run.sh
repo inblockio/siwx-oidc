@@ -7,7 +7,11 @@
 #   CTRF_OUTPUT_DIR   host directory for the CTRF report (file name ctrf-report.json)
 #   QUALIFY_STATE_DIR host directory a continuity suite keeps its state in (ew-upgrade-*),
 #                     mounted at the same path
-#   E2E_STRICT_SKIPS, T2_* and MAS_SHARED_SECRET are passed through unchanged.
+#   E2E_STRICT_SKIPS, T2_*, EW_* and MAS_SHARED_SECRET are passed through unchanged; an EW_*
+#                     value that is an absolute path to a file (EW_THEME_OVERRIDES_CSS,
+#                     EW_SW_OVERRIDE) has its directory mounted read-only at the same path
+# Arguments go to `playwright test` unchanged, e.g. a patch selection:
+#   ./run.sh --grep '@ew-p|@ew-delta' ew-attested-did.spec.mjs ew-copy-markdown.spec.mjs
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 IMG=mcr.microsoft.com/playwright:v1.62.1-noble
@@ -16,9 +20,11 @@ IMG=mcr.microsoft.com/playwright:v1.62.1-noble
 E2E_ROOT="$(cd "$DIR/.." && pwd)"
 
 extra=()
-mount_same() { # mount a host directory at the same path inside the container
+declare -A mounted=()
+mount_same() { # mount a host directory at the same path inside the container (once)
   mkdir -p "$1"
-  extra+=(-v "$1:$1:z")
+  [ -n "${mounted[$1]:-}" ] || extra+=(-v "$1:$1:${2:-z}")
+  mounted[$1]=1
 }
 if [ -n "${CTRF_OUTPUT:-}" ]; then
   case "$CTRF_OUTPUT" in /*) ;; *) echo "run.sh: CTRF_OUTPUT must be an absolute path" >&2; exit 2 ;; esac
@@ -36,8 +42,11 @@ if [ -n "${QUALIFY_STATE_DIR:-}" ]; then
   extra+=(-e "QUALIFY_STATE_DIR=$QUALIFY_STATE_DIR")
 fi
 # Names only: podman reads each value from this environment, so no value is on a command line.
-for v in $(compgen -e | grep -E '^(T2_[A-Z0-9_]+|E2E_STRICT_SKIPS|MAS_SHARED_SECRET)$' || true); do
+for v in $(compgen -e | grep -E '^(T2_[A-Z0-9_]+|EW_[A-Z0-9_]+|E2E_STRICT_SKIPS|MAS_SHARED_SECRET)$' || true); do
   extra+=(-e "$v")
+  case "$v" in EW_*)
+    if [[ "${!v}" == /* ]] && [ -f "${!v}" ]; then mount_same "$(dirname "${!v}")" ro,z; fi ;;
+  esac
 done
 
 exec podman run --rm --network host --userns=keep-id \

@@ -44,7 +44,8 @@
  *   UX8 (siwx login unchanged): either login fails to get through the siwx UI
  *       and the Secure Backup wizard, the first account is not the Matrix user
  *       derived from its DID, or an uncaught page error mentioning CORS,
- *       issuer or OIDC fires after the first login.
+ *       issuer or OIDC fires after the first login (in either tab: the second
+ *       tab, which carries UX6's second login, has the same listener).
  *
  * TARGET: ELEMENT_URL / MATRIX_URL / SIWX_URL (defaults: local lab). Against a
  * remote (non-production) deployment: ELEMENT_URL=https://element.example.org
@@ -121,7 +122,7 @@ function storageHasPlaintext(dump, needles) {
   return needles.filter((n) => blob.includes(n.toLowerCase()));
 }
 
-test('UX1-UX8 encrypted search on hosted Element Web', async ({ page, context }) => {
+test('UX1-UX8 encrypted search on hosted Element Web', { tag: '@ew-p6' }, async ({ page, context }) => {
   test.setTimeout(420_000);
   const w = makeWallet();
 
@@ -308,8 +309,16 @@ test('UX1-UX8 encrypted search on hosted Element Web', async ({ page, context })
   // UX6: second account on the SAME browser profile cannot search the first account.
   // New page (injectMockWallet cannot rebind a different wallet on the same page)
   // but the same Playwright context shares IndexedDB/localStorage.
+  // Close the first tab first. Signed out, it stays on #/welcome with Element
+  // still running and holding Element's one-tab session lock, and the second
+  // login then ends on "connected in another tab" instead of the Secure Backup
+  // wizard. Closing it changes nothing UX6 checks: storage belongs to the
+  // context, not the tab.
+  await page.close();
   const w2 = makeWallet();
   const page2 = await context.newPage();
+  // UX8: the second tab's page errors count too, second login included
+  page2.on('pageerror', (e) => pageErrors.push(String(e)));
   const session2 = await elementWalletClickLogin(page2, w2);
   console.log(`[UX] account ${session2.user_id}`);
   expect(session2.user_id).not.toBe(session.user_id);

@@ -88,7 +88,7 @@ test('EW-L1: wallet CAIP-122 through siwx produces Matrix whoami (headless OIDC)
  *  - CRYPTO: NO identity-confirmation gate. The gate reappearing here is a
  *    REGRESSION of the FINDING 2 fix — fail loudly, do not re-widen this spec.
  */
-test('EW-L1b: reload restores AUTH + CRYPTO (no OIDC round-trip, no identity gate)', async ({
+test('EW-L1b: reload restores AUTH + CRYPTO (no OIDC round-trip, no identity gate)', { tag: '@ew-p1' }, async ({
   page,
 }) => {
   test.setTimeout(360_000);

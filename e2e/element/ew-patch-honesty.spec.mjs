@@ -55,7 +55,7 @@ test.beforeAll(async () => {
 // ---------------------------------------------------------------------------
 // PH-0 — both patch strings are present in the served English strings.
 // ---------------------------------------------------------------------------
-test('PH-0: served i18n carries both honesty-patch keys', async ({ request }) => {
+test('PH-0: served i18n carries both honesty-patch keys', { tag: ['@ew-p3', '@ew-p4'] }, async ({ request }) => {
   const langs = await (await request.get(`${ELEMENT_URL}/i18n/languages.json`)).json();
   const en = langs.en;
   const fileName = typeof en === 'string' ? en : en?.fileName;
@@ -142,7 +142,7 @@ async function readSettingsSurface(page) {
 // ---------------------------------------------------------------------------
 // PH-1 — honest disabled-reason + verify affordance instead of the provider lie.
 // ---------------------------------------------------------------------------
-test('PH-1: not-ready session sees the honest QR reason and a Verify session action', async ({
+test('PH-1: not-ready session sees the honest QR reason and a Verify session action', { tag: '@ew-p3' }, async ({
   page,
 }) => {
   test.setTimeout(600_000);
@@ -180,7 +180,7 @@ test('PH-1: not-ready session sees the honest QR reason and a Verify session act
 // ---------------------------------------------------------------------------
 // PH-2 — current session with unknown verification status keeps a verify exit.
 // ---------------------------------------------------------------------------
-test('PH-2: current session with null verification status gets a verify exit, not the encryption lie', async ({
+test('PH-2: current session with null verification status gets a verify exit, not the encryption lie', { tag: '@ew-p4' }, async ({
   page,
 }) => {
   test.setTimeout(600_000);

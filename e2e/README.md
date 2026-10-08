@@ -335,6 +335,56 @@ checks that only read Element's own storage, Synapse or the account page (EW-UA1
 UA8) pass inside Synapse's two-minute introspection cache, which is why EW-UA2 asks the
 provider itself.
 
+`T2_DIRECTION=rollback` runs the same three stages from the candidate to the baseline (the
+rollback drill): `mint` expects the candidate, `switch` installs the baseline, `check` expects
+the baseline. The default is `upgrade`.
+
+#### The Element Web swap (T2-EW, `T2_SWAP=element-web`)
+
+The same driver replaces ONLY the element-web image, with Redis, siwx-oidc, Synapse and the edge
+kept, which is what a promotion of Element Web does. The two images come from
+`ELEMENT_BASELINE_IMAGE` and `ELEMENT_CANDIDATE_IMAGE` (digests), the switch sets
+`ELEMENT_IMAGE_REF`, and the lab needs `SIWX_OIDC_IMAGE_REF` in its place:
+
+```bash
+export T2_SWAP=element-web                                  # T2_DIRECTION=rollback for candidate -> baseline
+export ELEMENT_BASELINE_IMAGE=registry.example.org/element-web@sha256:<the deployed build>
+export ELEMENT_CANDIDATE_IMAGE=registry.example.org/element-web@sha256:<the build to promote>
+export REDIS_IMAGE_REF=... SYNAPSE_IMAGE_REF=... SIWX_OIDC_IMAGE_REF=...   # what the lab runs, digests
+export LAB_COMPOSE_DIR=... LAB_PROJECT=... LAB_ENV_FILE=.env.qualify
+export ELEMENT_URL=... MATRIX_URL=... SIWX_URL=... QUALIFY_STATE_DIR=... CTRF_OUTPUT=...
+bash e2e/element/upgrade-survival.sh                        # QUALIFY_STAGE=mint|switch|check as above
+```
+
+What carries state across an Element switch is the browser: the session, the crypto store and
+the encrypted search index of siwx-oidc-matrix-server `patches/element-web` entry 6 (IndexedDB
+database `element-eventindex`). `mint` runs `ew-upgrade-ew-capture.spec.mjs` in a persistent
+profile: user A signs in with a wallet and sets the recovery key (EW-EC1); in an encrypted room
+three messages with unique tokens are sent, one is then edited (a real `m.replace`) and one
+redacted, and the index must find the kept one, the edited one by its new text and not the
+redacted one (EW-EC2); a sentinel event with its own token is fed to the index manager directly
+and never sent to the homeserver (EW-EC3); then the index is flushed and its fingerprint is
+recorded: a SHA-256 fingerprint of the per-index salt in its `meta` row (random, created with the
+index, kept until the index is deleted), the chunk and checkpoint record counts, and the
+manager's own stats (EW-EC4). Nothing is read as content. `check` runs
+`ew-upgrade-ew-assert.spec.mjs` on the other build:
+
+| Test | Passes when |
+|---|---|
+| EW-EA1 | Element opens signed in: no login screen, no trip to the provider |
+| EW-EA2 | same account and device id |
+| EW-EA3 | the index was NOT reset: same salt fingerprint, chunk records present, the sentinel found within 15 s (no crawl can bring it back), and the hydrated index holds at least as many events as before |
+| EW-EA4 | the kept and the edited message are found within 15 s (time to the first hit recorded) |
+| EW-EA5 | the edited message is found by its new text under its original event id, and not by its pre-edit text |
+| EW-EA6 | the redacted message is not found (no hit, count 0) |
+| EW-EA7 | a message sent from the composer after the switch is indexed and found |
+| EW-EZ | cleanup: A is deactivated |
+
+EA4 to EA6 cannot tell a surviving index from a rebuilt one, since the crawler refills a small
+room in seconds; EA3 can. Negative control: `T2_NEGATIVE=drop-eventindex` makes the check delete
+the profile's `element-eventindex` database (from Element's static `config.json`, so no Element
+code runs) before it opens Element; EW-EA3 must then fail.
+
 ### Population soak (`examples/soak.rs`)
 
 ```bash

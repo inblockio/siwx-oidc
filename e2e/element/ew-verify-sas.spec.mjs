@@ -114,7 +114,7 @@ function tally(list) {
   return out;
 }
 
-test('EW-V1: second session cross-signed by SAS/emoji from a live first session — no recovery phrase', async ({
+test('EW-V1: second session cross-signed by SAS/emoji from a live first session — no recovery phrase', { tag: '@ew-p2' }, async ({
   browser,
 }) => {
   test.setTimeout(900_000);

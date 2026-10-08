@@ -316,7 +316,7 @@ async function obstructed(page) {
 
 // ---------------------------------------------------------------------------
 
-test('EW-D1: add a second device while device A is live — every screen on both devices offers an exit', async ({
+test('EW-D1: add a second device while device A is live — every screen on both devices offers an exit', { tag: '@ew-p2' }, async ({
   browser,
 }) => {
   test.setTimeout(900_000);

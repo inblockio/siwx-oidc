@@ -416,7 +416,7 @@ test('H3-B: the /device approval page is walkable and its approval issues a work
 // button is visible and never clicks it.
 // ---------------------------------------------------------------------------
 
-test('H3-C: B-initiated "Use another device" on the new device gate reaches a verified session', async ({
+test('H3-C: B-initiated "Use another device" on the new device gate reaches a verified session', { tag: '@ew-p2' }, async ({
   browser,
 }) => {
   test.setTimeout(900_000);
