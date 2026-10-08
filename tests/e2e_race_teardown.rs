@@ -2855,6 +2855,9 @@ struct StartedLogin {
     session_id: String,
     nonce: String,
     domain: String,
+    /// The query of the login page URL `/authorize` redirected to: the page
+    /// forwards it to `/sign_in`.
+    page_query: String,
 }
 
 impl StartedLogin {
@@ -2892,13 +2895,18 @@ async fn start_login_for(base: &str, rc: RegisteredClient) -> StartedLogin {
         .map(|rest| rest.split(';').next().unwrap_or("").to_string())
         .find(|v| !v.is_empty())
         .expect("authorize sets the session cookie");
-    let q = parse_query(resp.headers().get("location").unwrap().to_str().unwrap());
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    let q = parse_query(location);
     StartedLogin {
         rc,
         verifier,
         session_id,
         nonce: q["nonce"].clone(),
         domain: q["domain"].clone(),
+        page_query: location
+            .split_once('?')
+            .map(|(_, query)| query.to_string())
+            .unwrap_or_default(),
     }
 }
 
@@ -2933,10 +2941,13 @@ fn siwx_cookie_for(base: &str, w: &Wallet, login: &StartedLogin) -> String {
     urlencoding::encode(&value).into_owned()
 }
 
-/// `GET /sign_in` for a started login; returns the authorization code.
-async fn sign_in_to_code(base: &str, w: &Wallet, login: &StartedLogin) -> String {
-    let resp = no_redirect_client()
-        .get(format!("{base}/sign_in"))
+/// `GET /sign_in` for a started login, signed by `w`. The link carries the
+/// login page's own query, as the page forwards it: the current build reads
+/// none of it (the request is bound at `/authorize`), a build before the bound
+/// request reads the request from it, so the R2 mint stage can run there too.
+async fn sign_in_response(base: &str, w: &Wallet, login: &StartedLogin) -> reqwest::Response {
+    no_redirect_client()
+        .get(format!("{base}/sign_in?{}", login.page_query))
         .header(
             "cookie",
             format!(
@@ -2947,7 +2958,12 @@ async fn sign_in_to_code(base: &str, w: &Wallet, login: &StartedLogin) -> String
         )
         .send()
         .await
-        .unwrap();
+        .unwrap()
+}
+
+/// `GET /sign_in` for a started login; returns the authorization code.
+async fn sign_in_to_code(base: &str, w: &Wallet, login: &StartedLogin) -> String {
+    let resp = sign_in_response(base, w, login).await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER, "sign_in 303");
     let location = resp.headers().get("location").unwrap().to_str().unwrap();
     parse_query(location)
@@ -3388,6 +3404,9 @@ struct InFlight {
     code_verifier: String,
     /// A login session started at `/authorize`, not yet signed in.
     session: StartedLogin,
+    /// Whether the server bound the authorization request to that session
+    /// (every build since the bound request; not the builds before it).
+    session_bound: bool,
     /// An approved, unredeemed device code.
     approved_client: String,
     approved_device_code: String,
@@ -3447,6 +3466,8 @@ impl InFlight {
             "session_id": self.session.session_id,
             "session_nonce": self.session.nonce,
             "session_domain": self.session.domain,
+            "session_page_query": self.session.page_query,
+            "session_bound": self.session_bound,
             "approved_client": self.approved_client,
             "approved_device_code": self.approved_device_code,
             "approved_user_code": self.approved_user_code,
@@ -3482,7 +3503,9 @@ impl InFlight {
                 session_id: s("session_id"),
                 nonce: s("session_nonce"),
                 domain: s("session_domain"),
+                page_query: s("session_page_query"),
             },
+            session_bound: v["session_bound"].as_bool().unwrap_or(true),
             approved_client: s("approved_client"),
             approved_device_code: s("approved_device_code"),
             approved_user_code: s("approved_user_code"),
@@ -3525,6 +3548,7 @@ async fn put_in_flight(c: &Client, base: &str) -> InFlight {
         code,
         code_verifier: login.verifier,
         session,
+        session_bound: true,
         approved_client: approved.client_id,
         approved_device_code,
         approved_user_code,
@@ -3720,7 +3744,9 @@ fn r2_file() -> String {
 ///   test and rewrites what it stored into the previous build's layout.
 ///
 /// The checks: the code redeems once and only once; the session signs in and
-/// its code exchanges; the approved device code redeems once; the pending
+/// its code exchanges (a session minted on a build before the bound request
+/// carries none: its sign-in is refused with "restart the sign-in", the
+/// documented outcome); the approved device code redeems once; the pending
 /// user code is still found, approved and redeemed; one client authenticates
 /// with its secret at the code exchange and the refresh grant, the other
 /// updates itself with its registration access token. Afterwards no key or
@@ -3750,8 +3776,17 @@ async fn in_flight_codes_and_sessions_survive_the_upgrade() {
     let flight = match stage.as_str() {
         "mint" => {
             mock_reset(&c).await;
-            let flight = put_in_flight(&c, &base).await;
+            let mut flight = put_in_flight(&c, &base).await;
             let mut conn = stack_redis(&url).await;
+            // A build before the bound request stores the session without it.
+            let stored: Option<String> = bb8_redis::redis::cmd("GET")
+                .arg(format!("sessions/{}", flight.session.session_id))
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            flight.session_bound = stored
+                .and_then(|v| serde_json::from_str::<Value>(&v).ok())
+                .is_some_and(|v| !v["request"].is_null());
             for key in [
                 format!("codes/{}", flight.code),
                 format!("codes/{}", flight.secret_code),
@@ -3819,19 +3854,36 @@ async fn in_flight_codes_and_sessions_survive_the_upgrade() {
         "the code redeems only once"
     );
 
-    // The session started on the previous build signs in, and its code exchanges.
+    // The session started on the previous build signs in, and its code
+    // exchanges. A session a build before the bound request started carries no
+    // request to issue a code for: its sign-in is refused with "restart the
+    // sign-in" (the user starts again, signed out of nothing).
     let w = new_wallet();
-    let code = sign_in_to_code(&base, &w, &flight.session).await;
-    let session_tokens = exchange_code(
-        &c,
-        &base,
-        &flight.session.rc,
-        &code,
-        &flight.session.verifier,
-    )
-    .await
-    .expect("the session's code exchanges");
-    assert!(token_active(&c, session_tokens["access_token"].as_str().unwrap()).await);
+    if flight.session_bound {
+        let code = sign_in_to_code(&base, &w, &flight.session).await;
+        let session_tokens = exchange_code(
+            &c,
+            &base,
+            &flight.session.rc,
+            &code,
+            &flight.session.verifier,
+        )
+        .await
+        .expect("the session's code exchanges");
+        assert!(token_active(&c, session_tokens["access_token"].as_str().unwrap()).await);
+    } else {
+        let resp = sign_in_response(&base, &w, &flight.session).await;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        assert!(
+            status == StatusCode::BAD_REQUEST && body.contains("Restart"),
+            "a session the previous build started without a bound request is refused with \
+             \"restart the sign-in\": {status} {body}"
+        );
+        eprintln!(
+            "R2 check: the unbound session of the previous build asks to restart the sign-in"
+        );
+    }
 
     // The approved device code redeems once.
     let (status, body) = poll_device_code(

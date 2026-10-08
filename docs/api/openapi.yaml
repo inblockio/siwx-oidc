@@ -467,8 +467,18 @@ paths:
         **Unauthenticated on purpose.** The DID → localpart direction is a pure
         function of the DID, and the MXID → DID direction reads a profile field
         Synapse serves without authentication and federates. Everything here is
-        already publicly computable, so authentication would buy rate-limiting,
-        not secrecy — put that at the reverse proxy.
+        publicly computable or readable, with one deliberate exception (next
+        paragraph), so authentication would buy rate-limiting, not secrecy:
+        put that at the reverse proxy.
+
+        `exists` is `false` for a deactivated or erased account, whose localpart
+        Synapse keeps reserved; such an answer carries `did: null` on the
+        `?mxid=` path and `attested: false`, and nothing is read from the
+        account. That is the one fact this route adds beyond what is publicly
+        readable: Synapse keeps serving a deactivated account's profile, so a
+        caller who reads the profile route as well can tell a deactivated
+        account from one that never existed. It is deliberate: a deactivated
+        account must not read as a live one.
 
         A `did` is checked before the homeserver is asked anything. It must be
         a DID some sign-in on this provider could accept: a method aqua-auth
@@ -503,6 +513,9 @@ paths:
                 unknown:
                   summary: A well-formed DID that has never signed in here
                   value: { did: "did:key:z6MkpFemPtmjvPZ1gFYM6d68tuwxxrcec4H2Ck23FRchU9ue", mxid: "@04gen9jsoj657dc0:matrix.example.org", exists: false, attested: false }
+                deactivated:
+                  summary: A deactivated or erased account, looked up by `?mxid=`
+                  value: { did: null, mxid: "@1vo8g4vofiha69ua:matrix.example.org", exists: false, attested: false }
         "400":
           description: |
             Not exactly one selector; a `did` that is not a DID any sign-in here
@@ -524,7 +537,9 @@ paths:
                   summary: A DID method this provider never signs in
                   value: { error: invalid_request, message: "`did:web:example.com` is not a DID this provider can sign in (supported methods: `did:pkh`, `did:key`, `did:peer`), so no account can exist for it." }
         "502":
-          description: The homeserver could not be asked. Never a guessed answer.
+          description: |
+            The homeserver could not be asked, or contradicted itself (a localpart
+            reported as taken that has no user). Never a guessed answer.
         '504':
           $ref: '#/components/responses/ResolveError'
           description: |
@@ -1079,7 +1094,12 @@ components:
         mxid:
           type: [string, "null"]
           description: The fully-qualified Matrix ID, honouring the grandfathering rule — a pre-2026-09 account keeps its legacy localpart.
-        exists: { type: boolean, description: Whether an account exists on THIS homeserver. Says nothing about any other. }
+        exists:
+          type: boolean
+          description: |
+            Whether an ACTIVE account exists on THIS homeserver: a deactivated or
+            erased account answers `false`. Says nothing about any other
+            homeserver.
         attested:
           type: boolean
           description: |

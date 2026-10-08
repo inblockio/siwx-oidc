@@ -1844,10 +1844,18 @@ pub async fn main() {
     );
 
     let addr = SocketAddr::from((config.address, config.port));
-    // Before the bind: from the moment the port accepts, a SIGTERM is handled.
+    // The handlers are installed before the bind and "Listening on" is logged after it, so the
+    // line means the port accepts and a SIGTERM or SIGINT is handled from here on.
+    // `tests/graceful_shutdown.rs` waits for it, and reads the port from it when asked for
+    // port 0; do not move it before the bind.
     let shutdown = shutdown_signal();
-    info!("Listening on {}", addr);
-    let listener = TcpListener::bind(addr).await.unwrap();
+    let listener = TcpListener::bind(addr)
+        .await
+        .unwrap_or_else(|e| panic!("FATAL: could not bind {addr}: {e}"));
+    info!(
+        "Listening on {}",
+        listener.local_addr().expect("read the bound address")
+    );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await

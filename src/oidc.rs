@@ -7579,14 +7579,30 @@ mod client_binding_tests {
     /// A refresh token written before the grant record (`token/{raw}`), as the
     /// previous build left it for `client_id`. Returns the raw token.
     async fn seed_legacy_refresh_token(db: &RedisClient, client_id: &str) -> String {
+        seed_legacy_device_refresh_token(db, client_id, "").await
+    }
+
+    /// [`seed_legacy_refresh_token`] for a Matrix device: the scope names the
+    /// Matrix API and the device, as the previous build wrote an agent's token
+    /// (`device_id` empty: a deviceless token with the `openid` scope).
+    async fn seed_legacy_device_refresh_token(
+        db: &RedisClient,
+        client_id: &str,
+        device_id: &str,
+    ) -> String {
         let raw = format!("mcr_{}", Uuid::new_v4().simple());
         let now = Utc::now().timestamp();
+        let scope = if device_id.is_empty() {
+            "openid".to_string()
+        } else {
+            format!("openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}")
+        };
         db.set_token(
             &raw,
             &TokenMetadata {
                 username: unique("localpart"),
-                device_id: String::new(),
-                scope: "openid".into(),
+                device_id: device_id.into(),
+                scope,
                 client_id: client_id.into(),
                 iat: now,
                 exp: now + REFRESH_TOKEN_TTL as i64,
@@ -7802,6 +7818,106 @@ mod client_binding_tests {
             "ok",
             "the same client, or none, still refreshes"
         );
+    }
+
+    /// The same at the lift: a LEGACY refresh token (`token/{raw}`, written by
+    /// a build before the grant record) whose client registration is gone is
+    /// lifted and answered in the current format, whether the request names
+    /// the client or not, and stays bound to that client. This is the shape of
+    /// most refresh tokens a long-running deployment holds at the upgrade (an
+    /// agent's registration expires after 30 days, its refresh token lives 90
+    /// days from its last use). A registration that is gone counts as public
+    /// under either `require_secret` (`client_is_confidential(None)`).
+    #[tokio::test]
+    async fn a_legacy_token_whose_registration_is_gone_is_lifted_at_the_token_endpoint() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let other = seed_client(&db, Registration::Public).await;
+        for require_secret in [true, false] {
+            let config = Config {
+                require_secret,
+                ..Config::default()
+            };
+            for (device, names_itself) in [
+                ("", true),
+                ("AQUA_LIFTGONE", true),
+                ("AQUA_LIFTGONE", false),
+            ] {
+                let what = format!(
+                    "require_secret={require_secret} device={device:?} names_itself={names_itself}"
+                );
+                let gone = seed_client(&db, Registration::Public).await;
+                let legacy = seed_legacy_device_refresh_token(&db, &gone, device).await;
+                db.delete_client(gone.clone()).await.unwrap();
+
+                let foreign = refresh(
+                    &db,
+                    &config,
+                    &legacy,
+                    Presented {
+                        client_id: Some(&other),
+                        ..NOTHING
+                    },
+                )
+                .await;
+                assert_eq!(outcome(&foreign), "invalid_grant", "{what}: another client");
+                assert!(
+                    db.get_token(&legacy).await.unwrap().is_some(),
+                    "{what}: a refused request leaves the legacy entry"
+                );
+
+                let lifted = refresh(
+                    &db,
+                    &config,
+                    &legacy,
+                    Presented {
+                        client_id: names_itself.then_some(gone.as_str()),
+                        ..NOTHING
+                    },
+                )
+                .await;
+                let new_rt = refresh_token_of(lifted);
+                assert!(
+                    siwx_oidc::db::tokens::parse_refresh_token(&new_rt).is_some(),
+                    "{what}: the answer is in the current format"
+                );
+                assert!(
+                    db.get_token(&legacy).await.unwrap().is_none(),
+                    "{what}: the legacy entry is gone"
+                );
+                let grant = db.peek_refresh_grant(&new_rt).await.unwrap().unwrap();
+                assert_eq!(grant.client_id, gone, "{what}: still bound to its client");
+                assert!(
+                    !grant.confidential_client,
+                    "{what}: a registration that is gone is public"
+                );
+                assert_eq!(grant.generation, 1, "{what}");
+                assert_eq!(grant.device_id, device, "{what}: the device is kept");
+
+                assert_eq!(
+                    outcome(
+                        &refresh(
+                            &db,
+                            &config,
+                            &new_rt,
+                            Presented {
+                                client_id: Some(&other),
+                                ..NOTHING
+                            }
+                        )
+                        .await
+                    ),
+                    "invalid_grant",
+                    "{what}: the lifted grant is bound to its client"
+                );
+                assert_eq!(
+                    outcome(&refresh(&db, &config, &new_rt, NOTHING).await),
+                    "ok",
+                    "{what}: the lifted token rotates"
+                );
+            }
+        }
     }
 
     /// An HTTP Basic header names the client in its user name, and that is
