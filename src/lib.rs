@@ -39,6 +39,9 @@ pub mod credential_store;
 /// tested without a Synapse.
 pub mod guest_room_audit;
 
+/// The pure rules of a guest invitation: request limits, ids, secrets, host match.
+pub mod guest_invite;
+
 // `synapse_client` is DELIBERATELY not re-exposed here.
 //
 // It used to be `pub mod synapse_client;`, which compiled the same file into

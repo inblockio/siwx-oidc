@@ -1586,8 +1586,6 @@ impl SynapseClient {
     /// A normal user steers this admin read, and room state names people, so the log
     /// carries the status and the duration only, never a body, and neither does the
     /// error.
-    // First caller: `POST /guest/invites` (work package S2b).
-    #[allow(dead_code)]
     pub async fn room_state(&self, room_id: &str) -> Result<Option<Vec<serde_json::Value>>> {
         let url = format!(
             "{}/_synapse/admin/v1/rooms/{}/state",

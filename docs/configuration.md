@@ -416,6 +416,8 @@ When guest mode is on, start-up refuses:
 | `guest_brake_reaping_count` | `SIWXOIDC_GUEST_BRAKE_REAPING_COUNT` | `50` | Guests reaped within `guest_brake_reaping_secs` that pause minting. |
 | `guest_brake_reaping_secs` | `SIWXOIDC_GUEST_BRAKE_REAPING_SECS` | `900` | The window `guest_brake_reaping_count` is counted over. |
 
+**Host API (S2b).** `POST /guest/invites`, `GET /guest/invites`, `POST /guest/invites/{invite_id}/end` and `POST /guest/meetings/end` take a Bearer access token and answer `403` with a fixed `error` class: `not_a_host` (not in `guest_hosts`; a localpart entry matches the account's localpart, an entry starting `did:` matches the DID byte for byte), `admin_token`, `guest_token` (the account holds an unpromoted guest record) or `disabled` (`guest:control` is `disabled`). Create refuses over a limit with `400` and never clamps: `count` at most `guest_max_guests`, `expires_in` at most 259200 (default 86400), `session_secs` 600 to 14400 (default 7200), `kind: open` only with `guest_allow_open_links` (then `max_guests` at most `guest_open_link_max_uses` and `expires_in` at most `guest_open_link_max_ttl_secs`). A room that fails the template answers `422 room_template` with a `reasons` list. The per-host quotas `guest_host_max_invites` (active links), `guest_host_max_open_invites` and `guest_host_invites_per_hour` answer `429 quota_exceeded` and write nothing. An invite id is 96 random bits (16 characters of base64url); the secret is `gi_` plus 32 base62 characters, and only its SHA-256 is stored.
+
 ### Variables outside the config struct
 
 | Variable | Meaning |

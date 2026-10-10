@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 pub mod grant;
+pub mod guest_invites;
 pub mod outbox;
 mod redis;
 pub mod seal;

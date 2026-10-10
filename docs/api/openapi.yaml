@@ -1079,6 +1079,112 @@ paths:
         "401": { description: "`M_UNKNOWN_TOKEN`: the bearer is missing, unknown, not an access token, or (with delegated auth) an `oidc` grant's." }
         "503": { description: "`M_UNKNOWN`, retryable: the token store could not resolve the bearer. Never reported as `M_UNKNOWN_TOKEN`; nothing was deleted." }
 
+  /guest/invites:
+    post:
+      tags: [Guest]
+      operationId: guestCreateInvites
+      summary: Create guest invitation links for a meeting room
+      description: |
+        Host only: the bearer must be a live access token of an account in `guest_hosts`, not a minted
+        admin token and not a guest account. The room is read through the service admin credential; the
+        caller must be joined with `invite` power and the room must pass the guest room template.
+        Each link is `https://<issuer>/guest/join/<invite_id>#<secret>`; the secret is shown once and only
+        its SHA-256 is stored. Limits are refused, never clamped: `count` 1..`guest_max_guests`, labels at most
+        40 characters, `expires_in` default 86400 and at most 259200, `session_secs` 600..14400 (default 7200),
+        `kind` `single` (default) or `open` (only with `guest_allow_open_links`). No idempotency: each call
+        spends quota. Errors carry `{"error": code}`; Synapse bodies are never echoed.
+      security: [{ bearerToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room_id]
+              additionalProperties: false
+              properties:
+                room_id: { type: string, description: "`!opaque[:server]`, at most 255 bytes." }
+                count: { type: integer, minimum: 1 }
+                labels: { type: array, items: { type: string, maxLength: 40 } }
+                kind: { type: string, enum: [single, open] }
+                max_guests: { type: integer }
+                expires_in: { type: integer, maximum: 259200 }
+                session_secs: { type: integer, minimum: 600, maximum: 14400 }
+                recording_expected: { type: boolean }
+      responses:
+        "200":
+          description: One link per invite.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  invites:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        label: { type: string }
+                        link: { type: string, format: uri }
+                        expires_at: { type: integer, description: Unix seconds. }
+        "400": { description: "`bad_request`, `bad_room_id`, `bad_count`, `bad_labels`, `bad_kind`, `bad_max_guests`, `bad_expires_in`, `bad_session_secs` or `open_links_disabled`." }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`not_a_host`, `admin_token`, `guest_token`, `disabled` or `not_room_host`." }
+        "415": { description: Not `application/json`. }
+        "422": { description: "`room_not_found`, or `room_template` with a `reasons` list of fixed codes." }
+        "429": { description: "`quota_exceeded` with `quota` `host_invites`, `host_open_invites` or `host_invites_per_hour`. Nothing was written." }
+        "503": { description: "`unavailable`: Redis or Synapse failed. Nothing was written." }
+    get:
+      tags: [Guest]
+      operationId: guestListInvites
+      summary: List the caller's own invitations
+      description: Another host's invites are never shown. The body carries no secret and no hash. A non-host gets 403 `not_a_host`.
+      security: [{ bearerToken: [] }]
+      responses:
+        "200": { description: "`{invites: [...]}` with id, label, kind, state (`active`, `revoked`, `expired`, `exhausted`), counts, created and expiry." }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`not_a_host`, `admin_token`, `guest_token` or `disabled`." }
+        "503": { description: "`unavailable`." }
+
+  /guest/invites/{invite_id}/end:
+    post:
+      tags: [Guest]
+      operationId: guestEndInvite
+      summary: Revoke one invitation
+      description: Idempotent. 404 unless the caller created the invite; another host's id is indistinguishable from an unknown one.
+      security: [{ bearerToken: [] }]
+      parameters: [{ name: invite_id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: "`{revoked: 1}`." }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`not_a_host`, `admin_token`, `guest_token` or `disabled`." }
+        "404": { description: "`not_found`." }
+        "503": { description: "`unavailable`." }
+
+  /guest/meetings/end:
+    post:
+      tags: [Guest]
+      operationId: guestEndMeeting
+      summary: Revoke every invitation of the caller for one room
+      security: [{ bearerToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room_id]
+              additionalProperties: false
+              properties:
+                room_id: { type: string }
+      responses:
+        "200": { description: "`{revoked: n}`, 0 when the caller has none for the room." }
+        "400": { description: "`bad_request` or `bad_room_id`." }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`not_a_host`, `admin_token`, `guest_token` or `disabled`." }
+        "503": { description: "`unavailable`." }
+
   /health:
     get:
       tags: [Operations]

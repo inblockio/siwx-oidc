@@ -1743,7 +1743,11 @@ pub async fn main() {
         );
     }
 
-    let guest_router = crate::guest::routes::router(&state.config);
+    let guest_router = crate::guest::routes::router(
+        &state.config,
+        state.redis_client.clone(),
+        state.synapse_client.clone(),
+    );
     let introspect_state = IntrospectState::from(&state);
     let admin_token_state = AdminTokenState::from(&state);
     let compat_state = compat::CompatState::new(
