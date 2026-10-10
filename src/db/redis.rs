@@ -608,7 +608,10 @@ impl RedisClient {
               n = n + redis.call('DEL', k)
             end
             redis.call('DEL', KEYS[1])
-            redis.call('SET', KEYS[2], '1', 'EX', tonumber(ARGV[1]))
+            -- the revocation time in ms: the grant issue gate (M0a) compares it
+            local t = redis.call('TIME')
+            local ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+            redis.call('SET', KEYS[2], string.format('%.0f', ms), 'EX', tonumber(ARGV[1]))
             return n
         "#;
         let idx_key = device_token_idx_key(username, device_id);
