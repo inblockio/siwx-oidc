@@ -672,6 +672,37 @@ async fn revoking_a_device_deletes_its_grants_only_and_plants_the_tombstone() {
     assert_eq!(members, vec![b.grant_id.as_str().to_string()]);
 }
 
+/// M0a, device axis: a device revoked (tombstone planted, grants deleted) between the
+/// sign-in that minted an authorization code and the exchange of that code must not end
+/// in a usable token for that device. The code carries the device id, so the exchange
+/// issues a grant for the tombstoned device. KNOWN GAP (reported in the S1 slice A
+/// handover): `ISSUE_LUA` reads no tombstone and the access check (`MARK_USED_LUA`)
+/// reads only epochs, so the access token is accepted until it expires; only the refresh
+/// token is refused (`a_tombstoned_device_or_user_refuses_rotation_and_replay`). Run with
+/// `-- --ignored` to see it fail; remove the ignore with the fix.
+#[tokio::test]
+#[ignore = "known gap: issue_grant and the access check ignore the device tombstone (M0a)"]
+async fn a_grant_issued_for_a_tombstoned_device_gets_no_usable_access_token() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("tombiss{}", nonce());
+    client
+        .revoke_grants_for_device(&user, "DEVT")
+        .await
+        .unwrap();
+    assert!(tombstone(&client, &device_tombstone_key(&user, "DEVT")).await);
+    let late = issue(&client, &matrix_grant(&user, "DEVT")).await;
+    assert!(
+        client
+            .check_access_token(&late.access_token)
+            .await
+            .unwrap()
+            .is_none(),
+        "the access token of a grant issued after the device was revoked is accepted"
+    );
+}
+
 /// The shape of an Element X device id: 43 base64 characters, with `/` and
 /// `+`. A deployment holds such ids in its grants and legacy tokens.
 const ELEMENT_X_DEVICE: &str = "q8Zr/Hk+2vN0xLc7WmJ4pT9sY1bQ+fG6dR3eUo5a/Ki";

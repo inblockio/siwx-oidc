@@ -3148,6 +3148,58 @@ mod tests {
         }
     }
 
+    /// M0b: a static client (from `default_clients`) carries no TTL at start-up and still
+    /// carries none after many sign-ins: every use runs `touch_client` and issues a grant
+    /// under its id, and a restart (a second sync) keeps it without a TTL too.
+    #[tokio::test]
+    async fn a_static_client_keeps_no_ttl_across_many_sign_ins() {
+        use crate::db::grant::{GrantKind, NewGrant};
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let n = unique_nonce();
+        let fixed = format!("static-{n}");
+        let fixed_key = format!("clients/{fixed}");
+        client
+            .sync_static_clients(vec![(fixed.clone(), lifetime_test_entry())])
+            .await
+            .unwrap();
+        assert_eq!(client.ttl_raw(&fixed_key).await.unwrap(), -1, "after start-up");
+        for i in 0..8 {
+            client.touch_client(&fixed).await.unwrap();
+            client
+                .issue_grant(&NewGrant {
+                    kind: GrantKind::Oidc,
+                    username: format!("m0b{n}"),
+                    did: format!("did:key:z6Mk{n}"),
+                    client_id: fixed.clone(),
+                    confidential_client: false,
+                    device_id: String::new(),
+                    scope: "openid".to_string(),
+                    name: "n".to_string(),
+                    auth_ms: None,
+                    access_ttl: crate::db::ACCESS_TOKEN_TTL,
+                    refresh_inactivity_secs: Some(crate::db::REFRESH_TOKEN_TTL),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                client.ttl_raw(&fixed_key).await.unwrap(),
+                -1,
+                "after sign-in {}",
+                i + 1
+            );
+        }
+        client
+            .sync_static_clients(vec![(fixed.clone(), lifetime_test_entry())])
+            .await
+            .unwrap();
+        assert_eq!(client.ttl_raw(&fixed_key).await.unwrap(), -1, "after a restart");
+        for key in [fixed_key, client.static_clients_key.clone()] {
+            client.del_raw(&key).await.ok();
+        }
+    }
+
     /// Rewriting a client's entry (a registration-management update) never changes whether
     /// it expires: a static client stays without an expiry, and a dynamic client gets its
     /// full lifetime back, as it does on every other use.
