@@ -672,35 +672,132 @@ async fn revoking_a_device_deletes_its_grants_only_and_plants_the_tombstone() {
     assert_eq!(members, vec![b.grant_id.as_str().to_string()]);
 }
 
-/// M0a, device axis: a device revoked (tombstone planted, grants deleted) between the
-/// sign-in that minted an authorization code and the exchange of that code must not end
-/// in a usable token for that device. The code carries the device id, so the exchange
-/// issues a grant for the tombstoned device. KNOWN GAP (reported in the S1 slice A
-/// handover): `ISSUE_LUA` reads no tombstone and the access check (`MARK_USED_LUA`)
-/// reads only epochs, so the access token is accepted until it expires; only the refresh
-/// token is refused (`a_tombstoned_device_or_user_refuses_rotation_and_replay`). Run with
-/// `-- --ignored` to see it fail; remove the ignore with the fix.
+fn ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+fn refused_as_revoked(r: anyhow::Result<IssuedGrant>) -> bool {
+    matches!(r, Err(e) if e.is::<super::IssueRevoked>())
+}
+
+/// M0a, device axis: a code authenticated before its device was revoked (tombstone
+/// planted, grants deleted) is refused at issue, and nothing is written for it. The
+/// gate is inside `ISSUE_LUA`, so no revocation can land between check and mint.
 #[tokio::test]
-#[ignore = "known gap: issue_grant and the access check ignore the device tombstone (M0a)"]
-async fn a_grant_issued_for_a_tombstoned_device_gets_no_usable_access_token() {
+async fn a_code_authenticated_before_its_device_was_revoked_is_refused_at_issue() {
     let Some(client) = crate::test_support::redis().await else {
         return;
     };
     let user = format!("tombiss{}", nonce());
+    let mut early = matrix_grant(&user, "DEVT");
+    early.auth_ms = Some(ms_now() - 5_000);
     client
         .revoke_grants_for_device(&user, "DEVT")
         .await
         .unwrap();
     assert!(tombstone(&client, &device_tombstone_key(&user, "DEVT")).await);
-    let late = issue(&client, &matrix_grant(&user, "DEVT")).await;
+    assert!(refused_as_revoked(client.issue_grant(&early).await));
+    let members: Vec<String> = raw(&client, &["SMEMBERS", &device_idx_key(&user, "DEVT")]).await;
+    assert!(members.is_empty(), "a refused issue writes no index entry");
+    let other = issue(&client, &{
+        let mut g = matrix_grant(&user, "DEVU");
+        g.auth_ms = early.auth_ms;
+        g
+    })
+    .await;
     assert!(
         client
-            .check_access_token(&late.access_token)
+            .check_access_token(&other.access_token)
             .await
             .unwrap()
-            .is_none(),
-        "the access token of a grant issued after the device was revoked is accepted"
+            .is_some(),
+        "another device of the user is untouched"
     );
+}
+
+/// M0a: a sign-in authenticated after the revocation is not refused by the tombstone
+/// (`TOMBSTONE_TTL_SECS`: "a fresh sign-in never consults it" stays true in effect).
+#[tokio::test]
+async fn a_sign_in_after_the_device_revocation_still_issues() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("tombfresh{}", nonce());
+    client
+        .revoke_grants_for_device(&user, "DEVF")
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let mut fresh = matrix_grant(&user, "DEVF");
+    fresh.auth_ms = Some(ms_now());
+    let issued = issue(&client, &fresh).await;
+    assert!(client
+        .check_access_token(&issued.access_token)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+/// M0a: a tombstone written by a build that stored `1` refuses every grant of the device
+/// while it lives.
+#[tokio::test]
+async fn a_legacy_device_tombstone_refuses_every_issue() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("tomblegacy{}", nonce());
+    let key = device_tombstone_key(&user, "DEVL");
+    let _: () = raw(&client, &["SET", &key, "1", "EX", "60"]).await;
+    let mut g = matrix_grant(&user, "DEVL");
+    g.auth_ms = Some(ms_now());
+    assert!(refused_as_revoked(client.issue_grant(&g).await));
+}
+
+/// M0a, user axis: a code authenticated before a user teardown (the user epoch) is
+/// refused at issue, not only at first use.
+#[tokio::test]
+async fn a_code_authenticated_before_a_user_teardown_is_refused_at_issue() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("epochiss{}", nonce());
+    let mut early = matrix_grant(&user, "DEVE");
+    early.auth_ms = Some(ms_now() - 5_000);
+    client.revoke_grants_for_user(&user).await.unwrap();
+    assert!(refused_as_revoked(client.issue_grant(&early).await));
+}
+
+/// M0a, the other order: a grant issued before the device revocation is found through
+/// the device index by the revocation and is dead on both tokens afterwards.
+#[tokio::test]
+async fn a_revocation_after_issue_kills_access_and_refresh() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("tombafter{}", nonce());
+    let issued = issue(&client, &matrix_grant(&user, "DEVA")).await;
+    assert_eq!(
+        client
+            .revoke_grants_for_device(&user, "DEVA")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(client
+        .check_access_token(&issued.access_token)
+        .await
+        .unwrap()
+        .is_none());
+    let rt = issued
+        .refresh_token
+        .expect("a matrix grant carries a refresh token");
+    assert!(!matches!(
+        rotate(&client, &rt).await,
+        RotateOutcome::Rotated(_)
+    ));
 }
 
 /// The shape of an Element X device id: 43 base64 characters, with `/` and

@@ -1887,7 +1887,18 @@ async fn token_authorization_code(
             access_ttl: ACCESS_TOKEN_TTL,
             refresh_inactivity_secs: issuance.refresh_token.then_some(REFRESH_TOKEN_TTL),
         })
-        .await?;
+        .await
+        .map_err(|e| {
+            if e.is::<siwx_oidc::db::grant::IssueRevoked>() {
+                // M0a: the code was minted before its user, client or device was revoked.
+                CustomError::BadRequestToken(TokenError {
+                    error: CoreErrorResponseType::InvalidGrant,
+                    error_description: "Unknown or already-exchanged code.".to_string(),
+                })
+            } else {
+                CustomError::from(e)
+            }
+        })?;
     touch_client_after_use(db_client, &client_id).await;
     let refresh_token = issued.refresh_token.map(RefreshToken::new);
     let access_token = AccessToken::new(issued.access_token);

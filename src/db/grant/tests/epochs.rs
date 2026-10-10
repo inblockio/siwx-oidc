@@ -164,18 +164,19 @@ async fn the_epoch_comparison_is_at_or_before_to_the_millisecond() {
         .await
         .unwrap();
     let user = |tag: &str| format!("epms{tag}{}", nonce());
+    // Since M0a the issue script applies the same comparison, so an authentication at
+    // or before the epoch is refused before anything is written; the use-time
+    // comparison is pinned by the `auth_time` loop below, on grants edited after issue.
     for (offset, refused) in [(-1, true), (0, true), (1, false)] {
-        let g = issue(
-            &client,
-            &grant_of(&user("o"), &client_id, "", Some(epoch + offset)),
-        )
-        .await;
+        let new = grant_of(&user("o"), &client_id, "", Some(epoch + offset));
         let what = format!("auth_ms = epoch {offset:+}");
         if refused {
-            access_refused(&client, &g, &what).await;
-            refresh_revoked(&client, g.refresh_token.as_deref().unwrap(), &what).await;
+            assert!(
+                matches!(client.issue_grant(&new).await, Err(e) if e.is::<crate::db::grant::IssueRevoked>()),
+                "{what}: refused at issue"
+            );
         } else {
-            accepted(&client, &g, &what).await;
+            accepted(&client, &issue(&client, &new).await, &what).await;
         }
     }
     let second = epoch.div_euclid(1000);
