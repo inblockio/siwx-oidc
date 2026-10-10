@@ -1,0 +1,18 @@
+:root { color-scheme: light dark; --fg: #1b1f24; --bg: #f6f7f9; --card: #fff; --line: #c9ced6; --accent: #1f5fbf; --err: #a4262c; }
+@media (prefers-color-scheme: dark) { :root { --fg: #e6e8eb; --bg: #14171b; --card: #1d2127; --line: #3a414b; --accent: #7fb0ff; --err: #ff8a8f; } }
+* { box-sizing: border-box; }
+body { margin: 0; font: 16px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+main { max-width: 30rem; margin: 0 auto; padding: 2rem 1rem; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 1.5rem; }
+h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+label { display: block; margin: 0.9rem 0 0.25rem; font-weight: 600; }
+.opt { font-weight: 400; opacity: 0.75; }
+input[type="text"], input[type="email"] { width: 100%; padding: 0.55rem; font: inherit; color: inherit; background: transparent; border: 1px solid var(--line); border-radius: 6px; }
+.check { display: flex; gap: 0.6rem; align-items: flex-start; font-weight: 400; }
+.check input { margin-top: 0.3rem; }
+button { margin-top: 1.2rem; padding: 0.65rem 1.4rem; font: inherit; font-weight: 600; color: #fff; background: var(--accent); border: 0; border-radius: 6px; cursor: pointer; }
+@media (prefers-color-scheme: dark) { button { color: #0b1220; } }
+button[disabled] { opacity: 0.6; cursor: default; }
+.note { font-size: 0.9rem; opacity: 0.8; margin-top: 1rem; }
+.err { color: var(--err); margin-top: 1rem; min-height: 1.5em; }
+[hidden] { display: none !important; }

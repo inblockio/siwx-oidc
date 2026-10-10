@@ -1079,6 +1079,38 @@ paths:
         "401": { description: "`M_UNKNOWN_TOKEN`: the bearer is missing, unknown, not an access token, or (with delegated auth) an `oidc` grant's." }
         "503": { description: "`M_UNKNOWN`, retryable: the token store could not resolve the bearer. Never reported as `M_UNKNOWN_TOKEN`; nothing was deleted." }
 
+  /guest/join/{invite_id}:
+    get:
+      tags: [Guest]
+      operationId: guestJoinPage
+      summary: The guest join page
+      description: |
+        The same HTML for every `invite_id`, known or not: the id is read by the page from its own path,
+        and the invite secret from the URL fragment, which a browser never sends. A top-level navigation
+        from a link in a mail or chat is allowed, so there is no origin check. Carries the GP-SEC-39
+        headers (a CSP that allows only own scripts and styles, `frame-ancestors 'none'`, `no-referrer`,
+        `no-store`). `503 guest_unavailable` while guest mode is off.
+      parameters:
+        - { name: invite_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: "The page, `text/html`." }
+        "503": { description: "`guest_unavailable`." }
+
+  /guest/assets/{file}:
+    get:
+      tags: [Guest]
+      operationId: guestAsset
+      summary: A script or style sheet of the guest pages
+      description: |
+        A fixed allow-list: `join.js`, `guest-key.js` and `guest.css`. Any other name, however spelled,
+        is `404 not_found`; no part of the request reaches the file system. Same headers as the page.
+      parameters:
+        - { name: file, in: path, required: true, schema: { type: string, enum: [join.js, guest-key.js, guest.css] } }
+      responses:
+        "200": { description: "The file, `text/javascript` or `text/css`." }
+        "404": { description: "`not_found`." }
+        "503": { description: "`guest_unavailable`." }
+
   /guest/peek:
     post:
       tags: [Guest]

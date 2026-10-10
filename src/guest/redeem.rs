@@ -1483,4 +1483,109 @@ mod tests {
         }
         assert_eq!(e.used(&inv).await, "0");
     }
+
+    // ---- the join page and its assets (S3c) ----
+
+    async fn get(e: &Env, path: &str) -> Resp {
+        let r = e
+            .client
+            .get(format!("{}{path}", e.base))
+            .header("sec-fetch-site", "none")
+            .send()
+            .await
+            .unwrap();
+        Resp {
+            status: r.status().as_u16(),
+            headers: r.headers().clone(),
+            bytes: r.bytes().await.unwrap().to_vec(),
+        }
+    }
+
+    fn assert_gp_sec_39(r: &Resp) {
+        let h = |n: &str| r.headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or("");
+        assert_eq!(
+            h("content-security-policy"),
+            "default-src 'self'; script-src 'self'; style-src 'self'; base-uri 'none'; \
+             form-action 'self'; frame-ancestors 'none'"
+        );
+        assert_eq!(h("x-frame-options"), "DENY");
+        assert_eq!(h("referrer-policy"), "no-referrer");
+        assert_eq!(h("x-content-type-options"), "nosniff");
+        assert_eq!(h("cache-control"), "no-store");
+    }
+
+    #[tokio::test]
+    async fn join_page_is_the_same_html_for_every_id_with_the_headers() {
+        let Some(e) = env(|_| {}).await else { return };
+        let a = get(&e, "/guest/join/inv_known_or_not").await;
+        let b = get(&e, "/guest/join/zzz").await;
+        for r in [&a, &b] {
+            assert_eq!(r.status, 200);
+            assert!(r.headers[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html"));
+            assert_gp_sec_39(r);
+        }
+        assert_eq!(a.bytes, b.bytes, "the id must not change a byte");
+        let html = a.text();
+        // CSP: nothing inline, so the page may only name its own scripts and styles.
+        assert!(!html.contains("<style"), "no inline style");
+        assert!(!html.contains(" style="), "no style attribute");
+        assert!(!html.contains(" onclick=") && !html.contains(" onsubmit="));
+        assert!(!html
+            .replace("<script type=\"module\" src=", "")
+            .contains("<script>"));
+    }
+
+    #[tokio::test]
+    async fn assets_are_a_fixed_allow_list() {
+        let Some(e) = env(|_| {}).await else { return };
+        for (file, ct) in [
+            ("join.js", "text/javascript"),
+            ("guest-key.js", "text/javascript"),
+            ("guest.css", "text/css"),
+        ] {
+            let r = get(&e, &format!("/guest/assets/{file}")).await;
+            assert_eq!(r.status, 200, "{file}");
+            assert!(
+                r.headers[header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with(ct),
+                "{file}"
+            );
+            assert!(!r.bytes.is_empty());
+            assert_gp_sec_39(&r);
+        }
+        for bad in [
+            "guest-key.test.mjs",
+            "join.html",
+            "nope.js",
+            "..%2F..%2FCargo.toml",
+            "%2e%2e%2fCargo.toml",
+            "..",
+            "join.js%00",
+            "JOIN.JS",
+        ] {
+            let r = get(&e, &format!("/guest/assets/{bad}")).await;
+            assert_eq!(r.status, 404, "{bad}");
+            assert_eq!(r.error(), "not_found", "{bad}");
+            assert_gp_sec_39(&r);
+        }
+        assert_eq!(get(&e, "/guest/assets/a/b").await.status, 404);
+    }
+
+    #[tokio::test]
+    async fn join_page_and_assets_give_the_503_shell_with_guest_mode_off() {
+        let Some(e) = env(|c| c.guest_enabled = false).await else {
+            return;
+        };
+        for path in ["/guest/join/abc", "/guest/assets/join.js"] {
+            let r = get(&e, path).await;
+            assert_eq!(r.status, 503, "{path}");
+            assert_eq!(r.error(), "guest_unavailable", "{path}");
+            assert_gp_sec_39(&r);
+        }
+    }
 }

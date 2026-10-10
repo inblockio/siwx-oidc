@@ -1289,6 +1289,41 @@ mod tests {
         Fixture { key, nonce }
     }
 
+    /// The cross-language vector: `static/guest/guest-key.test.mjs` asserts the same
+    /// input and the same text from the JS builder the join page signs with.
+    #[test]
+    fn redeem_message_vector_matches_the_join_page_builder() {
+        let issuer = Url::parse("https://id.example.org").unwrap();
+        let issued = DateTime::parse_from_rfc3339("2026-10-11T12:34:56Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let expires = DateTime::parse_from_rfc3339("2026-10-11T12:39:56.789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let text = build_redeem_message(
+            &issuer,
+            "did:key:z6MkiTBz1ymuepAQ4HEHYSF1H8quG5GLVVQR3djdX3mDooWp",
+            "inv_0123456789abcdef",
+            "1700000300.AAAA_nonce-tag",
+            issued,
+            expires,
+        )
+        .unwrap();
+        let expected = "id.example.org wants you to sign in with your Ed25519 account:\n\
+            did:key:z6MkiTBz1ymuepAQ4HEHYSF1H8quG5GLVVQR3djdX3mDooWp\n\
+            \n\
+            Join as a guest\n\
+            \n\
+            URI: https://id.example.org\n\
+            Version: 1\n\
+            Nonce: 1700000300.AAAA_nonce-tag\n\
+            Issued At: 2026-10-11T12:34:56.000Z\n\
+            Expiration Time: 2026-10-11T12:39:56.789Z\n\
+            Resources:\n\
+            - urn:io.inblock:guest:invite:inv_0123456789abcdef";
+        assert_eq!(text, expected);
+    }
+
     fn msg(f: &Fixture, did: &str) -> String {
         build_redeem_message(
             &issuer(),
