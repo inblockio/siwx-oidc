@@ -35,6 +35,10 @@ pub mod credential_migration;
 /// default, selected by `AQUA_WEBAUTHN_REDIS_URL`.
 pub mod credential_store;
 
+/// The guest room template audited at mint (design 01 §4.3): pure, so every rule is
+/// tested without a Synapse.
+pub mod guest_room_audit;
+
 // `synapse_client` is DELIBERATELY not re-exposed here.
 //
 // It used to be `pub mod synapse_client;`, which compiled the same file into

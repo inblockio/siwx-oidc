@@ -1572,6 +1572,54 @@ impl SynapseClient {
             .context("read_did_field: response was not JSON")?;
         Ok(did_from_profile_field(body.get(DID_PROFILE_FIELD)))
     }
+
+    /// The current state of a room: the `state` array of
+    /// `GET /_synapse/admin/v1/rooms/{room_id}/state`, or `None` when Synapse does not
+    /// know the room (404).
+    ///
+    /// Backs the guest room audit at mint (design 01 §4.3,
+    /// `siwx_oidc::guest_room_audit`). The state carries the `m.room.member` events too,
+    /// so "the host is joined with invite power" needs no second read. The caller checks
+    /// `room_id` against the room id grammar first (04 GP-SEC-07); here it is sent as one
+    /// percent-encoded path segment.
+    ///
+    /// A normal user steers this admin read, and room state names people, so the log
+    /// carries the status and the duration only, never a body, and neither does the
+    /// error.
+    // First caller: `POST /guest/invites` (work package S2b).
+    #[allow(dead_code)]
+    pub async fn room_state(&self, room_id: &str) -> Result<Option<Vec<serde_json::Value>>> {
+        let url = format!(
+            "{}/_synapse/admin/v1/rooms/{}/state",
+            self.endpoint,
+            urlencoding::encode(room_id)
+        );
+        let started = std::time::Instant::now();
+        let resp = self
+            .admin_request(|http, token| http.get(&url).bearer_auth(token))
+            .await
+            .context("room_state: request failed")?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let status = resp.status;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            debug!(%status, elapsed_ms, "room_state: room unknown");
+            return Ok(None);
+        }
+        if !status.is_success() {
+            warn!(%status, elapsed_ms, "room_state failed");
+            anyhow::bail!("room_state: HTTP {status}{}", admin_status_hint(status));
+        }
+        debug!(%status, elapsed_ms, "room_state read");
+
+        #[derive(Deserialize)]
+        struct StateResponse {
+            state: Vec<serde_json::Value>,
+        }
+        // `serde_json`'s error names a position, never the content.
+        let body: StateResponse =
+            serde_json::from_str(&resp.body).context("room_state: invalid JSON")?;
+        Ok(Some(body.state))
+    }
 }
 
 /// Extract the published DID from the value of the [`DID_PROFILE_FIELD`] member
@@ -3711,6 +3759,96 @@ mod tests {
         assert!(
             !info.is_suspended,
             "suspension is parsed but is not a login gate"
+        );
+        handle.abort();
+    }
+
+    // -- room_state (guest room audit, S2a) ----------------------------------
+
+    /// A body no log line and no error may ever carry.
+    const ROOM_SECRET: &str = "Board-meeting-of-Erika-Mustermann";
+
+    #[tokio::test]
+    async fn room_state_wire_shape_and_parse() {
+        let state = json!({"state": [
+            {"type": "m.room.name", "state_key": "", "sender": "@h:example.org",
+             "content": {"name": ROOM_SECRET}}
+        ]});
+        let (client, log, handle) =
+            spawn_mock_synapse(MockReplies::new(axum::http::StatusCode::OK).body(state)).await;
+        let Some(client) = with_redis_mint(client).await else {
+            handle.abort();
+            return;
+        };
+
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let events = client
+            .room_state("!abc:example.org")
+            .await
+            .expect("a 200 is Ok")
+            .expect("a 200 is Some");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["content"]["name"], ROOM_SECRET);
+
+        let recorded = log.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "one read, got {recorded:?}");
+        assert_eq!(recorded[0].method, "GET");
+        assert_eq!(
+            recorded[0].path, "/_synapse/admin/v1/rooms/%21abc%3Aexample.org/state",
+            "the room id is ONE percent-encoded path segment"
+        );
+        let token = recorded[0]
+            .authorization
+            .as_deref()
+            .and_then(|a| a.strip_prefix("Bearer "))
+            .expect("a bearer token");
+        assert!(
+            token.starts_with(ADMIN_TOKEN_PREFIX),
+            "a minted admin token"
+        );
+        let out = logs.output();
+        assert!(out.contains("room_state read"), "the read is logged: {out}");
+        assert!(!out.contains(ROOM_SECRET), "no body in the log: {out}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn room_state_unknown_room_is_none() {
+        let (client, _log, handle) =
+            spawn_mock_synapse(MockReplies::new(axum::http::StatusCode::NOT_FOUND)).await;
+        let Some(client) = with_redis_mint(client).await else {
+            handle.abort();
+            return;
+        };
+        assert!(client.room_state("!gone").await.unwrap().is_none());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn room_state_failure_logs_and_returns_no_body() {
+        let (client, _log, handle) = spawn_mock_synapse(
+            MockReplies::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(json!({"error": ROOM_SECRET})),
+        )
+        .await;
+        let Some(client) = with_redis_mint(client).await else {
+            handle.abort();
+            return;
+        };
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let err = client
+            .room_state("!abc:example.org")
+            .await
+            .expect_err("a 500 is Err");
+        let out = logs.output();
+        assert!(
+            out.contains("room_state failed"),
+            "the failure is logged: {out}"
+        );
+        assert!(!out.contains(ROOM_SECRET), "no body in the log: {out}");
+        assert!(
+            !format!("{err:#}").contains(ROOM_SECRET),
+            "no body in the error"
         );
         handle.abort();
     }
