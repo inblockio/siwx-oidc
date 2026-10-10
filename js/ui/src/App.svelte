@@ -261,7 +261,14 @@
 	// Measured on the served bundle 2026-07-26; present since edff2b2, i.e. this
 	// one-step flow has never completed. The guard still protects every real user
 	// entry point (all of which pass `chained = false`).
-	async function handlePasskeySignIn(forceAll = false, chained = false) {
+	//
+	// `keyHintSpki` (unified RP sign-up only) is the base64url SPKI of the key just
+	// created; the server uses it to name the right credential for the first prompt.
+	async function handlePasskeySignIn(
+		forceAll = false,
+		chained = false,
+		keyHintSpki: string | null = null
+	) {
 		if (passkeyLoading && !chained) return;
 		passkeyLoading = true;
 		error = null;
@@ -273,7 +280,11 @@
 			const startResp = await fetch('/webauthn/authenticate/start', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: forceAll ? JSON.stringify({ all: true }) : '{}',
+				body: forceAll
+					? JSON.stringify({ all: true })
+					: keyHintSpki
+						? JSON.stringify({ key_hint_spki_b64url: keyHintSpki })
+						: '{}',
 			});
 			if (!startResp.ok) {
 				throw new Error(await startResp.text());
@@ -285,48 +296,73 @@
 			// null/absent and the UI shows no account hint.
 			detectedMxid = forceAll ? null : (options.detected_mxid ?? null);
 
-			options.publicKey.challenge = base64urlToBuffer(options.publicKey.challenge);
 			// Discoverable login: the server returns an empty `allowCredentials`, so the
 			// authenticator offers the user's own resident passkeys (not a server-wide
 			// picker). An empty/absent list is a no-op here — never treat it as an error.
-			if (options.publicKey.allowCredentials) {
-				for (const c of options.publicKey.allowCredentials) {
-					c.id = base64urlToBuffer(c.id);
+			const decodeRequest = (o: any) => {
+				o.publicKey.challenge = base64urlToBuffer(o.publicKey.challenge);
+				if (o.publicKey.allowCredentials) {
+					for (const c of o.publicKey.allowCredentials) {
+						c.id = base64urlToBuffer(c.id);
+					}
+				}
+				return o;
+			};
+			const promptAndFinish = async (o: any) => {
+				const assertion = await navigator.credentials.get({ publicKey: o.publicKey });
+				if (!assertion) throw new Error('No credential returned');
+				const authResponse = (assertion as PublicKeyCredential)
+					.response as AuthenticatorAssertionResponse;
+				return fetch('/webauthn/authenticate/finish', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						id: assertion.id,
+						rawId: bufferToBase64url(new Uint8Array((assertion as PublicKeyCredential).rawId)),
+						type: assertion.type,
+						response: {
+							authenticatorData: bufferToBase64url(new Uint8Array(authResponse.authenticatorData)),
+							clientDataJSON: bufferToBase64url(new Uint8Array(authResponse.clientDataJSON)),
+							signature: bufferToBase64url(new Uint8Array(authResponse.signature)),
+							userHandle: authResponse.userHandle
+								? bufferToBase64url(new Uint8Array(authResponse.userHandle))
+								: null,
+						},
+					}),
+				});
+			};
+
+			let requested = decodeRequest(options);
+			let finishResp = await promptAndFinish(requested);
+
+			// The server may ask for one more assertion (a plain re-prompt for a named
+			// credential): decode the options it hands back, prompt again and post to
+			// the same finish. No extra state in the UI.
+			if (finishResp.ok) {
+				const again = await finishResp.clone().json().catch(() => null);
+				if (again && again.need_second_assertion === true && again.options) {
+					requested = decodeRequest(again.options);
+					finishResp = await promptAndFinish(requested);
 				}
 			}
-
-			const assertion = await navigator.credentials.get({ publicKey: options.publicKey });
-			if (!assertion) throw new Error('No credential returned');
-
-			const authResponse = (assertion as PublicKeyCredential).response as AuthenticatorAssertionResponse;
-			const finishResp = await fetch('/webauthn/authenticate/finish', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({
-					id: assertion.id,
-					rawId: bufferToBase64url(new Uint8Array((assertion as PublicKeyCredential).rawId)),
-					type: assertion.type,
-					response: {
-						authenticatorData: bufferToBase64url(new Uint8Array(authResponse.authenticatorData)),
-						clientDataJSON: bufferToBase64url(new Uint8Array(authResponse.clientDataJSON)),
-						signature: bufferToBase64url(new Uint8Array(authResponse.signature)),
-						userHandle: authResponse.userHandle
-							? bufferToBase64url(new Uint8Array(authResponse.userHandle))
-							: null,
-					},
-				}),
-			});
 			if (!finishResp.ok) {
 				const errBody = await finishResp.clone().json().catch(() => null);
 				if (errBody && errBody.error === 'unknown_credential') {
 					// Progressive enhancement: ask the platform to prune this stale passkey
 					// from the picker. Privacy-safe (we only signal an id the client just
 					// presented). Best-effort + feature-detected; unsupported browsers skip it.
+					// Only for the legacy RP (the host of this page): on the unified RP the
+					// same passkey may be valid for other services, so it is never signalled.
 					try {
 						const pkc = window.PublicKeyCredential as any;
-						if (pkc && typeof pkc.signalUnknownCredential === 'function' && options.publicKey.rpId) {
+						if (
+							pkc &&
+							typeof pkc.signalUnknownCredential === 'function' &&
+							requested.publicKey.rpId &&
+							requested.publicKey.rpId === window.location.hostname
+						) {
 							await pkc.signalUnknownCredential({
-								rpId: options.publicKey.rpId,
+								rpId: requested.publicKey.rpId,
 								credentialId: errBody.credential_id,
 							});
 						}
@@ -412,6 +448,18 @@
 			if (!credential) throw new Error('No credential created');
 
 			const attestationResponse = (credential as PublicKeyCredential).response as AuthenticatorAttestationResponse;
+
+			// Unified RP (its id is not the host of this page): registration is options
+			// only, nothing is stored and there is no register/finish. The new key's SPKI
+			// goes into the chained sign-in as the hint for the first prompt.
+			if (options.publicKey.rp?.id && options.publicKey.rp.id !== window.location.hostname) {
+				const spki = attestationResponse.getPublicKey?.();
+				status = 'Passkey created. Signing in...';
+				error = null;
+				await handlePasskeySignIn(false, true, spki ? bufferToBase64url(new Uint8Array(spki)) : null);
+				return;
+			}
+
 			const finishResp = await fetch('/webauthn/register/finish', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
