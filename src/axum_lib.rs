@@ -1743,6 +1743,7 @@ pub async fn main() {
         );
     }
 
+    let guest_router = crate::guest::routes::router(&state.config);
     let introspect_state = IntrospectState::from(&state);
     let admin_token_state = AdminTokenState::from(&state);
     let compat_state = compat::CompatState::new(
@@ -1868,6 +1869,10 @@ pub async fn main() {
             ])
             .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
     );
+    // Merged after the CORS layer so the guest routes inherit none of it: they carry
+    // their own origin check, CORS, body cap and headers (`guest::layers`). With guest
+    // mode off every `/guest` path answers 503 and nothing else changes.
+    let app = app.merge(with_request_logging(guest_router));
 
     let addr = SocketAddr::from((config.address, config.port));
     // The handlers are installed before the bind and "Listening on" is logged after it, so the

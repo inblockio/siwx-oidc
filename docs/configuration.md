@@ -382,6 +382,13 @@ When guest mode is on, start-up refuses:
 - a zero for `guest_session_max_secs` or any quota;
 - any URL among `base_url`, `guest_client_url` and every `guest_client_redirect_uris` entry that is not `https`. When `base_url`'s host is `localhost`, `127.0.0.1` or `[::1]` (local development), `http` is allowed for all of them. `synapse_endpoint` is exempt from the `https` rule: it is an internal admin endpoint.
 
+
+**The `/guest` routes.** With guest mode off, every path under `/guest` answers `503` with `{"error":"guest_unavailable"}`, and no other route changes. With it on, an unknown `/guest` path answers `404` with `{"error":"not_found"}`. Either way, every `/guest` response, errors included, carries `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`, and none of the global CORS layer. With guest mode on:
+
+- A `POST` must be `application/json` (`415`) and at most 4 KiB (`413`). `claim/finish` takes up to 16 KiB.
+- The routes a guest's browser calls with its cookie, or with no credential, refuse a `POST` with `403` (`forbidden_origin`) unless at least one of `Origin` and `Sec-Fetch-Site` is present and each present one names this provider (`Origin` equal to the origin of `base_url`, `Sec-Fetch-Site: same-origin`). They answer no CORS. A `GET` is not checked, since a guest reaches the join page from a link.
+- The routes authorised by a Bearer token (the host's invitations) answer `Access-Control-Allow-Origin: *` without credentials and have no origin check.
+
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
 | `guest_enabled` | `SIWXOIDC_GUEST_ENABLED` | `false` | Master switch for the guest path. |

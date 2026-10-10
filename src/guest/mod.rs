@@ -1,11 +1,15 @@
-//! The guest server path (work package S1). Slice A holds only the start-up
-//! check of its configuration; the endpoints arrive in later slices.
+//! The guest server path (work package S1). Slice A holds the start-up check of
+//! its configuration, slice B the `/guest` router and its shared layers; the
+//! endpoints arrive in later slices.
 //!
 //! There is deliberately no `guest_key_secret`: a guest's identity is a
 //! `did:key` the browser makes, so the server never holds or derives a guest key.
 
 use crate::config::Config;
 use url::Url;
+
+pub mod layers;
+pub mod routes;
 
 /// The values `guest_client_topology` may take.
 pub const TOPOLOGIES: [&str; 2] = ["same-site", "cross-site"];
