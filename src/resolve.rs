@@ -1430,7 +1430,9 @@ mod tests {
             "did:pkh:eip155:1:0x254b0d7b63342fcb8955db82e95c21d72efdb6f7".to_string(),
             DID.to_string(),
             OTHER_DID.to_string(),
-            format!("did:pkh:ed25519:0x{}", "ab".repeat(32)),
+            // A real curve point (RFC 8032 test vector 1): the DID parser rejects a 32-byte
+            // string that does not decompress to an Ed25519 point.
+            "did:pkh:ed25519:0xd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a".to_string(),
             format!("did:pkh:p256:0x02{}", "cd".repeat(32)),
             "did:peer:0z6MkqRYqQiSgvZQdnBytw86Qbs2ZWUkGv22od935YF4s8M7V".to_string(),
             long_peer_did(),
