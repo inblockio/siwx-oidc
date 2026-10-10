@@ -141,6 +141,9 @@ impl IntoResponse for CustomError {
             CustomError::RegistrationRefused => {
                 warn!("registration_refused");
             }
+            CustomError::Gone => {
+                warn!("gone");
+            }
             // A server-side fault we have already CLASSIFIED, unlike
             // `internal_error`. Logged under its own name so an operator can
             // tell "a dependency is down and we failed closed on purpose" from
@@ -204,6 +207,7 @@ impl IntoResponse for CustomError {
                 Json(serde_json::json!({ "error": "registration failed" })),
             )
                 .into_response(),
+            CustomError::Gone => (StatusCode::GONE, self.to_string()).into_response(),
             CustomError::NotFound => (StatusCode::NOT_FOUND, self.to_string()).into_response(),
             CustomError::Redirect(uri) => Redirect::to(&uri).into_response(),
             CustomError::ServiceUnavailable(_) => {
@@ -780,10 +784,17 @@ async fn webauthn_register_start(
     State(state): State<AppState>,
     TypedHeader(cookies): TypedHeader<headers::Cookie>,
     Json(payload): Json<wa::RegisterStartRequest>,
-) -> Result<Json<CreationChallengeResponse>, CustomError> {
+) -> Result<Json<serde_json::Value>, CustomError> {
     let session_id = cookies
         .get(SESSION_COOKIE_NAME)
         .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
+    // With a distinct unified RP the offer is options only (ES256, resident
+    // key); the browser creates the key and no server write happens.
+    if let Some(options) =
+        wa::unified_registration_options(&state.rp_dispatch, payload.display_name.as_deref())?
+    {
+        return Ok(Json(options));
+    }
     let ccr = wa::register_start(
         &state.webauthn,
         &state.redis_client,
@@ -791,25 +802,16 @@ async fn webauthn_register_start(
         payload.display_name,
     )
     .await?;
-    Ok(Json(ccr))
+    Ok(Json(
+        serde_json::to_value(&ccr).map_err(|e| anyhow::anyhow!("encode options: {}", e))?,
+    ))
 }
 
-async fn webauthn_register_finish(
-    State(state): State<AppState>,
-    TypedHeader(cookies): TypedHeader<headers::Cookie>,
-    Json(reg_response): Json<RegisterPublicKeyCredential>,
+/// Registration no longer finishes on the server: the key is created in the
+/// browser and proven by its first login. Every request is answered 410.
+pub(crate) async fn webauthn_register_finish(
 ) -> Result<Json<wa::RegisterFinishResponse>, CustomError> {
-    let session_id = cookies
-        .get(SESSION_COOKIE_NAME)
-        .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
-    let resp = wa::register_finish(
-        &state.webauthn,
-        &state.redis_client,
-        session_id,
-        reg_response,
-    )
-    .await?;
-    Ok(Json(resp))
+    Err(CustomError::Gone)
 }
 
 /// Optional escape-hatch signals for `/webauthn/authenticate/start`. Both forms
@@ -822,6 +824,10 @@ async fn webauthn_register_finish(
 struct AuthenticateStartBody {
     #[serde(default)]
     all: bool,
+    /// Base64url SubjectPublicKeyInfo of a key the browser just created; names
+    /// the signer of the first unified login. Unusable values are ignored.
+    #[serde(default)]
+    key_hint_spki_b64url: Option<String>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -867,6 +873,9 @@ async fn webauthn_authenticate_start(
 
     // Escape hatch: `?all=1` OR JSON `{"all": true}` forces usernameless even with
     // a cookie ("use a different passkey").
+    let key_hint = body
+        .as_ref()
+        .and_then(|Json(b)| b.key_hint_spki_b64url.clone());
     let force_all = body.map(|Json(b)| b.all).unwrap_or(false)
         || query
             .all
@@ -884,12 +893,13 @@ async fn webauthn_authenticate_start(
     )
     .await;
 
-    let challenge = wa::authenticate_start(
+    let challenge = wa::authenticate_start_with_hint(
         &state.rp_dispatch,
         &state.redis_client,
         session_id,
         scope_did.as_deref(),
         false,
+        key_hint.as_deref(),
     )
     .await?;
 
@@ -938,18 +948,53 @@ struct WebauthnAuthenticateFinishResponse {
 async fn webauthn_authenticate_finish(
     State(state): State<AppState>,
     TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    request_headers: axum::http::HeaderMap,
     Json(auth_response): Json<PublicKeyCredential>,
-) -> Result<Json<WebauthnAuthenticateFinishResponse>, CustomError> {
+) -> Result<axum::response::Response, CustomError> {
     let session_id = cookies
         .get(SESSION_COOKIE_NAME)
         .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
-    let resp = wa::authenticate_finish(
+
+    // Hints for the unified login, in order of trust: the `aqua_did_hint`
+    // cookies, then the `siwx_user` session DID. A hint only ever picks among
+    // the two keys the assertion itself recovers.
+    let mut hints: Vec<aqua_auth::DidHint> = Vec::new();
+    for value in request_headers.get_all(axum::http::header::COOKIE) {
+        if let Ok(raw) = value.to_str() {
+            hints.extend(aqua_auth::hints_from_cookie_header(raw));
+        }
+    }
+    if let Some(did) = user_session_scope_did(
+        &state.redis_client,
+        &Some(TypedHeader(cookies.clone())),
+        false,
+    )
+    .await
+    {
+        hints.extend(aqua_auth::DidHint::parse(&did));
+    }
+
+    let step = wa::authenticate_finish_step(
         &state.redis_client,
         session_id,
         &state.rp_dispatch,
         auth_response,
+        &hints,
     )
     .await?;
+    let hint_cookie = wa::login_hint_cookie(&state.rp_dispatch, &step);
+    let resp = match step {
+        wa::LoginStep::Done { resp, .. } => resp,
+        wa::LoginStep::NeedSecondAssertion(options) => {
+            // A plain re-prompt: the browser asks for the same credential again.
+            return Ok(Json(serde_json::json!({
+                "ok": false,
+                "need_second_assertion": true,
+                "options": options,
+            }))
+            .into_response());
+        }
+    };
 
     // Detection only (no blocking, no change to provisioning). The verified DID
     // is already stored in the session by authenticate_finish; the new-user gate
@@ -974,12 +1019,19 @@ async fn webauthn_authenticate_finish(
         None => (false, String::new()),
     };
 
-    Ok(Json(WebauthnAuthenticateFinishResponse {
+    let mut response = Json(WebauthnAuthenticateFinishResponse {
         ok: resp.ok,
         did: resp.did,
         new_user,
         mxid,
-    }))
+    })
+    .into_response();
+    if let Some(cookie) = hint_cookie.and_then(|c| axum::http::HeaderValue::from_str(&c).ok()) {
+        response
+            .headers_mut()
+            .append(axum::http::header::SET_COOKIE, cookie);
+    }
+    Ok(response)
 }
 
 // -- Account linking route handlers (Phase 2) ------------------------------

@@ -111,6 +111,7 @@ sha3 = "0.10"
 test-log = "0.2"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 urlencoding = "2"
+aqua-auth = { git = "https://github.com/inblockio/aqua-auth", tag = "v0.7.0", features = ["webauthn-testkit"] }
 
 [profile.release]
 opt-level = "z"

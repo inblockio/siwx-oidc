@@ -388,6 +388,9 @@ pub enum CustomError {
     /// `{"error":"registration failed"}`, which names no reason and echoes no id.
     #[error("registration refused")]
     RegistrationRefused,
+    /// The endpoint no longer exists for any request (HTTP 410).
+    #[error("Gone")]
+    Gone,
     #[error("Not found")]
     NotFound,
     #[error("{0:?}")]
