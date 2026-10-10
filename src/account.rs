@@ -972,14 +972,15 @@ pub async fn account_passkey_finish(
         serde_json::from_value(req.credential)
             .map_err(|e| CustomError::BadRequest(format!("Invalid credential: {}", e)))?;
 
-    let resp = wa::verify_credential(db_client, session_id, rp_id, rp_origin, &auth_response)
-        .await
-        // Route the stale-passkey case to the structured 401 discriminator; keep every
-        // other verification failure as the existing 400 BadRequest for this flow.
-        .map_err(|e| match e {
-            wa::VerifyError::UnknownCredential(id) => CustomError::UnknownCredential(id),
-            wa::VerifyError::Other(inner) => CustomError::BadRequest(inner.to_string()),
-        })?;
+    let resp =
+        wa::verify_credential_legacy(db_client, session_id, rp_id, rp_origin, &auth_response)
+            .await
+            // Route the stale-passkey case to the structured 401 discriminator; keep every
+            // other verification failure as the existing 400 BadRequest for this flow.
+            .map_err(|e| match e {
+                wa::VerifyError::UnknownCredential(id) => CustomError::UnknownCredential(id),
+                wa::VerifyError::Other(inner) => CustomError::BadRequest(inner.to_string()),
+            })?;
 
     // New-account creation is reachable ONLY from the login screen. Account
     // management operates on an EXISTING account, so a passkey resolving to a DID

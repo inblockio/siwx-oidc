@@ -106,6 +106,7 @@ abused, leave it out of the list and let its proofs fail; the next sign-in re-as
 | `supported_pkh_namespaces` | `SIWXOIDC_SUPPORTED_PKH_NAMESPACES` | `["eip155", "ed25519", "p256"]` | `did:pkh` namespaces accepted. Must be registered in aqua-auth. |
 | `rp_id` | `SIWXOIDC_RP_ID` | host of `base_url` | WebAuthn Relying Party ID. Browsers offer only passkeys registered for exactly this domain. |
 | `rp_origin` | `SIWXOIDC_RP_ORIGIN` | `base_url` | Expected WebAuthn origin (scheme, host, port). Set it with `rp_id` when the public origin differs from `base_url`. |
+| `legacy_rp_id` | `SIWXOIDC_LEGACY_RP_ID` | host of `base_url` | Relying Party ID of the legacy ceremony (registration, linking, account and device flows; assertions for it take the stored-passkey path). With `rp_id` set to a different domain, `rp_id` / `rp_origin` name the unified RP and a login assertion is routed by its rpIdHash; unset or equal means a single RP. |
 
 ### Clients
 

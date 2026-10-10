@@ -61,6 +61,7 @@ struct AppState {
     webauthn: Arc<Webauthn>,
     rp_id: String,
     rp_origin: String,
+    rp_dispatch: Arc<wa::RpDispatch>,
     synapse_client: Option<Arc<SynapseClient>>,
 }
 
@@ -715,10 +716,11 @@ async fn device_passkey_start_handler(
     let scope_did =
         user_session_scope_did(&state.redis_client, &cookies, payload_force_all(&payload)).await;
     let rcr = wa::authenticate_start(
-        &state.webauthn,
+        &state.rp_dispatch,
         &state.redis_client,
         &session_id,
         scope_did.as_deref(),
+        true,
     )
     .await?;
     let detected_mxid = detected_mxid_for(
@@ -745,7 +747,7 @@ async fn device_passkey_finish_handler(
     let auth_response: PublicKeyCredential = serde_json::from_value(payload.clone())
         .map_err(|e| CustomError::BadRequest(format!("Invalid credential: {}", e)))?;
     let session_id = format!("device_passkey_{}", user_code);
-    let resp = wa::verify_credential(
+    let resp = wa::verify_credential_legacy(
         &state.redis_client,
         &session_id,
         &state.rp_id,
@@ -883,10 +885,11 @@ async fn webauthn_authenticate_start(
     .await;
 
     let challenge = wa::authenticate_start(
-        &state.webauthn,
+        &state.rp_dispatch,
         &state.redis_client,
         session_id,
         scope_did.as_deref(),
+        false,
     )
     .await?;
 
@@ -943,8 +946,7 @@ async fn webauthn_authenticate_finish(
     let resp = wa::authenticate_finish(
         &state.redis_client,
         session_id,
-        &state.rp_id,
-        &state.rp_origin,
+        &state.rp_dispatch,
         auth_response,
     )
     .await?;
@@ -1334,10 +1336,11 @@ async fn account_passkey_start_handler(
     let scope_did =
         user_session_scope_did(&state.redis_client, &cookies, payload_force_all(&payload)).await;
     let rcr = wa::authenticate_start(
-        &state.webauthn,
+        &state.rp_dispatch,
         &state.redis_client,
         &session_id,
         scope_did.as_deref(),
+        true,
     )
     .await?;
     let mut value = serde_json::to_value(&rcr)
@@ -1675,12 +1678,13 @@ pub async fn main() {
         None => Vec::new(),
     };
 
-    let wa_config = wa::build_webauthn(
+    let (wa_config, rp_dispatch) = wa::build_rp_dispatch(
         &config.base_url,
         config.rp_id.as_deref(),
         config.rp_origin.as_deref(),
+        config.legacy_rp_id.as_deref(),
     )
-    .expect("Failed to initialize WebAuthn — check SIWXOIDC_BASE_URL, SIWXOIDC_RP_ID, SIWXOIDC_RP_ORIGIN");
+    .expect("Failed to initialize WebAuthn: check SIWXOIDC_BASE_URL, SIWXOIDC_RP_ID, SIWXOIDC_RP_ORIGIN, SIWXOIDC_LEGACY_RP_ID");
 
     // Initialize Synapse client for MSC3861 device lifecycle (optional).
     //
@@ -1713,6 +1717,7 @@ pub async fn main() {
         webauthn: Arc::new(wa_config.webauthn),
         rp_id: wa_config.rp_id,
         rp_origin: wa_config.rp_origin,
+        rp_dispatch: Arc::new(rp_dispatch),
         synapse_client,
     };
 
@@ -2215,7 +2220,8 @@ mod unknown_credential_response_tests {
             return;
         };
         let base = url::Url::parse("http://localhost:8000").unwrap();
-        let cfg = wa::build_webauthn(&base, None, None).expect("build webauthn");
+        let (_cfg, dispatch) =
+            wa::build_rp_dispatch(&base, None, None, None).expect("build rp dispatch");
         let cookie_of = |value: &str| {
             let header = format!("siwx_user={value}");
             let hv = axum::http::HeaderValue::from_str(&header).expect("header value");
@@ -2236,10 +2242,11 @@ mod unknown_credential_response_tests {
             let scope = user_session_scope_did(&redis, &cookie_of(&genuine), false).await;
             assert_eq!(scope.as_deref(), Some(did.as_str()), "control: {did}");
             let rcr = wa::authenticate_start(
-                &cfg.webauthn,
+                &dispatch,
                 &redis,
                 &format!("didgenuine{n}{i}"),
                 scope.as_deref(),
+                false,
             )
             .await
             .expect("authenticate_start");
@@ -2261,10 +2268,11 @@ mod unknown_credential_response_tests {
                 "a DID as the cookie value scopes nothing: {did}"
             );
             let rcr = wa::authenticate_start(
-                &cfg.webauthn,
+                &dispatch,
                 &redis,
                 &format!("didforged{n}{i}"),
                 scope.as_deref(),
+                false,
             )
             .await
             .expect("authenticate_start");
