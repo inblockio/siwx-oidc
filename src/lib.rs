@@ -42,6 +42,11 @@ pub mod guest_room_audit;
 /// The pure rules of a guest invitation: request limits, ids, secrets, host match.
 pub mod guest_invite;
 
+/// Guest admission (work package S3a, design 01 §4 B3, 04 GP-SEC-16..22): name, e-mail
+/// and consent validators, `did:key` admission, the stateless peek nonce and the
+/// redeem proof of possession. Pure, so every rule is tested without Redis or HTTP.
+pub mod guest_admission;
+
 // `synapse_client` is DELIBERATELY not re-exposed here.
 //
 // It used to be `pub mod synapse_client;`, which compiled the same file into

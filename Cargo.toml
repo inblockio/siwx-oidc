@@ -75,6 +75,9 @@ uuid = { version = "1", features = ["serde", "v4"] }
 webauthn-rs = { version = "=0.6.1-dev", features = ["danger-allow-state-serialisation", "conditional-ui"] }
 bs58 = "0.5"
 webauthn-rs-proto = "=0.6.1-dev"
+unicode-normalization = "0.1"
+unicode-security = "0.1"
+hmac = "0.12"
 
 [dev-dependencies]
 # `figment::Jail` for the config-loading tests in src/config.rs: a temporary
