@@ -1567,6 +1567,9 @@ pub async fn main() {
         }
     }
 
+    // Guest mode (S1): a misconfigured guest path exits non-zero here, before anything binds.
+    crate::guest::validate_guest_config(&config).unwrap_or_else(|e| panic!("FATAL: {e}"));
+
     let grant_lifetime = config
         .grant_lifetime()
         .unwrap_or_else(|e| panic!("FATAL: {e}"));

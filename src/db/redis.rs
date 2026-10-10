@@ -3164,7 +3164,11 @@ mod tests {
             .sync_static_clients(vec![(fixed.clone(), lifetime_test_entry())])
             .await
             .unwrap();
-        assert_eq!(client.ttl_raw(&fixed_key).await.unwrap(), -1, "after start-up");
+        assert_eq!(
+            client.ttl_raw(&fixed_key).await.unwrap(),
+            -1,
+            "after start-up"
+        );
         for i in 0..8 {
             client.touch_client(&fixed).await.unwrap();
             client
@@ -3194,7 +3198,11 @@ mod tests {
             .sync_static_clients(vec![(fixed.clone(), lifetime_test_entry())])
             .await
             .unwrap();
-        assert_eq!(client.ttl_raw(&fixed_key).await.unwrap(), -1, "after a restart");
+        assert_eq!(
+            client.ttl_raw(&fixed_key).await.unwrap(),
+            -1,
+            "after a restart"
+        );
         for key in [fixed_key, client.static_clients_key.clone()] {
             client.del_raw(&key).await.ok();
         }

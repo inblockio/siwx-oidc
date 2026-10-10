@@ -278,6 +278,86 @@ pub struct Config {
     /// Env: `SIWXOIDC_REUSE_REVOKES_GRANT`
     #[serde(default)]
     pub reuse_revokes_grant: bool,
+    // -- Guest server path (S1). Flat on purpose, like the rest of the struct. --
+    /// Master switch for the guest server path. Off (the default): every other `guest_*` key is ignored and the guest endpoints do not exist. On: start-up runs `guest::validate_guest_config` and refuses to start when a prerequisite is missing.
+    /// Env: `SIWXOIDC_GUEST_ENABLED`
+    #[serde(default)]
+    pub guest_enabled: bool,
+    /// The fixed Meet start URL a guest invitation leads to. Required when guest mode is on; https (http only for a `localhost` `base_url`). An empty string unsets it.
+    /// Env: `SIWXOIDC_GUEST_CLIENT_URL`
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub guest_client_url: Option<Url>,
+    /// The OIDC `client_id` of the Meet client guests sign in through. Required when guest mode is on.
+    /// Env: `SIWXOIDC_GUEST_CLIENT_ID`
+    #[serde(default)]
+    pub guest_client_id: Option<String>,
+    /// Redirect URIs the guest client may use. At least one is required when guest mode is on; each must be https (http only for a `localhost` `base_url`).
+    /// Env: `SIWXOIDC_GUEST_CLIENT_REDIRECT_URIS`
+    #[serde(default)]
+    pub guest_client_redirect_uris: Vec<Url>,
+    /// Localparts or DIDs allowed to create guest invitations. At least one is required when guest mode is on.
+    /// Env: `SIWXOIDC_GUEST_HOSTS`
+    #[serde(default)]
+    pub guest_hosts: Vec<String>,
+    /// How the guest client is deployed relative to this provider: `same-site` or `cross-site`. Anything else is refused when guest mode is on.
+    /// Env: `SIWXOIDC_GUEST_CLIENT_TOPOLOGY`
+    pub guest_client_topology: String,
+    /// Longest lifetime of a guest session, in seconds. Must be non-zero when guest mode is on.
+    /// Env: `SIWXOIDC_GUEST_SESSION_MAX_SECS`
+    pub guest_session_max_secs: u64,
+    /// Suffix appended to a guest's display name.
+    /// Env: `SIWXOIDC_GUEST_NAME_SUFFIX`
+    pub guest_name_suffix: String,
+    /// Allow invitations that any holder of the link may use (open links). Off by default.
+    /// Env: `SIWXOIDC_GUEST_ALLOW_OPEN_LINKS`
+    #[serde(default)]
+    pub guest_allow_open_links: bool,
+    /// Allow a guest to claim a persistent account. Off by default.
+    /// Env: `SIWXOIDC_GUEST_CLAIM_ENABLED`
+    #[serde(default)]
+    pub guest_claim_enabled: bool,
+    /// Quota: guests per invitation.
+    /// Env: `SIWXOIDC_GUEST_MAX_GUESTS`
+    pub guest_max_guests: u64,
+    /// Quota: live invitations per host.
+    /// Env: `SIWXOIDC_GUEST_HOST_MAX_INVITES`
+    pub guest_host_max_invites: u64,
+    /// Quota: live guests per host.
+    /// Env: `SIWXOIDC_GUEST_HOST_MAX_LIVE_GUESTS`
+    pub guest_host_max_live_guests: u64,
+    /// Quota: invitations a host may create per hour.
+    /// Env: `SIWXOIDC_GUEST_HOST_INVITES_PER_HOUR`
+    pub guest_host_invites_per_hour: u64,
+    /// Quota: active guests across the deployment.
+    /// Env: `SIWXOIDC_GUEST_GLOBAL_MAX_ACTIVE`
+    pub guest_global_max_active: u64,
+    /// Quota: guest identities minted per day across the deployment.
+    /// Env: `SIWXOIDC_GUEST_DAILY_MINT_MAX`
+    pub guest_daily_mint_max: u64,
+    /// Quota: claimed guest accounts across the deployment.
+    /// Env: `SIWXOIDC_GUEST_MAX_CLAIMED`
+    pub guest_max_claimed: u64,
+    /// Quota: devices per guest.
+    /// Env: `SIWXOIDC_GUEST_MAX_DEVICES`
+    pub guest_max_devices: u64,
+    /// Quota: device hand-offs per guest per minute.
+    /// Env: `SIWXOIDC_GUEST_HANDOFF_PER_MINUTE`
+    pub guest_handoff_per_minute: u64,
+    /// Quota: uses of one open link.
+    /// Env: `SIWXOIDC_GUEST_OPEN_LINK_MAX_USES`
+    pub guest_open_link_max_uses: u64,
+    /// Quota: longest lifetime of an open link, in seconds.
+    /// Env: `SIWXOIDC_GUEST_OPEN_LINK_MAX_TTL_SECS`
+    pub guest_open_link_max_ttl_secs: u64,
+    /// Quota: live open links per host.
+    /// Env: `SIWXOIDC_GUEST_HOST_MAX_OPEN_INVITES`
+    pub guest_host_max_open_invites: u64,
+    /// Brake: guests reaped within `guest_brake_reaping_secs` that pause minting.
+    /// Env: `SIWXOIDC_GUEST_BRAKE_REAPING_COUNT`
+    pub guest_brake_reaping_count: u64,
+    /// Brake: the window, in seconds, over which `guest_brake_reaping_count` is counted.
+    /// Env: `SIWXOIDC_GUEST_BRAKE_REAPING_SECS`
+    pub guest_brake_reaping_secs: u64,
 }
 
 /// The shortest configurable absolute grant lifetime: a device code's
@@ -355,6 +435,30 @@ impl Default for Config {
             backchannel_logout_allowed_hosts: Vec::new(),
             backchannel_logout_required_for_refresh: false,
             reuse_revokes_grant: false,
+            guest_enabled: false,
+            guest_client_url: None,
+            guest_client_id: None,
+            guest_client_redirect_uris: Vec::new(),
+            guest_hosts: Vec::new(),
+            guest_client_topology: "same-site".to_string(),
+            guest_session_max_secs: 7200,
+            guest_name_suffix: " (Guest)".to_string(),
+            guest_allow_open_links: false,
+            guest_claim_enabled: false,
+            guest_max_guests: 10,
+            guest_host_max_invites: 5,
+            guest_host_max_live_guests: 25,
+            guest_host_invites_per_hour: 20,
+            guest_global_max_active: 50,
+            guest_daily_mint_max: 500,
+            guest_max_claimed: 200,
+            guest_max_devices: 8,
+            guest_handoff_per_minute: 3,
+            guest_open_link_max_uses: 10,
+            guest_open_link_max_ttl_secs: 86400,
+            guest_host_max_open_invites: 1,
+            guest_brake_reaping_count: 50,
+            guest_brake_reaping_secs: 900,
         }
     }
 }
@@ -408,6 +512,57 @@ mod tests {
                 figment().extract::<Config>()?.mail_domain.as_deref(),
                 Some("matrix.example.org")
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn guest_mode_is_off_with_the_documented_defaults_and_reads_the_environment() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            let c = figment().extract::<Config>()?;
+            assert!(!c.guest_enabled && !c.guest_allow_open_links && !c.guest_claim_enabled);
+            assert_eq!(c.guest_client_url, None);
+            assert!(c.guest_client_redirect_uris.is_empty() && c.guest_hosts.is_empty());
+            assert_eq!(c.guest_client_topology, "same-site");
+            assert_eq!(c.guest_name_suffix, " (Guest)");
+            assert_eq!(
+                [
+                    c.guest_session_max_secs,
+                    c.guest_max_guests,
+                    c.guest_host_max_invites,
+                    c.guest_host_max_live_guests,
+                    c.guest_host_invites_per_hour,
+                    c.guest_global_max_active,
+                    c.guest_daily_mint_max,
+                    c.guest_max_claimed,
+                    c.guest_max_devices,
+                    c.guest_handoff_per_minute,
+                    c.guest_open_link_max_uses,
+                    c.guest_open_link_max_ttl_secs,
+                    c.guest_host_max_open_invites,
+                    c.guest_brake_reaping_count,
+                    c.guest_brake_reaping_secs,
+                ],
+                [7200, 10, 5, 25, 20, 50, 500, 200, 8, 3, 10, 86400, 1, 50, 900]
+            );
+            jail.set_env("SIWXOIDC_GUEST_ENABLED", "true");
+            jail.set_env("SIWXOIDC_GUEST_HOSTS", r#"["alice","bob"]"#);
+            jail.set_env(
+                "SIWXOIDC_GUEST_CLIENT_URL",
+                "https://meet.example.org/start",
+            );
+            jail.set_env("SIWXOIDC_GUEST_MAX_GUESTS", "3");
+            let c = figment().extract::<Config>()?;
+            assert!(c.guest_enabled);
+            assert_eq!(c.guest_hosts, ["alice", "bob"]);
+            assert_eq!(
+                c.guest_client_url.map(String::from).as_deref(),
+                Some("https://meet.example.org/start")
+            );
+            assert_eq!(c.guest_max_guests, 3);
+            jail.set_env("SIWXOIDC_GUEST_CLIENT_URL", "");
+            assert_eq!(figment().extract::<Config>()?.guest_client_url, None);
             Ok(())
         });
     }

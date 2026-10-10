@@ -364,6 +364,51 @@ name nothing is published, because the assertion binds an MXID. The `proof` insi
 minted only with a configured `signing_key_pem`. Write protection of the field is Synapse
 configuration, see [matrix-integration.md](matrix-integration.md).
 
+### Guest mode
+
+The guest server path (work package S1) is off by default. With `guest_enabled = false` every
+other `guest_*` key is ignored. With it on, start-up checks the whole block (`validate_guest_config`)
+and exits non-zero before binding a port when anything is wrong; the message lists every
+problem and names each key. There is deliberately no key for a guest secret: a guest's identity is a
+`did:key` the browser makes, and the server never holds or derives it. Lists use Figment's syntax,
+for example `SIWXOIDC_GUEST_HOSTS='["alice","did:key:z6Mk…"]'`.
+
+When guest mode is on, start-up refuses:
+
+- a missing `mas_shared_secret`, `synapse_endpoint`, `matrix_server_name`, `guest_client_url` or `guest_client_id`;
+- an empty `guest_client_redirect_uris` or `guest_hosts`;
+- `supported_did_methods` without `key`;
+- a `guest_client_topology` other than `same-site` or `cross-site`;
+- a zero for `guest_session_max_secs` or any quota;
+- any URL among `base_url`, `guest_client_url` and every `guest_client_redirect_uris` entry that is not `https`. When `base_url`'s host is `localhost`, `127.0.0.1` or `[::1]` (local development), `http` is allowed for all of them. `synapse_endpoint` is exempt from the `https` rule: it is an internal admin endpoint.
+
+| Key | Environment | Default | Meaning |
+|---|---|---|---|
+| `guest_enabled` | `SIWXOIDC_GUEST_ENABLED` | `false` | Master switch for the guest path. |
+| `guest_client_url` | `SIWXOIDC_GUEST_CLIENT_URL` | none | The fixed Meet start URL a guest invitation leads to. Required when on. |
+| `guest_client_id` | `SIWXOIDC_GUEST_CLIENT_ID` | none | The OIDC `client_id` of the Meet client. Required when on. |
+| `guest_client_redirect_uris` | `SIWXOIDC_GUEST_CLIENT_REDIRECT_URIS` | `[]` | Redirect URIs of the Meet client. At least one when on. |
+| `guest_hosts` | `SIWXOIDC_GUEST_HOSTS` | `[]` | Localparts or DIDs allowed to create invitations. At least one when on. |
+| `guest_client_topology` | `SIWXOIDC_GUEST_CLIENT_TOPOLOGY` | `same-site` | `same-site` or `cross-site`: where the Meet client is deployed relative to this provider. |
+| `guest_session_max_secs` | `SIWXOIDC_GUEST_SESSION_MAX_SECS` | `7200` | Longest lifetime of a guest session. |
+| `guest_name_suffix` | `SIWXOIDC_GUEST_NAME_SUFFIX` | ` (Guest)` | Appended to a guest's display name. |
+| `guest_allow_open_links` | `SIWXOIDC_GUEST_ALLOW_OPEN_LINKS` | `false` | Allow invitations any holder of the link can use. |
+| `guest_claim_enabled` | `SIWXOIDC_GUEST_CLAIM_ENABLED` | `false` | Allow a guest to claim a persistent account. |
+| `guest_max_guests` | `SIWXOIDC_GUEST_MAX_GUESTS` | `10` | Guests per invitation. |
+| `guest_host_max_invites` | `SIWXOIDC_GUEST_HOST_MAX_INVITES` | `5` | Live invitations per host. |
+| `guest_host_max_live_guests` | `SIWXOIDC_GUEST_HOST_MAX_LIVE_GUESTS` | `25` | Live guests per host. |
+| `guest_host_invites_per_hour` | `SIWXOIDC_GUEST_HOST_INVITES_PER_HOUR` | `20` | Invitations a host may create per hour. |
+| `guest_global_max_active` | `SIWXOIDC_GUEST_GLOBAL_MAX_ACTIVE` | `50` | Active guests across the deployment. |
+| `guest_daily_mint_max` | `SIWXOIDC_GUEST_DAILY_MINT_MAX` | `500` | Guest identities minted per day across the deployment. |
+| `guest_max_claimed` | `SIWXOIDC_GUEST_MAX_CLAIMED` | `200` | Claimed guest accounts across the deployment. |
+| `guest_max_devices` | `SIWXOIDC_GUEST_MAX_DEVICES` | `8` | Devices per guest. |
+| `guest_handoff_per_minute` | `SIWXOIDC_GUEST_HANDOFF_PER_MINUTE` | `3` | Device hand-offs per guest per minute. |
+| `guest_open_link_max_uses` | `SIWXOIDC_GUEST_OPEN_LINK_MAX_USES` | `10` | Uses of one open link. |
+| `guest_open_link_max_ttl_secs` | `SIWXOIDC_GUEST_OPEN_LINK_MAX_TTL_SECS` | `86400` | Longest lifetime of an open link. |
+| `guest_host_max_open_invites` | `SIWXOIDC_GUEST_HOST_MAX_OPEN_INVITES` | `1` | Live open links per host. |
+| `guest_brake_reaping_count` | `SIWXOIDC_GUEST_BRAKE_REAPING_COUNT` | `50` | Guests reaped within `guest_brake_reaping_secs` that pause minting. |
+| `guest_brake_reaping_secs` | `SIWXOIDC_GUEST_BRAKE_REAPING_SECS` | `900` | The window `guest_brake_reaping_count` is counted over. |
+
 ### Variables outside the config struct
 
 | Variable | Meaning |
