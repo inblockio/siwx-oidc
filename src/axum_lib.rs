@@ -137,6 +137,9 @@ impl IntoResponse for CustomError {
                 // Expected user condition (stale/revoked passkey), NOT a server fault.
                 warn!(credential_fp = %fingerprint(cred_id), "unknown_credential");
             }
+            CustomError::RegistrationRefused => {
+                warn!("registration_refused");
+            }
             // A server-side fault we have already CLASSIFIED, unlike
             // `internal_error`. Logged under its own name so an operator can
             // tell "a dependency is down and we failed closed on purpose" from
@@ -192,6 +195,12 @@ impl IntoResponse for CustomError {
                                 Remove it from your device's passkey settings, or sign \
                                 in another way and register a new passkey.",
                 })),
+            )
+                .into_response(),
+            // A fixed body that names no reason and echoes no credential id.
+            CustomError::RegistrationRefused => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "registration failed" })),
             )
                 .into_response(),
             CustomError::NotFound => (StatusCode::NOT_FOUND, self.to_string()).into_response(),
@@ -2278,6 +2287,42 @@ mod unknown_credential_response_tests {
                 .await
                 .ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod registration_refused_response_tests {
+    //! Infra-free guards for how `/webauthn/register/finish` renders a refused
+    //! registration. The refusal itself is covered against Redis in
+    //! `webauthn::tests`.
+    use super::*;
+    use crate::webauthn::RegisterFinishError;
+
+    /// An already-registered credential id maps to `RegistrationRefused` and
+    /// renders as HTTP 400 with exactly `{"error":"registration failed"}`.
+    #[tokio::test]
+    async fn an_already_registered_credential_id_renders_400_with_a_fixed_body() {
+        let ce: CustomError = RegisterFinishError::AlreadyRegistered.into();
+        assert!(matches!(ce, CustomError::RegistrationRefused));
+
+        let resp = ce.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json, serde_json::json!({ "error": "registration failed" }));
+    }
+
+    /// Every other registration failure keeps its existing 500.
+    #[tokio::test]
+    async fn other_register_finish_errors_stay_internal_errors() {
+        let ce: CustomError = RegisterFinishError::Other(anyhow::anyhow!("no challenge")).into();
+        assert!(matches!(ce, CustomError::Other(_)));
+        assert_eq!(
+            ce.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }
 

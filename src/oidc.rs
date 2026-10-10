@@ -383,6 +383,11 @@ pub enum CustomError {
     /// `unknown_credential`, never `internal_error`.
     #[error("unknown_credential: {0}")]
     UnknownCredential(String),
+    /// A passkey registration was refused because its credential id is already
+    /// registered; nothing was written. Renders as HTTP 400 with the fixed body
+    /// `{"error":"registration failed"}`, which names no reason and echoes no id.
+    #[error("registration refused")]
+    RegistrationRefused,
     #[error("Not found")]
     NotFound,
     #[error("{0:?}")]
@@ -430,6 +435,18 @@ impl From<crate::webauthn::VerifyError> for CustomError {
             }
             // Every other verification failure keeps its existing 500/Other behavior.
             crate::webauthn::VerifyError::Other(inner) => CustomError::Other(inner),
+        }
+    }
+}
+
+impl From<crate::webauthn::RegisterFinishError> for CustomError {
+    fn from(e: crate::webauthn::RegisterFinishError) -> Self {
+        match e {
+            crate::webauthn::RegisterFinishError::AlreadyRegistered => {
+                CustomError::RegistrationRefused
+            }
+            // Every other registration failure keeps its existing 500/Other behavior.
+            crate::webauthn::RegisterFinishError::Other(inner) => CustomError::Other(inner),
         }
     }
 }

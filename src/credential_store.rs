@@ -32,6 +32,12 @@
 //! miss. That makes flipping the flag safe even if the backfill
 //! ([`crate::credential_migration`]) has not run, or has not finished.
 //!
+//! # Registration
+//!
+//! A mirror write inserts or replaces. Registration is create-only, so before
+//! it writes anything it asks [`shared_store_holds`] and refuses an id the store
+//! already holds, even when the legacy namespace has no entry for it.
+//!
 //! # What this module does NOT touch
 //!
 //! Account linking. `webauthn:link/*` is written only by the binary's
@@ -197,6 +203,41 @@ pub async fn mirror_credential(cred_id_b64: &str, blob: &str, did: &str, label: 
             cred = fingerprint(cred_id_b64)
         ),
     }
+}
+
+/// Whether the shared aqua-auth store already holds a credential under this
+/// id. `Ok(false)` when the flag is off.
+///
+/// Registration asks this before its create-only legacy write, because
+/// [`mirror_credential`] inserts or replaces: without the check, an id the
+/// store already holds (written there by another service sharing the store, or
+/// one whose legacy entry is gone) would get its row's key and `did` replaced
+/// by the new registration.
+///
+/// A failed lookup is an `Err`, never `false`: registration fails closed (the
+/// user can retry) instead of mirroring over a row it could not see. An id
+/// that is not base64url is `Ok(false)`, because [`mirror_credential`] never
+/// writes such an id either.
+///
+/// The check and the later mirror write are separate operations on a Redis
+/// that may be another server than the legacy one, so no atomic step covers
+/// both: a writer outside this process that inserts the same id between them
+/// is still replaced. Closing that gap needs a create-only insert in the store
+/// itself.
+pub async fn shared_store_holds(cred_id_b64: &str) -> Result<bool> {
+    let Some(store) = shared_store().await else {
+        return Ok(false);
+    };
+    let Some(id) = credential_id(cred_id_b64) else {
+        return Ok(false);
+    };
+    let row = store.get_by_id(&id).await.map_err(|e| {
+        anyhow::anyhow!(
+            "aqua-auth credential store lookup for {cred} failed: {e}",
+            cred = fingerprint(cred_id_b64)
+        )
+    })?;
+    Ok(row.is_some())
 }
 
 /// Mirror an advanced sign counter. No-op when the flag is off. Best-effort.

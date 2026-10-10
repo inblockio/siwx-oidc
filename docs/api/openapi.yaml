@@ -827,8 +827,28 @@ paths:
       tags: [Sign-in ceremonies]
       operationId: webauthnRegisterFinish
       summary: Finish passkey registration
-      description: The resulting P-256 public key derives the user's `did:key:zDn…`.
-      responses: { "200": { description: The derived DID. } }
+      description: |
+        The resulting P-256 public key derives the user's `did:key:zDn…`.
+        Registration is create-only: a credential id that is already registered,
+        that has link state, or that the enabled aqua-auth credential store
+        already holds, is refused and nothing is written.
+      responses:
+        "200": { description: "`{did, credential_id}`: the derived DID." }
+        "400":
+          description: |
+            Two different answers share this status; tell them apart by the body.
+            A refused registration (the credential id is already registered, has
+            link state, or is held by the enabled credential store) is JSON with
+            exactly `{"error":"registration failed"}`, a fixed body that names no
+            reason and echoes no id. A request the ceremony never started on
+            (no `session` cookie, no `Cookie` header, a body that is not JSON)
+            is a plain-text 400 instead.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, const: "registration failed" }
 
   /webauthn/authenticate/start:
     post:
