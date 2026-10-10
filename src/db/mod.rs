@@ -22,6 +22,7 @@ use url::Url;
 
 pub mod grant;
 pub mod guest_invites;
+pub mod guest_records;
 pub mod outbox;
 mod redis;
 pub mod seal;

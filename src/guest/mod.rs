@@ -10,6 +10,7 @@ use url::Url;
 
 pub mod invite;
 pub mod layers;
+pub mod redeem;
 pub mod routes;
 
 /// The values `guest_client_topology` may take.
@@ -82,6 +83,13 @@ pub fn validate_guest_config(config: &Config) -> Result<(), String> {
             "guest_client_topology = {:?}: must be one of {}",
             config.guest_client_topology,
             TOPOLOGIES.join(", ")
+        ));
+    }
+
+    if !["off", "optional", "required"].contains(&config.guest_email_policy.as_str()) {
+        problems.push(format!(
+            "guest_email_policy = {:?}: must be one of off, optional, required",
+            config.guest_email_policy
         ));
     }
 
@@ -226,6 +234,10 @@ mod tests {
             (
                 "guest_client_topology",
                 Box::new(|c| c.guest_client_topology = "sideways".into()),
+            ),
+            (
+                "guest_email_policy",
+                Box::new(|c| c.guest_email_policy = "maybe".into()),
             ),
             (
                 "guest_session_max_secs",

@@ -1079,6 +1079,102 @@ paths:
         "401": { description: "`M_UNKNOWN_TOKEN`: the bearer is missing, unknown, not an access token, or (with delegated auth) an `oidc` grant's." }
         "503": { description: "`M_UNKNOWN`, retryable: the token store could not resolve the bearer. Never reported as `M_UNKNOWN_TOKEN`; nothing was deleted." }
 
+  /guest/peek:
+    post:
+      tags: [Guest]
+      operationId: guestPeek
+      summary: Look at an invitation without using it
+      description: |
+        Authorised by the invite secret in the body; same-origin only (`Origin` or `Sec-Fetch-Site`),
+        JSON only, 4 KiB. Changes no state, so a link scanner cannot burn it. The secret is compared in
+        constant time and exactly one invite lookup is made whether or not the id exists. An unknown id,
+        a wrong secret and a body that does not parse give the same `404 {"error":"invalid_link"}`.
+        After the secret verifies: `200 {"state": "expired"|"exhausted"|"revoked"}` for an ended invite,
+        else `200` with `state: "active"`, `email_policy` (`off`, `optional`, `required`), `session_secs`,
+        `consent_version`, `recording_expected`, a stateless `nonce` (an HMAC over the invite id and an
+        expiry five minutes ahead) that the redeem proof must carry, `did_methods` (`["key"]`) and `curves`
+        (`["Ed25519","P-256"]`). It carries no host text and no meeting name. `503 disabled` while the
+        kill switch is on.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invite_id, secret]
+              properties:
+                invite_id: { type: string }
+                secret: { type: string }
+      responses:
+        "200": { description: "The invite's state and, when active, what the join page needs." }
+        "403": { description: "`forbidden_origin`." }
+        "404": { description: "`invalid_link`: unknown id, wrong secret or malformed body." }
+        "413": { description: "`payload_too_large`." }
+        "415": { description: "`unsupported_media_type`." }
+        "503": { description: "`disabled` or `unavailable`." }
+
+  /guest/redeem:
+    post:
+      tags: [Guest]
+      operationId: guestRedeem
+      summary: Use an invitation as a guest, binding a browser-made did:key
+      description: |
+        Authorised by the invite secret in the body; same-origin only, JSON only, 4 KiB. Order: secret
+        (the generic `404 invalid_link` as in peek), invite state, input validation, proof of possession,
+        DID in use, then one atomic Redis script on Redis `TIME`. A refusal writes nothing. No Synapse write.
+
+        `did` is a canonical `did:key` (Ed25519 or P-256). `proof.message` is the CAIP-122 text the browser
+        signed, exactly as `guest_admission::build_redeem_message` builds it: issuer domain, the DID, the
+        statement `Join as a guest`, `URI` (the issuer origin), `Version: 1`, the `nonce` from peek,
+        `Issued At`, `Expiration Time` (at most 10 minutes after issue) and the resource
+        `urn:io.inblock:guest:invite:<invite_id>`. `proof.signature` is the raw Ed25519 signature, or the
+        WebCrypto ECDSA `r || s` over SHA-256 for P-256, encoded as base64url without padding (standard
+        base64 is accepted too).
+
+        Success: `200 {guest_client_url, deadline, seconds_left}` and `Set-Cookie: __Host-guest_session=<handle>;
+        Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=<seconds to the deadline>`. When `base_url` is plain
+        http (local development) the cookie is `guest_session` without `Secure`. `guest_client_url` comes from
+        configuration. `deadline` is Unix seconds (Redis `TIME` plus the invite's `session_secs`). Redis keeps
+        only the SHA-256 of the handle.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invite_id, secret, first_name, second_name, consent, did, proof]
+              properties:
+                invite_id: { type: string }
+                secret: { type: string }
+                first_name: { type: string }
+                second_name: { type: string }
+                email: { type: string }
+                consent:
+                  type: object
+                  required: [version, variant]
+                  properties:
+                    version: { type: string }
+                    variant: { type: string }
+                did: { type: string }
+                proof:
+                  type: object
+                  required: [message, signature]
+                  properties:
+                    message: { type: string }
+                    signature: { type: string }
+      responses:
+        "200": { description: "`{guest_client_url, deadline, seconds_left}` and the session cookie." }
+        "400": { description: "`bad_request`: the secret verified but the rest of the body does not parse." }
+        "403": { description: "`forbidden_origin`." }
+        "404": { description: "`invalid_link`: unknown id, wrong secret or unparsable credentials." }
+        "409": { description: "`did_in_use`: a record, an `erased:did` marker or a known account holds the DID." }
+        "410": { description: "`expired`, `exhausted` or `revoked`." }
+        "413": { description: "`payload_too_large`." }
+        "415": { description: "`unsupported_media_type`." }
+        "422": { description: "`name_empty`, `name_too_long`, `name_chars`, `name_mixed_script`, `name_reserved`, `email_required`, `email_invalid`, `email_not_allowed`, `consent_required`, `did_invalid`, `did_unsupported`, `did_unusable` (the browser makes a new key) or `proof_invalid`." }
+        "429": { description: "`quota_exceeded` with `quota` `global_active`, `daily_mint` or `host_live_guests`." }
+        "503": { description: "`disabled` (kill switch) or `unavailable`." }
+
   /guest/invites:
     post:
       tags: [Guest]
@@ -1139,7 +1235,7 @@ paths:
       tags: [Guest]
       operationId: guestListInvites
       summary: List the caller's own invitations
-      description: Another host's invites are never shown. The body carries no secret and no hash. A non-host gets 403 `not_a_host`.
+      description: Another host's invites are never shown. The body carries no secret and no hash. Each invite lists its guests (`first_name`, `second_name`, `email` if given, `state`) and `counts`. A non-host gets 403 `not_a_host`.
       security: [{ bearerToken: [] }]
       responses:
         "200": { description: "`{invites: [...]}` with id, label, kind, state (`active`, `revoked`, `expired`, `exhausted`), counts, created and expiry." }

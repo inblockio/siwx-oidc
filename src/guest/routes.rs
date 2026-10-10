@@ -8,6 +8,7 @@ use std::sync::Arc;
 use axum::{routing::post, Router};
 
 use super::invite::{self, GuestState};
+use super::redeem;
 use crate::config::Config;
 use crate::synapse_client::SynapseClient;
 use siwx_oidc::db::RedisClient;
@@ -15,9 +16,12 @@ use siwx_oidc::db::RedisClient;
 /// The guest router, merged into the app after the global CORS layer.
 pub fn router(config: &Config, redis: RedisClient, synapse: Option<Arc<SynapseClient>>) -> Router {
     // Authorised by the guest cookie or by nothing: origin-checked, no CORS.
-    let cookie_routes = Router::new();
-    // Authorised by a Bearer token: `*` CORS, no origin check.
     let state = GuestState::new(config.clone(), redis, synapse);
+    let cookie_routes = Router::new()
+        .route("/guest/peek", post(redeem::peek))
+        .route("/guest/redeem", post(redeem::redeem))
+        .with_state(state.clone());
+    // Authorised by a Bearer token: `*` CORS, no origin check.
     let bearer_routes = Router::new()
         .route("/guest/invites", post(invite::create).get(invite::list))
         .route("/guest/invites/{invite_id}/end", post(invite::end_invite))

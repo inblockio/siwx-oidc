@@ -26,7 +26,9 @@ use super::layers::error;
 use crate::config::Config;
 use crate::synapse_client::{matrix_user_id, SynapseClient};
 use siwx_oidc::db::guest_invites::{CreateOutcome, InviteView, NewBatch, NewInvite, QuotaLimits};
+use siwx_oidc::db::guest_records::GuestView;
 use siwx_oidc::db::RedisClient;
+use siwx_oidc::guest_admission::NonceKey;
 use siwx_oidc::guest_invite::{
     self as rules, is_host, join_link, new_invite_id, new_secret, secret_hash, valid_invite_id,
     CreateRequest, Limits, ADMIN_SUBJECT,
@@ -35,17 +37,26 @@ use siwx_oidc::guest_room_audit::{audit_room, may_invite, RoomState};
 
 #[derive(Clone)]
 pub struct GuestState {
-    config: Arc<Config>,
-    redis: RedisClient,
-    synapse: Option<Arc<SynapseClient>>,
+    pub(super) config: Arc<Config>,
+    pub(super) redis: RedisClient,
+    pub(super) synapse: Option<Arc<SynapseClient>>,
+    /// The HMAC key of the peek nonce, shared by peek and redeem: derived from the
+    /// signing key when one is configured (so it survives a restart and is the same
+    /// on every instance), else random per process.
+    pub(super) nonce_key: NonceKey,
 }
 
 impl GuestState {
     pub fn new(config: Config, redis: RedisClient, synapse: Option<Arc<SynapseClient>>) -> Self {
+        let nonce_key = match config.signing_key_pem.as_deref() {
+            Some(pem) if !pem.is_empty() => NonceKey::derive(pem.as_bytes()),
+            _ => NonceKey::random(),
+        };
         Self {
             config: Arc::new(config),
             redis,
             synapse,
+            nonce_key,
         }
     }
 }
@@ -262,8 +273,28 @@ pub async fn create(State(state): State<GuestState>, headers: HeaderMap, body: B
 }
 
 /// What a host sees of an invite. There is deliberately no secret and no hash.
-/// The guest sub-list stays empty until guests exist (S3).
-fn public_view(v: &InviteView) -> Value {
+/// `guests` lists the invite's live guests (name, optional e-mail, state) and `counts`
+/// is derived from them: `redeemed` is the invite's burn count, `active` the guests
+/// not ending (minted, provisioning, active, claimed), `ended` those being reaped, and
+/// `reaped` the redeemed guests whose record is gone.
+fn public_view(v: &InviteView, guests: &[GuestView]) -> Value {
+    let ending = guests.iter().filter(|g| g.state == "reaping").count() as u64;
+    let active = guests.len() as u64 - ending;
+    let reaped = v.used.saturating_sub(guests.len() as u64);
+    let guests: Vec<Value> = guests
+        .iter()
+        .map(|g| {
+            let mut o = json!({
+                "first_name": g.first_name,
+                "second_name": g.second_name,
+                "state": g.state,
+            });
+            if let Some(email) = &g.email {
+                o["email"] = json!(email);
+            }
+            o
+        })
+        .collect();
     json!({
         "id": v.id,
         "label": v.label,
@@ -271,8 +302,8 @@ fn public_view(v: &InviteView) -> Value {
         "state": v.state,
         "room_id": v.room_id,
         "max_guests": v.max_guests,
-        "counts": { "redeemed": v.used, "active": 0, "ended": 0, "reaped": 0 },
-        "guests": [],
+        "counts": { "redeemed": v.used, "active": active, "ended": ending, "reaped": reaped },
+        "guests": guests,
         "session_secs": v.session_secs,
         "recording_expected": v.recording_expected,
         "created_at": v.created_at,
@@ -288,7 +319,18 @@ pub async fn list(State(state): State<GuestState>, headers: HeaderMap) -> Respon
     };
     match state.redis.list_guest_invites(&host.username).await {
         Ok(views) => {
-            let invites: Vec<Value> = views.iter().map(public_view).collect();
+            let ids: Vec<String> = views.iter().map(|v| v.id.clone()).collect();
+            let mut guests = match state.redis.guests_of_invites(&ids).await {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!(error = %e, "guest invite: guest list failed");
+                    return unavailable();
+                }
+            };
+            let invites: Vec<Value> = views
+                .iter()
+                .map(|v| public_view(v, &guests.remove(&v.id).unwrap_or_default()))
+                .collect();
             Json(json!({ "invites": invites })).into_response()
         }
         Err(e) => {
@@ -298,10 +340,15 @@ pub async fn list(State(state): State<GuestState>, headers: HeaderMap) -> Respon
     }
 }
 
-/// Seam for S3/S5: moving the deadline of the unclaimed guests of revoked
-/// invites to now. No guest record exists yet, so there is nothing to move;
-/// the reaper (S5) finds them through `guest:by_invite/{id}`.
-async fn move_guest_deadlines_to_now(_state: &GuestState, _invite_ids: &[String]) {}
+/// Move the deadline of the unclaimed guests of just-revoked invites to now (never
+/// later; `claimed` is skipped), so the reaper (S5) finds them due. The revoke has
+/// already succeeded: a failure here is logged, and the guests then end at their own
+/// deadline.
+async fn move_guest_deadlines_to_now(state: &GuestState, invite_ids: &[String]) {
+    if let Err(e) = state.redis.move_guest_deadlines_to_now(invite_ids).await {
+        warn!(error = %e, "guest invite: moving guest deadlines failed");
+    }
+}
 
 /// `POST /guest/invites/{invite_id}/end`: 404 unless the caller made it.
 pub async fn end_invite(
@@ -358,13 +405,23 @@ pub async fn end_meeting(
     if !siwx_oidc::guest_room_audit::valid_room_id(&room_id, server_name) {
         return error(StatusCode::BAD_REQUEST, "bad_room_id");
     }
+    // The caller's own invites for this room, read before the revoke (the set is the
+    // caller's and the room's, so no other host's invite is in it).
+    let ids = state
+        .redis
+        .smembers_raw(&siwx_oidc::db::guest_invites::by_room_key(
+            &host.username,
+            &room_id,
+        ))
+        .await
+        .unwrap_or_default();
     match state
         .redis
         .revoke_guest_invites_for_room(&host.username, &room_id)
         .await
     {
         Ok(n) => {
-            move_guest_deadlines_to_now(&state, &[]).await;
+            move_guest_deadlines_to_now(&state, &ids).await;
             Json(json!({ "revoked": n })).into_response()
         }
         Err(e) => {

@@ -308,6 +308,9 @@ pub struct Config {
     /// Suffix appended to a guest's display name.
     /// Env: `SIWXOIDC_GUEST_NAME_SUFFIX`
     pub guest_name_suffix: String,
+    /// Whether a guest is asked for an e-mail address at redeem: `off` (no address accepted), `optional` or `required`. The same for every invitation.
+    /// Env: `SIWXOIDC_GUEST_EMAIL_POLICY`
+    pub guest_email_policy: String,
     /// Allow invitations that any holder of the link may use (open links). Off by default.
     /// Env: `SIWXOIDC_GUEST_ALLOW_OPEN_LINKS`
     #[serde(default)]
@@ -443,6 +446,7 @@ impl Default for Config {
             guest_client_topology: "same-site".to_string(),
             guest_session_max_secs: 7200,
             guest_name_suffix: " (Guest)".to_string(),
+            guest_email_policy: "off".to_string(),
             guest_allow_open_links: false,
             guest_claim_enabled: false,
             guest_max_guests: 10,
