@@ -543,10 +543,13 @@ pub async fn register_start(
 /// shared credential store enabled, a row in that store), so the registration
 /// was refused and nothing was written. Every other failure (missing or expired
 /// challenge, attestation verification, I/O) stays `Other`.
-// Kept with its unit tests; the HTTP route answers 410, so only tests construct it.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Error)]
 pub enum RegisterFinishError {
+    /// The deployment serves a distinct unified relying party: keys are created
+    /// in the browser and proven by their first login, so there is nothing to
+    /// finish on the server (answered 410).
+    #[error("registration no longer finishes on the server")]
+    Retired,
     /// A passkey, link state or shared-store row already exists under this
     /// credential id; nothing was written.
     #[error("credential id already registered")]
@@ -554,6 +557,23 @@ pub enum RegisterFinishError {
     /// Any other registration failure.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+/// `register/finish` for the relying parties this server serves. A deployment
+/// with a distinct unified RP finishes nothing on the server
+/// ([`RegisterFinishError::Retired`]); a single-RP deployment verifies and
+/// stores the passkey with [`register_finish`].
+pub async fn register_finish_for(
+    dispatch: &RpDispatch,
+    webauthn: &Webauthn,
+    redis: &RedisClient,
+    session_id: &str,
+    reg_response: RegisterPublicKeyCredential,
+) -> Result<RegisterFinishResponse, RegisterFinishError> {
+    if dispatch.unified.is_some() {
+        return Err(RegisterFinishError::Retired);
+    }
+    register_finish(webauthn, redis, session_id, reg_response).await
 }
 
 /// Verify a registration and store its passkey.
@@ -566,7 +586,6 @@ pub enum RegisterFinishError {
 /// an id that store already holds is refused the same way, checked first
 /// ([`siwx_oidc::credential_store::shared_store_holds`]); that check and the
 /// mirror write are not one atomic step (see there).
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn register_finish(
     webauthn: &Webauthn,
     redis: &RedisClient,
@@ -747,6 +766,7 @@ pub async fn authenticate_start_with_hint(
     legacy: bool,
     key_hint_spki_b64url: Option<&str>,
 ) -> Result<RequestChallengeResponse> {
+    let legacy_arm = !matches!((&dispatch.unified, legacy), (Some(_), false));
     let mut rcr = match (&dispatch.unified, legacy) {
         (Some(unified), false) => {
             let hint = key_hint_spki_b64url
@@ -773,6 +793,9 @@ pub async fn authenticate_start_with_hint(
         }
     };
 
+    // The unified arm is discoverable only: the scope DID's stored ids are
+    // legacy credentials, and listing them would exclude the store-free key.
+    let scope_did = scope_did.filter(|_| legacy_arm);
     if let Some(did) = scope_did {
         // The UNION of the legacy webauthn:by_did index (with its scan
         // self-heal) and, when the flag is on, aqua-auth's did index -- not a
@@ -2163,6 +2186,62 @@ mod tests {
         );
     }
 
+    /// A unified-RP login offers discoverable credentials only: a scope DID
+    /// (the `siwx_user` cookie) that still has stored legacy credentials must
+    /// not narrow the unified request to those ids, or the store-free key is
+    /// excluded from the picker. Needs Redis.
+    #[tokio::test]
+    async fn unified_login_ignores_the_scope_dids_legacy_allow_list() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let dispatch = two_rp_dispatch();
+        let nonce = Uuid::new_v4().simple().to_string();
+        let did = format!("did:key:zDnU{nonce}");
+        let cred = URL_SAFE_NO_PAD.encode(format!("credU-{nonce}").as_bytes());
+        redis.index_add_passkey(&did, &cred).await.expect("seed");
+
+        let unified_session = format!("unisess{nonce}");
+        let unified = authenticate_start_with_hint(
+            &dispatch,
+            &redis,
+            &unified_session,
+            Some(&did),
+            false,
+            None,
+        )
+        .await
+        .expect("unified start");
+        let legacy_session = format!("legsess{nonce}");
+        let legacy = authenticate_start_with_hint(
+            &dispatch,
+            &redis,
+            &legacy_session,
+            Some(&did),
+            true,
+            None,
+        )
+        .await
+        .expect("legacy start");
+        redis
+            .del_raw(&format!(
+                "{}/{did}",
+                siwx_oidc::db::KV_WEBAUTHN_BY_DID_PREFIX
+            ))
+            .await
+            .ok();
+        assert_eq!(unified.public_key.rp_id, UNIFIED_TEST_RP);
+        assert!(
+            unified.public_key.allow_credentials.is_empty(),
+            "unified RP: discoverable only, the scope DID's legacy ids must not narrow it"
+        );
+        assert_eq!(
+            legacy.public_key.allow_credentials.len(),
+            1,
+            "the legacy arm keeps scoping to the DID's stored credentials"
+        );
+    }
+
     /// A ceremony's session id is the key to its challenge in Redis and arrives
     /// as a cookie, so it is a credential for the ceremony's duration. The start
     /// of each ceremony logs at `info!`; the logs may name the session only by
@@ -2422,6 +2501,55 @@ mod tests {
             .expect("register_start");
         let reg = none_attestation(&ccr.public_key.challenge, cred_id, key);
         register_finish(webauthn, redis, &session_id, reg).await
+    }
+
+    /// The route's registration finish by deployment shape. A single-RP
+    /// deployment (the default, no distinct unified RP) still registers and
+    /// stores the passkey; a deployment with a distinct unified RP answers
+    /// Retired (410) and writes nothing. Needs Redis.
+    #[tokio::test]
+    async fn register_finish_route_by_deployment_shape() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (cfg, single) =
+            build_rp_dispatch(&Url::parse(REG_TEST_ORIGIN).unwrap(), None, None, None)
+                .expect("single-RP dispatch");
+        assert!(single.unified.is_none());
+        let two = two_rp_dispatch();
+
+        // single-RP: register_start, then the routed finish stores the passkey
+        let cred_id = Uuid::new_v4().as_bytes().to_vec();
+        let cred_key = format!("{CREDENTIAL_PREFIX}/{}", URL_SAFE_NO_PAD.encode(&cred_id));
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let session_id = format!("regroute{}", Uuid::new_v4().simple());
+        let ccr = register_start(&cfg.webauthn, &redis, &session_id, None)
+            .await
+            .expect("register_start");
+        let reg = none_attestation(&ccr.public_key.challenge, &cred_id, &key);
+        let done = register_finish_for(&single, &cfg.webauthn, &redis, &session_id, reg).await;
+        let stored = redis.get_raw(&cred_key).await.expect("GET");
+        redis.del_raw(&cred_key).await.ok();
+        let resp = done.expect("a single-RP deployment still registers");
+        assert_eq!(resp.did, did_of(&key));
+        assert!(stored.is_some(), "the passkey was stored");
+
+        // unified RP: Retired, and nothing is written
+        let cred_id2 = Uuid::new_v4().as_bytes().to_vec();
+        let cred_key2 = format!("{CREDENTIAL_PREFIX}/{}", URL_SAFE_NO_PAD.encode(&cred_id2));
+        let key2 = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let session2 = format!("regroute{}", Uuid::new_v4().simple());
+        let ccr2 = register_start(&cfg.webauthn, &redis, &session2, None)
+            .await
+            .expect("register_start");
+        let reg2 = none_attestation(&ccr2.public_key.challenge, &cred_id2, &key2);
+        let gone = register_finish_for(&two, &cfg.webauthn, &redis, &session2, reg2).await;
+        let written = redis.get_raw(&cred_key2).await.expect("GET");
+        redis.del_raw(&cred_key2).await.ok();
+        assert!(matches!(gone, Err(RegisterFinishError::Retired)));
+        assert!(written.is_none(), "a unified deployment stores nothing");
+        let ce: crate::oidc::CustomError = RegisterFinishError::Retired.into();
+        assert!(matches!(ce, crate::oidc::CustomError::Gone));
     }
 
     fn reg_test_webauthn() -> WebauthnConfig {
@@ -3200,14 +3328,6 @@ mod tests {
             .collect();
         assert_eq!(algs, vec![-7], "ES256 only");
         assert_eq!(pk["authenticatorSelection"]["residentKey"], "required");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("runtime");
-        let gone = rt
-            .block_on(crate::axum_lib::webauthn_register_finish())
-            .err()
-            .expect("finish never succeeds");
-        assert!(matches!(gone, crate::oidc::CustomError::Gone));
     }
 
     #[tokio::test]

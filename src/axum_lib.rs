@@ -807,11 +807,26 @@ async fn webauthn_register_start(
     ))
 }
 
-/// Registration no longer finishes on the server: the key is created in the
-/// browser and proven by its first login. Every request is answered 410.
-pub(crate) async fn webauthn_register_finish(
+/// Registration finish. With a distinct unified RP the key is created in the
+/// browser and proven by its first login, so every request is answered 410;
+/// a single-RP deployment (the default) still verifies and stores the passkey.
+async fn webauthn_register_finish(
+    State(state): State<AppState>,
+    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    Json(reg_response): Json<RegisterPublicKeyCredential>,
 ) -> Result<Json<wa::RegisterFinishResponse>, CustomError> {
-    Err(CustomError::Gone)
+    let session_id = cookies
+        .get(SESSION_COOKIE_NAME)
+        .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
+    let resp = wa::register_finish_for(
+        &state.rp_dispatch,
+        &state.webauthn,
+        &state.redis_client,
+        session_id,
+        reg_response,
+    )
+    .await?;
+    Ok(Json(resp))
 }
 
 /// Optional escape-hatch signals for `/webauthn/authenticate/start`. Both forms

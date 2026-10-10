@@ -445,6 +445,7 @@ impl From<crate::webauthn::VerifyError> for CustomError {
 impl From<crate::webauthn::RegisterFinishError> for CustomError {
     fn from(e: crate::webauthn::RegisterFinishError) -> Self {
         match e {
+            crate::webauthn::RegisterFinishError::Retired => CustomError::Gone,
             crate::webauthn::RegisterFinishError::AlreadyRegistered => {
                 CustomError::RegistrationRefused
             }
