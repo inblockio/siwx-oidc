@@ -14,8 +14,8 @@ re-verify or remove the exception (all three places together).
 
 ## Guest mode: residual risks
 
-Accepted residual risks and deviations of the guest mode (`docs/guest-portal.md`; design set
-`docs/design/guest-portal/`, section 6.2 of `04-security-and-limits.md`). These are not advisory
+Accepted residual risks and deviations of the guest mode (`docs/guest-portal.md`; the guest-portal
+design set, which is not published in this repository, section 6.2 of its security document). These are not advisory
 exceptions: they have no `.cargo/audit.toml` ignore and no VEX statement. Each row is reviewable;
 when its trigger fires, re-decide it and update this table.
 
@@ -23,9 +23,9 @@ when its trigger fires, re-decide it and update this table.
 
 | ID | Deviation | Reason | Review trigger |
 |---|---|---|---|
-| GD-01 | The guest identity is a `did:key` generated **in the guest's browser** (design row "FP A1"), replacing the design's server-derived custodial key (M3b, `key_ref`, per-guest key value). The server holds the public DID only; it never holds, derives or receives private key material. | Removes the custodial key, its secret, its destruction rule and the operator's ability to act as a guest by key. A8 is reworded to match. | A requirement that the server sign for a guest. |
+| GD-01 | The guest identity is a `did:key` generated **in the guest's browser** (an operator decision on the design), replacing the design's server-derived custodial key (M3b, `key_ref`, per-guest key value). The server holds the public DID only; it never holds, derives or receives private key material. | Removes the custodial key, its secret, its destruction rule and the operator's ability to act as a guest by key. A8 is reworded to match. | A requirement that the server sign for a guest. |
 | GD-02 | The server cannot prove that a browser forgot its private key, in particular one that never returns. After the reap the DID is tombstoned (`erased:did`) and refused by every signature path, so a retained key is useless against this server, but it is not deleted. | The key is not ours to delete. The tombstone is the control; "destroyed" is claimed for server state only. | A DID method whose key the issuer can revoke elsewhere. |
-| GD-03 | A claimed account's DID is not tombstoned: it is the account's permanent identity, signs in with its passkey, and the guest hand-off refuses it from the commit on. | The claim keeps the same DID and MXID by design (GP-CLM-09). | A change to the claim model. |
+| GD-03 | A claimed account's DID is not tombstoned: it is the account's permanent identity, signs in with its passkey, and the guest hand-off refuses it from the commit on. | The claim keeps the same DID and MXID by design (claim requirement GP-CLM-09 of the unpublished design set). | A change to the claim model. |
 | GD-04 | The Bearer routes of `/guest` answer `Access-Control-Allow-Origin: *` without credentials (the cookie routes answer none). | The host tool and Meet client call them from their own origins; the Bearer token is the whole authorisation. | Any route moved between the groups. |
 
 ### Residual risks

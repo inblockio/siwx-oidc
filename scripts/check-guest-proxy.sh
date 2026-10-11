@@ -5,7 +5,8 @@
 # Deployment check for the reverse proxy in front of a guest-enabled siwx-oidc
 # (GP-SEC-04, ST-04, prerequisite P6 of docs/guest-portal.md). It probes the PUBLIC
 # URL, and optionally the direct upstream URL, and prints one PASS / FAIL / SKIP
-# line per check; it exits 1 when any check FAILed, 0 otherwise.
+# line per check; it exits 1 when any check FAILed, 2 when guest mode is off behind
+# the URL (nothing was checked, which is not a pass), 0 otherwise.
 #
 # What it proves:
 #   1. The public origin is the issuer's base_url: a same-origin POST is accepted
@@ -102,7 +103,8 @@ if [ "$CODE" = 503 ] && [ "$(bodycode)" = guest_unavailable ]; then
     skip "guest mode is off; run scripts/check-guest-posture.sh first, enable it, then repeat this check"
     echo
     echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
-    exit 0
+    echo "NOT CHECKED: no proxy check ran (exit 2)"
+    exit 2
 elif [ "$CODE" != 404 ] || [ "$(bodycode)" != not_found ]; then
     fail "GET /guest/<unknown> through the public URL answered $CODE '$(bodycode)' (want the app's 404 not_found): is the proxy routing /guest to siwx-oidc?"
     echo
