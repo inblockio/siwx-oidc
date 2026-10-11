@@ -25,7 +25,7 @@ const JOIN_HTML: &str = include_str!("../../static/guest/join.html");
 
 /// The only files `/guest/assets/{file}` serves. Compiled in, so no path from the
 /// request ever reaches the file system.
-const ASSETS: [(&str, &str, &str); 5] = [
+const ASSETS: [(&str, &str, &str); 6] = [
     (
         "continue.js",
         "text/javascript; charset=utf-8",
@@ -35,6 +35,11 @@ const ASSETS: [(&str, &str, &str); 5] = [
         "continue-message.js",
         "text/javascript; charset=utf-8",
         include_str!("../../static/guest/continue-message.js"),
+    ),
+    (
+        "ended.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../../static/guest/ended.js"),
     ),
     (
         "join.js",
@@ -85,6 +90,10 @@ pub fn router(config: &Config, redis: RedisClient, synapse: Option<Arc<SynapseCl
             "/guest/continue",
             get(handoff::continue_page).post(handoff::continue_post),
         )
+        // The issuer pages' read of the cookie's record, and the ended page (no cookie
+        // needed: it only draws the copy and forgets this browser's key).
+        .route("/guest/resume", get(handoff::resume))
+        .route("/guest/ended", get(handoff::ended_page))
         // Top-level navigations and sub-resources of the join page: GET, so the
         // origin check (POST only) does not apply; the layers still add the headers.
         .route("/guest/join/{invite_id}", get(join_page))
@@ -95,6 +104,8 @@ pub fn router(config: &Config, redis: RedisClient, synapse: Option<Arc<SynapseCl
         .route("/guest/invites", post(invite::create).get(invite::list))
         .route("/guest/invites/{invite_id}/end", post(invite::end_invite))
         .route("/guest/meetings/end", post(invite::end_meeting))
+        // The guest's own Bearer (S4b).
+        .route("/guest/context", get(handoff::context))
         .with_state(state);
     super::layers::build(
         config.guest_enabled,

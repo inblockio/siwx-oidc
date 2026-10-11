@@ -393,12 +393,12 @@ When guest mode is on, start-up refuses:
 |---|---|---|---|
 | `guest_enabled` | `SIWXOIDC_GUEST_ENABLED` | `false` | Master switch for the guest path. |
 | `guest_client_url` | `SIWXOIDC_GUEST_CLIENT_URL` | none | The fixed Meet start URL a guest invitation leads to. Required when on. |
-| `guest_client_id` | `SIWXOIDC_GUEST_CLIENT_ID` | none | The OIDC `client_id` of the Meet client: the only client that may use the `urn:io.inblock:guest` scope at `/authorize`. Required when on. |
+| `guest_client_id` | `SIWXOIDC_GUEST_CLIENT_ID` | none | The OIDC `client_id` of the Meet client: the only client that may use the `urn:io.inblock:guest` scope at `/authorize`. Required when on. At every start it is written as a static public client (no expiry, no secret that anyone knows, `token_endpoint_auth_method = none`, authorization-code and refresh grants) with exactly `guest_client_redirect_uris`; a `default_clients` entry with the same id, or a failure to write it, stops start-up. |
 | `guest_client_redirect_uris` | `SIWXOIDC_GUEST_CLIENT_REDIRECT_URIS` | `[]` | Redirect URIs of the Meet client; the guest hand-off accepts exactly these (string-equal) and `/guest/continue` refuses any other. At least one when on. |
 | `guest_hosts` | `SIWXOIDC_GUEST_HOSTS` | `[]` | Localparts or DIDs allowed to create invitations. At least one when on. |
 | `guest_client_topology` | `SIWXOIDC_GUEST_CLIENT_TOPOLOGY` | `same-site` | `same-site` or `cross-site`: where the Meet client is deployed relative to this provider. With `same-site` (the default) `/authorize` answers a `Sec-Fetch-Site: cross-site` request carrying the guest marker with `access_denied`. |
 | `guest_session_max_secs` | `SIWXOIDC_GUEST_SESSION_MAX_SECS` | `7200` | Longest lifetime of a guest session. |
-| `guest_name_suffix` | `SIWXOIDC_GUEST_NAME_SUFFIX` | ` (Guest)` | Appended to a guest's display name. |
+| `guest_name_suffix` | `SIWXOIDC_GUEST_NAME_SUFFIX` | ` (Guest)` | Appended to the typed name to make the guest's display name ("First Second (Guest)"). It seeds the account and is written again, as the canonical name, in the second admin PUT of the hand-off. |
 | `guest_email_policy` | `SIWXOIDC_GUEST_EMAIL_POLICY` | `off` | `off` (no address accepted), `optional` or `required`: whether a guest gives an e-mail address at redeem. The same for every invitation. |
 | `guest_allow_open_links` | `SIWXOIDC_GUEST_ALLOW_OPEN_LINKS` | `false` | Allow invitations any holder of the link can use. |
 | `guest_claim_enabled` | `SIWXOIDC_GUEST_CLAIM_ENABLED` | `false` | Allow a guest to claim a persistent account. |
@@ -409,8 +409,8 @@ When guest mode is on, start-up refuses:
 | `guest_global_max_active` | `SIWXOIDC_GUEST_GLOBAL_MAX_ACTIVE` | `50` | Active guests across the deployment. |
 | `guest_daily_mint_max` | `SIWXOIDC_GUEST_DAILY_MINT_MAX` | `500` | Guest identities minted per day across the deployment. |
 | `guest_max_claimed` | `SIWXOIDC_GUEST_MAX_CLAIMED` | `200` | Claimed guest accounts across the deployment. |
-| `guest_max_devices` | `SIWXOIDC_GUEST_MAX_DEVICES` | `8` | Devices per guest. |
-| `guest_handoff_per_minute` | `SIWXOIDC_GUEST_HANDOFF_PER_MINUTE` | `3` | Device hand-offs per guest per minute. |
+| `guest_max_devices` | `SIWXOIDC_GUEST_MAX_DEVICES` | `8` | Devices per guest. A ninth device hand-off gets `temporarily_unavailable` on the redirect URI. |
+| `guest_handoff_per_minute` | `SIWXOIDC_GUEST_HANDOFF_PER_MINUTE` | `3` | Device hand-offs per guest per minute (a sliding 60 s window per record). A fourth gets `temporarily_unavailable` on the redirect URI. |
 | `guest_open_link_max_uses` | `SIWXOIDC_GUEST_OPEN_LINK_MAX_USES` | `10` | Uses of one open link. |
 | `guest_open_link_max_ttl_secs` | `SIWXOIDC_GUEST_OPEN_LINK_MAX_TTL_SECS` | `86400` | Longest lifetime of an open link. |
 | `guest_host_max_open_invites` | `SIWXOIDC_GUEST_HOST_MAX_OPEN_INVITES` | `1` | Live open links per host. |

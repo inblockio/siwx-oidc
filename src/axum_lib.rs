@@ -460,6 +460,7 @@ async fn sign_in(
         state.synapse_client.as_deref(),
         state.config.matrix_server_name.as_deref(),
         Some(&publication),
+        Some(&state.config),
     )
     .await?;
 
@@ -1451,9 +1452,19 @@ fn log_pruned_static_clients(pruned: usize) {
 /// map no longer names is deleted. Every instance that shares one Redis must carry the
 /// same map: the last start wins.
 async fn store_default_clients(config: &config::Config, db: &RedisClient) -> anyhow::Result<()> {
-    let pruned = db
-        .sync_static_clients(parse_default_clients(config)?)
-        .await?;
+    let mut clients = parse_default_clients(config)?;
+    // Guest mode (S4b): the portal's client is a static public client, seeded here from
+    // `guest_client_*` so that code issuance can read it. A start-up that cannot seed it
+    // stops, and so does a `default_clients` entry that claims its id.
+    if let Some((id, entry)) =
+        crate::guest::guest_client_entry(config).map_err(anyhow::Error::msg)?
+    {
+        if clients.iter().any(|(existing, _)| *existing == id) {
+            anyhow::bail!("default_clients names {id:?}, which is guest_client_id");
+        }
+        clients.push((id, entry));
+    }
+    let pruned = db.sync_static_clients(clients).await?;
     log_pruned_static_clients(pruned);
     Ok(())
 }
@@ -1620,7 +1631,7 @@ pub async fn main() {
 
     // Configured clients are written before the server listens, and a failure stops
     // start-up.
-    if config.default_clients.is_empty() {
+    if config.default_clients.is_empty() && !config.guest_enabled {
         prune_static_clients_in_background(&redis_client);
     } else {
         store_default_clients(&config, &redis_client)

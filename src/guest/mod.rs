@@ -17,6 +17,52 @@ pub mod routes;
 /// The values `guest_client_topology` may take.
 pub const TOPOLOGIES: [&str; 2] = ["same-site", "cross-site"];
 
+/// The guest client as the static public client it is (S4b): `guest_client_id`, exactly
+/// `guest_client_redirect_uris`, `token_endpoint_auth_method = none` (PKCE S256 is
+/// mandatory on the guest path), the authorization-code and refresh grants, no expiry and
+/// no `/register`. Its secret is random and thrown away: nobody can authenticate with it.
+/// `None` with guest mode off.
+pub fn guest_client_entry(
+    config: &Config,
+) -> Result<Option<(String, siwx_oidc::db::ClientEntry)>, String> {
+    use openidconnect::core::{CoreClientAuthMethod, CoreGrantType};
+    use openidconnect::RedirectUrl;
+    use rand::RngCore as _;
+    if !config.guest_enabled {
+        return Ok(None);
+    }
+    let id = config
+        .guest_client_id
+        .clone()
+        .filter(|i| !i.is_empty())
+        .ok_or("guest_client_id is required when guest_enabled is true")?;
+    let redirects = config
+        .guest_client_redirect_uris
+        .iter()
+        .map(|u| RedirectUrl::new(u.to_string()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("guest_client_redirect_uris: {e}"))?;
+    if redirects.is_empty() {
+        return Err("guest_client_redirect_uris must name at least one URI".into());
+    }
+    let metadata = siwx_oidc::db::SiwxClientMetadata::new(
+        redirects,
+        siwx_oidc::db::LogoutClientMetadata::default(),
+    )
+    .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::None))
+    .set_grant_types(Some(vec![
+        CoreGrantType::AuthorizationCode,
+        CoreGrantType::RefreshToken,
+    ]));
+    let mut secret = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+    let secret = hex::encode(secret);
+    Ok(Some((
+        id,
+        siwx_oidc::db::ClientEntry::new(&secret, metadata, None),
+    )))
+}
+
 /// Whether `url`'s host is a local-development host (`localhost`, `127.0.0.1`, `[::1]`).
 fn is_local_host(url: &Url) -> bool {
     matches!(

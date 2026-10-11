@@ -1171,6 +1171,79 @@ paths:
         "415": { description: "`unsupported_media_type`." }
         "503": { description: "`unavailable`." }
 
+  /guest/context:
+    get:
+      tags: [Guest]
+      operationId: guestContext
+      summary: The guest's room, deadline and meeting name
+      description: |
+        Authorised by the guest's own Bearer access token (the portal's token after the hand-off). Makes no
+        Synapse call. Returns `{room_id, deadline, invite_id, meeting_name}`; `deadline` is Unix seconds and
+        `meeting_name` is the invite's label, text only (empty if the invite is gone). The room id is only ever
+        in this body, never in a URL. A missing, unknown or expired token is `401 invalid_token`; a valid token
+        whose subject has no guest record (a host's or a registered user's) is `403 not_a_guest`.
+      security: [{ bearerToken: [] }]
+      responses:
+        "200":
+          description: "The record's context, `Cache-Control: no-store`."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [room_id, deadline, invite_id, meeting_name]
+                properties:
+                  room_id: { type: string }
+                  deadline: { type: integer }
+                  invite_id: { type: string }
+                  meeting_name: { type: string }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`not_a_guest`." }
+        "503": { description: "`unavailable` (Redis), or `guest_unavailable` while guest mode is off." }
+
+  /guest/resume:
+    get:
+      tags: [Guest]
+      operationId: guestResume
+      summary: What the issuer pages know about the cookie's guest
+      description: |
+        Authorised by the guest cookie, same-origin only (a request with a foreign `Origin` or a `Sec-Fetch-Site`
+        other than `same-origin` is `403 forbidden_origin`); no CORS. For the issuer pages (the join page uses
+        `did` to check that its local key matches before it offers "Continue as ..."); the portal does not call
+        it. No secret in the body. With no live record (no cookie, unknown handle, `reaping`, past the deadline,
+        kill switch on) the answer is `200 {"state": "no_session"}`. The 10 minutes of `state: claimed` after a
+        claim arrive with S7.
+      responses:
+        "200":
+          description: "`{first_name, second_name, state, seconds_left, did, claim_allowed, email_present}`, or `{state: no_session}`."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state]
+                properties:
+                  first_name: { type: string }
+                  second_name: { type: string }
+                  state: { type: string, enum: [minted, provisioning, active, no_session] }
+                  seconds_left: { type: integer }
+                  did: { type: string }
+                  claim_allowed: { type: boolean, description: "Advisory: `guest_claim_enabled`." }
+                  email_present: { type: boolean }
+        "403": { description: "`forbidden_origin`." }
+        "503": { description: "`unavailable`, or `guest_unavailable` while guest mode is off." }
+
+  /guest/ended:
+    get:
+      tags: [Guest]
+      operationId: guestEndedPage
+      summary: The page a portal sends an ended guest to
+      description: |
+        The same page for everyone; it needs no cookie and no record. It says "This guest account is deleted;
+        this browser forgets its key." and calls `forgetKey()` on this browser's key store (script
+        `/guest/assets/ended.js`). The kept-account copy after a claim arrives with S7.
+      responses:
+        "200": { description: "The page, `text/html`." }
+        "503": { description: "`guest_unavailable` while guest mode is off." }
+
   /guest/peek:
     post:
       tags: [Guest]

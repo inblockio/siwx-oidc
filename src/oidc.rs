@@ -327,6 +327,29 @@ fn verification_jwk(verifying_key: &p256::ecdsa::VerifyingKey, kid: &str) -> Cor
 pub struct SidClaims {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
+    /// `io.inblock.guest: true` for a guest (S4b). Absent, never `false`, for everyone
+    /// else: a relying party that tests for the key sees no difference on a normal account.
+    #[serde(
+        rename = "io.inblock.guest",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub guest: Option<bool>,
+}
+
+/// The guest claim for the subject of a token: `Some(true)` when guest mode is on, the
+/// token belongs to the guest client and the localpart has a live guest record, else
+/// `None`. One Redis read, and none at all for any other client or with guest mode off.
+pub(crate) async fn guest_claim(
+    config: &crate::config::Config,
+    db_client: &DBClientType,
+    client_id: &str,
+    localpart: &str,
+) -> Result<Option<bool>, CustomError> {
+    if !config.guest_enabled || config.guest_client_id.as_deref() != Some(client_id) {
+        return Ok(None);
+    }
+    Ok(db_client.guest_flag(localpart).await?.then_some(true))
 }
 
 impl AdditionalClaims for SidClaims {}
@@ -1548,7 +1571,10 @@ async fn token_device_code(
                 now + Duration::seconds(config.id_token_ttl_secs as i64),
                 now,
                 claims,
-                SidClaims { sid: issued.sid },
+                SidClaims {
+                    sid: issued.sid,
+                    guest: None,
+                },
             );
 
             let id_token = SiwxIdToken::new(
@@ -1870,6 +1896,7 @@ async fn token_authorization_code(
         .clone()
         .unwrap_or_else(|| crate::localpart::legacy_localpart(&code_entry.did));
     let claims = resolve_claims(config, &code_entry.did, client_entry.class).await;
+    let guest = guest_claim(config, db_client, &client_id, &username).await?;
     let display_name = claims
         .name()
         .and_then(|n| n.get(None))
@@ -1914,7 +1941,10 @@ async fn token_authorization_code(
         now + Duration::seconds(config.id_token_ttl_secs as i64),
         now,
         claims,
-        SidClaims { sid: issued.sid },
+        SidClaims {
+            sid: issued.sid,
+            guest,
+        },
     )
     .set_nonce(code_entry.nonce)
     .set_auth_time(Some(code_entry.auth_time));
@@ -2597,7 +2627,7 @@ fn bound_request(session: &SessionEntry) -> Result<AuthorizationRequest, CustomE
 }
 
 /// Extract a device_id from a scope string containing `urn:matrix:client:device:XXX`.
-fn extract_device_id_from_scope(scope: &str) -> Option<String> {
+pub(crate) fn extract_device_id_from_scope(scope: &str) -> Option<String> {
     const STABLE_PREFIX: &str = "urn:matrix:client:device:";
     const MSC2967_PREFIX: &str = "urn:matrix:org.matrix.msc2967.client:device:";
     scope
@@ -2636,7 +2666,7 @@ const MAX_DEVICE_DISPLAY_NAME_CHARS: usize = 100;
 /// names (`client_name#de`) gets the one with the lexicographically smallest
 /// tag. The tagged names sit in a `HashMap`, so "the first one" would change
 /// from one sign-in to the next.
-fn device_display_name(client_id: &str, client: Option<&ClientEntry>) -> String {
+pub(crate) fn device_display_name(client_id: &str, client: Option<&ClientEntry>) -> String {
     let registered = client
         .and_then(|c| c.metadata.client_name())
         .and_then(|names| {
@@ -3106,6 +3136,7 @@ pub async fn sign_in(
     synapse_client: Option<&SynapseClient>,
     server_name: Option<&str>,
     did_publication: Option<&DidPublication<'_>>,
+    guest_config: Option<&crate::config::Config>,
 ) -> Result<(Url, String), CustomError> {
     let session_id = if let Some(c) = cookies.get(SESSION_COOKIE_NAME) {
         c
@@ -3127,10 +3158,11 @@ pub async fn sign_in(
         .map_err(|e| anyhow!("bound redirect_uri does not parse: {}", e))?;
 
     // A session `/authorize` started for the guest marker is finished only by
-    // `/guest/continue`; the seam below ends in a 503 until S4b fills it. Before the
-    // session is marked signed in, so a refusal burns nothing.
+    // `/guest/continue`, which writes `verified_did`. Checked before the session is
+    // marked signed in, so a refusal burns nothing; the provisioning is further down,
+    // where the Matrix class arm branches on `guest_id`.
     if session_entry.guest_id.is_some() {
-        crate::guest::handoff::guest_sign_in_seam(&session_entry)?;
+        crate::guest::handoff::guest_sign_in_precheck(&session_entry)?;
     }
 
     // Atomically mark session as signed-in (prevents race-condition double sign-in).
@@ -3316,7 +3348,23 @@ pub async fn sign_in(
     let client =
         validate_registered_redirect_uri(&request.client_id, &redirect_uri, db_client).await?;
 
-    let (resolved, device_id) = match client.class {
+    let (localpart, device_id) = match client.class {
+        ClientClass::Matrix if session_entry.guest_id.is_some() => {
+            // The guest branch (S4b): fence, fail-closed provisioning, marker, canonical
+            // name, device, `active`. It issues no device or account any other way.
+            let grant = crate::guest::handoff::provision_guest(
+                guest_config,
+                db_client,
+                synapse_client,
+                server_name,
+                &session_entry,
+                &request,
+                &client,
+                &did,
+            )
+            .await?;
+            (grant.localpart, Some(grant.device_id))
+        }
         ClientClass::Matrix => {
             let device_name = device_display_name(&request.client_id, Some(&client));
 
@@ -3350,7 +3398,7 @@ pub async fn sign_in(
                 did_publication,
             )
             .await;
-            (resolved, device_id)
+            (resolved.localpart.clone(), device_id)
         }
         ClientClass::Generic => {
             // The scope first: checking it has no side effects. `/authorize` asked the
@@ -3367,7 +3415,7 @@ pub async fn sign_in(
             }
             // No device and no cross-signing reset: a generic client's token is not a
             // Matrix session, so there is nothing for either to belong to.
-            (resolved, None)
+            (resolved.localpart.clone(), None)
         }
     };
 
@@ -3384,7 +3432,7 @@ pub async fn sign_in(
         .ok_or_else(|| anyhow!("Redis TIME out of range"))?,
         code_challenge: Some(request.code_challenge.clone()),
         code_challenge_method: Some("S256".to_string()),
-        localpart: Some(resolved.localpart.clone()),
+        localpart: Some(localpart),
         device_id,
         scope: request.scope.clone(),
         client_class: Some(client.class),
@@ -3900,6 +3948,13 @@ pub struct SiwxAdditionalClaims {
         skip_serializing_if = "Option::is_none"
     )]
     pub mailbox: Option<String>,
+    /// `io.inblock.guest: true` for a guest (S4b); omitted, never `false`, otherwise.
+    #[serde(
+        rename = "io.inblock.guest",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub guest: Option<bool>,
 }
 
 impl AdditionalClaims for SiwxAdditionalClaims {}
@@ -4040,6 +4095,7 @@ pub async fn userinfo(
             &client_entry,
             config.mail_domain.as_deref(),
         ),
+        guest: guest_claim(config, db_client, &metadata.client_id, &metadata.username).await?,
     };
     let response = SiwxUserInfoClaims::new(
         resolve_claims(config, &metadata.did, client_entry.class).await,
@@ -4621,6 +4677,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4764,7 +4821,8 @@ mod tests {
             &db_client,
             None, // no synapse_client in tests
             None, // no matrix_server_name in tests
-            None, // DID publication is off: no Synapse to publish into
+            None, // DID publication is off: no Synapse to publish into,
+            None,
         )
         .await
         .unwrap();
@@ -4902,6 +4960,7 @@ mod tests {
             &["eip155".to_string()],
             cookie,
             &db_client,
+            None,
             None,
             None,
             None,
@@ -7046,6 +7105,7 @@ mod sign_in_deactivation_order_tests {
             Some(&synapse),
             Some(SERVER_NAME),
             None,
+            None,
         )
         .await;
         server.abort();
@@ -7351,6 +7411,7 @@ mod device_display_name_tests {
             &db,
             Some(&synapse),
             Some(SERVER_NAME),
+            None,
             None,
         )
         .await
@@ -9560,6 +9621,7 @@ mod end_session_tests {
             StandardClaims::new(SubjectIdentifier::new(did.to_string())),
             SidClaims {
                 sid: sid.map(str::to_string),
+                guest: None,
             },
         );
         SiwxIdToken::new(
@@ -10498,6 +10560,7 @@ mod generic_client_tests {
             Some(&synapse),
             Some(SERVER_NAME),
             Some(&publication),
+            None,
         )
         .await;
         server.abort();

@@ -30,15 +30,20 @@ use base64::{
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::invite::GuestState;
 use super::layers::error;
 use crate::config::Config;
 use crate::oidc::{AuthorizeParams, CustomError};
-use siwx_oidc::db::guest_records::GuestSession;
-use siwx_oidc::db::{DBClient, RedisClient, SessionEntry, SESSION_COOKIE_NAME};
+use crate::synapse_client::{DeviceUpsert, SynapseClient};
+use siwx_oidc::db::guest_records::{GuestSession, HandoffBegin, HandoffRefusal};
+use siwx_oidc::db::{
+    AuthorizationRequest, ClientClass, ClientEntry, DBClient, RedisClient, SessionEntry,
+    SESSION_COOKIE_NAME,
+};
 use siwx_oidc::guest_admission::{verify_continue_proof, ContinueError};
+use url::Url;
 
 /// The scope word that routes an `/authorize` request here.
 pub const GUEST_MARKER_SCOPE: &str = "urn:io.inblock:guest";
@@ -241,24 +246,222 @@ pub async fn authorize(
     Ok((out, Redirect::to(CONTINUE_PATH)))
 }
 
-/// S4b seam: a verified guest session reached code issuance. The fence
-/// (`minted`/`provisioning` to `provisioning`), the fail-closed provisioning, the marker
-/// PUT, the canonical-name PUT, the caps and the `active` write replace this body; until
-/// then no code is issued to a guest. Called from `oidc::sign_in` before the session is
-/// marked signed in, so a refusal here burns nothing.
-pub fn guest_sign_in_seam(session: &SessionEntry) -> Result<(), CustomError> {
-    // A guest session is finished only by /guest/continue, which writes `verified_did`.
+/// The first check of the guest branch of `sign_in`, before the session is marked signed
+/// in (so a refusal burns nothing): a guest session is finished only by
+/// `/guest/continue`, which writes `verified_did`.
+pub fn guest_sign_in_precheck(session: &SessionEntry) -> Result<(), CustomError> {
     if session.verified_did.is_none() {
         return Err(CustomError::Unauthorized(
             "The guest hand-off was not completed.".to_string(),
         ));
     }
-    // S4b: provision here and fall through to code issuance.
-    Err(CustomError::Coded {
-        status: 503,
-        code: "unavailable",
-    })
+    Ok(())
 }
+
+/// An error on the redirect URI of a bound request (RFC 6749 4.1.2.1), in the fragment
+/// when the request asked for `response_mode=fragment`.
+fn redirect_error(request: &AuthorizationRequest, error: &str) -> CustomError {
+    match Url::parse(&request.redirect_uri) {
+        Ok(mut url) => {
+            let pairs = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("state", &request.state)
+                .append_pair("error", error)
+                .finish();
+            if request.response_mode.as_deref() == Some("fragment") {
+                url.set_fragment(Some(&pairs));
+            } else {
+                url.query_pairs_mut()
+                    .append_pair("state", &request.state)
+                    .append_pair("error", error);
+            }
+            CustomError::Redirect(url.to_string())
+        }
+        Err(_) => CustomError::BadRequest("The bound redirect_uri does not parse.".to_string()),
+    }
+}
+
+/// What the guest branch hands `sign_in`: the account and the device the code is for.
+pub struct GuestGrant {
+    pub localpart: String,
+    pub device_id: String,
+}
+
+/// The guest branch of `sign_in` (S4b), in the contract's order, failing closed:
+///
+/// 1. the fence ([`RedisClient::guest_handoff_begin`]): CAS to `provisioning` with a 120 s
+///    lease, the write-ahead device id, the device cap and the hand-off rate;
+/// 2. `provision_user`, seeded with "First Second" plus the suffix;
+/// 3. the admin PUT of `user_type = io.inblock.guest`;
+/// 4. the admin PUT of the canonical display name (the P4 module lets a guest without it
+///    only leave);
+/// 5. the device;
+/// 6. the record `active` (only for the attempt that still holds the lease).
+///
+/// Any failure: no code, the lease released, the record left `provisioning` (a retry
+/// re-takes it and heals), a device this attempt created deleted again. A refusal is an
+/// error on the redirect URI.
+#[allow(clippy::too_many_arguments)]
+pub async fn provision_guest(
+    config: Option<&Config>,
+    redis: &RedisClient,
+    synapse: Option<&SynapseClient>,
+    server_name: Option<&str>,
+    session: &SessionEntry,
+    request: &AuthorizationRequest,
+    client: &ClientEntry,
+    did: &str,
+) -> Result<GuestGrant, CustomError> {
+    let (Some(config), Some(guest_id)) = (config, session.guest_id.as_deref()) else {
+        return Err(CustomError::Coded {
+            status: 503,
+            code: "unavailable",
+        });
+    };
+    // The client and the redirect again, from the config: the bound request is only as
+    // good as the session that carried it.
+    let redirect_ok = Url::parse(&request.redirect_uri)
+        .is_ok_and(|u| config.guest_client_redirect_uris.contains(&u));
+    if config.guest_client_id.as_deref() != Some(request.client_id.as_str())
+        || !redirect_ok
+        || client.class != ClientClass::Matrix
+    {
+        return Err(CustomError::BadRequest(
+            "This client is not the guest client.".to_string(),
+        ));
+    }
+    let localpart = siwx_oidc::mxid::localpart_for(did);
+    if localpart != guest_id || session.verified_did.as_deref() != Some(did) {
+        return Err(redirect_error(request, "access_denied"));
+    }
+    let unavailable = || redirect_error(request, "temporarily_unavailable");
+    let (Some(synapse), Some(server_name)) = (synapse, server_name) else {
+        warn!("guest hand-off: no homeserver is configured");
+        return Err(unavailable());
+    };
+    let record = match redis.read_guest_by_localpart(&localpart).await {
+        Ok(Some(r)) if r.did == did && r.is_live() => r,
+        Ok(_) => return Err(redirect_error(request, "access_denied")),
+        Err(e) => {
+            warn!(error = %e, "guest hand-off: record lookup failed");
+            return Err(unavailable());
+        }
+    };
+    if matches!(guest_kill_switch_engaged(redis).await, Ok(true) | Err(_)) {
+        return Err(unavailable());
+    }
+    let names = match redis.read_guest_resume(&record.localpart).await {
+        Ok(Some(n)) => n,
+        _ => return Err(unavailable()),
+    };
+    let display_name = format!(
+        "{} {}{}",
+        names.first_name, names.second_name, config.guest_name_suffix
+    );
+    let device_id = request
+        .scope
+        .as_deref()
+        .and_then(crate::oidc::extract_device_id_from_scope)
+        .unwrap_or_else(|| format!("SIWX_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+    let attempt = uuid::Uuid::new_v4().simple().to_string();
+
+    let was_active = match redis
+        .guest_handoff_begin(
+            &localpart,
+            &attempt,
+            &device_id,
+            config.guest_max_devices,
+            config.guest_handoff_per_minute,
+        )
+        .await
+    {
+        Ok(HandoffBegin::Started { was_active }) => was_active,
+        Ok(HandoffBegin::Refused(HandoffRefusal::NotLive)) => {
+            return Err(redirect_error(request, "access_denied"))
+        }
+        Ok(HandoffBegin::Refused(why)) => {
+            info!(?why, "guest hand-off refused");
+            return Err(unavailable());
+        }
+        Err(e) => {
+            warn!(error = %e, "guest hand-off: fence failed");
+            return Err(unavailable());
+        }
+    };
+
+    let mut device_created = false;
+    let steps = async {
+        if !was_active {
+            synapse.provision_user(&localpart, &display_name).await?;
+            synapse
+                .admin_put_user(
+                    &localpart,
+                    server_name,
+                    "user_type",
+                    &json!({"user_type": GUEST_USER_TYPE}),
+                )
+                .await?;
+            synapse
+                .admin_put_user(
+                    &localpart,
+                    server_name,
+                    "displayname",
+                    &json!({"displayname": display_name}),
+                )
+                .await?;
+        }
+        if synapse.upsert_device(&localpart, &device_id).await? == DeviceUpsert::Created {
+            device_created = true;
+            if let Err(e) = synapse
+                .update_device_display_name(
+                    &localpart,
+                    &device_id,
+                    &crate::oidc::device_display_name(&request.client_id, Some(client)),
+                )
+                .await
+            {
+                warn!(error = %e, "naming the guest device failed (non-fatal)");
+            }
+        }
+        anyhow::Ok(())
+    }
+    .await;
+
+    let activated = match steps {
+        Ok(()) => redis.guest_handoff_activate(&localpart, &attempt).await,
+        Err(e) => Err(e),
+    };
+    match activated {
+        Ok(true) => Ok(GuestGrant {
+            localpart,
+            device_id,
+        }),
+        failure => {
+            match &failure {
+                Ok(_) => warn!("guest hand-off: the lease was lost before activation"),
+                Err(e) => warn!(error = %e, "guest hand-off failed; no code is issued"),
+            }
+            // A device this attempt created is taken back; the write-ahead id leaves the
+            // set only when no device can exist under it.
+            let mut no_device = !was_active && !device_created;
+            if device_created {
+                no_device = synapse
+                    .delete_device(&localpart, &device_id, server_name)
+                    .await
+                    .is_ok();
+            }
+            if let Err(e) = redis
+                .guest_handoff_release(&localpart, &attempt, no_device.then_some(&device_id[..]))
+                .await
+            {
+                warn!(error = %e, "guest hand-off: releasing the lease failed (it expires)");
+            }
+            Err(unavailable())
+        }
+    }
+}
+
+/// The `user_type` the P4 module and the reaper recognise a guest by.
+pub const GUEST_USER_TYPE: &str = "io.inblock.guest";
 
 // ---------------------------------------------------------------------------------
 // /guest/continue
@@ -430,6 +633,125 @@ pub async fn continue_post(
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+// ---------------------------------------------------------------------------------
+// In-session reads (contract section 5) and the ended page (section 6)
+// ---------------------------------------------------------------------------------
+
+const ENDED_HTML: &str = include_str!("../../static/guest/ended.html");
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    (scheme.eq_ignore_ascii_case("bearer") && !token.trim().is_empty()).then(|| token.trim())
+}
+
+/// `GET /guest/context`: the guest's Bearer, the room, deadline, invite and meeting name
+/// of its record. No Synapse call; the room id is only ever in this body.
+///
+/// 401 `invalid_token` for a missing, unknown or expired token; 403 `not_a_guest` for a
+/// valid token whose subject has no guest record (a host's or a registered user's);
+/// 503 `unavailable` on a Redis error.
+pub async fn context(State(state): State<GuestState>, headers: HeaderMap) -> Response {
+    let Some(token) = bearer_token(&headers) else {
+        return error(StatusCode::UNAUTHORIZED, "invalid_token");
+    };
+    let meta = match state.redis.check_access_token(token).await {
+        Ok(Some(m)) if m.exp > Utc::now().timestamp() => m,
+        Ok(_) => return error(StatusCode::UNAUTHORIZED, "invalid_token"),
+        Err(e) => {
+            warn!(error = %e, "guest context: token store unavailable");
+            return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+        }
+    };
+    match state.redis.read_guest_context(&meta.username).await {
+        Ok(Some(c)) => {
+            let mut response = Json(json!({
+                "room_id": c.room_id,
+                "deadline": c.deadline,
+                "invite_id": c.invite_id,
+                "meeting_name": c.meeting_name,
+            }))
+            .into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Ok(None) => error(StatusCode::FORBIDDEN, "not_a_guest"),
+        Err(e) => {
+            warn!(error = %e, "guest context: record read failed");
+            error(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+        }
+    }
+}
+
+/// `GET /guest/resume`: what the issuer pages need to greet a returning guest. The
+/// cookie authorises it; a request that says it comes from another origin is refused
+/// (the cookie is `SameSite=Lax`, and the answer carries no CORS header, so this is the
+/// belt on top of the braces). No secret in the body. No live record (no cookie, unknown
+/// handle, reaping, past the deadline, kill switch on) is `{"state": "no_session"}`.
+///
+/// S7 adds `state: claimed` for 10 minutes after a claim; until then a claimed record is
+/// `no_session` like any other record that is not live.
+pub async fn resume(State(state): State<GuestState>, headers: HeaderMap) -> Response {
+    let issuer = super::layers::issuer_origin(&state.config.base_url);
+    let foreign_origin = headers
+        .get(header::ORIGIN)
+        .is_some_and(|o| o.to_str().ok() != Some(issuer.as_str()));
+    let foreign_site = headers
+        .get("sec-fetch-site")
+        .is_some_and(|v| v.to_str().ok() != Some("same-origin"));
+    if foreign_origin || foreign_site {
+        return error(StatusCode::FORBIDDEN, "forbidden_origin");
+    }
+    let record = match live_guest(&state.config, &state.redis, &headers).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "guest resume: record lookup failed");
+            return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+        }
+    };
+    let body = match record {
+        None => json!({"state": "no_session"}),
+        Some(r) => match state.redis.read_guest_resume(&r.localpart).await {
+            Ok(Some(v)) => json!({
+                "first_name": v.first_name,
+                "second_name": v.second_name,
+                "state": v.state,
+                "seconds_left": (r.deadline - r.now).max(0),
+                "did": v.did,
+                "claim_allowed": state.config.guest_claim_enabled,
+                "email_present": v.email_present,
+            }),
+            Ok(None) => json!({"state": "no_session"}),
+            Err(e) => {
+                warn!(error = %e, "guest resume: record read failed");
+                return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+            }
+        },
+    };
+    let mut response = Json(body).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// `GET /guest/ended`: the page a portal sends a guest to after `invalid_grant`. The same
+/// bytes for everyone: it needs no cookie and no record (the guest account is gone by the
+/// time anyone reads it), says the account is deleted and calls `forgetKey()` on this
+/// browser's key store. The kept-account copy after a claim is S7.
+pub async fn ended_page() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        ENDED_HTML,
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -1034,31 +1356,762 @@ mod tests {
         }
     }
 
-    /// The 503 seam: a verified guest session reaches code issuance and gets
-    /// `503 {"error":"unavailable"}`; a guest session that skipped /guest/continue is
-    /// refused before that.
+    // ---- S4b: provisioning, context, resume, ended, claim ----------------------------
+
+    use axum::extract::{Path as AxPath, State as AxState};
+    use axum::routing::{get as ax_get, post as ax_post, put as ax_put};
+    use std::sync::{Arc, Mutex};
+
+    const SERVER: &str = "example.org";
+    const ADMIN_LP: &str = "siwx-test-admin";
+
+    #[derive(Default)]
+    struct Flags {
+        fail_marker: bool,
+        fail_name: bool,
+        provision_delay_ms: u64,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockSynapse {
+        log: Arc<Mutex<Vec<(String, String)>>>,
+        flags: Arc<Mutex<Flags>>,
+    }
+
+    impl MockSynapse {
+        fn calls(&self) -> Vec<String> {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(c, _)| c.clone())
+                .collect()
+        }
+        fn bodies(&self, call_prefix: &str) -> Vec<String> {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(c, _)| c.starts_with(call_prefix))
+                .map(|(_, b)| b.clone())
+                .collect()
+        }
+        fn count(&self, call_prefix: &str) -> usize {
+            self.bodies(call_prefix).len()
+        }
+    }
+
+    async fn spawn_mock() -> (MockSynapse, SynapseClient) {
+        async fn rec(m: &MockSynapse, call: String, body: String) {
+            m.log.lock().unwrap().push((call, body));
+        }
+        let mock = MockSynapse::default();
+        let app = axum::Router::new()
+            .route(
+                "/_synapse/mas/is_localpart_available",
+                ax_get(
+                    |axum::extract::Query(q): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| async move {
+                        if q.get("localpart").map(String::as_str) == Some(ADMIN_LP) {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                r#"{"errcode":"M_USER_IN_USE","error":"taken"}"#,
+                            )
+                        } else {
+                            (StatusCode::OK, "{}")
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/_synapse/mas/query_user",
+                ax_get(|| async { StatusCode::NOT_FOUND }),
+            )
+            .route(
+                "/_synapse/mas/provision_user",
+                ax_post(|AxState(m): AxState<MockSynapse>, b: String| async move {
+                    let delay = m.flags.lock().unwrap().provision_delay_ms;
+                    rec(&m, "POST provision_user".into(), b).await;
+                    if delay > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
+                    "{}"
+                }),
+            )
+            .route(
+                "/_synapse/mas/upsert_device",
+                ax_post(|AxState(m): AxState<MockSynapse>, b: String| async move {
+                    rec(&m, "POST upsert_device".into(), b).await;
+                    (StatusCode::CREATED, "{}")
+                }),
+            )
+            .route(
+                "/_synapse/mas/update_device_display_name",
+                ax_post(|AxState(m): AxState<MockSynapse>, b: String| async move {
+                    rec(&m, "POST update_device_display_name".into(), b).await;
+                    "{}"
+                }),
+            )
+            .route(
+                "/_synapse/mas/delete_device",
+                ax_post(|AxState(m): AxState<MockSynapse>, b: String| async move {
+                    rec(&m, "POST delete_device".into(), b).await;
+                    "{}"
+                }),
+            )
+            .route(
+                "/_synapse/admin/v2/users/{mxid}",
+                ax_put(
+                    |AxState(m): AxState<MockSynapse>,
+                     AxPath(mxid): AxPath<String>,
+                     headers: HeaderMap,
+                     b: String| async move {
+                        assert!(headers.contains_key(header::AUTHORIZATION));
+                        let v: Value = serde_json::from_str(&b).unwrap();
+                        let which = if v.get("user_type").is_some() {
+                            "user_type"
+                        } else {
+                            "displayname"
+                        };
+                        rec(&m, format!("PUT admin/users/{mxid} {which}"), b).await;
+                        let (fail_marker, fail_name) = {
+                            let f = m.flags.lock().unwrap();
+                            (f.fail_marker, f.fail_name)
+                        };
+                        if (which == "user_type" && fail_marker)
+                            || (which == "displayname" && fail_name)
+                        {
+                            (StatusCode::INTERNAL_SERVER_ERROR, "{}")
+                        } else {
+                            (StatusCode::OK, "{}")
+                        }
+                    },
+                ),
+            )
+            .with_state(mock.clone());
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let redis = siwx_oidc::test_support::redis().await.unwrap();
+        let client = SynapseClient::new(&format!("http://{addr}"), "shared-secret")
+            .with_admin_mint(redis, ADMIN_LP.to_string(), 300);
+        (mock, client)
+    }
+
+    /// The guest client as start-up seeds it.
+    async fn seed_guest_client(e: &Env) {
+        let (id, entry) = crate::guest::guest_client_entry(&e.config)
+            .unwrap()
+            .unwrap();
+        e.redis.set_client(id, entry).await.unwrap();
+    }
+
+    /// A fresh login session for an existing record, as `/authorize` and a verified
+    /// `/guest/continue` leave it. Returns the session id.
+    async fn start_session(e: &Env, g: &Guest, handle: &str, device: &str) -> String {
+        let scope = format!(
+            "openid urn:matrix:client:api:* urn:matrix:client:device:{device} urn:io.inblock:guest"
+        );
+        let (headers, _) = authorize(
+            &e.config,
+            &e.redis,
+            params(CLIENT, REDIRECT, &scope, json!({})),
+            &cookies(e, handle),
+        )
+        .await
+        .unwrap();
+        let sid = session_cookie_of(&headers)
+            .split_once('=')
+            .unwrap()
+            .1
+            .to_string();
+        let mut s = e.redis.get_session(sid.clone()).await.unwrap().unwrap();
+        s.verified_did = Some(g.did.clone());
+        e.redis.set_session(sid.clone(), s).await.unwrap();
+        sid
+    }
+
+    async fn sign_in_as(
+        e: &Env,
+        synapse: &SynapseClient,
+        sid: &str,
+    ) -> Result<(url::Url, String), CustomError> {
+        use headers::HeaderMapExt;
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::COOKIE,
+            format!("{SESSION_COOKIE_NAME}={sid}").parse().unwrap(),
+        );
+        crate::oidc::sign_in(
+            &e.config.base_url,
+            &["key".to_string()],
+            &[],
+            h.typed_get::<headers::Cookie>().unwrap(),
+            &e.redis,
+            Some(synapse),
+            Some(SERVER),
+            None,
+            Some(&e.config),
+        )
+        .await
+    }
+
+    fn redirect_error_of(r: Result<(url::Url, String), CustomError>) -> String {
+        match r {
+            Err(CustomError::Redirect(u)) => {
+                let u = url::Url::parse(&u).unwrap();
+                assert_eq!(u.as_str().split('?').next().unwrap(), REDIRECT);
+                u.query_pairs()
+                    .find(|(k, _)| k == "error")
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_default()
+            }
+            Err(_) => "other-error".into(),
+            Ok(_) => "ok".into(),
+        }
+    }
+
+    async fn guest_env(edit: impl Fn(&mut Config)) -> Option<(Env, MockSynapse, SynapseClient)> {
+        let e = env(edit).await?;
+        seed_guest_client(&e).await;
+        let (mock, client) = spawn_mock().await;
+        Some((e, mock, client))
+    }
+
+    async fn record_of(e: &Env, localpart: &str) -> std::collections::HashMap<String, String> {
+        e.redis
+            .hgetall_for_test(&siwx_oidc::db::guest_invites::guest_account_key(localpart))
+            .await
+    }
+
+    /// The marker, then the name, each exactly once and before the device; the account is
+    /// seeded with "First Second (Guest)"; the record is `active` and a code is issued
+    /// for the guest's localpart and the proposed device.
     #[tokio::test]
-    async fn the_sign_in_guest_seam_is_a_503_for_a_verified_guest() {
-        let Some(e) = env(|_| {}).await else { return };
-        let h = hand_off(&e, "active").await;
-        let sid = h.session_cookie.split_once('=').unwrap().1.to_string();
-        let mut s = e.redis.get_session(sid).await.unwrap().unwrap();
-        assert!(matches!(
-            guest_sign_in_seam(&s),
-            Err(CustomError::Unauthorized(_))
-        ));
-        s.verified_did = Some(h.guest.did.clone());
-        let r = guest_sign_in_seam(&s);
-        assert!(matches!(
-            r,
-            Err(CustomError::Coded {
-                status: 503,
-                code: "unavailable"
+    async fn provisioning_order_bodies_and_the_active_record() {
+        let Some((e, mock, synapse)) = guest_env(|_| {}).await else {
+            return;
+        };
+        let g = Guest::new();
+        let (lp, handle) = record(&e, &g, "minted", 600).await;
+        e.redis
+            .hset_raw_for_test(
+                &siwx_oidc::db::guest_invites::guest_account_key(&lp),
+                "first_name",
+                "Ada",
+            )
+            .await;
+        e.redis
+            .hset_raw_for_test(
+                &siwx_oidc::db::guest_invites::guest_account_key(&lp),
+                "second_name",
+                "Lovelace",
+            )
+            .await;
+        let sid = start_session(&e, &g, &handle, "DEVICE0001").await;
+        let (url, did) = sign_in_as(&e, &synapse, &sid).await.expect("sign in");
+        assert_eq!(did, g.did);
+        assert!(url.query_pairs().any(|(k, _)| k == "code"));
+        let calls = mock.calls();
+        let mxid = format!("%40{lp}%3Aexample.org");
+        let _ = mxid;
+        let kinds: Vec<&str> = calls
+            .iter()
+            .map(|c| {
+                if c.starts_with("PUT") && c.ends_with("user_type") {
+                    "marker"
+                } else if c.starts_with("PUT") && c.ends_with("displayname") {
+                    "name"
+                } else {
+                    c.as_str()
+                }
             })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "POST provision_user",
+                "marker",
+                "name",
+                "POST upsert_device",
+                "POST update_device_display_name"
+            ],
+            "the order is: account, marker, canonical name, device"
+        );
+        let seed: Value = serde_json::from_str(&mock.bodies("POST provision_user")[0]).unwrap();
+        assert_eq!(
+            seed,
+            json!({"localpart": lp, "set_displayname": "Ada Lovelace (Guest)"})
+        );
+        assert_eq!(
+            mock.bodies("PUT")[0],
+            r#"{"user_type":"io.inblock.guest"}"#,
+            "the exact marker body"
+        );
+        assert_eq!(
+            mock.bodies("PUT")[1],
+            r#"{"displayname":"Ada Lovelace (Guest)"}"#,
+            "the exact canonical-name body"
+        );
+        let rec = record_of(&e, &lp).await;
+        assert_eq!(rec["state"], "active");
+        assert!(!rec.contains_key("lease_owner") && !rec.contains_key("lease_until"));
+        assert_eq!(rec["device_id"], "DEVICE0001");
+        // The code is for the guest's account and device.
+        let code = url
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .unwrap()
+            .1
+            .to_string();
+        let entry = e.redis.try_consume_code(code).await.unwrap().unwrap();
+        assert_eq!(entry.localpart.as_deref(), Some(lp.as_str()));
+        assert_eq!(entry.device_id.as_deref(), Some("DEVICE0001"));
+        assert_eq!(
+            entry
+                .scope
+                .as_deref()
+                .map(|s| s.contains("urn:io.inblock:guest")),
+            Some(false)
+        );
+    }
+
+    /// ST-43: a refused marker PUT (then a refused canonical-name PUT) leaves no device
+    /// and no code, the record `provisioning` with the lease released; a retry with the
+    /// PUT working heals.
+    #[tokio::test]
+    async fn st43_a_refused_marker_or_name_put_issues_nothing_and_a_retry_heals() {
+        for which in ["marker", "name"] {
+            let Some((e, mock, synapse)) = guest_env(|_| {}).await else {
+                return;
+            };
+            let g = Guest::new();
+            let (lp, handle) = record(&e, &g, "minted", 600).await;
+            {
+                let mut f = mock.flags.lock().unwrap();
+                f.fail_marker = which == "marker";
+                f.fail_name = which == "name";
+            }
+            let sid = start_session(&e, &g, &handle, "DEVICE0002").await;
+            assert_eq!(
+                redirect_error_of(sign_in_as(&e, &synapse, &sid).await),
+                "temporarily_unavailable",
+                "{which}"
+            );
+            assert_eq!(mock.count("POST upsert_device"), 0, "{which}: no device");
+            if which == "marker" {
+                assert_eq!(
+                    mock.count("PUT"),
+                    1,
+                    "the name is not attempted after a refused marker"
+                );
+            }
+            let rec = record_of(&e, &lp).await;
+            assert_eq!(rec["state"], "provisioning", "{which}: not active");
+            assert!(!rec.contains_key("lease_owner"), "{which}: lease released");
+            assert!(
+                e.redis
+                    .try_consume_code("x".into())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "no code"
+            );
+            // Retry with the PUT working: heals.
+            {
+                let mut f = mock.flags.lock().unwrap();
+                f.fail_marker = false;
+                f.fail_name = false;
+            }
+            let sid = start_session(&e, &g, &handle, "DEVICE0002").await;
+            let (url, _) = sign_in_as(&e, &synapse, &sid)
+                .await
+                .expect("the retry heals");
+            assert!(url.query_pairs().any(|(k, _)| k == "code"));
+            assert_eq!(record_of(&e, &lp).await["state"], "active");
+            assert_eq!(mock.count("POST upsert_device"), 1);
+        }
+    }
+
+    /// The fence: two sign-ins at once provision once; the other is told to come back.
+    #[tokio::test]
+    async fn the_fence_lets_one_of_two_concurrent_sign_ins_provision() {
+        let Some((e, mock, synapse)) = guest_env(|_| {}).await else {
+            return;
+        };
+        mock.flags.lock().unwrap().provision_delay_ms = 400;
+        let g = Guest::new();
+        let (lp, handle) = record(&e, &g, "minted", 600).await;
+        let a = start_session(&e, &g, &handle, "DEVICE0003").await;
+        let b = start_session(&e, &g, &handle, "DEVICE0004").await;
+        let (ra, rb) = tokio::join!(sign_in_as(&e, &synapse, &a), sign_in_as(&e, &synapse, &b));
+        let outcomes = [redirect_error_of(ra), redirect_error_of(rb)];
+        assert_eq!(
+            outcomes.iter().filter(|o| *o == "ok").count(),
+            1,
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| *o == "temporarily_unavailable")
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+        assert_eq!(mock.count("POST provision_user"), 1);
+        assert_eq!(mock.count("PUT"), 2);
+        assert_eq!(record_of(&e, &lp).await["state"], "active");
+    }
+
+    /// An expired lease may be re-taken; a live one of another attempt may not.
+    #[tokio::test]
+    async fn a_lease_is_live_for_120_seconds_then_free() {
+        let Some(e) = env(|_| {}).await else { return };
+        let g = Guest::new();
+        let (lp, _) = record(&e, &g, "minted", 600).await;
+        let begin = |attempt: &'static str, dev: &'static str| {
+            let (r, lp) = (e.redis.clone(), lp.clone());
+            async move {
+                r.guest_handoff_begin(&lp, attempt, dev, 8, 100)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            begin("a1", "d1").await,
+            HandoffBegin::Started { was_active: false }
+        );
+        assert_eq!(
+            begin("a2", "d2").await,
+            HandoffBegin::Refused(HandoffRefusal::Busy)
+        );
+        let key = siwx_oidc::db::guest_invites::guest_account_key(&lp);
+        e.redis.hset_raw_for_test(&key, "lease_until", "1").await;
+        assert_eq!(
+            begin("a2", "d2").await,
+            HandoffBegin::Started { was_active: false },
+            "an expired lease is re-taken"
+        );
+        assert_eq!(record_of(&e, &lp).await["lease_owner"], "a2");
+    }
+
+    /// At most 8 devices (here 2) and at most 3 hand-offs a minute.
+    #[tokio::test]
+    async fn the_device_cap_and_the_hand_off_rate_refuse_with_temporarily_unavailable() {
+        // Device cap 2, rate high.
+        let Some((e, mock, synapse)) = guest_env(|c| {
+            c.guest_max_devices = 2;
+            c.guest_handoff_per_minute = 100;
+        })
+        .await
+        else {
+            return;
+        };
+        let g = Guest::new();
+        let (lp, handle) = record(&e, &g, "minted", 600).await;
+        let mut results = Vec::new();
+        for dev in ["DEVA0001", "DEVB0002", "DEVC0003"] {
+            let sid = start_session(&e, &g, &handle, dev).await;
+            results.push(redirect_error_of(sign_in_as(&e, &synapse, &sid).await));
+        }
+        assert_eq!(results, ["ok", "ok", "temporarily_unavailable"]);
+        assert_eq!(mock.count("POST upsert_device"), 2);
+        assert_eq!(
+            mock.count("POST provision_user"),
+            1,
+            "an active guest is not provisioned again"
+        );
+        assert_eq!(
+            e.redis.scard_for_test(&format!("guest:devices/{lp}")).await,
+            2
+        );
+
+        // Rate 3 a minute, caps high: the fourth hand-off inside the minute is refused.
+        let Some((e, _mock, synapse)) = guest_env(|c| {
+            c.guest_max_devices = 100;
+            c.guest_handoff_per_minute = 3;
+        })
+        .await
+        else {
+            return;
+        };
+        let g = Guest::new();
+        let (_, handle) = record(&e, &g, "minted", 600).await;
+        let mut results = Vec::new();
+        for dev in ["DEVA0001", "DEVB0002", "DEVC0003", "DEVD0004"] {
+            let sid = start_session(&e, &g, &handle, dev).await;
+            results.push(redirect_error_of(sign_in_as(&e, &synapse, &sid).await));
+        }
+        assert_eq!(results, ["ok", "ok", "ok", "temporarily_unavailable"]);
+    }
+
+    /// Refusals that are not retryable: a wrong client, a record that is not live.
+    #[tokio::test]
+    async fn a_record_that_is_not_live_or_a_foreign_client_gets_no_code() {
+        let Some((e, mock, synapse)) = guest_env(|_| {}).await else {
+            return;
+        };
+        let g = Guest::new();
+        let (lp, handle) = record(&e, &g, "minted", 600).await;
+        let sid = start_session(&e, &g, &handle, "DEVICE0009").await;
+        // The reaper got there first.
+        e.redis
+            .hset_raw_for_test(
+                &siwx_oidc::db::guest_invites::guest_account_key(&lp),
+                "state",
+                "reaping",
+            )
+            .await;
+        assert_eq!(
+            redirect_error_of(sign_in_as(&e, &synapse, &sid).await),
+            "access_denied"
+        );
+        assert!(mock.calls().is_empty(), "nothing reached Synapse");
+        // A session whose client is not the guest client is refused without a redirect.
+        let (lp2, h2) = record(&e, &Guest::new(), "minted", 600).await;
+        let _ = (lp2, h2);
+        let mut cfg = e.config.clone();
+        cfg.guest_client_id = Some("someone-else".into());
+        let g2 = Guest::new();
+        let (_, handle2) = record(&e, &g2, "minted", 600).await;
+        let sid2 = start_session(&e, &g2, &handle2, "DEVICE0010").await;
+        let e2 = Env {
+            base: e.base.clone(),
+            redis: e.redis.clone(),
+            config: cfg,
+        };
+        assert!(matches!(
+            sign_in_as(&e2, &synapse, &sid2).await,
+            Err(CustomError::BadRequest(_))
         ));
-        let resp = r.unwrap_err().into_response();
-        assert_eq!(resp.status(), 503);
-        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert_eq!(&bytes[..], br#"{"error":"unavailable"}"#);
+        assert!(mock.calls().is_empty());
+    }
+
+    /// `io.inblock.guest: true` for a guest's token, absent for everyone else; ST-39 (the
+    /// claim of a claimed or unknown account is absent too).
+    #[tokio::test]
+    async fn st39_the_guest_claim_is_true_for_a_guest_and_absent_otherwise() {
+        let Some(e) = env(|_| {}).await else { return };
+        let g = Guest::new();
+        let (lp, _) = record(&e, &g, "active", 600).await;
+        let claim = |client: &'static str, lp: String, cfg: Config| {
+            let r = e.redis.clone();
+            async move {
+                crate::oidc::guest_claim(&cfg, &r, client, &lp)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            claim(CLIENT, lp.clone(), e.config.clone()).await,
+            Some(true)
+        );
+        assert_eq!(
+            claim("other-client", lp.clone(), e.config.clone()).await,
+            None
+        );
+        assert_eq!(claim(CLIENT, "nobody".into(), e.config.clone()).await, None);
+        let mut off = e.config.clone();
+        off.guest_enabled = false;
+        assert_eq!(claim(CLIENT, lp.clone(), off).await, None);
+        e.redis
+            .hset_raw_for_test(
+                &siwx_oidc::db::guest_invites::guest_account_key(&lp),
+                "state",
+                "claimed",
+            )
+            .await;
+        assert_eq!(claim(CLIENT, lp, e.config.clone()).await, None);
+        // On the wire: present as `true`, never `false`, never null.
+        let with = serde_json::to_value(crate::oidc::SidClaims {
+            sid: Some("s".into()),
+            guest: Some(true),
+        })
+        .unwrap();
+        assert_eq!(with, json!({"sid": "s", "io.inblock.guest": true}));
+        let without = serde_json::to_value(crate::oidc::SidClaims {
+            sid: Some("s".into()),
+            guest: None,
+        })
+        .unwrap();
+        assert_eq!(without, json!({"sid": "s"}));
+        let userinfo = serde_json::to_value(crate::oidc::SiwxAdditionalClaims::default()).unwrap();
+        assert!(userinfo.get("io.inblock.guest").is_none());
+    }
+
+    async fn get(e: &Env, path: &str, headers: &[(&str, &str)]) -> (u16, Value, String) {
+        let mut req = reqwest::Client::new().get(format!("{}{path}", e.base));
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let r = req.send().await.unwrap();
+        let status = r.status().as_u16();
+        let text = r.text().await.unwrap();
+        (
+            status,
+            serde_json::from_str(&text).unwrap_or(Value::Null),
+            text,
+        )
+    }
+
+    async fn seed_token(e: &Env, username: &str, did: &str) -> String {
+        use siwx_oidc::db::{TokenKind, TokenMetadata};
+        let token = format!("mat_{}", uniq());
+        let meta = TokenMetadata {
+            username: username.into(),
+            device_id: String::new(),
+            scope: "openid".into(),
+            client_id: CLIENT.into(),
+            iat: 0,
+            exp: i64::MAX,
+            did: did.into(),
+            name: "n".into(),
+            kind: Some(TokenKind::Access),
+            grant_kind: None,
+        };
+        e.redis.set_token(&token, &meta, 300).await.unwrap();
+        token
+    }
+
+    /// `GET /guest/context`: 200 with the four fields for a guest token; 401 for no or an
+    /// unknown token; 403 `not_a_guest` for a valid token that is not a guest's.
+    #[tokio::test]
+    async fn the_context_vectors() {
+        let Some(e) = env(|_| {}).await else { return };
+        let g = Guest::new();
+        let (lp, _) = record(&e, &g, "active", 600).await;
+        let key = siwx_oidc::db::guest_invites::guest_account_key(&lp);
+        let invite = format!("ctx{}", uniq());
+        e.redis
+            .hset_raw_for_test(&key, "room_id", "!room:example.org")
+            .await;
+        e.redis.hset_raw_for_test(&key, "invite_id", &invite).await;
+        let token = seed_token(&e, &lp, &g.did).await;
+        let bearer = format!("Bearer {token}");
+        let (status, body, _) = get(&e, "/guest/context", &[("authorization", &bearer)]).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["room_id"], "!room:example.org");
+        assert_eq!(body["invite_id"], invite);
+        assert!(body["deadline"].as_i64().unwrap() > 0);
+        assert_eq!(body["meeting_name"], "", "no invite stored: empty text");
+        assert_eq!(body.as_object().unwrap().len(), 4);
+        assert_eq!(get(&e, "/guest/context", &[]).await.0, 401);
+        assert_eq!(
+            get(&e, "/guest/context", &[("authorization", "Bearer nope")])
+                .await
+                .0,
+            401
+        );
+        let other = seed_token(&e, &format!("host{}", uniq()), "did:key:zHost").await;
+        let (status, body, _) = get(
+            &e,
+            "/guest/context",
+            &[("authorization", &format!("Bearer {other}"))],
+        )
+        .await;
+        assert_eq!((status, body["error"].as_str()), (403, Some("not_a_guest")));
+    }
+
+    /// `GET /guest/resume`: the record's face for the cookie, no secret; `no_session`
+    /// without a live record; a foreign origin refused.
+    #[tokio::test]
+    async fn the_resume_vectors() {
+        let Some(e) = env(|c| c.guest_claim_enabled = true).await else {
+            return;
+        };
+        let g = Guest::new();
+        let (lp, handle) = record(&e, &g, "active", 600).await;
+        let key = siwx_oidc::db::guest_invites::guest_account_key(&lp);
+        e.redis.hset_raw_for_test(&key, "first_name", "Ada").await;
+        e.redis
+            .hset_raw_for_test(&key, "second_name", "Lovelace")
+            .await;
+        let cookie = format!("{}={handle}", guest_cookie_name(&e.config));
+        let (status, body, text) = get(&e, "/guest/resume", &[("cookie", &cookie)]).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["first_name"], "Ada");
+        assert_eq!(body["second_name"], "Lovelace");
+        assert_eq!(body["state"], "active");
+        assert_eq!(body["did"], g.did);
+        assert_eq!(body["claim_allowed"], true);
+        assert_eq!(body["email_present"], false);
+        let left = body["seconds_left"].as_i64().unwrap();
+        assert!((590..=600).contains(&left), "{left}");
+        assert_eq!(body.as_object().unwrap().len(), 7);
+        assert!(!text.contains(&handle), "no secret in the body");
+        e.redis
+            .hset_raw_for_test(&key, "email", "a@example.org")
+            .await;
+        assert_eq!(
+            get(&e, "/guest/resume", &[("cookie", &cookie)]).await.1["email_present"],
+            true
+        );
+        // No cookie, an unknown handle, a record that is reaping: no_session.
+        for headers in [vec![], vec![("cookie", "guest_session=unknown")]] {
+            let (status, body, _) = get(&e, "/guest/resume", &headers).await;
+            assert_eq!((status, body), (200, json!({"state": "no_session"})));
+        }
+        // A cross-origin read is refused.
+        let (status, _, _) = get(
+            &e,
+            "/guest/resume",
+            &[("cookie", &cookie), ("origin", "https://evil.example.org")],
+        )
+        .await;
+        assert_eq!(status, 403);
+        let (status, _, _) = get(
+            &e,
+            "/guest/resume",
+            &[("cookie", &cookie), ("sec-fetch-site", "cross-site")],
+        )
+        .await;
+        assert_eq!(status, 403);
+        e.redis.hset_raw_for_test(&key, "state", "reaping").await;
+        assert_eq!(
+            get(&e, "/guest/resume", &[("cookie", &cookie)]).await.1,
+            json!({"state": "no_session"})
+        );
+    }
+
+    /// `GET /guest/ended` needs no cookie and no record, says the account is deleted and
+    /// loads the script that calls `forgetKey()`; the script is on the asset allow-list.
+    #[tokio::test]
+    async fn the_ended_page_is_served_without_a_cookie_or_a_record() {
+        let Some(e) = env(|_| {}).await else { return };
+        let (status, _, text) = get(&e, "/guest/ended", &[]).await;
+        assert_eq!(status, 200);
+        assert!(text.contains("This guest account is deleted; this browser forgets its key."));
+        assert!(text.contains("/guest/assets/ended.js"));
+        let (status, _, js) = get(&e, "/guest/assets/ended.js", &[]).await;
+        assert_eq!(status, 200);
+        assert!(js.contains("forgetKey"));
+    }
+
+    /// The guest client is a static public client with exactly the configured redirects.
+    #[test]
+    fn the_guest_client_is_a_public_client_with_exact_redirects() {
+        let config = Config {
+            guest_enabled: true,
+            guest_client_id: Some(CLIENT.into()),
+            guest_client_redirect_uris: vec![url::Url::parse(REDIRECT).unwrap()],
+            ..Config::default()
+        };
+        let (id, entry) = crate::guest::guest_client_entry(&config).unwrap().unwrap();
+        assert_eq!(id, CLIENT);
+        assert_eq!(
+            entry.metadata.token_endpoint_auth_method(),
+            Some(&openidconnect::core::CoreClientAuthMethod::None)
+        );
+        let uris: Vec<_> = entry
+            .metadata
+            .redirect_uris()
+            .iter()
+            .map(|u| u.as_str())
+            .collect();
+        assert_eq!(uris, [REDIRECT]);
+        let off = Config::default();
+        assert!(crate::guest::guest_client_entry(&off).unwrap().is_none());
     }
 }

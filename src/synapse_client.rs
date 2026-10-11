@@ -486,6 +486,43 @@ impl SynapseClient {
         Ok(())
     }
 
+    /// One admin write to a user: `PUT /_synapse/admin/v2/users/{mxid}` with `body`, a
+    /// JSON object of the fields to change (Synapse merges them into the account). Used
+    /// by the guest hand-off for the `user_type` marker and for the canonical display
+    /// name, as two separate calls. Authenticated with the minted admin token.
+    ///
+    /// Fails on any non-2xx. Neither the body nor Synapse's reply is logged (the display
+    /// name is personal data): the log carries the status and `what` only. Retried once on
+    /// a rejected credential by [`admin_request`](Self::admin_request); the PUT is
+    /// idempotent.
+    pub async fn admin_put_user(
+        &self,
+        localpart: &str,
+        server_name: &str,
+        what: &'static str,
+        body: &serde_json::Value,
+    ) -> Result<()> {
+        let user_id = matrix_user_id(localpart, server_name);
+        let url = format!(
+            "{}/_synapse/admin/v2/users/{}",
+            self.endpoint,
+            urlencoding::encode(&user_id)
+        );
+        let resp = self
+            .admin_request(|http, token| http.put(&url).bearer_auth(token).json(body))
+            .await
+            .with_context(|| format!("admin_put_user({what}): request failed"))?;
+        if !resp.status.is_success() {
+            let status = resp.status;
+            warn!(%status, what, "admin_put_user failed");
+            anyhow::bail!(
+                "admin_put_user({what}): HTTP {status}{}",
+                admin_status_hint(status)
+            );
+        }
+        Ok(())
+    }
+
     /// Create a device for a user, or confirm that it exists, WITHOUT a
     /// display name (`POST /_synapse/mas/upsert_device`).
     ///

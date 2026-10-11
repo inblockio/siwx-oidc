@@ -3,6 +3,9 @@
 //! | Key | Holds |
 //! |---|---|
 //! | `guest:acct/{localpart}` | HASH: `state` (`minted`), `did`, `invite_id`, `host`, `room_id`, `first_name`, `second_name`, `email` (only if given), `consent_version`, `consent_variant`, `created_at`, `deadline`. No secret, no key material. No TTL: the reaper (S5) needs the record to erase the account |
+//! | (same hash, S4b) | `state` `minted`/`provisioning`/`active`; while a hand-off runs `lease_owner`, `lease_until` (Redis `TIME` + 120 s) and the write-ahead `device_id` |
+//! | `guest:devices/{localpart}` | SET of device ids handed to the guest (the cap of `guest_max_devices`), no TTL |
+//! | `guest:handoff/{localpart}` | ZSET of admitted hand-off attempts by `TIME`, the sliding window of `guest_handoff_per_minute` |
 //! | `guest:due` | ZSET `localpart -> deadline` |
 //! | `guest:by_invite/{id}` | SET of the invite's localparts |
 //! | `guest:handle/{sha256(handle)}` | the localpart, TTL until the deadline |
@@ -241,6 +244,104 @@ fn parse_redeem(reply: &[Value]) -> Result<RedeemOutcome> {
     }
 }
 
+/// How long a hand-off holds its lease on the record. An expired lease may be re-taken.
+pub const HANDOFF_LEASE_SECS: u64 = 120;
+
+/// `guest:devices/{localpart}`: SET of the device ids a guest has been handed (written
+/// ahead of provisioning, so the cap counts an attempt in flight). No TTL; the reaper
+/// removes it with the record.
+pub fn devices_key(localpart: &str) -> String {
+    format!("guest:devices/{localpart}")
+}
+/// `guest:handoff/{localpart}`: ZSET of admitted hand-off attempts, scored by Redis `TIME`
+/// seconds; the sliding window of the per-minute limit.
+pub fn handoff_rate_key(localpart: &str) -> String {
+    format!("guest:handoff/{localpart}")
+}
+
+/// `KEYS`: 1 record, 2 device set, 3 rate window. `ARGV`: 1 attempt, 2 lease secs, 3 max
+/// devices, 4 hand-offs per minute, 5 device id. Returns `{1, prior_state}` or
+/// `{0, reason}`.
+const HANDOFF_BEGIN: &str = r#"
+local now = tonumber(redis.call('TIME')[1])
+local f = redis.call('HMGET', KEYS[1], 'state', 'deadline', 'lease_until', 'lease_owner')
+if not f[1] then return {0, 'no_record'} end
+if f[1] ~= 'minted' and f[1] ~= 'provisioning' and f[1] ~= 'active' then return {0, 'not_live'} end
+if (not f[2]) or tonumber(f[2]) <= now then return {0, 'not_live'} end
+if f[3] and tonumber(f[3]) > now and f[4] ~= ARGV[1] then return {0, 'busy'} end
+redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now - 60)
+if redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[4]) then return {0, 'rate'} end
+if redis.call('SISMEMBER', KEYS[2], ARGV[5]) == 0 then
+  if redis.call('SCARD', KEYS[2]) >= tonumber(ARGV[3]) then return {0, 'devices'} end
+  redis.call('SADD', KEYS[2], ARGV[5])
+end
+redis.call('ZADD', KEYS[3], now, ARGV[1])
+redis.call('EXPIRE', KEYS[3], 120)
+if f[1] ~= 'active' then redis.call('HSET', KEYS[1], 'state', 'provisioning') end
+redis.call('HSET', KEYS[1], 'lease_owner', ARGV[1], 'lease_until', tostring(now + tonumber(ARGV[2])), 'device_id', ARGV[5])
+return {1, f[1]}
+"#;
+
+/// `KEYS`: 1 record. `ARGV`: 1 attempt.
+const HANDOFF_ACTIVATE: &str = r#"
+local f = redis.call('HMGET', KEYS[1], 'state', 'lease_owner')
+if f[2] ~= ARGV[1] then return 0 end
+if f[1] ~= 'provisioning' and f[1] ~= 'active' then return 0 end
+redis.call('HSET', KEYS[1], 'state', 'active')
+redis.call('HDEL', KEYS[1], 'lease_owner', 'lease_until')
+return 1
+"#;
+
+/// `KEYS`: 1 record, 2 device set. `ARGV`: 1 attempt, 2 device id to drop (`""` for none).
+const HANDOFF_RELEASE: &str = r#"
+if redis.call('HGET', KEYS[1], 'lease_owner') == ARGV[1] then
+  redis.call('HDEL', KEYS[1], 'lease_owner', 'lease_until')
+  if ARGV[2] ~= '' then redis.call('SREM', KEYS[2], ARGV[2]) end
+end
+return 1
+"#;
+
+/// The outcome of the hand-off fence.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HandoffBegin {
+    /// The lease is held. `was_active`: the account was provisioned by an earlier hand-off.
+    Started {
+        was_active: bool,
+    },
+    Refused(HandoffRefusal),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffRefusal {
+    /// No record, a state a hand-off may not start from, or past the deadline.
+    NotLive,
+    /// Another attempt holds a live lease.
+    Busy,
+    /// The per-minute hand-off limit.
+    Rate,
+    /// The device cap.
+    Devices,
+}
+
+/// What `GET /guest/context` answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestContext {
+    pub room_id: String,
+    pub deadline: i64,
+    pub invite_id: String,
+    pub meeting_name: String,
+}
+
+/// What `GET /guest/resume` reads from the record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestResume {
+    pub first_name: String,
+    pub second_name: String,
+    pub state: String,
+    pub did: String,
+    pub email_present: bool,
+}
+
 /// A guest record as `/authorize` and `/guest/continue` read it through the cookie.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestSession {
@@ -282,9 +383,20 @@ impl RedisClient {
         let Some(localpart) = localpart else {
             return Ok(None);
         };
+        drop(conn);
+        self.read_guest_by_localpart(&localpart).await
+    }
+
+    /// The record of a localpart, with Redis `TIME`. `None` when it does not exist.
+    pub async fn read_guest_by_localpart(&self, localpart: &str) -> Result<Option<GuestSession>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
         let (f, (secs, _)): (Vec<Option<String>>, (String, String)) = bb8_redis::redis::pipe()
             .cmd("HMGET")
-            .arg(guest_account_key(&localpart))
+            .arg(guest_account_key(localpart))
             .arg("state")
             .arg("did")
             .arg("deadline")
@@ -298,7 +410,7 @@ impl RedisClient {
             return Ok(None);
         };
         Ok(Some(GuestSession {
-            localpart,
+            localpart: localpart.to_string(),
             did: did.clone(),
             state: state.clone(),
             deadline: deadline
@@ -329,6 +441,188 @@ impl RedisClient {
             .await
             .map_err(|e| anyhow!("guest record lookup: {e}"))?;
         Ok(n > 0)
+    }
+
+    /// The fence of a hand-off (`sign_in`, S4b): one script, on Redis `TIME`.
+    ///
+    /// Refuses a record that is not `minted`, `provisioning` or `active`, or is past its
+    /// deadline (`NotLive`); a live lease held by another attempt (`Busy`); a fourth
+    /// hand-off inside 60 s (`Rate`, a sliding window in `guest:handoff/{localpart}`, only
+    /// admitted attempts count); a ninth distinct device (`Devices`). Otherwise it writes
+    /// the device id ahead of provisioning (`guest:devices/{localpart}` and the record's
+    /// `device_id`), takes the lease (`lease_owner`, `lease_until`) and moves `minted` or
+    /// `provisioning` to `provisioning`. An `active` record stays `active`: its account
+    /// is already provisioned and the lease only serializes the device hand-offs.
+    pub async fn guest_handoff_begin(
+        &self,
+        localpart: &str,
+        attempt: &str,
+        device_id: &str,
+        max_devices: u64,
+        per_minute: u64,
+    ) -> Result<HandoffBegin> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let reply: Vec<Value> = cmd("EVAL")
+            .arg(HANDOFF_BEGIN)
+            .arg(3)
+            .arg(guest_account_key(localpart))
+            .arg(devices_key(localpart))
+            .arg(handoff_rate_key(localpart))
+            .arg(attempt)
+            .arg(HANDOFF_LEASE_SECS)
+            .arg(max_devices)
+            .arg(per_minute)
+            .arg(device_id)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest hand-off begin: {e}"))?;
+        let int = matches!(reply.first(), Some(Value::Int(1)));
+        let why = reply.get(1).and_then(text).unwrap_or_default();
+        if int {
+            return Ok(HandoffBegin::Started {
+                was_active: why == "active",
+            });
+        }
+        Ok(HandoffBegin::Refused(match why.as_str() {
+            "busy" => HandoffRefusal::Busy,
+            "rate" => HandoffRefusal::Rate,
+            "devices" => HandoffRefusal::Devices,
+            "not_live" | "no_record" => HandoffRefusal::NotLive,
+            _ => return Err(anyhow!("guest hand-off begin: unknown refusal")),
+        }))
+    }
+
+    /// The last step of a hand-off: `provisioning` (or `active`) to `active` and the
+    /// lease released, only for the attempt that holds the lease. `false` when the lease
+    /// was lost or the record left those states (reaping): no code may follow.
+    pub async fn guest_handoff_activate(&self, localpart: &str, attempt: &str) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let n: i64 = cmd("EVAL")
+            .arg(HANDOFF_ACTIVATE)
+            .arg(1)
+            .arg(guest_account_key(localpart))
+            .arg(attempt)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest hand-off activate: {e}"))?;
+        Ok(n == 1)
+    }
+
+    /// A failed attempt: release the lease it holds (the state stays `provisioning`, so a
+    /// retry re-takes it at once) and, when `drop_device`, take the write-ahead device id
+    /// back out of the device set.
+    pub async fn guest_handoff_release(
+        &self,
+        localpart: &str,
+        attempt: &str,
+        drop_device: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let _: i64 = cmd("EVAL")
+            .arg(HANDOFF_RELEASE)
+            .arg(2)
+            .arg(guest_account_key(localpart))
+            .arg(devices_key(localpart))
+            .arg(attempt)
+            .arg(drop_device.unwrap_or(""))
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest hand-off release: {e}"))?;
+        Ok(())
+    }
+
+    /// Whether a token or ID token of this localpart is a guest's: the record exists and
+    /// is `minted`, `provisioning`, `active` or `reaping`. A `claimed` account is a
+    /// persistent account and carries no guest claim (S7).
+    pub async fn guest_flag(&self, localpart: &str) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let state: Option<String> = cmd("HGET")
+            .arg(guest_account_key(localpart))
+            .arg("state")
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest flag: {e}"))?;
+        Ok(matches!(
+            state.as_deref(),
+            Some("minted" | "provisioning" | "active" | "reaping")
+        ))
+    }
+
+    /// What `GET /guest/context` returns: the record's room, deadline and invite, and the
+    /// invite's label as the meeting name. `None` when there is no record for the
+    /// localpart. No Synapse call.
+    pub async fn read_guest_context(&self, localpart: &str) -> Result<Option<GuestContext>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let f: HashMap<String, String> = cmd("HGETALL")
+            .arg(guest_account_key(localpart))
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest context: {e}"))?;
+        if f.is_empty() || !f.contains_key("did") {
+            return Ok(None);
+        }
+        let invite_id = f.get("invite_id").cloned().unwrap_or_default();
+        let label: Option<String> = if crate::guest_invite::valid_invite_id(&invite_id) {
+            cmd("HGET")
+                .arg(invite_key(&invite_id))
+                .arg("label")
+                .query_async(&mut *conn)
+                .await
+                .map_err(|e| anyhow!("guest context: {e}"))?
+        } else {
+            None
+        };
+        Ok(Some(GuestContext {
+            room_id: f.get("room_id").cloned().unwrap_or_default(),
+            deadline: f.get("deadline").and_then(|v| v.parse().ok()).unwrap_or(0),
+            invite_id,
+            meeting_name: label.unwrap_or_default(),
+        }))
+    }
+
+    /// What `GET /guest/resume` returns, for a localpart the cookie named. The caller has
+    /// decided that the record is live.
+    pub async fn read_guest_resume(&self, localpart: &str) -> Result<Option<GuestResume>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let f: HashMap<String, String> = cmd("HGETALL")
+            .arg(guest_account_key(localpart))
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest resume: {e}"))?;
+        let (Some(state), Some(did)) = (f.get("state"), f.get("did")) else {
+            return Ok(None);
+        };
+        Ok(Some(GuestResume {
+            first_name: f.get("first_name").cloned().unwrap_or_default(),
+            second_name: f.get("second_name").cloned().unwrap_or_default(),
+            state: state.clone(),
+            did: did.clone(),
+            email_present: f.get("email").is_some_and(|e| !e.is_empty()),
+        }))
     }
 
     /// The one invite lookup of peek and redeem: the invite's hash and Redis `TIME` in
@@ -567,6 +861,13 @@ impl RedisClient {
             .query_async(&mut *conn)
             .await
             .unwrap();
+    }
+
+    /// Test helper: the cardinality of the set at `key`.
+    #[doc(hidden)]
+    pub async fn scard_for_test(&self, key: &str) -> i64 {
+        let mut conn = self.pool.get().await.unwrap();
+        cmd("SCARD").arg(key).query_async(&mut *conn).await.unwrap()
     }
 
     /// Test helper: the whole hash at `key`.
