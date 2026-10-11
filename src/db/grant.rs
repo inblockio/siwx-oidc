@@ -539,8 +539,8 @@ pub enum InvalidReason {
     NotCurrentFormat,
     /// No grant carries this handle.
     UnknownGrant,
-    /// A user tombstone, or a device tombstone planted at or after the
-    /// grant's authentication, refuses the grant.
+    /// A user tombstone, or a device tombstone or epoch at or after the
+    /// grant's authentication, refuses the grant (the latter two delete it).
     Revoked,
     /// The grant's inactivity or absolute expiry has passed; it was deleted
     /// (by the lift: the legacy token is past the cap, and stays as it is).
@@ -952,11 +952,10 @@ return {'lifted_now'}
 /// 10 the candidate access token's `exp`, 11 the absolute-lifetime cap now
 /// configured for the grant's client (`` = none), 12 reuse enforcement (`1`:
 /// a reuse deletes the grant and its index entries through `drop_grant`, and
-/// the reply's fourth element says `revoked`, else `kept`). A user tombstone, or a device
-/// tombstone planted at or after the grant's `auth_ms`, refuses the grant
-/// (`revoked`; the user tombstone is only read, for one release, see
-/// [`RedisClient::revoke_grants_for_user`]); the device tombstone and an epoch
-/// at or after its `auth_ms` refuse and delete it (`revoked`, I9). The absolute expiry in force
+/// the reply's fourth element says `revoked`, else `kept`). A user tombstone
+/// refuses the grant (`revoked`; it is only read, for one release, see
+/// [`RedisClient::revoke_grants_for_user`]); a device tombstone or an epoch at
+/// or after the grant's `auth_ms` refuses and deletes it (`revoked`, I9). The absolute expiry in force
 /// is the earlier of the written `absolute_exp` and `auth_time` + cap
 /// ([`effective_absolute_exp`]); past it the grant is deleted like an
 /// inactive one, and a rotation writes it back, so a lowered cap applies at
@@ -971,6 +970,8 @@ if not f[1] or f[1] ~= ARGV[4] or f[2] ~= ARGV[5] then
   return {'invalid', 'unknown_grant'}
 end
 local grant_auth_ms = auth_ms_of(f[15], f[13])
+-- the legacy user tombstone only refuses: no build writes it any more and it
+-- lives 900 s, so it is left as it was rather than given the delete.
 if redis.call('EXISTS', KEYS[3]) == 1 then
   return {'invalid', 'revoked'}
 end

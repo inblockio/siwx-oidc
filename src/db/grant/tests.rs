@@ -557,6 +557,18 @@ async fn a_tombstoned_device_or_user_refuses_rotation_and_replay() {
         rotate(&client, &a1.pair.refresh_token).await,
         RotateOutcome::Invalid(InvalidReason::UnknownGrant)
     );
+    // The current token is refused (and deletes the grant) the same way.
+    let c = issue(&client, &matrix_grant(&user, "DEVC")).await;
+    let c1 = rotated(rotate(&client, c.refresh_token.as_deref().unwrap()).await);
+    client
+        .set_ex_raw(&device_tombstone_key(&user, "DEVC"), "1", 60)
+        .await
+        .unwrap();
+    assert_eq!(
+        rotate(&client, &c1.pair.refresh_token).await,
+        RotateOutcome::Invalid(InvalidReason::Revoked)
+    );
+    assert!(hgetall(&client, &grant_key(&c.grant_id)).await.is_empty());
     // User tombstone, deviceless grant: no build writes one any more (the user
     // epoch replaced it), but one a previous build wrote still refuses for its
     // lifetime, so it is seeded the way that build planted it.
