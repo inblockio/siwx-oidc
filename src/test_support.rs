@@ -75,8 +75,10 @@ pub async fn redis() -> Option<RedisClient> {
 
 /// [`redis`] on database `db` of the same server, for a test that must not
 /// share a database with the others (one that claims every due outbox entry
-/// in it, say). Each such test takes its own number; taken so far: 9 (the
-/// outbox), 10 (back-channel logout), 11 (static-client isolation).
+/// in it, say). Each such test takes its own number; taken so far: 4 to 7 and
+/// 12 to 15 (guest route tests, `env(Some(n))`/`env_in(Some(n))` and the reaper),
+/// 2 and 8 (the orphan scan), 9 (the outbox), 10 (back-channel logout), 11
+/// (static-client isolation). Free: 1 and 3.
 pub async fn redis_db(db: u8) -> Option<RedisClient> {
     connect(redis_db_url(db)).await
 }

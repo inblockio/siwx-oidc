@@ -470,10 +470,9 @@ mod tests {
         assert_eq!(f.state().await.as_deref(), Some("provisioning"));
         assert!(log.lock().unwrap().is_empty());
         assert!(!redis.is_account_erased(&f.localpart, &f.did).await.unwrap());
-        // A lapsed lease (the hand-off died) no longer blocks.
-        redis
-            .hset_raw_for_test(&key, "lease_until", &(now - 1).to_string())
-            .await;
+        // A lapsed lease (the hand-off died) no longer blocks. `0`, not `now - 1`: the
+        // script compares with Redis `TIME`, whose clock may lag this one.
+        redis.hset_raw_for_test(&key, "lease_until", "0").await;
         assert_eq!(
             teardown_guest(&redis, &synapse, "example.org", &f.localpart)
                 .await

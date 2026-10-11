@@ -254,7 +254,7 @@ mod tests {
     /// operator turned guests off brings the scan back.
     #[tokio::test]
     async fn guests_off_and_none_scheduled_scans_nothing() {
-        let (seen, synapse, redis) = mock(13).await;
+        let (seen, synapse, redis) = mock(2).await;
         let scan = OrphanScan {
             redis: redis.clone(),
             synapse,
