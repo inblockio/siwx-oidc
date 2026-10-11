@@ -831,7 +831,7 @@ async fn claimed_marker(state: &GuestState, headers: &HeaderMap) -> Result<bool,
 /// deadline, the host not banned, and room under `guest_max_claimed`. The admission read of
 /// CP-11 is left to start and finish (resume stays a Redis-only read). A fault is `false`.
 async fn claim_allowed(state: &GuestState, localpart: &str) -> bool {
-    if !state.config.guest_claim_enabled || state.webauthn.is_none() {
+    if !state.config.guest_claim_enabled {
         return false;
     }
     match state.redis.read_claim(localpart).await {
