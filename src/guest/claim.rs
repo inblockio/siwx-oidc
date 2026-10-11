@@ -398,6 +398,8 @@ mod tests {
         redis: RedisClient,
         config: Config,
         synapse: Arc<Mutex<Synapse>>,
+        /// The client the routes use, for a test that drives the erase sequence itself.
+        client: Arc<SynapseClient>,
         http: reqwest::Client,
     }
 
@@ -465,10 +467,11 @@ mod tests {
         };
         edit(&mut config);
         let wa = crate::webauthn::build_webauthn(&config.base_url, None, None).unwrap();
+        let client = Arc::new(client);
         let app = super::super::routes::router_with(
             &config,
             redis.clone(),
-            Some(Arc::new(client)),
+            Some(client.clone()),
             Some(Arc::new(wa.webauthn)),
         );
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -479,6 +482,7 @@ mod tests {
             redis,
             config,
             synapse,
+            client,
             http: reqwest::Client::new(),
         })
     }
@@ -1128,5 +1132,59 @@ mod tests {
                 .0,
             400
         );
+    }
+
+    /// GP-CLM-16: an account erase of a claimed guest frees its slot and drops its record
+    /// (the name and e-mail go with it). With the cap full, a second guest cannot claim
+    /// until the first account is erased; the erase is idempotent.
+    #[tokio::test]
+    async fn erasing_a_claimed_account_frees_its_slot_and_drops_the_record() {
+        let Some(e) = env(Some(12), |c| c.guest_max_claimed = 1).await else {
+            return;
+        };
+        e.redis.flush_db_for_test().await;
+        let g1 = guest(&e).await;
+        assert_eq!(claim(&e, &g1, b"clm16-first").await.0, 200);
+        let g2 = guest(&e).await;
+        assert_eq!(
+            start(&e, &g2).await.1["error"],
+            "claim_unavailable",
+            "the cap of one is full"
+        );
+
+        for round in 0..2 {
+            crate::teardown::erase_account(&crate::teardown::Erasure {
+                redis: &e.redis,
+                synapse: &e.client,
+                server_name: SERVER,
+                localpart: &g1.localpart,
+                did: &g1.did,
+                devices: &[],
+                guest: false,
+                missing_account_ok: false,
+                purge_with: Some(crate::webauthn::derive_did_from_credential_json),
+            })
+            .await
+            .unwrap_or_else(|err| panic!("erase round {round}: {err}"));
+            let members = e.redis.smembers_raw(CLAIMED_KEY).await.unwrap();
+            assert!(
+                !members.contains(&g1.localpart),
+                "round {round}: {members:?}"
+            );
+            assert!(
+                e.redis.read_claim(&g1.localpart).await.unwrap().is_none(),
+                "round {round}: the guest record is gone"
+            );
+            assert!(!e
+                .redis
+                .smembers_raw("guest:claim_revoke")
+                .await
+                .unwrap()
+                .contains(&g1.localpart));
+        }
+
+        let (status, body) = start(&e, &g2).await;
+        assert_eq!(status, 200, "the freed slot can be taken: {body}");
+        assert_eq!(claim(&e, &g2, b"clm16-second").await.0, 200);
     }
 }

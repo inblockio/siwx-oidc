@@ -404,6 +404,26 @@ redis.call('ZREM', KEYS[4], ARGV[1])
 return 1
 "#;
 
+/// GP-CLM-16: the erase of a CLAIMED account frees its slot. Drops the record and what is
+/// keyed by its localpart, and removes it from `guest:claimed` and `guest:claim_revoke`.
+/// `KEYS`: 1 record, 2 device set, 3 hand-off window, 4 due, 5 claimed set, 6 claim_revoke
+/// set. `ARGV`: 1 localpart, 2 by_invite prefix. Returns `released` (a claimed record was
+/// dropped), `cleaned` (no record: only a leftover set member was removed) or `kept` (the
+/// record is not `claimed`: an unclaimed guest is the reaper's, not an account erase's).
+/// Idempotent, one atomic script: never half done.
+const RELEASE_CLAIMED: &str = r#"
+local s = redis.call('HGET', KEYS[1], 'state')
+if s and s ~= 'claimed' then return 'kept' end
+local inv = redis.call('HGET', KEYS[1], 'invite_id')
+if inv then redis.call('SREM', ARGV[2] .. inv, ARGV[1]) end
+redis.call('DEL', KEYS[1], KEYS[2], KEYS[3])
+redis.call('ZREM', KEYS[4], ARGV[1])
+redis.call('SREM', KEYS[5], ARGV[1])
+redis.call('SREM', KEYS[6], ARGV[1])
+if s then return 'released' end
+return 'cleaned'
+"#;
+
 /// What [`RedisClient::end_guest_now`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndOutcome {
@@ -650,6 +670,33 @@ impl RedisClient {
             .await
             .map_err(|e| anyhow!("guest record drop: {e}"))?;
         Ok(())
+    }
+
+    /// GP-CLM-16: the account of `localpart` was erased. If it holds a `claimed` guest
+    /// record, drop the record and free its slot in `guest:claimed`; an account with no
+    /// record, or an unclaimed guest, is left as it is. Returns whether a claimed record
+    /// was dropped. Idempotent; a Redis error is returned for the caller to fail on.
+    pub async fn release_claimed_guest(&self, localpart: &str) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let out: String = cmd("EVAL")
+            .arg(RELEASE_CLAIMED)
+            .arg(6)
+            .arg(guest_account_key(localpart))
+            .arg(devices_key(localpart))
+            .arg(handoff_rate_key(localpart))
+            .arg(DUE_KEY)
+            .arg(CLAIMED_KEY)
+            .arg(CLAIM_REVOKE_KEY)
+            .arg(localpart)
+            .arg(BY_INVITE_PREFIX)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest claimed release: {e}"))?;
+        Ok(out == "released")
     }
 
     /// The reaper's claim: up to `batch` due guests (deadline <= Redis `TIME`) that are
