@@ -13,6 +13,7 @@ pub mod invite;
 pub mod layers;
 pub mod redeem;
 pub mod routes;
+pub mod teardown;
 
 /// The values `guest_client_topology` may take.
 pub const TOPOLOGIES: [&str; 2] = ["same-site", "cross-site"];

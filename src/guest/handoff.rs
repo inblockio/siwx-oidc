@@ -37,7 +37,7 @@ use super::layers::error;
 use crate::config::Config;
 use crate::oidc::{AuthorizeParams, CustomError};
 use crate::synapse_client::{DeviceUpsert, SynapseClient};
-use siwx_oidc::db::guest_records::{GuestSession, HandoffBegin, HandoffRefusal};
+use siwx_oidc::db::guest_records::{EndOutcome, GuestSession, HandoffBegin, HandoffRefusal};
 use siwx_oidc::db::{
     AuthorizationRequest, ClientClass, ClientEntry, DBClient, RedisClient, SessionEntry,
     SESSION_COOKIE_NAME,
@@ -94,6 +94,47 @@ fn guest_cookie_name(config: &Config) -> &'static str {
 pub async fn guest_kill_switch_engaged(_redis: &RedisClient) -> anyhow::Result<bool> {
     // S6: read the control key.
     Ok(false)
+}
+
+/// The refresh guard (S5), asked by `/token` (refresh grant) and `compat::refresh` for a
+/// grant they are about to rotate. `Ok(true)`: rotate. `Ok(false)`: answer `invalid_grant`.
+/// `Err`: a Redis read failed, the caller answers 5xx; the guard never passes on an error.
+///
+/// Only a grant of the guest client is looked at (`guest_client_id`; no Redis read for any
+/// other, and none is needed when the client is not configured). For a guest-client grant
+/// the answer is [`refresh_verdict`] of one read of its record, the device set and the
+/// kill switch. The deadline is also written into the grant (`absolute_exp`), so the
+/// rotation script refuses past it on its own; this guard adds the reasons the grant
+/// cannot know.
+pub async fn guest_refresh_allowed(
+    guest_client_id: Option<&str>,
+    redis: &RedisClient,
+    grant: &siwx_oidc::db::grant::GrantView,
+) -> anyhow::Result<bool> {
+    if guest_client_id != Some(grant.client_id.as_str()) {
+        return Ok(true);
+    }
+    let read = redis
+        .guest_refresh_read(&grant.username, &grant.device_id)
+        .await?;
+    let killed = guest_kill_switch_engaged(redis).await?;
+    Ok(refresh_verdict(&read, killed))
+}
+
+/// The four refusals of contract section 6, as a function of what was read. A record that
+/// is gone, `reaping` or in a state this build does not know refuses; a `claimed` account
+/// is a persistent account and is not this guard's (S7).
+pub fn refresh_verdict(
+    read: &siwx_oidc::db::guest_records::GuestRefreshRead,
+    kill_switch: bool,
+) -> bool {
+    match read.state.as_deref() {
+        Some("claimed") => true,
+        Some("minted" | "provisioning" | "active") => {
+            read.deadline.is_some_and(|d| read.now < d) && read.device_recorded && !kill_switch
+        }
+        _ => false,
+    }
 }
 
 /// The record behind the request's guest cookie, if it is a live session and the kill
@@ -685,6 +726,63 @@ pub async fn context(State(state): State<GuestState>, headers: HeaderMap) -> Res
             error(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
         }
     }
+}
+
+/// `POST /guest/end` (S5): the guest ends its own session. The guest's Bearer, or the
+/// cookie with the same-origin check (403 `forbidden_origin`); the Bearer wins when both
+/// are sent. The deadline moves to now (record and `guest:due`), so the reaper erases the
+/// guest within a tick; the cookie is cleared. 200 `{"state":"ending"}`, also when the
+/// record is already ending (second call) or, on the cookie, already gone
+/// (`{"state":"ended"}`). 409 `claimed` for a claimed account. 401 `invalid_token` without
+/// a credential or with a bad token, 403 `not_a_guest` for a valid token that is not a
+/// guest's, 503 `unavailable` on a Redis error.
+pub async fn end(State(state): State<GuestState>, headers: HeaderMap) -> Response {
+    let localpart = if let Some(token) = bearer_token(&headers) {
+        match state.redis.check_access_token(token).await {
+            Ok(Some(m)) if m.exp > Utc::now().timestamp() => m.username,
+            Ok(_) => return error(StatusCode::UNAUTHORIZED, "invalid_token"),
+            Err(e) => {
+                warn!(error = %e, "guest end: token store unavailable");
+                return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+            }
+        }
+    } else {
+        let issuer = super::layers::issuer_origin(&state.config.base_url);
+        if !super::layers::same_origin_ok(&headers, &issuer) {
+            return error(StatusCode::FORBIDDEN, "forbidden_origin");
+        }
+        let Some(handle) = cookie_value(&headers, guest_cookie_name(&state.config)) else {
+            return error(StatusCode::UNAUTHORIZED, "invalid_token");
+        };
+        match state.redis.read_guest_session(&handle).await {
+            Ok(Some(r)) => r.localpart,
+            Ok(None) => return ended_response(&state.config, "ended"),
+            Err(e) => {
+                warn!(error = %e, "guest end: record lookup failed");
+                return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+            }
+        }
+    };
+    match state.redis.end_guest_now(&localpart).await {
+        Ok(EndOutcome::Moved | EndOutcome::Ending) => ended_response(&state.config, "ending"),
+        Ok(EndOutcome::Claimed) => error(StatusCode::CONFLICT, "claimed"),
+        Ok(EndOutcome::Gone) => error(StatusCode::FORBIDDEN, "not_a_guest"),
+        Err(e) => {
+            warn!(error = %e, "guest end: moving the deadline failed");
+            error(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+        }
+    }
+}
+
+/// 200 with the session cookie cleared.
+fn ended_response(config: &Config, state: &str) -> Response {
+    let mut response = Json(json!({ "state": state })).into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if let Ok(v) = HeaderValue::from_str(&super::redeem::session_cookie(&config.base_url, "", 0)) {
+        headers.append(header::SET_COOKIE, v);
+    }
+    response
 }
 
 /// `GET /guest/resume`: what the issuer pages need to greet a returning guest. The
@@ -2113,5 +2211,198 @@ mod tests {
         assert_eq!(uris, [REDIRECT]);
         let off = Config::default();
         assert!(crate::guest::guest_client_entry(&off).unwrap().is_none());
+    }
+
+    // ---- S5: refresh verdict, POST /guest/end ----
+
+    fn read(state: Option<&str>, deadline: Option<i64>, device: bool) -> GuestRefreshRead {
+        GuestRefreshRead {
+            state: state.map(str::to_string),
+            deadline,
+            device_recorded: device,
+            now: 1_000,
+        }
+    }
+    use siwx_oidc::db::guest_records::GuestRefreshRead;
+
+    /// The four refusals of contract section 6 as a pure function, including the kill
+    /// switch (the S6 seam is always false in a running build, so only this reaches it).
+    #[test]
+    fn st11_the_refresh_verdict_has_exactly_the_four_refusals() {
+        assert!(refresh_verdict(
+            &read(Some("active"), Some(1_001), true),
+            false
+        ));
+        assert!(refresh_verdict(
+            &read(Some("minted"), Some(2_000), true),
+            false
+        ));
+        // at the deadline: refused (`now < deadline` is the live side)
+        assert!(!refresh_verdict(
+            &read(Some("active"), Some(1_000), true),
+            false
+        ));
+        assert!(!refresh_verdict(
+            &read(Some("active"), Some(900), true),
+            false
+        ));
+        assert!(!refresh_verdict(
+            &read(Some("reaping"), Some(2_000), true),
+            false
+        ));
+        assert!(!refresh_verdict(
+            &read(Some("active"), Some(2_000), true),
+            true
+        ));
+        assert!(!refresh_verdict(
+            &read(Some("active"), Some(2_000), false),
+            false
+        ));
+        assert!(!refresh_verdict(&read(None, None, false), false));
+        assert!(!refresh_verdict(
+            &read(Some("weird"), Some(2_000), true),
+            false
+        ));
+        // a claimed account is a persistent account: not this guard's
+        assert!(refresh_verdict(
+            &read(Some("claimed"), Some(1), false),
+            false
+        ));
+    }
+
+    async fn post_end(e: &Env, headers: &[(&str, &str)]) -> (u16, Value, Vec<String>) {
+        // The guest layers take JSON only on a POST, as on every guest route.
+        let mut r = reqwest::Client::new()
+            .post(format!("{}/guest/end", e.base))
+            .header("content-type", "application/json")
+            .body("{}");
+        for (k, v) in headers {
+            r = r.header(*k, *v);
+        }
+        let r = r.send().await.unwrap();
+        let status = r.status().as_u16();
+        let cookies = r
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        let body = r.json::<Value>().await.unwrap_or(Value::Null);
+        (status, body, cookies)
+    }
+
+    async fn deadline_and_due(e: &Env, localpart: &str) -> (i64, Option<f64>) {
+        let d = e
+            .redis
+            .get_hash_field_for_test(
+                &siwx_oidc::db::guest_invites::guest_account_key(localpart),
+                "deadline",
+            )
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+        (d, e.redis.zscore_for_test("guest:due", localpart).await)
+    }
+
+    /// `POST /guest/end`: the Bearer, the cookie (same-origin only), a foreign origin
+    /// (403), a claimed account (409), a second call (200), no credential (401).
+    #[tokio::test]
+    async fn st33_the_guest_end_vectors() {
+        let Some(e) = env(|_| {}).await else { return };
+        let now = Utc::now().timestamp();
+        let same = [("origin", ISSUER)];
+
+        // the cookie
+        let g = Guest::new();
+        let (lp, handle) = record(&e, &g, "active", 600).await;
+        let cookie = format!("{}={handle}", guest_cookie_name(&e.config));
+        let (st, body, set) = post_end(&e, &[("cookie", &cookie), ("origin", ISSUER)]).await;
+        assert_eq!((st, body["state"].as_str()), (200, Some("ending")));
+        assert!(
+            set[0].contains("guest_session=;") && set[0].contains("Max-Age=0"),
+            "{set:?}"
+        );
+        let (d, due) = deadline_and_due(&e, &lp).await;
+        assert!(
+            (now - 2..=now + 2).contains(&d),
+            "deadline moved to now: {d} vs {now}"
+        );
+        assert_eq!(due, Some(d as f64));
+        // twice: 200, deadline not moved again
+        let (st, body, _) = post_end(&e, &[("cookie", &cookie), ("origin", ISSUER)]).await;
+        assert_eq!((st, body["state"].as_str()), (200, Some("ending")));
+        assert_eq!(deadline_and_due(&e, &lp).await.0, d);
+
+        // a foreign origin, a cross-site fetch, and no provenance at all: 403, nothing moved
+        let g = Guest::new();
+        let (lp, handle) = record(&e, &g, "active", 600).await;
+        let cookie = format!("{}={handle}", guest_cookie_name(&e.config));
+        for hs in [
+            vec![
+                ("cookie", cookie.as_str()),
+                ("origin", "https://evil.example.org"),
+            ],
+            vec![
+                ("cookie", cookie.as_str()),
+                ("origin", ISSUER),
+                ("sec-fetch-site", "cross-site"),
+            ],
+            vec![("cookie", cookie.as_str())],
+        ] {
+            let (st, body, _) = post_end(&e, &hs).await;
+            assert_eq!(
+                (st, body["error"].as_str()),
+                (403, Some("forbidden_origin"))
+            );
+        }
+        assert!(deadline_and_due(&e, &lp).await.0 > now + 500);
+        // no credential: 401
+        let (st, body, _) = post_end(&e, &same).await;
+        assert_eq!((st, body["error"].as_str()), (401, Some("invalid_token")));
+        // a cookie whose record is gone: 200 ended, cookie cleared
+        let unknown = format!("{}=nosuchhandle", guest_cookie_name(&e.config));
+        let (st, body, set) =
+            post_end(&e, &[("cookie", unknown.as_str()), ("origin", ISSUER)]).await;
+        assert_eq!((st, body["state"].as_str()), (200, Some("ended")));
+        assert!(set[0].contains("Max-Age=0"));
+
+        // claimed: 409, nothing moved
+        let g = Guest::new();
+        let (lp, handle) = record(&e, &g, "claimed", 600).await;
+        let cookie = format!("{}={handle}", guest_cookie_name(&e.config));
+        let (st, body, _) = post_end(&e, &[("cookie", &cookie), ("origin", ISSUER)]).await;
+        assert_eq!((st, body["error"].as_str()), (409, Some("claimed")));
+        assert!(deadline_and_due(&e, &lp).await.0 > now + 500);
+        assert_eq!(e.redis.zscore_for_test("guest:due", &lp).await, None);
+
+        // the Bearer, from another origin (the portal), no origin check, CORS open
+        let g = Guest::new();
+        let (lp, _) = record(&e, &g, "active", 600).await;
+        let token = seed_token(&e, &lp, &g.did).await;
+        let bearer = format!("Bearer {token}");
+        let portal = [
+            ("authorization", bearer.as_str()),
+            ("origin", "https://meet.example.org"),
+        ];
+        let (st, body, _) = post_end(&e, &portal).await;
+        assert_eq!((st, body["state"].as_str()), (200, Some("ending")));
+        let (d, due) = deadline_and_due(&e, &lp).await;
+        assert!((now - 2..=now + 2).contains(&d));
+        assert_eq!(due, Some(d as f64));
+        let (st, _, _) = post_end(&e, &portal).await;
+        assert_eq!(st, 200, "a second call on an ending record");
+        // a valid token that is not a guest's, and a bad token
+        let other = seed_token(&e, &format!("host{}", uniq()), "did:key:zHost").await;
+        let (st, body, _) = post_end(&e, &[("authorization", &format!("Bearer {other}"))]).await;
+        assert_eq!((st, body["error"].as_str()), (403, Some("not_a_guest")));
+        let (st, _, _) = post_end(&e, &[("authorization", "Bearer nope")]).await;
+        assert_eq!(st, 401);
+        // a guest at the Bearer whose record is claimed: 409
+        let g = Guest::new();
+        let (lp, _) = record(&e, &g, "claimed", 600).await;
+        let token = seed_token(&e, &lp, &g.did).await;
+        let (st, _, _) = post_end(&e, &[("authorization", &format!("Bearer {token}"))]).await;
+        assert_eq!(st, 409);
     }
 }

@@ -73,6 +73,8 @@ pub struct CompatState {
     /// deployment's relying parties, so these routes act on Matrix credentials
     /// only (see [`CompatState::acts_on`]).
     pub delegated_auth: bool,
+    /// `config.guest_client_id`: the refresh guard of S5 looks only at its grants.
+    pub guest_client_id: Option<String>,
 }
 
 impl CompatState {
@@ -89,6 +91,7 @@ impl CompatState {
             server_name: config.matrix_server_name.clone(),
             require_secret: config.require_secret,
             delegated_auth: crate::oidc::delegated_auth_enabled(config),
+            guest_client_id: config.guest_client_id.clone(),
         }
     }
 
@@ -838,6 +841,34 @@ pub async fn refresh(
             return invalid_refresh_token("Invalid refresh token");
         }
     }
+    // S5: the guest refresh guard (deadline, `reaping`, kill switch, unrecorded device):
+    // 400 `invalid_grant` so the portal signs out; a read error is a retryable 503.
+    if let Ok(RefreshPeek::Grant(grant)) = &peeked {
+        match crate::guest::handoff::guest_refresh_allowed(
+            state.guest_client_id.as_deref(),
+            &state.redis_client,
+            grant,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!("refresh refused: guest session ended");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_grant",
+                        "error_description": "The guest session has ended.",
+                        "errcode": "M_UNKNOWN_TOKEN"
+                    })),
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "refresh: guest guard read failed; returning retryable 503");
+                return token_store_unavailable();
+            }
+        }
+    }
     // The client the token belongs to, for the lifetime touch after an accepted refresh:
     // never a request field, which this endpoint does not have.
     let bound_client = match &peeked {
@@ -990,6 +1021,7 @@ mod tests {
             synapse_client: None,
             server_name: None,
             delegated_auth: false,
+            guest_client_id: None,
         }
     }
 
@@ -1167,6 +1199,99 @@ mod tests {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
+    /// S5 on the compat refresh: a guest's session that is over (deadline, `reaping`,
+    /// unrecorded device) is `400 invalid_grant`; a read error is a retryable 503; a live,
+    /// recorded one and a non-guest client's rotate.
+    #[tokio::test]
+    async fn st11_the_compat_refresh_applies_the_guest_guard() {
+        let Some(client) = redis().await else { return };
+        let mut state = standalone_state(client.clone());
+        state.guest_client_id = Some("compat-guest".into());
+        let now = Utc::now().timestamp();
+        let issue = |user: String, dev: String, cid: &'static str| {
+            let client = client.clone();
+            async move {
+                client
+                    .issue_grant(&NewGrant {
+                        kind: GrantKind::MatrixDevice,
+                        username: user.clone(),
+                        did: format!("did:key:z{user}"),
+                        client_id: cid.into(),
+                        confidential_client: false,
+                        device_id: dev,
+                        scope: "openid".into(),
+                        name: user,
+                        auth_ms: None,
+                        access_ttl: ACCESS_TOKEN_TTL,
+                        refresh_inactivity_secs: Some(120),
+                        absolute_deadline: None,
+                    })
+                    .await
+                    .unwrap()
+                    .refresh_token
+                    .unwrap()
+            }
+        };
+        let record = |user: String, st: &'static str, dev: &'static str| {
+            let client = client.clone();
+            async move {
+                client
+                    .put_guest_for_test(&user, &format!("did:key:z{user}"), st, 600, &user)
+                    .await;
+                client
+                    .sadd_raw_for_test(&siwx_oidc::db::guest_records::devices_key(&user), dev)
+                    .await;
+            }
+        };
+        let u = |p: &str| format!("{p}{}", uuid::Uuid::new_v4().simple());
+
+        // live and recorded
+        let user = u("live");
+        record(user.clone(), "active", "D1").await;
+        let rt = issue(user, "D1".into(), "compat-guest").await;
+        assert_eq!(matrix_refresh(&state, &rt).await.0, StatusCode::OK);
+
+        // the deadline has passed
+        let user = u("late");
+        record(user.clone(), "active", "D1").await;
+        client
+            .hset_raw_for_test(
+                &siwx_oidc::db::guest_invites::guest_account_key(&user),
+                "deadline",
+                &(now - 5).to_string(),
+            )
+            .await;
+        let rt = issue(user, "D1".into(), "compat-guest").await;
+        let (status, body) = matrix_refresh(&state, &rt).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_grant");
+
+        // reaping, and an unrecorded device
+        let user = u("reap");
+        record(user.clone(), "reaping", "D1").await;
+        let rt = issue(user, "D1".into(), "compat-guest").await;
+        assert_eq!(matrix_refresh(&state, &rt).await.0, StatusCode::BAD_REQUEST);
+        let user = u("dev");
+        record(user.clone(), "active", "D1").await;
+        let rt = issue(user, "D9".into(), "compat-guest").await;
+        assert_eq!(matrix_refresh(&state, &rt).await.0, StatusCode::BAD_REQUEST);
+
+        // a read error is not an answer about the session
+        let user = u("err");
+        client
+            .sadd_raw_for_test(&siwx_oidc::db::guest_invites::guest_account_key(&user), "x")
+            .await;
+        let rt = issue(user, "D1".into(), "compat-guest").await;
+        assert_eq!(
+            matrix_refresh(&state, &rt).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        // another client's grant is untouched, with no record at all
+        let rt = issue(u("plain"), "D1".into(), "compat-test").await;
+        assert_eq!(matrix_refresh(&state, &rt).await.0, StatusCode::OK);
+    }
+
     /// A grant with a refresh token, for the refresh and revoke tests.
     async fn seed_grant(client: &RedisClient, user: &str, dev: &str) -> IssuedGrant {
         seed_grant_for(client, user, dev, false).await
@@ -1196,6 +1321,7 @@ mod tests {
                 auth_ms: None,
                 access_ttl: ACCESS_TOKEN_TTL,
                 refresh_inactivity_secs: Some(120),
+                absolute_deadline: None,
             })
             .await
             .unwrap()
@@ -1338,6 +1464,7 @@ mod tests {
             ))),
             server_name: Some("example.org".to_string()),
             delegated_auth: true,
+            guest_client_id: None,
         };
 
         let grant = seed_grant(&client, &user, &dev).await;
@@ -1578,6 +1705,7 @@ mod tests {
             synapse_client: Some(Arc::new(SynapseClient::new(&endpoint, "secret"))),
             server_name: Some("example.org".to_string()),
             delegated_auth: true,
+            guest_client_id: None,
         };
         let prefix = EX.split('/').next().unwrap();
         let n = nonce();
@@ -2627,6 +2755,7 @@ mod tests {
                 auth_ms: None,
                 access_ttl: ACCESS_TOKEN_TTL,
                 refresh_inactivity_secs: Some(120),
+                absolute_deadline: None,
             })
             .await
             .unwrap()
@@ -2660,6 +2789,7 @@ mod tests {
     fn matrix_state(redis_client: RedisClient) -> CompatState {
         CompatState {
             delegated_auth: true,
+            guest_client_id: None,
             ..standalone_state(redis_client)
         }
     }
@@ -2720,6 +2850,7 @@ mod tests {
                     GrantKind::Service => None,
                     GrantKind::MatrixDevice | GrantKind::Oidc => Some(120),
                 },
+                absolute_deadline: None,
             })
             .await
             .unwrap()

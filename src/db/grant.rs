@@ -369,6 +369,11 @@ pub struct NewGrant {
     /// many seconds after its last rotation; `None` issues none, and the grant
     /// lives exactly as long as its access token. A `service` grant takes `None`.
     pub refresh_inactivity_secs: Option<u64>,
+    /// An absolute expiry in Unix seconds written into the grant as `absolute_exp`
+    /// (S5: a guest's deadline), on top of any configured lifetime cap; the earlier
+    /// of the two applies. A deadline at or before `now` refuses the issue
+    /// ([`IssueRevoked`]). `None` for every non-guest grant.
+    pub absolute_deadline: Option<i64>,
 }
 
 /// The tokens [`RedisClient::issue_grant`] hands out.
@@ -812,6 +817,16 @@ if ARGV[16] ~= '' then
   if now >= absolute_exp then
     return redis.error_reply('authentication older than the absolute lifetime')
   end
+  access_exp = math.min(access_exp, absolute_exp)
+  access_life = math.min(access_life, absolute_exp - now)
+  grant_ttl = math.min(grant_ttl, absolute_exp - now)
+end
+if ARGV[18] ~= '' then
+  local deadline = tonumber(ARGV[18])
+  if now >= deadline then
+    return redis.error_reply('ISSUE_REVOKED the grant deadline has passed')
+  end
+  if (not absolute_exp) or deadline < absolute_exp then absolute_exp = deadline end
   access_exp = math.min(access_exp, absolute_exp)
   access_life = math.min(access_life, absolute_exp - now)
   grant_ttl = math.min(grant_ttl, absolute_exp - now)
@@ -1308,6 +1323,9 @@ impl RedisClient {
                     &current_rt,
                     &cap_arg(self.lifetime.cap_for(&new.client_id)),
                     sid.as_deref().unwrap_or_default(),
+                    &new.absolute_deadline
+                        .map(|d| d.to_string())
+                        .unwrap_or_default(),
                 ],
             )
             .await

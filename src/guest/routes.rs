@@ -106,6 +106,9 @@ pub fn router(config: &Config, redis: RedisClient, synapse: Option<Arc<SynapseCl
         .route("/guest/meetings/end", post(invite::end_meeting))
         // The guest's own Bearer (S4b).
         .route("/guest/context", get(handoff::context))
+        // The guest ends its own session (S5): the guest's Bearer, or the cookie with the
+        // same-origin check done inside the handler.
+        .route("/guest/end", post(handoff::end))
         .with_state(state);
     super::layers::build(
         config.guest_enabled,

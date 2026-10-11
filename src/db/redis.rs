@@ -60,7 +60,7 @@ fn erased_user_key(localpart: &str) -> String {
 /// Redis key for the durable erasure marker of a DID: the SHA-256 of its
 /// canonical form (`mxid::canonicalize`), so the case variants of one `did:pkh`
 /// share a marker and the DID itself is not kept in cleartext.
-fn erased_did_key(did: &str) -> String {
+pub(super) fn erased_did_key(did: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(crate::mxid::canonicalize(did).as_bytes());
     format!("{}/{}", KV_ERASED_DID_PREFIX, hex::encode(digest))
@@ -703,6 +703,18 @@ impl RedisClient {
         let at = chrono::Utc::now().to_rfc3339();
         self.set_raw(&erased_user_key(localpart), &at).await?;
         self.set_raw(&erased_did_key(did), &at).await
+    }
+
+    /// [`mark_account_erased`](Self::mark_account_erased) for a guest (S5): the same two
+    /// keys, no TTL, but the DID marker's value starts with `guest `, which is what keeps
+    /// a reaped guest's DID refused on Path B (`guest_record_exists_for_did`) once its
+    /// record is gone, without touching the sign-in of a registered user whose account
+    /// was erased. Idempotent: a re-run rewrites the timestamp only.
+    pub async fn mark_guest_erased(&self, localpart: &str, did: &str) -> Result<()> {
+        let at = chrono::Utc::now().to_rfc3339();
+        self.set_raw(&erased_user_key(localpart), &at).await?;
+        self.set_raw(&erased_did_key(did), &format!("guest {at}"))
+            .await
     }
 
     /// Whether the account `localpart` of `did` carries an erasure marker
@@ -3192,6 +3204,7 @@ mod tests {
                     auth_ms: None,
                     access_ttl: crate::db::ACCESS_TOKEN_TTL,
                     refresh_inactivity_secs: Some(crate::db::REFRESH_TOKEN_TTL),
+                    absolute_deadline: None,
                 })
                 .await
                 .unwrap();

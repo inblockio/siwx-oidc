@@ -144,17 +144,21 @@ async fn require_same_origin(
     request: Request,
     next: Next,
 ) -> Response {
-    if request.method() == Method::POST {
-        let headers = request.headers();
-        let origin = headers.get(header::ORIGIN);
-        let fetch_site = headers.get("sec-fetch-site");
-        let origin_ok = origin.is_none_or(|v| v.as_bytes() == issuer_origin.as_bytes());
-        let fetch_site_ok = fetch_site.is_none_or(|v| v.as_bytes() == b"same-origin");
-        if (origin.is_none() && fetch_site.is_none()) || !origin_ok || !fetch_site_ok {
-            return error(StatusCode::FORBIDDEN, "forbidden_origin");
-        }
+    if request.method() == Method::POST && !same_origin_ok(request.headers(), &issuer_origin) {
+        return error(StatusCode::FORBIDDEN, "forbidden_origin");
     }
     next.run(request).await
+}
+
+/// The GP-SEC-40 test, for a handler that takes the cookie on a route of the Bearer
+/// group (`POST /guest/end`): at least one of `Origin` and `Sec-Fetch-Site` is present,
+/// and each one present matches the issuer.
+pub fn same_origin_ok(headers: &axum::http::HeaderMap, issuer_origin: &str) -> bool {
+    let origin = headers.get(header::ORIGIN);
+    let fetch_site = headers.get("sec-fetch-site");
+    let origin_ok = origin.is_none_or(|v| v.as_bytes() == issuer_origin.as_bytes());
+    let fetch_site_ok = fetch_site.is_none_or(|v| v.as_bytes() == b"same-origin");
+    !(origin.is_none() && fetch_site.is_none()) && origin_ok && fetch_site_ok
 }
 
 /// Set the GP-SEC-39 headers, and give an error that axum produced itself (an

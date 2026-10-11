@@ -26,6 +26,7 @@ mod oidc;
 // discovery hint only — see the module doc's "never an authorization source".
 mod resolve;
 mod synapse_client;
+mod teardown;
 mod webauthn;
 
 #[tokio::main]

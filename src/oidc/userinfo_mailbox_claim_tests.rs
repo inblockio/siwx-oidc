@@ -79,6 +79,7 @@ async fn issue(
         auth_ms: None,
         access_ttl: ACCESS_TOKEN_TTL,
         refresh_inactivity_secs: (kind != GrantKind::Service).then_some(REFRESH_TOKEN_TTL),
+        absolute_deadline: None,
     })
     .await
     .unwrap()

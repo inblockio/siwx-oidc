@@ -361,7 +361,10 @@ paths:
             OAuth error. `authorization_pending` and `slow_down` are the normal
             polling answers on the device-code grant, not failures.
             `invalid_grant` includes a code or refresh token presented by a
-            client it was not issued to.
+            client it was not issued to, and a guest's refresh at or past its
+            deadline, while its record is `reaping`, with the guest kill switch
+            on, or for a device its record does not list (a Redis read error
+            there is a 503, never a pass).
         "401":
           description: |
             `invalid_client`: the client did not authenticate (RFC 6749 §5.2). A
@@ -1198,6 +1201,37 @@ paths:
                   meeting_name: { type: string }
         "401": { description: "`invalid_token`." }
         "403": { description: "`not_a_guest`." }
+        "503": { description: "`unavailable` (Redis), or `guest_unavailable` while guest mode is off." }
+
+  /guest/end:
+    post:
+      tags: [Guest]
+      operationId: guestEnd
+      summary: The guest ends its own session
+      description: |
+        Authorised by the guest's own Bearer access token, or by the guest cookie with the same-origin check
+        (`403 forbidden_origin` for a foreign `Origin` or a `Sec-Fetch-Site` other than `same-origin`); when both
+        are sent the Bearer wins. Like every guest POST it takes `Content-Type: application/json` (the body, `{}`, is not read). Moves the guest's deadline to now (the record and `guest:due`, never
+        later), so the reaper revokes the grants, deletes the devices, writes `erased:user` and `erased:did` (the
+        DID never signs in again), erases the Synapse account and drops the record within one tick. Clears the
+        session cookie. A second call on a record that is already ending is `200` as well; a cookie whose record
+        is already gone is `200 {"state": "ended"}`. A `claimed` account is `409 claimed`: it is kept, nothing is
+        moved. Without a credential or with a bad token `401 invalid_token`; a valid token that is not a guest's
+        is `403 not_a_guest`.
+      security: [{ bearerToken: [] }, {}]
+      responses:
+        "200":
+          description: "`{\"state\": \"ending\"}` (or `\"ended\"`), `Cache-Control: no-store`, the cookie cleared."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state]
+                properties:
+                  state: { type: string, enum: [ending, ended] }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`forbidden_origin` (cookie, foreign origin) or `not_a_guest`." }
+        "409": { description: "`claimed`." }
         "503": { description: "`unavailable` (Redis), or `guest_unavailable` while guest mode is off." }
 
   /guest/resume:

@@ -180,7 +180,7 @@ async fn host_display_name(state: &GuestState, host: &str) -> Option<String> {
 /// The session cookie. `__Host-` and `Secure` on https; on plain-http development
 /// (`base_url` is http, which start-up allows only for localhost) the unprefixed name
 /// without `Secure`, since a browser would not store the other.
-fn session_cookie(base_url: &url::Url, handle: &str, max_age: i64) -> String {
+pub(super) fn session_cookie(base_url: &url::Url, handle: &str, max_age: i64) -> String {
     if base_url.scheme() == "https" {
         format!(
             "__Host-guest_session={handle}; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}"
@@ -884,6 +884,23 @@ mod tests {
             assert!(e.record(g).await.is_empty());
         }
         assert_eq!(e.used(&b).await, "0");
+    }
+
+    /// S5: the tombstone a guest teardown writes (`mark_guest_erased`) makes the DID's
+    /// redeem `did_in_use`, and nothing is written.
+    #[tokio::test]
+    async fn st22_a_reaped_dids_redeem_is_did_in_use() {
+        let Some(e) = env(|_| {}).await else { return };
+        let inv = e.invite(Kind::Open, 5).await;
+        let reaped = Guest::new();
+        e.redis
+            .mark_guest_erased(&localpart_for(&reaped.did), &reaped.did)
+            .await
+            .unwrap();
+        let r = e.redeem(&inv, &reaped).await;
+        assert_eq!((r.status, r.error()), (409, "did_in_use".into()));
+        assert_eq!(e.used(&inv).await, "0");
+        assert!(e.record(&reaped).await.is_empty());
     }
 
     /// The order is secret, state, validation, proof; every input refusal writes nothing.

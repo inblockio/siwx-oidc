@@ -194,6 +194,257 @@ end
 return moved
 "#;
 
+/// `POST /guest/end`: move one guest's deadline to now. `KEYS`: 1 record, 2 due.
+/// `ARGV`: 1 localpart. `claimed` (or a host-promoted record) is refused; a record that
+/// is already `reaping` or already due is left as it is (`ending`).
+const END_NOW: &str = r#"
+local f = redis.call('HMGET', KEYS[1], 'state', 'deadline', 'promoted_at')
+if not f[1] then return 'gone' end
+if f[1] == 'claimed' or f[3] then return 'claimed' end
+if f[1] == 'reaping' then return 'ending' end
+local now = tonumber(redis.call('TIME')[1])
+local d = tonumber(f[2])
+if d and d <= now then
+  redis.call('ZADD', KEYS[2], 'NX', d, ARGV[1])
+  return 'ending'
+end
+redis.call('HSET', KEYS[1], 'deadline', tostring(now))
+redis.call('ZADD', KEYS[2], now, ARGV[1])
+return 'moved'
+"#;
+
+/// The CAS to `reaping`, refusing a `claimed` (or promoted) record. `KEYS`: 1 record.
+const CAS_REAPING: &str = r#"
+local s = redis.call('HGET', KEYS[1], 'state')
+if not s then return 'gone' end
+if s == 'claimed' or redis.call('HEXISTS', KEYS[1], 'promoted_at') == 1 then return 'claimed' end
+if s == 'reaping' then return 'already' end
+redis.call('HSET', KEYS[1], 'state', 'reaping')
+return 'marked'
+"#;
+
+/// Drop a guest record and everything keyed by its localpart. `KEYS`: 1 record, 2 device
+/// set, 3 hand-off window, 4 due. `ARGV`: 1 localpart, 2 by_invite prefix. Idempotent.
+const DROP_RECORD: &str = r#"
+local inv = redis.call('HGET', KEYS[1], 'invite_id')
+if inv then redis.call('SREM', ARGV[2] .. inv, ARGV[1]) end
+redis.call('DEL', KEYS[1], KEYS[2], KEYS[3])
+redis.call('ZREM', KEYS[4], ARGV[1])
+return 1
+"#;
+
+/// What [`RedisClient::end_guest_now`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndOutcome {
+    /// The deadline moved to now; the reaper finds the guest due.
+    Moved,
+    /// Already due or `reaping`: nothing to move (the caller answers 200 as well).
+    Ending,
+    /// A `claimed` account (the caller answers 409).
+    Claimed,
+    /// No record.
+    Gone,
+}
+
+/// What [`RedisClient::cas_guest_reaping`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapCas {
+    Marked,
+    Already,
+    Claimed,
+    Gone,
+}
+
+/// What the refresh guard needs of a guest, read in one round trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestRefreshRead {
+    /// `None`: no record.
+    pub state: Option<String>,
+    pub deadline: Option<i64>,
+    /// The device is in `guest:devices/{localpart}`.
+    pub device_recorded: bool,
+    /// Redis `TIME` at the read.
+    pub now: i64,
+}
+
+impl RedisClient {
+    /// The deadline a guest grant is capped at: `Some` for a record that is `minted`,
+    /// `provisioning`, `active` or `reaping` (a reaping record's deadline is already
+    /// past, which refuses the issue), `None` for no record or a `claimed` one.
+    pub async fn guest_grant_deadline(&self, localpart: &str) -> Result<Option<i64>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let f: Vec<Option<String>> = cmd("HMGET")
+            .arg(guest_account_key(localpart))
+            .arg("state")
+            .arg("deadline")
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest deadline: {e}"))?;
+        match (f.first(), f.get(1)) {
+            (Some(Some(state)), Some(Some(d)))
+                if matches!(
+                    state.as_str(),
+                    "minted" | "provisioning" | "active" | "reaping"
+                ) =>
+            {
+                Ok(Some(d.parse().map_err(|e| anyhow!("guest deadline: {e}"))?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The refresh guard's read (S5): record state and deadline, whether `device_id` is a
+    /// recorded device, and Redis `TIME`. One pipeline; an error is the caller's 5xx.
+    pub async fn guest_refresh_read(
+        &self,
+        localpart: &str,
+        device_id: &str,
+    ) -> Result<GuestRefreshRead> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let (f, recorded, (secs, _)): (Vec<Option<String>>, i64, (String, String)) =
+            bb8_redis::redis::pipe()
+                .cmd("HMGET")
+                .arg(guest_account_key(localpart))
+                .arg("state")
+                .arg("deadline")
+                .cmd("SISMEMBER")
+                .arg(devices_key(localpart))
+                .arg(device_id)
+                .cmd("TIME")
+                .query_async(&mut *conn)
+                .await
+                .map_err(|e| anyhow!("guest refresh guard: {e}"))?;
+        Ok(GuestRefreshRead {
+            state: f.first().cloned().flatten(),
+            deadline: f
+                .get(1)
+                .cloned()
+                .flatten()
+                .map(|d| d.parse())
+                .transpose()
+                .map_err(|e| anyhow!("guest refresh guard: {e}"))?,
+            device_recorded: recorded == 1,
+            now: secs
+                .parse()
+                .map_err(|e| anyhow!("guest refresh guard: {e}"))?,
+        })
+    }
+
+    /// `POST /guest/end`: move this guest's deadline to now (never later).
+    pub async fn end_guest_now(&self, localpart: &str) -> Result<EndOutcome> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let r: String = cmd("EVAL")
+            .arg(END_NOW)
+            .arg(2)
+            .arg(guest_account_key(localpart))
+            .arg(DUE_KEY)
+            .arg(localpart)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest end: {e}"))?;
+        Ok(match r.as_str() {
+            "moved" => EndOutcome::Moved,
+            "ending" => EndOutcome::Ending,
+            "claimed" => EndOutcome::Claimed,
+            _ => EndOutcome::Gone,
+        })
+    }
+
+    /// The CAS of the teardown: `minted`/`provisioning`/`active` to `reaping`; a
+    /// `claimed` account is refused, `reaping` is already there, no record is `Gone`.
+    pub async fn cas_guest_reaping(&self, localpart: &str) -> Result<ReapCas> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let r: String = cmd("EVAL")
+            .arg(CAS_REAPING)
+            .arg(1)
+            .arg(guest_account_key(localpart))
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest reaping CAS: {e}"))?;
+        Ok(match r.as_str() {
+            "marked" => ReapCas::Marked,
+            "already" => ReapCas::Already,
+            "claimed" => ReapCas::Claimed,
+            _ => ReapCas::Gone,
+        })
+    }
+
+    /// The DID of a guest record and whether it may be torn down, for the teardown:
+    /// `(did, state, promoted)`; `None` when there is no record.
+    pub async fn read_guest_for_teardown(
+        &self,
+        localpart: &str,
+    ) -> Result<Option<(String, String, bool)>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let f: Vec<Option<String>> = cmd("HMGET")
+            .arg(guest_account_key(localpart))
+            .arg("did")
+            .arg("state")
+            .arg("promoted_at")
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest teardown read: {e}"))?;
+        match (f.first(), f.get(1)) {
+            (Some(Some(did)), Some(Some(state))) => Ok(Some((
+                did.clone(),
+                state.clone(),
+                f.get(2).is_some_and(Option::is_some),
+            ))),
+            _ => Ok(None),
+        }
+    }
+
+    /// The device ids recorded for a guest (the write-ahead set).
+    pub async fn guest_device_ids(&self, localpart: &str) -> Result<Vec<String>> {
+        let mut ids = self.smembers_raw(&devices_key(localpart)).await?;
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// The last step of a teardown: drop the record, its device set, its hand-off window,
+    /// its `guest:due` member and its `guest:by_invite` membership. Idempotent.
+    pub async fn drop_guest_record(&self, localpart: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let _: i64 = cmd("EVAL")
+            .arg(DROP_RECORD)
+            .arg(4)
+            .arg(guest_account_key(localpart))
+            .arg(devices_key(localpart))
+            .arg(handoff_rate_key(localpart))
+            .arg(DUE_KEY)
+            .arg(localpart)
+            .arg(BY_INVITE_PREFIX)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest record drop: {e}"))?;
+        Ok(())
+    }
+}
+
 /// A guest as the host sees them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestView {
@@ -440,7 +691,17 @@ impl RedisClient {
             .query_async(&mut *conn)
             .await
             .map_err(|e| anyhow!("guest record lookup: {e}"))?;
-        Ok(n > 0)
+        if n > 0 {
+            return Ok(true);
+        }
+        // S5: the tombstone of a reaped guest (`mark_guest_erased`) keeps the DID refused
+        // after its record is gone. An erasure marker of a registered user is not one.
+        let marker: Option<String> = cmd("GET")
+            .arg(super::redis::erased_did_key(did))
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest record lookup: {e}"))?;
+        Ok(marker.is_some_and(|m| m.starts_with("guest ")))
     }
 
     /// The fence of a hand-off (`sign_in`, S4b): one script, on Redis `TIME`.
@@ -858,6 +1119,18 @@ impl RedisClient {
             .arg(localpart)
             .arg("EX")
             .arg(3600)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    /// Test helper: add `member` to the set at `key`.
+    #[doc(hidden)]
+    pub async fn sadd_raw_for_test(&self, key: &str, member: &str) {
+        let mut conn = self.pool.get().await.unwrap();
+        let _: () = cmd("SADD")
+            .arg(key)
+            .arg(member)
             .query_async(&mut *conn)
             .await
             .unwrap();

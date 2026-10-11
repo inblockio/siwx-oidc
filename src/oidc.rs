@@ -1271,9 +1271,9 @@ async fn token_refresh(
     // before the grant record) not lifted yet. An access or admin token,
     // garbage, and a token of a grant that is gone are all answered exactly
     // like an unknown token.
-    let (bound_client, legacy) = match db_client.peek_refresh_token(&rt).await? {
-        RefreshPeek::Grant(grant) => (grant.client_id, None),
-        RefreshPeek::Legacy(legacy) => (legacy.meta.client_id.clone(), Some(legacy)),
+    let (bound_client, legacy, peeked_grant) = match db_client.peek_refresh_token(&rt).await? {
+        RefreshPeek::Grant(grant) => (grant.client_id.clone(), None, Some(grant)),
+        RefreshPeek::Legacy(legacy) => (legacy.meta.client_id.clone(), Some(legacy), None),
         RefreshPeek::Unknown => return Err(unknown_refresh_token()),
     };
 
@@ -1290,6 +1290,28 @@ async fn token_refresh(
         db_client,
     )
     .await?;
+
+    // S5: a guest's refresh is refused at its deadline, while its record is `reaping`,
+    // when the kill switch is on, and for a device the record does not list. A Redis
+    // read error is a 503 for the client to retry: the guard never passes on an error.
+    if let Some(grant) = &peeked_grant {
+        match crate::guest::handoff::guest_refresh_allowed(
+            config.guest_client_id.as_deref(),
+            db_client,
+            grant,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Err(guest_session_ended()),
+            Err(e) => {
+                warn!(error = %e, "guest refresh guard: record read failed");
+                return Err(CustomError::ServiceUnavailable(
+                    "The session store is unavailable; retry.".to_string(),
+                ));
+            }
+        }
+    }
 
     // The one rotation script (I3) decides everything else atomically: rotate,
     // replay the unused successor of a lost response (I4), or refuse. The
@@ -1351,6 +1373,15 @@ async fn token_refresh(
     // An accepted rotation or replay is a use of the client the grant belongs to.
     touch_client_after_use(db_client, &bound_client).await;
     Ok(response)
+}
+
+/// 400 `invalid_grant` for a guest whose session is over (S5): the portal signs out and
+/// goes to `/guest/ended`.
+fn guest_session_ended() -> CustomError {
+    CustomError::BadRequestToken(TokenError {
+        error: CoreErrorResponseType::InvalidGrant,
+        error_description: "The guest session has ended.".to_string(),
+    })
 }
 
 /// The answer to a refresh token that is unknown, expired, of another kind, or
@@ -1557,6 +1588,7 @@ async fn token_device_code(
                     auth_ms: entry.auth_ms,
                     access_ttl: ACCESS_TOKEN_TTL,
                     refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+                    absolute_deadline: None,
                 })
                 .await?;
             touch_client_after_use(db_client, &client_id).await;
@@ -1897,6 +1929,13 @@ async fn token_authorization_code(
         .unwrap_or_else(|| crate::localpart::legacy_localpart(&code_entry.did));
     let claims = resolve_claims(config, &code_entry.did, client_entry.class).await;
     let guest = guest_claim(config, db_client, &client_id, &username).await?;
+    // S5: a guest's grant ends at its deadline (`absolute_exp`), so no refresh outlives
+    // the record even with the reaper stopped. Only the guest client's grants.
+    let absolute_deadline = if config.guest_client_id.as_deref() == Some(client_id.as_str()) {
+        db_client.guest_grant_deadline(&username).await?
+    } else {
+        None
+    };
     let display_name = claims
         .name()
         .and_then(|n| n.get(None))
@@ -1918,6 +1957,7 @@ async fn token_authorization_code(
             auth_ms: Some(code_entry.auth_time.timestamp_millis()),
             access_ttl: ACCESS_TOKEN_TTL,
             refresh_inactivity_secs: issuance.refresh_token.then_some(REFRESH_TOKEN_TTL),
+            absolute_deadline,
         })
         .await
         .map_err(|e| {
@@ -7813,6 +7853,7 @@ mod client_binding_tests {
             auth_ms: Some(Utc::now().timestamp_millis()),
             access_ttl: ACCESS_TOKEN_TTL,
             refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+            absolute_deadline: None,
         })
         .await
         .unwrap()
@@ -7958,6 +7999,281 @@ mod client_binding_tests {
             .await
             .unwrap()
             .is_some_and(|grant| grant.generation == 0)
+    }
+
+    // ---- S5: the guest refresh guard on /token, and `absolute_exp = deadline` ----
+
+    const GUEST_DID: &str = "did:key:zDnGUEST";
+
+    async fn guest_record(db: &RedisClient, state: &str, deadline_in: i64, device: &str) -> String {
+        let localpart = unique("guestlp");
+        db.put_guest_for_test(&localpart, GUEST_DID, state, deadline_in, &unique("h"))
+            .await;
+        db.sadd_raw_for_test(
+            &siwx_oidc::db::guest_records::devices_key(&localpart),
+            device,
+        )
+        .await;
+        localpart
+    }
+
+    async fn guest_grant(
+        db: &RedisClient,
+        client: &str,
+        localpart: &str,
+        device: &str,
+        deadline: Option<i64>,
+    ) -> (String, siwx_oidc::db::grant::GrantId) {
+        let issued = db
+            .issue_grant(&NewGrant {
+                kind: GrantKind::MatrixDevice,
+                username: localpart.into(),
+                did: GUEST_DID.into(),
+                client_id: client.into(),
+                confidential_client: false,
+                device_id: device.into(),
+                scope: "openid".into(),
+                name: "g".into(),
+                auth_ms: None,
+                access_ttl: ACCESS_TOKEN_TTL,
+                refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+                absolute_deadline: deadline,
+            })
+            .await
+            .unwrap();
+        (issued.refresh_token.unwrap(), issued.grant_id)
+    }
+
+    fn guest_config(client: &str) -> Config {
+        Config {
+            guest_client_id: Some(client.into()),
+            ..Config::default()
+        }
+    }
+
+    /// `ok`, `invalid_grant` or `5xx`: what a client sees.
+    fn guest_refresh_class(r: Result<SiwxTokenResponse, CustomError>) -> &'static str {
+        match r {
+            Ok(_) => "ok",
+            Err(CustomError::BadRequestToken(t))
+                if t.error == CoreErrorResponseType::InvalidGrant =>
+            {
+                "invalid_grant"
+            }
+            Err(CustomError::ServiceUnavailable(_)) => "5xx",
+            Err(other) => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// S5, ST-11 shape: with no reaper running the deadline, `reaping` and an unrecorded
+    /// device each refuse a guest's refresh with `invalid_grant`; a live, recorded one
+    /// rotates; a Redis read error is a 5xx; a non-guest client is unaffected.
+    #[tokio::test]
+    async fn st11_the_guest_refresh_guard_refuses_at_the_deadline_reaping_and_an_unrecorded_device()
+    {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let guest_client = seed_client(&db, Registration::Public).await;
+        let config = guest_config(&guest_client);
+        let now = Utc::now().timestamp();
+        let go = |rt: String| {
+            let (db, config, c) = (db.clone(), config.clone(), guest_client.clone());
+            async move {
+                guest_refresh_class(
+                    refresh(
+                        &db,
+                        &config,
+                        &rt,
+                        Presented {
+                            client_id: Some(&c),
+                            ..NOTHING
+                        },
+                    )
+                    .await,
+                )
+            }
+        };
+
+        // live and recorded: rotates
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let (rt, _) = guest_grant(&db, &guest_client, &lp, "DEV1", Some(now + 600)).await;
+        assert_eq!(go(rt).await, "ok");
+
+        // the deadline has passed (the record's; no reaper has run)
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let (rt, _) = guest_grant(&db, &guest_client, &lp, "DEV1", Some(now + 600)).await;
+        db.hset_raw_for_test(
+            &siwx_oidc::db::guest_invites::guest_account_key(&lp),
+            "deadline",
+            &(now - 5).to_string(),
+        )
+        .await;
+        assert_eq!(go(rt).await, "invalid_grant");
+
+        // reaping
+        let lp = guest_record(&db, "reaping", 600, "DEV1").await;
+        let (rt, _) = guest_grant(&db, &guest_client, &lp, "DEV1", Some(now + 600)).await;
+        assert_eq!(go(rt).await, "invalid_grant");
+
+        // no record at all (reaped)
+        let (rt, _) = guest_grant(&db, &guest_client, &unique("gone"), "DEV1", None).await;
+        assert_eq!(go(rt).await, "invalid_grant");
+
+        // a device the record does not list
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let (rt, _) = guest_grant(&db, &guest_client, &lp, "DEV2", Some(now + 600)).await;
+        assert_eq!(go(rt).await, "invalid_grant");
+
+        // a read error: the record key has the wrong type; never passed on
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let (rt, _) = guest_grant(&db, &guest_client, &lp, "DEV1", Some(now + 600)).await;
+        db.del_raw(&siwx_oidc::db::guest_invites::guest_account_key(&lp))
+            .await
+            .unwrap();
+        db.sadd_raw_for_test(&siwx_oidc::db::guest_invites::guest_account_key(&lp), "x")
+            .await;
+        assert_eq!(go(rt).await, "5xx");
+
+        // a non-guest client and a non-guest grant are unaffected (no record, no device)
+        let other = seed_client(&db, Registration::Public).await;
+        let rt = seed_refresh_token(&db, &other).await;
+        let r = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&other),
+                ..NOTHING
+            },
+        )
+        .await;
+        assert_eq!(guest_refresh_class(r), "ok");
+    }
+
+    /// S5: `absolute_exp = deadline` is written into a guest's grant only (the code
+    /// exchange of the guest client with a live record), and the rotation script itself
+    /// refuses past it, independent of the guard.
+    #[tokio::test]
+    async fn s5_absolute_exp_is_the_deadline_for_a_guest_grant_only() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let guest_client = seed_client(&db, Registration::Public).await;
+        let other_client = seed_client(&db, Registration::Public).await;
+        let config = guest_config(&guest_client);
+        let now = Utc::now().timestamp();
+        let exp_of = |db: RedisClient, id: siwx_oidc::db::grant::GrantId| async move {
+            db.hgetall_for_test(&format!("grant/{}", id.as_str()))
+                .await
+                .get("absolute_exp")
+                .cloned()
+        };
+        let exchange_code = |client: String, localpart: String| {
+            let (db, config) = (db.clone(), config.clone());
+            async move {
+                let code = unique("code-");
+                db.set_code(
+                    code.clone(),
+                    CodeEntry {
+                        exchange_count: 0,
+                        did: GUEST_DID.into(),
+                        nonce: None,
+                        client_id: client.clone(),
+                        auth_time: Utc::now(),
+                        code_challenge: Some(CHALLENGE.into()),
+                        code_challenge_method: Some("S256".into()),
+                        device_id: None,
+                        localpart: Some(localpart),
+                        scope: Some("openid offline_access".into()),
+                        client_class: None,
+                    },
+                )
+                .await
+                .unwrap();
+                let r = exchange(
+                    &db,
+                    &config,
+                    &code,
+                    Presented {
+                        client_id: Some(&client),
+                        ..NOTHING
+                    },
+                )
+                .await;
+                let rt = refresh_token_of(r);
+                match db.peek_refresh_token(&rt).await.unwrap() {
+                    RefreshPeek::Grant(g) => g,
+                    _ => panic!("no grant"),
+                }
+            }
+        };
+
+        // the guest client with a live record: the grant ends at the record's deadline
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let record_deadline = db
+            .guest_grant_deadline(&lp)
+            .await
+            .unwrap()
+            .expect("a live record has a deadline");
+        let g = exchange_code(guest_client.clone(), lp.clone()).await;
+        assert_eq!(g.absolute_exp, Some(record_deadline));
+        assert!(record_deadline >= now + 590 && record_deadline <= now + 610);
+
+        // another client with the very same live record: no absolute_exp
+        let g = exchange_code(other_client.clone(), lp.clone()).await;
+        assert_eq!(g.absolute_exp, None);
+
+        // the guest client without a record (or claimed): unchanged, the guard decides
+        let g = exchange_code(guest_client.clone(), unique("norecord")).await;
+        assert_eq!(g.absolute_exp, None);
+        let claimed = guest_record(&db, "claimed", 600, "DEV1").await;
+        assert_eq!(db.guest_grant_deadline(&claimed).await.unwrap(), None);
+
+        // a deadline already past refuses the issue (the code is then invalid_grant)
+        let late = guest_record(&db, "active", -5, "DEV1").await;
+        let late_deadline = db.guest_grant_deadline(&late).await.unwrap().unwrap();
+        assert!(late_deadline < now);
+        let err = db
+            .issue_grant(&NewGrant {
+                kind: GrantKind::MatrixDevice,
+                username: late,
+                did: GUEST_DID.into(),
+                client_id: guest_client.clone(),
+                confidential_client: false,
+                device_id: "DEV1".into(),
+                scope: "openid".into(),
+                name: "g".into(),
+                auth_ms: None,
+                access_ttl: ACCESS_TOKEN_TTL,
+                refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+                absolute_deadline: Some(late_deadline),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.is::<siwx_oidc::db::grant::IssueRevoked>());
+
+        // the rotation script refuses past `absolute_exp` on its own: the record says
+        // "live" (deadline far away), the GRANT says two seconds.
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let (rt, id) = guest_grant(&db, &guest_client, &lp, "DEV1", Some(now + 2)).await;
+        assert_eq!(exp_of(db.clone(), id).await, Some((now + 2).to_string()));
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let r = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&guest_client),
+                ..NOTHING
+            },
+        )
+        .await;
+        assert_ne!(
+            guest_refresh_class(r),
+            "ok",
+            "a refresh past absolute_exp rotates nothing"
+        );
     }
 
     /// Another client, even one that authenticates correctly as itself, cannot
@@ -9967,6 +10283,7 @@ mod end_session_tests {
                 auth_ms: None,
                 access_ttl: ACCESS_TOKEN_TTL,
                 refresh_inactivity_secs: None,
+                absolute_deadline: None,
             })
             .await
             .unwrap();
