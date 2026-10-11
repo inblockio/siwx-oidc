@@ -1234,6 +1234,81 @@ paths:
         "409": { description: "`claimed`." }
         "503": { description: "`unavailable` (Redis), or `guest_unavailable` while guest mode is off." }
 
+  /guest/claim:
+    get:
+      tags: [Guest]
+      operationId: guestClaimPage
+      summary: The page where a guest keeps the account with a passkey
+      description: |
+        The same page for everyone; it reads no cookie. Its script (`/guest/assets/claim.js`) asks `GET /guest/resume`
+        and runs the claim states of the design (loading, intro, passkey prompt, saving, done, declined, and the
+        errors), then calls `POST /guest/claim/start`, `POST /guest/claim/finish` and, for "Delete everything now",
+        `POST /guest/end` with the cookie. It never sees or derives a private key; after a commit or a lost race it
+        calls `forgetKey()` on this browser's guest key store. `Cache-Control: no-store`; the guest CSP (script and
+        style from this origin only) and `frame-ancestors 'none'` apply.
+      responses:
+        "200": { description: "The page, `text/html`." }
+        "503": { description: "`guest_unavailable` while guest mode is off." }
+
+  /guest/claim/start:
+    post:
+      tags: [Guest]
+      operationId: guestClaimStart
+      summary: Begin keeping the guest account with a passkey
+      description: |
+        Authorised by the guest cookie only (a Bearer token is `401 no_session`); same-origin only, JSON only, 4 KiB, body ignored.
+        Gate (each refusal is a counted `guest_refused` event, route `claim_start`): `guest_claim_enabled` and the kill switch
+        off, a record in state `active` before its deadline (Redis `TIME`), host not banned, fewer than `guest_max_claimed`
+        claims, the Synapse account exists and is active, and it is currently joined to its invite's room (a Synapse fault is
+        `503`, never a pass). Success: the WebAuthn creation options (`CreationChallengeResponse`) for the guest's own DID, the
+        pending challenge stored under `claim_<sha256(handle)>` (idempotent: a repeat replaces it). `Cache-Control: no-store`.
+      responses:
+        "200": { description: "WebAuthn `CreationChallengeResponse` JSON." }
+        "401": { description: "`no_session`: no cookie, an unknown handle, or a Bearer token." }
+        "403": { description: "`claim_unavailable`: claim off, kill switch, host banned, cap reached, or the record is not `active` yet." }
+        "409": { description: "`already_claimed`." }
+        "410": { description: "`ended`: reaping, past the deadline, the account gone or deactivated, or no longer in the room." }
+        "503": { description: "`unavailable` (Redis or Synapse), or `guest_unavailable` while guest mode is off." }
+
+  /guest/claim/finish:
+    post:
+      tags: [Guest]
+      operationId: guestClaimFinish
+      summary: Keep the guest account with the passkey just made
+      description: |
+        Authorised by the guest cookie only; same-origin only, JSON only, 16 KiB. Body: the WebAuthn registration response
+        (`id`, `rawId`, `type`, `response`) plus `keep_email` (boolean, default false). Steps: a per-guest single-flight lock
+        (`SET NX EX 30`, `409 claim_in_progress` while held), the gate of `claim/start` again, the credential verified and stored
+        under the guest's own DID (set-if-absent; a credential id that is already known is `400 verify_failed`), then one Lua
+        compare-and-set `active` to `claimed`: the record leaves `guest:due` and the invite's guest set, the deadline is dropped,
+        the localpart joins `guest:claimed` and `guest:claim_revoke`, the e-mail is dropped unless `keep_email`, the device ids are
+        kept as `pre_claim_devices`, and the handle moves to a 10-minute `claimed` marker. A lost compare-and-set (the reaper or
+        the deadline won) deletes exactly the credential this call wrote and answers `409 lost_race`. After the commit the tokens
+        of each pre-claim device are revoked (`revoke_device_tokens`, never all of the user's), and the `siwx_user` cookie is set.
+        The DID, the localpart, the Synapse account and its `io.inblock.guest` marker are untouched. `200 {"state": "claimed"}`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, rawId, type, response]
+              properties:
+                id: { type: string }
+                rawId: { type: string }
+                type: { type: string }
+                response: { type: object }
+                keep_email: { type: boolean, default: false }
+      responses:
+        "200": { description: "`{\"state\": \"claimed\"}`, `Set-Cookie: siwx_user`." }
+        "400": { description: "`bad_request` (unreadable body) or `verify_failed` (attestation, no challenge, known credential id)." }
+        "401": { description: "`no_session`." }
+        "403": { description: "`claim_unavailable`." }
+        "409": { description: "`claim_in_progress`, `already_claimed` or `lost_race`." }
+        "410": { description: "`ended`." }
+        "413": { description: "Body over 16 KiB." }
+        "503": { description: "`unavailable`, or `guest_unavailable` while guest mode is off." }
+
   /guest/resume:
     get:
       tags: [Guest]
@@ -1244,8 +1319,9 @@ paths:
         other than `same-origin` is `403 forbidden_origin`); no CORS. For the issuer pages (the join page uses
         `did` to check that its local key matches before it offers "Continue as ..."); the portal does not call
         it. No secret in the body. With no live record (no cookie, unknown handle, `reaping`, past the deadline,
-        kill switch on) the answer is `200 {"state": "no_session"}`. The 10 minutes of `state: claimed` after a
-        claim arrive with S7.
+        kill switch on) the answer is `200 {"state": "no_session"}`. After a claim the cookie answers `200 {"state": "claimed"}` for 10 minutes (the claimed-handle marker, no
+        names), then `no_session`; the helper page forgets the browser key on `claimed`. `claim_allowed` is advisory: the flag, an `active`
+        record before its deadline, the host not banned and room under `guest_max_claimed`; the room-membership read is left to start and finish.
       responses:
         "200":
           description: "`{first_name, second_name, state, seconds_left, did, claim_allowed, email_present}`, or `{state: no_session}`."
@@ -1257,11 +1333,12 @@ paths:
                 properties:
                   first_name: { type: string }
                   second_name: { type: string }
-                  state: { type: string, enum: [minted, provisioning, active, no_session] }
+                  state: { type: string, enum: [minted, provisioning, active, claimed, no_session] }
                   seconds_left: { type: integer }
                   did: { type: string }
                   claim_allowed: { type: boolean, description: "Advisory: `guest_claim_enabled`." }
                   email_present: { type: boolean }
+                  client_url: { type: [string, 'null'], description: "The fixed Meet start URL (`guest_client_url`), sent with `active` and `claimed` so the claim page can lead back to the call." }
         "403": { description: "`forbidden_origin`." }
         "503": { description: "`unavailable`, or `guest_unavailable` while guest mode is off." }
 
@@ -1273,7 +1350,8 @@ paths:
       description: |
         The same page for everyone; it needs no cookie and no record. It says "This guest account is deleted;
         this browser forgets its key." and calls `forgetKey()` on this browser's key store (script
-        `/guest/assets/ended.js`). The kept-account copy after a claim arrives with S7.
+        `/guest/assets/ended.js`). For 10 minutes after a claim the script reads `/guest/resume`, sees `claimed` and draws the kept-account copy
+        (the account is kept, sign in with the passkey); it forgets the browser key in both cases.
       responses:
         "200": { description: "The page, `text/html`." }
         "503": { description: "`guest_unavailable` while guest mode is off." }

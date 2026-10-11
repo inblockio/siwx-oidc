@@ -1277,6 +1277,37 @@ pub async fn link_start(
     Ok(ccr)
 }
 
+/// Undo exactly one credential a claim verified and wrote (GP-CLM-06): the id comes from
+/// [`LinkFinishResponse`], never from a request, and `webauthn:link/{id}` must still name
+/// `expected_did` before anything is deleted. Returns whether it deleted.
+pub async fn delete_linked_credential(
+    redis: &RedisClient,
+    cred_id_b64: &str,
+    expected_did: &str,
+) -> Result<bool> {
+    let link_key = format!("{}/{}", LINK_PREFIX, cred_id_b64);
+    let Some(raw) = redis.get_raw(&link_key).await? else {
+        return Ok(false);
+    };
+    let entry: LinkEntry =
+        serde_json::from_str(&raw).map_err(|e| anyhow!("link entry unreadable: {e}"))?;
+    if entry.primary_did != expected_did {
+        return Ok(false);
+    }
+    redis
+        .del_raw(&format!("{}/{}", CREDENTIAL_PREFIX, cred_id_b64))
+        .await?;
+    redis.del_raw(&link_key).await?;
+    if let Err(e) = redis.index_remove_passkey(expected_did, cred_id_b64).await {
+        info!(
+            "webauthn claim compensation: by_did index update failed: {}",
+            e
+        );
+    }
+    siwx_oidc::credential_store::mirror_delete(expected_did, cred_id_b64).await;
+    Ok(true)
+}
+
 pub async fn link_finish(
     webauthn: &Webauthn,
     redis: &RedisClient,
@@ -1303,12 +1334,19 @@ pub async fn link_finish(
     // Store the credential persistently (same as register_finish).
     let cred_json = serde_json::to_string(&passkey)
         .map_err(|e| anyhow!("Failed to serialize passkey: {}", e))?;
-    redis
-        .set_raw(
-            &format!("{}/{}", CREDENTIAL_PREFIX, cred_id_b64),
-            &cred_json,
-        )
-        .await?;
+    //
+    // Refuse-overwrite (design 05 GP-CLM-02, gap G3): neither the credential key nor the
+    // link key may exist yet, so a request that names a known credential id can neither
+    // replace that credential nor, through a later compensation, delete it. Nothing is
+    // written when the id is known.
+    let cred_key = format!("{}/{}", CREDENTIAL_PREFIX, cred_id_b64);
+    let link_key = format!("{}/{}", LINK_PREFIX, cred_id_b64);
+    if !redis
+        .set_nx_raw_guarded(&cred_key, &link_key, &cred_json)
+        .await?
+    {
+        return Err(anyhow!("credential id already registered"));
+    }
 
     // Store the link mapping: cred_id → primary_did.
     let link_entry = LinkEntry {
@@ -1317,9 +1355,11 @@ pub async fn link_finish(
     };
     let link_json = serde_json::to_string(&link_entry)
         .map_err(|e| anyhow!("Failed to serialize link entry: {}", e))?;
-    redis
-        .set_raw(&format!("{}/{}", LINK_PREFIX, cred_id_b64), &link_json)
-        .await?;
+    if let Err(e) = redis.set_raw(&link_key, &link_json).await {
+        // The core removes its own credential when its link write fails (G2).
+        let _ = redis.del_raw(&cred_key).await;
+        return Err(e);
+    }
 
     // Maintain the webauthn:by_did reverse index against the PRIMARY (wallet) DID:
     // a linked passkey resolves to primary_did at verify time, so a returning login

@@ -895,6 +895,54 @@ impl RedisClient {
         Ok(purged)
     }
 
+    /// GP-CLM-07: the scan-free twin of [`Self::purge_identity`], for the teardown of an
+    /// UNCLAIMED guest. Deletes exactly the credentials listed in `webauthn:by_did/{did}`
+    /// (`webauthn:credential/{id}` and `webauthn:link/{id}`, with the aqua-auth mirror),
+    /// then the index key itself. It issues no `KEYS` and no `SCAN`: a credential the index
+    /// does not list is not found, which is the contract (`link_finish` and `register_finish`
+    /// write the index before they answer, and a guest DID is a `did:key` no one else
+    /// links to). Errors are collected, the sweep completes, and a partial failure is an
+    /// `Err` so the reaper retries (the index stays until every member is gone).
+    pub async fn purge_identity_by_index(&self, did: &str) -> Result<usize> {
+        let index_key = format!("{}/{}", KV_WEBAUTHN_BY_DID_PREFIX, did);
+        let mut purged = 0usize;
+        let mut errors = 0usize;
+        for cred_id in self.smembers_raw(&index_key).await? {
+            for key in [
+                format!("webauthn:credential/{cred_id}"),
+                format!("webauthn:link/{cred_id}"),
+            ] {
+                match self.del_raw(&key).await {
+                    Ok(()) => purged += 1,
+                    Err(e) => {
+                        debug!(
+                            "purge_identity_by_index: del {} failed: {}",
+                            redact_key(&key),
+                            e
+                        );
+                        errors += 1;
+                    }
+                }
+            }
+            crate::credential_store::mirror_delete(did, &cred_id).await;
+            if let Err(e) = self.srem_raw(&index_key, &cred_id).await {
+                debug!(
+                    "purge_identity_by_index: srem {} failed: {}",
+                    fingerprint(&cred_id),
+                    e
+                );
+                errors += 1;
+            }
+        }
+        if errors > 0 {
+            return Err(anyhow!(
+                "purge_identity_by_index completed with {errors} error(s)"
+            ));
+        }
+        self.del_raw(&index_key).await?;
+        Ok(purged)
+    }
+
     // -- webauthn:by_did reverse index ----------------------------------------
     //
     // `webauthn:by_did/{did}` is a Redis SET of the `cred_id_b64` values that

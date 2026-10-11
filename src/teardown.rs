@@ -12,6 +12,7 @@
 //! | 3 | `Markers` | `erased:user/<localpart>` and `erased:did/<hash>` (no TTL) | `SET`, overwritten with a fresh timestamp |
 //! | 4 | `Synapse` | `delete_user` with `erase: true` | Synapse deactivates an already deactivated user again; a 404 (no Synapse account was ever made) is tolerated when `missing_account_ok` |
 //! | 5 | `Purge` | passkeys and links of the DID (`purge_identity`), when asked for | scan and delete |
+//! | 6 | `Record` | accounts only (GP-CLM-16): a `claimed` guest record is dropped and its `guest:claimed` slot freed | one atomic script, a no-op without a claimed record |
 //!
 //! Markers come before Synapse on purpose: the erasure of a Synapse account that cannot be
 //! recorded must not happen (`reactivation_gate` reads the markers).
@@ -32,7 +33,8 @@ pub enum Step {
     Markers,
     Synapse,
     Purge,
-    /// Guest only: dropping the record, the last step.
+    /// The last step: a guest's record (the reaper), or a claimed guest's record and
+    /// `guest:claimed` slot on an account erase (GP-CLM-16).
     Record,
 }
 
@@ -159,6 +161,25 @@ pub(crate) async fn run(e: &Erasure<'_>, until: Option<Step>) -> Result<(), Tear
             .purge_identity(e.did, derive)
             .await
             .map_err(|err| at(Step::Purge)(anyhow!(err)))?;
+    } else if e.guest {
+        // GP-CLM-07: a guest's orphan credential (a `link_finish` the reaper beat) goes by
+        // the `webauthn:by_did` index, never by a keyspace scan.
+        e.redis
+            .purge_identity_by_index(e.did)
+            .await
+            .map_err(|err| at(Step::Purge)(anyhow!(err)))?;
+    }
+
+    // 6. GP-CLM-16: an erased CLAIMED guest account frees its `guest:claimed` slot and
+    // drops its record (name, e-mail), last, so a failure before it leaves the record to
+    // retry on. An account without a guest record, and a guest that is not `claimed`, are
+    // untouched. An error is returned like any other step's: the erase is idempotent and
+    // the caller repeats it.
+    if !e.guest {
+        e.redis
+            .release_claimed_guest(e.localpart)
+            .await
+            .map_err(at(Step::Record))?;
     }
     Ok(())
 }

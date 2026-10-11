@@ -1182,7 +1182,7 @@ const USER_SESSION_COOKIE: &str = "siwx_user";
 /// `Set-Cookie` value that establishes the opaque login user-session. Mirrors
 /// [`account_cookie_set`] but with `Path=/` (so it reaches the login-time
 /// `/webauthn/authenticate/start`) and the longer [`USER_SESSION_LIFETIME`].
-fn user_cookie_set(base_url: &url::Url, token: &str) -> String {
+pub(crate) fn user_cookie_set(base_url: &url::Url, token: &str) -> String {
     let secure = if base_url.scheme() == "https" {
         "; Secure"
     } else {
@@ -1907,10 +1907,11 @@ pub async fn main() {
         _ => None,
     };
 
-    let guest_router = crate::guest::routes::router(
+    let guest_router = crate::guest::routes::router_with(
         &state.config,
         state.redis_client.clone(),
         state.synapse_client.clone(),
+        Some(state.webauthn.clone()),
     );
     let introspect_state = IntrospectState::from(&state);
     let admin_token_state = AdminTokenState::from(&state);

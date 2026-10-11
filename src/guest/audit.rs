@@ -10,12 +10,14 @@
 //! | `guest_invite_created` | `POST /guest/invites` | `count` |
 //! | `guest_minted` | redeem | |
 //! | `guest_signin` | the hand-off, once a code is issued | |
-//! | `guest_refused` | a refused guest request: the host checks (`invites`), `peek` and `redeem` (`disabled`, `invalid_link`, the redeem classes), `authorize`, `refresh`, `continue` (the error code) | `route`, `reason` |
+//! | `guest_refused` | a refused guest request: the host checks (`invites`), `peek` and `redeem` (`disabled`, `invalid_link`, the redeem classes), `authorize`, `refresh`, `continue` (the error code), `claim_start` and `claim_finish` (the error code) | `route`, `reason` |
 //! | `guest_reap` | the reaper, per teardown | `reason`, `outcome`, `attempts` |
 //! | `guest_control_changed` | the reaper, when `guest:control` or `guest:banned_hosts` differ from the last tick | `disabled`, `reap_before`, `banned_hosts` |
 //! | `guest_orphan` | the orphan scan | `localpart` |
 //!
-//! `guest_claimed` is added by S7 with the claim path. Alerts: `reaping_stuck`,
+//! | `guest_claimed` | `POST /guest/claim/finish`, at the commit | `localpart`, `invite_id`, `credential` (fingerprint) |
+//!
+//! Alerts: `reaping_stuck`,
 //! `live_guests_high`, `daily_mints_high`, `refusal_burst`.
 
 use siwx_oidc::db::RedisClient;
@@ -40,6 +42,12 @@ pub async fn refused(redis: &RedisClient, route: &'static str, reason: &str) {
     if let Err(e) = redis.count_guest_refusal().await {
         debug!(error = %e, "guest audit: refusal counter unavailable");
     }
+}
+
+/// The claim committed (GP-CLM-21): who (opaque localpart), which invite, a credential
+/// fingerprint. No name, no e-mail.
+pub fn claimed(localpart: &str, invite_id: &str, credential: &str) {
+    info!(target: "guest_audit", event = "guest_claimed", localpart, invite_id, credential);
 }
 
 pub fn reap(reason: &'static str, outcome: &'static str, attempts: u64) {

@@ -190,9 +190,27 @@ impl Reaper {
     /// next tick tries again.
     pub async fn tick(&self, stop: &watch::Receiver<bool>) -> usize {
         self.control_pass().await;
+        self.claim_revoke_pass().await;
         let count = self.reap_due(stop).await;
         self.alerts().await;
         count
+    }
+
+    /// Finish the device revocation of any claim a crash interrupted (S7a): the commit puts
+    /// the localpart on `guest:claim_revoke`, the handler takes it off when done. Idempotent.
+    async fn claim_revoke_pass(&self) {
+        let pending = match self.redis.pending_claim_revokes().await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "guest reaper: guest:claim_revoke cannot be read");
+                return;
+            }
+        };
+        for localpart in pending {
+            if let Err(e) = super::claim::finish_claim_revoke(&self.redis, &localpart).await {
+                warn!(error = %e, localpart, "guest reaper: claim revocation retry failed");
+            }
+        }
     }
 
     /// The operator's switches (S6): log a change, then make the guests that
