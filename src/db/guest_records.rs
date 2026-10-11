@@ -87,6 +87,15 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
 return {n, delay}
 "#;
 
+/// A deferred teardown (a hand-off holds the record's lease). `KEYS`: 1 lease, 2 retry gate.
+/// `ARGV`: 1 owner token, 2 gate in ms. Gates the entry without counting a failure, so a
+/// later real failure still starts at the base backoff.
+const REAP_DEFERRED: &str = r#"
+redis.call('SET', KEYS[2], 'deferred', 'PX', ARGV[2])
+if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
+return 1
+"#;
+
 /// A finished teardown (erased, already gone or claimed). `KEYS`: 1 lease, 2 failure
 /// count, 3 retry gate, 4 due set. `ARGV`: 1 owner token, 2 localpart. Leaves nothing of
 /// the entry behind.
@@ -447,7 +456,7 @@ pub enum ReapCas {
     Claimed,
     Gone,
     /// A hand-off holds the lease (`lease_until` after Redis `TIME`): nothing was
-    /// changed. The caller retries after its backoff; the lease lapses within
+    /// changed. The caller retries after a short gate; the lease lapses within
     /// [`HANDOFF_LEASE_SECS`] even if the hand-off dies (#49 F3).
     Busy,
 }
@@ -765,6 +774,27 @@ impl RedisClient {
             .await
             .map_err(|e| anyhow!("guest reaper failure: {e}"))?;
         Ok((n, delay))
+    }
+
+    /// Put off the teardown of a claimed guest whose record a hand-off holds: gate the entry
+    /// for `gate_ms` and release the lease, leaving the failure count as it is.
+    pub async fn reap_deferred(&self, localpart: &str, owner: &str, gate_ms: u64) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let _: i64 = cmd("EVAL")
+            .arg(REAP_DEFERRED)
+            .arg(2)
+            .arg(reap_lease_key(localpart))
+            .arg(reap_retry_key(localpart))
+            .arg(owner)
+            .arg(gate_ms)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest reaper deferral: {e}"))?;
+        Ok(())
     }
 
     /// A claimed guest is done (erased, already gone or claimed): remove its schedule entry,
@@ -1242,8 +1272,8 @@ pub fn handoff_rate_key(localpart: &str) -> String {
 }
 
 /// `KEYS`: 1 record, 2 device set, 3 rate window. `ARGV`: 1 attempt, 2 lease secs, 3 max
-/// devices, 4 hand-offs per minute, 5 device id. Returns `{1, prior_state, acct_checked}`
-/// or `{0, reason}`.
+/// devices, 4 hand-offs per minute, 5 device id. Returns `{1, prior_state, acct_checked,
+/// added}` (`added` `'1'` when this call put the device id in the set) or `{0, reason}`.
 const HANDOFF_BEGIN: &str = r#"
 local now = tonumber(redis.call('TIME')[1])
 local f = redis.call('HMGET', KEYS[1], 'state', 'deadline', 'lease_until', 'lease_owner', 'acct_checked')
@@ -1253,15 +1283,17 @@ if (not f[2]) or tonumber(f[2]) <= now then return {0, 'not_live'} end
 if f[3] and tonumber(f[3]) > now and f[4] ~= ARGV[1] then return {0, 'busy'} end
 redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now - 60)
 if redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[4]) then return {0, 'rate'} end
+local added = '0'
 if redis.call('SISMEMBER', KEYS[2], ARGV[5]) == 0 then
   if redis.call('SCARD', KEYS[2]) >= tonumber(ARGV[3]) then return {0, 'devices'} end
   redis.call('SADD', KEYS[2], ARGV[5])
+  added = '1'
 end
 redis.call('ZADD', KEYS[3], now, ARGV[1])
 redis.call('EXPIRE', KEYS[3], 120)
 if f[1] ~= 'active' then redis.call('HSET', KEYS[1], 'state', 'provisioning') end
 redis.call('HSET', KEYS[1], 'lease_owner', ARGV[1], 'lease_until', tostring(now + tonumber(ARGV[2])), 'device_id', ARGV[5])
-return {1, f[1], f[5] or ''}
+return {1, f[1], f[5] or '', added}
 "#;
 
 /// `KEYS`: 1 record. `ARGV`: 1 attempt.
@@ -1296,9 +1328,12 @@ pub enum HandoffBegin {
     /// The lease is held. `was_active`: the account was provisioned by an earlier hand-off.
     /// `account_checked`: an earlier attempt of this record already found no foreign account
     /// under the localpart (`acct_checked`, written under the lease before `provision_user`).
+    /// `fresh_device`: this attempt added the device id to the record's set (no earlier
+    /// attempt of the record used it).
     Started {
         was_active: bool,
         account_checked: bool,
+        fresh_device: bool,
     },
     Refused(HandoffRefusal),
 }
@@ -1488,6 +1523,7 @@ impl RedisClient {
             return Ok(HandoffBegin::Started {
                 was_active: why == "active",
                 account_checked: reply.get(2).and_then(text).as_deref() == Some("1"),
+                fresh_device: reply.get(3).and_then(text).as_deref() == Some("1"),
             });
         }
         Ok(HandoffBegin::Refused(match why.as_str() {
