@@ -618,11 +618,42 @@ async fn a_device_tombstone_refuses_only_grants_authenticated_before_it() {
         RotateOutcome::Invalid(InvalidReason::Revoked),
         "a tombstone at the grant's auth_ms refuses"
     );
+    // Strictly after auth_ms, a seconds value and a non-number refuse as well.
+    for v in ["1700000000001", "1700000000", "x"] {
+        client
+            .set_ex_raw(&device_tombstone_key(&user2, "DEVB"), v, 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            rotate(&client, g.refresh_token.as_deref().unwrap()).await,
+            RotateOutcome::Invalid(InvalidReason::Revoked),
+            "tombstone {v} refuses a grant authenticated at 1_700_000_000_000"
+        );
+    }
     client
         .set_ex_raw(&device_tombstone_key(&user2, "DEVB"), "1699999999999", 60)
         .await
         .unwrap();
     rotated(rotate(&client, g.refresh_token.as_deref().unwrap()).await);
+
+    // A grant that a real sign-out missed (absent from the device index) is
+    // refused by the tombstone that sign-out planted.
+    let user3 = format!("tombm{}", nonce());
+    let m = issue(&client, &matrix_grant(&user3, "DEVM")).await;
+    let _: i64 = raw(
+        &client,
+        &["SREM", &device_idx_key(&user3, "DEVM"), m.grant_id.as_str()],
+    )
+    .await;
+    client
+        .revoke_grants_for_device(&user3, "DEVM")
+        .await
+        .unwrap();
+    assert_eq!(
+        rotate(&client, m.refresh_token.as_deref().unwrap()).await,
+        RotateOutcome::Invalid(InvalidReason::Revoked),
+        "a grant the sweep missed is refused by its tombstone"
+    );
 }
 
 #[tokio::test]
