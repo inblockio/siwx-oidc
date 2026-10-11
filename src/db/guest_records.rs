@@ -1080,6 +1080,31 @@ impl RedisClient {
         Ok(())
     }
 
+    /// Test helper: the score of `member` in `guest:due`.
+    #[doc(hidden)]
+    pub async fn due_score_for_test(&self, member: &str) -> Option<f64> {
+        let mut conn = self.pool.get().await.unwrap();
+        cmd("ZSCORE")
+            .arg(DUE_KEY)
+            .arg(member)
+            .query_async(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    /// Test helper: schedule `member` in `guest:due` at `score`.
+    #[doc(hidden)]
+    pub async fn due_add_for_test(&self, member: &str, score: i64) {
+        let mut conn = self.pool.get().await.unwrap();
+        let _: () = cmd("ZADD")
+            .arg(DUE_KEY)
+            .arg(score)
+            .arg(member)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+    }
+
     /// Test helper: set one field of a record.
     #[doc(hidden)]
     pub async fn hset_for_test(&self, key: &str, field: &str, value: &str) {
