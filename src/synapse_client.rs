@@ -140,7 +140,7 @@ pub struct AdminUsersPage {
     pub next_token: Option<String>,
 }
 
-/// The two fields of a user row the orphan scan reads.
+/// The two fields of a user row the orphan scan and the guest hand-off read.
 #[derive(Debug, Deserialize)]
 pub struct AdminUserRow {
     /// The Matrix id, `@localpart:server`.
@@ -554,6 +554,39 @@ impl SynapseClient {
             );
         }
         Ok(())
+    }
+
+    /// One account through the admin API (`GET /_synapse/admin/v2/users/{mxid}`): its
+    /// name and `user_type`, or `None` when Synapse answers 404 (no such account). A
+    /// deactivated account is still an account. Read by the guest hand-off before it
+    /// provisions a fresh guest, so it never stamps the guest marker on an account it did
+    /// not make. The body is never logged (it carries personal data).
+    pub async fn admin_get_user(
+        &self,
+        localpart: &str,
+        server_name: &str,
+    ) -> Result<Option<AdminUserRow>> {
+        let user_id = matrix_user_id(localpart, server_name);
+        let url = format!(
+            "{}/_synapse/admin/v2/users/{}",
+            self.endpoint,
+            urlencoding::encode(&user_id)
+        );
+        let resp = self
+            .admin_request(|http, token| http.get(&url).bearer_auth(token))
+            .await
+            .context("admin_get_user: request failed")?;
+        if resp.status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status.is_success() {
+            let status = resp.status;
+            warn!(%status, "admin_get_user failed");
+            anyhow::bail!("admin_get_user: HTTP {status}{}", admin_status_hint(status));
+        }
+        serde_json::from_str(&resp.body)
+            .map(Some)
+            .context("admin_get_user: invalid JSON")
     }
 
     /// Create a device for a user, or confirm that it exists, WITHOUT a

@@ -37,7 +37,9 @@ use super::layers::error;
 use crate::config::Config;
 use crate::oidc::{AuthorizeParams, CustomError};
 use crate::synapse_client::{DeviceUpsert, SynapseClient};
-use siwx_oidc::db::guest_records::{EndOutcome, GuestSession, HandoffBegin, HandoffRefusal};
+use siwx_oidc::db::guest_records::{
+    EndOutcome, GuestSession, HandoffBegin, HandoffRefusal, HANDOFF_LEASE_SECS,
+};
 use siwx_oidc::db::{
     AuthorizationRequest, ClientClass, ClientEntry, DBClient, RedisClient, SessionEntry,
     SESSION_COOKIE_NAME,
@@ -338,15 +340,19 @@ pub struct GuestGrant {
 ///
 /// 1. the fence ([`RedisClient::guest_handoff_begin`]): CAS to `provisioning` with a 120 s
 ///    lease, the write-ahead device id, the device cap and the hand-off rate;
-/// 2. `provision_user`, seeded with "First Second" plus the suffix;
-/// 3. the admin PUT of `user_type = io.inblock.guest`;
-/// 4. the admin PUT of the canonical display name (the P4 module lets a guest without it
+/// 2. on a `minted` record only, the account check: an existing account under the
+///    localpart whose `user_type` is not `io.inblock.guest` refuses with `access_denied`
+///    and the record goes back to `minted`;
+/// 3. `provision_user`, seeded with "First Second" plus the suffix;
+/// 4. the admin PUT of `user_type = io.inblock.guest`;
+/// 5. the admin PUT of the canonical display name (the P4 module lets a guest without it
 ///    only leave);
-/// 5. the device;
-/// 6. the record `active` (only for the attempt that still holds the lease).
+/// 6. the device;
+/// 7. the record `active` (only for the attempt that still holds the lease).
 ///
-/// Any failure: no code, the lease released, the record left `provisioning` (a retry
-/// re-takes it and heals), a device this attempt created deleted again. A refusal is an
+/// Steps 2 to 6 share one deadline, [`HANDOFF_STEPS_TIMEOUT`]. Any failure: no code, the
+/// lease released, the record left `provisioning` (a retry re-takes it and heals), a
+/// device this attempt created deleted again. A refusal is an
 /// error on the redirect URI.
 #[allow(clippy::too_many_arguments)]
 pub async fn provision_guest(
@@ -415,7 +421,7 @@ pub async fn provision_guest(
         .unwrap_or_else(|| format!("SIWX_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
     let attempt = uuid::Uuid::new_v4().simple().to_string();
 
-    let was_active = match redis
+    let (was_active, was_minted) = match redis
         .guest_handoff_begin(
             &localpart,
             &attempt,
@@ -425,7 +431,10 @@ pub async fn provision_guest(
         )
         .await
     {
-        Ok(HandoffBegin::Started { was_active }) => was_active,
+        Ok(HandoffBegin::Started {
+            was_active,
+            was_minted,
+        }) => (was_active, was_minted),
         Ok(HandoffBegin::Refused(HandoffRefusal::NotLive)) => {
             return Err(redirect_error(request, "access_denied"))
         }
@@ -438,6 +447,48 @@ pub async fn provision_guest(
             return Err(unavailable());
         }
     };
+
+    // Everything below runs inside the lease: past `HANDOFF_STEPS_TIMEOUT` the attempt
+    // gives up, so a slow Synapse cannot outlive the lease and race the reaper.
+    let steps_deadline = tokio::time::Instant::now() + steps_timeout();
+
+    // A record no hand-off has touched has no account yet. An account under its
+    // localpart that is not a guest's was made elsewhere (the same did:key signed in as a
+    // member): never stamp the guest marker on it, or the reaper erases it at the
+    // deadline. A `provisioning` retry skips this, as its own half-made account may not
+    // carry the marker yet.
+    if was_minted {
+        let refusal = match tokio::time::timeout_at(
+            steps_deadline,
+            synapse.admin_get_user(&localpart, server_name),
+        )
+        .await
+        {
+            Ok(Ok(None)) => None,
+            Ok(Ok(Some(row))) if row.user_type.as_deref() == Some(GUEST_USER_TYPE) => None,
+            Ok(Ok(Some(_))) => {
+                super::audit::refused(redis, "authorize", "account_exists").await;
+                Some(redirect_error(request, "access_denied"))
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "guest hand-off: the account check failed");
+                Some(unavailable())
+            }
+            Err(_) => {
+                warn!("guest hand-off: the account check timed out");
+                Some(unavailable())
+            }
+        };
+        if let Some(refusal) = refusal {
+            if let Err(e) = redis
+                .guest_handoff_release(&localpart, &attempt, Some(&device_id), true)
+                .await
+            {
+                warn!(error = %e, "guest hand-off: releasing the lease failed (it expires)");
+            }
+            return Err(refusal);
+        }
+    }
 
     let mut device_created = false;
     let steps = async {
@@ -474,8 +525,14 @@ pub async fn provision_guest(
             }
         }
         anyhow::Ok(())
-    }
-    .await;
+    };
+    // On a timeout the step in flight is dropped, so whether Synapse made the device is
+    // unknown: the write-ahead id then stays in the set (the cap counts it, the reaper
+    // deletes the account's devices either way).
+    let (steps, timed_out) = match tokio::time::timeout_at(steps_deadline, steps).await {
+        Ok(r) => (r, false),
+        Err(_) => (Err(anyhow::anyhow!("the hand-off steps timed out")), true),
+    };
 
     let activated = match steps {
         Ok(()) => redis.guest_handoff_activate(&localpart, &attempt).await,
@@ -496,7 +553,7 @@ pub async fn provision_guest(
             }
             // A device this attempt created is taken back; the write-ahead id leaves the
             // set only when no device can exist under it.
-            let mut no_device = !was_active && !device_created;
+            let mut no_device = !was_active && !device_created && !timed_out;
             if device_created {
                 no_device = synapse
                     .delete_device(&localpart, &device_id, server_name)
@@ -504,7 +561,12 @@ pub async fn provision_guest(
                     .is_ok();
             }
             if let Err(e) = redis
-                .guest_handoff_release(&localpart, &attempt, no_device.then_some(&device_id[..]))
+                .guest_handoff_release(
+                    &localpart,
+                    &attempt,
+                    no_device.then_some(&device_id[..]),
+                    false,
+                )
                 .await
             {
                 warn!(error = %e, "guest hand-off: releasing the lease failed (it expires)");
@@ -512,6 +574,26 @@ pub async fn provision_guest(
             Err(unavailable())
         }
     }
+}
+
+/// The overall cap on a hand-off's Synapse steps (the account check, provisioning, the
+/// device). Below the 120 s lease, so an attempt ends before its lease can lapse and the
+/// reaper's CAS can take the record while a step is still writing.
+pub const HANDOFF_STEPS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+const _: () = assert!(HANDOFF_STEPS_TIMEOUT.as_secs() + 20 <= HANDOFF_LEASE_SECS);
+
+#[cfg(test)]
+tokio::task_local! {
+    /// A shorter steps deadline for one test's task.
+    static STEPS_TIMEOUT_FOR_TEST: std::time::Duration;
+}
+
+fn steps_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    if let Ok(d) = STEPS_TIMEOUT_FOR_TEST.try_with(|d| *d) {
+        return d;
+    }
+    HANDOFF_STEPS_TIMEOUT
 }
 
 /// The `user_type` the P4 module and the reaper recognise a guest by.
@@ -1652,7 +1734,7 @@ mod tests {
     // ---- S4b: provisioning, context, resume, ended, claim ----------------------------
 
     use axum::extract::{Path as AxPath, State as AxState};
-    use axum::routing::{get as ax_get, post as ax_post, put as ax_put};
+    use axum::routing::{get as ax_get, post as ax_post};
     use std::sync::{Arc, Mutex};
 
     const SERVER: &str = "example.org";
@@ -1663,6 +1745,9 @@ mod tests {
         fail_marker: bool,
         fail_name: bool,
         provision_delay_ms: u64,
+        /// The admin GET of the account: `None` answers 404, `Some(row)` 200 with it.
+        existing_account: Option<Value>,
+        fail_account_check: bool,
     }
 
     #[derive(Clone, Default)]
@@ -1755,7 +1840,23 @@ mod tests {
             )
             .route(
                 "/_synapse/admin/v2/users/{mxid}",
-                ax_put(
+                ax_get(
+                    |AxState(m): AxState<MockSynapse>, AxPath(mxid): AxPath<String>| async move {
+                        rec(&m, format!("GET admin/users/{mxid}"), String::new()).await;
+                        let f = m.flags.lock().unwrap();
+                        if f.fail_account_check {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, "{}".to_string());
+                        }
+                        match &f.existing_account {
+                            None => (
+                                StatusCode::NOT_FOUND,
+                                r#"{"errcode":"M_NOT_FOUND","error":"User not found"}"#.to_string(),
+                            ),
+                            Some(row) => (StatusCode::OK, row.to_string()),
+                        }
+                    },
+                )
+                .put(
                     |AxState(m): AxState<MockSynapse>,
                      AxPath(mxid): AxPath<String>,
                      headers: HeaderMap,
@@ -1912,7 +2013,9 @@ mod tests {
         let kinds: Vec<&str> = calls
             .iter()
             .map(|c| {
-                if c.starts_with("PUT") && c.ends_with("user_type") {
+                if c.starts_with("GET admin/users/") {
+                    "account check"
+                } else if c.starts_with("PUT") && c.ends_with("user_type") {
                     "marker"
                 } else if c.starts_with("PUT") && c.ends_with("displayname") {
                     "name"
@@ -1924,13 +2027,14 @@ mod tests {
         assert_eq!(
             kinds,
             [
+                "account check",
                 "POST provision_user",
                 "marker",
                 "name",
                 "POST upsert_device",
                 "POST update_device_display_name"
             ],
-            "the order is: account, marker, canonical name, device"
+            "the order is: account check, account, marker, canonical name, device"
         );
         let seed: Value = serde_json::from_str(&mock.bodies("POST provision_user")[0]).unwrap();
         assert_eq!(
@@ -2058,6 +2162,134 @@ mod tests {
         assert_eq!(record_of(&e, &lp).await["state"], "active");
     }
 
+    /// #49 F5: a `minted` record whose localpart already has an account that is not a
+    /// guest's (the same did:key signed in as a member) is refused with `access_denied`
+    /// before anything is written to Synapse; the record goes back to `minted` with the
+    /// lease and the write-ahead device released, so the next attempt checks again.
+    #[tokio::test]
+    async fn f5_a_minted_record_refuses_an_existing_member_account() {
+        let Some((e, mock, synapse)) = guest_env(|_| {}).await else {
+            return;
+        };
+        let g = Guest::new();
+        let (lp, handle) = record(&e, &g, "minted", 600).await;
+        mock.flags.lock().unwrap().existing_account =
+            Some(json!({"name": format!("@{lp}:{SERVER}"), "user_type": null}));
+        for round in 0..2 {
+            let sid = start_session(&e, &g, &handle, "DEVICE0005").await;
+            assert_eq!(
+                redirect_error_of(sign_in_as(&e, &synapse, &sid).await),
+                "access_denied",
+                "round {round}"
+            );
+            assert_eq!(
+                mock.count("GET admin/users/"),
+                round + 1,
+                "checked each time"
+            );
+            assert_eq!(mock.count("POST provision_user"), 0, "round {round}");
+            assert_eq!(mock.count("PUT"), 0, "no marker on a member's account");
+            assert_eq!(mock.count("POST upsert_device"), 0, "round {round}");
+            let rec = record_of(&e, &lp).await;
+            assert_eq!(rec["state"], "minted", "round {round}");
+            assert!(
+                !rec.contains_key("lease_owner"),
+                "round {round}: lease released"
+            );
+            assert_eq!(
+                e.redis.scard_for_test(&format!("guest:devices/{lp}")).await,
+                0,
+                "round {round}: the write-ahead device is dropped"
+            );
+        }
+        // A failing check fails closed the same way, as `temporarily_unavailable`.
+        mock.flags.lock().unwrap().fail_account_check = true;
+        let sid = start_session(&e, &g, &handle, "DEVICE0005").await;
+        assert_eq!(
+            redirect_error_of(sign_in_as(&e, &synapse, &sid).await),
+            "temporarily_unavailable"
+        );
+        assert_eq!(mock.count("POST provision_user"), 0);
+        assert_eq!(record_of(&e, &lp).await["state"], "minted");
+    }
+
+    /// #49 F5: an existing account that already carries the guest marker is this guest's
+    /// and is provisioned over; a `provisioning` retry (its own half-made account, maybe
+    /// without the marker yet) is not checked at all.
+    #[tokio::test]
+    async fn f5_a_guest_account_proceeds_and_a_provisioning_retry_is_not_checked() {
+        let Some((e, mock, synapse)) = guest_env(|_| {}).await else {
+            return;
+        };
+        let g = Guest::new();
+        let (lp, handle) = record(&e, &g, "minted", 600).await;
+        mock.flags.lock().unwrap().existing_account =
+            Some(json!({"name": format!("@{lp}:{SERVER}"), "user_type": GUEST_USER_TYPE}));
+        let sid = start_session(&e, &g, &handle, "DEVICE0006").await;
+        assert_eq!(
+            redirect_error_of(sign_in_as(&e, &synapse, &sid).await),
+            "ok"
+        );
+        assert_eq!(mock.count("POST provision_user"), 1);
+
+        let g = Guest::new();
+        let (lp, handle) = record(&e, &g, "provisioning", 600).await;
+        mock.flags.lock().unwrap().existing_account =
+            Some(json!({"name": format!("@{lp}:{SERVER}"), "user_type": null}));
+        let before = mock.count("GET admin/users/");
+        let sid = start_session(&e, &g, &handle, "DEVICE0007").await;
+        assert_eq!(
+            redirect_error_of(sign_in_as(&e, &synapse, &sid).await),
+            "ok"
+        );
+        assert_eq!(
+            mock.count("GET admin/users/"),
+            before,
+            "no check on a retry"
+        );
+        assert_eq!(record_of(&e, &lp).await["state"], "active");
+    }
+
+    /// #54 L1: the hand-off steps share one deadline below the lease. A Synapse slower
+    /// than that ends the attempt (no code, lease released, the write-ahead device kept
+    /// because whether Synapse made it is unknown) instead of outliving the lease.
+    #[tokio::test]
+    async fn l1_hand_off_steps_slower_than_the_deadline_give_up() {
+        let Some((e, mock, synapse)) = guest_env(|_| {}).await else {
+            return;
+        };
+        mock.flags.lock().unwrap().provision_delay_ms = 2_000;
+        let g = Guest::new();
+        let (lp, handle) = record(&e, &g, "minted", 600).await;
+        let sid = start_session(&e, &g, &handle, "DEVICE0008").await;
+        let started = std::time::Instant::now();
+        let r = STEPS_TIMEOUT_FOR_TEST
+            .scope(
+                std::time::Duration::from_millis(300),
+                sign_in_as(&e, &synapse, &sid),
+            )
+            .await;
+        assert_eq!(redirect_error_of(r), "temporarily_unavailable");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_500),
+            "it did not wait for Synapse: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(mock.count("PUT"), 0, "no step after the deadline");
+        let rec = record_of(&e, &lp).await;
+        assert_eq!(rec["state"], "provisioning");
+        assert!(!rec.contains_key("lease_owner"), "lease released");
+        assert_eq!(
+            e.redis.scard_for_test(&format!("guest:devices/{lp}")).await,
+            1,
+            "the write-ahead device stays counted"
+        );
+        assert!(
+            HANDOFF_STEPS_TIMEOUT < std::time::Duration::from_secs(HANDOFF_LEASE_SECS),
+            "the deadline is below the lease"
+        );
+    }
+
     /// An expired lease may be re-taken; a live one of another attempt may not.
     #[tokio::test]
     async fn a_lease_is_live_for_120_seconds_then_free() {
@@ -2074,7 +2306,10 @@ mod tests {
         };
         assert_eq!(
             begin("a1", "d1").await,
-            HandoffBegin::Started { was_active: false }
+            HandoffBegin::Started {
+                was_active: false,
+                was_minted: true
+            }
         );
         assert_eq!(
             begin("a2", "d2").await,
@@ -2084,7 +2319,10 @@ mod tests {
         e.redis.hset_raw_for_test(&key, "lease_until", "1").await;
         assert_eq!(
             begin("a2", "d2").await,
-            HandoffBegin::Started { was_active: false },
+            HandoffBegin::Started {
+                was_active: false,
+                was_minted: false
+            },
             "an expired lease is re-taken"
         );
         assert_eq!(record_of(&e, &lp).await["lease_owner"], "a2");

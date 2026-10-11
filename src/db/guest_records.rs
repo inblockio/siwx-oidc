@@ -1274,11 +1274,15 @@ redis.call('HDEL', KEYS[1], 'lease_owner', 'lease_until')
 return 1
 "#;
 
-/// `KEYS`: 1 record, 2 device set. `ARGV`: 1 attempt, 2 device id to drop (`""` for none).
+/// `KEYS`: 1 record, 2 device set. `ARGV`: 1 attempt, 2 device id to drop (`""` for none),
+/// 3 `1` to put a `provisioning` record back to `minted`.
 const HANDOFF_RELEASE: &str = r#"
 if redis.call('HGET', KEYS[1], 'lease_owner') == ARGV[1] then
   redis.call('HDEL', KEYS[1], 'lease_owner', 'lease_until')
   if ARGV[2] ~= '' then redis.call('SREM', KEYS[2], ARGV[2]) end
+  if ARGV[3] == '1' and redis.call('HGET', KEYS[1], 'state') == 'provisioning' then
+    redis.call('HSET', KEYS[1], 'state', 'minted')
+  end
 end
 return 1
 "#;
@@ -1287,8 +1291,12 @@ return 1
 #[derive(Debug, PartialEq, Eq)]
 pub enum HandoffBegin {
     /// The lease is held. `was_active`: the account was provisioned by an earlier hand-off.
+    /// `was_minted`: no hand-off began before this one, so no account of this record can
+    /// exist yet (an earlier attempt that got as far as `provision_user` left the record
+    /// `provisioning`).
     Started {
         was_active: bool,
+        was_minted: bool,
     },
     Refused(HandoffRefusal),
 }
@@ -1477,6 +1485,7 @@ impl RedisClient {
         if int {
             return Ok(HandoffBegin::Started {
                 was_active: why == "active",
+                was_minted: why == "minted",
             });
         }
         Ok(HandoffBegin::Refused(match why.as_str() {
@@ -1510,12 +1519,15 @@ impl RedisClient {
 
     /// A failed attempt: release the lease it holds (the state stays `provisioning`, so a
     /// retry re-takes it at once) and, when `drop_device`, take the write-ahead device id
-    /// back out of the device set.
+    /// back out of the device set. `restore_minted` puts a `provisioning` record back to
+    /// `minted`: for an attempt that began on `minted` and stopped before `provision_user`,
+    /// so the next attempt runs the existing-account check again.
     pub async fn guest_handoff_release(
         &self,
         localpart: &str,
         attempt: &str,
         drop_device: Option<&str>,
+        restore_minted: bool,
     ) -> Result<()> {
         let mut conn = self
             .pool
@@ -1529,6 +1541,7 @@ impl RedisClient {
             .arg(devices_key(localpart))
             .arg(attempt)
             .arg(drop_device.unwrap_or(""))
+            .arg(if restore_minted { "1" } else { "0" })
             .query_async(&mut *conn)
             .await
             .map_err(|e| anyhow!("guest hand-off release: {e}"))?;
