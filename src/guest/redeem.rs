@@ -74,7 +74,15 @@ struct Credentials {
 
 /// Look the invite up once and compare the secret in constant time. `Ok(gate)` only
 /// when the invite exists and the secret matches; every other input is [`invalid_link`].
-async fn verify_secret(state: &GuestState, body: &[u8]) -> Result<InviteGate, Response> {
+///
+/// A refusal is counted (`route` is `"peek"` or `"redeem"`, the reason `invalid_link`) for
+/// the refusal-burst alert; the event carries neither id nor secret, and the answer is
+/// the same bytes with or without the count.
+async fn verify_secret(
+    state: &GuestState,
+    body: &[u8],
+    route: &'static str,
+) -> Result<InviteGate, Response> {
     let creds: Credentials = serde_json::from_slice(body).unwrap_or_default();
     let gate = match state.redis.read_invite_gate(&creds.invite_id).await {
         Ok(g) => g,
@@ -88,7 +96,10 @@ async fn verify_secret(state: &GuestState, body: &[u8]) -> Result<InviteGate, Re
     let matches: bool = given.as_bytes().ct_eq(expected.as_bytes()).into();
     match gate {
         Some(g) if matches => Ok(g),
-        _ => Err(invalid_link()),
+        _ => {
+            super::audit::refused(&state.redis, route, "invalid_link").await;
+            Err(invalid_link())
+        }
     }
 }
 
@@ -102,7 +113,7 @@ fn email_policy(state: &GuestState) -> EmailPolicy {
 
 /// `POST /guest/peek` `{invite_id, secret}`. Changes no state.
 pub async fn peek(State(state): State<GuestState>, body: Bytes) -> Response {
-    let gate = match verify_secret(&state, &body).await {
+    let gate = match verify_secret(&state, &body, "peek").await {
         Ok(g) => g,
         Err(r) => return r,
     };
@@ -196,7 +207,7 @@ pub(super) fn session_cookie(base_url: &url::Url, handle: &str, max_age: i64) ->
 /// `POST /guest/redeem`.
 pub async fn redeem(State(state): State<GuestState>, body: Bytes) -> Response {
     // 1. The secret.
-    let gate = match verify_secret(&state, &body).await {
+    let gate = match verify_secret(&state, &body, "redeem").await {
         Ok(g) => g,
         Err(r) => return r,
     };
@@ -1143,6 +1154,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(e.post("/guest/redeem", body).await.status, 200);
+        db.flush_db_for_test().await;
+    }
+
+    /// The invalid-link answer of peek and redeem is counted for the refusal-burst alert
+    /// (one per refused request, whatever made the link invalid), while a valid link and
+    /// the answer's bytes stay as they were.
+    #[tokio::test]
+    async fn an_invalid_link_is_counted_on_peek_and_redeem_and_answers_the_same() {
+        let Some(db) = siwx_oidc::test_support::redis_db(6).await else {
+            return;
+        };
+        db.flush_db_for_test().await;
+        let e = env_in(Some(6), None, |_| {}).await.unwrap();
+        let inv = e.invite(Kind::Open, 5).await;
+        // A valid peek is no refusal.
+        assert_eq!(e.peek(&inv).await.status, 200);
+        assert_eq!(db.guest_refusal_total_for_test().await, 0);
+        let origin = e.config.base_url.origin().ascii_serialization();
+        let mut answers = Vec::new();
+        let mut expect = 0;
+        for route in ["/guest/peek", "/guest/redeem"] {
+            for body in [
+                // an unknown id
+                json!({"invite_id": "gv_unknown", "secret": inv.secret}).to_string(),
+                // the right id, a wrong secret
+                json!({"invite_id": inv.id, "secret": "gi_wrong"}).to_string(),
+                // a body that does not parse
+                "not json".to_string(),
+            ] {
+                let r = e.post_with(route, body, Some(&origin)).await;
+                assert_eq!(
+                    (r.status, r.error()),
+                    (404, "invalid_link".into()),
+                    "{route}"
+                );
+                answers.push(r.bytes.clone());
+                expect += 1;
+                assert_eq!(
+                    db.guest_refusal_total_for_test().await,
+                    expect,
+                    "{route}: one count per refused request"
+                );
+            }
+        }
+        assert!(
+            answers.windows(2).all(|w| w[0] == w[1]),
+            "the same bytes for every reason and both routes"
+        );
+        // The valid link still works after the refusals.
+        assert_eq!(e.peek(&inv).await.status, 200);
+        assert_eq!(db.guest_refusal_total_for_test().await, expect);
         db.flush_db_for_test().await;
     }
 

@@ -618,6 +618,14 @@ fn decode_signature(s: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+/// A refusal of `POST /guest/continue`: audited as `guest_refused` (route `continue`, the
+/// error code as the reason) and counted for the burst alert, then answered. A 503 is not
+/// a refusal and does not come through here.
+async fn refuse(state: &GuestState, status: StatusCode, code: &'static str) -> Response {
+    super::audit::refused(&state.redis, "continue", code).await;
+    error(status, code)
+}
+
 /// `POST /guest/continue` `{redirect_uri, message, signature}`. 200 `{"next":"/sign_in"}`
 /// after `verified_did` is written; the page then navigates there.
 ///
@@ -631,12 +639,12 @@ pub async fn continue_post(
     body: Bytes,
 ) -> Response {
     let Ok(req) = serde_json::from_slice::<ContinueBody>(&body) else {
-        return error(StatusCode::BAD_REQUEST, "bad_request");
+        return refuse(&state, StatusCode::BAD_REQUEST, "bad_request").await;
     };
     let (session_id, mut entry, record) = match hand_off_context(&state, &headers).await {
         Ok(t) => t,
         Err("unavailable") => return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
-        Err(_) => return error(StatusCode::UNAUTHORIZED, "no_session"),
+        Err(_) => return refuse(&state, StatusCode::UNAUTHORIZED, "no_session").await,
     };
     let bound = entry
         .request
@@ -649,10 +657,10 @@ pub async fn continue_post(
         .iter()
         .any(|u| u.as_str() == req.redirect_uri);
     if !in_list || req.redirect_uri != bound {
-        return error(StatusCode::BAD_REQUEST, "redirect_not_allowed");
+        return refuse(&state, StatusCode::BAD_REQUEST, "redirect_not_allowed").await;
     }
     let Some(signature) = decode_signature(&req.signature) else {
-        return error(StatusCode::UNAUTHORIZED, "signature_invalid");
+        return refuse(&state, StatusCode::UNAUTHORIZED, "signature_invalid").await;
     };
     if let Err(why) = verify_continue_proof(
         &state.config.base_url,
@@ -663,13 +671,14 @@ pub async fn continue_post(
         &signature,
         Utc::now(),
     ) {
-        return match why {
-            ContinueError::DidMismatch => error(StatusCode::UNAUTHORIZED, "did_mismatch"),
-            ContinueError::SignatureInvalid => error(StatusCode::UNAUTHORIZED, "signature_invalid"),
-            ContinueError::NonceMismatch => error(StatusCode::BAD_REQUEST, "nonce_mismatch"),
-            ContinueError::ResourceMismatch => error(StatusCode::BAD_REQUEST, "resource_mismatch"),
-            ContinueError::Malformed => error(StatusCode::BAD_REQUEST, "bad_request"),
+        let (status, code) = match why {
+            ContinueError::DidMismatch => (StatusCode::UNAUTHORIZED, "did_mismatch"),
+            ContinueError::SignatureInvalid => (StatusCode::UNAUTHORIZED, "signature_invalid"),
+            ContinueError::NonceMismatch => (StatusCode::BAD_REQUEST, "nonce_mismatch"),
+            ContinueError::ResourceMismatch => (StatusCode::BAD_REQUEST, "resource_mismatch"),
+            ContinueError::Malformed => (StatusCode::BAD_REQUEST, "bad_request"),
         };
+        return refuse(&state, status, code).await;
     }
     entry.verified_did = Some(record.did);
     if let Err(e) = state.redis.set_session(session_id, entry).await {
@@ -1352,6 +1361,111 @@ mod tests {
         let m = message(&e, &b.guest.did, REDIRECT, &a.nonce, 0);
         let (st, j) = post(&e, &a, Some(&mixed), body(REDIRECT, &m, &b.guest.sign(&m))).await;
         assert_eq!((st, j["error"].as_str()), (401, Some("no_session")));
+    }
+
+    /// Every refusal `/guest/continue` answers is counted for the refusal-burst alert
+    /// (one per request); the success is not, and neither is a store fault.
+    #[tokio::test]
+    async fn each_continue_refusal_is_counted() {
+        let Some(db) = siwx_oidc::test_support::redis_db(5).await else {
+            return;
+        };
+        db.flush_db_for_test().await;
+        let e = env_in(Some(5), |_| {}).await.unwrap();
+        let h = hand_off(&e, "active").await;
+        let other = Guest::new();
+        let evil = "https://evil.example.net/cb";
+        let good = message(&e, &h.guest.did, REDIRECT, &h.nonce, 0);
+        let other_msg = message(&e, &other.did, REDIRECT, &h.nonce, 0);
+        let wrong_nonce = message(&e, &h.guest.did, REDIRECT, "someoneElsesNonce", 0);
+        let wrong_uri = message(
+            &e,
+            &h.guest.did,
+            "https://meet.example.org/other",
+            &h.nonce,
+            0,
+        );
+        let only_guest = format!("{}={}", guest_cookie_name(&e.config), h.handle);
+        let cases: Vec<(&str, Option<&str>, Value, u16, &str)> = vec![
+            (
+                "did_mismatch",
+                None,
+                body(REDIRECT, &other_msg, &other.sign(&other_msg)),
+                401,
+                "did_mismatch",
+            ),
+            (
+                "signature_invalid",
+                None,
+                body(REDIRECT, &good, &other.sign(&good)),
+                401,
+                "signature_invalid",
+            ),
+            (
+                "undecodable",
+                None,
+                body(REDIRECT, &good, "!!"),
+                401,
+                "signature_invalid",
+            ),
+            (
+                "nonce_mismatch",
+                None,
+                body(REDIRECT, &wrong_nonce, &h.guest.sign(&wrong_nonce)),
+                400,
+                "nonce_mismatch",
+            ),
+            (
+                "redirect_unlisted",
+                None,
+                body(
+                    "https://meet.example.org/other",
+                    &wrong_uri,
+                    &h.guest.sign(&wrong_uri),
+                ),
+                400,
+                "redirect_not_allowed",
+            ),
+            (
+                "redirect_not_allowed",
+                None,
+                body(evil, &good, &h.guest.sign(&good)),
+                400,
+                "redirect_not_allowed",
+            ),
+            ("bad_request", None, json!({"x": 1}), 400, "bad_request"),
+            (
+                "no_session",
+                Some(only_guest.as_str()),
+                body(REDIRECT, &good, &h.guest.sign(&good)),
+                401,
+                "no_session",
+            ),
+        ];
+        let mut expect = 0;
+        for (what, cookie, b, status, code) in cases {
+            let (st, j) = post(&e, &h, cookie, b).await;
+            assert_eq!((st, j["error"].as_str()), (status, Some(code)), "{what}");
+            expect += 1;
+            assert_eq!(db.guest_refusal_total_for_test().await, expect, "{what}");
+        }
+        // The resource_mismatch error (a message that binds another URI) is its own class.
+        let m = message(
+            &e,
+            &h.guest.did,
+            "https://meet.example.org/other",
+            &h.nonce,
+            0,
+        );
+        let (st, j) = post(&e, &h, None, body(REDIRECT, &m, &h.guest.sign(&m))).await;
+        assert_eq!((st, j["error"].as_str()), (400, Some("resource_mismatch")));
+        expect += 1;
+        assert_eq!(db.guest_refusal_total_for_test().await, expect);
+        // A good signature is no refusal.
+        let (st, _) = post(&e, &h, None, body(REDIRECT, &good, &h.guest.sign(&good))).await;
+        assert_eq!(st, 200);
+        assert_eq!(db.guest_refusal_total_for_test().await, expect);
+        db.flush_db_for_test().await;
     }
 
     #[tokio::test]

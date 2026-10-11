@@ -1626,6 +1626,24 @@ impl RedisClient {
         all - counters.len() as i64
     }
 
+    /// Test helper: refusals counted so far in `guest:refusals/*`, summed over the minutes
+    /// still alive (so a minute boundary inside a test cannot split the figure).
+    #[doc(hidden)]
+    pub async fn guest_refusal_total_for_test(&self) -> u64 {
+        let mut conn = self.pool.get().await.unwrap();
+        let keys: Vec<String> = cmd("KEYS")
+            .arg(format!("{REFUSAL_PREFIX}*"))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        let mut total = 0;
+        for k in keys {
+            let n: Option<u64> = cmd("GET").arg(&k).query_async(&mut *conn).await.unwrap();
+            total += n.unwrap_or(0);
+        }
+        total
+    }
+
     /// Test helper: empty this database. Only for a test that owns its database.
     #[doc(hidden)]
     pub async fn flush_db_for_test(&self) {

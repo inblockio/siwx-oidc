@@ -10,7 +10,7 @@
 //! | `guest_invite_created` | `POST /guest/invites` | `count` |
 //! | `guest_minted` | redeem | |
 //! | `guest_signin` | the hand-off, once a code is issued | |
-//! | `guest_refused` | a refused guest request | `route`, `reason` |
+//! | `guest_refused` | a refused guest request: the host checks (`invites`), `peek` and `redeem` (`disabled`, `invalid_link`, the redeem classes), `authorize`, `refresh`, `continue` (the error code) | `route`, `reason` |
 //! | `guest_reap` | the reaper, per teardown | `reason`, `outcome`, `attempts` |
 //! | `guest_control_changed` | the reaper, when `guest:control` or `guest:banned_hosts` differ from the last tick | `disabled`, `reap_before`, `banned_hosts` |
 //! | `guest_orphan` | the orphan scan | `localpart` |
