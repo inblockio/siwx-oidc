@@ -295,6 +295,128 @@ mod tests {
         }
     }
 
+    /// GP-CLM-07: an orphan credential of an unclaimed guest (as `link_finish` writes it:
+    /// credential, link, `webauthn:by_did` index) is gone after the teardown, the index with
+    /// it. "No scan" is asserted behaviourally, not by counting commands: a DECOY link whose
+    /// `primary_did` is the same guest DID but which the index does not list survives. The
+    /// scan-based `purge_identity` would find and delete it, so its survival shows that the
+    /// teardown read the index only. A claimed guest's credential is untouched.
+    #[tokio::test]
+    async fn teardown_deletes_the_credentials_in_the_by_did_index_and_scans_nothing() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (_log, synapse) = mock().await;
+        let f = fixture(&redis, "active").await;
+        let plant = |cred: &str, indexed: bool| {
+            let redis = redis.clone();
+            let did = f.did.clone();
+            let cred = cred.to_string();
+            async move {
+                redis
+                    .set_raw(&format!("webauthn:credential/{cred}"), "{\"passkey\":1}")
+                    .await
+                    .unwrap();
+                redis
+                    .set_raw(
+                        &format!("webauthn:link/{cred}"),
+                        &format!("{{\"primary_did\":\"{did}\"}}"),
+                    )
+                    .await
+                    .unwrap();
+                if indexed {
+                    redis.index_add_passkey(&did, &cred).await.unwrap();
+                }
+            }
+        };
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let (orphan_a, orphan_b, decoy) = (
+            format!("orphanA{tag}"),
+            format!("orphanB{tag}"),
+            format!("decoy{tag}"),
+        );
+        plant(&orphan_a, true).await;
+        plant(&orphan_b, true).await;
+        plant(&decoy, false).await;
+        let index = format!("webauthn:by_did/{}", f.did);
+
+        let r = teardown_guest(&redis, &synapse, "example.org", &f.localpart).await;
+        assert_eq!(r.unwrap(), GuestTeardown::Erased);
+
+        for cred in [&orphan_a, &orphan_b] {
+            assert!(redis
+                .get_raw(&format!("webauthn:credential/{cred}"))
+                .await
+                .unwrap()
+                .is_none());
+            assert!(redis
+                .get_raw(&format!("webauthn:link/{cred}"))
+                .await
+                .unwrap()
+                .is_none());
+        }
+        assert!(redis.smembers_raw(&index).await.unwrap().is_empty());
+        assert_eq!(
+            redis.scard_for_test(&index).await,
+            0,
+            "the index key is gone"
+        );
+        // The decoy proves no keyspace scan ran.
+        assert!(
+            redis
+                .get_raw(&format!("webauthn:credential/{decoy}"))
+                .await
+                .unwrap()
+                .is_some(),
+            "an unindexed credential survives: the teardown must not scan"
+        );
+        redis
+            .del_raw(&format!("webauthn:credential/{decoy}"))
+            .await
+            .unwrap();
+        redis
+            .del_raw(&format!("webauthn:link/{decoy}"))
+            .await
+            .unwrap();
+    }
+
+    /// A claimed guest is never torn down, so its credential is left alone.
+    #[tokio::test]
+    async fn a_claimed_guests_credentials_are_not_purged() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (_log, synapse) = mock().await;
+        let f = fixture(&redis, "claimed").await;
+        let cred = format!("claimedcred{}", uuid::Uuid::new_v4().simple());
+        redis
+            .set_raw(&format!("webauthn:credential/{cred}"), "{}")
+            .await
+            .unwrap();
+        redis.index_add_passkey(&f.did, &cred).await.unwrap();
+        let r = teardown_guest(&redis, &synapse, "example.org", &f.localpart).await;
+        assert_eq!(r.unwrap(), GuestTeardown::Claimed);
+        assert!(redis
+            .get_raw(&format!("webauthn:credential/{cred}"))
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            redis
+                .scard_for_test(&format!("webauthn:by_did/{}", f.did))
+                .await,
+            1
+        );
+        redis
+            .del_raw(&format!("webauthn:credential/{cred}"))
+            .await
+            .unwrap();
+        redis
+            .del_raw(&format!("webauthn:by_did/{}", f.did))
+            .await
+            .unwrap();
+    }
+
     /// A `claimed` account is never torn down, and nothing is called.
     #[tokio::test]
     async fn a_claimed_account_is_not_torn_down() {

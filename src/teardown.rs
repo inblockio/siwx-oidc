@@ -159,6 +159,13 @@ pub(crate) async fn run(e: &Erasure<'_>, until: Option<Step>) -> Result<(), Tear
             .purge_identity(e.did, derive)
             .await
             .map_err(|err| at(Step::Purge)(anyhow!(err)))?;
+    } else if e.guest {
+        // GP-CLM-07: a guest's orphan credential (a `link_finish` the reaper beat) goes by
+        // the `webauthn:by_did` index, never by a keyspace scan.
+        e.redis
+            .purge_identity_by_index(e.did)
+            .await
+            .map_err(|err| at(Step::Purge)(anyhow!(err)))?;
     }
     Ok(())
 }
