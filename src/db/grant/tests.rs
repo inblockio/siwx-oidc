@@ -546,16 +546,29 @@ async fn a_tombstoned_device_or_user_refuses_rotation_and_replay() {
         .set_ex_raw(&device_tombstone_key(&user, "DEVA"), "1", 60)
         .await
         .unwrap();
-    for t in [&a0, &a1.pair.refresh_token] {
-        assert_eq!(
-            rotate(&client, t).await,
-            RotateOutcome::Invalid(InvalidReason::Revoked)
-        );
-    }
+    // The replayed predecessor is refused and the refusal deletes the grant,
+    // so the current token then names no grant.
     assert_eq!(
-        hgetall(&client, &grant_key(&a.grant_id)).await["generation"],
-        "1"
+        rotate(&client, &a0).await,
+        RotateOutcome::Invalid(InvalidReason::Revoked)
     );
+    assert!(hgetall(&client, &grant_key(&a.grant_id)).await.is_empty());
+    assert_eq!(
+        rotate(&client, &a1.pair.refresh_token).await,
+        RotateOutcome::Invalid(InvalidReason::UnknownGrant)
+    );
+    // The current token is refused (and deletes the grant) the same way.
+    let c = issue(&client, &matrix_grant(&user, "DEVC")).await;
+    let c1 = rotated(rotate(&client, c.refresh_token.as_deref().unwrap()).await);
+    client
+        .set_ex_raw(&device_tombstone_key(&user, "DEVC"), "1", 60)
+        .await
+        .unwrap();
+    assert_eq!(
+        rotate(&client, &c1.pair.refresh_token).await,
+        RotateOutcome::Invalid(InvalidReason::Revoked)
+    );
+    assert!(hgetall(&client, &grant_key(&c.grant_id)).await.is_empty());
     // User tombstone, deviceless grant: no build writes one any more (the user
     // epoch replaced it), but one a previous build wrote still refuses for its
     // lifetime, so it is seeded the way that build planted it.
@@ -605,23 +618,16 @@ async fn a_device_tombstone_refuses_only_grants_authenticated_before_it() {
     let f1 = rotated(rotate(&client, f.refresh_token.as_deref().unwrap()).await);
     rotated(rotate(&client, &f1.pair.refresh_token).await);
 
-    // A grant authenticated before a tombstone that somehow survived it still
-    // refuses: the tombstone is compared with the grant's `auth_ms`.
-    let user2 = format!("tombb{}", nonce());
-    let g = issue(&client, &matrix_grant(&user2, "DEVB")).await; // auth_ms 1_700_000_000_000
-    client
-        .set_ex_raw(&device_tombstone_key(&user2, "DEVB"), "1700000000000", 60)
-        .await
-        .unwrap();
-    assert_eq!(
-        rotate(&client, g.refresh_token.as_deref().unwrap()).await,
-        RotateOutcome::Invalid(InvalidReason::Revoked),
-        "a tombstone at the grant's auth_ms refuses"
-    );
-    // Strictly after auth_ms, a seconds value and a non-number refuse as well.
-    for v in ["1700000000001", "1700000000", "x"] {
+    // A grant authenticated before a tombstone that somehow survived it is
+    // refused, and the refusal deletes it with its index entries (as an epoch
+    // refusal does), so it cannot rotate again once the tombstone expires.
+    // The tombstone is compared with the grant's `auth_ms`: at it, strictly
+    // after it, a seconds value and a non-number refuse.
+    for v in ["1700000000000", "1700000000001", "1700000000", "x"] {
+        let u = format!("tombb{}", nonce());
+        let g = issue(&client, &matrix_grant(&u, "DEVB")).await; // auth_ms 1_700_000_000_000
         client
-            .set_ex_raw(&device_tombstone_key(&user2, "DEVB"), v, 60)
+            .set_ex_raw(&device_tombstone_key(&u, "DEVB"), v, 60)
             .await
             .unwrap();
         assert_eq!(
@@ -629,7 +635,24 @@ async fn a_device_tombstone_refuses_only_grants_authenticated_before_it() {
             RotateOutcome::Invalid(InvalidReason::Revoked),
             "tombstone {v} refuses a grant authenticated at 1_700_000_000_000"
         );
+        let exists: i64 = raw(&client, &["EXISTS", &grant_key(&g.grant_id)]).await;
+        assert_eq!(exists, 0, "tombstone {v}: the refused grant is deleted");
+        for idx in [user_idx_key(&u), device_idx_key(&u, "DEVB")] {
+            let m: Vec<String> = raw(&client, &["SMEMBERS", &idx]).await;
+            assert!(
+                !m.iter().any(|x| x == g.grant_id.as_str()),
+                "tombstone {v}: {idx} drops the grant"
+            );
+        }
+        let _: i64 = raw(&client, &["DEL", &device_tombstone_key(&u, "DEVB")]).await;
+        assert_eq!(
+            rotate(&client, g.refresh_token.as_deref().unwrap()).await,
+            RotateOutcome::Invalid(InvalidReason::UnknownGrant),
+            "tombstone {v}: the grant stays dead after the tombstone is gone"
+        );
     }
+    let user2 = format!("tombb{}", nonce());
+    let g = issue(&client, &matrix_grant(&user2, "DEVB")).await;
     client
         .set_ex_raw(&device_tombstone_key(&user2, "DEVB"), "1699999999999", 60)
         .await
@@ -654,6 +677,8 @@ async fn a_device_tombstone_refuses_only_grants_authenticated_before_it() {
         RotateOutcome::Invalid(InvalidReason::Revoked),
         "a grant the sweep missed is refused by its tombstone"
     );
+    let exists: i64 = raw(&client, &["EXISTS", &grant_key(&m.grant_id)]).await;
+    assert_eq!(exists, 0, "the missed grant is deleted by its refusal");
 }
 
 #[tokio::test]

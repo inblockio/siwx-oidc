@@ -90,8 +90,8 @@
 //! | Grant state | Presented token | Outcome |
 //! |---|---|---|
 //! | missing | any | [`RotateOutcome::Invalid`] (`UnknownGrant`) |
-//! | user tombstone present (only as a previous build planted it), or a device tombstone planted at or after `auth_ms` | any | `Invalid` (`Revoked`) |
-//! | an epoch at or after `auth_ms` | any | `Invalid` (`Revoked`); the grant is deleted |
+//! | user tombstone present (only as a previous build planted it) | any | `Invalid` (`Revoked`) |
+//! | a device tombstone planted at or after `auth_ms`, or an epoch at or after `auth_ms` | any | `Invalid` (`Revoked`); the grant is deleted |
 //! | `last_used` + `inactivity_secs` passed, or the absolute expiry (the earlier of `absolute_exp` and `auth_time` + the cap now configured) | any | `Invalid` (`Expired`); the grant is deleted |
 //! | the request names another client | any | [`RotateOutcome::ClientMismatch`] |
 //! | confidential client, caller refuses those | any | [`RotateOutcome::ConfidentialClient`] |
@@ -539,8 +539,8 @@ pub enum InvalidReason {
     NotCurrentFormat,
     /// No grant carries this handle.
     UnknownGrant,
-    /// A user tombstone, or a device tombstone planted at or after the
-    /// grant's authentication, refuses the grant.
+    /// A user tombstone, or a device tombstone or epoch at or after the
+    /// grant's authentication, refuses the grant (the latter two delete it).
     Revoked,
     /// The grant's inactivity or absolute expiry has passed; it was deleted
     /// (by the lift: the legacy token is past the cap, and stays as it is).
@@ -952,11 +952,10 @@ return {'lifted_now'}
 /// 10 the candidate access token's `exp`, 11 the absolute-lifetime cap now
 /// configured for the grant's client (`` = none), 12 reuse enforcement (`1`:
 /// a reuse deletes the grant and its index entries through `drop_grant`, and
-/// the reply's fourth element says `revoked`, else `kept`). A user tombstone, or a device
-/// tombstone planted at or after the grant's `auth_ms`, refuses the grant
-/// (`revoked`; the user tombstone is only read, for one release, see
-/// [`RedisClient::revoke_grants_for_user`]); an epoch at or after its `auth_ms`
-/// refuses and deletes it (`revoked`, I9). The absolute expiry in force
+/// the reply's fourth element says `revoked`, else `kept`). A user tombstone
+/// refuses the grant (`revoked`; it is only read, for one release, see
+/// [`RedisClient::revoke_grants_for_user`]); a device tombstone or an epoch at
+/// or after the grant's `auth_ms` refuses and deletes it (`revoked`, I9). The absolute expiry in force
 /// is the earlier of the written `absolute_exp` and `auth_time` + cap
 /// ([`effective_absolute_exp`]); past it the grant is deleted like an
 /// inactive one, and a rotation writes it back, so a lowered cap applies at
@@ -971,6 +970,8 @@ if not f[1] or f[1] ~= ARGV[4] or f[2] ~= ARGV[5] then
   return {'invalid', 'unknown_grant'}
 end
 local grant_auth_ms = auth_ms_of(f[15], f[13])
+-- the legacy user tombstone only refuses: no build writes it any more and it
+-- lives 900 s, so it is left as it was rather than given the delete.
 if redis.call('EXISTS', KEYS[3]) == 1 then
   return {'invalid', 'revoked'}
 end
@@ -978,9 +979,14 @@ if ARGV[9] == '1' then
   -- as the issue gate: a device tombstone refuses a grant authenticated at or
   -- before it; a value that is no millisecond timestamp (a previous build
   -- wrote `1`) refuses all. A sign-in after a sign-out on the same device id rotates.
+  -- A refused grant is deleted, as the epoch branch does, so it cannot rotate
+  -- again once the tombstone expires.
   local revoked_ms = redis.call('GET', KEYS[4])
   local v = revoked_ms and tonumber(revoked_ms)
   if revoked_ms and (v == nil or v < 1000000000000 or v >= grant_auth_ms) then
+    drop_grant(KEYS[1])
+    redis.call('SREM', KEYS[5], ARGV[8])
+    redis.call('SREM', KEYS[6], ARGV[8])
     return {'invalid', 'revoked'}
   end
 end
