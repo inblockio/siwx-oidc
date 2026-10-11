@@ -121,6 +121,17 @@ where
     }
 }
 
+/// Deserializes an optional string, treating an empty or blank value as `None`,
+/// so `SIWXOIDC_RP_ID=` (a compose `${VAR:-}` default) means unset.
+fn blank_string_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty()))
+}
+
 /// Deserializes an optional absolute `http`/`https` URL, treating an empty
 /// string as `None` like [`empty_string_as_none`]. Anything else, a relative
 /// path or another scheme, is an error, so a bad value stops the server at
@@ -180,13 +191,17 @@ pub struct Config {
     /// Must be a subset of the cipher suites registered in aqua-auth.
     pub supported_pkh_namespaces: Vec<String>,
     /// WebAuthn Relying Party ID (domain). Defaults to the hostname of `base_url`.
+    /// An empty value is unset (as for `rp_origin` and `legacy_rp_id`).
+    #[serde(default, deserialize_with = "blank_string_as_none")]
     pub rp_id: Option<String>,
     /// WebAuthn expected origin. Defaults to `base_url` (scheme + host + port).
+    #[serde(default, deserialize_with = "blank_string_as_none")]
     pub rp_origin: Option<String>,
     /// The RP ID of the legacy ceremony (registration, linking, account and
     /// device flows). Setting it together with a different `rp_id` is what turns
     /// on two RPs: `rp_id` / `rp_origin` then name the unified RP. Without it
     /// there is one RP (`rp_id`, else the hostname of `base_url`).
+    #[serde(default, deserialize_with = "blank_string_as_none")]
     pub legacy_rp_id: Option<String>,
     /// The MAS shared secret (MSC3861 mode); must equal Synapse's
     /// `matrix_authentication_service.secret`. It authenticates Synapse to
@@ -550,6 +565,38 @@ mod tests {
             assert_eq!(
                 figment().extract::<Config>()?.mail_domain.as_deref(),
                 Some("matrix.example.org")
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn an_empty_webauthn_rp_variable_means_unset() {
+        // A compose file's `SIWXOIDC_RP_ID=${SIWXOIDC_RP_ID:-}` passes an empty
+        // string; it must fall back to the default RP, not name an RP "".
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWXOIDC_BASE_URL", "https://issuer.example.org");
+            jail.set_env("SIWXOIDC_RP_ID", "");
+            jail.set_env("SIWXOIDC_RP_ORIGIN", " ");
+            jail.set_env("SIWXOIDC_LEGACY_RP_ID", "");
+            let config = figment().extract::<Config>()?;
+            assert_eq!(config.rp_id, None);
+            assert_eq!(config.rp_origin, None);
+            assert_eq!(config.legacy_rp_id, None);
+            let (wa, dispatch) = crate::webauthn::build_rp_dispatch(
+                &config.base_url,
+                config.rp_id.as_deref(),
+                config.rp_origin.as_deref(),
+                config.legacy_rp_id.as_deref(),
+            )
+            .expect("an empty RP variable builds the default RP");
+            assert_eq!(wa.rp_id, "issuer.example.org");
+            assert_eq!(dispatch.legacy_rp_id, "issuer.example.org");
+            jail.set_env("SIWXOIDC_RP_ID", "example.org");
+            assert_eq!(
+                figment().extract::<Config>()?.rp_id.as_deref(),
+                Some("example.org")
             );
             Ok(())
         });
