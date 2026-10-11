@@ -736,6 +736,7 @@ async fn device_passkey_start_handler(
     Ok(Json(AuthenticateStartResponse {
         challenge: rcr,
         detected_mxid,
+        linked_passkey_login: false,
     }))
 }
 
@@ -843,6 +844,11 @@ struct AuthenticateStartBody {
     /// the signer of the first unified login. Unusable values are ignored.
     #[serde(default)]
     key_hint_spki_b64url: Option<String>,
+    /// Ask for the legacy RP (stored and wallet-linked passkeys) instead of the
+    /// unified RP. Only meaningful in a two-RP deployment; with one RP both are
+    /// the same offer.
+    #[serde(default)]
+    legacy: bool,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -874,6 +880,10 @@ struct AuthenticateStartResponse {
     challenge: RequestChallengeResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     detected_mxid: Option<String>,
+    /// True in a two-RP deployment: the login page then offers "sign in with a
+    /// linked passkey" (the legacy RP, where wallet-linked passkeys live).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    linked_passkey_login: bool,
 }
 
 async fn webauthn_authenticate_start(
@@ -891,6 +901,7 @@ async fn webauthn_authenticate_start(
     let key_hint = body
         .as_ref()
         .and_then(|Json(b)| b.key_hint_spki_b64url.clone());
+    let legacy = body.as_ref().map(|Json(b)| b.legacy).unwrap_or(false);
     let force_all = body.map(|Json(b)| b.all).unwrap_or(false)
         || query
             .all
@@ -913,7 +924,7 @@ async fn webauthn_authenticate_start(
         &state.redis_client,
         session_id,
         scope_did.as_deref(),
-        false,
+        legacy,
         key_hint.as_deref(),
     )
     .await?;
@@ -934,6 +945,7 @@ async fn webauthn_authenticate_start(
     Ok(Json(AuthenticateStartResponse {
         challenge,
         detected_mxid,
+        linked_passkey_login: state.rp_dispatch.unified.is_some(),
     }))
 }
 
@@ -2149,21 +2161,30 @@ mod unknown_credential_response_tests {
         let scoped = serde_json::to_value(AuthenticateStartResponse {
             challenge: rcr.clone(),
             detected_mxid: Some("@did-key-zdn:matrix.example.com".to_string()),
+            linked_passkey_login: true,
         })
         .unwrap();
         assert_eq!(scoped["publicKey"]["challenge"], "AAECAwQFBgcICQ");
         assert_eq!(scoped["publicKey"]["rpId"], "matrix.example.com");
         assert!(scoped["publicKey"]["allowCredentials"].is_array());
         assert_eq!(scoped["detected_mxid"], "@did-key-zdn:matrix.example.com");
+        assert_eq!(scoped["linked_passkey_login"], true);
 
         // Unscoped: extra omitted entirely; publicKey still intact.
         let unscoped = serde_json::to_value(AuthenticateStartResponse {
             challenge: rcr,
             detected_mxid: None,
+            linked_passkey_login: false,
         })
         .unwrap();
         assert_eq!(unscoped["publicKey"]["challenge"], "AAECAwQFBgcICQ");
         assert!(unscoped.get("detected_mxid").is_none());
+        assert!(unscoped.get("linked_passkey_login").is_none());
+        // The request flag defaults to the unified RP and reads `legacy: true`.
+        let default: AuthenticateStartBody = serde_json::from_str("{}").unwrap();
+        assert!(!default.legacy);
+        let legacy: AuthenticateStartBody = serde_json::from_str(r#"{"legacy":true}"#).unwrap();
+        assert!(legacy.legacy);
     }
 
     /// H3 (escape hatch): the account/device `{"all":true}` body flag forces

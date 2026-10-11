@@ -1421,10 +1421,12 @@ pub struct RpDispatch {
 
 /// Build the legacy `WebauthnConfig` and the dispatch over it.
 ///
-/// `rp_id` / `rp_origin` name the unified RP; `legacy_rp_id` names the legacy
-/// one (default: the host of `base_url`, origin `base_url`). When `rp_id` is
-/// absent or equals the legacy RP there is one RP and the legacy config is
-/// exactly what `build_webauthn(base_url, rp_id, rp_origin)` gave before.
+/// Two relying parties exist only when BOTH `legacy_rp_id` and a different
+/// `rp_id` are set: then `rp_id` / `rp_origin` name the unified RP and
+/// `legacy_rp_id` the legacy one (origin `base_url`). In every other case there
+/// is one RP and the legacy config is exactly what
+/// `build_webauthn(base_url, rp_id, rp_origin)` gave before (`legacy_rp_id`
+/// alone names that one RP; neither set means the host of `base_url`).
 pub fn build_rp_dispatch(
     base_url: &Url,
     rp_id: Option<&str>,
@@ -1434,8 +1436,13 @@ pub fn build_rp_dispatch(
     let host = base_url
         .host_str()
         .ok_or_else(|| anyhow!("SIWXOIDC_BASE_URL has no host, cannot derive WebAuthn RP ID"))?;
-    let legacy_id = legacy_rp_id.unwrap_or(host);
-    let unified_id = rp_id.filter(|id| *id != legacy_id);
+    // Two RPs are opt-in: a distinct unified RP exists only when the legacy RP
+    // is named explicitly. Without `legacy_rp_id`, `rp_id` keeps its
+    // pre-dispatch meaning (the one RP), so an existing deployment that set
+    // `SIWXOIDC_RP_ID` to a domain other than the host of `base_url` does not
+    // silently change shape on upgrade.
+    let legacy_id = legacy_rp_id.or(rp_id).unwrap_or(host);
+    let unified_id = legacy_rp_id.and(rp_id).filter(|id| *id != legacy_id);
     let legacy = if unified_id.is_none() {
         build_webauthn(base_url, Some(legacy_id), rp_origin)?
     } else {
@@ -2881,7 +2888,7 @@ mod tests {
             &Url::parse(REG_TEST_ORIGIN).unwrap(),
             Some(UNIFIED_TEST_RP),
             Some(UNIFIED_TEST_ORIGIN),
-            None,
+            Some("localhost"),
         )
         .expect("build rp dispatch");
         dispatch
@@ -3122,6 +3129,43 @@ mod tests {
         assert_eq!(dispatch.policy.entries().len(), 1);
         assert_eq!(dispatch.legacy_rp_id, cfg.base_url.host_str().unwrap());
         assert_eq!(legacy.rp_id, dispatch.legacy_rp_id);
+    }
+
+    /// An `rp_id` alone is the one RP, as before the dispatch existed: it never
+    /// turns an upgraded deployment into a two-RP one. Two RPs need
+    /// `legacy_rp_id` too (the dev shape: RP `inblock.io`, host `dev.siwx...`).
+    #[test]
+    fn rp_id_alone_stays_single_rp_and_two_rps_need_legacy_rp_id() {
+        let base = Url::parse("https://siwx.example.org").unwrap();
+        let (cfg, d) = build_rp_dispatch(
+            &base,
+            Some("example.org"),
+            Some("https://example.org"),
+            None,
+        )
+        .expect("rp_id alone");
+        assert!(d.unified.is_none(), "rp_id alone must not add a second RP");
+        assert_eq!(d.legacy_rp_id, "example.org");
+        assert_eq!(cfg.rp_id, "example.org");
+        assert_eq!(
+            d.legacy_origin, "https://example.org",
+            "rp_origin still applies"
+        );
+        assert_eq!(d.policy.entries().len(), 1);
+
+        let (_cfg, d) = build_rp_dispatch(
+            &base,
+            Some("example.org"),
+            Some("https://example.org"),
+            Some("siwx.example.org"),
+        )
+        .expect("both set");
+        assert_eq!(
+            d.unified.as_ref().map(|u| u.rp_id.as_str()),
+            Some("example.org")
+        );
+        assert_eq!(d.legacy_rp_id, "siwx.example.org");
+        assert_eq!(d.policy.entries().len(), 2);
     }
 
     // -- store-free unified login ------------------------------------------------
