@@ -557,8 +557,9 @@ impl SynapseClient {
     }
 
     /// One account through the admin API (`GET /_synapse/admin/v2/users/{mxid}`): its
-    /// name and `user_type`, or `None` when Synapse answers 404 (no such account). A
-    /// deactivated account is still an account. Read by the guest hand-off before it
+    /// name and `user_type`, or `None` when Synapse answers 404 with errcode `M_NOT_FOUND`
+    /// (no such account). Any other 404 (a proxy that hides the admin API) is an error, so
+    /// the caller fails closed. A deactivated account is still an account. Read by the guest hand-off before it
     /// provisions a fresh guest, so it never stamps the guest marker on an account it did
     /// not make. The body is never logged (it carries personal data).
     pub async fn admin_get_user(
@@ -576,7 +577,10 @@ impl SynapseClient {
             .admin_request(|http, token| http.get(&url).bearer_auth(token))
             .await
             .context("admin_get_user: request failed")?;
-        if resp.status == reqwest::StatusCode::NOT_FOUND {
+        if resp.status == reqwest::StatusCode::NOT_FOUND
+            && serde_json::from_str::<serde_json::Value>(&resp.body)
+                .is_ok_and(|v| v["errcode"] == "M_NOT_FOUND")
+        {
             return Ok(None);
         }
         if !resp.status.is_success() {

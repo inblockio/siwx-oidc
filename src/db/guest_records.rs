@@ -1242,11 +1242,11 @@ pub fn handoff_rate_key(localpart: &str) -> String {
 }
 
 /// `KEYS`: 1 record, 2 device set, 3 rate window. `ARGV`: 1 attempt, 2 lease secs, 3 max
-/// devices, 4 hand-offs per minute, 5 device id. Returns `{1, prior_state}` or
-/// `{0, reason}`.
+/// devices, 4 hand-offs per minute, 5 device id. Returns `{1, prior_state, acct_checked}`
+/// or `{0, reason}`.
 const HANDOFF_BEGIN: &str = r#"
 local now = tonumber(redis.call('TIME')[1])
-local f = redis.call('HMGET', KEYS[1], 'state', 'deadline', 'lease_until', 'lease_owner')
+local f = redis.call('HMGET', KEYS[1], 'state', 'deadline', 'lease_until', 'lease_owner', 'acct_checked')
 if not f[1] then return {0, 'no_record'} end
 if f[1] ~= 'minted' and f[1] ~= 'provisioning' and f[1] ~= 'active' then return {0, 'not_live'} end
 if (not f[2]) or tonumber(f[2]) <= now then return {0, 'not_live'} end
@@ -1261,7 +1261,14 @@ redis.call('ZADD', KEYS[3], now, ARGV[1])
 redis.call('EXPIRE', KEYS[3], 120)
 if f[1] ~= 'active' then redis.call('HSET', KEYS[1], 'state', 'provisioning') end
 redis.call('HSET', KEYS[1], 'lease_owner', ARGV[1], 'lease_until', tostring(now + tonumber(ARGV[2])), 'device_id', ARGV[5])
-return {1, f[1]}
+return {1, f[1], f[5] or ''}
+"#;
+
+/// `KEYS`: 1 record. `ARGV`: 1 attempt.
+const HANDOFF_MARK_CHECKED: &str = r#"
+if redis.call('HGET', KEYS[1], 'lease_owner') ~= ARGV[1] then return 0 end
+redis.call('HSET', KEYS[1], 'acct_checked', '1')
+return 1
 "#;
 
 /// `KEYS`: 1 record. `ARGV`: 1 attempt.
@@ -1274,15 +1281,11 @@ redis.call('HDEL', KEYS[1], 'lease_owner', 'lease_until')
 return 1
 "#;
 
-/// `KEYS`: 1 record, 2 device set. `ARGV`: 1 attempt, 2 device id to drop (`""` for none),
-/// 3 `1` to put a `provisioning` record back to `minted`.
+/// `KEYS`: 1 record, 2 device set. `ARGV`: 1 attempt, 2 device id to drop (`""` for none).
 const HANDOFF_RELEASE: &str = r#"
 if redis.call('HGET', KEYS[1], 'lease_owner') == ARGV[1] then
   redis.call('HDEL', KEYS[1], 'lease_owner', 'lease_until')
   if ARGV[2] ~= '' then redis.call('SREM', KEYS[2], ARGV[2]) end
-  if ARGV[3] == '1' and redis.call('HGET', KEYS[1], 'state') == 'provisioning' then
-    redis.call('HSET', KEYS[1], 'state', 'minted')
-  end
 end
 return 1
 "#;
@@ -1291,12 +1294,11 @@ return 1
 #[derive(Debug, PartialEq, Eq)]
 pub enum HandoffBegin {
     /// The lease is held. `was_active`: the account was provisioned by an earlier hand-off.
-    /// `was_minted`: no hand-off began before this one, so no account of this record can
-    /// exist yet (an earlier attempt that got as far as `provision_user` left the record
-    /// `provisioning`).
+    /// `account_checked`: an earlier attempt of this record already found no foreign account
+    /// under the localpart (`acct_checked`, written under the lease before `provision_user`).
     Started {
         was_active: bool,
-        was_minted: bool,
+        account_checked: bool,
     },
     Refused(HandoffRefusal),
 }
@@ -1485,7 +1487,7 @@ impl RedisClient {
         if int {
             return Ok(HandoffBegin::Started {
                 was_active: why == "active",
-                was_minted: why == "minted",
+                account_checked: reply.get(2).and_then(text).as_deref() == Some("1"),
             });
         }
         Ok(HandoffBegin::Refused(match why.as_str() {
@@ -1495,6 +1497,27 @@ impl RedisClient {
             "not_live" | "no_record" => HandoffRefusal::NotLive,
             _ => return Err(anyhow!("guest hand-off begin: unknown refusal")),
         }))
+    }
+
+    /// Records that this attempt found no foreign account under the localpart
+    /// (`acct_checked = 1`), only while it holds the lease; `false` when it lost the lease.
+    /// Written before `provision_user`, so every later attempt that skips the account
+    /// check does so because a check passed, never because of the state alone.
+    pub async fn guest_handoff_mark_checked(&self, localpart: &str, attempt: &str) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let n: i64 = cmd("EVAL")
+            .arg(HANDOFF_MARK_CHECKED)
+            .arg(1)
+            .arg(guest_account_key(localpart))
+            .arg(attempt)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest hand-off mark checked: {e}"))?;
+        Ok(n == 1)
     }
 
     /// The last step of a hand-off: `provisioning` (or `active`) to `active` and the
@@ -1519,15 +1542,12 @@ impl RedisClient {
 
     /// A failed attempt: release the lease it holds (the state stays `provisioning`, so a
     /// retry re-takes it at once) and, when `drop_device`, take the write-ahead device id
-    /// back out of the device set. `restore_minted` puts a `provisioning` record back to
-    /// `minted`: for an attempt that began on `minted` and stopped before `provision_user`,
-    /// so the next attempt runs the existing-account check again.
+    /// back out of the device set.
     pub async fn guest_handoff_release(
         &self,
         localpart: &str,
         attempt: &str,
         drop_device: Option<&str>,
-        restore_minted: bool,
     ) -> Result<()> {
         let mut conn = self
             .pool
@@ -1541,7 +1561,6 @@ impl RedisClient {
             .arg(devices_key(localpart))
             .arg(attempt)
             .arg(drop_device.unwrap_or(""))
-            .arg(if restore_minted { "1" } else { "0" })
             .query_async(&mut *conn)
             .await
             .map_err(|e| anyhow!("guest hand-off release: {e}"))?;
