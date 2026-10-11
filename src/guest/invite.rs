@@ -44,6 +44,8 @@ pub struct GuestState {
     /// signing key when one is configured (so it survives a restart and is the same
     /// on every instance), else random per process.
     pub(super) nonce_key: NonceKey,
+    /// The WebAuthn relying party of the claim ceremony (S7); `None` leaves the claim off.
+    pub(super) webauthn: Option<Arc<webauthn_rs::Webauthn>>,
 }
 
 impl GuestState {
@@ -57,7 +59,13 @@ impl GuestState {
             redis,
             synapse,
             nonce_key,
+            webauthn: None,
         }
+    }
+
+    pub fn with_webauthn(mut self, webauthn: Option<Arc<webauthn_rs::Webauthn>>) -> Self {
+        self.webauthn = webauthn;
+        self
     }
 }
 

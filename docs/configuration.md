@@ -402,14 +402,14 @@ When guest mode is on, start-up refuses:
 | `guest_name_suffix` | `SIWXOIDC_GUEST_NAME_SUFFIX` | ` (Guest)` | Appended to the typed name to make the guest's display name ("First Second (Guest)"). It seeds the account and is written again, as the canonical name, in the second admin PUT of the hand-off. |
 | `guest_email_policy` | `SIWXOIDC_GUEST_EMAIL_POLICY` | `off` | `off` (no address accepted), `optional` or `required`: whether a guest gives an e-mail address at redeem. The same for every invitation. |
 | `guest_allow_open_links` | `SIWXOIDC_GUEST_ALLOW_OPEN_LINKS` | `false` | Allow invitations any holder of the link can use. |
-| `guest_claim_enabled` | `SIWXOIDC_GUEST_CLAIM_ENABLED` | `false` | Allow a guest to claim a persistent account. |
+| `guest_claim_enabled` | `SIWXOIDC_GUEST_CLAIM_ENABLED` | `false` | Allow a guest to claim a persistent account (`POST /guest/claim/start` and `/finish`, S7a). Needs `matrix_server_name` and a Synapse client (the gate reads the account and the room membership). The claimed account stays confined (the `io.inblock.guest` marker stays) until an operator promotes it. |
 | `guest_max_guests` | `SIWXOIDC_GUEST_MAX_GUESTS` | `10` | Guests per invitation. |
 | `guest_host_max_invites` | `SIWXOIDC_GUEST_HOST_MAX_INVITES` | `5` | Live invitations per host. |
 | `guest_host_max_live_guests` | `SIWXOIDC_GUEST_HOST_MAX_LIVE_GUESTS` | `25` | Live guests per host. |
 | `guest_host_invites_per_hour` | `SIWXOIDC_GUEST_HOST_INVITES_PER_HOUR` | `20` | Invitations a host may create per hour. |
 | `guest_global_max_active` | `SIWXOIDC_GUEST_GLOBAL_MAX_ACTIVE` | `50` | Active guests across the deployment. |
 | `guest_daily_mint_max` | `SIWXOIDC_GUEST_DAILY_MINT_MAX` | `500` | Guest identities minted per day across the deployment. |
-| `guest_max_claimed` | `SIWXOIDC_GUEST_MAX_CLAIMED` | `200` | Claimed guest accounts across the deployment. |
+| `guest_max_claimed` | `SIWXOIDC_GUEST_MAX_CLAIMED` | `200` | Claimed guest accounts across the deployment: the members of `guest:claimed`; only an erase of a claimed account frees a slot. |
 | `guest_max_devices` | `SIWXOIDC_GUEST_MAX_DEVICES` | `8` | Devices per guest. A ninth device hand-off gets `temporarily_unavailable` on the redirect URI. |
 | `guest_handoff_per_minute` | `SIWXOIDC_GUEST_HANDOFF_PER_MINUTE` | `3` | Device hand-offs per guest per minute (a sliding 60 s window per record). A fourth gets `temporarily_unavailable` on the redirect URI. |
 | `guest_open_link_max_uses` | `SIWXOIDC_GUEST_OPEN_LINK_MAX_USES` | `10` | Uses of one open link. |

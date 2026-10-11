@@ -67,7 +67,7 @@ fn strip_marker(scope: &str) -> String {
 }
 
 /// The value of cookie `name` in the request's `Cookie` headers.
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(super) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(header::COOKIE)
         .iter()
@@ -79,7 +79,7 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 /// The guest session cookie's name: `__Host-` on https, plain on http development.
-fn guest_cookie_name(config: &Config) -> &'static str {
+pub(super) fn guest_cookie_name(config: &Config) -> &'static str {
     if config.base_url.scheme() == "https" {
         "__Host-guest_session"
     } else {
@@ -126,7 +126,7 @@ pub async fn guest_refresh_allowed(
 
 /// The refusals of contract section 6 (and the operator's `disabled` and `reap_before`), as a function of what was read. A record that
 /// is gone, `reaping` or in a state this build does not know refuses; a `claimed` account
-/// is a persistent account and is not this guard's (S7).
+/// is a persistent account and is not this guard's.
 pub fn refresh_verdict(read: &siwx_oidc::db::guest_records::GuestRefreshRead) -> bool {
     match read.state.as_deref() {
         Some("claimed") => true,
@@ -698,7 +698,7 @@ pub async fn continue_post(
 
 const ENDED_HTML: &str = include_str!("../../static/guest/ended.html");
 
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+pub(super) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.split_once(' ')?;
     (scheme.eq_ignore_ascii_case("bearer") && !token.trim().is_empty()).then(|| token.trim())
@@ -772,7 +772,18 @@ pub async fn end(State(state): State<GuestState>, headers: HeaderMap) -> Respons
         };
         match state.redis.read_guest_session(&handle).await {
             Ok(Some(r)) => r.localpart,
-            Ok(None) => return ended_response(&state.config, "ended"),
+            Ok(None) => {
+                // A guest that claimed in the last ten minutes still holds this cookie: the
+                // account is kept, nothing is ended (409, like the Bearer path).
+                return match state.redis.read_claimed_handle(&handle).await {
+                    Ok(Some(_)) => error(StatusCode::CONFLICT, "claimed"),
+                    Ok(None) => ended_response(&state.config, "ended"),
+                    Err(e) => {
+                        warn!(error = %e, "guest end: claimed marker unreadable");
+                        error(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+                    }
+                };
+            }
             Err(e) => {
                 warn!(error = %e, "guest end: record lookup failed");
                 return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
@@ -801,14 +812,47 @@ fn ended_response(config: &Config, state: &str) -> Response {
     response
 }
 
+/// Whether the cookie's handle still maps to a claimed account (the ten minutes after a
+/// claim). `Err(())`: Redis could not be read.
+async fn claimed_marker(state: &GuestState, headers: &HeaderMap) -> Result<bool, ()> {
+    let Some(handle) = cookie_value(headers, guest_cookie_name(&state.config)) else {
+        return Ok(false);
+    };
+    match state.redis.read_claimed_handle(&handle).await {
+        Ok(found) => Ok(found.is_some()),
+        Err(e) => {
+            warn!(error = %e, "guest resume: claimed marker unreadable");
+            Err(())
+        }
+    }
+}
+
+/// The advisory `claim_allowed` (05 section 3.3): the flag, an `active` record before its
+/// deadline, the host not banned, and room under `guest_max_claimed`. The admission read of
+/// CP-11 is left to start and finish (resume stays a Redis-only read). A fault is `false`.
+async fn claim_allowed(state: &GuestState, localpart: &str) -> bool {
+    if !state.config.guest_claim_enabled || state.webauthn.is_none() {
+        return false;
+    }
+    match state.redis.read_claim(localpart).await {
+        Ok(Some(c)) => {
+            c.state == "active"
+                && c.deadline.is_some_and(|d| c.now < d)
+                && !c.host_banned
+                && c.claimed_count < state.config.guest_max_claimed
+        }
+        _ => false,
+    }
+}
+
 /// `GET /guest/resume`: what the issuer pages need to greet a returning guest. The
 /// cookie authorises it; a request that says it comes from another origin is refused
 /// (the cookie is `SameSite=Lax`, and the answer carries no CORS header, so this is the
 /// belt on top of the braces). No secret in the body. No live record (no cookie, unknown
 /// handle, reaping, past the deadline, kill switch on) is `{"state": "no_session"}`.
 ///
-/// S7 adds `state: claimed` for 10 minutes after a claim; until then a claimed record is
-/// `no_session` like any other record that is not live.
+/// After a claim the cookie answers `{"state": "claimed"}` for 10 minutes (the claimed-handle
+/// marker), then `no_session`; the helper page forgets the browser key on `claimed`.
 pub async fn resume(State(state): State<GuestState>, headers: HeaderMap) -> Response {
     let issuer = super::layers::issuer_origin(&state.config.base_url);
     let foreign_origin = headers
@@ -828,7 +872,11 @@ pub async fn resume(State(state): State<GuestState>, headers: HeaderMap) -> Resp
         }
     };
     let body = match record {
-        None => json!({"state": "no_session"}),
+        None => match claimed_marker(&state, &headers).await {
+            Ok(true) => json!({"state": "claimed"}),
+            Ok(false) => json!({"state": "no_session"}),
+            Err(()) => return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        },
         Some(r) => match state.redis.read_guest_resume(&r.localpart).await {
             Ok(Some(v)) => json!({
                 "first_name": v.first_name,
@@ -836,7 +884,7 @@ pub async fn resume(State(state): State<GuestState>, headers: HeaderMap) -> Resp
                 "state": v.state,
                 "seconds_left": (r.deadline - r.now).max(0),
                 "did": v.did,
-                "claim_allowed": state.config.guest_claim_enabled,
+                "claim_allowed": claim_allowed(&state, &r.localpart).await,
                 "email_present": v.email_present,
             }),
             Ok(None) => json!({"state": "no_session"}),
@@ -856,7 +904,8 @@ pub async fn resume(State(state): State<GuestState>, headers: HeaderMap) -> Resp
 /// `GET /guest/ended`: the page a portal sends a guest to after `invalid_grant`. The same
 /// bytes for everyone: it needs no cookie and no record (the guest account is gone by the
 /// time anyone reads it), says the account is deleted and calls `forgetKey()` on this
-/// browser's key store. The kept-account copy after a claim is S7.
+/// browser's key store. After a claim (ten minutes) the page reads
+/// `resume`, says the account is kept and still forgets the browser key.
 pub async fn ended_page() -> Response {
     (
         [

@@ -12,6 +12,7 @@ use axum::{
     Router,
 };
 
+use super::claim;
 use super::handoff;
 use super::invite::{self, GuestState};
 use super::redeem;
@@ -78,10 +79,22 @@ async fn asset(axum::extract::Path(file): axum::extract::Path<String>) -> Respon
     }
 }
 
-/// The guest router, merged into the app after the global CORS layer.
+/// The guest router, merged into the app after the global CORS layer. The tests build it
+/// without the claim ceremony; the app uses [`router_with`].
+#[cfg(test)]
 pub fn router(config: &Config, redis: RedisClient, synapse: Option<Arc<SynapseClient>>) -> Router {
+    router_with(config, redis, synapse, None)
+}
+
+/// [`router`] with the WebAuthn relying party the claim ceremony needs (S7).
+pub fn router_with(
+    config: &Config,
+    redis: RedisClient,
+    synapse: Option<Arc<SynapseClient>>,
+    webauthn: Option<Arc<webauthn_rs::Webauthn>>,
+) -> Router {
     // Authorised by the guest cookie or by nothing: origin-checked, no CORS.
-    let state = GuestState::new(config.clone(), redis, synapse);
+    let state = GuestState::new(config.clone(), redis, synapse).with_webauthn(webauthn);
     let cookie_routes = Router::new()
         .route("/guest/peek", post(redeem::peek))
         .route("/guest/redeem", post(redeem::redeem))
@@ -92,6 +105,12 @@ pub fn router(config: &Config, redis: RedisClient, synapse: Option<Arc<SynapseCl
         )
         // The issuer pages' read of the cookie's record, and the ended page (no cookie
         // needed: it only draws the copy and forgets this browser's key).
+        // The claim (S7a): the cookie alone authorises it, a Bearer token is refused.
+        .route("/guest/claim/start", post(claim::start))
+        .route(
+            "/guest/claim/finish",
+            post(claim::finish).layer(super::layers::claim_body_limit()),
+        )
         .route("/guest/resume", get(handoff::resume))
         .route("/guest/ended", get(handoff::ended_page))
         // Top-level navigations and sub-resources of the join page: GET, so the

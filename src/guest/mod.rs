@@ -9,6 +9,7 @@ use crate::config::Config;
 use url::Url;
 
 pub mod audit;
+pub mod claim;
 pub mod handoff;
 pub mod invite;
 pub mod layers;

@@ -805,6 +805,295 @@ fn parse_redeem(reply: &[Value]) -> Result<RedeemOutcome> {
     }
 }
 
+// ---------------------------------------------------------------------------------
+// The claim (S7a, design 05 section 4.3)
+// ---------------------------------------------------------------------------------
+
+/// `guest:claimed`: SET of the localparts of claimed accounts (the `guest_max_claimed` count).
+pub const CLAIMED_KEY: &str = "guest:claimed";
+/// `guest:claim_revoke`: SET of claimed localparts whose pre-claim devices are not yet revoked.
+pub const CLAIM_REVOKE_KEY: &str = "guest:claim_revoke";
+/// How long the handle of a claimed guest still resolves, for `resume` and a retry.
+pub const CLAIMED_HANDLE_SECS: u64 = 600;
+/// The single-flight lock of one guest's `claim/finish`.
+pub const CLAIM_LOCK_SECS: u64 = 30;
+
+/// `guest:claimed_handle/{sha256(handle)}`: the localpart, `CLAIMED_HANDLE_SECS`, no personal data.
+pub fn claimed_handle_key(handle_sha256_hex: &str) -> String {
+    format!("guest:claimed_handle/{handle_sha256_hex}")
+}
+/// `claim_lock/{sha256(handle)}`.
+pub fn claim_lock_key(handle_sha256_hex: &str) -> String {
+    format!("claim_lock/{handle_sha256_hex}")
+}
+/// The lowercase hex SHA-256 of a cookie handle, the form every handle-keyed key uses.
+pub fn handle_hash(handle: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(handle.as_bytes()))
+}
+
+/// The commit: `active` to `claimed`, atomically with everything that makes it final.
+/// `KEYS`: 1 record, 2 due, 3 claimed set, 4 claim_revoke set, 5 device set, 6 claimed
+/// handle, 7 handle. `ARGV`: 1 localpart, 2 max claimed, 3 credential id, 4 keep_email
+/// (`1`/`0`), 5 marker secs, 6 by_invite prefix.
+/// Returns `claimed`, `already`, `capped`, `gone` or `lost` (not `active`, past the
+/// deadline by Redis `TIME`, or promoted). A refusal writes nothing.
+const COMMIT_CLAIM: &str = r#"
+local f = redis.call('HMGET', KEYS[1], 'state', 'deadline', 'invite_id')
+if not f[1] then return 'gone' end
+if f[1] == 'claimed' then return 'already' end
+if f[1] ~= 'active' then return 'lost' end
+local now = tonumber(redis.call('TIME')[1])
+local d = tonumber(f[2])
+if not d or now >= d then return 'lost' end
+if redis.call('HEXISTS', KEYS[1], 'promoted_at') == 1 then return 'lost' end
+if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 0
+   and redis.call('SCARD', KEYS[3]) >= tonumber(ARGV[2]) then return 'capped' end
+local devices = redis.call('SMEMBERS', KEYS[5])
+table.sort(devices)
+redis.call('HSET', KEYS[1], 'state', 'claimed', 'claimed_at', tostring(now),
+  'claim_credential', ARGV[3], 'pre_claim_devices', table.concat(devices, ','))
+redis.call('HDEL', KEYS[1], 'deadline')
+if ARGV[4] ~= '1' then redis.call('HDEL', KEYS[1], 'email') end
+redis.call('ZREM', KEYS[2], ARGV[1])
+if f[3] then redis.call('SREM', ARGV[6] .. f[3], ARGV[1]) end
+redis.call('SADD', KEYS[3], ARGV[1])
+redis.call('SADD', KEYS[4], ARGV[1])
+redis.call('DEL', KEYS[7])
+redis.call('SET', KEYS[6], ARGV[1], 'EX', tonumber(ARGV[5]))
+return 'claimed'
+"#;
+
+/// Release the claim lock only when it is still ours. `KEYS`: 1 lock. `ARGV`: 1 token.
+const CLAIM_UNLOCK: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+return 0
+"#;
+
+/// What the claim gate reads of a record, in one round trip, with Redis `TIME`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimRead {
+    pub localpart: String,
+    pub did: String,
+    pub state: String,
+    pub deadline: Option<i64>,
+    pub now: i64,
+    pub invite_id: String,
+    pub room_id: String,
+    pub host: String,
+    pub first_name: String,
+    pub second_name: String,
+    pub email_present: bool,
+    pub host_banned: bool,
+    /// Members of `guest:claimed`.
+    pub claimed_count: u64,
+}
+
+/// What [`RedisClient::commit_guest_claim`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimCas {
+    /// `active` to `claimed`.
+    Claimed,
+    /// Already `claimed`.
+    Already,
+    /// `guest_max_claimed` reached.
+    Capped,
+    /// Not `active`, past the deadline, or promoted: the reaper (or the clock) won.
+    Lost,
+    /// No record.
+    Gone,
+}
+
+impl RedisClient {
+    /// The record behind a claim, for the gate (CP-02/03/04 and the cap).
+    pub async fn read_claim(&self, localpart: &str) -> Result<Option<ClaimRead>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let (f, (secs, _), count): (HashMap<String, String>, (String, String), u64) =
+            bb8_redis::redis::pipe()
+                .cmd("HGETALL")
+                .arg(guest_account_key(localpart))
+                .cmd("TIME")
+                .cmd("SCARD")
+                .arg(CLAIMED_KEY)
+                .query_async(&mut *conn)
+                .await
+                .map_err(|e| anyhow!("guest claim read: {e}"))?;
+        let (Some(state), Some(did)) = (f.get("state"), f.get("did")) else {
+            return Ok(None);
+        };
+        let host = f.get("host").cloned().unwrap_or_default();
+        let host_banned: i64 = cmd("SISMEMBER")
+            .arg(BANNED_HOSTS_KEY)
+            .arg(&host)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest claim read: {e}"))?;
+        let get = |k: &str| f.get(k).cloned().unwrap_or_default();
+        Ok(Some(ClaimRead {
+            localpart: localpart.to_string(),
+            did: did.clone(),
+            state: state.clone(),
+            deadline: f.get("deadline").and_then(|d| d.parse().ok()),
+            now: secs.parse().map_err(|e| anyhow!("guest claim read: {e}"))?,
+            invite_id: get("invite_id"),
+            room_id: get("room_id"),
+            host,
+            first_name: get("first_name"),
+            second_name: get("second_name"),
+            email_present: f.get("email").is_some_and(|e| !e.is_empty()),
+            host_banned: host_banned == 1,
+            claimed_count: count,
+        }))
+    }
+
+    /// The localpart a cookie handle maps to for `CLAIMED_HANDLE_SECS` after a claim.
+    pub async fn read_claimed_handle(&self, handle: &str) -> Result<Option<String>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        cmd("GET")
+            .arg(claimed_handle_key(&handle_hash(handle)))
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest claimed handle: {e}"))
+    }
+
+    /// `SET claim_lock/{h} {token} NX EX 30`. `false`: another finish holds it.
+    pub async fn take_claim_lock(&self, hash: &str, token: &str) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let set: Option<String> = cmd("SET")
+            .arg(claim_lock_key(hash))
+            .arg(token)
+            .arg("NX")
+            .arg("EX")
+            .arg(CLAIM_LOCK_SECS)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("claim lock: {e}"))?;
+        Ok(set.is_some())
+    }
+
+    /// Give the claim lock back (only if the token is still ours). Best effort.
+    pub async fn release_claim_lock(&self, hash: &str, token: &str) {
+        let Ok(mut conn) = self.pool.get().await else {
+            return;
+        };
+        let _: Result<i64, _> = cmd("EVAL")
+            .arg(CLAIM_UNLOCK)
+            .arg(1)
+            .arg(claim_lock_key(hash))
+            .arg(token)
+            .query_async(&mut *conn)
+            .await;
+    }
+
+    /// The commit point of the claim ([`COMMIT_CLAIM`]).
+    pub async fn commit_guest_claim(
+        &self,
+        localpart: &str,
+        hash: &str,
+        credential_id: &str,
+        max_claimed: u64,
+        keep_email: bool,
+    ) -> Result<ClaimCas> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let out: String = cmd("EVAL")
+            .arg(COMMIT_CLAIM)
+            .arg(7)
+            .arg(guest_account_key(localpart))
+            .arg(DUE_KEY)
+            .arg(CLAIMED_KEY)
+            .arg(CLAIM_REVOKE_KEY)
+            .arg(devices_key(localpart))
+            .arg(claimed_handle_key(hash))
+            .arg(handle_key(hash))
+            .arg(localpart)
+            .arg(max_claimed)
+            .arg(credential_id)
+            .arg(if keep_email { "1" } else { "0" })
+            .arg(CLAIMED_HANDLE_SECS)
+            .arg(BY_INVITE_PREFIX)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest claim commit: {e}"))?;
+        Ok(match out.as_str() {
+            "claimed" => ClaimCas::Claimed,
+            "already" => ClaimCas::Already,
+            "capped" => ClaimCas::Capped,
+            "gone" => ClaimCas::Gone,
+            _ => ClaimCas::Lost,
+        })
+    }
+
+    /// The device ids a claim revokes (the record's `pre_claim_devices`).
+    pub async fn read_pre_claim_devices(&self, localpart: &str) -> Result<Vec<String>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let v: Option<String> = cmd("HGET")
+            .arg(guest_account_key(localpart))
+            .arg("pre_claim_devices")
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest claim devices: {e}"))?;
+        Ok(v.unwrap_or_default()
+            .split(',')
+            .filter(|d| !d.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// The claims whose revocation a crash may have left unfinished.
+    pub async fn pending_claim_revokes(&self) -> Result<Vec<String>> {
+        self.smembers_raw(CLAIM_REVOKE_KEY).await
+    }
+
+    /// The revocation of this claim is done.
+    pub async fn claim_revoke_done(&self, localpart: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let _: i64 = cmd("SREM")
+            .arg(CLAIM_REVOKE_KEY)
+            .arg(localpart)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest claim revoke done: {e}"))?;
+        Ok(())
+    }
+
+    /// Test helper: set one field of a record.
+    #[doc(hidden)]
+    pub async fn hset_for_test(&self, key: &str, field: &str, value: &str) {
+        let mut conn = self.pool.get().await.unwrap();
+        let _: () = cmd("HSET")
+            .arg(key)
+            .arg(field)
+            .arg(value)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+    }
+}
+
 /// How long a hand-off holds its lease on the record. An expired lease may be re-taken.
 pub const HANDOFF_LEASE_SECS: u64 = 120;
 
