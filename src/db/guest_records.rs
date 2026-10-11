@@ -1059,6 +1059,38 @@ impl RedisClient {
             .collect())
     }
 
+    /// GP-CLM-26: whether `device_id` is one of the `pre_claim_devices` kept on the guest
+    /// record of this DID (modern or legacy localpart). One pipelined round trip of two
+    /// `HGET`s, no scan. An account with no guest record has no such field, so the answer
+    /// is `false` for every ordinary account. A Redis error is an `Err`: the caller fails
+    /// closed, since the error hides whether a record exists.
+    pub async fn device_is_pre_claim_for_did(&self, did: &str, device_id: &str) -> Result<bool> {
+        let modern = crate::mxid::localpart_for(did);
+        let legacy = crate::mxid::legacy_localpart(did);
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let mut pipe = bb8_redis::redis::pipe();
+        pipe.cmd("HGET")
+            .arg(guest_account_key(&modern))
+            .arg("pre_claim_devices");
+        if legacy != modern {
+            pipe.cmd("HGET")
+                .arg(guest_account_key(&legacy))
+                .arg("pre_claim_devices");
+        }
+        let lists: Vec<Option<String>> = pipe
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest pre-claim devices: {e}"))?;
+        Ok(lists
+            .into_iter()
+            .flatten()
+            .any(|l| l.split(',').any(|d| d == device_id)))
+    }
+
     /// The claims whose revocation a crash may have left unfinished.
     pub async fn pending_claim_revokes(&self) -> Result<Vec<String>> {
         self.smembers_raw(CLAIM_REVOKE_KEY).await

@@ -3139,6 +3139,11 @@ pub async fn provision_synapse_device(
 /// generic-class client whose request grants it no `openid`.
 const GENERIC_OPENID_REQUIRED_MSG: &str = "This client must request the openid scope.";
 
+/// What `sign_in` answers (a 400, as for an invalid scope) when the scope proposes a device
+/// id the account held before its guest claim (GP-CLM-26).
+const PRE_CLAIM_DEVICE_REFUSED_MSG: &str =
+    "The requested device id cannot be used for this account. Choose another device.";
+
 /// The 503 a generic-class sign-in answers when the homeserver cannot confirm the account.
 const GENERIC_IDENTITY_UNAVAILABLE_MSG: &str = "Sign-in is temporarily unavailable \
      because the homeserver could not confirm this account. Please try again shortly.";
@@ -3333,6 +3338,29 @@ pub async fn sign_in(
 
         siwx_cookie.did
     };
+
+    // GP-CLM-26: a claimed guest's pre-claim device ids stay refused. The device tombstone
+    // lasts 900 s and Synapse keeps the device rows, so a login proposing one of those ids
+    // after that would reuse a revoked device. Placed after the DID is proven and BEFORE
+    // the deactivation gate and every other Synapse call. One cheap Redis read, only when
+    // the scope proposes an id; an account without a guest record has no field, so an
+    // ordinary account is unaffected. A Redis error fails closed (it hides whether a
+    // record exists): `?` answers it as a server error and no code is issued.
+    if let Some(proposed) = request
+        .scope
+        .as_deref()
+        .and_then(extract_device_id_from_scope)
+    {
+        if db_client
+            .device_is_pre_claim_for_did(&did, &proposed)
+            .await?
+        {
+            warn!(did = %did, "sign_in: refused a pre-claim device id (GP-CLM-26)");
+            return Err(CustomError::BadRequest(
+                PRE_CLAIM_DEVICE_REFUSED_MSG.to_string(),
+            ));
+        }
+    }
 
     // Deactivation gate. Synapse's delegated-auth path never checks
     // `users.deactivated` (zero references in `api/auth/mas.py`, 1.159.0) — it
@@ -7080,6 +7108,21 @@ mod sign_in_deactivation_order_tests {
     async fn sign_in_against(
         hs: Homeserver,
     ) -> Option<(Result<(Url, String), CustomError>, Vec<String>)> {
+        sign_in_as(hs, DID, None, |_| async {}).await
+    }
+
+    /// [`sign_in_against`] for `did`, with the request's `scope` and a `plant` step that
+    /// runs against the Redis client before `sign_in` (a guest record, say).
+    async fn sign_in_as<F, Fut>(
+        hs: Homeserver,
+        did: &str,
+        scope: Option<&str>,
+        plant: F,
+    ) -> Option<(Result<(Url, String), CustomError>, Vec<String>)>
+    where
+        F: FnOnce(RedisClient) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let hs = Arc::new(hs);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -7102,6 +7145,7 @@ mod sign_in_deactivation_order_tests {
             server.abort();
             return None;
         };
+        plant(db.clone()).await;
         let nonce = Uuid::new_v4().simple().to_string();
         let client_id = format!("deactivation-order-{nonce}");
         db.set_client(
@@ -7126,8 +7170,11 @@ mod sign_in_deactivation_order_tests {
                 siwe_nonce: nonce.clone(),
                 secret: "secret".into(),
                 signin_count: 0,
-                verified_did: Some(DID.to_string()),
-                request: Some(bound_test_request(&client_id)),
+                verified_did: Some(did.to_string()),
+                request: Some(AuthorizationRequest {
+                    scope: scope.map(str::to_string),
+                    ..bound_test_request(&client_id)
+                }),
                 guest_id: None,
             },
         )
@@ -7230,6 +7277,90 @@ mod sign_in_deactivation_order_tests {
             vec![format!("is_localpart_available {legacy}")],
             "the gate's failed probe must be the only request: a second probe means the \
              login localpart was resolved (and guessed) before the gate decided"
+        );
+    }
+
+    // ---- GP-CLM-26: a claimed guest's pre-claim device ids stay refused ----
+
+    const PRE_CLAIM: &str = "PRECLAIMDEV1";
+
+    fn scope_with(device: &str) -> String {
+        format!("openid urn:matrix:client:api:* urn:matrix:client:device:{device}")
+    }
+
+    /// A fresh DID, so parallel runs and reruns never share a record.
+    fn fresh_did() -> String {
+        format!("did:key:zDnClm26{}", Uuid::new_v4().simple())
+    }
+
+    /// The guest record as the claim script leaves it: `pre_claim_devices` on
+    /// `guest:acct/{localpart}` (the field is asserted against the real claim in
+    /// `guest::claim`'s tests; here it is planted so only `sign_in` is under test).
+    async fn plant_claimed_record(db: &RedisClient, did: &str) {
+        db.hset_for_test(
+            &siwx_oidc::db::guest_invites::guest_account_key(&localpart_for(did)),
+            "pre_claim_devices",
+            &format!("OTHERDEV0,{PRE_CLAIM}"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sign_in_refuses_a_pre_claim_device_id_before_any_synapse_call() {
+        let did = fresh_did();
+        let scope = scope_with(PRE_CLAIM);
+        let Some((result, log)) = sign_in_as(Homeserver::default(), &did, Some(&scope), |db| {
+            let did = did.clone();
+            async move { plant_claimed_record(&db, &did).await }
+        })
+        .await
+        else {
+            return;
+        };
+        match result {
+            Err(CustomError::BadRequest(msg)) => assert_eq!(msg, PRE_CLAIM_DEVICE_REFUSED_MSG),
+            other => panic!("a pre-claim device id must be refused, got {other:?}"),
+        }
+        assert!(
+            log.is_empty(),
+            "the refusal must precede every Synapse call (deactivation gate included): {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_in_accepts_no_proposed_id_or_a_fresh_one_for_a_claimed_account() {
+        for scope in [
+            Some("openid urn:matrix:client:api:*".to_string()),
+            Some(scope_with("FRESHDEV99")),
+            // A prefix of a listed id is not the id.
+            Some(scope_with("PRECLAIMDEV")),
+        ] {
+            let did = fresh_did();
+            let Some((result, _)) =
+                sign_in_as(Homeserver::default(), &did, scope.as_deref(), |db| {
+                    let did = did.clone();
+                    async move { plant_claimed_record(&db, &did).await }
+                })
+                .await
+            else {
+                return;
+            };
+            assert!(result.is_ok(), "{scope:?} must sign in, got {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_in_of_an_ordinary_account_is_unaffected_by_the_proposed_id() {
+        let did = fresh_did();
+        let scope = scope_with(PRE_CLAIM);
+        let Some((result, _)) =
+            sign_in_as(Homeserver::default(), &did, Some(&scope), |_| async {}).await
+        else {
+            return;
+        };
+        assert!(
+            result.is_ok(),
+            "an account with no guest record may propose any id, got {result:?}"
         );
     }
 }
