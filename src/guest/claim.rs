@@ -290,6 +290,25 @@ async fn finish_locked(
                 return refuse(state, FINISH, StatusCode::BAD_REQUEST, "verify_failed").await;
             }
         };
+    // The by_did index is advisory for an ordinary link (`link_finish` only logs a failed
+    // write), but a guest's credentials are torn down BY that index (GP-CLM-07, no scan),
+    // so an unindexed credential would outlive an erased guest. Assert it here (an
+    // idempotent SADD): a claim whose credential cannot be indexed is not made. The
+    // credential is removed again (bound to this DID) and the guest retries.
+    if let Err(e) = state
+        .redis
+        .index_add_passkey(&rec.did, &linked.credential_id)
+        .await
+    {
+        warn!(error = %e, "guest claim: credential not indexed, claim refused");
+        if let Err(e) =
+            crate::webauthn::delete_linked_credential(&state.redis, &linked.credential_id, &rec.did)
+                .await
+        {
+            warn!(error = %e, "guest claim: compensation failed");
+        }
+        return unavailable();
+    }
     let cas = state
         .redis
         .commit_guest_claim(
@@ -1186,5 +1205,47 @@ mod tests {
         let (status, body) = start(&e, &g2).await;
         assert_eq!(status, 200, "the freed slot can be taken: {body}");
         assert_eq!(claim(&e, &g2, b"clm16-second").await.0, 200);
+    }
+
+    /// Audit F4: the by_did index write is advisory for an ordinary link, but GP-CLM-07
+    /// tears a guest's credentials down BY that index. A claim whose index cannot be
+    /// written is not made: the credential is removed again, the answer is 503 and the
+    /// record stays `active`. (The index key holds a string, so SADD fails with WRONGTYPE.)
+    #[tokio::test]
+    async fn a_claim_whose_credential_cannot_be_indexed_is_not_made() {
+        let Some(e) = env(None, |_| {}).await else {
+            return;
+        };
+        let g = guest(&e).await;
+        let cred = format!("cred-{}", uniq());
+        let id = B64.encode(cred.as_bytes());
+        let (status, opts) = start(&e, &g).await;
+        assert_eq!(status, 200, "start: {opts}");
+        let index_key = format!("webauthn:by_did/{}", g.did);
+        e.redis.set_raw(&index_key, "not a set").await.unwrap();
+
+        let (status, body, _) = finish(&e, &g, &attest(&opts, cred.as_bytes())).await;
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(body["error"], "unavailable");
+        for key in [
+            format!("webauthn:credential/{id}"),
+            format!("webauthn:link/{id}"),
+        ] {
+            assert!(
+                e.redis.get_raw(&key).await.unwrap().is_none(),
+                "{key} must be removed again"
+            );
+        }
+        assert_eq!(state_of(&e, &g).await.as_deref(), Some("active"));
+        assert!(!e
+            .redis
+            .smembers_raw(CLAIMED_KEY)
+            .await
+            .unwrap()
+            .contains(&g.localpart));
+
+        // The fault gone, the guest claims.
+        e.redis.del_raw(&index_key).await.unwrap();
+        assert_eq!(claim(&e, &g, cred.as_bytes()).await.0, 200);
     }
 }
