@@ -11,6 +11,7 @@ An index of the documentation in this repository. Start with the project
 | [identity-model.md](identity-model.md) | The three identifiers (alias, MXID, DID), MXID derivation and grandfathering, the `io.inblock.did` wire format, trust model, publication, verification, `GET /resolve`, the `io.inblock.mxid` claim |
 | [matrix-integration.md](matrix-integration.md) | Wiring siwx-oidc into Synapse, dependencies and risks, MSC3861 history, token model, admin-token mint, device lifecycle, MSC4191 account management, device-code/QR login, cross-signing, what is not supported |
 | [passkeys.md](passkeys.md) | WebAuthn architecture, DID derivation, linking to a wallet, picker scoping, the new-account policy, unknown credentials |
+| [guest-portal.md](guest-portal.md) | Operator guide for guest mode: prerequisites, enabling, lifecycle, acceptance A1 to A8, kill switch, audit events, retention and residues, the posture and proxy check scripts |
 | [troubleshooting.md](troubleshooting.md) | Symptoms and fixes for headless, wallet, passkey, account, QR and DID problems; Redis inspection |
 | [architecture.md](architecture.md) | Layers, code map, DID methods, frontend, Redis keyspace, logging, lineage from siwe-oidc |
 | [configuration.md](configuration.md) | Every configuration option, key rotation, reverse proxy and CORS, running with Docker |
