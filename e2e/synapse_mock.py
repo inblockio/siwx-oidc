@@ -635,6 +635,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._profile_get(m.group(1))
 
         # -- admin surface --------------------------------------------------
+        # GET /_synapse/admin/v1/rooms/{room_id}/state  (SynapseClient::room_state, the claim gate)
+        # Every account the mock knows (a device or a profile) is a joined member of every room.
+        m = re.match(r"^/_synapse/admin/v1/rooms/([^/]+)/state$", path)
+        if m:
+            denied = self._admin_auth()
+            if denied:
+                return self._send(*denied)
+            with LOCK:
+                members = sorted(set(DEVICES) | set(PROFILES))
+            return self._send(200, {"state": [
+                {"type": "m.room.member", "state_key": u, "content": {"membership": "join"}}
+                for u in members
+            ]})
         # GET /_synapse/admin/v2/users/{user_id}/devices  (list_devices)
         m = re.match(r"^/_synapse/admin/v2/users/([^/]+)/devices$", path)
         if m:

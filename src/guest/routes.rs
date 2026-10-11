@@ -24,9 +24,12 @@ use siwx_oidc::db::RedisClient;
 /// path and the secret from `location.hash`, which a browser never sends.
 const JOIN_HTML: &str = include_str!("../../static/guest/join.html");
 
+/// The claim page (S7b): the same bytes for everyone; it reads `GET /guest/resume`.
+const CLAIM_HTML: &str = include_str!("../../static/guest/claim.html");
+
 /// The only files `/guest/assets/{file}` serves. Compiled in, so no path from the
 /// request ever reaches the file system.
-const ASSETS: [(&str, &str, &str); 6] = [
+const ASSETS: [(&str, &str, &str); 7] = [
     (
         "continue.js",
         "text/javascript; charset=utf-8",
@@ -48,6 +51,11 @@ const ASSETS: [(&str, &str, &str); 6] = [
         include_str!("../../static/guest/join.js"),
     ),
     (
+        "claim.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../../static/guest/claim.js"),
+    ),
+    (
         "guest-key.js",
         "text/javascript; charset=utf-8",
         include_str!("../../static/guest/guest-key.js"),
@@ -65,6 +73,19 @@ async fn join_page() -> Response {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         JOIN_HTML,
+    )
+        .into_response()
+}
+
+/// `GET /guest/claim`: the claim page. No cookie is read here (the script asks `/guest/resume`),
+/// so a link scanner learns nothing; the answer is never cached.
+async fn claim_page() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        CLAIM_HTML,
     )
         .into_response()
 }
@@ -111,6 +132,7 @@ pub fn router_with(
             "/guest/claim/finish",
             post(claim::finish).layer(super::layers::claim_body_limit()),
         )
+        .route("/guest/claim", get(claim_page))
         .route("/guest/resume", get(handoff::resume))
         .route("/guest/ended", get(handoff::ended_page))
         // Top-level navigations and sub-resources of the join page: GET, so the

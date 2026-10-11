@@ -845,6 +845,16 @@ async fn claim_allowed(state: &GuestState, localpart: &str) -> bool {
     }
 }
 
+/// The fixed Meet start URL (public config): where the claim page's "Back to the call" and
+/// "Sign in" lead. `null` when unset.
+fn client_url(state: &GuestState) -> Option<String> {
+    state
+        .config
+        .guest_client_url
+        .as_ref()
+        .map(|u| u.to_string())
+}
+
 /// `GET /guest/resume`: what the issuer pages need to greet a returning guest. The
 /// cookie authorises it; a request that says it comes from another origin is refused
 /// (the cookie is `SameSite=Lax`, and the answer carries no CORS header, so this is the
@@ -873,7 +883,7 @@ pub async fn resume(State(state): State<GuestState>, headers: HeaderMap) -> Resp
     };
     let body = match record {
         None => match claimed_marker(&state, &headers).await {
-            Ok(true) => json!({"state": "claimed"}),
+            Ok(true) => json!({"state": "claimed", "client_url": client_url(&state)}),
             Ok(false) => json!({"state": "no_session"}),
             Err(()) => return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         },
@@ -886,6 +896,7 @@ pub async fn resume(State(state): State<GuestState>, headers: HeaderMap) -> Resp
                 "did": v.did,
                 "claim_allowed": claim_allowed(&state, &r.localpart).await,
                 "email_present": v.email_present,
+                "client_url": client_url(&state),
             }),
             Ok(None) => json!({"state": "no_session"}),
             Err(e) => {
@@ -2327,7 +2338,12 @@ mod tests {
     /// without a live record; a foreign origin refused.
     #[tokio::test]
     async fn the_resume_vectors() {
-        let Some(e) = env(|c| c.guest_claim_enabled = true).await else {
+        let Some(e) = env(|c| {
+            c.guest_claim_enabled = true;
+            c.guest_client_url = Some(url::Url::parse("https://meet.example.org/start").unwrap());
+        })
+        .await
+        else {
             return;
         };
         let g = Guest::new();
@@ -2348,7 +2364,8 @@ mod tests {
         assert_eq!(body["email_present"], false);
         let left = body["seconds_left"].as_i64().unwrap();
         assert!((590..=600).contains(&left), "{left}");
-        assert_eq!(body.as_object().unwrap().len(), 7);
+        assert_eq!(body["client_url"], "https://meet.example.org/start");
+        assert_eq!(body.as_object().unwrap().len(), 8);
         assert!(!text.contains(&handle), "no secret in the body");
         e.redis
             .hset_raw_for_test(&key, "email", "a@example.org")

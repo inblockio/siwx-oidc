@@ -1234,6 +1234,22 @@ paths:
         "409": { description: "`claimed`." }
         "503": { description: "`unavailable` (Redis), or `guest_unavailable` while guest mode is off." }
 
+  /guest/claim:
+    get:
+      tags: [Guest]
+      operationId: guestClaimPage
+      summary: The page where a guest keeps the account with a passkey
+      description: |
+        The same page for everyone; it reads no cookie. Its script (`/guest/assets/claim.js`) asks `GET /guest/resume`
+        and runs the claim states of the design (loading, intro, passkey prompt, saving, done, declined, and the
+        errors), then calls `POST /guest/claim/start`, `POST /guest/claim/finish` and, for "Delete everything now",
+        `POST /guest/end` with the cookie. It never sees or derives a private key; after a commit or a lost race it
+        calls `forgetKey()` on this browser's guest key store. `Cache-Control: no-store`; the guest CSP (script and
+        style from this origin only) and `frame-ancestors 'none'` apply.
+      responses:
+        "200": { description: "The page, `text/html`." }
+        "503": { description: "`guest_unavailable` while guest mode is off." }
+
   /guest/claim/start:
     post:
       tags: [Guest]
@@ -1317,11 +1333,12 @@ paths:
                 properties:
                   first_name: { type: string }
                   second_name: { type: string }
-                  state: { type: string, enum: [minted, provisioning, active, no_session] }
+                  state: { type: string, enum: [minted, provisioning, active, claimed, no_session] }
                   seconds_left: { type: integer }
                   did: { type: string }
                   claim_allowed: { type: boolean, description: "Advisory: `guest_claim_enabled`." }
                   email_present: { type: boolean }
+                  client_url: { type: [string, 'null'], description: "The fixed Meet start URL (`guest_client_url`), sent with `active` and `claimed` so the claim page can lead back to the call." }
         "403": { description: "`forbidden_origin`." }
         "503": { description: "`unavailable`, or `guest_unavailable` while guest mode is off." }
 

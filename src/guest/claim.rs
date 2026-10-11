@@ -785,7 +785,11 @@ mod tests {
     /// The whole claim: state, due entry, DID, devices, cookies, and every reader after it.
     #[tokio::test]
     async fn the_claim_commits_and_every_reader_follows() {
-        let Some(e) = env(None, |_| {}).await else {
+        let Some(e) = env(None, |c| {
+            c.guest_client_url = Some(url::Url::parse("https://meet.example.org/start").unwrap());
+        })
+        .await
+        else {
             return;
         };
         let g = guest(&e).await;
@@ -864,7 +868,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             r.json::<Value>().await.unwrap(),
-            json!({"state": "claimed"})
+            json!({"state": "claimed", "client_url": "https://meet.example.org/start"})
         );
         let (s, v, _) = post(&e, "/guest/end", Some(&c), None, "{}".into()).await;
         assert_eq!((s, v["error"].as_str().unwrap()), (409, "claimed"));
