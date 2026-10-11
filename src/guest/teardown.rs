@@ -31,6 +31,9 @@ pub enum GuestTeardown {
     AlreadyGone,
     /// The account was claimed: nothing was touched. The reaper drops it from its schedule.
     Claimed,
+    /// A hand-off holds the record's lease: nothing was touched. The reaper retries after a
+    /// short gate, without counting a failure (the lease bounds the wait).
+    Deferred,
 }
 
 /// Tear down the guest `localpart`. Call it for a record that is due (`guest:due`); it
@@ -72,13 +75,8 @@ pub(crate) async fn run(
         ReapCas::Claimed => return Ok(GuestTeardown::Claimed),
         ReapCas::Gone => return Ok(GuestTeardown::AlreadyGone),
         // A hand-off in flight may be provisioning the account right now: erasing it
-        // first would leave an account nothing erases (#49 F3). Back off and retry.
-        ReapCas::Busy => {
-            return Err(TeardownError {
-                step: Step::Mark,
-                source: anyhow::anyhow!("a hand-off holds the lease, retry after it"),
-            })
-        }
+        // first would leave an account nothing erases (#49 F3). Retry after it.
+        ReapCas::Busy => return Ok(GuestTeardown::Deferred),
         ReapCas::Marked | ReapCas::Already => {}
     }
     if until == Some(Step::Mark) {
@@ -463,10 +461,12 @@ mod tests {
         redis
             .hset_raw_for_test(&key, "lease_until", &(now + 120).to_string())
             .await;
-        let e = teardown_guest(&redis, &synapse, "example.org", &f.localpart)
-            .await
-            .unwrap_err();
-        assert_eq!(e.step, Step::Mark);
+        assert_eq!(
+            teardown_guest(&redis, &synapse, "example.org", &f.localpart)
+                .await
+                .unwrap(),
+            GuestTeardown::Deferred
+        );
         assert_eq!(f.state().await.as_deref(), Some("provisioning"));
         assert!(log.lock().unwrap().is_empty());
         assert!(!redis.is_account_erased(&f.localpart, &f.did).await.unwrap());

@@ -13,6 +13,8 @@
 //! - **Backoff.** A failed teardown sets `guest:reap:retry/<lp>` for
 //!   `min(15 s * 2^(n-1), 15 min)` (`n` from `guest:reap:fail/<lp>`); the claim skips the
 //!   entry until it expires. The log names the failing step, never a name or a DID.
+//! - **Deferred.** A hand-off holding the record's lease is not a failure: the entry is
+//!   gated for 10 s, the failure count is left alone, and the audit outcome is `deferred`.
 //! - **Done.** `Erased`, `AlreadyGone` and `Claimed` remove the entry from `guest:due`
 //!   together with its lease and backoff state.
 //! - **Shutdown.** On stop the loop takes no new entries; teardowns in flight get
@@ -66,6 +68,10 @@ struct Seen {
     control: Option<String>,
     refusal_minute: u64,
 }
+
+/// How long a deferred entry (a hand-off holds the record) waits before the next try. The
+/// hand-off lease (120 s) bounds how often this repeats.
+const DEFERRED_GATE: Duration = Duration::from_secs(10);
 
 /// The reaper's timings and bounds.
 #[derive(Clone, Debug)]
@@ -368,6 +374,21 @@ impl Reaper {
                             localpart,
                             "guest reaper: the account is claimed, dropped from the schedule"
                         )
+                    }
+                    GuestTeardown::Deferred => {
+                        super::audit::reap("due", "deferred", 0);
+                        debug!(
+                            localpart,
+                            "guest reaper: a hand-off holds the record, retried shortly"
+                        );
+                        if let Err(e) = self
+                            .redis
+                            .reap_deferred(localpart, &self.owner, millis(DEFERRED_GATE))
+                            .await
+                        {
+                            warn!(localpart, error = %e, "guest reaper: could not gate a deferred entry, it is retried after the lease");
+                        }
+                        return;
                     }
                 }
                 if let Err(e) = self.redis.reap_done(localpart, &self.owner).await {
@@ -850,6 +871,52 @@ mod tests {
         for key in [reap_retry_key(&g.localpart), reap_fail_key(&g.localpart)] {
             assert_eq!(redis.get_raw(&key).await.unwrap(), None, "{key}");
         }
+    }
+
+    /// #54 L2: a hand-off holding the record defers the teardown without counting a
+    /// failure: nothing is touched, the lease is given back, a short gate is set, and once
+    /// the hand-off lease lapses the next try erases the guest.
+    #[tokio::test]
+    async fn a_live_hand_off_defers_the_teardown_without_a_failure() {
+        let _turn = DB15.lock().await;
+        let Some(redis) = db().await else { return };
+        let (m, synapse) = mock().await;
+        let g = due_guest(&redis).await;
+        let key = siwx_oidc::db::guest_invites::guest_account_key(&g.localpart);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        redis
+            .hset_raw_for_test(&key, "lease_owner", "attempt-1")
+            .await;
+        redis
+            .hset_raw_for_test(&key, "lease_until", &(now + 120).to_string())
+            .await;
+        let r = reaper(&redis, &synapse, fast());
+        let (_tx, rx) = never_stop();
+        assert_eq!(r.tick(&rx).await, 1);
+        assert!(g.record_exists(&redis).await);
+        assert!(redis.zscore_for_test(DUE_KEY, &g.localpart).await.is_some());
+        assert_eq!(m.count("delete_device"), 0);
+        assert_eq!(m.count("delete_user"), 0);
+        assert_eq!(
+            redis.get_raw(&reap_lease_key(&g.localpart)).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            redis.get_raw(&reap_fail_key(&g.localpart)).await.unwrap(),
+            None,
+            "a deferral is not a failure"
+        );
+        let ttl = redis.pttl_for_test(&reap_retry_key(&g.localpart)).await;
+        assert!((9_000..=10_000).contains(&ttl), "a 10 s gate, got {ttl}");
+        assert_eq!(r.tick(&rx).await, 0, "gated");
+        // The hand-off ends (`0`: the script compares with Redis `TIME`) and the gate opens.
+        redis.hset_raw_for_test(&key, "lease_until", "0").await;
+        redis.del_raw(&reap_retry_key(&g.localpart)).await.unwrap();
+        assert_eq!(r.tick(&rx).await, 1);
+        assert!(g.gone(&redis).await);
     }
 
     /// A claimed account is dropped from the schedule and left alone.
