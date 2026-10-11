@@ -10,7 +10,8 @@
 //! | `guest:by_room/{host}/{sha256(room_id)}` | SET of the host's invite ids for one room, for `meetings/end` |
 //! | `guest:quota/host_invites_hour/{host}/{hour}` | counter, one hour window of Redis `TIME` |
 //! | `guest:acct/{localpart}` | HASH of a guest record (written from S3); read here only to refuse a guest as a host |
-//! | `guest:control` | kill switch value (`disabled`); read here, written by an operator (S6) |
+//! | `guest:control` | HASH, written by an operator only: `disabled` (`1`/`true` engages the kill switch), `reap_before` (epoch seconds; every unclaimed guest minted at or before it is due now) |
+//! | `guest:banned_hosts` | SET of host identities (`TokenMetadata.username`); operator only |
 //!
 //! Every instant is Redis `TIME`, never an instance clock (GP-SEC-08). The scripts
 //! build the `guest:invite/{id}` keys they scan from `ARGV[1]`, which is fine on the
@@ -48,6 +49,49 @@ pub fn guest_account_key(localpart: &str) -> String {
     format!("guest:acct/{localpart}")
 }
 pub const CONTROL_KEY: &str = "guest:control";
+pub const BANNED_HOSTS_KEY: &str = "guest:banned_hosts";
+
+/// The operator's switches in `guest:control` (GP-SEC-48, S6). Redis holds a HASH with up
+/// to two fields; both absent is the normal state. A value that does not parse, or a key
+/// of another type, is an `Err` and every caller fails closed on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GuestControl {
+    /// `disabled` is `1` or `true`: no mint, redeem, hand-off or refresh.
+    pub disabled: bool,
+    /// `reap_before`: unclaimed guests minted at or before this epoch second are due now.
+    pub reap_before: Option<i64>,
+}
+
+impl GuestControl {
+    /// The two hash fields as read. `0`, `false` and an empty value are "off".
+    pub fn parse(disabled: Option<&str>, reap_before: Option<&str>) -> Result<Self> {
+        let disabled = match disabled {
+            None | Some("" | "0" | "false") => false,
+            Some("1" | "true") => true,
+            Some(_) => return Err(anyhow!("guest:control: `disabled` is not 1 or true")),
+        };
+        let reap_before = reap_before
+            .map(|v| {
+                v.parse::<i64>()
+                    .map_err(|_| anyhow!("guest:control: `reap_before` is not an integer"))
+            })
+            .transpose()?;
+        Ok(Self {
+            disabled,
+            reap_before,
+        })
+    }
+}
+
+/// Whether an unclaimed guest minted at `created_at` is due under `reap_before`. A record
+/// without a mint time matches (fail closed).
+pub fn reap_before_matches(created_at: Option<i64>, reap_before: Option<i64>) -> bool {
+    match (reap_before, created_at) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(rb), Some(c)) => c <= rb,
+    }
+}
 
 /// Create `count` invites for one host, or refuse all of them. `KEYS[1]` the
 /// host's set, `KEYS[2]` the hour-quota key prefix, `KEYS[3]` the room set,
@@ -347,9 +391,48 @@ impl RedisClient {
             .unwrap()
     }
 
-    /// Whether the operator's kill switch is `disabled` (GP-SEC-48; S6 adds the rest).
-    pub async fn guest_kill_switch_on(&self) -> Result<bool> {
-        Ok(self.get_raw(CONTROL_KEY).await?.as_deref() == Some("disabled"))
+    /// The operator's switches (`guest:control`). `Err` on a read failure, a WRONGTYPE
+    /// (an old plain-string key) or a value that does not parse.
+    pub async fn guest_control(&self) -> Result<GuestControl> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let f: Vec<Option<String>> = cmd("HMGET")
+            .arg(CONTROL_KEY)
+            .arg("disabled")
+            .arg("reap_before")
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest control: {e}"))?;
+        GuestControl::parse(
+            f.first().and_then(|v| v.as_deref()),
+            f.get(1).and_then(|v| v.as_deref()),
+        )
+    }
+
+    /// Whether the operator banned this host (`guest:banned_hosts`).
+    pub async fn guest_host_banned(&self, host: &str) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let n: i64 = cmd("SISMEMBER")
+            .arg(BANNED_HOSTS_KEY)
+            .arg(host)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest banned hosts: {e}"))?;
+        Ok(n == 1)
+    }
+
+    /// The banned hosts, sorted.
+    pub async fn guest_banned_hosts(&self) -> Result<Vec<String>> {
+        let mut v = self.smembers_raw(BANNED_HOSTS_KEY).await?;
+        v.sort();
+        Ok(v)
     }
 }
 

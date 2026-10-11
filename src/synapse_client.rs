@@ -130,6 +130,25 @@ pub(crate) fn matrix_user_id(localpart: &str, server_name: &str) -> String {
 /// `admin_token`") is deliberately gone: on 1.157+ there IS no `admin_token`
 /// setting to check, and pointing an operator at it sent them looking for a
 /// config key that no longer exists.
+/// One page of [`SynapseClient::admin_users_page`].
+#[derive(Debug, Deserialize)]
+pub struct AdminUsersPage {
+    #[serde(default)]
+    pub users: Vec<AdminUserRow>,
+    /// Absent on the last page.
+    #[serde(default)]
+    pub next_token: Option<String>,
+}
+
+/// The two fields of a user row the orphan scan reads.
+#[derive(Debug, Deserialize)]
+pub struct AdminUserRow {
+    /// The Matrix id, `@localpart:server`.
+    pub name: String,
+    #[serde(default)]
+    pub user_type: Option<String>,
+}
+
 /// A buffered admin-scoped response: status plus the body, already read.
 ///
 /// Buffered rather than a live [`reqwest::Response`] because the retry decision
@@ -1085,6 +1104,33 @@ impl SynapseClient {
         let body: DevicesResponse =
             serde_json::from_str(&resp.body).context("list_devices: invalid JSON")?;
         Ok(body.devices)
+    }
+
+    /// One page of the Synapse admin user list (`GET /_synapse/admin/v2/users`), active
+    /// non-guest accounts, 100 per page, from the opaque `from` token. Read-only. The body is
+    /// never logged (it carries every user's name).
+    pub async fn admin_users_page(&self, from: Option<&str>) -> Result<AdminUsersPage> {
+        let mut url = format!(
+            "{}/_synapse/admin/v2/users?limit=100&guests=false&deactivated=false",
+            self.endpoint
+        );
+        if let Some(from) = from {
+            url.push_str("&from=");
+            url.push_str(&urlencoding::encode(from));
+        }
+        let resp = self
+            .admin_request(|http, token| http.get(&url).bearer_auth(token))
+            .await
+            .context("admin_users_page: request failed")?;
+        if !resp.status.is_success() {
+            let status = resp.status;
+            warn!(%status, "admin_users_page failed");
+            anyhow::bail!(
+                "admin_users_page: HTTP {status}{}",
+                admin_status_hint(status)
+            );
+        }
+        serde_json::from_str(&resp.body).context("admin_users_page: invalid JSON")
     }
 
     /// Fetch a single device belonging to the user, or `None` if no device with

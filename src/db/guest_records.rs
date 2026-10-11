@@ -23,7 +23,10 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 use bb8_redis::redis::{cmd, Value};
 
-use super::guest_invites::{by_host_key, guest_account_key, invite_key, CONTROL_KEY};
+use super::guest_invites::{
+    by_host_key, guest_account_key, invite_key, reap_before_matches, GuestControl,
+    BANNED_HOSTS_KEY, CONTROL_KEY,
+};
 use super::RedisClient;
 
 pub const DUE_KEY: &str = "guest:due";
@@ -196,7 +199,8 @@ pub struct RedeemLimits {
 
 /// Mint one guest record, or refuse. `KEYS`: 1 invite, 2 record, 3 due, 4 by_invite,
 /// 5 handle, 6 control, 7 host's invite set, 8 daily-quota prefix, 9 `erased:did`,
-/// 10 `erased:user/<localpart>`, 11 `erased:user/<legacy localpart>`. `ARGV`: 1 secret
+/// 10 `erased:user/<localpart>`, 11 `erased:user/<legacy localpart>`, 12 banned hosts. `KEYS[6]`
+/// is the control HASH (`disabled` field). `ARGV`: 1 secret
 /// hash, 2 localpart, 3 did, 4 first, 5 second, 6 email (`""` for none), 7 consent
 /// version, 8 consent variant, 9 invite id, 10 global max, 11 daily max, 12 host live
 /// max, 13 record key prefix, 14 by_invite key prefix.
@@ -204,11 +208,14 @@ pub struct RedeemLimits {
 const REDEEM: &str = r#"
 local t = redis.call('TIME')
 local now = tonumber(t[1])
-if redis.call('GET', KEYS[6]) == 'disabled' then return {0, 'disabled'} end
+local dis = redis.call('HGET', KEYS[6], 'disabled')
+if dis and dis ~= '0' and dis ~= 'false' and dis ~= '' then return {0, 'disabled'} end
 local f = redis.call('HMGET', KEYS[1], 'state', 'expires_at', 'used', 'max_guests', 'host', 'room_id', 'session_secs', 'secret_hash')
 if not f[1] then return {0, 'expired'} end
 if f[8] ~= ARGV[1] then return {0, 'invalid_link'} end
 if f[1] == 'revoked' then return {0, 'revoked'} end
+-- a banned host's invites answer as revoked
+if redis.call('SISMEMBER', KEYS[12], f[5]) == 1 then return {0, 'revoked'} end
 if tonumber(f[2]) <= now then return {0, 'expired'} end
 -- the bounded guest count: a single-use invite (max_guests 1) burns here
 if tonumber(f[3]) >= tonumber(f[4]) then return {0, 'exhausted'} end
@@ -242,6 +249,100 @@ redis.call('INCR', day)
 redis.call('EXPIRE', day, 172800)
 return {1, deadline, now}
 "#;
+
+/// The invite hash, `TIME` and whether the invite's host is banned. `KEYS`: 1 invite,
+/// 2 banned hosts. Returns `{hash, now, banned}`.
+const INVITE_GATE: &str = r#"
+local h = redis.call('HGETALL', KEYS[1])
+local host = redis.call('HGET', KEYS[1], 'host') or ''
+local banned = redis.call('SISMEMBER', KEYS[2], host)
+return {h, redis.call('TIME')[1], banned}
+"#;
+
+/// The reaper's control pass (S6): make due now every live, unclaimed guest the operator's
+/// switches name. `KEYS`: 1 due, 2 banned hosts. `ARGV`: 1 record prefix, 2 `reap_before`
+/// (`""`: none), 3 how many future-dated members to look at. Walks `guest:due` only (every
+/// live guest is in it), never the keyspace. A record without `created_at` matches
+/// `reap_before`. Returns `{moved by reap_before, moved by ban}`.
+const ENFORCE_CONTROL: &str = r#"
+local now = tonumber(redis.call('TIME')[1])
+local rb = tonumber(ARGV[2])
+local by_rb, by_ban = 0, 0
+local members = redis.call('ZRANGEBYSCORE', KEYS[1], '(' .. now, '+inf', 'LIMIT', 0, tonumber(ARGV[3]))
+for _, lp in ipairs(members) do
+  local k = ARGV[1] .. lp
+  local f = redis.call('HMGET', k, 'state', 'created_at', 'promoted_at', 'host')
+  if (f[1] == 'minted' or f[1] == 'provisioning' or f[1] == 'active') and not f[3] then
+    local why = nil
+    if f[4] and redis.call('SISMEMBER', KEYS[2], f[4]) == 1 then
+      why = 'ban'
+    elseif rb and ((not tonumber(f[2])) or tonumber(f[2]) <= rb) then
+      why = 'rb'
+    end
+    if why then
+      redis.call('ZADD', KEYS[1], now, lp)
+      redis.call('HSET', k, 'deadline', tostring(now))
+      if why == 'ban' then by_ban = by_ban + 1 else by_rb = by_rb + 1 end
+    end
+  end
+end
+return {by_rb, by_ban}
+"#;
+
+/// The alert figures (S6). `KEYS`: 1 due. `ARGV`: 1 record prefix, 2 daily-quota prefix,
+/// 3 reaping age secs, 4 refusal-counter prefix. Returns `{live, daily, stuck, oldest
+/// stuck age, refusals, minute}`: `stuck` counts `reaping` records due for longer than
+/// `ARGV[3]` (the 256 longest-overdue are looked at); `refusals` is the larger of the
+/// current and the previous minute, `minute` the one it came from.
+const ALERT_FIGURES: &str = r#"
+local now = tonumber(redis.call('TIME')[1])
+local live = redis.call('ZCARD', KEYS[1])
+local daily = tonumber(redis.call('GET', ARGV[2] .. math.floor(now / 86400)) or '0')
+local stuck, oldest = 0, 0
+local late = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now - tonumber(ARGV[3]), 'WITHSCORES', 'LIMIT', 0, 256)
+for i = 1, #late, 2 do
+  if redis.call('HGET', ARGV[1] .. late[i], 'state') == 'reaping' then
+    stuck = stuck + 1
+    local age = now - tonumber(late[i + 1])
+    if age > oldest then oldest = age end
+  end
+end
+local m = math.floor(now / 60)
+local cur = tonumber(redis.call('GET', ARGV[4] .. m) or '0')
+local prev = tonumber(redis.call('GET', ARGV[4] .. (m - 1)) or '0')
+local refusals, minute = cur, m
+if prev >= cur then refusals, minute = prev, m - 1 end
+return {live, daily, stuck, oldest, refusals, minute}
+"#;
+
+/// Count one refusal in the current minute's counter. `ARGV`: 1 counter prefix.
+const COUNT_REFUSAL: &str = r#"
+local k = ARGV[1] .. math.floor(tonumber(redis.call('TIME')[1]) / 60)
+redis.call('INCR', k)
+redis.call('EXPIRE', k, 180)
+return 1
+"#;
+
+/// A per-minute refusal counter: `guest:refusals/{minute}`, three minutes of life.
+const REFUSAL_PREFIX: &str = "guest:refusals/";
+
+/// What the control pass moved to now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ControlMoved {
+    pub by_reap_before: u64,
+    pub by_ban: u64,
+}
+
+/// The figures behind the alerts, from one script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AlertFigures {
+    pub live: u64,
+    pub daily_mints: u64,
+    pub stuck_reaping: u64,
+    pub oldest_stuck_secs: u64,
+    pub refusals_per_min: u64,
+    pub refusal_minute: u64,
+}
 
 /// Move the deadline of every unclaimed guest of the given invites to now, never
 /// later. `KEYS[1]` due; `ARGV`: 1 record prefix, 2 by_invite prefix, then invite ids.
@@ -335,6 +436,19 @@ pub struct GuestRefreshRead {
     pub device_recorded: bool,
     /// Redis `TIME` at the read.
     pub now: i64,
+    /// The record's mint time (`created_at`).
+    pub created_at: Option<i64>,
+    /// The kill switch is engaged (`guest:control` `disabled`).
+    pub disabled: bool,
+    /// `guest:control` `reap_before`.
+    pub reap_before: Option<i64>,
+}
+
+impl GuestRefreshRead {
+    /// An unclaimed guest the operator's `reap_before` makes due now.
+    pub fn reap_before_due(&self) -> bool {
+        reap_before_matches(self.created_at, self.reap_before)
+    }
 }
 
 impl RedisClient {
@@ -379,20 +493,44 @@ impl RedisClient {
             .get()
             .await
             .map_err(|e| anyhow!("Redis pool: {e}"))?;
-        let (f, recorded, (secs, _)): (Vec<Option<String>>, i64, (String, String)) =
-            bb8_redis::redis::pipe()
-                .cmd("HMGET")
-                .arg(guest_account_key(localpart))
-                .arg("state")
-                .arg("deadline")
-                .cmd("SISMEMBER")
-                .arg(devices_key(localpart))
-                .arg(device_id)
-                .cmd("TIME")
-                .query_async(&mut *conn)
-                .await
-                .map_err(|e| anyhow!("guest refresh guard: {e}"))?;
+        /// Record fields, control fields, device membership, Redis `TIME`.
+        type Read = (
+            Vec<Option<String>>,
+            Vec<Option<String>>,
+            i64,
+            (String, String),
+        );
+        let (f, ctl, recorded, (secs, _)): Read = bb8_redis::redis::pipe()
+            .cmd("HMGET")
+            .arg(guest_account_key(localpart))
+            .arg("state")
+            .arg("deadline")
+            .arg("created_at")
+            .cmd("HMGET")
+            .arg(CONTROL_KEY)
+            .arg("disabled")
+            .arg("reap_before")
+            .cmd("SISMEMBER")
+            .arg(devices_key(localpart))
+            .arg(device_id)
+            .cmd("TIME")
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest refresh guard: {e}"))?;
+        let control = GuestControl::parse(
+            ctl.first().and_then(|v| v.as_deref()),
+            ctl.get(1).and_then(|v| v.as_deref()),
+        )?;
         Ok(GuestRefreshRead {
+            created_at: f
+                .get(2)
+                .cloned()
+                .flatten()
+                .map(|d| d.parse())
+                .transpose()
+                .map_err(|e| anyhow!("guest refresh guard: {e}"))?,
+            disabled: control.disabled,
+            reap_before: control.reap_before,
             state: f.first().cloned().flatten(),
             deadline: f
                 .get(1)
@@ -1072,10 +1210,12 @@ impl RedisClient {
             .get()
             .await
             .map_err(|e| anyhow!("Redis pool: {e}"))?;
-        let (h, (secs, _)): (HashMap<String, String>, (String, String)) = bb8_redis::redis::pipe()
-            .cmd("HGETALL")
+        // One script, so the banned-host test costs the same for every input (GP-SEC-09).
+        let (h, secs, banned): (HashMap<String, String>, String, i64) = cmd("EVAL")
+            .arg(INVITE_GATE)
+            .arg(2)
             .arg(&key)
-            .cmd("TIME")
+            .arg(BANNED_HOSTS_KEY)
             .query_async(&mut *conn)
             .await
             .map_err(|e| anyhow!("guest invite gate: {e}"))?;
@@ -1087,7 +1227,8 @@ impl RedisClient {
             .map_err(|e| anyhow!("guest invite gate: {e}"))?;
         let num = |k: &str| h.get(k).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
         let get = |k: &str| h.get(k).cloned().unwrap_or_default();
-        let state = if get("state") == "revoked" {
+        // A banned host's invites answer as an ended one (revoked): no new oracle.
+        let state = if get("state") == "revoked" || banned == 1 {
             InviteState::Revoked
         } else if num("expires_at") <= now {
             InviteState::Expired
@@ -1156,7 +1297,7 @@ impl RedisClient {
         let erased = |lp: &str| format!("{}/{lp}", super::KV_ERASED_USER_PREFIX);
         let reply: Vec<Value> = cmd("EVAL")
             .arg(REDEEM)
-            .arg(11)
+            .arg(12)
             .arg(invite_key(g.invite_id))
             .arg(guest_account_key(g.localpart))
             .arg(DUE_KEY)
@@ -1172,6 +1313,7 @@ impl RedisClient {
             ))
             .arg(erased(g.localpart))
             .arg(erased(g.legacy_localpart))
+            .arg(BANNED_HOSTS_KEY)
             .arg(g.secret_hash)
             .arg(g.localpart)
             .arg(g.did)
@@ -1257,6 +1399,125 @@ impl RedisClient {
             .await
             .map_err(|e| anyhow!("guest deadlines: {e}"))?;
         Ok(n.max(0) as u64)
+    }
+
+    /// The reaper's control pass: moves the deadline of every live unclaimed guest that
+    /// `reap_before` or a banned host names to now (ZADD `guest:due`, then HSET).
+    pub async fn enforce_guest_control(&self, reap_before: Option<i64>) -> Result<ControlMoved> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let r: Vec<i64> = cmd("EVAL")
+            .arg(ENFORCE_CONTROL)
+            .arg(2)
+            .arg(DUE_KEY)
+            .arg(BANNED_HOSTS_KEY)
+            .arg(guest_account_key(""))
+            .arg(reap_before.map(|v| v.to_string()).unwrap_or_default())
+            .arg(1000)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest control pass: {e}"))?;
+        let n = |i: usize| r.get(i).copied().unwrap_or(0).max(0) as u64;
+        Ok(ControlMoved {
+            by_reap_before: n(0),
+            by_ban: n(1),
+        })
+    }
+
+    /// The figures the alerts compare with their thresholds.
+    pub async fn guest_alert_figures(&self, reaping_secs: u64) -> Result<AlertFigures> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let r: Vec<i64> = cmd("EVAL")
+            .arg(ALERT_FIGURES)
+            .arg(1)
+            .arg(DUE_KEY)
+            .arg(guest_account_key(""))
+            .arg(DAILY_PREFIX)
+            .arg(reaping_secs)
+            .arg(REFUSAL_PREFIX)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest alert figures: {e}"))?;
+        let n = |i: usize| r.get(i).copied().unwrap_or(0).max(0) as u64;
+        Ok(AlertFigures {
+            live: n(0),
+            daily_mints: n(1),
+            stuck_reaping: n(2),
+            oldest_stuck_secs: n(3),
+            refusals_per_min: n(4),
+            refusal_minute: n(5),
+        })
+    }
+
+    /// Count one refused guest request in this minute's instance-wide counter.
+    pub async fn count_guest_refusal(&self) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let _: i64 = cmd("EVAL")
+            .arg(COUNT_REFUSAL)
+            .arg(0)
+            .arg(REFUSAL_PREFIX)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest refusal counter: {e}"))?;
+        Ok(())
+    }
+
+    /// `SET key 1 NX EX secs`: whether this caller took the lease.
+    pub async fn try_lease(&self, key: &str, secs: u64) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let r: Option<String> = cmd("SET")
+            .arg(key)
+            .arg("1")
+            .arg("NX")
+            .arg("EX")
+            .arg(secs.max(1))
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("lease: {e}"))?;
+        Ok(r.is_some())
+    }
+
+    /// Whether `guest:acct/{localpart}` exists (any state).
+    pub async fn guest_record_present(&self, localpart: &str) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let n: i64 = cmd("EXISTS")
+            .arg(guest_account_key(localpart))
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest record: {e}"))?;
+        Ok(n == 1)
+    }
+
+    /// Test helper: `ZADD key score member`.
+    #[doc(hidden)]
+    pub async fn zadd_for_test(&self, key: &str, score: i64, member: &str) {
+        let mut conn = self.pool.get().await.unwrap();
+        let _: () = cmd("ZADD")
+            .arg(key)
+            .arg(score)
+            .arg(member)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
     }
 
     /// Test helper: a guest record and its cookie handle, as redeem leaves them, with
@@ -1351,11 +1612,18 @@ impl RedisClient {
         cmd("TTL").arg(key).query_async(&mut *conn).await.unwrap()
     }
 
-    /// Test helper: the number of keys in this database.
+    /// Test helper: the number of keys in this database, not counting the audit refusal
+    /// counters (`guest:refusals/*`): a refused request writes no state, only a count.
     #[doc(hidden)]
     pub async fn dbsize_for_test(&self) -> i64 {
         let mut conn = self.pool.get().await.unwrap();
-        cmd("DBSIZE").query_async(&mut *conn).await.unwrap()
+        let all: i64 = cmd("DBSIZE").query_async(&mut *conn).await.unwrap();
+        let counters: Vec<String> = cmd("KEYS")
+            .arg(format!("{REFUSAL_PREFIX}*"))
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        all - counters.len() as i64
     }
 
     /// Test helper: empty this database. Only for a test that owns its database.

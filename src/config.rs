@@ -366,6 +366,24 @@ pub struct Config {
     /// off. A zero is read as one second.
     /// Env: `SIWXOIDC_GUEST_REAPER_INTERVAL_SECS`
     pub guest_reaper_interval_secs: u64,
+    /// Alert (GP-SEC-47): a `reaping` record due for longer than this many seconds.
+    /// Zero turns the alert off.
+    /// Env: `SIWXOIDC_GUEST_ALERT_REAPING_SECS`
+    pub guest_alert_reaping_secs: u64,
+    /// Alert: live guests at this percentage of `guest_global_max_active`. Zero is off.
+    /// Env: `SIWXOIDC_GUEST_ALERT_LIVE_PCT`
+    pub guest_alert_live_pct: u64,
+    /// Alert: guests minted today at this percentage of `guest_daily_mint_max`. Zero is off.
+    /// Env: `SIWXOIDC_GUEST_ALERT_DAILY_PCT`
+    pub guest_alert_daily_pct: u64,
+    /// Alert: more than this many refused guest requests in one minute, across
+    /// instances. Zero is off.
+    /// Env: `SIWXOIDC_GUEST_ALERT_REFUSALS_PER_MIN`
+    pub guest_alert_refusals_per_min: u64,
+    /// Seconds between two report-only orphan scans (guest accounts in Synapse that have
+    /// no record). Zero turns the scan off.
+    /// Env: `SIWXOIDC_GUEST_ORPHAN_REPORT_SECS`
+    pub guest_orphan_report_secs: u64,
 }
 
 /// The shortest configurable absolute grant lifetime: a device code's
@@ -469,6 +487,11 @@ impl Default for Config {
             guest_brake_reaping_count: 50,
             guest_brake_reaping_secs: 900,
             guest_reaper_interval_secs: 15,
+            guest_alert_reaping_secs: 900,
+            guest_alert_live_pct: 80,
+            guest_alert_daily_pct: 80,
+            guest_alert_refusals_per_min: 50,
+            guest_orphan_report_secs: 604_800,
         }
     }
 }

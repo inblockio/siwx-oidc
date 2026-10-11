@@ -1425,7 +1425,7 @@ paths:
                         expires_at: { type: integer, description: Unix seconds. }
         "400": { description: "`bad_request`, `bad_room_id`, `bad_count`, `bad_labels`, `bad_kind`, `bad_max_guests`, `bad_expires_in`, `bad_session_secs` or `open_links_disabled`." }
         "401": { description: "`invalid_token`." }
-        "403": { description: "`not_a_host`, `admin_token`, `guest_token`, `disabled` or `not_room_host`." }
+        "403": { description: "`not_a_host`, `host_banned`, `admin_token`, `guest_token`, `disabled` or `not_room_host`." }
         "415": { description: Not `application/json`. }
         "422": { description: "`room_not_found`, or `room_template` with a `reasons` list of fixed codes." }
         "429": { description: "`quota_exceeded` with `quota` `host_invites`, `host_open_invites` or `host_invites_per_hour`. Nothing was written." }
@@ -1439,7 +1439,7 @@ paths:
       responses:
         "200": { description: "`{invites: [...]}` with id, label, kind, state (`active`, `revoked`, `expired`, `exhausted`), counts, created and expiry." }
         "401": { description: "`invalid_token`." }
-        "403": { description: "`not_a_host`, `admin_token`, `guest_token` or `disabled`." }
+        "403": { description: "`not_a_host`, `host_banned`, `admin_token`, `guest_token` or `disabled`." }
         "503": { description: "`unavailable`." }
 
   /guest/invites/{invite_id}/end:
@@ -1453,7 +1453,7 @@ paths:
       responses:
         "200": { description: "`{revoked: 1}`." }
         "401": { description: "`invalid_token`." }
-        "403": { description: "`not_a_host`, `admin_token`, `guest_token` or `disabled`." }
+        "403": { description: "`not_a_host`, `host_banned`, `admin_token`, `guest_token` or `disabled`." }
         "404": { description: "`not_found`." }
         "503": { description: "`unavailable`: the store failed or the guests' deadlines could not be moved to now (fail-closed, never a 200 while a guest stays live); repeat the call." }
 
@@ -1477,7 +1477,7 @@ paths:
         "200": { description: "`{revoked: n}`, 0 when the caller has none for the room." }
         "400": { description: "`bad_request` or `bad_room_id`." }
         "401": { description: "`invalid_token`." }
-        "403": { description: "`not_a_host`, `admin_token`, `guest_token` or `disabled`." }
+        "403": { description: "`not_a_host`, `host_banned`, `admin_token`, `guest_token` or `disabled`." }
         "503": { description: "`unavailable`: the store failed or the guests' deadlines could not be moved to now (fail-closed, never a 200 while a guest stays live); repeat the call." }
 
   /health:

@@ -106,9 +106,12 @@ pub async fn peek(State(state): State<GuestState>, body: Bytes) -> Response {
         Ok(g) => g,
         Err(r) => return r,
     };
-    match state.redis.guest_kill_switch_on().await {
-        Ok(false) => {}
-        Ok(true) => return error(StatusCode::SERVICE_UNAVAILABLE, "disabled"),
+    match state.redis.guest_control().await {
+        Ok(c) if !c.disabled => {}
+        Ok(_) => {
+            super::audit::refused(&state.redis, "peek", "disabled").await;
+            return error(StatusCode::SERVICE_UNAVAILABLE, "disabled");
+        }
         Err(e) => {
             warn!(error = %e, "guest peek: control read failed");
             return unavailable();
@@ -301,6 +304,7 @@ pub async fn redeem(State(state): State<GuestState>, body: Bytes) -> Response {
         .await;
     match outcome {
         Ok(RedeemOutcome::Minted { deadline, now }) => {
+            super::audit::minted();
             let seconds_left = (deadline - now).max(0);
             let mut response = Json(json!({
                 "guest_client_url": client_url.as_str(),
@@ -314,11 +318,27 @@ pub async fn redeem(State(state): State<GuestState>, body: Bytes) -> Response {
             }
             response
         }
-        Ok(RedeemOutcome::Refused(why)) => refusal(why),
+        Ok(RedeemOutcome::Refused(why)) => {
+            super::audit::refused(&state.redis, "redeem", refusal_class(why)).await;
+            refusal(why)
+        }
         Err(e) => {
             warn!(error = %e, "guest redeem: store write failed");
             unavailable()
         }
+    }
+}
+
+/// The reason class of a refusal, for the audit event.
+fn refusal_class(why: RedeemRefusal) -> &'static str {
+    match why {
+        RedeemRefusal::Disabled => "disabled",
+        RedeemRefusal::InvalidLink => "invalid_link",
+        RedeemRefusal::Expired => "expired",
+        RedeemRefusal::Exhausted => "exhausted",
+        RedeemRefusal::Revoked => "revoked",
+        RedeemRefusal::DidInUse => "did_in_use",
+        RedeemRefusal::Quota(class) => class,
     }
 }
 
@@ -1078,7 +1098,9 @@ mod tests {
         let inv = e.invite(Kind::Single, 1).await;
         let nonce = e.nonce(&inv).await;
         let body = e.body(&inv, &Guest::new(), &nonce);
-        e.redis.set_raw(CONTROL_KEY, "disabled").await.unwrap();
+        e.redis
+            .hset_raw_for_test(CONTROL_KEY, "disabled", "1")
+            .await;
         let before = e.redis.dbsize_for_test().await;
         let r = e.post("/guest/redeem", body.clone()).await;
         assert_eq!((r.status, r.error()), (503, "disabled".into()));
@@ -1088,6 +1110,38 @@ mod tests {
         assert_eq!(e.used(&inv).await, "0");
         // Switched off again: the same link still works (the refusal burned nothing).
         e.redis.del_raw(CONTROL_KEY).await.unwrap();
+        assert_eq!(e.post("/guest/redeem", body).await.status, 200);
+        db.flush_db_for_test().await;
+    }
+
+    /// S6: a banned host's invite answers as an ended one at peek and redeem and burns
+    /// nothing; lifting the ban restores it. Own database: the key is global.
+    #[tokio::test]
+    async fn a_banned_hosts_invite_is_refused_as_revoked() {
+        let Some(db) = siwx_oidc::test_support::redis_db(7).await else {
+            return;
+        };
+        db.flush_db_for_test().await;
+        let e = env_in(Some(7), None, |_| {}).await.unwrap();
+        let inv = e.invite(Kind::Single, 1).await;
+        let nonce = e.nonce(&inv).await;
+        let body = e.body(&inv, &Guest::new(), &nonce);
+        e.redis
+            .sadd_raw(siwx_oidc::db::guest_invites::BANNED_HOSTS_KEY, &inv.host)
+            .await
+            .unwrap();
+        let p = e.peek(&inv).await;
+        assert_eq!(
+            (p.status, p.json()["state"].clone()),
+            (200, json!("revoked"))
+        );
+        let r = e.post("/guest/redeem", body.clone()).await;
+        assert_eq!((r.status, r.error()), (410, "revoked".into()));
+        assert_eq!(e.used(&inv).await, "0");
+        e.redis
+            .del_raw(siwx_oidc::db::guest_invites::BANNED_HOSTS_KEY)
+            .await
+            .unwrap();
         assert_eq!(e.post("/guest/redeem", body).await.status, 200);
         db.flush_db_for_test().await;
     }

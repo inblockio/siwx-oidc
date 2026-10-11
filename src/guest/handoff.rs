@@ -87,13 +87,13 @@ fn guest_cookie_name(config: &Config) -> &'static str {
     }
 }
 
-/// S6 seam: the kill switch. Returns whether guest hand-offs are switched off
-/// (`guest:control == disabled`, set by the operator). S6 fills this in; until then it is
-/// never engaged here. Both `/authorize` and `/guest/continue` ask it, so a guest session
-/// stops handing off the moment it is.
-pub async fn guest_kill_switch_engaged(_redis: &RedisClient) -> anyhow::Result<bool> {
-    // S6: read the control key.
-    Ok(false)
+/// The kill switch (S6, GP-SEC-48): whether guest hand-offs are switched off
+/// (`guest:control` field `disabled` is `1` or `true`, set by the operator). `Err` when the
+/// control cannot be read or does not parse; every caller treats that as engaged. Both
+/// `/authorize` and `/guest/continue` ask it (and `/guest/resume` through [`live_guest`]),
+/// so a guest session stops handing off the moment it is.
+pub async fn guest_kill_switch_engaged(redis: &RedisClient) -> anyhow::Result<bool> {
+    Ok(redis.guest_control().await?.disabled)
 }
 
 /// The refresh guard (S5), asked by `/token` (refresh grant) and `compat::refresh` for a
@@ -103,7 +103,7 @@ pub async fn guest_kill_switch_engaged(_redis: &RedisClient) -> anyhow::Result<b
 /// Only a grant of the guest client is looked at (`guest_client_id`; no Redis read for any
 /// other, and none is needed when the client is not configured). For a guest-client grant
 /// the answer is [`refresh_verdict`] of one read of its record, the device set and the
-/// kill switch. The deadline is also written into the grant (`absolute_exp`), so the
+/// operator's control (`disabled`, `reap_before`). The deadline is also written into the grant (`absolute_exp`), so the
 /// rotation script refuses past it on its own; this guard adds the reasons the grant
 /// cannot know.
 pub async fn guest_refresh_allowed(
@@ -117,21 +117,24 @@ pub async fn guest_refresh_allowed(
     let read = redis
         .guest_refresh_read(&grant.username, &grant.device_id)
         .await?;
-    let killed = guest_kill_switch_engaged(redis).await?;
-    Ok(refresh_verdict(&read, killed))
+    let allowed = refresh_verdict(&read);
+    if !allowed {
+        super::audit::refused(redis, "refresh", "guest_grant").await;
+    }
+    Ok(allowed)
 }
 
-/// The four refusals of contract section 6, as a function of what was read. A record that
+/// The refusals of contract section 6 (and the operator's `disabled` and `reap_before`), as a function of what was read. A record that
 /// is gone, `reaping` or in a state this build does not know refuses; a `claimed` account
 /// is a persistent account and is not this guard's (S7).
-pub fn refresh_verdict(
-    read: &siwx_oidc::db::guest_records::GuestRefreshRead,
-    kill_switch: bool,
-) -> bool {
+pub fn refresh_verdict(read: &siwx_oidc::db::guest_records::GuestRefreshRead) -> bool {
     match read.state.as_deref() {
         Some("claimed") => true,
         Some("minted" | "provisioning" | "active") => {
-            read.deadline.is_some_and(|d| read.now < d) && read.device_recorded && !kill_switch
+            read.deadline.is_some_and(|d| read.now < d)
+                && read.device_recorded
+                && !read.disabled
+                && !read.reap_before_due()
         }
         _ => false,
     }
@@ -388,6 +391,7 @@ pub async fn provision_guest(
         }
     };
     if matches!(guest_kill_switch_engaged(redis).await, Ok(true) | Err(_)) {
+        super::audit::refused(redis, "authorize", "disabled").await;
         return Err(unavailable());
     }
     let names = match redis.read_guest_resume(&record.localpart).await {
@@ -472,10 +476,13 @@ pub async fn provision_guest(
         Err(e) => Err(e),
     };
     match activated {
-        Ok(true) => Ok(GuestGrant {
-            localpart,
-            device_id,
-        }),
+        Ok(true) => {
+            super::audit::signin();
+            Ok(GuestGrant {
+                localpart,
+                device_id,
+            })
+        }
         failure => {
             match &failure {
                 Ok(_) => warn!("guest hand-off: the lease was lost before activation"),
@@ -899,7 +906,15 @@ mod tests {
     }
 
     async fn env(edit: impl Fn(&mut Config)) -> Option<Env> {
-        let redis = siwx_oidc::test_support::redis().await?;
+        env_in(None, edit).await
+    }
+
+    /// `db`: an own Redis database, for a test that sets the global `guest:control`.
+    async fn env_in(db: Option<u8>, edit: impl Fn(&mut Config)) -> Option<Env> {
+        let redis = match db {
+            None => siwx_oidc::test_support::redis().await?,
+            Some(n) => siwx_oidc::test_support::redis_db(n).await?,
+        };
         let mut config = Config {
             guest_enabled: true,
             base_url: url::Url::parse(ISSUER).unwrap(),
@@ -2112,6 +2127,39 @@ mod tests {
         assert_eq!((status, body["error"].as_str()), (403, Some("not_a_guest")));
     }
 
+    /// S6: `disabled` makes the cookie no live session for `/guest/resume` (the shared
+    /// reader `live_guest` that `/authorize` and `/guest/continue` also use) and clearing it
+    /// restores it; an unreadable control (an old plain-string key) is a 503, never a pass.
+    #[tokio::test]
+    async fn the_kill_switch_ends_resume_and_an_unreadable_control_fails_closed() {
+        use siwx_oidc::db::guest_invites::CONTROL_KEY;
+        let Some(e) = env_in(Some(13), |_| {}).await else {
+            return;
+        };
+        e.redis.flush_db_for_test().await;
+        let g = Guest::new();
+        let (_lp, handle) = record(&e, &g, "active", 600).await;
+        let cookie = format!("{}={handle}", guest_cookie_name(&e.config));
+        let headers = [("cookie", cookie.as_str())];
+        let resume = || get(&e, "/guest/resume", &headers);
+        assert_eq!(resume().await.1["state"], "active");
+        e.redis
+            .hset_raw_for_test(CONTROL_KEY, "disabled", "1")
+            .await;
+        assert_eq!(
+            resume().await.1,
+            json!({"state": "no_session"}),
+            "non-revealing"
+        );
+        assert!(guest_kill_switch_engaged(&e.redis).await.unwrap());
+        e.redis.del_raw(CONTROL_KEY).await.unwrap();
+        assert_eq!(resume().await.1["state"], "active");
+        e.redis.set_raw(CONTROL_KEY, "disabled").await.unwrap();
+        assert_eq!(resume().await.0, 503);
+        assert!(guest_kill_switch_engaged(&e.redis).await.is_err());
+        e.redis.flush_db_for_test().await;
+    }
+
     /// `GET /guest/resume`: the record's face for the cookie, no secret; `no_session`
     /// without a live record; a foreign origin refused.
     #[tokio::test]
@@ -2221,53 +2269,45 @@ mod tests {
             deadline,
             device_recorded: device,
             now: 1_000,
+            created_at: Some(500),
+            disabled: false,
+            reap_before: None,
         }
     }
     use siwx_oidc::db::guest_records::GuestRefreshRead;
 
-    /// The four refusals of contract section 6 as a pure function, including the kill
-    /// switch (the S6 seam is always false in a running build, so only this reaches it).
+    /// The refusals of contract section 6 as a pure function, including the kill switch
+    /// and `reap_before` (S6).
     #[test]
-    fn st11_the_refresh_verdict_has_exactly_the_four_refusals() {
-        assert!(refresh_verdict(
-            &read(Some("active"), Some(1_001), true),
-            false
-        ));
-        assert!(refresh_verdict(
-            &read(Some("minted"), Some(2_000), true),
-            false
-        ));
+    fn st11_the_refresh_verdict_has_exactly_the_refusals() {
+        let ok = |r: GuestRefreshRead| refresh_verdict(&r);
+        assert!(ok(read(Some("active"), Some(1_001), true)));
+        assert!(ok(read(Some("minted"), Some(2_000), true)));
         // at the deadline: refused (`now < deadline` is the live side)
-        assert!(!refresh_verdict(
-            &read(Some("active"), Some(1_000), true),
-            false
-        ));
-        assert!(!refresh_verdict(
-            &read(Some("active"), Some(900), true),
-            false
-        ));
-        assert!(!refresh_verdict(
-            &read(Some("reaping"), Some(2_000), true),
-            false
-        ));
-        assert!(!refresh_verdict(
-            &read(Some("active"), Some(2_000), true),
-            true
-        ));
-        assert!(!refresh_verdict(
-            &read(Some("active"), Some(2_000), false),
-            false
-        ));
-        assert!(!refresh_verdict(&read(None, None, false), false));
-        assert!(!refresh_verdict(
-            &read(Some("weird"), Some(2_000), true),
-            false
-        ));
+        assert!(!ok(read(Some("active"), Some(1_000), true)));
+        assert!(!ok(read(Some("active"), Some(900), true)));
+        assert!(!ok(read(Some("reaping"), Some(2_000), true)));
+        let mut killed = read(Some("active"), Some(2_000), true);
+        killed.disabled = true;
+        assert!(!ok(killed));
+        assert!(!ok(read(Some("active"), Some(2_000), false)));
+        assert!(!ok(read(None, None, false)));
+        assert!(!ok(read(Some("weird"), Some(2_000), true)));
         // a claimed account is a persistent account: not this guard's
-        assert!(refresh_verdict(
-            &read(Some("claimed"), Some(1), false),
-            false
-        ));
+        assert!(ok(read(Some("claimed"), Some(1), false)));
+        // reap_before: minted at or before it is refused, after it is untouched, a
+        // missing mint time matches, a claimed record is never touched
+        let mut rb = read(Some("active"), Some(2_000), true);
+        rb.reap_before = Some(500);
+        assert!(!ok(rb.clone()));
+        rb.reap_before = Some(499);
+        assert!(ok(rb.clone()));
+        rb.created_at = None;
+        assert!(!ok(rb));
+        let mut claimed = read(Some("claimed"), Some(1), false);
+        claimed.reap_before = Some(10_000);
+        claimed.disabled = true;
+        assert!(ok(claimed));
     }
 
     async fn post_end(e: &Env, headers: &[(&str, &str)]) -> (u16, Value, Vec<String>) {

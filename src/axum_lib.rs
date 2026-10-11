@@ -1783,14 +1783,13 @@ pub async fn main() {
     // The guest reaper: on every instance, whether or not guests are enabled (a guest is
     // still erased after an operator turns them off). Stopped with the server.
     let (reaper_stop, reaper_stopped) = tokio::sync::watch::channel(false);
+    let reaper_stopped_orphan = reaper_stopped.clone();
     let reaper_task = match (
         state.synapse_client.clone(),
         state.config.matrix_server_name.clone(),
     ) {
         (Some(synapse), Some(server_name)) => {
-            let policy = crate::guest::reaper::ReaperPolicy::from_interval_secs(
-                state.config.guest_reaper_interval_secs,
-            );
+            let policy = crate::guest::reaper::ReaperPolicy::from_config(&state.config);
             let grace = policy.shutdown_grace;
             let reaper = crate::guest::reaper::Reaper::new(
                 state.redis_client.clone(),
@@ -1804,6 +1803,24 @@ pub async fn main() {
             info!("guest reaper not started: synapse_endpoint, mas_shared_secret or matrix_server_name is not set");
             None
         }
+    };
+
+    // The report-only orphan scan, beside the reaper and stopped with it.
+    let orphan_task = match (
+        state.synapse_client.clone(),
+        state.config.matrix_server_name.clone(),
+        state.config.guest_orphan_report_secs,
+    ) {
+        (Some(synapse), Some(server_name), secs) if secs > 0 => {
+            let scan = crate::guest::orphan::OrphanScan {
+                redis: state.redis_client.clone(),
+                synapse,
+                server_name,
+                interval: Duration::from_secs(secs),
+            };
+            Some(tokio::spawn(scan.run(reaper_stopped_orphan)))
+        }
+        _ => None,
     };
 
     let guest_router = crate::guest::routes::router(
@@ -1964,6 +1981,9 @@ pub async fn main() {
         .unwrap();
     if let Some((task, grace)) = reaper_task {
         let _ = tokio::time::timeout(grace + Duration::from_secs(1), task).await;
+    }
+    if let Some(task) = orphan_task {
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
     }
 }
 

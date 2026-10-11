@@ -76,6 +76,12 @@ fn forbidden(class: &'static str) -> Response {
     error(StatusCode::FORBIDDEN, class)
 }
 
+/// A 403 of the host checks, audited as `guest_refused` and counted for the burst alert.
+async fn refused(state: &GuestState, class: &'static str) -> Response {
+    super::audit::refused(&state.redis, "invites", class).await;
+    forbidden(class)
+}
+
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.split_once(' ')?;
@@ -98,24 +104,32 @@ pub async fn authorise_host(state: &GuestState, headers: &HeaderMap) -> Result<H
         }
     };
     if meta.did == ADMIN_SUBJECT {
-        return Err(forbidden("admin_token"));
+        return Err(refused(state, "admin_token").await);
     }
     match state.redis.is_unpromoted_guest(&meta.username).await {
         Ok(false) => {}
-        Ok(true) => return Err(forbidden("guest_token")),
+        Ok(true) => return Err(refused(state, "guest_token").await),
         Err(e) => {
             warn!(error = %e, "guest host auth: guest record read failed");
             return Err(unavailable());
         }
     }
     if !is_host(&state.config.guest_hosts, &meta.username, &meta.did) {
-        return Err(forbidden("not_a_host"));
+        return Err(refused(state, "not_a_host").await);
     }
-    match state.redis.guest_kill_switch_on().await {
-        Ok(false) => {}
-        Ok(true) => return Err(forbidden("disabled")),
+    match state.redis.guest_control().await {
+        Ok(c) if !c.disabled => {}
+        Ok(_) => return Err(refused(state, "disabled").await),
         Err(e) => {
             warn!(error = %e, "guest host auth: control read failed");
+            return Err(unavailable());
+        }
+    }
+    match state.redis.guest_host_banned(&meta.username).await {
+        Ok(false) => {}
+        Ok(true) => return Err(refused(state, "host_banned").await),
+        Err(e) => {
+            warn!(error = %e, "guest host auth: banned-host read failed");
             return Err(unavailable());
         }
     }
@@ -245,6 +259,7 @@ pub async fn create(State(state): State<GuestState>, headers: HeaderMap, body: B
     };
     match state.redis.create_guest_invites(&batch, &quotas).await {
         Ok(CreateOutcome::Created { expires_at, .. }) => {
+            super::audit::invite_created(invites.len());
             let issuer = config.base_url.as_str();
             let links: Vec<Value> = invites
                 .iter()
@@ -705,6 +720,25 @@ mod tests {
         e.redis.del_raw(&key).await.unwrap();
     }
 
+    /// S6: a banned host cannot mint; an unreadable control (an old plain-string key)
+    /// fails closed. Own database: the keys are global.
+    #[tokio::test]
+    async fn st05_a_banned_host_and_an_unreadable_control_block_create() {
+        use siwx_oidc::db::guest_invites::{BANNED_HOSTS_KEY, CONTROL_KEY};
+        let Some(e) = env_in(Some(11), |_| {}).await else {
+            return;
+        };
+        e.redis.sadd_raw(BANNED_HOSTS_KEY, &e.host).await.unwrap();
+        let banned = e.create(json!({"room_id": ROOM})).await;
+        e.redis.del_raw(BANNED_HOSTS_KEY).await.unwrap();
+        assert_eq!(banned, (403, json!({"error": "host_banned"})));
+        e.redis.set_raw(CONTROL_KEY, "disabled").await.unwrap();
+        let wrongtype = e.create(json!({"room_id": ROOM})).await;
+        e.redis.del_raw(CONTROL_KEY).await.unwrap();
+        assert_eq!(wrongtype, (503, json!({"error": "unavailable"})));
+        assert_eq!(e.create(json!({"room_id": ROOM})).await.0, 200);
+    }
+
     /// ST-05: the kill switch blocks mint. Own database: the key is global.
     #[tokio::test]
     async fn st05_the_kill_switch_blocks_create_and_list() {
@@ -712,9 +746,8 @@ mod tests {
             return;
         };
         e.redis
-            .set_raw(siwx_oidc::db::guest_invites::CONTROL_KEY, "disabled")
-            .await
-            .unwrap();
+            .hset_raw_for_test(siwx_oidc::db::guest_invites::CONTROL_KEY, "disabled", "1")
+            .await;
         let (a, b) = (
             e.create(json!({"room_id": ROOM})).await,
             e.get_text("/guest/invites", &e.host_token).await,
