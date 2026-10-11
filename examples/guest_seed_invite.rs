@@ -29,7 +29,7 @@ async fn main() {
         secret_hash: secret_hash(&secret),
         label: "e2e".into(),
     }];
-    let host = format!("e2ehost{}", &id[..6].to_lowercase());
+    let host = format!("e2ehost{}", id[..6].to_lowercase());
     redis
         .create_guest_invites(
             &NewBatch {

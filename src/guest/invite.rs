@@ -91,6 +91,7 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 /// The common checks of contract §2. Order: token, admin token, guest account,
 /// host list, kill switch. The guest-account read is the seam S3 fills with real
 /// records; today no record exists, so the answer is "not a guest".
+#[allow(clippy::result_large_err)]
 pub async fn authorise_host(state: &GuestState, headers: &HeaderMap) -> Result<Host, Response> {
     let Some(token) = bearer(headers) else {
         return Err(error(StatusCode::UNAUTHORIZED, "invalid_token"));
@@ -359,6 +360,7 @@ pub async fn list(State(state): State<GuestState>, headers: HeaderMap) -> Respon
 /// later; `claimed` is skipped), so the reaper (S5) finds them due. Fail-closed: an
 /// error is a 503 `unavailable`, so "End meeting" never answers 200 while a guest stays
 /// live. The host retries; the revoke is idempotent and the move is repeatable.
+#[allow(clippy::result_large_err)]
 async fn move_guest_deadlines_to_now(
     state: &GuestState,
     invite_ids: &[String],

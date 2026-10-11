@@ -78,6 +78,7 @@ struct Credentials {
 /// A refusal is counted (`route` is `"peek"` or `"redeem"`, the reason `invalid_link`) for
 /// the refusal-burst alert; the event carries neither id nor secret, and the answer is
 /// the same bytes with or without the count.
+#[allow(clippy::result_large_err)]
 async fn verify_secret(
     state: &GuestState,
     body: &[u8],
