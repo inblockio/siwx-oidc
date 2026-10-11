@@ -2887,6 +2887,7 @@ mod tests {
             let legacy = match ceremony {
                 Ceremony::Challenge => format!("webauthn:challenge/{old}"),
                 Ceremony::Link => format!("webauthn:link_challenge/{old}"),
+                Ceremony::Unified => format!("webauthn:unified_challenge/{old}"),
             };
             client.set_ex_raw(&legacy, "old-state", 60).await.unwrap();
             assert_eq!(

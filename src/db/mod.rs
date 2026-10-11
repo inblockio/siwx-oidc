@@ -132,6 +132,10 @@ pub enum Ceremony {
     Challenge,
     /// Linking a passkey to an account: `webauthn:link_ceremony/{digest}`.
     Link,
+    /// Store-free unified login: the sign-up key hint stored with the login
+    /// challenge, then the first assertion's pending recovery while a second
+    /// assertion is awaited: `webauthn:unified_ceremony/{digest}`.
+    Unified,
 }
 
 impl Ceremony {
@@ -139,6 +143,7 @@ impl Ceremony {
         match self {
             Ceremony::Challenge => "webauthn:ceremony",
             Ceremony::Link => "webauthn:link_ceremony",
+            Ceremony::Unified => "webauthn:unified_ceremony",
         }
     }
 
@@ -147,6 +152,7 @@ impl Ceremony {
         match self {
             Ceremony::Challenge => "webauthn:challenge",
             Ceremony::Link => "webauthn:link_challenge",
+            Ceremony::Unified => "webauthn:unified_challenge",
         }
     }
 }

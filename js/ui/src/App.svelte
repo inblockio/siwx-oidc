@@ -46,6 +46,10 @@
 	// a brand-new account, so we gate instead of auto-redirecting. Holds the mxid to
 	// show. null = no gate.
 	let newUserGate: { mxid: string } | null = null;
+	// Second-assertion request parked until the user clicks Continue (a new gesture).
+	let secondRequest: any = null;
+	// Two-RP deployment: the server offers sign-in with a linked (wallet-linked) passkey.
+	let linkedPasskeyLogin = false;
 
 	const config = createConfig({
 		chains: [mainnet],
@@ -249,6 +253,101 @@
 		}
 	}
 
+	function decodeRequest(o: any) {
+		o.publicKey.challenge = base64urlToBuffer(o.publicKey.challenge);
+		if (o.publicKey.allowCredentials) {
+			for (const c of o.publicKey.allowCredentials) {
+				c.id = base64urlToBuffer(c.id);
+			}
+		}
+		return o;
+	}
+	async function promptAndFinish(o: any) {
+		const assertion = await navigator.credentials.get({ publicKey: o.publicKey });
+		if (!assertion) throw new Error('No credential returned');
+		const authResponse = (assertion as PublicKeyCredential)
+			.response as AuthenticatorAssertionResponse;
+		return fetch('/webauthn/authenticate/finish', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				id: assertion.id,
+				rawId: bufferToBase64url(new Uint8Array((assertion as PublicKeyCredential).rawId)),
+				type: assertion.type,
+				response: {
+					authenticatorData: bufferToBase64url(new Uint8Array(authResponse.authenticatorData)),
+					clientDataJSON: bufferToBase64url(new Uint8Array(authResponse.clientDataJSON)),
+					signature: bufferToBase64url(new Uint8Array(authResponse.signature)),
+					userHandle: authResponse.userHandle
+						? bufferToBase64url(new Uint8Array(authResponse.userHandle))
+						: null,
+				},
+			}),
+		});
+	}
+
+	// Handle the finish response of a completed login prompt (errors, new-user gate,
+	// redirect). Throws on failure; the callers report it through failLogin.
+	async function completeLogin(requested: any, finishResp: Response) {
+		if (!finishResp.ok) {
+			const errBody = await finishResp.clone().json().catch(() => null);
+			if (errBody && errBody.error === 'unknown_credential') {
+				// Progressive enhancement: ask the platform to prune this stale passkey
+				// from the picker. Privacy-safe (we only signal an id the client just
+				// presented). Best-effort + feature-detected; unsupported browsers skip it.
+				// Only for the legacy RP (the host of this page): on the unified RP the
+				// same passkey may be valid for other services, so it is never signalled.
+				try {
+					const pkc = window.PublicKeyCredential as any;
+					if (
+						pkc &&
+						typeof pkc.signalUnknownCredential === 'function' &&
+						requested.publicKey.rpId &&
+						requested.publicKey.rpId === window.location.hostname
+					) {
+						await pkc.signalUnknownCredential({
+							rpId: requested.publicKey.rpId,
+							credentialId: errBody.credential_id,
+						});
+					}
+				} catch (_) {
+					/* best-effort prune; ignore */
+				}
+				throw new Error(
+					errBody.message ||
+						'This passkey is no longer valid. Remove it from your device settings or use another sign-in method.'
+				);
+			}
+			throw new Error(await finishResp.text());
+		}
+
+		// New-user gate: when the server reports this passkey resolves to a DID
+		// with NO existing account, signing in would CREATE one. Do NOT auto-
+		// redirect; show the gate and let the user confirm or pick another key.
+		// Nothing is provisioned until the browser navigates to /sign_in (the
+		// "Continue" action), so cancelling leaves zero Synapse state.
+		const result = await finishResp.json().catch(() => ({}));
+		if (result && result.new_user === true) {
+			newUserGate = { mxid: result.mxid || '' };
+			status = 'New account — confirm to continue';
+			return;
+		}
+
+		// Existing user: keep the current immediate redirect.
+		status = 'Redirecting...';
+		window.location.replace(buildSignInUrl());
+	}
+
+	function failLogin(e: any) {
+		if (e.name === 'NotAllowedError') {
+			error = 'Passkey authentication was cancelled.';
+		} else {
+			error = e.message || 'Passkey authentication failed';
+		}
+		status = 'Not Logged In';
+		console.error(e);
+	}
+
 	// `forceAll` drives the "use a different passkey" escape hatch: it re-runs
 	// authenticate/start with {"all": true}, forcing usernameless (all keys) even
 	// when a valid siwx_user cookie would otherwise scope the picker to one account.
@@ -261,19 +360,36 @@
 	// Measured on the served bundle 2026-07-26; present since edff2b2, i.e. this
 	// one-step flow has never completed. The guard still protects every real user
 	// entry point (all of which pass `chained = false`).
-	async function handlePasskeySignIn(forceAll = false, chained = false) {
+	//
+	// `keyHintSpki` (unified RP sign-up only) is the base64url SPKI of the key just
+	// created; the server uses it to name the right credential for the first prompt.
+	async function handlePasskeySignIn(
+		forceAll = false,
+		chained = false,
+		keyHintSpki: string | null = null,
+		legacy = false
+	) {
 		if (passkeyLoading && !chained) return;
 		passkeyLoading = true;
 		error = null;
 		// Re-running start clears any prior gate so we never show stale gate copy.
 		newUserGate = null;
+		secondRequest = null;
 		status = 'Authenticating with passkey...';
 
 		try {
 			const startResp = await fetch('/webauthn/authenticate/start', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: forceAll ? JSON.stringify({ all: true }) : '{}',
+				body: JSON.stringify(
+					legacy
+						? { legacy: true }
+						: forceAll
+							? { all: true }
+							: keyHintSpki
+								? { key_hint_spki_b64url: keyHintSpki }
+								: {}
+				),
 			});
 			if (!startResp.ok) {
 				throw new Error(await startResp.text());
@@ -284,86 +400,47 @@
 			// request (valid cookie, not the escape hatch). When unscoped this is
 			// null/absent and the UI shows no account hint.
 			detectedMxid = forceAll ? null : (options.detected_mxid ?? null);
+			linkedPasskeyLogin = options.linked_passkey_login === true;
 
-			options.publicKey.challenge = base64urlToBuffer(options.publicKey.challenge);
 			// Discoverable login: the server returns an empty `allowCredentials`, so the
 			// authenticator offers the user's own resident passkeys (not a server-wide
 			// picker). An empty/absent list is a no-op here — never treat it as an error.
-			if (options.publicKey.allowCredentials) {
-				for (const c of options.publicKey.allowCredentials) {
-					c.id = base64urlToBuffer(c.id);
+			let requested = decodeRequest(options);
+			const finishResp = await promptAndFinish(requested);
+
+			// The server may ask for one more assertion (a plain re-prompt for a named
+			// credential). Do NOT start it here: the first prompt and the finish request
+			// have used up the click's user activation, and Safari rejects a
+			// credentials.get() without a fresh gesture. Park the request and let the
+			// user start it with a click (continueSecondAssertion).
+			if (finishResp.ok) {
+				const again = await finishResp.clone().json().catch(() => null);
+				if (again && again.need_second_assertion === true && again.options) {
+					secondRequest = decodeRequest(again.options);
+					status = 'One more step: confirm your passkey';
+					return;
 				}
 			}
-
-			const assertion = await navigator.credentials.get({ publicKey: options.publicKey });
-			if (!assertion) throw new Error('No credential returned');
-
-			const authResponse = (assertion as PublicKeyCredential).response as AuthenticatorAssertionResponse;
-			const finishResp = await fetch('/webauthn/authenticate/finish', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({
-					id: assertion.id,
-					rawId: bufferToBase64url(new Uint8Array((assertion as PublicKeyCredential).rawId)),
-					type: assertion.type,
-					response: {
-						authenticatorData: bufferToBase64url(new Uint8Array(authResponse.authenticatorData)),
-						clientDataJSON: bufferToBase64url(new Uint8Array(authResponse.clientDataJSON)),
-						signature: bufferToBase64url(new Uint8Array(authResponse.signature)),
-						userHandle: authResponse.userHandle
-							? bufferToBase64url(new Uint8Array(authResponse.userHandle))
-							: null,
-					},
-				}),
-			});
-			if (!finishResp.ok) {
-				const errBody = await finishResp.clone().json().catch(() => null);
-				if (errBody && errBody.error === 'unknown_credential') {
-					// Progressive enhancement: ask the platform to prune this stale passkey
-					// from the picker. Privacy-safe (we only signal an id the client just
-					// presented). Best-effort + feature-detected; unsupported browsers skip it.
-					try {
-						const pkc = window.PublicKeyCredential as any;
-						if (pkc && typeof pkc.signalUnknownCredential === 'function' && options.publicKey.rpId) {
-							await pkc.signalUnknownCredential({
-								rpId: options.publicKey.rpId,
-								credentialId: errBody.credential_id,
-							});
-						}
-					} catch (_) {
-						/* best-effort prune; ignore */
-					}
-					throw new Error(
-						errBody.message ||
-							'This passkey is no longer valid. Remove it from your device settings or use another sign-in method.'
-					);
-				}
-				throw new Error(await finishResp.text());
-			}
-
-			// New-user gate: when the server reports this passkey resolves to a DID
-			// with NO existing account, signing in would CREATE one. Do NOT auto-
-			// redirect; show the gate and let the user confirm or pick another key.
-			// Nothing is provisioned until the browser navigates to /sign_in (the
-			// "Continue" action), so cancelling leaves zero Synapse state.
-			const result = await finishResp.json().catch(() => ({}));
-			if (result && result.new_user === true) {
-				newUserGate = { mxid: result.mxid || '' };
-				status = 'New account — confirm to continue';
-				return;
-			}
-
-			// Existing user: keep the current immediate redirect.
-			status = 'Redirecting...';
-			window.location.replace(buildSignInUrl());
+			await completeLogin(requested, finishResp);
 		} catch (e: any) {
-			if (e.name === 'NotAllowedError') {
-				error = 'Passkey authentication was cancelled.';
-			} else {
-				error = e.message || 'Passkey authentication failed';
-			}
-			status = 'Not Logged In';
-			console.error(e);
+			failLogin(e);
+		} finally {
+			passkeyLoading = false;
+		}
+	}
+
+	// Second assertion of a first visit, started from a fresh click.
+	async function continueSecondAssertion() {
+		const requested = secondRequest;
+		if (!requested || passkeyLoading) return;
+		secondRequest = null;
+		passkeyLoading = true;
+		error = null;
+		status = 'Authenticating with passkey...';
+		try {
+			await completeLogin(requested, await promptAndFinish(requested));
+		} catch (e: any) {
+			failLogin(e);
 		} finally {
 			passkeyLoading = false;
 		}
@@ -412,6 +489,18 @@
 			if (!credential) throw new Error('No credential created');
 
 			const attestationResponse = (credential as PublicKeyCredential).response as AuthenticatorAttestationResponse;
+
+			// Unified RP (its id is not the host of this page): registration is options
+			// only, nothing is stored and there is no register/finish. The new key's SPKI
+			// goes into the chained sign-in as the hint for the first prompt.
+			if (options.publicKey.rp?.id && options.publicKey.rp.id !== window.location.hostname) {
+				const spki = attestationResponse.getPublicKey?.();
+				status = 'Passkey created. Signing in...';
+				error = null;
+				await handlePasskeySignIn(false, true, spki ? bufferToBase64url(new Uint8Array(spki)) : null);
+				return;
+			}
+
 			const finishResp = await fetch('/webauthn/register/finish', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
@@ -575,6 +664,33 @@
 						</svg>
 						<span>{#if passkeyLoading}Authenticating...{:else}Sign in with Passkey{/if}</span>
 					</button>
+
+					{#if secondRequest}
+						<!-- The server asked for one more assertion: it needs its own click. -->
+						<p class="register-hint">
+							<button
+								class="link-btn"
+								disabled={passkeyLoading}
+								on:click={continueSecondAssertion}
+							>
+								Continue
+							</button>
+						</p>
+					{/if}
+
+					{#if linkedPasskeyLogin}
+						<!-- Two-RP deployment: passkeys linked to a wallet live on the legacy RP,
+						     which the default (unified) offer does not name. -->
+						<p class="register-hint">
+							<button
+								class="link-btn"
+								disabled={passkeyLoading}
+								on:click={() => handlePasskeySignIn(false, false, null, true)}
+							>
+								Sign in with a passkey linked to a wallet
+							</button>
+						</p>
+					{/if}
 
 					{#if detectedMxid}
 						<!-- Escape hatch: re-run usernameless so the picker shows ALL keys. -->

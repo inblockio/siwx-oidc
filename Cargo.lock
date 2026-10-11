@@ -794,22 +794,26 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "aqua-auth"
-version = "0.7.0"
-source = "git+https://github.com/inblockio/aqua-auth?tag=v0.7.0#97f69c378f4325004a80bfc61193d1e1cbc6ea91"
+version = "0.9.0"
+source = "git+https://github.com/inblockio/aqua-auth?tag=v0.9.0#99ceea885fdffff30b227ca13b7e010bed8373f1"
 dependencies = [
  "async-trait",
  "base64 0.21.7",
  "bs58",
+ "curve25519-dalek",
+ "ecdsa",
  "ed25519-dalek",
  "hex",
  "k256",
  "p256",
+ "rand 0.8.6",
  "redis 0.27.6",
  "serde",
  "serde_json",
  "sha2 0.10.6",
  "sha3",
  "thiserror 2.0.18",
+ "url",
  "uuid",
  "webauthn-rs",
 ]

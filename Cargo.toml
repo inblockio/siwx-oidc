@@ -29,7 +29,7 @@ description = "Key-first OpenID Connect provider and Matrix auth service: agents
 # everywhere. The pin below, which is the part that actually matters, is
 # unaffected by the spelling.
 #
-# `v0.7.0` is the async credential store this crate's source targets. It replaces
+# `v0.9.0` carries the async credential store this crate's source targets (first tagged at v0.7.0). It replaces
 # the `refactor/async-credential-store` branch rev this tracked while no tag
 # existed; the tagged tree differs from that rev by documentation only, so this
 # is a re-pin, not an upgrade. A release tag rather than a branch rev so a clean
@@ -37,7 +37,7 @@ description = "Key-first OpenID Connect provider and Matrix auth service: agents
 # machine-local `[patch]` the migration was developed under. aqua-node,
 # aquafier-rs and aqua-state-viewer still resolve 0.6.0 and move to this tag in
 # one batch. See CONSUMERS.md in aqua-auth.
-aqua-auth = { git = "https://github.com/inblockio/aqua-auth", tag = "v0.7.0", features = ["webauthn", "ceremony", "redis"] }
+aqua-auth = { git = "https://github.com/inblockio/aqua-auth", tag = "v0.9.0", features = ["webauthn", "ceremony", "redis"] }
 alloy-primitives = { version = "1", features = ["serde"] }
 alloy = { version = "1", features = ["providers", "transport-http", "contract", "sol-types", "ens"] }
 aes-gcm = "0.10"
@@ -111,6 +111,7 @@ sha3 = "0.10"
 test-log = "0.2"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 urlencoding = "2"
+aqua-auth = { git = "https://github.com/inblockio/aqua-auth", tag = "v0.9.0", features = ["webauthn-testkit"] }
 
 [profile.release]
 opt-level = "z"

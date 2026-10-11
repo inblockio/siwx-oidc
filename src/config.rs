@@ -183,6 +183,11 @@ pub struct Config {
     pub rp_id: Option<String>,
     /// WebAuthn expected origin. Defaults to `base_url` (scheme + host + port).
     pub rp_origin: Option<String>,
+    /// The RP ID of the legacy ceremony (registration, linking, account and
+    /// device flows). Setting it together with a different `rp_id` is what turns
+    /// on two RPs: `rp_id` / `rp_origin` then name the unified RP. Without it
+    /// there is one RP (`rp_id`, else the hostname of `base_url`).
+    pub legacy_rp_id: Option<String>,
     /// The MAS shared secret (MSC3861 mode); must equal Synapse's
     /// `matrix_authentication_service.secret`. It authenticates Synapse to
     /// `/oauth2/introspect` and `/oauth2/admin_token`, and this provider to
@@ -340,6 +345,7 @@ impl Default for Config {
             ],
             rp_id: None,
             rp_origin: None,
+            legacy_rp_id: None,
             mas_shared_secret: None,
             synapse_endpoint: None,
             log_format: "pretty".to_string(),

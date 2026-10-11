@@ -106,6 +106,7 @@ abused, leave it out of the list and let its proofs fail; the next sign-in re-as
 | `supported_pkh_namespaces` | `SIWXOIDC_SUPPORTED_PKH_NAMESPACES` | `["eip155", "ed25519", "p256"]` | `did:pkh` namespaces accepted. Must be registered in aqua-auth. |
 | `rp_id` | `SIWXOIDC_RP_ID` | host of `base_url` | WebAuthn Relying Party ID. Browsers offer only passkeys registered for exactly this domain. |
 | `rp_origin` | `SIWXOIDC_RP_ORIGIN` | `base_url` | Expected WebAuthn origin (scheme, host, port). Set it with `rp_id` when the public origin differs from `base_url`. |
+| `legacy_rp_id` | `SIWXOIDC_LEGACY_RP_ID` | unset | Opt-in for two relying parties. Set it together with a different `rp_id`: then `rp_id` / `rp_origin` name the unified RP (login default, assertions routed by rpIdHash), and `legacy_rp_id` the legacy RP (registration, linking, account and device flows; wallet-linked passkeys sign in through the login page's "passkey linked to a wallet" option). Without `legacy_rp_id` there is one RP, `rp_id` (else the host of `base_url`), exactly as before; an existing `SIWXOIDC_RP_ID` therefore keeps working unchanged. Example: `rp_id = inblock.io` with `base_url` host `dev.siwx.inblock.io` needs `legacy_rp_id = dev.siwx.inblock.io` to get the unified RP `inblock.io`. |
 
 ### Clients
 

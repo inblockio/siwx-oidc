@@ -61,6 +61,7 @@ struct AppState {
     webauthn: Arc<Webauthn>,
     rp_id: String,
     rp_origin: String,
+    rp_dispatch: Arc<wa::RpDispatch>,
     synapse_client: Option<Arc<SynapseClient>>,
 }
 
@@ -140,6 +141,9 @@ impl IntoResponse for CustomError {
             CustomError::RegistrationRefused => {
                 warn!("registration_refused");
             }
+            CustomError::Gone => {
+                warn!("gone");
+            }
             // A server-side fault we have already CLASSIFIED, unlike
             // `internal_error`. Logged under its own name so an operator can
             // tell "a dependency is down and we failed closed on purpose" from
@@ -203,6 +207,7 @@ impl IntoResponse for CustomError {
                 Json(serde_json::json!({ "error": "registration failed" })),
             )
                 .into_response(),
+            CustomError::Gone => (StatusCode::GONE, self.to_string()).into_response(),
             CustomError::NotFound => (StatusCode::NOT_FOUND, self.to_string()).into_response(),
             CustomError::Redirect(uri) => Redirect::to(&uri).into_response(),
             CustomError::ServiceUnavailable(_) => {
@@ -715,10 +720,11 @@ async fn device_passkey_start_handler(
     let scope_did =
         user_session_scope_did(&state.redis_client, &cookies, payload_force_all(&payload)).await;
     let rcr = wa::authenticate_start(
-        &state.webauthn,
+        &state.rp_dispatch,
         &state.redis_client,
         &session_id,
         scope_did.as_deref(),
+        true,
     )
     .await?;
     let detected_mxid = detected_mxid_for(
@@ -730,6 +736,7 @@ async fn device_passkey_start_handler(
     Ok(Json(AuthenticateStartResponse {
         challenge: rcr,
         detected_mxid,
+        linked_passkey_login: false,
     }))
 }
 
@@ -745,7 +752,7 @@ async fn device_passkey_finish_handler(
     let auth_response: PublicKeyCredential = serde_json::from_value(payload.clone())
         .map_err(|e| CustomError::BadRequest(format!("Invalid credential: {}", e)))?;
     let session_id = format!("device_passkey_{}", user_code);
-    let resp = wa::verify_credential(
+    let resp = wa::verify_credential_legacy(
         &state.redis_client,
         &session_id,
         &state.rp_id,
@@ -778,10 +785,17 @@ async fn webauthn_register_start(
     State(state): State<AppState>,
     TypedHeader(cookies): TypedHeader<headers::Cookie>,
     Json(payload): Json<wa::RegisterStartRequest>,
-) -> Result<Json<CreationChallengeResponse>, CustomError> {
+) -> Result<Json<serde_json::Value>, CustomError> {
     let session_id = cookies
         .get(SESSION_COOKIE_NAME)
         .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
+    // With a distinct unified RP the offer is options only (ES256, resident
+    // key); the browser creates the key and no server write happens.
+    if let Some(options) =
+        wa::unified_registration_options(&state.rp_dispatch, payload.display_name.as_deref())?
+    {
+        return Ok(Json(options));
+    }
     let ccr = wa::register_start(
         &state.webauthn,
         &state.redis_client,
@@ -789,9 +803,14 @@ async fn webauthn_register_start(
         payload.display_name,
     )
     .await?;
-    Ok(Json(ccr))
+    Ok(Json(
+        serde_json::to_value(&ccr).map_err(|e| anyhow::anyhow!("encode options: {}", e))?,
+    ))
 }
 
+/// Registration finish. With a distinct unified RP the key is created in the
+/// browser and proven by its first login, so every request is answered 410;
+/// a single-RP deployment (the default) still verifies and stores the passkey.
 async fn webauthn_register_finish(
     State(state): State<AppState>,
     TypedHeader(cookies): TypedHeader<headers::Cookie>,
@@ -800,7 +819,8 @@ async fn webauthn_register_finish(
     let session_id = cookies
         .get(SESSION_COOKIE_NAME)
         .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
-    let resp = wa::register_finish(
+    let resp = wa::register_finish_for(
+        &state.rp_dispatch,
         &state.webauthn,
         &state.redis_client,
         session_id,
@@ -820,6 +840,15 @@ async fn webauthn_register_finish(
 struct AuthenticateStartBody {
     #[serde(default)]
     all: bool,
+    /// Base64url SubjectPublicKeyInfo of a key the browser just created; names
+    /// the signer of the first unified login. Unusable values are ignored.
+    #[serde(default)]
+    key_hint_spki_b64url: Option<String>,
+    /// Ask for the legacy RP (stored and wallet-linked passkeys) instead of the
+    /// unified RP. Only meaningful in a two-RP deployment; with one RP both are
+    /// the same offer.
+    #[serde(default)]
+    legacy: bool,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -851,6 +880,10 @@ struct AuthenticateStartResponse {
     challenge: RequestChallengeResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     detected_mxid: Option<String>,
+    /// True in a two-RP deployment: the login page then offers "sign in with a
+    /// linked passkey" (the legacy RP, where wallet-linked passkeys live).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    linked_passkey_login: bool,
 }
 
 async fn webauthn_authenticate_start(
@@ -865,6 +898,10 @@ async fn webauthn_authenticate_start(
 
     // Escape hatch: `?all=1` OR JSON `{"all": true}` forces usernameless even with
     // a cookie ("use a different passkey").
+    let key_hint = body
+        .as_ref()
+        .and_then(|Json(b)| b.key_hint_spki_b64url.clone());
+    let legacy = body.as_ref().map(|Json(b)| b.legacy).unwrap_or(false);
     let force_all = body.map(|Json(b)| b.all).unwrap_or(false)
         || query
             .all
@@ -882,11 +919,13 @@ async fn webauthn_authenticate_start(
     )
     .await;
 
-    let challenge = wa::authenticate_start(
-        &state.webauthn,
+    let challenge = wa::authenticate_start_with_hint(
+        &state.rp_dispatch,
         &state.redis_client,
         session_id,
         scope_did.as_deref(),
+        legacy,
+        key_hint.as_deref(),
     )
     .await?;
 
@@ -906,6 +945,7 @@ async fn webauthn_authenticate_start(
     Ok(Json(AuthenticateStartResponse {
         challenge,
         detected_mxid,
+        linked_passkey_login: state.rp_dispatch.unified.is_some(),
     }))
 }
 
@@ -935,19 +975,53 @@ struct WebauthnAuthenticateFinishResponse {
 async fn webauthn_authenticate_finish(
     State(state): State<AppState>,
     TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    request_headers: axum::http::HeaderMap,
     Json(auth_response): Json<PublicKeyCredential>,
-) -> Result<Json<WebauthnAuthenticateFinishResponse>, CustomError> {
+) -> Result<axum::response::Response, CustomError> {
     let session_id = cookies
         .get(SESSION_COOKIE_NAME)
         .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
-    let resp = wa::authenticate_finish(
+
+    // Hints for the unified login, in order of trust: the `aqua_did_hint`
+    // cookies, then the `siwx_user` session DID. A hint only ever picks among
+    // the two keys the assertion itself recovers.
+    let mut hints: Vec<aqua_auth::DidHint> = Vec::new();
+    for value in request_headers.get_all(axum::http::header::COOKIE) {
+        if let Ok(raw) = value.to_str() {
+            hints.extend(aqua_auth::hints_from_cookie_header(raw));
+        }
+    }
+    if let Some(did) = user_session_scope_did(
+        &state.redis_client,
+        &Some(TypedHeader(cookies.clone())),
+        false,
+    )
+    .await
+    {
+        hints.extend(aqua_auth::DidHint::parse(&did));
+    }
+
+    let step = wa::authenticate_finish_step(
         &state.redis_client,
         session_id,
-        &state.rp_id,
-        &state.rp_origin,
+        &state.rp_dispatch,
         auth_response,
+        &hints,
     )
     .await?;
+    let hint_cookie = wa::login_hint_cookie(&state.rp_dispatch, &step);
+    let resp = match step {
+        wa::LoginStep::Done { resp, .. } => resp,
+        wa::LoginStep::NeedSecondAssertion(options) => {
+            // A plain re-prompt: the browser asks for the same credential again.
+            return Ok(Json(serde_json::json!({
+                "ok": false,
+                "need_second_assertion": true,
+                "options": options,
+            }))
+            .into_response());
+        }
+    };
 
     // Detection only (no blocking, no change to provisioning). The verified DID
     // is already stored in the session by authenticate_finish; the new-user gate
@@ -972,12 +1046,19 @@ async fn webauthn_authenticate_finish(
         None => (false, String::new()),
     };
 
-    Ok(Json(WebauthnAuthenticateFinishResponse {
+    let mut response = Json(WebauthnAuthenticateFinishResponse {
         ok: resp.ok,
         did: resp.did,
         new_user,
         mxid,
-    }))
+    })
+    .into_response();
+    if let Some(cookie) = hint_cookie.and_then(|c| axum::http::HeaderValue::from_str(&c).ok()) {
+        response
+            .headers_mut()
+            .append(axum::http::header::SET_COOKIE, cookie);
+    }
+    Ok(response)
 }
 
 // -- Account linking route handlers (Phase 2) ------------------------------
@@ -1334,10 +1415,11 @@ async fn account_passkey_start_handler(
     let scope_did =
         user_session_scope_did(&state.redis_client, &cookies, payload_force_all(&payload)).await;
     let rcr = wa::authenticate_start(
-        &state.webauthn,
+        &state.rp_dispatch,
         &state.redis_client,
         &session_id,
         scope_did.as_deref(),
+        true,
     )
     .await?;
     let mut value = serde_json::to_value(&rcr)
@@ -1675,12 +1757,13 @@ pub async fn main() {
         None => Vec::new(),
     };
 
-    let wa_config = wa::build_webauthn(
+    let (wa_config, rp_dispatch) = wa::build_rp_dispatch(
         &config.base_url,
         config.rp_id.as_deref(),
         config.rp_origin.as_deref(),
+        config.legacy_rp_id.as_deref(),
     )
-    .expect("Failed to initialize WebAuthn — check SIWXOIDC_BASE_URL, SIWXOIDC_RP_ID, SIWXOIDC_RP_ORIGIN");
+    .expect("Failed to initialize WebAuthn: check SIWXOIDC_BASE_URL, SIWXOIDC_RP_ID, SIWXOIDC_RP_ORIGIN, SIWXOIDC_LEGACY_RP_ID");
 
     // Initialize Synapse client for MSC3861 device lifecycle (optional).
     //
@@ -1713,6 +1796,7 @@ pub async fn main() {
         webauthn: Arc::new(wa_config.webauthn),
         rp_id: wa_config.rp_id,
         rp_origin: wa_config.rp_origin,
+        rp_dispatch: Arc::new(rp_dispatch),
         synapse_client,
     };
 
@@ -2077,21 +2161,30 @@ mod unknown_credential_response_tests {
         let scoped = serde_json::to_value(AuthenticateStartResponse {
             challenge: rcr.clone(),
             detected_mxid: Some("@did-key-zdn:matrix.example.com".to_string()),
+            linked_passkey_login: true,
         })
         .unwrap();
         assert_eq!(scoped["publicKey"]["challenge"], "AAECAwQFBgcICQ");
         assert_eq!(scoped["publicKey"]["rpId"], "matrix.example.com");
         assert!(scoped["publicKey"]["allowCredentials"].is_array());
         assert_eq!(scoped["detected_mxid"], "@did-key-zdn:matrix.example.com");
+        assert_eq!(scoped["linked_passkey_login"], true);
 
         // Unscoped: extra omitted entirely; publicKey still intact.
         let unscoped = serde_json::to_value(AuthenticateStartResponse {
             challenge: rcr,
             detected_mxid: None,
+            linked_passkey_login: false,
         })
         .unwrap();
         assert_eq!(unscoped["publicKey"]["challenge"], "AAECAwQFBgcICQ");
         assert!(unscoped.get("detected_mxid").is_none());
+        assert!(unscoped.get("linked_passkey_login").is_none());
+        // The request flag defaults to the unified RP and reads `legacy: true`.
+        let default: AuthenticateStartBody = serde_json::from_str("{}").unwrap();
+        assert!(!default.legacy);
+        let legacy: AuthenticateStartBody = serde_json::from_str(r#"{"legacy":true}"#).unwrap();
+        assert!(legacy.legacy);
     }
 
     /// H3 (escape hatch): the account/device `{"all":true}` body flag forces
@@ -2215,7 +2308,8 @@ mod unknown_credential_response_tests {
             return;
         };
         let base = url::Url::parse("http://localhost:8000").unwrap();
-        let cfg = wa::build_webauthn(&base, None, None).expect("build webauthn");
+        let (_cfg, dispatch) =
+            wa::build_rp_dispatch(&base, None, None, None).expect("build rp dispatch");
         let cookie_of = |value: &str| {
             let header = format!("siwx_user={value}");
             let hv = axum::http::HeaderValue::from_str(&header).expect("header value");
@@ -2236,10 +2330,11 @@ mod unknown_credential_response_tests {
             let scope = user_session_scope_did(&redis, &cookie_of(&genuine), false).await;
             assert_eq!(scope.as_deref(), Some(did.as_str()), "control: {did}");
             let rcr = wa::authenticate_start(
-                &cfg.webauthn,
+                &dispatch,
                 &redis,
                 &format!("didgenuine{n}{i}"),
                 scope.as_deref(),
+                false,
             )
             .await
             .expect("authenticate_start");
@@ -2261,10 +2356,11 @@ mod unknown_credential_response_tests {
                 "a DID as the cookie value scopes nothing: {did}"
             );
             let rcr = wa::authenticate_start(
-                &cfg.webauthn,
+                &dispatch,
                 &redis,
                 &format!("didforged{n}{i}"),
                 scope.as_deref(),
+                false,
             )
             .await
             .expect("authenticate_start");

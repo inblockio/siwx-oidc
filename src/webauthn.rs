@@ -10,7 +10,7 @@
 //! `sign_in` reads it from there (server-side, trusted).
 
 use anyhow::{anyhow, Result};
-use aqua_auth::{verify_webauthn_assertion, WebAuthnAssertionParams};
+use aqua_auth::{verify_webauthn_assertion, AssertionPolicy, WebAuthnAssertionParams};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use p256::ecdsa::Signature;
 use serde::{Deserialize, Serialize};
@@ -545,6 +545,11 @@ pub async fn register_start(
 /// challenge, attestation verification, I/O) stays `Other`.
 #[derive(Debug, Error)]
 pub enum RegisterFinishError {
+    /// The deployment serves a distinct unified relying party: keys are created
+    /// in the browser and proven by their first login, so there is nothing to
+    /// finish on the server (answered 410).
+    #[error("registration no longer finishes on the server")]
+    Retired,
     /// A passkey, link state or shared-store row already exists under this
     /// credential id; nothing was written.
     #[error("credential id already registered")]
@@ -552,6 +557,23 @@ pub enum RegisterFinishError {
     /// Any other registration failure.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+/// `register/finish` for the relying parties this server serves. A deployment
+/// with a distinct unified RP finishes nothing on the server
+/// ([`RegisterFinishError::Retired`]); a single-RP deployment verifies and
+/// stores the passkey with [`register_finish`].
+pub async fn register_finish_for(
+    dispatch: &RpDispatch,
+    webauthn: &Webauthn,
+    redis: &RedisClient,
+    session_id: &str,
+    reg_response: RegisterPublicKeyCredential,
+) -> Result<RegisterFinishResponse, RegisterFinishError> {
+    if dispatch.unified.is_some() {
+        return Err(RegisterFinishError::Retired);
+    }
+    register_finish(webauthn, redis, session_id, reg_response).await
 }
 
 /// Verify a registration and store its passkey.
@@ -679,16 +701,101 @@ pub async fn register_finish(
 /// scoped path we obtain a `RequestChallengeResponse` exactly as the usernameless
 /// path does and set `allow_credentials` directly (the shape the pre-discoverable
 /// code used). The stored challenge and `verify_credential` are unchanged.
+///
+/// `legacy` picks the relying party the offer names: the unified RP by default
+/// (`false`), the legacy RP on request (`true`). With a single-RP configuration
+/// (`dispatch.unified` is `None`) both are the legacy RP, exactly as before.
 pub async fn authenticate_start(
-    webauthn: &Webauthn,
+    dispatch: &RpDispatch,
     redis: &RedisClient,
     session_id: &str,
     scope_did: Option<&str>,
+    legacy: bool,
 ) -> Result<RequestChallengeResponse> {
-    let (mut rcr, _auth_state) = webauthn
-        .start_discoverable_authentication()
-        .map_err(|e| anyhow!("WebAuthn auth start failed: {:?}", e))?;
+    authenticate_start_with_hint(dispatch, redis, session_id, scope_did, legacy, None).await
+}
 
+/// The unified request options in the webauthn-rs response shape, over a fresh
+/// random challenge (or the given one) and an optional allow list.
+fn unified_request_options(
+    rp_id: &str,
+    challenge: &[u8; 32],
+    allow: &[Vec<u8>],
+) -> Result<RequestChallengeResponse> {
+    let options = aqua_auth::request_options(rp_id, challenge, allow);
+    let mut value = serde_json::to_value(&options)
+        .map_err(|e| anyhow!("Failed to encode request options: {}", e))?;
+    // The aqua-auth shape omits an empty allow list; the webauthn-rs shape
+    // requires the key.
+    if let Some(public_key) = value.get_mut("publicKey").and_then(|v| v.as_object_mut()) {
+        public_key
+            .entry("allowCredentials")
+            .or_insert_with(|| serde_json::json!([]));
+    }
+    serde_json::from_value::<RequestChallengeResponse>(value)
+        .map_err(|e| anyhow!("Failed to read request options: {}", e))
+}
+
+fn fresh_challenge() -> [u8; 32] {
+    use rand::RngCore;
+    let mut challenge = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut challenge);
+    challenge
+}
+
+/// What the store-free unified login keeps between its prompts: the sign-up key
+/// hint from the login start, then the first assertion's pending recovery while
+/// a second assertion is awaited. Public keys only.
+#[derive(Serialize, Deserialize, Default)]
+struct UnifiedCeremonyState {
+    #[serde(default)]
+    hint: Option<String>,
+    #[serde(default)]
+    pending: Option<aqua_auth::PendingRecovery>,
+}
+
+/// [`authenticate_start`] plus the sign-up key hint of the unified RP:
+/// `key_hint_spki_b64url` is the base64url SubjectPublicKeyInfo of a key the
+/// browser just created. A value that does not decode or is no P-256 key is
+/// ignored, never an error. The legacy arm ignores it.
+pub async fn authenticate_start_with_hint(
+    dispatch: &RpDispatch,
+    redis: &RedisClient,
+    session_id: &str,
+    scope_did: Option<&str>,
+    legacy: bool,
+    key_hint_spki_b64url: Option<&str>,
+) -> Result<RequestChallengeResponse> {
+    let legacy_arm = !matches!((&dispatch.unified, legacy), (Some(_), false));
+    let mut rcr = match (&dispatch.unified, legacy) {
+        (Some(unified), false) => {
+            let hint = key_hint_spki_b64url
+                .and_then(|h| URL_SAFE_NO_PAD.decode(h.trim_end_matches('=')).ok())
+                .and_then(|der| aqua_auth::DidHint::from_spki_der(&der).ok())
+                .map(|h| h.as_str().to_owned());
+            let state = UnifiedCeremonyState {
+                hint,
+                pending: None,
+            };
+            let state_json = serde_json::to_string(&state)
+                .map_err(|e| anyhow!("Failed to encode login state: {}", e))?;
+            redis
+                .put_ceremony_state(Ceremony::Unified, session_id, &state_json, CHALLENGE_TTL)
+                .await?;
+            unified_request_options(&unified.rp_id, &fresh_challenge(), &[])?
+        }
+        _ => {
+            let (rcr, _auth_state) = dispatch
+                .legacy_webauthn
+                .start_discoverable_authentication()
+                .map_err(|e| anyhow!("WebAuthn auth start failed: {:?}", e))?;
+            rcr
+        }
+    };
+
+    // The unified arm is discoverable only: the scope DID's stored ids are
+    // legacy credentials, and listing them would exclude the store-free key.
+    let scope_did = scope_did.filter(|_| legacy_arm);
     if let Some(did) = scope_did {
         // The UNION of the legacy webauthn:by_did index (with its scan
         // self-heal) and, when the flag is on, aqua-auth's did index -- not a
@@ -754,25 +861,254 @@ pub async fn authenticate_start(
     Ok(rcr)
 }
 
-/// Core WebAuthn assertion verification: challenge retrieval, credential lookup,
-/// cryptographic verification, counter update, and DID resolution. Shared by
-/// both the OIDC login flow and the device approval flow.
+/// Take the stored challenge for `session_id` and decode it.
+async fn take_challenge(redis: &RedisClient, session_id: &str) -> Result<Vec<u8>, VerifyError> {
+    let challenge_b64 = redis
+        .take_ceremony_state(Ceremony::Challenge, session_id)
+        .await?
+        .ok_or_else(|| anyhow!("No auth challenge found (expired or already used)"))?;
+
+    Ok(URL_SAFE_NO_PAD
+        .decode(&challenge_b64)
+        .map_err(|e| anyhow!("Failed to decode stored challenge: {}", e))?)
+}
+
+/// Assertion verification for the login flow, dispatched on the relying party
+/// the authenticator signed for (`authenticatorData[0..32]`, the rpIdHash).
+/// An RP the policy does not serve is refused before any credential-store read.
+/// The legacy RP takes the stored-passkey path; the unified RP is verified from
+/// the assertion alone (see [`verify_credential_step`]). This wrapper carries no
+/// request hints and treats a second-assertion request as a failure.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn verify_credential(
+    redis: &RedisClient,
+    session_id: &str,
+    dispatch: &RpDispatch,
+    auth_response: &PublicKeyCredential,
+) -> Result<AuthenticateFinishResponse, VerifyError> {
+    match verify_credential_step(redis, session_id, dispatch, auth_response, &[]).await? {
+        LoginStep::Done { resp, .. } => Ok(resp),
+        LoginStep::NeedSecondAssertion(_) => {
+            Err(anyhow!("a second assertion is required to identify the key").into())
+        }
+    }
+}
+
+/// The result of one login assertion.
+pub enum LoginStep {
+    /// The signer is known. `principal` is present when it was recovered from
+    /// the assertion on the unified RP (no stored credential was read).
+    Done {
+        resp: AuthenticateFinishResponse,
+        principal: Option<aqua_auth::Principal>,
+    },
+    /// The first visit of a key that no hint names: prompt again with these
+    /// options (allowCredentials is that one credential). A plain re-prompt.
+    NeedSecondAssertion(RequestChallengeResponse),
+}
+
+/// [`verify_credential`] with the request's hints (`aqua_did_hint` cookies, the
+/// `siwx_user` session DID): the unified arm needs them to pick the signer.
+pub async fn verify_credential_step(
+    redis: &RedisClient,
+    session_id: &str,
+    dispatch: &RpDispatch,
+    auth_response: &PublicKeyCredential,
+    extra_hints: &[aqua_auth::DidHint],
+) -> Result<LoginStep, VerifyError> {
+    let auth_data = &*auth_response.response.authenticator_data;
+    if auth_data.len() < 37 {
+        return Err(anyhow!("authenticatorData is too short").into());
+    }
+    let rp_id_hash: [u8; 32] = auth_data[..32]
+        .try_into()
+        .map_err(|_| anyhow!("authenticatorData is too short"))?;
+
+    let challenge_bytes = take_challenge(redis, session_id).await?;
+
+    match dispatch.policy.entry_for_rp_id_hash(&rp_id_hash) {
+        None => Err(anyhow!("assertion is for a relying party this server does not serve").into()),
+        Some(entry) if entry.rp_id_hash == dispatch.legacy_rp_id_hash => {
+            let resp = verify_stored_credential(
+                redis,
+                &challenge_bytes,
+                &dispatch.legacy_rp_id,
+                &dispatch.legacy_origin,
+                auth_response,
+            )
+            .await?;
+            Ok(LoginStep::Done {
+                resp,
+                principal: None,
+            })
+        }
+        Some(_) => match &dispatch.unified {
+            Some(unified) => {
+                verify_unified(
+                    redis,
+                    session_id,
+                    dispatch,
+                    unified,
+                    &challenge_bytes,
+                    auth_response,
+                    extra_hints,
+                )
+                .await
+            }
+            None => Err(anyhow!("unified RP not enabled").into()),
+        },
+    }
+}
+
+/// Unified-RP login: verify the assertion and recover its two candidate keys,
+/// then pick the signer by hints or by a second assertion. Reads no stored
+/// credential.
+async fn verify_unified(
+    redis: &RedisClient,
+    session_id: &str,
+    dispatch: &RpDispatch,
+    unified: &UnifiedRp,
+    challenge: &[u8],
+    cred: &PublicKeyCredential,
+    extra_hints: &[aqua_auth::DidHint],
+) -> Result<LoginStep, VerifyError> {
+    let enc = |b: &[u8]| URL_SAFE_NO_PAD.encode(b);
+    let assertion = aqua_auth::AssertionJson {
+        id: cred.id.clone(),
+        raw_id: enc(&cred.raw_id),
+        type_: cred.type_.clone(),
+        response: aqua_auth::AssertionResponseJson {
+            authenticator_data: enc(&cred.response.authenticator_data),
+            client_data_json: enc(&cred.response.client_data_json),
+            signature: enc(&cred.response.signature),
+            user_handle: cred.response.user_handle.as_deref().map(enc),
+        },
+        client_extension_results: serde_json::json!({}),
+    };
+    let recovered = aqua_auth::verify_and_recover(
+        &assertion,
+        aqua_auth::ExpectedChallenge::Exact(challenge),
+        &dispatch.policy,
+    )
+    .map_err(|e| anyhow!("assertion refused: {}", e))?;
+    if recovered.rp_id != unified.rp_id {
+        return Err(anyhow!("assertion is for another relying party").into());
+    }
+
+    let state: UnifiedCeremonyState = match redis
+        .take_ceremony_state(Ceremony::Unified, session_id)
+        .await?
+    {
+        Some(json) => serde_json::from_str(&json).unwrap_or_default(),
+        None => UnifiedCeremonyState::default(),
+    };
+    let done = |principal: aqua_auth::Principal| LoginStep::Done {
+        resp: AuthenticateFinishResponse {
+            ok: true,
+            did: principal.did().to_owned(),
+        },
+        principal: Some(principal),
+    };
+
+    if let Some(pending) = state.pending {
+        let principal = pending
+            .resolve(&recovered)
+            .map_err(|e| anyhow!("second assertion refused: {}", e))?;
+        return Ok(done(principal));
+    }
+
+    let mut hints: Vec<aqua_auth::DidHint> = Vec::new();
+    hints.extend(state.hint.as_deref().and_then(aqua_auth::DidHint::parse));
+    hints.extend(extra_hints.iter().cloned());
+    // Known-principal lookup (Synapse) is deferred: no candidate is "known".
+    match recovered.select(&hints, [false, false]) {
+        aqua_auth::Selection::Selected { principal, .. } => Ok(done(principal)),
+        aqua_auth::Selection::NeedSecondAssertion(pending) => {
+            let next = fresh_challenge();
+            let rcr = unified_request_options(
+                &unified.rp_id,
+                &next,
+                &[pending.credential_id().to_vec()],
+            )?;
+            redis
+                .put_ceremony_state(
+                    Ceremony::Challenge,
+                    session_id,
+                    &URL_SAFE_NO_PAD.encode(next),
+                    CHALLENGE_TTL,
+                )
+                .await?;
+            let state_json = serde_json::to_string(&UnifiedCeremonyState {
+                hint: None,
+                pending: Some(pending),
+            })
+            .map_err(|e| anyhow!("Failed to encode login state: {}", e))?;
+            redis
+                .put_ceremony_state(Ceremony::Unified, session_id, &state_json, CHALLENGE_TTL)
+                .await?;
+            Ok(LoginStep::NeedSecondAssertion(rcr))
+        }
+    }
+}
+
+/// The `Set-Cookie` that names the verified principal as the DID hint, only
+/// after a verified login on the unified RP. This is the deliberate exception
+/// to the host-only cookie invariant: the cookie is scoped to the unified RP
+/// id so every service under it can pick the right candidate key.
+pub fn login_hint_cookie(dispatch: &RpDispatch, step: &LoginStep) -> Option<String> {
+    let unified = dispatch.unified.as_ref()?;
+    match step {
+        LoginStep::Done {
+            principal: Some(principal),
+            ..
+        } => Some(aqua_auth::hint_set_cookie(
+            principal,
+            &aqua_auth::HintCookieConfig::for_rp_id(&unified.rp_id),
+        )),
+        _ => None,
+    }
+}
+
+/// Registration options for the unified RP (ES256, resident key required);
+/// `None` when no distinct unified RP is configured. Options only: nothing is
+/// stored and no credential is written by the server.
+pub fn unified_registration_options(
+    dispatch: &RpDispatch,
+    display_name: Option<&str>,
+) -> Result<Option<serde_json::Value>> {
+    let Some(unified) = &dispatch.unified else {
+        return Ok(None);
+    };
+    let name = display_name.unwrap_or("passkey-user");
+    let options = aqua_auth::creation_options(&unified.rp_id, "Aqua", name, &fresh_challenge());
+    Ok(Some(serde_json::to_value(&options).map_err(|e| {
+        anyhow!("Failed to encode creation options: {}", e)
+    })?))
+}
+
+/// The pre-dispatch signature: verify against ONE relying party, whatever the
+/// assertion names. Account and device flows stay on the legacy ceremony.
+pub async fn verify_credential_legacy(
     redis: &RedisClient,
     session_id: &str,
     rp_id: &str,
     rp_origin: &str,
     auth_response: &PublicKeyCredential,
 ) -> Result<AuthenticateFinishResponse, VerifyError> {
-    let challenge_b64 = redis
-        .take_ceremony_state(Ceremony::Challenge, session_id)
-        .await?
-        .ok_or_else(|| anyhow!("No auth challenge found (expired or already used)"))?;
+    let challenge_bytes = take_challenge(redis, session_id).await?;
+    verify_stored_credential(redis, &challenge_bytes, rp_id, rp_origin, auth_response).await
+}
 
-    let challenge_bytes = URL_SAFE_NO_PAD
-        .decode(&challenge_b64)
-        .map_err(|e| anyhow!("Failed to decode stored challenge: {}", e))?;
-
+/// Core WebAuthn assertion verification against the stored passkey: credential
+/// lookup, cryptographic verification, counter update, and DID resolution.
+/// Shared by the OIDC login flow, the account flow and the device approval flow.
+async fn verify_stored_credential(
+    redis: &RedisClient,
+    challenge_bytes: &[u8],
+    rp_id: &str,
+    rp_origin: &str,
+    auth_response: &PublicKeyCredential,
+) -> Result<AuthenticateFinishResponse, VerifyError> {
     let cred_id_b64 = URL_SAFE_NO_PAD.encode(&*auth_response.raw_id);
     if cred_id_b64.is_empty() {
         return Err(anyhow!("Empty credential ID in WebAuthn assertion").into());
@@ -803,7 +1139,7 @@ pub async fn verify_credential(
         authenticator_data: &auth_response.response.authenticator_data,
         client_data_json: &auth_response.response.client_data_json,
         signature: &sig_bytes,
-        expected_challenge: &challenge_bytes,
+        expected_challenge: challenge_bytes,
         expected_origin: rp_origin,
         expected_rp_id: rp_id,
     };
@@ -880,25 +1216,27 @@ pub async fn verify_credential(
     Ok(AuthenticateFinishResponse { ok: true, did })
 }
 
-/// Full authenticate-finish for the OIDC login flow: verifies the credential
-/// AND stores the verified DID in the Redis session (needed by `sign_in`).
-pub async fn authenticate_finish(
+/// Full authenticate-finish for the OIDC login flow: verifies the credential and,
+/// once the login is done, stores the verified DID in the Redis session (needed
+/// by `sign_in`). `hints` are the request hints of the unified login; a hintless
+/// first visit answers with a second-assertion prompt and stores nothing yet.
+pub async fn authenticate_finish_step(
     redis: &RedisClient,
     session_id: &str,
-    rp_id: &str,
-    rp_origin: &str,
+    dispatch: &RpDispatch,
     auth_response: PublicKeyCredential,
-) -> Result<AuthenticateFinishResponse, VerifyError> {
-    let resp = verify_credential(redis, session_id, rp_id, rp_origin, &auth_response).await?;
-
-    let mut session = redis
-        .get_session(session_id.to_string())
-        .await?
-        .ok_or_else(|| anyhow!("Session not found"))?;
-    session.verified_did = Some(resp.did.clone());
-    redis.set_session(session_id.to_string(), session).await?;
-
-    Ok(resp)
+    hints: &[aqua_auth::DidHint],
+) -> Result<LoginStep, VerifyError> {
+    let step = verify_credential_step(redis, session_id, dispatch, &auth_response, hints).await?;
+    if let LoginStep::Done { resp, .. } = &step {
+        let mut session = redis
+            .get_session(session_id.to_string())
+            .await?
+            .ok_or_else(|| anyhow!("Session not found"))?;
+        session.verified_did = Some(resp.did.clone());
+        redis.set_session(session_id.to_string(), session).await?;
+    }
+    Ok(step)
 }
 
 // -- Account linking ceremony (Phase 2) ------------------------------------
@@ -1061,6 +1399,81 @@ pub fn build_webauthn(
         rp_id: resolved_rp_id,
         rp_origin: resolved_rp_origin,
     })
+}
+
+/// The unified relying party, when it differs from the legacy one.
+pub struct UnifiedRp {
+    pub rp_id: String,
+}
+
+/// The relying parties this server serves and the policy that tells them apart
+/// by the rpIdHash in `authenticatorData`. The legacy RP is the one
+/// `WebauthnConfig` (and so `AppState::webauthn`) carries; the unified RP is
+/// present only when configured differently.
+pub struct RpDispatch {
+    pub legacy_rp_id: String,
+    pub legacy_origin: String,
+    legacy_rp_id_hash: [u8; 32],
+    legacy_webauthn: Webauthn,
+    pub unified: Option<UnifiedRp>,
+    policy: AssertionPolicy,
+}
+
+/// Build the legacy `WebauthnConfig` and the dispatch over it.
+///
+/// Two relying parties exist only when BOTH `legacy_rp_id` and a different
+/// `rp_id` are set: then `rp_id` / `rp_origin` name the unified RP and
+/// `legacy_rp_id` the legacy one (origin `base_url`). In every other case there
+/// is one RP and the legacy config is exactly what
+/// `build_webauthn(base_url, rp_id, rp_origin)` gave before (`legacy_rp_id`
+/// alone names that one RP; neither set means the host of `base_url`).
+pub fn build_rp_dispatch(
+    base_url: &Url,
+    rp_id: Option<&str>,
+    rp_origin: Option<&str>,
+    legacy_rp_id: Option<&str>,
+) -> Result<(WebauthnConfig, RpDispatch)> {
+    let host = base_url
+        .host_str()
+        .ok_or_else(|| anyhow!("SIWXOIDC_BASE_URL has no host, cannot derive WebAuthn RP ID"))?;
+    // Two RPs are opt-in: a distinct unified RP exists only when the legacy RP
+    // is named explicitly. Without `legacy_rp_id`, `rp_id` keeps its
+    // pre-dispatch meaning (the one RP), so an existing deployment that set
+    // `SIWXOIDC_RP_ID` to a domain other than the host of `base_url` does not
+    // silently change shape on upgrade.
+    let legacy_id = legacy_rp_id.or(rp_id).unwrap_or(host);
+    let unified_id = legacy_rp_id.and(rp_id).filter(|id| *id != legacy_id);
+    let legacy = if unified_id.is_none() {
+        build_webauthn(base_url, Some(legacy_id), rp_origin)?
+    } else {
+        build_webauthn(base_url, Some(legacy_id), None)?
+    };
+
+    let mut builder = AssertionPolicy::builder().rp(&legacy.rp_id, &[legacy.rp_origin.as_str()]);
+    let unified = match unified_id {
+        Some(id) => {
+            let unified = build_webauthn(base_url, Some(id), rp_origin)?;
+            builder = builder.and_then(|b| b.rp(&unified.rp_id, &[unified.rp_origin.as_str()]));
+            Some(UnifiedRp {
+                rp_id: unified.rp_id,
+            })
+        }
+        None => None,
+    };
+    let policy = builder
+        .and_then(|b| b.build())
+        .map_err(|e| anyhow!("Invalid WebAuthn relying party policy: {}", e))?;
+
+    use sha2::{Digest, Sha256};
+    let dispatch = RpDispatch {
+        legacy_rp_id: legacy.rp_id.clone(),
+        legacy_origin: legacy.rp_origin.clone(),
+        legacy_rp_id_hash: Sha256::digest(legacy.rp_id.as_bytes()).into(),
+        legacy_webauthn: legacy.webauthn.clone(),
+        unified,
+        policy,
+    };
+    Ok((legacy, dispatch))
 }
 
 #[cfg(test)]
@@ -1754,7 +2167,8 @@ mod tests {
         // A localhost RP is valid for WebauthnBuilder (origin must be https OR
         // localhost); this lets the test build a real Webauthn without TLS.
         let base = Url::parse("http://localhost:8000").unwrap();
-        let cfg = build_webauthn(&base, None, None).expect("build webauthn");
+        let (_cfg, dispatch) =
+            build_rp_dispatch(&base, None, None, None).expect("build rp dispatch");
 
         // A forged/guessed token that was never minted -> lookup must miss -> None.
         let nonce = Uuid::new_v4().simple().to_string();
@@ -1770,12 +2184,68 @@ mod tests {
 
         // Drive authenticate_start with the resolved (None) scope: usernameless.
         let session_id = format!("forgedsess{nonce}");
-        let rcr = authenticate_start(&cfg.webauthn, &redis, &session_id, scope_did.as_deref())
+        let rcr = authenticate_start(&dispatch, &redis, &session_id, scope_did.as_deref(), false)
             .await
             .expect("authenticate_start must succeed");
         assert!(
             rcr.public_key.allow_credentials.is_empty(),
             "forged cookie -> usernameless -> allowCredentials MUST be empty (no enumeration)"
+        );
+    }
+
+    /// A unified-RP login offers discoverable credentials only: a scope DID
+    /// (the `siwx_user` cookie) that still has stored legacy credentials must
+    /// not narrow the unified request to those ids, or the store-free key is
+    /// excluded from the picker. Needs Redis.
+    #[tokio::test]
+    async fn unified_login_ignores_the_scope_dids_legacy_allow_list() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let dispatch = two_rp_dispatch();
+        let nonce = Uuid::new_v4().simple().to_string();
+        let did = format!("did:key:zDnU{nonce}");
+        let cred = URL_SAFE_NO_PAD.encode(format!("credU-{nonce}").as_bytes());
+        redis.index_add_passkey(&did, &cred).await.expect("seed");
+
+        let unified_session = format!("unisess{nonce}");
+        let unified = authenticate_start_with_hint(
+            &dispatch,
+            &redis,
+            &unified_session,
+            Some(&did),
+            false,
+            None,
+        )
+        .await
+        .expect("unified start");
+        let legacy_session = format!("legsess{nonce}");
+        let legacy = authenticate_start_with_hint(
+            &dispatch,
+            &redis,
+            &legacy_session,
+            Some(&did),
+            true,
+            None,
+        )
+        .await
+        .expect("legacy start");
+        redis
+            .del_raw(&format!(
+                "{}/{did}",
+                siwx_oidc::db::KV_WEBAUTHN_BY_DID_PREFIX
+            ))
+            .await
+            .ok();
+        assert_eq!(unified.public_key.rp_id, UNIFIED_TEST_RP);
+        assert!(
+            unified.public_key.allow_credentials.is_empty(),
+            "unified RP: discoverable only, the scope DID's legacy ids must not narrow it"
+        );
+        assert_eq!(
+            legacy.public_key.allow_credentials.len(),
+            1,
+            "the legacy arm keeps scoping to the DID's stored credentials"
         );
     }
 
@@ -1791,7 +2261,8 @@ mod tests {
             return;
         };
         let base = Url::parse("http://localhost:8000").unwrap();
-        let cfg = build_webauthn(&base, None, None).expect("build webauthn");
+        let (cfg, dispatch) =
+            build_rp_dispatch(&base, None, None, None).expect("build rp dispatch");
         let nonce = Uuid::new_v4().simple().to_string();
         let did = format!("did:key:zDnLOG{nonce}");
         let cred = URL_SAFE_NO_PAD.encode(format!("cred-{nonce}").as_bytes());
@@ -1806,10 +2277,10 @@ mod tests {
         register_start(&cfg.webauthn, &redis, &register_session, None)
             .await
             .expect("register_start");
-        authenticate_start(&cfg.webauthn, &redis, &scoped_session, Some(&did))
+        authenticate_start(&dispatch, &redis, &scoped_session, Some(&did), false)
             .await
             .expect("scoped authenticate_start");
-        authenticate_start(&cfg.webauthn, &redis, &open_session, None)
+        authenticate_start(&dispatch, &redis, &open_session, None, false)
             .await
             .expect("usernameless authenticate_start");
         link_start(&cfg.webauthn, &redis, &link_session, &did, None)
@@ -1855,7 +2326,8 @@ mod tests {
             return;
         };
         let base = Url::parse("http://localhost:8000").unwrap();
-        let cfg = build_webauthn(&base, None, None).expect("build webauthn");
+        let (_cfg, dispatch) =
+            build_rp_dispatch(&base, None, None, None).expect("build rp dispatch");
 
         let nonce = Uuid::new_v4().simple().to_string();
         let did_a = format!("did:key:zDnA{nonce}");
@@ -1880,7 +2352,7 @@ mod tests {
         assert_eq!(scope_did.as_deref(), Some(did_a.as_str()));
 
         let session_id = format!("scopesess{nonce}");
-        let rcr = authenticate_start(&cfg.webauthn, &redis, &session_id, scope_did.as_deref())
+        let rcr = authenticate_start(&dispatch, &redis, &session_id, scope_did.as_deref(), false)
             .await
             .expect("authenticate_start");
 
@@ -2036,6 +2508,55 @@ mod tests {
             .expect("register_start");
         let reg = none_attestation(&ccr.public_key.challenge, cred_id, key);
         register_finish(webauthn, redis, &session_id, reg).await
+    }
+
+    /// The route's registration finish by deployment shape. A single-RP
+    /// deployment (the default, no distinct unified RP) still registers and
+    /// stores the passkey; a deployment with a distinct unified RP answers
+    /// Retired (410) and writes nothing. Needs Redis.
+    #[tokio::test]
+    async fn register_finish_route_by_deployment_shape() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (cfg, single) =
+            build_rp_dispatch(&Url::parse(REG_TEST_ORIGIN).unwrap(), None, None, None)
+                .expect("single-RP dispatch");
+        assert!(single.unified.is_none());
+        let two = two_rp_dispatch();
+
+        // single-RP: register_start, then the routed finish stores the passkey
+        let cred_id = Uuid::new_v4().as_bytes().to_vec();
+        let cred_key = format!("{CREDENTIAL_PREFIX}/{}", URL_SAFE_NO_PAD.encode(&cred_id));
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let session_id = format!("regroute{}", Uuid::new_v4().simple());
+        let ccr = register_start(&cfg.webauthn, &redis, &session_id, None)
+            .await
+            .expect("register_start");
+        let reg = none_attestation(&ccr.public_key.challenge, &cred_id, &key);
+        let done = register_finish_for(&single, &cfg.webauthn, &redis, &session_id, reg).await;
+        let stored = redis.get_raw(&cred_key).await.expect("GET");
+        redis.del_raw(&cred_key).await.ok();
+        let resp = done.expect("a single-RP deployment still registers");
+        assert_eq!(resp.did, did_of(&key));
+        assert!(stored.is_some(), "the passkey was stored");
+
+        // unified RP: Retired, and nothing is written
+        let cred_id2 = Uuid::new_v4().as_bytes().to_vec();
+        let cred_key2 = format!("{CREDENTIAL_PREFIX}/{}", URL_SAFE_NO_PAD.encode(&cred_id2));
+        let key2 = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let session2 = format!("regroute{}", Uuid::new_v4().simple());
+        let ccr2 = register_start(&cfg.webauthn, &redis, &session2, None)
+            .await
+            .expect("register_start");
+        let reg2 = none_attestation(&ccr2.public_key.challenge, &cred_id2, &key2);
+        let gone = register_finish_for(&two, &cfg.webauthn, &redis, &session2, reg2).await;
+        let written = redis.get_raw(&cred_key2).await.expect("GET");
+        redis.del_raw(&cred_key2).await.ok();
+        assert!(matches!(gone, Err(RegisterFinishError::Retired)));
+        assert!(written.is_none(), "a unified deployment stores nothing");
+        let ce: crate::oidc::CustomError = RegisterFinishError::Retired.into();
+        assert!(matches!(ce, crate::oidc::CustomError::Gone));
     }
 
     fn reg_test_webauthn() -> WebauthnConfig {
@@ -2354,5 +2875,535 @@ mod tests {
             !index_b.contains(&cred_b64),
             "the second key's DID index lists the id"
         );
+    }
+
+    // -- rpIdHash dispatch (two relying parties) --------------------------------
+
+    const UNIFIED_TEST_RP: &str = "example.org";
+    const UNIFIED_TEST_ORIGIN: &str = "https://siwx.example.org";
+
+    /// Legacy RP `localhost` (origin `REG_TEST_ORIGIN`) plus a distinct unified RP.
+    fn two_rp_dispatch() -> RpDispatch {
+        let (_cfg, dispatch) = build_rp_dispatch(
+            &Url::parse(REG_TEST_ORIGIN).unwrap(),
+            Some(UNIFIED_TEST_RP),
+            Some(UNIFIED_TEST_ORIGIN),
+            Some("localhost"),
+        )
+        .expect("build rp dispatch");
+        dispatch
+    }
+
+    /// A user-verified assertion for `rp_id` / `origin` over `challenge`, signed by `key`.
+    fn assertion_for(
+        rp_id: &str,
+        origin: &str,
+        challenge: &[u8],
+        cred_id: &[u8],
+        key: &p256::ecdsa::SigningKey,
+        counter: u32,
+    ) -> PublicKeyCredential {
+        use p256::ecdsa::signature::Signer;
+        use sha2::{Digest, Sha256};
+
+        let client_data_json = serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": URL_SAFE_NO_PAD.encode(challenge),
+            "origin": origin,
+            "crossOrigin": false,
+        })
+        .to_string()
+        .into_bytes();
+        let mut authenticator_data = Sha256::digest(rp_id.as_bytes()).to_vec();
+        authenticator_data.push(0x05); // UP | UV
+        authenticator_data.extend_from_slice(&counter.to_be_bytes());
+        let mut signed = authenticator_data.clone();
+        signed.extend_from_slice(&Sha256::digest(&client_data_json));
+        let sig: Signature = key.sign(&signed);
+        PublicKeyCredential {
+            id: URL_SAFE_NO_PAD.encode(cred_id),
+            raw_id: cred_id.to_vec(),
+            response: webauthn_rs_proto::AuthenticatorAssertionResponseRaw {
+                authenticator_data,
+                client_data_json,
+                signature: sig.to_der().as_bytes().to_vec(),
+                user_handle: None,
+            },
+            extensions: Default::default(),
+            type_: "public-key".to_string(),
+        }
+    }
+
+    /// The login offer names the unified RP unless the legacy RP is asked for.
+    /// Needs Redis.
+    #[tokio::test]
+    async fn authenticate_start_uses_the_unified_rp_by_default_and_the_legacy_rp_on_request() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let dispatch = two_rp_dispatch();
+        let n = Uuid::new_v4().simple().to_string();
+        let unified = authenticate_start(&dispatch, &redis, &format!("rpd-u{n}"), None, false)
+            .await
+            .expect("unified start");
+        let legacy = authenticate_start(&dispatch, &redis, &format!("rpd-l{n}"), None, true)
+            .await
+            .expect("legacy start");
+        assert_eq!(unified.public_key.rp_id, UNIFIED_TEST_RP);
+        assert_eq!(legacy.public_key.rp_id, "localhost");
+        assert_ne!(
+            unified.public_key.challenge, legacy.public_key.challenge,
+            "each offer carries its own challenge"
+        );
+        for sid in [format!("rpd-u{n}"), format!("rpd-l{n}")] {
+            redis
+                .take_ceremony_state(Ceremony::Challenge, &sid)
+                .await
+                .ok();
+        }
+    }
+
+    /// A legacy-RP assertion takes the stored-blob path and resolves exactly the
+    /// DID the old signature resolves, link override included. Needs Redis.
+    #[tokio::test]
+    async fn a_legacy_rp_assertion_takes_the_stored_path_unchanged() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let dispatch = two_rp_dispatch();
+        let cfg = reg_test_webauthn();
+        let cred_id = Uuid::new_v4().as_bytes().to_vec();
+        let cred_b64 = URL_SAFE_NO_PAD.encode(&cred_id);
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let own_did = did_of(&key);
+        let linked_did = format!("did:key:zLinked{}", Uuid::new_v4().simple());
+        register_with(&cfg.webauthn, &redis, &cred_id, &key)
+            .await
+            .expect("register");
+        let link_key = format!("{}/{}", siwx_oidc::db::KV_WEBAUTHN_LINK_PREFIX, cred_b64);
+        let link = serde_json::json!({ "primary_did": linked_did, "label": "t" }).to_string();
+
+        let n = Uuid::new_v4().simple().to_string();
+        let mut got = Vec::new();
+        for (i, counter) in [(0u32, 1u32), (1, 2)] {
+            // First pass: no link entry. Second pass: the link overrides the DID.
+            if i == 1 {
+                redis.set_raw(&link_key, &link).await.expect("seed link");
+            }
+            let sid = format!("rpd-leg{n}{i}");
+            let rcr = authenticate_start(&dispatch, &redis, &sid, None, true)
+                .await
+                .expect("start");
+            let cred = assertion_for(
+                "localhost",
+                REG_TEST_ORIGIN,
+                &rcr.public_key.challenge,
+                &cred_id,
+                &key,
+                counter,
+            );
+            got.push(verify_credential(&redis, &sid, &dispatch, &cred).await);
+        }
+        // Control: the old signature, on the same stored state.
+        let sid = format!("rpd-ctl{n}");
+        let rcr = authenticate_start(&dispatch, &redis, &sid, None, true)
+            .await
+            .expect("start");
+        let cred = assertion_for(
+            "localhost",
+            REG_TEST_ORIGIN,
+            &rcr.public_key.challenge,
+            &cred_id,
+            &key,
+            3,
+        );
+        let control =
+            verify_credential_legacy(&redis, &sid, "localhost", REG_TEST_ORIGIN, &cred).await;
+
+        redis.del_raw(&link_key).await.ok();
+        redis
+            .del_raw(&format!("{CREDENTIAL_PREFIX}/{cred_b64}"))
+            .await
+            .ok();
+        redis.index_remove_passkey(&own_did, &cred_b64).await.ok();
+
+        let plain = got.remove(0).expect("legacy assertion verifies");
+        let linked = got
+            .remove(0)
+            .expect("legacy assertion verifies when linked");
+        let control = control.expect("control verifies");
+        assert_eq!(plain.did, own_did);
+        assert_eq!(linked.did, linked_did);
+        assert_eq!(control.did, linked.did, "the legacy wrapper agrees");
+    }
+
+    /// An assertion for an RP the policy does not serve is refused before any
+    /// credential-store read; the unified RP answers "not enabled" until it is
+    /// wired; a truncated authenticatorData does not panic. Needs Redis.
+    #[tokio::test]
+    async fn an_assertion_for_a_third_rp_is_rejected() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let dispatch = two_rp_dispatch();
+        let cred_id = Uuid::new_v4().as_bytes().to_vec();
+        let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let n = Uuid::new_v4().simple().to_string();
+
+        // NO blob is stored for `cred_id`: reaching the store read would be
+        // VerifyError::UnknownCredential.
+        let sid = format!("rpd-third{n}");
+        let rcr = authenticate_start(&dispatch, &redis, &sid, None, true)
+            .await
+            .expect("start");
+        let cred = assertion_for(
+            "evil.example",
+            "https://evil.example",
+            &rcr.public_key.challenge,
+            &cred_id,
+            &key,
+            1,
+        );
+        let err = verify_credential(&redis, &sid, &dispatch, &cred)
+            .await
+            .err()
+            .expect("a third RP must be rejected");
+        assert!(
+            !matches!(err, VerifyError::UnknownCredential(_)),
+            "the store was read before the RP was checked"
+        );
+        assert!(
+            err.to_string().contains("relying party"),
+            "the rejection names the cause: {err}"
+        );
+
+        let sid = format!("rpd-unif{n}");
+        let rcr = authenticate_start(&dispatch, &redis, &sid, None, false)
+            .await
+            .expect("start");
+        let cred = assertion_for(
+            UNIFIED_TEST_RP,
+            UNIFIED_TEST_ORIGIN,
+            &rcr.public_key.challenge,
+            &cred_id,
+            &key,
+            1,
+        );
+        let err = verify_credential(&redis, &sid, &dispatch, &cred)
+            .await
+            .err()
+            .expect("a hintless first visit asks for a second assertion");
+        assert!(err.to_string().contains("second assertion"), "{err}");
+
+        let sid = format!("rpd-short{n}");
+        authenticate_start(&dispatch, &redis, &sid, None, true)
+            .await
+            .expect("start");
+        let mut cred = assertion_for("localhost", REG_TEST_ORIGIN, b"x", &cred_id, &key, 1);
+        cred.response.authenticator_data.truncate(36);
+        assert!(verify_credential(&redis, &sid, &dispatch, &cred)
+            .await
+            .is_err());
+        redis
+            .take_ceremony_state(Ceremony::Challenge, &sid)
+            .await
+            .ok();
+    }
+
+    /// With the default configuration the dispatch serves one RP only.
+    #[test]
+    fn default_config_is_single_rp() {
+        // The default `base_url` is an IP literal, which is no valid RP ID.
+        let cfg = crate::config::Config {
+            base_url: Url::parse("http://localhost:8000").unwrap(),
+            ..Default::default()
+        };
+        let (legacy, dispatch) = build_rp_dispatch(
+            &cfg.base_url,
+            cfg.rp_id.as_deref(),
+            cfg.rp_origin.as_deref(),
+            cfg.legacy_rp_id.as_deref(),
+        )
+        .expect("build rp dispatch");
+        assert!(dispatch.unified.is_none());
+        assert_eq!(dispatch.policy.entries().len(), 1);
+        assert_eq!(dispatch.legacy_rp_id, cfg.base_url.host_str().unwrap());
+        assert_eq!(legacy.rp_id, dispatch.legacy_rp_id);
+    }
+
+    /// An `rp_id` alone is the one RP, as before the dispatch existed: it never
+    /// turns an upgraded deployment into a two-RP one. Two RPs need
+    /// `legacy_rp_id` too (the dev shape: RP `inblock.io`, host `dev.siwx...`).
+    #[test]
+    fn rp_id_alone_stays_single_rp_and_two_rps_need_legacy_rp_id() {
+        let base = Url::parse("https://siwx.example.org").unwrap();
+        let (cfg, d) = build_rp_dispatch(
+            &base,
+            Some("example.org"),
+            Some("https://example.org"),
+            None,
+        )
+        .expect("rp_id alone");
+        assert!(d.unified.is_none(), "rp_id alone must not add a second RP");
+        assert_eq!(d.legacy_rp_id, "example.org");
+        assert_eq!(cfg.rp_id, "example.org");
+        assert_eq!(
+            d.legacy_origin, "https://example.org",
+            "rp_origin still applies"
+        );
+        assert_eq!(d.policy.entries().len(), 1);
+
+        let (_cfg, d) = build_rp_dispatch(
+            &base,
+            Some("example.org"),
+            Some("https://example.org"),
+            Some("siwx.example.org"),
+        )
+        .expect("both set");
+        assert_eq!(
+            d.unified.as_ref().map(|u| u.rp_id.as_str()),
+            Some("example.org")
+        );
+        assert_eq!(d.legacy_rp_id, "siwx.example.org");
+        assert_eq!(d.policy.entries().len(), 2);
+    }
+
+    // -- store-free unified login ------------------------------------------------
+
+    fn pkc_of(a: &aqua_auth::AssertionJson) -> PublicKeyCredential {
+        let d = |s: &str| URL_SAFE_NO_PAD.decode(s).expect("base64url");
+        PublicKeyCredential {
+            id: a.id.clone(),
+            raw_id: d(&a.raw_id),
+            response: webauthn_rs_proto::AuthenticatorAssertionResponseRaw {
+                authenticator_data: d(&a.response.authenticator_data),
+                client_data_json: d(&a.response.client_data_json),
+                signature: d(&a.response.signature),
+                user_handle: a.response.user_handle.as_deref().map(d),
+            },
+            extensions: Default::default(),
+            type_: "public-key".to_string(),
+        }
+    }
+
+    fn passkey(seed: u64) -> aqua_auth::SoftPasskey {
+        aqua_auth::SoftPasskey::new_seeded(seed, UNIFIED_TEST_RP)
+    }
+
+    fn hint_of(did: &str) -> aqua_auth::DidHint {
+        aqua_auth::DidHint::parse(did).expect("a did:key hint")
+    }
+
+    /// Start a unified login for a fresh session; returns the session id and challenge.
+    async fn unified_start(
+        dispatch: &RpDispatch,
+        redis: &RedisClient,
+        tag: &str,
+        signup_hint_spki: Option<&str>,
+    ) -> (String, Vec<u8>) {
+        let sid = format!("{tag}{}", Uuid::new_v4().simple());
+        let rcr =
+            authenticate_start_with_hint(dispatch, redis, &sid, None, false, signup_hint_spki)
+                .await
+                .expect("start");
+        (sid, rcr.public_key.challenge.to_vec())
+    }
+
+    fn assertion_by(
+        pk: &aqua_auth::SoftPasskey,
+        challenge: &[u8],
+        tweak: impl FnOnce(&mut aqua_auth::AssertOpts<'_>),
+    ) -> PublicKeyCredential {
+        let mut opts = aqua_auth::AssertOpts::new(challenge, UNIFIED_TEST_ORIGIN);
+        tweak(&mut opts);
+        pkc_of(&pk.assert(&opts))
+    }
+
+    fn done_did(step: LoginStep) -> String {
+        match step {
+            LoginStep::Done { resp, principal } => {
+                assert!(principal.is_some(), "a unified login is labelled as such");
+                resp.did
+            }
+            LoginStep::NeedSecondAssertion(_) => panic!("expected a login, got a second prompt"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unified_assertion_with_a_matching_hint_logs_in_as_the_key_did_without_any_store_read()
+    {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let dispatch = two_rp_dispatch();
+        let pk = passkey(11);
+        // Nothing is registered for this credential id: a stored-blob lookup
+        // would end in UnknownCredential.
+        let (sid, ch) = unified_start(&dispatch, &redis, "u1", None).await;
+        let cred = assertion_by(&pk, &ch, |_| {});
+        let hints = [hint_of(&pk.did())];
+        let step = verify_credential_step(&redis, &sid, &dispatch, &cred, &hints)
+            .await
+            .expect("the hinted login verifies");
+        assert_eq!(done_did(step), pk.did());
+    }
+
+    /// The DID a unified login yields is a P-256 `did:key:zDn...`; `sign_in` Path A
+    /// refuses a DID `find_did_method` does not know, so it must be accepted and
+    /// map to the `key` method (the method the server enables by default).
+    #[test]
+    fn a_unified_login_did_is_accepted_by_find_did_method() {
+        let did = passkey(13).did();
+        assert!(did.starts_with("did:key:zDn"), "{did}");
+        let method = aqua_auth::find_did_method(&did).expect("did:key is a known method");
+        assert_eq!(method.method_name(), "key");
+    }
+
+    #[tokio::test]
+    async fn without_hint_or_known_principal_a_second_assertion_is_requested_and_the_intersection_is_the_signer(
+    ) {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let dispatch = two_rp_dispatch();
+        let pk = passkey(12);
+        let (sid, ch) = unified_start(&dispatch, &redis, "u2", None).await;
+        let first = assertion_by(&pk, &ch, |_| {});
+        let step = verify_credential_step(&redis, &sid, &dispatch, &first, &[])
+            .await
+            .expect("first assertion");
+        let LoginStep::NeedSecondAssertion(rcr) = step else {
+            panic!("a hintless first visit must ask for a second assertion");
+        };
+        let allowed: Vec<Vec<u8>> = rcr
+            .public_key
+            .allow_credentials
+            .iter()
+            .map(|c| c.id.to_vec())
+            .collect();
+        assert_eq!(allowed, vec![pk.credential_id.clone()]);
+        let second = assertion_by(&pk, &rcr.public_key.challenge, |_| {});
+        let step = verify_credential_step(&redis, &sid, &dispatch, &second, &[])
+            .await
+            .expect("second assertion");
+        assert_eq!(done_did(step), pk.did());
+    }
+
+    #[tokio::test]
+    async fn a_hint_that_is_not_a_candidate_is_never_selected() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let dispatch = two_rp_dispatch();
+        let pk = passkey(13);
+        let other = passkey(14);
+        let (sid, ch) = unified_start(&dispatch, &redis, "u3", None).await;
+        let cred = assertion_by(&pk, &ch, |_| {});
+        let hints = [hint_of(&other.did())];
+        let step = verify_credential_step(&redis, &sid, &dispatch, &cred, &hints)
+            .await
+            .expect("verifies");
+        assert!(
+            matches!(step, LoginStep::NeedSecondAssertion(_)),
+            "a foreign hint must not pick a signer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signup_spki_hint_selects_the_new_key_in_one_assertion() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let dispatch = two_rp_dispatch();
+        let pk = passkey(15);
+        let spki = URL_SAFE_NO_PAD.encode(pk.spki_der());
+        let (sid, ch) = unified_start(&dispatch, &redis, "u4", Some(&spki)).await;
+        let cred = assertion_by(&pk, &ch, |_| {});
+        let step = verify_credential_step(&redis, &sid, &dispatch, &cred, &[])
+            .await
+            .expect("verifies");
+        assert_eq!(done_did(step), pk.did());
+        // A malformed hint is ignored, never an error.
+        let (sid, ch) = unified_start(&dispatch, &redis, "u4b", Some("not-base64!!")).await;
+        let cred = assertion_by(&pk, &ch, |_| {});
+        let step = verify_credential_step(&redis, &sid, &dispatch, &cred, &[])
+            .await
+            .expect("verifies");
+        assert!(matches!(step, LoginStep::NeedSecondAssertion(_)));
+    }
+
+    #[tokio::test]
+    async fn unified_negative_controls() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let dispatch = two_rp_dispatch();
+        let pk = passkey(16);
+        let hints = [hint_of(&pk.did())];
+        type Tweak = fn(&mut aqua_auth::AssertOpts<'_>);
+        let cases: [(&str, Tweak); 5] = [
+            ("wrong origin", |o| o.origin = "https://evil.example"),
+            ("user not verified", |o| o.flags = 0x01),
+            ("cross origin", |o| o.cross_origin = Some(true)),
+            ("mutated challenge", |o| o.challenge = &[7u8; 32]),
+            ("third rp hash", |o| o.rp_id_override = Some("evil.example")),
+        ];
+        for (name, tweak) in cases {
+            let (sid, ch) = unified_start(&dispatch, &redis, "u5", None).await;
+            let cred = assertion_by(&pk, &ch, tweak);
+            let got = verify_credential_step(&redis, &sid, &dispatch, &cred, &hints).await;
+            assert!(got.is_err(), "{name} must be refused");
+        }
+    }
+
+    #[test]
+    fn unified_registration_offers_es256_resident_only_and_finish_is_gone() {
+        let dispatch = two_rp_dispatch();
+        let options = unified_registration_options(&dispatch, Some("alice"))
+            .expect("options")
+            .expect("the unified RP is configured");
+        let pk = &options["publicKey"];
+        assert_eq!(pk["rp"]["id"], UNIFIED_TEST_RP);
+        let algs: Vec<i64> = pk["pubKeyCredParams"]
+            .as_array()
+            .expect("params")
+            .iter()
+            .map(|p| p["alg"].as_i64().expect("alg"))
+            .collect();
+        assert_eq!(algs, vec![-7], "ES256 only");
+        assert_eq!(pk["authenticatorSelection"]["residentKey"], "required");
+    }
+
+    #[tokio::test]
+    async fn the_did_hint_cookie_is_set_only_after_a_verified_unified_login() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let dispatch = two_rp_dispatch();
+        let pk = passkey(17);
+        let (sid, ch) = unified_start(&dispatch, &redis, "u7", None).await;
+        let cred = assertion_by(&pk, &ch, |_| {});
+        let hints = [hint_of(&pk.did())];
+        let step = verify_credential_step(&redis, &sid, &dispatch, &cred, &hints)
+            .await
+            .expect("verifies");
+        let cookie = login_hint_cookie(&dispatch, &step).expect("set after a unified login");
+        assert!(cookie.starts_with("aqua_did_hint="), "{cookie}");
+        assert!(cookie.contains(&pk.did()), "{cookie}");
+
+        let legacy = LoginStep::Done {
+            resp: AuthenticateFinishResponse {
+                ok: true,
+                did: pk.did(),
+            },
+            principal: None,
+        };
+        assert!(login_hint_cookie(&dispatch, &legacy).is_none());
+        let (sid, ch) = unified_start(&dispatch, &redis, "u7b", None).await;
+        let cred = assertion_by(&pk, &ch, |_| {});
+        let second = verify_credential_step(&redis, &sid, &dispatch, &cred, &[])
+            .await
+            .expect("first assertion");
+        assert!(login_hint_cookie(&dispatch, &second).is_none());
     }
 }
