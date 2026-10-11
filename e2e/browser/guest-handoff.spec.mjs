@@ -24,6 +24,10 @@ import os from 'node:os';
 const BASE = process.env.SIWEOIDC_HOST || 'http://localhost:18080';
 const MOCK = process.env.SYNAPSE_MOCK || 'http://localhost:8090';
 const SEED = process.env.GUEST_SEED_BIN;
+// Opt-in, like the --ignored cargo e2e suites: this spec needs a guest-enabled
+// server and the guest_seed_invite example binary, which the default CI job
+// (guest mode off) does not provide. Without GUEST_SEED_BIN it is skipped.
+test.skip(!SEED, 'GUEST_SEED_BIN not set: needs a guest-enabled server (opt-in)');
 const REDIS_URL = process.env.E2E_REDIS_URL || 'redis://localhost:6379';
 const CLIENT = process.env.GUEST_CLIENT_ID || 'meet-guest';
 const REDIRECT = process.env.GUEST_REDIRECT || `${BASE}/portal/callback`;
