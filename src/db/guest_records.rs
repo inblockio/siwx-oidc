@@ -456,7 +456,7 @@ pub enum ReapCas {
     Claimed,
     Gone,
     /// A hand-off holds the lease (`lease_until` after Redis `TIME`): nothing was
-    /// changed. The caller retries after its backoff; the lease lapses within
+    /// changed. The caller retries after a short gate; the lease lapses within
     /// [`HANDOFF_LEASE_SECS`] even if the hand-off dies (#49 F3).
     Busy,
 }
@@ -1272,8 +1272,8 @@ pub fn handoff_rate_key(localpart: &str) -> String {
 }
 
 /// `KEYS`: 1 record, 2 device set, 3 rate window. `ARGV`: 1 attempt, 2 lease secs, 3 max
-/// devices, 4 hand-offs per minute, 5 device id. Returns `{1, prior_state, acct_checked}`
-/// or `{0, reason}`.
+/// devices, 4 hand-offs per minute, 5 device id. Returns `{1, prior_state, acct_checked,
+/// added}` (`added` `'1'` when this call put the device id in the set) or `{0, reason}`.
 const HANDOFF_BEGIN: &str = r#"
 local now = tonumber(redis.call('TIME')[1])
 local f = redis.call('HMGET', KEYS[1], 'state', 'deadline', 'lease_until', 'lease_owner', 'acct_checked')

@@ -506,6 +506,7 @@ pub async fn provision_guest(
     }
 
     let mut device_created = false;
+    let mut device_step = false;
     let steps = async {
         if !was_active {
             synapse.provision_user(&localpart, &display_name).await?;
@@ -526,6 +527,7 @@ pub async fn provision_guest(
                 )
                 .await?;
         }
+        device_step = true;
         if synapse.upsert_device(&localpart, &device_id).await? == DeviceUpsert::Created {
             device_created = true;
             if let Err(e) = synapse
@@ -541,8 +543,9 @@ pub async fn provision_guest(
         }
         anyhow::Ok(())
     };
-    // On a timeout the step in flight is dropped, so whether Synapse made the device is
-    // unknown: the failure path below deletes it when this attempt added the id.
+    // On a timeout the step in flight is dropped. Before the device step no device of this
+    // attempt can exist; inside it whether Synapse made the device is unknown, so the
+    // failure path below deletes it when this attempt added the id.
     let (steps, timed_out) = match tokio::time::timeout_at(steps_deadline, steps).await {
         Ok(r) => (r, false),
         Err(_) => (Err(anyhow::anyhow!("the hand-off steps timed out")), true),
@@ -566,11 +569,14 @@ pub async fn provision_guest(
                 Err(e) => warn!(error = %e, "guest hand-off failed; no code is issued"),
             }
             // A device this attempt created, or may have created before a timeout under an
-            // id it added, is taken back; the write-ahead id leaves the set only when no
-            // device can exist under it. Without the timeout delete, repeated timeouts fill
-            // the device cap with ids Synapse may never have made.
-            let mut no_device = !was_active && !device_created && !timed_out;
-            if device_created || (timed_out && fresh_device) {
+            // id it added, is taken back, and the write-ahead id leaves the set once the
+            // delete succeeded. A timeout before the device step made no device, so a fresh
+            // id simply leaves. Otherwise repeated timeouts fill the device cap with ids
+            // Synapse never made. (An upsert request already sent can still land after the
+            // delete; the reaper's account erase removes that device.)
+            let mut no_device = (!was_active && !device_created && !timed_out)
+                || (timed_out && fresh_device && !device_step);
+            if device_created || (timed_out && fresh_device && device_step) {
                 no_device = matches!(
                     tokio::time::timeout(
                         HANDOFF_CLEANUP_TIMEOUT,
@@ -1772,6 +1778,7 @@ mod tests {
         /// A 404 without `M_NOT_FOUND`, as a proxy hiding the admin API answers.
         bare_404: bool,
         fail_delete_device: bool,
+        upsert_delay_ms: u64,
     }
 
     #[derive(Clone, Default)]
@@ -1844,7 +1851,11 @@ mod tests {
             .route(
                 "/_synapse/mas/upsert_device",
                 ax_post(|AxState(m): AxState<MockSynapse>, b: String| async move {
+                    let delay = m.flags.lock().unwrap().upsert_delay_ms;
                     rec(&m, "POST upsert_device".into(), b).await;
+                    if delay > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
                     (StatusCode::CREATED, "{}")
                 }),
             )
@@ -2330,8 +2341,9 @@ mod tests {
     }
 
     /// #54 L1: the hand-off steps share one deadline below the lease. A Synapse slower
-    /// than that ends the attempt (no code, lease released, the device this attempt may
-    /// have made deleted and its id dropped, #55 low 3) instead of outliving the lease.
+    /// than that ends the attempt (no code, lease released; it timed out before the device
+    /// step, so no device was made and the fresh id leaves the set, #55 low 3) instead of
+    /// outliving the lease.
     #[tokio::test]
     async fn l1_hand_off_steps_slower_than_the_deadline_give_up() {
         let Some((e, mock, synapse)) = guest_env(|_| {}).await else {
@@ -2360,13 +2372,13 @@ mod tests {
         assert!(!rec.contains_key("lease_owner"), "lease released");
         assert_eq!(
             mock.count("POST delete_device"),
-            1,
-            "the device is taken back"
+            0,
+            "no device step, nothing to delete"
         );
         assert_eq!(
             e.redis.scard_for_test(&format!("guest:devices/{lp}")).await,
             0,
-            "the write-ahead id leaves the set once the delete succeeded"
+            "the fresh write-ahead id leaves the set"
         );
         assert!(
             HANDOFF_STEPS_TIMEOUT < std::time::Duration::from_secs(HANDOFF_LEASE_SECS),
@@ -2374,15 +2386,16 @@ mod tests {
         );
     }
 
-    /// #55 low 3: a timed-out attempt deletes the device only under an id it added itself,
-    /// and keeps the id counted when the delete fails, so the cap never forgets a device
-    /// that may exist and repeated timeouts do not fill it with ids that do not.
+    /// #55 low 3: a timed-out attempt takes back only what it may have made under an id it
+    /// added itself: before the device step the id just leaves; inside it the device is
+    /// deleted and the id leaves only when the delete succeeded. An earlier attempt's id is
+    /// never deleted, so the cap never forgets a device that may exist and repeated
+    /// timeouts do not fill it with ids that do not.
     #[tokio::test]
     async fn low3_a_timed_out_attempt_takes_back_only_the_id_it_added() {
-        let Some((e, mock, synapse)) = guest_env(|_| {}).await else {
+        let Some((e, mock, synapse)) = guest_env(|c| c.guest_handoff_per_minute = 10).await else {
             return;
         };
-        mock.flags.lock().unwrap().provision_delay_ms = 2_000;
         let g = Guest::new();
         let (lp, handle) = record(&e, &g, "minted", 600).await;
         let set = format!("guest:devices/{lp}");
@@ -2399,11 +2412,28 @@ mod tests {
                 assert_eq!(redirect_error_of(r), "temporarily_unavailable");
             }
         };
+        let deleted = || {
+            mock.bodies("POST delete_device")
+                .iter()
+                .map(|b| serde_json::from_str::<Value>(b).unwrap()["device_id"].clone())
+                .collect::<Vec<_>>()
+        };
 
-        // A fresh id whose delete fails stays counted.
-        mock.flags.lock().unwrap().fail_delete_device = true;
+        // Timed out in provisioning, before the device step: no delete, the id leaves.
+        mock.flags.lock().unwrap().provision_delay_ms = 2_000;
         attempt("DEVICE0009").await;
-        assert_eq!(mock.count("POST delete_device"), 1);
+        assert!(deleted().is_empty());
+        assert_eq!(e.redis.scard_for_test(&set).await, 0);
+
+        // Timed out inside the device step under a fresh id, the delete fails: kept.
+        {
+            let mut f = mock.flags.lock().unwrap();
+            f.provision_delay_ms = 0;
+            f.upsert_delay_ms = 2_000;
+            f.fail_delete_device = true;
+        }
+        attempt("DEVICE000A").await;
+        assert_eq!(deleted(), vec![json!("DEVICE000A")]);
         assert_eq!(
             e.redis.scard_for_test(&set).await,
             1,
@@ -2412,21 +2442,17 @@ mod tests {
 
         // The same id again is not this attempt's: no delete, still counted.
         mock.flags.lock().unwrap().fail_delete_device = false;
-        attempt("DEVICE0009").await;
-        assert_eq!(
-            mock.count("POST delete_device"),
-            1,
-            "an earlier attempt's id is kept"
-        );
+        attempt("DEVICE000A").await;
+        assert_eq!(deleted().len(), 1, "an earlier attempt's id is kept");
         assert_eq!(e.redis.scard_for_test(&set).await, 1);
 
         // A fresh id whose delete succeeds leaves the set.
-        attempt("DEVICE000A").await;
-        assert_eq!(mock.count("POST delete_device"), 2);
+        attempt("DEVICE000B").await;
+        assert_eq!(deleted(), vec![json!("DEVICE000A"), json!("DEVICE000B")]);
         assert_eq!(
             e.redis.scard_for_test(&set).await,
             1,
-            "only DEVICE0009 is left"
+            "only DEVICE000A is left"
         );
         assert_eq!(record_of(&e, &lp).await["state"], "provisioning");
     }

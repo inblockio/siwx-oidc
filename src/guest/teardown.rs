@@ -7,7 +7,7 @@
 //! [`crate::teardown`]). Order:
 //!
 //! 1. CAS to `reaping` (refuses a `claimed` account: [`GuestTeardown::Claimed`]; while a
-//!    hand-off holds the lease it changes nothing and returns a `Mark` error to retry);
+//!    hand-off holds the lease it changes nothing and returns [`GuestTeardown::Deferred`]);
 //! 2. epoch bump, revoke every grant, end the DID's own sessions;
 //! 3. `delete_device` for each device of `guest:devices/<lp>`;
 //! 4. `erased:user/<lp>` and `erased:did/<hash>` (the DID tombstone: the DID never signs in
