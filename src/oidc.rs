@@ -1510,6 +1510,28 @@ async fn token_device_code(
             let proposed_device_id = scope_device_id(&entry.scope).map_err(|InvalidDeviceId| {
                 device_code_error("invalid_scope", INVALID_DEVICE_ID_MSG)
             })?;
+            // GP-CLM-26, as in `sign_in`: a claimed guest's pre-claim device ids stay
+            // refused. The check sits before any Synapse call. A Redis error fails closed
+            // (no session is provisioned).
+            if let Some(ref proposed) = proposed_device_id {
+                match db_client.device_is_pre_claim_for_did(&did, proposed).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        warn!(did = %did, "device_code grant: refused a pre-claim device id (GP-CLM-26)");
+                        return Err(device_code_error(
+                            "invalid_scope",
+                            PRE_CLAIM_DEVICE_REFUSED_MSG,
+                        ));
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "device_code grant: pre-claim device check failed");
+                        return Err(device_code_error(
+                            "server_error",
+                            "The device could not be checked. Try again.",
+                        ));
+                    }
+                }
+            }
             debug!(
                 scope = %entry.scope,
                 extracted_device_id = ?proposed_device_id,
@@ -12930,5 +12952,75 @@ mod generic_client_tests {
             "a comma in the proposed device id must be refused, got {:?}",
             outcome.map(|_| ())
         );
+    }
+
+    // ---- GP-CLM-26 on the device-code grant (PR #50 audit F3) ----
+
+    /// Redeem an approved device code for `did` whose scope proposes `device`.
+    async fn redeem_device_code(
+        db: &RedisClient,
+        did: &str,
+        device: &str,
+    ) -> Result<SiwxTokenResponse, CustomError> {
+        let client_id = store_client(db, matrix_client()).await;
+        let device_code = format!("dvc_clm26-{}", nonce());
+        let mut entry = DeviceCodeEntry::new(
+            &format!("C26-{}", nonce()),
+            client_id.clone(),
+            device_scope(device),
+            Utc::now().timestamp(),
+        );
+        entry.status = DeviceCodeStatus::Approved;
+        entry.did = Some(did.to_string());
+        db.set_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
+            .await
+            .unwrap();
+        token(
+            TokenForm {
+                code: None,
+                client_id: Some(client_id),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code),
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &delegated(),
+            db,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_device_grant_refuses_a_pre_claim_device_id() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let did = format!("did:key:zDnClm26dc{}", Uuid::new_v4().simple());
+        db.hset_for_test(
+            &siwx_oidc::db::guest_invites::guest_account_key(&localpart_for(&did)),
+            "pre_claim_devices",
+            "OTHERDEV0,PRECLAIMDEV1",
+        )
+        .await;
+
+        match redeem_device_code(&db, &did, "PRECLAIMDEV1").await {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error_description, PRE_CLAIM_DEVICE_REFUSED_MSG)
+            }
+            other => panic!(
+                "a pre-claim device id must be refused, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        // A fresh id, a prefix of a listed id, and no proposal at all are not refused.
+        for device in ["FRESHDEV99", "PRECLAIMDEV"] {
+            redeem_device_code(&db, &did, device)
+                .await
+                .unwrap_or_else(|e| panic!("{device} must pass: {e:?}"));
+        }
     }
 }
