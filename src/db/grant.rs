@@ -369,6 +369,11 @@ pub struct NewGrant {
     /// many seconds after its last rotation; `None` issues none, and the grant
     /// lives exactly as long as its access token. A `service` grant takes `None`.
     pub refresh_inactivity_secs: Option<u64>,
+    /// An absolute expiry in Unix seconds written into the grant as `absolute_exp`
+    /// (S5: a guest's deadline), on top of any configured lifetime cap; the earlier
+    /// of the two applies. A deadline at or before `now` refuses the issue
+    /// ([`IssueRevoked`]). `None` for every non-guest grant.
+    pub absolute_deadline: Option<i64>,
 }
 
 /// The tokens [`RedisClient::issue_grant`] hands out.
@@ -757,6 +762,29 @@ local function drop_grant(key)
 end
 "#;
 
+/// The error code of [`ISSUE_LUA`]'s M0a gate (one word: Redis reads the first word of
+/// an error reply as its code).
+const ISSUE_REVOKED_REPLY: &str = "ISSUE_REVOKED";
+
+/// [`RedisClient::issue_grant`] refused the grant because its authentication
+/// predates a revocation of its user, client or device (M0a). The caller answers
+/// `invalid_grant`, never a server error.
+#[derive(Debug, thiserror::Error)]
+#[error("the authentication predates a revocation")]
+pub struct IssueRevoked;
+
+/// Issue a grant and its first access token, with its index entries. Needs
+/// [`LUA_EXTEND`], [`LUA_INDEX`] and [`LUA_EPOCH`].
+///
+/// KEYS: 1 grant, 2 access entry, 3 user index, 4 device index, 5 device
+/// tombstone. The gate of M0a runs first and writes nothing when it refuses: an
+/// epoch at or after the grant's `auth_ms` (a user, client or global teardown
+/// since the authentication), or a device tombstone planted at or after it (the
+/// device was revoked since; a tombstone from a build that wrote `1` refuses
+/// every grant of the device). Both are read in this script, so a revocation
+/// lands either before it (refused here) or after it (the revocation's own
+/// script finds the new grant in the index and deletes it). A fresh sign-in,
+/// authenticated after the revocation, passes.
 const ISSUE_LUA: &str = r#"
 local clock = redis.call('TIME')
 local now = tonumber(clock[1])
@@ -769,6 +797,17 @@ if grant_ttl == 0 then grant_ttl = access_ttl end
 local inactivity = grant_ttl
 local auth_ms = now * 1000 + math.floor(tonumber(clock[2]) / 1000)
 if ARGV[12] ~= '' then auth_ms = tonumber(ARGV[12]) end
+if epoch_refuses(auth_ms, ARGV[5], ARGV[7]) then
+  return redis.error_reply('ISSUE_REVOKED authentication predates a revocation (epoch)')
+end
+if ARGV[3] == '1' then
+  local revoked_ms = redis.call('GET', KEYS[5])
+  local v = revoked_ms and tonumber(revoked_ms)
+  -- a value that is no millisecond timestamp (a previous build wrote `1`) refuses all
+  if revoked_ms and (v == nil or v < 1000000000000 or v >= auth_ms) then
+    return redis.error_reply('ISSUE_REVOKED authentication predates a revocation (device)')
+  end
+end
 local auth_time = math.floor(auth_ms / 1000)
 local access_exp = now + access_ttl
 local access_life = access_ttl
@@ -778,6 +817,16 @@ if ARGV[16] ~= '' then
   if now >= absolute_exp then
     return redis.error_reply('authentication older than the absolute lifetime')
   end
+  access_exp = math.min(access_exp, absolute_exp)
+  access_life = math.min(access_life, absolute_exp - now)
+  grant_ttl = math.min(grant_ttl, absolute_exp - now)
+end
+if ARGV[18] ~= '' then
+  local deadline = tonumber(ARGV[18])
+  if now >= deadline then
+    return redis.error_reply('ISSUE_REVOKED the grant deadline has passed')
+  end
+  if (not absolute_exp) or deadline < absolute_exp then absolute_exp = deadline end
   access_exp = math.min(access_exp, absolute_exp)
   access_life = math.min(access_life, absolute_exp - now)
   grant_ttl = math.min(grant_ttl, absolute_exp - now)
@@ -1043,7 +1092,9 @@ for _, id in ipairs(redis.call('SMEMBERS', KEYS[1])) do
   redis.call('SREM', KEYS[3], id)
 end
 redis.call('DEL', KEYS[1])
-redis.call('SET', KEYS[2], '1', 'EX', tonumber(ARGV[1]))
+local t = redis.call('TIME')
+local revoked_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+redis.call('SET', KEYS[2], string.format('%.0f', revoked_ms), 'EX', tonumber(ARGV[1]))
 return n
 "#;
 
@@ -1243,7 +1294,7 @@ impl RedisClient {
             GrantKind::Service => None,
             GrantKind::MatrixDevice | GrantKind::Oidc => Some(tokens::new_session_id()),
         };
-        let script = format!("{LUA_EXTEND}{LUA_INDEX}{ISSUE_LUA}");
+        let script = format!("{LUA_EXTEND}{LUA_INDEX}{LUA_EPOCH}{ISSUE_LUA}");
         let reply: Vec<String> = self
             .eval(
                 &script,
@@ -1252,6 +1303,7 @@ impl RedisClient {
                     &at_key(&access_token),
                     &user_idx_key(&new.username),
                     &device_idx_key(&new.username, &new.device_id),
+                    &device_tombstone_key(&new.username, &new.device_id),
                 ],
                 &[
                     grant_id.as_str(),
@@ -1271,9 +1323,19 @@ impl RedisClient {
                     &current_rt,
                     &cap_arg(self.lifetime.cap_for(&new.client_id)),
                     sid.as_deref().unwrap_or_default(),
+                    &new.absolute_deadline
+                        .map(|d| d.to_string())
+                        .unwrap_or_default(),
                 ],
             )
-            .await?;
+            .await
+            .map_err(|e| {
+                if format!("{e:#}").contains(ISSUE_REVOKED_REPLY) {
+                    anyhow::Error::new(IssueRevoked)
+                } else {
+                    e
+                }
+            })?;
         let field = |i: usize| reply.get(i).map(String::as_str);
         Ok(IssuedGrant {
             grant_id,

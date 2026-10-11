@@ -188,6 +188,10 @@ they are public identifiers the server hands out in `allowCredentials`, not cred
 | `siwx_user/{sha256(cookie)}` | 30 d | DID behind the opaque `siwx_user` cookie (passkey-picker scoping) |
 | `idx:own_sessions/{sha256(canonical DID)}` | the longest session it names | sorted set of the DID's `siwx_user/…` and `acct_session/…` keys, scored by expiry (Unix ms, Redis `TIME`); written with the session in one script, pruned of expired members on each write, emptied with the sessions by `logout/all`, deactivation and erasure |
 | `account_session/{token}`, `user:session/{token}` | 600 s / 30 d | legacy own sessions: read until they expire, ended by the account page's sign-out, and found by a prefix scan when the user's sessions are revoked |
+| `guest:invite/{id}` | the invite's lifetime + `guest_session_max_secs` + 300 s | HASH of one guest invitation: host (`username`) and DID, room id, label, kind, state, `max_guests`, `used`, `session_secs`, `secret_hash` (SHA-256 of the `gi_` secret, never the secret), `created_at`, `expires_at` (Redis `TIME`) |
+| `guest:by_host/{host}`, `guest:by_room/{host}/{sha256(room_id)}` | as the longest invite | SETs of invite ids, for the host's list, the quotas and `meetings/end` |
+| `guest:quota/host_invites_hour/{host}/{hour}` | 3600 s | links a host made in one Redis `TIME` hour |
+| `guest:acct/{localpart}`, `guest:control` | none | read by the host API only: a guest record (S3 writes it; a missing `promoted_at` bars the account from hosting) and the kill switch (`disabled` refuses every host call) |
 | `webauthn:ceremony/{sha256(ceremony id)}` | 120 s | registration or authentication ceremony state, read and deleted in one step; the ceremony id is the `session` cookie, the `session_id` the account re-auth start returns, or `device_passkey_{user_code}` |
 | `webauthn:link_ceremony/{sha256(session id)}` | 120 s | link ceremony state |
 | `webauthn:challenge/{id}`, `webauthn:link_challenge/{id}` | 120 s | legacy ceremony state, read until it expires |

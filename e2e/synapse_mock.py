@@ -197,6 +197,10 @@ PROFILES = {}
 # where `publish_did_field` writes `io.inblock.did`.
 PROFILE_FIELDS = {}
 CALL_LOG = []  # list of "METHOD path"
+# Admin PUT /_synapse/admin/v2/users/{mxid} (the guest hand-off), in arrival order.
+ADMIN_PUTS = []
+# user_id -> user_type set by the admin PUT.
+USER_TYPES = {}
 # Mutable expected secret (so a test can flip it to force 401s) and the
 # admin-surface kill switch (see __reject_admin_token).
 STATE = {"secret": SECRET, "reject_admin": False}
@@ -573,6 +577,8 @@ class Handler(BaseHTTPRequestHandler):
                     "existing_users": sorted(EXISTING_USERS),
                     "profiles": PROFILES,
                     "profile_fields": PROFILE_FIELDS,
+                    "admin_puts": list(ADMIN_PUTS),
+                    "user_types": dict(USER_TYPES),
                     "reject_admin": STATE["reject_admin"],
                 })
         if path == "/health":
@@ -862,7 +868,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "user_id": uid, "state": state})
         if path == "/__reset":
             with LOCK:
-                DEVICES.clear(); LIFECYCLE.clear(); CALL_LOG.clear()
+                DEVICES.clear(); LIFECYCLE.clear(); CALL_LOG.clear(); ADMIN_PUTS.clear(); USER_TYPES.clear()
                 FAIL.clear(); EFFECTIVE_DELETES.clear()
                 EXISTING_USERS.clear(); PROFILES.clear(); PROFILE_FIELDS.clear()
                 RP_RECEIVED.clear(); RP_MODE.clear(); RP_REDIRECTED.clear()
@@ -1073,9 +1079,41 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/_matrix/client/v3/profile/([^/]+)/(.+)$", path)
         if m:
             return self._profile_field_put(m.group(1), m.group(2), body)
-        if re.match(r"^/_synapse/admin/v2/users/(.+)$", path):
-            return self._ported_away("POST /_synapse/mas/reactivate_user")
+        m = re.match(r"^/_synapse/admin/v2/users/(.+)$", path)
+        if m:
+            if "deactivated" in body:
+                return self._ported_away("POST /_synapse/mas/reactivate_user")
+            return self._admin_user_put(m.group(1), body)
         return self._send(404, {"errcode": "M_NOT_FOUND", "error": path})
+
+    def _admin_user_put(self, raw_user_id, body):
+        """PUT /_synapse/admin/v2/users/{mxid} - `SynapseClient::admin_put_user`.
+
+        The guest hand-off sends two of these, in order: `{"user_type": "io.inblock.guest"}`
+        and then `{"displayname": ...}`. Each is recorded, in order, in `admin_puts`
+        (`GET /__state`), and has its own fault endpoint for `POST /__fail`:
+        `admin_put_user_type` and `admin_put_displayname`. A 500 there models Synapse
+        refusing the write (ST-43 / SY-4).
+        """
+        denied = self._admin_auth()
+        if denied:
+            return self._send(*denied)
+        which = "user_type" if "user_type" in body else "displayname"
+        if self._maybe_fail("admin_put_" + which):
+            with LOCK:
+                ADMIN_PUTS.append({"user_id": unquote(raw_user_id), "field": which, "applied": False})
+            return
+        uid = unquote(raw_user_id)
+        with LOCK:
+            if _localpart_of(uid) not in EXISTING_USERS:
+                return self._send(404, {"errcode": "M_NOT_FOUND", "error": "User not found"})
+            if which == "user_type":
+                USER_TYPES[uid] = body["user_type"]
+            else:
+                _mark_profile(_localpart_of(uid), body["displayname"])
+                PROFILES[uid]["displayname"] = body["displayname"]
+            ADMIN_PUTS.append({"user_id": uid, "field": which, "value": body[which], "applied": True})
+        return self._send(200, {"name": uid})
 
     def _profile_field_put(self, raw_user_id, field, body):
         """PUT /_matrix/client/v3/profile/{mxid}/{field} — `publish_did_field`.

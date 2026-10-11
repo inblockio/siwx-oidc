@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 pub mod grant;
+pub mod guest_invites;
+pub mod guest_records;
 pub mod outbox;
 mod redis;
 pub mod seal;
@@ -560,6 +562,12 @@ pub struct SessionEntry {
     /// build, which `sign_in` refuses with a "restart sign-in" error.
     #[serde(default)]
     pub request: Option<AuthorizationRequest>,
+    /// Set by the `/authorize` marker branch (`urn:io.inblock:guest`) to the localpart of
+    /// the guest record whose cookie started this session. Such a session is completed only
+    /// through `/guest/continue`, which writes `verified_did`; `sign_in` refuses it
+    /// otherwise. Absent on every other session.
+    #[serde(default)]
+    pub guest_id: Option<String>,
 }
 
 /// Every form a login session is read in; see [`SessionEntry`].
@@ -572,6 +580,8 @@ struct StoredSessionEntry {
     verified_did: Option<String>,
     #[serde(default)]
     request: Option<AuthorizationRequest>,
+    #[serde(default)]
+    guest_id: Option<String>,
     /// Beside the request in a session a build before Phase 2b stored; it
     /// lives [`SESSION_LIFETIME`]. TODO(remove one release after Phase 2b).
     #[serde(default)]
@@ -594,6 +604,7 @@ impl From<StoredSessionEntry> for SessionEntry {
             signin_count: stored.signin_count,
             verified_did: stored.verified_did,
             request,
+            guest_id: stored.guest_id,
         }
     }
 }
@@ -896,6 +907,10 @@ pub trait DBClient {
     async fn set_code(&self, code: String, code_entry: CodeEntry) -> Result<()>;
     async fn set_session(&self, id: String, entry: SessionEntry) -> Result<()>;
     async fn get_session(&self, id: String) -> Result<Option<SessionEntry>>;
+    /// Whether a guest record exists for the DID (under `localpart_for` or the legacy
+    /// localpart). M6: a guest DID is refused wherever a signature would sign it in, except
+    /// at `/guest/continue`. No record, or guest mode never on, is `false`.
+    async fn guest_did_has_record(&self, did: &str) -> Result<bool>;
     /// Atomically consume an authorization code: read and delete its entry in
     /// one step. Returns the entry to exactly one caller, or None if the code is
     /// unknown, expired or already consumed. There is no other reader of codes:

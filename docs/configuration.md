@@ -365,6 +365,83 @@ name nothing is published, because the assertion binds an MXID. The `proof` insi
 minted only with a configured `signing_key_pem`. Write protection of the field is Synapse
 configuration, see [matrix-integration.md](matrix-integration.md).
 
+### Guest mode
+
+The guest server path (work package S1) is off by default. With `guest_enabled = false` every
+other `guest_*` key is ignored. With it on, start-up checks the whole block (`validate_guest_config`)
+and exits non-zero before binding a port when anything is wrong; the message lists every
+problem and names each key. There is deliberately no key for a guest secret: a guest's identity is a
+`did:key` the browser makes, and the server never holds or derives it. Lists use Figment's syntax,
+for example `SIWXOIDC_GUEST_HOSTS='["alice","did:key:z6Mk…"]'`.
+
+When guest mode is on, start-up refuses:
+
+- a missing `mas_shared_secret`, `synapse_endpoint`, `matrix_server_name`, `guest_client_url` or `guest_client_id`;
+- an empty `guest_client_redirect_uris` or `guest_hosts`;
+- `supported_did_methods` without `key`;
+- a `guest_client_topology` other than `same-site` or `cross-site`;
+- a zero for `guest_session_max_secs` or any quota;
+- any URL among `base_url`, `guest_client_url` and every `guest_client_redirect_uris` entry that is not `https`. When `base_url`'s host is `localhost`, `127.0.0.1` or `[::1]` (local development), `http` is allowed for all of them. `synapse_endpoint` is exempt from the `https` rule: it is an internal admin endpoint.
+
+
+**The `/guest` routes.** With guest mode off, every path under `/guest` answers `503` with `{"error":"guest_unavailable"}`, and no other route changes. With it on, an unknown `/guest` path answers `404` with `{"error":"not_found"}`. Either way, every `/guest` response, errors included, carries `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`, and none of the global CORS layer. With guest mode on:
+
+- A `POST` must be `application/json` (`415`) and at most 4 KiB (`413`). `claim/finish` takes up to 16 KiB.
+- The routes a guest's browser calls with its cookie, or with no credential, refuse a `POST` with `403` (`forbidden_origin`) unless at least one of `Origin` and `Sec-Fetch-Site` is present and each present one names this provider (`Origin` equal to the origin of `base_url`, `Sec-Fetch-Site: same-origin`). They answer no CORS. A `GET` is not checked, since a guest reaches the join page from a link.
+- The routes authorised by a Bearer token (the host's invitations) answer `Access-Control-Allow-Origin: *` without credentials and have no origin check.
+
+| Key | Environment | Default | Meaning |
+|---|---|---|---|
+| `guest_enabled` | `SIWXOIDC_GUEST_ENABLED` | `false` | Master switch for the guest path. |
+| `guest_client_url` | `SIWXOIDC_GUEST_CLIENT_URL` | none | The fixed Meet start URL a guest invitation leads to. Required when on. |
+| `guest_client_id` | `SIWXOIDC_GUEST_CLIENT_ID` | none | The OIDC `client_id` of the Meet client: the only client that may use the `urn:io.inblock:guest` scope at `/authorize`. Required when on. At every start it is written as a static public client (no expiry, no secret that anyone knows, `token_endpoint_auth_method = none`, authorization-code and refresh grants) with exactly `guest_client_redirect_uris`; a `default_clients` entry with the same id, or a failure to write it, stops start-up. |
+| `guest_client_redirect_uris` | `SIWXOIDC_GUEST_CLIENT_REDIRECT_URIS` | `[]` | Redirect URIs of the Meet client; the guest hand-off accepts exactly these (string-equal) and `/guest/continue` refuses any other. At least one when on. |
+| `guest_hosts` | `SIWXOIDC_GUEST_HOSTS` | `[]` | Localparts or DIDs allowed to create invitations. At least one when on. |
+| `guest_client_topology` | `SIWXOIDC_GUEST_CLIENT_TOPOLOGY` | `same-site` | `same-site` or `cross-site`: where the Meet client is deployed relative to this provider. With `same-site` (the default) `/authorize` answers a `Sec-Fetch-Site: cross-site` request carrying the guest marker with `access_denied`. |
+| `guest_session_max_secs` | `SIWXOIDC_GUEST_SESSION_MAX_SECS` | `7200` | Longest lifetime of a guest session. |
+| `guest_name_suffix` | `SIWXOIDC_GUEST_NAME_SUFFIX` | ` (Guest)` | Appended to the typed name to make the guest's display name ("First Second (Guest)"). It seeds the account and is written again, as the canonical name, in the second admin PUT of the hand-off. |
+| `guest_email_policy` | `SIWXOIDC_GUEST_EMAIL_POLICY` | `off` | `off` (no address accepted), `optional` or `required`: whether a guest gives an e-mail address at redeem. The same for every invitation. |
+| `guest_allow_open_links` | `SIWXOIDC_GUEST_ALLOW_OPEN_LINKS` | `false` | Allow invitations any holder of the link can use. |
+| `guest_claim_enabled` | `SIWXOIDC_GUEST_CLAIM_ENABLED` | `false` | Allow a guest to claim a persistent account. |
+| `guest_max_guests` | `SIWXOIDC_GUEST_MAX_GUESTS` | `10` | Guests per invitation. |
+| `guest_host_max_invites` | `SIWXOIDC_GUEST_HOST_MAX_INVITES` | `5` | Live invitations per host. |
+| `guest_host_max_live_guests` | `SIWXOIDC_GUEST_HOST_MAX_LIVE_GUESTS` | `25` | Live guests per host. |
+| `guest_host_invites_per_hour` | `SIWXOIDC_GUEST_HOST_INVITES_PER_HOUR` | `20` | Invitations a host may create per hour. |
+| `guest_global_max_active` | `SIWXOIDC_GUEST_GLOBAL_MAX_ACTIVE` | `50` | Active guests across the deployment. |
+| `guest_daily_mint_max` | `SIWXOIDC_GUEST_DAILY_MINT_MAX` | `500` | Guest identities minted per day across the deployment. |
+| `guest_max_claimed` | `SIWXOIDC_GUEST_MAX_CLAIMED` | `200` | Claimed guest accounts across the deployment. |
+| `guest_max_devices` | `SIWXOIDC_GUEST_MAX_DEVICES` | `8` | Devices per guest. A ninth device hand-off gets `temporarily_unavailable` on the redirect URI. |
+| `guest_handoff_per_minute` | `SIWXOIDC_GUEST_HANDOFF_PER_MINUTE` | `3` | Device hand-offs per guest per minute (a sliding 60 s window per record). A fourth gets `temporarily_unavailable` on the redirect URI. |
+| `guest_open_link_max_uses` | `SIWXOIDC_GUEST_OPEN_LINK_MAX_USES` | `10` | Uses of one open link. |
+| `guest_open_link_max_ttl_secs` | `SIWXOIDC_GUEST_OPEN_LINK_MAX_TTL_SECS` | `86400` | Longest lifetime of an open link. |
+| `guest_host_max_open_invites` | `SIWXOIDC_GUEST_HOST_MAX_OPEN_INVITES` | `1` | Live open links per host. |
+| `guest_brake_reaping_count` | `SIWXOIDC_GUEST_BRAKE_REAPING_COUNT` | `50` | Guests reaped within `guest_brake_reaping_secs` that pause minting. |
+| `guest_brake_reaping_secs` | `SIWXOIDC_GUEST_BRAKE_REAPING_SECS` | `900` | The window `guest_brake_reaping_count` is counted over. |
+| `guest_reaper_interval_secs` | `SIWXOIDC_GUEST_REAPER_INTERVAL_SECS` | `15` | Seconds between two ticks of the guest reaper (a zero is read as `1`). The reaper starts with the server **whether or not `guest_enabled` is set**, so guests are still erased after guests are turned off; it needs `synapse_endpoint`, `mas_shared_secret` and `matrix_server_name` and is not started without them. |
+| `guest_alert_reaping_secs` | `SIWXOIDC_GUEST_ALERT_REAPING_SECS` | `900` | Alert `reaping_stuck`: a guest record in `reaping` that has been due for longer than this. `0` turns the alert off. |
+| `guest_alert_live_pct` | `SIWXOIDC_GUEST_ALERT_LIVE_PCT` | `80` | Alert `live_guests_high`: live guests (`guest:due` size) at this percentage of `guest_global_max_active`. `0` is off. |
+| `guest_alert_daily_pct` | `SIWXOIDC_GUEST_ALERT_DAILY_PCT` | `80` | Alert `daily_mints_high`: guests minted today at this percentage of `guest_daily_mint_max`. `0` is off. |
+| `guest_alert_refusals_per_min` | `SIWXOIDC_GUEST_ALERT_REFUSALS_PER_MIN` | `50` | Alert `refusal_burst`: more than this many refused guest requests in one minute, counted across instances in Redis (`guest:refusals/{minute}`). `0` is off. |
+| `guest_orphan_report_secs` | `SIWXOIDC_GUEST_ORPHAN_REPORT_SECS` | `604800` | Seconds between two report-only orphan scans (Synapse accounts of `user_type` `io.inblock.guest` that have no guest record; the scan asks Synapse for typed accounts only, `not_user_type=`). `0` turns the scan off. One instance per interval wins the Redis lease `guest:orphan_scan:lease`. |
+
+**Kill switch (S6).** There is no HTTP admin endpoint, no config key and no restart: the operator writes Redis. `guest:control` is a HASH with two fields, `guest:banned_hosts` a SET.
+
+```
+HSET guest:control disabled 1            # engage (1 or true); HDEL guest:control disabled to clear
+HSET guest:control reap_before <epoch>   # every unclaimed guest minted at or before it is due now; HDEL to clear
+SADD guest:banned_hosts <host>           # host = the invite's host identity (TokenMetadata.username); SREM to clear
+```
+
+`disabled` refuses `POST /guest/invites` (403 `disabled`, with every other host route), peek and redeem (503 `disabled`), the hand-off (`/authorize` marker branch and `/guest/continue`), answers `/guest/resume` as `no_session`, and refuses the guest refresh (400 `invalid_grant`). `reap_before` is enforced twice: the refresh guard refuses a matching guest at once, and each reaper tick moves the deadline of every matching live record to now (a `claimed` account is never touched), so the normal reap follows even with Synapse down. A banned host cannot mint (403 `host_banned`), its invites answer as `revoked` at peek and redeem, and each tick makes its live guests due now. A value that does not parse, or a `guest:control` of another type (an old plain-string key), is an error: the refresh guard answers 5xx and the hand-off is refused; the reaper logs it and keeps reaping what is due. Every change is logged once per instance as `guest_control_changed`.
+
+**Audit events and alerts (S6).** Events use `target: "guest_audit"` with an `event` field (`guest_invite_created`, `guest_minted`, `guest_signin`, `guest_refused` with `route` and `reason`; routes `invites`, `peek`, `redeem` (including `invalid_link`), `authorize`, `refresh` and `continue` (the error code), each counted for `refusal_burst`, `guest_reap` with `reason`, `outcome`, `attempts`, `guest_control_changed`, `guest_orphan`, `guest_orphan_scan`); they carry no name, e-mail, secret or token. Alerts are `error` lines on the same target with an `alert` field (`reaping_stuck`, `live_guests_high`, `daily_mints_high`, `refusal_burst`), at most one per condition per tick, thresholds from the `guest_alert_*` keys. The orphan scan only reports (`guest_orphan` with the localpart); it never erases or writes.
+
+**The reaper (S5b).** Every instance runs a reaper that wakes every `guest_reaper_interval_secs` and tears down the guests in `guest:due` whose deadline has passed (a deadline that ran out, or one moved to now by `POST /guest/end`, the host's end routes or the kill switch), at most 16 per tick. It runs with guests turned off. Several instances can share one Redis: each entry is claimed with `SET guest:reap:lease/<localpart> <owner> NX PX 120000`, so one teardown never runs twice at once, and a holder that died is resumed by another instance when the 120 s lease expires. A failed teardown (the log line names the step and the localpart, never a name or a DID) is retried with a backoff of 15 s doubling to 15 min (`guest:reap:retry/<localpart>` gates the entry, `guest:reap:fail/<localpart>` counts). On SIGTERM the reaper takes no new guest and lets teardowns in flight finish for up to 5 s; anything still running is abandoned, its lease is given back and the next instance resumes it from the top (the teardown is idempotent). The host's `POST /guest/invites/{invite_id}/end` and `POST /guest/meetings/end` answer `503 unavailable` when the guests' deadlines cannot be moved to now, so they never answer 200 while a guest stays live; the host repeats the call.
+
+**Host API (S2b).** `POST /guest/invites`, `GET /guest/invites`, `POST /guest/invites/{invite_id}/end` and `POST /guest/meetings/end` take a Bearer access token and answer `403` with a fixed `error` class: `not_a_host` (not in `guest_hosts`; a localpart entry matches the account's localpart, an entry starting `did:` matches the DID byte for byte), `admin_token`, `guest_token` (the account holds an unpromoted guest record) or `disabled` (`guest:control` is `disabled`). Create refuses over a limit with `400` and never clamps: `count` at most `guest_max_guests`, `expires_in` at most 259200 (default 86400), `session_secs` 600 to 14400 (default 7200), `kind: open` only with `guest_allow_open_links` (then `max_guests` at most `guest_open_link_max_uses` and `expires_in` at most `guest_open_link_max_ttl_secs`). A room that fails the template answers `422 room_template` with a `reasons` list. On power levels the template allows a per-type `events` override below 50 only for the call types (the four call-member state types at 0, plus the call keys, reaction, notification, decline and redaction types) and for `m.room.encrypted` (F14-R07: registered participants chat in the encrypted room; `events_default` stays 50, and the Synapse guest-policy module still refuses a guest's messages). `m.room.encrypted` is allowed, never required; any other override below 50 answers `room_power_levels`. The per-host quotas `guest_host_max_invites` (active links), `guest_host_max_open_invites` and `guest_host_invites_per_hour` answer `429 quota_exceeded` and write nothing. An invite id is 96 random bits (16 characters of base64url); the secret is `gi_` plus 32 base62 characters, and only its SHA-256 is stored.
+
+**Peek and redeem (S3b).** `POST /guest/peek` and `POST /guest/redeem` carry the invite secret in the body and are authorised by nothing else. An unknown id, a wrong secret and a body that does not parse answer the same `404 {"error":"invalid_link"}`; after the secret verifies, an ended invite is `410` (`expired`, `exhausted`, `revoked`), a rejected input `422` with one reason class, a DID this server already knows `409 did_in_use`, a quota `429 quota_exceeded` with `quota` (`global_active` from `guest_global_max_active`, `daily_mint` from `guest_daily_mint_max`, `host_live_guests` from `guest_host_max_live_guests`) and the kill switch (`guest:control` = `disabled`) `503 disabled`. The browser proves possession of its `did:key` by signing a CAIP-122 message over the peek nonce; the signature is base64url without padding (standard base64 is accepted). The nonce key is derived from `signing_key_pem` when one is configured, else random per process: without a configured signing key a restart, or a second instance, invalidates nonces issued before it (they live five minutes). Success sets `__Host-guest_session` (`Secure; HttpOnly; SameSite=Lax; Path=/`, `Max-Age` to the deadline); with a plain-http `base_url` (local development) the cookie is `guest_session` without `Secure`. The deadline is Redis `TIME` plus the invite's `session_secs`. Redeem makes no Synapse write.
+
 ### Variables outside the config struct
 
 | Variable | Meaning |

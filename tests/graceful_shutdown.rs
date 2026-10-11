@@ -269,6 +269,47 @@ fn a_server_that_cannot_bind_says_which_address() {
     );
 }
 
+/// A guest mode with a missing prerequisite (here `guest_client_url`) must stop the process
+/// with a non-zero exit and name the key, before any port is bound: the server logs
+/// `Listening on` only after the bind, and a bind failure would say `could not bind`.
+#[test]
+fn guest_mode_with_a_missing_prerequisite_refuses_to_start_before_binding() {
+    let mut server = Server::spawn(&[
+        ("SIWXOIDC_GUEST_ENABLED", "true".to_string()),
+        ("SIWXOIDC_MAS_SHARED_SECRET", "s3cret".to_string()),
+        (
+            "SIWXOIDC_SYNAPSE_ENDPOINT",
+            "http://127.0.0.1:1".to_string(),
+        ),
+        (
+            "SIWXOIDC_MATRIX_SERVER_NAME",
+            "matrix.example.org".to_string(),
+        ),
+        ("SIWXOIDC_GUEST_CLIENT_ID", "meet".to_string()),
+        (
+            "SIWXOIDC_GUEST_CLIENT_REDIRECT_URIS",
+            r#"["http://localhost:5173/cb"]"#.to_string(),
+        ),
+        ("SIWXOIDC_GUEST_HOSTS", r#"["alice"]"#.to_string()),
+    ]);
+
+    let status = server.wait_exit("start-up", START_UP);
+    let log = server.output();
+
+    assert!(
+        !status.success(),
+        "a misconfigured guest mode must not start; output:\n{log}"
+    );
+    assert!(
+        log.contains("guest_client_url"),
+        "the refusal must name the missing key; output:\n{log}"
+    );
+    assert!(
+        !log.contains("Listening on") && !log.contains("could not bind"),
+        "the refusal must come before the bind; output:\n{log}"
+    );
+}
+
 /// A listener nothing answers on, and the `redis://` URL that names it.
 fn redis_trap() -> (TcpListener, String) {
     let trap = TcpListener::bind("127.0.0.1:0").unwrap();

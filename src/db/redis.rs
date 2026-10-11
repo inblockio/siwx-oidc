@@ -60,7 +60,7 @@ fn erased_user_key(localpart: &str) -> String {
 /// Redis key for the durable erasure marker of a DID: the SHA-256 of its
 /// canonical form (`mxid::canonicalize`), so the case variants of one `did:pkh`
 /// share a marker and the DID itself is not kept in cleartext.
-fn erased_did_key(did: &str) -> String {
+pub(super) fn erased_did_key(did: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(crate::mxid::canonicalize(did).as_bytes());
     format!("{}/{}", KV_ERASED_DID_PREFIX, hex::encode(digest))
@@ -608,7 +608,10 @@ impl RedisClient {
               n = n + redis.call('DEL', k)
             end
             redis.call('DEL', KEYS[1])
-            redis.call('SET', KEYS[2], '1', 'EX', tonumber(ARGV[1]))
+            -- the revocation time in ms: the grant issue gate (M0a) compares it
+            local t = redis.call('TIME')
+            local ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+            redis.call('SET', KEYS[2], string.format('%.0f', ms), 'EX', tonumber(ARGV[1]))
             return n
         "#;
         let idx_key = device_token_idx_key(username, device_id);
@@ -700,6 +703,18 @@ impl RedisClient {
         let at = chrono::Utc::now().to_rfc3339();
         self.set_raw(&erased_user_key(localpart), &at).await?;
         self.set_raw(&erased_did_key(did), &at).await
+    }
+
+    /// [`mark_account_erased`](Self::mark_account_erased) for a guest (S5): the same two
+    /// keys, no TTL, but the DID marker's value starts with `guest `, which is what keeps
+    /// a reaped guest's DID refused on Path B (`guest_record_exists_for_did`) once its
+    /// record is gone, without touching the sign-in of a registered user whose account
+    /// was erased. Idempotent: a re-run rewrites the timestamp only.
+    pub async fn mark_guest_erased(&self, localpart: &str, did: &str) -> Result<()> {
+        let at = chrono::Utc::now().to_rfc3339();
+        self.set_raw(&erased_user_key(localpart), &at).await?;
+        self.set_raw(&erased_did_key(did), &format!("guest {at}"))
+            .await
     }
 
     /// Whether the account `localpart` of `did` carries an erasure marker
@@ -1396,6 +1411,10 @@ impl DBClient for RedisClient {
             .await
             .map_err(|e| anyhow!("Failed to set kv: {}", e))?;
         Ok(())
+    }
+
+    async fn guest_did_has_record(&self, did: &str) -> Result<bool> {
+        self.guest_record_exists_for_did(did).await
     }
 
     async fn get_session(&self, id: String) -> Result<Option<SessionEntry>> {
@@ -2548,6 +2567,7 @@ mod tests {
             signin_count: 0,
             verified_did: None,
             request: None,
+            guest_id: None,
         }
     }
 
@@ -3145,6 +3165,67 @@ mod tests {
         );
 
         for key in [dynamic_key, fixed_key, client.static_clients_key.clone()] {
+            client.del_raw(&key).await.ok();
+        }
+    }
+
+    /// M0b: a static client (from `default_clients`) carries no TTL at start-up and still
+    /// carries none after many sign-ins: every use runs `touch_client` and issues a grant
+    /// under its id, and a restart (a second sync) keeps it without a TTL too.
+    #[tokio::test]
+    async fn a_static_client_keeps_no_ttl_across_many_sign_ins() {
+        use crate::db::grant::{GrantKind, NewGrant};
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let n = unique_nonce();
+        let fixed = format!("static-{n}");
+        let fixed_key = format!("clients/{fixed}");
+        client
+            .sync_static_clients(vec![(fixed.clone(), lifetime_test_entry())])
+            .await
+            .unwrap();
+        assert_eq!(
+            client.ttl_raw(&fixed_key).await.unwrap(),
+            -1,
+            "after start-up"
+        );
+        for i in 0..8 {
+            client.touch_client(&fixed).await.unwrap();
+            client
+                .issue_grant(&NewGrant {
+                    kind: GrantKind::Oidc,
+                    username: format!("m0b{n}"),
+                    did: format!("did:key:z6Mk{n}"),
+                    client_id: fixed.clone(),
+                    confidential_client: false,
+                    device_id: String::new(),
+                    scope: "openid".to_string(),
+                    name: "n".to_string(),
+                    auth_ms: None,
+                    access_ttl: crate::db::ACCESS_TOKEN_TTL,
+                    refresh_inactivity_secs: Some(crate::db::REFRESH_TOKEN_TTL),
+                    absolute_deadline: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                client.ttl_raw(&fixed_key).await.unwrap(),
+                -1,
+                "after sign-in {}",
+                i + 1
+            );
+        }
+        client
+            .sync_static_clients(vec![(fixed.clone(), lifetime_test_entry())])
+            .await
+            .unwrap();
+        assert_eq!(
+            client.ttl_raw(&fixed_key).await.unwrap(),
+            -1,
+            "after a restart"
+        );
+        for key in [fixed_key, client.static_clients_key.clone()] {
             client.del_raw(&key).await.ok();
         }
     }

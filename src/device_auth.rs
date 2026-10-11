@@ -992,6 +992,9 @@ pub async fn device_approve(
         ));
     }
 
+    // M6: a guest DID never approves a device by signature.
+    crate::oidc::refuse_guest_did(db_client, did).await?;
+
     // C1: a bare valid signature is NOT enough. The message must carry the exact
     // server-issued single-use nonce minted for THIS device approval (GET
     // /device/nonce), an unexpired Expiration Time, and the device-approval

@@ -23,6 +23,8 @@ RUN cargo install cargo-about --version 0.9.2 --locked --features cli
 
 FROM chef AS dep_planner
 COPY ./src/ ./src/
+# The guest pages and scripts are compiled into the binary (include_str! in src/guest/).
+COPY ./static/guest/ ./static/guest/
 COPY ./siwx-oidc-auth/ ./siwx-oidc-auth/
 COPY ./Cargo.lock ./
 COPY ./Cargo.toml ./

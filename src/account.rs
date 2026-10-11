@@ -222,6 +222,10 @@ const ERASED_NOT_REACTIVATABLE_MSG: &str =
 /// 503 when the erasure marker cannot be read, so reactivation is refused.
 const ERASURE_CHECK_UNAVAILABLE_MSG: &str =
     "The server could not check this account right now. Please try again later.";
+/// A step of the shared erase sequence failed other than the tombstone and Synapse: the
+/// action is idempotent, so repeating it finishes the job.
+const ERASURE_INCOMPLETE_MSG: &str =
+    "Erasing the account did not complete; nothing is lost, repeat the request.";
 /// 503 when the erasure cannot be recorded, so nothing is erased.
 const ERASURE_NOT_RECORDED_MSG: &str =
     "The server could not erase this account right now. It was not erased; please try again later.";
@@ -694,71 +698,42 @@ async fn execute_action(
         Action::AccountErase => {
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
-            // Record the erasure BEFORE anything changes, and do not erase what
-            // cannot be recorded. Synapse would let the account come back: its
-            // `reactivate_user` (1.161.0) clears the erased flag and recreates the
-            // profile row, and `query_user` does not report erasure. This marker
-            // is what `Action::Reactivate` checks. If the erasure below then
-            // fails, the marker stays: it can only refuse a later reactivation,
-            // never allow one.
-            db_client
-                .mark_account_erased(&localpart, did)
-                .await
-                .map_err(|e| {
+            // The shared, idempotent sequence (`teardown::erase_account`, S5): epoch and
+            // revoke every grant, then the tombstones, THEN Synapse, then the passkey
+            // purge. The tombstones precede the Synapse erase for the reason they always
+            // did: Synapse would let an erased account come back (`reactivate_user`
+            // 1.161.0 clears its erased flag), so an erasure that cannot be recorded is
+            // not performed, and a failure after it leaves the marker, which can only
+            // refuse a later reactivation. Unlike before, a failed revoke, session sweep
+            // or purge is now returned (503, nothing is lost: the action is idempotent
+            // and the user repeats it) instead of logged; the order is revoke first.
+            crate::teardown::erase_account(&crate::teardown::Erasure {
+                redis: db_client,
+                synapse,
+                server_name: server,
+                localpart: &localpart,
+                did,
+                devices: &[],
+                guest: false,
+                missing_account_ok: false,
+                purge_with: Some(wa::derive_did_from_credential_json),
+            })
+            .await
+            .map_err(|e| match e.step {
+                crate::teardown::Step::Markers => {
                     warn!(error = %e, "could not record the erasure; nothing was erased");
                     CustomError::ServiceUnavailable(ERASURE_NOT_RECORDED_MSG.to_string())
-                })?;
-            // Then set the user epoch (S3-4 / H6, I9), still before Synapse, so
-            // a concurrent refresh cannot resurrect access during the erase
-            // sweep.
-            if let Err(e) = db_client.set_user_epoch(&localpart).await {
-                warn!(error = %e, "set_user_epoch failed (pre-erase)");
-            }
-            // Irreversible: GDPR erasure removes profile, media, and room
-            // memberships in addition to deactivating the account.
-            synapse
-                .deactivate_user(&localpart, server, true)
-                .await
-                .map_err(|e| {
+                }
+                crate::teardown::Step::Synapse => {
                     warn!(error = %e, "deactivate_user(erase=true) failed during account action");
-                    CustomError::BadRequest(format!("Failed to erase account: {e}"))
-                })?;
-            // Revoke ALL OAuth sessions (best-effort) so introspection reports
-            // every session inactive.
-            let revoked = db_client
-                .revoke_all_user_tokens(&localpart)
-                .await
-                .unwrap_or_else(|e| {
-                    warn!(error = %e, "revoke_all_user_tokens failed during account erasure");
-                    0
-                });
-            // End the user's own sessions on this provider too: every `siwx_user`
-            // picker hint and `acct_session` account session of the DID.
-            let ended = db_client
-                .revoke_own_sessions(did)
-                .await
-                .unwrap_or_else(|e| {
-                    warn!(error = %e, "revoke_own_sessions failed during account erasure");
-                    0
-                });
-            // Purge WebAuthn identity artifacts (best-effort) so the erased DID
-            // cannot be silently re-derived from a leftover passkey/link. The
-            // standalone-credential pass reuses the webauthn layer's single
-            // source of truth for did:key derivation.
-            let purged = db_client
-                .purge_identity(did, wa::derive_did_from_credential_json)
-                .await
-                .unwrap_or_else(|e| {
-                    warn!(error = %e, "purge_identity failed during account erasure");
-                    0
-                });
-            info!(
-                did = %did,
-                revoked = revoked as u64,
-                own_sessions = ended as u64,
-                purged = purged as u64,
-                "account erased via account management"
-            );
+                    CustomError::BadRequest(format!("Failed to erase account: {}", e.source))
+                }
+                _ => {
+                    warn!(error = %e, "account erasure did not complete");
+                    CustomError::ServiceUnavailable(ERASURE_INCOMPLETE_MSG.to_string())
+                }
+            })?;
+            info!(did = %did, "account erased via account management");
             Ok(ActionOutcome::Erased)
         }
         Action::Reactivate => {
@@ -885,6 +860,9 @@ pub async fn account_wallet(
             "Signature verification failed".to_string(),
         ));
     }
+
+    // M6: a guest DID never re-authenticates an account action by signature.
+    crate::oidc::refuse_guest_did(db_client, &req.did).await?;
 
     // C1: a bare valid signature is NOT enough. The message must carry the exact
     // server-issued single-use nonce minted for THIS action (GET /account/nonce),

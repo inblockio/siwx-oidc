@@ -151,6 +151,12 @@ impl IntoResponse for CustomError {
             CustomError::ServiceUnavailable(msg) => {
                 warn!(error = %msg, "service_unavailable");
             }
+            CustomError::Coded {
+                status,
+                code: reason,
+            } => {
+                warn!(status = %status, reason = %reason, "coded_refusal");
+            }
             CustomError::Other(e) => {
                 warn!(error = %e, "internal_error");
             }
@@ -213,6 +219,11 @@ impl IntoResponse for CustomError {
             CustomError::ServiceUnavailable(_) => {
                 (StatusCode::SERVICE_UNAVAILABLE, self.to_string()).into_response()
             }
+            CustomError::Coded { status, code } => (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                Json(serde_json::json!({ "error": code })),
+            )
+                .into_response(),
             CustomError::Other(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()).into_response()
             }
@@ -398,8 +409,21 @@ async fn end_session_response(
 
 async fn authorize(
     State(state): State<AppState>,
+    request_headers: HeaderMap,
     Query(params): Query<oidc::AuthorizeParams>,
 ) -> Result<(HeaderMap, Redirect), CustomError> {
+    // The guest marker routes the request to the hand-off branch (S4): it never reaches
+    // the login page. With guest mode off the marker is an ordinary, ignored scope word.
+    if state.config.guest_enabled && crate::guest::handoff::scope_has_marker(params.scope.as_str())
+    {
+        return crate::guest::handoff::authorize(
+            &state.config,
+            &state.redis_client,
+            params,
+            &request_headers,
+        )
+        .await;
+    }
     let (url, session_cookie) = oidc::authorize(params, &state.redis_client).await?;
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -441,6 +465,7 @@ async fn sign_in(
         state.synapse_client.as_deref(),
         state.config.matrix_server_name.as_deref(),
         Some(&publication),
+        Some(&state.config),
     )
     .await?;
 
@@ -1083,6 +1108,8 @@ async fn webauthn_link_start(
         &state.config.supported_did_methods,
         &state.config.supported_pkh_namespaces,
     )?;
+    // M6: a guest DID never links a passkey through a signature.
+    oidc::refuse_guest_did(&state.redis_client, &primary_did).await?;
 
     let ccr = wa::link_start(
         &state.webauthn,
@@ -1507,9 +1534,19 @@ fn log_pruned_static_clients(pruned: usize) {
 /// map no longer names is deleted. Every instance that shares one Redis must carry the
 /// same map: the last start wins.
 async fn store_default_clients(config: &config::Config, db: &RedisClient) -> anyhow::Result<()> {
-    let pruned = db
-        .sync_static_clients(parse_default_clients(config)?)
-        .await?;
+    let mut clients = parse_default_clients(config)?;
+    // Guest mode (S4b): the portal's client is a static public client, seeded here from
+    // `guest_client_*` so that code issuance can read it. A start-up that cannot seed it
+    // stops, and so does a `default_clients` entry that claims its id.
+    if let Some((id, entry)) =
+        crate::guest::guest_client_entry(config).map_err(anyhow::Error::msg)?
+    {
+        if clients.iter().any(|(existing, _)| *existing == id) {
+            anyhow::bail!("default_clients names {id:?}, which is guest_client_id");
+        }
+        clients.push((id, entry));
+    }
+    let pruned = db.sync_static_clients(clients).await?;
     log_pruned_static_clients(pruned);
     Ok(())
 }
@@ -1649,6 +1686,9 @@ pub async fn main() {
         }
     }
 
+    // Guest mode (S1): a misconfigured guest path exits non-zero here, before anything binds.
+    crate::guest::validate_guest_config(&config).unwrap_or_else(|e| panic!("FATAL: {e}"));
+
     let grant_lifetime = config
         .grant_lifetime()
         .unwrap_or_else(|e| panic!("FATAL: {e}"));
@@ -1673,7 +1713,7 @@ pub async fn main() {
 
     // Configured clients are written before the server listens, and a failure stops
     // start-up.
-    if config.default_clients.is_empty() {
+    if config.default_clients.is_empty() && !config.guest_enabled {
         prune_static_clients_in_background(&redis_client);
     } else {
         store_default_clients(&config, &redis_client)
@@ -1824,6 +1864,54 @@ pub async fn main() {
         );
     }
 
+    // The guest reaper: on every instance, whether or not guests are enabled (a guest is
+    // still erased after an operator turns them off). Stopped with the server.
+    let (reaper_stop, reaper_stopped) = tokio::sync::watch::channel(false);
+    let reaper_stopped_orphan = reaper_stopped.clone();
+    let reaper_task = match (
+        state.synapse_client.clone(),
+        state.config.matrix_server_name.clone(),
+    ) {
+        (Some(synapse), Some(server_name)) => {
+            let policy = crate::guest::reaper::ReaperPolicy::from_config(&state.config);
+            let grace = policy.shutdown_grace;
+            let reaper = crate::guest::reaper::Reaper::new(
+                state.redis_client.clone(),
+                synapse,
+                server_name,
+                policy,
+            );
+            Some((tokio::spawn(reaper.run(reaper_stopped)), grace))
+        }
+        _ => {
+            info!("guest reaper not started: synapse_endpoint, mas_shared_secret or matrix_server_name is not set");
+            None
+        }
+    };
+
+    // The report-only orphan scan, beside the reaper and stopped with it.
+    let orphan_task = match (
+        state.synapse_client.clone(),
+        state.config.matrix_server_name.clone(),
+        state.config.guest_orphan_report_secs,
+    ) {
+        (Some(synapse), Some(server_name), secs) if secs > 0 => {
+            let scan = crate::guest::orphan::OrphanScan {
+                redis: state.redis_client.clone(),
+                synapse,
+                server_name,
+                interval: Duration::from_secs(secs),
+            };
+            Some(tokio::spawn(scan.run(reaper_stopped_orphan)))
+        }
+        _ => None,
+    };
+
+    let guest_router = crate::guest::routes::router(
+        &state.config,
+        state.redis_client.clone(),
+        state.synapse_client.clone(),
+    );
     let introspect_state = IntrospectState::from(&state);
     let admin_token_state = AdminTokenState::from(&state);
     let compat_state = compat::CompatState::new(
@@ -1949,6 +2037,10 @@ pub async fn main() {
             ])
             .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
     );
+    // Merged after the CORS layer so the guest routes inherit none of it: they carry
+    // their own origin check, CORS, body cap and headers (`guest::layers`). With guest
+    // mode off every `/guest` path answers 503 and nothing else changes.
+    let app = app.merge(with_request_logging(guest_router));
 
     let addr = SocketAddr::from((config.address, config.port));
     // The handlers are installed before the bind and "Listening on" is logged after it, so the
@@ -1964,9 +2056,19 @@ pub async fn main() {
         listener.local_addr().expect("read the bound address")
     );
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            // The reaper takes no new guest and gives a teardown in flight a bounded time.
+            let _ = reaper_stop.send(true);
+        })
         .await
         .unwrap();
+    if let Some((task, grace)) = reaper_task {
+        let _ = tokio::time::timeout(grace + Duration::from_secs(1), task).await;
+    }
+    if let Some(task) = orphan_task {
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+    }
 }
 
 /// Request logging: one `info!` line per request (method and path) and one per

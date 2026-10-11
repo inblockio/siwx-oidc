@@ -430,6 +430,7 @@ mod tests {
                             GrantKind::Service => None,
                             GrantKind::MatrixDevice | GrantKind::Oidc => Some(120),
                         },
+                        absolute_deadline: None,
                     })
                     .await
                     .unwrap()

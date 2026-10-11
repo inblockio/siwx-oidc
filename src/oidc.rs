@@ -327,6 +327,29 @@ fn verification_jwk(verifying_key: &p256::ecdsa::VerifyingKey, kid: &str) -> Cor
 pub struct SidClaims {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
+    /// `io.inblock.guest: true` for a guest (S4b). Absent, never `false`, for everyone
+    /// else: a relying party that tests for the key sees no difference on a normal account.
+    #[serde(
+        rename = "io.inblock.guest",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub guest: Option<bool>,
+}
+
+/// The guest claim for the subject of a token: `Some(true)` when guest mode is on, the
+/// token belongs to the guest client and the localpart has a live guest record, else
+/// `None`. One Redis read, and none at all for any other client or with guest mode off.
+pub(crate) async fn guest_claim(
+    config: &crate::config::Config,
+    db_client: &DBClientType,
+    client_id: &str,
+    localpart: &str,
+) -> Result<Option<bool>, CustomError> {
+    if !config.guest_enabled || config.guest_client_id.as_deref() != Some(client_id) {
+        return Ok(None);
+    }
+    Ok(db_client.guest_flag(localpart).await?.then_some(true))
 }
 
 impl AdditionalClaims for SidClaims {}
@@ -425,6 +448,11 @@ pub enum CustomError {
     /// logged at the point of failure and must never be put on the wire.
     #[error("{0}")]
     ServiceUnavailable(String),
+    /// A refusal with a fixed machine-readable body `{"error": code}` and its own
+    /// status. The guest paths use it: the 503 seam of the guest `sign_in` branch and
+    /// the refusal of a guest DID at a signature site (M6).
+    #[error("{code}")]
+    Coded { status: u16, code: &'static str },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -1247,9 +1275,9 @@ async fn token_refresh(
     // before the grant record) not lifted yet. An access or admin token,
     // garbage, and a token of a grant that is gone are all answered exactly
     // like an unknown token.
-    let (bound_client, legacy) = match db_client.peek_refresh_token(&rt).await? {
-        RefreshPeek::Grant(grant) => (grant.client_id, None),
-        RefreshPeek::Legacy(legacy) => (legacy.meta.client_id.clone(), Some(legacy)),
+    let (bound_client, legacy, peeked_grant) = match db_client.peek_refresh_token(&rt).await? {
+        RefreshPeek::Grant(grant) => (grant.client_id.clone(), None, Some(grant)),
+        RefreshPeek::Legacy(legacy) => (legacy.meta.client_id.clone(), Some(legacy), None),
         RefreshPeek::Unknown => return Err(unknown_refresh_token()),
     };
 
@@ -1266,6 +1294,28 @@ async fn token_refresh(
         db_client,
     )
     .await?;
+
+    // S5: a guest's refresh is refused at its deadline, while its record is `reaping`,
+    // when the kill switch is on, and for a device the record does not list. A Redis
+    // read error is a 503 for the client to retry: the guard never passes on an error.
+    if let Some(grant) = &peeked_grant {
+        match crate::guest::handoff::guest_refresh_allowed(
+            config.guest_client_id.as_deref(),
+            db_client,
+            grant,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Err(guest_session_ended()),
+            Err(e) => {
+                warn!(error = %e, "guest refresh guard: record read failed");
+                return Err(CustomError::ServiceUnavailable(
+                    "The session store is unavailable; retry.".to_string(),
+                ));
+            }
+        }
+    }
 
     // The one rotation script (I3) decides everything else atomically: rotate,
     // replay the unused successor of a lost response (I4), or refuse. The
@@ -1327,6 +1377,15 @@ async fn token_refresh(
     // An accepted rotation or replay is a use of the client the grant belongs to.
     touch_client_after_use(db_client, &bound_client).await;
     Ok(response)
+}
+
+/// 400 `invalid_grant` for a guest whose session is over (S5): the portal signs out and
+/// goes to `/guest/ended`.
+fn guest_session_ended() -> CustomError {
+    CustomError::BadRequestToken(TokenError {
+        error: CoreErrorResponseType::InvalidGrant,
+        error_description: "The guest session has ended.".to_string(),
+    })
 }
 
 /// The answer to a refresh token that is unknown, expired, of another kind, or
@@ -1533,6 +1592,7 @@ async fn token_device_code(
                     auth_ms: entry.auth_ms,
                     access_ttl: ACCESS_TOKEN_TTL,
                     refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+                    absolute_deadline: None,
                 })
                 .await?;
             touch_client_after_use(db_client, &client_id).await;
@@ -1547,7 +1607,10 @@ async fn token_device_code(
                 now + Duration::seconds(config.id_token_ttl_secs as i64),
                 now,
                 claims,
-                SidClaims { sid: issued.sid },
+                SidClaims {
+                    sid: issued.sid,
+                    guest: None,
+                },
             );
 
             let id_token = SiwxIdToken::new(
@@ -1869,6 +1932,14 @@ async fn token_authorization_code(
         .clone()
         .unwrap_or_else(|| crate::localpart::legacy_localpart(&code_entry.did));
     let claims = resolve_claims(config, &code_entry.did, client_entry.class).await;
+    let guest = guest_claim(config, db_client, &client_id, &username).await?;
+    // S5: a guest's grant ends at its deadline (`absolute_exp`), so no refresh outlives
+    // the record even with the reaper stopped. Only the guest client's grants.
+    let absolute_deadline = if config.guest_client_id.as_deref() == Some(client_id.as_str()) {
+        db_client.guest_grant_deadline(&username).await?
+    } else {
+        None
+    };
     let display_name = claims
         .name()
         .and_then(|n| n.get(None))
@@ -1890,8 +1961,20 @@ async fn token_authorization_code(
             auth_ms: Some(code_entry.auth_time.timestamp_millis()),
             access_ttl: ACCESS_TOKEN_TTL,
             refresh_inactivity_secs: issuance.refresh_token.then_some(REFRESH_TOKEN_TTL),
+            absolute_deadline,
         })
-        .await?;
+        .await
+        .map_err(|e| {
+            if e.is::<siwx_oidc::db::grant::IssueRevoked>() {
+                // M0a: the code was minted before its user, client or device was revoked.
+                CustomError::BadRequestToken(TokenError {
+                    error: CoreErrorResponseType::InvalidGrant,
+                    error_description: "Unknown or already-exchanged code.".to_string(),
+                })
+            } else {
+                CustomError::from(e)
+            }
+        })?;
     touch_client_after_use(db_client, &client_id).await;
     let refresh_token = issued.refresh_token.map(RefreshToken::new);
     let access_token = AccessToken::new(issued.access_token);
@@ -1902,7 +1985,10 @@ async fn token_authorization_code(
         now + Duration::seconds(config.id_token_ttl_secs as i64),
         now,
         claims,
-        SidClaims { sid: issued.sid },
+        SidClaims {
+            sid: issued.sid,
+            guest,
+        },
     )
     .set_nonce(code_entry.nonce)
     .set_auth_time(Some(code_entry.auth_time));
@@ -1962,6 +2048,89 @@ pub struct AuthorizeParams {
     /// (Element Web >= 1.12.24) sends `fragment` and reads the authorization
     /// response ONLY from the URL fragment.
     pub response_mode: Option<String>,
+}
+
+/// M6: refuse a DID that has a guest record. Called after a signature has verified, at
+/// Path B of `sign_in`, account re-auth, device approval and the `siwx` cookie check of
+/// `link_start`. The one carve-out is `/guest/continue` for a live record, which does not
+/// come through here. A guest DID without a record (guest mode never on) is unchanged.
+/// A store failure refuses too: fail closed.
+pub async fn refuse_guest_did(
+    db_client: &(dyn DBClient + Sync),
+    did: &str,
+) -> Result<(), CustomError> {
+    match db_client.guest_did_has_record(did).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(CustomError::Coded {
+            status: 403,
+            code: "guest_identity",
+        }),
+        Err(e) => {
+            warn!(error = %e, "guest record lookup failed, refusing the signature");
+            Err(CustomError::ServiceUnavailable(
+                "The session store is unavailable; retry.".to_string(),
+            ))
+        }
+    }
+}
+
+/// The guest branch of `/authorize` binds the request to a login session that carries
+/// `guest_id`, with the marker already stripped from `scope`. Same session id, secret,
+/// nonce and cookie as [`authorize`]; no login page follows, `/guest/continue` does.
+pub async fn start_guest_session(
+    params: &AuthorizeParams,
+    state: &str,
+    scope: String,
+    guest_id: String,
+    db_client: &DBClientType,
+) -> Result<Box<Cookie<'static>>, CustomError> {
+    let code_challenge = params
+        .code_challenge
+        .clone()
+        .ok_or_else(|| CustomError::BadRequest("code_challenge is required.".to_string()))?;
+    let nonce: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(16)
+        .map(char::from)
+        .collect();
+    let secret: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(16)
+        .map(char::from)
+        .collect();
+    let session_id = Uuid::new_v4();
+    db_client
+        .set_session(
+            session_id.to_string(),
+            SessionEntry {
+                siwe_nonce: nonce,
+                secret,
+                signin_count: 0,
+                verified_did: None,
+                request: Some(AuthorizationRequest {
+                    client_id: params.client_id.clone(),
+                    redirect_uri: params.redirect_uri.as_str().to_string(),
+                    state: state.to_string(),
+                    response_mode: params.response_mode.clone(),
+                    code_challenge,
+                    scope: Some(scope),
+                    nonce: params.nonce.clone(),
+                }),
+                guest_id: Some(guest_id),
+            },
+        )
+        .await?;
+    let is_https = params.redirect_uri.url().scheme() == "https";
+    Ok(Box::new(
+        Cookie::build((SESSION_COOKIE_NAME, session_id.to_string()))
+            .same_site(SameSite::Strict)
+            .http_only(true)
+            .secure(is_https)
+            .max_age(cookie::time::Duration::seconds(
+                SESSION_LIFETIME.try_into().unwrap(),
+            ))
+            .build(),
+    ))
 }
 
 pub async fn authorize(
@@ -2141,6 +2310,7 @@ pub async fn authorize(
                     scope: Some(params.scope.as_str().to_string()),
                     nonce: params.nonce.clone(),
                 }),
+                guest_id: None,
             },
         )
         .await?;
@@ -2501,7 +2671,7 @@ fn bound_request(session: &SessionEntry) -> Result<AuthorizationRequest, CustomE
 }
 
 /// Extract a device_id from a scope string containing `urn:matrix:client:device:XXX`.
-fn extract_device_id_from_scope(scope: &str) -> Option<String> {
+pub(crate) fn extract_device_id_from_scope(scope: &str) -> Option<String> {
     const STABLE_PREFIX: &str = "urn:matrix:client:device:";
     const MSC2967_PREFIX: &str = "urn:matrix:org.matrix.msc2967.client:device:";
     scope
@@ -2540,7 +2710,7 @@ const MAX_DEVICE_DISPLAY_NAME_CHARS: usize = 100;
 /// names (`client_name#de`) gets the one with the lexicographically smallest
 /// tag. The tagged names sit in a `HashMap`, so "the first one" would change
 /// from one sign-in to the next.
-fn device_display_name(client_id: &str, client: Option<&ClientEntry>) -> String {
+pub(crate) fn device_display_name(client_id: &str, client: Option<&ClientEntry>) -> String {
     let registered = client
         .and_then(|c| c.metadata.client_name())
         .and_then(|names| {
@@ -3010,6 +3180,7 @@ pub async fn sign_in(
     synapse_client: Option<&SynapseClient>,
     server_name: Option<&str>,
     did_publication: Option<&DidPublication<'_>>,
+    guest_config: Option<&crate::config::Config>,
 ) -> Result<(Url, String), CustomError> {
     let session_id = if let Some(c) = cookies.get(SESSION_COOKIE_NAME) {
         c
@@ -3029,6 +3200,14 @@ pub async fn sign_in(
     let request = bound_request(&session_entry)?;
     let redirect_uri = RedirectUrl::new(request.redirect_uri.clone())
         .map_err(|e| anyhow!("bound redirect_uri does not parse: {}", e))?;
+
+    // A session `/authorize` started for the guest marker is finished only by
+    // `/guest/continue`, which writes `verified_did`. Checked before the session is
+    // marked signed in, so a refusal burns nothing; the provisioning is further down,
+    // where the Matrix class arm branches on `guest_id`.
+    if session_entry.guest_id.is_some() {
+        crate::guest::handoff::guest_sign_in_precheck(&session_entry)?;
+    }
 
     // Atomically mark session as signed-in (prevents race-condition double sign-in).
     if !db_client
@@ -3125,6 +3304,9 @@ pub async fn sign_in(
             ));
         }
 
+        // M6: a guest DID does not sign in by signature on Path B.
+        refuse_guest_did(db_client, &siwx_cookie.did).await?;
+
         let msg_nonce = extract_nonce(&siwx_cookie.message)
             .ok_or_else(|| anyhow!("Nonce not found in CAIP-122 message"))?;
         if msg_nonce != session_entry.siwe_nonce {
@@ -3210,7 +3392,23 @@ pub async fn sign_in(
     let client =
         validate_registered_redirect_uri(&request.client_id, &redirect_uri, db_client).await?;
 
-    let (resolved, device_id) = match client.class {
+    let (localpart, device_id) = match client.class {
+        ClientClass::Matrix if session_entry.guest_id.is_some() => {
+            // The guest branch (S4b): fence, fail-closed provisioning, marker, canonical
+            // name, device, `active`. It issues no device or account any other way.
+            let grant = crate::guest::handoff::provision_guest(
+                guest_config,
+                db_client,
+                synapse_client,
+                server_name,
+                &session_entry,
+                &request,
+                &client,
+                &did,
+            )
+            .await?;
+            (grant.localpart, Some(grant.device_id))
+        }
         ClientClass::Matrix => {
             let device_name = device_display_name(&request.client_id, Some(&client));
 
@@ -3244,7 +3442,7 @@ pub async fn sign_in(
                 did_publication,
             )
             .await;
-            (resolved, device_id)
+            (resolved.localpart.clone(), device_id)
         }
         ClientClass::Generic => {
             // The scope first: checking it has no side effects. `/authorize` asked the
@@ -3261,7 +3459,7 @@ pub async fn sign_in(
             }
             // No device and no cross-signing reset: a generic client's token is not a
             // Matrix session, so there is nothing for either to belong to.
-            (resolved, None)
+            (resolved.localpart.clone(), None)
         }
     };
 
@@ -3278,7 +3476,7 @@ pub async fn sign_in(
         .ok_or_else(|| anyhow!("Redis TIME out of range"))?,
         code_challenge: Some(request.code_challenge.clone()),
         code_challenge_method: Some("S256".to_string()),
-        localpart: Some(resolved.localpart.clone()),
+        localpart: Some(localpart),
         device_id,
         scope: request.scope.clone(),
         client_class: Some(client.class),
@@ -3794,6 +3992,13 @@ pub struct SiwxAdditionalClaims {
         skip_serializing_if = "Option::is_none"
     )]
     pub mailbox: Option<String>,
+    /// `io.inblock.guest: true` for a guest (S4b); omitted, never `false`, otherwise.
+    #[serde(
+        rename = "io.inblock.guest",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub guest: Option<bool>,
 }
 
 impl AdditionalClaims for SiwxAdditionalClaims {}
@@ -3934,6 +4139,7 @@ pub async fn userinfo(
             &client_entry,
             config.mail_domain.as_deref(),
         ),
+        guest: guest_claim(config, db_client, &metadata.client_id, &metadata.username).await?,
     };
     let response = SiwxUserInfoClaims::new(
         resolve_claims(config, &metadata.did, client_entry.class).await,
@@ -4371,6 +4577,7 @@ mod tests {
             signin_count: 0,
             verified_did: None,
             request,
+            guest_id: None,
         }
     }
 
@@ -4494,6 +4701,7 @@ mod tests {
                             scope: Some("openid profile offline_access".into()),
                             nonce: Some(Nonce::new("oidc-nonce".into())),
                         }),
+                        guest_id: None,
                     },
                 )
                 .await
@@ -4510,6 +4718,7 @@ mod tests {
             &[],
             headers.typed_get::<headers::Cookie>().unwrap(),
             &db_client,
+            None,
             None,
             None,
             None,
@@ -4656,7 +4865,8 @@ mod tests {
             &db_client,
             None, // no synapse_client in tests
             None, // no matrix_server_name in tests
-            None, // DID publication is off: no Synapse to publish into
+            None, // DID publication is off: no Synapse to publish into,
+            None,
         )
         .await
         .unwrap();
@@ -4794,6 +5004,7 @@ mod tests {
             &["eip155".to_string()],
             cookie,
             &db_client,
+            None,
             None,
             None,
             None,
@@ -6917,6 +7128,7 @@ mod sign_in_deactivation_order_tests {
                 signin_count: 0,
                 verified_did: Some(DID.to_string()),
                 request: Some(bound_test_request(&client_id)),
+                guest_id: None,
             },
         )
         .await
@@ -6936,6 +7148,7 @@ mod sign_in_deactivation_order_tests {
             &db,
             Some(&synapse),
             Some(SERVER_NAME),
+            None,
             None,
         )
         .await;
@@ -7224,6 +7437,7 @@ mod device_display_name_tests {
                 signin_count: 0,
                 verified_did: Some(DID.to_string()),
                 request: Some(bound_test_request(&client_id)),
+                guest_id: None,
             },
         )
         .await
@@ -7241,6 +7455,7 @@ mod device_display_name_tests {
             &db,
             Some(&synapse),
             Some(SERVER_NAME),
+            None,
             None,
         )
         .await
@@ -7642,6 +7857,7 @@ mod client_binding_tests {
             auth_ms: Some(Utc::now().timestamp_millis()),
             access_ttl: ACCESS_TOKEN_TTL,
             refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+            absolute_deadline: None,
         })
         .await
         .unwrap()
@@ -7787,6 +8003,281 @@ mod client_binding_tests {
             .await
             .unwrap()
             .is_some_and(|grant| grant.generation == 0)
+    }
+
+    // ---- S5: the guest refresh guard on /token, and `absolute_exp = deadline` ----
+
+    const GUEST_DID: &str = "did:key:zDnGUEST";
+
+    async fn guest_record(db: &RedisClient, state: &str, deadline_in: i64, device: &str) -> String {
+        let localpart = unique("guestlp");
+        db.put_guest_for_test(&localpart, GUEST_DID, state, deadline_in, &unique("h"))
+            .await;
+        db.sadd_raw_for_test(
+            &siwx_oidc::db::guest_records::devices_key(&localpart),
+            device,
+        )
+        .await;
+        localpart
+    }
+
+    async fn guest_grant(
+        db: &RedisClient,
+        client: &str,
+        localpart: &str,
+        device: &str,
+        deadline: Option<i64>,
+    ) -> (String, siwx_oidc::db::grant::GrantId) {
+        let issued = db
+            .issue_grant(&NewGrant {
+                kind: GrantKind::MatrixDevice,
+                username: localpart.into(),
+                did: GUEST_DID.into(),
+                client_id: client.into(),
+                confidential_client: false,
+                device_id: device.into(),
+                scope: "openid".into(),
+                name: "g".into(),
+                auth_ms: None,
+                access_ttl: ACCESS_TOKEN_TTL,
+                refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+                absolute_deadline: deadline,
+            })
+            .await
+            .unwrap();
+        (issued.refresh_token.unwrap(), issued.grant_id)
+    }
+
+    fn guest_config(client: &str) -> Config {
+        Config {
+            guest_client_id: Some(client.into()),
+            ..Config::default()
+        }
+    }
+
+    /// `ok`, `invalid_grant` or `5xx`: what a client sees.
+    fn guest_refresh_class(r: Result<SiwxTokenResponse, CustomError>) -> &'static str {
+        match r {
+            Ok(_) => "ok",
+            Err(CustomError::BadRequestToken(t))
+                if t.error == CoreErrorResponseType::InvalidGrant =>
+            {
+                "invalid_grant"
+            }
+            Err(CustomError::ServiceUnavailable(_)) => "5xx",
+            Err(other) => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// S5, ST-11 shape: with no reaper running the deadline, `reaping` and an unrecorded
+    /// device each refuse a guest's refresh with `invalid_grant`; a live, recorded one
+    /// rotates; a Redis read error is a 5xx; a non-guest client is unaffected.
+    #[tokio::test]
+    async fn st11_the_guest_refresh_guard_refuses_at_the_deadline_reaping_and_an_unrecorded_device()
+    {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let guest_client = seed_client(&db, Registration::Public).await;
+        let config = guest_config(&guest_client);
+        let now = Utc::now().timestamp();
+        let go = |rt: String| {
+            let (db, config, c) = (db.clone(), config.clone(), guest_client.clone());
+            async move {
+                guest_refresh_class(
+                    refresh(
+                        &db,
+                        &config,
+                        &rt,
+                        Presented {
+                            client_id: Some(&c),
+                            ..NOTHING
+                        },
+                    )
+                    .await,
+                )
+            }
+        };
+
+        // live and recorded: rotates
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let (rt, _) = guest_grant(&db, &guest_client, &lp, "DEV1", Some(now + 600)).await;
+        assert_eq!(go(rt).await, "ok");
+
+        // the deadline has passed (the record's; no reaper has run)
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let (rt, _) = guest_grant(&db, &guest_client, &lp, "DEV1", Some(now + 600)).await;
+        db.hset_raw_for_test(
+            &siwx_oidc::db::guest_invites::guest_account_key(&lp),
+            "deadline",
+            &(now - 5).to_string(),
+        )
+        .await;
+        assert_eq!(go(rt).await, "invalid_grant");
+
+        // reaping
+        let lp = guest_record(&db, "reaping", 600, "DEV1").await;
+        let (rt, _) = guest_grant(&db, &guest_client, &lp, "DEV1", Some(now + 600)).await;
+        assert_eq!(go(rt).await, "invalid_grant");
+
+        // no record at all (reaped)
+        let (rt, _) = guest_grant(&db, &guest_client, &unique("gone"), "DEV1", None).await;
+        assert_eq!(go(rt).await, "invalid_grant");
+
+        // a device the record does not list
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let (rt, _) = guest_grant(&db, &guest_client, &lp, "DEV2", Some(now + 600)).await;
+        assert_eq!(go(rt).await, "invalid_grant");
+
+        // a read error: the record key has the wrong type; never passed on
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let (rt, _) = guest_grant(&db, &guest_client, &lp, "DEV1", Some(now + 600)).await;
+        db.del_raw(&siwx_oidc::db::guest_invites::guest_account_key(&lp))
+            .await
+            .unwrap();
+        db.sadd_raw_for_test(&siwx_oidc::db::guest_invites::guest_account_key(&lp), "x")
+            .await;
+        assert_eq!(go(rt).await, "5xx");
+
+        // a non-guest client and a non-guest grant are unaffected (no record, no device)
+        let other = seed_client(&db, Registration::Public).await;
+        let rt = seed_refresh_token(&db, &other).await;
+        let r = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&other),
+                ..NOTHING
+            },
+        )
+        .await;
+        assert_eq!(guest_refresh_class(r), "ok");
+    }
+
+    /// S5: `absolute_exp = deadline` is written into a guest's grant only (the code
+    /// exchange of the guest client with a live record), and the rotation script itself
+    /// refuses past it, independent of the guard.
+    #[tokio::test]
+    async fn s5_absolute_exp_is_the_deadline_for_a_guest_grant_only() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let guest_client = seed_client(&db, Registration::Public).await;
+        let other_client = seed_client(&db, Registration::Public).await;
+        let config = guest_config(&guest_client);
+        let now = Utc::now().timestamp();
+        let exp_of = |db: RedisClient, id: siwx_oidc::db::grant::GrantId| async move {
+            db.hgetall_for_test(&format!("grant/{}", id.as_str()))
+                .await
+                .get("absolute_exp")
+                .cloned()
+        };
+        let exchange_code = |client: String, localpart: String| {
+            let (db, config) = (db.clone(), config.clone());
+            async move {
+                let code = unique("code-");
+                db.set_code(
+                    code.clone(),
+                    CodeEntry {
+                        exchange_count: 0,
+                        did: GUEST_DID.into(),
+                        nonce: None,
+                        client_id: client.clone(),
+                        auth_time: Utc::now(),
+                        code_challenge: Some(CHALLENGE.into()),
+                        code_challenge_method: Some("S256".into()),
+                        device_id: None,
+                        localpart: Some(localpart),
+                        scope: Some("openid offline_access".into()),
+                        client_class: None,
+                    },
+                )
+                .await
+                .unwrap();
+                let r = exchange(
+                    &db,
+                    &config,
+                    &code,
+                    Presented {
+                        client_id: Some(&client),
+                        ..NOTHING
+                    },
+                )
+                .await;
+                let rt = refresh_token_of(r);
+                match db.peek_refresh_token(&rt).await.unwrap() {
+                    RefreshPeek::Grant(g) => g,
+                    _ => panic!("no grant"),
+                }
+            }
+        };
+
+        // the guest client with a live record: the grant ends at the record's deadline
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let record_deadline = db
+            .guest_grant_deadline(&lp)
+            .await
+            .unwrap()
+            .expect("a live record has a deadline");
+        let g = exchange_code(guest_client.clone(), lp.clone()).await;
+        assert_eq!(g.absolute_exp, Some(record_deadline));
+        assert!(record_deadline >= now + 590 && record_deadline <= now + 610);
+
+        // another client with the very same live record: no absolute_exp
+        let g = exchange_code(other_client.clone(), lp.clone()).await;
+        assert_eq!(g.absolute_exp, None);
+
+        // the guest client without a record (or claimed): unchanged, the guard decides
+        let g = exchange_code(guest_client.clone(), unique("norecord")).await;
+        assert_eq!(g.absolute_exp, None);
+        let claimed = guest_record(&db, "claimed", 600, "DEV1").await;
+        assert_eq!(db.guest_grant_deadline(&claimed).await.unwrap(), None);
+
+        // a deadline already past refuses the issue (the code is then invalid_grant)
+        let late = guest_record(&db, "active", -5, "DEV1").await;
+        let late_deadline = db.guest_grant_deadline(&late).await.unwrap().unwrap();
+        assert!(late_deadline < now);
+        let err = db
+            .issue_grant(&NewGrant {
+                kind: GrantKind::MatrixDevice,
+                username: late,
+                did: GUEST_DID.into(),
+                client_id: guest_client.clone(),
+                confidential_client: false,
+                device_id: "DEV1".into(),
+                scope: "openid".into(),
+                name: "g".into(),
+                auth_ms: None,
+                access_ttl: ACCESS_TOKEN_TTL,
+                refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+                absolute_deadline: Some(late_deadline),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.is::<siwx_oidc::db::grant::IssueRevoked>());
+
+        // the rotation script refuses past `absolute_exp` on its own: the record says
+        // "live" (deadline far away), the GRANT says two seconds.
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let (rt, id) = guest_grant(&db, &guest_client, &lp, "DEV1", Some(now + 2)).await;
+        assert_eq!(exp_of(db.clone(), id).await, Some((now + 2).to_string()));
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let r = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&guest_client),
+                ..NOTHING
+            },
+        )
+        .await;
+        assert_ne!(
+            guest_refresh_class(r),
+            "ok",
+            "a refresh past absolute_exp rotates nothing"
+        );
     }
 
     /// Another client, even one that authenticates correctly as itself, cannot
@@ -9450,6 +9941,7 @@ mod end_session_tests {
             StandardClaims::new(SubjectIdentifier::new(did.to_string())),
             SidClaims {
                 sid: sid.map(str::to_string),
+                guest: None,
             },
         );
         SiwxIdToken::new(
@@ -9795,6 +10287,7 @@ mod end_session_tests {
                 auth_ms: None,
                 access_ttl: ACCESS_TOKEN_TTL,
                 refresh_inactivity_secs: None,
+                absolute_deadline: None,
             })
             .await
             .unwrap();
@@ -10362,6 +10855,7 @@ mod generic_client_tests {
                     scope: Some(scope.to_string()),
                     ..bound_test_request(&client_id)
                 }),
+                guest_id: None,
             },
         )
         .await
@@ -10387,6 +10881,7 @@ mod generic_client_tests {
             Some(&synapse),
             Some(SERVER_NAME),
             Some(&publication),
+            None,
         )
         .await;
         server.abort();

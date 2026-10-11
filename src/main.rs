@@ -18,6 +18,7 @@ mod device_auth;
 // if it ever needs to come back, that means the publication call site was
 // deleted and users stopped getting an attested DID.
 mod did_assertion;
+mod guest;
 mod introspect;
 mod localpart;
 mod oidc;
@@ -25,6 +26,7 @@ mod oidc;
 // discovery hint only — see the module doc's "never an authorization source".
 mod resolve;
 mod synapse_client;
+mod teardown;
 mod webauthn;
 
 #[tokio::main]

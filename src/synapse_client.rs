@@ -130,6 +130,25 @@ pub(crate) fn matrix_user_id(localpart: &str, server_name: &str) -> String {
 /// `admin_token`") is deliberately gone: on 1.157+ there IS no `admin_token`
 /// setting to check, and pointing an operator at it sent them looking for a
 /// config key that no longer exists.
+/// One page of [`SynapseClient::admin_users_page`].
+#[derive(Debug, Deserialize)]
+pub struct AdminUsersPage {
+    #[serde(default)]
+    pub users: Vec<AdminUserRow>,
+    /// Absent on the last page.
+    #[serde(default)]
+    pub next_token: Option<String>,
+}
+
+/// The two fields of a user row the orphan scan reads.
+#[derive(Debug, Deserialize)]
+pub struct AdminUserRow {
+    /// The Matrix id, `@localpart:server`.
+    pub name: String,
+    #[serde(default)]
+    pub user_type: Option<String>,
+}
+
 /// A buffered admin-scoped response: status plus the body, already read.
 ///
 /// Buffered rather than a live [`reqwest::Response`] because the retry decision
@@ -180,6 +199,20 @@ fn admin_retry_warranted(status: reqwest::StatusCode, body: &str) -> bool {
         return true;
     }
     status == reqwest::StatusCode::INTERNAL_SERVER_ERROR && body.contains(MAS_USER_NOT_FOUND)
+}
+
+/// The URL of one admin user-list page; see [`SynapseClient::admin_users_page`].
+fn admin_users_url(endpoint: &str, from: Option<&str>, typed_only: bool) -> String {
+    let mut url =
+        format!("{endpoint}/_synapse/admin/v2/users?limit=100&guests=false&deactivated=false");
+    if typed_only {
+        url.push_str("&not_user_type=");
+    }
+    if let Some(from) = from {
+        url.push_str("&from=");
+        url.push_str(&urlencoding::encode(from));
+    }
+    url
 }
 
 fn admin_status_hint(status: reqwest::StatusCode) -> &'static str {
@@ -482,6 +515,43 @@ impl SynapseClient {
             let body = resp.text().await.unwrap_or_default();
             warn!(%status, %body, "provision_user failed");
             anyhow::bail!("provision_user: HTTP {status}");
+        }
+        Ok(())
+    }
+
+    /// One admin write to a user: `PUT /_synapse/admin/v2/users/{mxid}` with `body`, a
+    /// JSON object of the fields to change (Synapse merges them into the account). Used
+    /// by the guest hand-off for the `user_type` marker and for the canonical display
+    /// name, as two separate calls. Authenticated with the minted admin token.
+    ///
+    /// Fails on any non-2xx. Neither the body nor Synapse's reply is logged (the display
+    /// name is personal data): the log carries the status and `what` only. Retried once on
+    /// a rejected credential by [`admin_request`](Self::admin_request); the PUT is
+    /// idempotent.
+    pub async fn admin_put_user(
+        &self,
+        localpart: &str,
+        server_name: &str,
+        what: &'static str,
+        body: &serde_json::Value,
+    ) -> Result<()> {
+        let user_id = matrix_user_id(localpart, server_name);
+        let url = format!(
+            "{}/_synapse/admin/v2/users/{}",
+            self.endpoint,
+            urlencoding::encode(&user_id)
+        );
+        let resp = self
+            .admin_request(|http, token| http.put(&url).bearer_auth(token).json(body))
+            .await
+            .with_context(|| format!("admin_put_user({what}): request failed"))?;
+        if !resp.status.is_success() {
+            let status = resp.status;
+            warn!(%status, what, "admin_put_user failed");
+            anyhow::bail!(
+                "admin_put_user({what}): HTTP {status}{}",
+                admin_status_hint(status)
+            );
         }
         Ok(())
     }
@@ -1050,6 +1120,35 @@ impl SynapseClient {
         Ok(body.devices)
     }
 
+    /// One page of the Synapse admin user list (`GET /_synapse/admin/v2/users`), active
+    /// non-guest accounts, 100 per page, from the opaque `from` token. Read-only. The body is
+    /// never logged (it carries every user's name).
+    ///
+    /// `typed_only` adds `not_user_type=` (empty), which Synapse reads as "exclude accounts
+    /// without a user type": the page then holds only typed accounts (our guests, and any
+    /// bot or support account), which is all the orphan scan looks at. `false` is the plain
+    /// list, URL unchanged.
+    pub async fn admin_users_page(
+        &self,
+        from: Option<&str>,
+        typed_only: bool,
+    ) -> Result<AdminUsersPage> {
+        let url = admin_users_url(&self.endpoint, from, typed_only);
+        let resp = self
+            .admin_request(|http, token| http.get(&url).bearer_auth(token))
+            .await
+            .context("admin_users_page: request failed")?;
+        if !resp.status.is_success() {
+            let status = resp.status;
+            warn!(%status, "admin_users_page failed");
+            anyhow::bail!(
+                "admin_users_page: HTTP {status}{}",
+                admin_status_hint(status)
+            );
+        }
+        serde_json::from_str(&resp.body).context("admin_users_page: invalid JSON")
+    }
+
     /// Fetch a single device belonging to the user, or `None` if no device with
     /// that id is owned by the user.
     ///
@@ -1571,6 +1670,52 @@ impl SynapseClient {
             .await
             .context("read_did_field: response was not JSON")?;
         Ok(did_from_profile_field(body.get(DID_PROFILE_FIELD)))
+    }
+
+    /// The current state of a room: the `state` array of
+    /// `GET /_synapse/admin/v1/rooms/{room_id}/state`, or `None` when Synapse does not
+    /// know the room (404).
+    ///
+    /// Backs the guest room audit at mint (design 01 §4.3,
+    /// `siwx_oidc::guest_room_audit`). The state carries the `m.room.member` events too,
+    /// so "the host is joined with invite power" needs no second read. The caller checks
+    /// `room_id` against the room id grammar first (04 GP-SEC-07); here it is sent as one
+    /// percent-encoded path segment.
+    ///
+    /// A normal user steers this admin read, and room state names people, so the log
+    /// carries the status and the duration only, never a body, and neither does the
+    /// error.
+    pub async fn room_state(&self, room_id: &str) -> Result<Option<Vec<serde_json::Value>>> {
+        let url = format!(
+            "{}/_synapse/admin/v1/rooms/{}/state",
+            self.endpoint,
+            urlencoding::encode(room_id)
+        );
+        let started = std::time::Instant::now();
+        let resp = self
+            .admin_request(|http, token| http.get(&url).bearer_auth(token))
+            .await
+            .context("room_state: request failed")?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let status = resp.status;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            debug!(%status, elapsed_ms, "room_state: room unknown");
+            return Ok(None);
+        }
+        if !status.is_success() {
+            warn!(%status, elapsed_ms, "room_state failed");
+            anyhow::bail!("room_state: HTTP {status}{}", admin_status_hint(status));
+        }
+        debug!(%status, elapsed_ms, "room_state read");
+
+        #[derive(Deserialize)]
+        struct StateResponse {
+            state: Vec<serde_json::Value>,
+        }
+        // `serde_json`'s error names a position, never the content.
+        let body: StateResponse =
+            serde_json::from_str(&resp.body).context("room_state: invalid JSON")?;
+        Ok(Some(body.state))
     }
 }
 
@@ -2120,6 +2265,26 @@ mod tests {
         assert!(
             err.contains("without a token store"),
             "error must name the missing precondition, got: {err}"
+        );
+    }
+
+    /// The orphan scan asks only for typed accounts (`not_user_type=`); the plain list keeps
+    /// its URL exactly.
+    #[test]
+    fn the_typed_user_list_carries_not_user_type_and_the_plain_list_does_not() {
+        let base = "https://hs.example.org/_synapse/admin/v2/users?limit=100&guests=false&deactivated=false";
+        assert_eq!(admin_users_url("https://hs.example.org", None, false), base);
+        assert_eq!(
+            admin_users_url("https://hs.example.org", Some("a b"), false),
+            format!("{base}&from=a%20b")
+        );
+        assert_eq!(
+            admin_users_url("https://hs.example.org", None, true),
+            format!("{base}&not_user_type=")
+        );
+        assert_eq!(
+            admin_users_url("https://hs.example.org", Some("100"), true),
+            format!("{base}&not_user_type=&from=100")
         );
     }
 
@@ -3711,6 +3876,96 @@ mod tests {
         assert!(
             !info.is_suspended,
             "suspension is parsed but is not a login gate"
+        );
+        handle.abort();
+    }
+
+    // -- room_state (guest room audit, S2a) ----------------------------------
+
+    /// A body no log line and no error may ever carry.
+    const ROOM_SECRET: &str = "Board-meeting-of-Erika-Mustermann";
+
+    #[tokio::test]
+    async fn room_state_wire_shape_and_parse() {
+        let state = json!({"state": [
+            {"type": "m.room.name", "state_key": "", "sender": "@h:example.org",
+             "content": {"name": ROOM_SECRET}}
+        ]});
+        let (client, log, handle) =
+            spawn_mock_synapse(MockReplies::new(axum::http::StatusCode::OK).body(state)).await;
+        let Some(client) = with_redis_mint(client).await else {
+            handle.abort();
+            return;
+        };
+
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let events = client
+            .room_state("!abc:example.org")
+            .await
+            .expect("a 200 is Ok")
+            .expect("a 200 is Some");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["content"]["name"], ROOM_SECRET);
+
+        let recorded = log.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "one read, got {recorded:?}");
+        assert_eq!(recorded[0].method, "GET");
+        assert_eq!(
+            recorded[0].path, "/_synapse/admin/v1/rooms/%21abc%3Aexample.org/state",
+            "the room id is ONE percent-encoded path segment"
+        );
+        let token = recorded[0]
+            .authorization
+            .as_deref()
+            .and_then(|a| a.strip_prefix("Bearer "))
+            .expect("a bearer token");
+        assert!(
+            token.starts_with(ADMIN_TOKEN_PREFIX),
+            "a minted admin token"
+        );
+        let out = logs.output();
+        assert!(out.contains("room_state read"), "the read is logged: {out}");
+        assert!(!out.contains(ROOM_SECRET), "no body in the log: {out}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn room_state_unknown_room_is_none() {
+        let (client, _log, handle) =
+            spawn_mock_synapse(MockReplies::new(axum::http::StatusCode::NOT_FOUND)).await;
+        let Some(client) = with_redis_mint(client).await else {
+            handle.abort();
+            return;
+        };
+        assert!(client.room_state("!gone").await.unwrap().is_none());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn room_state_failure_logs_and_returns_no_body() {
+        let (client, _log, handle) = spawn_mock_synapse(
+            MockReplies::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(json!({"error": ROOM_SECRET})),
+        )
+        .await;
+        let Some(client) = with_redis_mint(client).await else {
+            handle.abort();
+            return;
+        };
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let err = client
+            .room_state("!abc:example.org")
+            .await
+            .expect_err("a 500 is Err");
+        let out = logs.output();
+        assert!(
+            out.contains("room_state failed"),
+            "the failure is logged: {out}"
+        );
+        assert!(!out.contains(ROOM_SECRET), "no body in the log: {out}");
+        assert!(
+            !format!("{err:#}").contains(ROOM_SECRET),
+            "no body in the error"
         );
         handle.abort();
     }

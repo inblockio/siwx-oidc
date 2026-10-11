@@ -191,6 +191,14 @@ paths:
         Issues the `session` cookie and the CAIP-122 nonce the client signs,
         then redirects to the login page.
 
+        The scope word `urn:io.inblock:guest` (guest mode on) selects the guest hand-off instead; it is
+        not in discovery and never granted. Only the static public client `guest_client_id` with an exact
+        URI of `guest_client_redirect_uris` may use it, with S256 PKCE and `prompt=none`; anything else is
+        `invalid_request` on the redirect URI. A `Sec-Fetch-Site: cross-site` request is `access_denied`
+        (topology `same-site`). Without a live guest session (a cookie whose record is `minted`,
+        `provisioning` or `active`, before its deadline) the answer is `interaction_required` on the
+        redirect URI; the login page is never shown. With one, the browser goes to `/guest/continue`.
+
         - `response_type` must be `code`. Any other value is answered by a
           redirect to the (validated) `redirect_uri` with
           `error=unsupported_response_type` and the `state`.
@@ -353,7 +361,10 @@ paths:
             OAuth error. `authorization_pending` and `slow_down` are the normal
             polling answers on the device-code grant, not failures.
             `invalid_grant` includes a code or refresh token presented by a
-            client it was not issued to.
+            client it was not issued to, and a guest's refresh at or past its
+            deadline, while its record is `reaping`, with the guest kill switch
+            on, or for a device its record does not list (a Redis read error
+            there is a 503, never a pass).
         "401":
           description: |
             `invalid_client`: the client did not authenticate (RFC 6749 §5.2). A
@@ -1078,6 +1089,396 @@ paths:
         "200": { description: Deleted. }
         "401": { description: "`M_UNKNOWN_TOKEN`: the bearer is missing, unknown, not an access token, or (with delegated auth) an `oidc` grant's." }
         "503": { description: "`M_UNKNOWN`, retryable: the token store could not resolve the bearer. Never reported as `M_UNKNOWN_TOKEN`; nothing was deleted." }
+
+  /guest/join/{invite_id}:
+    get:
+      tags: [Guest]
+      operationId: guestJoinPage
+      summary: The guest join page
+      description: |
+        The same HTML for every `invite_id`, known or not: the id is read by the page from its own path,
+        and the invite secret from the URL fragment, which a browser never sends. A top-level navigation
+        from a link in a mail or chat is allowed, so there is no origin check. Carries the GP-SEC-39
+        headers (a CSP that allows only own scripts and styles, `frame-ancestors 'none'`, `no-referrer`,
+        `no-store`). `503 guest_unavailable` while guest mode is off.
+      parameters:
+        - { name: invite_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: "The page, `text/html`." }
+        "503": { description: "`guest_unavailable`." }
+
+  /guest/assets/{file}:
+    get:
+      tags: [Guest]
+      operationId: guestAsset
+      summary: A script or style sheet of the guest pages
+      description: |
+        A fixed allow-list: `join.js`, `guest-key.js`, `continue.js`, `continue-message.js` and `guest.css`. Any other name, however spelled,
+        is `404 not_found`; no part of the request reaches the file system. Same headers as the page.
+      parameters:
+        - { name: file, in: path, required: true, schema: { type: string, enum: [join.js, guest-key.js, continue.js, continue-message.js, guest.css] } }
+      responses:
+        "200": { description: "The file, `text/javascript` or `text/css`." }
+        "404": { description: "`not_found`." }
+        "503": { description: "`guest_unavailable`." }
+
+  /guest/continue:
+    get:
+      tags: [Guest]
+      operationId: guestContinuePage
+      summary: The guest hand-off page
+      description: |
+        Where `/authorize` sends the browser when the scope carries the marker `urn:io.inblock:guest` and
+        the guest cookie names a live record. The shell is compiled in; the facts the script needs (the
+        record's DID, the bound `redirect_uri`, the login session's nonce) are written into `data-`
+        attributes, never into a script. `data-state` is `ready`, `no_guest` (no live guest cookie: "open your
+        invitation link again in this browser"), `no_session` (the login session is missing or not a guest
+        hand-off) or `unavailable`. The script loads the key the join page stored, never creates one, checks
+        its DID against the record, signs the continue message and posts it. Same headers as the other
+        guest pages.
+      responses:
+        "200": { description: "The page, `text/html`, in every state (`ready`, `no_guest`, `no_session`, `unavailable`): the guest layers replace the body of an error status with their JSON shell, so the state is in `data-state`, not in the status." }
+        "503": { description: "`guest_unavailable` while guest mode is off." }
+
+    post:
+      tags: [Guest]
+      operationId: guestContinue
+      summary: Prove the browser holds the guest's key
+      description: |
+        Authorised by the guest cookie plus the login session cookie `/authorize` set, and by a signature;
+        same-origin only, JSON only, 4 KiB. The message is the twelve-line redeem layout with the statement
+        `Continue as a guest`, the login session's nonce, and the session's bound `redirect_uri` as the one
+        resource. The server checks that the `redirect_uri` is in `guest_client_redirect_uris` and equals the
+        bound one, that the DID line is the record's DID, the nonce, the times (skew 120 s, at most 600 s
+        validity) and the signature, then writes `verified_did` on the login session, so `sign_in` stays
+        Path A. Refused: `400` `bad_request`, `redirect_not_allowed`, `nonce_mismatch`, `resource_mismatch`;
+        `401` `no_session` (no live guest cookie, a record that is `reaping` or past its deadline, or no
+        guest login session), `did_mismatch`, `signature_invalid`; `503` `unavailable`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [redirect_uri, message, signature]
+              properties:
+                redirect_uri: { type: string }
+                message: { type: string }
+                signature: { type: string, description: "base64url without padding; P-256 as raw r||s or DER." }
+      responses:
+        "200": { description: "`{\"next\": \"/sign_in\"}`: the browser goes there to finish the sign-in." }
+        "400": { description: "`bad_request`, `redirect_not_allowed`, `nonce_mismatch` or `resource_mismatch`." }
+        "401": { description: "`no_session`, `did_mismatch` or `signature_invalid`." }
+        "403": { description: "`forbidden_origin`." }
+        "413": { description: "`payload_too_large`." }
+        "415": { description: "`unsupported_media_type`." }
+        "503": { description: "`unavailable`." }
+
+  /guest/context:
+    get:
+      tags: [Guest]
+      operationId: guestContext
+      summary: The guest's room, deadline and meeting name
+      description: |
+        Authorised by the guest's own Bearer access token (the portal's token after the hand-off). Makes no
+        Synapse call. Returns `{room_id, deadline, invite_id, meeting_name}`; `deadline` is Unix seconds and
+        `meeting_name` is the invite's label, text only (empty if the invite is gone). The room id is only ever
+        in this body, never in a URL. A missing, unknown or expired token is `401 invalid_token`; a valid token
+        whose subject has no guest record (a host's or a registered user's) is `403 not_a_guest`.
+      security: [{ bearerToken: [] }]
+      responses:
+        "200":
+          description: "The record's context, `Cache-Control: no-store`."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [room_id, deadline, invite_id, meeting_name]
+                properties:
+                  room_id: { type: string }
+                  deadline: { type: integer }
+                  invite_id: { type: string }
+                  meeting_name: { type: string }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`not_a_guest`." }
+        "503": { description: "`unavailable` (Redis), or `guest_unavailable` while guest mode is off." }
+
+  /guest/end:
+    post:
+      tags: [Guest]
+      operationId: guestEnd
+      summary: The guest ends its own session
+      description: |
+        Authorised by the guest's own Bearer access token, or by the guest cookie with the same-origin check
+        (`403 forbidden_origin` for a foreign `Origin` or a `Sec-Fetch-Site` other than `same-origin`); when both
+        are sent the Bearer wins. Like every guest POST it takes `Content-Type: application/json` (the body, `{}`, is not read). Moves the guest's deadline to now (the record and `guest:due`, never
+        later), so the reaper revokes the grants, deletes the devices, writes `erased:user` and `erased:did` (the
+        DID never signs in again), erases the Synapse account and drops the record within one tick. Clears the
+        session cookie. A second call on a record that is already ending is `200` as well; a cookie whose record
+        is already gone is `200 {"state": "ended"}`. A `claimed` account is `409 claimed`: it is kept, nothing is
+        moved. Without a credential or with a bad token `401 invalid_token`; a valid token that is not a guest's
+        is `403 not_a_guest`.
+      security: [{ bearerToken: [] }, {}]
+      responses:
+        "200":
+          description: "`{\"state\": \"ending\"}` (or `\"ended\"`), `Cache-Control: no-store`, the cookie cleared."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state]
+                properties:
+                  state: { type: string, enum: [ending, ended] }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`forbidden_origin` (cookie, foreign origin) or `not_a_guest`." }
+        "409": { description: "`claimed`." }
+        "503": { description: "`unavailable` (Redis), or `guest_unavailable` while guest mode is off." }
+
+  /guest/resume:
+    get:
+      tags: [Guest]
+      operationId: guestResume
+      summary: What the issuer pages know about the cookie's guest
+      description: |
+        Authorised by the guest cookie, same-origin only (a request with a foreign `Origin` or a `Sec-Fetch-Site`
+        other than `same-origin` is `403 forbidden_origin`); no CORS. For the issuer pages (the join page uses
+        `did` to check that its local key matches before it offers "Continue as ..."); the portal does not call
+        it. No secret in the body. With no live record (no cookie, unknown handle, `reaping`, past the deadline,
+        kill switch on) the answer is `200 {"state": "no_session"}`. The 10 minutes of `state: claimed` after a
+        claim arrive with S7.
+      responses:
+        "200":
+          description: "`{first_name, second_name, state, seconds_left, did, claim_allowed, email_present}`, or `{state: no_session}`."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state]
+                properties:
+                  first_name: { type: string }
+                  second_name: { type: string }
+                  state: { type: string, enum: [minted, provisioning, active, no_session] }
+                  seconds_left: { type: integer }
+                  did: { type: string }
+                  claim_allowed: { type: boolean, description: "Advisory: `guest_claim_enabled`." }
+                  email_present: { type: boolean }
+        "403": { description: "`forbidden_origin`." }
+        "503": { description: "`unavailable`, or `guest_unavailable` while guest mode is off." }
+
+  /guest/ended:
+    get:
+      tags: [Guest]
+      operationId: guestEndedPage
+      summary: The page a portal sends an ended guest to
+      description: |
+        The same page for everyone; it needs no cookie and no record. It says "This guest account is deleted;
+        this browser forgets its key." and calls `forgetKey()` on this browser's key store (script
+        `/guest/assets/ended.js`). The kept-account copy after a claim arrives with S7.
+      responses:
+        "200": { description: "The page, `text/html`." }
+        "503": { description: "`guest_unavailable` while guest mode is off." }
+
+  /guest/peek:
+    post:
+      tags: [Guest]
+      operationId: guestPeek
+      summary: Look at an invitation without using it
+      description: |
+        Authorised by the invite secret in the body; same-origin only (`Origin` or `Sec-Fetch-Site`),
+        JSON only, 4 KiB. Changes no state, so a link scanner cannot burn it. The secret is compared in
+        constant time and exactly one invite lookup is made whether or not the id exists. An unknown id,
+        a wrong secret and a body that does not parse give the same `404 {"error":"invalid_link"}`.
+        After the secret verifies: `200 {"state": "expired"|"exhausted"|"revoked"}` for an ended invite,
+        else `200` with `state: "active"`, `email_policy` (`off`, `optional`, `required`), `session_secs`,
+        `consent_version`, `recording_expected`, a stateless `nonce` (an HMAC over the invite id and an
+        expiry five minutes ahead) that the redeem proof must carry, `did_methods` (`["key"]`) and `curves`
+        (`["Ed25519","P-256"]`). It carries no host text and no meeting name. `503 disabled` while the
+        kill switch is on.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invite_id, secret]
+              properties:
+                invite_id: { type: string }
+                secret: { type: string }
+      responses:
+        "200": { description: "The invite's state and, when active, what the join page needs." }
+        "403": { description: "`forbidden_origin`." }
+        "404": { description: "`invalid_link`: unknown id, wrong secret or malformed body." }
+        "413": { description: "`payload_too_large`." }
+        "415": { description: "`unsupported_media_type`." }
+        "503": { description: "`disabled` or `unavailable`." }
+
+  /guest/redeem:
+    post:
+      tags: [Guest]
+      operationId: guestRedeem
+      summary: Use an invitation as a guest, binding a browser-made did:key
+      description: |
+        Authorised by the invite secret in the body; same-origin only, JSON only, 4 KiB. Order: secret
+        (the generic `404 invalid_link` as in peek), invite state, input validation, proof of possession,
+        DID in use, then one atomic Redis script on Redis `TIME`. A refusal writes nothing. No Synapse write.
+
+        `did` is a canonical `did:key` (Ed25519 or P-256). `proof.message` is the CAIP-122 text the browser
+        signed, exactly as `guest_admission::build_redeem_message` builds it: issuer domain, the DID, the
+        statement `Join as a guest`, `URI` (the issuer origin), `Version: 1`, the `nonce` from peek,
+        `Issued At`, `Expiration Time` (at most 10 minutes after issue) and the resource
+        `urn:io.inblock:guest:invite:<invite_id>`. `proof.signature` is the raw Ed25519 signature, or the
+        WebCrypto ECDSA `r || s` over SHA-256 for P-256, encoded as base64url without padding (standard
+        base64 is accepted too).
+
+        Success: `200 {guest_client_url, deadline, seconds_left}` and `Set-Cookie: __Host-guest_session=<handle>;
+        Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=<seconds to the deadline>`. When `base_url` is plain
+        http (local development) the cookie is `guest_session` without `Secure`. `guest_client_url` comes from
+        configuration. `deadline` is Unix seconds (Redis `TIME` plus the invite's `session_secs`). Redis keeps
+        only the SHA-256 of the handle.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invite_id, secret, first_name, second_name, consent, did, proof]
+              properties:
+                invite_id: { type: string }
+                secret: { type: string }
+                first_name: { type: string }
+                second_name: { type: string }
+                email: { type: string }
+                consent:
+                  type: object
+                  required: [version, variant]
+                  properties:
+                    version: { type: string }
+                    variant: { type: string }
+                did: { type: string }
+                proof:
+                  type: object
+                  required: [message, signature]
+                  properties:
+                    message: { type: string }
+                    signature: { type: string }
+      responses:
+        "200": { description: "`{guest_client_url, deadline, seconds_left}` and the session cookie." }
+        "400": { description: "`bad_request`: the secret verified but the rest of the body does not parse." }
+        "403": { description: "`forbidden_origin`." }
+        "404": { description: "`invalid_link`: unknown id, wrong secret or unparsable credentials." }
+        "409": { description: "`did_in_use`: a record, an `erased:did` marker or a known account holds the DID." }
+        "410": { description: "`expired`, `exhausted` or `revoked`." }
+        "413": { description: "`payload_too_large`." }
+        "415": { description: "`unsupported_media_type`." }
+        "422": { description: "`name_empty`, `name_too_long`, `name_chars`, `name_mixed_script`, `name_reserved`, `email_required`, `email_invalid`, `email_not_allowed`, `consent_required`, `did_invalid`, `did_unsupported`, `did_unusable` (the browser makes a new key) or `proof_invalid`." }
+        "429": { description: "`quota_exceeded` with `quota` `global_active`, `daily_mint` or `host_live_guests`." }
+        "503": { description: "`disabled` (kill switch) or `unavailable`." }
+
+  /guest/invites:
+    post:
+      tags: [Guest]
+      operationId: guestCreateInvites
+      summary: Create guest invitation links for a meeting room
+      description: |
+        Host only: the bearer must be a live access token of an account in `guest_hosts`, not a minted
+        admin token and not a guest account. The room is read through the service admin credential; the
+        caller must be joined with `invite` power and the room must pass the guest room template.
+        Each link is `https://<issuer>/guest/join/<invite_id>#<secret>`; the secret is shown once and only
+        its SHA-256 is stored. Limits are refused, never clamped: `count` 1..`guest_max_guests`, labels at most
+        40 characters, `expires_in` default 86400 and at most 259200, `session_secs` 600..14400 (default 7200),
+        `kind` `single` (default) or `open` (only with `guest_allow_open_links`). No idempotency: each call
+        spends quota. Errors carry `{"error": code}`; Synapse bodies are never echoed.
+      security: [{ bearerToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room_id]
+              additionalProperties: false
+              properties:
+                room_id: { type: string, description: "`!opaque[:server]`, at most 255 bytes." }
+                count: { type: integer, minimum: 1 }
+                labels: { type: array, items: { type: string, maxLength: 40 } }
+                kind: { type: string, enum: [single, open] }
+                max_guests: { type: integer }
+                expires_in: { type: integer, maximum: 259200 }
+                session_secs: { type: integer, minimum: 600, maximum: 14400 }
+                recording_expected: { type: boolean }
+      responses:
+        "200":
+          description: One link per invite.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  invites:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        label: { type: string }
+                        link: { type: string, format: uri }
+                        expires_at: { type: integer, description: Unix seconds. }
+        "400": { description: "`bad_request`, `bad_room_id`, `bad_count`, `bad_labels`, `bad_kind`, `bad_max_guests`, `bad_expires_in`, `bad_session_secs` or `open_links_disabled`." }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`not_a_host`, `host_banned`, `admin_token`, `guest_token`, `disabled` or `not_room_host`." }
+        "415": { description: Not `application/json`. }
+        "422": { description: "`room_not_found`, or `room_template` with a `reasons` list of fixed codes." }
+        "429": { description: "`quota_exceeded` with `quota` `host_invites`, `host_open_invites` or `host_invites_per_hour`. Nothing was written." }
+        "503": { description: "`unavailable`: Redis or Synapse failed. Nothing was written." }
+    get:
+      tags: [Guest]
+      operationId: guestListInvites
+      summary: List the caller's own invitations
+      description: Another host's invites are never shown. The body carries no secret and no hash. Each invite lists its guests (`first_name`, `second_name`, `email` if given, `state`) and `counts`. A non-host gets 403 `not_a_host`.
+      security: [{ bearerToken: [] }]
+      responses:
+        "200": { description: "`{invites: [...]}` with id, label, kind, state (`active`, `revoked`, `expired`, `exhausted`), counts, created and expiry." }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`not_a_host`, `host_banned`, `admin_token`, `guest_token` or `disabled`." }
+        "503": { description: "`unavailable`." }
+
+  /guest/invites/{invite_id}/end:
+    post:
+      tags: [Guest]
+      operationId: guestEndInvite
+      summary: Revoke one invitation
+      description: Idempotent. 404 unless the caller created the invite; another host's id is indistinguishable from an unknown one.
+      security: [{ bearerToken: [] }]
+      parameters: [{ name: invite_id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: "`{revoked: 1}`." }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`not_a_host`, `host_banned`, `admin_token`, `guest_token` or `disabled`." }
+        "404": { description: "`not_found`." }
+        "503": { description: "`unavailable`: the store failed or the guests' deadlines could not be moved to now (fail-closed, never a 200 while a guest stays live); repeat the call." }
+
+  /guest/meetings/end:
+    post:
+      tags: [Guest]
+      operationId: guestEndMeeting
+      summary: Revoke every invitation of the caller for one room
+      security: [{ bearerToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room_id]
+              additionalProperties: false
+              properties:
+                room_id: { type: string }
+      responses:
+        "200": { description: "`{revoked: n}`, 0 when the caller has none for the room." }
+        "400": { description: "`bad_request` or `bad_room_id`." }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`not_a_host`, `host_banned`, `admin_token`, `guest_token` or `disabled`." }
+        "503": { description: "`unavailable`: the store failed or the guests' deadlines could not be moved to now (fail-closed, never a 200 while a guest stays live); repeat the call." }
 
   /health:
     get:
