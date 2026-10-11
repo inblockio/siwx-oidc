@@ -1505,7 +1505,11 @@ async fn token_device_code(
                 .ok_or_else(|| device_code_error("server_error", "Approved but no DID."))?
                 .clone();
 
-            let proposed_device_id = extract_device_id_from_scope(&entry.scope);
+            // The device_code is already claimed (consumed) above, so a refusal here
+            // cannot be retried with the same code: the user starts a new device flow.
+            let proposed_device_id = scope_device_id(&entry.scope).map_err(|InvalidDeviceId| {
+                device_code_error("invalid_scope", INVALID_DEVICE_ID_MSG)
+            })?;
             debug!(
                 scope = %entry.scope,
                 extracted_device_id = ?proposed_device_id,
@@ -2250,6 +2254,18 @@ pub async fn authorize(
         return Err(CustomError::Redirect(url.to_string()));
     }
 
+    // A proposed device id outside the accepted charset is refused as an invalid scope,
+    // before a session exists; it is never replaced by a minted id (`device_id_is_valid`).
+    if scope_device_id(params.scope.as_str()).is_err() {
+        let mut url = params.redirect_uri.url().clone();
+        url.query_pairs_mut().append_pair("state", &state);
+        url.query_pairs_mut()
+            .append_pair("error", CoreAuthErrorResponseType::InvalidScope.as_ref());
+        url.query_pairs_mut()
+            .append_pair("error_description", INVALID_DEVICE_ID_MSG);
+        return Err(CustomError::Redirect(url.to_string()));
+    }
+
     // Validate response_mode strictly (invalid_request semantics): discovery
     // advertises exactly {"query","fragment"}, so anything else is a 400 rather
     // than a silently-ignored param the client then waits on.
@@ -2670,18 +2686,65 @@ fn bound_request(session: &SessionEntry) -> Result<AuthorizationRequest, CustomE
     })
 }
 
-/// Extract a device_id from a scope string containing `urn:matrix:client:device:XXX`.
-pub(crate) fn extract_device_id_from_scope(scope: &str) -> Option<String> {
+/// A device id a scope proposes that is outside the accepted charset.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct InvalidDeviceId;
+
+/// What an authorization request answers (as `invalid_scope`, or a 400) when its scope
+/// proposes a device id outside [`device_id_is_valid`]'s charset.
+pub(crate) const INVALID_DEVICE_ID_MSG: &str =
+    "The requested device id is not valid. Use 1 to 64 letters, digits or . _ ~ - + /.";
+
+/// Whether `id` is an acceptable proposed device id: 1 to 64 characters of
+/// `[A-Za-z0-9._~+/-]`.
+///
+/// RFC 3986 unreserved characters (what MSC2967 allows) plus `+` and `/`, which Element X
+/// has sent in base64-style device ids. The charset is a security property, not only
+/// hygiene: `pre_claim_devices` on a guest record is one comma-joined Redis string
+/// (`COMMIT_CLAIM`, `read_pre_claim_devices`), so an id holding `,` would split into
+/// other ids and escape claim revocation and the GP-CLM-26 refusal. No character here is
+/// a comma, whitespace or control character.
+pub(crate) fn device_id_is_valid(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'+' | b'/' | b'-')
+        })
+}
+
+/// The device id a scope proposes via `urn:matrix:client:device:XXX` (or the MSC2967
+/// unstable prefix): `Ok(None)` when it proposes none, `Err` when a proposal is outside
+/// the accepted charset. An invalid proposal is refused by the caller, never replaced by
+/// a minted id.
+pub(crate) fn scope_device_id(scope: &str) -> Result<Option<String>, InvalidDeviceId> {
     const STABLE_PREFIX: &str = "urn:matrix:client:device:";
     const MSC2967_PREFIX: &str = "urn:matrix:org.matrix.msc2967.client:device:";
-    scope
-        .split_whitespace()
-        .find_map(|s| {
-            s.strip_prefix(STABLE_PREFIX)
-                .or_else(|| s.strip_prefix(MSC2967_PREFIX))
-                .map(|id| id.to_string())
-        })
-        .filter(|id| !id.is_empty())
+    let mut found = None;
+    for id in scope.split_whitespace().filter_map(|s| {
+        s.strip_prefix(STABLE_PREFIX)
+            .or_else(|| s.strip_prefix(MSC2967_PREFIX))
+    }) {
+        // An empty id is no proposal; every other one must be valid, whichever is used.
+        if id.is_empty() {
+            continue;
+        }
+        if !device_id_is_valid(id) {
+            return Err(InvalidDeviceId);
+        }
+        found.get_or_insert_with(|| id.to_string());
+    }
+    Ok(found)
+}
+
+/// [`scope_device_id`] over an optional request scope, an invalid proposal as the 400 that
+/// `sign_in` answers for an invalid scope.
+fn bound_device_id(scope: Option<&str>) -> Result<Option<String>, CustomError> {
+    match scope.map(scope_device_id) {
+        None | Some(Ok(None)) => Ok(None),
+        Some(Ok(Some(id))) => Ok(Some(id)),
+        Some(Err(InvalidDeviceId)) => {
+            Err(CustomError::BadRequest(INVALID_DEVICE_ID_MSG.to_string()))
+        }
+    }
 }
 
 /// Resolve the device_id to provision: use the client-proposed id when present,
@@ -3346,11 +3409,11 @@ pub async fn sign_in(
     // the scope proposes an id; an account without a guest record has no field, so an
     // ordinary account is unaffected. A Redis error fails closed (it hides whether a
     // record exists): `?` answers it as a server error and no code is issued.
-    if let Some(proposed) = request
-        .scope
-        .as_deref()
-        .and_then(extract_device_id_from_scope)
-    {
+    // The charset rule (`device_id_is_valid`) is enforced here too, as a 400, though
+    // `/authorize` already refused such a scope: a request bound before this check existed
+    // must not slip a comma-bearing id past the list lookup below.
+    let proposed_device_id = bound_device_id(request.scope.as_deref())?;
+    if let Some(proposed) = proposed_device_id.clone() {
         if db_client
             .device_is_pre_claim_for_did(&did, &proposed)
             .await?
@@ -3441,10 +3504,7 @@ pub async fn sign_in(
             let device_name = device_display_name(&request.client_id, Some(&client));
 
             // Extract a client-proposed device_id from the bound request's scope (if any).
-            let proposed_device_id = request
-                .scope
-                .as_deref()
-                .and_then(extract_device_id_from_scope);
+            // Validated (and the pre-claim check made) before the deactivation gate.
             // Resolve ONCE (grandfathering decision), and reuse the result as the
             // single source of truth for both provisioning and the CodeEntry the
             // eventual /token exchange reads back. Best-effort: a Synapse hiccup here
@@ -5792,38 +5852,54 @@ mod tests {
     fn test_extract_device_id_from_scope() {
         // Stable prefix
         assert_eq!(
-            extract_device_id_from_scope(
+            scope_device_id(
                 "openid urn:matrix:client:api:* urn:matrix:client:device:W6ujlqyJoG5+BxH9eLdYgizkylgTS9z6ZzWqRM0FIBQ"
-            ),
+            ).unwrap(),
             Some("W6ujlqyJoG5+BxH9eLdYgizkylgTS9z6ZzWqRM0FIBQ".to_string())
         );
         assert_eq!(
-            extract_device_id_from_scope(
+            scope_device_id(
                 "openid urn:matrix:client:api:* urn:matrix:client:device:SIWX_43efbac7"
-            ),
+            )
+            .unwrap(),
             Some("SIWX_43efbac7".to_string())
         );
         // MSC2967 unstable prefix (used by Element X)
         assert_eq!(
-            extract_device_id_from_scope(
+            scope_device_id(
                 "urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:CW2fdkGgZZW8StwGioe2CVKBb3685OjKt8wRUR0iZyc"
-            ),
+            ).unwrap(),
             Some("CW2fdkGgZZW8StwGioe2CVKBb3685OjKt8wRUR0iZyc".to_string())
         );
         // Device ID with slash (base64url-encoded, as sent by Element X)
         assert_eq!(
-            extract_device_id_from_scope(
+            scope_device_id(
                 "urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:r8LXBERpNLfhbR3a/Wy1m9xE6ennsd2RJltz0xLrt3A"
-            ),
+            ).unwrap(),
             Some("r8LXBERpNLfhbR3a/Wy1m9xE6ennsd2RJltz0xLrt3A".to_string())
         );
-        assert_eq!(extract_device_id_from_scope("openid"), None);
+        // The charset rule: a comma (or any character outside [A-Za-z0-9._~+/-]) or a length
+        // outside 1..=64 is an error, not a missing proposal.
+        for bad in ["X,Y", ",", "a=b", "a:b", "é", &"A".repeat(65)] {
+            let scope = format!("openid urn:matrix:client:device:{bad}");
+            assert_eq!(scope_device_id(&scope), Err(InvalidDeviceId), "{bad}");
+        }
         assert_eq!(
-            extract_device_id_from_scope("openid urn:matrix:client:api:*"),
+            scope_device_id("urn:matrix:client:device:ABCDEFGHIJ urn:matrix:client:device:X,Y"),
+            Err(InvalidDeviceId),
+            "every proposal is checked, not only the first"
+        );
+        for ok in ["ABCDEFGHIJ", "a.b_c~d-e", &"A".repeat(64)] {
+            let scope = format!("openid urn:matrix:client:device:{ok}");
+            assert_eq!(scope_device_id(&scope), Ok(Some(ok.to_string())));
+        }
+        assert_eq!(scope_device_id("openid").unwrap(), None);
+        assert_eq!(
+            scope_device_id("openid urn:matrix:client:api:*").unwrap(),
             None
         );
         assert_eq!(
-            extract_device_id_from_scope("openid urn:matrix:client:device:"),
+            scope_device_id("openid urn:matrix:client:device:").unwrap(),
             None
         );
     }
@@ -12783,5 +12859,76 @@ mod generic_client_tests {
         assert_eq!(stored.status, DeviceCodeStatus::Approved);
         assert_eq!(stored.last_poll, None, "the refused poll recorded nothing");
         db.delete_device_code(&device_ref).await.ok();
+    }
+
+    // ---- a proposed device id must match [A-Za-z0-9._~+/-]{1,64} (PR #50 audit F1) ----
+
+    /// The scope a client sends with a device id in it.
+    fn device_scope(device: &str) -> String {
+        format!("openid urn:matrix:client:api:* urn:matrix:client:device:{device}")
+    }
+
+    #[tokio::test]
+    async fn authorize_refuses_a_device_id_with_a_comma() {
+        let Some(outcome) = authorize_with(matrix_client(), &device_scope("X,Y")).await else {
+            return;
+        };
+        assert_invalid_scope_redirect(outcome);
+    }
+
+    #[tokio::test]
+    async fn authorize_refuses_an_overlong_device_id() {
+        let Some(outcome) = authorize_with(matrix_client(), &device_scope(&"A".repeat(65))).await
+        else {
+            return;
+        };
+        assert_invalid_scope_redirect(outcome);
+    }
+
+    #[tokio::test]
+    async fn authorize_still_accepts_plain_and_unreserved_device_ids() {
+        for id in ["ABCDEFGHIJ", "a.b_c~d-e"] {
+            let Some(outcome) = authorize_with(matrix_client(), &device_scope(id)).await else {
+                return;
+            };
+            outcome.unwrap_or_else(|e| panic!("device id {id} must pass: {e:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_in_refuses_a_device_id_with_a_comma_before_any_homeserver_call() {
+        let Some((result, code, log)) =
+            sign_in_with(matrix_client(), &device_scope("X,Y"), Homeserver::default()).await
+        else {
+            return;
+        };
+        assert!(
+            matches!(result, Err(CustomError::BadRequest(_))),
+            "a comma in the proposed device id must be refused, got {result:?}"
+        );
+        assert!(code.is_none(), "no code is issued");
+        assert!(log.is_empty(), "no homeserver call: {log:?}");
+    }
+
+    #[tokio::test]
+    async fn device_authorization_refuses_a_device_id_with_a_comma() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = store_client(&db, matrix_client()).await;
+        let outcome = crate::device_auth::device_authorization(
+            &delegated(),
+            &db,
+            crate::device_auth::DeviceAuthRequest {
+                client_id,
+                scope: Some(device_scope("X,Y")),
+            },
+        )
+        .await;
+        assert!(
+            matches!(outcome, Err(CustomError::BadRequest(_))),
+            "a comma in the proposed device id must be refused, got {:?}",
+            outcome.map(|_| ())
+        );
     }
 }

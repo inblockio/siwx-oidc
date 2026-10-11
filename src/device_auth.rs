@@ -95,6 +95,13 @@ pub async fn device_authorization(
     let user_code = generate_user_code();
     debug!(raw_scope = ?form.scope, "device_authorization: scope from client");
     let scope = form.scope.unwrap_or_else(|| "openid".to_string());
+    // A proposed device id outside the accepted charset is refused here, before any
+    // code is stored (RFC 6749 5.2 `invalid_scope`), never replaced by a minted id.
+    if crate::oidc::scope_device_id(&scope).is_err() {
+        return Err(CustomError::BadRequest(
+            crate::oidc::INVALID_DEVICE_ID_MSG.to_string(),
+        ));
+    }
 
     // 3. Build entry
     let entry = DeviceCodeEntry::new(

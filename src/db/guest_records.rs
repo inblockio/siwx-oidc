@@ -849,6 +849,10 @@ if not d or now >= d then return 'lost' end
 if redis.call('HEXISTS', KEYS[1], 'promoted_at') == 1 then return 'lost' end
 if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 0
    and redis.call('SCARD', KEYS[3]) >= tonumber(ARGV[2]) then return 'capped' end
+-- `,` is a safe separator only because a device id is validated at /authorize, sign_in
+-- and the device grant to [A-Za-z0-9._~+/-]{1,64} (`oidc::device_id_is_valid`): no id
+-- can hold a comma, so `read_pre_claim_devices` and `device_is_pre_claim_for_did` split it
+-- back losslessly.
 local devices = redis.call('SMEMBERS', KEYS[5])
 table.sort(devices)
 redis.call('HSET', KEYS[1], 'state', 'claimed', 'claimed_at', tostring(now),

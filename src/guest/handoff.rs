@@ -261,6 +261,10 @@ pub async fn authorize(
         return Err(fail("invalid_scope", "The openid scope is required."));
     }
 
+    if crate::oidc::scope_device_id(&granted).is_err() {
+        return Err(fail("invalid_scope", crate::oidc::INVALID_DEVICE_ID_MSG));
+    }
+
     let live = match live_guest(config, redis, headers).await {
         Ok(l) => l,
         Err(e) => {
@@ -402,10 +406,12 @@ pub async fn provision_guest(
         "{} {}{}",
         names.first_name, names.second_name, config.guest_name_suffix
     );
-    let device_id = request
-        .scope
-        .as_deref()
-        .and_then(crate::oidc::extract_device_id_from_scope)
+    let proposed = match request.scope.as_deref().map(crate::oidc::scope_device_id) {
+        None | Some(Ok(None)) => None,
+        Some(Ok(Some(id))) => Some(id),
+        Some(Err(_)) => return Err(redirect_error(request, "invalid_scope")),
+    };
+    let device_id = proposed
         .unwrap_or_else(|| format!("SIWX_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
     let attempt = uuid::Uuid::new_v4().simple().to_string();
 
