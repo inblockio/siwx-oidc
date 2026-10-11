@@ -6,7 +6,8 @@
 //! next call resumes at the first step again; every step is safe to repeat (see
 //! [`crate::teardown`]). Order:
 //!
-//! 1. CAS to `reaping` (refuses a `claimed` account: [`GuestTeardown::Claimed`]);
+//! 1. CAS to `reaping` (refuses a `claimed` account: [`GuestTeardown::Claimed`]; while a
+//!    hand-off holds the lease it changes nothing and returns a `Mark` error to retry);
 //! 2. epoch bump, revoke every grant, end the DID's own sessions;
 //! 3. `delete_device` for each device of `guest:devices/<lp>`;
 //! 4. `erased:user/<lp>` and `erased:did/<hash>` (the DID tombstone: the DID never signs in
@@ -70,6 +71,14 @@ pub(crate) async fn run(
     {
         ReapCas::Claimed => return Ok(GuestTeardown::Claimed),
         ReapCas::Gone => return Ok(GuestTeardown::AlreadyGone),
+        // A hand-off in flight may be provisioning the account right now: erasing it
+        // first would leave an account nothing erases (#49 F3). Back off and retry.
+        ReapCas::Busy => {
+            return Err(TeardownError {
+                step: Step::Mark,
+                source: anyhow::anyhow!("a hand-off holds the lease, retry after it"),
+            })
+        }
         ReapCas::Marked | ReapCas::Already => {}
     }
     if until == Some(Step::Mark) {
@@ -430,6 +439,48 @@ mod tests {
         assert_eq!(f.state().await.as_deref(), Some("claimed"));
         assert!(log.lock().unwrap().is_empty());
         assert!(!redis.is_account_erased(&f.localpart, &f.did).await.unwrap());
+    }
+
+    /// #49 F3: a hand-off holding the lease (Redis `TIME` + 120 s) blocks the CAS to
+    /// `reaping`, so the teardown cannot erase an account the hand-off is about to
+    /// provision; it returns a `Mark` error for the reaper's backoff and touches nothing.
+    /// Once the lease is released or lapses the teardown runs.
+    #[tokio::test]
+    async fn a_live_hand_off_lease_defers_the_teardown() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (log, synapse) = mock().await;
+        let f = fixture(&redis, "provisioning").await;
+        let key = siwx_oidc::db::guest_invites::guest_account_key(&f.localpart);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        redis
+            .hset_raw_for_test(&key, "lease_owner", "attempt-1")
+            .await;
+        redis
+            .hset_raw_for_test(&key, "lease_until", &(now + 120).to_string())
+            .await;
+        let e = teardown_guest(&redis, &synapse, "example.org", &f.localpart)
+            .await
+            .unwrap_err();
+        assert_eq!(e.step, Step::Mark);
+        assert_eq!(f.state().await.as_deref(), Some("provisioning"));
+        assert!(log.lock().unwrap().is_empty());
+        assert!(!redis.is_account_erased(&f.localpart, &f.did).await.unwrap());
+        // A lapsed lease (the hand-off died) no longer blocks.
+        redis
+            .hset_raw_for_test(&key, "lease_until", &(now - 1).to_string())
+            .await;
+        assert_eq!(
+            teardown_guest(&redis, &synapse, "example.org", &f.localpart)
+                .await
+                .unwrap(),
+            GuestTeardown::Erased
+        );
+        assert!(!f.record_exists().await);
     }
 
     /// A failing Synapse leaves the record `reaping` for the reaper's retry; the error
