@@ -422,7 +422,7 @@ When guest mode is on, start-up refuses:
 | `guest_alert_live_pct` | `SIWXOIDC_GUEST_ALERT_LIVE_PCT` | `80` | Alert `live_guests_high`: live guests (`guest:due` size) at this percentage of `guest_global_max_active`. `0` is off. |
 | `guest_alert_daily_pct` | `SIWXOIDC_GUEST_ALERT_DAILY_PCT` | `80` | Alert `daily_mints_high`: guests minted today at this percentage of `guest_daily_mint_max`. `0` is off. |
 | `guest_alert_refusals_per_min` | `SIWXOIDC_GUEST_ALERT_REFUSALS_PER_MIN` | `50` | Alert `refusal_burst`: more than this many refused guest requests in one minute, counted across instances in Redis (`guest:refusals/{minute}`). `0` is off. |
-| `guest_orphan_report_secs` | `SIWXOIDC_GUEST_ORPHAN_REPORT_SECS` | `604800` | Seconds between two report-only orphan scans (Synapse accounts of `user_type` `io.inblock.guest` that have no guest record; the scan asks Synapse for typed accounts only, `not_user_type=`). `0` turns the scan off. One instance per interval wins the Redis lease `guest:orphan_scan:lease`. |
+| `guest_orphan_report_secs` | `SIWXOIDC_GUEST_ORPHAN_REPORT_SECS` | `604800` | Seconds between two report-only orphan scans (Synapse accounts of `user_type` `io.inblock.guest` that have no guest record; the scan asks Synapse for typed accounts only, `not_user_type=`). `0` turns the scan off. With `guest_enabled = false` the scan runs only while a guest is still scheduled in `guest:due` (after guests were turned off); otherwise it takes no lease and makes no Synapse call. One instance per interval wins the Redis lease `guest:orphan_scan:lease`. |
 
 **Kill switch (S6).** There is no HTTP admin endpoint, no config key and no restart: the operator writes Redis. `guest:control` is a HASH with two fields, `guest:banned_hosts` a SET.
 

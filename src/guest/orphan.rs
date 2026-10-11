@@ -8,6 +8,9 @@
 //!
 //! Several instances can share one Redis: a scan runs only for the instance that wins
 //! `SET guest:orphan_scan:lease 1 NX EX <interval>`, so the fleet scans once per interval.
+//!
+//! With `guest_enabled = false` a wake does nothing (no lease, no Synapse call) unless a
+//! guest is still scheduled in `guest:due`, as after an operator turned guests off (#49 F4).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +43,8 @@ pub struct OrphanScan {
     pub synapse: Arc<SynapseClient>,
     pub server_name: String,
     pub interval: Duration,
+    /// `guest_enabled`: when false, scan only while a guest is still scheduled.
+    pub guest_enabled: bool,
 }
 
 impl OrphanScan {
@@ -60,8 +65,11 @@ impl OrphanScan {
     }
 
     /// One attempt: take the lease, then [`scan_once`](Self::scan_once). `None`: another
-    /// instance holds the lease.
+    /// instance holds the lease, or guests are off and none is scheduled.
     pub async fn scan_if_leased(&self) -> Result<Option<OrphanReport>> {
+        if !self.guest_enabled && !self.redis.guests_scheduled().await? {
+            return Ok(None);
+        }
         if !self
             .redis
             .try_lease(LEASE_KEY, self.interval.as_secs())
@@ -126,8 +134,9 @@ mod tests {
     /// Every request the mock saw: `(method, path-and-query)`.
     type Seen = Arc<Mutex<Vec<(Method, String)>>>;
 
-    async fn mock() -> (Seen, Arc<SynapseClient>, RedisClient) {
-        let redis = siwx_oidc::test_support::redis_db(8).await.unwrap();
+    /// `db`: a Redis database of this test's own, since each test flushes it.
+    async fn mock(db: u8) -> (Seen, Arc<SynapseClient>, RedisClient) {
+        let redis = siwx_oidc::test_support::redis_db(db).await.unwrap();
         redis.flush_db_for_test().await;
         let seen: Seen = Arc::default();
         let s = seen.clone();
@@ -181,7 +190,7 @@ mod tests {
     /// scan inside the interval away.
     #[tokio::test]
     async fn st34_the_orphan_scan_reports_and_erases_nothing() {
-        let (seen, synapse, redis) = mock().await;
+        let (seen, synapse, redis) = mock(8).await;
         redis
             .put_guest_for_test("withrecord", "did:key:zX", "active", 600, "h")
             .await;
@@ -191,6 +200,7 @@ mod tests {
             synapse,
             server_name: "example.org".into(),
             interval: Duration::from_secs(3600),
+            guest_enabled: true,
         };
         let cap = siwx_oidc::test_support::LogCapture::start();
         seen.lock().unwrap().clear();
@@ -237,5 +247,31 @@ mod tests {
             .is_empty());
         assert!(scan.scan_if_leased().await.unwrap().is_none(), "leased");
         redis.flush_db_for_test().await;
+    }
+
+    /// #49 F4: with guests off and nobody scheduled, a wake takes no lease and makes no
+    /// Synapse call (no admin-token mint either); a guest left in `guest:due` after the
+    /// operator turned guests off brings the scan back.
+    #[tokio::test]
+    async fn guests_off_and_none_scheduled_scans_nothing() {
+        let (seen, synapse, redis) = mock(2).await;
+        let scan = OrphanScan {
+            redis: redis.clone(),
+            synapse,
+            server_name: "example.org".into(),
+            interval: Duration::from_secs(3600),
+            guest_enabled: false,
+        };
+        seen.lock().unwrap().clear();
+        assert!(scan.scan_if_leased().await.unwrap().is_none());
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(
+            redis.try_lease(LEASE_KEY, 1).await.unwrap(),
+            "no lease was taken"
+        );
+        redis.flush_db_for_test().await;
+        redis.due_add_for_test("withrecord", 1).await;
+        assert!(scan.scan_if_leased().await.unwrap().is_some());
+        assert!(!seen.lock().unwrap().is_empty());
     }
 }

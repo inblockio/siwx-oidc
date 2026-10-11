@@ -390,6 +390,8 @@ local s = redis.call('HGET', KEYS[1], 'state')
 if not s then return 'gone' end
 if s == 'claimed' or redis.call('HEXISTS', KEYS[1], 'promoted_at') == 1 then return 'claimed' end
 if s == 'reaping' then return 'already' end
+local lu = tonumber(redis.call('HGET', KEYS[1], 'lease_until'))
+if lu and lu > tonumber(redis.call('TIME')[1]) then return 'busy' end
 redis.call('HSET', KEYS[1], 'state', 'reaping')
 return 'marked'
 "#;
@@ -444,6 +446,10 @@ pub enum ReapCas {
     Already,
     Claimed,
     Gone,
+    /// A hand-off holds the lease (`lease_until` after Redis `TIME`): nothing was
+    /// changed. The caller retries after its backoff; the lease lapses within
+    /// [`HANDOFF_LEASE_SECS`] even if the hand-off dies (#49 F3).
+    Busy,
 }
 
 /// What the refresh guard needs of a guest, read in one round trip.
@@ -591,7 +597,8 @@ impl RedisClient {
     }
 
     /// The CAS of the teardown: `minted`/`provisioning`/`active` to `reaping`; a
-    /// `claimed` account is refused, `reaping` is already there, no record is `Gone`.
+    /// `claimed` account is refused, `reaping` is already there, no record is `Gone`, and
+    /// a live hand-off lease is `Busy` (the hand-off may be provisioning the account).
     pub async fn cas_guest_reaping(&self, localpart: &str) -> Result<ReapCas> {
         let mut conn = self
             .pool
@@ -609,6 +616,7 @@ impl RedisClient {
             "marked" => ReapCas::Marked,
             "already" => ReapCas::Already,
             "claimed" => ReapCas::Claimed,
+            "busy" => ReapCas::Busy,
             _ => ReapCas::Gone,
         })
     }
@@ -1161,6 +1169,22 @@ impl RedisClient {
             .await
             .map_err(|e| anyhow!("guest claim revoke done: {e}"))?;
         Ok(())
+    }
+
+    /// Whether any guest is still scheduled (`guest:due` is not empty; every live guest is
+    /// in it). The orphan scan runs on an install with guests off only while this holds.
+    pub async fn guests_scheduled(&self) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let n: i64 = cmd("EXISTS")
+            .arg(DUE_KEY)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest due exists: {e}"))?;
+        Ok(n > 0)
     }
 
     /// Test helper: the score of `member` in `guest:due`.

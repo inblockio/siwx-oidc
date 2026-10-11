@@ -1901,6 +1901,7 @@ pub async fn main() {
                 synapse,
                 server_name,
                 interval: Duration::from_secs(secs),
+                guest_enabled: state.config.guest_enabled,
             };
             Some(tokio::spawn(scan.run(reaper_stopped_orphan)))
         }
