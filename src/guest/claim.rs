@@ -56,6 +56,7 @@ fn unavailable() -> Response {
 
 /// The cookie handle and its hash. A request carrying a Bearer token is refused outright:
 /// the claim is authorised by the cookie alone.
+#[allow(clippy::result_large_err)]
 async fn handle_of(
     state: &GuestState,
     headers: &HeaderMap,
@@ -83,6 +84,7 @@ fn is_joined(events: &[Value], mxid: &str) -> bool {
 }
 
 /// The claim gate (CP-01..06, CP-11, CP-12). Run at start and again at finish.
+#[allow(clippy::result_large_err)]
 async fn gate(
     state: &GuestState,
     handle: &str,
