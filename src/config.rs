@@ -361,6 +361,11 @@ pub struct Config {
     /// Brake: the window, in seconds, over which `guest_brake_reaping_count` is counted.
     /// Env: `SIWXOIDC_GUEST_BRAKE_REAPING_SECS`
     pub guest_brake_reaping_secs: u64,
+    /// Seconds between two ticks of the guest reaper. The reaper runs whether or not
+    /// `guest_enabled` is set, so guests are still erased after an operator turns guests
+    /// off. A zero is read as one second.
+    /// Env: `SIWXOIDC_GUEST_REAPER_INTERVAL_SECS`
+    pub guest_reaper_interval_secs: u64,
 }
 
 /// The shortest configurable absolute grant lifetime: a device code's
@@ -463,6 +468,7 @@ impl Default for Config {
             guest_host_max_open_invites: 1,
             guest_brake_reaping_count: 50,
             guest_brake_reaping_secs: 900,
+            guest_reaper_interval_secs: 15,
         }
     }
 }

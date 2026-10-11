@@ -15,10 +15,6 @@
 //! 6. drop the record, its device set, hand-off window, `guest:due` entry and
 //!    `guest:by_invite` membership.
 
-// `teardown_guest` has no caller until the reaper loop (S5b) lands: the whole module is the
-// seam it plugs into.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use siwx_oidc::db::guest_records::ReapCas;
 use siwx_oidc::db::RedisClient;
 

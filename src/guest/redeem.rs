@@ -1402,6 +1402,85 @@ mod tests {
         let _ = by_host_key(&host);
     }
 
+    /// S5b: the host's "End meeting" and "End link" are fail-closed. When the deadline move
+    /// fails (here: the invite's guest set is not a set), the answer is 503 `unavailable`
+    /// and never 200 while a guest stays live; after the fault is gone a retry succeeds
+    /// (the revoke is idempotent) and the guest is due.
+    #[tokio::test]
+    async fn the_host_end_routes_answer_503_when_the_deadline_move_fails() {
+        let host = format!("host{}", uniq());
+        let hosts = host.clone();
+        let Some(e) = env(move |c| c.guest_hosts = vec![hosts.clone()]).await else {
+            return;
+        };
+        let token = format!("mat_{}", uniq());
+        e.redis
+            .set_token(
+                &token,
+                &TokenMetadata {
+                    username: host.clone(),
+                    device_id: String::new(),
+                    scope: "openid".into(),
+                    client_id: "c".into(),
+                    iat: 0,
+                    exp: i64::MAX,
+                    did: "did:key:zHost".into(),
+                    name: "n".into(),
+                    kind: Some(TokenKind::Access),
+                    grant_kind: None,
+                },
+                300,
+            )
+            .await
+            .unwrap();
+        let inv = e.invite_of(&host, Kind::Open, 5).await;
+        let g = Guest::new();
+        assert_eq!(e.redeem(&inv, &g).await.status, 200);
+        let lp = localpart_for(&g.did);
+        let members = by_invite_key(&inv.id);
+        let post = |path: String, body: String| {
+            let (client, url, token) =
+                (e.client.clone(), format!("{}{path}", e.base), token.clone());
+            async move {
+                let r = client
+                    .post(url)
+                    .bearer_auth(token)
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap();
+                (r.status().as_u16(), r.json::<Value>().await.unwrap())
+            }
+        };
+        let end_invite = format!("/guest/invites/{}/end", inv.id);
+        let meeting = json!({"room_id": "!room:example.org"}).to_string();
+        // The fault: the member set of the invite is a string, so the script errors.
+        e.redis.del_raw(&members).await.unwrap();
+        e.redis.set_raw(&members, "broken").await.unwrap();
+        for (path, body) in [
+            (end_invite.clone(), "{}".to_string()),
+            ("/guest/meetings/end".to_string(), meeting.clone()),
+        ] {
+            let (status, v) = post(path.clone(), body).await;
+            assert_eq!(
+                (status, v),
+                (503, json!({"error": "unavailable"})),
+                "{path}"
+            );
+        }
+        // Healed: the set is back, both routes answer 200 and the guest is due.
+        e.redis.del_raw(&members).await.unwrap();
+        e.redis.sadd_raw_for_test(&members, &lp).await;
+        let (status, _) = post(end_invite, "{}".to_string()).await;
+        assert_eq!(status, 200);
+        let now = Utc::now().timestamp();
+        let due = e.redis.zscore_for_test(DUE_KEY, &lp).await.unwrap() as i64;
+        assert!((now - 5..=now + 1).contains(&due), "the guest is due now");
+        let (status, _) = post("/guest/meetings/end".to_string(), meeting).await;
+        assert_eq!(status, 200);
+    }
+
     /// A guest's record makes its token a guest token on the host routes.
     #[tokio::test]
     async fn a_minted_guest_is_refused_as_a_host() {

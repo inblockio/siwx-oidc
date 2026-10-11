@@ -1455,7 +1455,7 @@ paths:
         "401": { description: "`invalid_token`." }
         "403": { description: "`not_a_host`, `admin_token`, `guest_token` or `disabled`." }
         "404": { description: "`not_found`." }
-        "503": { description: "`unavailable`." }
+        "503": { description: "`unavailable`: the store failed or the guests' deadlines could not be moved to now (fail-closed, never a 200 while a guest stays live); repeat the call." }
 
   /guest/meetings/end:
     post:
@@ -1478,7 +1478,7 @@ paths:
         "400": { description: "`bad_request` or `bad_room_id`." }
         "401": { description: "`invalid_token`." }
         "403": { description: "`not_a_host`, `admin_token`, `guest_token` or `disabled`." }
-        "503": { description: "`unavailable`." }
+        "503": { description: "`unavailable`: the store failed or the guests' deadlines could not be moved to now (fail-closed, never a 200 while a guest stays live); repeat the call." }
 
   /health:
     get:

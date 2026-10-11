@@ -1780,6 +1780,32 @@ pub async fn main() {
         );
     }
 
+    // The guest reaper: on every instance, whether or not guests are enabled (a guest is
+    // still erased after an operator turns them off). Stopped with the server.
+    let (reaper_stop, reaper_stopped) = tokio::sync::watch::channel(false);
+    let reaper_task = match (
+        state.synapse_client.clone(),
+        state.config.matrix_server_name.clone(),
+    ) {
+        (Some(synapse), Some(server_name)) => {
+            let policy = crate::guest::reaper::ReaperPolicy::from_interval_secs(
+                state.config.guest_reaper_interval_secs,
+            );
+            let grace = policy.shutdown_grace;
+            let reaper = crate::guest::reaper::Reaper::new(
+                state.redis_client.clone(),
+                synapse,
+                server_name,
+                policy,
+            );
+            Some((tokio::spawn(reaper.run(reaper_stopped)), grace))
+        }
+        _ => {
+            info!("guest reaper not started: synapse_endpoint, mas_shared_secret or matrix_server_name is not set");
+            None
+        }
+    };
+
     let guest_router = crate::guest::routes::router(
         &state.config,
         state.redis_client.clone(),
@@ -1929,9 +1955,16 @@ pub async fn main() {
         listener.local_addr().expect("read the bound address")
     );
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            // The reaper takes no new guest and gives a teardown in flight a bounded time.
+            let _ = reaper_stop.send(true);
+        })
         .await
         .unwrap();
+    if let Some((task, grace)) = reaper_task {
+        let _ = tokio::time::timeout(grace + Duration::from_secs(1), task).await;
+    }
 }
 
 /// Request logging: one `info!` line per request (method and path) and one per

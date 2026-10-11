@@ -341,12 +341,19 @@ pub async fn list(State(state): State<GuestState>, headers: HeaderMap) -> Respon
 }
 
 /// Move the deadline of the unclaimed guests of just-revoked invites to now (never
-/// later; `claimed` is skipped), so the reaper (S5) finds them due. The revoke has
-/// already succeeded: a failure here is logged, and the guests then end at their own
-/// deadline.
-async fn move_guest_deadlines_to_now(state: &GuestState, invite_ids: &[String]) {
-    if let Err(e) = state.redis.move_guest_deadlines_to_now(invite_ids).await {
-        warn!(error = %e, "guest invite: moving guest deadlines failed");
+/// later; `claimed` is skipped), so the reaper (S5) finds them due. Fail-closed: an
+/// error is a 503 `unavailable`, so "End meeting" never answers 200 while a guest stays
+/// live. The host retries; the revoke is idempotent and the move is repeatable.
+async fn move_guest_deadlines_to_now(
+    state: &GuestState,
+    invite_ids: &[String],
+) -> Result<(), Response> {
+    match state.redis.move_guest_deadlines_to_now(invite_ids).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            warn!(error = %e, "guest invite: moving guest deadlines failed");
+            Err(unavailable())
+        }
     }
 }
 
@@ -369,7 +376,9 @@ pub async fn end_invite(
         .await
     {
         Ok(true) => {
-            move_guest_deadlines_to_now(&state, &[invite_id]).await;
+            if let Err(r) = move_guest_deadlines_to_now(&state, &[invite_id]).await {
+                return r;
+            }
             Json(json!({ "revoked": 1 })).into_response()
         }
         Ok(false) => error(StatusCode::NOT_FOUND, "not_found"),
@@ -407,21 +416,29 @@ pub async fn end_meeting(
     }
     // The caller's own invites for this room, read before the revoke (the set is the
     // caller's and the room's, so no other host's invite is in it).
-    let ids = state
+    let ids = match state
         .redis
         .smembers_raw(&siwx_oidc::db::guest_invites::by_room_key(
             &host.username,
             &room_id,
         ))
         .await
-        .unwrap_or_default();
+    {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!(error = %e, "guest invite: reading the meeting's invites failed");
+            return unavailable();
+        }
+    };
     match state
         .redis
         .revoke_guest_invites_for_room(&host.username, &room_id)
         .await
     {
         Ok(n) => {
-            move_guest_deadlines_to_now(&state, &ids).await;
+            if let Err(r) = move_guest_deadlines_to_now(&state, &ids).await {
+                return r;
+            }
             Json(json!({ "revoked": n })).into_response()
         }
         Err(e) => {

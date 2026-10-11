@@ -11,6 +11,7 @@ use url::Url;
 pub mod handoff;
 pub mod invite;
 pub mod layers;
+pub mod reaper;
 pub mod redeem;
 pub mod routes;
 pub mod teardown;

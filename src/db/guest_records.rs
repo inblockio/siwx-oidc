@@ -30,6 +30,76 @@ pub const DUE_KEY: &str = "guest:due";
 const BY_INVITE_PREFIX: &str = "guest:by_invite/";
 const HANDLE_PREFIX: &str = "guest:handle/";
 const DAILY_PREFIX: &str = "guest:quota/daily_mint/";
+const REAP_LEASE_PREFIX: &str = "guest:reap:lease/";
+const REAP_RETRY_PREFIX: &str = "guest:reap:retry/";
+const REAP_FAIL_PREFIX: &str = "guest:reap:fail/";
+/// The reaper's per-entry lease: `guest:reap:lease/{localpart}` holds the owner token, with
+/// a `PX` lifetime. `NX` is what keeps two instances off one teardown.
+pub fn reap_lease_key(localpart: &str) -> String {
+    format!("{REAP_LEASE_PREFIX}{localpart}")
+}
+/// The reaper's backoff gate: `guest:reap:retry/{localpart}` exists (with a `PX` lifetime
+/// of the backoff delay) after a failed teardown; the entry is not claimed meanwhile.
+pub fn reap_retry_key(localpart: &str) -> String {
+    format!("{REAP_RETRY_PREFIX}{localpart}")
+}
+/// The reaper's failure count: `guest:reap:fail/{localpart}`, one hour from the last failure.
+pub fn reap_fail_key(localpart: &str) -> String {
+    format!("{REAP_FAIL_PREFIX}{localpart}")
+}
+
+/// Claim due entries. `KEYS[1]` the due set. `ARGV`: 1 owner token, 2 lease ms, 3 batch,
+/// 4 lease prefix, 5 retry prefix, 6 how many due entries to look at. An entry that is
+/// leased or backing off is skipped (it does not starve the ones behind it). Returns the
+/// claimed localparts.
+const CLAIM_DUE: &str = r#"
+local now = tonumber(redis.call('TIME')[1])
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now, 'LIMIT', 0, tonumber(ARGV[6]))
+local out = {}
+local batch = tonumber(ARGV[3])
+for _, lp in ipairs(due) do
+  if #out >= batch then break end
+  if redis.call('EXISTS', ARGV[5] .. lp) == 0 then
+    if redis.call('SET', ARGV[4] .. lp, ARGV[1], 'NX', 'PX', ARGV[2]) then
+      out[#out + 1] = lp
+    end
+  end
+end
+return out
+"#;
+
+/// A failed teardown. `KEYS`: 1 lease, 2 failure count, 3 retry gate. `ARGV`: 1 owner
+/// token, 2 base ms, 3 cap ms, 4 failure-count lifetime ms. Counts the failure, sets the
+/// gate to `min(base * 2^(n-1), cap)` and releases the lease if it is still ours. Returns
+/// `{n, delay_ms}`.
+const REAP_FAILED: &str = r#"
+local n = redis.call('INCR', KEYS[2])
+redis.call('PEXPIRE', KEYS[2], ARGV[4])
+local delay = tonumber(ARGV[2]) * (2 ^ (math.min(n, 30) - 1))
+local cap = tonumber(ARGV[3])
+if delay > cap then delay = cap end
+delay = math.floor(delay)
+redis.call('SET', KEYS[3], tostring(n), 'PX', delay)
+if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
+return {n, delay}
+"#;
+
+/// A finished teardown (erased, already gone or claimed). `KEYS`: 1 lease, 2 failure
+/// count, 3 retry gate, 4 due set. `ARGV`: 1 owner token, 2 localpart. Leaves nothing of
+/// the entry behind.
+const REAP_DONE: &str = r#"
+redis.call('ZREM', KEYS[4], ARGV[2])
+redis.call('DEL', KEYS[2], KEYS[3])
+if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
+return 1
+"#;
+
+/// Give a lease back without counting a failure (shutdown abandoned the teardown).
+const REAP_RELEASE: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+return 0
+"#;
+
 /// A key that never exists: a lookup for a malformed invite id reads this, so every
 /// peek and redeem does exactly one invite lookup (GP-SEC-09).
 const DUMMY_INVITE_ID: &str = "-";
@@ -185,8 +255,8 @@ for i = 3, #ARGV do
     local f = redis.call('HMGET', k, 'state', 'deadline', 'promoted_at')
     if (f[1] == 'minted' or f[1] == 'provisioning' or f[1] == 'active') and not f[3]
        and tonumber(f[2]) and tonumber(f[2]) > now then
-      redis.call('HSET', k, 'deadline', tostring(now))
       redis.call('ZADD', KEYS[1], now, lp)
+      redis.call('HSET', k, 'deadline', tostring(now))
       moved = moved + 1
     end
   end
@@ -441,6 +511,108 @@ impl RedisClient {
             .query_async(&mut *conn)
             .await
             .map_err(|e| anyhow!("guest record drop: {e}"))?;
+        Ok(())
+    }
+
+    /// The reaper's claim: up to `batch` due guests (deadline <= Redis `TIME`) that are
+    /// neither leased by another owner nor backing off, each leased to `owner` for
+    /// `lease_ms`. Looks at no more than `scan` due entries.
+    pub async fn claim_due_guests(
+        &self,
+        owner: &str,
+        lease_ms: u64,
+        batch: usize,
+        scan: usize,
+    ) -> Result<Vec<String>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        cmd("EVAL")
+            .arg(CLAIM_DUE)
+            .arg(1)
+            .arg(DUE_KEY)
+            .arg(owner)
+            .arg(lease_ms)
+            .arg(batch)
+            .arg(REAP_LEASE_PREFIX)
+            .arg(REAP_RETRY_PREFIX)
+            .arg(scan)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest reaper claim: {e}"))
+    }
+
+    /// Record a failed teardown of a claimed guest: bump the failure count, gate the entry
+    /// for `min(base_ms * 2^(n-1), cap_ms)` and release the lease. Returns `(n, delay_ms)`.
+    pub async fn reap_failed(
+        &self,
+        localpart: &str,
+        owner: &str,
+        base_ms: u64,
+        cap_ms: u64,
+    ) -> Result<(u64, u64)> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let (n, delay): (u64, u64) = cmd("EVAL")
+            .arg(REAP_FAILED)
+            .arg(3)
+            .arg(reap_lease_key(localpart))
+            .arg(reap_fail_key(localpart))
+            .arg(reap_retry_key(localpart))
+            .arg(owner)
+            .arg(base_ms)
+            .arg(cap_ms)
+            .arg(3_600_000u64)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest reaper failure: {e}"))?;
+        Ok((n, delay))
+    }
+
+    /// A claimed guest is done (erased, already gone or claimed): remove its schedule entry,
+    /// its backoff state and its lease.
+    pub async fn reap_done(&self, localpart: &str, owner: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let _: i64 = cmd("EVAL")
+            .arg(REAP_DONE)
+            .arg(4)
+            .arg(reap_lease_key(localpart))
+            .arg(reap_fail_key(localpart))
+            .arg(reap_retry_key(localpart))
+            .arg(DUE_KEY)
+            .arg(owner)
+            .arg(localpart)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest reaper done: {e}"))?;
+        Ok(())
+    }
+
+    /// Give back a lease that is still `owner`'s (a teardown abandoned at shutdown), so the
+    /// next instance resumes at once instead of after the lease lifetime.
+    pub async fn reap_release(&self, localpart: &str, owner: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let _: i64 = cmd("EVAL")
+            .arg(REAP_RELEASE)
+            .arg(1)
+            .arg(reap_lease_key(localpart))
+            .arg(owner)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest reaper release: {e}"))?;
         Ok(())
     }
 }
@@ -1167,6 +1339,12 @@ impl RedisClient {
     }
 
     /// Test helper: the TTL of a key in seconds (-1 none, -2 absent).
+    #[doc(hidden)]
+    pub async fn pttl_for_test(&self, key: &str) -> i64 {
+        let mut conn = self.pool.get().await.unwrap();
+        cmd("PTTL").arg(key).query_async(&mut *conn).await.unwrap()
+    }
+
     #[doc(hidden)]
     pub async fn ttl_for_test(&self, key: &str) -> i64 {
         let mut conn = self.pool.get().await.unwrap();
