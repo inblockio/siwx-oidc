@@ -147,6 +147,12 @@ impl IntoResponse for CustomError {
             CustomError::ServiceUnavailable(msg) => {
                 warn!(error = %msg, "service_unavailable");
             }
+            CustomError::Coded {
+                status,
+                code: reason,
+            } => {
+                warn!(status = %status, reason = %reason, "coded_refusal");
+            }
             CustomError::Other(e) => {
                 warn!(error = %e, "internal_error");
             }
@@ -208,6 +214,11 @@ impl IntoResponse for CustomError {
             CustomError::ServiceUnavailable(_) => {
                 (StatusCode::SERVICE_UNAVAILABLE, self.to_string()).into_response()
             }
+            CustomError::Coded { status, code } => (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                Json(serde_json::json!({ "error": code })),
+            )
+                .into_response(),
             CustomError::Other(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()).into_response()
             }
@@ -393,8 +404,21 @@ async fn end_session_response(
 
 async fn authorize(
     State(state): State<AppState>,
+    request_headers: HeaderMap,
     Query(params): Query<oidc::AuthorizeParams>,
 ) -> Result<(HeaderMap, Redirect), CustomError> {
+    // The guest marker routes the request to the hand-off branch (S4): it never reaches
+    // the login page. With guest mode off the marker is an ordinary, ignored scope word.
+    if state.config.guest_enabled && crate::guest::handoff::scope_has_marker(params.scope.as_str())
+    {
+        return crate::guest::handoff::authorize(
+            &state.config,
+            &state.redis_client,
+            params,
+            &request_headers,
+        )
+        .await;
+    }
     let (url, session_cookie) = oidc::authorize(params, &state.redis_client).await?;
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -1002,6 +1026,8 @@ async fn webauthn_link_start(
         &state.config.supported_did_methods,
         &state.config.supported_pkh_namespaces,
     )?;
+    // M6: a guest DID never links a passkey through a signature.
+    oidc::refuse_guest_did(&state.redis_client, &primary_did).await?;
 
     let ccr = wa::link_start(
         &state.webauthn,

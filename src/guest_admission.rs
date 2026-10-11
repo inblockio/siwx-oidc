@@ -793,6 +793,159 @@ pub fn verify_redeem_proof(
     }
 }
 
+// ---------------------------------------------------------------------------------
+// The continue proof (S4): the hand-off ceremony at `/guest/continue`
+// ---------------------------------------------------------------------------------
+
+/// The statement line of the continue message.
+pub const CONTINUE_STATEMENT: &str = "Continue as a guest";
+
+/// Why a continue proof was refused. The route maps these to its status and code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContinueError {
+    /// The message names another DID than the record's (401 `did_mismatch`).
+    DidMismatch,
+    /// The message does not carry the session nonce (400 `nonce_mismatch`).
+    NonceMismatch,
+    /// The message's resource is not the session's `redirect_uri` (400 `resource_mismatch`).
+    ResourceMismatch,
+    /// Not the fixed twelve-line layout, or the times are out of range (400 `bad_request`).
+    Malformed,
+    /// The signature does not verify for the DID (401 `signature_invalid`).
+    SignatureInvalid,
+}
+
+/// The fields of a continue message, as they appear on its lines.
+struct ContinueFields<'a> {
+    domain: &'a str,
+    label: &'a str,
+    did: &'a str,
+    uri: &'a str,
+    nonce: &'a str,
+    issued_at: &'a str,
+    expiration_time: &'a str,
+    redirect_uri: &'a str,
+}
+
+fn format_continue_message(f: &ContinueFields<'_>) -> String {
+    let ContinueFields {
+        domain,
+        label,
+        did,
+        uri,
+        nonce,
+        issued_at,
+        expiration_time,
+        redirect_uri,
+    } = f;
+    format!(
+        "{domain} wants you to sign in with your {label} account:\n\
+         {did}\n\
+         \n\
+         {CONTINUE_STATEMENT}\n\
+         \n\
+         URI: {uri}\n\
+         Version: 1\n\
+         Nonce: {nonce}\n\
+         Issued At: {issued_at}\n\
+         Expiration Time: {expiration_time}\n\
+         Resources:\n\
+         - {redirect_uri}"
+    )
+}
+
+/// The exact message the `/guest/continue` page signs: the redeem layout with the
+/// statement `Continue as a guest`, the login session's nonce, and the exact
+/// `redirect_uri` as the one resource.
+pub fn build_continue_message(
+    issuer: &Url,
+    did: &str,
+    redirect_uri: &str,
+    nonce: &str,
+    issued_at: DateTime<Utc>,
+    expiration_time: DateTime<Utc>,
+) -> Result<String, ProofError> {
+    let admitted = admit_did(did).map_err(|_| ProofError)?;
+    Ok(format_continue_message(&ContinueFields {
+        domain: &issuer_domain(issuer).ok_or(ProofError)?,
+        label: admitted.curve.label(),
+        did,
+        uri: &issuer_uri(issuer),
+        nonce,
+        issued_at: &iso_ms(issued_at),
+        expiration_time: &iso_ms(expiration_time),
+        redirect_uri,
+    }))
+}
+
+/// Verify a continue proof: the DID line is the record's DID, the nonce is the session's,
+/// the resource is the session's bound `redirect_uri`, the whole message is the fixed
+/// layout byte for byte, the times are valid at `now` (expiry at most
+/// [`POP_MAX_VALIDITY_SECS`] after issue, [`POP_CLOCK_SKEW_SECS`] of skew), and the
+/// signature verifies for the DID.
+pub fn verify_continue_proof(
+    issuer: &Url,
+    expected_did: &str,
+    redirect_uri: &str,
+    session_nonce: &str,
+    message: &str,
+    signature: &[u8],
+    now: DateTime<Utc>,
+) -> Result<(), ContinueError> {
+    let admitted = admit_did(expected_did).map_err(|_| ContinueError::Malformed)?;
+    let domain = issuer_domain(issuer).ok_or(ContinueError::Malformed)?;
+    let lines: Vec<&str> = message.split('\n').collect();
+    if lines.len() != 12 {
+        return Err(ContinueError::Malformed);
+    }
+    if lines[1] != expected_did {
+        return Err(ContinueError::DidMismatch);
+    }
+    let nonce = lines[7]
+        .strip_prefix("Nonce: ")
+        .ok_or(ContinueError::Malformed)?;
+    if nonce != session_nonce {
+        return Err(ContinueError::NonceMismatch);
+    }
+    if lines[11].strip_prefix("- ") != Some(redirect_uri) {
+        return Err(ContinueError::ResourceMismatch);
+    }
+    let issued_raw = lines[8]
+        .strip_prefix("Issued At: ")
+        .ok_or(ContinueError::Malformed)?;
+    let expires_raw = lines[9]
+        .strip_prefix("Expiration Time: ")
+        .ok_or(ContinueError::Malformed)?;
+    let expected = format_continue_message(&ContinueFields {
+        domain: &domain,
+        label: admitted.curve.label(),
+        did: expected_did,
+        uri: &issuer_uri(issuer),
+        nonce,
+        issued_at: issued_raw,
+        expiration_time: expires_raw,
+        redirect_uri,
+    });
+    if expected != message {
+        return Err(ContinueError::Malformed);
+    }
+    let issued = parse_time(issued_raw).ok_or(ContinueError::Malformed)?;
+    let expires = parse_time(expires_raw).ok_or(ContinueError::Malformed)?;
+    let skew = chrono::Duration::seconds(POP_CLOCK_SKEW_SECS);
+    if issued > now + skew
+        || expires <= issued
+        || expires - issued > chrono::Duration::seconds(POP_MAX_VALIDITY_SECS)
+        || now - skew >= expires
+    {
+        return Err(ContinueError::Malformed);
+    }
+    let method = find_did_method(expected_did).ok_or(ContinueError::Malformed)?;
+    match method.verify(expected_did, message, signature) {
+        Ok(true) => Ok(()),
+        _ => Err(ContinueError::SignatureInvalid),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1321,6 +1474,41 @@ mod tests {
             Expiration Time: 2026-10-11T12:39:56.789Z\n\
             Resources:\n\
             - urn:io.inblock:guest:invite:inv_0123456789abcdef";
+        assert_eq!(text, expected);
+    }
+
+    /// The cross-language vector of the continue message: the same fixed input and text as
+    /// `static/guest/continue-message.test.mjs`, which runs the page's JS builder.
+    #[test]
+    fn continue_message_vector_matches_the_continue_page_builder() {
+        let issuer = Url::parse("https://id.example.org").unwrap();
+        let issued = DateTime::parse_from_rfc3339("2026-10-11T12:34:56Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let expires = DateTime::parse_from_rfc3339("2026-10-11T12:39:56.789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let text = build_continue_message(
+            &issuer,
+            "did:key:z6MkiTBz1ymuepAQ4HEHYSF1H8quG5GLVVQR3djdX3mDooWp",
+            "https://meet.example.org/auth/callback?x=1",
+            "aB3dE5gH7jK9mN1p",
+            issued,
+            expires,
+        )
+        .unwrap();
+        let expected = "id.example.org wants you to sign in with your Ed25519 account:\n\
+            did:key:z6MkiTBz1ymuepAQ4HEHYSF1H8quG5GLVVQR3djdX3mDooWp\n\
+            \n\
+            Continue as a guest\n\
+            \n\
+            URI: https://id.example.org\n\
+            Version: 1\n\
+            Nonce: aB3dE5gH7jK9mN1p\n\
+            Issued At: 2026-10-11T12:34:56.000Z\n\
+            Expiration Time: 2026-10-11T12:39:56.789Z\n\
+            Resources:\n\
+            - https://meet.example.org/auth/callback?x=1";
         assert_eq!(text, expected);
     }
 

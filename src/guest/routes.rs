@@ -12,6 +12,7 @@ use axum::{
     Router,
 };
 
+use super::handoff;
 use super::invite::{self, GuestState};
 use super::redeem;
 use crate::config::Config;
@@ -24,7 +25,17 @@ const JOIN_HTML: &str = include_str!("../../static/guest/join.html");
 
 /// The only files `/guest/assets/{file}` serves. Compiled in, so no path from the
 /// request ever reaches the file system.
-const ASSETS: [(&str, &str, &str); 3] = [
+const ASSETS: [(&str, &str, &str); 5] = [
+    (
+        "continue.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../../static/guest/continue.js"),
+    ),
+    (
+        "continue-message.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../../static/guest/continue-message.js"),
+    ),
     (
         "join.js",
         "text/javascript; charset=utf-8",
@@ -69,6 +80,11 @@ pub fn router(config: &Config, redis: RedisClient, synapse: Option<Arc<SynapseCl
     let cookie_routes = Router::new()
         .route("/guest/peek", post(redeem::peek))
         .route("/guest/redeem", post(redeem::redeem))
+        // The hand-off ceremony (S4): the page for the browser, the proof from its script.
+        .route(
+            "/guest/continue",
+            get(handoff::continue_page).post(handoff::continue_post),
+        )
         // Top-level navigations and sub-resources of the join page: GET, so the
         // origin check (POST only) does not apply; the layers still add the headers.
         .route("/guest/join/{invite_id}", get(join_page))

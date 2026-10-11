@@ -1401,6 +1401,10 @@ impl DBClient for RedisClient {
         Ok(())
     }
 
+    async fn guest_did_has_record(&self, did: &str) -> Result<bool> {
+        self.guest_record_exists_for_did(did).await
+    }
+
     async fn get_session(&self, id: String) -> Result<Option<SessionEntry>> {
         match self
             .get_either(&session_key(&id), &legacy_session_key(&id))
@@ -2551,6 +2555,7 @@ mod tests {
             signin_count: 0,
             verified_did: None,
             request: None,
+            guest_id: None,
         }
     }
 

@@ -241,7 +241,96 @@ fn parse_redeem(reply: &[Value]) -> Result<RedeemOutcome> {
     }
 }
 
+/// A guest record as `/authorize` and `/guest/continue` read it through the cookie.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestSession {
+    /// The record key suffix: the guest's localpart, and the `guest_id` of a session.
+    pub localpart: String,
+    pub did: String,
+    pub state: String,
+    pub deadline: i64,
+    /// Redis `TIME` at the read.
+    pub now: i64,
+}
+
+impl GuestSession {
+    /// `minted`, `provisioning` or `active`, and before the deadline. `reaping`,
+    /// `claimed` and anything else is not a session a hand-off may start from.
+    pub fn is_live(&self) -> bool {
+        matches!(self.state.as_str(), "minted" | "provisioning" | "active")
+            && self.now < self.deadline
+    }
+}
+
 impl RedisClient {
+    /// The record behind a session-cookie handle, with Redis `TIME`: handle hash to
+    /// localpart to record, in two round trips. `None` for an unknown or expired handle
+    /// (its key has a TTL until the deadline) or a record that no longer exists.
+    pub async fn read_guest_session(&self, handle: &str) -> Result<Option<GuestSession>> {
+        use sha2::{Digest, Sha256};
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let hash = hex::encode(Sha256::digest(handle.as_bytes()));
+        let localpart: Option<String> = cmd("GET")
+            .arg(handle_key(&hash))
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest session: {e}"))?;
+        let Some(localpart) = localpart else {
+            return Ok(None);
+        };
+        let (f, (secs, _)): (Vec<Option<String>>, (String, String)) = bb8_redis::redis::pipe()
+            .cmd("HMGET")
+            .arg(guest_account_key(&localpart))
+            .arg("state")
+            .arg("did")
+            .arg("deadline")
+            .cmd("TIME")
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest session: {e}"))?;
+        let (Some(Some(state)), Some(Some(did)), Some(Some(deadline))) =
+            (f.first(), f.get(1), f.get(2))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(GuestSession {
+            localpart,
+            did: did.clone(),
+            state: state.clone(),
+            deadline: deadline
+                .parse()
+                .map_err(|e| anyhow!("guest session: {e}"))?,
+            now: secs.parse().map_err(|e| anyhow!("guest session: {e}"))?,
+        }))
+    }
+
+    /// M6: whether a guest record exists for this DID, under the modern or the legacy
+    /// localpart. Any record state counts, `claimed` too: the DID of a guest never signs
+    /// in by signature again outside `/guest/continue`.
+    pub async fn guest_record_exists_for_did(&self, did: &str) -> Result<bool> {
+        let modern = crate::mxid::localpart_for(did);
+        let legacy = crate::mxid::legacy_localpart(did);
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {e}"))?;
+        let mut c = cmd("EXISTS");
+        c.arg(guest_account_key(&modern));
+        if legacy != modern {
+            c.arg(guest_account_key(&legacy));
+        }
+        let n: i64 = c
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("guest record lookup: {e}"))?;
+        Ok(n > 0)
+    }
+
     /// The one invite lookup of peek and redeem: the invite's hash and Redis `TIME` in
     /// one round trip. A malformed id reads a key that never exists, so the work is the
     /// same for every input. `None` when there is no such invite.
@@ -441,6 +530,43 @@ impl RedisClient {
             .await
             .map_err(|e| anyhow!("guest deadlines: {e}"))?;
         Ok(n.max(0) as u64)
+    }
+
+    /// Test helper: a guest record and its cookie handle, as redeem leaves them, with
+    /// `state` and a deadline `deadline_in` seconds from Redis `TIME` (negative: past).
+    /// The handle key lives an hour regardless, so an expired record is still found.
+    #[doc(hidden)]
+    pub async fn put_guest_for_test(
+        &self,
+        localpart: &str,
+        did: &str,
+        state: &str,
+        deadline_in: i64,
+        handle: &str,
+    ) {
+        use sha2::{Digest, Sha256};
+        let mut conn = self.pool.get().await.unwrap();
+        let (secs, _): (String, String) = cmd("TIME").query_async(&mut *conn).await.unwrap();
+        let deadline = secs.parse::<i64>().unwrap() + deadline_in;
+        let _: () = cmd("HSET")
+            .arg(guest_account_key(localpart))
+            .arg("state")
+            .arg(state)
+            .arg("did")
+            .arg(did)
+            .arg("deadline")
+            .arg(deadline.to_string())
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
+        let _: () = cmd("SET")
+            .arg(handle_key(&hex::encode(Sha256::digest(handle.as_bytes()))))
+            .arg(localpart)
+            .arg("EX")
+            .arg(3600)
+            .query_async(&mut *conn)
+            .await
+            .unwrap();
     }
 
     /// Test helper: the whole hash at `key`.

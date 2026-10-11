@@ -422,6 +422,11 @@ pub enum CustomError {
     /// logged at the point of failure and must never be put on the wire.
     #[error("{0}")]
     ServiceUnavailable(String),
+    /// A refusal with a fixed machine-readable body `{"error": code}` and its own
+    /// status. The guest paths use it: the 503 seam of the guest `sign_in` branch and
+    /// the refusal of a guest DID at a signature site (M6).
+    #[error("{code}")]
+    Coded { status: u16, code: &'static str },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -1971,6 +1976,89 @@ pub struct AuthorizeParams {
     pub response_mode: Option<String>,
 }
 
+/// M6: refuse a DID that has a guest record. Called after a signature has verified, at
+/// Path B of `sign_in`, account re-auth, device approval and the `siwx` cookie check of
+/// `link_start`. The one carve-out is `/guest/continue` for a live record, which does not
+/// come through here. A guest DID without a record (guest mode never on) is unchanged.
+/// A store failure refuses too: fail closed.
+pub async fn refuse_guest_did(
+    db_client: &(dyn DBClient + Sync),
+    did: &str,
+) -> Result<(), CustomError> {
+    match db_client.guest_did_has_record(did).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(CustomError::Coded {
+            status: 403,
+            code: "guest_identity",
+        }),
+        Err(e) => {
+            warn!(error = %e, "guest record lookup failed, refusing the signature");
+            Err(CustomError::ServiceUnavailable(
+                "The session store is unavailable; retry.".to_string(),
+            ))
+        }
+    }
+}
+
+/// The guest branch of `/authorize` binds the request to a login session that carries
+/// `guest_id`, with the marker already stripped from `scope`. Same session id, secret,
+/// nonce and cookie as [`authorize`]; no login page follows, `/guest/continue` does.
+pub async fn start_guest_session(
+    params: &AuthorizeParams,
+    state: &str,
+    scope: String,
+    guest_id: String,
+    db_client: &DBClientType,
+) -> Result<Box<Cookie<'static>>, CustomError> {
+    let code_challenge = params
+        .code_challenge
+        .clone()
+        .ok_or_else(|| CustomError::BadRequest("code_challenge is required.".to_string()))?;
+    let nonce: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(16)
+        .map(char::from)
+        .collect();
+    let secret: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(16)
+        .map(char::from)
+        .collect();
+    let session_id = Uuid::new_v4();
+    db_client
+        .set_session(
+            session_id.to_string(),
+            SessionEntry {
+                siwe_nonce: nonce,
+                secret,
+                signin_count: 0,
+                verified_did: None,
+                request: Some(AuthorizationRequest {
+                    client_id: params.client_id.clone(),
+                    redirect_uri: params.redirect_uri.as_str().to_string(),
+                    state: state.to_string(),
+                    response_mode: params.response_mode.clone(),
+                    code_challenge,
+                    scope: Some(scope),
+                    nonce: params.nonce.clone(),
+                }),
+                guest_id: Some(guest_id),
+            },
+        )
+        .await?;
+    let is_https = params.redirect_uri.url().scheme() == "https";
+    Ok(Box::new(
+        Cookie::build((SESSION_COOKIE_NAME, session_id.to_string()))
+            .same_site(SameSite::Strict)
+            .http_only(true)
+            .secure(is_https)
+            .max_age(cookie::time::Duration::seconds(
+                SESSION_LIFETIME.try_into().unwrap(),
+            ))
+            .build(),
+    ))
+}
+
 pub async fn authorize(
     params: AuthorizeParams,
     db_client: &DBClientType,
@@ -2148,6 +2236,7 @@ pub async fn authorize(
                     scope: Some(params.scope.as_str().to_string()),
                     nonce: params.nonce.clone(),
                 }),
+                guest_id: None,
             },
         )
         .await?;
@@ -3037,6 +3126,13 @@ pub async fn sign_in(
     let redirect_uri = RedirectUrl::new(request.redirect_uri.clone())
         .map_err(|e| anyhow!("bound redirect_uri does not parse: {}", e))?;
 
+    // A session `/authorize` started for the guest marker is finished only by
+    // `/guest/continue`; the seam below ends in a 503 until S4b fills it. Before the
+    // session is marked signed in, so a refusal burns nothing.
+    if session_entry.guest_id.is_some() {
+        crate::guest::handoff::guest_sign_in_seam(&session_entry)?;
+    }
+
     // Atomically mark session as signed-in (prevents race-condition double sign-in).
     if !db_client
         .try_mark_session_signed_in(session_id.to_string())
@@ -3131,6 +3227,9 @@ pub async fn sign_in(
                 "Signature verification failed".to_string(),
             ));
         }
+
+        // M6: a guest DID does not sign in by signature on Path B.
+        refuse_guest_did(db_client, &siwx_cookie.did).await?;
 
         let msg_nonce = extract_nonce(&siwx_cookie.message)
             .ok_or_else(|| anyhow!("Nonce not found in CAIP-122 message"))?;
@@ -4378,6 +4477,7 @@ mod tests {
             signin_count: 0,
             verified_did: None,
             request,
+            guest_id: None,
         }
     }
 
@@ -4501,6 +4601,7 @@ mod tests {
                             scope: Some("openid profile offline_access".into()),
                             nonce: Some(Nonce::new("oidc-nonce".into())),
                         }),
+                        guest_id: None,
                     },
                 )
                 .await
@@ -6924,6 +7025,7 @@ mod sign_in_deactivation_order_tests {
                 signin_count: 0,
                 verified_did: Some(DID.to_string()),
                 request: Some(bound_test_request(&client_id)),
+                guest_id: None,
             },
         )
         .await
@@ -7231,6 +7333,7 @@ mod device_display_name_tests {
                 signin_count: 0,
                 verified_did: Some(DID.to_string()),
                 request: Some(bound_test_request(&client_id)),
+                guest_id: None,
             },
         )
         .await
@@ -10369,6 +10472,7 @@ mod generic_client_tests {
                     scope: Some(scope.to_string()),
                     ..bound_test_request(&client_id)
                 }),
+                guest_id: None,
             },
         )
         .await

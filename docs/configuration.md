@@ -393,10 +393,10 @@ When guest mode is on, start-up refuses:
 |---|---|---|---|
 | `guest_enabled` | `SIWXOIDC_GUEST_ENABLED` | `false` | Master switch for the guest path. |
 | `guest_client_url` | `SIWXOIDC_GUEST_CLIENT_URL` | none | The fixed Meet start URL a guest invitation leads to. Required when on. |
-| `guest_client_id` | `SIWXOIDC_GUEST_CLIENT_ID` | none | The OIDC `client_id` of the Meet client. Required when on. |
-| `guest_client_redirect_uris` | `SIWXOIDC_GUEST_CLIENT_REDIRECT_URIS` | `[]` | Redirect URIs of the Meet client. At least one when on. |
+| `guest_client_id` | `SIWXOIDC_GUEST_CLIENT_ID` | none | The OIDC `client_id` of the Meet client: the only client that may use the `urn:io.inblock:guest` scope at `/authorize`. Required when on. |
+| `guest_client_redirect_uris` | `SIWXOIDC_GUEST_CLIENT_REDIRECT_URIS` | `[]` | Redirect URIs of the Meet client; the guest hand-off accepts exactly these (string-equal) and `/guest/continue` refuses any other. At least one when on. |
 | `guest_hosts` | `SIWXOIDC_GUEST_HOSTS` | `[]` | Localparts or DIDs allowed to create invitations. At least one when on. |
-| `guest_client_topology` | `SIWXOIDC_GUEST_CLIENT_TOPOLOGY` | `same-site` | `same-site` or `cross-site`: where the Meet client is deployed relative to this provider. |
+| `guest_client_topology` | `SIWXOIDC_GUEST_CLIENT_TOPOLOGY` | `same-site` | `same-site` or `cross-site`: where the Meet client is deployed relative to this provider. With `same-site` (the default) `/authorize` answers a `Sec-Fetch-Site: cross-site` request carrying the guest marker with `access_denied`. |
 | `guest_session_max_secs` | `SIWXOIDC_GUEST_SESSION_MAX_SECS` | `7200` | Longest lifetime of a guest session. |
 | `guest_name_suffix` | `SIWXOIDC_GUEST_NAME_SUFFIX` | ` (Guest)` | Appended to a guest's display name. |
 | `guest_email_policy` | `SIWXOIDC_GUEST_EMAIL_POLICY` | `off` | `off` (no address accepted), `optional` or `required`: whether a guest gives an e-mail address at redeem. The same for every invitation. |

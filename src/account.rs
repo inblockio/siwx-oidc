@@ -886,6 +886,9 @@ pub async fn account_wallet(
         ));
     }
 
+    // M6: a guest DID never re-authenticates an account action by signature.
+    crate::oidc::refuse_guest_did(db_client, &req.did).await?;
+
     // C1: a bare valid signature is NOT enough. The message must carry the exact
     // server-issued single-use nonce minted for THIS action (GET /account/nonce),
     // an unexpired Expiration Time, and the action-specific Resources audience.

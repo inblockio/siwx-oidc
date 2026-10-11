@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Continue to the meeting</title>
+<link rel="stylesheet" href="/guest/assets/guest.css">
+</head>
+<body>
+<main>
+  <div class="card" id="app" data-state="{{STATE}}" data-did="{{DID}}" data-redirect="{{REDIRECT}}" data-nonce="{{NONCE}}">
+    <h1 id="title">Continue to the meeting</h1>
+    <noscript><p class="err">This page needs JavaScript to prove that this browser holds your key.</p></noscript>
+    <p id="status">Checking this browser...</p>
+    <p id="error" class="err" role="alert" aria-live="polite"></p>
+  </div>
+</main>
+<script type="module" src="/guest/assets/continue.js"></script>
+</body>
+</html>

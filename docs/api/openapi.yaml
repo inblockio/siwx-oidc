@@ -191,6 +191,14 @@ paths:
         Issues the `session` cookie and the CAIP-122 nonce the client signs,
         then redirects to the login page.
 
+        The scope word `urn:io.inblock:guest` (guest mode on) selects the guest hand-off instead; it is
+        not in discovery and never granted. Only the static public client `guest_client_id` with an exact
+        URI of `guest_client_redirect_uris` may use it, with S256 PKCE and `prompt=none`; anything else is
+        `invalid_request` on the redirect URI. A `Sec-Fetch-Site: cross-site` request is `access_denied`
+        (topology `same-site`). Without a live guest session (a cookie whose record is `minted`,
+        `provisioning` or `active`, before its deadline) the answer is `interaction_required` on the
+        redirect URI; the login page is never shown. With one, the browser goes to `/guest/continue`.
+
         - `response_type` must be `code`. Any other value is answered by a
           redirect to the (validated) `redirect_uri` with
           `error=unsupported_response_type` and the `state`.
@@ -1102,14 +1110,66 @@ paths:
       operationId: guestAsset
       summary: A script or style sheet of the guest pages
       description: |
-        A fixed allow-list: `join.js`, `guest-key.js` and `guest.css`. Any other name, however spelled,
+        A fixed allow-list: `join.js`, `guest-key.js`, `continue.js`, `continue-message.js` and `guest.css`. Any other name, however spelled,
         is `404 not_found`; no part of the request reaches the file system. Same headers as the page.
       parameters:
-        - { name: file, in: path, required: true, schema: { type: string, enum: [join.js, guest-key.js, guest.css] } }
+        - { name: file, in: path, required: true, schema: { type: string, enum: [join.js, guest-key.js, continue.js, continue-message.js, guest.css] } }
       responses:
         "200": { description: "The file, `text/javascript` or `text/css`." }
         "404": { description: "`not_found`." }
         "503": { description: "`guest_unavailable`." }
+
+  /guest/continue:
+    get:
+      tags: [Guest]
+      operationId: guestContinuePage
+      summary: The guest hand-off page
+      description: |
+        Where `/authorize` sends the browser when the scope carries the marker `urn:io.inblock:guest` and
+        the guest cookie names a live record. The shell is compiled in; the facts the script needs (the
+        record's DID, the bound `redirect_uri`, the login session's nonce) are written into `data-`
+        attributes, never into a script. `data-state` is `ready`, `no_guest` (no live guest cookie: "open your
+        invitation link again in this browser"), `no_session` (the login session is missing or not a guest
+        hand-off) or `unavailable`. The script loads the key the join page stored, never creates one, checks
+        its DID against the record, signs the continue message and posts it. Same headers as the other
+        guest pages.
+      responses:
+        "200": { description: "The page, `text/html`, in every state (`ready`, `no_guest`, `no_session`, `unavailable`): the guest layers replace the body of an error status with their JSON shell, so the state is in `data-state`, not in the status." }
+        "503": { description: "`guest_unavailable` while guest mode is off." }
+
+    post:
+      tags: [Guest]
+      operationId: guestContinue
+      summary: Prove the browser holds the guest's key
+      description: |
+        Authorised by the guest cookie plus the login session cookie `/authorize` set, and by a signature;
+        same-origin only, JSON only, 4 KiB. The message is the twelve-line redeem layout with the statement
+        `Continue as a guest`, the login session's nonce, and the session's bound `redirect_uri` as the one
+        resource. The server checks that the `redirect_uri` is in `guest_client_redirect_uris` and equals the
+        bound one, that the DID line is the record's DID, the nonce, the times (skew 120 s, at most 600 s
+        validity) and the signature, then writes `verified_did` on the login session, so `sign_in` stays
+        Path A. Refused: `400` `bad_request`, `redirect_not_allowed`, `nonce_mismatch`, `resource_mismatch`;
+        `401` `no_session` (no live guest cookie, a record that is `reaping` or past its deadline, or no
+        guest login session), `did_mismatch`, `signature_invalid`; `503` `unavailable`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [redirect_uri, message, signature]
+              properties:
+                redirect_uri: { type: string }
+                message: { type: string }
+                signature: { type: string, description: "base64url without padding; P-256 as raw r||s or DER." }
+      responses:
+        "200": { description: "`{\"next\": \"/sign_in\"}`: the browser goes there to finish the sign-in." }
+        "400": { description: "`bad_request`, `redirect_not_allowed`, `nonce_mismatch` or `resource_mismatch`." }
+        "401": { description: "`no_session`, `did_mismatch` or `signature_invalid`." }
+        "403": { description: "`forbidden_origin`." }
+        "413": { description: "`payload_too_large`." }
+        "415": { description: "`unsupported_media_type`." }
+        "503": { description: "`unavailable`." }
 
   /guest/peek:
     post:

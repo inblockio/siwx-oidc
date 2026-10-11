@@ -8,6 +8,7 @@
 use crate::config::Config;
 use url::Url;
 
+pub mod handoff;
 pub mod invite;
 pub mod layers;
 pub mod redeem;
