@@ -39,6 +39,12 @@ pub const CALL_EVENT_TYPES: [&str; 7] = [
     "m.room.redaction",
 ];
 
+/// Non-state event types that may also sit below 50 (F14-R07): the encrypted message
+/// event, so registered participants can chat in the encrypted room. `events_default`
+/// stays 50, and the Synapse guest-policy module still refuses a guest's messages. Allowed,
+/// never required.
+pub const CHAT_EVENT_TYPES: [&str; 1] = ["m.room.encrypted"];
+
 /// The lowest power a guarded action may require (`invite`, `kick`, `ban`, `redact`,
 /// `state_default`, `events_default` and every per-type override).
 const GUARDED: i64 = 50;
@@ -72,7 +78,8 @@ pub enum Violation {
     PowerTooLow(&'static str),
     /// `users_default` is not 0.
     UsersDefault,
-    /// A per-type override below 50 for a type that is not a call type.
+    /// A per-type override below 50 for a type that is neither a call type nor
+    /// `m.room.encrypted`.
     EventOverride(String),
     /// A call-member type is not at 0.
     CallMemberPower(&'static str),
@@ -336,8 +343,10 @@ pub fn audit_room(state: &RoomState, hosts: &[String]) -> Result<(), Vec<Violati
         }
     }
     for (kind, level) in &levels {
-        let call_type = CALL_MEMBER_TYPES.contains(kind) || CALL_EVENT_TYPES.contains(kind);
-        if *level < GUARDED && !call_type {
+        let allowed = CALL_MEMBER_TYPES.contains(kind)
+            || CALL_EVENT_TYPES.contains(kind)
+            || CHAT_EVENT_TYPES.contains(kind);
+        if *level < GUARDED && !allowed {
             problems.push(Violation::EventOverride((*kind).to_string()));
         }
     }
@@ -683,6 +692,38 @@ mod tests {
             );
             refused_with(&with(b(), GUEST_ROOM_STATE, None), Violation::GuestRoomFlag);
         }
+    }
+
+    /// F14-R07: `m.room.encrypted` at 0 is allowed (never required), with `events_default`
+    /// at 50; every other override below 50 still fails as `room_power_levels`.
+    #[test]
+    fn the_encrypted_event_may_sit_at_zero_and_nothing_else_may() {
+        for v in VERSIONS {
+            let room = pl(baseline(v), |c| c["events"]["m.room.encrypted"] = json!(0));
+            assert_eq!(audit(&room), Ok(()), "room version {v}: encrypted at 0");
+            // Not required: the baseline has no such override and passes (above).
+            let at_default = pl(baseline(v), |c| {
+                c["events"]["m.room.encrypted"] = json!(50);
+            });
+            assert_eq!(audit(&at_default), Ok(()), "room version {v}: at 50");
+        }
+        // Allowing it moves nothing else: `events_default` below 50 and the neighbours fail.
+        let room = pl(baseline("11"), |c| {
+            c["events"]["m.room.encrypted"] = json!(0);
+            c["events"]["m.room.message"] = json!(0);
+        });
+        let problems = audit(&room).expect_err("m.room.message at 0 is refused");
+        assert_eq!(
+            problems,
+            vec![Violation::EventOverride("m.room.message".into())]
+        );
+        assert_eq!(problems[0].code(), "room_power_levels");
+        let room = pl(baseline("11"), |c| {
+            c["events"]["m.room.encrypted"] = json!(0);
+            c["events_default"] = json!(0);
+        });
+        let problems = audit(&room).expect_err("events_default at 0 is refused");
+        assert_eq!(problems, vec![Violation::PowerTooLow("events_default")]);
     }
 
     #[test]
