@@ -579,6 +579,53 @@ async fn a_tombstoned_device_or_user_refuses_rotation_and_replay() {
 }
 
 #[tokio::test]
+async fn a_device_tombstone_refuses_only_grants_authenticated_before_it() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("tombt{}", nonce());
+    // Sign out (the device revocation) plants a millisecond tombstone; a sign-in
+    // on the same device id afterwards is issued (the issue gate) and must
+    // also rotate, for the tombstone's whole lifetime.
+    let old = issue(&client, &matrix_grant(&user, "DEVS")).await;
+    client
+        .revoke_grants_for_device(&user, "DEVS")
+        .await
+        .unwrap();
+    assert!(tombstone(&client, &device_tombstone_key(&user, "DEVS")).await);
+    assert_eq!(
+        rotate(&client, old.refresh_token.as_deref().unwrap()).await,
+        RotateOutcome::Invalid(InvalidReason::UnknownGrant),
+        "the signed-out grant is gone"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let mut fresh = matrix_grant(&user, "DEVS");
+    fresh.auth_ms = None;
+    let f = issue(&client, &fresh).await;
+    let f1 = rotated(rotate(&client, f.refresh_token.as_deref().unwrap()).await);
+    rotated(rotate(&client, &f1.pair.refresh_token).await);
+
+    // A grant authenticated before a tombstone that somehow survived it still
+    // refuses: the tombstone is compared with the grant's `auth_ms`.
+    let user2 = format!("tombb{}", nonce());
+    let g = issue(&client, &matrix_grant(&user2, "DEVB")).await; // auth_ms 1_700_000_000_000
+    client
+        .set_ex_raw(&device_tombstone_key(&user2, "DEVB"), "1700000000000", 60)
+        .await
+        .unwrap();
+    assert_eq!(
+        rotate(&client, g.refresh_token.as_deref().unwrap()).await,
+        RotateOutcome::Invalid(InvalidReason::Revoked),
+        "a tombstone at the grant's auth_ms refuses"
+    );
+    client
+        .set_ex_raw(&device_tombstone_key(&user2, "DEVB"), "1699999999999", 60)
+        .await
+        .unwrap();
+    rotated(rotate(&client, g.refresh_token.as_deref().unwrap()).await);
+}
+
+#[tokio::test]
 async fn an_inactive_grant_is_expired_and_deleted() {
     let Some(client) = crate::test_support::redis().await else {
         return;

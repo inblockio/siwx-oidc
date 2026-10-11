@@ -523,9 +523,12 @@ sign-out, and signing in again usually means a new device with key-backup
 restore, so choose a short cap with care.
 
 A refresh is refused (`invalid_grant`, "Session has been revoked.") when the
-device was just signed out (a short-lived device tombstone, 15 minutes, closes
-the race between a refresh and the teardown) or when an epoch refuses the
-grant.
+device was signed out after the grant was authenticated (a short-lived device
+tombstone, 15 minutes, holding the sign-out time, closes the race between a
+refresh and the teardown) or when an epoch refuses the grant. A sign-in on the
+same device id after the sign-out is not refused by that tombstone: it is
+issued and refreshes as usual (a tombstone a previous build wrote as `1` still
+refuses every grant of the device until it expires).
 
 ### Epochs
 
