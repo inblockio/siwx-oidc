@@ -201,6 +201,20 @@ fn admin_retry_warranted(status: reqwest::StatusCode, body: &str) -> bool {
     status == reqwest::StatusCode::INTERNAL_SERVER_ERROR && body.contains(MAS_USER_NOT_FOUND)
 }
 
+/// The URL of one admin user-list page; see [`SynapseClient::admin_users_page`].
+fn admin_users_url(endpoint: &str, from: Option<&str>, typed_only: bool) -> String {
+    let mut url =
+        format!("{endpoint}/_synapse/admin/v2/users?limit=100&guests=false&deactivated=false");
+    if typed_only {
+        url.push_str("&not_user_type=");
+    }
+    if let Some(from) = from {
+        url.push_str("&from=");
+        url.push_str(&urlencoding::encode(from));
+    }
+    url
+}
+
 fn admin_status_hint(status: reqwest::StatusCode) -> &'static str {
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         " — Synapse rejected the minted admin token (its scope must carry both \
@@ -1109,15 +1123,17 @@ impl SynapseClient {
     /// One page of the Synapse admin user list (`GET /_synapse/admin/v2/users`), active
     /// non-guest accounts, 100 per page, from the opaque `from` token. Read-only. The body is
     /// never logged (it carries every user's name).
-    pub async fn admin_users_page(&self, from: Option<&str>) -> Result<AdminUsersPage> {
-        let mut url = format!(
-            "{}/_synapse/admin/v2/users?limit=100&guests=false&deactivated=false",
-            self.endpoint
-        );
-        if let Some(from) = from {
-            url.push_str("&from=");
-            url.push_str(&urlencoding::encode(from));
-        }
+    ///
+    /// `typed_only` adds `not_user_type=` (empty), which Synapse reads as "exclude accounts
+    /// without a user type": the page then holds only typed accounts (our guests, and any
+    /// bot or support account), which is all the orphan scan looks at. `false` is the plain
+    /// list, URL unchanged.
+    pub async fn admin_users_page(
+        &self,
+        from: Option<&str>,
+        typed_only: bool,
+    ) -> Result<AdminUsersPage> {
+        let url = admin_users_url(&self.endpoint, from, typed_only);
         let resp = self
             .admin_request(|http, token| http.get(&url).bearer_auth(token))
             .await
@@ -2249,6 +2265,26 @@ mod tests {
         assert!(
             err.contains("without a token store"),
             "error must name the missing precondition, got: {err}"
+        );
+    }
+
+    /// The orphan scan asks only for typed accounts (`not_user_type=`); the plain list keeps
+    /// its URL exactly.
+    #[test]
+    fn the_typed_user_list_carries_not_user_type_and_the_plain_list_does_not() {
+        let base = "https://hs.example.org/_synapse/admin/v2/users?limit=100&guests=false&deactivated=false";
+        assert_eq!(admin_users_url("https://hs.example.org", None, false), base);
+        assert_eq!(
+            admin_users_url("https://hs.example.org", Some("a b"), false),
+            format!("{base}&from=a%20b")
+        );
+        assert_eq!(
+            admin_users_url("https://hs.example.org", None, true),
+            format!("{base}&not_user_type=")
+        );
+        assert_eq!(
+            admin_users_url("https://hs.example.org", Some("100"), true),
+            format!("{base}&not_user_type=&from=100")
         );
     }
 

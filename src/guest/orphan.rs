@@ -72,13 +72,15 @@ impl OrphanScan {
         self.scan_once().await.map(Some)
     }
 
-    /// Page the whole user list once. Read-only.
+    /// Page the typed users once (`not_user_type=`: accounts without a type are not asked
+    /// for). The client-side filter on `io.inblock.guest` stays, since bots and support
+    /// accounts carry a type too. Read-only.
     pub async fn scan_once(&self) -> Result<OrphanReport> {
         let suffix = format!(":{}", self.server_name);
         let mut report = OrphanReport::default();
         let mut from: Option<String> = None;
         for _ in 0..MAX_PAGES {
-            let page = self.synapse.admin_users_page(from.as_deref()).await?;
+            let page = self.synapse.admin_users_page(from.as_deref(), true).await?;
             for row in &page.users {
                 report.scanned += 1;
                 if row.user_type.as_deref() != Some(GUEST_USER_TYPE) {
@@ -149,6 +151,14 @@ mod tests {
                             user("support", Some("support"))],
                             "next_token": "100"})
                     };
+                    // Like Synapse: `not_user_type=` (empty) leaves out untyped accounts.
+                    let mut body = body;
+                    if q.split('&').any(|p| p == "not_user_type=") {
+                        body["users"]
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|u| !u["user_type"].is_null());
+                    }
                     return Json(body).into_response();
                 }
                 (StatusCode::OK, Json(json!({}))).into_response()
@@ -188,7 +198,7 @@ mod tests {
         assert_eq!(
             report,
             OrphanReport {
-                scanned: 6,
+                scanned: 4,
                 guests: 3,
                 orphans: 2
             }
@@ -212,6 +222,10 @@ mod tests {
             "read-only: {calls:?}"
         );
         assert!(calls.iter().any(|(_, p)| p.contains("from=100")), "paged");
+        assert!(
+            calls.iter().all(|(_, p)| p.contains("&not_user_type=")),
+            "the scan asks for typed accounts only: {calls:?}"
+        );
         assert_eq!(
             redis.hgetall_for_test("guest:acct/withrecord").await,
             before
