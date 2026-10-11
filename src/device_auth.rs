@@ -98,9 +98,10 @@ pub async fn device_authorization(
     // A proposed device id outside the accepted charset is refused here, before any
     // code is stored (RFC 6749 5.2 `invalid_scope`), never replaced by a minted id.
     if crate::oidc::scope_device_id(&scope).is_err() {
-        return Err(CustomError::BadRequest(
-            crate::oidc::INVALID_DEVICE_ID_MSG.to_string(),
-        ));
+        return Err(CustomError::BadRequestToken(crate::oidc::TokenError {
+            error: openidconnect::core::CoreErrorResponseType::InvalidScope,
+            error_description: crate::oidc::INVALID_DEVICE_ID_MSG.to_string(),
+        }));
     }
 
     // 3. Build entry

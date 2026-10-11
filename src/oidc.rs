@@ -1484,29 +1484,14 @@ async fn token_device_code(
             ))
         }
         DeviceCodeStatus::Approved => {
-            // Atomically claim this approved device_code BEFORE issuing any token
-            // (S3-1 / H9). Without this, two concurrent polls both pass the
-            // `status == Approved` check and each mint a token pair (+ a phantom
-            // device). The SETNX-style claim ensures exactly one poll issues
-            // tokens; concurrent losers fall back to authorization_pending (the
-            // winner deletes the device_code at the end, so a subsequent poll then
-            // gets expired_token — same as a normal completed flow).
-            if !db_client.try_claim_device_code(&dc).await? {
-                debug!(device_code_fp = %siwx_oidc::redact::fingerprint(&dc), "device_code already claimed by a concurrent poll");
-                return Err(device_code_error(
-                    "authorization_pending",
-                    "Device code is being processed.",
-                ));
-            }
-
             let did = entry
                 .did
                 .as_ref()
                 .ok_or_else(|| device_code_error("server_error", "Approved but no DID."))?
                 .clone();
 
-            // The device_code is already claimed (consumed) above, so a refusal here
-            // cannot be retried with the same code: the user starts a new device flow.
+            // The device-id checks only read, so they run before the code is claimed: a
+            // refusal or a failed check (a Redis error) leaves the code unconsumed.
             let proposed_device_id = scope_device_id(&entry.scope).map_err(|InvalidDeviceId| {
                 device_code_error("invalid_scope", INVALID_DEVICE_ID_MSG)
             })?;
@@ -1531,6 +1516,20 @@ async fn token_device_code(
                         ));
                     }
                 }
+            }
+            // Atomically claim this approved device_code BEFORE issuing any token
+            // (S3-1 / H9). Without this, two concurrent polls both pass the
+            // `status == Approved` check and each mint a token pair (+ a phantom
+            // device). The SETNX-style claim ensures exactly one poll issues
+            // tokens; concurrent losers fall back to authorization_pending (the
+            // winner deletes the device_code at the end, so a subsequent poll then
+            // gets expired_token — same as a normal completed flow).
+            if !db_client.try_claim_device_code(&dc).await? {
+                debug!(device_code_fp = %siwx_oidc::redact::fingerprint(&dc), "device_code already claimed by a concurrent poll");
+                return Err(device_code_error(
+                    "authorization_pending",
+                    "Device code is being processed.",
+                ));
             }
             debug!(
                 scope = %entry.scope,
@@ -12947,11 +12946,16 @@ mod generic_client_tests {
             },
         )
         .await;
-        assert!(
-            matches!(outcome, Err(CustomError::BadRequest(_))),
-            "a comma in the proposed device id must be refused, got {:?}",
-            outcome.map(|_| ())
-        );
+        match outcome {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error, CoreErrorResponseType::InvalidScope);
+                assert_eq!(e.error_description, INVALID_DEVICE_ID_MSG);
+            }
+            other => panic!(
+                "a comma in the proposed device id must be refused with invalid_scope, got {:?}",
+                other.map(|_| ())
+            ),
+        }
     }
 
     // ---- GP-CLM-26 on the device-code grant (PR #50 audit F3) ----
@@ -12962,8 +12966,17 @@ mod generic_client_tests {
         did: &str,
         device: &str,
     ) -> Result<SiwxTokenResponse, CustomError> {
+        redeem_device_code_as(db, did, device, &format!("dvc_clm26-{}", nonce())).await
+    }
+
+    async fn redeem_device_code_as(
+        db: &RedisClient,
+        did: &str,
+        device: &str,
+        device_code: &str,
+    ) -> Result<SiwxTokenResponse, CustomError> {
         let client_id = store_client(db, matrix_client()).await;
-        let device_code = format!("dvc_clm26-{}", nonce());
+        let device_code = device_code.to_string();
         let mut entry = DeviceCodeEntry::new(
             &format!("C26-{}", nonce()),
             client_id.clone(),
@@ -13016,6 +13029,16 @@ mod generic_client_tests {
                 other.map(|_| ())
             ),
         }
+        // The refusal is decided before the code is claimed, so a failed check (a Redis
+        // error) never burns the code: the claim is still free afterwards.
+        let code = format!("dvc_clm26-{}", nonce());
+        assert!(redeem_device_code_as(&db, &did, "PRECLAIMDEV1", &code)
+            .await
+            .is_err());
+        assert!(
+            db.try_claim_device_code(&code).await.unwrap(),
+            "a refused redemption must not consume the device code"
+        );
         // A fresh id, a prefix of a listed id, and no proposal at all are not refused.
         for device in ["FRESHDEV99", "PRECLAIMDEV"] {
             redeem_device_code(&db, &did, device)
