@@ -1828,7 +1828,13 @@ pub async fn main() {
                         admin_token::clamp_admin_token_ttl(config.admin_token_ttl_secs),
                     )
                     // SS4 flag 1: every teardown that reaches Synapse is strict.
-                    .with_strict_teardown(config.revoke_deletes_device),
+                    .with_strict_teardown(config.revoke_deletes_device)
+                    // SS4 flag 2: every delete plants the deleted-id marker.
+                    .with_deleted_markers(
+                        config
+                            .refuse_deleted_device_ids
+                            .then_some(config.deleted_device_marker_ttl_secs),
+                    ),
             ))
         }
         _ => None,

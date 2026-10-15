@@ -70,6 +70,13 @@ const KV_DEVICE_TOKEN_IDX_PREFIX: &str = "idx:user_device";
 /// in-flight refresh that completes right after the sweep cannot leave a survivor
 /// (S3-3 / H3 fix). Checked by the rotation and lift scripts (`db::grant`).
 const KV_DEVICE_TOMBSTONE_PREFIX: &str = "tombstone:device";
+/// Durable deleted-id marker `deleted:device/{localpart lowercased}/{device_id}`
+/// (SS4 flag 2, `refuse_deleted_device_ids`, 8.12): planted by every siwx-oidc
+/// delete path after Synapse deleted the device, with the delete time in Unix ms
+/// (Redis `TIME`) as its value and `deleted_device_marker_ttl_secs` as its TTL; a
+/// sign-in naming the id is refused while it lives. Distinct from the 900 s
+/// tombstone above, which the rotation and lift scripts read.
+pub const KV_DELETED_DEVICE_PREFIX: &str = "deleted:device";
 /// Per-user tombstone that builds before the user epoch (I9) planted at
 /// `logout/all`, deactivation and erasure. No build writes it any more; the
 /// rotation and lift scripts (`db::grant`) still read it so one a previous
@@ -973,6 +980,16 @@ pub trait DBClient {
     /// Redis `TIME` in Unix milliseconds: the clock of every lifetime deadline
     /// (I6) and of the epochs (I9), so instances with skewed clocks agree.
     async fn server_time_ms(&self) -> Result<i64>;
+    /// Plant the deleted-id marker of `(localpart, device_id)` for `ttl_secs`
+    /// (SS4 flag 2, [`KV_DELETED_DEVICE_PREFIX`]); idempotent, a replant renews it.
+    async fn plant_deleted_device_marker(
+        &self,
+        localpart: &str,
+        device_id: &str,
+        ttl_secs: u64,
+    ) -> Result<()>;
+    /// Whether `(localpart, device_id)` carries a live deleted-id marker (`EXISTS`).
+    async fn is_deleted_device(&self, localpart: &str, device_id: &str) -> Result<bool>;
     /// Delete the entry a lookup returned.
     async fn delete_device_code(&self, device_code: &DeviceCodeRef) -> Result<()>;
     /// Look up a device code by the user code a person presents, exactly as

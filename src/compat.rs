@@ -205,15 +205,69 @@ pub(crate) enum StrictFault {
     Revoke,
 }
 
-/// The deleted-id marker step of a strict teardown (8.23 step 2), between the
-/// Synapse delete and the revoke. SS4 flag 2 (`refuse_deleted_device_ids`)
-/// plants it; until then it is a no-op.
+/// The deleted-id marker step of every teardown (8.23 step 2, 8.12), between
+/// the Synapse delete (2xx or 404, never a device still listed) and the revoke:
+/// with SS4 flag 2 (`refuse_deleted_device_ids`) on, plant
+/// `deleted:device/<localpart>/<device_id>` for the configured TTL, so a later
+/// sign-in naming the id is refused; with it off, nothing.
 pub(crate) async fn plant_deleted_marker(
-    _redis: &RedisClient,
-    _username: &str,
-    _device_id: &str,
+    redis: &RedisClient,
+    synapse: &SynapseClient,
+    username: &str,
+    device_id: &str,
 ) -> anyhow::Result<()> {
-    Ok(())
+    match synapse.deleted_marker_ttl() {
+        Some(ttl) => {
+            redis
+                .plant_deleted_device_marker(username, device_id, ttl)
+                .await
+        }
+        None => Ok(()),
+    }
+}
+
+/// The best-effort device delete (flag 1 off) with the marker (flag 2): with
+/// flag 2 off exactly today's `delete_device`, a failure logged at `warn!` and
+/// never returned. With flag 2 on, a delete Synapse answered 2xx or 404 plants
+/// the marker; a marker that could not be written is
+/// [`StrictFault::Marker`], so the caller revokes nothing and answers the
+/// retryable 503 (card default: like a transient fault; the retry is idempotent).
+pub(crate) async fn best_effort_delete_device(
+    redis: &RedisClient,
+    synapse: &SynapseClient,
+    server_name: &str,
+    username: &str,
+    device_id: &str,
+    ctx: &str,
+) -> Result<(), StrictFault> {
+    if synapse.deleted_marker_ttl().is_none() {
+        if let Err(e) = synapse
+            .delete_device(username, device_id, server_name)
+            .await
+        {
+            warn!(error = %e, ctx, username = %username, device_id = %device_id,
+                "Synapse delete_device failed (best-effort)");
+        }
+        return Ok(());
+    }
+    let device = siwx_oidc::redact::fingerprint(device_id);
+    match synapse
+        .delete_device_status(username, device_id, server_name)
+        .await
+    {
+        DeviceDelete::Deleted | DeviceDelete::NotFound => {
+            plant_deleted_marker(redis, synapse, username, device_id)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, ctx, device = %device, "deleted-id marker not written; nothing revoked, retryable");
+                    StrictFault::Marker
+                })
+        }
+        answer => {
+            warn!(ctx, device = %device, ?answer, "Synapse delete_device failed (best-effort); no marker");
+            Ok(())
+        }
+    }
 }
 
 /// One device's strict teardown (SS4 flag 1, 8.23): Synapse delete, then the
@@ -248,7 +302,7 @@ pub(crate) async fn strict_teardown_device(
             error!(ctx, device = %device, "strict teardown: Synapse refused the device delete (check the MAS shared secret); revoking anyway, the device stays for the reaper");
         }
         DeviceDelete::Deleted | DeviceDelete::NotFound => {
-            if let Err(e) = plant_deleted_marker(redis, username, device_id).await {
+            if let Err(e) = plant_deleted_marker(redis, synapse, username, device_id).await {
                 warn!(error = %e, ctx, device = %device, "strict teardown: deleted-id marker not written; nothing revoked, retryable");
                 return Err(StrictFault::Marker);
             }
@@ -361,12 +415,20 @@ async fn teardown_session(
                         fallback: Fallback::Retry,
                     }),
                 };
-            } else if let Err(e) = synapse
-                .delete_device(&meta.username, &meta.device_id, server_name)
-                .await
+            } else if let Err(fault) = best_effort_delete_device(
+                &state.redis_client,
+                synapse,
+                server_name,
+                &meta.username,
+                &meta.device_id,
+                ctx,
+            )
+            .await
             {
-                warn!(error = %e, ctx, username = %meta.username, device_id = %meta.device_id,
-                    "teardown_session: Synapse delete_device failed (best-effort)");
+                return Err(TeardownFault {
+                    error: anyhow::anyhow!("teardown stopped at {fault:?}"),
+                    fallback: Fallback::Retry,
+                });
             }
         }
     }
@@ -767,14 +829,23 @@ pub async fn logout_all(
         } else {
             match synapse.list_devices(&username, server_name).await {
                 Ok(devices) => {
+                    // Flag 2: a marker that could not be written answers 503
+                    // before phase 3 (the loop continues; the retry is idempotent).
+                    let mut marked = true;
                     for dev in devices {
-                        if let Err(e) = synapse
-                            .delete_device(&username, &dev.device_id, server_name)
-                            .await
-                        {
-                            warn!(error = %e, username = %username, device_id = %dev.device_id,
-                            "logout_all: Synapse delete_device failed (best-effort, continuing)");
-                        }
+                        marked &= best_effort_delete_device(
+                            &state.redis_client,
+                            synapse,
+                            server_name,
+                            &username,
+                            &dev.device_id,
+                            "logout_all",
+                        )
+                        .await
+                        .is_ok();
+                    }
+                    if !marked {
+                        return token_store_unavailable();
                     }
                 }
                 Err(e) => {
@@ -918,21 +989,29 @@ async fn strict_teardown_devices(
 }
 
 /// Delete one of `username`'s Synapse devices (MAS API) and revoke its tokens.
-/// Best-effort, idempotent, never fails the caller — same teardown as logout.
+/// Best-effort, idempotent, never fails the caller — same teardown as logout —
+/// except a deleted-id marker that could not be written (flag 2): then nothing
+/// is revoked and it answers `false` (the route answers 503).
 /// Flag 1 runs [`strict_teardown_devices`] instead (the routes do).
-async fn teardown_device(state: &CompatState, username: &str, device_id: &str, ctx: &str) {
+async fn teardown_device(state: &CompatState, username: &str, device_id: &str, ctx: &str) -> bool {
     if device_id.is_empty() {
-        return;
+        return true;
     }
     if let (Some(synapse), Some(server_name)) =
         (state.synapse_client.as_ref(), state.server_name.as_deref())
     {
-        if let Err(e) = synapse
-            .delete_device(username, device_id, server_name)
-            .await
+        if best_effort_delete_device(
+            &state.redis_client,
+            synapse,
+            server_name,
+            username,
+            device_id,
+            ctx,
+        )
+        .await
+        .is_err()
         {
-            warn!(error = %e, ctx, username = %username, device_id = %device_id,
-                "compat device teardown: Synapse delete_device failed (best-effort)");
+            return false;
         }
     }
     match state
@@ -947,6 +1026,7 @@ async fn teardown_device(state: &CompatState, username: &str, device_id: &str, c
         ),
         Err(e) => warn!(error = %e, ctx, "compat device teardown: revoke_device_tokens failed"),
     }
+    true
 }
 
 const UNKNOWN_TOKEN: &str = "M_UNKNOWN_TOKEN";
@@ -1004,8 +1084,12 @@ async fn teardown_devices(
             return (StatusCode::OK, Json(serde_json::json!({})));
         }
     }
+    let mut marked = true;
     for device_id in devices {
-        teardown_device(state, username, device_id, ctx).await;
+        marked &= teardown_device(state, username, device_id, ctx).await;
+    }
+    if !marked {
+        return token_store_unavailable();
     }
     (StatusCode::OK, Json(serde_json::json!({})))
 }
@@ -3863,6 +3947,194 @@ mod tests {
         );
         assert_eq!(hs.calls(), [db.clone(), dc.clone(), db, dc]);
         client.revoke_grants_for_device(&user, &da).await.ok();
+        hs.server.abort();
+    }
+
+    // -- SS4 flag 2: deleted-id markers (8.12) ---------------------------------
+
+    /// [`strict_state`] with flag 2's markers at `ttl` (`None`: flag 2 off).
+    fn marker_state(
+        client: &RedisClient,
+        hs: &Scripted,
+        strict: bool,
+        ttl: Option<u64>,
+    ) -> CompatState {
+        let mut state = strict_state(client, hs, strict);
+        state.synapse_client = Some(Arc::new(
+            SynapseClient::new(&hs.url, "secret")
+                .with_admin_mint(client.clone(), "ss4-admin".into(), 300)
+                .with_strict_teardown(strict)
+                .with_deleted_markers(ttl),
+        ));
+        state
+    }
+
+    async fn marked(client: &RedisClient, user: &str, device: &str) -> bool {
+        client.is_deleted_device(user, device).await.unwrap()
+    }
+
+    /// Run every compat delete path once against `state`, one device each:
+    /// `/logout`, `/logout/all` (two listed devices), `DELETE /devices/{id}`,
+    /// `delete_devices`, and revoke (deletes only under flag 1). Returns
+    /// `(path, user, device, status)` per deleted device.
+    async fn run_compat_delete_paths(
+        client: &RedisClient,
+        hs: &Scripted,
+        strict: bool,
+        ttl: Option<u64>,
+        tag: &str,
+    ) -> Vec<(&'static str, String, String, StatusCode)> {
+        let n = nonce();
+        let state = marker_state(client, hs, strict, ttl);
+        let mut out = Vec::new();
+        let (user, dev) = (format!("ss4-mk-lo-{tag}{n}"), format!("DEVICE_A{n}"));
+        let a = seed_grant(client, &user, &dev).await.access_token;
+        let status = logout(State(state.clone()), bearer(&a))
+            .await
+            .into_response()
+            .status();
+        out.push(("logout", user, dev, status));
+
+        let user = format!("ss4-mk-all-{tag}{n}");
+        let [da, db] = ["A", "B"].map(|x| format!("DEVICE_{x}{n}"));
+        let hs_all = scripted_homeserver(vec![da.clone(), db.clone()]).await;
+        let state_all = marker_state(client, &hs_all, strict, ttl);
+        let a = seed_grant(client, &user, &da).await.access_token;
+        seed_grant(client, &user, &db).await;
+        let status = logout_all(State(state_all), bearer(&a))
+            .await
+            .into_response()
+            .status();
+        out.push(("logout_all", user.clone(), da, status));
+        out.push(("logout_all", user, db, status));
+        hs_all.server.abort();
+
+        let user = format!("ss4-mk-del-{tag}{n}");
+        let [da, db, dc] = ["A", "B", "C"].map(|x| format!("DEVICE_{x}{n}"));
+        let a = seed_grant(client, &user, &da).await.access_token;
+        seed_grant(client, &user, &db).await;
+        seed_grant(client, &user, &dc).await;
+        let status = delete_device(State(state.clone()), Path(db.clone()), bearer(&a))
+            .await
+            .into_response()
+            .status();
+        out.push(("DELETE /devices/{id}", user.clone(), db, status));
+        let status = delete_devices(
+            State(state.clone()),
+            bearer(&a),
+            Json(DeleteDevicesRequest {
+                devices: vec![dc.clone()],
+            }),
+        )
+        .await
+        .into_response()
+        .status();
+        out.push(("delete_devices", user.clone(), dc, status));
+        client.revoke_grants_for_device(&user, &da).await.ok();
+
+        if strict {
+            let (user, dev) = (format!("ss4-mk-rev-{tag}{n}"), format!("DEVICE_A{n}"));
+            let issued = seed_grant(client, &user, &dev).await;
+            let status = revoke_status(&state, issued.refresh_token.as_deref().unwrap()).await;
+            out.push(("revoke (flag 1)", user, dev, status));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn marker_planted_on_every_delete_path_flag2_on() {
+        let Some(client) = redis().await else { return };
+        let hs = scripted_homeserver(vec![]).await;
+        // Flag 2 alone (best-effort teardown) and flags 1 + 2 (strict). The
+        // account paths (MSC4191, deactivate, erase) and the guest claim have the
+        // same-named tests in `account` and `guest::claim`.
+        for strict in [false, true] {
+            for (path, user, dev, status) in
+                run_compat_delete_paths(&client, &hs, strict, Some(600), "on").await
+            {
+                assert_eq!(status, StatusCode::OK, "{path} (flag 1 {strict})");
+                assert!(
+                    marked(&client, &user, &dev).await,
+                    "{path} (flag 1 {strict}) plants the marker"
+                );
+            }
+        }
+        hs.server.abort();
+    }
+
+    #[tokio::test]
+    async fn marker_not_planted_flag2_off() {
+        let Some(client) = redis().await else { return };
+        let hs = scripted_homeserver(vec![]).await;
+        for (path, user, dev, status) in
+            run_compat_delete_paths(&client, &hs, false, None, "off").await
+        {
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert!(
+                !marked(&client, &user, &dev).await,
+                "{path}: no marker with flag 2 off"
+            );
+        }
+        hs.server.abort();
+    }
+
+    #[tokio::test]
+    async fn marker_not_planted_when_synapse_delete_failed() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let hs = scripted_homeserver(vec![]).await;
+        for (strict, code) in [(false, 500), (true, 500), (false, 403), (true, 403)] {
+            let user = format!("ss4-mk-fail-{strict}-{code}-{n}");
+            let dev = format!("DEVICE_A{n}{code}");
+            hs.set(&dev, code);
+            let state = marker_state(&client, &hs, strict, Some(600));
+            let a = seed_grant(&client, &user, &dev).await.access_token;
+            logout(State(state), bearer(&a)).await;
+            assert!(
+                !marked(&client, &user, &dev).await,
+                "Synapse {code} (flag 1 {strict}): the device may still be listed, no marker"
+            );
+            client.revoke_grants_for_device(&user, &dev).await.ok();
+        }
+        hs.server.abort();
+    }
+
+    #[tokio::test]
+    async fn marker_ttl_is_the_configured_value() {
+        let Some(client) = redis().await else { return };
+        let n = nonce();
+        let hs = scripted_homeserver(vec![]).await;
+        let (user, dev) = (format!("ss4-mk-ttl-{n}"), format!("DEVICE_A{n}"));
+        let state = marker_state(&client, &hs, true, Some(4242));
+        let a = seed_grant(&client, &user, &dev).await.access_token;
+        assert_eq!(
+            logout(State(state), bearer(&a))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+        let raw =
+            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
+        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let key = format!("deleted:device/{user}/{dev}");
+        let ttl: i64 = bb8_redis::redis::cmd("TTL")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!((4230..=4242).contains(&ttl), "TTL {ttl}");
+        let value: String = bb8_redis::redis::cmd("GET")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let ms: i64 = value.parse().unwrap();
+        let now = client.server_time_ms().await.unwrap();
+        assert!(
+            ms <= now && now - ms < 60_000,
+            "the value is the delete time in ms"
+        );
         hs.server.abort();
     }
 

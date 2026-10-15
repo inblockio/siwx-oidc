@@ -662,6 +662,33 @@ mod tests {
         assert_eq!(m.count("delete_user"), 1);
     }
 
+    /// SS4 flag 2 (8.12): the guest reaper plants no deleted-id marker, even with the
+    /// markers on in its Synapse client (`erased:did` already refuses a reaped guest DID).
+    #[tokio::test]
+    async fn marker_not_planted_by_guest_reaper() {
+        let _turn = DB15.lock().await;
+        let Some(redis) = db().await else { return };
+        let (m, synapse) = mock().await;
+        let synapse = Arc::new(
+            Arc::try_unwrap(synapse)
+                .ok()
+                .expect("one owner")
+                .with_deleted_markers(Some(600)),
+        );
+        let g = due_guest(&redis).await;
+        let (_tx, rx) = never_stop();
+        assert_eq!(reaper(&redis, &synapse, fast()).tick(&rx).await, 1);
+        assert_eq!(m.count("delete_device"), 2, "the devices are deleted");
+        for dev in ["DEVICE_A", "DEVICE_B"] {
+            assert!(
+                !siwx_oidc::db::DBClient::is_deleted_device(&redis, &g.localpart, dev)
+                    .await
+                    .unwrap(),
+                "{dev}"
+            );
+        }
+    }
+
     /// A guest whose deadline is still ahead is left alone.
     #[tokio::test]
     async fn a_guest_before_its_deadline_is_not_touched() {

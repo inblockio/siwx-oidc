@@ -345,6 +345,10 @@ pub struct SynapseClient {
     /// teardown that deletes a device runs strictly (see
     /// [`SynapseClient::strict_teardown`]).
     strict_teardown: bool,
+    /// SS4 flag 2 (`refuse_deleted_device_ids`), read once at startup: the TTL
+    /// of the deleted-id marker every delete path plants after a Synapse delete
+    /// ([`SynapseClient::deleted_marker_ttl`]); `None` with the flag off.
+    deleted_marker_ttl: Option<u64>,
 }
 
 /// What Synapse answered to `POST /_synapse/mas/delete_device` (8.23): the
@@ -378,6 +382,7 @@ impl SynapseClient {
             http: build_http_client(),
             admin: None,
             strict_teardown: false,
+            deleted_marker_ttl: None,
         }
     }
 
@@ -391,6 +396,19 @@ impl SynapseClient {
     /// marker, then revoke, answered by [`DeviceDelete`]. Off: best-effort.
     pub fn strict_teardown(&self) -> bool {
         self.strict_teardown
+    }
+
+    /// Switch the deleted-id markers (SS4 flag 2, `refuse_deleted_device_ids`)
+    /// on with their TTL (`deleted_device_marker_ttl_secs`), or off (`None`).
+    pub fn with_deleted_markers(mut self, ttl_secs: Option<u64>) -> Self {
+        self.deleted_marker_ttl = ttl_secs;
+        self
+    }
+
+    /// The TTL of the deleted-id marker a delete plants (flag 2), `None` when
+    /// no marker is planted (flag off).
+    pub fn deleted_marker_ttl(&self) -> Option<u64> {
+        self.deleted_marker_ttl
     }
 
     /// Enable the admin-scoped calls by giving the client a token store to mint

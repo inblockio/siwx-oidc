@@ -649,3 +649,80 @@ async fn wrong_mas_shared_secret_fails_closed_not_open() {
          account': {text}"
     );
 }
+
+/// SS4 flag 2 (`SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`) as the stack under test runs it.
+fn flag2_on() -> bool {
+    std::env::var("SIWXOIDC_REFUSE_DELETED_DEVICE_IDS").is_ok_and(|v| v == "true" || v == "1")
+}
+
+/// Whether the stack's Redis holds the deleted-id marker of `(mxid, device_id)`.
+async fn marked(mxid: &str, device_id: &str) -> bool {
+    let raw = std::env::var("SIWXOIDC_REDIS_URL")
+        .or_else(|_| std::env::var("SIWEOIDC_REDIS_URL"))
+        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let redis = siwx_oidc::db::RedisClient::new(&url::Url::parse(&raw).unwrap())
+        .await
+        .expect("the stack's Redis");
+    let localpart = mxid.trim_start_matches('@').split(':').next().unwrap();
+    siwx_oidc::db::DBClient::is_deleted_device(&redis, localpart, device_id)
+        .await
+        .unwrap()
+}
+
+/// SS4 WP4, the account rows of the marker table (the compat routes and the guest
+/// claim are the same-named unit tests): MSC4191 `device_delete` and `session_end`,
+/// deactivate and erase (one marker per device listed before the Synapse call, 8.13).
+/// With flag 2 off, the same paths plant nothing.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn marker_planted_on_every_delete_path_flag2_on() {
+    let c = Client::builder().build().unwrap();
+    let base = oidc();
+    let on = flag2_on();
+    mock_reset(&c).await;
+
+    // device_delete and session_end, through one account session.
+    let w = new_wallet();
+    for d in ["DEVICE_A", "DEVICE_B", "DEVICE_C"] {
+        mock_seed_device(&c, &w.mxid, d).await;
+    }
+    let resp = wallet_action(&c, &w, &base, "org.matrix.devices_list").await;
+    assert_eq!(resp.status(), 200);
+    let cookie = session_cookie(&resp).unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let csrf = body["csrf"].as_str().unwrap().to_string();
+    for (action, dev) in [
+        ("org.matrix.device_delete", "DEVICE_A"),
+        ("org.matrix.session_end", "DEVICE_B"),
+    ] {
+        let resp = c
+            .post(format!("{base}/account/action"))
+            .header("Cookie", format!("acct_session={cookie}"))
+            .json(&json!({ "action": action, "device_id": dev, "csrf": csrf }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{action}");
+        assert_eq!(marked(&w.mxid, dev).await, on, "{action} (flag 2 {on})");
+    }
+    assert!(
+        !marked(&w.mxid, "DEVICE_C").await,
+        "a listed device has no marker"
+    );
+
+    // deactivate and erase: every device listed before the Synapse call.
+    for action in ["org.matrix.account_deactivate", "io.inblock.account_erase"] {
+        let w = new_wallet();
+        mock_seed_device(&c, &w.mxid, "DEVICE_A").await;
+        mock_seed_device(&c, &w.mxid, "DEVICE_B").await;
+        let resp = wallet_action(&c, &w, &base, action).await;
+        assert_eq!(resp.status(), 200, "{action}");
+        for dev in ["DEVICE_A", "DEVICE_B"] {
+            assert_eq!(
+                marked(&w.mxid, dev).await,
+                on,
+                "{action} {dev} (flag 2 {on})"
+            );
+        }
+    }
+}

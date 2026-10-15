@@ -479,7 +479,11 @@ const STRICT_TEARDOWN_RETRY_MSG: &str =
 /// account's devices first and tear each down strictly (delete, marker, revoke),
 /// before anything else is touched. One failed device does not stop the loop;
 /// any failure (or a failed listing) is a 503 and the action does not run, so
-/// the retry starts again. Flag 1 off: nothing (today's sequence).
+/// the retry starts again. Flag 1 off, flag 2 on (8.13): the listed devices are
+/// deleted best-effort first and each deleted one gets its deleted-id marker
+/// (Synapse would drop them with the account, unmarked); a failed listing or a
+/// marker that could not be written is the same 503. Both off: nothing (today's
+/// sequence).
 async fn strict_pre_teardown(
     synapse: &SynapseClient,
     db_client: &RedisClient,
@@ -488,7 +492,33 @@ async fn strict_pre_teardown(
     ctx: &str,
 ) -> Result<(), CustomError> {
     if !synapse.strict_teardown() {
-        return Ok(());
+        if synapse.deleted_marker_ttl().is_none() {
+            return Ok(());
+        }
+        let devices = synapse.list_devices(localpart, server).await.map_err(|e| {
+            warn!(error = %e, ctx, "list_devices failed before the deleted-id markers");
+            CustomError::ServiceUnavailable(STRICT_TEARDOWN_RETRY_MSG.to_string())
+        })?;
+        let mut marked = true;
+        for device in devices {
+            marked &= crate::compat::best_effort_delete_device(
+                db_client,
+                synapse,
+                server,
+                localpart,
+                &device.device_id,
+                ctx,
+            )
+            .await
+            .is_ok();
+        }
+        return if marked {
+            Ok(())
+        } else {
+            Err(CustomError::ServiceUnavailable(
+                STRICT_TEARDOWN_RETRY_MSG.to_string(),
+            ))
+        };
     }
     let devices = synapse.list_devices(localpart, server).await.map_err(|e| {
         warn!(error = %e, ctx, "list_devices failed before a strict teardown");
@@ -704,6 +734,14 @@ async fn execute_action(
                 .map_err(|e| {
                     warn!(error = %e, "delete_device failed during account action");
                     CustomError::BadRequest("Failed to sign out device".to_string())
+                })?;
+            // Flag 2: the deleted-id marker before the revoke; not written = 503,
+            // nothing revoked (the retry is idempotent).
+            crate::compat::plant_deleted_marker(db_client, synapse, &localpart, device_id)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "deleted-id marker not written during account action");
+                    CustomError::ServiceUnavailable(STRICT_TEARDOWN_RETRY_MSG.to_string())
                 })?;
             // Revoke the OAuth session so introspection reports it inactive (AC3).
             // Key on the localpart (== TokenMetadata.username), which is stable

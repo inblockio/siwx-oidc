@@ -528,7 +528,15 @@ mod tests {
         };
         edit(&mut config);
         let wa = crate::webauthn::build_webauthn(&config.base_url, None, None).unwrap();
-        let client = Arc::new(client.with_strict_teardown(config.revoke_deletes_device));
+        let client = Arc::new(
+            client
+                .with_strict_teardown(config.revoke_deletes_device)
+                .with_deleted_markers(
+                    config
+                        .refuse_deleted_device_ids
+                        .then_some(config.deleted_device_marker_ttl_secs),
+                ),
+        );
         let app = super::super::routes::router_with(
             &config,
             redis.clone(),
@@ -1001,6 +1009,32 @@ mod tests {
                 .all(|l| l != &g.localpart),
             "teardown finished"
         );
+    }
+
+    /// SS4 flag 2 (the guest-claim row of the marker table; the compat and account rows
+    /// are the same-named tests there): flags 1 + 2, each torn-down pre-claim device
+    /// carries the deleted-id marker.
+    #[tokio::test]
+    async fn marker_planted_on_every_delete_path_flag2_on() {
+        let Some(e) = env(None, |c| {
+            c.revoke_deletes_device = true;
+            c.refuse_deleted_device_ids = true;
+        })
+        .await
+        else {
+            return;
+        };
+        let g = guest(&e).await;
+        token(&e, &g, "DEVA").await;
+        token(&e, &g, "DEVB").await;
+        let (s, _, _) = claim(&e, &g, format!("cred-{}", uniq()).as_bytes()).await;
+        assert_eq!(s, 200);
+        for dev in ["DEVA", "DEVB"] {
+            assert!(
+                e.redis.is_deleted_device(&g.localpart, dev).await.unwrap(),
+                "{dev} carries the marker"
+            );
+        }
     }
 
     /// SS4 flag 1 off: the claim revokes the pre-claim devices' grants and keeps the rows.
