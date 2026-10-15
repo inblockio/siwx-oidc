@@ -498,11 +498,14 @@ OAuth 2.0 API does not call `POST /_matrix/client/v3/logout`; it revokes both
 tokens at `/oauth2/revoke` in parallel, each with `client_id` and
 `token_type_hint` (matrix-js-sdk 42.4, `Lifecycle.ts` `doLogout`). In Matrix
 mode either revocation ends the device's grants (the first one wins, the
-second finds nothing and answers 200), and neither deletes the Synapse device
+second finds nothing and answers 200). With `SIWXOIDC_REVOKE_DELETES_DEVICE`
+off (the default) neither deletes the Synapse device
 (`TeardownPolicy::TokensOnly`): the device stays until it is removed from the
-session list or the account page. Grant-level RFC 7009 (provisional): for a
+session list or the account page. With it on, the revoke of a Matrix-credential
+grant ends the session including its device, as MAS does
+([Session teardown](#session-teardown)). Grant-level RFC 7009 (provisional): for a
 token with no device, a refresh token ends its grant and an access token only
-itself. Pin: `h1_revoke_does_not_delete_device_but_logout_does`,
+itself. Pin: `h1_revoke_does_not_delete_device_but_logout_does` (both flag states),
 `teardown_policy_only_deletes_device_on_explicit_signout`,
 `revoking_a_deviceless_refresh_token_revokes_its_grant_an_access_token_only_itself`,
 `revoking_by_token_deletes_the_grant_of_an_accepted_token_only`.
@@ -529,6 +532,24 @@ refresh and the teardown) or when an epoch refuses the grant. A sign-in on the
 same device id after the sign-out is not refused by that tombstone: it is
 issued and refreshes as usual (a tombstone a previous build wrote as `1` still
 refuses every grant of the device until it expires).
+
+**Deleted device ids (`SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`, off by default).**
+Synapse cannot recycle a device id cleanly (above), and Element Web and Element
+X propose the same id at every sign-in of an install. With the flag on, every
+delete siwx-oidc makes (logout, `logout/all`, device deletion, the MSC4191
+actions, deactivation and erasure, revoke under `SIWXOIDC_REVOKE_DELETES_DEVICE`,
+a guest claim) plants a marker `deleted:device/{localpart}/{device_id}` for
+`SIWXOIDC_DELETED_DEVICE_MARKER_TTL_SECS` (365 days) after Synapse deleted the
+device, and a Matrix-class sign-in that proposes a marked id is refused instead
+of recreating it: `GET /sign_in` redirects to the client's `redirect_uri` with
+`error=invalid_scope` and its `state`, and the device-code poll answers 400
+`invalid_scope` (then `access_denied`). The client recovers by signing in with a
+fresh device id and a fresh crypto store; `siwx-oidc-auth` reports it as
+`AuthError::DeviceRefused` ([agents.md](agents.md)). With the flag on, the other
+`/sign_in` refusals are redirects too: `access_denied` for a deactivated or
+erased account, `temporarily_unavailable` when the homeserver cannot be asked or
+the device cannot be created (no code is issued then). Off: no marker is
+written and a deleted id is recreated as before.
 
 ### Epochs
 
@@ -832,7 +853,9 @@ device that is *ending* (below) is safe because its ID is never used again.
 
 Teardown always revokes the ending session's tokens. Whether it also deletes the
 Synapse device depends on intent (`compat::TeardownPolicy`): an explicit
-sign-out deletes the device, token hygiene does not.
+sign-out deletes the device, token hygiene does not. The table shows the default;
+`SIWXOIDC_REVOKE_DELETES_DEVICE` changes the revoke row and the error handling
+(below).
 
 | Endpoint | Policy | Synapse | Tokens |
 |---|---|---|---|
@@ -842,10 +865,26 @@ sign-out deletes the device, token hygiene does not.
 | `DELETE /_matrix/client/v3/devices/{id}`, `POST …/delete_devices` | delete | deletes the named devices of the bearer's own account | tokens of each device |
 | MSC4191 `device_delete` / `session_end` | delete | deletes the device after confirming it belongs to the user | tokens of the device |
 
-- **Revoke never deletes the device.** Clients call RFC 7009 revocation on token
-  rotation and when dialogs are dismissed. Deleting the device there raced
+- **Revoke never deletes the device** (default). Clients call RFC 7009 revocation
+  on token rotation and when dialogs are dismissed. Deleting the device there raced
   in-flight key uploads and broke users' cross-signing identity in a June 2026
   incident.
+- **`SIWXOIDC_REVOKE_DELETES_DEVICE` (off by default).** On, the revoke of a
+  Matrix-credential grant deletes its device (MAS parity; a revoke ends every
+  token of the device, so no live session loses it; other grants stay
+  tokens-only), and every teardown above is strict: Synapse delete, then the
+  deleted-id marker, then the revoke. Synapse's answer decides: deleted or 404
+  revokes and answers 200; 403 (a wrong shared secret) revokes, logs at error and
+  answers 200; a transient failure answers the retryable 503 (`M_UNKNOWN`, for
+  revoke an HTTP 503) and revokes nothing; `delete_devices` deletes the bearer's
+  own device last and answers 503 if any failed. The retry finishes the
+  teardown, unless the caller gives up: Element's session manager and the
+  account page act on another device's session and may not retry. The device is
+  then gone and its grant lives on, so its client refreshes fine and Synapse
+  answers every request with `M_UNKNOWN_TOKEN`. The flag requires
+  `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`: the server refuses to start without it,
+  because a client that proposes the same device id again would get the deleted
+  id recreated. A guest claim then also tears down the pre-claim devices.
 - `logout/all` ends sessions; it does **not** deactivate the account. It also
   ends the user's own sessions at this provider: every `siwx_user` picker hint
   and `acct_session` account session of the DID (deactivation and erasure do
@@ -1128,8 +1167,10 @@ symbol in the code.
   `urn:synapse:admin:*` (`admin_token::ADMIN_SCOPE`). Keep the TTL clamp.
 - **The MAS routes take a bare localpart; the admin and client routes take a
   percent-encoded MXID.** Do not unify them.
-- **Revoke never deletes a device.** Device deletion belongs to explicit
-  sign-out paths only (`compat::TeardownPolicy`).
+- **Revoke never deletes a device unless `SIWXOIDC_REVOKE_DELETES_DEVICE` is
+  on.** Device deletion belongs to explicit sign-out paths only
+  (`compat::TeardownPolicy`); the flag adds the revoke of a Matrix credential,
+  and only together with `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`.
 - **Never delete and then reuse a device ID.** Sign-in only upserts.
 - **Name a device only when this sign-in creates it.** `upsert_device` never
   carries a name, because a name sent with it overwrites the one the user

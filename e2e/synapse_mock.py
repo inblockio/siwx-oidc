@@ -97,11 +97,18 @@ nondeterministic, so every admin request introspects.
   GET    /__state                 whole in-memory state
   POST   /__reset                 clear everything, restore the real secret
   POST   /__seed_user             mark a localpart as EXISTING (+ profile row)
-  POST   /__seed_device           seed a device (implies EXISTING + profile row)
+  POST   /__seed_device           seed a device (implies EXISTING + profile row);
+                                  optional last_seen_ip / last_seen_ts (ms, NULL
+                                  when absent: the device reaper's idle data, SS4
+                                  flag 3); a device id seeded again replaces its row
   POST   /__set_secret            change the MAS shared secret (401s that surface)
   POST   /__reject_admin_token    make the ADMIN surface reject, MAS untouched
   POST   /__profile               force a profile row present / empty / absent
-  POST   /__fail                  arm a 500/timeout on a logical endpoint
+  POST   /__fail                  arm a 500/timeout on a logical endpoint;
+                                  delete_device also takes 404 / 403 and an
+                                  optional device_id (one device of a bulk
+                                  path), the answers the strict teardown of SS4
+                                  flag 1 decides by (see FAIL below)
 
   -- stub OIDC relying party (NOT Synapse surface; tests/e2e_backchannel_logout.rs)
   POST   /__rp/{name}/backchannel_logout  record the POST (content type + raw

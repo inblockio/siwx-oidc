@@ -549,7 +549,10 @@ doc; read it before changing the code the rule covers.
   once. Never plant the user tombstone again, and keep the scripts READING it until one release
   after Phase 3: one a previous build planted must still refuse for its 900 s. The device
   tombstone stays: it closes the race between a device sweep and the lift of a legacy refresh
-  token. Global and client epochs have no HTTP endpoint, to add no remote surface: an operator
+  token. It is not the deleted-id marker (`deleted:device/…`, 365 d, flag 2): the tombstone
+  refuses grants of a device authenticated before its sign-out and lets a later sign-in on the
+  same id through; the marker refuses that later sign-in. Neither replaces the other, and with
+  flag 2 off no marker exists (`tombstone_900s_key_unchanged`). Global and client epochs have no HTTP endpoint, to add no remote surface: an operator
   sets them ([docs/matrix-integration.md](docs/matrix-integration.md#epochs)), and the start-up
   sync of static clients sets a generic-class client's (next bullet). An unset epoch
   is none, never 0. Teardown's resolver (`resolve_refresh_token`) treats a refused refresh token as
@@ -683,8 +686,9 @@ doc; read it before changing the code the rule covers.
   (phase B): the rotation script that detected the reuse also deletes the grant, in the same
   atomic step, through `drop_grant` (an `oidc` grant queues its back-channel logout, the `sid`
   index entry goes) and drops its index entries; the event says `grant_revoked=true`; the answer
-  stays the unknown-token answer; the Synapse device is never deleted and no device tombstone is
-  planted (as with revoke). The current holder of the grant is refused from then on, its access
+  stays the unknown-token answer; the Synapse device is never deleted and no device tombstone or
+  deleted-id marker is planted (as with revoke under flag 1 off; flag 1 makes revoke delete the
+  device, reuse does not follow it). The current holder of the grant is refused from then on, its access
   token at once and its refresh token at its next refresh: that is the point of enforcement. A
   replay of the previous token while its successor is unused is a lost response (I4), never
   reuse, so it never revokes. The switch stays off until the maintainers decide (D2: at least 30
@@ -966,11 +970,46 @@ doc; read it before changing the code the rule covers.
   Pin: `a_store_fault_during_logout_is_a_retryable_503_and_the_retry_tears_down`,
   `a_store_fault_during_logout_all_is_a_retryable_503`,
   `a_logout_all_retry_after_an_own_session_fault_ends_the_own_sessions_and_the_grants`.
-- **`/oauth2/revoke` never deletes a device.** Only explicit sign-out (`logout`, MSC4191
-  `device_delete`) does; `logout/all` never deactivates the account. Pin:
-  `teardown_policy_only_deletes_device_on_explicit_signout`,
-  `h1_revoke_does_not_delete_device_but_logout_does`,
+- **`/oauth2/revoke` deletes a device only under flag 1.** With
+  `SIWXOIDC_REVOKE_DELETES_DEVICE` off (the default) only explicit sign-out (`logout`, MSC4191
+  `device_delete`) deletes a device; revoke is `TeardownPolicy::TokensOnly`. With it on, a
+  revoke of a Matrix-credential grant ends the session including its device (MAS parity; other
+  grant kinds stay tokens-only), and every teardown is strict: Synapse delete, then the
+  deleted-id marker, then revoke; a transient Synapse failure is a 503 that revokes nothing,
+  a 404 counts as deleted, a 403 revokes and logs at error. A caller that gives up on the 503
+  (another device's session manager, the account page) leaves the device deleted and its grant
+  live; the owner's client then refreshes fine and Synapse answers `M_UNKNOWN_TOKEN`. Flag 1
+  requires `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` (flag 2): a client that proposes its device id
+  again would get the deleted id recreated, the recycling Synapse cannot do cleanly, so the
+  server refuses to start with flag 1 on and flag 2 off. `logout/all` never deactivates the
+  account. Pin: `teardown_policy_only_deletes_device_on_explicit_signout`,
+  `h1_revoke_does_not_delete_device_but_logout_does` (both flag states),
+  `config_flag1_without_flag2_refuses_to_start`,
+  `h4b_replay_forced_recovery_escapes_each_revoke_no_wedge`,
   `logout_all_invalidates_all_sessions_without_deactivating`.
+- **A deleted device id is never recreated (flag 2).** With
+  `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` on, every siwx-oidc delete path plants
+  `deleted:device/{localpart lowercased}/{device_id}` (the delete time, TTL
+  `SIWXOIDC_DELETED_DEVICE_MARKER_TTL_SECS`, 365 d) after Synapse deleted the device and before
+  the revoke; a marker that cannot be written is the retryable 503 with nothing revoked. A
+  Matrix-class sign-in that proposes a marked id is refused: `sign_in` redirects with
+  `error=invalid_scope` and the bound `state`, the device-code poll answers 400
+  `invalid_scope` and then `access_denied`. The other `sign_in` refusals become redirects too
+  (`access_denied`, `temporarily_unavailable`). A client that pins a stable device id must
+  handle the refusal with a fresh id and a fresh store before flag 2 goes on (agents:
+  `AuthError::is_device_refused`). Off: nothing is planted, a deleted id is recreated as before.
+  Pin: `marker_planted_on_every_delete_path_flag2_on`, `marker_not_planted_flag2_off`,
+  `sign_in_refuses_deleted_device_id_redirect_invalid_scope_with_state`,
+  `device_code_poll_refused_400_invalid_scope_and_code_denied`, `ss4_all_flags_off_is_inert`.
+- **The device reaper deletes only what no client can use (flag 3).** With
+  `SIWXOIDC_DEVICE_REAPER_ENABLED` on, one instance per interval (lease `device_reaper:lease`)
+  deletes a device only when its account is not spared, Synapse's `last_seen_ts` is not NULL
+  and older than the refresh lifetime (90 d) plus a margin, and the device has no live grant
+  (one `EXISTS`, never `SMEMBERS`, `SCAN` or `KEYS`). It starts as a dry run. A client that
+  loops on refused requests keeps refreshing its grant, and each refresh renews the 90 d: such
+  a grant (Element: unbounded while the app loops) has no device row, so the reaper never sees
+  it. Pin: the planted-case table in `src/device_reaper/tests.rs`,
+  `ss4_reaper_planted_cases_on_mock_stack`.
 - **Revocation keys on the username** (the localpart: a grant's `username`, a legacy entry's
   `TokenMetadata.username`), not the raw DID.
 

@@ -315,6 +315,52 @@ event explained, and no unexplained event for a session with a single holder (hy
 the token lifecycle design). A client that presents an older token on its own, for example a
 second process refreshing beside the app without a shared lock, would otherwise be signed out.
 
+### Session end and device deletion
+
+Three switches make the end of a Matrix session remove its Synapse device for every client, as
+MAS does. All three are off by default, and with all three off the server behaves as before
+them: no marker is written, teardown is best-effort and answers as before, no reaper runs. Each
+is read once at startup. The behaviour is described in
+[matrix-integration.md](matrix-integration.md#session-teardown).
+
+| Key | Environment | Default | Meaning |
+|---|---|---|---|
+| `revoke_deletes_device` | `SIWXOIDC_REVOKE_DELETES_DEVICE` | `false` | Flag 1. On: `POST /oauth2/revoke` of a Matrix-credential grant ends the session including its device (other grants stay tokens-only); every teardown is strict (Synapse delete, then the deleted-id marker, then the revoke; a transient Synapse failure is a retryable 503 that revokes nothing); a guest claim tears the pre-claim devices down. Requires flag 2: the server refuses to start with flag 1 on and flag 2 off. |
+| `refuse_deleted_device_ids` | `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` | `false` | Flag 2. On: every device delete plants a deleted-id marker, and a Matrix-class sign-in that proposes a marked device id is refused (`/sign_in` redirects with `error=invalid_scope`, the device-code poll answers 400 `invalid_scope`) instead of recreating it. The other `/sign_in` refusals become redirects too (`access_denied`, `temporarily_unavailable`). |
+| `deleted_device_marker_ttl_secs` | `SIWXOIDC_DELETED_DEVICE_MARKER_TTL_SECS` | `31536000` (365 days) | Lifetime of a deleted-id marker (flag 2). |
+| `device_reaper_enabled` | `SIWXOIDC_DEVICE_REAPER_ENABLED` | `false` | Flag 3. On: the device reaper runs (below). |
+| `device_reaper_spare_users` | `SIWXOIDC_DEVICE_REAPER_SPARE_USERS` | `[]` | Accounts the reaper never touches, as a localpart or a full Matrix id (`agent`, `@agent:example.org`), any case. List agent and bot accounts here. |
+| `device_reaper_dry_run` | `SIWXOIDC_DEVICE_REAPER_DRY_RUN` | `true` | A pass deletes nothing and only reports. Set `false` to delete. |
+| `device_reaper_interval_secs` | `SIWXOIDC_DEVICE_REAPER_INTERVAL_SECS` | `86400` (1 day) | Seconds between two passes; one instance per interval holds the lease. `0` is read as 1. |
+| `device_reaper_margin_secs` | `SIWXOIDC_DEVICE_REAPER_MARGIN_SECS` | `604800` (7 days) | Added to the refresh-token lifetime (90 days) to give the idle threshold. |
+| `device_reaper_min_idle_secs` | `SIWXOIDC_DEVICE_REAPER_MIN_IDLE_SECS` | unset | Replaces the idle threshold by this many seconds. For tests only; never set it in production. |
+| `device_reaper_report_path` | `SIWXOIDC_DEVICE_REAPER_REPORT_PATH` | unset | File each pass writes its full list to: one JSON line per device (account, device, verdict) plus a summary line, mode 0600, replaced each pass. It holds Matrix ids in clear: keep it on the host. Unset: no file; the log carries counts only. |
+
+**The device reaper** pages Synapse's user list, lists each account's devices, and deletes a
+device only when all of these hold: the account is not spared; Synapse's `last_seen_ts` is set
+(a device never seen is spared) and older than the refresh-token lifetime plus the margin (or
+the minimum idle time, when set); and the device has no live grant at this provider. A delete
+takes the teardown order (Synapse delete, then the marker under flag 2). A failed delete is
+counted and the pass goes on. A client that loops on refused requests keeps refreshing its
+grant, and each refresh renews the 90 days, so such a grant lives on (Element: unbounded while
+the app loops); it has no device left, so the reaper never sees it.
+
+**Rollout order.**
+
+1. **Flag 2 first, and only after every client that pins a stable device id handles the
+   refusal.** Element Web and Element X propose the same id at each sign-in of an install; an
+   agent or bot that keeps its device id must, on `invalid_scope` (`siwx-oidc-auth`:
+   `AuthError::is_device_refused`), sign in again with a fresh device id and a fresh crypto
+   store. A client that does not would fail to sign in after its device was deleted.
+2. **Flag 1 together with or after flag 2**, never alone: the server refuses to start with flag
+   1 on and flag 2 off, because a client that proposes its device id again would get the deleted
+   id recreated, which Synapse cannot do cleanly.
+3. **The reaper as a dry run first.** List agent and bot accounts in
+   `SIWXOIDC_DEVICE_REAPER_SPARE_USERS`, set `SIWXOIDC_DEVICE_REAPER_REPORT_PATH`, turn
+   `SIWXOIDC_DEVICE_REAPER_ENABLED` on with `SIWXOIDC_DEVICE_REAPER_DRY_RUN` left at `true`,
+   and check the report of a pass before setting `SIWXOIDC_DEVICE_REAPER_DRY_RUN=false`. With
+   flag 2 on, a reaped device's id is refused at a later sign-in like any deleted id.
+
 ### Legal documents
 
 | Key | Environment | Default | Meaning |

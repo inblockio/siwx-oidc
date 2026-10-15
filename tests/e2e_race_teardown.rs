@@ -895,15 +895,16 @@ async fn grandfathered_legacy_account_keeps_legacy_localpart_on_real_signin() {
 ///
 /// SS4 flag 1 (`SIWXOIDC_REVOKE_DELETES_DEVICE`, off by default): with the flag
 /// on, the revoke of a Matrix-credential grant ends the session including its
-/// device (MAS parity), so the revoke half asserts the deletion instead. The
-/// flag-off half is unchanged and is what the mock-stack job runs.
+/// device (MAS parity), so the revoke half asserts the deletion instead; the
+/// logout half is the same in both states. The flag-off half is unchanged and is
+/// what the mock-stack job runs.
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn h1_revoke_does_not_delete_device_but_logout_does() {
     let c = Client::new();
     let base = oidc();
 
-    // --- revoke path: tokens gone, device intact, NO DELETE in the call log ---
+    // --- revoke path: tokens gone; flag 1 off: device intact, NO DELETE in the call log ---
     mock_reset(&c).await;
     let w = new_wallet();
     let login = wallet_login(&c, &base, &w).await;
@@ -935,33 +936,32 @@ async fn h1_revoke_does_not_delete_device_but_logout_does() {
             !device_ids(&state, &w.mxid).contains(&login.device_id),
             "flag 1: revoke ends the session including its device"
         );
-        assert!(!token_active(&c, &login.access_token).await);
-        return;
+    } else {
+        assert_eq!(
+            count_calls(&state, DELETE_DEVICE_CALL),
+            0,
+            "REVOKE MUST NOT delete the Synapse device (H1 incident guard)"
+        );
+        // Belt and braces: the PRE-1.157 dialect must be absent too. Without this a
+        // revert to `DELETE /_synapse/admin/v2/users/{mxid}/devices/{id}` would slip
+        // past the needle above and this guard would pass while revoke was once
+        // again wedging users' cross-signing identity.
+        assert_eq!(
+            count_calls(&state, "DELETE "),
+            0,
+            "REVOKE MUST NOT issue the legacy admin-API DELETE /devices either"
+        );
+        assert!(
+            device_ids(&state, &w.mxid).contains(&login.device_id),
+            "revoke must leave the Synapse device intact"
+        );
     }
-    assert_eq!(
-        count_calls(&state, DELETE_DEVICE_CALL),
-        0,
-        "REVOKE MUST NOT delete the Synapse device (H1 incident guard)"
-    );
-    // Belt and braces: the PRE-1.157 dialect must be absent too. Without this a
-    // revert to `DELETE /_synapse/admin/v2/users/{mxid}/devices/{id}` would slip
-    // past the needle above and this guard would pass while revoke was once
-    // again wedging users' cross-signing identity.
-    assert_eq!(
-        count_calls(&state, "DELETE "),
-        0,
-        "REVOKE MUST NOT issue the legacy admin-API DELETE /devices either"
-    );
-    assert!(
-        device_ids(&state, &w.mxid).contains(&login.device_id),
-        "revoke must leave the Synapse device intact"
-    );
     assert!(
         !token_active(&c, &login.access_token).await,
         "revoke must still revoke the session's tokens"
     );
 
-    // --- logout path: explicit intent DOES delete the device ---
+    // --- logout path: explicit intent DOES delete the device (both flag states) ---
     mock_reset(&c).await;
     let w2 = new_wallet();
     let login2 = wallet_login(&c, &base, &w2).await;

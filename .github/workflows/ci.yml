@@ -377,9 +377,11 @@ jobs:
       # the session (its token stops authenticating at whoami), and that
       # /logout/all invalidates every session WITHOUT deactivating the account.
       # These observe tokens, not devices: that revoke keeps the Synapse device
-      # (token hygiene deleting it raced in-flight key uploads and wedged
-      # cross-signing) is pinned by the unit test
-      # `compat::tests::teardown_policy_only_deletes_device_on_explicit_signout`.
+      # with SIWXOIDC_REVOKE_DELETES_DEVICE off (the default here; token hygiene
+      # deleting it raced in-flight key uploads and wedged cross-signing), and
+      # deletes a Matrix credential's device with it on, is pinned by the unit
+      # test `compat::tests::teardown_policy_only_deletes_device_on_explicit_signout`
+      # (both flag states) and by `e2e_race_teardown::h1_revoke_does_not_delete_device_but_logout_does`.
       - name: E2E session teardown policy
         run: cargo test --test e2e_session_teardown -- --ignored --test-threads=1
 

@@ -16,7 +16,15 @@
 //! [`TeardownPolicy`]): an explicit `POST /_matrix/client/v3/logout` deletes the
 //! device; a bare RFC 7009 `POST /oauth2/revoke` is token hygiene and does NOT
 //! (clients fire revoke on rotation and on dialog dismissals, where deleting the
-//! device strands the user's identity — the 2026-06-12 login incident).
+//! device strands the user's identity — the 2026-06-12 login incident). That is
+//! the default. With `SIWXOIDC_REVOKE_DELETES_DEVICE` (flag 1, off by default) a
+//! revoke of a Matrix-credential grant ends the session including its device
+//! (MAS parity), and every teardown is strict: Synapse delete, then the
+//! deleted-id marker (flag 2), then revoke; a transient Synapse failure answers
+//! 503 and revokes nothing; the caller's retry finishes it, unless the caller
+//! gives up: the device is then gone while its grant lives, so the owner's
+//! client refreshes fine and Synapse refuses every request with
+//! `M_UNKNOWN_TOKEN`.
 //!
 //! Deleting a device that is *ending* (on explicit logout) is distinct from device
 //! *recycling* (re-issuing the same `device_id` with new keys), which Synapse
@@ -24,7 +32,11 @@
 //! `e2e_cross_signing_signatures` rows, and the signature-upload handler then
 //! skips fresh uploads. Sign-in therefore never deletes-then-reuses a device id;
 //! it upserts a fresh `SIWX_{uuid}`, so the explicit-logout delete is safe
-//! precisely because the id is not reused. Apart from the Matrix-shaped
+//! precisely because the id is not reused. A client may still propose an id of
+//! its own (Element keeps one per install): with
+//! `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` (flag 2) every delete plants a
+//! deleted-id marker and a sign-in naming that id is refused, never recreated.
+//! Flag 1 requires flag 2 (the server refuses to start otherwise). Apart from the Matrix-shaped
 //! `refresh`, none of this code touches sign-in or token issuance (`oidc.rs`);
 //! see `docs/matrix-integration.md`, "Accounts and devices".
 

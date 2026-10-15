@@ -106,6 +106,13 @@ pinned at the handler by row 17 (`h1_revoke_does_not_delete_device_but_logout_do
 which counts the mock's `delete_device` calls). Since 2026-09-29 row 41 also checks
 that the device is gone from the Synapse mock's device list.
 
+Note (2026-10-15, row 42): "revoke must NOT delete the device" holds with
+`SIWXOIDC_REVOKE_DELETES_DEVICE` off, the default and the CI configuration. With
+it on, a revoke of a Matrix-credential grant ends the session including its device
+(MAS parity; the flag requires `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`, so the deleted
+id is never recreated). Row 42 observes only `whoami` and passes either way; row 17
+asserts the deletion when the stack runs with the flag on.
+
 Note on #34: step 1 (siwx-oidc's own discovery doc) *would* run against the mock
 stack, but step 2 asserts Synapse forwards the action list verbatim to
 `/_matrix/client/v1/auth_metadata`. The test's own comment says *"Left honestly red
