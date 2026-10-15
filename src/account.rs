@@ -471,6 +471,51 @@ pub(crate) fn reset_outcome(allow_ok: bool, readback: ResetReadback) -> ActionOu
 
 // -- Action execution ---------------------------------------------------------
 
+/// The retryable answer when a strict teardown (SS4 flag 1) stopped.
+const STRICT_TEARDOWN_RETRY_MSG: &str =
+    "Your sessions could not all be signed out right now; nothing was changed. Try again.";
+
+/// Deactivate and erase under SS4 flag 1 (8.13, 8.23, audit r2 #7): list the
+/// account's devices first and tear each down strictly (delete, marker, revoke),
+/// before anything else is touched. One failed device does not stop the loop;
+/// any failure (or a failed listing) is a 503 and the action does not run, so
+/// the retry starts again. Flag 1 off: nothing (today's sequence).
+async fn strict_pre_teardown(
+    synapse: &SynapseClient,
+    db_client: &RedisClient,
+    server: &str,
+    localpart: &str,
+    ctx: &str,
+) -> Result<(), CustomError> {
+    if !synapse.strict_teardown() {
+        return Ok(());
+    }
+    let devices = synapse.list_devices(localpart, server).await.map_err(|e| {
+        warn!(error = %e, ctx, "list_devices failed before a strict teardown");
+        CustomError::ServiceUnavailable(STRICT_TEARDOWN_RETRY_MSG.to_string())
+    })?;
+    let mut all = true;
+    for device in devices {
+        all &= crate::compat::strict_teardown_device(
+            db_client,
+            synapse,
+            server,
+            localpart,
+            &device.device_id,
+            ctx,
+        )
+        .await
+        .is_ok();
+    }
+    if all {
+        Ok(())
+    } else {
+        Err(CustomError::ServiceUnavailable(
+            STRICT_TEARDOWN_RETRY_MSG.to_string(),
+        ))
+    }
+}
+
 /// Execute a (canonicalized) account action for an already-authenticated `did`.
 ///
 /// `device_id` is required only for [`Action::DeviceView`] / [`Action::DeviceDelete`].
@@ -633,6 +678,26 @@ async fn execute_action(
                     "That device is not among your active sessions".to_string(),
                 ));
             }
+            if synapse.strict_teardown() {
+                // Flag 1 (8.23): delete, marker, revoke; a transient fault is a 503
+                // the user retries (the steps are idempotent).
+                let revoked = crate::compat::strict_teardown_device(
+                    db_client,
+                    synapse,
+                    server,
+                    &localpart,
+                    device_id,
+                    "account_device_delete",
+                )
+                .await
+                .map_err(|_| {
+                    CustomError::ServiceUnavailable(STRICT_TEARDOWN_RETRY_MSG.to_string())
+                })?;
+                info!(did = %did, device_id = %device_id, revoked = revoked as u64, "device signed out via account management (strict)");
+                return Ok(ActionOutcome::Deleted {
+                    device_id: device_id.to_string(),
+                });
+            }
             synapse
                 .delete_device(&localpart, device_id, server)
                 .await
@@ -659,6 +724,8 @@ async fn execute_action(
         Action::AccountDeactivate => {
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
+            strict_pre_teardown(synapse, db_client, server, &localpart, "account_deactivate")
+                .await?;
             // Set the user epoch FIRST (S3-4 / H6, I9): from now on every grant
             // of this user authenticated until now is refused by both refresh
             // endpoints and the access check, so a refresh racing the sweep
@@ -698,6 +765,7 @@ async fn execute_action(
         Action::AccountErase => {
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
+            strict_pre_teardown(synapse, db_client, server, &localpart, "account_erase").await?;
             // The shared, idempotent sequence (`teardown::erase_account`, S5): epoch and
             // revoke every grant, then the tombstones, THEN Synapse, then the passkey
             // purge. The tombstones precede the Synapse erase for the reason they always

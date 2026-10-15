@@ -341,6 +341,25 @@ pub struct SynapseClient {
     shared_secret: String,
     http: Client,
     admin: Option<AdminMint>,
+    /// SS4 flag 1 (`revoke_deletes_device`), read once at startup: every
+    /// teardown that deletes a device runs strictly (see
+    /// [`SynapseClient::strict_teardown`]).
+    strict_teardown: bool,
+}
+
+/// What Synapse answered to `POST /_synapse/mas/delete_device` (8.23): the
+/// strict teardown of flag 1 decides by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceDelete {
+    /// 2xx. Synapse also answers this for a device that is already gone.
+    Deleted,
+    /// 404 (`User not found`): there is nothing to delete.
+    NotFound,
+    /// 401, 403 or another 4xx: a permanent refusal, typically a wrong MAS
+    /// shared secret. A configuration fault, not the client's.
+    Forbidden,
+    /// 5xx or no answer (network, timeout): retryable.
+    Transient,
 }
 
 impl SynapseClient {
@@ -358,7 +377,20 @@ impl SynapseClient {
             shared_secret: shared_secret.to_string(),
             http: build_http_client(),
             admin: None,
+            strict_teardown: false,
         }
+    }
+
+    /// Switch strict teardown (SS4 flag 1, `revoke_deletes_device`) on or off.
+    pub fn with_strict_teardown(mut self, on: bool) -> Self {
+        self.strict_teardown = on;
+        self
+    }
+
+    /// Whether teardown is strict (flag 1): Synapse delete, then the deleted-id
+    /// marker, then revoke, answered by [`DeviceDelete`]. Off: best-effort.
+    pub fn strict_teardown(&self) -> bool {
+        self.strict_teardown
     }
 
     /// Enable the admin-scoped calls by giving the client a token store to mint
@@ -1226,6 +1258,45 @@ impl SynapseClient {
         device_id: &str,
         server_name: &str,
     ) -> Result<()> {
+        let status = self
+            .send_delete_device(localpart, device_id, server_name)
+            .await?;
+        if !status.is_success() {
+            anyhow::bail!("delete_device: HTTP {status}{}", mas_status_hint(status));
+        }
+        Ok(())
+    }
+
+    /// [`delete_device`](Self::delete_device), answered by what Synapse said
+    /// instead of an error (8.23, SS4 flag 1).
+    pub async fn delete_device_status(
+        &self,
+        localpart: &str,
+        device_id: &str,
+        server_name: &str,
+    ) -> DeviceDelete {
+        match self
+            .send_delete_device(localpart, device_id, server_name)
+            .await
+        {
+            Ok(s) if s.is_success() => DeviceDelete::Deleted,
+            Ok(reqwest::StatusCode::NOT_FOUND) => DeviceDelete::NotFound,
+            Ok(s) if s.is_client_error() => DeviceDelete::Forbidden,
+            Ok(_) => DeviceDelete::Transient,
+            Err(e) => {
+                warn!(error = %e, "delete_device: no answer from Synapse");
+                DeviceDelete::Transient
+            }
+        }
+    }
+
+    /// The request of both, logging a non-2xx answer.
+    async fn send_delete_device(
+        &self,
+        localpart: &str,
+        device_id: &str,
+        server_name: &str,
+    ) -> Result<reqwest::StatusCode> {
         let url = format!("{}/_synapse/mas/delete_device", self.endpoint);
         let resp = self
             .http
@@ -1236,14 +1307,13 @@ impl SynapseClient {
             .await
             .context("delete_device: request failed")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let status = resp.status();
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             let user_id = matrix_user_id(localpart, server_name);
             warn!(%status, %body, %user_id, %device_id, "delete_device failed");
-            anyhow::bail!("delete_device: HTTP {status}{}", mas_status_hint(status));
         }
-        Ok(())
+        Ok(status)
     }
 
     /// Deactivate a user's account via the MAS API

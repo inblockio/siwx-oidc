@@ -353,7 +353,11 @@ async fn finish_locked(
         &siwx_oidc::redact::fingerprint(&linked.credential_id),
     );
     // Revoke the pre-claim devices; a failure stays in `guest:claim_revoke` for the reaper.
-    if let Err(e) = finish_claim_revoke(&state.redis, &rec.localpart).await {
+    let synapse = state
+        .synapse
+        .as_deref()
+        .zip(state.config.matrix_server_name.as_deref());
+    if let Err(e) = finish_claim_revoke(&state.redis, synapse, &rec.localpart).await {
         warn!(error = %e, "guest claim: device revocation deferred to the reaper");
     }
     let mut response = no_store(Json(json!({"state": "claimed"})).into_response());
@@ -372,9 +376,40 @@ async fn finish_locked(
 /// Revoke the tokens of every device the guest held at the commit, one by one, then take the
 /// localpart off `guest:claim_revoke`. Idempotent: the reaper tick runs it for what a crash
 /// left behind. The Synapse device rows stay (GP-CLM-11); only the Redis grants die.
-pub async fn finish_claim_revoke(redis: &RedisClient, localpart: &str) -> anyhow::Result<()> {
+///
+/// SS4 flag 1 (8.26, `synapse` given and strict): each pre-claim device is torn down in the
+/// 8.23 order instead (Synapse delete, marker, revoke). A device that failed leaves the
+/// localpart on `guest:claim_revoke`, so the reaper retries the whole list (idempotent).
+pub async fn finish_claim_revoke(
+    redis: &RedisClient,
+    synapse: Option<(&crate::synapse_client::SynapseClient, &str)>,
+    localpart: &str,
+) -> anyhow::Result<()> {
+    let strict = synapse.filter(|(s, _)| s.strict_teardown());
+    let mut failed = 0usize;
     for device in redis.read_pre_claim_devices(localpart).await? {
-        redis.revoke_device_tokens(localpart, &device).await?;
+        match strict {
+            Some((synapse, server_name)) => {
+                failed += usize::from(
+                    crate::compat::strict_teardown_device(
+                        redis,
+                        synapse,
+                        server_name,
+                        localpart,
+                        &device,
+                        "guest_claim",
+                    )
+                    .await
+                    .is_err(),
+                );
+            }
+            None => {
+                redis.revoke_device_tokens(localpart, &device).await?;
+            }
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} pre-claim device(s) not torn down; left for the reaper");
     }
     redis.claim_revoke_done(localpart).await
 }
@@ -410,6 +445,8 @@ mod tests {
         joined: HashSet<String>,
         room_status: Option<u16>,
         down: bool,
+        /// The device ids `POST /_synapse/mas/delete_device` was asked to delete.
+        deleted: Vec<String>,
     }
 
     struct Env {
@@ -441,7 +478,12 @@ mod tests {
                 let path = req.uri().path().to_string();
                 let query = req.uri().query().unwrap_or_default().to_string();
                 let lp = query.strip_prefix("localpart=").unwrap_or_default().to_string();
-                let m = mock.lock().unwrap();
+                let body = axum::body::to_bytes(req.into_body(), 1 << 16).await.unwrap_or_default();
+                let mut m = mock.lock().unwrap();
+                if path == "/_synapse/mas/delete_device" && !m.down {
+                    let v: Value = serde_json::from_slice(&body).unwrap_or_default();
+                    m.deleted.push(v["device_id"].as_str().unwrap_or_default().to_string());
+                }
                 if m.down {
                     return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({}))).into_response();
                 }
@@ -486,7 +528,7 @@ mod tests {
         };
         edit(&mut config);
         let wa = crate::webauthn::build_webauthn(&config.base_url, None, None).unwrap();
-        let client = Arc::new(client);
+        let client = Arc::new(client.with_strict_teardown(config.revoke_deletes_device));
         let app = super::super::routes::router_with(
             &config,
             redis.clone(),
@@ -929,6 +971,55 @@ mod tests {
     }
 
     /// `keep_email: true` keeps the address.
+    /// SS4 flag 1 (8.26, PG-21, SD-19, OS-16): the claim tears every pre-claim device
+    /// down in the 8.23 order, Synapse delete then revoke, instead of revoking only.
+    #[tokio::test]
+    async fn guest_claim_tears_down_preclaim_devices_flag_on() {
+        let Some(e) = env(None, |c| c.revoke_deletes_device = true).await else {
+            return;
+        };
+        let g = guest(&e).await;
+        let t_a = token(&e, &g, "DEVA").await;
+        let t_b = token(&e, &g, "DEVB").await;
+        let (s, v, _) = claim(&e, &g, format!("cred-{}", uniq()).as_bytes()).await;
+        assert_eq!((s, v), (200, json!({"state": "claimed"})));
+        let mut deleted = e.synapse.lock().unwrap().deleted.clone();
+        deleted.sort();
+        assert_eq!(
+            deleted,
+            ["DEVA", "DEVB"],
+            "each pre-claim device is deleted"
+        );
+        assert!(e.redis.check_access_token(&t_a).await.unwrap().is_none());
+        assert!(e.redis.check_access_token(&t_b).await.unwrap().is_none());
+        assert!(
+            e.redis
+                .pending_claim_revokes()
+                .await
+                .unwrap()
+                .iter()
+                .all(|l| l != &g.localpart),
+            "teardown finished"
+        );
+    }
+
+    /// SS4 flag 1 off: the claim revokes the pre-claim devices' grants and keeps the rows.
+    #[tokio::test]
+    async fn guest_claim_revokes_only_flag_off() {
+        let Some(e) = env(None, |_| {}).await else {
+            return;
+        };
+        let g = guest(&e).await;
+        let t_a = token(&e, &g, "DEVA").await;
+        let (s, v, _) = claim(&e, &g, format!("cred-{}", uniq()).as_bytes()).await;
+        assert_eq!((s, v), (200, json!({"state": "claimed"})));
+        assert!(
+            e.synapse.lock().unwrap().deleted.is_empty(),
+            "flag 1 off: no device is deleted"
+        );
+        assert!(e.redis.check_access_token(&t_a).await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn keep_email_keeps_the_address() {
         let Some(e) = env(None, |_| {}).await else {

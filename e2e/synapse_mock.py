@@ -73,6 +73,8 @@ nondeterministic, so every admin request introspects.
   GET    /_matrix/client/v3/account/whoami        tests/e2e_msc3861.rs,
                                                   tests/e2e_session_teardown.rs
   GET    /_matrix/client/v3/devices               tests/e2e_device_code.rs
+  POST   /_matrix/client/v3/keys/upload           tests/e2e_race_teardown.rs (H4b replay;
+                                                  401 when the token's device is gone)
   GET    /_matrix/client/v3/sync                  siwx-oidc-auth/examples/soak.rs (an
                                                   empty sync: no rooms, a next_batch)
          siwx-oidc itself calls NEITHER: these are the Synapse->siwx-oidc
@@ -208,12 +210,21 @@ STATE = {"secret": SECRET, "reject_admin": False}
 # mode string: "500" returns HTTP 500, "timeout" sleeps long enough that the
 # siwx-oidc reqwest client times out. Cleared by /__reset.
 #   POST /__fail {"endpoint": "delete_device", "mode": "500"|"timeout"|"off"}
+# delete_device also takes "404" (Synapse's `User not found`) and "403" (a wrong
+# MAS shared secret), the answers the strict teardown of SS4 flag 1 decides by,
+# and an optional "device_id" that arms the fault for that one device only
+# (a bulk path with one failing device):
+#   POST /__fail {"endpoint": "delete_device", "mode": "404"|"403"|"500", "device_id": "DEVICE_A"}
 # Recognized endpoints: delete_device, list_devices, deactivate, query_user,
 # publish_did_field, read_did_field. ("get_device" is gone as a fault target
 # because `synapse_client::get_device` no longer has a route of its own: since
 # the 1.157 port it is `list_devices` plus a client-side filter, so fault it via
 # "list_devices".)
 FAIL = {}
+# Per-device faults on delete_device ("device_id" in /__fail). Cleared by /__reset.
+FAIL_DEVICE = {}
+# The device keys uploaded per "user_id/device_id" (POST keys/upload). Cleared by /__reset.
+KEYS = {}
 # How long a "timeout" fault sleeps before (not) responding, in seconds. Must
 # exceed the siwx-oidc Synapse HTTP client timeout so the call fails.
 TIMEOUT_SLEEP_SECS = float(os.environ.get("SYNAPSE_MOCK_TIMEOUT_SLEEP", "30"))
@@ -540,6 +551,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             return True
+        if mode == "404":
+            self._send(404, {"errcode": "M_NOT_FOUND", "error": "User not found"})
+            return True
+        if mode == "403":
+            self._send(403, {"errcode": "M_FORBIDDEN", "error": "This endpoint must only be called by MAS"})
+            return True
         # default: "500"
         self._send(500, {"errcode": "M_UNKNOWN", "error": "simulated failure"})
         return True
@@ -573,6 +590,8 @@ class Handler(BaseHTTPRequestHandler):
                     "lifecycle": LIFECYCLE,
                     "calls": list(CALL_LOG),
                     "fail": dict(FAIL),
+                    "fail_device": dict(FAIL_DEVICE),
+                    "keys": dict(KEYS),
                     "effective_deletes": dict(EFFECTIVE_DELETES),
                     "existing_users": sorted(EXISTING_USERS),
                     "profiles": PROFILES,
@@ -882,7 +901,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/__reset":
             with LOCK:
                 DEVICES.clear(); LIFECYCLE.clear(); CALL_LOG.clear(); ADMIN_PUTS.clear(); USER_TYPES.clear()
-                FAIL.clear(); EFFECTIVE_DELETES.clear()
+                FAIL.clear(); EFFECTIVE_DELETES.clear(); FAIL_DEVICE.clear(); KEYS.clear()
                 EXISTING_USERS.clear(); PROFILES.clear(); PROFILE_FIELDS.clear()
                 RP_RECEIVED.clear(); RP_MODE.clear(); RP_REDIRECTED.clear()
                 STATE["secret"] = SECRET
@@ -909,14 +928,37 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/__fail":
             endpoint = body.get("endpoint", "")
             mode = body.get("mode", "off")
+            device_id = body.get("device_id")
             with LOCK:
-                if not endpoint or mode in ("off", None):
+                if device_id:
+                    if mode in ("off", None):
+                        FAIL_DEVICE.pop(device_id, None)
+                    else:
+                        FAIL_DEVICE[device_id] = mode
+                elif not endpoint or mode in ("off", None):
                     FAIL.pop(endpoint, None)
                 else:
                     FAIL[endpoint] = mode
             return self._send(200, {"ok": True, "fail": dict(FAIL)})
 
         self._log("POST", path)
+
+        # POST /_matrix/client/v3/keys/upload -- the user's own device keys (H4b:
+        # "keys uploadable"). Under delegated auth Synapse refuses a token whose
+        # device it does not hold ("Token is not active"), so the mock does too.
+        if path == "/_matrix/client/v3/keys/upload":
+            introspection, denied = self._cs_api_auth()
+            if denied:
+                return self._send(*denied)
+            user_id = _mxid(introspection.get("username") or "")
+            device_id = introspection.get("device_id") or ""
+            with LOCK:
+                present = any(d["device_id"] == device_id for d in DEVICES.get(user_id, []))
+                if present:
+                    KEYS[f"{user_id}/{device_id}"] = body
+            if not present:
+                return self._send(401, {"errcode": "M_UNKNOWN_TOKEN", "error": "Token is not active"})
+            return self._send(200, {"one_time_key_counts": {}})
 
         # -- admin surface --------------------------------------------------
         if path == "/_matrix/client/v3/keys/query":
@@ -1013,6 +1055,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             uid = _mxid(body.get("localpart", ""))
             device_id = body.get("device_id", "")
+            with LOCK:
+                per_device = FAIL_DEVICE.get(device_id)
+            if per_device:
+                with LOCK:
+                    FAIL["__device"] = per_device
+                try:
+                    self._maybe_fail("__device")
+                finally:
+                    with LOCK:
+                        FAIL.pop("__device", None)
+                return
             with LOCK:
                 devs = DEVICES.get(uid, [])
                 existed = any(d["device_id"] == device_id for d in devs)

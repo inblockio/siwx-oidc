@@ -1812,17 +1812,23 @@ pub async fn main() {
     // API require from Synapse 1.157 on. Without it, `list_devices` /
     // `get_device` / `has_cross_signing_keys` fail closed with a clear error
     // instead of silently presenting a credential Synapse no longer accepts.
+    if config.revoke_deletes_device {
+        info!("revoke_deletes_device on: revoke ends a Matrix session with its device; teardown is strict");
+    }
     let synapse_client = match (&config.synapse_endpoint, &config.mas_shared_secret) {
         (Some(endpoint), Some(secret)) => {
             info!("Synapse client enabled: {}", endpoint);
             Some(Arc::new(
-                SynapseClient::new(endpoint.as_str(), secret).with_admin_mint(
-                    redis_client.clone(),
-                    config.admin_token_localpart.clone(),
-                    // Clamped here, at the configuration boundary, exactly as
-                    // `AdminTokenState` clamps it for the HTTP mint endpoint.
-                    admin_token::clamp_admin_token_ttl(config.admin_token_ttl_secs),
-                ),
+                SynapseClient::new(endpoint.as_str(), secret)
+                    .with_admin_mint(
+                        redis_client.clone(),
+                        config.admin_token_localpart.clone(),
+                        // Clamped here, at the configuration boundary, exactly as
+                        // `AdminTokenState` clamps it for the HTTP mint endpoint.
+                        admin_token::clamp_admin_token_ttl(config.admin_token_ttl_secs),
+                    )
+                    // SS4 flag 1: every teardown that reaches Synapse is strict.
+                    .with_strict_teardown(config.revoke_deletes_device),
             ))
         }
         _ => None,

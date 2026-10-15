@@ -213,7 +213,10 @@ impl Reaper {
             }
         };
         for localpart in pending {
-            if let Err(e) = super::claim::finish_claim_revoke(&self.redis, &localpart).await {
+            let synapse = Some((self.synapse.as_ref(), self.server_name.as_str()));
+            if let Err(e) =
+                super::claim::finish_claim_revoke(&self.redis, synapse, &localpart).await
+            {
                 warn!(error = %e, localpart, "guest reaper: claim revocation retry failed");
             }
         }
