@@ -1065,7 +1065,8 @@ doc; read it before changing the code the rule covers.
   computes the answer once per code (`device_passkey_offer/{user code digest}`, never a field of
   the device code entry, which an approval rewrites) and reads the DID's passkeys through
   `credential_store::did_has_credential_bounded`: at most one `KEYS webauthn:link/*` and
-  `KEYS webauthn:credential/*` scan per DID per ten minutes, however many requests arrive at once.
+  `KEYS webauthn:credential/*` scan per DID per ten minutes when the scan completes (a failing one
+  at most once per 30 s; none while the aqua-auth store fails), however many requests arrive at once.
   The caller claims the scan BEFORE running it, with one atomic `SET webauthn:no_passkey/{sha256(did)}
   scanning NX EX` (read after the `by_did` index); never read first and write the marker after the
   scan, which lets every concurrent caller scan. A caller that loses the claim answers from the

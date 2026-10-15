@@ -414,8 +414,9 @@ pub enum PasskeyCheck {
     Found,
     /// The DID has none: a scan found nothing, or a recent scan did.
     Absent,
-    /// The server cannot tell now: another request holds the scan and has not finished,
-    /// or the scan failed. Nothing is kept for it, so a later call asks again.
+    /// The server cannot tell now: another request holds the scan claim (running, or kept
+    /// by a scan that failed or skipped a read, until the claim expires), or the aqua-auth
+    /// store failed. Nothing is kept for the code, so a later call asks again.
     Unknown,
 }
 
@@ -425,9 +426,10 @@ const NO_PASSKEY_MARKER: &str = "1";
 /// The value of a `webauthn:no_passkey` marker while one request is scanning.
 const SCAN_CLAIM: &str = "scanning";
 
-/// The longest a scan claim lives (seconds). A request that is dropped mid-scan (the
-/// client hung up) never releases its claim, so this bounds how long callers for that
-/// DID are told "cannot tell" instead of getting an answer.
+/// The longest a scan claim lives (seconds), counted from when it was taken. A request
+/// dropped mid-scan, or a scan that failed or skipped a read, leaves its claim, so this
+/// bounds how long callers for that DID are told "cannot tell" and how often a failing
+/// scan can run again.
 const SCAN_CLAIM_TTL_SECS: u64 = 30;
 
 /// Whether `did` has a stored passkey, for the unauthenticated device approval page,
@@ -445,15 +447,17 @@ const SCAN_CLAIM_TTL_SECS: u64 = 30;
 /// BEFORE the scan, so of any number of concurrent callers exactly one scans. A caller
 /// that loses the claim answers from the marker: `1` is [`PasskeyCheck::Absent`],
 /// `scanning` is [`PasskeyCheck::Unknown`]. The winner replaces the marker with `1` for
-/// `negative_ttl_secs` when the scan finds nothing (so one DID costs at most one scan per
-/// window), deletes it when the scan finds a passkey (the index the scan back-fills
-/// answers the next call). A scan that fails, or that skipped a key whose read failed
-/// (as when the aqua-auth store failed), is [`PasskeyCheck::Unknown`] and keeps its claim
-/// until the claim expires, so a failing scan repeats at most once per claim lifetime
-/// per DID (a `KEYS` that timed out on the client still ran on the server). A passkey
-/// registered or linked inside the window lands in the index, which is read before the
-/// marker, so the marker hides it only if that best-effort index write failed. The login picker and every other
-/// caller keep [`list_credential_ids`] unchanged.
+/// `negative_ttl_secs` when the scan finds nothing (so one DID costs at most one completed
+/// scan per window), and deletes it when the scan finds a passkey (the index the scan
+/// back-fills answers the next call). A scan that fails, or that skipped a key whose
+/// read failed, is [`PasskeyCheck::Unknown`] and keeps its claim until the claim expires,
+/// so a failing scan repeats at most once per claim lifetime per DID (a `KEYS` that timed
+/// out on the client still ran on the server). While the aqua-auth store fails, the
+/// answer is [`PasskeyCheck::Unknown`] without a scan, since a scan then could not say
+/// "no passkey" anyway. A passkey registered or linked inside the window lands in the
+/// index, which is read before the marker, so the marker hides it only if that
+/// best-effort index write failed. The login picker and every other caller keep
+/// [`list_credential_ids`] unchanged.
 pub async fn did_has_credential_bounded<F>(
     redis: &RedisClient,
     did: &str,
@@ -487,6 +491,11 @@ where
     if let Some(marker) = redis.get_raw(&marker_key).await? {
         return Ok(marker_answer(&marker));
     }
+    if store_failed {
+        // A scan could only answer Found or Unknown now, and both keep the button: no
+        // full-keyspace scan while the store is down.
+        return Ok(PasskeyCheck::Unknown);
+    }
     // Claim the scan before running it, so that concurrent callers do not each run it.
     let claim_ttl = negative_ttl_secs.clamp(1, SCAN_CLAIM_TTL_SECS);
     if !redis
@@ -508,7 +517,7 @@ where
             release_claim(redis, &marker_key).await;
             Ok(PasskeyCheck::Found)
         }
-        Ok((_, complete)) if !complete || store_failed => {
+        Ok((_, false)) => {
             warn!("did_has_credential_bounded: a read failed during the check; cannot tell");
             Ok(PasskeyCheck::Unknown)
         }

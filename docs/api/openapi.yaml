@@ -847,12 +847,14 @@ paths:
         can approve here. It is a display hint: the approval itself is checked
         against the account either way. The answer is computed once per code and
         reused for up to a minute (a "none" answer) or the code's lifetime. The
-        credential scan behind it runs at most once per account per ten minutes,
-        concurrent requests included: a request that arrives while another is
+        credential scan behind it runs at most once per account per ten minutes
+        when it completes, concurrent requests included: a request that arrives while another is
         scanning for the same account cannot be told yet, so it answers
         `passkey_offered: true` and keeps nothing for the code, and the next
-        request asks again. A scan that fails keeps its claim for 30 seconds, so
-        a failing scan repeats at most once per 30 seconds per account.
+        request asks again. A scan that fails keeps its claim until 30 seconds
+        after it was taken, so a failing scan repeats at most once per 30
+        seconds per account; while the credential store fails, nothing is
+        scanned and the answer is `passkey_offered: true`.
       parameters: [{ name: user_code, in: query, required: true, schema: { type: string } }]
       responses:
         "200":
