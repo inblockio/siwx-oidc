@@ -5116,7 +5116,7 @@ async fn ss4_all_flags_off_is_inert() {
     mock_fail(&c, "delete_device", "off").await;
 
     // A deleted id proposed again is recreated, as today.
-    let stable = format!("SS4INERT{}", &w.mxid.len());
+    let stable = format!("SS4INERT{}", w.mxid.len());
     let scope = format!("openid urn:matrix:client:api:* urn:matrix:client:device:{stable}");
     let f = wallet_login_scoped(&c, &base, &w, register_client(&c, &base).await, &scope).await;
     assert_eq!(f.device_id, stable);
