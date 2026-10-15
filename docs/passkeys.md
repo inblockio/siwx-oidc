@@ -115,7 +115,7 @@ rather than as a new `did:key`:
 | `webauthn:link/{cred_id_b64}` | none | `{primary_did, label}` for a linked passkey |
 | `webauthn:link_ceremony/{sha256(session id)}` | 120 s | link ceremony state and the wallet DID |
 | `webauthn:by_did/{did}` | none | set of credential IDs that resolve to the DID |
-| `webauthn:no_passkey/{sha256(did)}` | 600 s | the device page's "no passkey found" marker: bounds its credential scan to one per DID per window (see below) |
+| `webauthn:no_passkey/{sha256(did)}` | 600 s (30 s while `scanning`) | the device page's scan marker: `scanning` while one request scans for the DID, `1` once a scan found no passkey. Bounds the credential scan to one per DID per window, concurrent requests included (see below) |
 | `siwx_user/{sha256(token)}` | 30 days | opaque login user session: token → DID (indexed under `idx:own_sessions/…`; a legacy `user:session/{token}` is read until it expires) |
 | `device_code/{sha256(device code)}` | 1800 s | device-code grant state (with the user code's digest) |
 | `user_code/{sha256(user code)}` | 1800 s | user code → the device code's digest |
@@ -143,13 +143,22 @@ for a code that names an account (`login_hint`), asks whether that account has a
 passkey, which for a DID with none is an index miss and so the full scan above. It
 therefore goes through `credential_store::did_has_credential_bounded`: the
 `by_did` index first, then the shared store, then the `webauthn:no_passkey` marker,
-and the scan only when none answers; a scan that finds nothing plants the marker
-for ten minutes. A passkey registered or linked inside the window lands in the
-index, which is read before the marker, so the marker never hides it. The login
-picker and every other caller keep `get_passkeys_for_did` as before. The answer
-for a code is kept in `device_passkey_offer/…` too, so repeating the request for
-one code costs nothing
-(`a_did_with_no_passkey_is_scanned_once_per_window`,
+and the scan only when none answers. The caller claims the scan before running it,
+with one atomic `SET webauthn:no_passkey/{sha256(did)} scanning NX EX`, so of any
+number of concurrent requests exactly one scans. A request that loses the claim reads
+the marker: `1` means no passkey, and `scanning` means the server cannot tell yet, so
+the page keeps the passkey button and nothing is kept for the code. The scan that
+finds nothing replaces the marker with `1` for ten minutes; one that finds a passkey,
+or fails, deletes it (the back-filled index answers next, or a later request tries
+again), and a claim abandoned by a dropped request expires after 30 seconds. At most
+one scan per DID per window, then, concurrent callers included. A passkey registered
+or linked inside the window lands in the index, which is read before the marker, so
+the marker never hides it. The login picker and every other caller keep
+`get_passkeys_for_did` as before. The answer for a code is kept in
+`device_passkey_offer/…` too, so repeating the request for a settled code asks
+neither the homeserver nor the credential store again
+(`concurrent_checks_of_one_did_run_exactly_one_scan`,
+`a_did_with_no_passkey_is_scanned_once_per_window`,
 `the_passkey_answer_for_a_code_is_computed_once`).
 
 **Optional shared credential store.** Setting `AQUA_WEBAUTHN_REDIS_URL` makes

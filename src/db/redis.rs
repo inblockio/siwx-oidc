@@ -464,6 +464,28 @@ impl RedisClient {
         Ok(())
     }
 
+    /// Store a key-value pair with a TTL only if `key` does not exist: one atomic
+    /// `SET key value NX EX ttl` (the expiry is part of the same command, so the claim
+    /// cannot outlive its TTL). Returns `false`, having written nothing, when the key
+    /// already existed, so exactly one of any number of concurrent callers gets `true`.
+    pub async fn set_nx_ex_raw(&self, key: &str, value: &str, ttl_secs: u64) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+        let set: Option<String> = bb8_redis::redis::cmd("SET")
+            .arg(key)
+            .arg(value)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_secs)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("Redis SET NX EX: {}", e))?;
+        Ok(set.is_some())
+    }
+
     /// Store a key-value pair with no TTL (persistent).
     pub async fn set_raw(&self, key: &str, value: &str) -> Result<()> {
         let mut conn = self

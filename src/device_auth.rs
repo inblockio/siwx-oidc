@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::introspect::generate_opaque_token;
 use crate::oidc::CustomError;
 use crate::synapse_client::SynapseClient;
+use siwx_oidc::credential_store::{did_has_credential_bounded, PasskeyCheck};
 use siwx_oidc::db::tokens::digest;
 use siwx_oidc::db::*;
 use siwx_oidc::redact::fingerprint;
@@ -698,7 +699,7 @@ function renderExpectedAccount(info) {
     const name = document.createElement('strong');
     name.textContent = info.expected_account;
     el.appendChild(name);
-    el.appendChild(document.createTextNode('. Sign in with that account.'));
+    el.appendChild(document.createTextNode('. Sign in with that account. Approve only if you started this on your own device.'));
     el.classList.remove('hidden');
   } else {
     el.classList.add('hidden');
@@ -1163,7 +1164,7 @@ async fn expected_account_passkey_offer(
         Some(did) if resolved.attested => did,
         _ => return Some(PasskeyOffer::Offered),
     };
-    match siwx_oidc::credential_store::did_has_credential_bounded(
+    match did_has_credential_bounded(
         redis,
         &did,
         crate::webauthn::derive_did_from_credential_json,
@@ -1171,9 +1172,11 @@ async fn expected_account_passkey_offer(
     )
     .await
     {
-        Ok(true) => Some(PasskeyOffer::Offered),
-        Ok(false) => Some(PasskeyOffer::NoPasskey),
-        Err(_) => None,
+        Ok(PasskeyCheck::Found) => Some(PasskeyOffer::Offered),
+        Ok(PasskeyCheck::Absent) => Some(PasskeyOffer::NoPasskey),
+        // Another request is scanning for this account, or the scan failed: the button
+        // stays and nothing is kept for the code.
+        Ok(PasskeyCheck::Unknown) | Err(_) => None,
     }
 }
 
@@ -1699,6 +1702,82 @@ mod tests {
         assert!(db.get_raw(&key).await.unwrap().is_none());
     }
 
+    /// A hinted account whose passkey scan is running in another request cannot be
+    /// told yet: the button stays and nothing is kept for the code, so the next look-up
+    /// asks again; once the scan has answered "none", the same look-up says so and keeps
+    /// the answer. Needs Redis.
+    #[tokio::test]
+    async fn a_look_up_during_another_requests_scan_keeps_the_button_and_stores_nothing() {
+        use crate::localpart::resolve_identity_tests::spawn_mock_synapse_with_did_fields;
+        use std::collections::{HashMap, HashSet};
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let did = format!("did:key:zScanningHint{}", uuid::Uuid::new_v4().simple());
+        let localpart = siwx_oidc::mxid::localpart_for(&did);
+        let mxid = format!("@{localpart}:example.org");
+        let (synapse, handle) = spawn_mock_synapse_with_did_fields(
+            HashSet::from([localpart]),
+            HashMap::from([(
+                mxid.clone(),
+                serde_json::json!({ "did": did, "proof": "eyJhbGciOiJFUzI1NiJ9.e30.sig" }),
+            )]),
+        )
+        .await;
+        let marker_key = format!("{}/{}", KV_WEBAUTHN_NO_PASSKEY_PREFIX, digest(&did));
+        let client_id = device_client(&db).await;
+        let issued = device_authorization(
+            &hint_config(),
+            &db,
+            DeviceAuthRequest {
+                client_id,
+                scope: None,
+                login_hint: Some(format!("mxid:{mxid}")),
+            },
+        )
+        .await
+        .unwrap();
+        let (_, entry) = db
+            .get_device_code_by_user_code(&issued.user_code)
+            .await
+            .unwrap()
+            .unwrap();
+        let offer_key = format!(
+            "{}/{}",
+            KV_DEVICE_PASSKEY_OFFER_PREFIX, entry.user_code_digest
+        );
+
+        // Another request is scanning for this account.
+        db.set_ex_raw(&marker_key, "scanning", 30).await.unwrap();
+        let during = device_lookup(&db, Some(&synapse), Some("example.org"), &issued.user_code)
+            .await
+            .unwrap();
+        assert_eq!(during.expected_account.as_deref(), Some(mxid.as_str()));
+        assert!(
+            during.passkey_offered && !during.account_missing,
+            "cannot tell yet: the passkey button stays"
+        );
+        assert!(
+            db.get_raw(&offer_key).await.unwrap().is_none(),
+            "an answer the server could not give is not kept for the code"
+        );
+
+        // The scan finished and found nothing.
+        db.set_ex_raw(&marker_key, "1", 60).await.unwrap();
+        let after = device_lookup(&db, Some(&synapse), Some("example.org"), &issued.user_code)
+            .await
+            .unwrap();
+        assert!(!after.passkey_offered && !after.account_missing);
+        assert_eq!(
+            db.get_raw(&offer_key).await.unwrap().as_deref(),
+            Some("no_passkey")
+        );
+
+        db.del_raw(&marker_key).await.unwrap();
+        db.del_raw(&offer_key).await.unwrap();
+        handle.abort();
+    }
+
     async fn device_client(db: &RedisClient) -> String {
         use openidconnect::RedirectUrl;
         let client_id = format!("device-hint-{}", uuid::Uuid::new_v4().simple());
@@ -1872,6 +1951,8 @@ mod tests {
         assert!(html.contains("renderExpectedAccount(info)"));
         assert!(html.contains("info.account_missing === true"));
         assert!(html.contains("name.textContent = info.expected_account"));
+        // A link that names a victim looks more trustworthy, so the page says who may approve.
+        assert!(html.contains("Approve only if you started this on your own device."));
     }
 
     /// The device page carries the operator's legal links and no others, and

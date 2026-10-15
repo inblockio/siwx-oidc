@@ -1060,15 +1060,25 @@ doc; read it before changing the code the rule covers.
   decision, with the expected account given by the requester. It only hides a button; the
   approval is checked against the account either way, and when the server cannot tell the button
   stays.
-- **The device page's passkey answer is cheap to repeat.** `GET /device/verify` is
-  unauthenticated and the account is the requester's input, so `device_lookup` computes the answer
-  once per code (`device_passkey_offer/{user code digest}`, never a field of the device code
-  entry, which an approval rewrites) and reads the DID's passkeys through
-  `credential_store::did_has_credential_bounded`, which never repeats the
-  `KEYS webauthn:link/*` and `KEYS webauthn:credential/*` scan for a DID with no passkey inside
-  ten minutes (`webauthn:no_passkey/{sha256(did)}`, read after the `by_did` index). Other callers
-  of `get_passkeys_for_did` are unchanged. Pin: `a_did_with_no_passkey_is_scanned_once_per_window`,
-  `a_did_with_a_passkey_plants_no_marker`, `the_passkey_answer_for_a_code_is_computed_once`,
+- **The device page's passkey scan is bounded, concurrent callers included.** `GET
+  /device/verify` is unauthenticated and the account is the requester's input, so `device_lookup`
+  computes the answer once per code (`device_passkey_offer/{user code digest}`, never a field of
+  the device code entry, which an approval rewrites) and reads the DID's passkeys through
+  `credential_store::did_has_credential_bounded`: at most one `KEYS webauthn:link/*` and
+  `KEYS webauthn:credential/*` scan per DID per ten minutes, however many requests arrive at once.
+  The caller claims the scan BEFORE running it, with one atomic `SET webauthn:no_passkey/{sha256(did)}
+  scanning NX EX` (read after the `by_did` index); never read first and write the marker after the
+  scan, which lets every concurrent caller scan. A caller that loses the claim answers from the
+  marker: `1` is no passkey, `scanning` is `PasskeyCheck::Unknown`, which `device_lookup` answers
+  as "the button stays, nothing kept for the code". The winner replaces the marker with `1` when
+  the scan finds none, deletes it when the scan finds a passkey (the back-filled index answers
+  next) or fails (a later call retries), and a claim abandoned by a dropped request expires in
+  30 s. Other callers of `get_passkeys_for_did` are unchanged. Pin:
+  `concurrent_checks_of_one_did_run_exactly_one_scan`,
+  `a_scan_in_progress_is_cannot_tell_and_scans_nothing`,
+  `a_look_up_during_another_requests_scan_keeps_the_button_and_stores_nothing`,
+  `a_did_with_no_passkey_is_scanned_once_per_window`, `a_did_with_a_passkey_plants_no_marker`,
+  `the_passkey_answer_for_a_code_is_computed_once`,
   `a_passkey_answer_the_server_cannot_give_is_not_kept`.
 - **A link overrides the derived DID**, for every reader (`credential_identity`); the credential
   store mirror never writes `webauthn:link/*`. Pin: `a_link_still_overrides_the_derived_did`,

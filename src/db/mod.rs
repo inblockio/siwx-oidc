@@ -114,11 +114,13 @@ pub const SESSION_COOKIE_NAME: &str = "session";
 /// missing/stale index, so the index never becomes load-bearing for correctness.
 pub const KV_WEBAUTHN_BY_DID_PREFIX: &str = "webauthn:by_did";
 
-/// Redis key prefix for the short-lived "no passkey" marker the device approval page
-/// reads: `webauthn:no_passkey/{sha256(did)}` -> `1`, planted for
-/// [`WEBAUTHN_NO_PASSKEY_TTL_SECS`] when a full credential scan found no passkey for the
-/// DID. While it lives, that page skips the scan for the DID. Nothing else reads it, and a
-/// passkey registered or linked afterwards lands in `webauthn:by_did`, which is read first.
+/// Redis key prefix for the short-lived scan marker the device approval page reads and
+/// writes: `webauthn:no_passkey/{sha256(did)}` -> `scanning` while one request runs the
+/// full credential scan for the DID (claimed atomically before the scan, so concurrent
+/// requests do not each scan), then `1` for [`WEBAUTHN_NO_PASSKEY_TTL_SECS`] when the scan
+/// found no passkey. While `1` lives, that page skips the scan for the DID. Nothing else
+/// reads it, and a passkey registered or linked afterwards lands in `webauthn:by_did`,
+/// which is read first.
 pub const KV_WEBAUTHN_NO_PASSKEY_PREFIX: &str = "webauthn:no_passkey";
 
 /// How long the "no passkey" marker lives (seconds): the longest a credential scan
