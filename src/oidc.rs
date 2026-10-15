@@ -1517,6 +1517,47 @@ async fn token_device_code(
                     }
                 }
             }
+            // SS4 flag 2 (8.1): a deleted device id is refused as at `sign_in`, as the
+            // token endpoint's `invalid_scope`, and the code is denied, so the verification
+            // page no longer reads approved and the next poll gets `access_denied`, never a
+            // token. Only reads before this point, so a failed check consumes nothing.
+            if let (true, Some(proposed)) = (
+                config.refuse_deleted_device_ids,
+                proposed_device_id.as_deref(),
+            ) {
+                match device_id_was_deleted(db_client, &did, proposed).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        warn!(
+                            security_event = "deleted_device_refused",
+                            channel = "device_code",
+                            client_id = %client_id,
+                            device_fp = %siwx_oidc::redact::fingerprint(proposed),
+                            "device_code grant: refused a deleted device id"
+                        );
+                        entry.status = DeviceCodeStatus::Denied;
+                        if let Err(e) = db_client
+                            .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
+                            .await
+                        {
+                            // The code stays approved, and every later poll is refused
+                            // here again while the marker lives: still never a token.
+                            warn!(error = %e, "device_code grant: could not deny the refused code");
+                        }
+                        return Err(device_code_error(
+                            "invalid_scope",
+                            DELETED_DEVICE_REFUSED_MSG,
+                        ));
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "device_code grant: deleted device check failed");
+                        return Err(device_code_error(
+                            "server_error",
+                            "The device could not be checked. Try again.",
+                        ));
+                    }
+                }
+            }
             // Atomically claim this approved device_code BEFORE issuing any token
             // (S3-1 / H9). Without this, two concurrent polls both pass the
             // `status == Approved` check and each mint a token pair (+ a phantom
@@ -3228,6 +3269,57 @@ const GENERIC_OPENID_REQUIRED_MSG: &str = "This client must request the openid s
 const PRE_CLAIM_DEVICE_REFUSED_MSG: &str =
     "The requested device id cannot be used for this account. Choose another device.";
 
+/// What `sign_in` (as an `invalid_scope` redirect to the bound redirect_uri) and the
+/// device-code grant (as its `invalid_scope` JSON error) tell a Matrix-class client whose
+/// scope proposes a device id siwx-oidc deleted while SS4 flag 2 was on (8.1).
+pub(crate) const DELETED_DEVICE_REFUSED_MSG: &str = "The requested device id was signed out \
+     and cannot be used again. Sign in with a new device id.";
+
+/// SS4 flag 2 (8.12): whether `device_id` carries a deleted-id marker for the account of
+/// `did`. Both localparts a DID can hold are asked (the legacy and the modern one; a
+/// guest's is the modern one), so no homeserver probe is needed and the check can run
+/// before the deactivation gate. Two `EXISTS`; a Redis error is an error (fail closed).
+async fn device_id_was_deleted(
+    db_client: &DBClientType,
+    did: &str,
+    device_id: &str,
+) -> Result<bool> {
+    let legacy = siwx_oidc::mxid::legacy_localpart(did);
+    if db_client.is_deleted_device(&legacy, device_id).await? {
+        return Ok(true);
+    }
+    let modern = siwx_oidc::mxid::localpart_for(did);
+    Ok(modern != legacy && db_client.is_deleted_device(&modern, device_id).await?)
+}
+
+/// A `sign_in` refusal as the authorization error response (RFC 6749 4.1.2.1): a 303 to
+/// the redirect_uri `/authorize` bound, never an issuer page, carrying `error`,
+/// `error_description` and the bound `state`, in the fragment when the request asked for
+/// `response_mode=fragment` (as the success redirect does). No `iss`: the `/authorize`
+/// error redirects add none. Used under SS4 flag 2 only.
+fn sign_in_refusal_redirect(
+    redirect_uri: &RedirectUrl,
+    request: &AuthorizationRequest,
+    error: CoreAuthErrorResponseType,
+    description: &str,
+) -> CustomError {
+    let mut url = redirect_uri.url().clone();
+    if request.response_mode.as_deref() == Some("fragment") {
+        let fragment = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("error", error.as_ref())
+            .append_pair("error_description", description)
+            .append_pair("state", &request.state)
+            .finish();
+        url.set_fragment(Some(&fragment));
+    } else {
+        url.query_pairs_mut()
+            .append_pair("error", error.as_ref())
+            .append_pair("error_description", description)
+            .append_pair("state", &request.state);
+    }
+    CustomError::Redirect(url.to_string())
+}
+
 /// The 503 a generic-class sign-in answers when the homeserver cannot confirm the account.
 const GENERIC_IDENTITY_UNAVAILABLE_MSG: &str = "Sign-in is temporarily unavailable \
      because the homeserver could not confirm this account. Please try again shortly.";
@@ -3433,6 +3525,10 @@ pub async fn sign_in(
     // The charset rule (`device_id_is_valid`) is enforced here too, as a 400, though
     // `/authorize` already refused such a scope: a request bound before this check existed
     // must not slip a comma-bearing id past the list lookup below.
+    // SS4 flag 2 (`guest_config` is the whole configuration; `None` only in tests): the
+    // refusals below go back to the client as the authorization error response at the
+    // bound redirect_uri (8.1, 8.11) instead of an issuer page with no exit.
+    let refuse_deleted_ids = guest_config.is_some_and(|c| c.refuse_deleted_device_ids);
     let proposed_device_id = bound_device_id(request.scope.as_deref())?;
     if let Some(proposed) = proposed_device_id.clone() {
         if db_client
@@ -3440,8 +3536,45 @@ pub async fn sign_in(
             .await?
         {
             warn!(did = %did, "sign_in: refused a pre-claim device id (GP-CLM-26)");
+            if refuse_deleted_ids {
+                return Err(sign_in_refusal_redirect(
+                    &redirect_uri,
+                    &request,
+                    CoreAuthErrorResponseType::InvalidScope,
+                    PRE_CLAIM_DEVICE_REFUSED_MSG,
+                ));
+            }
             return Err(CustomError::BadRequest(
                 PRE_CLAIM_DEVICE_REFUSED_MSG.to_string(),
+            ));
+        }
+    }
+
+    // SS4 flag 2 (8.1, 8.12): a device id siwx-oidc deleted while the flag was on is never
+    // recreated (Synapse keeps a deleted device's cross-signing signature rows, which
+    // shadow a fresh key upload under the same id). Placed with GP-CLM-26 and for the
+    // same reasons: after the DID is proven, BEFORE the deactivation gate and every
+    // Synapse call, so a refusal provisions nothing, issues no code and arms no
+    // cross-signing reset; the login session is already spent. Matrix-class clients
+    // only (a generic client's token holds no device). A Redis error fails closed.
+    if let (true, Some(proposed)) = (refuse_deleted_ids, proposed_device_id.as_deref()) {
+        let matrix_class = db_client
+            .get_client(request.client_id.clone())
+            .await?
+            .is_some_and(|c| c.class == ClientClass::Matrix);
+        if matrix_class && device_id_was_deleted(db_client, &did, proposed).await? {
+            warn!(
+                security_event = "deleted_device_refused",
+                channel = "sign_in",
+                client_id = %request.client_id,
+                device_fp = %siwx_oidc::redact::fingerprint(proposed),
+                "sign_in: refused a deleted device id"
+            );
+            return Err(sign_in_refusal_redirect(
+                &redirect_uri,
+                &request,
+                CoreAuthErrorResponseType::InvalidScope,
+                DELETED_DEVICE_REFUSED_MSG,
             ));
         }
     }
@@ -7220,6 +7353,29 @@ mod sign_in_deactivation_order_tests {
         F: FnOnce(RedisClient) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        sign_in_with(hs, did, scope, SignInSetup::default(), plant).await
+    }
+
+    /// What [`sign_in_with`] varies beyond [`sign_in_as`]: the bound `response_mode`, the
+    /// client's class, and the configuration `sign_in` reads (SS4 flag 2).
+    #[derive(Default)]
+    struct SignInSetup {
+        response_mode: Option<String>,
+        generic: bool,
+        config: Option<crate::config::Config>,
+    }
+
+    async fn sign_in_with<F, Fut>(
+        hs: Homeserver,
+        did: &str,
+        scope: Option<&str>,
+        setup: SignInSetup,
+        plant: F,
+    ) -> Option<(Result<(Url, String), CustomError>, Vec<String>)>
+    where
+        F: FnOnce(RedisClient) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let hs = Arc::new(hs);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -7245,19 +7401,19 @@ mod sign_in_deactivation_order_tests {
         plant(db.clone()).await;
         let nonce = Uuid::new_v4().simple().to_string();
         let client_id = format!("deactivation-order-{nonce}");
-        db.set_client(
-            client_id.clone(),
-            ClientEntry::new(
-                "secret",
-                SiwxClientMetadata::new(
-                    vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
-                    LogoutClientMetadata::default(),
-                ),
-                None,
+        let mut client = ClientEntry::new(
+            "secret",
+            SiwxClientMetadata::new(
+                vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
+                LogoutClientMetadata::default(),
             ),
-        )
-        .await
-        .unwrap();
+            None,
+        );
+        if setup.generic {
+            client.class = ClientClass::Generic;
+            client.allowed_scopes = Some(vec!["openid".to_string()]);
+        }
+        db.set_client(client_id.clone(), client).await.unwrap();
         // The passkey path: the ceremony already verified the DID and stored it
         // in the session, so `sign_in` needs no CAIP-122 cookie.
         let session_id = format!("deactivation-order-{nonce}");
@@ -7270,6 +7426,7 @@ mod sign_in_deactivation_order_tests {
                 verified_did: Some(did.to_string()),
                 request: Some(AuthorizationRequest {
                     scope: scope.map(str::to_string),
+                    response_mode: setup.response_mode.clone(),
                     ..bound_test_request(&client_id)
                 }),
                 guest_id: None,
@@ -7293,7 +7450,7 @@ mod sign_in_deactivation_order_tests {
             Some(&synapse),
             Some(SERVER_NAME),
             None,
-            None,
+            setup.config.as_ref(),
         )
         .await;
         server.abort();
@@ -7458,6 +7615,251 @@ mod sign_in_deactivation_order_tests {
         assert!(
             result.is_ok(),
             "an account with no guest record may propose any id, got {result:?}"
+        );
+    }
+
+    // ---- SS4 WP5: a deleted device id is refused at sign_in (flag 2, 8.1) ----
+
+    const DELETED: &str = "DELETEDDEV1";
+
+    fn flag2(on: bool) -> SignInSetup {
+        SignInSetup {
+            config: Some(crate::config::Config {
+                refuse_deleted_device_ids: on,
+                ..crate::config::Config::default()
+            }),
+            ..SignInSetup::default()
+        }
+    }
+
+    /// The marker as a delete under flag 2 leaves it, under the localpart `sign_in`
+    /// provisions for `did` on a homeserver where no account exists yet (the modern one).
+    async fn plant_deleted_marker(db: &RedisClient, did: &str) {
+        db.plant_deleted_device_marker(&localpart_for(did), DELETED, 60)
+            .await
+            .unwrap();
+    }
+
+    /// The query (or, with `fragment`, the fragment) of a refusal redirect.
+    fn refusal_params(
+        result: &Result<(Url, String), CustomError>,
+        fragment: bool,
+    ) -> HashMap<String, String> {
+        let Err(CustomError::Redirect(location)) = result else {
+            panic!("the refusal must be a redirect to the client, got {result:?}");
+        };
+        let url = Url::parse(location).unwrap();
+        assert_eq!(
+            format!("{}{}", url.origin().ascii_serialization(), url.path()),
+            REDIRECT,
+            "the refusal goes to the bound redirect_uri, never an issuer page"
+        );
+        let raw = if fragment {
+            assert!(url.query().is_none(), "fragment mode: nothing in the query");
+            url.fragment().unwrap_or_default().to_string()
+        } else {
+            assert!(url.fragment().is_none(), "query mode: no fragment");
+            url.query().unwrap_or_default().to_string()
+        };
+        url::form_urlencoded::parse(raw.as_bytes())
+            .into_owned()
+            .collect()
+    }
+
+    fn is_deleted_device_refusal(result: &Result<(Url, String), CustomError>) -> bool {
+        matches!(result, Err(CustomError::Redirect(l)) if l.contains("invalid_scope"))
+    }
+
+    #[tokio::test]
+    async fn sign_in_refuses_deleted_device_id_redirect_invalid_scope_with_state() {
+        let did = fresh_did();
+        let scope = scope_with(DELETED);
+        let Some((result, log)) = sign_in_with(
+            Homeserver::default(),
+            &did,
+            Some(&scope),
+            flag2(true),
+            |db| {
+                let did = did.clone();
+                async move { plant_deleted_marker(&db, &did).await }
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        let q = refusal_params(&result, false);
+        assert_eq!(q.get("error").map(String::as_str), Some("invalid_scope"));
+        assert_eq!(
+            q.get("error_description").map(String::as_str),
+            Some(DELETED_DEVICE_REFUSED_MSG)
+        );
+        assert_eq!(
+            q.get("state").map(String::as_str),
+            Some("state"),
+            "state echoed"
+        );
+        assert!(!q.contains_key("code"), "no code, so no grant");
+        assert!(
+            !q.contains_key("iss"),
+            "no iss: the authorize error redirects add none"
+        );
+        // No Synapse call at all: no upsert, no cross-signing reset arm, and the refusal
+        // precedes the deactivation gate.
+        assert!(log.is_empty(), "no homeserver call: {log:?}");
+    }
+
+    #[tokio::test]
+    async fn sign_in_deleted_device_flag2_off_recreates_as_today() {
+        let did = fresh_did();
+        let scope = scope_with(DELETED);
+        let Some((result, log)) = sign_in_with(
+            Homeserver::default(),
+            &did,
+            Some(&scope),
+            flag2(false),
+            |db| {
+                let did = did.clone();
+                async move { plant_deleted_marker(&db, &did).await }
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        let (url, _) = result.expect("flag 2 off: the deleted id signs in as today");
+        assert!(url.query().unwrap_or_default().contains("code="));
+        assert!(
+            log.iter().any(|l| l.ends_with("/upsert_device")),
+            "flag 2 off: the device is provisioned (recreated): {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refusal_honours_response_mode_fragment() {
+        let did = fresh_did();
+        let scope = scope_with(DELETED);
+        let setup = SignInSetup {
+            response_mode: Some("fragment".to_string()),
+            ..flag2(true)
+        };
+        let Some((result, _)) =
+            sign_in_with(Homeserver::default(), &did, Some(&scope), setup, |db| {
+                let did = did.clone();
+                async move { plant_deleted_marker(&db, &did).await }
+            })
+            .await
+        else {
+            return;
+        };
+        let f = refusal_params(&result, true);
+        assert_eq!(f.get("error").map(String::as_str), Some("invalid_scope"));
+        assert_eq!(f.get("state").map(String::as_str), Some("state"));
+    }
+
+    #[tokio::test]
+    async fn refusal_applies_to_matrix_class_clients_only() {
+        let did = fresh_did();
+        let scope = scope_with(DELETED);
+        let setup = SignInSetup {
+            generic: true,
+            ..flag2(true)
+        };
+        let Some((result, _)) =
+            sign_in_with(Homeserver::default(), &did, Some(&scope), setup, |db| {
+                let did = did.clone();
+                async move { plant_deleted_marker(&db, &did).await }
+            })
+            .await
+        else {
+            return;
+        };
+        assert!(
+            !is_deleted_device_refusal(&result),
+            "a generic-class client holds no Matrix device: not refused, got {result:?}"
+        );
+        // And a Matrix-class client proposing a fresh id is not refused either.
+        let did = fresh_did();
+        let fresh = scope_with("FRESHDEV99");
+        let Some((result, _)) = sign_in_with(
+            Homeserver::default(),
+            &did,
+            Some(&fresh),
+            flag2(true),
+            |db| {
+                let did = did.clone();
+                async move { plant_deleted_marker(&db, &did).await }
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(result.is_ok(), "a fresh id signs in, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn guest_preclaim_device_refusal_redirects_flag2_on() {
+        let did = fresh_did();
+        let scope = scope_with(PRE_CLAIM);
+        let Some((result, log)) = sign_in_with(
+            Homeserver::default(),
+            &did,
+            Some(&scope),
+            flag2(true),
+            |db| {
+                let did = did.clone();
+                async move { plant_claimed_record(&db, &did).await }
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        let q = refusal_params(&result, false);
+        assert_eq!(q.get("error").map(String::as_str), Some("invalid_scope"));
+        assert_eq!(
+            q.get("error_description").map(String::as_str),
+            Some(PRE_CLAIM_DEVICE_REFUSED_MSG)
+        );
+        assert_eq!(q.get("state").map(String::as_str), Some("state"));
+        assert!(log.is_empty(), "no homeserver call: {log:?}");
+    }
+
+    #[tokio::test]
+    async fn refusal_logs_hashed_device_id_only() {
+        let did = fresh_did();
+        let scope = scope_with(DELETED);
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let Some((result, _)) = sign_in_with(
+            Homeserver::default(),
+            &did,
+            Some(&scope),
+            flag2(true),
+            |db| {
+                let did = did.clone();
+                async move { plant_deleted_marker(&db, &did).await }
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        let output = logs.output();
+        assert!(is_deleted_device_refusal(&result), "{result:?}");
+        let lines: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains("deleted_device_refused"))
+            .collect();
+        assert_eq!(lines.len(), 1, "one security event line: {output}");
+        assert!(
+            lines[0].contains(&siwx_oidc::redact::fingerprint(DELETED)),
+            "the line names the device by its hash: {}",
+            lines[0]
+        );
+        assert!(
+            !output.contains(DELETED),
+            "the device id never appears in clear: {output}"
         );
     }
 }
@@ -12975,6 +13377,16 @@ mod generic_client_tests {
         device: &str,
         device_code: &str,
     ) -> Result<SiwxTokenResponse, CustomError> {
+        redeem_device_code_with(db, did, device, device_code, &delegated()).await
+    }
+
+    async fn redeem_device_code_with(
+        db: &RedisClient,
+        did: &str,
+        device: &str,
+        device_code: &str,
+        config: &Config,
+    ) -> Result<SiwxTokenResponse, CustomError> {
         let client_id = store_client(db, matrix_client()).await;
         let device_code = device_code.to_string();
         let mut entry = DeviceCodeEntry::new(
@@ -13000,7 +13412,7 @@ mod generic_client_tests {
             },
             ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
-            &delegated(),
+            config,
             db,
             None,
         )
@@ -13045,5 +13457,111 @@ mod generic_client_tests {
                 .await
                 .unwrap_or_else(|e| panic!("{device} must pass: {e:?}"));
         }
+    }
+
+    // ---- SS4 WP5: a deleted device id is refused at the token poll (flag 2, 8.1) ----
+
+    fn delegated_flag2() -> Config {
+        Config {
+            refuse_deleted_device_ids: true,
+            ..delegated()
+        }
+    }
+
+    /// An approved device code whose scope proposes a deleted id, polled once with flag 2.
+    async fn poll_deleted_device(
+        db: &RedisClient,
+    ) -> (String, Result<SiwxTokenResponse, CustomError>) {
+        let did = format!("did:key:zDnSs4wp5dc{}", Uuid::new_v4().simple());
+        db.plant_deleted_device_marker(&localpart_for(&did), "DELETEDDEV1", 60)
+            .await
+            .unwrap();
+        let code = format!("dvc_ss4-{}", nonce());
+        let first =
+            redeem_device_code_with(db, &did, "DELETEDDEV1", &code, &delegated_flag2()).await;
+        (code, first)
+    }
+
+    #[tokio::test]
+    async fn device_code_poll_refused_400_invalid_scope_and_code_denied() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (code, first) = poll_deleted_device(&db).await;
+        match first {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error.as_ref(), "invalid_scope");
+                assert_eq!(e.error_description, DELETED_DEVICE_REFUSED_MSG);
+            }
+            other => panic!(
+                "a deleted device id must be refused with invalid_scope, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        let (_, entry) = db
+            .get_device_code(&code)
+            .await
+            .unwrap()
+            .expect("the code is kept as denied until the client reads the denial");
+        assert!(
+            matches!(entry.status, DeviceCodeStatus::Denied),
+            "the refused code is denied, never left approved: {:?}",
+            entry.status
+        );
+    }
+
+    #[tokio::test]
+    async fn device_code_poll_after_refusal_is_access_denied() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (code, first) = poll_deleted_device(&db).await;
+        assert!(first.is_err());
+        // The next poll (past the interval) gets access_denied, never a token.
+        let (dref, mut entry) = db.get_device_code(&code).await.unwrap().unwrap();
+        entry.last_poll = None;
+        db.update_device_code(&dref, &entry, DEVICE_CODE_LIFETIME)
+            .await
+            .unwrap();
+        let second = token(
+            TokenForm {
+                code: None,
+                client_id: Some(entry.client_id.clone()),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(code.clone()),
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &delegated_flag2(),
+            &db,
+            None,
+        )
+        .await;
+        match second {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error.as_ref(), "access_denied")
+            }
+            other => panic!(
+                "the second poll must be access_denied, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn device_code_deleted_id_flag2_off_is_redeemed_as_today() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let did = format!("did:key:zDnSs4wp5off{}", Uuid::new_v4().simple());
+        db.plant_deleted_device_marker(&localpart_for(&did), "DELETEDDEV1", 60)
+            .await
+            .unwrap();
+        redeem_device_code(&db, &did, "DELETEDDEV1")
+            .await
+            .unwrap_or_else(|e| panic!("flag 2 off: redeemed as today: {e:?}"));
     }
 }
