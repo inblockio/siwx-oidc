@@ -481,9 +481,11 @@ const STRICT_TEARDOWN_RETRY_MSG: &str =
 /// any failure (or a failed listing) is a 503 and the action does not run, so
 /// the retry starts again. Flag 1 off, flag 2 on (8.13): the listed devices are
 /// deleted best-effort first and each deleted one gets its deleted-id marker
-/// (Synapse would drop them with the account, unmarked); a failed listing or a
-/// marker that could not be written is the same 503. Both off: nothing (today's
-/// sequence).
+/// (Synapse would drop them with the account, unmarked) and then has its grants
+/// revoked, in flag 1's order (delete, marker, revoke), so no grant outlives its
+/// deleted, marked device if the Synapse deactivation then fails; a failed
+/// listing, a marker that could not be written or a failed revoke is the same
+/// 503. Both off: nothing (today's sequence).
 async fn strict_pre_teardown(
     synapse: &SynapseClient,
     db_client: &RedisClient,
@@ -501,7 +503,7 @@ async fn strict_pre_teardown(
         })?;
         let mut marked = true;
         for device in devices {
-            marked &= crate::compat::best_effort_delete_device(
+            match crate::compat::best_effort_delete_device(
                 db_client,
                 synapse,
                 server,
@@ -510,7 +512,20 @@ async fn strict_pre_teardown(
                 ctx,
             )
             .await
-            .is_ok();
+            {
+                Ok(true) => {
+                    if let Err(e) = db_client
+                        .revoke_device_tokens(localpart, &device.device_id)
+                        .await
+                    {
+                        warn!(error = %e, ctx, device = %siwx_oidc::redact::fingerprint(&device.device_id),
+                            "revoke failed after the delete and the marker; retryable");
+                        marked = false;
+                    }
+                }
+                Ok(false) => {}
+                Err(_) => marked = false,
+            }
         }
         return if marked {
             Ok(())

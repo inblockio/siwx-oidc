@@ -246,6 +246,7 @@ pub(crate) async fn plant_deleted_marker(
 /// the marker; a marker that could not be written is
 /// [`StrictFault::Marker`], so the caller revokes nothing and answers the
 /// retryable 503 (card default: like a transient fault; the retry is idempotent).
+/// `Ok(true)` when the device is gone and marked (flag 2 on, a 2xx or 404).
 pub(crate) async fn best_effort_delete_device(
     redis: &RedisClient,
     synapse: &SynapseClient,
@@ -253,7 +254,7 @@ pub(crate) async fn best_effort_delete_device(
     username: &str,
     device_id: &str,
     ctx: &str,
-) -> Result<(), StrictFault> {
+) -> Result<bool, StrictFault> {
     if synapse.deleted_marker_ttl().is_none() {
         if let Err(e) = synapse
             .delete_device(username, device_id, server_name)
@@ -262,7 +263,7 @@ pub(crate) async fn best_effort_delete_device(
             warn!(error = %e, ctx, username = %username, device_id = %device_id,
                 "Synapse delete_device failed (best-effort)");
         }
-        return Ok(());
+        return Ok(false);
     }
     let device = siwx_oidc::redact::fingerprint(device_id);
     match synapse
@@ -272,6 +273,7 @@ pub(crate) async fn best_effort_delete_device(
         DeviceDelete::Deleted | DeviceDelete::NotFound => {
             plant_deleted_marker(redis, synapse, username, device_id)
                 .await
+                .map(|()| true)
                 .map_err(|e| {
                     warn!(error = %e, ctx, device = %device, "deleted-id marker not written; nothing revoked, retryable");
                     StrictFault::Marker
@@ -279,7 +281,7 @@ pub(crate) async fn best_effort_delete_device(
         }
         answer => {
             warn!(ctx, device = %device, ?answer, "Synapse delete_device failed (best-effort); no marker");
-            Ok(())
+            Ok(false)
         }
     }
 }

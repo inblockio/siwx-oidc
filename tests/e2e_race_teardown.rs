@@ -5407,3 +5407,46 @@ async fn authenticate_with_device_deleted_id_returns_device_refused() {
         again.expect("flag 1 or 2 off: the same id signs in again as today");
     }
 }
+
+/// SS4 audit #5: flag 2 on, flag 1 off. Deactivate and erase delete and mark every
+/// listed device before Synapse is asked; when the Synapse deactivation then fails, no
+/// token of a deleted, marked device stays active (each device's grants are revoked
+/// right after its marker, flag 1's order). Skips unless the stack runs flag 2 alone.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn flag2_only_failed_deactivation_leaves_no_live_grant_on_a_marked_device() {
+    if !flag2_on() || flag1_on() {
+        eprintln!("SKIP: needs a stack with SS4 flag 2 on and flag 1 off");
+        return;
+    }
+    let base = oidc();
+    let c = Client::new();
+    for action in ["org.matrix.account_deactivate", "io.inblock.account_erase"] {
+        mock_reset(&c).await;
+        let w = new_wallet();
+        let login = wallet_login(&c, &base, &w).await;
+        assert!(
+            token_active(&c, &login.access_token).await,
+            "{action}: before"
+        );
+        let (cookie, csrf, _) = account_reauth(&c, &base, &w, "org.matrix.devices_list").await;
+        mock_fail(&c, "deactivate", "500").await;
+        let status = account_action(&c, &base, &cookie, action, None, &csrf)
+            .await
+            .status();
+        mock_fail(&c, "deactivate", "off").await;
+        assert!(
+            !status.is_success(),
+            "{action}: the deactivation failed: {status}"
+        );
+        let state = mock_state(&c).await;
+        assert!(
+            !device_ids(&state, &w.mxid).contains(&login.device_id),
+            "{action}: the device was deleted before Synapse was asked"
+        );
+        assert!(
+            !token_active(&c, &login.access_token).await,
+            "{action}: no live grant on the deleted, marked device"
+        );
+    }
+}
