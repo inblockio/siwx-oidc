@@ -1043,8 +1043,9 @@ Rules:
   account already signed in on the device that shows the QR code. The server
   name is everything after the first colon that follows the localpart (a port
   included) and must equal `matrix_server_name` exactly; a value that is not
-  this form, or names another homeserver, is refused with `invalid_request`
-  and no code. An empty value counts as absent. Only the form is checked at
+  this form, names another homeserver, or has an uppercase letter in the
+  localpart (every localpart here is lowercase), is refused with
+  `invalid_request` and no code. An empty value counts as absent. Only the form is checked at
   this point, never whether the account exists. For such a code:
   - the approval page shows "This request is for @localpart:server_name";
   - both approval routes (`POST /device`, `/device/passkey/finish`) resolve the
@@ -1060,7 +1061,10 @@ Rules:
   - the page offers the passkey sign-in only when the account may have a stored
     passkey (derived from or linked to the DID that `GET /resolve?mxid=`
     answers); otherwise it says to sign in with the wallet, and that a passkey
-    can be linked after a wallet sign-in on the login page. This tells anyone
+    can be linked after a wallet sign-in on the login page; an account that does
+    not exist or is deactivated gets a plain "no active account was found" note
+    instead. The answer is kept per code and the credential scan behind it is
+    bounded per account (see [passkeys.md](passkeys.md)). This tells anyone
     who mints a hinted code whether that account has such a passkey; the
     account name itself is the requester's input, and its DID is already public
     through `/resolve`. The named account never scopes the passkey picker,

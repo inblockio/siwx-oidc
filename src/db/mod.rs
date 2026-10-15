@@ -114,6 +114,23 @@ pub const SESSION_COOKIE_NAME: &str = "session";
 /// missing/stale index, so the index never becomes load-bearing for correctness.
 pub const KV_WEBAUTHN_BY_DID_PREFIX: &str = "webauthn:by_did";
 
+/// Redis key prefix for the short-lived "no passkey" marker the device approval page
+/// reads: `webauthn:no_passkey/{sha256(did)}` -> `1`, planted for
+/// [`WEBAUTHN_NO_PASSKEY_TTL_SECS`] when a full credential scan found no passkey for the
+/// DID. While it lives, that page skips the scan for the DID. Nothing else reads it, and a
+/// passkey registered or linked afterwards lands in `webauthn:by_did`, which is read first.
+pub const KV_WEBAUTHN_NO_PASSKEY_PREFIX: &str = "webauthn:no_passkey";
+
+/// How long the "no passkey" marker lives (seconds): the longest a credential scan
+/// for one DID is repeated on behalf of the unauthenticated device page.
+pub const WEBAUTHN_NO_PASSKEY_TTL_SECS: u64 = 600;
+
+/// Redis key prefix for the device page's per-code answer:
+/// `device_passkey_offer/{sha256(user code)}` -> `offered`, `no_passkey` or `no_account`.
+/// A separate key, never a field of the `DeviceCodeEntry`: writing the answer back into the
+/// entry would race an approval and could undo it.
+pub const KV_DEVICE_PASSKEY_OFFER_PREFIX: &str = "device_passkey_offer";
+
 /// Redis key prefix for a stored passkey credential:
 /// `webauthn:credential/{cred_id_b64}` -> the raw serialized `webauthn_rs::Passkey`
 /// JSON. Written by `register_finish`/`link_finish` and rewritten on every login

@@ -793,8 +793,10 @@ paths:
                     everything after the first colon that follows the localpart (it
                     may carry a port) and must equal this deployment's homeserver
                     server name exactly. An empty value is treated as absent (RFC
-                    6749 §3.1). Only the form and the server are checked, never
-                    whether the account exists.
+                    6749 §3.1). A localpart with an uppercase letter is refused
+                    (every localpart here is lowercase). Only the form and the server
+                    are checked, never whether the account exists. In Matrix mode
+                    without a configured server name any hint is refused with 400.
                   example: "mxid:@alice:example.org"
       responses:
         "200":
@@ -809,8 +811,10 @@ paths:
             `{"error": "unauthorized_client", "error_description": …}` for a
             generic-class client; `{"error": "invalid_request",
             "error_description": …}` for a `login_hint` that is not
-            `mxid:@localpart:server_name` or names another homeserver (no code
-            is issued); a plain 400 for an unknown `client_id`.
+            `mxid:@localpart:server_name`, names another homeserver, has an
+            uppercase letter in the localpart, or arrives when no Matrix server
+            name is configured (no code is issued); a plain 400 for an unknown
+            `client_id`.
 
   /device:
     get:
@@ -825,7 +829,7 @@ paths:
       summary: Approve a device login with a wallet signature
       responses:
         "200": { description: Approval outcome. }
-        "400": { description: "Rejected — including a new identity, which may only be created at the login screen, and, for a code whose request named an account (`login_hint`), an identity that does not sign in as that account. The plain-text body names the expected account and the one signed in; the code stays pending." }
+        "400": { description: "Rejected: including a new identity, which may only be created at the login screen, and, for a code whose request named an account (`login_hint`), an identity that does not sign in as that account. The plain-text body names the expected account and the one signed in; the code stays pending." }
         "503": { description: "The account checks could not run (the homeserver could not be asked). Nothing was approved." }
 
   /device/verify:
@@ -841,7 +845,10 @@ paths:
         /resolve?mxid=` answers) has no stored passkey, derived or linked; so for
         a hinted code it tells the caller whether that account has a passkey that
         can approve here. It is a display hint: the approval itself is checked
-        against the account either way.
+        against the account either way. The answer is computed once per code and
+        reused for up to a minute (a "none" answer) or the code's lifetime, and
+        the credential scan behind it runs at most once per account per ten
+        minutes, so repeating this request costs the server nothing extra.
       parameters: [{ name: user_code, in: query, required: true, schema: { type: string } }]
       responses:
         "200":
@@ -858,6 +865,9 @@ paths:
                   passkey_offered:
                     type: boolean
                     description: Whether the page offers the passkey sign-in; always `true` for a code that names no account.
+                  account_missing:
+                    type: boolean
+                    description: Present and `true` only when `passkey_offered` is `false` because the named account does not exist or is deactivated, so the page does not say it has no passkey.
         "400": { description: The code is unknown, expired or already used (plain text). }
 
   /device/nonce:
@@ -886,7 +896,7 @@ paths:
       summary: Finish passkey authentication and approve the device
       responses:
         "200": { description: Approved. }
-        "400": { description: "Rejected — a new identity cannot be created here; for a code whose request named an account, a passkey that does not sign in as that account (a linked passkey signs in as the identity it is linked to). The code stays pending." }
+        "400": { description: "Rejected: a new identity cannot be created here; for a code whose request named an account, a passkey that does not sign in as that account (a linked passkey signs in as the identity it is linked to). The code stays pending." }
         "401": { $ref: "#/components/responses/UnknownCredential" }
         "503": { description: "The account checks could not run. Nothing was approved." }
 

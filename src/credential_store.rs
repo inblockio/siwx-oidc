@@ -57,7 +57,10 @@ use tokio::sync::OnceCell;
 use tracing::{error, info, warn};
 
 use crate::credential_migration::sign_count_from_blob;
-use crate::db::{RedisClient, KV_WEBAUTHN_CREDENTIAL_PREFIX};
+use crate::db::{
+    RedisClient, KV_WEBAUTHN_BY_DID_PREFIX, KV_WEBAUTHN_CREDENTIAL_PREFIX,
+    KV_WEBAUTHN_NO_PASSKEY_PREFIX,
+};
 use crate::redact::{fingerprint, redact_url};
 
 /// The runtime flag. Set to a Redis URL to enable the shared store.
@@ -404,6 +407,59 @@ where
     Ok(ids)
 }
 
+/// Whether `did` has a stored passkey, for the unauthenticated device approval page,
+/// with the credential scan bounded.
+///
+/// [`list_credential_ids`] answers an index miss with `KEYS webauthn:link/*` and
+/// `KEYS webauthn:credential/*` plus a `GET` per credential, and a DID with no passkey
+/// is exactly an index miss every time. The device page is reachable by anyone who can
+/// mint a code, naming any account, so it must not run that scan per request. This
+/// reads, in order: the `webauthn:by_did` index, the aqua-auth store when it is on, then
+/// a `webauthn:no_passkey` marker, and scans only when none of them answers. A scan that
+/// finds nothing plants the marker for `negative_ttl_secs`, so one DID costs at most one
+/// scan per window. A passkey registered or linked inside the window lands in the index,
+/// which is read before the marker, so the marker never hides it. The login picker and
+/// every other caller keep [`list_credential_ids`] unchanged.
+pub async fn did_has_credential_bounded<F>(
+    redis: &RedisClient,
+    did: &str,
+    derive: F,
+    negative_ttl_secs: u64,
+) -> Result<bool>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let index_key = format!("{}/{}", KV_WEBAUTHN_BY_DID_PREFIX, did);
+    if !redis.smembers_raw(&index_key).await?.is_empty() {
+        return Ok(true);
+    }
+    if let Some(store) = shared_store().await {
+        match store.list_for_did(did).await {
+            Ok(rows) if !rows.is_empty() => return Ok(true),
+            Ok(_) => {}
+            Err(e) => {
+                warn!("did_has_credential_bounded: aqua-auth store failed ({e}); legacy only")
+            }
+        }
+    }
+    let marker_key = format!(
+        "{}/{}",
+        KV_WEBAUTHN_NO_PASSKEY_PREFIX,
+        crate::db::tokens::digest(did)
+    );
+    if redis.get_raw(&marker_key).await?.is_some() {
+        return Ok(false);
+    }
+    // The scan (and its back-fill of the index) is the picker's own.
+    if !redis.get_passkeys_for_did(did, derive).await?.is_empty() {
+        return Ok(true);
+    }
+    if let Err(e) = redis.set_ex_raw(&marker_key, "1", negative_ttl_secs).await {
+        warn!("did_has_credential_bounded: could not plant the no-passkey marker: {e}");
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,5 +497,108 @@ mod tests {
             Some("redis://127.0.0.1:6379"),
             "a URL means on, trimmed"
         );
+    }
+
+    /// The device page asks about a DID anyone can name, so a DID with no passkey is
+    /// scanned once per window and a later passkey is still seen at once. Needs Redis.
+    #[tokio::test]
+    async fn a_did_with_no_passkey_is_scanned_once_per_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(db) = crate::test_support::redis().await else {
+            return;
+        };
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let did = format!("did:key:zNoPasskey{nonce}");
+        // One stored credential, so every scan has something to look at: `derive` runs
+        // once per `webauthn:credential/*` key a scan reads.
+        let cred_key = format!("{}/probe-{nonce}", KV_WEBAUTHN_CREDENTIAL_PREFIX);
+        db.set_raw(&cred_key, "{}").await.unwrap();
+        let marker_key = format!(
+            "{}/{}",
+            KV_WEBAUTHN_NO_PASSKEY_PREFIX,
+            crate::db::tokens::digest(&did)
+        );
+        let index_key = format!("{}/{did}", KV_WEBAUTHN_BY_DID_PREFIX);
+
+        let scans = AtomicUsize::new(0);
+        let derive = |_: &str| {
+            scans.fetch_add(1, Ordering::SeqCst);
+            None
+        };
+        assert!(!did_has_credential_bounded(&db, &did, derive, 60)
+            .await
+            .unwrap());
+        assert!(
+            scans.load(Ordering::SeqCst) >= 1,
+            "the first check scans the credentials"
+        );
+        let ttl = db.ttl_raw(&marker_key).await.unwrap();
+        assert!(
+            (1..=60).contains(&ttl),
+            "a scan that found nothing plants the marker for the window: {ttl}"
+        );
+
+        let before = scans.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            assert!(!did_has_credential_bounded(&db, &did, derive, 60)
+                .await
+                .unwrap());
+        }
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            before,
+            "inside the window the credentials are not scanned again"
+        );
+
+        // A passkey registered inside the window lands in the index, read before the marker.
+        db.index_add_passkey(&did, &format!("probe-{nonce}"))
+            .await
+            .unwrap();
+        assert!(did_has_credential_bounded(&db, &did, derive, 60)
+            .await
+            .unwrap());
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            before,
+            "answered by the index"
+        );
+
+        // Without the marker the scan runs again (the window really is what bounds it).
+        db.del_raw(&index_key).await.unwrap();
+        db.del_raw(&marker_key).await.unwrap();
+        assert!(!did_has_credential_bounded(&db, &did, derive, 60)
+            .await
+            .unwrap());
+        assert!(scans.load(Ordering::SeqCst) > before);
+
+        db.del_raw(&cred_key).await.unwrap();
+        db.del_raw(&marker_key).await.unwrap();
+    }
+
+    /// A DID the scan finds a passkey for is answered `true` and plants no marker.
+    /// Needs Redis.
+    #[tokio::test]
+    async fn a_did_with_a_passkey_plants_no_marker() {
+        let Some(db) = crate::test_support::redis().await else {
+            return;
+        };
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let did = format!("did:key:zHasPasskey{nonce}");
+        let cred_key = format!("{}/has-{nonce}", KV_WEBAUTHN_CREDENTIAL_PREFIX);
+        db.set_raw(&cred_key, &did).await.unwrap();
+        let marker_key = format!(
+            "{}/{}",
+            KV_WEBAUTHN_NO_PASSKEY_PREFIX,
+            crate::db::tokens::digest(&did)
+        );
+        let derive = |raw: &str| (raw == did).then(|| did.clone());
+        assert!(did_has_credential_bounded(&db, &did, derive, 60)
+            .await
+            .unwrap());
+        assert!(db.get_raw(&marker_key).await.unwrap().is_none());
+        db.del_raw(&cred_key).await.unwrap();
+        db.del_raw(&format!("{}/{did}", KV_WEBAUTHN_BY_DID_PREFIX))
+            .await
+            .unwrap();
     }
 }

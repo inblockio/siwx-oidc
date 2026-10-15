@@ -941,8 +941,8 @@ async fn a_hinted_device_grant_is_refused_to_another_account() {
     assert_eq!(poll["error"], "authorization_pending", "no token: {poll}");
 }
 
-/// A `login_hint` that is malformed or names another homeserver is refused with
-/// `invalid_request` and no code; an empty one is no hint.
+/// A `login_hint` that is malformed, names another homeserver or has an uppercase
+/// localpart is refused with `invalid_request` and no code; an empty one is no hint.
 #[tokio::test]
 #[ignore = "requires a live siwx-oidc + Synapse stack (e.g. the e2eh hermetic stack)"]
 async fn a_malformed_or_foreign_login_hint_is_refused() {
@@ -954,6 +954,8 @@ async fn a_malformed_or_foreign_login_hint_is_refused() {
         "@alice:matrix.test",
         "mxid:alice",
         "mxid:@alice:elsewhere.example",
+        // Every localpart here is lowercase: an uppercase one can never be approved.
+        "mxid:@Alice:matrix.test",
     ] {
         let r = device_authorization_with_hint(&c, &base, &rc.client_id, Some(hint)).await;
         assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{hint} is refused");

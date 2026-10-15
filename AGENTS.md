@@ -50,7 +50,7 @@ everything else exists only in the binary crate.
 | `redact.rs` (lib) | `fingerprint`, `redact_key`, `redact_url`: what a log line may say about a credential. |
 | `alias.rs` (lib) | `alias_for(did)`: the generated `Firstname Surname` a new account is seeded with. |
 | `credential_identity.rs` (lib) | Which identity a stored passkey authenticates: a `webauthn:link/*` entry overrides the derived `did:key`. |
-| `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL`. |
+| `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL`; `did_has_credential_bounded`, the scan-bounded passkey check of the device page. |
 | `credential_migration.rs` (lib) | Additive backfill of passkey credentials into the aqua-auth store. |
 | `client_policy.rs` (lib) | Pure rules for generic-class clients: `grant_for` (the scopes a client is granted), `mailbox_claim` (what userinfo asks: every condition of the mailbox claim) and `mailbox_for` (the one place its value is built), `validate_mail_domain`, `validate_static_client`, and `parse_static_clients`, which start-up runs on `default_clients` before anything is written, and `grant_end` (whether replacing or deleting a static client's stored entry ends its grants, and why). |
 | `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry` with the digests of its secret and registration access token, its `ClientClass` and scope policy, and `client_entry_without_plaintext`, `DeviceCodeEntry` and the `DeviceCodeRef` naming its layout, `TokenMetadata` with its `TokenKind` and the `GrantKind` of its grant, `grant_kind`, which only `AccessGrant::metadata` sets and which is never stored), `Ceremony`, `OwnSession` (the `siwx_user` and `acct_session` layouts), `legacy_token_kind`, Redis key prefixes and TTLs. |
@@ -333,9 +333,13 @@ doc; read it before changing the code the rule covers.
   `resolve_identity`, refuses another account and an identity with no account, and leaves the
   code pending; the device-code grant refuses a localpart that differs at redemption. The hint
   only narrows: it never scopes the passkey picker (see "Passkeys") and never decides by DID
-  method. Pin: `a_hinted_code_is_approved_only_by_the_account_it_names`,
+  method. A hint with an uppercase letter in the localpart is refused at
+  `/device_authorization` (every localpart here is lowercase, so it could never be approved).
+  Pin: `a_hinted_code_is_approved_only_by_the_account_it_names`,
   `a_code_without_a_hint_is_approved_by_any_account_as_before`,
-  `a_login_hint_must_name_an_account_on_this_homeserver`, and on the wire
+  `a_login_hint_must_name_an_account_on_this_homeserver`,
+  `a_login_hint_with_an_uppercase_localpart_is_refused`, the redemption check
+  `a_hinted_device_code_is_not_redeemed_for_another_account`, and on the wire
   `a_hinted_device_grant_is_refused_to_another_account`.
 - **Standalone deployments degrade, never 500.** No Synapse client means the gates are no-ops.
 - **A generic-class sign-in never guesses a localpart.** It resolves with the fallible
@@ -1027,7 +1031,10 @@ doc; read it before changing the code the rule covers.
 
 - **Enumeration safety.** The picker is scoped only by the opaque `siwx_user` token; a forged,
   guessed or expired token is a Redis miss and yields usernameless login with zero credential
-  ids. Never accept a client-supplied DID or identifier as the scope. Pin:
+  ids. Never accept a client-supplied DID or identifier as the scope. Accepted and documented:
+  anyone who mints a hinted device code learns, from `GET /device/verify`, whether that account
+  has a passkey (and whether it exists, which `GET /resolve?mxid=` already says); the hint
+  itself never scopes a picker. Pin:
   `forged_user_cookie_yields_usernameless_empty_allow_credentials`,
   `a_did_shaped_forged_user_cookie_yields_usernameless_empty_allow_credentials`,
   `user_session_create_lookup_roundtrip_and_forged_miss`.
@@ -1048,6 +1055,21 @@ doc; read it before changing the code the rule covers.
   `a_credential_id_held_only_by_the_shared_store_is_refused` (runs itself in a child process
   with the flag on), `an_already_registered_credential_id_renders_400_with_a_fixed_body`.
 - **No server-side method prediction.** The login page does not grey out a method from a server hint.
+  One exception: the `/device` page for a code that names its account (`login_hint`) hides the
+  passkey button when that account has no passkey (`passkey_offered`), the product owner's
+  decision, with the expected account given by the requester. It only hides a button; the
+  approval is checked against the account either way, and when the server cannot tell the button
+  stays.
+- **The device page's passkey answer is cheap to repeat.** `GET /device/verify` is
+  unauthenticated and the account is the requester's input, so `device_lookup` computes the answer
+  once per code (`device_passkey_offer/{user code digest}`, never a field of the device code
+  entry, which an approval rewrites) and reads the DID's passkeys through
+  `credential_store::did_has_credential_bounded`, which never repeats the
+  `KEYS webauthn:link/*` and `KEYS webauthn:credential/*` scan for a DID with no passkey inside
+  ten minutes (`webauthn:no_passkey/{sha256(did)}`, read after the `by_did` index). Other callers
+  of `get_passkeys_for_did` are unchanged. Pin: `a_did_with_no_passkey_is_scanned_once_per_window`,
+  `a_did_with_a_passkey_plants_no_marker`, `the_passkey_answer_for_a_code_is_computed_once`,
+  `a_passkey_answer_the_server_cannot_give_is_not_kept`.
 - **A link overrides the derived DID**, for every reader (`credential_identity`); the credential
   store mirror never writes `webauthn:link/*`. Pin: `a_link_still_overrides_the_derived_did`,
   `mirroring_never_writes_the_link_namespace`.

@@ -115,9 +115,11 @@ rather than as a new `did:key`:
 | `webauthn:link/{cred_id_b64}` | none | `{primary_did, label}` for a linked passkey |
 | `webauthn:link_ceremony/{sha256(session id)}` | 120 s | link ceremony state and the wallet DID |
 | `webauthn:by_did/{did}` | none | set of credential IDs that resolve to the DID |
+| `webauthn:no_passkey/{sha256(did)}` | 600 s | the device page's "no passkey found" marker: bounds its credential scan to one per DID per window (see below) |
 | `siwx_user/{sha256(token)}` | 30 days | opaque login user session: token → DID (indexed under `idx:own_sessions/…`; a legacy `user:session/{token}` is read until it expires) |
 | `device_code/{sha256(device code)}` | 1800 s | device-code grant state (with the user code's digest) |
 | `user_code/{sha256(user code)}` | 1800 s | user code → the device code's digest |
+| `device_passkey_offer/{sha256(user code)}` | 1800 s (60 s for a "none" answer) | the device page's answer for a hinted code: `offered`, `no_passkey` or `no_account` |
 
 Ceremony, device and user codes are keyed by their digest so the store never holds a value a
 client presents; entries a build before digest keys wrote under `webauthn:challenge/`,
@@ -135,6 +137,20 @@ credential keyspace and fills it back in
 (`get_passkeys_for_did_scan_fallback_equals_index`), so a missed update costs a
 scan and never hides a passkey. A failed index update never fails the
 registration.
+
+**The device page's scan is bounded.** `GET /device/verify` is unauthenticated and,
+for a code that names an account (`login_hint`), asks whether that account has a
+passkey, which for a DID with none is an index miss and so the full scan above. It
+therefore goes through `credential_store::did_has_credential_bounded`: the
+`by_did` index first, then the shared store, then the `webauthn:no_passkey` marker,
+and the scan only when none answers; a scan that finds nothing plants the marker
+for ten minutes. A passkey registered or linked inside the window lands in the
+index, which is read before the marker, so the marker never hides it. The login
+picker and every other caller keep `get_passkeys_for_did` as before. The answer
+for a code is kept in `device_passkey_offer/…` too, so repeating the request for
+one code costs nothing
+(`a_did_with_no_passkey_is_scanned_once_per_window`,
+`the_passkey_answer_for_a_code_is_computed_once`).
 
 **Optional shared credential store.** Setting `AQUA_WEBAUTHN_REDIS_URL` makes
 siwx-oidc also write credentials to aqua-auth's credential store at that Redis
