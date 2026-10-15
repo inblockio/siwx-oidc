@@ -335,6 +335,20 @@ async fn wallet_login_scoped(
     rc: RegisteredClient,
     scope: &str,
 ) -> LoginResult {
+    wallet_login_or_refusal(c, base, w, rc, scope)
+        .await
+        .unwrap_or_else(|q| panic!("sign_in redirect must carry code, got {q:?}"))
+}
+
+/// [`wallet_login_scoped`], answering a `sign_in` refusal redirect (one that carries
+/// `error`) with its query parameters instead of a login.
+async fn wallet_login_or_refusal(
+    c: &Client,
+    base: &str,
+    w: &Wallet,
+    rc: RegisteredClient,
+    scope: &str,
+) -> Result<LoginResult, HashMap<String, String>> {
     let (verifier, challenge) = pkce_pair();
     let state = "race_state";
     let nrc = no_redirect_client();
@@ -416,17 +430,21 @@ async fn wallet_login_scoped(
         .await
         .unwrap();
     assert_eq!(sign_in_resp.status(), StatusCode::SEE_OTHER, "sign_in 303");
-    let code = parse_query(
+    let redirect = parse_query(
         sign_in_resp
             .headers()
             .get("location")
             .unwrap()
             .to_str()
             .unwrap(),
-    )
-    .get("code")
-    .expect("sign_in redirect must carry code")
-    .clone();
+    );
+    if redirect.contains_key("error") {
+        return Err(redirect);
+    }
+    let code = redirect
+        .get("code")
+        .expect("sign_in redirect must carry code")
+        .clone();
 
     let token: Value = exchange_code(c, base, &rc, &code, &verifier)
         .await
@@ -438,13 +456,13 @@ async fn wallet_login_scoped(
         .as_str()
         .unwrap()
         .to_string();
-    LoginResult {
+    Ok(LoginResult {
         access_token,
         refresh_token,
         device_id,
         client_id: rc.client_id.clone(),
         id_token,
-    }
+    })
 }
 
 /// One-shot wallet login that stops at the auth CODE (for code-double-spend
@@ -645,6 +663,10 @@ async fn mock_state(c: &Client) -> Value {
 /// the suite is told by the same variable (the mock-stack job sets neither).
 fn flag1_on() -> bool {
     std::env::var("SIWXOIDC_REVOKE_DELETES_DEVICE").is_ok_and(|v| v == "true" || v == "1")
+}
+/// SS4 flag 2 (`SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`) as the stack under test runs it.
+fn flag2_on() -> bool {
+    std::env::var("SIWXOIDC_REFUSE_DELETED_DEVICE_IDS").is_ok_and(|v| v == "true" || v == "1")
 }
 /// Whether any SS4 flag is on for the stack under test.
 fn any_ss4_flag_on() -> bool {
@@ -5116,12 +5138,19 @@ async fn ss4_all_flags_off_is_inert() {
 /// Two client shapes: one that proposes a fresh device id per sign-in, and one
 /// that proposes its stable device id again (Element Web and X keep one per
 /// install; Element X's re-login reuses the session's device id).
+///
+/// Flag 1 alone recreates the stable id (the WEDGE assertion below), which is
+/// why siwx-oidc refuses to start with flag 1 on and flag 2 off. With flags 1
+/// and 2, the stable id is refused after its first escape (`invalid_scope`
+/// redirect with the state, the id not recreated), and the client's retry
+/// with a fresh id is confirmable.
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn h4b_replay_forced_recovery_escapes_each_revoke_no_wedge() {
     let c = Client::new();
     let base = oidc();
     let flag1 = flag1_on();
+    let flag2 = flag2_on();
     mock_reset(&c).await;
     let w = new_wallet();
     let n = std::time::SystemTime::now()
@@ -5131,14 +5160,39 @@ async fn h4b_replay_forced_recovery_escapes_each_revoke_no_wedge() {
 
     for shape in ["fresh", "stable"] {
         let mut escaped: Vec<String> = Vec::new();
+        let mut refused = 0;
         for escape in 0..4 {
             let device = match shape {
                 "fresh" => format!("H4BFRESH{escape}X{n}"),
                 _ => format!("H4BSTABLE{n}"),
             };
             let scope = format!("openid urn:matrix:client:api:* urn:matrix:client:device:{device}");
-            let login =
-                wallet_login_scoped(&c, &base, &w, register_client(&c, &base).await, &scope).await;
+            let attempt =
+                wallet_login_or_refusal(&c, &base, &w, register_client(&c, &base).await, &scope)
+                    .await;
+            let login = match attempt {
+                Ok(login) => login,
+                Err(q) => {
+                    // Flags 1 and 2: the escaped stable id is refused, never recreated.
+                    assert!(
+                        flag1 && flag2 && shape == "stable" && escape > 0,
+                        "[{shape} #{escape}] unexpected sign_in refusal: {q:?}"
+                    );
+                    assert_eq!(q.get("error").map(String::as_str), Some("invalid_scope"));
+                    assert_eq!(q.get("state").map(String::as_str), Some("race_state"));
+                    assert!(
+                        !device_ids(&mock_state(&c).await, &w.mxid).contains(&device),
+                        "[{shape} #{escape}] the refused id is not recreated"
+                    );
+                    refused += 1;
+                    // The client's retry: a fresh id, which must be confirmable (no wedge).
+                    let retry = format!(
+                        "openid urn:matrix:client:api:* urn:matrix:client:device:H4BRETRY{escape}X{n}"
+                    );
+                    wallet_login_scoped(&c, &base, &w, register_client(&c, &base).await, &retry)
+                        .await
+                }
+            };
             // The device can be confirmed.
             let state = mock_state(&c).await;
             assert!(
@@ -5193,6 +5247,11 @@ async fn h4b_replay_forced_recovery_escapes_each_revoke_no_wedge() {
             escaped.sort();
             escaped.dedup();
             assert_eq!(escaped.len(), 4, "each escape's sign-in got its own device");
+        } else if flag1 && flag2 {
+            assert_eq!(
+                refused, 3,
+                "each escape after the first refuses the stable id"
+            );
         }
     }
 }
