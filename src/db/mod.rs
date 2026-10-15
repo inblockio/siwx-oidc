@@ -934,6 +934,11 @@ pub trait DBClient {
     /// [`try_consume_code`](Self::try_consume_code) receives a code. A claim a
     /// build before digest keys left (`device_codes/{raw}/redeemed`) counts too.
     async fn try_claim_device_code(&self, device_code: &str) -> Result<bool>;
+    /// Undo [`try_claim_device_code`](Self::try_claim_device_code) for a poll that issued
+    /// nothing (SS4 flag 2, 8.27: the homeserver could not provision the device), so a
+    /// later poll can redeem the still-approved code. Deletes only the digest-keyed claim,
+    /// the one a claim writes.
+    async fn release_device_code_claim(&self, device_code: &str) -> Result<()>;
 
     // -- Legacy token entries (`token/{raw}`) -----------------------------------
     //

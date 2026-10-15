@@ -1597,7 +1597,7 @@ async fn token_device_code(
             // Same DID publication as the wallet/passkey login path: the QR
             // flow provisions a real session for a real identity, so it must
             // publish (and re-assert) the same attested field. Both call sites
-            // route through `provision_synapse_device`, which publishes through
+            // route through `provision_synapse_device_with`, which publishes through
             // `provision_synapse_account`, so there is no other place this could
             // be forgotten.
             let publication = DidPublication {
@@ -1611,7 +1611,12 @@ async fn token_device_code(
             // from a client-supplied one (maybe renamed by the user, so named
             // only when confirmed new). Without a Synapse client nothing is
             // provisioned and the id is minted here, for the token scope alone.
-            let dev_id = provision_synapse_device(
+            // SS4 flag 2 (8.27): no grant without a Synapse device, as at `sign_in`. A failed
+            // upsert answers `temporarily_unavailable` before the cross-signing reset window
+            // is armed and issues nothing; the claim is released, so the still-approved code
+            // is redeemed by a later poll once the homeserver is back (the code expires as
+            // usual otherwise). Flag 2 off keeps today's warning.
+            let dev_id = match provision_synapse_device_with(
                 &did,
                 &resolved,
                 synapse_client,
@@ -1619,9 +1624,24 @@ async fn token_device_code(
                 proposed_device_id.as_deref(),
                 config.matrix_server_name.as_deref(),
                 Some(&publication),
+                config.refuse_deleted_device_ids,
             )
             .await
-            .unwrap_or_else(|| resolve_device_id(proposed_device_id.as_deref()));
+            {
+                Ok(Some(dev_id)) => dev_id,
+                Ok(None) => resolve_device_id(proposed_device_id.as_deref()),
+                Err(()) => {
+                    if let Err(e) = db_client.release_device_code_claim(&dc).await {
+                        // The claim then lapses with the code: later polls read
+                        // `authorization_pending`, then `expired_token`. Never a token.
+                        warn!(error = %e, "device_code grant: could not release the claim");
+                    }
+                    return Err(device_code_error(
+                        "temporarily_unavailable",
+                        DEVICE_PROVISIONING_UNAVAILABLE_MSG,
+                    ));
+                }
+            };
 
             let now = Utc::now();
             let username = resolved.localpart;
@@ -3208,6 +3228,10 @@ pub async fn provision_synapse_account(
 /// ([`device_display_name`]). An existing device keeps its name: the device is
 /// upserted without one and named only when Synapse reports it created it (see
 /// the upsert below).
+///
+/// The non-strict form, kept for tests: both production call sites (`sign_in`, the
+/// device-code grant) call [`provision_synapse_device_with`] with SS4 flag 2's strictness.
+#[cfg(test)]
 pub async fn provision_synapse_device(
     did: &str,
     identity: &crate::localpart::ResolvedIdentity,
@@ -3315,9 +3339,10 @@ const PRE_CLAIM_DEVICE_REFUSED_MSG: &str =
 pub(crate) const DELETED_DEVICE_REFUSED_MSG: &str = "The requested device id was signed out \
      and cannot be used again. Sign in with a new device id.";
 
-/// What `sign_in` tells the client (as a `temporarily_unavailable` redirect, SS4 flag 2,
-/// 8.27) when the homeserver could not provision the session's device: no grant is issued
-/// without a Synapse device.
+/// What `sign_in` (as a `temporarily_unavailable` redirect) and the device-code grant (as
+/// its `temporarily_unavailable` JSON error) tell the client under SS4 flag 2 (8.27) when
+/// the homeserver could not provision the session's device: no grant is issued without a
+/// Synapse device.
 pub(crate) const DEVICE_PROVISIONING_UNAVAILABLE_MSG: &str = "Sign-in is temporarily \
      unavailable because the homeserver could not set up this device. Please try again shortly.";
 
@@ -13832,6 +13857,155 @@ mod generic_client_tests {
             .await
             .unwrap();
         redeem_device_code(&db, &did, "DELETEDDEV1")
+            .await
+            .unwrap_or_else(|e| panic!("flag 2 off: redeemed as today: {e:?}"));
+    }
+
+    // ---- SS4 audit fix #1: no device-code grant without a Synapse device (flag 2, 8.27) ----
+
+    /// A homeserver whose `upsert_device` answers 500 while `upsert_fails` is set; every
+    /// other call is an empty 200. Records the device ids it was asked to upsert.
+    #[derive(Default)]
+    struct UpsertHomeserver {
+        upsert_fails: std::sync::atomic::AtomicBool,
+        upserts: Mutex<Vec<String>>,
+    }
+
+    async fn upsert_homeserver_route(
+        State(hs): State<Arc<UpsertHomeserver>>,
+        uri: Uri,
+        body: String,
+    ) -> axum::response::Response {
+        if uri.path().ends_with("/upsert_device") {
+            hs.upserts.lock().unwrap().push(body);
+            if hs.upsert_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
+            }
+            return (StatusCode::CREATED, Json(serde_json::json!({}))).into_response();
+        }
+        (StatusCode::OK, Json(serde_json::json!({}))).into_response()
+    }
+
+    async fn upsert_homeserver() -> (Arc<UpsertHomeserver>, SynapseClient) {
+        let hs = Arc::new(UpsertHomeserver::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .fallback(upsert_homeserver_route)
+            .with_state(hs.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (hs, SynapseClient::new(&format!("http://{addr}"), "secret"))
+    }
+
+    /// Poll an approved device code once, as a client past its interval.
+    async fn poll_device_code_against(
+        db: &RedisClient,
+        code: &str,
+        config: &Config,
+        synapse: &SynapseClient,
+    ) -> Result<SiwxTokenResponse, CustomError> {
+        let (dref, mut entry) = db.get_device_code(code).await.unwrap().unwrap();
+        entry.last_poll = None;
+        db.update_device_code(&dref, &entry, DEVICE_CODE_LIFETIME)
+            .await
+            .unwrap();
+        token(
+            TokenForm {
+                code: None,
+                client_id: Some(entry.client_id.clone()),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(code.to_string()),
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            Some(synapse),
+        )
+        .await
+    }
+
+    /// An approved device code proposing `device`, stored for a fresh DID.
+    async fn approved_device_code(db: &RedisClient, device: &str) -> String {
+        let client_id = store_client(db, matrix_client()).await;
+        let code = format!("dvc_ss4fix1-{}", nonce());
+        let mut entry = DeviceCodeEntry::new(
+            &format!("F1-{}", nonce()),
+            client_id,
+            device_scope(device),
+            Utc::now().timestamp(),
+        );
+        entry.status = DeviceCodeStatus::Approved;
+        entry.did = Some(format!("did:key:zDnSs4fix1{}", Uuid::new_v4().simple()));
+        db.set_device_code(&code, &entry, DEVICE_CODE_LIFETIME)
+            .await
+            .unwrap();
+        code
+    }
+
+    /// Flag 2 on: a failed `upsert_device` answers the poll `temporarily_unavailable` and
+    /// issues no grant; the code is released, so the next poll (the homeserver back) gets
+    /// the token for the same device.
+    #[tokio::test]
+    async fn device_code_upsert_failure_flag2_on_is_temporarily_unavailable_no_grant() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (hs, synapse) = upsert_homeserver().await;
+        hs.upsert_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let code = approved_device_code(&db, "DEVICE_A").await;
+
+        match poll_device_code_against(&db, &code, &delegated_flag2(), &synapse).await {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error.as_ref(), "temporarily_unavailable");
+            }
+            Err(other) => panic!("expected temporarily_unavailable, got {other:?}"),
+            Ok(_) => panic!("no grant may be issued without a Synapse device"),
+        }
+        assert_eq!(hs.upserts.lock().unwrap().len(), 1, "the upsert was tried");
+        let (_, entry) = db
+            .get_device_code(&code)
+            .await
+            .unwrap()
+            .expect("the code is kept for a retry");
+        assert_eq!(entry.status, DeviceCodeStatus::Approved);
+
+        hs.upsert_fails
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let retried = poll_device_code_against(&db, &code, &delegated_flag2(), &synapse)
+            .await
+            .unwrap_or_else(|e| panic!("the released code is redeemed on retry: {e:?}"));
+        let scope = serde_json::to_value(&retried).unwrap()["scope"].clone();
+        assert!(
+            scope
+                .as_str()
+                .is_some_and(|s| s.contains("urn:matrix:client:device:DEVICE_A")),
+            "the retry is for the same device: {scope}"
+        );
+        assert_eq!(
+            hs.upserts.lock().unwrap().len(),
+            2,
+            "the retry upserted the device"
+        );
+    }
+
+    /// Flag 2 off: a failed upsert stays today's warning and the grant is issued.
+    #[tokio::test]
+    async fn device_code_upsert_failure_flag2_off_is_redeemed_as_today() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (hs, synapse) = upsert_homeserver().await;
+        hs.upsert_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let code = approved_device_code(&db, "DEVICE_A").await;
+        poll_device_code_against(&db, &code, &delegated(), &synapse)
             .await
             .unwrap_or_else(|e| panic!("flag 2 off: redeemed as today: {e:?}"));
     }

@@ -104,7 +104,9 @@ nondeterministic, so every admin request introspects.
   POST   /__set_secret            change the MAS shared secret (401s that surface)
   POST   /__reject_admin_token    make the ADMIN surface reject, MAS untouched
   POST   /__profile               force a profile row present / empty / absent
-  POST   /__fail                  arm a 500/timeout on a logical endpoint;
+  POST   /__fail                  arm a 500/timeout on a logical endpoint
+                                  (upsert_device among them: SS4 flag 2 issues no
+                                  grant without a device);
                                   delete_device also takes 404 / 403 and an
                                   optional device_id (one device of a bulk
                                   path), the answers the strict teardown of SS4
@@ -224,7 +226,8 @@ STATE = {"secret": SECRET, "reject_admin": False}
 # (a bulk path with one failing device):
 #   POST /__fail {"endpoint": "delete_device", "mode": "404"|"403"|"500", "device_id": "DEVICE_A"}
 # Recognized endpoints: delete_device, list_devices, deactivate, query_user,
-# publish_did_field, read_did_field. ("get_device" is gone as a fault target
+# publish_did_field, read_did_field, upsert_device (a device that cannot be
+# provisioned: under SS4 flag 2 no grant is issued without one, 8.27). ("get_device" is gone as a fault target
 # because `synapse_client::get_device` no longer has a route of its own: since
 # the 1.157 port it is `list_devices` plus a client-side filter, so fault it via
 # "list_devices".)
@@ -1041,6 +1044,8 @@ class Handler(BaseHTTPRequestHandler):
         # a name it wrongly sent to an existing device must show up here the way
         # it would on Synapse. This mock used to keep the old name, which hid it.
         if path == "/_synapse/mas/upsert_device":
+            if self._maybe_fail("upsert_device"):
+                return
             uid = _mxid(body["localpart"])
             with LOCK:
                 # Provisioning a device implies the user EXISTS — but it does

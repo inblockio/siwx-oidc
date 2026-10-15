@@ -1582,6 +1582,20 @@ impl DBClient for RedisClient {
         .map_err(|e| anyhow!("Failed to claim a device code: {}", e))
     }
 
+    async fn release_device_code_claim(&self, device_code: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+        conn.del::<_, ()>(format!(
+            "{}/redeemed",
+            device_code_key(&digest(device_code))
+        ))
+        .await
+        .map_err(|e| anyhow!("Failed to release a device code claim: {}", e))
+    }
+
     async fn set_token(&self, token: &str, metadata: &TokenMetadata, ttl: u64) -> Result<()> {
         // Every endpoint accepts exactly one kind of token, so an entry without a
         // kind would be classified by lifetime instead of by its writer.

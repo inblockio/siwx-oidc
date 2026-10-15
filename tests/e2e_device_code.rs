@@ -638,3 +638,122 @@ fn uuid_like() -> String {
     rand::thread_rng().fill_bytes(&mut b);
     hex::encode(b)
 }
+
+/// SS4 flag 2 (`SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`) as the stack under test runs it.
+fn flag2_on() -> bool {
+    std::env::var("SIWXOIDC_REFUSE_DELETED_DEVICE_IDS").is_ok_and(|v| v == "true" || v == "1")
+}
+
+/// Arm (`"500"`) or clear (`"off"`) the mock's `upsert_device` fault.
+async fn fail_upsert(c: &Client, mode: &str) {
+    let r = c
+        .post(format!("{}/__fail", matrix_host()))
+        .json(&json!({"endpoint": "upsert_device", "mode": mode}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "/__fail upsert_device {mode}");
+}
+
+/// The mock's device table, as JSON text (device ids are unique per test).
+async fn mock_devices(c: &Client) -> String {
+    let state: Value = c
+        .get(format!("{}/__state", matrix_host()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    state["devices"].to_string()
+}
+
+/// SS4 audit fix #1 (8.27): an approved device code polled while the homeserver cannot
+/// provision the device. Flag 2 on: `temporarily_unavailable`, no token, no device; the
+/// code stays redeemable, and the poll after the homeserver recovers gets the token and
+/// the device. Flag 2 off: today's behaviour, the token is issued without a device.
+#[tokio::test]
+#[ignore = "needs the mock stack (e2e/README.md)"]
+async fn device_code_upsert_failure_issues_no_grant_without_a_device() {
+    let base = oidc();
+    let c = Client::new();
+    let w = new_wallet();
+    seed_login(&c, &base, &w).await;
+
+    let rc = register_client(&c, &base).await;
+    let device_id = format!("DEVCODE_{}", uuid_like());
+    let scope = format!("openid urn:matrix:client:device:{device_id}");
+    let da: Value = c
+        .post(format!("{base}/device_authorization"))
+        .form(&[
+            ("client_id", rc.client_id.as_str()),
+            ("scope", scope.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let device_code = da["device_code"].as_str().unwrap().to_string();
+    let user_code = da["user_code"].as_str().unwrap().to_string();
+    let interval = da["interval"].as_u64().unwrap_or(5);
+    let (message, signature) = sign_device_message(&c, &w, &base, &user_code).await;
+    let approve = c
+        .post(format!("{base}/device"))
+        .json(&json!({
+            "user_code": user_code,
+            "action": "approve",
+            "did": w.did,
+            "message": message,
+            "signature": signature,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approve.status(), StatusCode::OK);
+
+    fail_upsert(&c, "500").await;
+    let first = c
+        .post(format!("{base}/token"))
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", device_code.as_str()),
+            ("client_id", rc.client_id.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let status = first.status();
+    let body: Value = first.json().await.unwrap_or(Value::Null);
+    fail_upsert(&c, "off").await;
+
+    if !flag2_on() {
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "flag 2 off: issued as today: {body}"
+        );
+        assert!(
+            !mock_devices(&c).await.contains(&device_id),
+            "flag 2 off: the token was issued without a device (today's N10)"
+        );
+        return;
+    }
+    assert_eq!(status, StatusCode::BAD_REQUEST, "error: {}", body["error"]);
+    assert_eq!(body["error"], "temporarily_unavailable", "{body}");
+    assert!(body.get("access_token").is_none(), "no token: {body}");
+    assert!(
+        !mock_devices(&c).await.contains(&device_id),
+        "no device was provisioned"
+    );
+
+    // The homeserver is back: the code was released, so the next poll redeems it.
+    tokio::time::sleep(Duration::from_secs(interval.max(1))).await;
+    let token = poll_device_token(&c, &base, &device_code, &rc.client_id, interval).await;
+    assert!(token["access_token"].as_str().is_some(), "{token}");
+    assert!(
+        mock_devices(&c).await.contains(&device_id),
+        "the retry provisioned the device"
+    );
+}
