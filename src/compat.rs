@@ -138,7 +138,8 @@ pub struct RefreshRequest {
 ///   token rotation and on dialog dismissals (Element's forced-recovery loop
 ///   revoked tokens on every escape). Deleting the device there destroyed devices
 ///   mid-flight and wedged accounts (2026-06-12 login incident, amplifier B). So
-///   revoke is [`TeardownPolicy::TokensOnly`].
+///   revoke is [`TeardownPolicy::TokensOnly`] (with flag 1 off; flag 1 changes
+///   this, below).
 /// - `POST /_matrix/client/v3/logout` is an explicit sign-out, so it is
 ///   [`TeardownPolicy::DeleteDevice`]. (The MSC4191 `device_delete` / `session_end`
 ///   actions in `account.rs` are the other explicit-intent path and delete there.)
@@ -157,8 +158,9 @@ pub struct RefreshRequest {
 /// the same device id again at its next sign-in (Element Web and X keep one per
 /// install): the id is recreated, the recycling Synapse cannot do cleanly (see
 /// the module doc). Only the refusal of a deleted id (flag 2) closes that, so
-/// flag 1 must not go on without flag 2
-/// (`e2e_race_teardown::h4b_replay_forced_recovery_escapes_each_revoke_no_wedge`).
+/// flag 1 requires flag 2: siwx-oidc refuses to start with flag 1 on and flag 2
+/// off (`Config::check_session_end_flags`;
+/// `e2e_race_teardown::h4b_replay_forced_recovery_escapes_each_revoke_no_wedge`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TeardownPolicy {
     /// Revoke the session's OAuth tokens only; leave the Synapse device intact.
