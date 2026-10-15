@@ -1953,13 +1953,24 @@ mod tests {
     /// A fresh login session for an existing record, as `/authorize` and a verified
     /// `/guest/continue` leave it. Returns the session id.
     async fn start_session(e: &Env, g: &Guest, handle: &str, device: &str) -> String {
+        start_session_as(CLIENT, e, g, handle, device).await
+    }
+
+    /// [`start_session`] through the guest client `client`.
+    async fn start_session_as(
+        client: &str,
+        e: &Env,
+        g: &Guest,
+        handle: &str,
+        device: &str,
+    ) -> String {
         let scope = format!(
             "openid urn:matrix:client:api:* urn:matrix:client:device:{device} urn:io.inblock:guest"
         );
         let (headers, _) = authorize(
             &e.config,
             &e.redis,
-            params(CLIENT, REDIRECT, &scope, json!({})),
+            params(client, REDIRECT, &scope, json!({})),
             &cookies(e, handle),
         )
         .await
@@ -2121,6 +2132,42 @@ mod tests {
                 .map(|s| s.contains("urn:io.inblock:guest")),
             Some(false)
         );
+    }
+
+    /// The device the hand-off creates is named after the guest client's `client_name`
+    /// (`guest_client_name`), or after the client id when none is configured or the name is
+    /// blank. Each case has a client id of its own: the client record is shared by every
+    /// test that runs against this Redis.
+    #[tokio::test]
+    async fn a_new_guest_device_is_named_by_guest_client_name_or_the_client_id() {
+        let cases = [
+            (
+                "meet-guest-named",
+                Some("Example Meet guest"),
+                "Example Meet guest",
+            ),
+            ("meet-guest-unnamed", None, "meet-guest-unnamed"),
+            ("meet-guest-blank", Some("   "), "meet-guest-blank"),
+        ];
+        for (client_id, configured, expected) in cases {
+            let Some((e, mock, synapse)) = guest_env(|c| {
+                c.guest_client_id = Some(client_id.into());
+                c.guest_client_name = configured.map(Into::into);
+            })
+            .await
+            else {
+                return;
+            };
+            let g = Guest::new();
+            let (_, handle) = record(&e, &g, "minted", 600).await;
+            let sid = start_session_as(client_id, &e, &g, &handle, "DEVICE0003").await;
+            sign_in_as(&e, &synapse, &sid).await.expect("sign in");
+            let bodies = mock.bodies("POST update_device_display_name");
+            assert_eq!(bodies.len(), 1, "{client_id}: the new device is named once");
+            let body: Value = serde_json::from_str(&bodies[0]).unwrap();
+            assert_eq!(body["display_name"], expected, "{client_id}");
+            assert_eq!(body["device_id"], "DEVICE0003", "{client_id}");
+        }
     }
 
     /// ST-43: a refused marker PUT (then a refused canonical-name PUT) leaves no device
@@ -2888,6 +2935,10 @@ mod tests {
             .map(|u| u.as_str())
             .collect();
         assert_eq!(uris, [REDIRECT]);
+        assert!(
+            entry.metadata.client_name().is_none(),
+            "no guest_client_name: the client has no client_name"
+        );
         let off = Config::default();
         assert!(crate::guest::guest_client_entry(&off).unwrap().is_none());
     }
