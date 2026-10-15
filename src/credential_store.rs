@@ -447,9 +447,12 @@ const SCAN_CLAIM_TTL_SECS: u64 = 30;
 /// `scanning` is [`PasskeyCheck::Unknown`]. The winner replaces the marker with `1` for
 /// `negative_ttl_secs` when the scan finds nothing (so one DID costs at most one scan per
 /// window), deletes it when the scan finds a passkey (the index the scan back-fills
-/// answers the next call), and deletes it when the scan fails, so a later call can try
-/// again. A passkey registered or linked inside the window lands in the index, which is
-/// read before the marker, so the marker never hides it. The login picker and every other
+/// answers the next call). A scan that fails, or that skipped a key whose read failed
+/// (as when the aqua-auth store failed), is [`PasskeyCheck::Unknown`] and keeps its claim
+/// until the claim expires, so a failing scan repeats at most once per claim lifetime
+/// per DID (a `KEYS` that timed out on the client still ran on the server). A passkey
+/// registered or linked inside the window lands in the index, which is read before the
+/// marker, so the marker hides it only if that best-effort index write failed. The login picker and every other
 /// caller keep [`list_credential_ids`] unchanged.
 pub async fn did_has_credential_bounded<F>(
     redis: &RedisClient,
@@ -464,12 +467,15 @@ where
     if !redis.smembers_raw(&index_key).await?.is_empty() {
         return Ok(PasskeyCheck::Found);
     }
+    // A failed read anywhere means "no passkey" cannot be said, only "cannot tell".
+    let mut store_failed = false;
     if let Some(store) = shared_store().await {
         match store.list_for_did(did).await {
             Ok(rows) if !rows.is_empty() => return Ok(PasskeyCheck::Found),
             Ok(_) => {}
             Err(e) => {
-                warn!("did_has_credential_bounded: aqua-auth store failed ({e}); legacy only")
+                warn!("did_has_credential_bounded: aqua-auth store failed ({e}); legacy only");
+                store_failed = true;
             }
         }
     }
@@ -493,11 +499,18 @@ where
             None => PasskeyCheck::Unknown,
         });
     }
-    // The scan (and its back-fill of the index) is the picker's own.
-    match redis.get_passkeys_for_did(did, derive).await {
-        Ok(found) if !found.is_empty() => {
+    // The scan (and its back-fill of the index) is the picker's own. A failure keeps the
+    // claim until it expires: releasing it would let the next request scan again at once
+    // (a KEYS that timed out on the client still ran on the server), so a failing scan
+    // repeats at most once per claim lifetime per DID.
+    match redis.get_passkeys_for_did_reporting(did, derive).await {
+        Ok((found, _)) if !found.is_empty() => {
             release_claim(redis, &marker_key).await;
             Ok(PasskeyCheck::Found)
+        }
+        Ok((_, complete)) if !complete || store_failed => {
+            warn!("did_has_credential_bounded: a read failed during the check; cannot tell");
+            Ok(PasskeyCheck::Unknown)
         }
         Ok(_) => {
             if let Err(e) = redis
@@ -505,13 +518,11 @@ where
                 .await
             {
                 warn!("did_has_credential_bounded: could not plant the no-passkey marker: {e}");
-                release_claim(redis, &marker_key).await;
             }
             Ok(PasskeyCheck::Absent)
         }
         Err(e) => {
             warn!("did_has_credential_bounded: the credential scan failed ({e})");
-            release_claim(redis, &marker_key).await;
             Ok(PasskeyCheck::Unknown)
         }
     }

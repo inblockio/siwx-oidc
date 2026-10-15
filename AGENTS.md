@@ -1071,9 +1071,10 @@ doc; read it before changing the code the rule covers.
   scan, which lets every concurrent caller scan. A caller that loses the claim answers from the
   marker: `1` is no passkey, `scanning` is `PasskeyCheck::Unknown`, which `device_lookup` answers
   as "the button stays, nothing kept for the code". The winner replaces the marker with `1` when
-  the scan finds none, deletes it when the scan finds a passkey (the back-filled index answers
-  next) or fails (a later call retries), and a claim abandoned by a dropped request expires in
-  30 s. Other callers of `get_passkeys_for_did` are unchanged. Pin:
+  the scan finds none and deletes it when the scan finds a passkey (the back-filled index answers
+  next). A scan that fails or skipped a failed read answers `Unknown` and keeps its claim until it
+  expires (30 s), as does a claim abandoned by a dropped request, so a failing scan repeats at most
+  once per 30 s per DID. Other callers of `get_passkeys_for_did` are unchanged. Pin:
   `concurrent_checks_of_one_did_run_exactly_one_scan`,
   `a_scan_in_progress_is_cannot_tell_and_scans_nothing`,
   `a_look_up_during_another_requests_scan_keeps_the_button_and_stores_nothing`,

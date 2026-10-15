@@ -851,7 +851,8 @@ paths:
         concurrent requests included: a request that arrives while another is
         scanning for the same account cannot be told yet, so it answers
         `passkey_offered: true` and keeps nothing for the code, and the next
-        request asks again.
+        request asks again. A scan that fails keeps its claim for 30 seconds, so
+        a failing scan repeats at most once per 30 seconds per account.
       parameters: [{ name: user_code, in: query, required: true, schema: { type: string } }]
       responses:
         "200":

@@ -148,12 +148,14 @@ with one atomic `SET webauthn:no_passkey/{sha256(did)} scanning NX EX`, so of an
 number of concurrent requests exactly one scans. A request that loses the claim reads
 the marker: `1` means no passkey, and `scanning` means the server cannot tell yet, so
 the page keeps the passkey button and nothing is kept for the code. The scan that
-finds nothing replaces the marker with `1` for ten minutes; one that finds a passkey,
-or fails, deletes it (the back-filled index answers next, or a later request tries
-again), and a claim abandoned by a dropped request expires after 30 seconds. At most
+finds nothing replaces the marker with `1` for ten minutes, and one that finds a
+passkey deletes it (the back-filled index answers next). A scan that fails, or skipped
+a key it could not read, cannot tell and keeps its claim until it expires after 30
+seconds, as does a claim abandoned by a dropped request, so a failing scan repeats at
+most once per 30 seconds per account. At most
 one scan per DID per window, then, concurrent callers included. A passkey registered
 or linked inside the window lands in the index, which is read before the marker, so
-the marker never hides it. The login picker and every other caller keep
+the marker hides it only if that best-effort index write failed. The login picker and every other caller keep
 `get_passkeys_for_did` as before. The answer for a code is kept in
 `device_passkey_offer/…` too, so repeating the request for a settled code asks
 neither the homeserver nor the credential store again

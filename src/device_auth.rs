@@ -323,7 +323,7 @@ pub fn device_page(query: DevicePageQuery, base_url: &str, legal_footer: &str) -
         </div>
 
         <p id="passkey-unavailable" class="account-note hidden">This account has no passkey that can approve here. Sign in with your wallet. To use a passkey next time, sign in with your wallet on the login page and choose Link a passkey.</p>
-        <p id="account-missing" class="account-note hidden">No active account was found for this request. Check the account on the other device, or sign in with your wallet.</p>
+        <p id="account-missing" class="account-note hidden">No active account was found for this request. Check the account on the other device and start again.</p>
 
         <button class="btn btn-secondary" id="btn-passkey" onclick="approvePasskey()">
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="btn-icon">
