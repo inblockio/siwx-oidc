@@ -441,6 +441,24 @@ pub struct Config {
 pub const MIN_GRANT_ABSOLUTE_LIFETIME_SECS: u64 = siwx_oidc::db::DEVICE_CODE_LIFETIME;
 
 impl Config {
+    /// SS4: the session-end flags must be switched on together where they
+    /// depend on each other, or the reason the combination is refused.
+    ///
+    /// Flag 1 without flag 2 is refused: strict teardown deletes the device,
+    /// but nothing stops a client that proposes the same device id again from
+    /// getting the deleted id recreated (H4b).
+    pub fn check_session_end_flags(&self) -> Result<(), String> {
+        if self.revoke_deletes_device && !self.refuse_deleted_device_ids {
+            return Err("SIWXOIDC_REVOKE_DELETES_DEVICE is on but \
+                 SIWXOIDC_REFUSE_DELETED_DEVICE_IDS is off: a client that proposes a \
+                 deleted device id again would get it recreated. Turn \
+                 SIWXOIDC_REFUSE_DELETED_DEVICE_IDS on as well, or \
+                 SIWXOIDC_REVOKE_DELETES_DEVICE off."
+                .to_string());
+        }
+        Ok(())
+    }
+
     /// The absolute-lifetime caps the grant store enforces (I6), or the
     /// reason the configured values are refused.
     pub fn grant_lifetime(&self) -> Result<siwx_oidc::db::grant::GrantLifetime, String> {
@@ -1069,6 +1087,27 @@ mod tests {
             assert!(figment().extract::<Config>()?.reuse_revokes_grant);
             Ok(())
         });
+    }
+
+    /// SS4: flag 1 alone recreates a deleted device id when a client proposes
+    /// it again (H4b), so flag 1 without flag 2 refuses to start.
+    #[test]
+    fn config_flag1_without_flag2_refuses_to_start() {
+        let flag1_alone = Config {
+            revoke_deletes_device: true,
+            ..Config::default()
+        };
+        let err = flag1_alone.check_session_end_flags().unwrap_err();
+        assert!(err.contains("SIWXOIDC_REVOKE_DELETES_DEVICE"), "{err}");
+        assert!(err.contains("SIWXOIDC_REFUSE_DELETED_DEVICE_IDS"), "{err}");
+        for (flag1, flag2) in [(false, false), (false, true), (true, true)] {
+            let c = Config {
+                revoke_deletes_device: flag1,
+                refuse_deleted_device_ids: flag2,
+                ..Config::default()
+            };
+            assert_eq!(c.check_session_end_flags(), Ok(()), "{flag1} {flag2}");
+        }
     }
 
     #[test]
