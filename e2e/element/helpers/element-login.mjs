@@ -68,10 +68,12 @@ export async function elementWalletClickLogin(page, wallet) {
   });
   const wizard = await completeSecureBackupWizard(page);
 
+  // Element Web keeps the access token in IndexedDB (pickle-key encrypted); localStorage holds it
+  // only when that write fails. Ask the running client, fall back to localStorage.
   const session = await page.evaluate(() => ({
     user_id: localStorage.getItem('mx_user_id'),
     device_id: localStorage.getItem('mx_device_id'),
-    access_token: localStorage.getItem('mx_access_token'),
+    access_token: window.mxMatrixClientPeg?.get()?.getAccessToken() ?? localStorage.getItem('mx_access_token'),
   }));
   if (!session.user_id || !session.device_id) {
     throw new Error('Element session storage missing: ' + JSON.stringify(session));
