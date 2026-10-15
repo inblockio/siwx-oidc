@@ -5255,3 +5255,68 @@ async fn h4b_replay_forced_recovery_escapes_each_revoke_no_wedge() {
         }
     }
 }
+
+/// SS4 WP7 (H5, 8.19): the headless client `siwx-oidc-auth` returns a refused
+/// device id as a typed error. An agent pins a device id with
+/// `authenticate_with_device`, its grant is revoked (flag 1: the device is
+/// deleted, flag 2: its id is marked), and the next sign-in with the same id is
+/// `AuthError::DeviceRefused`, which `is_device_refused` recognises, not the old
+/// "no 'code' in /sign_in redirect". A fresh id then signs in. With the flags
+/// off (or flag 2 alone, where a revoke deletes nothing), the same id signs in
+/// again as today.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn authenticate_with_device_deleted_id_returns_device_refused() {
+    use siwx_oidc_auth::{authenticate_with_device, is_device_refused, AuthError, SiwxKey};
+    // The Matrix-class static client of the mock stack (e2e/up.sh, ci.yml).
+    const CLIENT: &str = "e2estatic";
+    const REDIRECT_URI: &str = "http://localhost:0/callback";
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let key = SiwxKey::generate_ed25519();
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let device = format!("AGENTDEV{n}");
+
+    let first = authenticate_with_device(&base, CLIENT, REDIRECT_URI, &key, Some(&device))
+        .await
+        .expect("the first sign-in with a pinned id");
+    let revoked = c
+        .post(format!("{base}/oauth2/revoke"))
+        .form(&[
+            ("token", first.access_token.as_str()),
+            ("client_id", CLIENT),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK, "revocation is always 200");
+
+    let again = authenticate_with_device(&base, CLIENT, REDIRECT_URI, &key, Some(&device)).await;
+    if flag1_on() && flag2_on() {
+        let error = again.expect_err("flags 1 and 2: a deleted id is refused");
+        assert!(is_device_refused(&error), "typed refusal, got {error:#}");
+        assert!(
+            matches!(
+                error.downcast_ref::<AuthError>(),
+                Some(AuthError::DeviceRefused {
+                    description: Some(_)
+                })
+            ),
+            "{error:?}"
+        );
+        assert!(
+            !format!("{error:#}").contains("no 'code'"),
+            "not the old untyped message: {error:#}"
+        );
+        let fresh = format!("AGENTNEW{n}");
+        authenticate_with_device(&base, CLIENT, REDIRECT_URI, &key, Some(&fresh))
+            .await
+            .expect("a fresh id signs in after the refusal");
+    } else {
+        again.expect("flag 1 or 2 off: the same id signs in again as today");
+    }
+}

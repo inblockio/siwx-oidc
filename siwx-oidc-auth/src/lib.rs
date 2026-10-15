@@ -466,6 +466,108 @@ fn flow_client() -> Result<reqwest::Client> {
         .context("failed to build HTTP client")
 }
 
+/// A sign-in that siwx-oidc refused at `/sign_in` with the authorization error
+/// response: a 303 to the redirect URI whose query carries `error` and
+/// `error_description` instead of a code. siwx-oidc answers this way when
+/// `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` is on; otherwise its refusals are pages,
+/// reported as untyped errors.
+///
+/// The code-flow entry points return it inside their [`anyhow::Error`]: recover
+/// it with `err.downcast_ref::<AuthError>()`, or ask [`is_device_refused`] and
+/// [`is_transient`]. What each kind asks of the caller:
+///
+/// - [`AuthError::DeviceRefused`]: the proposed device id cannot be used again
+///   (it was signed out). Forget it, sign in with a new id; retrying the same id
+///   is refused again.
+/// - [`AuthError::AccessDenied`]: the account cannot sign in (deactivated or
+///   erased). Final: stop, and report it once.
+/// - [`AuthError::TemporarilyUnavailable`]: the homeserver could not be asked or
+///   could not set up the device. Transient: retry as after an outage.
+/// - [`AuthError::SignInRefused`]: any other `error` code, as the server sent it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AuthError {
+    /// `invalid_scope`: the device id the scope proposes is refused.
+    DeviceRefused { description: Option<String> },
+    /// `access_denied`: the account is deactivated or erased.
+    AccessDenied { description: Option<String> },
+    /// `temporarily_unavailable`: no grant was issued; try again later.
+    TemporarilyUnavailable { description: Option<String> },
+    /// Any other `error` code at `/sign_in`.
+    SignInRefused {
+        error: String,
+        description: Option<String>,
+    },
+}
+
+impl AuthError {
+    fn from_refusal(error: String, description: Option<String>) -> Self {
+        match error.as_str() {
+            "invalid_scope" => AuthError::DeviceRefused { description },
+            "access_denied" => AuthError::AccessDenied { description },
+            "temporarily_unavailable" => AuthError::TemporarilyUnavailable { description },
+            _ => AuthError::SignInRefused { error, description },
+        }
+    }
+
+    /// The `error` code the server sent.
+    pub fn error_code(&self) -> &str {
+        match self {
+            AuthError::DeviceRefused { .. } => "invalid_scope",
+            AuthError::AccessDenied { .. } => "access_denied",
+            AuthError::TemporarilyUnavailable { .. } => "temporarily_unavailable",
+            AuthError::SignInRefused { error, .. } => error,
+        }
+    }
+
+    /// The `error_description` the server sent, if any.
+    pub fn description(&self) -> Option<&str> {
+        match self {
+            AuthError::DeviceRefused { description }
+            | AuthError::AccessDenied { description }
+            | AuthError::TemporarilyUnavailable { description }
+            | AuthError::SignInRefused { description, .. } => description.as_deref(),
+        }
+    }
+
+    /// Whether this is [`AuthError::DeviceRefused`].
+    pub fn is_device_refused(&self) -> bool {
+        matches!(self, AuthError::DeviceRefused { .. })
+    }
+
+    /// Whether this is [`AuthError::TemporarilyUnavailable`], the one refusal to
+    /// retry unchanged.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, AuthError::TemporarilyUnavailable { .. })
+    }
+}
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "/sign_in refused the request: {}", self.error_code())?;
+        match self.description() {
+            Some(description) => write!(f, ": {description}"),
+            None => Ok(()),
+        }
+    }
+}
+
+impl std::error::Error for AuthError {}
+
+/// Whether `err` is an [`AuthError::DeviceRefused`] from a code-flow entry point.
+pub fn is_device_refused(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<AuthError>()
+        .is_some_and(AuthError::is_device_refused)
+}
+
+/// Whether `err` is an [`AuthError::TemporarilyUnavailable`] from a code-flow
+/// entry point. An untyped error (a network fault, say) answers `false`: the
+/// caller decides for those as before.
+pub fn is_transient(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<AuthError>()
+        .is_some_and(AuthError::is_transient)
+}
+
 /// The error for a response from `endpoint` that is not the 303 redirect the
 /// code flow is waiting for.
 ///
@@ -491,9 +593,11 @@ fn not_the_redirect(endpoint: &str, status: StatusCode, body: Option<&str>) -> a
 /// `/authorize` refuses a request it can still answer, an unsupported scope for
 /// one, with a 303 to the redirect URI whose query carries `error` and
 /// `error_description`. That redirect sets no session cookie, so a flow that read
-/// the cookie first would report a missing cookie and hide the reason. `None`
-/// when `location` is no refusal.
-fn authorize_refusal(base: &Url, location: &str) -> Option<String> {
+/// the cookie first would report a missing cookie and hide the reason. `/sign_in`
+/// refuses the same way when siwx-oidc runs `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`
+/// (see [`AuthError`]). The `error` and the `error_description`, or `None` when
+/// `location` is no refusal.
+fn authorize_refusal(base: &Url, location: &str) -> Option<(String, Option<String>)> {
     let redirect = base.join(location).ok()?;
     let mut error = None;
     let mut description = None;
@@ -504,11 +608,7 @@ fn authorize_refusal(base: &Url, location: &str) -> Option<String> {
             _ => {}
         }
     }
-    let error = error?;
-    Some(match description {
-        Some(description) => format!("{error}: {description}"),
-        None => error,
-    })
+    Some((error?, description))
 }
 
 /// The authorization code flow every code-flow entry point runs: PKCE,
@@ -567,8 +667,13 @@ async fn code_flow(
         .headers()
         .get(header::LOCATION)
         .and_then(|v| v.to_str().ok());
-    if let Some(reason) = location.and_then(|location| authorize_refusal(&base, location)) {
-        return Err(anyhow!("/authorize refused the request: {reason}"));
+    if let Some((error, description)) =
+        location.and_then(|location| authorize_refusal(&base, location))
+    {
+        return Err(match description {
+            Some(description) => anyhow!("/authorize refused the request: {error}: {description}"),
+            None => anyhow!("/authorize refused the request: {error}"),
+        });
     }
 
     let session_cookie = resp
@@ -638,6 +743,11 @@ async fn code_flow(
         .get(header::LOCATION)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| anyhow!("/sign_in response missing Location header"))?;
+
+    // A refusal is the authorization error response, typed for the caller.
+    if let Some((error, description)) = authorize_refusal(&base, code_location) {
+        return Err(AuthError::from_refusal(error, description).into());
+    }
 
     let code_url = Url::parse(code_location)
         .or_else(|_| base.join(code_location))
@@ -1342,5 +1452,147 @@ mod tests {
             "/authorize response missing session cookie"
         );
         served.join().unwrap();
+    }
+
+    // ---- SS4 WP7: a /sign_in refusal is a typed error (8.19) ----
+
+    /// Run the code flow with a proposed device against a server whose `/authorize`
+    /// redirects to the login page and whose `/sign_in` answers with `sign_in_location`.
+    async fn sign_in_answering(sign_in_location: &str) -> anyhow::Error {
+        let key = SiwxKey::generate_ed25519();
+        let authorize_redirect = format!(
+            "location: /login?nonce=n1&state=headless&client_id=client&redirect_uri={}",
+            urlencoding::encode(REDIRECT_URI)
+        );
+        let sign_in_redirect = format!("location: {sign_in_location}");
+        let (base, served) = serve_in_order(vec![
+            raw_response(
+                "303 See Other",
+                &[&authorize_redirect, "set-cookie: session=abc; Path=/"],
+            ),
+            raw_response("303 See Other", &[&sign_in_redirect]),
+        ]);
+        let error = authenticate_with_device(&base, "client", REDIRECT_URI, &key, Some("DEVICE_A"))
+            .await
+            .expect_err("the sign-in redirect carries no code");
+        assert_eq!(
+            served.join().unwrap().len(),
+            2,
+            "the flow stops at /sign_in, before /token"
+        );
+        error
+    }
+
+    fn sign_in_refusal(error: &str, description: &str) -> String {
+        format!(
+            "{REDIRECT_URI}?error={error}&error_description={}&state=headless",
+            urlencoding::encode(description)
+        )
+    }
+
+    #[tokio::test]
+    async fn auth_sign_in_invalid_scope_redirect_is_device_refused() {
+        let description = "The requested device id was signed out and cannot be used again.";
+        let error = sign_in_answering(&sign_in_refusal("invalid_scope", description)).await;
+        assert_eq!(
+            error.downcast_ref::<AuthError>(),
+            Some(&AuthError::DeviceRefused {
+                description: Some(description.to_string())
+            })
+        );
+        assert!(is_device_refused(&error));
+        assert!(!is_transient(&error), "a refused id is not retried as is");
+        assert_eq!(
+            format!("{error:#}"),
+            format!("/sign_in refused the request: invalid_scope: {description}")
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_sign_in_access_denied_redirect_is_typed() {
+        let description = "This account has been deactivated.";
+        let error = sign_in_answering(&sign_in_refusal("access_denied", description)).await;
+        let typed = error
+            .downcast_ref::<AuthError>()
+            .expect("access_denied is typed");
+        assert_eq!(
+            typed,
+            &AuthError::AccessDenied {
+                description: Some(description.to_string())
+            }
+        );
+        assert!(!typed.is_device_refused());
+        assert!(
+            !typed.is_transient(),
+            "access_denied is final, never retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_sign_in_temporarily_unavailable_is_transient() {
+        let error = sign_in_answering(&sign_in_refusal(
+            "temporarily_unavailable",
+            "Please try again shortly.",
+        ))
+        .await;
+        assert!(matches!(
+            error.downcast_ref::<AuthError>(),
+            Some(AuthError::TemporarilyUnavailable { .. })
+        ));
+        assert!(is_transient(&error), "retried like an outage");
+        assert!(!is_device_refused(&error));
+    }
+
+    #[tokio::test]
+    async fn auth_is_device_refused_matches_only_that_error() {
+        let device_refused = AuthError::DeviceRefused { description: None };
+        assert!(device_refused.is_device_refused());
+        for other in [
+            AuthError::AccessDenied { description: None },
+            AuthError::TemporarilyUnavailable { description: None },
+            AuthError::SignInRefused {
+                error: "server_error".to_string(),
+                description: None,
+            },
+        ] {
+            assert!(!other.is_device_refused(), "{other:?}");
+            assert!(!is_device_refused(&anyhow::Error::new(other)));
+        }
+        assert!(!is_device_refused(&anyhow!("invalid_scope")), "untyped");
+        // An unknown error code at /sign_in is typed, but neither refusal kind.
+        let error = sign_in_answering(&sign_in_refusal("server_error", "boom")).await;
+        assert_eq!(
+            error.downcast_ref::<AuthError>(),
+            Some(&AuthError::SignInRefused {
+                error: "server_error".to_string(),
+                description: Some("boom".to_string())
+            })
+        );
+        assert!(!is_device_refused(&error));
+        // `/authorize`'s own invalid_scope (a scope refusal, not a device refusal) stays
+        // its untyped message.
+        let key = SiwxKey::generate_ed25519();
+        let refusal = format!("location: {REDIRECT_URI}?state=headless&error=invalid_scope");
+        let (base, served) = serve_in_order(vec![raw_response("303 See Other", &[&refusal])]);
+        let error = authenticate_with_device(&base, "client", REDIRECT_URI, &key, Some("DEVICE_A"))
+            .await
+            .expect_err("refused at /authorize");
+        assert!(!is_device_refused(&error));
+        assert_eq!(
+            format!("{error:#}"),
+            "/authorize refused the request: invalid_scope"
+        );
+        served.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn auth_missing_code_without_error_keeps_old_message() {
+        let location = format!("{REDIRECT_URI}?state=headless");
+        let error = sign_in_answering(&location).await;
+        assert!(error.downcast_ref::<AuthError>().is_none());
+        assert_eq!(
+            format!("{error:#}"),
+            format!("no 'code' in /sign_in redirect: {location}")
+        );
     }
 }
