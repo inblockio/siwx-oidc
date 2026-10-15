@@ -265,6 +265,7 @@ jobs:
           SIWXOIDC_DEFAULT_CLIENTS__MAILE2E: '{"secret":"not-a-secret-e2e-fixture","class":"generic","allowed_scopes":["openid","io.inblock.mail","offline_access"],"metadata":{"redirect_uris":["http://localhost:0/callback"],"token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"]}}'
         run: |
           nohup env -u SIWEOIDC_HOST ./target/debug/siwx-oidc > /tmp/siwx-oidc.log 2>&1 &
+          echo $! > /tmp/siwx-oidc.pid
           for _ in $(seq 1 60); do
             if curl -sf "${SIWXOIDC_BASE_URL}/health" >/dev/null 2>&1; then
               echo "siwx-oidc healthy"; exit 0
@@ -393,6 +394,81 @@ jobs:
         run: |
           cargo test --test e2e_msc4191_live \
             msc4191_account_menu_and_deactivate_page_live -- --ignored --test-threads=1
+
+      # -------------------------------------------------------------------
+      # SS4 flags on. Every step above runs with the three session-end flags off
+      # (the default; `ss4_all_flags_off_is_inert`). The same server is then
+      # restarted with flags 1 and 2, and again with flag 3 too, so the flag-on
+      # halves run: h4b_replay_*, authenticate_with_device_deleted_id_returns_device_refused,
+      # the marker table, the device-code upsert refusal, the reaper's planted
+      # cases. Flags 1 and 2 go to $GITHUB_ENV: the suites read them to pick the
+      # half they assert, and each later step then sees the server's flags.
+      # -------------------------------------------------------------------
+      - name: Turn on SS4 flags 1 and 2 for the steps below
+        run: |
+          echo "SIWXOIDC_REVOKE_DELETES_DEVICE=true" >> "$GITHUB_ENV"
+          echo "SIWXOIDC_REFUSE_DELETED_DEVICE_IDS=true" >> "$GITHUB_ENV"
+
+      - name: Restart siwx-oidc with SS4 flags 1 and 2
+        env:
+          SIWXOIDC_MAIL_DOMAIN: matrix.test
+          SIWXOIDC_DEFAULT_CLIENTS__MAILE2E: '{"secret":"not-a-secret-e2e-fixture","class":"generic","allowed_scopes":["openid","io.inblock.mail","offline_access"],"metadata":{"redirect_uris":["http://localhost:0/callback"],"token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"]}}'
+        run: |
+          kill "$(cat /tmp/siwx-oidc.pid)"
+          while kill -0 "$(cat /tmp/siwx-oidc.pid)" 2>/dev/null; do sleep 0.2; done
+          nohup env -u SIWEOIDC_HOST ./target/debug/siwx-oidc >> /tmp/siwx-oidc.log 2>&1 &
+          echo $! > /tmp/siwx-oidc.pid
+          for _ in $(seq 1 60); do
+            if curl -sf "${SIWXOIDC_BASE_URL}/health" >/dev/null 2>&1; then
+              echo "siwx-oidc healthy with SS4 flags 1 and 2"; exit 0
+            fi
+            sleep 0.5
+          done
+          echo "siwx-oidc did not come back with SS4 flags 1 and 2" >&2
+          cat /tmp/siwx-oidc.log >&2
+          exit 1
+
+      - name: E2E with SS4 flags 1 and 2
+        run: |
+          for suite in e2e_race_teardown e2e_session_teardown e2e_account_management e2e_device_code; do
+            cargo test --test "$suite" -- --ignored --test-threads=1
+          done
+
+      # Flag 3: the reaper deleting (not a dry run) every second, sparing the test's
+      # agent account. Only its own test runs: a reaper that deletes idle devices
+      # every second would race the other suites' seeded devices.
+      - name: Restart siwx-oidc with SS4 flags 1, 2 and 3
+        env:
+          SIWXOIDC_MAIL_DOMAIN: matrix.test
+          SIWXOIDC_DEFAULT_CLIENTS__MAILE2E: '{"secret":"not-a-secret-e2e-fixture","class":"generic","allowed_scopes":["openid","io.inblock.mail","offline_access"],"metadata":{"redirect_uris":["http://localhost:0/callback"],"token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"]}}'
+          SIWXOIDC_DEVICE_REAPER_ENABLED: "true"
+          SIWXOIDC_DEVICE_REAPER_DRY_RUN: "false"
+          SIWXOIDC_DEVICE_REAPER_INTERVAL_SECS: "1"
+          SIWXOIDC_DEVICE_REAPER_SPARE_USERS: '["ss4reaperagent"]'
+        run: |
+          kill "$(cat /tmp/siwx-oidc.pid)"
+          while kill -0 "$(cat /tmp/siwx-oidc.pid)" 2>/dev/null; do sleep 0.2; done
+          nohup env -u SIWEOIDC_HOST ./target/debug/siwx-oidc >> /tmp/siwx-oidc.log 2>&1 &
+          echo $! > /tmp/siwx-oidc.pid
+          for _ in $(seq 1 60); do
+            if curl -sf "${SIWXOIDC_BASE_URL}/health" >/dev/null 2>&1; then
+              echo "siwx-oidc healthy with SS4 flags 1, 2 and 3"; exit 0
+            fi
+            sleep 0.5
+          done
+          echo "siwx-oidc did not come back with SS4 flags 1, 2 and 3" >&2
+          cat /tmp/siwx-oidc.log >&2
+          exit 1
+
+      - name: E2E device reaper (SS4 flag 3)
+        env:
+          SIWXOIDC_DEVICE_REAPER_ENABLED: "true"
+          SIWXOIDC_DEVICE_REAPER_DRY_RUN: "false"
+          SIWXOIDC_DEVICE_REAPER_INTERVAL_SECS: "1"
+          SIWXOIDC_DEVICE_REAPER_SPARE_USERS: '["ss4reaperagent"]'
+        run: |
+          cargo test --test e2e_race_teardown ss4_reaper_planted_cases_on_mock_stack \
+            -- --ignored --test-threads=1 --exact
 
       - name: Collect service logs
         if: failure()
