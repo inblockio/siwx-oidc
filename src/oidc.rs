@@ -3346,6 +3346,12 @@ pub(crate) const DELETED_DEVICE_REFUSED_MSG: &str = "The requested device id was
 pub(crate) const DEVICE_PROVISIONING_UNAVAILABLE_MSG: &str = "Sign-in is temporarily \
      unavailable because the homeserver could not set up this device. Please try again shortly.";
 
+/// What `sign_in` tells the client (as a `temporarily_unavailable` redirect, SS4 flag 2,
+/// 8.27) when a device check before provisioning (the pre-claim list, the deleted-id
+/// marker) could not be read: it fails closed, no code is issued.
+pub(crate) const DEVICE_CHECK_UNAVAILABLE_MSG: &str = "Sign-in is temporarily unavailable \
+     because the requested device id could not be checked. Please try again shortly.";
+
 /// SS4 flag 2 (8.12): whether `device_id` carries a deleted-id marker for the account of
 /// `did`. Both localparts a DID can hold are asked (the legacy and the modern one; a
 /// guest's is the modern one), so no homeserver probe is needed and the check can run
@@ -3592,20 +3598,43 @@ pub async fn sign_in(
     // the deactivation gate and every other Synapse call. One cheap Redis read, only when
     // the scope proposes an id; an account without a guest record has no field, so an
     // ordinary account is unaffected. A Redis error fails closed (it hides whether a
-    // record exists): `?` answers it as a server error and no code is issued.
+    // record exists): a server error (under SS4 flag 2 a `temporarily_unavailable`
+    // redirect) and no code is issued.
     // The charset rule (`device_id_is_valid`) is enforced here too, as a 400, though
     // `/authorize` already refused such a scope: a request bound before this check existed
     // must not slip a comma-bearing id past the list lookup below.
     // SS4 flag 2 (`guest_config` is the whole configuration; `None` only in tests): the
     // refusals below go back to the client as the authorization error response at the
-    // bound redirect_uri (8.1, 8.11) instead of an issuer page with no exit.
+    // bound redirect_uri (8.1, 8.11) instead of an issuer page with no exit, and so does a
+    // device check that could not be read (8.27, `temporarily_unavailable`).
     let refuse_deleted_ids = guest_config.is_some_and(|c| c.refuse_deleted_device_ids);
     let proposed_device_id = bound_device_id(request.scope.as_deref())?;
+    // SS4 flag 2: C2 step 3 (below) runs here instead, before the first refusal, so an
+    // error redirect only ever goes to a redirect_uri the client's registration still
+    // lists; a stale one gets the re-validation's issuer error. It reads Redis only, so
+    // the refusals still come before the deactivation gate and every Synapse call. Flag 2
+    // off keeps the re-validation where it was.
+    let revalidated_client = if refuse_deleted_ids {
+        Some(validate_registered_redirect_uri(&request.client_id, &redirect_uri, db_client).await?)
+    } else {
+        None
+    };
+    let check_unavailable = |what: &str, e: anyhow::Error| {
+        warn!(error = %e, "sign_in: {what} device check failed; refusing the sign-in");
+        sign_in_refusal_redirect(
+            &redirect_uri,
+            &request,
+            CoreAuthErrorResponseType::TemporarilyUnavailable,
+            DEVICE_CHECK_UNAVAILABLE_MSG,
+        )
+    };
     if let Some(proposed) = proposed_device_id.clone() {
-        if db_client
-            .device_is_pre_claim_for_did(&did, &proposed)
-            .await?
-        {
+        let pre_claim = match db_client.device_is_pre_claim_for_did(&did, &proposed).await {
+            Ok(pre_claim) => pre_claim,
+            Err(e) if refuse_deleted_ids => return Err(check_unavailable("pre-claim", e)),
+            Err(e) => return Err(e.into()),
+        };
+        if pre_claim {
             warn!(did = %did, "sign_in: refused a pre-claim device id (GP-CLM-26)");
             if refuse_deleted_ids {
                 return Err(sign_in_refusal_redirect(
@@ -3627,13 +3656,17 @@ pub async fn sign_in(
     // same reasons: after the DID is proven, BEFORE the deactivation gate and every
     // Synapse call, so a refusal provisions nothing, issues no code and arms no
     // cross-signing reset; the login session is already spent. Matrix-class clients
-    // only (a generic client's token holds no device). A Redis error fails closed.
-    if let (true, Some(proposed)) = (refuse_deleted_ids, proposed_device_id.as_deref()) {
-        let matrix_class = db_client
-            .get_client(request.client_id.clone())
-            .await?
-            .is_some_and(|c| c.class == ClientClass::Matrix);
-        if matrix_class && device_id_was_deleted(db_client, &did, proposed).await? {
+    // only (a generic client's token holds no device). A Redis error fails closed, as a
+    // `temporarily_unavailable` redirect.
+    if let (Some(client), Some(proposed)) =
+        (revalidated_client.as_ref(), proposed_device_id.as_deref())
+    {
+        let deleted = client.class == ClientClass::Matrix
+            && match device_id_was_deleted(db_client, &did, proposed).await {
+                Ok(deleted) => deleted,
+                Err(e) => return Err(check_unavailable("deleted-id", e)),
+            };
+        if deleted {
             warn!(
                 security_event = "deleted_device_refused",
                 channel = "sign_in",
@@ -3725,9 +3758,13 @@ pub async fn sign_in(
     // bound the request; this re-check covers a registration that changed or
     // expired since, on BOTH the wallet (Path B) and WebAuthn (Path A) paths.
     // Path B additionally binds the redirect via the signed `Resources:` list
-    // above.
-    let client =
-        validate_registered_redirect_uri(&request.client_id, &redirect_uri, db_client).await?;
+    // above. Under SS4 flag 2 it already ran, before the refusals.
+    let client = match revalidated_client {
+        Some(client) => client,
+        None => {
+            validate_registered_redirect_uri(&request.client_id, &redirect_uri, db_client).await?
+        }
+    };
 
     let (localpart, device_id) = match client.class {
         ClientClass::Matrix if session_entry.guest_id.is_some() => {
@@ -7472,6 +7509,8 @@ mod sign_in_deactivation_order_tests {
         response_mode: Option<String>,
         generic: bool,
         config: Option<crate::config::Config>,
+        /// The client's registration no longer lists the bound redirect_uri.
+        stale_redirect: bool,
     }
 
     async fn sign_in_with<F, Fut>(
@@ -7513,7 +7552,12 @@ mod sign_in_deactivation_order_tests {
         let mut client = ClientEntry::new(
             "secret",
             SiwxClientMetadata::new(
-                vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
+                vec![RedirectUrl::new(if setup.stale_redirect {
+                    "https://example.com/elsewhere".into()
+                } else {
+                    REDIRECT.into()
+                })
+                .unwrap()],
                 LogoutClientMetadata::default(),
             ),
             None,
@@ -8016,6 +8060,92 @@ mod sign_in_deactivation_order_tests {
     fn armed_reset(log: &[String]) -> bool {
         log.iter()
             .any(|l| l.ends_with("/allow_cross_signing_reset"))
+    }
+
+    // ---- SS4 audit fixes #3 and #7 ----
+
+    /// #7: a refusal never redirects to a bound redirect_uri the client's registration no
+    /// longer lists. Flag 2 on, the re-validation (C2 step 3) runs before the refusals, so
+    /// a deactivated account or a deleted device id with a stale redirect_uri gets the
+    /// re-validation's issuer error, never a redirect.
+    #[tokio::test]
+    async fn sign_in_refusal_never_redirects_to_an_unregistered_redirect_uri() {
+        let did = fresh_did();
+        let stale = || SignInSetup {
+            stale_redirect: true,
+            ..flag2(true)
+        };
+        let Some((result, log)) =
+            sign_in_with(deactivated_for(&did), &did, None, stale(), |_| async {}).await
+        else {
+            return;
+        };
+        match result {
+            Err(CustomError::BadRequest(msg)) => assert!(msg.contains("not registered"), "{msg}"),
+            other => panic!("deactivated, stale redirect_uri: no redirect, got {other:?}"),
+        }
+        assert!(log.is_empty(), "nothing reached the homeserver: {log:?}");
+
+        let did = fresh_did();
+        let scope = scope_with(DELETED);
+        let Some((result, _)) =
+            sign_in_with(Homeserver::default(), &did, Some(&scope), stale(), |db| {
+                let did = did.clone();
+                async move {
+                    db.plant_deleted_device_marker(&localpart_for(&did), DELETED, 60)
+                        .await
+                        .unwrap()
+                }
+            })
+            .await
+        else {
+            return;
+        };
+        match result {
+            Err(CustomError::BadRequest(msg)) => assert!(msg.contains("not registered"), "{msg}"),
+            other => panic!("deleted id, stale redirect_uri: no redirect, got {other:?}"),
+        }
+    }
+
+    /// #3: flag 2 on, a Redis error in the device checks before provisioning (here the
+    /// pre-claim lookup, a wrong-type guest record) is a `temporarily_unavailable` redirect
+    /// with no code, not an issuer page; nothing reaches the homeserver. Flag 2 off keeps
+    /// today's server error.
+    #[tokio::test]
+    async fn sign_in_device_check_redis_error_redirects_temporarily_unavailable() {
+        for on in [true, false] {
+            let did = fresh_did();
+            let scope = scope_with("DEVICE_A");
+            let Some((result, log)) =
+                sign_in_with(Homeserver::default(), &did, Some(&scope), flag2(on), |db| {
+                    let did = did.clone();
+                    async move {
+                        db.zadd_for_test(
+                            &siwx_oidc::db::guest_invites::guest_account_key(&localpart_for(&did)),
+                            1,
+                            "not-a-hash",
+                        )
+                        .await
+                    }
+                })
+                .await
+            else {
+                return;
+            };
+            if on {
+                assert_refusal(
+                    &result,
+                    "temporarily_unavailable",
+                    DEVICE_CHECK_UNAVAILABLE_MSG,
+                );
+            } else {
+                assert!(
+                    !matches!(result, Ok(_) | Err(CustomError::Redirect(_))),
+                    "flag 2 off: today's issuer error, got {result:?}"
+                );
+            }
+            assert!(log.is_empty(), "nothing reached the homeserver: {log:?}");
+        }
     }
 
     #[tokio::test]
