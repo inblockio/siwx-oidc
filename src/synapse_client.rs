@@ -1327,9 +1327,17 @@ impl SynapseClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            let user_id = matrix_user_id(localpart, server_name);
-            warn!(%status, %body, %user_id, %device_id, "delete_device failed");
+            // Fingerprints and Synapse's `errcode` only: the answer's `error` text can
+            // name the account or the device (SS4 audit #4).
+            let errcode = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v["errcode"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let user_fp = siwx_oidc::redact::fingerprint(&matrix_user_id(localpart, server_name));
+            let device_fp = siwx_oidc::redact::fingerprint(device_id);
+            warn!(%status, %errcode, %user_fp, %device_fp, "delete_device failed");
         }
         Ok(status)
     }
@@ -2174,6 +2182,44 @@ fn profile_404_means_row_absent(body: &str) -> bool {
 mod tests {
     use super::*;
     use siwx_oidc::db::tokens::ADMIN_TOKEN_PREFIX;
+
+    /// SS4 audit #4: a refused `delete_device` is logged with fingerprints and Synapse's
+    /// `errcode` only: never the MXID, the device id or the answer's text.
+    #[tokio::test]
+    async fn a_failed_delete_device_logs_no_mxid_device_id_or_body() {
+        use axum::{http::StatusCode, routing::post, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/_synapse/mas/delete_device",
+            post(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    r#"{"errcode":"M_NOT_FOUND","error":"Device DEVICE_A of @alice:example.org not found"}"#,
+                )
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let client = SynapseClient::new(&format!("http://{addr}"), "shared-secret");
+
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let outcome = client
+            .delete_device_status("alice", "DEVICE_A", "example.org")
+            .await;
+        let out = logs.output();
+        server.abort();
+
+        assert!(matches!(outcome, DeviceDelete::NotFound), "{outcome:?}");
+        assert!(out.contains("delete_device failed"), "{out}");
+        assert!(out.contains("M_NOT_FOUND"), "the errcode is kept: {out}");
+        assert!(
+            out.contains(&siwx_oidc::redact::fingerprint("DEVICE_A")),
+            "the device fingerprint is logged: {out}"
+        );
+        for clear in ["alice", "DEVICE_A", "not found"] {
+            assert!(!out.contains(clear), "{clear:?} logged in clear: {out}");
+        }
+    }
 
     #[test]
     fn new_strips_trailing_slash() {
