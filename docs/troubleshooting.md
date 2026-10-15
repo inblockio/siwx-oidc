@@ -52,6 +52,9 @@ after a deployment.
 | `/sign_in returned 401 …: Signature verification failed` | the signature does not match the DID in the message | check the key file; do not edit the generated message |
 | `/sign_in returned 401 …: This account has been deactivated …` | the account was deactivated | a deactivated account cannot sign in |
 | `/sign_in returned 503 …` | the deactivation check could not reach Synapse | check Synapse and the shared secret; retry |
+| `/sign_in refused the request: invalid_scope: …` (`AuthError::DeviceRefused`) | the server runs `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` and the device id passed to `authenticate_with_device` was signed out (deleted); it is never recreated | forget the id and sign in with a new one; check with `siwx_oidc_auth::is_device_refused` |
+| `/sign_in refused the request: access_denied: …` (`AuthError::AccessDenied`) | the same setting, for a deactivated or erased account (the 401 above) | a deactivated account cannot sign in; stop, do not retry |
+| `/sign_in refused the request: temporarily_unavailable: …` (`AuthError::TemporarilyUnavailable`) | the same setting: Synapse could not be asked about the account, or could not set up the device (the 503 above); no tokens were issued | retry later, as after an outage (`siwx_oidc_auth::is_transient`) |
 | `/token returned 401 …: {"error":"invalid_client","error_description":"Secret required."}` | the client was registered as a confidential client | register it with `token_endpoint_auth_method: "none"` |
 | `/token refresh returned 400 …: invalid_grant` with "client_id does not match the refresh token." | the refresh names another client than the one the tokens were issued to | refresh with the `client_id` used at sign-in |
 | `/token refresh returned 400 …: invalid_grant` | the refresh token was already rotated (more than 60 s ago), expired, or its session was revoked | sign in again with the key; always store the newest refresh token |

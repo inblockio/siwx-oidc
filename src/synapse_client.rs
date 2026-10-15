@@ -341,6 +341,29 @@ pub struct SynapseClient {
     shared_secret: String,
     http: Client,
     admin: Option<AdminMint>,
+    /// SS4 flag 1 (`revoke_deletes_device`), read once at startup: every
+    /// teardown that deletes a device runs strictly (see
+    /// [`SynapseClient::strict_teardown`]).
+    strict_teardown: bool,
+    /// SS4 flag 2 (`refuse_deleted_device_ids`), read once at startup: the TTL
+    /// of the deleted-id marker every delete path plants after a Synapse delete
+    /// ([`SynapseClient::deleted_marker_ttl`]); `None` with the flag off.
+    deleted_marker_ttl: Option<u64>,
+}
+
+/// What Synapse answered to `POST /_synapse/mas/delete_device` (8.23): the
+/// strict teardown of flag 1 decides by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceDelete {
+    /// 2xx. Synapse also answers this for a device that is already gone.
+    Deleted,
+    /// 404 (`User not found`): there is nothing to delete.
+    NotFound,
+    /// 401, 403 or another 4xx: a permanent refusal, typically a wrong MAS
+    /// shared secret. A configuration fault, not the client's.
+    Forbidden,
+    /// 5xx or no answer (network, timeout): retryable.
+    Transient,
 }
 
 impl SynapseClient {
@@ -358,7 +381,34 @@ impl SynapseClient {
             shared_secret: shared_secret.to_string(),
             http: build_http_client(),
             admin: None,
+            strict_teardown: false,
+            deleted_marker_ttl: None,
         }
+    }
+
+    /// Switch strict teardown (SS4 flag 1, `revoke_deletes_device`) on or off.
+    pub fn with_strict_teardown(mut self, on: bool) -> Self {
+        self.strict_teardown = on;
+        self
+    }
+
+    /// Whether teardown is strict (flag 1): Synapse delete, then the deleted-id
+    /// marker, then revoke, answered by [`DeviceDelete`]. Off: best-effort.
+    pub fn strict_teardown(&self) -> bool {
+        self.strict_teardown
+    }
+
+    /// Switch the deleted-id markers (SS4 flag 2, `refuse_deleted_device_ids`)
+    /// on with their TTL (`deleted_device_marker_ttl_secs`), or off (`None`).
+    pub fn with_deleted_markers(mut self, ttl_secs: Option<u64>) -> Self {
+        self.deleted_marker_ttl = ttl_secs;
+        self
+    }
+
+    /// The TTL of the deleted-id marker a delete plants (flag 2), `None` when
+    /// no marker is planted (flag off).
+    pub fn deleted_marker_ttl(&self) -> Option<u64> {
+        self.deleted_marker_ttl
     }
 
     /// Enable the admin-scoped calls by giving the client a token store to mint
@@ -1226,6 +1276,45 @@ impl SynapseClient {
         device_id: &str,
         server_name: &str,
     ) -> Result<()> {
+        let status = self
+            .send_delete_device(localpart, device_id, server_name)
+            .await?;
+        if !status.is_success() {
+            anyhow::bail!("delete_device: HTTP {status}{}", mas_status_hint(status));
+        }
+        Ok(())
+    }
+
+    /// [`delete_device`](Self::delete_device), answered by what Synapse said
+    /// instead of an error (8.23, SS4 flag 1).
+    pub async fn delete_device_status(
+        &self,
+        localpart: &str,
+        device_id: &str,
+        server_name: &str,
+    ) -> DeviceDelete {
+        match self
+            .send_delete_device(localpart, device_id, server_name)
+            .await
+        {
+            Ok(s) if s.is_success() => DeviceDelete::Deleted,
+            Ok(reqwest::StatusCode::NOT_FOUND) => DeviceDelete::NotFound,
+            Ok(s) if s.is_client_error() => DeviceDelete::Forbidden,
+            Ok(_) => DeviceDelete::Transient,
+            Err(e) => {
+                warn!(error = %e, "delete_device: no answer from Synapse");
+                DeviceDelete::Transient
+            }
+        }
+    }
+
+    /// The request of both, logging a non-2xx answer.
+    async fn send_delete_device(
+        &self,
+        localpart: &str,
+        device_id: &str,
+        server_name: &str,
+    ) -> Result<reqwest::StatusCode> {
         let url = format!("{}/_synapse/mas/delete_device", self.endpoint);
         let resp = self
             .http
@@ -1236,14 +1325,21 @@ impl SynapseClient {
             .await
             .context("delete_device: request failed")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            let user_id = matrix_user_id(localpart, server_name);
-            warn!(%status, %body, %user_id, %device_id, "delete_device failed");
-            anyhow::bail!("delete_device: HTTP {status}{}", mas_status_hint(status));
+        let status = resp.status();
+        if !status.is_success() {
+            // Fingerprints and Synapse's `errcode` only: the answer's `error` text can
+            // name the account or the device (SS4 audit #4).
+            let errcode = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v["errcode"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let user_fp = siwx_oidc::redact::fingerprint(&matrix_user_id(localpart, server_name));
+            let device_fp = siwx_oidc::redact::fingerprint(device_id);
+            warn!(%status, %errcode, %user_fp, %device_fp, "delete_device failed");
         }
-        Ok(())
+        Ok(status)
     }
 
     /// Deactivate a user's account via the MAS API
@@ -2086,6 +2182,44 @@ fn profile_404_means_row_absent(body: &str) -> bool {
 mod tests {
     use super::*;
     use siwx_oidc::db::tokens::ADMIN_TOKEN_PREFIX;
+
+    /// SS4 audit #4: a refused `delete_device` is logged with fingerprints and Synapse's
+    /// `errcode` only: never the MXID, the device id or the answer's text.
+    #[tokio::test]
+    async fn a_failed_delete_device_logs_no_mxid_device_id_or_body() {
+        use axum::{http::StatusCode, routing::post, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/_synapse/mas/delete_device",
+            post(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    r#"{"errcode":"M_NOT_FOUND","error":"Device DEVICE_A of @alice:example.org not found"}"#,
+                )
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let client = SynapseClient::new(&format!("http://{addr}"), "shared-secret");
+
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let outcome = client
+            .delete_device_status("alice", "DEVICE_A", "example.org")
+            .await;
+        let out = logs.output();
+        server.abort();
+
+        assert!(matches!(outcome, DeviceDelete::NotFound), "{outcome:?}");
+        assert!(out.contains("delete_device failed"), "{out}");
+        assert!(out.contains("M_NOT_FOUND"), "the errcode is kept: {out}");
+        assert!(
+            out.contains(&siwx_oidc::redact::fingerprint("DEVICE_A")),
+            "the device fingerprint is logged: {out}"
+        );
+        for clear in ["alice", "DEVICE_A", "not found"] {
+            assert!(!out.contains(clear), "{clear:?} logged in clear: {out}");
+        }
+    }
 
     #[test]
     fn new_strips_trailing_slash() {

@@ -47,6 +47,17 @@ pub(super) fn device_tombstone_key(username: &str, device_id: &str) -> String {
     format!("{}/{}/{}", KV_DEVICE_TOMBSTONE_PREFIX, username, device_id)
 }
 
+/// Redis key for the deleted-id marker (SS4 flag 2): the localpart lowercased,
+/// as Synapse keys users, so a sign-in under another address case meets it.
+pub(super) fn deleted_device_key(localpart: &str, device_id: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        KV_DELETED_DEVICE_PREFIX,
+        localpart.to_lowercase(),
+        device_id
+    )
+}
+
 /// Redis key for the per-user deactivation tombstone.
 pub(super) fn user_tombstone_key(username: &str) -> String {
     format!("{}/{}", KV_USER_TOMBSTONE_PREFIX, username)
@@ -262,6 +273,47 @@ fn ceremony_key(ceremony: Ceremony, id: &str) -> String {
 
 fn legacy_ceremony_key(ceremony: Ceremony, id: &str) -> String {
     format!("{}/{id}", ceremony.legacy_prefix())
+}
+
+/// Whether `(username, device_id)` has a live grant, for the device reaper (SS4
+/// flag 3, 8.14, 8.29): one `EXISTS` over the device's grant index
+/// (`idx:grants:user_device/…`) and the legacy device index
+/// (`idx:user_device/…`), on any connection so a test can record what is sent.
+///
+/// Read-only, and nothing but `EXISTS`: never `SMEMBERS`, `SCAN` or `KEYS` (the
+/// legacy index's members are raw token keys), never a value. An index that
+/// exists counts as live even when its members have expired, which can only
+/// spare a device.
+pub async fn device_has_live_grant_on<C>(
+    conn: &mut C,
+    username: &str,
+    device_id: &str,
+) -> Result<bool>
+where
+    C: bb8_redis::redis::aio::ConnectionLike + Send,
+{
+    let n: i64 = bb8_redis::redis::cmd("EXISTS")
+        .arg(format!(
+            "{}/{username}/{device_id}",
+            super::grant::KV_GRANT_DEVICE_IDX_PREFIX
+        ))
+        .arg(device_token_idx_key(username, device_id))
+        .query_async(conn)
+        .await
+        .map_err(|e| anyhow!("device_has_live_grant failed: {}", e))?;
+    Ok(n > 0)
+}
+
+impl RedisClient {
+    /// [`device_has_live_grant_on`] on a pooled connection.
+    pub async fn device_has_live_grant(&self, username: &str, device_id: &str) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+        device_has_live_grant_on(&mut *conn, username, device_id).await
+    }
 }
 
 impl RedisClient {
@@ -1530,6 +1582,20 @@ impl DBClient for RedisClient {
         .map_err(|e| anyhow!("Failed to claim a device code: {}", e))
     }
 
+    async fn release_device_code_claim(&self, device_code: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+        conn.del::<_, ()>(format!(
+            "{}/redeemed",
+            device_code_key(&digest(device_code))
+        ))
+        .await
+        .map_err(|e| anyhow!("Failed to release a device code claim: {}", e))
+    }
+
     async fn set_token(&self, token: &str, metadata: &TokenMetadata, ttl: u64) -> Result<()> {
         // Every endpoint accepts exactly one kind of token, so an entry without a
         // kind would be classified by lifetime instead of by its writer.
@@ -1633,6 +1699,50 @@ impl DBClient for RedisClient {
             .map_err(|e| anyhow!("Failed to serialize DeviceCodeEntry: {}", e))?;
         self.set_ex_raw(&stored_device_code_key(device_code), &value, ttl)
             .await
+    }
+
+    async fn plant_deleted_device_marker(
+        &self,
+        localpart: &str,
+        device_id: &str,
+        ttl_secs: u64,
+    ) -> Result<()> {
+        // The value is the delete time in Unix ms from Redis `TIME` (one clock
+        // for every instance), written in the same server-side call.
+        const PLANT_LUA: &str = r#"
+            local t = redis.call('TIME')
+            local ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+            redis.call('SET', KEYS[1], string.format('%.0f', ms), 'EX', tonumber(ARGV[1]))
+            return 1
+        "#;
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+        let _: i64 = bb8_redis::redis::cmd("EVAL")
+            .arg(PLANT_LUA)
+            .arg(1)
+            .arg(deleted_device_key(localpart, device_id))
+            .arg(ttl_secs.max(1))
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("plant_deleted_device_marker failed: {}", e))?;
+        Ok(())
+    }
+
+    async fn is_deleted_device(&self, localpart: &str, device_id: &str) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+        let n: i64 = bb8_redis::redis::cmd("EXISTS")
+            .arg(deleted_device_key(localpart, device_id))
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("is_deleted_device failed: {}", e))?;
+        Ok(n == 1)
     }
 
     async fn delete_device_code(&self, device_code: &DeviceCodeRef) -> Result<()> {
@@ -1776,6 +1886,48 @@ mod tests {
     }
 
     /// The store refuses a token entry without a kind: every writer sets one.
+    #[tokio::test]
+    async fn marker_key_lowercases_localpart() {
+        assert_eq!(
+            super::deleted_device_key("Alice", "DEVICE_A"),
+            "deleted:device/alice/DEVICE_A",
+            "the localpart is lowercased, the device id is kept as given"
+        );
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let n = unique_nonce();
+        let (upper, lower, dev) = (
+            format!("Alice{n}"),
+            format!("alice{n}"),
+            format!("DEVICE_A{n}"),
+        );
+        client
+            .plant_deleted_device_marker(&upper, &dev, 60)
+            .await
+            .unwrap();
+        assert!(client.is_deleted_device(&lower, &dev).await.unwrap());
+        assert!(client.is_deleted_device(&upper, &dev).await.unwrap());
+        assert!(!client
+            .is_deleted_device(&lower, &dev.to_lowercase())
+            .await
+            .unwrap());
+    }
+
+    #[test]
+    fn tombstone_900s_key_unchanged() {
+        // The rotate and lift scripts read this key; the SS4 marker is another one.
+        assert_eq!(
+            super::device_tombstone_key("alice", "DEVICE_A"),
+            "tombstone:device/alice/DEVICE_A"
+        );
+        assert_eq!(crate::db::TOMBSTONE_TTL_SECS, 900);
+        assert_ne!(
+            super::device_tombstone_key("alice", "DEVICE_A"),
+            super::deleted_device_key("alice", "DEVICE_A")
+        );
+    }
+
     #[tokio::test]
     async fn set_token_refuses_an_entry_without_a_kind() {
         let Some(client) = crate::test_support::redis().await else {

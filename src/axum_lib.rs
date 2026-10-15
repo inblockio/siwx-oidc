@@ -1689,6 +1689,11 @@ pub async fn main() {
     // Guest mode (S1): a misconfigured guest path exits non-zero here, before anything binds.
     crate::guest::validate_guest_config(&config).unwrap_or_else(|e| panic!("FATAL: {e}"));
 
+    // SS4: flag 1 requires flag 2; a refused combination exits here, before anything binds.
+    config
+        .check_session_end_flags()
+        .unwrap_or_else(|e| panic!("FATAL: {e}"));
+
     let grant_lifetime = config
         .grant_lifetime()
         .unwrap_or_else(|e| panic!("FATAL: {e}"));
@@ -1812,17 +1817,29 @@ pub async fn main() {
     // API require from Synapse 1.157 on. Without it, `list_devices` /
     // `get_device` / `has_cross_signing_keys` fail closed with a clear error
     // instead of silently presenting a credential Synapse no longer accepts.
+    if config.revoke_deletes_device {
+        info!("revoke_deletes_device on: revoke ends a Matrix session with its device; teardown is strict");
+    }
     let synapse_client = match (&config.synapse_endpoint, &config.mas_shared_secret) {
         (Some(endpoint), Some(secret)) => {
             info!("Synapse client enabled: {}", endpoint);
             Some(Arc::new(
-                SynapseClient::new(endpoint.as_str(), secret).with_admin_mint(
-                    redis_client.clone(),
-                    config.admin_token_localpart.clone(),
-                    // Clamped here, at the configuration boundary, exactly as
-                    // `AdminTokenState` clamps it for the HTTP mint endpoint.
-                    admin_token::clamp_admin_token_ttl(config.admin_token_ttl_secs),
-                ),
+                SynapseClient::new(endpoint.as_str(), secret)
+                    .with_admin_mint(
+                        redis_client.clone(),
+                        config.admin_token_localpart.clone(),
+                        // Clamped here, at the configuration boundary, exactly as
+                        // `AdminTokenState` clamps it for the HTTP mint endpoint.
+                        admin_token::clamp_admin_token_ttl(config.admin_token_ttl_secs),
+                    )
+                    // SS4 flag 1: every teardown that reaches Synapse is strict.
+                    .with_strict_teardown(config.revoke_deletes_device)
+                    // SS4 flag 2: every delete plants the deleted-id marker.
+                    .with_deleted_markers(
+                        config
+                            .refuse_deleted_device_ids
+                            .then_some(config.deleted_device_marker_ttl_secs),
+                    ),
             ))
         }
         _ => None,
@@ -1888,6 +1905,14 @@ pub async fn main() {
             None
         }
     };
+
+    // SS4 flag 3: the device reaper, stopped with the guest reaper. Off: no task.
+    let device_reaper_task = crate::device_reaper::spawn(
+        &state.config,
+        state.redis_client.clone(),
+        state.synapse_client.clone(),
+        reaper_stopped_orphan.clone(),
+    );
 
     // The report-only orphan scan, beside the reaper and stopped with it.
     let orphan_task = match (
@@ -2069,6 +2094,9 @@ pub async fn main() {
         let _ = tokio::time::timeout(grace + Duration::from_secs(1), task).await;
     }
     if let Some(task) = orphan_task {
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+    }
+    if let Some(task) = device_reaper_task {
         let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
     }
 }

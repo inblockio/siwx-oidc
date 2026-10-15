@@ -471,6 +471,96 @@ pub(crate) fn reset_outcome(allow_ok: bool, readback: ResetReadback) -> ActionOu
 
 // -- Action execution ---------------------------------------------------------
 
+/// The retryable answer when a strict teardown (SS4 flag 1) stopped.
+const STRICT_TEARDOWN_RETRY_MSG: &str =
+    "Your sessions could not all be signed out right now; nothing was changed. Try again.";
+
+/// Deactivate and erase under SS4 flag 1 (8.13, 8.23, audit r2 #7): list the
+/// account's devices first and tear each down strictly (delete, marker, revoke),
+/// before anything else is touched. One failed device does not stop the loop;
+/// any failure (or a failed listing) is a 503 and the action does not run, so
+/// the retry starts again. Flag 1 off, flag 2 on (8.13): the listed devices are
+/// deleted best-effort first and each deleted one gets its deleted-id marker
+/// (Synapse would drop them with the account, unmarked) and then has its grants
+/// revoked, in flag 1's order (delete, marker, revoke), so no grant outlives its
+/// deleted, marked device if the Synapse deactivation then fails; a failed
+/// listing, a marker that could not be written or a failed revoke is the same
+/// 503. Both off: nothing (today's sequence).
+async fn strict_pre_teardown(
+    synapse: &SynapseClient,
+    db_client: &RedisClient,
+    server: &str,
+    localpart: &str,
+    ctx: &str,
+) -> Result<(), CustomError> {
+    if !synapse.strict_teardown() {
+        if synapse.deleted_marker_ttl().is_none() {
+            return Ok(());
+        }
+        let devices = synapse.list_devices(localpart, server).await.map_err(|e| {
+            warn!(error = %e, ctx, "list_devices failed before the deleted-id markers");
+            CustomError::ServiceUnavailable(STRICT_TEARDOWN_RETRY_MSG.to_string())
+        })?;
+        let mut marked = true;
+        for device in devices {
+            match crate::compat::best_effort_delete_device(
+                db_client,
+                synapse,
+                server,
+                localpart,
+                &device.device_id,
+                ctx,
+            )
+            .await
+            {
+                Ok(true) => {
+                    if let Err(e) = db_client
+                        .revoke_device_tokens(localpart, &device.device_id)
+                        .await
+                    {
+                        warn!(error = %e, ctx, device = %siwx_oidc::redact::fingerprint(&device.device_id),
+                            "revoke failed after the delete and the marker; retryable");
+                        marked = false;
+                    }
+                }
+                Ok(false) => {}
+                Err(_) => marked = false,
+            }
+        }
+        return if marked {
+            Ok(())
+        } else {
+            Err(CustomError::ServiceUnavailable(
+                STRICT_TEARDOWN_RETRY_MSG.to_string(),
+            ))
+        };
+    }
+    let devices = synapse.list_devices(localpart, server).await.map_err(|e| {
+        warn!(error = %e, ctx, "list_devices failed before a strict teardown");
+        CustomError::ServiceUnavailable(STRICT_TEARDOWN_RETRY_MSG.to_string())
+    })?;
+    let mut all = true;
+    for device in devices {
+        all &= crate::compat::strict_teardown_device(
+            db_client,
+            synapse,
+            server,
+            localpart,
+            &device.device_id,
+            ctx,
+        )
+        .await
+        .is_ok();
+    }
+    if all {
+        Ok(())
+    } else {
+        Err(CustomError::ServiceUnavailable(
+            STRICT_TEARDOWN_RETRY_MSG.to_string(),
+        ))
+    }
+}
+
 /// Execute a (canonicalized) account action for an already-authenticated `did`.
 ///
 /// `device_id` is required only for [`Action::DeviceView`] / [`Action::DeviceDelete`].
@@ -633,12 +723,40 @@ async fn execute_action(
                     "That device is not among your active sessions".to_string(),
                 ));
             }
+            if synapse.strict_teardown() {
+                // Flag 1 (8.23): delete, marker, revoke; a transient fault is a 503
+                // the user retries (the steps are idempotent).
+                let revoked = crate::compat::strict_teardown_device(
+                    db_client,
+                    synapse,
+                    server,
+                    &localpart,
+                    device_id,
+                    "account_device_delete",
+                )
+                .await
+                .map_err(|_| {
+                    CustomError::ServiceUnavailable(STRICT_TEARDOWN_RETRY_MSG.to_string())
+                })?;
+                info!(did = %did, device_id = %device_id, revoked = revoked as u64, "device signed out via account management (strict)");
+                return Ok(ActionOutcome::Deleted {
+                    device_id: device_id.to_string(),
+                });
+            }
             synapse
                 .delete_device(&localpart, device_id, server)
                 .await
                 .map_err(|e| {
                     warn!(error = %e, "delete_device failed during account action");
                     CustomError::BadRequest("Failed to sign out device".to_string())
+                })?;
+            // Flag 2: the deleted-id marker before the revoke; not written = 503,
+            // nothing revoked (the retry is idempotent).
+            crate::compat::plant_deleted_marker(db_client, synapse, &localpart, device_id)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "deleted-id marker not written during account action");
+                    CustomError::ServiceUnavailable(STRICT_TEARDOWN_RETRY_MSG.to_string())
                 })?;
             // Revoke the OAuth session so introspection reports it inactive (AC3).
             // Key on the localpart (== TokenMetadata.username), which is stable
@@ -659,6 +777,8 @@ async fn execute_action(
         Action::AccountDeactivate => {
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
+            strict_pre_teardown(synapse, db_client, server, &localpart, "account_deactivate")
+                .await?;
             // Set the user epoch FIRST (S3-4 / H6, I9): from now on every grant
             // of this user authenticated until now is refused by both refresh
             // endpoints and the access check, so a refresh racing the sweep
@@ -698,6 +818,7 @@ async fn execute_action(
         Action::AccountErase => {
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
+            strict_pre_teardown(synapse, db_client, server, &localpart, "account_erase").await?;
             // The shared, idempotent sequence (`teardown::erase_account`, S5): epoch and
             // revoke every grant, then the tombstones, THEN Synapse, then the passkey
             // purge. The tombstones precede the Synapse erase for the reason they always

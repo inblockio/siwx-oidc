@@ -65,6 +65,7 @@ nondeterministic, so every admin request introspects.
   POST   /_synapse/mas/reactivate_user            synapse_client::reactivate_user
 
   -- admin surface (minted admin token) --------------------------------------
+  GET    /_synapse/admin/v2/users                 synapse_client::admin_users_page (device reaper, orphan scan)
   GET    /_synapse/admin/v2/users/{mxid}/devices  synapse_client::list_devices (and get_device)
   POST   /_matrix/client/v3/keys/query            synapse_client::has_cross_signing_keys
   PUT    /_matrix/client/v3/profile/{mxid}/{field} synapse_client::publish_did_field
@@ -73,6 +74,8 @@ nondeterministic, so every admin request introspects.
   GET    /_matrix/client/v3/account/whoami        tests/e2e_msc3861.rs,
                                                   tests/e2e_session_teardown.rs
   GET    /_matrix/client/v3/devices               tests/e2e_device_code.rs
+  POST   /_matrix/client/v3/keys/upload           tests/e2e_race_teardown.rs (H4b replay;
+                                                  401 when the token's device is gone)
   GET    /_matrix/client/v3/sync                  siwx-oidc-auth/examples/soak.rs (an
                                                   empty sync: no rooms, a next_batch)
          siwx-oidc itself calls NEITHER: these are the Synapse->siwx-oidc
@@ -94,11 +97,20 @@ nondeterministic, so every admin request introspects.
   GET    /__state                 whole in-memory state
   POST   /__reset                 clear everything, restore the real secret
   POST   /__seed_user             mark a localpart as EXISTING (+ profile row)
-  POST   /__seed_device           seed a device (implies EXISTING + profile row)
+  POST   /__seed_device           seed a device (implies EXISTING + profile row);
+                                  optional last_seen_ip / last_seen_ts (ms, NULL
+                                  when absent: the device reaper's idle data, SS4
+                                  flag 3); a device id seeded again replaces its row
   POST   /__set_secret            change the MAS shared secret (401s that surface)
   POST   /__reject_admin_token    make the ADMIN surface reject, MAS untouched
   POST   /__profile               force a profile row present / empty / absent
   POST   /__fail                  arm a 500/timeout on a logical endpoint
+                                  (upsert_device among them: SS4 flag 2 issues no
+                                  grant without a device);
+                                  delete_device also takes 404 / 403 and an
+                                  optional device_id (one device of a bulk
+                                  path), the answers the strict teardown of SS4
+                                  flag 1 decides by (see FAIL below)
 
   -- stub OIDC relying party (NOT Synapse surface; tests/e2e_backchannel_logout.rs)
   POST   /__rp/{name}/backchannel_logout  record the POST (content type + raw
@@ -208,12 +220,22 @@ STATE = {"secret": SECRET, "reject_admin": False}
 # mode string: "500" returns HTTP 500, "timeout" sleeps long enough that the
 # siwx-oidc reqwest client times out. Cleared by /__reset.
 #   POST /__fail {"endpoint": "delete_device", "mode": "500"|"timeout"|"off"}
+# delete_device also takes "404" (Synapse's `User not found`) and "403" (a wrong
+# MAS shared secret), the answers the strict teardown of SS4 flag 1 decides by,
+# and an optional "device_id" that arms the fault for that one device only
+# (a bulk path with one failing device):
+#   POST /__fail {"endpoint": "delete_device", "mode": "404"|"403"|"500", "device_id": "DEVICE_A"}
 # Recognized endpoints: delete_device, list_devices, deactivate, query_user,
-# publish_did_field, read_did_field. ("get_device" is gone as a fault target
+# publish_did_field, read_did_field, upsert_device (a device that cannot be
+# provisioned: under SS4 flag 2 no grant is issued without one, 8.27). ("get_device" is gone as a fault target
 # because `synapse_client::get_device` no longer has a route of its own: since
 # the 1.157 port it is `list_devices` plus a client-side filter, so fault it via
 # "list_devices".)
 FAIL = {}
+# Per-device faults on delete_device ("device_id" in /__fail). Cleared by /__reset.
+FAIL_DEVICE = {}
+# The device keys uploaded per "user_id/device_id" (POST keys/upload). Cleared by /__reset.
+KEYS = {}
 # How long a "timeout" fault sleeps before (not) responding, in seconds. Must
 # exceed the siwx-oidc Synapse HTTP client timeout so the call fails.
 TIMEOUT_SLEEP_SECS = float(os.environ.get("SYNAPSE_MOCK_TIMEOUT_SLEEP", "30"))
@@ -540,6 +562,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             return True
+        if mode == "404":
+            self._send(404, {"errcode": "M_NOT_FOUND", "error": "User not found"})
+            return True
+        if mode == "403":
+            self._send(403, {"errcode": "M_FORBIDDEN", "error": "This endpoint must only be called by MAS"})
+            return True
         # default: "500"
         self._send(500, {"errcode": "M_UNKNOWN", "error": "simulated failure"})
         return True
@@ -573,6 +601,8 @@ class Handler(BaseHTTPRequestHandler):
                     "lifecycle": LIFECYCLE,
                     "calls": list(CALL_LOG),
                     "fail": dict(FAIL),
+                    "fail_device": dict(FAIL_DEVICE),
+                    "keys": dict(KEYS),
                     "effective_deletes": dict(EFFECTIVE_DELETES),
                     "existing_users": sorted(EXISTING_USERS),
                     "profiles": PROFILES,
@@ -648,6 +678,27 @@ class Handler(BaseHTTPRequestHandler):
                 {"type": "m.room.member", "state_key": u, "content": {"membership": "join"}}
                 for u in members
             ]})
+        # GET /_synapse/admin/v2/users  (admin_users_page: the device reaper and the
+        # orphan scan). Every account that exists or carries a device, active only
+        # (`deactivated=false`), `not_user_type=` (empty) leaves out untyped accounts
+        # as Synapse does; `from` is an offset, `next_token` absent on the last page.
+        if path == "/_synapse/admin/v2/users":
+            denied = self._admin_auth()
+            if denied:
+                return self._send(*denied)
+            q = parse_qs(p.query, keep_blank_values=True)
+            limit = int((q.get("limit") or ["100"])[0])
+            start = int((q.get("from") or ["0"])[0] or 0)
+            with LOCK:
+                names = sorted({_mxid(lp) for lp in EXISTING_USERS} | set(DEVICES))
+                names = [n for n in names if not LIFECYCLE.get(n, {}).get("deactivated")]
+                rows = [{"name": n, "user_type": USER_TYPES.get(n)} for n in names]
+            if "not_user_type" in q:
+                rows = [r for r in rows if r["user_type"] is not None]
+            out = {"users": rows[start:start + limit], "total": len(rows)}
+            if start + limit < len(rows):
+                out["next_token"] = str(start + limit)
+            return self._send(200, out)
         # GET /_synapse/admin/v2/users/{user_id}/devices  (list_devices)
         m = re.match(r"^/_synapse/admin/v2/users/([^/]+)/devices$", path)
         if m:
@@ -834,6 +885,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/__seed_device":
             uid = body.get("user_id") or _mxid(body["localpart"])
             with LOCK:
+                # A device id seeded again replaces the old row (a test sets the
+                # `last_seen_ts` of a sign-in's device this way; NULL when absent).
+                DEVICES[uid] = [d for d in DEVICES.get(uid, []) if d["device_id"] != body["device_id"]]
                 DEVICES.setdefault(uid, []).append(_device(
                     body["device_id"], body.get("display_name"),
                     body.get("last_seen_ip"), body.get("last_seen_ts")))
@@ -882,7 +936,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/__reset":
             with LOCK:
                 DEVICES.clear(); LIFECYCLE.clear(); CALL_LOG.clear(); ADMIN_PUTS.clear(); USER_TYPES.clear()
-                FAIL.clear(); EFFECTIVE_DELETES.clear()
+                FAIL.clear(); EFFECTIVE_DELETES.clear(); FAIL_DEVICE.clear(); KEYS.clear()
                 EXISTING_USERS.clear(); PROFILES.clear(); PROFILE_FIELDS.clear()
                 RP_RECEIVED.clear(); RP_MODE.clear(); RP_REDIRECTED.clear()
                 STATE["secret"] = SECRET
@@ -909,14 +963,37 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/__fail":
             endpoint = body.get("endpoint", "")
             mode = body.get("mode", "off")
+            device_id = body.get("device_id")
             with LOCK:
-                if not endpoint or mode in ("off", None):
+                if device_id:
+                    if mode in ("off", None):
+                        FAIL_DEVICE.pop(device_id, None)
+                    else:
+                        FAIL_DEVICE[device_id] = mode
+                elif not endpoint or mode in ("off", None):
                     FAIL.pop(endpoint, None)
                 else:
                     FAIL[endpoint] = mode
             return self._send(200, {"ok": True, "fail": dict(FAIL)})
 
         self._log("POST", path)
+
+        # POST /_matrix/client/v3/keys/upload -- the user's own device keys (H4b:
+        # "keys uploadable"). Under delegated auth Synapse refuses a token whose
+        # device it does not hold ("Token is not active"), so the mock does too.
+        if path == "/_matrix/client/v3/keys/upload":
+            introspection, denied = self._cs_api_auth()
+            if denied:
+                return self._send(*denied)
+            user_id = _mxid(introspection.get("username") or "")
+            device_id = introspection.get("device_id") or ""
+            with LOCK:
+                present = any(d["device_id"] == device_id for d in DEVICES.get(user_id, []))
+                if present:
+                    KEYS[f"{user_id}/{device_id}"] = body
+            if not present:
+                return self._send(401, {"errcode": "M_UNKNOWN_TOKEN", "error": "Token is not active"})
+            return self._send(200, {"one_time_key_counts": {}})
 
         # -- admin surface --------------------------------------------------
         if path == "/_matrix/client/v3/keys/query":
@@ -967,6 +1044,8 @@ class Handler(BaseHTTPRequestHandler):
         # a name it wrongly sent to an existing device must show up here the way
         # it would on Synapse. This mock used to keep the old name, which hid it.
         if path == "/_synapse/mas/upsert_device":
+            if self._maybe_fail("upsert_device"):
+                return
             uid = _mxid(body["localpart"])
             with LOCK:
                 # Provisioning a device implies the user EXISTS — but it does
@@ -1013,6 +1092,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             uid = _mxid(body.get("localpart", ""))
             device_id = body.get("device_id", "")
+            with LOCK:
+                per_device = FAIL_DEVICE.get(device_id)
+            if per_device:
+                with LOCK:
+                    FAIL["__device"] = per_device
+                try:
+                    self._maybe_fail("__device")
+                finally:
+                    with LOCK:
+                        FAIL.pop("__device", None)
+                return
             with LOCK:
                 devs = DEVICES.get(uid, [])
                 existed = any(d["device_id"] == device_id for d in devs)

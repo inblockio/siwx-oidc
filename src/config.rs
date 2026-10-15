@@ -298,6 +298,63 @@ pub struct Config {
     /// Env: `SIWXOIDC_REUSE_REVOKES_GRANT`
     #[serde(default)]
     pub reuse_revokes_grant: bool,
+    // -- Session end removes its device (SS4). Every switch is off by default:
+    // a build with all three off behaves as before them (model D8). --
+    /// Flag 1. On: `POST /oauth2/revoke` of a Matrix-credential grant ends the
+    /// session including its Synapse device (other grant kinds keep tokens-only
+    /// revocation), every teardown becomes strict (Synapse delete, then the
+    /// deleted-id marker, then revoke; a transient Synapse failure answers 503
+    /// and revokes nothing), and a guest claim tears the pre-claim devices down.
+    /// Off (the default): revoke keeps the device; teardown is best-effort and
+    /// answers 200. Read once at startup.
+    /// Env: `SIWXOIDC_REVOKE_DELETES_DEVICE`
+    #[serde(default)]
+    pub revoke_deletes_device: bool,
+    /// Flag 2. On: every device delete plants a deleted-id marker and a sign-in
+    /// naming such an id is refused. Off (the default): no marker is written.
+    /// Env: `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`
+    #[serde(default)]
+    pub refuse_deleted_device_ids: bool,
+    /// Flag 3. On: the device reaper runs. Off (the default): no reaper task.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_ENABLED`
+    #[serde(default)]
+    pub device_reaper_enabled: bool,
+    /// Lifetime of a deleted-id marker (flag 2), seconds. Default 365 days.
+    /// Env: `SIWXOIDC_DELETED_DEVICE_MARKER_TTL_SECS`
+    pub deleted_device_marker_ttl_secs: u64,
+    /// Localparts the device reaper (flag 3) never touches. Default empty.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_SPARE_USERS`
+    #[serde(default)]
+    pub device_reaper_spare_users: Vec<String>,
+    /// Device reaper (flag 3): a pass deletes nothing and only reports (counts in
+    /// the log, the full list in `device_reaper_report_path`). Default true, so
+    /// turning flag 3 on starts with a dry run; set false to delete.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_DRY_RUN`
+    pub device_reaper_dry_run: bool,
+    /// Device reaper (flag 3): seconds between two passes of the fleet (one
+    /// instance per interval holds the lease). Default 86400 (one day). A zero
+    /// is read as one second.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_INTERVAL_SECS`
+    pub device_reaper_interval_secs: u64,
+    /// Device reaper (flag 3): added to the refresh-token lifetime (90 days) to
+    /// give the idle time after which Synapse's `last_seen` makes a device a
+    /// candidate. Default 604800 (7 days).
+    /// Env: `SIWXOIDC_DEVICE_REAPER_MARGIN_SECS`
+    pub device_reaper_margin_secs: u64,
+    /// Device reaper (flag 3): when set, replaces the idle threshold (refresh
+    /// lifetime plus margin) by this many seconds. A device with a live grant, a
+    /// NULL `last_seen` or on a spared account is still never deleted. For a
+    /// test deployment only; unset (the default) on production.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_MIN_IDLE_SECS`
+    #[serde(default)]
+    pub device_reaper_min_idle_secs: Option<u64>,
+    /// Device reaper (flag 3): a file each pass writes its full list to (one
+    /// JSON line per device with its account, type and verdict), mode 0600,
+    /// replaced each pass. It holds Matrix ids in clear, so it belongs on the
+    /// host only, never in logs or a repository. Unset (the default): no file.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_REPORT_PATH`
+    #[serde(default)]
+    pub device_reaper_report_path: Option<String>,
     // -- Guest server path (S1). Flat on purpose, like the rest of the struct. --
     /// Master switch for the guest server path. Off (the default): every other `guest_*` key is ignored and the guest endpoints do not exist. On: start-up runs `guest::validate_guest_config` and refuses to start when a prerequisite is missing.
     /// Env: `SIWXOIDC_GUEST_ENABLED`
@@ -413,6 +470,24 @@ pub struct Config {
 pub const MIN_GRANT_ABSOLUTE_LIFETIME_SECS: u64 = siwx_oidc::db::DEVICE_CODE_LIFETIME;
 
 impl Config {
+    /// SS4: the session-end flags must be switched on together where they
+    /// depend on each other, or the reason the combination is refused.
+    ///
+    /// Flag 1 without flag 2 is refused: strict teardown deletes the device,
+    /// but nothing stops a client that proposes the same device id again from
+    /// getting the deleted id recreated (H4b).
+    pub fn check_session_end_flags(&self) -> Result<(), String> {
+        if self.revoke_deletes_device && !self.refuse_deleted_device_ids {
+            return Err("SIWXOIDC_REVOKE_DELETES_DEVICE is on but \
+                 SIWXOIDC_REFUSE_DELETED_DEVICE_IDS is off: a client that proposes a \
+                 deleted device id again would get it recreated. Turn \
+                 SIWXOIDC_REFUSE_DELETED_DEVICE_IDS on as well, or \
+                 SIWXOIDC_REVOKE_DELETES_DEVICE off."
+                .to_string());
+        }
+        Ok(())
+    }
+
     /// The absolute-lifetime caps the grant store enforces (I6), or the
     /// reason the configured values are refused.
     pub fn grant_lifetime(&self) -> Result<siwx_oidc::db::grant::GrantLifetime, String> {
@@ -482,6 +557,16 @@ impl Default for Config {
             backchannel_logout_allowed_hosts: Vec::new(),
             backchannel_logout_required_for_refresh: false,
             reuse_revokes_grant: false,
+            revoke_deletes_device: false,
+            refuse_deleted_device_ids: false,
+            device_reaper_enabled: false,
+            deleted_device_marker_ttl_secs: 31_536_000,
+            device_reaper_spare_users: Vec::new(),
+            device_reaper_dry_run: true,
+            device_reaper_interval_secs: 86_400,
+            device_reaper_margin_secs: 604_800,
+            device_reaper_min_idle_secs: None,
+            device_reaper_report_path: None,
             guest_enabled: false,
             guest_client_url: None,
             guest_client_id: None,
@@ -989,6 +1074,55 @@ mod tests {
         });
     }
 
+    /// SS4: the three session-end flags are off and the companion settings
+    /// have their documented defaults unless an operator sets them.
+    #[test]
+    fn ss4_flags_are_off_by_default_and_read_from_the_environment() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            for c in [figment().extract::<Config>()?, Config::default()] {
+                assert!(!c.revoke_deletes_device);
+                assert!(!c.refuse_deleted_device_ids);
+                assert!(!c.device_reaper_enabled);
+                assert_eq!(c.deleted_device_marker_ttl_secs, 31_536_000);
+                assert!(c.device_reaper_spare_users.is_empty());
+                assert!(c.device_reaper_dry_run);
+                assert_eq!(c.device_reaper_interval_secs, 86_400);
+                assert_eq!(c.device_reaper_margin_secs, 604_800);
+                assert_eq!(c.device_reaper_min_idle_secs, None);
+                assert_eq!(c.device_reaper_report_path, None);
+            }
+            jail.set_env("SIWXOIDC_REVOKE_DELETES_DEVICE", "true");
+            jail.set_env("SIWXOIDC_REFUSE_DELETED_DEVICE_IDS", "true");
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_ENABLED", "true");
+            jail.set_env("SIWXOIDC_DELETED_DEVICE_MARKER_TTL_SECS", "60");
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_SPARE_USERS", r#"["agent"]"#);
+            let c = figment().extract::<Config>()?;
+            assert!(c.revoke_deletes_device && c.refuse_deleted_device_ids);
+            assert!(c.device_reaper_enabled);
+            assert_eq!(c.deleted_device_marker_ttl_secs, 60);
+            assert_eq!(c.device_reaper_spare_users, vec!["agent".to_string()]);
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_DRY_RUN", "false");
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_INTERVAL_SECS", "5");
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_MARGIN_SECS", "6");
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_MIN_IDLE_SECS", "7");
+            jail.set_env(
+                "SIWXOIDC_DEVICE_REAPER_REPORT_PATH",
+                "/var/lib/reaper.jsonl",
+            );
+            let c = figment().extract::<Config>()?;
+            assert!(!c.device_reaper_dry_run);
+            assert_eq!(c.device_reaper_interval_secs, 5);
+            assert_eq!(c.device_reaper_margin_secs, 6);
+            assert_eq!(c.device_reaper_min_idle_secs, Some(7));
+            assert_eq!(
+                c.device_reaper_report_path.as_deref(),
+                Some("/var/lib/reaper.jsonl")
+            );
+            Ok(())
+        });
+    }
+
     /// Reuse enforcement (I5 phase B) is off unless an operator turns it on,
     /// under either prefix; the new prefix beats the legacy one.
     #[test]
@@ -1009,6 +1143,27 @@ mod tests {
             assert!(figment().extract::<Config>()?.reuse_revokes_grant);
             Ok(())
         });
+    }
+
+    /// SS4: flag 1 alone recreates a deleted device id when a client proposes
+    /// it again (H4b), so flag 1 without flag 2 refuses to start.
+    #[test]
+    fn config_flag1_without_flag2_refuses_to_start() {
+        let flag1_alone = Config {
+            revoke_deletes_device: true,
+            ..Config::default()
+        };
+        let err = flag1_alone.check_session_end_flags().unwrap_err();
+        assert!(err.contains("SIWXOIDC_REVOKE_DELETES_DEVICE"), "{err}");
+        assert!(err.contains("SIWXOIDC_REFUSE_DELETED_DEVICE_IDS"), "{err}");
+        for (flag1, flag2) in [(false, false), (false, true), (true, true)] {
+            let c = Config {
+                revoke_deletes_device: flag1,
+                refuse_deleted_device_ids: flag2,
+                ..Config::default()
+            };
+            assert_eq!(c.check_session_end_flags(), Ok(()), "{flag1} {flag2}");
+        }
     }
 
     #[test]

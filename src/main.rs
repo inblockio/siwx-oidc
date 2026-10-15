@@ -9,6 +9,8 @@ mod backchannel;
 mod compat;
 mod config;
 mod device_auth;
+// SS4 flag 3: removes devices no client can use (off by default).
+mod device_reaper;
 // Provider-attested DID assertions: the field name, the `{did, proof}` value
 // builder, and the ES256 minter behind the `io.inblock.did` profile object.
 //

@@ -1779,6 +1779,7 @@ mod tests {
         bare_404: bool,
         fail_delete_device: bool,
         upsert_delay_ms: u64,
+        fail_upsert: bool,
     }
 
     #[derive(Clone, Default)]
@@ -1851,10 +1852,16 @@ mod tests {
             .route(
                 "/_synapse/mas/upsert_device",
                 ax_post(|AxState(m): AxState<MockSynapse>, b: String| async move {
-                    let delay = m.flags.lock().unwrap().upsert_delay_ms;
+                    let (delay, fail) = {
+                        let f = m.flags.lock().unwrap();
+                        (f.upsert_delay_ms, f.fail_upsert)
+                    };
                     rec(&m, "POST upsert_device".into(), b).await;
                     if delay > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
+                    if fail {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "{}");
                     }
                     (StatusCode::CREATED, "{}")
                 }),
@@ -2170,6 +2177,37 @@ mod tests {
             assert!(url.query_pairs().any(|(k, _)| k == "code"));
             assert_eq!(record_of(&e, &lp).await["state"], "active");
             assert_eq!(mock.count("POST upsert_device"), 1);
+        }
+    }
+
+    /// SS4 audit #2: a failing `upsert_device` on the guest branch is the
+    /// `temporarily_unavailable` redirect with no code (never an issuer page), with SS4
+    /// flag 2 on and off alike; the retry heals.
+    #[tokio::test]
+    async fn a_failing_guest_upsert_redirects_temporarily_unavailable() {
+        for flag2 in [true, false] {
+            let Some((e, mock, synapse)) = guest_env(|c| c.refuse_deleted_device_ids = flag2).await
+            else {
+                return;
+            };
+            mock.flags.lock().unwrap().fail_upsert = true;
+            let g = Guest::new();
+            let (lp, handle) = record(&e, &g, "minted", 600).await;
+            let sid = start_session(&e, &g, &handle, "DEVICE0009").await;
+            let r = sign_in_as(&e, &synapse, &sid).await;
+            assert_eq!(
+                redirect_error_of(r),
+                "temporarily_unavailable",
+                "flag 2 {flag2}"
+            );
+            assert_eq!(mock.count("POST upsert_device"), 1);
+            assert_eq!(record_of(&e, &lp).await["state"], "provisioning");
+            mock.flags.lock().unwrap().fail_upsert = false;
+            let sid = start_session(&e, &g, &handle, "DEVICE0009").await;
+            let (url, _) = sign_in_as(&e, &synapse, &sid)
+                .await
+                .expect("the retry heals");
+            assert!(url.query_pairs().any(|(k, _)| k == "code"));
         }
     }
 

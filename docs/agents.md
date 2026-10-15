@@ -337,6 +337,15 @@ issuer their homeserver uses. Full details:
   name set in a Matrix client survives the next sign-in.
 - **A deactivated account cannot sign in**: `/sign_in` answers 401. If Synapse
   cannot be reached for that check, it answers 503; retry later.
+- **Typed refusals.** A server that runs `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`
+  answers its `/sign_in` refusals as a redirect carrying `error` instead, and the
+  library returns them as `siwx_oidc_auth::AuthError` inside the
+  `anyhow::Error` (`err.downcast_ref::<AuthError>()`): `DeviceRefused` for a
+  pinned device id that was signed out (it is never recreated: sign in with a
+  new id), `AccessDenied` for a deactivated or erased account (final), and
+  `TemporarilyUnavailable` when Synapse could not be asked or could not set up
+  the device (retry later). `is_device_refused(&err)` and `is_transient(&err)`
+  answer the two questions a caller usually has.
 - **Common errors** at sign-in, with fixes, are in
   [troubleshooting.md](troubleshooting.md#headless-sign-in-siwx-oidc-auth).
 

@@ -324,15 +324,41 @@ async fn wallet_login(c: &Client, base: &str, w: &Wallet) -> LoginResult {
 
 /// [`wallet_login`] with a client the caller registered.
 async fn wallet_login_as(c: &Client, base: &str, w: &Wallet, rc: RegisteredClient) -> LoginResult {
+    wallet_login_scoped(c, base, w, rc, "openid").await
+}
+
+/// [`wallet_login_as`] asking for `scope` (e.g. a device id the client proposes).
+async fn wallet_login_scoped(
+    c: &Client,
+    base: &str,
+    w: &Wallet,
+    rc: RegisteredClient,
+    scope: &str,
+) -> LoginResult {
+    wallet_login_or_refusal(c, base, w, rc, scope)
+        .await
+        .unwrap_or_else(|q| panic!("sign_in redirect must carry code, got {q:?}"))
+}
+
+/// [`wallet_login_scoped`], answering a `sign_in` refusal redirect (one that carries
+/// `error`) with its query parameters instead of a login.
+async fn wallet_login_or_refusal(
+    c: &Client,
+    base: &str,
+    w: &Wallet,
+    rc: RegisteredClient,
+    scope: &str,
+) -> Result<LoginResult, HashMap<String, String>> {
     let (verifier, challenge) = pkce_pair();
     let state = "race_state";
     let nrc = no_redirect_client();
 
     // /authorize -> session cookie + nonce
     let authorize_url = format!(
-        "{base}/authorize?client_id={}&redirect_uri={}&scope=openid&response_type=code&state={state}&code_challenge={}&code_challenge_method=S256",
+        "{base}/authorize?client_id={}&redirect_uri={}&scope={}&response_type=code&state={state}&code_challenge={}&code_challenge_method=S256",
         urlencoding::encode(&rc.client_id),
         urlencoding::encode(&rc.redirect_uri),
+        urlencoding::encode(scope),
         urlencoding::encode(&challenge),
     );
     let auth_resp = nrc.get(&authorize_url).send().await.unwrap();
@@ -404,17 +430,21 @@ async fn wallet_login_as(c: &Client, base: &str, w: &Wallet, rc: RegisteredClien
         .await
         .unwrap();
     assert_eq!(sign_in_resp.status(), StatusCode::SEE_OTHER, "sign_in 303");
-    let code = parse_query(
+    let redirect = parse_query(
         sign_in_resp
             .headers()
             .get("location")
             .unwrap()
             .to_str()
             .unwrap(),
-    )
-    .get("code")
-    .expect("sign_in redirect must carry code")
-    .clone();
+    );
+    if redirect.contains_key("error") {
+        return Err(redirect);
+    }
+    let code = redirect
+        .get("code")
+        .expect("sign_in redirect must carry code")
+        .clone();
 
     let token: Value = exchange_code(c, base, &rc, &code, &verifier)
         .await
@@ -426,13 +456,13 @@ async fn wallet_login_as(c: &Client, base: &str, w: &Wallet, rc: RegisteredClien
         .as_str()
         .unwrap()
         .to_string();
-    LoginResult {
+    Ok(LoginResult {
         access_token,
         refresh_token,
         device_id,
         client_id: rc.client_id.clone(),
         id_token,
-    }
+    })
 }
 
 /// One-shot wallet login that stops at the auth CODE (for code-double-spend
@@ -593,6 +623,14 @@ async fn mock_seed_device(c: &Client, mxid: &str, device_id: &str) {
         .await
         .unwrap();
 }
+/// Seed (or replace) a device with Synapse's `last_seen_ts` (`None`: NULL, never seen).
+async fn mock_seed_device_seen(c: &Client, mxid: &str, device_id: &str, last_seen_ts: Option<i64>) {
+    c.post(format!("{}/__seed_device", mock()))
+        .json(&json!({ "user_id": mxid, "device_id": device_id, "last_seen_ts": last_seen_ts }))
+        .send()
+        .await
+        .unwrap();
+}
 /// Mark a localpart as an EXISTING account without seeding a device.
 ///
 /// `reject_if_new_identity` (`src/webauthn.rs`) 400s an unprovisioned identity on
@@ -628,6 +666,44 @@ async fn mock_state(c: &Client) -> Value {
         .json()
         .await
         .unwrap()
+}
+/// SS4 flag 1 (`SIWXOIDC_REVOKE_DELETES_DEVICE`) as the stack under test runs it:
+/// the suite is told by the same variable (the mock-stack job sets neither).
+fn flag1_on() -> bool {
+    std::env::var("SIWXOIDC_REVOKE_DELETES_DEVICE").is_ok_and(|v| v == "true" || v == "1")
+}
+/// SS4 flag 2 (`SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`) as the stack under test runs it.
+fn flag2_on() -> bool {
+    std::env::var("SIWXOIDC_REFUSE_DELETED_DEVICE_IDS").is_ok_and(|v| v == "true" || v == "1")
+}
+/// Whether any SS4 flag is on for the stack under test.
+fn any_ss4_flag_on() -> bool {
+    [
+        "SIWXOIDC_REVOKE_DELETES_DEVICE",
+        "SIWXOIDC_REFUSE_DELETED_DEVICE_IDS",
+        "SIWXOIDC_DEVICE_REAPER_ENABLED",
+    ]
+    .iter()
+    .any(|k| std::env::var(k).is_ok_and(|v| v == "true" || v == "1"))
+}
+/// `POST /oauth2/revoke` of `token`; the status.
+async fn revoke_token(c: &Client, base: &str, token: &str) -> StatusCode {
+    c.post(format!("{base}/oauth2/revoke"))
+        .form(&[("token", token)])
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+/// `POST /_matrix/client/v3/keys/upload` at the homeserver as the token's device.
+async fn keys_upload(c: &Client, token: &str) -> StatusCode {
+    c.post(format!("{}/_matrix/client/v3/keys/upload", mock()))
+        .bearer_auth(token)
+        .json(&json!({"device_keys": {"keys": {"ed25519:X": "k"}}, "one_time_keys": {}}))
+        .send()
+        .await
+        .unwrap()
+        .status()
 }
 async fn mock_fail(c: &Client, endpoint: &str, mode: &str) {
     c.post(format!("{}/__fail", mock()))
@@ -816,13 +892,19 @@ async fn grandfathered_legacy_account_keeps_legacy_localpart_on_real_signin() {
 
 /// RFC 7009 `/oauth2/revoke` is token hygiene: it revokes the session's tokens
 /// but must NEVER issue a Synapse `DELETE /devices` (the 2026-06-12 incident).
+///
+/// SS4 flag 1 (`SIWXOIDC_REVOKE_DELETES_DEVICE`, off by default): with the flag
+/// on, the revoke of a Matrix-credential grant ends the session including its
+/// device (MAS parity), so the revoke half asserts the deletion instead; the
+/// logout half is the same in both states. The flag-off half is unchanged and is
+/// what the mock-stack job runs.
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn h1_revoke_does_not_delete_device_but_logout_does() {
     let c = Client::new();
     let base = oidc();
 
-    // --- revoke path: tokens gone, device intact, NO DELETE in the call log ---
+    // --- revoke path: tokens gone; flag 1 off: device intact, NO DELETE in the call log ---
     mock_reset(&c).await;
     let w = new_wallet();
     let login = wallet_login(&c, &base, &w).await;
@@ -844,30 +926,42 @@ async fn h1_revoke_does_not_delete_device_but_logout_does() {
     assert_eq!(r.status(), 200, "revoke is always 200 (RFC 7009)");
 
     let state = mock_state(&c).await;
-    assert_eq!(
-        count_calls(&state, DELETE_DEVICE_CALL),
-        0,
-        "REVOKE MUST NOT delete the Synapse device (H1 incident guard)"
-    );
-    // Belt and braces: the PRE-1.157 dialect must be absent too. Without this a
-    // revert to `DELETE /_synapse/admin/v2/users/{mxid}/devices/{id}` would slip
-    // past the needle above and this guard would pass while revoke was once
-    // again wedging users' cross-signing identity.
-    assert_eq!(
-        count_calls(&state, "DELETE "),
-        0,
-        "REVOKE MUST NOT issue the legacy admin-API DELETE /devices either"
-    );
-    assert!(
-        device_ids(&state, &w.mxid).contains(&login.device_id),
-        "revoke must leave the Synapse device intact"
-    );
+    if flag1_on() {
+        assert_eq!(
+            count_calls(&state, DELETE_DEVICE_CALL),
+            1,
+            "flag 1: revoke of a Matrix grant deletes the device"
+        );
+        assert!(
+            !device_ids(&state, &w.mxid).contains(&login.device_id),
+            "flag 1: revoke ends the session including its device"
+        );
+    } else {
+        assert_eq!(
+            count_calls(&state, DELETE_DEVICE_CALL),
+            0,
+            "REVOKE MUST NOT delete the Synapse device (H1 incident guard)"
+        );
+        // Belt and braces: the PRE-1.157 dialect must be absent too. Without this a
+        // revert to `DELETE /_synapse/admin/v2/users/{mxid}/devices/{id}` would slip
+        // past the needle above and this guard would pass while revoke was once
+        // again wedging users' cross-signing identity.
+        assert_eq!(
+            count_calls(&state, "DELETE "),
+            0,
+            "REVOKE MUST NOT issue the legacy admin-API DELETE /devices either"
+        );
+        assert!(
+            device_ids(&state, &w.mxid).contains(&login.device_id),
+            "revoke must leave the Synapse device intact"
+        );
+    }
     assert!(
         !token_active(&c, &login.access_token).await,
         "revoke must still revoke the session's tokens"
     );
 
-    // --- logout path: explicit intent DOES delete the device ---
+    // --- logout path: explicit intent DOES delete the device (both flag states) ---
     mock_reset(&c).await;
     let w2 = new_wallet();
     let login2 = wallet_login(&c, &base, &w2).await;
@@ -1259,6 +1353,16 @@ async fn h14_synapse_delete_failure_is_surfaced_not_500() {
         StatusCode::INTERNAL_SERVER_ERROR,
         "must not 500: {text}"
     );
+    if flag1_on() {
+        // SS4 flag 1 (8.23): a transient Synapse failure is the retryable 503,
+        // and nothing was revoked.
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "flag 1: a transient Synapse delete failure is a retryable 503, got {status}: {text}"
+        );
+        return;
+    }
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
@@ -4936,4 +5040,413 @@ async fn account_sign_out_ends_this_browsers_account_session_and_picker_hint() {
         StatusCode::OK,
         "a sign-out without cookies is a 200"
     );
+}
+
+// ===========================================================================
+// SS4: session end removes its device, behind three flags (all off by default)
+// ===========================================================================
+
+/// The standing guard of SS4 (model D8): with every SS4 flag off, the build
+/// behaves as before the flags. Revoke keeps the device; a failing Synapse
+/// delete leaves logout, `DELETE /devices/{id}` and `/logout/all` at today's
+/// best-effort 200 with the tokens revoked; a deleted device id proposed again
+/// at sign-in is recreated as today; no device reaper runs, so an old device
+/// with no grant stays listed (run the stack with
+/// `SIWXOIDC_DEVICE_REAPER_INTERVAL_SECS=1` and `SIWXOIDC_DEVICE_REAPER_DRY_RUN=false`,
+/// which are not flags, so a reaper started without flag 3 would delete it within
+/// this test). Skips, loudly, against a stack started with a flag on.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn ss4_all_flags_off_is_inert() {
+    if any_ss4_flag_on() {
+        eprintln!("[ss4] an SS4 flag is on for this run: the all-off guard does not apply");
+        return;
+    }
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    mock_seed_device_seen(&c, &w.mxid, "SS4INERTGHOST", Some(1)).await;
+
+    // Revoke keeps the device.
+    let a = wallet_login(&c, &base, &w).await;
+    assert_eq!(revoke_token(&c, &base, &a.access_token).await, 200);
+    let state = mock_state(&c).await;
+    assert_eq!(
+        count_calls(&state, DELETE_DEVICE_CALL),
+        0,
+        "flags off: revoke keeps the device"
+    );
+    assert!(device_ids(&state, &w.mxid).contains(&a.device_id));
+
+    // A failing Synapse delete: logout is still 200 and ends the tokens.
+    let b = wallet_login(&c, &base, &w).await;
+    mock_fail(&c, "delete_device", "500").await;
+    let lo = c
+        .post(format!("{base}/_matrix/client/v3/logout"))
+        .bearer_auth(&b.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(lo.status(), 200, "flags off: logout stays best-effort 200");
+    assert!(!token_active(&c, &b.access_token).await);
+
+    // The same for DELETE /devices/{id} and /logout/all.
+    let d = wallet_login(&c, &base, &w).await;
+    let e = wallet_login(&c, &base, &w).await;
+    let dd = c
+        .delete(format!(
+            "{base}/_matrix/client/v3/devices/{}",
+            urlencoding::encode(&e.device_id)
+        ))
+        .bearer_auth(&d.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dd.status(), 200, "flags off: DELETE /devices stays 200");
+    assert!(!token_active(&c, &e.access_token).await);
+    let all = c
+        .post(format!("{base}/_matrix/client/v3/logout/all"))
+        .bearer_auth(&d.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(all.status(), 200, "flags off: logout/all stays 200");
+    assert!(!token_active(&c, &d.access_token).await);
+    mock_fail(&c, "delete_device", "off").await;
+
+    // A deleted id proposed again is recreated, as today.
+    let stable = format!("SS4INERT{}", w.mxid.len());
+    let scope = format!("openid urn:matrix:client:api:* urn:matrix:client:device:{stable}");
+    let f = wallet_login_scoped(&c, &base, &w, register_client(&c, &base).await, &scope).await;
+    assert_eq!(f.device_id, stable);
+    let lo = c
+        .post(format!("{base}/_matrix/client/v3/logout"))
+        .bearer_auth(&f.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(lo.status(), 200);
+    assert!(!device_ids(&mock_state(&c).await, &w.mxid).contains(&stable));
+    let g = wallet_login_scoped(&c, &base, &w, register_client(&c, &base).await, &scope).await;
+    assert_eq!(
+        g.device_id, stable,
+        "flags off: the deleted id is recreated as today"
+    );
+    assert!(device_ids(&mock_state(&c).await, &w.mxid).contains(&stable));
+
+    // No device reaper: the old device without a grant is still listed.
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    assert!(
+        device_ids(&mock_state(&c).await, &w.mxid).contains(&"SS4INERTGHOST".to_string()),
+        "flags off: no device reaper"
+    );
+}
+
+/// SS4 WP8 (flag 3, model 8.14), H6 on the mock stack: the device reaper's planted
+/// cases end to end. Needs the stack with `SIWXOIDC_DEVICE_REAPER_ENABLED=true`,
+/// `SIWXOIDC_DEVICE_REAPER_DRY_RUN=false`, `SIWXOIDC_DEVICE_REAPER_INTERVAL_SECS=1`
+/// and `SIWXOIDC_DEVICE_REAPER_SPARE_USERS=["ss4reaperagent"]`; skips otherwise. An
+/// old device with no grant goes (with its marker under flag 2); a signed-in device
+/// last seen just as long ago stays, as do a recent one, one never seen (NULL) and
+/// the spared account's.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn ss4_reaper_planted_cases_on_mock_stack() {
+    let on = |k: &str| std::env::var(k).is_ok_and(|v| v == "true" || v == "1");
+    if !on("SIWXOIDC_DEVICE_REAPER_ENABLED")
+        || std::env::var("SIWXOIDC_DEVICE_REAPER_DRY_RUN").as_deref() != Ok("false")
+    {
+        eprintln!("[ss4] the stack does not run the device reaper for real: skipped");
+        return;
+    }
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    let old = Some(1_i64); // 1970: older than any threshold
+    let now = Some(chrono::Utc::now().timestamp_millis());
+    let live = wallet_login(&c, &base, &w).await;
+    mock_seed_device_seen(&c, &w.mxid, &live.device_id, old).await;
+    mock_seed_device_seen(&c, &w.mxid, "SS4GHOST", old).await;
+    mock_seed_device_seen(&c, &w.mxid, "SS4RECENT", now).await;
+    mock_seed_device_seen(&c, &w.mxid, "SS4NEVERSEEN", None).await;
+    let server = w.mxid.split_once(':').unwrap().1;
+    let agent = format!("@ss4reaperagent:{server}");
+    mock_seed_device_seen(&c, &agent, "SS4AGENT", old).await;
+
+    let mut gone = false;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if !device_ids(&mock_state(&c).await, &w.mxid).contains(&"SS4GHOST".to_string()) {
+            gone = true;
+            break;
+        }
+    }
+    assert!(gone, "the ghost (old, no grant) is reaped");
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await; // one more pass
+    let state = mock_state(&c).await;
+    let mine = device_ids(&state, &w.mxid);
+    for d in [live.device_id.as_str(), "SS4RECENT", "SS4NEVERSEEN"] {
+        assert!(mine.contains(&d.to_string()), "{d} spared");
+    }
+    assert!(device_ids(&state, &agent).contains(&"SS4AGENT".to_string()));
+    assert!(
+        token_active(&c, &live.access_token).await,
+        "the live session is untouched"
+    );
+
+    let redis = siwx_oidc::db::RedisClient::new(
+        &url::Url::parse(&std::env::var("SIWXOIDC_REDIS_URL").unwrap()).unwrap(),
+    )
+    .await
+    .unwrap();
+    let lp = w.mxid[1..].split(':').next().unwrap();
+    let marked = siwx_oidc::db::DBClient::is_deleted_device(&redis, lp, "SS4GHOST")
+        .await
+        .unwrap();
+    assert_eq!(
+        marked,
+        on("SIWXOIDC_REFUSE_DELETED_DEVICE_IDS"),
+        "marker iff flag 2"
+    );
+}
+
+/// H4b (SS4, WP11 part 1): the 2026-06-12 sequence. Element's forced-recovery
+/// dialog was escaped again and again, and each escape revoked the session's
+/// tokens (both, in parallel, as matrix-js-sdk's sign-out does). With flag 1
+/// each revoke also deletes the device. After each escape the next sign-in
+/// must get a device that can be confirmed: listed by Synapse, its token
+/// accepted, its keys uploadable; and nothing wedges: no 5xx, no stuck grant,
+/// and no deleted device id comes back (Synapse cannot recycle a device id:
+/// its delete leaves the cross-signing signature rows, which then shadow a
+/// fresh upload; the compat module doc).
+///
+/// Two client shapes: one that proposes a fresh device id per sign-in, and one
+/// that proposes its stable device id again (Element Web and X keep one per
+/// install; Element X's re-login reuses the session's device id).
+///
+/// Flag 1 alone recreates the stable id (the WEDGE assertion below), which is
+/// why siwx-oidc refuses to start with flag 1 on and flag 2 off. With flags 1
+/// and 2, the stable id is refused after its first escape (`invalid_scope`
+/// redirect with the state, the id not recreated), and the client's retry
+/// with a fresh id is confirmable.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn h4b_replay_forced_recovery_escapes_each_revoke_no_wedge() {
+    let c = Client::new();
+    let base = oidc();
+    let flag1 = flag1_on();
+    let flag2 = flag2_on();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+
+    for shape in ["fresh", "stable"] {
+        let mut escaped: Vec<String> = Vec::new();
+        let mut refused = 0;
+        for escape in 0..4 {
+            let device = match shape {
+                "fresh" => format!("H4BFRESH{escape}X{n}"),
+                _ => format!("H4BSTABLE{n}"),
+            };
+            let scope = format!("openid urn:matrix:client:api:* urn:matrix:client:device:{device}");
+            let attempt =
+                wallet_login_or_refusal(&c, &base, &w, register_client(&c, &base).await, &scope)
+                    .await;
+            let login = match attempt {
+                Ok(login) => login,
+                Err(q) => {
+                    // Flags 1 and 2: the escaped stable id is refused, never recreated.
+                    assert!(
+                        flag1 && flag2 && shape == "stable" && escape > 0,
+                        "[{shape} #{escape}] unexpected sign_in refusal: {q:?}"
+                    );
+                    assert_eq!(q.get("error").map(String::as_str), Some("invalid_scope"));
+                    assert_eq!(q.get("state").map(String::as_str), Some("race_state"));
+                    assert!(
+                        !device_ids(&mock_state(&c).await, &w.mxid).contains(&device),
+                        "[{shape} #{escape}] the refused id is not recreated"
+                    );
+                    refused += 1;
+                    // The client's retry: a fresh id, which must be confirmable (no wedge).
+                    let retry = format!(
+                        "openid urn:matrix:client:api:* urn:matrix:client:device:H4BRETRY{escape}X{n}"
+                    );
+                    wallet_login_scoped(&c, &base, &w, register_client(&c, &base).await, &retry)
+                        .await
+                }
+            };
+            // The device can be confirmed.
+            let state = mock_state(&c).await;
+            assert!(
+                device_ids(&state, &w.mxid).contains(&login.device_id),
+                "[{shape} #{escape}] the sign-in's device is listed"
+            );
+            assert!(
+                token_active(&c, &login.access_token).await,
+                "[{shape} #{escape}] token live"
+            );
+            assert_eq!(
+                keys_upload(&c, &login.access_token).await,
+                200,
+                "[{shape} #{escape}] the device's keys are uploadable"
+            );
+            // No deleted id is recreated.
+            let recreated = state["effective_deletes"]
+                .get(format!("{}/{}", w.mxid, login.device_id))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            assert_eq!(
+                recreated, 0,
+                "[{shape} #{escape}] WEDGE: sign-in recreated device id {} that a revoke had \
+                 deleted (Synapse keeps its cross-signing signature rows)",
+                login.device_id
+            );
+            // The escape: both tokens revoked in parallel.
+            let (ra, rr) = tokio::join!(
+                revoke_token(&c, &base, &login.access_token),
+                revoke_token(&c, &base, &login.refresh_token)
+            );
+            assert_eq!(
+                (ra, rr),
+                (StatusCode::OK, StatusCode::OK),
+                "[{shape} #{escape}] no 5xx"
+            );
+            assert!(
+                !token_active(&c, &login.access_token).await,
+                "no stuck grant"
+            );
+            let after = mock_state(&c).await;
+            assert_eq!(
+                device_ids(&after, &w.mxid).contains(&login.device_id),
+                !flag1,
+                "[{shape} #{escape}] flag 1 {}: the escaped device is {}",
+                if flag1 { "on" } else { "off" },
+                if flag1 { "deleted" } else { "kept" }
+            );
+            escaped.push(login.device_id);
+        }
+        if shape == "fresh" {
+            escaped.sort();
+            escaped.dedup();
+            assert_eq!(escaped.len(), 4, "each escape's sign-in got its own device");
+        } else if flag1 && flag2 {
+            assert_eq!(
+                refused, 3,
+                "each escape after the first refuses the stable id"
+            );
+        }
+    }
+}
+
+/// SS4 WP7 (H5, 8.19): the headless client `siwx-oidc-auth` returns a refused
+/// device id as a typed error. An agent pins a device id with
+/// `authenticate_with_device`, its grant is revoked (flag 1: the device is
+/// deleted, flag 2: its id is marked), and the next sign-in with the same id is
+/// `AuthError::DeviceRefused`, which `is_device_refused` recognises, not the old
+/// "no 'code' in /sign_in redirect". A fresh id then signs in. With the flags
+/// off (or flag 2 alone, where a revoke deletes nothing), the same id signs in
+/// again as today.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn authenticate_with_device_deleted_id_returns_device_refused() {
+    use siwx_oidc_auth::{authenticate_with_device, is_device_refused, AuthError, SiwxKey};
+    // The Matrix-class static client of the mock stack (e2e/up.sh, ci.yml).
+    const CLIENT: &str = "e2estatic";
+    const REDIRECT_URI: &str = "http://localhost:0/callback";
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let key = SiwxKey::generate_ed25519();
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let device = format!("AGENTDEV{n}");
+
+    let first = authenticate_with_device(&base, CLIENT, REDIRECT_URI, &key, Some(&device))
+        .await
+        .expect("the first sign-in with a pinned id");
+    let revoked = c
+        .post(format!("{base}/oauth2/revoke"))
+        .form(&[
+            ("token", first.access_token.as_str()),
+            ("client_id", CLIENT),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK, "revocation is always 200");
+
+    let again = authenticate_with_device(&base, CLIENT, REDIRECT_URI, &key, Some(&device)).await;
+    if flag1_on() && flag2_on() {
+        let error = again.expect_err("flags 1 and 2: a deleted id is refused");
+        assert!(is_device_refused(&error), "typed refusal, got {error:#}");
+        assert!(
+            matches!(
+                error.downcast_ref::<AuthError>(),
+                Some(AuthError::DeviceRefused {
+                    description: Some(_)
+                })
+            ),
+            "{error:?}"
+        );
+        assert!(
+            !format!("{error:#}").contains("no 'code'"),
+            "not the old untyped message: {error:#}"
+        );
+        let fresh = format!("AGENTNEW{n}");
+        authenticate_with_device(&base, CLIENT, REDIRECT_URI, &key, Some(&fresh))
+            .await
+            .expect("a fresh id signs in after the refusal");
+    } else {
+        again.expect("flag 1 or 2 off: the same id signs in again as today");
+    }
+}
+
+/// SS4 audit #5: flag 2 on, flag 1 off. Deactivate and erase delete and mark every
+/// listed device before Synapse is asked; when the Synapse deactivation then fails, no
+/// token of a deleted, marked device stays active (each device's grants are revoked
+/// right after its marker, flag 1's order). Skips unless the stack runs flag 2 alone.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn flag2_only_failed_deactivation_leaves_no_live_grant_on_a_marked_device() {
+    if !flag2_on() || flag1_on() {
+        eprintln!("SKIP: needs a stack with SS4 flag 2 on and flag 1 off");
+        return;
+    }
+    let base = oidc();
+    let c = Client::new();
+    for action in ["org.matrix.account_deactivate", "io.inblock.account_erase"] {
+        mock_reset(&c).await;
+        let w = new_wallet();
+        let login = wallet_login(&c, &base, &w).await;
+        assert!(
+            token_active(&c, &login.access_token).await,
+            "{action}: before"
+        );
+        let (cookie, csrf, _) = account_reauth(&c, &base, &w, "org.matrix.devices_list").await;
+        mock_fail(&c, "deactivate", "500").await;
+        let status = account_action(&c, &base, &cookie, action, None, &csrf)
+            .await
+            .status();
+        mock_fail(&c, "deactivate", "off").await;
+        assert!(
+            !status.is_success(),
+            "{action}: the deactivation failed: {status}"
+        );
+        let state = mock_state(&c).await;
+        assert!(
+            !device_ids(&state, &w.mxid).contains(&login.device_id),
+            "{action}: the device was deleted before Synapse was asked"
+        );
+        assert!(
+            !token_active(&c, &login.access_token).await,
+            "{action}: no live grant on the deleted, marked device"
+        );
+    }
 }
