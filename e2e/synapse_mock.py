@@ -96,7 +96,9 @@ nondeterministic, so every admin request introspects.
   -- test-only control plane (never authenticated, never call-logged) --------
   GET    /__state                 whole in-memory state
   POST   /__reset                 clear everything, restore the real secret
-  POST   /__seed_user             mark a localpart as EXISTING (+ profile row)
+  POST   /__seed_user             mark a localpart as EXISTING (+ profile row);
+                                  optional `did`: also publish it as the
+                                  account's `io.inblock.did` field
   POST   /__seed_device           seed a device (implies EXISTING + profile row);
                                   optional last_seen_ip / last_seen_ts (ms, NULL
                                   when absent: the device reaper's idle data, SS4
@@ -899,10 +901,14 @@ class Handler(BaseHTTPRequestHandler):
         # Explicitly mark a user as EXISTING without seeding a device. Accepts a
         # `user_id` mxid or a bare `localpart`. Used to test flows that must
         # distinguish a returning account from a brand-new identity.
+        # With `did`, the account also publishes it as `io.inblock.did` (the
+        # `{"did": ...}` shape `read_did_field` reads), as a sign-in would.
         if path == "/__seed_user":
             lp = body.get("localpart") or _localpart_of(body.get("user_id", ""))
             with LOCK:
                 _mark_profile(lp)
+                if body.get("did"):
+                    PROFILE_FIELDS.setdefault(_mxid(lp), {})["io.inblock.did"] = {"did": body["did"]}
             return self._send(200, {"ok": True, "localpart": lp})
         # Force a user's `profiles` row into one of the three states
         # `has_profile_row` must tell apart:

@@ -1594,6 +1594,33 @@ async fn token_device_code(
             // (never modern — see resolve_identity_or_legacy's fail-safe
             // direction), matching the pre-existing degraded-provisioning path.
             let resolved = crate::localpart::resolve_identity_or_legacy(&did, synapse_client).await;
+            // A code that names its account (`login_hint`) is redeemed only for that
+            // account. The approval checked it with the fallible resolver; this one
+            // degrades to the legacy localpart on a fault, which for an account on the
+            // modern localpart names another account. A mismatch issues nothing: on a
+            // degraded answer the claim is released and a later poll tries again,
+            // otherwise the code is refused and deleted.
+            if crate::device_auth::names_another_account(
+                entry.expected_mxid.as_deref(),
+                &resolved.localpart,
+            ) {
+                if let Err(e) = db_client.release_device_code_claim(&dc).await {
+                    warn!(error = %e, "device_code grant: could not release the claim");
+                }
+                if resolved.degraded {
+                    return Err(device_code_error(
+                        "temporarily_unavailable",
+                        DEVICE_PROVISIONING_UNAVAILABLE_MSG,
+                    ));
+                }
+                warn!(did = %did, "device_code grant: the approving identity is not the account the request names");
+                let _ = db_client.delete_device_code(&device_ref).await;
+                let _ = db_client.delete_user_code_mapping(&entry).await;
+                return Err(device_code_error(
+                    "access_denied",
+                    "The request was approved by an account other than the one it names.",
+                ));
+            }
             // Same DID publication as the wallet/passkey login path: the QR
             // flow provisions a real session for a real identity, so it must
             // publish (and re-assert) the same attested field. Both call sites
@@ -5962,6 +5989,7 @@ mod tests {
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
                 auth_ms: None,
+                expected_mxid: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -6032,6 +6060,7 @@ mod tests {
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
                 auth_ms: None,
+                expected_mxid: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -8730,6 +8759,7 @@ mod device_display_name_tests {
                 last_poll: None,
                 created_at: approved_at - 10,
                 auth_ms: Some(approved_at * 1000),
+                expected_mxid: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -8796,6 +8826,7 @@ mod device_display_name_tests {
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
                 auth_ms: None,
+                expected_mxid: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -10463,6 +10494,7 @@ mod client_binding_tests {
                     last_poll: None,
                     created_at: Utc::now().timestamp(),
                     auth_ms: None,
+                    expected_mxid: None,
                 },
                 DEVICE_CODE_LIFETIME,
             )
@@ -13621,6 +13653,7 @@ mod generic_client_tests {
             crate::device_auth::DeviceAuthRequest {
                 client_id,
                 scope: Some("openid".into()),
+                login_hint: None,
             },
         )
         .await
@@ -13771,6 +13804,7 @@ mod generic_client_tests {
             crate::device_auth::DeviceAuthRequest {
                 client_id,
                 scope: Some(device_scope("X,Y")),
+                login_hint: None,
             },
         )
         .await;
@@ -13999,13 +14033,22 @@ mod generic_client_tests {
     struct UpsertHomeserver {
         upsert_fails: std::sync::atomic::AtomicBool,
         upserts: Mutex<Vec<String>>,
+        /// Every request that is not a `GET`: provisioning of any kind.
+        writes: Mutex<Vec<String>>,
     }
 
     async fn upsert_homeserver_route(
         State(hs): State<Arc<UpsertHomeserver>>,
+        method: axum::http::Method,
         uri: Uri,
         body: String,
     ) -> axum::response::Response {
+        if method != axum::http::Method::GET {
+            hs.writes
+                .lock()
+                .unwrap()
+                .push(format!("{method} {}", uri.path()));
+        }
         if uri.path().ends_with("/upsert_device") {
             hs.upserts.lock().unwrap().push(body);
             if hs.upsert_fails.load(std::sync::atomic::Ordering::SeqCst) {
@@ -14122,6 +14165,86 @@ mod generic_client_tests {
             hs.upserts.lock().unwrap().len(),
             2,
             "the retry upserted the device"
+        );
+    }
+
+    /// A code that names its account (`login_hint`) is redeemed only for that account.
+    /// The approval routes refuse another account first; this is the check at the poll,
+    /// for an identity the approval-time resolver and the grant's resolver read
+    /// differently. An approved entry whose identity resolves to another account is
+    /// answered `access_denied`, the code and its user-code mapping are deleted, and the
+    /// homeserver sees no write at all. The same entry naming the identity's own account
+    /// is redeemed, so the refusal is the check's and not a broken setup's.
+    #[tokio::test]
+    async fn a_hinted_device_code_is_not_redeemed_for_another_account() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (hs, synapse) = upsert_homeserver().await;
+        let client_id = store_client(&db, matrix_client()).await;
+        let did = format!("did:key:zDnHint{}", Uuid::new_v4().simple());
+        let store = |expected: String| {
+            let client_id = client_id.clone();
+            let did = did.clone();
+            let db = &db;
+            async move {
+                let code = format!("dvc_hint-{}", nonce());
+                let user_code = format!("HINT-{}", nonce());
+                let mut entry = DeviceCodeEntry::new(
+                    &user_code,
+                    client_id,
+                    device_scope("DEVICE_A"),
+                    Utc::now().timestamp(),
+                );
+                entry.status = DeviceCodeStatus::Approved;
+                entry.did = Some(did);
+                entry.expected_mxid = Some(expected);
+                db.set_device_code(&code, &entry, DEVICE_CODE_LIFETIME)
+                    .await
+                    .unwrap();
+                db.set_user_code_mapping(&user_code, &code, DEVICE_CODE_LIFETIME)
+                    .await
+                    .unwrap();
+                (code, user_code)
+            }
+        };
+
+        // Control: the account the identity signs in as redeems the code.
+        let own = format!("@{}:example.org", localpart_for(&did));
+        let (own_code, _) = store(own).await;
+        poll_device_code_against(&db, &own_code, &delegated(), &synapse)
+            .await
+            .unwrap_or_else(|e| panic!("the named account must redeem its code: {e:?}"));
+        let provisioned = hs.writes.lock().unwrap().len();
+        assert!(provisioned > 0, "the control provisioned the device");
+
+        // Another account is refused, and nothing more is written to the homeserver.
+        let (code, user_code) = store(format!("@someone-else-{}:example.org", nonce())).await;
+        match poll_device_code_against(&db, &code, &delegated(), &synapse).await {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error.as_ref(), "access_denied")
+            }
+            other => panic!(
+                "another account must be denied at the poll, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        assert!(
+            db.get_device_code(&code).await.unwrap().is_none(),
+            "the refused code is deleted"
+        );
+        assert!(
+            db.get_device_code_by_user_code(&user_code)
+                .await
+                .unwrap()
+                .is_none(),
+            "its user-code mapping is deleted"
+        );
+        assert_eq!(
+            hs.writes.lock().unwrap().len(),
+            provisioned,
+            "a refused redemption provisions nothing: {:?}",
+            hs.writes.lock().unwrap()
         );
     }
 

@@ -769,12 +769,35 @@ paths:
         user could approve but a client never redeem. A generic-class client is
         refused the same way with `unauthorized_client`: the grant mints a Matrix
         session, which such a client never gets.
+
+        With `login_hint`, the code is for one account: the approval page shows
+        it, and only an identity that signs in as that account can approve the
+        code (any other is refused and the code stays pending). The device-code
+        grant then issues tokens for that account only. Without it, any account
+        may approve, as before. Unknown form fields are ignored, so a client may
+        send `login_hint` to a build that does not read it.
       requestBody:
         content:
           application/x-www-form-urlencoded:
             schema:
               type: object
-              properties: { client_id: { type: string }, scope: { type: string } }
+              required: [client_id]
+              properties:
+                client_id: { type: string }
+                scope: { type: string }
+                login_hint:
+                  type: string
+                  description: |
+                    The account the device asks to be signed in as, in the form MAS
+                    reads: `mxid:@localpart:server_name`. The server name is
+                    everything after the first colon that follows the localpart (it
+                    may carry a port) and must equal this deployment's homeserver
+                    server name exactly. An empty value is treated as absent (RFC
+                    6749 §3.1). A localpart with an uppercase letter is refused
+                    (every localpart here is lowercase). Only the form and the server
+                    are checked, never whether the account exists. In Matrix mode
+                    without a configured server name any hint is refused with 400.
+                  example: "mxid:@alice:example.org"
       responses:
         "200":
           description: Device and user codes.
@@ -786,7 +809,12 @@ paths:
             `{"error": "unsupported_grant_type", "error_description": …}` when
             the deployment is not in delegated-auth mode;
             `{"error": "unauthorized_client", "error_description": …}` for a
-            generic-class client; a plain 400 for an unknown `client_id`.
+            generic-class client; `{"error": "invalid_request",
+            "error_description": …}` for a `login_hint` that is not
+            `mxid:@localpart:server_name`, names another homeserver, has an
+            uppercase letter in the localpart, or arrives when no Matrix server
+            name is configured (no code is issued); a plain 400 for an unknown
+            `client_id`.
 
   /device:
     get:
@@ -801,15 +829,52 @@ paths:
       summary: Approve a device login with a wallet signature
       responses:
         "200": { description: Approval outcome. }
-        "400": { description: "Rejected — including a new identity, which may only be created at the login screen." }
+        "400": { description: "Rejected: including a new identity, which may only be created at the login screen, and, for a code whose request named an account (`login_hint`), an identity that does not sign in as that account. The plain-text body names the expected account and the one signed in; the code stays pending." }
+        "503": { description: "The account checks could not run (the homeserver could not be asked). Nothing was approved." }
 
   /device/verify:
     get:
       tags: [Device grant]
       operationId: deviceVerify
       summary: Check whether a user code is valid and still pending
+      description: |
+        For a code whose request named an account (`login_hint`), the answer names
+        that account and whether the page offers the passkey sign-in. The account
+        name is the requester's own input. `passkey_offered` is `false` only when
+        the account does not exist, or when its published DID (the one `GET
+        /resolve?mxid=` answers) has no stored passkey, derived or linked; so for
+        a hinted code it tells the caller whether that account has a passkey that
+        can approve here. It is a display hint: the approval itself is checked
+        against the account either way. The answer is computed once per code and
+        reused for up to a minute (a "none" answer) or the code's lifetime. The
+        credential scan behind it runs at most once per account per ten minutes
+        when it completes, concurrent requests included: a request that arrives while another is
+        scanning for the same account cannot be told yet, so it answers
+        `passkey_offered: true` and keeps nothing for the code, and the next
+        request asks again. A scan that fails keeps its claim until 30 seconds
+        after it was taken, so a failing scan repeats at most once per 30
+        seconds per account; while the credential store fails, nothing is
+        scanned and the answer is `passkey_offered: true`.
       parameters: [{ name: user_code, in: query, required: true, schema: { type: string } }]
-      responses: { "200": { description: Validity of the code. } }
+      responses:
+        "200":
+          description: The code is valid and pending.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [passkey_offered]
+                properties:
+                  expected_account:
+                    type: string
+                    description: The account the request is for, `@localpart:server_name`; absent when it names none.
+                  passkey_offered:
+                    type: boolean
+                    description: Whether the page offers the passkey sign-in; always `true` for a code that names no account.
+                  account_missing:
+                    type: boolean
+                    description: Present and `true` only when `passkey_offered` is `false` because the named account does not exist or is deactivated, so the page does not say it has no passkey.
+        "400": { description: The code is unknown, expired or already used (plain text). }
 
   /device/nonce:
     get:
@@ -823,6 +888,11 @@ paths:
       tags: [Device grant]
       operationId: devicePasskeyStart
       summary: Begin passkey authentication for device approval
+      description: |
+        Scoped by the opaque `siwx_user` cookie as at login. For a code whose
+        request named an account, a cookie for another account is ignored
+        (usernameless); the named account never scopes the picker, so this
+        endpoint lists no credential ids for a requester-supplied account.
       responses: { "200": { description: A WebAuthn request challenge. } }
 
   /device/passkey/finish:
@@ -832,8 +902,9 @@ paths:
       summary: Finish passkey authentication and approve the device
       responses:
         "200": { description: Approved. }
-        "400": { description: "Rejected — a new identity cannot be created here." }
+        "400": { description: "Rejected: a new identity cannot be created here; for a code whose request named an account, a passkey that does not sign in as that account (a linked passkey signs in as the identity it is linked to). The code stays pending." }
         "401": { $ref: "#/components/responses/UnknownCredential" }
+        "503": { description: "The account checks could not run. Nothing was approved." }
 
   /webauthn/register/start:
     post:

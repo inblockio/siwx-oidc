@@ -1008,8 +1008,8 @@ siwx-oidc implements the RFC 8628 device authorization grant (MSC4341, spec
 v1.18). Element X uses it for QR-code login; `siwx-oidc-auth --device-flow`
 uses it for headless machines (see [agents.md](agents.md)).
 
-1. The device calls `POST /device_authorization` with a registered `client_id`
-   and optional `scope`. It receives `device_code` (`dvc_…`), `user_code`
+1. The device calls `POST /device_authorization` with a registered `client_id`,
+   an optional `scope` and an optional `login_hint` (see below). It receives `device_code` (`dvc_…`), `user_code`
    (`XXX-XXX`, 6 consonants), `verification_uri` (`{base_url}/device`),
    `verification_uri_complete`, `expires_in` (1800 s) and `interval` (5 s).
 2. The device polls `POST /token` with
@@ -1038,6 +1038,42 @@ Rules:
   generic and is still served.
 - **Existing accounts only.** Approval rejects a DID with no account (400) and a
   deactivated account (401). See [Gates](#gates-that-protect-accounts).
+- **A request may name its account.** `login_hint=mxid:@localpart:server_name`
+  (the form MAS reads) says which account the device is for, typically the
+  account already signed in on the device that shows the QR code. The server
+  name is everything after the first colon that follows the localpart (a port
+  included) and must equal `matrix_server_name` exactly; a value that is not
+  this form, names another homeserver, or has an uppercase letter in the
+  localpart (every localpart here is lowercase), is refused with
+  `invalid_request` and no code. An empty value counts as absent. Only the form is checked at
+  this point, never whether the account exists. For such a code:
+  - the approval page shows "This request is for @localpart:server_name";
+  - both approval routes (`POST /device`, `/device/passkey/finish`) resolve the
+    proven identity to its localpart as the token grant does (the fallible
+    `resolve_identity`; a passkey's identity is the one its link makes it) and
+    refuse any other account, and an identity with no account, with a 400
+    naming both accounts. The code stays pending, so the person can try again
+    with the right account; a fault in the check is a 503 and approves nothing.
+    Any method that signs in as the account may approve; the DID method is
+    never the question;
+  - the poll issues tokens only for that account: a localpart that differs at
+    redemption (the resolver degraded to the legacy guess) issues nothing;
+  - the page offers the passkey sign-in only when the account may have a stored
+    passkey (derived from or linked to the DID that `GET /resolve?mxid=`
+    answers); otherwise it says to sign in with the wallet, and that a passkey
+    can be linked after a wallet sign-in on the login page; an account that does
+    not exist or is deactivated gets a plain "no active account was found" note
+    instead. The answer is kept per code and the credential scan behind it is
+    bounded per account (see [passkeys.md](passkeys.md)). This tells anyone
+    who mints a hinted code whether that account has such a passkey; the
+    account name itself is the requester's input, and its DID is already public
+    through `/resolve`. The named account never scopes the passkey picker,
+    because a requester-supplied identifier must not list credential ids; a
+    `siwx_user` cookie for another account is ignored.
+
+  Without `login_hint`, any account may approve, as before. The form ignores
+  fields it does not know, so a client may send `login_hint` to a build that
+  does not read it; that build then behaves as without it.
 - The tokens belong to the **approving** user's DID, not to the device.
 - The device code, the user code and the approval nonce are stored only as
   digests (`device_code/`, `user_code/`, `caip122/` in the

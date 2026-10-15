@@ -464,6 +464,28 @@ impl RedisClient {
         Ok(())
     }
 
+    /// Store a key-value pair with a TTL only if `key` does not exist: one atomic
+    /// `SET key value NX EX ttl` (the expiry is part of the same command, so the claim
+    /// cannot outlive its TTL). Returns `false`, having written nothing, when the key
+    /// already existed, so exactly one of any number of concurrent callers gets `true`.
+    pub async fn set_nx_ex_raw(&self, key: &str, value: &str, ttl_secs: u64) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+        let set: Option<String> = bb8_redis::redis::cmd("SET")
+            .arg(key)
+            .arg(value)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_secs)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("Redis SET NX EX: {}", e))?;
+        Ok(set.is_some())
+    }
+
     /// Store a key-value pair with no TTL (persistent).
     pub async fn set_raw(&self, key: &str, value: &str) -> Result<()> {
         let mut conn = self
@@ -1047,21 +1069,40 @@ impl RedisClient {
     /// scan result is still returned. The fallback makes the index advisory rather
     /// than load-bearing, so a missed `index_add_passkey` cannot lose a passkey.
     ///
-    /// Enumeration-safety: this is a server-side helper called only with a DID the
-    /// server already resolved (from a valid opaque user-session); it never enables
-    /// an unauthenticated caller to enumerate credentials.
+    /// Enumeration-safety: the picker calls this only with a DID the server already
+    /// resolved (from a valid opaque user-session). The device approval page also
+    /// reaches it, through `credential_store::did_has_credential_bounded`, for the DID
+    /// of the account a request names; that caller lets out only one bit (whether the
+    /// account has a passkey) and bounds the scan. Neither lets an unauthenticated
+    /// caller list credentials.
     pub async fn get_passkeys_for_did<F>(&self, did: &str, derive: F) -> Result<Vec<String>>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        Ok(self.get_passkeys_for_did_reporting(did, derive).await?.0)
+    }
+
+    /// [`get_passkeys_for_did`](Self::get_passkeys_for_did), also saying whether the
+    /// scan read every key it listed (`true`) or skipped one whose read failed
+    /// (`false`). An index hit is complete. A caller that records "no passkey" must not
+    /// do so from an incomplete scan.
+    pub async fn get_passkeys_for_did_reporting<F>(
+        &self,
+        did: &str,
+        derive: F,
+    ) -> Result<(Vec<String>, bool)>
     where
         F: Fn(&str) -> Option<String>,
     {
         let index_key = format!("{}/{}", KV_WEBAUTHN_BY_DID_PREFIX, did);
         let indexed = self.smembers_raw(&index_key).await?;
         if !indexed.is_empty() {
-            return Ok(indexed);
+            return Ok((indexed, true));
         }
 
         // Index miss: self-heal from a read-only scan (the twin of purge_identity).
         let mut found: Vec<String> = Vec::new();
+        let mut complete = true;
 
         // (a) Linked credentials: webauthn:link/{cred_id} -> { primary_did }.
         let link_prefix = "webauthn:link/";
@@ -1076,6 +1117,7 @@ impl RedisClient {
                         redact_key(&link_key),
                         e
                     );
+                    complete = false;
                     continue;
                 }
             };
@@ -1104,6 +1146,7 @@ impl RedisClient {
                         redact_key(&cred_key),
                         e
                     );
+                    complete = false;
                     continue;
                 }
             };
@@ -1128,7 +1171,7 @@ impl RedisClient {
             did,
             found.len()
         );
-        Ok(found)
+        Ok((found, complete))
     }
 
     // -- siwx-oidc's own sessions (`siwx_user`, `acct_session`) -----------------

@@ -1,12 +1,13 @@
 use axum::response::Html;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::introspect::generate_opaque_token;
 use crate::oidc::CustomError;
 use crate::synapse_client::SynapseClient;
+use siwx_oidc::credential_store::{did_has_credential_bounded, PasskeyCheck};
 use siwx_oidc::db::tokens::digest;
 use siwx_oidc::db::*;
 use siwx_oidc::redact::fingerprint;
@@ -48,10 +49,89 @@ pub fn generate_user_code() -> String {
     format!("{}-{}", left, right)
 }
 
+/// The form of `POST /device_authorization`. Unknown fields are ignored (no
+/// `deny_unknown_fields`), as RFC 6749 3.1 asks of an authorization server.
 #[derive(Deserialize)]
 pub struct DeviceAuthRequest {
     pub client_id: String,
     pub scope: Option<String>,
+    /// The account the device asks to be signed in as: `mxid:@localpart:server_name`
+    /// (see [`parse_login_hint`]).
+    #[serde(default)]
+    pub login_hint: Option<String>,
+}
+
+/// The prefix of a `login_hint` that names a Matrix account, the form MAS reads.
+const LOGIN_HINT_MXID_PREFIX: &str = "mxid:";
+
+/// The longest Matrix user ID the specification allows, in bytes.
+const MAX_MXID_LEN: usize = 255;
+
+/// Read the `login_hint` of a device authorization request into the Matrix ID of
+/// the account the code is for.
+///
+/// The accepted form is `mxid:@localpart:server_name`, naming an account on this
+/// deployment's homeserver (`matrix_server_name`, the name every MXID here is built
+/// with). An absent or empty hint is no hint: RFC 6749 3.1 treats a parameter sent
+/// without a value as omitted. Any other value that is not that form, or that names
+/// another homeserver, is refused with `invalid_request` before a code exists, so a
+/// client learns that its hint was not taken instead of getting a code that any
+/// account could approve. Only the syntax and the server are checked here; whether
+/// the account exists is not, so this endpoint answers the same for every localpart. A
+/// localpart with an uppercase letter is refused too: every localpart this server
+/// derives is lowercase, so no account of that name can exist.
+pub fn parse_login_hint(
+    raw: Option<&str>,
+    server_name: Option<&str>,
+) -> Result<Option<String>, CustomError> {
+    let raw = match raw {
+        None | Some("") => return Ok(None),
+        Some(raw) => raw,
+    };
+    let refuse = |why: String| {
+        CustomError::BadRequestToken(crate::oidc::TokenError {
+            error: openidconnect::core::CoreErrorResponseType::InvalidRequest,
+            error_description: format!("login_hint {why}"),
+        })
+    };
+    let malformed = || refuse("must have the form mxid:@localpart:server_name".to_string());
+    let mxid = raw
+        .strip_prefix(LOGIN_HINT_MXID_PREFIX)
+        .ok_or_else(malformed)?;
+    if mxid.len() > MAX_MXID_LEN {
+        return Err(refuse(format!(
+            "names a Matrix ID longer than {MAX_MXID_LEN} bytes"
+        )));
+    }
+    let (localpart, server) = crate::resolve::split_mxid(mxid).map_err(|_| malformed())?;
+    // Every localpart this server derives is lowercase, so a hint with an uppercase
+    // letter names an account that cannot exist and could never be approved.
+    if localpart.chars().any(char::is_uppercase) {
+        return Err(refuse(
+            "names an account with an uppercase letter; account names here are lowercase"
+                .to_string(),
+        ));
+    }
+    let own = server_name.ok_or_else(|| {
+        refuse("cannot be checked: this server has no Matrix server name configured".to_string())
+    })?;
+    if server != own {
+        return Err(refuse(format!(
+            "names an account on {server}; this server signs in accounts on {own} only"
+        )));
+    }
+    Ok(Some(mxid.to_string()))
+}
+
+/// Whether a code that names the account `expected_mxid` would be redeemed for
+/// another one, `localpart`. A code that names no account never is; a stored value
+/// that is not a Matrix ID matches nothing.
+pub fn names_another_account(expected_mxid: Option<&str>, localpart: &str) -> bool {
+    expected_mxid.is_some_and(|mxid| {
+        crate::resolve::split_mxid(mxid)
+            .map(|(expected, _)| expected != localpart)
+            .unwrap_or(true)
+    })
 }
 
 #[derive(Serialize)]
@@ -89,6 +169,12 @@ pub async fn device_authorization(
         .await?
         .ok_or_else(|| CustomError::BadRequest("Unknown client_id".to_string()))?;
     crate::oidc::refuse_device_grant_for(&client)?;
+    // The account the device asks for, refused before anything is stored when it is
+    // malformed or names another homeserver.
+    let expected_mxid = parse_login_hint(
+        form.login_hint.as_deref(),
+        config.matrix_server_name.as_deref(),
+    )?;
 
     // 2. Generate codes
     let device_code = generate_opaque_token("dvc_");
@@ -105,12 +191,14 @@ pub async fn device_authorization(
     }
 
     // 3. Build entry
-    let entry = DeviceCodeEntry::new(
+    let mut entry = DeviceCodeEntry::new(
         &user_code,
         form.client_id,
         scope.clone(),
         chrono::Utc::now().timestamp(),
     );
+    let login_hint = expected_mxid.is_some();
+    entry.expected_mxid = expected_mxid;
 
     // 4. Store device code and user_code -> device_code mapping
     db_client
@@ -129,6 +217,7 @@ pub async fn device_authorization(
         device_code_fp = %fingerprint(&device_code),
         user_code_fp = %fingerprint(&user_code),
         scope = %scope,
+        login_hint,
         "device_authorization issued"
     );
 
@@ -211,6 +300,7 @@ pub fn device_page(query: DevicePageQuery, base_url: &str, legal_footer: &str) -
         <h1 class="title">Approve device</h1>
         <p class="subtitle">Confirm this code matches what's shown on your device.</p>
         <div class="code-chip" id="display-code"></div>
+        <p id="expected-account" class="account-note hidden"></p>
 
         <button class="btn btn-primary" id="btn-wallet" onclick="approveWallet()">
           <svg xmlns="http://www.w3.org/2000/svg" clip-rule="evenodd" fill-rule="evenodd" viewBox="170 30 220 350" class="btn-icon eth-icon">
@@ -226,11 +316,14 @@ pub fn device_page(query: DevicePageQuery, base_url: &str, legal_footer: &str) -
           <span>Sign with wallet</span>
         </button>
 
-        <div class="divider">
+        <div class="divider" id="passkey-divider">
           <div class="divider-line"></div>
           <span class="divider-text">or</span>
           <div class="divider-line"></div>
         </div>
+
+        <p id="passkey-unavailable" class="account-note hidden">This account has no passkey that can approve here. Sign in with your wallet. To use a passkey next time, sign in with your wallet on the login page and choose Link a passkey.</p>
+        <p id="account-missing" class="account-note hidden">No active account was found for this request. Check the account on the other device and start again.</p>
 
         <button class="btn btn-secondary" id="btn-passkey" onclick="approvePasskey()">
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="btn-icon">
@@ -530,6 +623,14 @@ html, body {
   transition: color 0.15s ease;
 }
 .footer a:hover { color: rgba(0,0,0,0.7); }
+
+.account-note {
+  font-size: 14px;
+  line-height: 1.5;
+  text-align: center;
+  margin: 12px 0 16px;
+  overflow-wrap: anywhere;
+}
 "##;
 
 /// JavaScript for the device approval page.
@@ -568,9 +669,11 @@ async function lookupCode() {
   try {
     const r = await fetch(BASE + '/device/verify?user_code=' + encodeURIComponent(code));
     if (r.ok) {
+      const info = await r.json().catch(() => ({}));
       $('code-section').classList.add('hidden');
       $('auth-section').classList.remove('hidden');
       $('display-code').textContent = code;
+      renderExpectedAccount(info);
       hideStatus();
     } else {
       const t = await r.text();
@@ -583,6 +686,31 @@ async function lookupCode() {
   } finally {
     setBusy('btn-verify', false);
   }
+}
+
+// A request that names its account (`expected_account`) shows it; only that account
+// can approve, which the server checks. Without a passkey for it, the passkey button
+// is replaced by a note. The mxid is set via textContent, never innerHTML.
+function renderExpectedAccount(info) {
+  const el = $('expected-account');
+  el.textContent = '';
+  if (info && info.expected_account) {
+    el.appendChild(document.createTextNode('This request is for '));
+    const name = document.createElement('strong');
+    name.textContent = info.expected_account;
+    el.appendChild(name);
+    el.appendChild(document.createTextNode('. Sign in with that account. Approve only if you started this on your own device.'));
+    el.classList.remove('hidden');
+  } else {
+    el.classList.add('hidden');
+  }
+  const offered = !info || info.passkey_offered !== false;
+  $('btn-passkey').classList.toggle('hidden', !offered);
+  $('passkey-divider').classList.toggle('hidden', !offered);
+  // The account missing is a different fact from the account having no passkey.
+  const missing = !!info && info.account_missing === true;
+  $('passkey-unavailable').classList.toggle('hidden', offered || missing);
+  $('account-missing').classList.toggle('hidden', !missing);
 }
 
 async function approveWallet() {
@@ -875,17 +1003,226 @@ pub struct DeviceApproveResponse {
 // prerequisite (cross-signing PRIVATE keys present on the SENDING device) is not
 // observable server-side; Element Web's force-first-device-recovery patch enforces it.
 
-/// Verify that a user code exists and is pending.
+/// Verify that a user code exists and is pending, and return its entry.
 pub async fn device_verify(
     db_client: &(dyn DBClient + Sync),
     user_code: &str,
-) -> Result<(), CustomError> {
+) -> Result<DeviceCodeEntry, CustomError> {
     let (_dc, entry) = db_client
         .get_device_code_by_user_code(user_code)
         .await?
         .ok_or_else(|| CustomError::BadRequest("User code not found or expired".to_string()))?;
     if entry.status != DeviceCodeStatus::Pending {
         return Err(CustomError::BadRequest("Code already used".to_string()));
+    }
+    Ok(entry)
+}
+
+/// What the approval page learns about a pending code (`GET /device/verify`).
+#[derive(Debug, Serialize)]
+pub struct DeviceVerifyResponse {
+    /// The account the request is for (its `login_hint`), absent when it names none.
+    /// The requester supplied it, so showing it reveals nothing new.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_account: Option<String>,
+    /// Whether the page offers the passkey sign-in. `false` only when the request
+    /// names an account that is known to have no stored passkey that signs in as it.
+    pub passkey_offered: bool,
+    /// Set when `passkey_offered` is `false` because the account does not exist or is
+    /// deactivated (what `GET /resolve?mxid=` already tells anyone), so the page does
+    /// not say the account "has no passkey". Left out when `false`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub account_missing: bool,
+}
+
+/// What the device page shows of the passkey sign-in for a code that names an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasskeyOffer {
+    /// The account may have a passkey that signs in as it.
+    Offered,
+    /// The account exists and has no such passkey.
+    NoPasskey,
+    /// The account does not exist or is deactivated.
+    NoAccount,
+}
+
+impl PasskeyOffer {
+    fn as_str(self) -> &'static str {
+        match self {
+            PasskeyOffer::Offered => "offered",
+            PasskeyOffer::NoPasskey => "no_passkey",
+            PasskeyOffer::NoAccount => "no_account",
+        }
+    }
+
+    fn parse(stored: &str) -> Option<Self> {
+        [Self::Offered, Self::NoPasskey, Self::NoAccount]
+            .into_iter()
+            .find(|offer| offer.as_str() == stored)
+    }
+
+    /// How long the answer is kept for its code. A passkey the person links after the
+    /// page said "none" must show on a reload of the same code, so the negative answers
+    /// are kept briefly; the credential scan they would repeat is bounded by its own
+    /// marker ([`siwx_oidc::credential_store::did_has_credential_bounded`]).
+    fn ttl_secs(self) -> u64 {
+        match self {
+            PasskeyOffer::Offered => DEVICE_CODE_LIFETIME,
+            PasskeyOffer::NoPasskey | PasskeyOffer::NoAccount => NEGATIVE_OFFER_TTL_SECS,
+        }
+    }
+}
+
+/// How long a "no passkey" or "no account" answer is reused for the same code (seconds).
+const NEGATIVE_OFFER_TTL_SECS: u64 = 60;
+
+/// `GET /device/verify`: the code is pending, and what the page shows for it.
+///
+/// The route is unauthenticated and the account is the requester's input, so the answer
+/// about its passkeys is computed once per code and kept in `device_passkey_offer/…`
+/// (not in the code's entry, which an approval rewrites), and the credential scan behind
+/// it is bounded per account.
+pub async fn device_lookup(
+    redis: &RedisClient,
+    synapse: Option<&SynapseClient>,
+    server_name: Option<&str>,
+    user_code: &str,
+) -> Result<DeviceVerifyResponse, CustomError> {
+    let entry = device_verify(redis, user_code).await?;
+    let Some(expected) = entry.expected_mxid else {
+        return Ok(DeviceVerifyResponse {
+            expected_account: None,
+            passkey_offered: true,
+            account_missing: false,
+        });
+    };
+    let key = format!(
+        "{}/{}",
+        KV_DEVICE_PASSKEY_OFFER_PREFIX, entry.user_code_digest
+    );
+    let stored = match redis.get_raw(&key).await {
+        Ok(stored) => stored.as_deref().and_then(PasskeyOffer::parse),
+        Err(e) => {
+            debug!(error = %e, "device verify: could not read the stored passkey answer");
+            None
+        }
+    };
+    let offer = match stored {
+        Some(offer) => offer,
+        None => {
+            match expected_account_passkey_offer(redis, synapse, server_name, &expected).await {
+                Some(offer) => {
+                    if let Err(e) = redis
+                        .set_ex_raw(&key, offer.as_str(), offer.ttl_secs())
+                        .await
+                    {
+                        debug!(error = %e, "device verify: could not store the passkey answer");
+                    }
+                    offer
+                }
+                // Could not tell: the button stays, and nothing is kept.
+                None => PasskeyOffer::Offered,
+            }
+        }
+    };
+    Ok(DeviceVerifyResponse {
+        expected_account: Some(expected),
+        passkey_offered: offer == PasskeyOffer::Offered,
+        account_missing: offer == PasskeyOffer::NoAccount,
+    })
+}
+
+/// Whether the account `mxid` may have a stored passkey that signs in as it: one
+/// derived from its DID, or one linked to it. The account's DID is the one
+/// `GET /resolve?mxid=` already answers publicly (the published, attested
+/// `io.inblock.did` field), and the passkeys are the set a scoped picker offers for
+/// that DID, read through the bounded
+/// [`siwx_oidc::credential_store::did_has_credential_bounded`].
+///
+/// It decides only whether the page shows the passkey button, never whether an
+/// approval is accepted ([`check_expected_account`] does that). So it answers
+/// `NoAccount` or `NoPasskey` only when that is known: the account does not exist, or it
+/// has an attested DID and no passkey for it. When it cannot tell (no homeserver, an
+/// upstream fault, no attested DID) it answers `None` or `Offered`, so a person is never
+/// steered away from a passkey that works; `None` is never kept.
+async fn expected_account_passkey_offer(
+    redis: &RedisClient,
+    synapse: Option<&SynapseClient>,
+    server_name: Option<&str>,
+    mxid: &str,
+) -> Option<PasskeyOffer> {
+    let (Some(synapse), Some(server_name)) = (synapse, server_name) else {
+        return None;
+    };
+    let resolved = crate::resolve::resolve_mxid(mxid, server_name, synapse)
+        .await
+        .ok()?;
+    if !resolved.exists {
+        return Some(PasskeyOffer::NoAccount);
+    }
+    let did = match resolved.did {
+        Some(did) if resolved.attested => did,
+        _ => return Some(PasskeyOffer::Offered),
+    };
+    match did_has_credential_bounded(
+        redis,
+        &did,
+        crate::webauthn::derive_did_from_credential_json,
+        WEBAUTHN_NO_PASSKEY_TTL_SECS,
+    )
+    .await
+    {
+        Ok(PasskeyCheck::Found) => Some(PasskeyOffer::Offered),
+        Ok(PasskeyCheck::Absent) => Some(PasskeyOffer::NoPasskey),
+        // Another request is scanning for this account, or the scan failed: the button
+        // stays and nothing is kept for the code.
+        Ok(PasskeyCheck::Unknown) | Err(_) => None,
+    }
+}
+
+/// Refuse an approval by an identity that does not sign in as the account the
+/// device asked for ([`DeviceCodeEntry::expected_mxid`]); a code that names no
+/// account passes.
+///
+/// The proven identity (the wallet DID, or the identity of the passkey, which a
+/// link overrides) is resolved to its localpart as the token grant resolves it,
+/// with the fallible [`crate::localpart::resolve_identity`]: a fault is a 503 and
+/// approves nothing, never a guess. An identity with no account is refused too.
+/// The DID method is never the question: any method that signs in as the expected
+/// account may approve. A refusal leaves the code pending, so the person can try
+/// again with the right account until the code expires.
+pub async fn check_expected_account(
+    entry: &DeviceCodeEntry,
+    did: &str,
+    synapse: Option<&SynapseClient>,
+) -> Result<(), CustomError> {
+    let Some(expected) = entry.expected_mxid.as_deref() else {
+        return Ok(());
+    };
+    let (expected_localpart, server) = crate::resolve::split_mxid(expected)
+        .map_err(|_| CustomError::BadRequest("The request names no valid account.".to_string()))?;
+    let resolved = crate::localpart::resolve_identity(did, synapse)
+        .await
+        .map_err(|e| {
+            warn!(did = %did, error = %e, "device approval: the expected-account check could not run");
+            CustomError::ServiceUnavailable(
+                crate::webauthn::IDENTITY_CHECK_UNAVAILABLE_MSG.to_string(),
+            )
+        })?;
+    if resolved.is_new {
+        info!(did = %did, "device approval refused: the identity has no account, the request names one");
+        return Err(CustomError::BadRequest(format!(
+            "This request is for {expected}. The wallet or passkey you used has no account \
+             here. Sign in with the account you use on the other device."
+        )));
+    }
+    if resolved.localpart != expected_localpart {
+        info!(did = %did, "device approval refused: not the account the request names");
+        return Err(CustomError::BadRequest(format!(
+            "This request is for {expected}. You signed in as @{}:{server}. Sign in with \
+             the account you use on the other device.",
+            resolved.localpart
+        )));
     }
     Ok(())
 }
@@ -1039,6 +1376,10 @@ pub async fn device_approve(
         chrono::Utc::now(),
     )?;
 
+    // A request that names its account is approved only by that account, checked
+    // before the new-identity gate so a key with no account hears which account the
+    // request is for. The code stays pending on a refusal.
+    check_expected_account(&entry, did, synapse_client).await?;
     // QR linking is for an EXISTING account only; new-account creation is reachable
     // ONLY from the login screen. Reject a wallet DID with no Synapse account BEFORE
     // entry.did is set/persisted, so the token grant never provisions one. No-op when
@@ -1086,6 +1427,10 @@ pub async fn device_approve_passkey(
         return Err(CustomError::BadRequest("Code already used".to_string()));
     }
 
+    // As in device_approve: only the account the request names may approve it. The
+    // passkey's identity is the one a link makes it, so a linked passkey approves
+    // as the account it is linked to.
+    check_expected_account(&entry, verified_did, synapse_client).await?;
     // QR linking is for an EXISTING account only; new-account creation is reachable
     // ONLY from the login screen. Reject a passkey DID with no Synapse account BEFORE
     // entry.did is set/persisted, so the token grant never provisions one. No-op when
@@ -1117,6 +1462,498 @@ pub async fn device_approve_passkey(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn invalid_request(outcome: Result<Option<String>, CustomError>) -> String {
+        match outcome {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(
+                    e.error,
+                    openidconnect::core::CoreErrorResponseType::InvalidRequest
+                );
+                e.error_description
+            }
+            other => panic!("expected invalid_request, got {other:?}"),
+        }
+    }
+
+    /// `login_hint` takes the form MAS reads, `mxid:@localpart:server_name`, for an
+    /// account on this homeserver only. An absent or empty hint is no hint; every
+    /// other value that is not that form is refused with `invalid_request`.
+    #[test]
+    fn a_login_hint_must_name_an_account_on_this_homeserver() {
+        let here = Some("example.org");
+        assert_eq!(parse_login_hint(None, here).unwrap(), None);
+        assert_eq!(parse_login_hint(Some(""), here).unwrap(), None);
+        assert_eq!(
+            parse_login_hint(Some("mxid:@alice:example.org"), here).unwrap(),
+            Some("@alice:example.org".to_string())
+        );
+        for malformed in [
+            "@alice:example.org",
+            "mxid:alice",
+            "mxid:@alice",
+            "mxid:@:example.org",
+            "mxid:@al ice:example.org",
+            "email:alice@example.org",
+            " mxid:@alice:example.org",
+        ] {
+            let why = invalid_request(parse_login_hint(Some(malformed), here));
+            assert!(
+                why.contains("mxid:@localpart:server_name"),
+                "{malformed}: {why}"
+            );
+        }
+        let foreign = invalid_request(parse_login_hint(Some("mxid:@alice:other.example"), here));
+        assert!(foreign.contains("other.example"), "{foreign}");
+        // The server name is everything after the first colon, a port included, and
+        // is compared with the configured one exactly.
+        assert_eq!(
+            parse_login_hint(
+                Some("mxid:@q7k2m9x4c8v1b3n5:localhost:30448"),
+                Some("localhost:30448")
+            )
+            .unwrap(),
+            Some("@q7k2m9x4c8v1b3n5:localhost:30448".to_string())
+        );
+        invalid_request(parse_login_hint(
+            Some("mxid:@q7k2m9x4c8v1b3n5:localhost:30448"),
+            Some("localhost"),
+        ));
+        invalid_request(parse_login_hint(
+            Some("mxid:@q7k2m9x4c8v1b3n5:localhost"),
+            Some("localhost:30448"),
+        ));
+        let long = format!("mxid:@{}:example.org", "a".repeat(250));
+        invalid_request(parse_login_hint(Some(&long), here));
+        invalid_request(parse_login_hint(Some("mxid:@alice:example.org"), None));
+    }
+
+    /// The form reads `login_hint` and, as before it was known, ignores a field it
+    /// does not know, so a client may send parameters a build does not read.
+    #[test]
+    fn the_device_authorization_form_reads_login_hint_and_ignores_unknown_fields() {
+        let form: DeviceAuthRequest = serde_urlencoded::from_str(
+            "client_id=c&scope=openid&login_hint=mxid%3A%40alice%3Aexample.org&x_unknown=1",
+        )
+        .unwrap();
+        assert_eq!(form.login_hint.as_deref(), Some("mxid:@alice:example.org"));
+        let bare: DeviceAuthRequest = serde_urlencoded::from_str("client_id=c").unwrap();
+        assert_eq!(bare.login_hint, None);
+    }
+
+    /// An entry without an expected account is written in exactly the layout an
+    /// older build wrote, and an entry an older build wrote reads as naming none.
+    #[test]
+    fn a_device_code_entry_keeps_its_layout_without_an_expected_account() {
+        let entry = DeviceCodeEntry::new("BCD-FGH", "client".into(), "openid".into(), 1);
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("expected_mxid"), "{json}");
+        assert_eq!(
+            DeviceCodeEntry::from_stored(&json).unwrap().expected_mxid,
+            None
+        );
+
+        let mut hinted = entry.clone();
+        hinted.expected_mxid = Some("@alice:example.org".into());
+        let json = serde_json::to_string(&hinted).unwrap();
+        assert_eq!(
+            DeviceCodeEntry::from_stored(&json)
+                .unwrap()
+                .expected_mxid
+                .as_deref(),
+            Some("@alice:example.org")
+        );
+    }
+
+    #[test]
+    fn only_a_code_that_names_an_account_can_name_another_one() {
+        assert!(!names_another_account(None, "alice"));
+        assert!(!names_another_account(Some("@alice:example.org"), "alice"));
+        assert!(names_another_account(Some("@alice:example.org"), "bob"));
+        assert!(names_another_account(Some("not-an-mxid"), "alice"));
+    }
+
+    /// Every localpart this server derives is lowercase, so a hint naming an uppercase
+    /// one can never be approved: it is refused with `invalid_request` before a code
+    /// exists, while the same name in lowercase is taken.
+    #[test]
+    fn a_login_hint_with_an_uppercase_localpart_is_refused() {
+        let here = Some("example.org");
+        for hint in ["mxid:@Alice:example.org", "mxid:@aliCe:example.org"] {
+            let why = invalid_request(parse_login_hint(Some(hint), here));
+            assert!(why.contains("uppercase"), "{hint}: {why}");
+        }
+        assert_eq!(
+            parse_login_hint(Some("mxid:@alice:example.org"), here).unwrap(),
+            Some("@alice:example.org".to_string())
+        );
+    }
+
+    /// A homeserver that answers every request 200 (so every localpart is available:
+    /// the account does not exist) and counts the requests.
+    async fn counting_homeserver() -> (
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        SynapseClient,
+    ) {
+        use std::sync::{atomic::AtomicUsize, atomic::Ordering, Arc};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = axum::Router::new().fallback(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                axum::Json(serde_json::json!({}))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (
+            hits,
+            SynapseClient::new(&format!("http://{addr}"), "secret"),
+        )
+    }
+
+    /// `GET /device/verify` is unauthenticated, so what it learns about a hinted account
+    /// is computed once per code: a second look-up of the same code asks the homeserver
+    /// nothing, and a missing account is told apart from one with no passkey. Needs Redis.
+    #[tokio::test]
+    async fn the_passkey_answer_for_a_code_is_computed_once() {
+        use std::sync::atomic::Ordering;
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (hits, synapse) = counting_homeserver().await;
+        let client_id = device_client(&db).await;
+        let issued = device_authorization(
+            &hint_config(),
+            &db,
+            DeviceAuthRequest {
+                client_id,
+                scope: None,
+                login_hint: Some("mxid:@nobody-here:example.org".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let first = device_lookup(&db, Some(&synapse), Some("example.org"), &issued.user_code)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.expected_account.as_deref(),
+            Some("@nobody-here:example.org")
+        );
+        assert!(!first.passkey_offered);
+        assert!(
+            first.account_missing,
+            "an account that is not there is said so"
+        );
+        let asked = hits.load(Ordering::SeqCst);
+        assert!(asked >= 1, "the first look-up asked the homeserver");
+
+        for _ in 0..3 {
+            let again = device_lookup(&db, Some(&synapse), Some("example.org"), &issued.user_code)
+                .await
+                .unwrap();
+            assert!(!again.passkey_offered && again.account_missing);
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            asked,
+            "the stored answer is reused; the homeserver is not asked again"
+        );
+    }
+
+    /// When the server cannot tell (no homeserver here), the passkey button stays and
+    /// nothing is stored for the code, so a later look-up asks again. Needs Redis.
+    #[tokio::test]
+    async fn a_passkey_answer_the_server_cannot_give_is_not_kept() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = device_client(&db).await;
+        let issued = device_authorization(
+            &hint_config(),
+            &db,
+            DeviceAuthRequest {
+                client_id,
+                scope: None,
+                login_hint: Some("mxid:@alice:example.org".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let looked = device_lookup(&db, None, Some("example.org"), &issued.user_code)
+            .await
+            .unwrap();
+        assert!(looked.passkey_offered && !looked.account_missing);
+        let (_, entry) = db
+            .get_device_code_by_user_code(&issued.user_code)
+            .await
+            .unwrap()
+            .unwrap();
+        let key = format!(
+            "{}/{}",
+            KV_DEVICE_PASSKEY_OFFER_PREFIX, entry.user_code_digest
+        );
+        assert!(db.get_raw(&key).await.unwrap().is_none());
+    }
+
+    /// A hinted account whose passkey scan is running in another request cannot be
+    /// told yet: the button stays and nothing is kept for the code, so the next look-up
+    /// asks again; once the scan has answered "none", the same look-up says so and keeps
+    /// the answer. Needs Redis.
+    #[tokio::test]
+    async fn a_look_up_during_another_requests_scan_keeps_the_button_and_stores_nothing() {
+        use crate::localpart::resolve_identity_tests::spawn_mock_synapse_with_did_fields;
+        use std::collections::{HashMap, HashSet};
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let did = format!("did:key:zScanningHint{}", uuid::Uuid::new_v4().simple());
+        let localpart = siwx_oidc::mxid::localpart_for(&did);
+        let mxid = format!("@{localpart}:example.org");
+        let (synapse, handle) = spawn_mock_synapse_with_did_fields(
+            HashSet::from([localpart]),
+            HashMap::from([(
+                mxid.clone(),
+                serde_json::json!({ "did": did, "proof": "eyJhbGciOiJFUzI1NiJ9.e30.sig" }),
+            )]),
+        )
+        .await;
+        let marker_key = format!("{}/{}", KV_WEBAUTHN_NO_PASSKEY_PREFIX, digest(&did));
+        let client_id = device_client(&db).await;
+        let issued = device_authorization(
+            &hint_config(),
+            &db,
+            DeviceAuthRequest {
+                client_id,
+                scope: None,
+                login_hint: Some(format!("mxid:{mxid}")),
+            },
+        )
+        .await
+        .unwrap();
+        let (_, entry) = db
+            .get_device_code_by_user_code(&issued.user_code)
+            .await
+            .unwrap()
+            .unwrap();
+        let offer_key = format!(
+            "{}/{}",
+            KV_DEVICE_PASSKEY_OFFER_PREFIX, entry.user_code_digest
+        );
+
+        // Another request is scanning for this account.
+        db.set_ex_raw(&marker_key, "scanning", 30).await.unwrap();
+        let during = device_lookup(&db, Some(&synapse), Some("example.org"), &issued.user_code)
+            .await
+            .unwrap();
+        assert_eq!(during.expected_account.as_deref(), Some(mxid.as_str()));
+        assert!(
+            during.passkey_offered && !during.account_missing,
+            "cannot tell yet: the passkey button stays"
+        );
+        assert!(
+            db.get_raw(&offer_key).await.unwrap().is_none(),
+            "an answer the server could not give is not kept for the code"
+        );
+
+        // The scan finished and found nothing.
+        db.set_ex_raw(&marker_key, "1", 60).await.unwrap();
+        let after = device_lookup(&db, Some(&synapse), Some("example.org"), &issued.user_code)
+            .await
+            .unwrap();
+        assert!(!after.passkey_offered && !after.account_missing);
+        assert_eq!(
+            db.get_raw(&offer_key).await.unwrap().as_deref(),
+            Some("no_passkey")
+        );
+
+        db.del_raw(&marker_key).await.unwrap();
+        db.del_raw(&offer_key).await.unwrap();
+        handle.abort();
+    }
+
+    async fn device_client(db: &RedisClient) -> String {
+        use openidconnect::RedirectUrl;
+        let client_id = format!("device-hint-{}", uuid::Uuid::new_v4().simple());
+        db.set_client(
+            client_id.clone(),
+            ClientEntry::new(
+                "secret",
+                SiwxClientMetadata::new(
+                    vec![RedirectUrl::new("https://example.com".into()).unwrap()],
+                    LogoutClientMetadata::default(),
+                ),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        client_id
+    }
+
+    fn hint_config() -> Config {
+        Config {
+            mas_shared_secret: Some("shared-secret".to_string()),
+            matrix_server_name: Some("example.org".to_string()),
+            ..Config::default()
+        }
+    }
+
+    /// A code whose request names an account is approved only by an identity that
+    /// signs in as that account. Another account is refused with a message naming
+    /// both, and the code stays pending with no identity on it, so the right account
+    /// can still approve it. Without a homeserver an identity resolves to its legacy
+    /// localpart, which is what the hint names here. Needs Redis.
+    #[tokio::test]
+    async fn a_hinted_code_is_approved_only_by_the_account_it_names() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = device_client(&db).await;
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let alice = format!("did:key:zAlice{nonce}");
+        let bob = format!("did:key:zBob{nonce}");
+        let alice_mxid = format!("@{}:example.org", siwx_oidc::mxid::legacy_localpart(&alice));
+        let bob_mxid = format!("@{}:example.org", siwx_oidc::mxid::legacy_localpart(&bob));
+
+        let refused = device_authorization(
+            &hint_config(),
+            &db,
+            DeviceAuthRequest {
+                client_id: client_id.clone(),
+                scope: None,
+                login_hint: Some("mxid:@alice:elsewhere.example".into()),
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(CustomError::BadRequestToken(ref e)) if e.error == openidconnect::core::CoreErrorResponseType::InvalidRequest),
+            "a foreign hint is refused before a code exists"
+        );
+
+        let issued = device_authorization(
+            &hint_config(),
+            &db,
+            DeviceAuthRequest {
+                client_id,
+                scope: None,
+                login_hint: Some(format!("mxid:{alice_mxid}")),
+            },
+        )
+        .await
+        .unwrap();
+        let (_, stored) = db
+            .get_device_code_by_user_code(&issued.user_code)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.expected_mxid.as_deref(), Some(alice_mxid.as_str()));
+
+        let wrong = device_approve_passkey(&db, &issued.user_code, &bob, None, None).await;
+        match wrong {
+            Err(CustomError::BadRequest(msg)) => {
+                assert!(
+                    msg.contains(&format!("This request is for {alice_mxid}.")),
+                    "{msg}"
+                );
+                assert!(
+                    msg.contains(&format!("You signed in as {bob_mxid}.")),
+                    "{msg}"
+                );
+            }
+            other => panic!(
+                "another account must be refused, got {:?}",
+                other.map(|r| r.status)
+            ),
+        }
+        let (_, after) = db
+            .get_device_code_by_user_code(&issued.user_code)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.status,
+            DeviceCodeStatus::Pending,
+            "the code stays pending"
+        );
+        assert_eq!(after.did, None, "no identity is recorded on a refusal");
+
+        let right = device_approve_passkey(&db, &issued.user_code, &alice, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("the named account must approve: {e:?}"));
+        assert_eq!(right.status, "approved");
+        let (_, approved) = db
+            .get_device_code_by_user_code(&issued.user_code)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(approved.status, DeviceCodeStatus::Approved);
+        assert_eq!(approved.did.as_deref(), Some(alice.as_str()));
+    }
+
+    /// Without a hint, any identity approves, as before. Needs Redis.
+    #[tokio::test]
+    async fn a_code_without_a_hint_is_approved_by_any_account_as_before() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = device_client(&db).await;
+        let issued = device_authorization(
+            &hint_config(),
+            &db,
+            DeviceAuthRequest {
+                client_id,
+                scope: None,
+                login_hint: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (_, stored) = db
+            .get_device_code_by_user_code(&issued.user_code)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.expected_mxid, None);
+        let did = format!("did:key:zAny{}", uuid::Uuid::new_v4().simple());
+        let approved = device_approve_passkey(&db, &issued.user_code, &did, None, None)
+            .await
+            .unwrap();
+        assert_eq!(approved.status, "approved");
+    }
+
+    /// The page shows the account a request names and hides the passkey button
+    /// when the server says the account has none; it never writes the name as HTML.
+    #[test]
+    fn the_device_page_can_show_the_expected_account() {
+        let html = device_page(
+            DevicePageQuery {
+                user_code: Some("JKQ-WZL".to_string()),
+            },
+            "https://id.example.org",
+            "",
+        )
+        .0;
+        for id in [
+            r#"id="expected-account""#,
+            r#"id="passkey-unavailable""#,
+            r#"id="account-missing""#,
+            r#"id="passkey-divider""#,
+        ] {
+            assert!(html.contains(id), "missing {id}");
+        }
+        assert!(html.contains("renderExpectedAccount(info)"));
+        assert!(html.contains("info.account_missing === true"));
+        assert!(html.contains("name.textContent = info.expected_account"));
+        // A link that names a victim looks more trustworthy, so the page says who may approve.
+        assert!(html.contains("Approve only if you started this on your own device."));
+    }
 
     /// The device page carries the operator's legal links and no others, and
     /// its title names the issuer host rather than a brand.
@@ -1171,6 +2008,7 @@ mod tests {
         let form = || DeviceAuthRequest {
             client_id: client_id.clone(),
             scope: None,
+            login_hint: None,
         };
 
         let refused = device_authorization(&Config::default(), &db, form()).await;
@@ -1233,6 +2071,7 @@ mod tests {
             DeviceAuthRequest {
                 client_id,
                 scope: Some("openid".to_string()),
+                login_hint: None,
             },
         )
         .await

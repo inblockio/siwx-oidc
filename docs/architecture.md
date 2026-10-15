@@ -106,7 +106,8 @@ P-256 key (`did:key`), no browser. See [agents.md](agents.md).
 **Device authorization (RFC 8628, used for Element X QR login):**
 
 1. `POST /device_authorization` returns `device_code`, a `user_code` such as `WDJ-BMJ`, and the
-   verification URI `/device`.
+   verification URI `/device`. An optional `login_hint` (`mxid:@localpart:server_name`) names the
+   one account that may approve the code.
 2. The device polls `POST /token` with `grant_type=urn:ietf:params:oauth:grant-type:device_code`.
 3. The user opens `/device?user_code=…` and approves with a wallet signature or a passkey.
 4. The next poll returns tokens and provisions the Synapse device.
@@ -185,6 +186,7 @@ they are public identifiers the server hands out in `allowCredentials`, not cred
 | `caip122/{category}/{sha256(nonce)}` | 300 s | server-issued nonce for device approval (bound to the user code's digest) and account re-auth (bound to the action); read and deleted on use |
 | `device_code/{sha256(device code)}` (+ `/redeemed`) | 1800 s | `DeviceCodeEntry` (RFC 8628, with the user code's digest) and its single-redemption claim |
 | `user_code/{sha256(user code)}` | 1800 s | the device code's digest; the user code is hashed exactly as presented |
+| `device_passkey_offer/{sha256(user code)}` | 1800 s (60 s for a "none" answer) | `GET /device/verify` for a code that names an account (`login_hint`): `offered`, `no_passkey` or `no_account`, so repeating the request for a settled code asks neither the homeserver nor the credential store again. A separate key, never a field of the device code entry, so it cannot race an approval |
 | `caip122_nonce/{category}/{nonce}` (+ `/consumed`), `device_codes/{device_code}` (+ `/redeemed`), `user_codes/{user_code}` | 300 s / 1800 s | legacy: read until they expire. A legacy device code is found by either code and updated and deleted in place; its claim is digest-keyed, and a legacy claim still counts |
 | `acct_session/{sha256(cookie)}` | 600 s | `/account` session (`acct_session` cookie, `Path=/account`): `{did, csrf, exp}` |
 | `siwx_user/{sha256(cookie)}` | 30 d | DID behind the opaque `siwx_user` cookie (passkey-picker scoping) |
@@ -200,6 +202,7 @@ they are public identifiers the server hands out in `allowCredentials`, not cred
 | `webauthn:credential/{cred_id_b64}` | none | stored passkey (serialized `webauthn_rs::Passkey`) |
 | `webauthn:link/{cred_id_b64}` | none | `{primary_did, label}`: the passkey signs in as this DID |
 | `webauthn:by_did/{did}` | none | SET of credential ids for a DID (advisory index) |
+| `webauthn:no_passkey/{sha256(did)}` | 600 s | the device approval page's scan marker: `scanning` (30 s) while one request runs the credential scan for the DID, claimed by an atomic `SET NX EX` before the scan so concurrent requests do not each scan; `1` (600 s) once a scan found no passkey, and while it lives that page skips the scan. Read only by `credential_store::did_has_credential_bounded`, after the `by_did` index, so a passkey registered or linked later is still seen |
 | `aqua:webauthn:cred:{cred_id_b64}`, `aqua:webauthn:did:{did}` | none | aqua-auth credential store, only when `AQUA_WEBAUTHN_REDIS_URL` is set (may be another Redis) |
 
 Passkeys and links have no TTL but are only as durable as Redis persistence; a flushed Redis

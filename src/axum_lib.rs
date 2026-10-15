@@ -636,10 +636,16 @@ async fn device_page_handler(
 async fn device_verify_handler(
     State(state): State<AppState>,
     Query(query): Query<device_auth::DevicePageQuery>,
-) -> Result<StatusCode, CustomError> {
+) -> Result<Json<device_auth::DeviceVerifyResponse>, CustomError> {
     let code = query.user_code.as_deref().unwrap_or("");
-    device_auth::device_verify(&state.redis_client, code).await?;
-    Ok(StatusCode::OK)
+    let resp = device_auth::device_lookup(
+        &state.redis_client,
+        state.synapse_client.as_deref(),
+        state.config.matrix_server_name.as_deref(),
+        code,
+    )
+    .await?;
+    Ok(Json(resp))
 }
 
 async fn device_nonce_handler(
@@ -734,7 +740,7 @@ async fn device_passkey_start_handler(
         .get("user_code")
         .and_then(|v| v.as_str())
         .ok_or_else(|| CustomError::BadRequest("Missing user_code".to_string()))?;
-    device_auth::device_verify(&state.redis_client, user_code).await?;
+    let entry = device_auth::device_verify(&state.redis_client, user_code).await?;
     let session_id = format!("device_passkey_{}", user_code);
     // Identity-scope the picker to the APPROVER's own passkeys when their opaque
     // `siwx_user` login cookie is present (Path=/ reaches this endpoint via the
@@ -742,8 +748,25 @@ async fn device_passkey_start_handler(
     // offer is never the security check: `verify_credential` + `reject_if_new_identity`
     // still run under the PROVEN DID. Degrade open: absent/forged/expired cookie, or
     // the `{"all":true}` escape hatch -> None -> usernameless, never an error.
-    let scope_did =
+    let mut scope_did =
         user_session_scope_did(&state.redis_client, &cookies, payload_force_all(&payload)).await;
+    let mut detected_mxid = detected_mxid_for(
+        state.synapse_client.as_deref(),
+        state.config.matrix_server_name.as_deref(),
+        scope_did.as_deref(),
+    )
+    .await;
+    // A request that names its account (`login_hint`) is approved only by that
+    // account, so a cookie that scopes the picker to another account's keys would
+    // offer only keys that are refused: drop that scope (usernameless). The hint
+    // itself never scopes the picker, because a requester-supplied identifier must
+    // not list an account's credential ids (see "Passkeys" in AGENTS.md).
+    if let Some(expected) = entry.expected_mxid.as_deref() {
+        if detected_mxid.as_deref() != Some(expected) {
+            scope_did = None;
+            detected_mxid = None;
+        }
+    }
     let rcr = wa::authenticate_start(
         &state.rp_dispatch,
         &state.redis_client,
@@ -752,12 +775,6 @@ async fn device_passkey_start_handler(
         true,
     )
     .await?;
-    let detected_mxid = detected_mxid_for(
-        state.synapse_client.as_deref(),
-        state.config.matrix_server_name.as_deref(),
-        scope_did.as_deref(),
-    )
-    .await;
     Ok(Json(AuthenticateStartResponse {
         challenge: rcr,
         detected_mxid,
