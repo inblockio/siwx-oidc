@@ -65,6 +65,7 @@ nondeterministic, so every admin request introspects.
   POST   /_synapse/mas/reactivate_user            synapse_client::reactivate_user
 
   -- admin surface (minted admin token) --------------------------------------
+  GET    /_synapse/admin/v2/users                 synapse_client::admin_users_page (device reaper, orphan scan)
   GET    /_synapse/admin/v2/users/{mxid}/devices  synapse_client::list_devices (and get_device)
   POST   /_matrix/client/v3/keys/query            synapse_client::has_cross_signing_keys
   PUT    /_matrix/client/v3/profile/{mxid}/{field} synapse_client::publish_did_field
@@ -667,6 +668,27 @@ class Handler(BaseHTTPRequestHandler):
                 {"type": "m.room.member", "state_key": u, "content": {"membership": "join"}}
                 for u in members
             ]})
+        # GET /_synapse/admin/v2/users  (admin_users_page: the device reaper and the
+        # orphan scan). Every account that exists or carries a device, active only
+        # (`deactivated=false`), `not_user_type=` (empty) leaves out untyped accounts
+        # as Synapse does; `from` is an offset, `next_token` absent on the last page.
+        if path == "/_synapse/admin/v2/users":
+            denied = self._admin_auth()
+            if denied:
+                return self._send(*denied)
+            q = parse_qs(p.query, keep_blank_values=True)
+            limit = int((q.get("limit") or ["100"])[0])
+            start = int((q.get("from") or ["0"])[0] or 0)
+            with LOCK:
+                names = sorted({_mxid(lp) for lp in EXISTING_USERS} | set(DEVICES))
+                names = [n for n in names if not LIFECYCLE.get(n, {}).get("deactivated")]
+                rows = [{"name": n, "user_type": USER_TYPES.get(n)} for n in names]
+            if "not_user_type" in q:
+                rows = [r for r in rows if r["user_type"] is not None]
+            out = {"users": rows[start:start + limit], "total": len(rows)}
+            if start + limit < len(rows):
+                out["next_token"] = str(start + limit)
+            return self._send(200, out)
         # GET /_synapse/admin/v2/users/{user_id}/devices  (list_devices)
         m = re.match(r"^/_synapse/admin/v2/users/([^/]+)/devices$", path)
         if m:
@@ -853,6 +875,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/__seed_device":
             uid = body.get("user_id") or _mxid(body["localpart"])
             with LOCK:
+                # A device id seeded again replaces the old row (a test sets the
+                # `last_seen_ts` of a sign-in's device this way; NULL when absent).
+                DEVICES[uid] = [d for d in DEVICES.get(uid, []) if d["device_id"] != body["device_id"]]
                 DEVICES.setdefault(uid, []).append(_device(
                     body["device_id"], body.get("display_name"),
                     body.get("last_seen_ip"), body.get("last_seen_ts")))

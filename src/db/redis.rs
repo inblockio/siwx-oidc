@@ -275,6 +275,47 @@ fn legacy_ceremony_key(ceremony: Ceremony, id: &str) -> String {
     format!("{}/{id}", ceremony.legacy_prefix())
 }
 
+/// Whether `(username, device_id)` has a live grant, for the device reaper (SS4
+/// flag 3, 8.14, 8.29): one `EXISTS` over the device's grant index
+/// (`idx:grants:user_device/…`) and the legacy device index
+/// (`idx:user_device/…`), on any connection so a test can record what is sent.
+///
+/// Read-only, and nothing but `EXISTS`: never `SMEMBERS`, `SCAN` or `KEYS` (the
+/// legacy index's members are raw token keys), never a value. An index that
+/// exists counts as live even when its members have expired, which can only
+/// spare a device.
+pub async fn device_has_live_grant_on<C>(
+    conn: &mut C,
+    username: &str,
+    device_id: &str,
+) -> Result<bool>
+where
+    C: bb8_redis::redis::aio::ConnectionLike + Send,
+{
+    let n: i64 = bb8_redis::redis::cmd("EXISTS")
+        .arg(format!(
+            "{}/{username}/{device_id}",
+            super::grant::KV_GRANT_DEVICE_IDX_PREFIX
+        ))
+        .arg(device_token_idx_key(username, device_id))
+        .query_async(conn)
+        .await
+        .map_err(|e| anyhow!("device_has_live_grant failed: {}", e))?;
+    Ok(n > 0)
+}
+
+impl RedisClient {
+    /// [`device_has_live_grant_on`] on a pooled connection.
+    pub async fn device_has_live_grant(&self, username: &str, device_id: &str) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+        device_has_live_grant_on(&mut *conn, username, device_id).await
+    }
+}
+
 impl RedisClient {
     /// Run [`TAKE_SCRIPT`] over a digest key, its legacy twin and an optional
     /// legacy used-marker.

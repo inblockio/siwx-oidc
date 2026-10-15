@@ -1906,6 +1906,14 @@ pub async fn main() {
         }
     };
 
+    // SS4 flag 3: the device reaper, stopped with the guest reaper. Off: no task.
+    let device_reaper_task = crate::device_reaper::spawn(
+        &state.config,
+        state.redis_client.clone(),
+        state.synapse_client.clone(),
+        reaper_stopped_orphan.clone(),
+    );
+
     // The report-only orphan scan, beside the reaper and stopped with it.
     let orphan_task = match (
         state.synapse_client.clone(),
@@ -2086,6 +2094,9 @@ pub async fn main() {
         let _ = tokio::time::timeout(grace + Duration::from_secs(1), task).await;
     }
     if let Some(task) = orphan_task {
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+    }
+    if let Some(task) = device_reaper_task {
         let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
     }
 }

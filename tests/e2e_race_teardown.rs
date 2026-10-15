@@ -623,6 +623,14 @@ async fn mock_seed_device(c: &Client, mxid: &str, device_id: &str) {
         .await
         .unwrap();
 }
+/// Seed (or replace) a device with Synapse's `last_seen_ts` (`None`: NULL, never seen).
+async fn mock_seed_device_seen(c: &Client, mxid: &str, device_id: &str, last_seen_ts: Option<i64>) {
+    c.post(format!("{}/__seed_device", mock()))
+        .json(&json!({ "user_id": mxid, "device_id": device_id, "last_seen_ts": last_seen_ts }))
+        .send()
+        .await
+        .unwrap();
+}
 /// Mark a localpart as an EXISTING account without seeding a device.
 ///
 /// `reject_if_new_identity` (`src/webauthn.rs`) 400s an unprovisioned identity on
@@ -5042,9 +5050,11 @@ async fn account_sign_out_ends_this_browsers_account_session_and_picker_hint() {
 /// behaves as before the flags. Revoke keeps the device; a failing Synapse
 /// delete leaves logout, `DELETE /devices/{id}` and `/logout/all` at today's
 /// best-effort 200 with the tokens revoked; a deleted device id proposed again
-/// at sign-in is recreated as today. (Flag 2's marker and flag 3's reaper add
-/// their halves to this test when they land.) Skips, loudly, against a stack
-/// started with a flag on.
+/// at sign-in is recreated as today; no device reaper runs, so an old device
+/// with no grant stays listed (run the stack with
+/// `SIWXOIDC_DEVICE_REAPER_INTERVAL_SECS=1` and `SIWXOIDC_DEVICE_REAPER_DRY_RUN=false`,
+/// which are not flags, so a reaper started without flag 3 would delete it within
+/// this test). Skips, loudly, against a stack started with a flag on.
 #[tokio::test]
 #[ignore = "requires live e2e stack (e2e/up.sh)"]
 async fn ss4_all_flags_off_is_inert() {
@@ -5056,6 +5066,7 @@ async fn ss4_all_flags_off_is_inert() {
     let base = oidc();
     mock_reset(&c).await;
     let w = new_wallet();
+    mock_seed_device_seen(&c, &w.mxid, "SS4INERTGHOST", Some(1)).await;
 
     // Revoke keeps the device.
     let a = wallet_login(&c, &base, &w).await;
@@ -5123,6 +5134,82 @@ async fn ss4_all_flags_off_is_inert() {
         "flags off: the deleted id is recreated as today"
     );
     assert!(device_ids(&mock_state(&c).await, &w.mxid).contains(&stable));
+
+    // No device reaper: the old device without a grant is still listed.
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    assert!(
+        device_ids(&mock_state(&c).await, &w.mxid).contains(&"SS4INERTGHOST".to_string()),
+        "flags off: no device reaper"
+    );
+}
+
+/// SS4 WP8 (flag 3, model 8.14), H6 on the mock stack: the device reaper's planted
+/// cases end to end. Needs the stack with `SIWXOIDC_DEVICE_REAPER_ENABLED=true`,
+/// `SIWXOIDC_DEVICE_REAPER_DRY_RUN=false`, `SIWXOIDC_DEVICE_REAPER_INTERVAL_SECS=1`
+/// and `SIWXOIDC_DEVICE_REAPER_SPARE_USERS=["ss4reaperagent"]`; skips otherwise. An
+/// old device with no grant goes (with its marker under flag 2); a signed-in device
+/// last seen just as long ago stays, as do a recent one, one never seen (NULL) and
+/// the spared account's.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn ss4_reaper_planted_cases_on_mock_stack() {
+    let on = |k: &str| std::env::var(k).is_ok_and(|v| v == "true" || v == "1");
+    if !on("SIWXOIDC_DEVICE_REAPER_ENABLED")
+        || std::env::var("SIWXOIDC_DEVICE_REAPER_DRY_RUN").as_deref() != Ok("false")
+    {
+        eprintln!("[ss4] the stack does not run the device reaper for real: skipped");
+        return;
+    }
+    let c = Client::new();
+    let base = oidc();
+    mock_reset(&c).await;
+    let w = new_wallet();
+    let old = Some(1_i64); // 1970: older than any threshold
+    let now = Some(chrono::Utc::now().timestamp_millis());
+    let live = wallet_login(&c, &base, &w).await;
+    mock_seed_device_seen(&c, &w.mxid, &live.device_id, old).await;
+    mock_seed_device_seen(&c, &w.mxid, "SS4GHOST", old).await;
+    mock_seed_device_seen(&c, &w.mxid, "SS4RECENT", now).await;
+    mock_seed_device_seen(&c, &w.mxid, "SS4NEVERSEEN", None).await;
+    let server = w.mxid.split_once(':').unwrap().1;
+    let agent = format!("@ss4reaperagent:{server}");
+    mock_seed_device_seen(&c, &agent, "SS4AGENT", old).await;
+
+    let mut gone = false;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if !device_ids(&mock_state(&c).await, &w.mxid).contains(&"SS4GHOST".to_string()) {
+            gone = true;
+            break;
+        }
+    }
+    assert!(gone, "the ghost (old, no grant) is reaped");
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await; // one more pass
+    let state = mock_state(&c).await;
+    let mine = device_ids(&state, &w.mxid);
+    for d in [live.device_id.as_str(), "SS4RECENT", "SS4NEVERSEEN"] {
+        assert!(mine.contains(&d.to_string()), "{d} spared");
+    }
+    assert!(device_ids(&state, &agent).contains(&"SS4AGENT".to_string()));
+    assert!(
+        token_active(&c, &live.access_token).await,
+        "the live session is untouched"
+    );
+
+    let redis = siwx_oidc::db::RedisClient::new(
+        &url::Url::parse(&std::env::var("SIWXOIDC_REDIS_URL").unwrap()).unwrap(),
+    )
+    .await
+    .unwrap();
+    let lp = w.mxid[1..].split(':').next().unwrap();
+    let marked = siwx_oidc::db::DBClient::is_deleted_device(&redis, lp, "SS4GHOST")
+        .await
+        .unwrap();
+    assert_eq!(
+        marked,
+        on("SIWXOIDC_REFUSE_DELETED_DEVICE_IDS"),
+        "marker iff flag 2"
+    );
 }
 
 /// H4b (SS4, WP11 part 1): the 2026-06-12 sequence. Element's forced-recovery

@@ -27,7 +27,7 @@ pub mod outbox;
 mod redis;
 pub mod seal;
 pub mod tokens;
-pub use self::redis::RedisClient;
+pub use self::redis::{device_has_live_grant_on, RedisClient};
 
 const KV_CLIENT_PREFIX: &str = "clients";
 /// Redis SET of the client ids written from `default_clients`, so the next start can

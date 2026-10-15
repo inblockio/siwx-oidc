@@ -326,6 +326,35 @@ pub struct Config {
     /// Env: `SIWXOIDC_DEVICE_REAPER_SPARE_USERS`
     #[serde(default)]
     pub device_reaper_spare_users: Vec<String>,
+    /// Device reaper (flag 3): a pass deletes nothing and only reports (counts in
+    /// the log, the full list in `device_reaper_report_path`). Default true, so
+    /// turning flag 3 on starts with a dry run; set false to delete.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_DRY_RUN`
+    pub device_reaper_dry_run: bool,
+    /// Device reaper (flag 3): seconds between two passes of the fleet (one
+    /// instance per interval holds the lease). Default 86400 (one day). A zero
+    /// is read as one second.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_INTERVAL_SECS`
+    pub device_reaper_interval_secs: u64,
+    /// Device reaper (flag 3): added to the refresh-token lifetime (90 days) to
+    /// give the idle time after which Synapse's `last_seen` makes a device a
+    /// candidate. Default 604800 (7 days).
+    /// Env: `SIWXOIDC_DEVICE_REAPER_MARGIN_SECS`
+    pub device_reaper_margin_secs: u64,
+    /// Device reaper (flag 3): when set, replaces the idle threshold (refresh
+    /// lifetime plus margin) by this many seconds. A device with a live grant, a
+    /// NULL `last_seen` or on a spared account is still never deleted. For a
+    /// test deployment only; unset (the default) on production.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_MIN_IDLE_SECS`
+    #[serde(default)]
+    pub device_reaper_min_idle_secs: Option<u64>,
+    /// Device reaper (flag 3): a file each pass writes its full list to (one
+    /// JSON line per device with its account, type and verdict), mode 0600,
+    /// replaced each pass. It holds Matrix ids in clear, so it belongs on the
+    /// host only, never in logs or a repository. Unset (the default): no file.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_REPORT_PATH`
+    #[serde(default)]
+    pub device_reaper_report_path: Option<String>,
     // -- Guest server path (S1). Flat on purpose, like the rest of the struct. --
     /// Master switch for the guest server path. Off (the default): every other `guest_*` key is ignored and the guest endpoints do not exist. On: start-up runs `guest::validate_guest_config` and refuses to start when a prerequisite is missing.
     /// Env: `SIWXOIDC_GUEST_ENABLED`
@@ -533,6 +562,11 @@ impl Default for Config {
             device_reaper_enabled: false,
             deleted_device_marker_ttl_secs: 31_536_000,
             device_reaper_spare_users: Vec::new(),
+            device_reaper_dry_run: true,
+            device_reaper_interval_secs: 86_400,
+            device_reaper_margin_secs: 604_800,
+            device_reaper_min_idle_secs: None,
+            device_reaper_report_path: None,
             guest_enabled: false,
             guest_client_url: None,
             guest_client_id: None,
@@ -1052,6 +1086,11 @@ mod tests {
                 assert!(!c.device_reaper_enabled);
                 assert_eq!(c.deleted_device_marker_ttl_secs, 31_536_000);
                 assert!(c.device_reaper_spare_users.is_empty());
+                assert!(c.device_reaper_dry_run);
+                assert_eq!(c.device_reaper_interval_secs, 86_400);
+                assert_eq!(c.device_reaper_margin_secs, 604_800);
+                assert_eq!(c.device_reaper_min_idle_secs, None);
+                assert_eq!(c.device_reaper_report_path, None);
             }
             jail.set_env("SIWXOIDC_REVOKE_DELETES_DEVICE", "true");
             jail.set_env("SIWXOIDC_REFUSE_DELETED_DEVICE_IDS", "true");
@@ -1063,6 +1102,23 @@ mod tests {
             assert!(c.device_reaper_enabled);
             assert_eq!(c.deleted_device_marker_ttl_secs, 60);
             assert_eq!(c.device_reaper_spare_users, vec!["agent".to_string()]);
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_DRY_RUN", "false");
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_INTERVAL_SECS", "5");
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_MARGIN_SECS", "6");
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_MIN_IDLE_SECS", "7");
+            jail.set_env(
+                "SIWXOIDC_DEVICE_REAPER_REPORT_PATH",
+                "/var/lib/reaper.jsonl",
+            );
+            let c = figment().extract::<Config>()?;
+            assert!(!c.device_reaper_dry_run);
+            assert_eq!(c.device_reaper_interval_secs, 5);
+            assert_eq!(c.device_reaper_margin_secs, 6);
+            assert_eq!(c.device_reaper_min_idle_secs, Some(7));
+            assert_eq!(
+                c.device_reaper_report_path.as_deref(),
+                Some("/var/lib/reaper.jsonl")
+            );
             Ok(())
         });
     }
