@@ -1594,6 +1594,33 @@ async fn token_device_code(
             // (never modern — see resolve_identity_or_legacy's fail-safe
             // direction), matching the pre-existing degraded-provisioning path.
             let resolved = crate::localpart::resolve_identity_or_legacy(&did, synapse_client).await;
+            // A code that names its account (`login_hint`) is redeemed only for that
+            // account. The approval checked it with the fallible resolver; this one
+            // degrades to the legacy localpart on a fault, which for an account on the
+            // modern localpart names another account. A mismatch issues nothing: on a
+            // degraded answer the claim is released and a later poll tries again,
+            // otherwise the code is refused and deleted.
+            if crate::device_auth::names_another_account(
+                entry.expected_mxid.as_deref(),
+                &resolved.localpart,
+            ) {
+                if let Err(e) = db_client.release_device_code_claim(&dc).await {
+                    warn!(error = %e, "device_code grant: could not release the claim");
+                }
+                if resolved.degraded {
+                    return Err(device_code_error(
+                        "temporarily_unavailable",
+                        DEVICE_PROVISIONING_UNAVAILABLE_MSG,
+                    ));
+                }
+                warn!(did = %did, "device_code grant: the approving identity is not the account the request names");
+                let _ = db_client.delete_device_code(&device_ref).await;
+                let _ = db_client.delete_user_code_mapping(&entry).await;
+                return Err(device_code_error(
+                    "access_denied",
+                    "The request was approved by an account other than the one it names.",
+                ));
+            }
             // Same DID publication as the wallet/passkey login path: the QR
             // flow provisions a real session for a real identity, so it must
             // publish (and re-assert) the same attested field. Both call sites
@@ -5962,6 +5989,7 @@ mod tests {
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
                 auth_ms: None,
+                expected_mxid: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -6032,6 +6060,7 @@ mod tests {
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
                 auth_ms: None,
+                expected_mxid: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -8730,6 +8759,7 @@ mod device_display_name_tests {
                 last_poll: None,
                 created_at: approved_at - 10,
                 auth_ms: Some(approved_at * 1000),
+                expected_mxid: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -8796,6 +8826,7 @@ mod device_display_name_tests {
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
                 auth_ms: None,
+                expected_mxid: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -10463,6 +10494,7 @@ mod client_binding_tests {
                     last_poll: None,
                     created_at: Utc::now().timestamp(),
                     auth_ms: None,
+                    expected_mxid: None,
                 },
                 DEVICE_CODE_LIFETIME,
             )
@@ -13621,6 +13653,7 @@ mod generic_client_tests {
             crate::device_auth::DeviceAuthRequest {
                 client_id,
                 scope: Some("openid".into()),
+                login_hint: None,
             },
         )
         .await
@@ -13771,6 +13804,7 @@ mod generic_client_tests {
             crate::device_auth::DeviceAuthRequest {
                 client_id,
                 scope: Some(device_scope("X,Y")),
+                login_hint: None,
             },
         )
         .await;

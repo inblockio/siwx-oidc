@@ -710,7 +710,7 @@ async fn resolve_did(
 }
 
 /// `?mxid=` — Matrix account to published DID.
-async fn resolve_mxid(
+pub(crate) async fn resolve_mxid(
     mxid: &str,
     server_name: &str,
     synapse: &SynapseClient,
@@ -844,7 +844,7 @@ async fn account_is_active(
 /// The server half is everything after the **first** colon, so a server name
 /// carrying an explicit port (`@alice:example.com:8448`, which Matrix permits)
 /// stays intact instead of being truncated at the port separator.
-fn split_mxid(mxid: &str) -> Result<(&str, &str), ResolveError> {
+pub(crate) fn split_mxid(mxid: &str) -> Result<(&str, &str), ResolveError> {
     let rest = mxid.strip_prefix('@').ok_or_else(|| {
         ResolveError::BadRequest(format!(
             "`{mxid}` is not a Matrix ID: it must start with `@` and look like \

@@ -38,7 +38,7 @@ everything else exists only in the binary crate.
 | `introspect.rs` | `POST /oauth2/introspect` (RFC 7662) for Synapse, inactive for an `oidc` grant's token; opaque `mat_`/`mcr_` token generation. |
 | `admin_token.rs` | `POST /oauth2/admin_token`: short-TTL token whose scope carries `urn:synapse:admin:*`. |
 | `compat.rs` | `POST /oauth2/revoke` (RFC 7009) and the Matrix client-server endpoints siwx-oidc answers (login flows, logout, logout/all, refresh, device deletion); `TeardownPolicy`, and `CompatState` (`new`, `acts_on`) with which grants the Matrix routes act on. |
-| `device_auth.rs` | RFC 8628 device authorization: `/device_authorization`, the `/device` approval page (wallet and passkey), server-issued CAIP-122 nonces. |
+| `device_auth.rs` | RFC 8628 device authorization: `/device_authorization` (with the optional `login_hint`, `parse_login_hint`), the `/device` approval page (wallet and passkey), server-issued CAIP-122 nonces, and `check_expected_account`, which both approval routes run for a code that names its account. |
 | `account.rs` | MSC4191 `/account` page and actions, MSC4312 cross-signing reset, and the two non-spec actions `io.inblock.account_erase` / `io.inblock.account_reactivate`. `SUPPORTED_ACTIONS` is the single source of truth for discovery and dispatch; `canonical_action` maps `session_*` aliases to `device_*` and the legacy `org.matrix.account_erase` / `org.matrix.account_reactivate` names to the new ones. The account session (`create_account_session`) lives in the `OwnSession::Account` layout; the page's sign-out is `POST /account/sign_out` (handler in `axum_lib.rs`). |
 | `webauthn.rs` | Passkey ceremonies (register, authenticate, link), the new-identity and deactivation gates (`reject_if_new_identity`, `reject_if_deactivated`), picker scoping. |
 | `synapse_client.rs` | Synapse client with two credentials: the MAS shared secret on `/_synapse/mas/*` (`provision_user`, `upsert_device`, `update_device_display_name`, `allow_cross_signing_reset`, `localpart_status`, `delete_device`, `deactivate_user`, `reactivate_user`) and a minted admin-scoped token (`admin_request`) on `/_synapse/admin/*` and the client-server API (`list_devices`, `get_device`, `has_cross_signing_keys`, `read_profile`, `publish_did_field`, `read_did_field`). |
@@ -327,6 +327,16 @@ doc; read it before changing the code the rule covers.
   `sign_in_refuses_a_deactivated_account_before_resolving_or_provisioning`,
   `a_partial_probe_fault_fails_sign_in_closed_before_any_legacy_guess` (they drive `sign_in`
   against a recording homeserver); rationale at the call site.
+- **A device code whose request names its account (`login_hint`) is approved only by that
+  account.** `check_expected_account` runs in both approval routes before the new-identity
+  gate, resolves the proven identity (a passkey's as its link makes it) with the fallible
+  `resolve_identity`, refuses another account and an identity with no account, and leaves the
+  code pending; the device-code grant refuses a localpart that differs at redemption. The hint
+  only narrows: it never scopes the passkey picker (see "Passkeys") and never decides by DID
+  method. Pin: `a_hinted_code_is_approved_only_by_the_account_it_names`,
+  `a_code_without_a_hint_is_approved_by_any_account_as_before`,
+  `a_login_hint_must_name_an_account_on_this_homeserver`, and on the wire
+  `a_hinted_device_grant_is_refused_to_another_account`.
 - **Standalone deployments degrade, never 500.** No Synapse client means the gates are no-ops.
 - **A generic-class sign-in never guesses a localpart.** It resolves with the fallible
   `resolve_identity` and answers 503 on a fault, because its localpart can become a mail address

@@ -703,6 +703,13 @@ pub struct DeviceCodeEntry {
     /// poll that redeems it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_ms: Option<i64>,
+    /// The account the device asked to be signed in as (its `login_hint`), as a
+    /// full Matrix ID `@localpart:server_name`. Only an identity that signs in as
+    /// that account may approve the code. `None` when the request named no account,
+    /// and in an entry an older build wrote; the key is left out when `None`, so an
+    /// older build reads a new entry exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_mxid: Option<String>,
 }
 
 impl std::fmt::Debug for DeviceCodeEntry {
@@ -721,6 +728,7 @@ impl std::fmt::Debug for DeviceCodeEntry {
             .field("last_poll", &self.last_poll)
             .field("created_at", &self.created_at)
             .field("auth_ms", &self.auth_ms)
+            .field("expected_mxid", &self.expected_mxid)
             .finish()
     }
 }
@@ -739,6 +747,7 @@ impl DeviceCodeEntry {
             last_poll: None,
             created_at,
             auth_ms: None,
+            expected_mxid: None,
         }
     }
 

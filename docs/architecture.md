@@ -106,7 +106,8 @@ P-256 key (`did:key`), no browser. See [agents.md](agents.md).
 **Device authorization (RFC 8628, used for Element X QR login):**
 
 1. `POST /device_authorization` returns `device_code`, a `user_code` such as `WDJ-BMJ`, and the
-   verification URI `/device`.
+   verification URI `/device`. An optional `login_hint` (`mxid:@localpart:server_name`) names the
+   one account that may approve the code.
 2. The device polls `POST /token` with `grant_type=urn:ietf:params:oauth:grant-type:device_code`.
 3. The user opens `/device?user_code=…` and approves with a wallet signature or a passkey.
 4. The next poll returns tokens and provisions the Synapse device.
