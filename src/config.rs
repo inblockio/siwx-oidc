@@ -298,6 +298,34 @@ pub struct Config {
     /// Env: `SIWXOIDC_REUSE_REVOKES_GRANT`
     #[serde(default)]
     pub reuse_revokes_grant: bool,
+    // -- Session end removes its device (SS4). Every switch is off by default:
+    // a build with all three off behaves as before them (model D8). --
+    /// Flag 1. On: `POST /oauth2/revoke` of a Matrix-credential grant ends the
+    /// session including its Synapse device (other grant kinds keep tokens-only
+    /// revocation), every teardown becomes strict (Synapse delete, then the
+    /// deleted-id marker, then revoke; a transient Synapse failure answers 503
+    /// and revokes nothing), and a guest claim tears the pre-claim devices down.
+    /// Off (the default): revoke keeps the device; teardown is best-effort and
+    /// answers 200. Read once at startup.
+    /// Env: `SIWXOIDC_REVOKE_DELETES_DEVICE`
+    #[serde(default)]
+    pub revoke_deletes_device: bool,
+    /// Flag 2. On: every device delete plants a deleted-id marker and a sign-in
+    /// naming such an id is refused. Off (the default): no marker is written.
+    /// Env: `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`
+    #[serde(default)]
+    pub refuse_deleted_device_ids: bool,
+    /// Flag 3. On: the device reaper runs. Off (the default): no reaper task.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_ENABLED`
+    #[serde(default)]
+    pub device_reaper_enabled: bool,
+    /// Lifetime of a deleted-id marker (flag 2), seconds. Default 365 days.
+    /// Env: `SIWXOIDC_DELETED_DEVICE_MARKER_TTL_SECS`
+    pub deleted_device_marker_ttl_secs: u64,
+    /// Localparts the device reaper (flag 3) never touches. Default empty.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_SPARE_USERS`
+    #[serde(default)]
+    pub device_reaper_spare_users: Vec<String>,
     // -- Guest server path (S1). Flat on purpose, like the rest of the struct. --
     /// Master switch for the guest server path. Off (the default): every other `guest_*` key is ignored and the guest endpoints do not exist. On: start-up runs `guest::validate_guest_config` and refuses to start when a prerequisite is missing.
     /// Env: `SIWXOIDC_GUEST_ENABLED`
@@ -482,6 +510,11 @@ impl Default for Config {
             backchannel_logout_allowed_hosts: Vec::new(),
             backchannel_logout_required_for_refresh: false,
             reuse_revokes_grant: false,
+            revoke_deletes_device: false,
+            refuse_deleted_device_ids: false,
+            device_reaper_enabled: false,
+            deleted_device_marker_ttl_secs: 31_536_000,
+            device_reaper_spare_users: Vec::new(),
             guest_enabled: false,
             guest_client_url: None,
             guest_client_id: None,
@@ -985,6 +1018,33 @@ mod tests {
                 Some(7_200),
                 "new beats legacy"
             );
+            Ok(())
+        });
+    }
+
+    /// SS4: the three session-end flags are off and the companion settings
+    /// have their documented defaults unless an operator sets them.
+    #[test]
+    fn ss4_flags_are_off_by_default_and_read_from_the_environment() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            for c in [figment().extract::<Config>()?, Config::default()] {
+                assert!(!c.revoke_deletes_device);
+                assert!(!c.refuse_deleted_device_ids);
+                assert!(!c.device_reaper_enabled);
+                assert_eq!(c.deleted_device_marker_ttl_secs, 31_536_000);
+                assert!(c.device_reaper_spare_users.is_empty());
+            }
+            jail.set_env("SIWXOIDC_REVOKE_DELETES_DEVICE", "true");
+            jail.set_env("SIWXOIDC_REFUSE_DELETED_DEVICE_IDS", "true");
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_ENABLED", "true");
+            jail.set_env("SIWXOIDC_DELETED_DEVICE_MARKER_TTL_SECS", "60");
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_SPARE_USERS", r#"["agent"]"#);
+            let c = figment().extract::<Config>()?;
+            assert!(c.revoke_deletes_device && c.refuse_deleted_device_ids);
+            assert!(c.device_reaper_enabled);
+            assert_eq!(c.deleted_device_marker_ttl_secs, 60);
+            assert_eq!(c.device_reaper_spare_users, vec!["agent".to_string()]);
             Ok(())
         });
     }
