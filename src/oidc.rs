@@ -3217,7 +3217,39 @@ pub async fn provision_synapse_device(
     server_name: Option<&str>,
     did_publication: Option<&DidPublication<'_>>,
 ) -> Option<String> {
-    let synapse = synapse_client?;
+    provision_synapse_device_with(
+        did,
+        identity,
+        synapse_client,
+        display_name,
+        proposed_device_id,
+        server_name,
+        did_publication,
+        false,
+    )
+    .await
+    // Not strict: never `Err`.
+    .ok()
+    .flatten()
+}
+
+/// [`provision_synapse_device`], failing closed when `strict` (SS4 flag 2, 8.27): a failed
+/// `upsert_device` is `Err(())`, answered before the cross-signing reset window is armed.
+/// Not `strict`, it is the warning it has always been and the device id is returned.
+#[allow(clippy::too_many_arguments)]
+async fn provision_synapse_device_with(
+    did: &str,
+    identity: &crate::localpart::ResolvedIdentity,
+    synapse_client: Option<&SynapseClient>,
+    display_name: &str,
+    proposed_device_id: Option<&str>,
+    server_name: Option<&str>,
+    did_publication: Option<&DidPublication<'_>>,
+    strict: bool,
+) -> std::result::Result<Option<String>, ()> {
+    let Some(synapse) = synapse_client else {
+        return Ok(None);
+    };
     let localpart = identity.localpart.as_str();
     let dev_id = resolve_device_id(proposed_device_id);
     debug!("provisioning device_id={} for did={}", dev_id, did);
@@ -3240,6 +3272,14 @@ pub async fn provision_synapse_device(
             }
         }
         Ok(DeviceUpsert::AlreadyExisted) => {}
+        Err(e) if strict => {
+            warn!(
+                device_fp = %siwx_oidc::redact::fingerprint(&dev_id),
+                error = %e,
+                "upsert_device failed; refusing the sign-in (no grant without a device)"
+            );
+            return Err(());
+        }
         Err(e) => warn!("upsert_device failed: {}", e),
     }
 
@@ -3257,7 +3297,7 @@ pub async fn provision_synapse_device(
         );
     }
 
-    Some(dev_id)
+    Ok(Some(dev_id))
 }
 
 /// What `/authorize` (as an `invalid_scope` redirect) and `/sign_in` (as a 400) tell a
@@ -3274,6 +3314,12 @@ const PRE_CLAIM_DEVICE_REFUSED_MSG: &str =
 /// scope proposes a device id siwx-oidc deleted while SS4 flag 2 was on (8.1).
 pub(crate) const DELETED_DEVICE_REFUSED_MSG: &str = "The requested device id was signed out \
      and cannot be used again. Sign in with a new device id.";
+
+/// What `sign_in` tells the client (as a `temporarily_unavailable` redirect, SS4 flag 2,
+/// 8.27) when the homeserver could not provision the session's device: no grant is issued
+/// without a Synapse device.
+pub(crate) const DEVICE_PROVISIONING_UNAVAILABLE_MSG: &str = "Sign-in is temporarily \
+     unavailable because the homeserver could not set up this device. Please try again shortly.";
 
 /// SS4 flag 2 (8.12): whether `device_id` carries a deleted-id marker for the account of
 /// `did`. Both localparts a DID can hold are asked (the legacy and the modern one; a
@@ -3626,7 +3672,28 @@ pub async fn sign_in(
     // That window exists for a Matrix-class client only: a generic-class sign-in
     // resolves with the fallible `resolve_identity` and answers a fault in it
     // with a 503 (see the class match below).
-    crate::webauthn::reject_if_deactivated(synapse_client, &did).await?;
+    //
+    // SS4 flag 2 (8.27): the gate's refusals go back to the client as the authorization
+    // error response at the bound redirect_uri, like the deleted-id refusal above:
+    // `access_denied` for a deactivated (or erased) account, `temporarily_unavailable`
+    // when the gate could not decide. Flag 2 off keeps the 401 and 503 issuer pages.
+    if let Err(e) = crate::webauthn::reject_if_deactivated(synapse_client, &did).await {
+        return Err(match e {
+            CustomError::Unauthorized(msg) if refuse_deleted_ids => sign_in_refusal_redirect(
+                &redirect_uri,
+                &request,
+                CoreAuthErrorResponseType::AccessDenied,
+                &msg,
+            ),
+            CustomError::ServiceUnavailable(msg) if refuse_deleted_ids => sign_in_refusal_redirect(
+                &redirect_uri,
+                &request,
+                CoreAuthErrorResponseType::TemporarilyUnavailable,
+                &msg,
+            ),
+            other => other,
+        });
+    }
 
     // C2 Step 3: re-validate the bound redirect_uri against the client's
     // registered set before issuing the code. `authorize` matched it when it
@@ -3674,7 +3741,10 @@ pub async fn sign_in(
             // would open and the paths that do exercise `degraded` freely, is at the
             // gate's call site above.
             let resolved = crate::localpart::resolve_identity_or_legacy(&did, synapse_client).await;
-            let device_id = provision_synapse_device(
+            // SS4 flag 2 (8.27): no grant without a Synapse device. A failed upsert
+            // answers `temporarily_unavailable` before the cross-signing reset window is
+            // armed and before a code exists; flag 2 off keeps today's warning.
+            let device_id = provision_synapse_device_with(
                 &did,
                 &resolved,
                 synapse_client,
@@ -3682,8 +3752,17 @@ pub async fn sign_in(
                 proposed_device_id.as_deref(),
                 server_name,
                 did_publication,
+                refuse_deleted_ids,
             )
-            .await;
+            .await
+            .map_err(|()| {
+                sign_in_refusal_redirect(
+                    &redirect_uri,
+                    &request,
+                    CoreAuthErrorResponseType::TemporarilyUnavailable,
+                    DEVICE_PROVISIONING_UNAVAILABLE_MSG,
+                )
+            })?;
             (resolved.localpart.clone(), device_id)
         }
         ClientClass::Generic => {
@@ -7264,6 +7343,8 @@ mod sign_in_deactivation_order_tests {
         /// `query_user` answers `is_deactivated: true`; any other localpart is
         /// a 404, which `query_user` reads as "no such account".
         deactivated: HashSet<String>,
+        /// `upsert_device` answers 500 (SS4 WP6: a device that cannot be provisioned).
+        upsert_fails: bool,
         /// Every request, in arrival order.
         log: Mutex<Vec<String>>,
     }
@@ -7329,6 +7410,9 @@ mod sign_in_deactivation_order_tests {
             .lock()
             .unwrap()
             .push(format!("{method} {}", uri.path()));
+        if hs.upsert_fails && uri.path().ends_with("/upsert_device") {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
+        }
         (StatusCode::OK, Json(serde_json::json!({}))).into_response()
     }
 
@@ -7861,6 +7945,193 @@ mod sign_in_deactivation_order_tests {
             !output.contains(DELETED),
             "the device id never appears in clear: {output}"
         );
+    }
+
+    // ---- SS4 WP6: the other sign_in refusals become redirects (flag 2, 8.27) ----
+
+    /// A homeserver on which `did`'s account exists under the modern localpart and is
+    /// deactivated (an erased account is deactivated too).
+    fn deactivated_for(did: &str) -> Homeserver {
+        let modern = localpart_for(did);
+        Homeserver {
+            taken: HashSet::from([modern.clone()]),
+            deactivated: HashSet::from([modern]),
+            ..Homeserver::default()
+        }
+    }
+
+    /// The legacy availability probe answers 500: the deactivation gate cannot decide.
+    fn probe_fault_for(did: &str) -> Homeserver {
+        Homeserver {
+            faulted: HashSet::from([legacy_localpart(did)]),
+            ..Homeserver::default()
+        }
+    }
+
+    fn upsert_fault() -> Homeserver {
+        Homeserver {
+            upsert_fails: true,
+            ..Homeserver::default()
+        }
+    }
+
+    /// Asserts `result` is a refusal redirect with `error` and `description`, the bound
+    /// state and no code.
+    fn assert_refusal(result: &Result<(Url, String), CustomError>, error: &str, description: &str) {
+        let q = refusal_params(result, false);
+        assert_eq!(q.get("error").map(String::as_str), Some(error), "{q:?}");
+        assert_eq!(
+            q.get("error_description").map(String::as_str),
+            Some(description)
+        );
+        assert_eq!(q.get("state").map(String::as_str), Some("state"));
+        assert!(!q.contains_key("code"), "no code, so no grant: {q:?}");
+    }
+
+    fn armed_reset(log: &[String]) -> bool {
+        log.iter()
+            .any(|l| l.ends_with("/allow_cross_signing_reset"))
+    }
+
+    #[tokio::test]
+    async fn sign_in_deactivated_account_redirects_access_denied_flag2_on() {
+        let did = fresh_did();
+        let Some((result, log)) =
+            sign_in_with(deactivated_for(&did), &did, None, flag2(true), |_| async {}).await
+        else {
+            return;
+        };
+        assert_refusal(
+            &result,
+            "access_denied",
+            crate::webauthn::DEACTIVATED_REJECT_MSG,
+        );
+        assert!(
+            log.iter().all(|l| !l.starts_with("POST")),
+            "nothing provisioned for a refused account: {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_in_deactivated_account_keeps_401_page_flag2_off() {
+        let did = fresh_did();
+        let Some((result, _)) =
+            sign_in_with(deactivated_for(&did), &did, None, flag2(false), |_| async {
+            })
+            .await
+        else {
+            return;
+        };
+        match result {
+            Err(CustomError::Unauthorized(msg)) => {
+                assert_eq!(msg, crate::webauthn::DEACTIVATED_REJECT_MSG)
+            }
+            other => panic!("flag 2 off keeps today's 401 page, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_in_erased_account_redirects_access_denied() {
+        let did = fresh_did();
+        let Some((result, log)) =
+            sign_in_with(deactivated_for(&did), &did, None, flag2(true), |db| {
+                let did = did.clone();
+                async move {
+                    db.mark_account_erased(&localpart_for(&did), &did)
+                        .await
+                        .unwrap()
+                }
+            })
+            .await
+        else {
+            return;
+        };
+        assert_refusal(
+            &result,
+            "access_denied",
+            crate::webauthn::DEACTIVATED_REJECT_MSG,
+        );
+        assert!(log.iter().all(|l| !l.starts_with("POST")), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn sign_in_deactivation_probe_failure_redirects_temporarily_unavailable_no_grant() {
+        let did = fresh_did();
+        let Some((result, log)) =
+            sign_in_with(probe_fault_for(&did), &did, None, flag2(true), |_| async {}).await
+        else {
+            return;
+        };
+        assert_refusal(
+            &result,
+            "temporarily_unavailable",
+            crate::webauthn::DEACTIVATION_CHECK_UNAVAILABLE_MSG,
+        );
+        assert_eq!(
+            log,
+            vec![format!("is_localpart_available {}", legacy_localpart(&did))],
+            "the failed probe is the only homeserver call"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_in_upsert_device_failure_redirects_temporarily_unavailable_no_grant() {
+        let did = fresh_did();
+        let scope = scope_with("DEVICE_A");
+        let Some((result, log)) =
+            sign_in_with(upsert_fault(), &did, Some(&scope), flag2(true), |_| async {
+            })
+            .await
+        else {
+            return;
+        };
+        assert_refusal(
+            &result,
+            "temporarily_unavailable",
+            DEVICE_PROVISIONING_UNAVAILABLE_MSG,
+        );
+        assert!(
+            log.iter().any(|l| l.ends_with("/upsert_device")),
+            "the upsert was tried: {log:?}"
+        );
+    }
+
+    /// No cross-signing reset window is armed by a sign-in refused as
+    /// `temporarily_unavailable`, for either cause. Flag 2 off, an upsert failure stays
+    /// today's warning: the grant is issued and the window armed.
+    #[tokio::test]
+    async fn temporarily_unavailable_redirect_does_not_arm_reset_window() {
+        let did = fresh_did();
+        let Some((result, log)) =
+            sign_in_with(probe_fault_for(&did), &did, None, flag2(true), |_| async {}).await
+        else {
+            return;
+        };
+        assert!(
+            matches!(result, Err(CustomError::Redirect(_))),
+            "{result:?}"
+        );
+        assert!(!armed_reset(&log), "probe failure: no reset arm: {log:?}");
+
+        for on in [true, false] {
+            let did = fresh_did();
+            let Some((result, log)) =
+                sign_in_with(upsert_fault(), &did, None, flag2(on), |_| async {}).await
+            else {
+                return;
+            };
+            if on {
+                assert!(
+                    matches!(result, Err(CustomError::Redirect(_))),
+                    "{result:?}"
+                );
+                assert!(!armed_reset(&log), "upsert failure: no reset arm: {log:?}");
+            } else {
+                let (url, _) = result.expect("flag 2 off: the grant is issued as today");
+                assert!(url.query().unwrap_or_default().contains("code="));
+                assert!(armed_reset(&log), "flag 2 off: armed as today: {log:?}");
+            }
+        }
     }
 }
 
