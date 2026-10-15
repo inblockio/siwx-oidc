@@ -31,7 +31,7 @@ and nothing else changes.
 | Invite | `POST /guest/invites` (host Bearer token) | A host in `guest_hosts` creates links for a room that passes the room template. The secret (`gi_` + 32 characters) is shown once; only its SHA-256 is stored. |
 | Peek | `POST /guest/peek` | The join page asks what the link allows. Reads only, burns nothing. An unknown id, a wrong secret and an unparsable body all answer the same `404 invalid_link`. |
 | Redeem | `POST /guest/redeem` | The browser sends its `did:key`, names and consent plus the proof. The server mints a guest record in one Redis script and sets the cookie. **No Synapse write.** The deadline is Redis `TIME` plus the invite's `session_secs`. A second redemption of a single-use link is refused (`410`). |
-| Hand-off | `GET /authorize` with scope `urn:io.inblock:guest`, then `GET/POST /guest/continue` | The Meet client starts a normal authorization-code flow; the hand-off page signs with the stored key, the `sign_in` guest branch creates the Synapse account and device. At most `guest_max_devices` devices, `guest_handoff_per_minute` hand-offs per minute. |
+| Hand-off | `GET /authorize` with scope `urn:io.inblock:guest`, then `GET/POST /guest/continue` | The Meet client starts a normal authorization-code flow; the hand-off page signs with the stored key, the `sign_in` guest branch creates the Synapse account and device, named after the guest client's `client_name` (`guest_client_name`; the client id when unset). At most `guest_max_devices` devices, `guest_handoff_per_minute` hand-offs per minute. |
 | In the call | Synapse, policy module, lk-jwt | The guest is confined by the Synapse policy module (P4) and lk-jwt membership enforcement (P1), not by siwx-oidc. |
 | End | deadline, `POST /guest/end`, host end routes, kill switch | The record's deadline moves to now. |
 | Reap | reaper, every `guest_reaper_interval_secs` | Revoke every grant and device, write `erased:user/<localpart>` and the DID tombstone `erased:did/<sha256(DID)>`, delete the Synapse user with erase, drop the record. Idempotent and crash-safe. |
@@ -74,6 +74,7 @@ SIWXOIDC_MAS_SHARED_SECRET=...  SIWXOIDC_SYNAPSE_ENDPOINT=http://synapse:8008  S
 # optional:
 SIWXOIDC_GUEST_EMAIL_POLICY=off|optional|required   SIWXOIDC_GUEST_CLAIM_ENABLED=true
 SIWXOIDC_GUEST_ALLOW_OPEN_LINKS=false               SIWXOIDC_GUEST_SESSION_MAX_SECS=7200
+SIWXOIDC_GUEST_CLIENT_NAME="Example Meet guest"     # device name of new guest devices (default: the client id)
 ```
 
 Start-up validates the whole block and refuses to start, naming each key, when a required key

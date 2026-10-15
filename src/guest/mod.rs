@@ -26,12 +26,14 @@ pub const TOPOLOGIES: [&str; 2] = ["same-site", "cross-site"];
 /// `guest_client_redirect_uris`, `token_endpoint_auth_method = none` (PKCE S256 is
 /// mandatory on the guest path), the authorization-code and refresh grants, no expiry and
 /// no `/register`. Its secret is random and thrown away: nobody can authenticate with it.
-/// `None` with guest mode off.
+/// A non-blank `guest_client_name` is its `client_name`, so a new guest device is named by
+/// it in the device list (`oidc::device_display_name`); without one the device is named
+/// after the client id. `None` with guest mode off.
 pub fn guest_client_entry(
     config: &Config,
 ) -> Result<Option<(String, siwx_oidc::db::ClientEntry)>, String> {
     use openidconnect::core::{CoreClientAuthMethod, CoreGrantType};
-    use openidconnect::RedirectUrl;
+    use openidconnect::{ClientName, LocalizedClaim, RedirectUrl};
     use rand::RngCore as _;
     if !config.guest_enabled {
         return Ok(None);
@@ -50,7 +52,7 @@ pub fn guest_client_entry(
     if redirects.is_empty() {
         return Err("guest_client_redirect_uris must name at least one URI".into());
     }
-    let metadata = siwx_oidc::db::SiwxClientMetadata::new(
+    let mut metadata = siwx_oidc::db::SiwxClientMetadata::new(
         redirects,
         siwx_oidc::db::LogoutClientMetadata::default(),
     )
@@ -59,6 +61,16 @@ pub fn guest_client_entry(
         CoreGrantType::AuthorizationCode,
         CoreGrantType::RefreshToken,
     ]));
+    if let Some(name) = config
+        .guest_client_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        let mut names = LocalizedClaim::new();
+        names.insert(None, ClientName::new(name.to_string()));
+        metadata = metadata.set_client_name(Some(names));
+    }
     let mut secret = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut secret);
     let secret = hex::encode(secret);
@@ -237,6 +249,41 @@ mod tests {
     #[test]
     fn the_valid_baseline_passes() {
         validate_guest_config(&valid()).unwrap();
+    }
+
+    /// The guest client's `client_name` is what names a new guest device
+    /// (`oidc::device_display_name`); unset or blank leaves the client id.
+    #[test]
+    fn the_guest_client_name_is_the_device_display_name() {
+        let named = |name: Option<&str>| {
+            let config = Config {
+                guest_client_name: name.map(Into::into),
+                ..valid()
+            };
+            let (id, entry) = guest_client_entry(&config).unwrap().unwrap();
+            assert_eq!(id, "meet");
+            entry
+        };
+        let device_name =
+            |name: Option<&str>| crate::oidc::device_display_name("meet", Some(&named(name)));
+        assert_eq!(
+            device_name(Some("Example Meet guest")),
+            "Example Meet guest"
+        );
+        assert_eq!(
+            device_name(Some("  Example Meet guest  ")),
+            "Example Meet guest",
+            "surrounding blanks are not part of the name"
+        );
+        assert_eq!(device_name(None), "meet");
+        assert_eq!(device_name(Some("")), "meet");
+        assert_eq!(device_name(Some("   ")), "meet");
+        assert!(named(None).metadata.client_name().is_none());
+        assert!(named(Some(" ")).metadata.client_name().is_none());
+        assert!(named(Some("Example Meet guest"))
+            .metadata
+            .client_name()
+            .is_some());
     }
 
     #[test]

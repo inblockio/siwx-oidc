@@ -368,6 +368,10 @@ pub struct Config {
     /// Env: `SIWXOIDC_GUEST_CLIENT_ID`
     #[serde(default)]
     pub guest_client_id: Option<String>,
+    /// Optional display name of the guest client. It becomes the client's `client_name`, which is the name a new guest device gets in the device list; without one the device is named after `guest_client_id`. Unset or blank: the `client_id`. Only a device created after the change is named by it. Read at start-up, when the client is written again.
+    /// Env: `SIWXOIDC_GUEST_CLIENT_NAME`
+    #[serde(default)]
+    pub guest_client_name: Option<String>,
     /// Redirect URIs the guest client may use. At least one is required when guest mode is on; each must be https (http only for a `localhost` `base_url`).
     /// Env: `SIWXOIDC_GUEST_CLIENT_REDIRECT_URIS`
     #[serde(default)]
@@ -570,6 +574,7 @@ impl Default for Config {
             guest_enabled: false,
             guest_client_url: None,
             guest_client_id: None,
+            guest_client_name: None,
             guest_client_redirect_uris: Vec::new(),
             guest_hosts: Vec::new(),
             guest_client_topology: "same-site".to_string(),
@@ -694,6 +699,7 @@ mod tests {
             let c = figment().extract::<Config>()?;
             assert!(!c.guest_enabled && !c.guest_allow_open_links && !c.guest_claim_enabled);
             assert_eq!(c.guest_client_url, None);
+            assert_eq!(c.guest_client_name, None);
             assert!(c.guest_client_redirect_uris.is_empty() && c.guest_hosts.is_empty());
             assert_eq!(c.guest_client_topology, "same-site");
             assert_eq!(c.guest_name_suffix, " (Guest)");
@@ -734,6 +740,11 @@ mod tests {
             assert_eq!(c.guest_max_guests, 3);
             jail.set_env("SIWXOIDC_GUEST_CLIENT_URL", "");
             assert_eq!(figment().extract::<Config>()?.guest_client_url, None);
+            jail.set_env("SIWXOIDC_GUEST_CLIENT_NAME", "Meet guest");
+            assert_eq!(
+                figment().extract::<Config>()?.guest_client_name.as_deref(),
+                Some("Meet guest")
+            );
             Ok(())
         });
     }
