@@ -343,8 +343,11 @@ discovery advertises, and requires PKCE with `S256` (`plain` is rejected). The
 redirect URI must equal a registered one exactly, query included. `/authorize`
 binds the validated request (client, redirect URI, state, response mode, PKCE
 challenge) to the login session, and `/sign_in` issues the code for that
-request. `/sign_in` reads no authorization parameter from its query: the login
-page still appends them to its link, and they are ignored. A code is single use,
+request. The query of `/sign_in` never decides the code: the login page appends
+the parameters to its link, and `/sign_in` reads them only when the 300 s login
+session has expired, to send the user back to a redirect URI the named client
+registered with `error=access_denied` and the link's `state` (else it shows a
+page saying the sign-in timed out). A code is single use,
 is deleted when it is exchanged, and is redeemable only at `POST /token` with
 its verifier.
 

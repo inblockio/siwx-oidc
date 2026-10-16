@@ -382,9 +382,13 @@ doc; read it before changing the code the rule covers.
   challenge is accepted; the validated request (client, redirect URI, state, response mode,
   challenge, scope, nonce) is stored in the session as one value, and `sign_in` issues the code
   for exactly that request; a session the previous build stored, with the scope and the nonce
-  beside the request, is read into it. The handler has no `Query` extractor: the login page
-  still appends the parameters to its `/sign_in` link, `encodeURI`-encoded and therefore altered
-  for some values, and they are never parsed. A session without a bound request (older build) is
+  beside the request, is read into it. The query never decides the code: the login page
+  appends the parameters to its `/sign_in` link (`URLSearchParams`-encoded), and the handler
+  reads them (`RawQuery`) only when the login session is gone (no cookie, or a session Redis no
+  longer holds: `CustomError::LoginSessionExpired`), in `oidc::expired_sign_in`, to send the
+  user back with `access_denied` and the link's `state` to a redirect URI the named client
+  registered (`redirect_uri_is_registered`), else to show the 400 timed-out page, which
+  reflects no input; it issues and writes nothing. A session without a bound request (older build) is
   refused; `/token` refuses a code without a challenge. `authorize` percent-encodes every value
   on the login page URL, because the page's CAIP-122 message binds the redirect URI it reads
   there. Pin (mock stack): `authorize_accepts_only_the_code_response_type`,
@@ -392,7 +396,11 @@ doc; read it before changing the code the rule covers.
   `sign_in_ignores_a_client_in_its_query`,
   `the_login_page_round_trip_keeps_the_exact_redirect_uri_and_state`,
   `unregistered_redirect_uri_at_sign_in_is_rejected`,
+  `an_expired_sign_in_goes_back_to_the_client_with_an_error`,
   `discovery_advertises_only_the_code_response_type`; unit:
+  `an_expired_sign_in_redirects_only_to_a_registered_redirect_uri`,
+  `a_sign_in_without_its_login_session_is_login_session_expired`,
+  `a_ceremony_without_the_login_cookie_answers_login_session_expired`,
   `sign_in_issues_the_code_for_the_bound_request`,
   `authorize_hands_the_login_page_the_exact_values`, `a_session_without_a_bound_request_is_refused`,
   `authorize_binds_the_request_to_the_session`,

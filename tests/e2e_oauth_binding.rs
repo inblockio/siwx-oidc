@@ -1961,9 +1961,10 @@ async fn redirect_uris_match_the_registration_exactly() {
     );
 }
 
-/// JavaScript's `encodeURI`, which the login page applies to every value of
-/// its /sign_in link: it leaves `;,/?:@&=+$#` and the unreserved characters as
-/// they are.
+/// JavaScript's `encodeURI`, which earlier login pages applied to every value of
+/// their /sign_in link (the page now uses `URLSearchParams`): it leaves
+/// `;,/?:@&=+$#` and the unreserved characters as they are. Kept as a lossy
+/// encoding the bound request must survive.
 fn encode_uri(value: &str) -> String {
     const KEEP: &[u8] = b";,/?:@&=+$-_.!~*'()#";
     value
@@ -2053,8 +2054,9 @@ async fn the_login_page_round_trip_keeps_the_exact_redirect_uri_and_state() {
     );
     assert_eq!(page.get("state").map(String::as_str), Some(state));
 
-    // The page signs the redirect URI it read, and links to /sign_in with
-    // encodeURI'd values (which alters `&`, `+` and spaces here).
+    // The page signs the redirect URI it read; the /sign_in link carries
+    // encodeURI'd values (which alters `&`, `+` and spaces here), as earlier
+    // login pages sent them: the bound request must not depend on them.
     let query = login_page_sign_in_query(&page);
     let resp = sign_in_raw(
         &nrc,
@@ -2516,4 +2518,133 @@ async fn a_basic_authorization_header_authenticates_the_code_exchange() {
         StatusCode::OK,
         "a Basic header carries the client id and secret: {body}"
     );
+}
+
+// ===========================================================================
+// #68: a sign-in whose login session expired goes back to the client.
+// ===========================================================================
+
+/// The login session `/authorize` starts, and its cookie, live 300 s. A `/sign_in` that
+/// finds no session (the browser still sends a cookie Redis no longer knows, or no
+/// cookie at all) sends the user back to the registered redirect URI with
+/// `access_denied` and the exact `state` of the login page's link, in the fragment for
+/// `response_mode=fragment`, instead of a plain-text dead end. The query is the login
+/// page's own: the values `/authorize` handed it. An unregistered redirect URI, an
+/// unknown client and a link without the parameters get the 400 timed-out page and no
+/// redirect.
+#[tokio::test]
+#[ignore = "requires live e2e stack (e2e/up.sh)"]
+async fn an_expired_sign_in_goes_back_to_the_client_with_an_error() {
+    let base = oidc();
+    let c = Client::new();
+    let nrc = no_redirect_client();
+    let rc = register_client(&c, &base).await;
+    let (_verifier, challenge) = pkce_pair();
+    let state = "st+a&b c";
+
+    // The login page's query, exactly as /authorize hands it over.
+    let page_query = |response_mode: Option<&str>| {
+        let nrc = nrc.clone();
+        let url = format!(
+            "{base}/authorize?client_id={}&redirect_uri={}&scope=openid&response_type=code&state={}&code_challenge={}&code_challenge_method=S256{}",
+            urlencoding::encode(&rc.client_id),
+            urlencoding::encode(&rc.redirect_uri),
+            urlencoding::encode(state),
+            urlencoding::encode(&challenge),
+            response_mode.map(|m| format!("&response_mode={m}")).unwrap_or_default(),
+        );
+        async move {
+            let resp = nrc.get(&url).send().await.unwrap();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER, "authorize 303");
+            let location = location_of(&resp);
+            location.split_once('?').unwrap().1.to_string()
+        }
+    };
+    // A session id Redis does not hold: what the cookie names once the session expired.
+    let expired_cookie = format!("session={}", uuid::Uuid::new_v4());
+
+    // 1. A cookie naming an expired session: the error redirect, in the query.
+    let query = page_query(None).await;
+    let resp = nrc
+        .get(format!("{base}/sign_in?{query}"))
+        .header("cookie", &expired_cookie)
+        .send()
+        .await
+        .unwrap();
+    let location = location_of(&resp);
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{location}");
+    assert!(location.starts_with(&rc.redirect_uri), "{location}");
+    let q = parse_query(&location);
+    assert_eq!(
+        q.get("error").map(String::as_str),
+        Some("access_denied"),
+        "{location}"
+    );
+    assert!(
+        q.get("error_description")
+            .is_some_and(|d| d.contains("timed out")),
+        "{location}"
+    );
+    assert_eq!(
+        q.get("state").map(String::as_str),
+        Some(state),
+        "{location}"
+    );
+    assert!(!q.contains_key("code"), "no code is issued: {location}");
+
+    // 2. No Cookie header at all, fragment mode: the error goes in the fragment.
+    let query = page_query(Some("fragment")).await;
+    let resp = nrc
+        .get(format!("{base}/sign_in?{query}"))
+        .send()
+        .await
+        .unwrap();
+    let location = location_of(&resp);
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{location}");
+    let (before, fragment) = location.split_once('#').expect("a fragment");
+    assert_eq!(before, rc.redirect_uri, "nothing in the query: {location}");
+    let f: HashMap<String, String> = url::form_urlencoded::parse(fragment.as_bytes())
+        .into_owned()
+        .collect();
+    assert_eq!(f.get("error").map(String::as_str), Some("access_denied"));
+    assert_eq!(f.get("state").map(String::as_str), Some(state));
+
+    // 3. What the user gets when the client cannot be told: the timed-out page.
+    let refused = [
+        // A redirect URI the client never registered.
+        format!(
+            "client_id={}&redirect_uri={}&state=s",
+            urlencoding::encode(&rc.client_id),
+            urlencoding::encode("https://attacker.example.org/cb"),
+        ),
+        // An unknown client.
+        format!(
+            "client_id=no-such-client&redirect_uri={}&state=s",
+            urlencoding::encode(&rc.redirect_uri),
+        ),
+        // No parameters.
+        String::new(),
+    ];
+    for query in refused {
+        let resp = nrc
+            .get(format!("{base}/sign_in?{query}"))
+            .header("cookie", &expired_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "query {query:?}");
+        assert!(resp.headers().get("location").is_none(), "query {query:?}");
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        assert!(content_type.starts_with("text/html"), "{content_type}");
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("Sign-in timed out"),
+            "query {query:?}: {body}"
+        );
+        assert!(!body.contains("attacker"), "the page reflects no input");
+    }
 }

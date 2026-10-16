@@ -418,6 +418,12 @@ pub enum CustomError {
     NotFound,
     #[error("{0:?}")]
     Redirect(String),
+    /// The login session `/sign_in` completes is gone: it lives [`SESSION_LIFETIME`], and its
+    /// cookie as long, so a sign-in that took longer finds neither. Renders as the 400
+    /// timed-out page ([`sign_in_timed_out_page`]); the `/sign_in` handler first tries the
+    /// error redirect to the client ([`expired_sign_in`]).
+    #[error("login session expired")]
+    LoginSessionExpired,
     /// A dependency this request could not proceed without — Synapse — was
     /// unreachable or refused our credentials, so a check that must not be
     /// skipped could not be completed. Renders as **503**.
@@ -2462,8 +2468,8 @@ pub async fn authorize(
     // binds `redirect_uri` in its `Resources:`) and its link to /sign_in. Each
     // value is percent-encoded so the page reads it back exactly: a redirect
     // URI with several query parameters, or a state with `&` or `+`, would
-    // otherwise be cut or altered. /sign_in itself reads none of them; it
-    // takes the request from the session.
+    // otherwise be cut or altered. /sign_in takes the request from the session;
+    // it reads them only when the session has expired (`expired_sign_in`).
     let mut page = url::form_urlencoded::Serializer::new(String::new());
     page.append_pair("nonce", &nonce)
         .append_pair("domain", &domain)
@@ -2781,10 +2787,10 @@ pub(crate) fn bound_test_request(client_id: &str) -> AuthorizationRequest {
 /// The authorization request this sign-in completes: the one `/authorize`
 /// validated and bound to the session. It is the only source of the client,
 /// redirect URI, state, response mode, PKCE challenge and nonce: `sign_in`
-/// reads no authorization parameter from its own query. The login page still
-/// appends them to its `/sign_in` link (encoded with `encodeURI`, which alters
-/// `&`, `+` and other characters in a state or redirect URI); they are never
-/// parsed.
+/// reads no authorization parameter from its own query while the session lives.
+/// The login page appends them to its `/sign_in` link; they are read only when
+/// the session has expired, and then only for the error redirect
+/// ([`expired_sign_in`]).
 fn bound_request(session: &SessionEntry) -> Result<AuthorizationRequest, CustomError> {
     session.request.clone().ok_or_else(|| {
         CustomError::BadRequest(
@@ -3407,21 +3413,98 @@ fn sign_in_refusal_redirect(
     error: CoreAuthErrorResponseType,
     description: &str,
 ) -> CustomError {
+    authorization_error_redirect(
+        redirect_uri,
+        request.response_mode.as_deref(),
+        error,
+        description,
+        Some(&request.state),
+    )
+}
+
+/// The authorization error response (RFC 6749 4.1.2.1) to `redirect_uri`, which the caller
+/// has validated: `error`, `error_description` and `state` when there is one, in the
+/// fragment for `response_mode=fragment` and in the query otherwise. No `iss`.
+fn authorization_error_redirect(
+    redirect_uri: &RedirectUrl,
+    response_mode: Option<&str>,
+    error: CoreAuthErrorResponseType,
+    description: &str,
+    state: Option<&str>,
+) -> CustomError {
     let mut url = redirect_uri.url().clone();
-    if request.response_mode.as_deref() == Some("fragment") {
-        let fragment = url::form_urlencoded::Serializer::new(String::new())
+    if response_mode == Some("fragment") {
+        let mut fragment = url::form_urlencoded::Serializer::new(String::new());
+        fragment
             .append_pair("error", error.as_ref())
-            .append_pair("error_description", description)
-            .append_pair("state", &request.state)
-            .finish();
-        url.set_fragment(Some(&fragment));
+            .append_pair("error_description", description);
+        if let Some(state) = state {
+            fragment.append_pair("state", state);
+        }
+        url.set_fragment(Some(&fragment.finish()));
     } else {
-        url.query_pairs_mut()
+        let mut query = url.query_pairs_mut();
+        query
             .append_pair("error", error.as_ref())
-            .append_pair("error_description", description)
-            .append_pair("state", &request.state);
+            .append_pair("error_description", description);
+        if let Some(state) = state {
+            query.append_pair("state", state);
+        }
     }
     CustomError::Redirect(url.to_string())
+}
+
+/// The `error_description` of the redirect [`expired_sign_in`] answers.
+pub(crate) const SIGN_IN_TIMED_OUT_MSG: &str = "The sign-in timed out. Start it again.";
+
+/// What `/sign_in` answers when its login session is gone ([`CustomError::LoginSessionExpired`]).
+///
+/// The request `/authorize` bound went with the session, so this reads the parameters the
+/// login page repeats on its `/sign_in` link (`client_id`, `redirect_uri`, `state`,
+/// `response_mode`; the first of each counts), for one purpose: when `client_id` names a
+/// registered client and `redirect_uri` is one of its registered redirect URIs, matched as
+/// `/authorize` matches it, the answer is the `access_denied` error redirect there with that
+/// `state`, so the client can offer a new sign-in. The client checks the `state` against
+/// its own, as for any authorization response. Anything else (a parameter missing, an
+/// unknown client, an unregistered redirect URI, a failed client lookup) gets the timed-out
+/// page, which reflects no input and links nowhere. Issues no code and writes nothing.
+pub async fn expired_sign_in(query: Option<&str>, db_client: &DBClientType) -> CustomError {
+    let (mut client_id, mut redirect_uri, mut state, mut response_mode) = (None, None, None, None);
+    for (name, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        let slot = match name.as_ref() {
+            "client_id" => &mut client_id,
+            "redirect_uri" => &mut redirect_uri,
+            "state" => &mut state,
+            "response_mode" => &mut response_mode,
+            _ => continue,
+        };
+        slot.get_or_insert_with(|| value.into_owned());
+    }
+    let (Some(client_id), Some(redirect_uri)) = (client_id, redirect_uri) else {
+        return CustomError::LoginSessionExpired;
+    };
+    let Ok(redirect_uri) = RedirectUrl::new(redirect_uri) else {
+        return CustomError::LoginSessionExpired;
+    };
+    let client = match db_client.get_client(client_id.clone()).await {
+        Ok(Some(client)) => client,
+        Ok(None) => return CustomError::LoginSessionExpired,
+        Err(e) => {
+            warn!(error = %e, "expired sign-in: client lookup failed, showing the timed-out page");
+            return CustomError::LoginSessionExpired;
+        }
+    };
+    if !redirect_uri_is_registered(&client, &redirect_uri) {
+        return CustomError::LoginSessionExpired;
+    }
+    info!(client_id = %client_id, "sign_in: login session expired, error redirect to the client");
+    authorization_error_redirect(
+        &redirect_uri,
+        response_mode.as_deref(),
+        CoreAuthErrorResponseType::AccessDenied,
+        SIGN_IN_TIMED_OUT_MSG,
+        state.as_deref().filter(|s| !s.is_empty()),
+    )
 }
 
 /// The 503 a generic-class sign-in answers when the homeserver cannot confirm the account.
@@ -3467,17 +3550,12 @@ pub async fn sign_in(
     did_publication: Option<&DidPublication<'_>>,
     guest_config: Option<&crate::config::Config>,
 ) -> Result<(Url, String), CustomError> {
-    let session_id = if let Some(c) = cookies.get(SESSION_COOKIE_NAME) {
-        c
-    } else {
-        return Err(CustomError::BadRequest(
-            "Session cookie not found".to_string(),
-        ));
+    // No cookie and no session are the same fact: the login session expired.
+    let Some(session_id) = cookies.get(SESSION_COOKIE_NAME) else {
+        return Err(CustomError::LoginSessionExpired);
     };
-    let session_entry = if let Some(e) = db_client.get_session(session_id.to_string()).await? {
-        e
-    } else {
-        return Err(CustomError::BadRequest("Session not found".to_string()));
+    let Some(session_entry) = db_client.get_session(session_id.to_string()).await? else {
+        return Err(CustomError::LoginSessionExpired);
     };
 
     // The request this sign-in completes, as `/authorize` bound it. Checked
@@ -4282,6 +4360,41 @@ pub fn signed_out_page(ended: bool) -> String {
     };
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Signed out</title></head><body><p>{message}</p></body></html>"
+    )
+}
+
+/// The page of [`CustomError::LoginSessionExpired`], in the look of the issuer's pages.
+/// Reflects no input and links nowhere: nothing it could link to was validated.
+pub fn sign_in_timed_out_page() -> String {
+    let css = crate::account::ACCOUNT_PAGE_CSS;
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign-in timed out</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<link href="https://api.fontshare.com/css?f[]=satoshi@300,400,500,700,900&display=swap" rel="stylesheet">
+<style>{css}</style>
+</head>
+<body>
+<div class="login-page">
+  <div class="ambient-glow"></div>
+  <div class="login-card">
+    <div class="card-inner">
+      <div class="logo-area">
+        <img src="/img/inblockio-logo.png" alt="inblock.io" class="logo logo-single">
+      </div>
+      <div class="auth-section">
+        <h1 class="title">Sign-in timed out</h1>
+        <p class="subtitle">The sign-in was not finished in time. Go back to the app and start again.</p>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>"##
     )
 }
 
@@ -5173,6 +5286,152 @@ mod tests {
             Err(CustomError::BadRequest(msg)) => assert!(msg.contains("Restart"), "{msg}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    /// No `session` cookie and a cookie naming a session Redis does not hold (what is
+    /// left once the 300 s login session expired) are both `LoginSessionExpired`, which
+    /// the handler turns into the way back to the client (#68).
+    #[tokio::test]
+    async fn a_sign_in_without_its_login_session_is_login_session_expired() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        let expired = format!("{SESSION_COOKIE_NAME}={}", Uuid::new_v4());
+        for cookie in [expired.as_str(), "siwx_user=other"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("cookie", HeaderValue::from_str(cookie).unwrap());
+            let result = sign_in(
+                &Url::parse("https://example.com").unwrap(),
+                &["key".to_string()],
+                &[],
+                headers.typed_get::<headers::Cookie>().unwrap(),
+                &db_client,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(CustomError::LoginSessionExpired)),
+                "{cookie}: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    fn expired_sign_in_link(pairs: &[(&str, &str)]) -> String {
+        let mut q = url::form_urlencoded::Serializer::new(String::new());
+        for (name, value) in pairs {
+            q.append_pair(name, value);
+        }
+        q.finish()
+    }
+
+    /// The way back from an expired sign-in: the `access_denied` redirect to a redirect
+    /// URI the named client registered (its own query kept, the exact `state` added, the
+    /// fragment for `response_mode=fragment`), and the timed-out page for everything
+    /// else. The first occurrence of a parameter counts.
+    #[tokio::test]
+    async fn an_expired_sign_in_redirects_only_to_a_registered_redirect_uri() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        let client_id = format!("expired-{}", Uuid::new_v4().simple());
+        seed_round_trip_client(&db_client, &client_id).await;
+        let expect_redirect = |e: CustomError| match e {
+            CustomError::Redirect(url) => Url::parse(&url).unwrap(),
+            other => panic!("expected a redirect, got {other:?}"),
+        };
+
+        let link = expired_sign_in_link(&[
+            ("redirect_uri", ROUND_TRIP_REDIRECT),
+            ("state", ROUND_TRIP_STATE),
+            ("client_id", &client_id),
+            ("code_challenge", RFC7636_CHALLENGE),
+        ]);
+        let url = expect_redirect(expired_sign_in(Some(&link), &db_client).await);
+        let q: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+        assert_eq!(q.get("a").map(String::as_str), Some("1"), "{url}");
+        assert_eq!(q.get("b").map(String::as_str), Some("2"), "{url}");
+        assert_eq!(q.get("error").map(String::as_str), Some("access_denied"));
+        assert_eq!(
+            q.get("error_description").map(String::as_str),
+            Some(SIGN_IN_TIMED_OUT_MSG)
+        );
+        assert_eq!(q.get("state").map(String::as_str), Some(ROUND_TRIP_STATE));
+        assert!(!q.contains_key("code"));
+        assert_eq!(url.fragment(), None);
+
+        let link = expired_sign_in_link(&[
+            ("redirect_uri", ROUND_TRIP_REDIRECT),
+            ("state", ROUND_TRIP_STATE),
+            ("client_id", &client_id),
+            ("response_mode", "fragment"),
+        ]);
+        let url = expect_redirect(expired_sign_in(Some(&link), &db_client).await);
+        assert_eq!(
+            url.query(),
+            Some("a=1&b=2"),
+            "the error is not in the query"
+        );
+        let f: std::collections::HashMap<String, String> =
+            url::form_urlencoded::parse(url.fragment().unwrap().as_bytes())
+                .into_owned()
+                .collect();
+        assert_eq!(f.get("error").map(String::as_str), Some("access_denied"));
+        assert_eq!(f.get("state").map(String::as_str), Some(ROUND_TRIP_STATE));
+
+        // No state on the link: the redirect carries none.
+        let link = expired_sign_in_link(&[
+            ("redirect_uri", ROUND_TRIP_REDIRECT),
+            ("client_id", &client_id),
+        ]);
+        let url = expect_redirect(expired_sign_in(Some(&link), &db_client).await);
+        assert!(!url.query_pairs().any(|(k, _)| k == "state"), "{url}");
+
+        // The first redirect_uri counts, whatever follows it.
+        let link = expired_sign_in_link(&[
+            ("redirect_uri", ROUND_TRIP_REDIRECT),
+            ("redirect_uri", "https://attacker.example.org/cb"),
+            ("client_id", &client_id),
+        ]);
+        let url = expect_redirect(expired_sign_in(Some(&link), &db_client).await);
+        assert!(url.as_str().starts_with(ROUND_TRIP_REDIRECT), "{url}");
+
+        let page = [
+            // An unregistered redirect URI, also when a registered one follows it.
+            expired_sign_in_link(&[
+                ("redirect_uri", "https://attacker.example.org/cb"),
+                ("redirect_uri", ROUND_TRIP_REDIRECT),
+                ("client_id", &client_id),
+            ]),
+            // The registered URI with something appended is another URI.
+            expired_sign_in_link(&[
+                ("redirect_uri", "https://example.com/callback?a=1&b=2&c=3"),
+                ("client_id", &client_id),
+            ]),
+            // An unknown client.
+            expired_sign_in_link(&[
+                ("redirect_uri", ROUND_TRIP_REDIRECT),
+                ("client_id", "no-such-client"),
+            ]),
+            // A parameter missing, or none at all.
+            expired_sign_in_link(&[("redirect_uri", ROUND_TRIP_REDIRECT)]),
+            expired_sign_in_link(&[("client_id", &client_id)]),
+            String::new(),
+        ];
+        for link in page {
+            let answer = expired_sign_in(Some(&link), &db_client).await;
+            assert!(
+                matches!(answer, CustomError::LoginSessionExpired),
+                "{link}: {answer:?}"
+            );
+        }
+        assert!(matches!(
+            expired_sign_in(None, &db_client).await,
+            CustomError::LoginSessionExpired
+        ));
     }
 
     #[derive(Deserialize)]

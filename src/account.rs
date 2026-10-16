@@ -1508,7 +1508,7 @@ pub fn account_page_inner(
     Html(html)
 }
 
-const ACCOUNT_PAGE_CSS: &str = r##"
+pub(crate) const ACCOUNT_PAGE_CSS: &str = r##"
 :root {
   --bg: #f5f5f5;
   --card-bg: #ffffff;

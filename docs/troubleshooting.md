@@ -111,8 +111,10 @@ after a deployment.
 8. **"User Verification flag not set"** or **"Sign count regression"**: the
    authenticator did not verify the user, or reported a counter lower than the
    stored one (a possible cloned authenticator).
-9. **"Session not found"**: the OIDC session (5 minutes) expired between
-   `/webauthn/authenticate/finish` and `/sign_in`. Look for proxy delays.
+9. **"Sign-in timed out"** page, or the client receives `error=access_denied`
+   with "The sign-in timed out": the login session (5 minutes) expired before
+   the sign-in finished. Start the sign-in again from the client. If it happens
+   within seconds, look for proxy delays.
 10. **The login page asks to confirm a new account**: the passkey resolves to a
     DID with no account. If the user expected an existing account, they chose a
     different passkey than the one they registered with, or their passkey was

@@ -59,28 +59,31 @@
 		},
 	});
 
-	let oidc_nonce_param = '';
-	if (oidc_nonce != null && oidc_nonce != '') {
-		oidc_nonce_param = `&oidc_nonce=${oidc_nonce}`;
-	}
-
-	let pkce_params = '';
-	if (code_challenge != null && code_challenge != '') {
-		pkce_params = `&code_challenge=${code_challenge}`;
-		if (code_challenge_method != null && code_challenge_method != '') {
-			pkce_params += `&code_challenge_method=${code_challenge_method}`;
-		} else {
-			pkce_params += '&code_challenge_method=S256';
-		}
-	}
-
-	let response_mode_param = '';
-	if (response_mode != null && response_mode != '') {
-		response_mode_param = `&response_mode=${response_mode}`;
-	}
-
+	// /sign_in issues the code for the request /authorize bound to the session and
+	// reads these values only when the session has expired, to send the user back to
+	// the client with an error. They are encoded with URLSearchParams, so a redirect
+	// URI with its own query or a state with `&` or `+` reaches it unaltered.
 	function buildSignInUrl(): string {
-		return `/sign_in?redirect_uri=${encodeURI(redirect)}&state=${encodeURI(state)}&client_id=${encodeURI(client_id)}${encodeURI(oidc_nonce_param)}${encodeURI(pkce_params)}${encodeURI(response_mode_param)}`;
+		const q = new URLSearchParams({ redirect_uri: redirect, state, client_id });
+		if (oidc_nonce) q.append('oidc_nonce', oidc_nonce);
+		if (code_challenge) {
+			q.append('code_challenge', code_challenge);
+			q.append('code_challenge_method', code_challenge_method || 'S256');
+		}
+		if (response_mode) q.append('response_mode', response_mode);
+		return `/sign_in?${q.toString()}`;
+	}
+
+	// The login session (300 s) has expired: hand over to /sign_in, which sends the
+	// user back to the client with an error it can act on, instead of leaving them
+	// on this page with a dead end.
+	async function leaveIfSessionExpired(resp: Response): Promise<boolean> {
+		if (resp.status !== 400) return false;
+		const body = await resp.clone().json().catch(() => null);
+		if (!body || body.error !== 'login_session_expired') return false;
+		status = 'Sign-in timed out';
+		window.location.replace(buildSignInUrl());
+		return true;
 	}
 
 	onMount(async () => {
@@ -290,6 +293,7 @@
 	// redirect). Throws on failure; the callers report it through failLogin.
 	async function completeLogin(requested: any, finishResp: Response) {
 		if (!finishResp.ok) {
+			if (await leaveIfSessionExpired(finishResp)) return;
 			const errBody = await finishResp.clone().json().catch(() => null);
 			if (errBody && errBody.error === 'unknown_credential') {
 				// Progressive enhancement: ask the platform to prune this stale passkey
@@ -392,6 +396,7 @@
 				),
 			});
 			if (!startResp.ok) {
+				if (await leaveIfSessionExpired(startResp)) return;
 				throw new Error(await startResp.text());
 			}
 			const options = await startResp.json();
@@ -473,6 +478,7 @@
 				body: JSON.stringify({ display_name: null }),
 			});
 			if (!startResp.ok) {
+				if (await leaveIfSessionExpired(startResp)) return;
 				throw new Error(await startResp.text());
 			}
 			const options = await startResp.json();
@@ -515,6 +521,7 @@
 				}),
 			});
 			if (!finishResp.ok) {
+				if (await leaveIfSessionExpired(finishResp)) return;
 				throw new Error(await finishResp.text());
 			}
 
@@ -619,43 +626,9 @@
 						</div>
 					{/if}
 
-					<!-- Primary: Ethereum -->
+					<!-- Primary: Passkey sign-in (the default method) -->
 					<button
 						class="btn btn-primary"
-						disabled={connecting}
-						on:click={handleConnect}
-					>
-						<svg
-							xmlns="http://www.w3.org/2000/svg"
-							clip-rule="evenodd"
-							fill-rule="evenodd"
-							stroke-linejoin="round"
-							stroke-miterlimit="1.41421"
-							viewBox="170 30 220 350"
-							class="btn-icon eth-icon"
-						>
-							<g fill-rule="nonzero" transform="matrix(.781253 0 0 .781253 180 37.1453)">
-								<path d="m127.961 0-2.795 9.5v275.668l2.795 2.79 127.962-75.638z" fill="#343434" />
-								<path d="m127.962 0-127.962 212.32 127.962 75.639v-133.801z" fill="#8c8c8c" />
-								<path d="m127.961 312.187-1.575 1.92v98.199l1.575 4.601 128.038-180.32z" fill="#3c3c3b" />
-								<path d="m127.962 416.905v-104.72l-127.962-75.6z" fill="#8c8c8c" />
-								<path d="m127.961 287.958 127.96-75.637-127.96-58.162z" fill="#141414" />
-								<path d="m.001 212.321 127.96 75.637v-133.799z" fill="#393939" />
-							</g>
-						</svg>
-						<span>{#if connecting}Connecting wallet...{:else}Sign in with Ethereum{/if}</span>
-					</button>
-
-					<!-- Divider -->
-					<div class="divider">
-						<div class="divider-line"></div>
-						<span class="divider-text">or</span>
-						<div class="divider-line"></div>
-					</div>
-
-					<!-- Secondary: Passkey sign-in -->
-					<button
-						class="btn btn-secondary"
 						disabled={passkeyLoading}
 						on:click={() => handlePasskeySignIn()}
 					>
@@ -715,6 +688,39 @@
 							Create one
 						</button>
 					</p>
+					<!-- Divider -->
+					<div class="divider">
+						<div class="divider-line"></div>
+						<span class="divider-text">or</span>
+						<div class="divider-line"></div>
+					</div>
+
+					<!-- Secondary: Ethereum wallet -->
+					<button
+						class="btn btn-secondary"
+						disabled={connecting}
+						on:click={handleConnect}
+					>
+						<svg
+							xmlns="http://www.w3.org/2000/svg"
+							clip-rule="evenodd"
+							fill-rule="evenodd"
+							stroke-linejoin="round"
+							stroke-miterlimit="1.41421"
+							viewBox="170 30 220 350"
+							class="btn-icon eth-icon"
+						>
+							<g fill-rule="nonzero" transform="matrix(.781253 0 0 .781253 180 37.1453)">
+								<path d="m127.961 0-2.795 9.5v275.668l2.795 2.79 127.962-75.638z" fill="#343434" />
+								<path d="m127.962 0-127.962 212.32 127.962 75.639v-133.801z" fill="#8c8c8c" />
+								<path d="m127.961 312.187-1.575 1.92v98.199l1.575 4.601 128.038-180.32z" fill="#3c3c3b" />
+								<path d="m127.962 416.905v-104.72l-127.962-75.6z" fill="#8c8c8c" />
+								<path d="m127.961 287.958 127.96-75.637-127.96-58.162z" fill="#141414" />
+								<path d="m.001 212.321 127.96 75.637v-133.799z" fill="#393939" />
+							</g>
+						</svg>
+						<span>{#if connecting}Connecting wallet...{:else}Sign in with Ethereum{/if}</span>
+					</button>
 				</div>
 
 			{:else}
