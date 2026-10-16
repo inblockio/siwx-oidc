@@ -398,6 +398,9 @@ doc; read it before changing the code the rule covers.
   `unregistered_redirect_uri_at_sign_in_is_rejected`,
   `an_expired_sign_in_goes_back_to_the_client_with_an_error`,
   `discovery_advertises_only_the_code_response_type`; unit:
+  `an_expired_sign_in_redirects_only_to_a_registered_redirect_uri`,
+  `a_sign_in_without_its_login_session_is_login_session_expired`,
+  `a_ceremony_without_the_login_cookie_answers_login_session_expired`,
   `sign_in_issues_the_code_for_the_bound_request`,
   `authorize_hands_the_login_page_the_exact_values`, `a_session_without_a_bound_request_is_refused`,
   `authorize_binds_the_request_to_the_session`,

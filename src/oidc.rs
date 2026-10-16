@@ -2468,8 +2468,8 @@ pub async fn authorize(
     // binds `redirect_uri` in its `Resources:`) and its link to /sign_in. Each
     // value is percent-encoded so the page reads it back exactly: a redirect
     // URI with several query parameters, or a state with `&` or `+`, would
-    // otherwise be cut or altered. /sign_in itself reads none of them; it
-    // takes the request from the session.
+    // otherwise be cut or altered. /sign_in takes the request from the session;
+    // it reads them only when the session has expired (`expired_sign_in`).
     let mut page = url::form_urlencoded::Serializer::new(String::new());
     page.append_pair("nonce", &nonce)
         .append_pair("domain", &domain)
@@ -2787,10 +2787,10 @@ pub(crate) fn bound_test_request(client_id: &str) -> AuthorizationRequest {
 /// The authorization request this sign-in completes: the one `/authorize`
 /// validated and bound to the session. It is the only source of the client,
 /// redirect URI, state, response mode, PKCE challenge and nonce: `sign_in`
-/// reads no authorization parameter from its own query. The login page still
-/// appends them to its `/sign_in` link (encoded with `encodeURI`, which alters
-/// `&`, `+` and other characters in a state or redirect URI); they are never
-/// parsed.
+/// reads no authorization parameter from its own query while the session lives.
+/// The login page appends them to its `/sign_in` link; they are read only when
+/// the session has expired, and then only for the error redirect
+/// ([`expired_sign_in`]).
 fn bound_request(session: &SessionEntry) -> Result<AuthorizationRequest, CustomError> {
     session.request.clone().ok_or_else(|| {
         CustomError::BadRequest(

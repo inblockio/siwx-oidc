@@ -59,34 +59,18 @@
 		},
 	});
 
-	let oidc_nonce_param = '';
-	if (oidc_nonce != null && oidc_nonce != '') {
-		oidc_nonce_param = `&oidc_nonce=${oidc_nonce}`;
-	}
-
-	let pkce_params = '';
-	if (code_challenge != null && code_challenge != '') {
-		pkce_params = `&code_challenge=${code_challenge}`;
-		if (code_challenge_method != null && code_challenge_method != '') {
-			pkce_params += `&code_challenge_method=${code_challenge_method}`;
-		} else {
-			pkce_params += '&code_challenge_method=S256';
-		}
-	}
-
-	let response_mode_param = '';
-	if (response_mode != null && response_mode != '') {
-		response_mode_param = `&response_mode=${response_mode}`;
-	}
-
 	// /sign_in issues the code for the request /authorize bound to the session and
 	// reads these values only when the session has expired, to send the user back to
 	// the client with an error. They are encoded with URLSearchParams, so a redirect
 	// URI with its own query or a state with `&` or `+` reaches it unaltered.
 	function buildSignInUrl(): string {
 		const q = new URLSearchParams({ redirect_uri: redirect, state, client_id });
-		const extra = new URLSearchParams(`${oidc_nonce_param}${pkce_params}${response_mode_param}`);
-		extra.forEach((value, name) => q.append(name, value));
+		if (oidc_nonce) q.append('oidc_nonce', oidc_nonce);
+		if (code_challenge) {
+			q.append('code_challenge', code_challenge);
+			q.append('code_challenge_method', code_challenge_method || 'S256');
+		}
+		if (response_mode) q.append('response_mode', response_mode);
 		return `/sign_in?${q.toString()}`;
 	}
 

@@ -1961,9 +1961,10 @@ async fn redirect_uris_match_the_registration_exactly() {
     );
 }
 
-/// JavaScript's `encodeURI`, which the login page applies to every value of
-/// its /sign_in link: it leaves `;,/?:@&=+$#` and the unreserved characters as
-/// they are.
+/// JavaScript's `encodeURI`, which earlier login pages applied to every value of
+/// their /sign_in link (the page now uses `URLSearchParams`): it leaves
+/// `;,/?:@&=+$#` and the unreserved characters as they are. Kept as a lossy
+/// encoding the bound request must survive.
 fn encode_uri(value: &str) -> String {
     const KEEP: &[u8] = b";,/?:@&=+$-_.!~*'()#";
     value
@@ -2053,8 +2054,9 @@ async fn the_login_page_round_trip_keeps_the_exact_redirect_uri_and_state() {
     );
     assert_eq!(page.get("state").map(String::as_str), Some(state));
 
-    // The page signs the redirect URI it read, and links to /sign_in with
-    // encodeURI'd values (which alters `&`, `+` and spaces here).
+    // The page signs the redirect URI it read; the /sign_in link carries
+    // encodeURI'd values (which alters `&`, `+` and spaces here), as earlier
+    // login pages sent them: the bound request must not depend on them.
     let query = login_page_sign_in_query(&page);
     let resp = sign_in_raw(
         &nrc,
