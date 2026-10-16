@@ -3,7 +3,7 @@
 // Modified by inblock.io assets GmbH. See NOTICE.
 
 use axum::{
-    extract::{rejection::QueryRejection, Form, Json, Path, Query, State},
+    extract::{rejection::QueryRejection, Form, Json, Path, Query, RawQuery, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::{delete, get, post},
@@ -160,6 +160,9 @@ impl IntoResponse for CustomError {
             CustomError::Other(e) => {
                 warn!(error = %e, "internal_error");
             }
+            CustomError::LoginSessionExpired => {
+                warn!("login_session_expired");
+            }
             CustomError::NotFound | CustomError::Redirect(_) => {}
         }
 
@@ -216,6 +219,12 @@ impl IntoResponse for CustomError {
             CustomError::Gone => (StatusCode::GONE, self.to_string()).into_response(),
             CustomError::NotFound => (StatusCode::NOT_FOUND, self.to_string()).into_response(),
             CustomError::Redirect(uri) => Redirect::to(&uri).into_response(),
+            CustomError::LoginSessionExpired => (
+                StatusCode::BAD_REQUEST,
+                [(header::CACHE_CONTROL, "no-store")],
+                axum::response::Html(oidc::sign_in_timed_out_page()),
+            )
+                .into_response(),
             CustomError::ServiceUnavailable(_) => {
                 (StatusCode::SERVICE_UNAVAILABLE, self.to_string()).into_response()
             }
@@ -433,13 +442,20 @@ async fn authorize(
     Ok((headers, Redirect::to(&url)))
 }
 
-/// `GET /sign_in`. The query string is never parsed: the login page still
-/// appends the authorization parameters to its link, but the code is issued
-/// for the request `/authorize` bound to the session.
+/// `GET /sign_in`. The code is issued for the request `/authorize` bound to the
+/// session, never from the query. The query (the authorization parameters the login
+/// page repeats on its link) is read only when the login session is gone, to send the
+/// user back to a registered redirect URI with an error ([`oidc::expired_sign_in`]).
 async fn sign_in(
     State(state): State<AppState>,
-    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
+    RawQuery(query): RawQuery,
 ) -> Result<(HeaderMap, Redirect), CustomError> {
+    // A browser whose only cookie for the issuer was the expired login cookie sends
+    // no Cookie header at all.
+    let Some(TypedHeader(cookies)) = cookies else {
+        return Err(oidc::expired_sign_in(query.as_deref(), &state.redis_client).await);
+    };
     // `sign_in` returns ONLY on the success path (a real login that issued a code),
     // surfacing the resolved DID (covers BOTH passkey and wallet, and runs only
     // after the browser confirmed the new-user gate). Error/early returns short-
@@ -456,7 +472,7 @@ async fn sign_in(
         key: &state.signing_key,
         issuer: state.config.base_url.as_str(),
     };
-    let (url, did) = oidc::sign_in(
+    let (url, did) = match oidc::sign_in(
         &state.config.base_url,
         &state.config.supported_did_methods,
         &state.config.supported_pkh_namespaces,
@@ -467,7 +483,14 @@ async fn sign_in(
         Some(&publication),
         Some(&state.config),
     )
-    .await?;
+    .await
+    {
+        Ok(signed_in) => signed_in,
+        Err(CustomError::LoginSessionExpired) => {
+            return Err(oidc::expired_sign_in(query.as_deref(), &state.redis_client).await)
+        }
+        Err(e) => return Err(e),
+    };
 
     // Mint an opaque login user-session bound to the DID and Set-Cookie it (Path=/,
     // HttpOnly, SameSite=Strict, Secure on https). The cookie value is the opaque
@@ -823,14 +846,31 @@ async fn device_passkey_finish_handler(
 
 // -- WebAuthn route handlers -----------------------------------------------
 
+/// The login session a passkey ceremony of the login page runs under. Its cookie lives
+/// as long as the session (300 s), so without it the sign-in has timed out: a 400
+/// `{"error":"login_session_expired"}`, on which the login page goes to `/sign_in`, whose
+/// answer leads back to the client (`oidc::expired_sign_in`).
+fn login_session(
+    cookies: Option<TypedHeader<headers::Cookie>>,
+) -> Result<(headers::Cookie, String), CustomError> {
+    cookies
+        .and_then(|TypedHeader(cookies)| {
+            let session_id = cookies.get(SESSION_COOKIE_NAME)?.to_string();
+            Some((cookies, session_id))
+        })
+        .ok_or(CustomError::Coded {
+            status: 400,
+            code: "login_session_expired",
+        })
+}
+
 async fn webauthn_register_start(
     State(state): State<AppState>,
-    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
     Json(payload): Json<wa::RegisterStartRequest>,
 ) -> Result<Json<serde_json::Value>, CustomError> {
-    let session_id = cookies
-        .get(SESSION_COOKIE_NAME)
-        .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
+    let (_, session_id) = login_session(cookies)?;
+    let session_id = session_id.as_str();
     // With a distinct unified RP the offer is options only (ES256, resident
     // key); the browser creates the key and no server write happens.
     if let Some(options) =
@@ -855,12 +895,11 @@ async fn webauthn_register_start(
 /// a single-RP deployment (the default) still verifies and stores the passkey.
 async fn webauthn_register_finish(
     State(state): State<AppState>,
-    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
     Json(reg_response): Json<RegisterPublicKeyCredential>,
 ) -> Result<Json<wa::RegisterFinishResponse>, CustomError> {
-    let session_id = cookies
-        .get(SESSION_COOKIE_NAME)
-        .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
+    let (_, session_id) = login_session(cookies)?;
+    let session_id = session_id.as_str();
     let resp = wa::register_finish_for(
         &state.rp_dispatch,
         &state.webauthn,
@@ -930,13 +969,12 @@ struct AuthenticateStartResponse {
 
 async fn webauthn_authenticate_start(
     State(state): State<AppState>,
-    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
     Query(query): Query<AuthenticateStartQuery>,
     body: Option<Json<AuthenticateStartBody>>,
 ) -> Result<Json<AuthenticateStartResponse>, CustomError> {
-    let session_id = cookies
-        .get(SESSION_COOKIE_NAME)
-        .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
+    let (cookies, session_id) = login_session(cookies)?;
+    let session_id = session_id.as_str();
 
     // Escape hatch: `?all=1` OR JSON `{"all": true}` forces usernameless even with
     // a cookie ("use a different passkey").
@@ -1016,13 +1054,12 @@ struct WebauthnAuthenticateFinishResponse {
 
 async fn webauthn_authenticate_finish(
     State(state): State<AppState>,
-    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
     request_headers: axum::http::HeaderMap,
     Json(auth_response): Json<PublicKeyCredential>,
 ) -> Result<axum::response::Response, CustomError> {
-    let session_id = cookies
-        .get(SESSION_COOKIE_NAME)
-        .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
+    let (cookies, session_id) = login_session(cookies)?;
+    let session_id = session_id.as_str();
 
     // Hints for the unified login, in order of trust: the `aqua_did_hint`
     // cookies, then the `siwx_user` session DID. A hint only ever picks among
@@ -3055,5 +3092,51 @@ mod invalid_token_response_tests {
                 "{what}: no Bearer challenge on this answer"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod login_session_tests {
+    //! The login page's passkey ceremonies tell an expired login session from every other
+    //! refusal, so the page can hand over to `/sign_in` (#68).
+    use super::*;
+    use headers::HeaderMapExt;
+
+    #[tokio::test]
+    async fn a_ceremony_without_the_login_cookie_answers_login_session_expired() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "siwx_user=other".parse().unwrap());
+        let other_cookie_only = headers.typed_get::<headers::Cookie>().map(TypedHeader);
+        for cookies in [None, other_cookie_only] {
+            let response = login_session(cookies).unwrap_err().into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], br#"{"error":"login_session_expired"}"#);
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "session=abc; siwx_user=x".parse().unwrap());
+        let (_, session_id) =
+            login_session(headers.typed_get::<headers::Cookie>().map(TypedHeader)).unwrap();
+        assert_eq!(session_id, "abc");
+    }
+
+    /// The page an expired sign-in shows when the client cannot be told: a 400 HTML page
+    /// that is never cached and says what happened.
+    #[tokio::test]
+    async fn an_expired_login_session_renders_the_timed_out_page() {
+        let response = CustomError::LoginSessionExpired.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Sign-in timed out"));
     }
 }

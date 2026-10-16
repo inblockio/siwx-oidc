@@ -84,8 +84,14 @@ New methods and namespaces are opt-in: operators enable them in
 3. `GET /sign_in` checks the DID method and namespace against configuration, verifies the
    signature through `find_did_method(did).verify(…)`, checks the nonce and that the bound
    redirect URI is in the message's `Resources:`, then issues a single-use code for the request
-   bound to the session. `/sign_in` reads no authorization parameter from its query (the page
-   still appends them to its link; they are ignored).
+   bound to the session. `/sign_in` reads no authorization parameter from its query while the
+   session lives (the page appends them to its link; they never decide the code). When the
+   session has expired (it and its cookie live 300 s), it reads `client_id`, `redirect_uri`,
+   `state` and `response_mode` there only to send the user back: an `access_denied` redirect
+   when the client is registered and the redirect URI is one of its registered ones, else a
+   400 page saying the sign-in timed out (`oidc::expired_sign_in`). The passkey ceremonies
+   answer a missing `session` cookie with a 400 `{"error":"login_session_expired"}`, on which
+   the page goes to `/sign_in`.
 4. `POST /token` exchanges the code, with its PKCE `S256` verifier, for an ES256 ID token, an
    access token and a refresh token. PKCE is mandatory: `/authorize` refuses a request without a
    `code_challenge`, and `/token` refuses a code without one.
@@ -133,6 +139,7 @@ namespaces. EIP-4361 (Sign-In with Ethereum) is Final.
 ## Frontend
 
 `js/ui/src/App.svelte` is the login page (Svelte 4, webpack 5, built into `static/build`).
+Passkey sign-in is the default, highlighted method; the wallet is offered below it.
 
 - **Wallet:** `@wagmi/core` with the `injected()` connector, i.e. whatever EIP-1193 wallet the
   browser exposes (MetaMask, Brave, Coinbase extension). The SIWE message is built with

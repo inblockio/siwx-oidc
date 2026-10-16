@@ -242,12 +242,22 @@ paths:
         `/authorize` bound to the session: its client, redirect URI, state,
         response mode and PKCE challenge.
 
-        No query parameter is read. The login page still appends the
-        authorization parameters (`redirect_uri`, `state`, `client_id`,
-        `oidc_nonce`, `code_challenge`, `code_challenge_method`,
-        `response_mode`) to its link; they are ignored. A session started
-        before the request was bound (an older server build) is refused with
-        a restart-sign-in error.
+        No query parameter is read while the session lives. The login page
+        appends the authorization parameters (`redirect_uri`, `state`,
+        `client_id`, `oidc_nonce`, `code_challenge`, `code_challenge_method`,
+        `response_mode`) to its link, and they never decide the code. A session
+        started before the request was bound (an older server build) is refused
+        with a restart-sign-in error.
+
+        The login session, and its cookie, live 300 s. When it is gone (no
+        `session` cookie, no `Cookie` header, or a session Redis no longer
+        holds), the query is read for one purpose: when `client_id` names a
+        registered client and `redirect_uri` is one of its registered redirect
+        URIs (matched exactly, as `/authorize` matches it), the answer is a 303
+        there with `error=access_denied`, an `error_description` saying the
+        sign-in timed out, and the query's `state` (in the fragment for
+        `response_mode=fragment`). Otherwise it is the 400 timed-out page.
+        Nothing is issued or written.
 
         This is also the single point where a Matrix account is provisioned: the
         localpart is resolved (honouring grandfathering), the alias is seeded on
@@ -264,8 +274,8 @@ paths:
       security:
         - sessionCookie: []
       responses:
-        "303": { description: "Redirect to the bound `redirect_uri` with `code` and the bound `state`. With `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` on, a refusal is also a redirect there, with `error` and the bound `state` (in the fragment for `response_mode=fragment`) and no code: `invalid_scope` when a Matrix-class request proposes a device id this server deleted (never recreated; sign in with a fresh id), `access_denied` for a deactivated or erased account, `temporarily_unavailable` when the deactivation check or the device creation failed." }
-        "400": { description: The session has no bound request, the CAIP-122 proof is invalid, or a generic-class client's request grants it no `openid`. }
+        "303": { description: "Redirect to the bound `redirect_uri` with `code` and the bound `state`. When the login session has expired, the `access_denied` redirect described above. With `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` on, a refusal is also a redirect there, with `error` and the bound `state` (in the fragment for `response_mode=fragment`) and no code: `invalid_scope` when a Matrix-class request proposes a device id this server deleted (never recreated; sign in with a fresh id), `access_denied` for a deactivated or erased account, `temporarily_unavailable` when the deactivation check or the device creation failed." }
+        "400": { description: "The session has no bound request, the CAIP-122 proof is invalid, or a generic-class client's request grants it no `openid`. The login session has expired and the query names no registered client and redirect URI: an HTML page saying the sign-in timed out, which reflects no input." }
         "401": { description: "The account is deactivated (with `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` off; on, the `access_denied` redirect), or the ceremony did not verify." }
         "503": { description: "The homeserver could not be asked: the deactivation check failed (with `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` off; on, the `temporarily_unavailable` redirect), or a generic-class sign-in could not confirm the account." }
 
@@ -911,7 +921,9 @@ paths:
       tags: [Sign-in ceremonies]
       operationId: webauthnRegisterStart
       summary: Begin passkey registration
-      responses: { "200": { description: A W3C `CreationChallengeResponse`. } }
+      responses:
+        "200": { description: A W3C `CreationChallengeResponse`. }
+        "400": { description: "No `session` cookie (or no `Cookie` header): the 300 s login session has expired, and the body is `{\"error\":\"login_session_expired\"}`; the login page then goes to `/sign_in`, which sends the user back to the client." }
 
   /webauthn/register/finish:
     post:
@@ -931,9 +943,11 @@ paths:
             A refused registration (the credential id is already registered, has
             link state, or is held by the enabled credential store) is JSON with
             exactly `{"error":"registration failed"}`, a fixed body that names no
-            reason and echoes no id. A request the ceremony never started on
-            (no `session` cookie, no `Cookie` header, a body that is not JSON)
-            is a plain-text 400 instead.
+            reason and echoes no id. A request without a `session` cookie (or
+            without a `Cookie` header) is JSON `{"error":"login_session_expired"}`:
+            the 300 s login session has expired, and the login page then goes to
+            `/sign_in`, which sends the user back to the client. A body that is
+            not JSON is a plain-text 400.
           content:
             application/json:
               schema:
@@ -958,6 +972,7 @@ paths:
             flattened at the top level, plus `detected_mxid` — present only when
             the request was scoped.
           content: { application/json: { schema: { type: object } } }
+        "400": { description: "No `session` cookie (or no `Cookie` header): the 300 s login session has expired, and the body is `{\"error\":\"login_session_expired\"}`; the login page then goes to `/sign_in`, which sends the user back to the client." }
 
   /webauthn/authenticate/finish:
     post:
@@ -970,6 +985,7 @@ paths:
         must confirm before `/sign_in` creates the account.
       responses:
         "200": { description: "`{ok, did, new_user, mxid}`." }
+        "400": { description: "No `session` cookie (or no `Cookie` header): the 300 s login session has expired, and the body is `{\"error\":\"login_session_expired\"}`; the login page then goes to `/sign_in`, which sends the user back to the client." }
         "401": { $ref: "#/components/responses/UnknownCredential" }
 
   /link/webauthn/start:
