@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Guest pre-join</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap">
+<style>
+body{margin:0}
+a{color:#1F5FD1}a:hover{color:#174AA6}
+</style>
+</helmet>
+<div style="width: 390px; height: 844px; box-sizing: border-box; background: #EEEEEA; font-family: 'IBM Plex Sans', sans-serif; color: #1B1B19; display: flex; flex-direction: column; padding: 24px 20px 20px; gap: 14px">
+<div style="display: flex; flex-direction: column; gap: 2px">
+<div style="font-size: 12px; font-weight: 500; color: #5A5A54; letter-spacing: 0.06em; text-transform: uppercase">You're joining</div>
+<h1 style="margin: 0; font-size: 22px; font-weight: 600; line-height: 1.25">[Meeting title]</h1>
+<div style="font-size: 14px; color: #5A5A54">Hosted by [Host name] · [Organisation]</div>
+</div>
+<div style="position: relative; height: 210px; border-radius: 12px; background: #3A3A36; display: flex; align-items: center; justify-content: center; color: #D9D9D4; font-size: 14px">
+<span>Camera preview</span>
+<span style="position: absolute; top: 10px; left: 10px; display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px">F9</span>
+<div style="position: absolute; bottom: 12px; left: 0; right: 0; display: flex; justify-content: center; gap: 12px">
+<button type="button" aria-label="Mute microphone" style="width: 44px; height: 44px; border-radius: 22px; border: none; background: #FFFFFF; color: #1B1B19; display: flex; align-items: center; justify-content: center; cursor: pointer"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"></rect><path d="M5 11a7 7 0 0 0 14 0"></path><line x1="12" y1="18" x2="12" y2="21"></line></svg></button>
+<button type="button" aria-label="Turn camera off" style="width: 44px; height: 44px; border-radius: 22px; border: none; background: #FFFFFF; color: #1B1B19; display: flex; align-items: center; justify-content: center; cursor: pointer"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="6" width="13" height="12" rx="2"></rect><path d="M16 10l5-3v10l-5-3z"></path></svg></button>
+</div>
+</div>
+<div style="display: flex; align-items: center; gap: 10px; font-size: 13px; color: #5A5A54">
+<div style="display: flex; align-items: flex-end; gap: 3px; height: 16px" aria-hidden="true">
+<div style="width: 4px; height: 6px; background: #1F5FD1; border-radius: 1px"></div>
+<div style="width: 4px; height: 10px; background: #1F5FD1; border-radius: 1px"></div>
+<div style="width: 4px; height: 14px; background: #1F5FD1; border-radius: 1px"></div>
+<div style="width: 4px; height: 9px; background: #1F5FD1; border-radius: 1px"></div>
+<div style="width: 4px; height: 5px; background: #C9C9C3; border-radius: 1px"></div>
+</div>
+<span>Your microphone is picking you up</span>
+</div>
+<div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px">
+<label style="display: flex; flex-direction: column; gap: 4px; font-size: 12px; font-weight: 500; color: #5A5A54">Camera<select style="height: 40px; border: 1px solid #BDBDB6; border-radius: 8px; background: #FFFFFF; font-family: inherit; font-size: 13px; color: #1B1B19; padding: 0 6px"><option>Front</option><option>Back</option></select></label>
+<label style="display: flex; flex-direction: column; gap: 4px; font-size: 12px; font-weight: 500; color: #5A5A54">Microphone<select style="height: 40px; border: 1px solid #BDBDB6; border-radius: 8px; background: #FFFFFF; font-family: inherit; font-size: 13px; color: #1B1B19; padding: 0 6px"><option>Built-in</option><option>Headset</option></select></label>
+<label style="display: flex; flex-direction: column; gap: 4px; font-size: 12px; font-weight: 500; color: #5A5A54">Speaker<select style="height: 40px; border: 1px solid #BDBDB6; border-radius: 8px; background: #FFFFFF; font-family: inherit; font-size: 13px; color: #1B1B19; padding: 0 6px"><option>Built-in</option><option>Headset</option></select></label>
+</div>
+<label style="display: flex; flex-direction: column; gap: 4px; font-size: 13px; font-weight: 500">Your name<input type="text" placeholder="Name the host will see" style="height: 44px; box-sizing: border-box; border: 1px solid #BDBDB6; border-radius: 8px; background: #FFFFFF; font-family: inherit; font-size: 15px; padding: 0 12px; color: #1B1B19"></label>
+<div style="background: #FFFFFF; border: 1px solid #D3D3CD; border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 8px">
+<div style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
+<div style="font-size: 14px; font-weight: 600">Joining as a guest</div>
+<div style="display: flex; gap: 4px">
+<span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px">F4</span>
+<span style="display: {{tagDisplay}}; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; line-height: 16px; color: #1F5FD1; background: #FFFFFF; border: 1px solid #1F5FD1; border-radius: 4px; padding: 0 5px">F17</span>
+</div>
+</div>
+<div style="font-size: 13px; line-height: 1.4; color: #5A5A54">The host will see you as Unverified. Verify your email to show as Verified, or sign in with your account.</div>
+<div style="display: flex; gap: 8px">
+<input type="email" aria-label="Email address" placeholder="you@example.com" style="flex-grow: 1; min-width: 0; height: 44px; box-sizing: border-box; border: 1px solid #BDBDB6; border-radius: 8px; font-family: inherit; font-size: 14px; padding: 0 10px; color: #1B1B19">
+<button type="button" style="height: 44px; padding: 0 14px; border: 1px solid #BDBDB6; border-radius: 8px; background: #FFFFFF; font-family: inherit; font-size: 14px; font-weight: 500; color: #1B1B19; cursor: pointer">Send code</button>
+</div>
+<a href="#" style="font-size: 13px; font-weight: 500">Sign in instead</a>
+</div>
+<button type="button" style="margin-top: auto; height: 48px; border: none; border-radius: 10px; background: #1F5FD1; color: #FFFFFF; font-family: inherit; font-size: 16px; font-weight: 600; cursor: pointer">Ask to join</button>
+<div style="font-size: 12px; color: #5A5A54; text-align: center">Nobody in the meeting sees or hears you until you're let in.</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"showTags":{"editor":"boolean","default":true},"$preview":{"width":390,"height":844}}'>
+class Component extends DCLogic {
+renderVals() {
+return { tagDisplay: (this.props.showTags ?? true) ? 'inline-block' : 'none' };
+}
+}
+</script>
+</body>
+</html>

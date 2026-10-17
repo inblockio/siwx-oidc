@@ -47,6 +47,7 @@ describe the current behaviour.
 | [design/2026-09-09-did-profile-field-feasibility.md](design/2026-09-09-did-profile-field-feasibility.md) | Feasibility of publishing the DID as an MSC4133 profile field on Synapse 1.159.0 |
 | [design/2026-10-02-token-handling-prior-art.md](design/2026-10-02-token-handling-prior-art.md) | Standards (RFC 9700, OAuth 2.1, browser-based apps BCP), other authorization servers and Matrix client behaviour for refresh-token rotation, reuse detection and storage; the principles adopted |
 | [design/2026-10-02-token-lifecycle-rework.md](design/2026-10-02-token-lifecycle-rework.md) | Security-first plan for the token lifecycle in Matrix and generic OIDC mode: threat model, invariants, the grant record and atomic rotation script, lifetime, revocation propagation, phases and open decisions (issue #30) |
+| [design/guest-portal/00-overview.md](design/guest-portal/00-overview.md) | Draft design set for anonymous guests joining a Matrix video call by link: flow model, Synapse validation, guest client, security limits, claim by passkey, wireframes, implementation plan and reference material. The baseline the guest path was built from (#49 to #57) and the design baseline aqua-meet pins; where they differ, the code and the guest docs describe the current behaviour |
 
 ## Audits and findings
 
