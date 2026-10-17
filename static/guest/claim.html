@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Keep this account</title>
+<link rel="stylesheet" href="/guest/assets/guest.css">
+</head>
+<body>
+<main>
+  <div class="card" id="app" data-state="CL-01">
+    <h1 id="title">Keep this account</h1>
+    <noscript><p class="err">This page needs JavaScript to create a passkey.</p></noscript>
+    <div id="live" class="visually-hidden" role="status" aria-live="polite"></div>
+
+    <section id="cl-01" data-state="CL-01">
+      <h2 tabindex="-1">Checking your guest session</h2>
+      <p>One moment.</p>
+    </section>
+
+    <section id="cl-02" data-state="CL-02" hidden>
+      <h2 tabindex="-1">Keep this account with a passkey</h2>
+      <p>You joined as <strong id="who"></strong>. This guest account ends in <span id="left"></span>. If you save it with a passkey, it stays after the meeting and you sign in with the passkey.</p>
+      <div data-trust="intro"></div>
+      <fieldset id="email-choice" hidden>
+        <legend>The e-mail address you gave</legend>
+        <label for="email-remove"><input type="radio" id="email-remove" name="keep_email" value="remove" checked> <span>Remove it when I keep the account (recommended).</span></label>
+        <label for="email-keep"><input type="radio" id="email-keep" name="keep_email" value="keep"> <span>Keep it on the account for notices. It is not checked and never signs you in or recovers the account.</span></label>
+      </fieldset>
+      <div class="actions">
+        <button id="create" type="button">Create passkey</button>
+        <button id="decline" type="button" class="secondary">No thanks</button>
+      </div>
+    </section>
+
+    <section id="cl-03" data-state="CL-03" hidden>
+      <h2 tabindex="-1">Starting</h2>
+      <p>Getting your passkey request ready.</p>
+    </section>
+
+    <section id="cl-04" data-state="CL-04" hidden>
+      <h2 tabindex="-1">Create your passkey</h2>
+      <p>Follow the prompt from your browser or device.</p>
+    </section>
+
+    <section id="cl-05" data-state="CL-05" hidden>
+      <h2 tabindex="-1">Saving your account</h2>
+      <p>Do not close this page.</p>
+      <div class="actions"><button id="saving" type="button" disabled>Saving</button></div>
+    </section>
+
+    <section id="cl-06" data-state="CL-06" hidden>
+      <h2 tabindex="-1">Your account is kept</h2>
+      <p>Your passkey is saved. Sign in with it from now on.</p>
+      <div data-trust="done"></div>
+      <div class="actions">
+        <a id="back-to-call" class="button" href="#" hidden>Back to the call</a>
+        <button id="done-close" type="button" class="secondary" data-close>Close</button>
+      </div>
+      <p class="note" data-closed hidden>You can close this tab.</p>
+    </section>
+
+    <section id="cl-07" data-state="CL-07" hidden>
+      <h2 tabindex="-1">Your guest account ends at the deadline</h2>
+      <p>Nothing has been kept. This guest account and everything in it is deleted when the time runs out, in <span id="left-decline"></span>. You can delete it now instead.</p>
+      <div class="actions">
+        <button id="delete-now" type="button">Delete everything now</button>
+      </div>
+    </section>
+
+    <section id="cl-07-done" data-state="CL-07-DONE" hidden>
+      <h2 tabindex="-1">Your guest account is deleted</h2>
+      <p>The session has ended and nothing was kept.</p>
+      <div class="actions"><button type="button" class="secondary" data-close>Close</button></div>
+      <p class="note" data-closed hidden>You can close this tab.</p>
+    </section>
+
+    <section id="cl-err" data-state="CL-E" hidden>
+      <h2 id="err-title" tabindex="-1"></h2>
+      <p id="err-text"></p>
+      <div class="actions">
+        <a id="err-signin" class="button" href="#" hidden>Sign in</a>
+        <button id="err-back" type="button" hidden>Back</button>
+        <button id="err-close" type="button" data-close hidden>Close</button>
+      </div>
+      <p class="note" data-closed hidden>You can close this tab.</p>
+    </section>
+
+    <template id="trust-statement">
+      <ul class="trust">
+        <li>Your passkey stays on your device. We never see it.</li>
+        <li>When you save the account, we delete the value the guest key was made from, and our sign-in service refuses that key from then on. We cannot prove that no copy existed before, for example in a backup.</li>
+        <li>We still run the sign-in service, so we are technically able to open a session for any account on it, yours included.</li>
+        <li>We keep your name. An e-mail address is not checked, and it is never a way to sign in or to recover the account.</li>
+        <li>There is no recovery. If you lose the passkey and your device does not sync it, the account is lost. You cannot add a second passkey yet.</li>
+        <li>The account stays limited. Earlier encrypted messages are not carried to other devices.</li>
+      </ul>
+    </template>
+  </div>
+</main>
+<script type="module" src="/guest/assets/claim.js"></script>
+</body>
+</html>

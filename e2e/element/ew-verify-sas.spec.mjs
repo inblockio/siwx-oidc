@@ -88,6 +88,7 @@ import {
   ALLOWED_CLICKS,
   RECOVERY_PATTERN,
   advanceVerification,
+  isSasStart,
   clickTheyMatch,
   crossSigningStatus,
   cryptoProbe,
@@ -114,7 +115,7 @@ function tally(list) {
   return out;
 }
 
-test('EW-V1: second session cross-signed by SAS/emoji from a live first session — no recovery phrase', async ({
+test('EW-V1: second session cross-signed by SAS/emoji from a live first session — no recovery phrase', { tag: '@ew-p2' }, async ({
   browser,
 }) => {
   test.setTimeout(900_000);
@@ -265,6 +266,7 @@ test('EW-V1: second session cross-signed by SAS/emoji from a live first session 
     // Drive both sides to the emoji comparison using only whitelisted clicks.
     const sasDeadline = Date.now() + 180_000;
     let bothShowEmoji = false;
+    let sasStarter = null; // only the side that started the SAS may start it (two starts collide)
     while (Date.now() < sasDeadline) {
       const [ea, eb] = await Promise.all([emojiVisible(pageA), emojiVisible(pageB)]);
       if (ea && eb) {
@@ -275,8 +277,9 @@ test('EW-V1: second session cross-signed by SAS/emoji from a live first session 
         ['B', pageB],
         ['A', pageA],
       ]) {
-        const clicked = await advanceVerification(page);
+        const clicked = await advanceVerification(page, { allowSasStart: sasStarter === null || sasStarter === tag });
         if (clicked) clickLog.push(`${tag}: ${clicked}`);
+        if (clicked && isSasStart(clicked)) sasStarter ??= tag;
       }
       await pageA.waitForTimeout(1_000);
     }

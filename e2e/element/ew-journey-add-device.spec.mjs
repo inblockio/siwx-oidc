@@ -85,6 +85,7 @@ import { settle, assertExit } from './helpers/journey.mjs';
 import { assertCeremonyInvariant, ceremonySample, PHASE_NAMES } from './helpers/ceremony-view.mjs';
 import {
   advanceVerification,
+  isSasStart,
   clickTheyMatch,
   cryptoProbe,
   describeSurface,
@@ -316,7 +317,7 @@ async function obstructed(page) {
 
 // ---------------------------------------------------------------------------
 
-test('EW-D1: add a second device while device A is live — every screen on both devices offers an exit', async ({
+test('EW-D1: add a second device while device A is live — every screen on both devices offers an exit', { tag: '@ew-p2' }, async ({
   browser,
 }) => {
   test.setTimeout(900_000);
@@ -492,6 +493,7 @@ test('EW-D1: add a second device while device A is live — every screen on both
     const t0 = Date.now();
     const sasDeadline = t0 + SAS_BUDGET_MS;
     let bothShowEmoji = false;
+    let sasStarter = null; // only the side that started the SAS may start it (two starts collide)
     let round = 0;
     while (Date.now() < sasDeadline) {
       const [ea, eb] = await Promise.all([emojiVisible(pageA), emojiVisible(pageB)]);
@@ -525,8 +527,9 @@ test('EW-D1: add a second device while device A is live — every screen on both
         ['B', pageB],
         ['A', pageA],
       ]) {
-        const clicked = await advanceVerification(p);
+        const clicked = await advanceVerification(p, { allowSasStart: sasStarter === null || sasStarter === tag });
         if (clicked) clickLog.push(`${tag}: ${clicked}`);
+        if (clicked && isSasStart(clicked)) sasStarter ??= tag;
       }
       await pageA.waitForTimeout(1_000);
     }

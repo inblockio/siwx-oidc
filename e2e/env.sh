@@ -36,3 +36,19 @@ export SYNAPSE_MOCK_OIDC_BASE="${SYNAPSE_MOCK_OIDC_BASE:-$SIWEOIDC_BASE_URL}"
 # drive (GET account/whoami, GET devices) through a real introspection against
 # siwx-oidc. Overridable, because a real-stack run must still point at Synapse.
 export MATRIX_HOST="${MATRIX_HOST:-http://localhost:${SYNAPSE_MOCK_PORT}}"
+# A static client for tests/e2e_client_lifetime.rs. The `if` form is needed because a
+# `${VAR:-...}` default cannot contain the JSON's closing brace.
+if [ -z "${SIWXOIDC_DEFAULT_CLIENTS__E2ESTATIC:-}" ]; then
+  export SIWXOIDC_DEFAULT_CLIENTS__E2ESTATIC='{"secret":"not-a-secret-e2e-fixture","metadata":{"redirect_uris":["http://localhost:0/callback"],"token_endpoint_auth_method":"none"}}'
+fi
+# A generic-class static client (the kind a mail client is) for tests/e2e_generic_client.rs,
+# and the mail domain its mailbox claim needs. It may be granted `openid`, `io.inblock.mail` and
+# `offline_access` and never a Matrix scope, and it may refresh.
+#
+# It belongs to the Matrix-mode server only: a generic-class client needs a Synapse, so a
+# generic-mode server (the second server of e2e_backchannel_logout) refuses to start with one.
+# Start that server without both variables.
+export SIWXOIDC_MAIL_DOMAIN="${SIWXOIDC_MAIL_DOMAIN:-matrix.test}"
+if [ -z "${SIWXOIDC_DEFAULT_CLIENTS__MAILE2E:-}" ]; then
+  export SIWXOIDC_DEFAULT_CLIENTS__MAILE2E='{"secret":"not-a-secret-e2e-fixture","class":"generic","allowed_scopes":["openid","io.inblock.mail","offline_access"],"metadata":{"redirect_uris":["http://localhost:0/callback"],"token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"]}}'
+fi

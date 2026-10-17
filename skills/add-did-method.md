@@ -1,6 +1,6 @@
 Add a new DID method to aqua-auth.
 
-DID methods live in aqua-auth (https://github.com/inblockio/aqua-rs-auth, crate
+DID methods live in aqua-auth (https://github.com/inblockio/aqua-auth, crate
 `aqua-auth`), which siwx-oidc pins by git tag. Paths below are relative to an
 aqua-auth checkout. Each DID method is one file + one line in the registry.
 Follow these steps exactly:

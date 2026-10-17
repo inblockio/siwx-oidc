@@ -58,9 +58,15 @@ registration token or application service is involved.
     -H 'Content-Type: application/json' \
     -d '{"redirect_uris": ["https://agent.example.org/callback"],
          "token_endpoint_auth_method": "none",
+         "grant_types": ["authorization_code", "refresh_token"],
          "client_name": "Example Agent"}'
   # -> {"client_id": "…", "client_secret": "…", "registration_access_token": "…", …}
   ```
+
+  List `refresh_token` among the `grant_types`: a standalone (non-Matrix)
+  server issues a refresh token only to a client that asked for
+  `offline_access`, which the client does, and whose registration allows the
+  refresh grant.
 
   Keep the returned `client_id`. The redirect URI must be registered, but
   nothing needs to listen on it: the client reads the authorization code from
@@ -107,7 +113,9 @@ It prints the tokens as JSON on stdout (diagnostics go to stderr):
   "expires_in": 300, "refresh_token": "mcr_…", "did": "did:key:z6Mk…" }
 ```
 
-What happens: `GET /authorize` with PKCE (S256) returns a session cookie and a
+What happens: `GET /authorize` with PKCE (S256), asking for the scope
+`openid profile offline_access urn:matrix:client:api:*` (plus the device scope
+when `--device-id` is given), returns a session cookie and a
 nonce; the client builds a CAIP-122 message for the server's host with that
 nonce and the redirect URI in `Resources:`, signs it with the key, sends it to
 `GET /sign_in`, and exchanges the returned code at `POST /token`.
@@ -184,9 +192,22 @@ let tokens = refresh(
 | `SiwxKey::did` | the `did:key:z…` DID |
 | `authenticate(server, client_id, redirect_uri, key)` | sign in; new device each time |
 | `authenticate_with_device(…, key, Some(device_id))` | sign in with a pinned device ID |
+| `authenticate_with_scope(server, client_id, redirect_uri, key, scope)` | sign in for exactly `scope`, for a client that is not a Matrix client |
+| `authenticate_with_scope_using(&client, server, client_id, redirect_uri, key, scope)` | the same over your own `reqwest::Client`, which must not follow redirects |
 | `refresh(server, client_id, refresh_token, did)` | rotate tokens; `did` is only carried into the result |
 | `authenticate_device_flow(server, client_id)` | RFC 8628 device flow (a human approves) |
 | `fetch_and_verify_did`, `verify_did_assertion` | verify another account's published DID |
+
+`authenticate` and `authenticate_with_device` ask for what a Matrix client relies
+on (`offline_access urn:matrix:client:api:*`). A client of another kind, a mail
+client for example, passes its own scope to `authenticate_with_scope`, which
+sends it as given and adds nothing. The server grants only what the client's
+registration allows, and a refresh token comes only with `offline_access`;
+`AuthTokens` does not carry the granted scope. `authenticate_with_scope_using`
+takes your own `reqwest::Client`. Build it with
+`redirect(reqwest::redirect::Policy::none())`: the flow reads the `Location`
+headers of two redirects itself, and a client that follows them ends on the
+login page and gets an error that names the redirect policy.
 
 All sign-in functions return `AuthTokens { access_token, token_type, id_token,
 expires_in, refresh_token, did }`. A refresh returns no `id_token`.
@@ -215,15 +236,17 @@ Token lifetimes:
 |---|---|
 | Access token | 300 s |
 | Refresh token | 90 days from its issue; every refresh issues a new one |
-| Lost-response grace | 60 s |
+| Lost-response recovery | until the new pair is first used |
 
-- **Refresh tokens rotate.** Each refresh returns a new refresh token and
-  deletes the old one. Persist the new one before using the new access token,
-  ideally with an atomic write.
-- **Grace window.** If a refresh response is lost, retrying with the old refresh
-  token within 60 seconds returns the **same** new pair instead of an error. Two
-  processes that refresh with the same token within that window also both get
-  the same pair. After 60 seconds the old token is `invalid_grant`.
+- **Refresh tokens rotate.** Each refresh returns a new refresh token, and the
+  old one stops working once the new pair is used. Persist the new one before
+  using the new access token, ideally with an atomic write.
+- **Lost responses.** If a refresh response is lost, retrying with the old
+  refresh token returns the **same** new pair instead of an error, however late,
+  as long as the new pair has not been used. Two processes that refresh with
+  the same token at once also both get the same pair. Once the new access token
+  has been used (or the new refresh token refreshed), the old token is
+  `invalid_grant`, and presenting it is logged as a possible token theft.
 - **Keep refreshing.** An agent that refreshes at least once every 90 days keeps
   its session indefinitely. After that, sign in again with the key (and the same
   pinned device ID).
@@ -256,6 +279,7 @@ siwx-oidc-auth --device-flow --server https://auth.example.org --client-id "$CLI
 ```
 
 The approval URL and code go to stderr; the tokens go to stdout once approved.
+The client asks for the scope `openid offline_access urn:matrix:client:api:*`.
 The flow requires the server's delegated-auth mode, and the approving DID must
 already have an account (the device flow never creates one).
 
@@ -313,6 +337,15 @@ issuer their homeserver uses. Full details:
   name set in a Matrix client survives the next sign-in.
 - **A deactivated account cannot sign in**: `/sign_in` answers 401. If Synapse
   cannot be reached for that check, it answers 503; retry later.
+- **Typed refusals.** A server that runs `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`
+  answers its `/sign_in` refusals as a redirect carrying `error` instead, and the
+  library returns them as `siwx_oidc_auth::AuthError` inside the
+  `anyhow::Error` (`err.downcast_ref::<AuthError>()`): `DeviceRefused` for a
+  pinned device id that was signed out (it is never recreated: sign in with a
+  new id), `AccessDenied` for a deactivated or erased account (final), and
+  `TemporarilyUnavailable` when Synapse could not be asked or could not set up
+  the device (retry later). `is_device_refused(&err)` and `is_transient(&err)`
+  answer the two questions a caller usually has.
 - **Common errors** at sign-in, with fixes, are in
   [troubleshooting.md](troubleshooting.md#headless-sign-in-siwx-oidc-auth).
 
@@ -361,7 +394,7 @@ secret or an IP address, is being standardised on the web:
 agent with a CAIP-122 signature over the OIDC authorization-code flow and then
 issues bearer tokens. The same key can also sign individual HTTP requests with
 the *experimental* `http-sig` feature of
-[aqua-auth](https://github.com/inblockio/aqua-rs-auth), the library siwx-oidc
+[aqua-auth](https://github.com/inblockio/aqua-auth), the library siwx-oidc
 uses for signature verification. siwx-oidc itself does not use that feature, and
 no interoperability with third-party Web Bot Auth verifiers is claimed here.
 

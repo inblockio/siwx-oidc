@@ -204,20 +204,59 @@ fn build_message(domain: &str, key: &SiwxKey, redirect_uri: &str, nonce: &str) -
 // OAuth scope construction
 // ---------------------------------------------------------------------------
 
+/// The scopes every flow asks for, whether or not a device is proposed.
+///
+/// - `offline_access`: the client relies on refresh tokens (`refresh`, and the
+///   advice to refresh instead of signing in again). A generic-mode server
+///   issues one only for this scope.
+/// - `urn:matrix:client:api:*`: the access token is used against a Matrix
+///   homeserver's client-server API. A Matrix deployment grants this scope
+///   whatever is asked today; asking for it keeps the client working against a
+///   server that grants it only on request.
+///
+/// A server that does not know a scope ignores it at `/authorize`, so this is
+/// harmless against a deployment that has no use for it.
+const RELIED_ON_SCOPES: [&str; 2] = ["offline_access", "urn:matrix:client:api:*"];
+
 /// Build the OAuth `scope` requested at `/authorize`.
 ///
-/// - `None`: the default `"openid profile"` (unchanged, backward compatible).
-/// - `Some(id)`: appends the stable Matrix device URN so the server pins this
-///   exact Synapse device_id instead of minting a fresh `SIWX_<uuid>` on every
-///   login. The siwx-oidc server validates the scope (it contains `openid`) and
-///   extracts the id via `extract_device_id_from_scope`, which strips the
-///   `urn:matrix:client:device:` prefix. The stable prefix is preferred over the
-///   `urn:matrix:org.matrix.msc2967.client:device:` (MSC2967 unstable) form.
+/// - `None`: `openid profile` plus [`RELIED_ON_SCOPES`].
+/// - `Some(id)`: the same, plus the stable Matrix device URN so the server pins
+///   this exact Synapse device_id instead of minting a fresh `SIWX_<uuid>` on
+///   every login. The siwx-oidc server validates the scope (it contains
+///   `openid`) and extracts the id via `extract_device_id_from_scope`, which
+///   strips the `urn:matrix:client:device:` prefix. The stable prefix is
+///   preferred over the `urn:matrix:org.matrix.msc2967.client:device:`
+///   (MSC2967 unstable) form.
 fn build_scope(device_id: Option<&str>) -> String {
-    match device_id {
-        None => "openid profile".to_string(),
-        Some(id) => format!("openid profile urn:matrix:client:device:{id}"),
+    let mut scopes = vec!["openid", "profile"];
+    scopes.extend(RELIED_ON_SCOPES);
+    let mut scope = scopes.join(" ");
+    if let Some(id) = device_id {
+        scope.push_str(" urn:matrix:client:device:");
+        scope.push_str(id);
     }
+    scope
+}
+
+/// The `scope` [`authenticate_with_device`] requests at `/authorize` for
+/// `device_id` (and [`authenticate`] for `None`).
+///
+/// A Matrix-mode server records the Matrix scope whatever was requested and
+/// never echoes the request, so a live check cannot read the scope off the
+/// server; it reads it here. The unit test
+/// `the_code_flow_sends_the_scope_it_relies_on` pins that this is exactly the
+/// value on the wire.
+pub fn code_flow_scope(device_id: Option<&str>) -> String {
+    build_scope(device_id)
+}
+
+/// The `scope` the device flow requests at `/device_authorization`:
+/// `openid` plus [`RELIED_ON_SCOPES`].
+fn build_device_flow_scope() -> String {
+    let mut scopes = vec!["openid"];
+    scopes.extend(RELIED_ON_SCOPES);
+    scopes.join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -301,10 +340,11 @@ struct TokenErrorResponse {
 /// To re-authenticate when tokens expire, call this function again — the flow
 /// is stateless and the key is deterministic.
 ///
-/// This is the backward-compatible entry point: it requests the default
-/// `"openid profile"` scope, so the server mints a fresh `SIWX_<uuid>` Synapse
-/// device on each login. To pin a stable device_id, use
-/// [`authenticate_with_device`].
+/// This is the backward-compatible entry point: it requests no device, so the
+/// server mints a fresh `SIWX_<uuid>` Synapse device on each login. To pin a
+/// stable device_id, use [`authenticate_with_device`]. The scope it requests is
+/// `openid profile offline_access urn:matrix:client:api:*`; a client that is not
+/// a Matrix client chooses its own with [`authenticate_with_scope`].
 pub async fn authenticate(
     server_url: &str,
     client_id: &str,
@@ -332,12 +372,257 @@ pub async fn authenticate_with_device(
     key: &SiwxKey,
     device_id: Option<&str>,
 ) -> Result<AuthTokens> {
-    let scope = build_scope(device_id);
-    let base = Url::parse(server_url).context("invalid server_url")?;
-    let client = reqwest::Client::builder()
+    let client = flow_client()?;
+    code_flow(
+        &client,
+        server_url,
+        client_id,
+        redirect_uri,
+        key,
+        &build_scope(device_id),
+    )
+    .await
+}
+
+/// Perform the authorization code flow for a scope the caller chooses.
+///
+/// Same flow as [`authenticate`], except for `scope`, which is sent to
+/// `/authorize` exactly as given: nothing is added (the scopes the other entry
+/// points rely on, [`RELIED_ON_SCOPES`], are not appended), nothing is removed,
+/// and nothing is checked. An empty scope, or one without `openid`, is for the
+/// server to refuse.
+///
+/// This is the entry point for a client that is not a Matrix client. A
+/// generic-class client (a mail client, say) is granted only the scopes its
+/// registration allows, and a Matrix scope in its request is dropped, so
+/// [`authenticate`], which always asks for `urn:matrix:client:api:*`, is the
+/// wrong choice for it:
+///
+/// ```no_run
+/// # async fn demo(key: &siwx_oidc_auth::SiwxKey) -> anyhow::Result<()> {
+/// let tokens = siwx_oidc_auth::authenticate_with_scope(
+///     "https://siwx.example.com",
+///     "my-mail-client",
+///     "https://mail.example.com/callback",
+///     key,
+///     "openid io.inblock.mail offline_access",
+/// ).await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The returned [`AuthTokens`] does not say which scope the server granted.
+/// A refresh token is present only when the server issued one, which for a
+/// generic-class client takes `offline_access` in the scope.
+///
+/// A server that refuses the request (a scope the client may not have, for
+/// one) is reported with the reason it gave:
+/// `/authorize refused the request: invalid_scope: ...`.
+///
+/// Builds its own HTTP client, which does not follow redirects. To use your own
+/// (a proxy, a timeout, a root certificate), call
+/// [`authenticate_with_scope_using`].
+pub async fn authenticate_with_scope(
+    server_url: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    key: &SiwxKey,
+    scope: &str,
+) -> Result<AuthTokens> {
+    let client = flow_client()?;
+    authenticate_with_scope_using(&client, server_url, client_id, redirect_uri, key, scope).await
+}
+
+/// [`authenticate_with_scope`] over a `client` the caller built.
+///
+/// **`client` must not follow redirects**: build it with
+/// `reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())`.
+/// The flow reads the `Location` header of the redirects from `/authorize` and
+/// `/sign_in` itself, and a client that follows them hands it a page instead.
+/// A 2xx where a 303 is due is reported as an error that names the redirect
+/// policy. Reqwest cannot tell the flow which policy a client has, so this is
+/// the only check.
+///
+/// The flow sends its cookies itself, so `client` should carry no cookie store.
+/// Timeouts, proxies and root certificates set on `client` apply to every
+/// request of the flow.
+pub async fn authenticate_with_scope_using(
+    client: &reqwest::Client,
+    server_url: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    key: &SiwxKey,
+    scope: &str,
+) -> Result<AuthTokens> {
+    code_flow(client, server_url, client_id, redirect_uri, key, scope).await
+}
+
+/// The HTTP client the flows build for themselves. It must not follow
+/// redirects: the code flow reads the `Location` header of two of them.
+fn flow_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
         .redirect(Policy::none())
         .build()
-        .context("failed to build HTTP client")?;
+        .context("failed to build HTTP client")
+}
+
+/// A sign-in that siwx-oidc refused at `/sign_in` with the authorization error
+/// response: a 303 to the redirect URI whose query carries `error` and
+/// `error_description` instead of a code. siwx-oidc answers this way when
+/// `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` is on; otherwise its refusals are pages,
+/// reported as untyped errors.
+///
+/// The code-flow entry points return it inside their [`anyhow::Error`]: recover
+/// it with `err.downcast_ref::<AuthError>()`, or ask [`is_device_refused`] and
+/// [`is_transient`]. What each kind asks of the caller:
+///
+/// - [`AuthError::DeviceRefused`]: the proposed device id cannot be used again
+///   (it was signed out). Forget it, sign in with a new id; retrying the same id
+///   is refused again.
+/// - [`AuthError::AccessDenied`]: the account cannot sign in (deactivated or
+///   erased). Final: stop, and report it once.
+/// - [`AuthError::TemporarilyUnavailable`]: the homeserver could not be asked or
+///   could not set up the device. Transient: retry as after an outage.
+/// - [`AuthError::SignInRefused`]: any other `error` code, as the server sent it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AuthError {
+    /// `invalid_scope`: the device id the scope proposes is refused.
+    DeviceRefused { description: Option<String> },
+    /// `access_denied`: the account is deactivated or erased.
+    AccessDenied { description: Option<String> },
+    /// `temporarily_unavailable`: no grant was issued; try again later.
+    TemporarilyUnavailable { description: Option<String> },
+    /// Any other `error` code at `/sign_in`.
+    SignInRefused {
+        error: String,
+        description: Option<String>,
+    },
+}
+
+impl AuthError {
+    fn from_refusal(error: String, description: Option<String>) -> Self {
+        match error.as_str() {
+            "invalid_scope" => AuthError::DeviceRefused { description },
+            "access_denied" => AuthError::AccessDenied { description },
+            "temporarily_unavailable" => AuthError::TemporarilyUnavailable { description },
+            _ => AuthError::SignInRefused { error, description },
+        }
+    }
+
+    /// The `error` code the server sent.
+    pub fn error_code(&self) -> &str {
+        match self {
+            AuthError::DeviceRefused { .. } => "invalid_scope",
+            AuthError::AccessDenied { .. } => "access_denied",
+            AuthError::TemporarilyUnavailable { .. } => "temporarily_unavailable",
+            AuthError::SignInRefused { error, .. } => error,
+        }
+    }
+
+    /// The `error_description` the server sent, if any.
+    pub fn description(&self) -> Option<&str> {
+        match self {
+            AuthError::DeviceRefused { description }
+            | AuthError::AccessDenied { description }
+            | AuthError::TemporarilyUnavailable { description }
+            | AuthError::SignInRefused { description, .. } => description.as_deref(),
+        }
+    }
+
+    /// Whether this is [`AuthError::DeviceRefused`].
+    pub fn is_device_refused(&self) -> bool {
+        matches!(self, AuthError::DeviceRefused { .. })
+    }
+
+    /// Whether this is [`AuthError::TemporarilyUnavailable`], the one refusal to
+    /// retry unchanged.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, AuthError::TemporarilyUnavailable { .. })
+    }
+}
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "/sign_in refused the request: {}", self.error_code())?;
+        match self.description() {
+            Some(description) => write!(f, ": {description}"),
+            None => Ok(()),
+        }
+    }
+}
+
+impl std::error::Error for AuthError {}
+
+/// Whether `err` is an [`AuthError::DeviceRefused`] from a code-flow entry point.
+pub fn is_device_refused(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<AuthError>()
+        .is_some_and(AuthError::is_device_refused)
+}
+
+/// Whether `err` is an [`AuthError::TemporarilyUnavailable`] from a code-flow
+/// entry point. An untyped error (a network fault, say) answers `false`: the
+/// caller decides for those as before.
+pub fn is_transient(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<AuthError>()
+        .is_some_and(AuthError::is_transient)
+}
+
+/// The error for a response from `endpoint` that is not the 303 redirect the
+/// code flow is waiting for.
+///
+/// A success status gets its own message, because it is what a client that
+/// follows redirects sees at the end of the redirect: the login page, a 200.
+fn not_the_redirect(endpoint: &str, status: StatusCode, body: Option<&str>) -> anyhow::Error {
+    if status.is_success() {
+        return anyhow!(
+            "{endpoint} returned {status} where a 303 redirect was expected: either the HTTP \
+             client followed the redirect, or the server did not redirect. The flow reads the \
+             Location header itself, so the client must be built with \
+             `reqwest::redirect::Policy::none()`"
+        );
+    }
+    match body {
+        Some(body) => anyhow!("{endpoint} returned {status}: {body}"),
+        None => anyhow!("{endpoint} returned {status} instead of 303"),
+    }
+}
+
+/// What the server says when it refuses the authorization request.
+///
+/// `/authorize` refuses a request it can still answer, an unsupported scope for
+/// one, with a 303 to the redirect URI whose query carries `error` and
+/// `error_description`. That redirect sets no session cookie, so a flow that read
+/// the cookie first would report a missing cookie and hide the reason. `/sign_in`
+/// refuses the same way when siwx-oidc runs `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`
+/// (see [`AuthError`]). The `error` and the `error_description`, or `None` when
+/// `location` is no refusal.
+fn authorize_refusal(base: &Url, location: &str) -> Option<(String, Option<String>)> {
+    let redirect = base.join(location).ok()?;
+    let mut error = None;
+    let mut description = None;
+    for (name, value) in redirect.query_pairs() {
+        match name.as_ref() {
+            "error" => error = Some(value.into_owned()),
+            "error_description" => description = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    Some((error?, description))
+}
+
+/// The authorization code flow every code-flow entry point runs: PKCE,
+/// `/authorize`, the CAIP-122 signature at `/sign_in`, and the code exchange at
+/// `/token`. `scope` is sent as given; the callers decide what it is.
+async fn code_flow(
+    client: &reqwest::Client,
+    server_url: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    key: &SiwxKey,
+    scope: &str,
+) -> Result<AuthTokens> {
+    let base = Url::parse(server_url).context("invalid server_url")?;
 
     // -----------------------------------------------------------------------
     // PKCE: generate code_verifier and code_challenge (S256)
@@ -364,7 +649,7 @@ pub async fn authenticate_with_device(
         .query(&[
             ("client_id", client_id),
             ("redirect_uri", redirect_uri),
-            ("scope", scope.as_str()),
+            ("scope", scope),
             ("response_type", "code"),
             ("state", "headless"),
             ("code_challenge", code_challenge.as_str()),
@@ -375,7 +660,20 @@ pub async fn authenticate_with_device(
         .context("GET /authorize failed")?;
 
     if resp.status() != StatusCode::SEE_OTHER {
-        bail!("/authorize returned {} instead of 303", resp.status());
+        return Err(not_the_redirect("/authorize", resp.status(), None));
+    }
+
+    let location = resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok());
+    if let Some((error, description)) =
+        location.and_then(|location| authorize_refusal(&base, location))
+    {
+        return Err(match description {
+            Some(description) => anyhow!("/authorize refused the request: {error}: {description}"),
+            None => anyhow!("/authorize refused the request: {error}"),
+        });
     }
 
     let session_cookie = resp
@@ -392,11 +690,8 @@ pub async fn authenticate_with_device(
         })
         .ok_or_else(|| anyhow!("/authorize response missing session cookie"))?;
 
-    let location = resp
-        .headers()
-        .get(header::LOCATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| anyhow!("/authorize response missing Location header"))?;
+    let location =
+        location.ok_or_else(|| anyhow!("/authorize response missing Location header"))?;
 
     let redirect_url = base.join(location).context("invalid Location header")?;
     let params: AuthorizeRedirectParams =
@@ -440,7 +735,7 @@ pub async fn authenticate_with_device(
     if resp.status() != StatusCode::SEE_OTHER {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        bail!("/sign_in returned {status}: {body}");
+        return Err(not_the_redirect("/sign_in", status, Some(&body)));
     }
 
     let code_location = resp
@@ -448,6 +743,11 @@ pub async fn authenticate_with_device(
         .get(header::LOCATION)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| anyhow!("/sign_in response missing Location header"))?;
+
+    // A refusal is the authorization error response, typed for the caller.
+    if let Some((error, description)) = authorize_refusal(&base, code_location) {
+        return Err(AuthError::from_refusal(error, description).into());
+    }
 
     let code_url = Url::parse(code_location)
         .or_else(|_| base.join(code_location))
@@ -514,10 +814,7 @@ pub async fn refresh(
     did: &str,
 ) -> Result<AuthTokens> {
     let base = Url::parse(server_url).context("invalid server_url")?;
-    let client = reqwest::Client::builder()
-        .redirect(Policy::none())
-        .build()
-        .context("failed to build HTTP client")?;
+    let client = flow_client()?;
 
     let token_url = base.join("/token")?;
     let resp = client
@@ -577,6 +874,9 @@ fn extract_did_from_id_token(id_token: &str) -> Option<String> {
 /// - `server_url`: Base URL of the siwx-oidc server.
 /// - `client_id`: OIDC client ID registered with the server.
 ///
+/// Requests the scope `openid offline_access urn:matrix:client:api:*`: the
+/// tokens are used against a Matrix homeserver and refreshed.
+///
 /// Prints the user code and verification URI to stderr, then polls until
 /// approved, denied, or expired.
 pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Result<AuthTokens> {
@@ -587,7 +887,10 @@ pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Resu
     let device_auth_url = base.join("/device_authorization")?;
     let resp = client
         .post(device_auth_url)
-        .form(&[("client_id", client_id), ("scope", "openid")])
+        .form(&[
+            ("client_id", client_id),
+            ("scope", build_device_flow_scope().as_str()),
+        ])
         .send()
         .await
         .context("POST /device_authorization failed")?;
@@ -692,19 +995,604 @@ pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    /// What the client asks for in the code flow, in the order it asks.
+    const CODE_FLOW_SCOPE: &str = "openid profile offline_access urn:matrix:client:api:*";
+    /// What the client asks for in the device flow.
+    const DEVICE_FLOW_SCOPE: &str = "openid offline_access urn:matrix:client:api:*";
 
     #[test]
-    fn build_scope_none_is_unchanged() {
-        assert_eq!(build_scope(None), "openid profile");
+    fn build_scope_none_asks_for_what_the_client_relies_on() {
+        assert_eq!(build_scope(None), CODE_FLOW_SCOPE);
     }
 
     #[test]
     fn build_scope_some_requests_stable_device() {
         let scope = build_scope(Some("agent-x"));
         // Must contain the stable Matrix device URN the server extracts from.
-        assert_eq!(scope, "openid profile urn:matrix:client:device:agent-x");
+        assert_eq!(
+            scope,
+            format!("{CODE_FLOW_SCOPE} urn:matrix:client:device:agent-x")
+        );
         assert!(scope.contains("urn:matrix:client:device:agent-x"));
         // Still an OIDC request (keeps openid + profile).
         assert!(scope.starts_with("openid profile"));
+    }
+
+    /// The client relies on a refresh token (`offline_access`: a generic-mode
+    /// server issues one only for it) and, against a Matrix deployment, on the
+    /// Matrix client-server API (`urn:matrix:client:api:*`: a server that grants
+    /// it only when asked would otherwise hand out tokens Synapse refuses). It
+    /// asks for both in every flow, whether or not a device is proposed.
+    #[test]
+    fn every_flow_asks_for_offline_access_and_the_matrix_api() {
+        for scope in [
+            build_scope(None),
+            build_scope(Some("agent-x")),
+            build_device_flow_scope(),
+        ] {
+            let asked: Vec<&str> = scope.split(' ').collect();
+            for needed in ["openid", "offline_access", "urn:matrix:client:api:*"] {
+                assert!(asked.contains(&needed), "`{scope}` lacks {needed}");
+            }
+        }
+        assert_eq!(build_device_flow_scope(), DEVICE_FLOW_SCOPE);
+    }
+
+    /// One request a stub server received.
+    struct Received {
+        /// The request line and the headers.
+        head: String,
+        body: String,
+    }
+
+    impl Received {
+        fn request_line(&self) -> &str {
+            self.head.lines().next().unwrap_or("")
+        }
+
+        fn header(&self, name: &str) -> Option<String> {
+            self.head.lines().skip(1).find_map(|line| {
+                let (field, value) = line.split_once(':')?;
+                field
+                    .eq_ignore_ascii_case(name)
+                    .then(|| value.trim().to_string())
+            })
+        }
+    }
+
+    fn read_request(stream: &mut TcpStream) -> Received {
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let (head_end, content_length) = loop {
+            let n = stream.read(&mut chunk).unwrap();
+            received.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&received).to_string();
+            if let Some(end) = text.find("\r\n\r\n") {
+                let length = text[..end]
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                break (end + 4, length);
+            }
+        };
+        while received.len() < head_end + content_length {
+            let n = stream.read(&mut chunk).unwrap();
+            received.extend_from_slice(&chunk[..n]);
+        }
+        let text = String::from_utf8_lossy(&received).to_string();
+        Received {
+            head: text[..head_end].to_string(),
+            body: text[head_end..].to_string(),
+        }
+    }
+
+    /// A raw HTTP response with an empty body that closes the connection.
+    fn raw_response(status: &str, headers: &[&str]) -> String {
+        let mut response =
+            format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n");
+        for header in headers {
+            response.push_str(header);
+            response.push_str("\r\n");
+        }
+        response.push_str("\r\n");
+        response
+    }
+
+    /// Answer one connection per entry of `responses`, in order, and hand back
+    /// what each one sent.
+    fn serve_in_order(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<Received>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            responses
+                .into_iter()
+                .map(|response| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request = read_request(&mut stream);
+                    let _ = stream.write_all(response.as_bytes());
+                    request
+                })
+                .collect()
+        });
+        (base, handle)
+    }
+
+    /// Answer the first request with a 500 and hand back the request line and
+    /// body. Enough server to see what a flow sends first.
+    fn capture_first_request() -> (String, std::thread::JoinHandle<(String, String)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            let _ = stream.write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            );
+            (request.request_line().to_string(), request.body)
+        });
+        (base, handle)
+    }
+
+    fn scope_in(query_or_form: &str) -> String {
+        let fields: HashMap<String, String> = serde_urlencoded::from_str(query_or_form).unwrap();
+        fields
+            .get("scope")
+            .unwrap_or_else(|| panic!("no scope in `{query_or_form}`"))
+            .clone()
+    }
+
+    /// The scope the code flow puts on the wire at `/authorize`, with and
+    /// without a proposed device.
+    #[tokio::test]
+    async fn the_code_flow_sends_the_scope_it_relies_on() {
+        let key = SiwxKey::generate_ed25519();
+        for (device, expected) in [
+            (None, CODE_FLOW_SCOPE.to_string()),
+            (
+                Some("agent-x"),
+                format!("{CODE_FLOW_SCOPE} urn:matrix:client:device:agent-x"),
+            ),
+        ] {
+            let (base, request) = capture_first_request();
+            let outcome = authenticate_with_device(
+                &base,
+                "client",
+                "https://agent.example.org/callback",
+                &key,
+                device,
+            )
+            .await;
+            assert!(outcome.is_err(), "the stub answers 500");
+            let (request_line, _) = request.join().unwrap();
+            let target = request_line.split(' ').nth(1).unwrap();
+            let (path, query) = target.split_once('?').expect("a query");
+            assert_eq!(path, "/authorize");
+            assert_eq!(scope_in(query), expected, "device {device:?}");
+            assert_eq!(
+                scope_in(query),
+                code_flow_scope(device),
+                "device {device:?}"
+            );
+        }
+    }
+
+    /// The scope the device flow puts on the wire at `/device_authorization`.
+    #[tokio::test]
+    async fn the_device_flow_sends_the_scope_it_relies_on() {
+        let (base, request) = capture_first_request();
+        let outcome = authenticate_device_flow(&base, "client").await;
+        assert!(outcome.is_err(), "the stub answers 500");
+        let (request_line, body) = request.join().unwrap();
+        assert!(
+            request_line.starts_with("POST /device_authorization"),
+            "{request_line}"
+        );
+        assert_eq!(scope_in(&body), DEVICE_FLOW_SCOPE);
+    }
+
+    const REDIRECT_URI: &str = "https://agent.example.org/callback";
+
+    /// A client built the way [`authenticate_with_scope_using`] asks a caller to.
+    fn caller_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    /// The `scope` of the `/authorize` request a stub received.
+    fn authorize_scope(request: std::thread::JoinHandle<(String, String)>) -> String {
+        let (request_line, _) = request.join().unwrap();
+        let target = request_line.split(' ').nth(1).unwrap();
+        let (path, query) = target.split_once('?').expect("a query");
+        assert_eq!(path, "/authorize");
+        scope_in(query)
+    }
+
+    /// The scope a caller names is the scope on the wire: nothing is added (the
+    /// Matrix scopes the other entry points rely on included), removed,
+    /// normalised or checked.
+    #[tokio::test]
+    async fn the_scope_entry_points_send_the_scope_exactly_as_given() {
+        let key = SiwxKey::generate_ed25519();
+        for scope in [
+            "openid io.inblock.mail",
+            "openid",
+            "openid io.inblock.mail offline_access",
+            "openid urn:matrix:client:api:*",
+            "openid  io.inblock.mail ",
+            "",
+        ] {
+            let (base, request) = capture_first_request();
+            let outcome = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, scope).await;
+            assert!(outcome.is_err(), "the stub answers 500");
+            assert_eq!(authorize_scope(request), scope, "authenticate_with_scope");
+
+            let (base, request) = capture_first_request();
+            let outcome = authenticate_with_scope_using(
+                &caller_client(),
+                &base,
+                "client",
+                REDIRECT_URI,
+                &key,
+                scope,
+            )
+            .await;
+            assert!(outcome.is_err(), "the stub answers 500");
+            assert_eq!(
+                authorize_scope(request),
+                scope,
+                "authenticate_with_scope_using"
+            );
+        }
+    }
+
+    /// `authenticate_with_scope_using` runs the flow through the client it is
+    /// given, not through one of its own.
+    #[tokio::test]
+    async fn the_caller_chosen_client_sends_the_flow() {
+        let key = SiwxKey::generate_ed25519();
+        let caller = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .user_agent("caller-client/1")
+            .build()
+            .unwrap();
+        let (base, served) = serve_in_order(vec![raw_response("500 Internal Server Error", &[])]);
+        let outcome = authenticate_with_scope_using(
+            &caller,
+            &base,
+            "client",
+            REDIRECT_URI,
+            &key,
+            "openid io.inblock.mail",
+        )
+        .await;
+        assert!(outcome.is_err(), "the stub answers 500");
+        let requests = served.join().unwrap();
+        assert_eq!(
+            requests[0].header("user-agent").as_deref(),
+            Some("caller-client/1")
+        );
+    }
+
+    /// A client that follows redirects ends the flow on the login page, a 200
+    /// where the 303 is due, and the error says why.
+    #[tokio::test]
+    async fn a_client_that_follows_redirects_gets_an_error_naming_the_redirect_policy() {
+        let key = SiwxKey::generate_ed25519();
+        let (base, served) = serve_in_order(vec![
+            raw_response(
+                "303 See Other",
+                &["location: /login", "set-cookie: session=abc; Path=/"],
+            ),
+            raw_response("200 OK", &[]),
+        ]);
+        let following = reqwest::Client::new();
+        let error = authenticate_with_scope_using(
+            &following,
+            &base,
+            "client",
+            REDIRECT_URI,
+            &key,
+            "openid io.inblock.mail",
+        )
+        .await
+        .expect_err("the login page is not a redirect");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("/authorize returned 200 OK where a 303 redirect was expected"),
+            "{message}"
+        );
+        assert!(
+            message.contains("reqwest::redirect::Policy::none()"),
+            "{message}"
+        );
+        let requests = served.join().unwrap();
+        assert_eq!(requests.len(), 2, "the client did follow the redirect");
+        assert!(requests[1].request_line().starts_with("GET /login"));
+    }
+
+    /// The same error at the second redirect, when a server answers `/sign_in`
+    /// with a page instead.
+    #[tokio::test]
+    async fn a_sign_in_that_answers_with_a_page_names_the_redirect_policy_too() {
+        let key = SiwxKey::generate_ed25519();
+        let authorize_redirect = format!(
+            "location: /login?nonce=n1&state=headless&client_id=client&redirect_uri={}",
+            urlencoding::encode(REDIRECT_URI)
+        );
+        let (base, served) = serve_in_order(vec![
+            raw_response(
+                "303 See Other",
+                &[&authorize_redirect, "set-cookie: session=abc; Path=/"],
+            ),
+            raw_response("200 OK", &[]),
+        ]);
+        let error = authenticate_with_scope(
+            &base,
+            "client",
+            REDIRECT_URI,
+            &key,
+            "openid io.inblock.mail",
+        )
+        .await
+        .expect_err("a page is not a redirect");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("/sign_in returned 200 OK where a 303 redirect was expected"),
+            "{message}"
+        );
+        assert!(
+            message.contains("reqwest::redirect::Policy::none()"),
+            "{message}"
+        );
+        let requests = served.join().unwrap();
+        assert!(requests[1].request_line().starts_with("GET /sign_in"));
+        assert!(requests[1]
+            .header("cookie")
+            .is_some_and(|cookie| cookie.starts_with("session=abc; siwx=")));
+    }
+
+    /// A status that is neither a 303 nor a success keeps the plain message.
+    #[tokio::test]
+    async fn an_error_status_at_authorize_is_not_blamed_on_the_redirect_policy() {
+        let key = SiwxKey::generate_ed25519();
+        let (base, request) = capture_first_request();
+        let error = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "openid")
+            .await
+            .expect_err("the stub answers 500");
+        request.join().unwrap();
+        assert_eq!(
+            format!("{error:#}"),
+            "/authorize returned 500 Internal Server Error instead of 303"
+        );
+    }
+
+    /// A server that refuses the scope answers `/authorize` with a 303 to the
+    /// redirect URI, `error` and `error_description` in its query and no session
+    /// cookie. The error carries what the server said, through both entry points
+    /// that take a scope.
+    #[tokio::test]
+    async fn a_refused_scope_is_reported_with_the_servers_reason() {
+        let key = SiwxKey::generate_ed25519();
+        let refusal = format!(
+            "location: {REDIRECT_URI}?state=headless&error=invalid_scope&error_description={}",
+            urlencoding::encode("the openid scope is required")
+        );
+        let expected =
+            "/authorize refused the request: invalid_scope: the openid scope is required";
+
+        let (base, served) = serve_in_order(vec![raw_response("303 See Other", &[&refusal])]);
+        let error = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "io.inblock.mail")
+            .await
+            .expect_err("the server refused the scope");
+        assert_eq!(format!("{error:#}"), expected);
+        assert_eq!(
+            served.join().unwrap().len(),
+            1,
+            "the flow stops at the refusal"
+        );
+
+        let (base, served) = serve_in_order(vec![raw_response("303 See Other", &[&refusal])]);
+        let error = authenticate_with_scope_using(
+            &caller_client(),
+            &base,
+            "client",
+            REDIRECT_URI,
+            &key,
+            "io.inblock.mail",
+        )
+        .await
+        .expect_err("the server refused the scope");
+        assert_eq!(format!("{error:#}"), expected);
+        served.join().unwrap();
+    }
+
+    /// A refusal without a description still names its error, and a redirect
+    /// with an `error` but also a cookie is a refusal all the same.
+    #[tokio::test]
+    async fn a_refusal_without_a_description_still_names_the_error() {
+        let key = SiwxKey::generate_ed25519();
+        let refusal = format!("location: {REDIRECT_URI}?state=headless&error=invalid_scope");
+        let (base, served) = serve_in_order(vec![raw_response(
+            "303 See Other",
+            &[&refusal, "set-cookie: session=abc; Path=/"],
+        )]);
+        let error = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "io.inblock.mail")
+            .await
+            .expect_err("the server refused the scope");
+        assert_eq!(
+            format!("{error:#}"),
+            "/authorize refused the request: invalid_scope"
+        );
+        served.join().unwrap();
+    }
+
+    /// A redirect that is no refusal and sets no cookie keeps its own message.
+    #[tokio::test]
+    async fn a_redirect_without_a_cookie_or_an_error_still_reports_the_missing_cookie() {
+        let key = SiwxKey::generate_ed25519();
+        let (base, served) = serve_in_order(vec![raw_response(
+            "303 See Other",
+            &["location: /login?nonce=n1&state=headless"],
+        )]);
+        let error = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "openid")
+            .await
+            .expect_err("no session cookie");
+        assert_eq!(
+            format!("{error:#}"),
+            "/authorize response missing session cookie"
+        );
+        served.join().unwrap();
+    }
+
+    // ---- SS4 WP7: a /sign_in refusal is a typed error (8.19) ----
+
+    /// Run the code flow with a proposed device against a server whose `/authorize`
+    /// redirects to the login page and whose `/sign_in` answers with `sign_in_location`.
+    async fn sign_in_answering(sign_in_location: &str) -> anyhow::Error {
+        let key = SiwxKey::generate_ed25519();
+        let authorize_redirect = format!(
+            "location: /login?nonce=n1&state=headless&client_id=client&redirect_uri={}",
+            urlencoding::encode(REDIRECT_URI)
+        );
+        let sign_in_redirect = format!("location: {sign_in_location}");
+        let (base, served) = serve_in_order(vec![
+            raw_response(
+                "303 See Other",
+                &[&authorize_redirect, "set-cookie: session=abc; Path=/"],
+            ),
+            raw_response("303 See Other", &[&sign_in_redirect]),
+        ]);
+        let error = authenticate_with_device(&base, "client", REDIRECT_URI, &key, Some("DEVICE_A"))
+            .await
+            .expect_err("the sign-in redirect carries no code");
+        assert_eq!(
+            served.join().unwrap().len(),
+            2,
+            "the flow stops at /sign_in, before /token"
+        );
+        error
+    }
+
+    fn sign_in_refusal(error: &str, description: &str) -> String {
+        format!(
+            "{REDIRECT_URI}?error={error}&error_description={}&state=headless",
+            urlencoding::encode(description)
+        )
+    }
+
+    #[tokio::test]
+    async fn auth_sign_in_invalid_scope_redirect_is_device_refused() {
+        let description = "The requested device id was signed out and cannot be used again.";
+        let error = sign_in_answering(&sign_in_refusal("invalid_scope", description)).await;
+        assert_eq!(
+            error.downcast_ref::<AuthError>(),
+            Some(&AuthError::DeviceRefused {
+                description: Some(description.to_string())
+            })
+        );
+        assert!(is_device_refused(&error));
+        assert!(!is_transient(&error), "a refused id is not retried as is");
+        assert_eq!(
+            format!("{error:#}"),
+            format!("/sign_in refused the request: invalid_scope: {description}")
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_sign_in_access_denied_redirect_is_typed() {
+        let description = "This account has been deactivated.";
+        let error = sign_in_answering(&sign_in_refusal("access_denied", description)).await;
+        let typed = error
+            .downcast_ref::<AuthError>()
+            .expect("access_denied is typed");
+        assert_eq!(
+            typed,
+            &AuthError::AccessDenied {
+                description: Some(description.to_string())
+            }
+        );
+        assert!(!typed.is_device_refused());
+        assert!(
+            !typed.is_transient(),
+            "access_denied is final, never retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_sign_in_temporarily_unavailable_is_transient() {
+        let error = sign_in_answering(&sign_in_refusal(
+            "temporarily_unavailable",
+            "Please try again shortly.",
+        ))
+        .await;
+        assert!(matches!(
+            error.downcast_ref::<AuthError>(),
+            Some(AuthError::TemporarilyUnavailable { .. })
+        ));
+        assert!(is_transient(&error), "retried like an outage");
+        assert!(!is_device_refused(&error));
+    }
+
+    #[tokio::test]
+    async fn auth_is_device_refused_matches_only_that_error() {
+        let device_refused = AuthError::DeviceRefused { description: None };
+        assert!(device_refused.is_device_refused());
+        for other in [
+            AuthError::AccessDenied { description: None },
+            AuthError::TemporarilyUnavailable { description: None },
+            AuthError::SignInRefused {
+                error: "server_error".to_string(),
+                description: None,
+            },
+        ] {
+            assert!(!other.is_device_refused(), "{other:?}");
+            assert!(!is_device_refused(&anyhow::Error::new(other)));
+        }
+        assert!(!is_device_refused(&anyhow!("invalid_scope")), "untyped");
+        // An unknown error code at /sign_in is typed, but neither refusal kind.
+        let error = sign_in_answering(&sign_in_refusal("server_error", "boom")).await;
+        assert_eq!(
+            error.downcast_ref::<AuthError>(),
+            Some(&AuthError::SignInRefused {
+                error: "server_error".to_string(),
+                description: Some("boom".to_string())
+            })
+        );
+        assert!(!is_device_refused(&error));
+        // `/authorize`'s own invalid_scope (a scope refusal, not a device refusal) stays
+        // its untyped message.
+        let key = SiwxKey::generate_ed25519();
+        let refusal = format!("location: {REDIRECT_URI}?state=headless&error=invalid_scope");
+        let (base, served) = serve_in_order(vec![raw_response("303 See Other", &[&refusal])]);
+        let error = authenticate_with_device(&base, "client", REDIRECT_URI, &key, Some("DEVICE_A"))
+            .await
+            .expect_err("refused at /authorize");
+        assert!(!is_device_refused(&error));
+        assert_eq!(
+            format!("{error:#}"),
+            "/authorize refused the request: invalid_scope"
+        );
+        served.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn auth_missing_code_without_error_keeps_old_message() {
+        let location = format!("{REDIRECT_URI}?state=headless");
+        let error = sign_in_answering(&location).await;
+        assert!(error.downcast_ref::<AuthError>().is_none());
+        assert_eq!(
+            format!("{error:#}"),
+            format!("no 'code' in /sign_in redirect: {location}")
+        );
     }
 }

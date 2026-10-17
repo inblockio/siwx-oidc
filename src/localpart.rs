@@ -72,7 +72,7 @@ pub(crate) struct ResolvedIdentity {
     /// and keys forever, and Synapse has no rename API. But the DID-publication
     /// feature added a way for that benign guess to become permanent damage:
     /// when the fallback fires for a user whose real account IS modern-shaped,
-    /// `oidc::provision_synapse_device` re-probes, finds the legacy shape free,
+    /// `oidc::provision_synapse_account` re-probes, finds the legacy shape free,
     /// provisions it, and publishes a **fully valid, correctly-verifying**
     /// `{did, proof}` assertion binding that DID to the new, WRONG mxid. Two
     /// Matrix accounts then carry provider-signed assertions for one DID and no
@@ -83,7 +83,7 @@ pub(crate) struct ResolvedIdentity {
     /// So this flag is threaded to the publication decision and suppresses it.
     /// Publishing nothing costs one login's worth of freshness; the next
     /// healthy sign-in re-asserts (the write is idempotent and unconditional —
-    /// see `provision_synapse_device`'s "why re-assert every time" note).
+    /// see `provision_synapse_account`'s "why re-assert every time" note).
     ///
     /// **Not a general "degraded" flag.** It says one thing: *this localpart
     /// came from the error path.* Do not overload it with "Synapse was slow" or
@@ -474,11 +474,33 @@ pub(crate) mod resolve_identity_tests {
         /// A raw `String` value so a non-JSON fault is expressible; build a JSON
         /// one with `serde_json::json!(…).to_string()`.
         pub(crate) probe_faults: HashMap<String, (axum::http::StatusCode, String)>,
+        /// Localparts `query_user` reports as deactivated. `query_user` answers `200` with
+        /// `is_deactivated` for every localpart in `existing` and `404` for any other, as
+        /// Synapse's `MasQueryUserResource` does: a deactivated or erased account keeps its
+        /// `users` row, so it stays in `existing` and is also listed here.
+        pub(crate) deactivated: HashSet<String>,
+        /// A status `query_user` answers verbatim for a localpart, ahead of every other rule
+        /// (a body of `{}`). Models a fault in front of Synapse, and, with `404`, a
+        /// homeserver whose two MAS reads disagree about whether an account exists.
+        pub(crate) query_user_status: HashMap<String, axum::http::StatusCode>,
     }
 
     #[derive(Clone)]
     struct MockState {
         cfg: Arc<MockSynapseConfig>,
+    }
+
+    /// The `403` Synapse's `assert_request_is_from_mas` answers for a wrong or rotated
+    /// shared secret, on every `/_synapse/mas/*` route alike.
+    fn mas_secret_rejected() -> axum::response::Response {
+        (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "errcode": "M_FORBIDDEN",
+                "error": "This endpoint must only be called by MAS",
+            })),
+        )
+            .into_response()
     }
 
     async fn is_localpart_available_handler(
@@ -495,14 +517,7 @@ pub(crate) mod resolve_identity_tests {
         // Before anything is looked up: a rejected credential says NOTHING
         // about the localpart, and Synapse never reaches `check_username`.
         if state.cfg.reject_secret {
-            return (
-                axum::http::StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "errcode": "M_FORBIDDEN",
-                    "error": "This endpoint must only be called by MAS",
-                })),
-            )
-                .into_response();
+            return mas_secret_rejected();
         }
         if state.cfg.unusable.contains(&localpart) {
             // The live dev shape: a legacy localpart from a long DID whose
@@ -528,6 +543,41 @@ pub(crate) mod resolve_identity_tests {
             )
                 .into_response()
         }
+    }
+
+    /// `GET /_synapse/mas/query_user`, Synapse's `MasQueryUserResource`: `200`
+    /// with the account's status for a localpart that has a `users` row, `404
+    /// M_NOT_FOUND` for any other. Deactivation never removes the row, so a
+    /// deactivated account answers `200` with `is_deactivated: true`.
+    async fn query_user_handler(
+        State(state): State<MockState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> axum::response::Response {
+        let localpart = params.get("localpart").cloned().unwrap_or_default();
+        if let Some(status) = state.cfg.query_user_status.get(&localpart) {
+            return (*status, Json(serde_json::json!({}))).into_response();
+        }
+        if state.cfg.reject_secret {
+            return mas_secret_rejected();
+        }
+        if !state.cfg.existing.contains(&localpart) {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"errcode": "M_NOT_FOUND", "error": "User not found"})),
+            )
+                .into_response();
+        }
+        (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({
+                "user_id": format!("@{localpart}:mock"),
+                "display_name": null,
+                "avatar_url": null,
+                "is_suspended": false,
+                "is_deactivated": state.cfg.deactivated.contains(&localpart),
+            })),
+        )
+            .into_response()
     }
 
     /// `GET /_matrix/client/v3/profile/{mxid}/{field}` — MSC4133's custom
@@ -602,6 +652,7 @@ pub(crate) mod resolve_identity_tests {
                 "/_synapse/mas/is_localpart_available",
                 get(is_localpart_available_handler),
             )
+            .route("/_synapse/mas/query_user", get(query_user_handler))
             .route(
                 "/_matrix/client/v3/profile/{mxid}/{field}",
                 get(profile_field_handler),
@@ -745,7 +796,7 @@ pub(crate) mod resolve_identity_tests {
         assert!(
             resolved.degraded,
             "a fallback must ANNOUNCE that it guessed — this flag is what stops \
-             oidc::provision_synapse_device publishing a signed assertion for a \
+             oidc::provision_synapse_account publishing a signed assertion for a \
              localpart nobody resolved (2026-09-10 audit, D4)"
         );
     }
@@ -920,7 +971,7 @@ OmV4YW1wbGU6c29tZW1lZGlhdG9yI3NvbWVrZXkiXSwiYSI6WyJkaWRjb21tL3YyIl19";
     /// the answer is that returning account — modern localpart, `is_new: false`.
     ///
     /// Without this, a second sign-in by a long-DID user would read as a first
-    /// sign-in, and `oidc::provision_synapse_device` would treat an established
+    /// sign-in, and `oidc::provision_synapse_account` would treat an established
     /// account as brand-new (re-seeding the displayname alias over a name the
     /// user chose).
     #[tokio::test]
@@ -1104,7 +1155,7 @@ OmV4YW1wbGU6c29tZW1lZGlhdG9yI3NvbWVrZXkiXSwiYSI6WyJkaWRjb21tL3YyIl19";
         );
         assert!(
             resolved.degraded,
-            "and the guess must ANNOUNCE itself, or `provision_synapse_device` will publish \
+            "and the guess must ANNOUNCE itself, or `provision_synapse_account` will publish \
              a second, fully-verifying `io.inblock.did` assertion under it (D4)"
         );
         assert!(

@@ -18,6 +18,7 @@ spelling is still accepted; see [configuration.md](configuration.md).
 - [Verifying a published DID](#verifying-a-published-did)
 - [Looking up an identity: `GET /resolve`](#looking-up-an-identity-get-resolve)
 - [The `io.inblock.mxid` userinfo claim](#the-ioinblockmxid-userinfo-claim)
+- [The `io.inblock.mailbox` userinfo claim](#the-ioinblockmailbox-userinfo-claim)
 - [Notes for implementers](#notes-for-implementers)
 
 ## The three tiers
@@ -30,7 +31,8 @@ spelling is still accepted; see [configuration.md](configuration.md).
 
 The DID is also the OIDC `sub` claim of every ID token this provider issues.
 That is the identity an application authorizes on (see the
-[trust model](#trust-model-a-discovery-hint-never-an-authorization-source)).
+[trust model](#trust-model-a-discovery-hint-never-an-authorization-source)). It is the same for
+every client, so discovery advertises `subject_types_supported: ["public"]`, never `pairwise`.
 
 ### The boundary is structural
 
@@ -325,9 +327,11 @@ leave every stored assertion failing as a silent "bad signature"; with a derived
 
 ## Publication
 
-- **One call site.** The field is written by `oidc::provision_synapse_device`,
-  which both sign-in paths use: `/sign_in` (wallet, passkey, headless key) and
-  the device-code grant (QR login). The issuer written into `iss` is
+- **One call site.** The field is written by `oidc::provision_synapse_account`,
+  the account half of provisioning, which `oidc::provision_synapse_device` calls
+  before its device half and which a generic-class sign-in calls alone. Every
+  sign-in path reaches it: `/sign_in` (wallet, passkey, headless key) and the
+  device-code grant (QR login). The issuer written into `iss` is
   `SIWXOIDC_BASE_URL`, the value discovery reports.
 - **Best-effort.** A publication failure never fails a sign-in. Every outcome is
   logged, the same contract as device provisioning and the cross-signing reset
@@ -525,8 +529,16 @@ All four keys are always present, `null` where unknown.
 |---|---|---|
 | `did` | the queried DID, or the published spelling when the account publishes the same DID | the DID the account publishes, or `null` |
 | `mxid` | the MXID the grandfathering rule resolves (legacy for pre-2026-09 accounts) | the queried MXID |
-| `exists` | an account exists under the legacy or the modern localpart | the localpart is taken on this homeserver |
+| `exists` | an ACTIVE account exists under the legacy or the modern localpart | an ACTIVE account holds the localpart on this homeserver |
 | `attested` | the account's `io.inblock.did` field is present and binds to this DID | the published DID derives to this localpart, under either scheme |
+
+**`exists` means an active account.** A deactivated or erased account answers
+`exists: false` on both paths, with `attested: false` and, on the `?mxid=` path,
+`did: null`. Synapse keeps the `users` row of such an account, so the
+availability probe alone reports its localpart as taken for good; the MAS
+`query_user` read is what tells a deactivated account from a live one. Nothing
+else is read from a deactivated account, so the DID its profile still carries is
+not reported. If the account is reactivated it reads `exists: true` again.
 
 **`attested` verifies no signature.** It compares the field's `did` member,
 under `mxid::canonicalize` on the `?did=` path and by re-deriving the localpart
@@ -543,7 +555,7 @@ one was already resolved. The route never returns 500.
 | Status | `error` | Meaning |
 |---|---|---|
 | 400 | `invalid_request` | the request is wrong (selectors, a malformed or foreign MXID, over-length input, a localpart Synapse refuses) |
-| 502 | `upstream_error` | the homeserver could not be asked or gave an unreadable answer; the state is unknown |
+| 502 | `upstream_error` | the homeserver could not be asked, gave an unreadable answer, or contradicted itself (a localpart reported as taken that has no user); the state is unknown |
 | 503 | `unavailable` | this deployment cannot answer: no `SIWXOIDC_MATRIX_SERVER_NAME`, or no Synapse client (standalone) |
 | 504 | `upstream_timeout` | the whole lookup exceeded 10 seconds |
 
@@ -569,11 +581,17 @@ Authentication would buy rate limiting, not secrecy:
   offline.
 - MXID → DID reads a profile field that Synapse serves without authentication
   by default and that federates.
-- `exists` is already observable through the same public profile route.
+- `exists` is observable through the same public profile route, apart from one
+  fact: that an account is deactivated. Synapse keeps serving a deactivated
+  account's profile, so only `/resolve` shows the deactivation, and a caller who
+  reads both can tell a deactivated account from one that never existed. That is
+  deliberate: a deactivated account must not read as a live one to a consumer
+  that acts on `exists`. An erased account's profile is deleted, so it looks
+  like one that never existed on the profile route.
 
 Rate limiting belongs at the reverse proxy. The response stays at four fields:
-adding anything a caller could not compute or fetch themselves would break this
-argument.
+adding anything else a caller could not compute or fetch themselves would break
+this argument.
 
 One side effect exists only on homeservers that set
 `require_auth_for_profile_requests: true`: the anonymous profile read is
@@ -605,6 +623,45 @@ happen.
   both the JSON and the signed-JWT userinfo variants
   (`userinfo_signed_response_alg`).
 
+## The `io.inblock.mailbox` userinfo claim
+
+For a generic mail client, `/userinfo` also carries the caller's mailbox address:
+
+```json
+{ "iss": "https://auth.example.org/", "aud": ["my-mail-client"],
+  "sub": "did:key:zDn…", "preferred_username": "did:key:zDn…",
+  "io.inblock.mxid": "@k3f9x2q7ab4d8m1p:example.org",
+  "io.inblock.mailbox": "k3f9x2q7ab4d8m1p@example.org" }
+```
+
+The value is `<localpart>@<mail_domain>`. Userinfo carries it only when all of these hold:
+
+- the access token belongs to an `oidc` grant (what a code exchange gives a client that
+  holds no Matrix session) whose scope contains `io.inblock.mail`, and the client is
+  generic-class now and still allowed that scope, so a client that changed class or lost
+  the scope stops getting the claim for tokens it already holds;
+- the localpart recorded at sign-in is the opaque one derived from the token's DID
+  (`mxid::localpart_for`) and has the opaque shape, exactly 16 lowercase base36
+  characters (`0-9`, `a-z`), so a grandfathered legacy localpart never gets an address
+  and no other spelling can reach a mail server, which accepts any case and length;
+- `mail_domain` (`SIWXOIDC_MAIL_DOMAIN`) is set.
+
+Otherwise the claim is omitted, never `null`. Like `io.inblock.mxid` it is built from
+the recorded localpart and never re-derived, and it is in both the JSON and the
+signed-JWT variants. `sub` and `preferred_username` stay the DID. It is not an `email`
+claim: a mail server creates the mailbox at first login, so an address in a token says
+nothing about whether mail to it is delivered yet. Userinfo never carries `email` for any
+client, because a mail server that finds no mailbox claim may fall back to it, and an
+`email` value would let a token open that mailbox
+(`userinfo_mailbox_claim_tests::userinfo_never_carries_an_email_claim`). The wire name is
+a serde `rename` literal, checked by
+`userinfo_mailbox_claim_tests::mailbox_claim_opaque_only`.
+
+A token userinfo cannot use (unknown, expired, a refresh token, an authorization code, one
+a client epoch refuses, or one whose client is gone) gets a 401 with
+`WWW-Authenticate: Bearer error="invalid_token"`, so a mail server stops retrying a
+credential that can never work; a request with no token is a 400.
+
 ## Notes for implementers
 
 These rules protect properties that are easy to break by "simplifying" code.
@@ -634,3 +691,4 @@ Each is enforced by a test or explained in the code at the named symbol.
 - **Renaming the field is a three-sided migration** with a dual-read period.
 - **Append to the alias lists; never reorder.**
 - **`io.inblock.mxid` is omitted, never `null`.**
+- **`io.inblock.mailbox` is omitted, never `null`, and userinfo never carries `email`.**

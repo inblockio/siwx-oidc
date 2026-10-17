@@ -357,7 +357,7 @@ async function samplePostUnlockState(page, label) {
 // question of whether a recovery phrase can EVER be entered in this deployment.
 // ---------------------------------------------------------------------------
 
-test('EW-R1-0: after the mandatory first-device wizard, the cross-signing master IS stored in 4S', async ({
+test('EW-R1-0: after the mandatory first-device wizard, the cross-signing master IS stored in 4S', { tag: '@ew-p1' }, async ({
   page,
 }) => {
   test.setTimeout(420_000);
@@ -424,7 +424,7 @@ test('EW-R1-0: after the mandatory first-device wizard, the cross-signing master
 // fire, the requirement is unchanged: the phrase must be enterable.
 // ---------------------------------------------------------------------------
 
-test('EW-R1-1: reload either restores the app OR presents a recovery-key entry that WORKS', async ({
+test('EW-R1-1: reload either restores the app OR presents a recovery-key entry that WORKS', { tag: '@ew-p1' }, async ({
   page,
 }) => {
   test.setTimeout(480_000);
@@ -477,7 +477,7 @@ test('EW-R1-1: reload either restores the app OR presents a recovery-key entry t
 // The recovery phrase is the ONLY correct answer here, so it must be enterable.
 // ---------------------------------------------------------------------------
 
-test('EW-R1-2: new device with NO other verified session can ENTER the recovery phrase (R5/R6)', async ({
+test('EW-R1-2: new device with NO other verified session can ENTER the recovery phrase (R5/R6)', { tag: '@ew-p2' }, async ({
   page,
   browser,
 }) => {

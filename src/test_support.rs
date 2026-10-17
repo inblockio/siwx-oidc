@@ -7,6 +7,11 @@
 //!   a machine without Redis.
 //! - With `SIWX_TEST_REQUIRE_REDIS=1` the same test panics instead. CI sets it,
 //!   so a CI run can never report an unexercised Redis test as a pass.
+//! - Every client it returns records static clients in a set of its own, never the
+//!   real `clients:static`. The start-up sync deletes each client its set records
+//!   that the configured map no longer names, and the Redis a test reaches can be a
+//!   running stack's or a developer's deployment's: a sync through the real set
+//!   would delete that stack's static clients.
 //!
 //! Not `#[cfg(test)]`, on purpose: the binary crate's unit tests and every
 //! `tests/*.rs` file link this library compiled *without* `cfg(test)`, so a
@@ -54,18 +59,42 @@ fn required_from(value: Option<&str>) -> bool {
     }
 }
 
+/// The test Redis's URL on database `db` of the same server.
+pub fn redis_db_url(db: u8) -> Url {
+    let mut url = redis_url();
+    url.set_path(&format!("/{db}"));
+    url
+}
+
 /// A client for the test Redis, or `None` after [`skip_or_fail`] when it is
-/// unreachable.
+/// unreachable. It records static clients in a set of its own (see the module
+/// docs), so a start-up sync through it prunes only what it wrote itself.
 pub async fn redis() -> Option<RedisClient> {
-    let url = redis_url();
+    connect(redis_url()).await
+}
+
+/// [`redis`] on database `db` of the same server, for a test that must not
+/// share a database with the others (one that claims every due outbox entry
+/// in it, say). Each such test takes its own number; taken so far: 4 to 7 and
+/// 12 to 15 (guest route tests, `env(Some(n))`/`env_in(Some(n))` and the reaper),
+/// 2 and 8 (the orphan scan), 9 (the outbox), 10 (back-channel logout), 11
+/// (static-client isolation). Free: 1 and 3.
+pub async fn redis_db(db: u8) -> Option<RedisClient> {
+    connect(redis_db_url(db)).await
+}
+
+/// The one way a test client is built, so none can come without its own set.
+async fn connect(url: Url) -> Option<RedisClient> {
     if let Err(reason) = probe(&url).await {
         return skip_or_fail(&format!("no Redis at {} ({reason})", redacted(&url)));
     }
-    Some(
-        RedisClient::new(&url)
-            .await
-            .unwrap_or_else(|e| panic!("{REDIS_URL_VAR}: cannot build a client: {e:#}")),
-    )
+    let client = RedisClient::new(&url)
+        .await
+        .unwrap_or_else(|e| panic!("{REDIS_URL_VAR}: cannot build a client: {e:#}"));
+    Some(client.with_static_clients_key(format!(
+        "clients:static:test-{}",
+        uuid::Uuid::new_v4().simple()
+    )))
 }
 
 /// One bounded `PING` on a fresh connection, proving a Redis answers at `url`.
@@ -120,6 +149,91 @@ fn redacted(url: &Url) -> Url {
     let mut shown = url.clone();
     let _ = shown.set_password(None);
     shown
+}
+
+/// Everything the code under test logs on the calling thread at `DEBUG` and
+/// above (what `RUST_LOG=debug` shows, the most verbose setting an operator
+/// reaches for), for as long as the value lives.
+///
+/// Built on `tracing::subscriber::set_default`, which is per thread: use it in a
+/// `#[tokio::test]` (a current-thread runtime, so every task the test awaits runs
+/// on the test's own thread) and in a plain `#[test]`. Tests running in parallel
+/// on other threads never write into it, and a global subscriber set by
+/// `test_log` or `env_logger` does not matter, because the thread-local one
+/// wins. A task spawned onto another thread logs elsewhere and is invisible
+/// here, so a test of such a path must not rely on `LogCapture` for its negative
+/// assertion.
+pub struct LogCapture {
+    buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+impl LogCapture {
+    /// Start capturing (spans included, so a field a span carries shows up on
+    /// every event inside it).
+    pub fn start() -> Self {
+        // A second dispatcher, registered for the life of the process and
+        // writing nowhere. tracing-core caches per callsite whether anyone
+        // wants it, and while exactly one dispatcher exists it asks only the
+        // dispatcher of the thread that first reaches the callsite. With the
+        // capture as that one dispatcher, a callsite first hit on a thread that
+        // has no capture is cached as "never", and the capturing thread then
+        // loses every event from it: a log assertion failed about every other
+        // run of the unit tests. With two registered, tracing-core asks every
+        // dispatcher, and this one enables DEBUG, so the callsite stays on.
+        // Pin: `tests/log_capture_callsite_interest.rs`.
+        static KEEP: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        KEEP.get_or_init(|| {
+            tracing::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::DEBUG)
+                    .with_writer(std::io::sink)
+                    .finish(),
+            )
+        });
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(SharedBuffer(buffer.clone()))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        Self {
+            buffer,
+            _guard: guard,
+        }
+    }
+
+    /// Everything captured so far.
+    pub fn output(&self) -> String {
+        let bytes = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+#[derive(Clone)]
+struct SharedBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Write for SharedBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuffer {
+    type Writer = SharedBuffer;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
 }
 
 #[cfg(test)]

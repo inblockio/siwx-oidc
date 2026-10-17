@@ -122,6 +122,26 @@ paths:
         `op_policy_uri` are present only when the operator configured them
         (`SIWXOIDC_OP_TOS_URI`, `SIWXOIDC_OP_POLICY_URI`); there is no
         default. The login page reads them here for its footer.
+
+        `subject_types_supported` is `["public"]`: the `sub` is the user's DID,
+        the same value for every client, so a relying party must not expect a
+        pairwise identifier.
+
+        `response_types_supported` is exactly `["code"]`: the
+        authorization-code flow is the only one `/authorize` accepts.
+
+        `scopes_supported` lists `io.inblock.mail`, and `claims_supported` lists
+        `io.inblock.mailbox`, only when `mail_domain` is configured, the one
+        case in which `/userinfo` can carry the mailbox claim. `claims_supported`
+        lists `io.inblock.mxid` only when a Matrix server name is configured.
+
+        `end_session_endpoint` (`{issuer}/end_session`) advertises
+        RP-initiated logout, in both modes.
+
+        `backchannel_logout_supported` and `backchannel_logout_session_supported`
+        (both `true`) advertise OpenID Connect Back-Channel Logout 1.0 in
+        generic mode only (no MAS shared secret): logout tokens are sent for
+        `oidc` grants, and in Matrix mode every grant is a Matrix device grant.
       responses:
         "200":
           description: Provider metadata.
@@ -167,18 +187,47 @@ paths:
       operationId: authorize
       summary: Begin an authorization-code flow
       description: |
-        Standard OIDC authorization request. Issues the `siwx` session cookie
-        and the CAIP-122 nonce the client signs, then renders the login page.
+        Standard OIDC authorization request, authorization-code flow only.
+        Issues the `session` cookie and the CAIP-122 nonce the client signs,
+        then redirects to the login page.
+
+        The scope word `urn:io.inblock:guest` (guest mode on) selects the guest hand-off instead; it is
+        not in discovery and never granted. Only the static public client `guest_client_id` with an exact
+        URI of `guest_client_redirect_uris` may use it, with S256 PKCE and `prompt=none`; anything else is
+        `invalid_request` on the redirect URI. A `Sec-Fetch-Site: cross-site` request is `access_denied`
+        (topology `same-site`). Without a live guest session (a cookie whose record is `minted`,
+        `provisioning` or `active`, before its deadline) the answer is `interaction_required` on the
+        redirect URI; the login page is never shown. With one, the browser goes to `/guest/continue`.
+
+        - `response_type` must be `code`. Any other value is answered by a
+          redirect to the (validated) `redirect_uri` with
+          `error=unsupported_response_type` and the `state`.
+        - PKCE is required: `code_challenge` with `code_challenge_method=S256`
+          (the default). A missing challenge or another method is a 400.
+        - `redirect_uri` must equal one of the client's registered redirect
+          URIs exactly, query included (RFC 9700 §4.1.3); otherwise the browser
+          is sent to `/error?message=unregistered_redirect_uri`.
+        - A generic-class client (a `default_clients` entry with
+          `"class": "generic"`) is granted only the requested scopes its entry
+          allows. A request that would grant it no `openid` is answered by a
+          redirect to the `redirect_uri` with `error=invalid_scope` and the
+          `state`.
+
+        The validated request (client, redirect URI, state, response mode,
+        PKCE challenge) is bound to the session; `/sign_in` issues the code for
+        exactly that request.
       parameters:
         - { name: client_id, in: query, required: true, schema: { type: string } }
         - { name: redirect_uri, in: query, required: true, schema: { type: string, format: uri } }
-        - { name: response_type, in: query, required: true, schema: { type: string } }
-        - { name: scope, in: query, required: false, schema: { type: string } }
-        - { name: state, in: query, required: false, schema: { type: string } }
+        - { name: response_type, in: query, required: true, schema: { type: string, enum: [code] } }
+        - { name: scope, in: query, required: true, schema: { type: string } }
+        - { name: state, in: query, required: true, schema: { type: string } }
         - { name: nonce, in: query, required: false, schema: { type: string } }
+        - { name: code_challenge, in: query, required: true, schema: { type: string } }
+        - { name: code_challenge_method, in: query, required: false, schema: { type: string, enum: [S256] } }
+        - { name: response_mode, in: query, required: false, schema: { type: string, enum: [query, fragment] } }
       responses:
-        "200": { description: The login page. }
-        "302": { description: Redirect back to the relying party. }
+        "303": { description: Redirect to the login page, or back to the relying party with an OAuth error. }
         "400": { $ref: "#/components/responses/BadRequest" }
 
   /sign_in:
@@ -189,7 +238,26 @@ paths:
       description: |
         Reads the verified DID — from the `siwx` cookie's CAIP-122 signature, or
         from the server-side session a WebAuthn ceremony wrote — and redirects
-        to the relying party with an authorization code.
+        to the relying party with an authorization code for the request
+        `/authorize` bound to the session: its client, redirect URI, state,
+        response mode and PKCE challenge.
+
+        No query parameter is read while the session lives. The login page
+        appends the authorization parameters (`redirect_uri`, `state`,
+        `client_id`, `oidc_nonce`, `code_challenge`, `code_challenge_method`,
+        `response_mode`) to its link, and they never decide the code. A session
+        started before the request was bound (an older server build) is refused
+        with a restart-sign-in error.
+
+        The login session, and its cookie, live 300 s. When it is gone (no
+        `session` cookie, no `Cookie` header, or a session Redis no longer
+        holds), the query is read for one purpose: when `client_id` names a
+        registered client and `redirect_uri` is one of its registered redirect
+        URIs (matched exactly, as `/authorize` matches it), the answer is a 303
+        there with `error=access_denied`, an `error_description` saying the
+        sign-in timed out, and the query's `state` (in the fragment for
+        `response_mode=fragment`). Otherwise it is the 400 timed-out page.
+        Nothing is issued or written.
 
         This is also the single point where a Matrix account is provisioned: the
         localpart is resolved (honouring grandfathering), the alias is seeded on
@@ -197,11 +265,19 @@ paths:
         named after the OAuth client's `client_name`, else its `client_id`; an
         existing one keeps its name), and the attested DID is re-published. Every one of those is best-effort and never fails the
         sign-in.
+
+        A generic-class client's sign-in provisions the account and publishes
+        the DID, but upserts no device and arms no cross-signing reset. It never
+        guesses a localpart: when the homeserver cannot confirm the account the
+        answer is a 503, and a request that grants the client no `openid` is a
+        400. The code records the class of the client it was issued to.
       security:
         - sessionCookie: []
       responses:
-        "302": { description: Redirect to `redirect_uri` with `code` and `state`. }
-        "401": { description: The account is deactivated, or the ceremony did not verify. }
+        "303": { description: "Redirect to the bound `redirect_uri` with `code` and the bound `state`. When the login session has expired, the `access_denied` redirect described above. With `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` on, a refusal is also a redirect there, with `error` and the bound `state` (in the fragment for `response_mode=fragment`) and no code: `invalid_scope` when a Matrix-class request proposes a device id this server deleted (never recreated; sign in with a fresh id), `access_denied` for a deactivated or erased account, `temporarily_unavailable` when the deactivation check or the device creation failed." }
+        "400": { description: "The session has no bound request, the CAIP-122 proof is invalid, or a generic-class client's request grants it no `openid`. The login session has expired and the query names no registered client and redirect URI: an HTML page saying the sign-in timed out, which reflects no input." }
+        "401": { description: "The account is deactivated (with `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` off; on, the `access_denied` redirect), or the ceremony did not verify." }
+        "503": { description: "The homeserver could not be asked: the deactivation check failed (with `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` off; on, the `temporarily_unavailable` redirect), or a generic-class sign-in could not confirm the account." }
 
   /token:
     post:
@@ -212,9 +288,62 @@ paths:
         Supports `authorization_code`, `refresh_token` and
         `urn:ietf:params:oauth:grant-type:device_code`.
 
-        Refresh rotates both tokens. A bounded grace pointer (60s) lets a client
-        that LOST the rotation response — common on mobile — replay the old
-        refresh token once instead of being signed out.
+        `authorization_code`: the code is single use (deleted on exchange) and
+        needs the PKCE `code_verifier` for the challenge bound at `/authorize`.
+        `refresh_token`: accepts only a refresh token; an access token (a
+        minted admin token included) is `invalid_grant`, like an unknown one.
+
+        Refresh rotates both tokens, atomically: concurrent refreshes of one
+        token all receive the same new pair. A client that LOST the rotation
+        response — common on mobile — can replay the previous refresh token and
+        receive the same successor pair, however late, for as long as that pair
+        is unused (its access token not yet accepted by introspection or
+        `/userinfo`, its refresh token not yet rotated). A replay after that, or
+        after the successor was rotated or revoked, is `invalid_grant`; reuse of
+        a superseded token is logged as a security event and, when the operator
+        enables `reuse_revokes_grant` (off by default), also revokes the grant,
+        so its current refresh token is refused too. A refresh token issued
+        by a build before the grant record is answered with tokens in the current
+        format (`mcr_{handle}_{secret}`), and its replays follow the same rule.
+        A refresh response carries no `scope`: a grant's scope is fixed when it
+        is issued and a rotation copies it (RFC 6749 section 5.1 lets an
+        unchanged scope go unnamed), so a client reads the granted scope from
+        its code exchange.
+
+        In a standalone deployment (no MAS shared secret) the code exchange
+        grants the requested scope among `openid`, `profile` and `offline_access`
+        and issues a refresh token only for `offline_access` to a client whose
+        registration allows the refresh grant; a delegated-auth deployment records
+        the Matrix scope for a Matrix-class client and always issues one.
+
+        A generic-class client (a `default_clients` entry with `"class":
+        "generic"`, served in delegated-auth deployments only) is issued an
+        `oidc` grant with no Matrix device. Its scope is the requested scopes
+        its entry allows, then the scopes the entry always grants; a refresh
+        token is issued only when `offline_access` is part of it and the client's
+        registration allows the refresh grant. The response names the scope when
+        it differs from the request, and the ID token carries the grant's `sid`.
+        A code is redeemed only by a client of the class it was issued to, and a
+        request that grants no `openid` has no grant to issue: both are
+        `invalid_grant`. The device-code grant mints a Matrix session, so a
+        generic-class client is refused it with `unauthorized_client`.
+
+        **Client authentication.** `authorization_code` and `refresh_token` are
+        bound to the client the code or token was issued to, and share one rule.
+        The client named in the request, in `client_id` or as the user name of an
+        `Authorization: Basic` header (both, if present, must agree), must be that
+        client: otherwise `invalid_grant`. A confidential client (registered with
+        a `token_endpoint_auth_method` other than `none`, or with none while
+        `SIWXOIDC_REQUIRE_SECRET` is on) must also present its secret, as
+        `client_secret` in the form or as the `Authorization` password (the Basic
+        user name and password are form-urldecoded, RFC 6749 §2.3.1): otherwise
+        `invalid_client`. A public client authenticates nothing and may omit
+        `client_id` at the refresh grant. The replay of a lost response is bound to
+        the client like a rotation. A refresh token whose client registration has expired
+        (a dynamic registration lasts 30 days from its last use) still refreshes when the request names that
+        client or none, and is refused when it presents a secret. The Matrix
+        refresh endpoint `POST /_matrix/client/v3/refresh` has no client identity
+        to carry, so it refuses a confidential client's refresh token.
       requestBody:
         required: true
         content:
@@ -230,6 +359,7 @@ paths:
                 redirect_uri: { type: string, format: uri }
                 client_id: { type: string }
                 client_secret: { type: string }
+                code_verifier: { type: string, description: PKCE verifier; required with `authorization_code`. }
       responses:
         "200":
           description: Tokens.
@@ -240,12 +370,37 @@ paths:
           description: |
             OAuth error. `authorization_pending` and `slow_down` are the normal
             polling answers on the device-code grant, not failures.
+            `invalid_grant` includes a code or refresh token presented by a
+            client it was not issued to, and a guest's refresh at or past its
+            deadline, while its record is `reaping`, with the guest kill switch
+            on, or for a device its record does not list (a Redis read error
+            there is a 503, never a pass). With
+            `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` on, a device-code poll whose
+            request proposes a device id this server deleted is
+            `invalid_scope`, and the code is denied: the next poll is
+            `access_denied`, never a token.
+        "401":
+          description: |
+            `invalid_client`: the client did not authenticate (RFC 6749 §5.2). A
+            request that tried HTTP Basic gets `WWW-Authenticate: Basic`.
 
   /userinfo:
     get:
       tags: [OIDC]
       operationId: userinfo
       summary: Claims about the authenticated user
+      description: |
+        Accepts an access token only. A token that cannot be used is answered
+        **401** with `WWW-Authenticate: Bearer error="invalid_token"` (RFC 6750
+        section 3.1), so a resource server can tell a dead credential from a
+        malformed request: an unknown or expired token, a refresh token
+        presented as a bearer token (it goes only to the refresh grants and to
+        revocation), an authorization code (before or after its exchange; a
+        code is a single-use grant, not a credential), a token an epoch refuses,
+        and the token of a client that no longer exists. A request that presents
+        no token at all is a 400.
+
+        The response never carries an `email` claim.
       security: [{ bearerToken: [] }]
       responses:
         "200":
@@ -256,10 +411,12 @@ paths:
             application/jwt:
               schema: { type: string, description: Returned when the client registered a `userinfo_signed_response_alg`. }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/InvalidBearerToken" }
     post:
       tags: [OIDC]
       operationId: userinfoPost
       summary: Claims about the authenticated user (form-encoded token)
+      description: Answers exactly as `GET /userinfo` does.
       security: [{ bearerToken: [] }]
       requestBody:
         content:
@@ -273,12 +430,17 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/UserInfo" }
+            application/jwt:
+              schema: { type: string, description: Returned when the client registered a `userinfo_signed_response_alg`. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/InvalidBearerToken" }
 
   /register:
     post:
       tags: [OIDC]
       operationId: registerClient
       summary: Dynamic client registration (RFC 7591)
+      description: The client is kept for 30 days after its last use (an authorization request, a code, device-code or refresh exchange, or a userinfo call). Registering again is the recovery after that.
       requestBody:
         required: true
         content:
@@ -289,13 +451,44 @@ paths:
               properties:
                 redirect_uris: { type: array, items: { type: string, format: uri } }
                 client_name: { type: string }
+                post_logout_redirect_uris:
+                  type: array
+                  items: { type: string, format: uri }
+                  description: |
+                    Where `/end_session` may send the user back (OpenID Connect
+                    RP-Initiated Logout 1.0 §3.1). Matched exactly, query
+                    included. Echoed in the response.
+                backchannel_logout_uri:
+                  type: string
+                  format: uri
+                  description: |
+                    Where a logout token (`logout_token=…`, a form POST) is sent
+                    when one of the client's grants is deleted (OpenID Connect
+                    Back-Channel Logout 1.0 §2.2; generic mode). No fragment;
+                    `https`, and every address its host resolves to must be
+                    public (not loopback, private, CGNAT, link-local,
+                    multicast, unspecified or reserved), unless the operator
+                    allowlisted the host. Checked again at every delivery.
+                    Echoed in the response.
+                backchannel_logout_session_required:
+                  type: boolean
+                  description: |
+                    The client requires a `sid` in every logout token; a grant
+                    without one sends it none. Echoed in the response.
       responses:
         "201":
           description: The registered client, with its secret and registration access token.
           content:
             application/json:
               schema: { type: object }
-        "400": { description: "Invalid metadata — a `redirect_uri` carrying a fragment is rejected." }
+        "400":
+          description: |
+            Invalid metadata: a `redirect_uri` carrying a fragment is
+            `invalid_redirect_uri`; a `post_logout_redirect_uri` carrying one,
+            a `backchannel_logout_uri` the SSRF guard refuses, and (with the
+            operator's `backchannel_logout_required_for_refresh`, generic
+            mode) a client that may refresh without a `backchannel_logout_uri`
+            are `invalid_client_metadata`.
 
   /client/{id}:
     parameters:
@@ -314,6 +507,10 @@ paths:
       security: [{ registrationAccessToken: [] }]
       responses:
         "200": { description: Updated client metadata. }
+        "400":
+          description: |
+            `invalid_client_metadata`, as at registration (the same logout
+            metadata checks, the SSRF guard included).
     delete:
       tags: [OIDC]
       operationId: deleteClient
@@ -342,8 +539,18 @@ paths:
         **Unauthenticated on purpose.** The DID → localpart direction is a pure
         function of the DID, and the MXID → DID direction reads a profile field
         Synapse serves without authentication and federates. Everything here is
-        already publicly computable, so authentication would buy rate-limiting,
-        not secrecy — put that at the reverse proxy.
+        publicly computable or readable, with one deliberate exception (next
+        paragraph), so authentication would buy rate-limiting, not secrecy:
+        put that at the reverse proxy.
+
+        `exists` is `false` for a deactivated or erased account, whose localpart
+        Synapse keeps reserved; such an answer carries `did: null` on the
+        `?mxid=` path and `attested: false`, and nothing is read from the
+        account. That is the one fact this route adds beyond what is publicly
+        readable: Synapse keeps serving a deactivated account's profile, so a
+        caller who reads the profile route as well can tell a deactivated
+        account from one that never existed. It is deliberate: a deactivated
+        account must not read as a live one.
 
         A `did` is checked before the homeserver is asked anything. It must be
         a DID some sign-in on this provider could accept: a method aqua-auth
@@ -378,6 +585,9 @@ paths:
                 unknown:
                   summary: A well-formed DID that has never signed in here
                   value: { did: "did:key:z6MkpFemPtmjvPZ1gFYM6d68tuwxxrcec4H2Ck23FRchU9ue", mxid: "@04gen9jsoj657dc0:matrix.example.org", exists: false, attested: false }
+                deactivated:
+                  summary: A deactivated or erased account, looked up by `?mxid=`
+                  value: { did: null, mxid: "@1vo8g4vofiha69ua:matrix.example.org", exists: false, attested: false }
         "400":
           description: |
             Not exactly one selector; a `did` that is not a DID any sign-in here
@@ -399,7 +609,9 @@ paths:
                   summary: A DID method this provider never signs in
                   value: { error: invalid_request, message: "`did:web:example.com` is not a DID this provider can sign in (supported methods: `did:pkh`, `did:key`, `did:peer`), so no account can exist for it." }
         "502":
-          description: The homeserver could not be asked. Never a guessed answer.
+          description: |
+            The homeserver could not be asked, or contradicted itself (a localpart
+            reported as taken that has no user). Never a guessed answer.
         '504':
           $ref: '#/components/responses/ResolveError'
           description: |
@@ -411,6 +623,56 @@ paths:
         "503":
           description: This deployment has no homeserver configured and cannot answer.
           content: { application/json: { schema: { $ref: "#/components/schemas/ResolveError" } } }
+
+  /end_session:
+    get:
+      tags: [OIDC]
+      operationId: endSession
+      summary: RP-initiated logout (OpenID Connect RP-Initiated Logout 1.0)
+      description: |
+        Ends the grant whose `sid` the `id_token_hint` carries, if the grant
+        belongs to the hint's client (`aud`) and subject (`sub`): its access
+        token is inactive at once and its refresh token is refused. Only that
+        grant ends; a Matrix device is never deleted here (the Matrix `logout`
+        is the device sign-out). The hint must be an ID token this provider
+        signed, with the live or a retired key (an expired one is accepted).
+        A hint without a `sid`, or no hint, ends nothing.
+
+        Everything is checked before anything ends: a hint that does not
+        verify, a `client_id` that is not the hint's audience, or a
+        `post_logout_redirect_uri` that is not registered for the client
+        (exact match, query included) is a 400 that ends nothing and never
+        redirects.
+      parameters:
+        - { name: id_token_hint, in: query, schema: { type: string } }
+        - { name: client_id, in: query, schema: { type: string } }
+        - { name: post_logout_redirect_uri, in: query, schema: { type: string, format: uri } }
+        - { name: state, in: query, schema: { type: string } }
+      responses:
+        "200": { description: "The signed-out page (no `post_logout_redirect_uri`)." }
+        "303": { description: "To the registered `post_logout_redirect_uri`, with `state` appended when one was sent." }
+        "400": { description: "The hint, the `client_id` or the `post_logout_redirect_uri` was refused; nothing ended." }
+        "503": { description: "The token store is unavailable; nothing ended, retry." }
+    post:
+      tags: [OIDC]
+      operationId: endSessionPost
+      summary: RP-initiated logout, form-encoded
+      description: The same as `GET /end_session`, with the parameters in the body.
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                id_token_hint: { type: string }
+                client_id: { type: string }
+                post_logout_redirect_uri: { type: string, format: uri }
+                state: { type: string }
+      responses:
+        "200": { description: "The signed-out page (no `post_logout_redirect_uri`)." }
+        "303": { description: "To the registered `post_logout_redirect_uri`, with `state` appended when one was sent." }
+        "400": { description: "The hint, the `client_id` or the `post_logout_redirect_uri` was refused; nothing ended." }
+        "503": { description: "The token store is unavailable; nothing ended, retry." }
 
   /oauth2/introspect:
     post:
@@ -426,6 +688,11 @@ paths:
 
         `device_id` is rendered as JSON `null`, never `""`: Synapse 1.159
         rejects a present-but-empty device id with a 500.
+
+        Only an access token (a minted admin token included) can be active. A
+        refresh token is `{"active": false}`, exactly like an unknown token. So
+        is the access token of an `oidc` grant, which here is a generic-class
+        client's: it is not a Matrix session, whatever its scope says.
       security: [{ masSharedSecret: [] }]
       requestBody:
         required: true
@@ -438,8 +705,9 @@ paths:
       responses:
         "200":
           description: |
-            Token metadata, or `{"active": false}`. An UNKNOWN token is
-            `{"active": false}` with HTTP 200 — never a 4xx.
+            Token metadata, or `{"active": false}`. An UNKNOWN token, one
+            that is not an access token, or an `oidc` grant's access token is
+            `{"active": false}` with HTTP 200, never a 4xx.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Introspection" }
@@ -474,10 +742,18 @@ paths:
       operationId: revoke
       summary: Revoke a token (RFC 7009)
       description: |
-        Token hygiene only. It revokes the access token and its paired refresh
-        token and **never deletes the Synapse device** — clients fire this on
+        Token hygiene by default. Accepts either an access or a refresh token. For a
+        Matrix device it revokes the device's grant (the access token and its
+        paired refresh token). For a token with no device, an access token is
+        revoked alone, and a refresh token revokes its whole grant, the grant's
+        live access token included (RFC 7009 §2.1; provisional). By default it
+        **never deletes the Synapse device** — clients fire this on
         rotation and on dialog dismissals, and deleting the device there raced
-        in-flight key uploads and wedged users' cross-signing identity.
+        in-flight key uploads and wedged users' cross-signing identity. With
+        `SIWXOIDC_REVOKE_DELETES_DEVICE` on (it requires
+        `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`), the revoke of a Matrix-credential
+        grant ends the session including its device (MAS parity): Synapse
+        delete, then the deleted-id marker, then the revoke.
       requestBody:
         content:
           application/x-www-form-urlencoded:
@@ -486,7 +762,8 @@ paths:
               required: [token]
               properties: { token: { type: string } }
       responses:
-        "200": { description: Always 200, per RFC 7009 — revoking an unknown token is not an error. }
+        "200": { description: 200 per RFC 7009 — revoking an unknown token is not an error. }
+        "503": { description: "Only with `SIWXOIDC_REVOKE_DELETES_DEVICE` on: Synapse could not delete the device (transient) or the revoke after the delete failed. Retryable (RFC 7009 §2.2.1); a transient delete failure revoked nothing, so the token is still valid." }
 
   /device_authorization:
     post:
@@ -499,13 +776,38 @@ paths:
         redeems the device code. Without it the request is refused before
         anything is stored, with the same RFC 6749 §5.2 error the token
         endpoint gives the grant (RFC 8628 §3.2), so no code is issued that a
-        user could approve but a client never redeem.
+        user could approve but a client never redeem. A generic-class client is
+        refused the same way with `unauthorized_client`: the grant mints a Matrix
+        session, which such a client never gets.
+
+        With `login_hint`, the code is for one account: the approval page shows
+        it, and only an identity that signs in as that account can approve the
+        code (any other is refused and the code stays pending). The device-code
+        grant then issues tokens for that account only. Without it, any account
+        may approve, as before. Unknown form fields are ignored, so a client may
+        send `login_hint` to a build that does not read it.
       requestBody:
         content:
           application/x-www-form-urlencoded:
             schema:
               type: object
-              properties: { client_id: { type: string }, scope: { type: string } }
+              required: [client_id]
+              properties:
+                client_id: { type: string }
+                scope: { type: string }
+                login_hint:
+                  type: string
+                  description: |
+                    The account the device asks to be signed in as, in the form MAS
+                    reads: `mxid:@localpart:server_name`. The server name is
+                    everything after the first colon that follows the localpart (it
+                    may carry a port) and must equal this deployment's homeserver
+                    server name exactly. An empty value is treated as absent (RFC
+                    6749 §3.1). A localpart with an uppercase letter is refused
+                    (every localpart here is lowercase). Only the form and the server
+                    are checked, never whether the account exists. In Matrix mode
+                    without a configured server name any hint is refused with 400.
+                  example: "mxid:@alice:example.org"
       responses:
         "200":
           description: Device and user codes.
@@ -515,8 +817,14 @@ paths:
         "400":
           description: |
             `{"error": "unsupported_grant_type", "error_description": …}` when
-            the deployment is not in delegated-auth mode; a plain 400 for an
-            unknown `client_id`.
+            the deployment is not in delegated-auth mode;
+            `{"error": "unauthorized_client", "error_description": …}` for a
+            generic-class client; `{"error": "invalid_request",
+            "error_description": …}` for a `login_hint` that is not
+            `mxid:@localpart:server_name`, names another homeserver, has an
+            uppercase letter in the localpart, or arrives when no Matrix server
+            name is configured (no code is issued); a plain 400 for an unknown
+            `client_id`.
 
   /device:
     get:
@@ -531,15 +839,52 @@ paths:
       summary: Approve a device login with a wallet signature
       responses:
         "200": { description: Approval outcome. }
-        "400": { description: "Rejected — including a new identity, which may only be created at the login screen." }
+        "400": { description: "Rejected: including a new identity, which may only be created at the login screen, and, for a code whose request named an account (`login_hint`), an identity that does not sign in as that account. The plain-text body names the expected account and the one signed in; the code stays pending." }
+        "503": { description: "The account checks could not run (the homeserver could not be asked). Nothing was approved." }
 
   /device/verify:
     get:
       tags: [Device grant]
       operationId: deviceVerify
       summary: Check whether a user code is valid and still pending
+      description: |
+        For a code whose request named an account (`login_hint`), the answer names
+        that account and whether the page offers the passkey sign-in. The account
+        name is the requester's own input. `passkey_offered` is `false` only when
+        the account does not exist, or when its published DID (the one `GET
+        /resolve?mxid=` answers) has no stored passkey, derived or linked; so for
+        a hinted code it tells the caller whether that account has a passkey that
+        can approve here. It is a display hint: the approval itself is checked
+        against the account either way. The answer is computed once per code and
+        reused for up to a minute (a "none" answer) or the code's lifetime. The
+        credential scan behind it runs at most once per account per ten minutes
+        when it completes, concurrent requests included: a request that arrives while another is
+        scanning for the same account cannot be told yet, so it answers
+        `passkey_offered: true` and keeps nothing for the code, and the next
+        request asks again. A scan that fails keeps its claim until 30 seconds
+        after it was taken, so a failing scan repeats at most once per 30
+        seconds per account; while the credential store fails, nothing is
+        scanned and the answer is `passkey_offered: true`.
       parameters: [{ name: user_code, in: query, required: true, schema: { type: string } }]
-      responses: { "200": { description: Validity of the code. } }
+      responses:
+        "200":
+          description: The code is valid and pending.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [passkey_offered]
+                properties:
+                  expected_account:
+                    type: string
+                    description: The account the request is for, `@localpart:server_name`; absent when it names none.
+                  passkey_offered:
+                    type: boolean
+                    description: Whether the page offers the passkey sign-in; always `true` for a code that names no account.
+                  account_missing:
+                    type: boolean
+                    description: Present and `true` only when `passkey_offered` is `false` because the named account does not exist or is deactivated, so the page does not say it has no passkey.
+        "400": { description: The code is unknown, expired or already used (plain text). }
 
   /device/nonce:
     get:
@@ -553,6 +898,11 @@ paths:
       tags: [Device grant]
       operationId: devicePasskeyStart
       summary: Begin passkey authentication for device approval
+      description: |
+        Scoped by the opaque `siwx_user` cookie as at login. For a code whose
+        request named an account, a cookie for another account is ignored
+        (usernameless); the named account never scopes the picker, so this
+        endpoint lists no credential ids for a requester-supplied account.
       responses: { "200": { description: A WebAuthn request challenge. } }
 
   /device/passkey/finish:
@@ -562,23 +912,48 @@ paths:
       summary: Finish passkey authentication and approve the device
       responses:
         "200": { description: Approved. }
-        "400": { description: "Rejected — a new identity cannot be created here." }
+        "400": { description: "Rejected: a new identity cannot be created here; for a code whose request named an account, a passkey that does not sign in as that account (a linked passkey signs in as the identity it is linked to). The code stays pending." }
         "401": { $ref: "#/components/responses/UnknownCredential" }
+        "503": { description: "The account checks could not run. Nothing was approved." }
 
   /webauthn/register/start:
     post:
       tags: [Sign-in ceremonies]
       operationId: webauthnRegisterStart
       summary: Begin passkey registration
-      responses: { "200": { description: A W3C `CreationChallengeResponse`. } }
+      responses:
+        "200": { description: A W3C `CreationChallengeResponse`. }
+        "400": { description: "No `session` cookie (or no `Cookie` header): the 300 s login session has expired, and the body is `{\"error\":\"login_session_expired\"}`; the login page then goes to `/sign_in`, which sends the user back to the client." }
 
   /webauthn/register/finish:
     post:
       tags: [Sign-in ceremonies]
       operationId: webauthnRegisterFinish
       summary: Finish passkey registration
-      description: The resulting P-256 public key derives the user's `did:key:zDn…`.
-      responses: { "200": { description: The derived DID. } }
+      description: |
+        The resulting P-256 public key derives the user's `did:key:zDn…`.
+        Registration is create-only: a credential id that is already registered,
+        that has link state, or that the enabled aqua-auth credential store
+        already holds, is refused and nothing is written.
+      responses:
+        "200": { description: "`{did, credential_id}`: the derived DID." }
+        "400":
+          description: |
+            Two different answers share this status; tell them apart by the body.
+            A refused registration (the credential id is already registered, has
+            link state, or is held by the enabled credential store) is JSON with
+            exactly `{"error":"registration failed"}`, a fixed body that names no
+            reason and echoes no id. A request without a `session` cookie (or
+            without a `Cookie` header) is JSON `{"error":"login_session_expired"}`:
+            the 300 s login session has expired, and the login page then goes to
+            `/sign_in`, which sends the user back to the client. A body that is
+            not JSON is a plain-text 400.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, const: "registration failed" }
 
   /webauthn/authenticate/start:
     post:
@@ -597,6 +972,7 @@ paths:
             flattened at the top level, plus `detected_mxid` — present only when
             the request was scoped.
           content: { application/json: { schema: { type: object } } }
+        "400": { description: "No `session` cookie (or no `Cookie` header): the 300 s login session has expired, and the body is `{\"error\":\"login_session_expired\"}`; the login page then goes to `/sign_in`, which sends the user back to the client." }
 
   /webauthn/authenticate/finish:
     post:
@@ -609,6 +985,7 @@ paths:
         must confirm before `/sign_in` creates the account.
       responses:
         "200": { description: "`{ok, did, new_user, mxid}`." }
+        "400": { description: "No `session` cookie (or no `Cookie` header): the 300 s login session has expired, and the body is `{\"error\":\"login_session_expired\"}`; the login page then goes to `/sign_in`, which sends the user back to the client." }
         "401": { $ref: "#/components/responses/UnknownCredential" }
 
   /link/webauthn/start:
@@ -700,6 +1077,25 @@ paths:
         "400": { description: "Missing, unknown, or unavailable action, or reactivation of an erased account." }
         "503": { description: "A required check (Synapse, or the erasure marker) could not run; nothing was changed." }
 
+  /account/sign_out:
+    post:
+      tags: [Account management]
+      operationId: accountSignOut
+      summary: Sign this browser out of the account page
+      description: |
+        Ends the account session (`acct_session` cookie) and the passkey-picker
+        hint (`siwx_user` cookie) this browser presents, each found by the digest
+        of the cookie value, and clears both cookies. Sessions of other browsers
+        stay; `logout/all`, deactivation and erasure end every session of the
+        user. Idempotent: without cookies it answers 200 and clears them all the
+        same. Needs no CSRF token: both cookies are `SameSite=Strict`, and a
+        forged request could only sign the browser out.
+      responses:
+        "200":
+          description: Signed out; both cookies cleared.
+          content: { application/json: { schema: { type: object, properties: { signed_out: { type: boolean, enum: [true] } } } } }
+        "503": { description: "Retryable: the session store could not end a session; the cookies are not cleared." }
+
   /account/passkey/start:
     post:
       tags: [Account management]
@@ -734,43 +1130,529 @@ paths:
     post:
       tags: [Matrix compatibility]
       operationId: matrixRefresh
-      summary: Matrix-shaped refresh, with the same rotation grace window as `/token`
-      responses: { "200": { description: New tokens. } }
+      summary: Matrix-shaped refresh, with the same rotation and lost-response rule as `/token`
+      description: Accepts only a refresh token; an access token (a minted admin token included) is `M_UNKNOWN_TOKEN`, like an unknown one. A replay of the previous refresh token returns the same successor pair while that pair is unused, and is `M_UNKNOWN_TOKEN` once it was used, rotated or revoked. The endpoint carries no client identity, so unlike `/token` it cannot bind the replay to a client, and it refuses the refresh token of a confidential client (one that must authenticate at `/token`) exactly like an unknown token, leaving it untouched for `/token`. A public client's refresh token issued by a build before the grant record is answered with tokens in the current format, and its replays follow the same rule. With delegated auth the refresh token of an `oidc` grant (a generic-class client's) is refused exactly like an unknown token, before any rotation, and left untouched for `/token`.
+      responses:
+        "200": { description: New tokens. }
+        "401": { description: "`M_UNKNOWN_TOKEN`: the refresh token is unknown, expired, reused, revoked, of another kind, a confidential client's, or (with delegated auth) a generic-class client's." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store could not answer. Never reported as `M_UNKNOWN_TOKEN`, which a Matrix client takes for \"signed out\" (it clears its crypto store). The rotation either ran entirely or not at all, so retrying with the same refresh token is safe." }
 
   /_matrix/client/v3/logout:
     post:
       tags: [Matrix compatibility]
       operationId: matrixLogout
       summary: End this session
-      description: Revokes the session's tokens **and** deletes its Synapse device — explicit intent, unlike `/oauth2/revoke`.
+      description: Revokes the session's tokens **and** deletes its Synapse device (explicit intent, unlike `/oauth2/revoke`). The bearer must be an access token; any other token is a no-op, like an unknown one. With delegated auth the access token of an `oidc` grant (a generic-class client's) is not a Matrix session: it is a 401 and nothing is torn down.
       security: [{ bearerToken: [] }]
-      responses: { "200": { description: Best-effort, idempotent, never 500. } }
+      responses:
+        "200": { description: "Signed out; also for a missing, unknown or non-access bearer (idempotent). The Synapse device delete is best-effort, unless `SIWXOIDC_REVOKE_DELETES_DEVICE` is on: then a transient Synapse failure is the 503 and revokes nothing." }
+        "401": { description: "`M_UNKNOWN_TOKEN`, with delegated auth only: the bearer is the access token of an `oidc` grant. Nothing was torn down." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store failed while resolving the bearer or revoking the device's tokens. Nothing is reported as signed out, and the bearer stays valid so the retry tears the session down With `SIWXOIDC_REVOKE_DELETES_DEVICE` on, also when Synapse could not delete a device (transient; nothing of that device is revoked); with `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` on, also when the deleted-id marker could not be written." }
 
   /_matrix/client/v3/logout/all:
     post:
       tags: [Matrix compatibility]
       operationId: matrixLogoutAll
       summary: End every session
-      description: Session invalidation, NOT deactivation — the account stays active and can sign in again.
+      description: Session invalidation, NOT deactivation: the account stays active and can sign in again. Ends every grant of the user (setting the user epoch), deletes every Synapse device (best-effort), and ends the user's own sessions on this provider (`siwx_user` picker hints, `acct_session` account sessions). The bearer must be an access token; any other token is a no-op, like an unknown one. With delegated auth the access token of an `oidc` grant (a generic-class client's) is not a Matrix session: it is a 401 and nothing is touched.
       security: [{ bearerToken: [] }]
-      responses: { "200": { description: Best-effort, idempotent, never 500. } }
+      responses:
+        "200": { description: "Every session ended; also for a missing, unknown or non-access bearer (idempotent)." }
+        "401": { description: "`M_UNKNOWN_TOKEN`, with delegated auth only: the bearer is the access token of an `oidc` grant. Nothing was touched." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store failed while resolving the bearer, revoking the user's tokens or ending the own sessions. Nothing is reported as signed out; the retry finishes the job With `SIWXOIDC_REVOKE_DELETES_DEVICE` on, also when Synapse could not delete a device (transient; nothing of that device is revoked); with `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` on, also when the deleted-id marker could not be written." }
 
   /_matrix/client/v3/devices/{device_id}:
     delete:
       tags: [Matrix compatibility]
       operationId: matrixDeleteDevice
       summary: Sign out one device
+      description: The bearer must be an access token; any other token is a 401 `M_UNKNOWN_TOKEN`. With delegated auth so is the access token of an `oidc` grant (a generic-class client's), which is not a Matrix session.
       security: [{ bearerToken: [] }]
       parameters: [{ name: device_id, in: path, required: true, schema: { type: string } }]
-      responses: { "200": { description: Deleted. } }
+      responses:
+        "200": { description: Deleted. }
+        "401": { description: "`M_UNKNOWN_TOKEN`: the bearer is missing, unknown, not an access token, or (with delegated auth) an `oidc` grant's." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store could not resolve the bearer. Never reported as `M_UNKNOWN_TOKEN`; nothing was deleted With `SIWXOIDC_REVOKE_DELETES_DEVICE` on, also when Synapse could not delete a device (transient; nothing of that device is revoked); with `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` on, also when the deleted-id marker could not be written." }
 
   /_matrix/client/v3/delete_devices:
     post:
       tags: [Matrix compatibility]
       operationId: matrixDeleteDevices
       summary: Sign out several devices
+      description: The bearer must be an access token; any other token is a 401 `M_UNKNOWN_TOKEN`. With delegated auth so is the access token of an `oidc` grant (a generic-class client's), which is not a Matrix session.
       security: [{ bearerToken: [] }]
-      responses: { "200": { description: Deleted. } }
+      responses:
+        "200": { description: Deleted. }
+        "401": { description: "`M_UNKNOWN_TOKEN`: the bearer is missing, unknown, not an access token, or (with delegated auth) an `oidc` grant's." }
+        "503": { description: "`M_UNKNOWN`, retryable: the token store could not resolve the bearer. Never reported as `M_UNKNOWN_TOKEN`; nothing was deleted With `SIWXOIDC_REVOKE_DELETES_DEVICE` on, also when Synapse could not delete a device (transient; nothing of that device is revoked); with `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` on, also when the deleted-id marker could not be written." }
+
+  /guest/join/{invite_id}:
+    get:
+      tags: [Guest]
+      operationId: guestJoinPage
+      summary: The guest join page
+      description: |
+        The same HTML for every `invite_id`, known or not: the id is read by the page from its own path,
+        and the invite secret from the URL fragment, which a browser never sends. A top-level navigation
+        from a link in a mail or chat is allowed, so there is no origin check. Carries the GP-SEC-39
+        headers (a CSP that allows only own scripts and styles, `frame-ancestors 'none'`, `no-referrer`,
+        `no-store`). `503 guest_unavailable` while guest mode is off.
+      parameters:
+        - { name: invite_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: "The page, `text/html`." }
+        "503": { description: "`guest_unavailable`." }
+
+  /guest/assets/{file}:
+    get:
+      tags: [Guest]
+      operationId: guestAsset
+      summary: A script or style sheet of the guest pages
+      description: |
+        A fixed allow-list: `join.js`, `guest-key.js`, `continue.js`, `continue-message.js` and `guest.css`. Any other name, however spelled,
+        is `404 not_found`; no part of the request reaches the file system. Same headers as the page.
+      parameters:
+        - { name: file, in: path, required: true, schema: { type: string, enum: [join.js, guest-key.js, continue.js, continue-message.js, guest.css] } }
+      responses:
+        "200": { description: "The file, `text/javascript` or `text/css`." }
+        "404": { description: "`not_found`." }
+        "503": { description: "`guest_unavailable`." }
+
+  /guest/continue:
+    get:
+      tags: [Guest]
+      operationId: guestContinuePage
+      summary: The guest hand-off page
+      description: |
+        Where `/authorize` sends the browser when the scope carries the marker `urn:io.inblock:guest` and
+        the guest cookie names a live record. The shell is compiled in; the facts the script needs (the
+        record's DID, the bound `redirect_uri`, the login session's nonce) are written into `data-`
+        attributes, never into a script. `data-state` is `ready`, `no_guest` (no live guest cookie: "open your
+        invitation link again in this browser"), `no_session` (the login session is missing or not a guest
+        hand-off) or `unavailable`. The script loads the key the join page stored, never creates one, checks
+        its DID against the record, signs the continue message and posts it. Same headers as the other
+        guest pages.
+      responses:
+        "200": { description: "The page, `text/html`, in every state (`ready`, `no_guest`, `no_session`, `unavailable`): the guest layers replace the body of an error status with their JSON shell, so the state is in `data-state`, not in the status." }
+        "503": { description: "`guest_unavailable` while guest mode is off." }
+
+    post:
+      tags: [Guest]
+      operationId: guestContinue
+      summary: Prove the browser holds the guest's key
+      description: |
+        Authorised by the guest cookie plus the login session cookie `/authorize` set, and by a signature;
+        same-origin only, JSON only, 4 KiB. The message is the twelve-line redeem layout with the statement
+        `Continue as a guest`, the login session's nonce, and the session's bound `redirect_uri` as the one
+        resource. The server checks that the `redirect_uri` is in `guest_client_redirect_uris` and equals the
+        bound one, that the DID line is the record's DID, the nonce, the times (skew 120 s, at most 600 s
+        validity) and the signature, then writes `verified_did` on the login session, so `sign_in` stays
+        Path A. Refused: `400` `bad_request`, `redirect_not_allowed`, `nonce_mismatch`, `resource_mismatch`;
+        `401` `no_session` (no live guest cookie, a record that is `reaping` or past its deadline, or no
+        guest login session), `did_mismatch`, `signature_invalid`; `503` `unavailable`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [redirect_uri, message, signature]
+              properties:
+                redirect_uri: { type: string }
+                message: { type: string }
+                signature: { type: string, description: "base64url without padding; P-256 as raw r||s or DER." }
+      responses:
+        "200": { description: "`{\"next\": \"/sign_in\"}`: the browser goes there to finish the sign-in." }
+        "400": { description: "`bad_request`, `redirect_not_allowed`, `nonce_mismatch` or `resource_mismatch`." }
+        "401": { description: "`no_session`, `did_mismatch` or `signature_invalid`." }
+        "403": { description: "`forbidden_origin`." }
+        "413": { description: "`payload_too_large`." }
+        "415": { description: "`unsupported_media_type`." }
+        "503": { description: "`unavailable`." }
+
+  /guest/context:
+    get:
+      tags: [Guest]
+      operationId: guestContext
+      summary: The guest's room, deadline and meeting name
+      description: |
+        Authorised by the guest's own Bearer access token (the portal's token after the hand-off). Makes no
+        Synapse call. Returns `{room_id, deadline, invite_id, meeting_name}`; `deadline` is Unix seconds and
+        `meeting_name` is the invite's label, text only (empty if the invite is gone). The room id is only ever
+        in this body, never in a URL. A missing, unknown or expired token is `401 invalid_token`; a valid token
+        whose subject has no guest record (a host's or a registered user's) is `403 not_a_guest`.
+      security: [{ bearerToken: [] }]
+      responses:
+        "200":
+          description: "The record's context, `Cache-Control: no-store`."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [room_id, deadline, invite_id, meeting_name]
+                properties:
+                  room_id: { type: string }
+                  deadline: { type: integer }
+                  invite_id: { type: string }
+                  meeting_name: { type: string }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`not_a_guest`." }
+        "503": { description: "`unavailable` (Redis), or `guest_unavailable` while guest mode is off." }
+
+  /guest/end:
+    post:
+      tags: [Guest]
+      operationId: guestEnd
+      summary: The guest ends its own session
+      description: |
+        Authorised by the guest's own Bearer access token, or by the guest cookie with the same-origin check
+        (`403 forbidden_origin` for a foreign `Origin` or a `Sec-Fetch-Site` other than `same-origin`); when both
+        are sent the Bearer wins. Like every guest POST it takes `Content-Type: application/json` (the body, `{}`, is not read). Moves the guest's deadline to now (the record and `guest:due`, never
+        later), so the reaper revokes the grants, deletes the devices, writes `erased:user` and `erased:did` (the
+        DID never signs in again), erases the Synapse account and drops the record within one tick. Clears the
+        session cookie. A second call on a record that is already ending is `200` as well; a cookie whose record
+        is already gone is `200 {"state": "ended"}`. A `claimed` account is `409 claimed`: it is kept, nothing is
+        moved. Without a credential or with a bad token `401 invalid_token`; a valid token that is not a guest's
+        is `403 not_a_guest`.
+      security: [{ bearerToken: [] }, {}]
+      responses:
+        "200":
+          description: "`{\"state\": \"ending\"}` (or `\"ended\"`), `Cache-Control: no-store`, the cookie cleared."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state]
+                properties:
+                  state: { type: string, enum: [ending, ended] }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`forbidden_origin` (cookie, foreign origin) or `not_a_guest`." }
+        "409": { description: "`claimed`." }
+        "503": { description: "`unavailable` (Redis), or `guest_unavailable` while guest mode is off." }
+
+  /guest/claim:
+    get:
+      tags: [Guest]
+      operationId: guestClaimPage
+      summary: The page where a guest keeps the account with a passkey
+      description: |
+        The same page for everyone; it reads no cookie. Its script (`/guest/assets/claim.js`) asks `GET /guest/resume`
+        and runs the claim states of the design (loading, intro, passkey prompt, saving, done, declined, and the
+        errors), then calls `POST /guest/claim/start`, `POST /guest/claim/finish` and, for "Delete everything now",
+        `POST /guest/end` with the cookie. It never sees or derives a private key; after a commit or a lost race it
+        calls `forgetKey()` on this browser's guest key store. `Cache-Control: no-store`; the guest CSP (script and
+        style from this origin only) and `frame-ancestors 'none'` apply.
+      responses:
+        "200": { description: "The page, `text/html`." }
+        "503": { description: "`guest_unavailable` while guest mode is off." }
+
+  /guest/claim/start:
+    post:
+      tags: [Guest]
+      operationId: guestClaimStart
+      summary: Begin keeping the guest account with a passkey
+      description: |
+        Authorised by the guest cookie only (a Bearer token is `401 no_session`); same-origin only, JSON only, 4 KiB, body ignored.
+        Gate (each refusal is a counted `guest_refused` event, route `claim_start`): `guest_claim_enabled` and the kill switch
+        off, a record in state `active` before its deadline (Redis `TIME`), host not banned, fewer than `guest_max_claimed`
+        claims, the Synapse account exists and is active, and it is currently joined to its invite's room (a Synapse fault is
+        `503`, never a pass). Success: the WebAuthn creation options (`CreationChallengeResponse`) for the guest's own DID, the
+        pending challenge stored under `claim_<sha256(handle)>` (idempotent: a repeat replaces it). `Cache-Control: no-store`.
+      responses:
+        "200": { description: "WebAuthn `CreationChallengeResponse` JSON." }
+        "401": { description: "`no_session`: no cookie, an unknown handle, or a Bearer token." }
+        "403": { description: "`claim_unavailable`: claim off, kill switch, host banned, cap reached, or the record is not `active` yet." }
+        "409": { description: "`already_claimed`." }
+        "410": { description: "`ended`: reaping, past the deadline, the account gone or deactivated, or no longer in the room." }
+        "503": { description: "`unavailable` (Redis or Synapse), or `guest_unavailable` while guest mode is off." }
+
+  /guest/claim/finish:
+    post:
+      tags: [Guest]
+      operationId: guestClaimFinish
+      summary: Keep the guest account with the passkey just made
+      description: |
+        Authorised by the guest cookie only; same-origin only, JSON only, 16 KiB. Body: the WebAuthn registration response
+        (`id`, `rawId`, `type`, `response`) plus `keep_email` (boolean, default false). Steps: a per-guest single-flight lock
+        (`SET NX EX 30`, `409 claim_in_progress` while held), the gate of `claim/start` again, the credential verified and stored
+        under the guest's own DID (set-if-absent; a credential id that is already known is `400 verify_failed`), then one Lua
+        compare-and-set `active` to `claimed`: the record leaves `guest:due` and the invite's guest set, the deadline is dropped,
+        the localpart joins `guest:claimed` and `guest:claim_revoke`, the e-mail is dropped unless `keep_email`, the device ids are
+        kept as `pre_claim_devices`, and the handle moves to a 10-minute `claimed` marker. A lost compare-and-set (the reaper or
+        the deadline won) deletes exactly the credential this call wrote and answers `409 lost_race`. After the commit the tokens
+        of each pre-claim device are revoked (`revoke_device_tokens`, never all of the user's), and the `siwx_user` cookie is set.
+        The DID, the localpart, the Synapse account and its `io.inblock.guest` marker are untouched. `200 {"state": "claimed"}`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, rawId, type, response]
+              properties:
+                id: { type: string }
+                rawId: { type: string }
+                type: { type: string }
+                response: { type: object }
+                keep_email: { type: boolean, default: false }
+      responses:
+        "200": { description: "`{\"state\": \"claimed\"}`, `Set-Cookie: siwx_user`." }
+        "400": { description: "`bad_request` (unreadable body) or `verify_failed` (attestation, no challenge, known credential id)." }
+        "401": { description: "`no_session`." }
+        "403": { description: "`claim_unavailable`." }
+        "409": { description: "`claim_in_progress`, `already_claimed` or `lost_race`." }
+        "410": { description: "`ended`." }
+        "413": { description: "Body over 16 KiB." }
+        "503": { description: "`unavailable`, or `guest_unavailable` while guest mode is off." }
+
+  /guest/resume:
+    get:
+      tags: [Guest]
+      operationId: guestResume
+      summary: What the issuer pages know about the cookie's guest
+      description: |
+        Authorised by the guest cookie, same-origin only (a request with a foreign `Origin` or a `Sec-Fetch-Site`
+        other than `same-origin` is `403 forbidden_origin`); no CORS. For the issuer pages (the join page uses
+        `did` to check that its local key matches before it offers "Continue as ..."); the portal does not call
+        it. No secret in the body. With no live record (no cookie, unknown handle, `reaping`, past the deadline,
+        kill switch on) the answer is `200 {"state": "no_session"}`. After a claim the cookie answers `200 {"state": "claimed"}` for 10 minutes (the claimed-handle marker, no
+        names), then `no_session`; the helper page forgets the browser key on `claimed`. `claim_allowed` is advisory: the flag, an `active`
+        record before its deadline, the host not banned and room under `guest_max_claimed`; the room-membership read is left to start and finish.
+      responses:
+        "200":
+          description: "`{first_name, second_name, state, seconds_left, did, claim_allowed, email_present}`, or `{state: no_session}`."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state]
+                properties:
+                  first_name: { type: string }
+                  second_name: { type: string }
+                  state: { type: string, enum: [minted, provisioning, active, claimed, no_session] }
+                  seconds_left: { type: integer }
+                  did: { type: string }
+                  claim_allowed: { type: boolean, description: "Advisory: `guest_claim_enabled`." }
+                  email_present: { type: boolean }
+                  client_url: { type: [string, 'null'], description: "The fixed Meet start URL (`guest_client_url`), sent with `active` and `claimed` so the claim page can lead back to the call." }
+        "403": { description: "`forbidden_origin`." }
+        "503": { description: "`unavailable`, or `guest_unavailable` while guest mode is off." }
+
+  /guest/ended:
+    get:
+      tags: [Guest]
+      operationId: guestEndedPage
+      summary: The page a portal sends an ended guest to
+      description: |
+        The same page for everyone; it needs no cookie and no record. It says "This guest account is deleted;
+        this browser forgets its key." and calls `forgetKey()` on this browser's key store (script
+        `/guest/assets/ended.js`). For 10 minutes after a claim the script reads `/guest/resume`, sees `claimed` and draws the kept-account copy
+        (the account is kept, sign in with the passkey); it forgets the browser key in both cases.
+      responses:
+        "200": { description: "The page, `text/html`." }
+        "503": { description: "`guest_unavailable` while guest mode is off." }
+
+  /guest/peek:
+    post:
+      tags: [Guest]
+      operationId: guestPeek
+      summary: Look at an invitation without using it
+      description: |
+        Authorised by the invite secret in the body; same-origin only (`Origin` or `Sec-Fetch-Site`),
+        JSON only, 4 KiB. Changes no state, so a link scanner cannot burn it. The secret is compared in
+        constant time and exactly one invite lookup is made whether or not the id exists. An unknown id,
+        a wrong secret and a body that does not parse give the same `404 {"error":"invalid_link"}`.
+        After the secret verifies: `200 {"state": "expired"|"exhausted"|"revoked"}` for an ended invite,
+        else `200` with `state: "active"`, `email_policy` (`off`, `optional`, `required`), `session_secs`,
+        `consent_version`, `recording_expected`, a stateless `nonce` (an HMAC over the invite id and an
+        expiry five minutes ahead) that the redeem proof must carry, `did_methods` (`["key"]`) and `curves`
+        (`["Ed25519","P-256"]`). It carries no host text and no meeting name. `503 disabled` while the
+        kill switch is on.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invite_id, secret]
+              properties:
+                invite_id: { type: string }
+                secret: { type: string }
+      responses:
+        "200": { description: "The invite's state and, when active, what the join page needs." }
+        "403": { description: "`forbidden_origin`." }
+        "404": { description: "`invalid_link`: unknown id, wrong secret or malformed body." }
+        "413": { description: "`payload_too_large`." }
+        "415": { description: "`unsupported_media_type`." }
+        "503": { description: "`disabled` or `unavailable`." }
+
+  /guest/redeem:
+    post:
+      tags: [Guest]
+      operationId: guestRedeem
+      summary: Use an invitation as a guest, binding a browser-made did:key
+      description: |
+        Authorised by the invite secret in the body; same-origin only, JSON only, 4 KiB. Order: secret
+        (the generic `404 invalid_link` as in peek), invite state, input validation, proof of possession,
+        DID in use, then one atomic Redis script on Redis `TIME`. A refusal writes nothing. No Synapse write.
+
+        `did` is a canonical `did:key` (Ed25519 or P-256). `proof.message` is the CAIP-122 text the browser
+        signed, exactly as `guest_admission::build_redeem_message` builds it: issuer domain, the DID, the
+        statement `Join as a guest`, `URI` (the issuer origin), `Version: 1`, the `nonce` from peek,
+        `Issued At`, `Expiration Time` (at most 10 minutes after issue) and the resource
+        `urn:io.inblock:guest:invite:<invite_id>`. `proof.signature` is the raw Ed25519 signature, or the
+        WebCrypto ECDSA `r || s` over SHA-256 for P-256, encoded as base64url without padding (standard
+        base64 is accepted too).
+
+        Success: `200 {guest_client_url, deadline, seconds_left}` and `Set-Cookie: __Host-guest_session=<handle>;
+        Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=<seconds to the deadline>`. When `base_url` is plain
+        http (local development) the cookie is `guest_session` without `Secure`. `guest_client_url` comes from
+        configuration. `deadline` is Unix seconds (Redis `TIME` plus the invite's `session_secs`). Redis keeps
+        only the SHA-256 of the handle.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invite_id, secret, first_name, second_name, consent, did, proof]
+              properties:
+                invite_id: { type: string }
+                secret: { type: string }
+                first_name: { type: string }
+                second_name: { type: string }
+                email: { type: string }
+                consent:
+                  type: object
+                  required: [version, variant]
+                  properties:
+                    version: { type: string }
+                    variant: { type: string }
+                did: { type: string }
+                proof:
+                  type: object
+                  required: [message, signature]
+                  properties:
+                    message: { type: string }
+                    signature: { type: string }
+      responses:
+        "200": { description: "`{guest_client_url, deadline, seconds_left}` and the session cookie." }
+        "400": { description: "`bad_request`: the secret verified but the rest of the body does not parse." }
+        "403": { description: "`forbidden_origin`." }
+        "404": { description: "`invalid_link`: unknown id, wrong secret or unparsable credentials." }
+        "409": { description: "`did_in_use`: a record, an `erased:did` marker or a known account holds the DID." }
+        "410": { description: "`expired`, `exhausted` or `revoked`." }
+        "413": { description: "`payload_too_large`." }
+        "415": { description: "`unsupported_media_type`." }
+        "422": { description: "`name_empty`, `name_too_long`, `name_chars`, `name_mixed_script`, `name_reserved`, `email_required`, `email_invalid`, `email_not_allowed`, `consent_required`, `did_invalid`, `did_unsupported`, `did_unusable` (the browser makes a new key) or `proof_invalid`." }
+        "429": { description: "`quota_exceeded` with `quota` `global_active`, `daily_mint` or `host_live_guests`." }
+        "503": { description: "`disabled` (kill switch) or `unavailable`." }
+
+  /guest/invites:
+    post:
+      tags: [Guest]
+      operationId: guestCreateInvites
+      summary: Create guest invitation links for a meeting room
+      description: |
+        Host only: the bearer must be a live access token of an account in `guest_hosts`, not a minted
+        admin token and not a guest account. The room is read through the service admin credential; the
+        caller must be joined with `invite` power and the room must pass the guest room template.
+        Each link is `https://<issuer>/guest/join/<invite_id>#<secret>`; the secret is shown once and only
+        its SHA-256 is stored. Limits are refused, never clamped: `count` 1..`guest_max_guests`, labels at most
+        40 characters, `expires_in` default 86400 and at most 259200, `session_secs` 600..14400 (default 7200),
+        `kind` `single` (default) or `open` (only with `guest_allow_open_links`). No idempotency: each call
+        spends quota. Errors carry `{"error": code}`; Synapse bodies are never echoed.
+      security: [{ bearerToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room_id]
+              additionalProperties: false
+              properties:
+                room_id: { type: string, description: "`!opaque[:server]`, at most 255 bytes." }
+                count: { type: integer, minimum: 1 }
+                labels: { type: array, items: { type: string, maxLength: 40 } }
+                kind: { type: string, enum: [single, open] }
+                max_guests: { type: integer }
+                expires_in: { type: integer, maximum: 259200 }
+                session_secs: { type: integer, minimum: 600, maximum: 14400 }
+                recording_expected: { type: boolean }
+      responses:
+        "200":
+          description: One link per invite.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  invites:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        label: { type: string }
+                        link: { type: string, format: uri }
+                        expires_at: { type: integer, description: Unix seconds. }
+        "400": { description: "`bad_request`, `bad_room_id`, `bad_count`, `bad_labels`, `bad_kind`, `bad_max_guests`, `bad_expires_in`, `bad_session_secs` or `open_links_disabled`." }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`not_a_host`, `host_banned`, `admin_token`, `guest_token`, `disabled` or `not_room_host`." }
+        "415": { description: Not `application/json`. }
+        "422": { description: "`room_not_found`, or `room_template` with a `reasons` list of fixed codes." }
+        "429": { description: "`quota_exceeded` with `quota` `host_invites`, `host_open_invites` or `host_invites_per_hour`. Nothing was written." }
+        "503": { description: "`unavailable`: Redis or Synapse failed. Nothing was written." }
+    get:
+      tags: [Guest]
+      operationId: guestListInvites
+      summary: List the caller's own invitations
+      description: Another host's invites are never shown. The body carries no secret and no hash. Each invite lists its guests (`first_name`, `second_name`, `email` if given, `state`) and `counts`. A non-host gets 403 `not_a_host`.
+      security: [{ bearerToken: [] }]
+      responses:
+        "200": { description: "`{invites: [...]}` with id, label, kind, state (`active`, `revoked`, `expired`, `exhausted`), counts, created and expiry." }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`not_a_host`, `host_banned`, `admin_token`, `guest_token` or `disabled`." }
+        "503": { description: "`unavailable`." }
+
+  /guest/invites/{invite_id}/end:
+    post:
+      tags: [Guest]
+      operationId: guestEndInvite
+      summary: Revoke one invitation
+      description: Idempotent. 404 unless the caller created the invite; another host's id is indistinguishable from an unknown one.
+      security: [{ bearerToken: [] }]
+      parameters: [{ name: invite_id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: "`{revoked: 1}`." }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`not_a_host`, `host_banned`, `admin_token`, `guest_token` or `disabled`." }
+        "404": { description: "`not_found`." }
+        "503": { description: "`unavailable`: the store failed or the guests' deadlines could not be moved to now (fail-closed, never a 200 while a guest stays live); repeat the call." }
+
+  /guest/meetings/end:
+    post:
+      tags: [Guest]
+      operationId: guestEndMeeting
+      summary: Revoke every invitation of the caller for one room
+      security: [{ bearerToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room_id]
+              additionalProperties: false
+              properties:
+                room_id: { type: string }
+      responses:
+        "200": { description: "`{revoked: n}`, 0 when the caller has none for the room." }
+        "400": { description: "`bad_request` or `bad_room_id`." }
+        "401": { description: "`invalid_token`." }
+        "403": { description: "`not_a_host`, `host_banned`, `admin_token`, `guest_token` or `disabled`." }
+        "503": { description: "`unavailable`: the store failed or the guests' deadlines could not be moved to now (fail-closed, never a 200 while a guest stays live); repeat the call." }
 
   /health:
     get:
@@ -810,6 +1692,15 @@ components:
     BadRequest:
       description: Malformed request.
       content: { application/json: { schema: { type: object } } }
+    InvalidBearerToken:
+      description: |
+        The bearer token cannot be used (RFC 6750 section 3.1). The body is a
+        plain-text reason.
+      headers:
+        WWW-Authenticate:
+          description: The Bearer challenge naming `invalid_token`.
+          schema: { type: string, const: 'Bearer error="invalid_token"' }
+      content: { text/plain: { schema: { type: string } } }
     UnknownCredential:
       description: |
         The presented passkey is not one this server stores. A machine-readable
@@ -831,9 +1722,9 @@ components:
         access_token: { type: string }
         token_type: { type: string }
         expires_in: { type: integer, description: 300 seconds. }
-        refresh_token: { type: string, description: 90-day TTL, rotated on every use. }
+        refresh_token: { type: string, description: "90-day TTL, rotated on every use. In a standalone deployment, and for a generic-class client, the code exchange issues one only for a granted `offline_access`, to a client whose registration allows the `refresh_token` grant." }
         id_token: { type: string, description: "ES256 JWT. `sub` is the DID." }
-        scope: { type: string, description: "Carries `urn:matrix:client:device:{id}` so a client can discover its provisioned device." }
+        scope: { type: string, description: "The granted scope. In the device-code grant it carries `urn:matrix:client:device:{id}` so a client can discover its provisioned device. In a standalone (generic-mode) or generic-class code exchange it is present when the granted scope differs from the request. A Matrix-class code exchange in a delegated-auth deployment omits it, and so does every refresh response: a grant's scope is fixed when it is issued." }
 
     UserInfo:
       type: object
@@ -850,6 +1741,16 @@ components:
             a present key asserts that the thing exists. Namespaced because no
             registered OIDC claim for a Matrix ID exists.
           example: "@1vo8g4vofiha69ua:matrix.example.org"
+        io.inblock.mailbox:
+          type: string
+          description: |
+            The caller's mailbox address, `<localpart>@<mail_domain>`. Present only
+            for an access token of an `oidc` grant with the `io.inblock.mail` scope,
+            issued to a generic-class client that is still allowed that scope, for an
+            opaque localpart (exactly 16 lowercase base36 characters, the one derived
+            from the DID), with `mail_domain` configured. **Omitted entirely, never
+            null,** otherwise. There is no `email` claim, whatever the scope.
+          example: "1vo8g4vofiha69ua@matrix.example.org"
 
     ResolveResponse:
       type: object
@@ -861,7 +1762,12 @@ components:
         mxid:
           type: [string, "null"]
           description: The fully-qualified Matrix ID, honouring the grandfathering rule — a pre-2026-09 account keeps its legacy localpart.
-        exists: { type: boolean, description: Whether an account exists on THIS homeserver. Says nothing about any other. }
+        exists:
+          type: boolean
+          description: |
+            Whether an ACTIVE account exists on THIS homeserver: a deactivated or
+            erased account answers `false`. Says nothing about any other
+            homeserver.
         attested:
           type: boolean
           description: |

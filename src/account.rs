@@ -19,7 +19,7 @@ use crate::localpart::resolve_identity;
 use crate::oidc::{constant_time_eq, CustomError};
 use crate::synapse_client::{DeviceInfo, SynapseClient};
 use crate::webauthn as wa;
-use siwx_oidc::db::{DBClient, RedisClient, CAIP122_NONCE_TTL_SECS};
+use siwx_oidc::db::{DBClient, OwnSession, RedisClient, CAIP122_NONCE_TTL_SECS};
 
 // -- Authenticated account-management session ---------------------------------
 //
@@ -54,8 +54,6 @@ fn account_action_resource(config: &Config, action: &str) -> String {
 
 /// Cookie name for the authenticated account-management session.
 pub const ACCOUNT_SESSION_COOKIE: &str = "acct_session";
-/// Redis key prefix for stored account sessions.
-const ACCOUNT_SESSION_PREFIX: &str = "account_session";
 /// How long one re-auth keeps the account page authenticated (seconds).
 pub const ACCOUNT_SESSION_TTL: u64 = 600; // 10 minutes
 
@@ -70,13 +68,13 @@ pub struct AccountSession {
     pub exp: i64,
 }
 
-/// Mint a fresh account session bound to `did`, store it in Redis (TTL
-/// [`ACCOUNT_SESSION_TTL`]), and return `(session_token, csrf_token)`.
+/// Mint a fresh account session bound to `did`, store it under the digest of
+/// its token ([`OwnSession::Account`], TTL [`ACCOUNT_SESSION_TTL`]), and return
+/// `(session_token, csrf_token)`.
 pub async fn create_account_session(
     db: &RedisClient,
     did: &str,
 ) -> Result<(String, String), CustomError> {
-    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let csrf = Uuid::new_v4().simple().to_string();
     let session = AccountSession {
         did: did.to_string(),
@@ -85,12 +83,9 @@ pub async fn create_account_session(
     };
     let json = serde_json::to_string(&session)
         .map_err(|e| anyhow::anyhow!("serialize account session: {e}"))?;
-    db.set_ex_raw(
-        &format!("{}/{}", ACCOUNT_SESSION_PREFIX, token),
-        &json,
-        ACCOUNT_SESSION_TTL,
-    )
-    .await?;
+    let token = db
+        .create_own_session(OwnSession::Account, did, &json, ACCOUNT_SESSION_TTL)
+        .await?;
     Ok((token, csrf))
 }
 
@@ -98,7 +93,7 @@ pub async fn create_account_session(
 /// or unreadable (fail-safe: any failure forces a fresh re-auth).
 pub async fn lookup_account_session(db: &RedisClient, token: &str) -> Option<AccountSession> {
     let raw = db
-        .get_raw(&format!("{}/{}", ACCOUNT_SESSION_PREFIX, token))
+        .lookup_own_session(OwnSession::Account, token)
         .await
         .ok()??;
     let session: AccountSession = serde_json::from_str(&raw).ok()?;
@@ -111,9 +106,7 @@ pub async fn lookup_account_session(db: &RedisClient, token: &str) -> Option<Acc
 /// Delete an account session (used after a terminal action like erase/deactivate
 /// invalidates the identity it was bound to). Best-effort.
 pub async fn destroy_account_session(db: &RedisClient, token: &str) {
-    let _ = db
-        .del_raw(&format!("{}/{}", ACCOUNT_SESSION_PREFIX, token))
-        .await;
+    let _ = db.end_own_session(OwnSession::Account, token).await;
 }
 
 // -- Request/response types ---------------------------------------------------
@@ -229,6 +222,10 @@ const ERASED_NOT_REACTIVATABLE_MSG: &str =
 /// 503 when the erasure marker cannot be read, so reactivation is refused.
 const ERASURE_CHECK_UNAVAILABLE_MSG: &str =
     "The server could not check this account right now. Please try again later.";
+/// A step of the shared erase sequence failed other than the tombstone and Synapse: the
+/// action is idempotent, so repeating it finishes the job.
+const ERASURE_INCOMPLETE_MSG: &str =
+    "Erasing the account did not complete; nothing is lost, repeat the request.";
 /// 503 when the erasure cannot be recorded, so nothing is erased.
 const ERASURE_NOT_RECORDED_MSG: &str =
     "The server could not erase this account right now. It was not erased; please try again later.";
@@ -474,6 +471,96 @@ pub(crate) fn reset_outcome(allow_ok: bool, readback: ResetReadback) -> ActionOu
 
 // -- Action execution ---------------------------------------------------------
 
+/// The retryable answer when a strict teardown (SS4 flag 1) stopped.
+const STRICT_TEARDOWN_RETRY_MSG: &str =
+    "Your sessions could not all be signed out right now; nothing was changed. Try again.";
+
+/// Deactivate and erase under SS4 flag 1 (8.13, 8.23, audit r2 #7): list the
+/// account's devices first and tear each down strictly (delete, marker, revoke),
+/// before anything else is touched. One failed device does not stop the loop;
+/// any failure (or a failed listing) is a 503 and the action does not run, so
+/// the retry starts again. Flag 1 off, flag 2 on (8.13): the listed devices are
+/// deleted best-effort first and each deleted one gets its deleted-id marker
+/// (Synapse would drop them with the account, unmarked) and then has its grants
+/// revoked, in flag 1's order (delete, marker, revoke), so no grant outlives its
+/// deleted, marked device if the Synapse deactivation then fails; a failed
+/// listing, a marker that could not be written or a failed revoke is the same
+/// 503. Both off: nothing (today's sequence).
+async fn strict_pre_teardown(
+    synapse: &SynapseClient,
+    db_client: &RedisClient,
+    server: &str,
+    localpart: &str,
+    ctx: &str,
+) -> Result<(), CustomError> {
+    if !synapse.strict_teardown() {
+        if synapse.deleted_marker_ttl().is_none() {
+            return Ok(());
+        }
+        let devices = synapse.list_devices(localpart, server).await.map_err(|e| {
+            warn!(error = %e, ctx, "list_devices failed before the deleted-id markers");
+            CustomError::ServiceUnavailable(STRICT_TEARDOWN_RETRY_MSG.to_string())
+        })?;
+        let mut marked = true;
+        for device in devices {
+            match crate::compat::best_effort_delete_device(
+                db_client,
+                synapse,
+                server,
+                localpart,
+                &device.device_id,
+                ctx,
+            )
+            .await
+            {
+                Ok(true) => {
+                    if let Err(e) = db_client
+                        .revoke_device_tokens(localpart, &device.device_id)
+                        .await
+                    {
+                        warn!(error = %e, ctx, device = %siwx_oidc::redact::fingerprint(&device.device_id),
+                            "revoke failed after the delete and the marker; retryable");
+                        marked = false;
+                    }
+                }
+                Ok(false) => {}
+                Err(_) => marked = false,
+            }
+        }
+        return if marked {
+            Ok(())
+        } else {
+            Err(CustomError::ServiceUnavailable(
+                STRICT_TEARDOWN_RETRY_MSG.to_string(),
+            ))
+        };
+    }
+    let devices = synapse.list_devices(localpart, server).await.map_err(|e| {
+        warn!(error = %e, ctx, "list_devices failed before a strict teardown");
+        CustomError::ServiceUnavailable(STRICT_TEARDOWN_RETRY_MSG.to_string())
+    })?;
+    let mut all = true;
+    for device in devices {
+        all &= crate::compat::strict_teardown_device(
+            db_client,
+            synapse,
+            server,
+            localpart,
+            &device.device_id,
+            ctx,
+        )
+        .await
+        .is_ok();
+    }
+    if all {
+        Ok(())
+    } else {
+        Err(CustomError::ServiceUnavailable(
+            STRICT_TEARDOWN_RETRY_MSG.to_string(),
+        ))
+    }
+}
+
 /// Execute a (canonicalized) account action for an already-authenticated `did`.
 ///
 /// `device_id` is required only for [`Action::DeviceView`] / [`Action::DeviceDelete`].
@@ -636,12 +723,40 @@ async fn execute_action(
                     "That device is not among your active sessions".to_string(),
                 ));
             }
+            if synapse.strict_teardown() {
+                // Flag 1 (8.23): delete, marker, revoke; a transient fault is a 503
+                // the user retries (the steps are idempotent).
+                let revoked = crate::compat::strict_teardown_device(
+                    db_client,
+                    synapse,
+                    server,
+                    &localpart,
+                    device_id,
+                    "account_device_delete",
+                )
+                .await
+                .map_err(|_| {
+                    CustomError::ServiceUnavailable(STRICT_TEARDOWN_RETRY_MSG.to_string())
+                })?;
+                info!(did = %did, device_id = %device_id, revoked = revoked as u64, "device signed out via account management (strict)");
+                return Ok(ActionOutcome::Deleted {
+                    device_id: device_id.to_string(),
+                });
+            }
             synapse
                 .delete_device(&localpart, device_id, server)
                 .await
                 .map_err(|e| {
                     warn!(error = %e, "delete_device failed during account action");
                     CustomError::BadRequest("Failed to sign out device".to_string())
+                })?;
+            // Flag 2: the deleted-id marker before the revoke; not written = 503,
+            // nothing revoked (the retry is idempotent).
+            crate::compat::plant_deleted_marker(db_client, synapse, &localpart, device_id)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "deleted-id marker not written during account action");
+                    CustomError::ServiceUnavailable(STRICT_TEARDOWN_RETRY_MSG.to_string())
                 })?;
             // Revoke the OAuth session so introspection reports it inactive (AC3).
             // Key on the localpart (== TokenMetadata.username), which is stable
@@ -662,12 +777,15 @@ async fn execute_action(
         Action::AccountDeactivate => {
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
-            // Plant the deactivation tombstone FIRST (S3-4 / H6): from now on any
-            // concurrent refresh/mint for this user refuses to issue tokens, so a
-            // refresh racing the sweep below cannot resurrect access. Best-effort:
-            // the sweep itself re-plants it, so a transient error here is not fatal.
-            if let Err(e) = db_client.mark_user_deactivated(&localpart).await {
-                warn!(error = %e, "mark_user_deactivated failed (pre-deactivate)");
+            strict_pre_teardown(synapse, db_client, server, &localpart, "account_deactivate")
+                .await?;
+            // Set the user epoch FIRST (S3-4 / H6, I9): from now on every grant
+            // of this user authenticated until now is refused by both refresh
+            // endpoints and the access check, so a refresh racing the sweep
+            // below cannot resurrect access. Best-effort: the sweep sets it
+            // again, so a transient error here is not fatal.
+            if let Err(e) = db_client.set_user_epoch(&localpart).await {
+                warn!(error = %e, "set_user_epoch failed (pre-deactivate)");
             }
             synapse
                 .deactivate_user(&localpart, server, false)
@@ -685,67 +803,58 @@ async fn execute_action(
                     warn!(error = %e, "revoke_all_user_tokens failed during account deactivation");
                     0
                 });
-            info!(did = %did, revoked = revoked as u64, "account deactivated via account management");
+            // End the user's own sessions on this provider too: every `siwx_user`
+            // picker hint and `acct_session` account session of the DID.
+            let ended = db_client
+                .revoke_own_sessions(did)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "revoke_own_sessions failed during account deactivation");
+                    0
+                });
+            info!(did = %did, revoked = revoked as u64, own_sessions = ended as u64, "account deactivated via account management");
             Ok(ActionOutcome::Deactivated)
         }
         Action::AccountErase => {
             let synapse = require_synapse(synapse_client)?;
             let server = require_server_name(server_name)?;
-            // Record the erasure BEFORE anything changes, and do not erase what
-            // cannot be recorded. Synapse would let the account come back: its
-            // `reactivate_user` (1.161.0) clears the erased flag and recreates the
-            // profile row, and `query_user` does not report erasure. This marker
-            // is what `Action::Reactivate` checks. If the erasure below then
-            // fails, the marker stays: it can only refuse a later reactivation,
-            // never allow one.
-            db_client
-                .mark_account_erased(&localpart, did)
-                .await
-                .map_err(|e| {
+            strict_pre_teardown(synapse, db_client, server, &localpart, "account_erase").await?;
+            // The shared, idempotent sequence (`teardown::erase_account`, S5): epoch and
+            // revoke every grant, then the tombstones, THEN Synapse, then the passkey
+            // purge. The tombstones precede the Synapse erase for the reason they always
+            // did: Synapse would let an erased account come back (`reactivate_user`
+            // 1.161.0 clears its erased flag), so an erasure that cannot be recorded is
+            // not performed, and a failure after it leaves the marker, which can only
+            // refuse a later reactivation. Unlike before, a failed revoke, session sweep
+            // or purge is now returned (503, nothing is lost: the action is idempotent
+            // and the user repeats it) instead of logged; the order is revoke first.
+            crate::teardown::erase_account(&crate::teardown::Erasure {
+                redis: db_client,
+                synapse,
+                server_name: server,
+                localpart: &localpart,
+                did,
+                devices: &[],
+                guest: false,
+                missing_account_ok: false,
+                purge_with: Some(wa::derive_did_from_credential_json),
+            })
+            .await
+            .map_err(|e| match e.step {
+                crate::teardown::Step::Markers => {
                     warn!(error = %e, "could not record the erasure; nothing was erased");
                     CustomError::ServiceUnavailable(ERASURE_NOT_RECORDED_MSG.to_string())
-                })?;
-            // Then plant the deactivation tombstone (S3-4 / H6), still before
-            // Synapse, so a concurrent refresh/mint cannot resurrect access
-            // during the erase sweep.
-            if let Err(e) = db_client.mark_user_deactivated(&localpart).await {
-                warn!(error = %e, "mark_user_deactivated failed (pre-erase)");
-            }
-            // Irreversible: GDPR erasure removes profile, media, and room
-            // memberships in addition to deactivating the account.
-            synapse
-                .deactivate_user(&localpart, server, true)
-                .await
-                .map_err(|e| {
+                }
+                crate::teardown::Step::Synapse => {
                     warn!(error = %e, "deactivate_user(erase=true) failed during account action");
-                    CustomError::BadRequest(format!("Failed to erase account: {e}"))
-                })?;
-            // Revoke ALL OAuth sessions (best-effort) so introspection reports
-            // every session inactive.
-            let revoked = db_client
-                .revoke_all_user_tokens(&localpart)
-                .await
-                .unwrap_or_else(|e| {
-                    warn!(error = %e, "revoke_all_user_tokens failed during account erasure");
-                    0
-                });
-            // Purge WebAuthn identity artifacts (best-effort) so the erased DID
-            // cannot be silently re-derived from a leftover passkey/link. The
-            // standalone-credential pass reuses the webauthn layer's single
-            // source of truth for did:key derivation.
-            let purged = db_client
-                .purge_identity(did, wa::derive_did_from_credential_json)
-                .await
-                .unwrap_or_else(|e| {
-                    warn!(error = %e, "purge_identity failed during account erasure");
-                    0
-                });
-            info!(
-                did = %did,
-                revoked = revoked as u64,
-                purged = purged as u64,
-                "account erased via account management"
-            );
+                    CustomError::BadRequest(format!("Failed to erase account: {}", e.source))
+                }
+                _ => {
+                    warn!(error = %e, "account erasure did not complete");
+                    CustomError::ServiceUnavailable(ERASURE_INCOMPLETE_MSG.to_string())
+                }
+            })?;
+            info!(did = %did, "account erased via account management");
             Ok(ActionOutcome::Erased)
         }
         Action::Reactivate => {
@@ -873,6 +982,9 @@ pub async fn account_wallet(
         ));
     }
 
+    // M6: a guest DID never re-authenticates an account action by signature.
+    crate::oidc::refuse_guest_did(db_client, &req.did).await?;
+
     // C1: a bare valid signature is NOT enough. The message must carry the exact
     // server-issued single-use nonce minted for THIS action (GET /account/nonce),
     // an unexpired Expiration Time, and the action-specific Resources audience.
@@ -959,14 +1071,15 @@ pub async fn account_passkey_finish(
         serde_json::from_value(req.credential)
             .map_err(|e| CustomError::BadRequest(format!("Invalid credential: {}", e)))?;
 
-    let resp = wa::verify_credential(db_client, session_id, rp_id, rp_origin, &auth_response)
-        .await
-        // Route the stale-passkey case to the structured 401 discriminator; keep every
-        // other verification failure as the existing 400 BadRequest for this flow.
-        .map_err(|e| match e {
-            wa::VerifyError::UnknownCredential(id) => CustomError::UnknownCredential(id),
-            wa::VerifyError::Other(inner) => CustomError::BadRequest(inner.to_string()),
-        })?;
+    let resp =
+        wa::verify_credential_legacy(db_client, session_id, rp_id, rp_origin, &auth_response)
+            .await
+            // Route the stale-passkey case to the structured 401 discriminator; keep every
+            // other verification failure as the existing 400 BadRequest for this flow.
+            .map_err(|e| match e {
+                wa::VerifyError::UnknownCredential(id) => CustomError::UnknownCredential(id),
+                wa::VerifyError::Other(inner) => CustomError::BadRequest(inner.to_string()),
+            })?;
 
     // New-account creation is reachable ONLY from the login screen. Account
     // management operates on an EXISTING account, so a passkey resolving to a DID
@@ -1363,6 +1476,8 @@ pub fn account_page_inner(
 
       <div id="result-section" class="result-section hidden"></div>
 
+      <button class="btn btn-secondary hidden" id="btn-sign-out" onclick="signOut()">Sign out</button>
+
       <div id="status" class="error-msg hidden">
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="error-icon">
           <path fill-rule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-8-5a.75.75 0 0 1 .75.75v4.5a.75.75 0 0 1-1.5 0v-4.5A.75.75 0 0 1 10 5Zm0 10a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" clip-rule="evenodd"/>
@@ -1393,7 +1508,7 @@ pub fn account_page_inner(
     Html(html)
 }
 
-const ACCOUNT_PAGE_CSS: &str = r##"
+pub(crate) const ACCOUNT_PAGE_CSS: &str = r##"
 :root {
   --bg: #f5f5f5;
   --card-bg: #ffffff;
@@ -1784,7 +1899,7 @@ async function authWallet() {
     });
     if (r.ok) {
       const data = await r.json();
-      AUTHED = true; if (data.csrf) CSRF = data.csrf;
+      AUTHED = true; syncSignOut(); if (data.csrf) CSRF = data.csrf;
       renderOutcome(data);
     } else {
       const t = await r.text();
@@ -1844,7 +1959,7 @@ async function authPasskey(forceAll) {
     });
     if (finishR.ok) {
       const data = await finishR.json();
-      AUTHED = true; if (data.csrf) CSRF = data.csrf;
+      AUTHED = true; syncSignOut(); if (data.csrf) CSRF = data.csrf;
       renderOutcome(data);
     } else {
       const errBody = await finishR.clone().json().catch(() => null);
@@ -2074,6 +2189,26 @@ function bufferToBase64(buf) {
   cb.addEventListener('change', sync);
   sync();
 })();
+
+// Explicit sign-out (POST /account/sign_out): ends this browser's account
+// session and passkey-picker hint and clears both cookies. Shown while the page
+// is authenticated.
+function syncSignOut() {
+  const b = $('btn-sign-out');
+  if (b) b.classList.toggle('hidden', !AUTHED);
+}
+async function signOut() {
+  hideStatus();
+  try {
+    const r = await fetch(BASE + '/account/sign_out', { method: 'POST' });
+    if (!r.ok) { showStatus('Sign-out failed — please try again.'); return; }
+    AUTHED = false; CSRF = ''; syncSignOut();
+    showTerminal('Signed out', 'This browser is signed out of account management.', false);
+  } catch (_) {
+    showStatus('Sign-out failed — please try again.');
+  }
+}
+syncSignOut();
 
 // In-page session actions: device View/Sign out buttons and the "back to
 // sessions" button carry data-act/data-dev and run against the live session

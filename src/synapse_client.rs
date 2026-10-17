@@ -41,7 +41,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use siwx_oidc::db::{DBClient, RedisClient};
+use siwx_oidc::db::RedisClient;
 
 /// What a profile read found.
 ///
@@ -58,9 +58,8 @@ pub struct ProfileState {
     pub displayname: Option<String>,
 }
 
-use crate::admin_token::{admin_token_metadata, ADMIN_DISPLAY_NAME, ADMIN_TOKEN_PREFIX};
+use crate::admin_token::{admin_service_grant, ADMIN_DISPLAY_NAME};
 use crate::did_assertion::DID_PROFILE_FIELD;
-use crate::introspect::generate_opaque_token;
 
 /// A user's account status as reported by the MAS query endpoint.
 ///
@@ -114,7 +113,7 @@ pub struct DeviceInfo {
 
 /// Build a fully-qualified Matrix user id (`@localpart:server_name`).
 ///
-/// `pub(crate)` so `oidc::provision_synapse_device` can build the `mxid` claim
+/// `pub(crate)` so `oidc::provision_synapse_account` can build the `mxid` claim
 /// of a DID assertion with the SAME function that builds the URL the assertion
 /// is published to. A second `format!("@{localpart}:{server_name}")` elsewhere
 /// would be a second definition of the binding this whole feature is about, and
@@ -131,6 +130,25 @@ pub(crate) fn matrix_user_id(localpart: &str, server_name: &str) -> String {
 /// `admin_token`") is deliberately gone: on 1.157+ there IS no `admin_token`
 /// setting to check, and pointing an operator at it sent them looking for a
 /// config key that no longer exists.
+/// One page of [`SynapseClient::admin_users_page`].
+#[derive(Debug, Deserialize)]
+pub struct AdminUsersPage {
+    #[serde(default)]
+    pub users: Vec<AdminUserRow>,
+    /// Absent on the last page.
+    #[serde(default)]
+    pub next_token: Option<String>,
+}
+
+/// The two fields of a user row the orphan scan and the guest hand-off read.
+#[derive(Debug, Deserialize)]
+pub struct AdminUserRow {
+    /// The Matrix id, `@localpart:server`.
+    pub name: String,
+    #[serde(default)]
+    pub user_type: Option<String>,
+}
+
 /// A buffered admin-scoped response: status plus the body, already read.
 ///
 /// Buffered rather than a live [`reqwest::Response`] because the retry decision
@@ -183,6 +201,20 @@ fn admin_retry_warranted(status: reqwest::StatusCode, body: &str) -> bool {
     status == reqwest::StatusCode::INTERNAL_SERVER_ERROR && body.contains(MAS_USER_NOT_FOUND)
 }
 
+/// The URL of one admin user-list page; see [`SynapseClient::admin_users_page`].
+fn admin_users_url(endpoint: &str, from: Option<&str>, typed_only: bool) -> String {
+    let mut url =
+        format!("{endpoint}/_synapse/admin/v2/users?limit=100&guests=false&deactivated=false");
+    if typed_only {
+        url.push_str("&not_user_type=");
+    }
+    if let Some(from) = from {
+        url.push_str("&from=");
+        url.push_str(&urlencoding::encode(from));
+    }
+    url
+}
+
 fn admin_status_hint(status: reqwest::StatusCode) -> &'static str {
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         " — Synapse rejected the minted admin token (its scope must carry both \
@@ -232,7 +264,7 @@ struct AdminMint {
 /// KERNEL gave up: Linux's `tcp_syn_retries` defaults to 6, i.e. ~127 seconds
 /// per connect. "Best-effort, never fails sign-in" was true of Synapse *errors*
 /// and false of Synapse *hangs*, and this branch made that much worse by
-/// putting new awaits on the login path (`provision_synapse_device`'s profile
+/// putting new awaits on the login path (`provision_synapse_account`'s profile
 /// PUT, and `detected_mxid_for` — which turned
 /// `POST /webauthn/authenticate/start`, a route with no Synapse dependency at
 /// all before, into one with two `is_localpart_available` probes).
@@ -309,6 +341,29 @@ pub struct SynapseClient {
     shared_secret: String,
     http: Client,
     admin: Option<AdminMint>,
+    /// SS4 flag 1 (`revoke_deletes_device`), read once at startup: every
+    /// teardown that deletes a device runs strictly (see
+    /// [`SynapseClient::strict_teardown`]).
+    strict_teardown: bool,
+    /// SS4 flag 2 (`refuse_deleted_device_ids`), read once at startup: the TTL
+    /// of the deleted-id marker every delete path plants after a Synapse delete
+    /// ([`SynapseClient::deleted_marker_ttl`]); `None` with the flag off.
+    deleted_marker_ttl: Option<u64>,
+}
+
+/// What Synapse answered to `POST /_synapse/mas/delete_device` (8.23): the
+/// strict teardown of flag 1 decides by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceDelete {
+    /// 2xx. Synapse also answers this for a device that is already gone.
+    Deleted,
+    /// 404 (`User not found`): there is nothing to delete.
+    NotFound,
+    /// 401, 403 or another 4xx: a permanent refusal, typically a wrong MAS
+    /// shared secret. A configuration fault, not the client's.
+    Forbidden,
+    /// 5xx or no answer (network, timeout): retryable.
+    Transient,
 }
 
 impl SynapseClient {
@@ -326,7 +381,34 @@ impl SynapseClient {
             shared_secret: shared_secret.to_string(),
             http: build_http_client(),
             admin: None,
+            strict_teardown: false,
+            deleted_marker_ttl: None,
         }
+    }
+
+    /// Switch strict teardown (SS4 flag 1, `revoke_deletes_device`) on or off.
+    pub fn with_strict_teardown(mut self, on: bool) -> Self {
+        self.strict_teardown = on;
+        self
+    }
+
+    /// Whether teardown is strict (flag 1): Synapse delete, then the deleted-id
+    /// marker, then revoke, answered by [`DeviceDelete`]. Off: best-effort.
+    pub fn strict_teardown(&self) -> bool {
+        self.strict_teardown
+    }
+
+    /// Switch the deleted-id markers (SS4 flag 2, `refuse_deleted_device_ids`)
+    /// on with their TTL (`deleted_device_marker_ttl_secs`), or off (`None`).
+    pub fn with_deleted_markers(mut self, ttl_secs: Option<u64>) -> Self {
+        self.deleted_marker_ttl = ttl_secs;
+        self
+    }
+
+    /// The TTL of the deleted-id marker a delete plants (flag 2), `None` when
+    /// no marker is planted (flag off).
+    pub fn deleted_marker_ttl(&self) -> Option<u64> {
+        self.deleted_marker_ttl
     }
 
     /// Enable the admin-scoped calls by giving the client a token store to mint
@@ -388,13 +470,12 @@ impl SynapseClient {
                 .context("admin mint: could not provision the admin service user")?;
         }
 
-        let token = generate_opaque_token(ADMIN_TOKEN_PREFIX);
-        let metadata = admin_token_metadata(&admin.localpart, admin.ttl, now);
-        admin
+        let token = admin
             .db
-            .set_token(&token, &metadata, admin.ttl)
+            .issue_grant(&admin_service_grant(&admin.localpart, admin.ttl))
             .await
-            .context("admin mint: could not store the minted token")?;
+            .context("admin mint: could not store the minted token")?
+            .access_token;
 
         debug!(
             localpart = %admin.localpart,
@@ -486,6 +567,80 @@ impl SynapseClient {
             anyhow::bail!("provision_user: HTTP {status}");
         }
         Ok(())
+    }
+
+    /// One admin write to a user: `PUT /_synapse/admin/v2/users/{mxid}` with `body`, a
+    /// JSON object of the fields to change (Synapse merges them into the account). Used
+    /// by the guest hand-off for the `user_type` marker and for the canonical display
+    /// name, as two separate calls. Authenticated with the minted admin token.
+    ///
+    /// Fails on any non-2xx. Neither the body nor Synapse's reply is logged (the display
+    /// name is personal data): the log carries the status and `what` only. Retried once on
+    /// a rejected credential by [`admin_request`](Self::admin_request); the PUT is
+    /// idempotent.
+    pub async fn admin_put_user(
+        &self,
+        localpart: &str,
+        server_name: &str,
+        what: &'static str,
+        body: &serde_json::Value,
+    ) -> Result<()> {
+        let user_id = matrix_user_id(localpart, server_name);
+        let url = format!(
+            "{}/_synapse/admin/v2/users/{}",
+            self.endpoint,
+            urlencoding::encode(&user_id)
+        );
+        let resp = self
+            .admin_request(|http, token| http.put(&url).bearer_auth(token).json(body))
+            .await
+            .with_context(|| format!("admin_put_user({what}): request failed"))?;
+        if !resp.status.is_success() {
+            let status = resp.status;
+            warn!(%status, what, "admin_put_user failed");
+            anyhow::bail!(
+                "admin_put_user({what}): HTTP {status}{}",
+                admin_status_hint(status)
+            );
+        }
+        Ok(())
+    }
+
+    /// One account through the admin API (`GET /_synapse/admin/v2/users/{mxid}`): its
+    /// name and `user_type`, or `None` when Synapse answers 404 with errcode `M_NOT_FOUND`
+    /// (no such account). Any other 404 (a proxy that hides the admin API) is an error, so
+    /// the caller fails closed. A deactivated account is still an account. Read by the guest hand-off before it
+    /// provisions a fresh guest, so it never stamps the guest marker on an account it did
+    /// not make. The body is never logged (it carries personal data).
+    pub async fn admin_get_user(
+        &self,
+        localpart: &str,
+        server_name: &str,
+    ) -> Result<Option<AdminUserRow>> {
+        let user_id = matrix_user_id(localpart, server_name);
+        let url = format!(
+            "{}/_synapse/admin/v2/users/{}",
+            self.endpoint,
+            urlencoding::encode(&user_id)
+        );
+        let resp = self
+            .admin_request(|http, token| http.get(&url).bearer_auth(token))
+            .await
+            .context("admin_get_user: request failed")?;
+        if resp.status == reqwest::StatusCode::NOT_FOUND
+            && serde_json::from_str::<serde_json::Value>(&resp.body)
+                .is_ok_and(|v| v["errcode"] == "M_NOT_FOUND")
+        {
+            return Ok(None);
+        }
+        if !resp.status.is_success() {
+            let status = resp.status;
+            warn!(%status, "admin_get_user failed");
+            anyhow::bail!("admin_get_user: HTTP {status}{}", admin_status_hint(status));
+        }
+        serde_json::from_str(&resp.body)
+            .map(Some)
+            .context("admin_get_user: invalid JSON")
     }
 
     /// Create a device for a user, or confirm that it exists, WITHOUT a
@@ -698,7 +853,7 @@ impl SynapseClient {
     /// modern localpart" — so an indeterminate 4xx made a **grandfathered**
     /// user, whose legacy account genuinely exists, fall through to a
     /// brand-new empty modern account, under which
-    /// `oidc::provision_synapse_device` then published a second,
+    /// `oidc::provision_synapse_account` then published a second,
     /// independently-verifying `io.inblock.did` assertion. Two provider-signed
     /// assertions for one DID, with no way for a consumer to tell which is
     /// canonical, and Synapse has no rename API to undo it: finding **D4** of
@@ -878,7 +1033,7 @@ impl SynapseClient {
     /// one is available, otherwise with no credential; see [`Self::read_profile`]).
     ///
     /// This is the half-provisioning discriminator behind the self-heal in
-    /// [`crate::oidc::provision_synapse_device`]: the 2026-08-01 dev incident
+    /// [`crate::oidc::provision_synapse_account`]: the 2026-08-01 dev incident
     /// found an account with a Synapse `users` row but no `profiles` row (because
     /// `provision_user` failed transiently at first sign-in), which then silently
     /// failed every subsequent displayname write.
@@ -924,7 +1079,7 @@ impl SynapseClient {
     /// The same read as [`Self::has_profile_row`], returning the displayname it
     /// already fetched alongside the presence verdict.
     ///
-    /// Split out for the alias-tier migration (`oidc::provision_synapse_device`):
+    /// Split out for the alias-tier migration (`oidc::provision_synapse_account`):
     /// deciding whether a displayname was written by US or chosen by the USER
     /// requires seeing its value, and doing that with a second GET would double
     /// the login-path probe count for a value this request already has in hand.
@@ -1052,6 +1207,35 @@ impl SynapseClient {
         Ok(body.devices)
     }
 
+    /// One page of the Synapse admin user list (`GET /_synapse/admin/v2/users`), active
+    /// non-guest accounts, 100 per page, from the opaque `from` token. Read-only. The body is
+    /// never logged (it carries every user's name).
+    ///
+    /// `typed_only` adds `not_user_type=` (empty), which Synapse reads as "exclude accounts
+    /// without a user type": the page then holds only typed accounts (our guests, and any
+    /// bot or support account), which is all the orphan scan looks at. `false` is the plain
+    /// list, URL unchanged.
+    pub async fn admin_users_page(
+        &self,
+        from: Option<&str>,
+        typed_only: bool,
+    ) -> Result<AdminUsersPage> {
+        let url = admin_users_url(&self.endpoint, from, typed_only);
+        let resp = self
+            .admin_request(|http, token| http.get(&url).bearer_auth(token))
+            .await
+            .context("admin_users_page: request failed")?;
+        if !resp.status.is_success() {
+            let status = resp.status;
+            warn!(%status, "admin_users_page failed");
+            anyhow::bail!(
+                "admin_users_page: HTTP {status}{}",
+                admin_status_hint(status)
+            );
+        }
+        serde_json::from_str(&resp.body).context("admin_users_page: invalid JSON")
+    }
+
     /// Fetch a single device belonging to the user, or `None` if no device with
     /// that id is owned by the user.
     ///
@@ -1092,6 +1276,45 @@ impl SynapseClient {
         device_id: &str,
         server_name: &str,
     ) -> Result<()> {
+        let status = self
+            .send_delete_device(localpart, device_id, server_name)
+            .await?;
+        if !status.is_success() {
+            anyhow::bail!("delete_device: HTTP {status}{}", mas_status_hint(status));
+        }
+        Ok(())
+    }
+
+    /// [`delete_device`](Self::delete_device), answered by what Synapse said
+    /// instead of an error (8.23, SS4 flag 1).
+    pub async fn delete_device_status(
+        &self,
+        localpart: &str,
+        device_id: &str,
+        server_name: &str,
+    ) -> DeviceDelete {
+        match self
+            .send_delete_device(localpart, device_id, server_name)
+            .await
+        {
+            Ok(s) if s.is_success() => DeviceDelete::Deleted,
+            Ok(reqwest::StatusCode::NOT_FOUND) => DeviceDelete::NotFound,
+            Ok(s) if s.is_client_error() => DeviceDelete::Forbidden,
+            Ok(_) => DeviceDelete::Transient,
+            Err(e) => {
+                warn!(error = %e, "delete_device: no answer from Synapse");
+                DeviceDelete::Transient
+            }
+        }
+    }
+
+    /// The request of both, logging a non-2xx answer.
+    async fn send_delete_device(
+        &self,
+        localpart: &str,
+        device_id: &str,
+        server_name: &str,
+    ) -> Result<reqwest::StatusCode> {
         let url = format!("{}/_synapse/mas/delete_device", self.endpoint);
         let resp = self
             .http
@@ -1102,14 +1325,21 @@ impl SynapseClient {
             .await
             .context("delete_device: request failed")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            let user_id = matrix_user_id(localpart, server_name);
-            warn!(%status, %body, %user_id, %device_id, "delete_device failed");
-            anyhow::bail!("delete_device: HTTP {status}{}", mas_status_hint(status));
+        let status = resp.status();
+        if !status.is_success() {
+            // Fingerprints and Synapse's `errcode` only: the answer's `error` text can
+            // name the account or the device (SS4 audit #4).
+            let errcode = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v["errcode"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let user_fp = siwx_oidc::redact::fingerprint(&matrix_user_id(localpart, server_name));
+            let device_fp = siwx_oidc::redact::fingerprint(device_id);
+            warn!(%status, %errcode, %user_fp, %device_fp, "delete_device failed");
         }
-        Ok(())
+        Ok(status)
     }
 
     /// Deactivate a user's account via the MAS API
@@ -1574,6 +1804,52 @@ impl SynapseClient {
             .context("read_did_field: response was not JSON")?;
         Ok(did_from_profile_field(body.get(DID_PROFILE_FIELD)))
     }
+
+    /// The current state of a room: the `state` array of
+    /// `GET /_synapse/admin/v1/rooms/{room_id}/state`, or `None` when Synapse does not
+    /// know the room (404).
+    ///
+    /// Backs the guest room audit at mint (design 01 §4.3,
+    /// `siwx_oidc::guest_room_audit`). The state carries the `m.room.member` events too,
+    /// so "the host is joined with invite power" needs no second read. The caller checks
+    /// `room_id` against the room id grammar first (04 GP-SEC-07); here it is sent as one
+    /// percent-encoded path segment.
+    ///
+    /// A normal user steers this admin read, and room state names people, so the log
+    /// carries the status and the duration only, never a body, and neither does the
+    /// error.
+    pub async fn room_state(&self, room_id: &str) -> Result<Option<Vec<serde_json::Value>>> {
+        let url = format!(
+            "{}/_synapse/admin/v1/rooms/{}/state",
+            self.endpoint,
+            urlencoding::encode(room_id)
+        );
+        let started = std::time::Instant::now();
+        let resp = self
+            .admin_request(|http, token| http.get(&url).bearer_auth(token))
+            .await
+            .context("room_state: request failed")?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let status = resp.status;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            debug!(%status, elapsed_ms, "room_state: room unknown");
+            return Ok(None);
+        }
+        if !status.is_success() {
+            warn!(%status, elapsed_ms, "room_state failed");
+            anyhow::bail!("room_state: HTTP {status}{}", admin_status_hint(status));
+        }
+        debug!(%status, elapsed_ms, "room_state read");
+
+        #[derive(Deserialize)]
+        struct StateResponse {
+            state: Vec<serde_json::Value>,
+        }
+        // `serde_json`'s error names a position, never the content.
+        let body: StateResponse =
+            serde_json::from_str(&resp.body).context("room_state: invalid JSON")?;
+        Ok(Some(body.state))
+    }
 }
 
 /// Extract the published DID from the value of the [`DID_PROFILE_FIELD`] member
@@ -1905,6 +2181,45 @@ fn profile_404_means_row_absent(body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use siwx_oidc::db::tokens::ADMIN_TOKEN_PREFIX;
+
+    /// SS4 audit #4: a refused `delete_device` is logged with fingerprints and Synapse's
+    /// `errcode` only: never the MXID, the device id or the answer's text.
+    #[tokio::test]
+    async fn a_failed_delete_device_logs_no_mxid_device_id_or_body() {
+        use axum::{http::StatusCode, routing::post, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/_synapse/mas/delete_device",
+            post(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    r#"{"errcode":"M_NOT_FOUND","error":"Device DEVICE_A of @alice:example.org not found"}"#,
+                )
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let client = SynapseClient::new(&format!("http://{addr}"), "shared-secret");
+
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let outcome = client
+            .delete_device_status("alice", "DEVICE_A", "example.org")
+            .await;
+        let out = logs.output();
+        server.abort();
+
+        assert!(matches!(outcome, DeviceDelete::NotFound), "{outcome:?}");
+        assert!(out.contains("delete_device failed"), "{out}");
+        assert!(out.contains("M_NOT_FOUND"), "the errcode is kept: {out}");
+        assert!(
+            out.contains(&siwx_oidc::redact::fingerprint("DEVICE_A")),
+            "the device fingerprint is logged: {out}"
+        );
+        for clear in ["alice", "DEVICE_A", "not found"] {
+            assert!(!out.contains(clear), "{clear:?} logged in clear: {out}");
+        }
+    }
 
     #[test]
     fn new_strips_trailing_slash() {
@@ -2121,6 +2436,26 @@ mod tests {
         assert!(
             err.contains("without a token store"),
             "error must name the missing precondition, got: {err}"
+        );
+    }
+
+    /// The orphan scan asks only for typed accounts (`not_user_type=`); the plain list keeps
+    /// its URL exactly.
+    #[test]
+    fn the_typed_user_list_carries_not_user_type_and_the_plain_list_does_not() {
+        let base = "https://hs.example.org/_synapse/admin/v2/users?limit=100&guests=false&deactivated=false";
+        assert_eq!(admin_users_url("https://hs.example.org", None, false), base);
+        assert_eq!(
+            admin_users_url("https://hs.example.org", Some("a b"), false),
+            format!("{base}&from=a%20b")
+        );
+        assert_eq!(
+            admin_users_url("https://hs.example.org", None, true),
+            format!("{base}&not_user_type=")
+        );
+        assert_eq!(
+            admin_users_url("https://hs.example.org", Some("100"), true),
+            format!("{base}&not_user_type=&from=100")
         );
     }
 
@@ -3712,6 +4047,96 @@ mod tests {
         assert!(
             !info.is_suspended,
             "suspension is parsed but is not a login gate"
+        );
+        handle.abort();
+    }
+
+    // -- room_state (guest room audit, S2a) ----------------------------------
+
+    /// A body no log line and no error may ever carry.
+    const ROOM_SECRET: &str = "Board-meeting-of-Erika-Mustermann";
+
+    #[tokio::test]
+    async fn room_state_wire_shape_and_parse() {
+        let state = json!({"state": [
+            {"type": "m.room.name", "state_key": "", "sender": "@h:example.org",
+             "content": {"name": ROOM_SECRET}}
+        ]});
+        let (client, log, handle) =
+            spawn_mock_synapse(MockReplies::new(axum::http::StatusCode::OK).body(state)).await;
+        let Some(client) = with_redis_mint(client).await else {
+            handle.abort();
+            return;
+        };
+
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let events = client
+            .room_state("!abc:example.org")
+            .await
+            .expect("a 200 is Ok")
+            .expect("a 200 is Some");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["content"]["name"], ROOM_SECRET);
+
+        let recorded = log.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "one read, got {recorded:?}");
+        assert_eq!(recorded[0].method, "GET");
+        assert_eq!(
+            recorded[0].path, "/_synapse/admin/v1/rooms/%21abc%3Aexample.org/state",
+            "the room id is ONE percent-encoded path segment"
+        );
+        let token = recorded[0]
+            .authorization
+            .as_deref()
+            .and_then(|a| a.strip_prefix("Bearer "))
+            .expect("a bearer token");
+        assert!(
+            token.starts_with(ADMIN_TOKEN_PREFIX),
+            "a minted admin token"
+        );
+        let out = logs.output();
+        assert!(out.contains("room_state read"), "the read is logged: {out}");
+        assert!(!out.contains(ROOM_SECRET), "no body in the log: {out}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn room_state_unknown_room_is_none() {
+        let (client, _log, handle) =
+            spawn_mock_synapse(MockReplies::new(axum::http::StatusCode::NOT_FOUND)).await;
+        let Some(client) = with_redis_mint(client).await else {
+            handle.abort();
+            return;
+        };
+        assert!(client.room_state("!gone").await.unwrap().is_none());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn room_state_failure_logs_and_returns_no_body() {
+        let (client, _log, handle) = spawn_mock_synapse(
+            MockReplies::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(json!({"error": ROOM_SECRET})),
+        )
+        .await;
+        let Some(client) = with_redis_mint(client).await else {
+            handle.abort();
+            return;
+        };
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let err = client
+            .room_state("!abc:example.org")
+            .await
+            .expect_err("a 500 is Err");
+        let out = logs.output();
+        assert!(
+            out.contains("room_state failed"),
+            "the failure is logged: {out}"
+        );
+        assert!(!out.contains(ROOM_SECRET), "no body in the log: {out}");
+        assert!(
+            !format!("{err:#}").contains(ROOM_SECRET),
+            "no body in the error"
         );
         handle.abort();
     }

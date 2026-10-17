@@ -638,3 +638,346 @@ fn uuid_like() -> String {
     rand::thread_rng().fill_bytes(&mut b);
     hex::encode(b)
 }
+
+/// SS4 flag 2 (`SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`) as the stack under test runs it.
+fn flag2_on() -> bool {
+    std::env::var("SIWXOIDC_REFUSE_DELETED_DEVICE_IDS").is_ok_and(|v| v == "true" || v == "1")
+}
+
+/// Arm (`"500"`) or clear (`"off"`) the mock's `upsert_device` fault.
+async fn fail_upsert(c: &Client, mode: &str) {
+    let r = c
+        .post(format!("{}/__fail", matrix_host()))
+        .json(&json!({"endpoint": "upsert_device", "mode": mode}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "/__fail upsert_device {mode}");
+}
+
+/// The mock's device table, as JSON text (device ids are unique per test).
+async fn mock_devices(c: &Client) -> String {
+    let state: Value = c
+        .get(format!("{}/__state", matrix_host()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    state["devices"].to_string()
+}
+
+/// SS4 audit fix #1 (8.27): an approved device code polled while the homeserver cannot
+/// provision the device. Flag 2 on: `temporarily_unavailable`, no token, no device; the
+/// code stays redeemable, and the poll after the homeserver recovers gets the token and
+/// the device. Flag 2 off: today's behaviour, the token is issued without a device.
+#[tokio::test]
+#[ignore = "needs the mock stack (e2e/README.md)"]
+async fn device_code_upsert_failure_issues_no_grant_without_a_device() {
+    let base = oidc();
+    let c = Client::new();
+    let w = new_wallet();
+    seed_login(&c, &base, &w).await;
+
+    let rc = register_client(&c, &base).await;
+    let device_id = format!("DEVCODE_{}", uuid_like());
+    let scope = format!("openid urn:matrix:client:device:{device_id}");
+    let da: Value = c
+        .post(format!("{base}/device_authorization"))
+        .form(&[
+            ("client_id", rc.client_id.as_str()),
+            ("scope", scope.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let device_code = da["device_code"].as_str().unwrap().to_string();
+    let user_code = da["user_code"].as_str().unwrap().to_string();
+    let interval = da["interval"].as_u64().unwrap_or(5);
+    let (message, signature) = sign_device_message(&c, &w, &base, &user_code).await;
+    let approve = c
+        .post(format!("{base}/device"))
+        .json(&json!({
+            "user_code": user_code,
+            "action": "approve",
+            "did": w.did,
+            "message": message,
+            "signature": signature,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approve.status(), StatusCode::OK);
+
+    fail_upsert(&c, "500").await;
+    let first = c
+        .post(format!("{base}/token"))
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", device_code.as_str()),
+            ("client_id", rc.client_id.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let status = first.status();
+    let body: Value = first.json().await.unwrap_or(Value::Null);
+    fail_upsert(&c, "off").await;
+
+    if !flag2_on() {
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "flag 2 off: issued as today: {body}"
+        );
+        assert!(
+            !mock_devices(&c).await.contains(&device_id),
+            "flag 2 off: the token was issued without a device (today's N10)"
+        );
+        return;
+    }
+    assert_eq!(status, StatusCode::BAD_REQUEST, "error: {}", body["error"]);
+    assert_eq!(body["error"], "temporarily_unavailable", "{body}");
+    assert!(body.get("access_token").is_none(), "no token: {body}");
+    assert!(
+        !mock_devices(&c).await.contains(&device_id),
+        "no device was provisioned"
+    );
+
+    // The homeserver is back: the code was released, so the next poll redeems it.
+    tokio::time::sleep(Duration::from_secs(interval.max(1))).await;
+    let token = poll_device_token(&c, &base, &device_code, &rc.client_id, interval).await;
+    assert!(token["access_token"].as_str().is_some(), "{token}");
+    assert!(
+        mock_devices(&c).await.contains(&device_id),
+        "the retry provisioned the device"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// login_hint: the account the device asks for
+// ---------------------------------------------------------------------------
+
+/// The MXID the server gives `did`'s account (`GET /resolve?did=`), so the test
+/// names the account the way the server built it, whatever its server name.
+async fn mxid_of(c: &Client, base: &str, did: &str) -> String {
+    let r: Value = c
+        .get(format!("{base}/resolve"))
+        .query(&[("did", did)])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["exists"], true, "the seeded account must exist: {r}");
+    r["mxid"]
+        .as_str()
+        .expect("/resolve must name the account's mxid")
+        .to_string()
+}
+
+/// `POST /device_authorization` with an optional `login_hint`; the raw response.
+async fn device_authorization_with_hint(
+    c: &Client,
+    base: &str,
+    client_id: &str,
+    login_hint: Option<&str>,
+) -> reqwest::Response {
+    let mut form = vec![("client_id", client_id), ("scope", "openid")];
+    if let Some(hint) = login_hint {
+        form.push(("login_hint", hint));
+    }
+    c.post(format!("{base}/device_authorization"))
+        .form(&form)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Approve `user_code` with wallet `w`'s CAIP-122 signature; the status and body.
+async fn approve_with_wallet(
+    c: &Client,
+    base: &str,
+    w: &Wallet,
+    user_code: &str,
+) -> (StatusCode, String) {
+    let (message, signature) = sign_device_message(c, w, base, user_code).await;
+    let r = c
+        .post(format!("{base}/device"))
+        .json(&json!({
+            "user_code": user_code,
+            "action": "approve",
+            "did": w.did,
+            "message": message,
+            "signature": signature,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    (status, r.text().await.unwrap_or_default())
+}
+
+/// A request that names its account (`login_hint=mxid:@localpart:server_name`) is
+/// shown with that account on the page, approved by it, and its token is for it.
+#[tokio::test]
+#[ignore = "requires a live siwx-oidc + Synapse stack (e.g. the e2eh hermetic stack)"]
+async fn a_hinted_device_grant_approved_by_that_account_is_for_that_account() {
+    let base = oidc();
+    let c = Client::new();
+    let w = new_wallet();
+    seed_login(&c, &base, &w).await;
+    let mxid = mxid_of(&c, &base, &w.did).await;
+    let localpart = mxid
+        .strip_prefix('@')
+        .and_then(|m| m.split_once(':'))
+        .map(|(l, _)| l.to_string())
+        .unwrap();
+
+    let rc = register_client(&c, &base).await;
+    let hint = format!("mxid:{mxid}");
+    let da = device_authorization_with_hint(&c, &base, &rc.client_id, Some(&hint)).await;
+    assert_eq!(
+        da.status(),
+        StatusCode::OK,
+        "a hint for an account here is accepted"
+    );
+    let da: Value = da.json().await.unwrap();
+    let user_code = da["user_code"].as_str().unwrap().to_string();
+    let device_code = da["device_code"].as_str().unwrap().to_string();
+
+    // The page learns the account the request is for.
+    let info: Value = c
+        .get(format!("{base}/device/verify"))
+        .query(&[("user_code", user_code.as_str())])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        info["expected_account"].as_str(),
+        Some(mxid.as_str()),
+        "{info}"
+    );
+
+    let (status, body) = approve_with_wallet(&c, &base, &w, &user_code).await;
+    assert_eq!(status, StatusCode::OK, "the named account approves: {body}");
+
+    let interval = da["interval"].as_u64().unwrap_or(5);
+    let token = poll_device_token(&c, &base, &device_code, &rc.client_id, interval).await;
+    let intro = introspect(&c, &base, token["access_token"].as_str().unwrap()).await;
+    assert_eq!(intro["active"], true, "{intro}");
+    assert_eq!(intro["sub"].as_str(), Some(w.did.as_str()), "{intro}");
+    assert_eq!(
+        intro["username"].as_str(),
+        Some(localpart.as_str()),
+        "the token is for the account the hint names: {intro}"
+    );
+}
+
+/// Another account cannot approve a request that names an account: the approval is
+/// refused with a message naming both, the code stays pending, and no token is issued.
+#[tokio::test]
+#[ignore = "requires a live siwx-oidc + Synapse stack (e.g. the e2eh hermetic stack)"]
+async fn a_hinted_device_grant_is_refused_to_another_account() {
+    let base = oidc();
+    let c = Client::new();
+    let expected = new_wallet();
+    let other = new_wallet();
+    seed_login(&c, &base, &expected).await;
+    seed_login(&c, &base, &other).await;
+    let expected_mxid = mxid_of(&c, &base, &expected.did).await;
+    let other_mxid = mxid_of(&c, &base, &other.did).await;
+
+    let rc = register_client(&c, &base).await;
+    let hint = format!("mxid:{expected_mxid}");
+    let da: Value = device_authorization_with_hint(&c, &base, &rc.client_id, Some(&hint))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let user_code = da["user_code"].as_str().unwrap().to_string();
+    let device_code = da["device_code"].as_str().unwrap().to_string();
+
+    let (status, body) = approve_with_wallet(&c, &base, &other, &user_code).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "another account is refused: {body}"
+    );
+    assert!(
+        body.contains(&format!("This request is for {expected_mxid}."))
+            && body.contains(&format!("You signed in as {other_mxid}.")),
+        "the refusal names both accounts: {body}"
+    );
+
+    // Still pending: the page can be used again, and a poll gets no token.
+    let verify = c
+        .get(format!("{base}/device/verify"))
+        .query(&[("user_code", user_code.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(verify.status(), StatusCode::OK, "the code stays pending");
+    let poll = c
+        .post(format!("{base}/token"))
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", device_code.as_str()),
+            ("client_id", rc.client_id.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(poll.status(), StatusCode::BAD_REQUEST);
+    let poll: Value = poll.json().await.unwrap();
+    assert_eq!(poll["error"], "authorization_pending", "no token: {poll}");
+}
+
+/// A `login_hint` that is malformed, names another homeserver or has an uppercase
+/// localpart is refused with `invalid_request` and no code; an empty one is no hint.
+#[tokio::test]
+#[ignore = "requires a live siwx-oidc + Synapse stack (e.g. the e2eh hermetic stack)"]
+async fn a_malformed_or_foreign_login_hint_is_refused() {
+    let base = oidc();
+    let c = Client::new();
+    let rc = register_client(&c, &base).await;
+    for hint in [
+        "alice",
+        "@alice:matrix.test",
+        "mxid:alice",
+        "mxid:@alice:elsewhere.example",
+        // Every localpart here is lowercase: an uppercase one can never be approved.
+        "mxid:@Alice:matrix.test",
+    ] {
+        let r = device_authorization_with_hint(&c, &base, &rc.client_id, Some(hint)).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{hint} is refused");
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["error"], "invalid_request", "{hint}: {body}");
+        assert!(
+            body.get("device_code").is_none(),
+            "{hint}: no code is issued"
+        );
+    }
+    let empty = device_authorization_with_hint(&c, &base, &rc.client_id, Some("")).await;
+    assert_eq!(empty.status(), StatusCode::OK, "an empty hint is no hint");
+    let empty: Value = empty.json().await.unwrap();
+    let info: Value = c
+        .get(format!("{base}/device/verify"))
+        .query(&[("user_code", empty["user_code"].as_str().unwrap())])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(info.get("expected_account").is_none(), "{info}");
+    assert_eq!(info["passkey_offered"], true, "{info}");
+}

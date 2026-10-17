@@ -29,7 +29,7 @@ description = "Key-first OpenID Connect provider and Matrix auth service: agents
 # everywhere. The pin below, which is the part that actually matters, is
 # unaffected by the spelling.
 #
-# `v0.7.0` is the async credential store this crate's source targets. It replaces
+# `v0.9.0` carries the async credential store this crate's source targets (first tagged at v0.7.0). It replaces
 # the `refactor/async-credential-store` branch rev this tracked while no tag
 # existed; the tagged tree differs from that rev by documentation only, so this
 # is a re-pin, not an upgrade. A release tag rather than a branch rev so a clean
@@ -37,9 +37,10 @@ description = "Key-first OpenID Connect provider and Matrix auth service: agents
 # machine-local `[patch]` the migration was developed under. aqua-node,
 # aquafier-rs and aqua-state-viewer still resolve 0.6.0 and move to this tag in
 # one batch. See CONSUMERS.md in aqua-auth.
-aqua-auth = { git = "https://github.com/inblockio/aqua-rs-auth", tag = "v0.7.0", features = ["webauthn", "ceremony", "redis"] }
+aqua-auth = { git = "https://github.com/inblockio/aqua-auth", tag = "v0.9.0", features = ["webauthn", "ceremony", "redis"] }
 alloy-primitives = { version = "1", features = ["serde"] }
 alloy = { version = "1", features = ["providers", "transport-http", "contract", "sol-types", "ens"] }
+aes-gcm = "0.10"
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
@@ -51,6 +52,7 @@ cookie = "0.18"
 figment = { version = "0.10", features = ["toml", "env"] }
 headers = "0.4"
 hex = "0.4"
+hkdf = "0.12"
 lazy_static = "1.4"
 openidconnect = "4.0"
 p256 = { version = "0.13", features = ["ecdsa", "pem", "jwk"] }
@@ -73,6 +75,9 @@ uuid = { version = "1", features = ["serde", "v4"] }
 webauthn-rs = { version = "=0.6.1-dev", features = ["danger-allow-state-serialisation", "conditional-ui"] }
 bs58 = "0.5"
 webauthn-rs-proto = "=0.6.1-dev"
+unicode-normalization = "0.1"
+unicode-security = "0.1"
+hmac = "0.12"
 
 [dev-dependencies]
 # `figment::Jail` for the config-loading tests in src/config.rs: a temporary
@@ -109,6 +114,7 @@ sha3 = "0.10"
 test-log = "0.2"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 urlencoding = "2"
+aqua-auth = { git = "https://github.com/inblockio/aqua-auth", tag = "v0.9.0", features = ["webauthn-testkit"] }
 
 [profile.release]
 opt-level = "z"

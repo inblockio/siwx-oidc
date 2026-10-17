@@ -121,6 +121,17 @@ where
     }
 }
 
+/// Deserializes an optional string, treating an empty or blank value as `None`,
+/// so `SIWXOIDC_RP_ID=` (a compose `${VAR:-}` default) means unset.
+fn blank_string_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty()))
+}
+
 /// Deserializes an optional absolute `http`/`https` URL, treating an empty
 /// string as `None` like [`empty_string_as_none`]. Anything else, a relative
 /// path or another scheme, is an error, so a bad value stops the server at
@@ -180,9 +191,18 @@ pub struct Config {
     /// Must be a subset of the cipher suites registered in aqua-auth.
     pub supported_pkh_namespaces: Vec<String>,
     /// WebAuthn Relying Party ID (domain). Defaults to the hostname of `base_url`.
+    /// An empty value is unset (as for `rp_origin` and `legacy_rp_id`).
+    #[serde(default, deserialize_with = "blank_string_as_none")]
     pub rp_id: Option<String>,
     /// WebAuthn expected origin. Defaults to `base_url` (scheme + host + port).
+    #[serde(default, deserialize_with = "blank_string_as_none")]
     pub rp_origin: Option<String>,
+    /// The RP ID of the legacy ceremony (registration, linking, account and
+    /// device flows). Setting it together with a different `rp_id` is what turns
+    /// on two RPs: `rp_id` / `rp_origin` then name the unified RP. Without it
+    /// there is one RP (`rp_id`, else the hostname of `base_url`).
+    #[serde(default, deserialize_with = "blank_string_as_none")]
+    pub legacy_rp_id: Option<String>,
     /// The MAS shared secret (MSC3861 mode); must equal Synapse's
     /// `matrix_authentication_service.secret`. It authenticates Synapse to
     /// `/oauth2/introspect` and `/oauth2/admin_token`, and this provider to
@@ -204,6 +224,13 @@ pub struct Config {
     /// userinfo claim and `GET /resolve`. Without it those degrade or are skipped.
     /// Env: `SIWEOIDC_MATRIX_SERVER_NAME`
     pub matrix_server_name: Option<String>,
+    /// The domain of the mailbox address (`<localpart>@<mail_domain>`) of an account that
+    /// signs in to a generic-class client. Unset: no account gets one. Must be a lowercase
+    /// DNS name that is not an IP address, and is required when a static client allows
+    /// `io.inblock.mail`; start-up refuses anything else.
+    /// Env: `SIWXOIDC_MAIL_DOMAIN`
+    #[serde(default)]
+    pub mail_domain: Option<String>,
     /// This deployment's terms of service, advertised as `op_tos_uri` in
     /// discovery. Unset or empty (the default): the field is omitted, because
     /// no deployment should advertise terms it did not write. An absolute
@@ -234,6 +261,266 @@ pub struct Config {
     /// first mint. Default: `siwx-admin`.
     /// Env: `SIWEOIDC_ADMIN_TOKEN_LOCALPART`
     pub admin_token_localpart: String,
+    /// Absolute lifetime of every grant, in seconds, counted from the
+    /// original authentication (I6): past it the refresh token and every
+    /// access token of the grant are refused, however recently it was used.
+    /// Unset (the default): no cap, a grant ends only after 90 days without a
+    /// refresh. At least [`MIN_GRANT_ABSOLUTE_LIFETIME_SECS`]. Provisional (D1).
+    /// Env: `SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS`
+    #[serde(default)]
+    pub grant_absolute_lifetime_secs: Option<u64>,
+    /// The same per client id, overriding the global value for that client,
+    /// longer or shorter (D1, provisional).
+    /// Env: `SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS_BY_CLIENT__<client id>`
+    #[serde(default)]
+    pub grant_absolute_lifetime_secs_by_client: HashMap<String, u64>,
+    /// Hosts a `backchannel_logout_uri` may name without the address check
+    /// (OIDC Back-Channel Logout; the SSRF guard): a listed host may resolve
+    /// to a loopback or private address and may use `http`. Matched against
+    /// the URI's host, case-insensitively, any port. Empty (the default):
+    /// every URI must be `https` and resolve only to public addresses.
+    /// Env: `SIWXOIDC_BACKCHANNEL_LOGOUT_ALLOWED_HOSTS='["rp.internal"]'`
+    #[serde(default)]
+    pub backchannel_logout_allowed_hosts: Vec<String>,
+    /// Refuse the dynamic registration of a client that may receive refresh
+    /// tokens unless it registers a `backchannel_logout_uri` (D4,
+    /// provisional). Enforced in generic mode only: in Matrix mode every grant
+    /// is a Matrix device grant, which never sends a logout token. Default off.
+    /// Env: `SIWXOIDC_BACKCHANNEL_LOGOUT_REQUIRED_FOR_REFRESH`
+    #[serde(default)]
+    pub backchannel_logout_required_for_refresh: bool,
+    /// Revoke the grant when a superseded refresh token is presented (I5
+    /// phase B): the rotation script that detects the reuse deletes the grant
+    /// (never the Synapse device), so its current holder is refused too. Off
+    /// (the default, phase A): reuse is refused and logged, nothing revoked.
+    /// Stays off until the maintainers decide (design decision D2: 30 days of
+    /// phase-A telemetry with every reuse event explained). Read once at startup.
+    /// Env: `SIWXOIDC_REUSE_REVOKES_GRANT`
+    #[serde(default)]
+    pub reuse_revokes_grant: bool,
+    // -- Session end removes its device (SS4). Every switch is off by default:
+    // a build with all three off behaves as before them (model D8). --
+    /// Flag 1. On: `POST /oauth2/revoke` of a Matrix-credential grant ends the
+    /// session including its Synapse device (other grant kinds keep tokens-only
+    /// revocation), every teardown becomes strict (Synapse delete, then the
+    /// deleted-id marker, then revoke; a transient Synapse failure answers 503
+    /// and revokes nothing), and a guest claim tears the pre-claim devices down.
+    /// Off (the default): revoke keeps the device; teardown is best-effort and
+    /// answers 200. Read once at startup.
+    /// Env: `SIWXOIDC_REVOKE_DELETES_DEVICE`
+    #[serde(default)]
+    pub revoke_deletes_device: bool,
+    /// Flag 2. On: every device delete plants a deleted-id marker and a sign-in
+    /// naming such an id is refused. Off (the default): no marker is written.
+    /// Env: `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`
+    #[serde(default)]
+    pub refuse_deleted_device_ids: bool,
+    /// Flag 3. On: the device reaper runs. Off (the default): no reaper task.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_ENABLED`
+    #[serde(default)]
+    pub device_reaper_enabled: bool,
+    /// Lifetime of a deleted-id marker (flag 2), seconds. Default 365 days.
+    /// Env: `SIWXOIDC_DELETED_DEVICE_MARKER_TTL_SECS`
+    pub deleted_device_marker_ttl_secs: u64,
+    /// Localparts the device reaper (flag 3) never touches. Default empty.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_SPARE_USERS`
+    #[serde(default)]
+    pub device_reaper_spare_users: Vec<String>,
+    /// Device reaper (flag 3): a pass deletes nothing and only reports (counts in
+    /// the log, the full list in `device_reaper_report_path`). Default true, so
+    /// turning flag 3 on starts with a dry run; set false to delete.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_DRY_RUN`
+    pub device_reaper_dry_run: bool,
+    /// Device reaper (flag 3): seconds between two passes of the fleet (one
+    /// instance per interval holds the lease). Default 86400 (one day). A zero
+    /// is read as one second.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_INTERVAL_SECS`
+    pub device_reaper_interval_secs: u64,
+    /// Device reaper (flag 3): added to the refresh-token lifetime (90 days) to
+    /// give the idle time after which Synapse's `last_seen` makes a device a
+    /// candidate. Default 604800 (7 days).
+    /// Env: `SIWXOIDC_DEVICE_REAPER_MARGIN_SECS`
+    pub device_reaper_margin_secs: u64,
+    /// Device reaper (flag 3): when set, replaces the idle threshold (refresh
+    /// lifetime plus margin) by this many seconds. A device with a live grant, a
+    /// NULL `last_seen` or on a spared account is still never deleted. For a
+    /// test deployment only; unset (the default) on production.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_MIN_IDLE_SECS`
+    #[serde(default)]
+    pub device_reaper_min_idle_secs: Option<u64>,
+    /// Device reaper (flag 3): a file each pass writes its full list to (one
+    /// JSON line per device with its account, type and verdict), mode 0600,
+    /// replaced each pass. It holds Matrix ids in clear, so it belongs on the
+    /// host only, never in logs or a repository. Unset (the default): no file.
+    /// Env: `SIWXOIDC_DEVICE_REAPER_REPORT_PATH`
+    #[serde(default)]
+    pub device_reaper_report_path: Option<String>,
+    // -- Guest server path (S1). Flat on purpose, like the rest of the struct. --
+    /// Master switch for the guest server path. Off (the default): every other `guest_*` key is ignored and the guest endpoints do not exist. On: start-up runs `guest::validate_guest_config` and refuses to start when a prerequisite is missing.
+    /// Env: `SIWXOIDC_GUEST_ENABLED`
+    #[serde(default)]
+    pub guest_enabled: bool,
+    /// The fixed Meet start URL a guest invitation leads to. Required when guest mode is on; https (http only for a `localhost` `base_url`). An empty string unsets it.
+    /// Env: `SIWXOIDC_GUEST_CLIENT_URL`
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub guest_client_url: Option<Url>,
+    /// The OIDC `client_id` of the Meet client guests sign in through. Required when guest mode is on.
+    /// Env: `SIWXOIDC_GUEST_CLIENT_ID`
+    #[serde(default)]
+    pub guest_client_id: Option<String>,
+    /// Optional display name of the guest client. It becomes the client's `client_name`, which is the name a new guest device gets in the device list; without one the device is named after `guest_client_id`. Unset or blank: the `client_id`. Only a device created after the change is named by it. Read at start-up, when the client is written again.
+    /// Env: `SIWXOIDC_GUEST_CLIENT_NAME`
+    #[serde(default)]
+    pub guest_client_name: Option<String>,
+    /// Redirect URIs the guest client may use. At least one is required when guest mode is on; each must be https (http only for a `localhost` `base_url`).
+    /// Env: `SIWXOIDC_GUEST_CLIENT_REDIRECT_URIS`
+    #[serde(default)]
+    pub guest_client_redirect_uris: Vec<Url>,
+    /// Localparts or DIDs allowed to create guest invitations. At least one is required when guest mode is on.
+    /// Env: `SIWXOIDC_GUEST_HOSTS`
+    #[serde(default)]
+    pub guest_hosts: Vec<String>,
+    /// How the guest client is deployed relative to this provider: `same-site` or `cross-site`. Anything else is refused when guest mode is on.
+    /// Env: `SIWXOIDC_GUEST_CLIENT_TOPOLOGY`
+    pub guest_client_topology: String,
+    /// Longest lifetime of a guest session, in seconds. Must be non-zero when guest mode is on.
+    /// Env: `SIWXOIDC_GUEST_SESSION_MAX_SECS`
+    pub guest_session_max_secs: u64,
+    /// Suffix appended to a guest's display name.
+    /// Env: `SIWXOIDC_GUEST_NAME_SUFFIX`
+    pub guest_name_suffix: String,
+    /// Whether a guest is asked for an e-mail address at redeem: `off` (no address accepted), `optional` or `required`. The same for every invitation.
+    /// Env: `SIWXOIDC_GUEST_EMAIL_POLICY`
+    pub guest_email_policy: String,
+    /// Allow invitations that any holder of the link may use (open links). Off by default.
+    /// Env: `SIWXOIDC_GUEST_ALLOW_OPEN_LINKS`
+    #[serde(default)]
+    pub guest_allow_open_links: bool,
+    /// Allow a guest to claim a persistent account. Off by default.
+    /// Env: `SIWXOIDC_GUEST_CLAIM_ENABLED`
+    #[serde(default)]
+    pub guest_claim_enabled: bool,
+    /// Quota: guests per invitation.
+    /// Env: `SIWXOIDC_GUEST_MAX_GUESTS`
+    pub guest_max_guests: u64,
+    /// Quota: live invitations per host.
+    /// Env: `SIWXOIDC_GUEST_HOST_MAX_INVITES`
+    pub guest_host_max_invites: u64,
+    /// Quota: live guests per host.
+    /// Env: `SIWXOIDC_GUEST_HOST_MAX_LIVE_GUESTS`
+    pub guest_host_max_live_guests: u64,
+    /// Quota: invitations a host may create per hour.
+    /// Env: `SIWXOIDC_GUEST_HOST_INVITES_PER_HOUR`
+    pub guest_host_invites_per_hour: u64,
+    /// Quota: active guests across the deployment.
+    /// Env: `SIWXOIDC_GUEST_GLOBAL_MAX_ACTIVE`
+    pub guest_global_max_active: u64,
+    /// Quota: guest identities minted per day across the deployment.
+    /// Env: `SIWXOIDC_GUEST_DAILY_MINT_MAX`
+    pub guest_daily_mint_max: u64,
+    /// Quota: claimed guest accounts across the deployment.
+    /// Env: `SIWXOIDC_GUEST_MAX_CLAIMED`
+    pub guest_max_claimed: u64,
+    /// Quota: devices per guest.
+    /// Env: `SIWXOIDC_GUEST_MAX_DEVICES`
+    pub guest_max_devices: u64,
+    /// Quota: device hand-offs per guest per minute.
+    /// Env: `SIWXOIDC_GUEST_HANDOFF_PER_MINUTE`
+    pub guest_handoff_per_minute: u64,
+    /// Quota: uses of one open link.
+    /// Env: `SIWXOIDC_GUEST_OPEN_LINK_MAX_USES`
+    pub guest_open_link_max_uses: u64,
+    /// Quota: longest lifetime of an open link, in seconds.
+    /// Env: `SIWXOIDC_GUEST_OPEN_LINK_MAX_TTL_SECS`
+    pub guest_open_link_max_ttl_secs: u64,
+    /// Quota: live open links per host.
+    /// Env: `SIWXOIDC_GUEST_HOST_MAX_OPEN_INVITES`
+    pub guest_host_max_open_invites: u64,
+    /// Brake: guests reaped within `guest_brake_reaping_secs` that pause minting.
+    /// Env: `SIWXOIDC_GUEST_BRAKE_REAPING_COUNT`
+    pub guest_brake_reaping_count: u64,
+    /// Brake: the window, in seconds, over which `guest_brake_reaping_count` is counted.
+    /// Env: `SIWXOIDC_GUEST_BRAKE_REAPING_SECS`
+    pub guest_brake_reaping_secs: u64,
+    /// Seconds between two ticks of the guest reaper. The reaper runs whether or not
+    /// `guest_enabled` is set, so guests are still erased after an operator turns guests
+    /// off. A zero is read as one second.
+    /// Env: `SIWXOIDC_GUEST_REAPER_INTERVAL_SECS`
+    pub guest_reaper_interval_secs: u64,
+    /// Alert (GP-SEC-47): a `reaping` record due for longer than this many seconds.
+    /// Zero turns the alert off.
+    /// Env: `SIWXOIDC_GUEST_ALERT_REAPING_SECS`
+    pub guest_alert_reaping_secs: u64,
+    /// Alert: live guests at this percentage of `guest_global_max_active`. Zero is off.
+    /// Env: `SIWXOIDC_GUEST_ALERT_LIVE_PCT`
+    pub guest_alert_live_pct: u64,
+    /// Alert: guests minted today at this percentage of `guest_daily_mint_max`. Zero is off.
+    /// Env: `SIWXOIDC_GUEST_ALERT_DAILY_PCT`
+    pub guest_alert_daily_pct: u64,
+    /// Alert: more than this many refused guest requests in one minute, across
+    /// instances. Zero is off.
+    /// Env: `SIWXOIDC_GUEST_ALERT_REFUSALS_PER_MIN`
+    pub guest_alert_refusals_per_min: u64,
+    /// Seconds between two report-only orphan scans (guest accounts in Synapse that have
+    /// no record). Zero turns the scan off.
+    /// Env: `SIWXOIDC_GUEST_ORPHAN_REPORT_SECS`
+    pub guest_orphan_report_secs: u64,
+}
+
+/// The shortest configurable absolute grant lifetime: a device code's
+/// lifetime, the longest a client may legitimately take between the
+/// authentication and the grant (the code flow takes at most 300 s). A shorter
+/// cap would refuse grants before their first token.
+pub const MIN_GRANT_ABSOLUTE_LIFETIME_SECS: u64 = siwx_oidc::db::DEVICE_CODE_LIFETIME;
+
+impl Config {
+    /// SS4: the session-end flags must be switched on together where they
+    /// depend on each other, or the reason the combination is refused.
+    ///
+    /// Flag 1 without flag 2 is refused: strict teardown deletes the device,
+    /// but nothing stops a client that proposes the same device id again from
+    /// getting the deleted id recreated (H4b).
+    pub fn check_session_end_flags(&self) -> Result<(), String> {
+        if self.revoke_deletes_device && !self.refuse_deleted_device_ids {
+            return Err("SIWXOIDC_REVOKE_DELETES_DEVICE is on but \
+                 SIWXOIDC_REFUSE_DELETED_DEVICE_IDS is off: a client that proposes a \
+                 deleted device id again would get it recreated. Turn \
+                 SIWXOIDC_REFUSE_DELETED_DEVICE_IDS on as well, or \
+                 SIWXOIDC_REVOKE_DELETES_DEVICE off."
+                .to_string());
+        }
+        Ok(())
+    }
+
+    /// The absolute-lifetime caps the grant store enforces (I6), or the
+    /// reason the configured values are refused.
+    pub fn grant_lifetime(&self) -> Result<siwx_oidc::db::grant::GrantLifetime, String> {
+        let check = |name: String, secs: u64| {
+            if secs < MIN_GRANT_ABSOLUTE_LIFETIME_SECS {
+                Err(format!(
+                    "{name} = {secs}: an absolute grant lifetime must be at least \
+                     {MIN_GRANT_ABSOLUTE_LIFETIME_SECS} s (a device code's lifetime)"
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        if let Some(secs) = self.grant_absolute_lifetime_secs {
+            check("grant_absolute_lifetime_secs".to_string(), secs)?;
+        }
+        for (client_id, secs) in &self.grant_absolute_lifetime_secs_by_client {
+            check(
+                format!("grant_absolute_lifetime_secs_by_client.{client_id}"),
+                *secs,
+            )?;
+        }
+        Ok(siwx_oidc::db::grant::GrantLifetime {
+            global_secs: self.grant_absolute_lifetime_secs,
+            per_client_secs: std::sync::Arc::new(
+                self.grant_absolute_lifetime_secs_by_client.clone(),
+            ),
+        })
+    }
 }
 
 impl Default for Config {
@@ -258,15 +545,64 @@ impl Default for Config {
             ],
             rp_id: None,
             rp_origin: None,
+            legacy_rp_id: None,
             mas_shared_secret: None,
             synapse_endpoint: None,
             log_format: "pretty".to_string(),
             matrix_server_name: None,
+            mail_domain: None,
             op_tos_uri: None,
             op_policy_uri: None,
             account_management_uri: None,
             admin_token_ttl_secs: 300,
             admin_token_localpart: "siwx-admin".to_string(),
+            grant_absolute_lifetime_secs: None,
+            grant_absolute_lifetime_secs_by_client: HashMap::new(),
+            backchannel_logout_allowed_hosts: Vec::new(),
+            backchannel_logout_required_for_refresh: false,
+            reuse_revokes_grant: false,
+            revoke_deletes_device: false,
+            refuse_deleted_device_ids: false,
+            device_reaper_enabled: false,
+            deleted_device_marker_ttl_secs: 31_536_000,
+            device_reaper_spare_users: Vec::new(),
+            device_reaper_dry_run: true,
+            device_reaper_interval_secs: 86_400,
+            device_reaper_margin_secs: 604_800,
+            device_reaper_min_idle_secs: None,
+            device_reaper_report_path: None,
+            guest_enabled: false,
+            guest_client_url: None,
+            guest_client_id: None,
+            guest_client_name: None,
+            guest_client_redirect_uris: Vec::new(),
+            guest_hosts: Vec::new(),
+            guest_client_topology: "same-site".to_string(),
+            guest_session_max_secs: 7200,
+            guest_name_suffix: " (Guest)".to_string(),
+            guest_email_policy: "off".to_string(),
+            guest_allow_open_links: false,
+            guest_claim_enabled: false,
+            guest_max_guests: 10,
+            guest_host_max_invites: 5,
+            guest_host_max_live_guests: 25,
+            guest_host_invites_per_hour: 20,
+            guest_global_max_active: 50,
+            guest_daily_mint_max: 500,
+            guest_max_claimed: 200,
+            guest_max_devices: 8,
+            guest_handoff_per_minute: 3,
+            guest_open_link_max_uses: 10,
+            guest_open_link_max_ttl_secs: 86400,
+            guest_host_max_open_invites: 1,
+            guest_brake_reaping_count: 50,
+            guest_brake_reaping_secs: 900,
+            guest_reaper_interval_secs: 15,
+            guest_alert_reaping_secs: 900,
+            guest_alert_live_pct: 80,
+            guest_alert_daily_pct: 80,
+            guest_alert_refusals_per_min: 50,
+            guest_orphan_report_secs: 604_800,
         }
     }
 }
@@ -306,6 +642,109 @@ mod tests {
             scrub_config_env(jail);
             jail.set_env("SIWXOIDC_PORT", 4101);
             assert_eq!(figment().extract::<Config>()?.port, 4101);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_mail_domain_is_unset_by_default_and_read_from_the_environment() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            assert_eq!(figment().extract::<Config>()?.mail_domain, None);
+            jail.set_env("SIWXOIDC_MAIL_DOMAIN", "matrix.example.org");
+            assert_eq!(
+                figment().extract::<Config>()?.mail_domain.as_deref(),
+                Some("matrix.example.org")
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn an_empty_webauthn_rp_variable_means_unset() {
+        // A compose file's `SIWXOIDC_RP_ID=${SIWXOIDC_RP_ID:-}` passes an empty
+        // string; it must fall back to the default RP, not name an RP "".
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWXOIDC_BASE_URL", "https://issuer.example.org");
+            jail.set_env("SIWXOIDC_RP_ID", "");
+            jail.set_env("SIWXOIDC_RP_ORIGIN", " ");
+            jail.set_env("SIWXOIDC_LEGACY_RP_ID", "");
+            let config = figment().extract::<Config>()?;
+            assert_eq!(config.rp_id, None);
+            assert_eq!(config.rp_origin, None);
+            assert_eq!(config.legacy_rp_id, None);
+            let (wa, dispatch) = crate::webauthn::build_rp_dispatch(
+                &config.base_url,
+                config.rp_id.as_deref(),
+                config.rp_origin.as_deref(),
+                config.legacy_rp_id.as_deref(),
+            )
+            .expect("an empty RP variable builds the default RP");
+            assert_eq!(wa.rp_id, "issuer.example.org");
+            assert_eq!(dispatch.legacy_rp_id, "issuer.example.org");
+            jail.set_env("SIWXOIDC_RP_ID", "example.org");
+            assert_eq!(
+                figment().extract::<Config>()?.rp_id.as_deref(),
+                Some("example.org")
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn guest_mode_is_off_with_the_documented_defaults_and_reads_the_environment() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            let c = figment().extract::<Config>()?;
+            assert!(!c.guest_enabled && !c.guest_allow_open_links && !c.guest_claim_enabled);
+            assert_eq!(c.guest_client_url, None);
+            assert_eq!(c.guest_client_name, None);
+            assert!(c.guest_client_redirect_uris.is_empty() && c.guest_hosts.is_empty());
+            assert_eq!(c.guest_client_topology, "same-site");
+            assert_eq!(c.guest_name_suffix, " (Guest)");
+            assert_eq!(
+                [
+                    c.guest_session_max_secs,
+                    c.guest_max_guests,
+                    c.guest_host_max_invites,
+                    c.guest_host_max_live_guests,
+                    c.guest_host_invites_per_hour,
+                    c.guest_global_max_active,
+                    c.guest_daily_mint_max,
+                    c.guest_max_claimed,
+                    c.guest_max_devices,
+                    c.guest_handoff_per_minute,
+                    c.guest_open_link_max_uses,
+                    c.guest_open_link_max_ttl_secs,
+                    c.guest_host_max_open_invites,
+                    c.guest_brake_reaping_count,
+                    c.guest_brake_reaping_secs,
+                ],
+                [7200, 10, 5, 25, 20, 50, 500, 200, 8, 3, 10, 86400, 1, 50, 900]
+            );
+            jail.set_env("SIWXOIDC_GUEST_ENABLED", "true");
+            jail.set_env("SIWXOIDC_GUEST_HOSTS", r#"["alice","bob"]"#);
+            jail.set_env(
+                "SIWXOIDC_GUEST_CLIENT_URL",
+                "https://meet.example.org/start",
+            );
+            jail.set_env("SIWXOIDC_GUEST_MAX_GUESTS", "3");
+            let c = figment().extract::<Config>()?;
+            assert!(c.guest_enabled);
+            assert_eq!(c.guest_hosts, ["alice", "bob"]);
+            assert_eq!(
+                c.guest_client_url.map(String::from).as_deref(),
+                Some("https://meet.example.org/start")
+            );
+            assert_eq!(c.guest_max_guests, 3);
+            jail.set_env("SIWXOIDC_GUEST_CLIENT_URL", "");
+            assert_eq!(figment().extract::<Config>()?.guest_client_url, None);
+            jail.set_env("SIWXOIDC_GUEST_CLIENT_NAME", "Meet guest");
+            assert_eq!(
+                figment().extract::<Config>()?.guest_client_name.as_deref(),
+                Some("Meet guest")
+            );
             Ok(())
         });
     }
@@ -599,5 +1038,169 @@ mod tests {
             );
             Ok(())
         });
+    }
+
+    #[test]
+    fn no_absolute_grant_lifetime_is_configured_by_default() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            let config = figment().extract::<Config>()?;
+            assert_eq!(config.grant_absolute_lifetime_secs, None);
+            assert!(config.grant_absolute_lifetime_secs_by_client.is_empty());
+            let lifetime = config.grant_lifetime().expect("defaults are valid");
+            assert!(!lifetime.is_configured());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn absolute_grant_lifetimes_are_read_under_both_prefixes() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWEOIDC_GRANT_ABSOLUTE_LIFETIME_SECS", 86_400);
+            jail.set_env(
+                "SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS_BY_CLIENT__ALPHA",
+                3_600,
+            );
+            jail.set_env(
+                "SIWEOIDC_GRANT_ABSOLUTE_LIFETIME_SECS_BY_CLIENT__BETA",
+                172_800,
+            );
+            let lifetime = figment().extract::<Config>()?.grant_lifetime().unwrap();
+            assert_eq!(lifetime.cap_for("alpha"), Some(3_600));
+            assert_eq!(
+                lifetime.cap_for("beta"),
+                Some(172_800),
+                "a per-client value overrides the global one"
+            );
+            assert_eq!(lifetime.cap_for("gamma"), Some(86_400));
+            jail.set_env("SIWXOIDC_GRANT_ABSOLUTE_LIFETIME_SECS", 7_200);
+            let config = figment().extract::<Config>()?;
+            assert_eq!(
+                config.grant_absolute_lifetime_secs,
+                Some(7_200),
+                "new beats legacy"
+            );
+            Ok(())
+        });
+    }
+
+    /// SS4: the three session-end flags are off and the companion settings
+    /// have their documented defaults unless an operator sets them.
+    #[test]
+    fn ss4_flags_are_off_by_default_and_read_from_the_environment() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            for c in [figment().extract::<Config>()?, Config::default()] {
+                assert!(!c.revoke_deletes_device);
+                assert!(!c.refuse_deleted_device_ids);
+                assert!(!c.device_reaper_enabled);
+                assert_eq!(c.deleted_device_marker_ttl_secs, 31_536_000);
+                assert!(c.device_reaper_spare_users.is_empty());
+                assert!(c.device_reaper_dry_run);
+                assert_eq!(c.device_reaper_interval_secs, 86_400);
+                assert_eq!(c.device_reaper_margin_secs, 604_800);
+                assert_eq!(c.device_reaper_min_idle_secs, None);
+                assert_eq!(c.device_reaper_report_path, None);
+            }
+            jail.set_env("SIWXOIDC_REVOKE_DELETES_DEVICE", "true");
+            jail.set_env("SIWXOIDC_REFUSE_DELETED_DEVICE_IDS", "true");
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_ENABLED", "true");
+            jail.set_env("SIWXOIDC_DELETED_DEVICE_MARKER_TTL_SECS", "60");
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_SPARE_USERS", r#"["agent"]"#);
+            let c = figment().extract::<Config>()?;
+            assert!(c.revoke_deletes_device && c.refuse_deleted_device_ids);
+            assert!(c.device_reaper_enabled);
+            assert_eq!(c.deleted_device_marker_ttl_secs, 60);
+            assert_eq!(c.device_reaper_spare_users, vec!["agent".to_string()]);
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_DRY_RUN", "false");
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_INTERVAL_SECS", "5");
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_MARGIN_SECS", "6");
+            jail.set_env("SIWXOIDC_DEVICE_REAPER_MIN_IDLE_SECS", "7");
+            jail.set_env(
+                "SIWXOIDC_DEVICE_REAPER_REPORT_PATH",
+                "/var/lib/reaper.jsonl",
+            );
+            let c = figment().extract::<Config>()?;
+            assert!(!c.device_reaper_dry_run);
+            assert_eq!(c.device_reaper_interval_secs, 5);
+            assert_eq!(c.device_reaper_margin_secs, 6);
+            assert_eq!(c.device_reaper_min_idle_secs, Some(7));
+            assert_eq!(
+                c.device_reaper_report_path.as_deref(),
+                Some("/var/lib/reaper.jsonl")
+            );
+            Ok(())
+        });
+    }
+
+    /// Reuse enforcement (I5 phase B) is off unless an operator turns it on,
+    /// under either prefix; the new prefix beats the legacy one.
+    #[test]
+    fn reuse_enforcement_is_off_by_default_and_read_under_both_prefixes() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            assert!(!figment().extract::<Config>()?.reuse_revokes_grant);
+            assert!(!Config::default().reuse_revokes_grant);
+            jail.set_env("SIWEOIDC_REUSE_REVOKES_GRANT", "true");
+            assert!(figment().extract::<Config>()?.reuse_revokes_grant);
+            jail.set_env("SIWXOIDC_REUSE_REVOKES_GRANT", "false");
+            assert!(
+                !figment().extract::<Config>()?.reuse_revokes_grant,
+                "new beats legacy"
+            );
+            jail.set_env("SIWEOIDC_REUSE_REVOKES_GRANT", "false");
+            jail.set_env("SIWXOIDC_REUSE_REVOKES_GRANT", "true");
+            assert!(figment().extract::<Config>()?.reuse_revokes_grant);
+            Ok(())
+        });
+    }
+
+    /// SS4: flag 1 alone recreates a deleted device id when a client proposes
+    /// it again (H4b), so flag 1 without flag 2 refuses to start.
+    #[test]
+    fn config_flag1_without_flag2_refuses_to_start() {
+        let flag1_alone = Config {
+            revoke_deletes_device: true,
+            ..Config::default()
+        };
+        let err = flag1_alone.check_session_end_flags().unwrap_err();
+        assert!(err.contains("SIWXOIDC_REVOKE_DELETES_DEVICE"), "{err}");
+        assert!(err.contains("SIWXOIDC_REFUSE_DELETED_DEVICE_IDS"), "{err}");
+        for (flag1, flag2) in [(false, false), (false, true), (true, true)] {
+            let c = Config {
+                revoke_deletes_device: flag1,
+                refuse_deleted_device_ids: flag2,
+                ..Config::default()
+            };
+            assert_eq!(c.check_session_end_flags(), Ok(()), "{flag1} {flag2}");
+        }
+    }
+
+    #[test]
+    fn an_absolute_grant_lifetime_shorter_than_a_device_code_is_refused() {
+        let global = Config {
+            grant_absolute_lifetime_secs: Some(MIN_GRANT_ABSOLUTE_LIFETIME_SECS - 1),
+            ..Config::default()
+        };
+        let err = global.grant_lifetime().unwrap_err();
+        assert!(err.contains("grant_absolute_lifetime_secs"), "{err}");
+        let per_client = Config {
+            grant_absolute_lifetime_secs_by_client: HashMap::from([("a".to_string(), 0)]),
+            ..Config::default()
+        };
+        let err = per_client.grant_lifetime().unwrap_err();
+        assert!(
+            err.contains("grant_absolute_lifetime_secs_by_client.a"),
+            "{err}"
+        );
+        let shortest = Config {
+            grant_absolute_lifetime_secs: Some(MIN_GRANT_ABSOLUTE_LIFETIME_SECS),
+            ..Config::default()
+        };
+        assert_eq!(
+            shortest.grant_lifetime().unwrap().cap_for("a"),
+            Some(MIN_GRANT_ABSOLUTE_LIFETIME_SECS)
+        );
     }
 }

@@ -50,7 +50,7 @@ test.beforeAll(async () => {
 // ---------------------------------------------------------------------------
 // J1 — first login on a brand-new identity, through to a usable session.
 // ---------------------------------------------------------------------------
-test('EW-J1: first login (new wallet identity) — every screen offers an exit', async ({ page }) => {
+test('EW-J1: first login (new wallet identity) — every screen offers an exit', { tag: '@ew-p1' }, async ({ page }) => {
   test.setTimeout(600_000);
   const w = makeWallet(undefined, SERVER_NAME);
 
@@ -92,7 +92,7 @@ test('EW-J1: first login (new wallet identity) — every screen offers an exit',
 // J2 — reload. The single most common thing a user does, and historically the
 // state that produced hard logouts and the verify gate.
 // ---------------------------------------------------------------------------
-test('EW-J2: reload an established session — every screen offers an exit', async ({ page }) => {
+test('EW-J2: reload an established session — every screen offers an exit', { tag: '@ew-p1' }, async ({ page }) => {
   test.setTimeout(600_000);
   const w = makeWallet(undefined, SERVER_NAME);
   await elementWalletClickLogin(page, w);
@@ -245,7 +245,7 @@ async function serverHas4S(page, wallet) {
   return { known: true, status: res.status, present: res.status === 200 };
 }
 
-test('EW-J4: first device — cancelling forced recovery setup must not strand or silently exempt', async ({
+test('EW-J4: first device — cancelling forced recovery setup must not strand or silently exempt', { tag: '@ew-p1' }, async ({
   page,
 }) => {
   test.setTimeout(600_000);
@@ -320,7 +320,7 @@ test('EW-J4: first device — cancelling forced recovery setup must not strand o
 // nothing to click -- the precise trap the patch was written to prevent, reached by
 // the one control most users instinctively press.
 // ---------------------------------------------------------------------------
-test('EW-J5: dismissing the "Set up recovery to continue" dialog must not strand the user', async ({
+test('EW-J5: dismissing the "Set up recovery to continue" dialog must not strand the user', { tag: '@ew-p1' }, async ({
   page,
 }) => {
   test.setTimeout(600_000);

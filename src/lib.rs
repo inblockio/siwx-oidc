@@ -8,6 +8,15 @@ pub mod db;
 /// binary's `src/localpart.rs`.
 pub mod mxid;
 
+/// Policy for generic-class clients: the scopes they are granted, the static entries
+/// start-up refuses, and which accounts get a mailbox address. Pure functions, in the
+/// library crate so the binary and the tests read one set of rules.
+pub mod client_policy;
+
+/// What a log line may say about a credential: a fingerprint, never the value.
+/// In the library crate so `tests/log_hygiene.rs` can pin it.
+pub mod redact;
+
 /// Tier 1 of the identity model: the human-readable alias a new account is
 /// seeded with, derived deterministically from the DID. Pure (`sha2` only),
 /// and in the library crate for the same reason as `mxid` — `tests/*.rs` link
@@ -25,6 +34,18 @@ pub mod credential_migration;
 /// The optional aqua-auth credential store: dual-write and read-through, off by
 /// default, selected by `AQUA_WEBAUTHN_REDIS_URL`.
 pub mod credential_store;
+
+/// The guest room template audited at mint (design 01 §4.3): pure, so every rule is
+/// tested without a Synapse.
+pub mod guest_room_audit;
+
+/// The pure rules of a guest invitation: request limits, ids, secrets, host match.
+pub mod guest_invite;
+
+/// Guest admission (work package S3a, design 01 §4 B3, 04 GP-SEC-16..22): name, e-mail
+/// and consent validators, `did:key` admission, the stateless peek nonce and the
+/// redeem proof of possession. Pure, so every rule is tested without Redis or HTTP.
+pub mod guest_admission;
 
 // `synapse_client` is DELIBERATELY not re-exposed here.
 //

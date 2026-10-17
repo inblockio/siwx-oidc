@@ -65,6 +65,7 @@ nondeterministic, so every admin request introspects.
   POST   /_synapse/mas/reactivate_user            synapse_client::reactivate_user
 
   -- admin surface (minted admin token) --------------------------------------
+  GET    /_synapse/admin/v2/users                 synapse_client::admin_users_page (device reaper, orphan scan)
   GET    /_synapse/admin/v2/users/{mxid}/devices  synapse_client::list_devices (and get_device)
   POST   /_matrix/client/v3/keys/query            synapse_client::has_cross_signing_keys
   PUT    /_matrix/client/v3/profile/{mxid}/{field} synapse_client::publish_did_field
@@ -73,8 +74,19 @@ nondeterministic, so every admin request introspects.
   GET    /_matrix/client/v3/account/whoami        tests/e2e_msc3861.rs,
                                                   tests/e2e_session_teardown.rs
   GET    /_matrix/client/v3/devices               tests/e2e_device_code.rs
+  POST   /_matrix/client/v3/keys/upload           tests/e2e_race_teardown.rs (H4b replay;
+                                                  401 when the token's device is gone)
+  GET    /_matrix/client/v3/sync                  siwx-oidc-auth/examples/soak.rs (an
+                                                  empty sync: no rooms, a next_batch)
          siwx-oidc itself calls NEITHER: these are the Synapse->siwx-oidc
          introspection leg, driven by the e2e suites as the user would.
+
+  -- the edge's split (NOT Synapse surface: forwarded to siwx-oidc) ---------
+  POST   /_matrix/client/v3/refresh               forwarded as a deployment's edge
+  DELETE /_matrix/client/v3/devices/{id}          does (Synapse under delegated auth
+                                                  does not serve them), so a client
+                                                  can use this mock as its homeserver
+                                                  (siwx-oidc-auth/tests/live_upgrade.rs)
 
   -- unauthenticated C-S API -------------------------------------------------
   GET    /_matrix/client/v3/profile/{mxid}        synapse_client::has_profile_row
@@ -84,12 +96,32 @@ nondeterministic, so every admin request introspects.
   -- test-only control plane (never authenticated, never call-logged) --------
   GET    /__state                 whole in-memory state
   POST   /__reset                 clear everything, restore the real secret
-  POST   /__seed_user             mark a localpart as EXISTING (+ profile row)
-  POST   /__seed_device           seed a device (implies EXISTING + profile row)
+  POST   /__seed_user             mark a localpart as EXISTING (+ profile row);
+                                  optional `did`: also publish it as the
+                                  account's `io.inblock.did` field
+  POST   /__seed_device           seed a device (implies EXISTING + profile row);
+                                  optional last_seen_ip / last_seen_ts (ms, NULL
+                                  when absent: the device reaper's idle data, SS4
+                                  flag 3); a device id seeded again replaces its row
   POST   /__set_secret            change the MAS shared secret (401s that surface)
   POST   /__reject_admin_token    make the ADMIN surface reject, MAS untouched
   POST   /__profile               force a profile row present / empty / absent
   POST   /__fail                  arm a 500/timeout on a logical endpoint
+                                  (upsert_device among them: SS4 flag 2 issues no
+                                  grant without a device);
+                                  delete_device also takes 404 / 403 and an
+                                  optional device_id (one device of a bulk
+                                  path), the answers the strict teardown of SS4
+                                  flag 1 decides by (see FAIL below)
+
+  -- stub OIDC relying party (NOT Synapse surface; tests/e2e_backchannel_logout.rs)
+  POST   /__rp/{name}/backchannel_logout  record the POST (content type + raw
+                                          body); answer per the RP's mode
+  POST   /__rp/{name}/mode        {"mode": "ok"|"500"|"redirect"}: 200 (default),
+                                  500, or a 303 to /__rp/{name}/redirected
+  GET    /__rp/{name}/received    {"received": [{content_type, body}, ...]}
+  ANY    /__rp/{name}/redirected  counts a followed redirect (must stay 0)
+  An RP is any name; it exists once used. __reset clears every RP.
 
 Routes REMOVED by the 1.157 port (`DELETE .../devices/{id}`,
 `POST /_synapse/admin/v1/deactivate/{mxid}`, `PUT /_synapse/admin/v2/users/{mxid}`)
@@ -112,6 +144,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse, parse_qs, urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 SECRET = os.environ.get("SYNAPSE_MOCK_SECRET", "testsecret")
@@ -168,15 +201,20 @@ LIFECYCLE = {}
 #
 # PRESENCE OF THE KEY IS THE `profiles` ROW. Synapse's `users` row and its
 # `profiles` row are separate, and an account can have the first without the
-# second — that is element-hq/synapse#19702, still unfixed in 1.159.0, and the
-# condition `has_profile_row` / `publish_did_field` discriminate on. So
-# `localpart in EXISTING_USERS` (users row) and `user_id in PROFILES` (profiles
-# row) are modelled as two INDEPENDENT facts. Do not collapse them.
+# second (element-hq/synapse#19702), which is the condition `has_profile_row` /
+# `publish_did_field` discriminate on. So `localpart in EXISTING_USERS` (users
+# row) and `user_id in PROFILES` (profiles row) are modelled as two INDEPENDENT
+# facts. Do not collapse them. What each route answers for such an account is
+# listed at `POST /__profile`.
 PROFILES = {}
 # user_id -> {field_name: json value} — MSC4133 custom profile fields, which is
 # where `publish_did_field` writes `io.inblock.did`.
 PROFILE_FIELDS = {}
 CALL_LOG = []  # list of "METHOD path"
+# Admin PUT /_synapse/admin/v2/users/{mxid} (the guest hand-off), in arrival order.
+ADMIN_PUTS = []
+# user_id -> user_type set by the admin PUT.
+USER_TYPES = {}
 # Mutable expected secret (so a test can flip it to force 401s) and the
 # admin-surface kill switch (see __reject_admin_token).
 STATE = {"secret": SECRET, "reject_admin": False}
@@ -184,12 +222,22 @@ STATE = {"secret": SECRET, "reject_admin": False}
 # mode string: "500" returns HTTP 500, "timeout" sleeps long enough that the
 # siwx-oidc reqwest client times out. Cleared by /__reset.
 #   POST /__fail {"endpoint": "delete_device", "mode": "500"|"timeout"|"off"}
+# delete_device also takes "404" (Synapse's `User not found`) and "403" (a wrong
+# MAS shared secret), the answers the strict teardown of SS4 flag 1 decides by,
+# and an optional "device_id" that arms the fault for that one device only
+# (a bulk path with one failing device):
+#   POST /__fail {"endpoint": "delete_device", "mode": "404"|"403"|"500", "device_id": "DEVICE_A"}
 # Recognized endpoints: delete_device, list_devices, deactivate, query_user,
-# publish_did_field. ("get_device" is gone as a fault target because
-# `synapse_client::get_device` no longer has a route of its own — since the 1.157
-# port it is `list_devices` plus a client-side filter, so fault it via
+# publish_did_field, read_did_field, upsert_device (a device that cannot be
+# provisioned: under SS4 flag 2 no grant is issued without one, 8.27). ("get_device" is gone as a fault target
+# because `synapse_client::get_device` no longer has a route of its own: since
+# the 1.157 port it is `list_devices` plus a client-side filter, so fault it via
 # "list_devices".)
 FAIL = {}
+# Per-device faults on delete_device ("device_id" in /__fail). Cleared by /__reset.
+FAIL_DEVICE = {}
+# The device keys uploaded per "user_id/device_id" (POST keys/upload). Cleared by /__reset.
+KEYS = {}
 # How long a "timeout" fault sleeps before (not) responding, in seconds. Must
 # exceed the siwx-oidc Synapse HTTP client timeout so the call fails.
 TIMEOUT_SLEEP_SECS = float(os.environ.get("SYNAPSE_MOCK_TIMEOUT_SLEEP", "30"))
@@ -197,6 +245,14 @@ TIMEOUT_SLEEP_SECS = float(os.environ.get("SYNAPSE_MOCK_TIMEOUT_SLEEP", "30"))
 # test can prove at most one delete actually mutated state. Distinct from
 # CALL_LOG (which records every request, including idempotent no-ops).
 EFFECTIVE_DELETES = {}
+# The stub relying party (back-channel logout receiver), keyed by RP name.
+# Not a Synapse mirror: siwx-oidc POSTs logout tokens here when a test
+# registers `{mock}/__rp/{name}/backchannel_logout` as a client's
+# `backchannel_logout_uri`. Cleared by /__reset.
+RP_RECEIVED = {}
+RP_MODE = {}
+RP_REDIRECTED = {}
+RP_PATH = re.compile(r"^/__rp/([A-Za-z0-9_.-]+)/(backchannel_logout|mode|received|redirected)$")
 
 # Twisted's generic 500 body. element-hq/synapse#19702 surfaces as an uncaught
 # TypeError, so its 500 is BYTE-IDENTICAL to the 500 from an exhausted database
@@ -205,6 +261,10 @@ EFFECTIVE_DELETES = {}
 # (audit finding D1). Emitting the real generic body here is what makes that
 # distinction testable at all.
 GENERIC_500 = {"errcode": "M_UNKNOWN", "error": "Internal server error"}
+
+# The 404 Synapse 1.161.0's `ProfileHandler` raises when a profile read finds
+# nothing to return: `SynapseError(404, "Profile was not found", Codes.NOT_FOUND)`.
+PROFILE_NOT_FOUND = {"errcode": "M_NOT_FOUND", "error": "Profile was not found"}
 
 
 def _localpart_of(user_id):
@@ -336,6 +396,27 @@ class Handler(BaseHTTPRequestHandler):
             return json.loads(raw)
         except Exception:
             return {}
+
+    def _forward_to_oidc(self, method, raw):
+        """Forward this request to siwx-oidc, as a deployment's edge does for the
+        client-server routes siwx-oidc owns. The raw path keeps its percent-encoding
+        (a device id may carry `/` and `+`)."""
+        req = Request(f"{OIDC_BASE}{self.path}", data=raw if raw else None, method=method)
+        for h in ("Authorization", "Content-Type"):
+            if self.headers.get(h):
+                req.add_header(h, self.headers.get(h))
+        try:
+            with urlopen(req, timeout=30) as resp:
+                status, payload = resp.status, resp.read()
+        except HTTPError as e:
+            status, payload = e.code, e.read()
+        except OSError:
+            status, payload = 502, b'{"errcode": "M_UNKNOWN", "error": "siwx-oidc unreachable"}'
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _send(self, code, obj=None):
         payload = json.dumps(obj if obj is not None else {}).encode()
@@ -483,6 +564,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             return True
+        if mode == "404":
+            self._send(404, {"errcode": "M_NOT_FOUND", "error": "User not found"})
+            return True
+        if mode == "403":
+            self._send(403, {"errcode": "M_FORBIDDEN", "error": "This endpoint must only be called by MAS"})
+            return True
         # default: "500"
         self._send(500, {"errcode": "M_UNKNOWN", "error": "simulated failure"})
         return True
@@ -516,14 +603,21 @@ class Handler(BaseHTTPRequestHandler):
                     "lifecycle": LIFECYCLE,
                     "calls": list(CALL_LOG),
                     "fail": dict(FAIL),
+                    "fail_device": dict(FAIL_DEVICE),
+                    "keys": dict(KEYS),
                     "effective_deletes": dict(EFFECTIVE_DELETES),
                     "existing_users": sorted(EXISTING_USERS),
                     "profiles": PROFILES,
                     "profile_fields": PROFILE_FIELDS,
+                    "admin_puts": list(ADMIN_PUTS),
+                    "user_types": dict(USER_TYPES),
                     "reject_admin": STATE["reject_admin"],
                 })
         if path == "/health":
             return self._send(200, {"ok": True})
+        rp = RP_PATH.match(path)
+        if rp:
+            return self._stub_rp(rp.group(1), rp.group(2), b"")
         # Log BEFORE authenticating. A request log that silently drops rejected
         # requests is a debugging trap: the 1.157 port's symptom was a stream of
         # 401s, and the old mock's call log showed nothing at all.
@@ -553,6 +647,15 @@ class Handler(BaseHTTPRequestHandler):
             # No `total`: that key belongs to the admin v2 route, not this one.
             return self._send(200, {"devices": devs})
 
+        # GET /_matrix/client/v3/sync -- the population soak's per-minute call.
+        # An account with no rooms: authenticated by the same introspection,
+        # answered with an empty sync and a next_batch.
+        if path == "/_matrix/client/v3/sync":
+            introspection, denied = self._cs_api_auth()
+            if denied:
+                return self._send(*denied)
+            return self._send(200, {"next_batch": "s0", "rooms": {}})
+
         # -- unauthenticated C-S API ---------------------------------------
         # GET /_matrix/client/v3/profile/{mxid}/{field}  (read_did_field; test read-back)
         m = re.match(r"^/_matrix/client/v3/profile/([^/]+)/(.+)$", path)
@@ -564,6 +667,40 @@ class Handler(BaseHTTPRequestHandler):
             return self._profile_get(m.group(1))
 
         # -- admin surface --------------------------------------------------
+        # GET /_synapse/admin/v1/rooms/{room_id}/state  (SynapseClient::room_state, the claim gate)
+        # Every account the mock knows (a device or a profile) is a joined member of every room.
+        m = re.match(r"^/_synapse/admin/v1/rooms/([^/]+)/state$", path)
+        if m:
+            denied = self._admin_auth()
+            if denied:
+                return self._send(*denied)
+            with LOCK:
+                members = sorted(set(DEVICES) | set(PROFILES))
+            return self._send(200, {"state": [
+                {"type": "m.room.member", "state_key": u, "content": {"membership": "join"}}
+                for u in members
+            ]})
+        # GET /_synapse/admin/v2/users  (admin_users_page: the device reaper and the
+        # orphan scan). Every account that exists or carries a device, active only
+        # (`deactivated=false`), `not_user_type=` (empty) leaves out untyped accounts
+        # as Synapse does; `from` is an offset, `next_token` absent on the last page.
+        if path == "/_synapse/admin/v2/users":
+            denied = self._admin_auth()
+            if denied:
+                return self._send(*denied)
+            q = parse_qs(p.query, keep_blank_values=True)
+            limit = int((q.get("limit") or ["100"])[0])
+            start = int((q.get("from") or ["0"])[0] or 0)
+            with LOCK:
+                names = sorted({_mxid(lp) for lp in EXISTING_USERS} | set(DEVICES))
+                names = [n for n in names if not LIFECYCLE.get(n, {}).get("deactivated")]
+                rows = [{"name": n, "user_type": USER_TYPES.get(n)} for n in names]
+            if "not_user_type" in q:
+                rows = [r for r in rows if r["user_type"] is not None]
+            out = {"users": rows[start:start + limit], "total": len(rows)}
+            if start + limit < len(rows):
+                out["next_token"] = str(start + limit)
+            return self._send(200, out)
         # GET /_synapse/admin/v2/users/{user_id}/devices  (list_devices)
         m = re.match(r"^/_synapse/admin/v2/users/([^/]+)/devices$", path)
         if m:
@@ -664,7 +801,7 @@ class Handler(BaseHTTPRequestHandler):
         if displayname is None and avatar_url is None:
             # PRESENT BUT EMPTY. Synapse also 404s this — with a DIFFERENT
             # errcode, which is the only thing separating it from the case above.
-            return self._send(404, {"errcode": "M_NOT_FOUND", "error": "Profile was not found"})
+            return self._send(404, PROFILE_NOT_FOUND)
         out = {}
         if displayname is not None:
             out["displayname"] = displayname
@@ -679,28 +816,80 @@ class Handler(BaseHTTPRequestHandler):
         that endpoint's read path (`synapse_client::read_did_field`), which since
         2026-09-13 reads ANONYMOUSLY first and only mints a token if the
         homeserver answers 401/403. Tests also call it, to read back what
-        `publish_did_field` wrote. A row-less account 500s here rather than
-        404ing because element-hq/synapse#19702 bites on READS too:
-        `get_profile_field` subscripts an unguarded `txn.fetchone()`.
+        `publish_did_field` wrote.
+
+        Synapse 1.161.0 answers ONE 404 for an account with no `profiles` row
+        and for a row without the field: the store raises its own 404 in both
+        cases and `ProfileHandler.get_profile_field` turns it into
+        `PROFILE_NOT_FOUND`. Releases before 1.161 answered a generic 500 for
+        the row-less account (element-hq/synapse#19702, an unguarded
+        `txn.fetchone()`). `read_did_field` reads a 404 as an unset field and
+        any other failure as an unreadable one, so only a fault reaches that
+        branch on this mock: arm it with
+        `POST /__fail {"endpoint": "read_did_field", "mode": "500"}`.
         """
+        if self._maybe_fail("read_did_field"):
+            return
         user_id = unquote(raw_user_id)
         with LOCK:
             has_row = user_id in PROFILES
             value = PROFILE_FIELDS.get(user_id, {}).get(field, KeyError)
-        if not has_row:
-            return self._send(500, GENERIC_500)
-        if value is KeyError:
-            return self._send(404, {"errcode": "M_NOT_FOUND", "error": "Profile field not found"})
+        if not has_row or value is KeyError:
+            return self._send(404, PROFILE_NOT_FOUND)
         return self._send(200, {field: value})
+
+    def _stub_rp(self, name, action, raw):
+        """The stub relying party (see RP_RECEIVED). Never call-logged."""
+        with LOCK:
+            if action == "received":
+                return self._send(200, {"received": list(RP_RECEIVED.get(name, [])),
+                                        "redirected": RP_REDIRECTED.get(name, 0)})
+            if action == "redirected":
+                RP_REDIRECTED[name] = RP_REDIRECTED.get(name, 0) + 1
+                return self._send(200, {})
+            if action == "mode":
+                try:
+                    RP_MODE[name] = json.loads(raw or b"{}").get("mode", "ok")
+                except Exception:
+                    return self._send(400, {"error": "mode body"})
+                return self._send(200, {"ok": True, "mode": RP_MODE[name]})
+            RP_RECEIVED.setdefault(name, []).append({
+                "content_type": self.headers.get("Content-Type", ""),
+                "body": raw.decode("utf-8", "replace"),
+            })
+            mode = RP_MODE.get(name, "ok")
+        if mode == "500":
+            return self._send(500, {})
+        if mode == "redirect":
+            self.send_response(303)
+            self.send_header("Location", f"/__rp/{name}/redirected")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return None
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return None
 
     def do_POST(self):
         p = urlparse(self.path)
         path = unquote(p.path)
+        rp = RP_PATH.match(path)
+        if rp:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            return self._stub_rp(rp.group(1), rp.group(2), self.rfile.read(n) if n else b"")
+        if path == "/_matrix/client/v3/refresh":
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            self._log("POST", path)
+            return self._forward_to_oidc("POST", self.rfile.read(n) if n else b"")
         body = self._body()
         # test helpers (no auth, never call-logged) ------------------------
         if path == "/__seed_device":
             uid = body.get("user_id") or _mxid(body["localpart"])
             with LOCK:
+                # A device id seeded again replaces the old row (a test sets the
+                # `last_seen_ts` of a sign-in's device this way; NULL when absent).
+                DEVICES[uid] = [d for d in DEVICES.get(uid, []) if d["device_id"] != body["device_id"]]
                 DEVICES.setdefault(uid, []).append(_device(
                     body["device_id"], body.get("display_name"),
                     body.get("last_seen_ip"), body.get("last_seen_ts")))
@@ -712,17 +901,24 @@ class Handler(BaseHTTPRequestHandler):
         # Explicitly mark a user as EXISTING without seeding a device. Accepts a
         # `user_id` mxid or a bare `localpart`. Used to test flows that must
         # distinguish a returning account from a brand-new identity.
+        # With `did`, the account also publishes it as `io.inblock.did` (the
+        # `{"did": ...}` shape `read_did_field` reads), as a sign-in would.
         if path == "/__seed_user":
             lp = body.get("localpart") or _localpart_of(body.get("user_id", ""))
             with LOCK:
                 _mark_profile(lp)
+                if body.get("did"):
+                    PROFILE_FIELDS.setdefault(_mxid(lp), {})["io.inblock.did"] = {"did": body["did"]}
             return self._send(200, {"ok": True, "localpart": lp})
         # Force a user's `profiles` row into one of the three states
         # `has_profile_row` must tell apart:
         #   "present" — a row with a displayname            -> GET 200
         #   "empty"   — a row with displayname+avatar null  -> GET 404 M_NOT_FOUND
         #   "absent"  — NO row (element-hq/synapse#19702)   -> GET 404 M_UNKNOWN,
-        #                                                      field PUT/GET 500
+        #                                                      field GET 404 M_NOT_FOUND,
+        #                                                      field PUT 500,
+        #                                                      provision_user with a
+        #                                                      displayname 500
         # Deliberately independent of EXISTING_USERS: the whole bug class is a
         # `users` row without a `profiles` row.
         if path == "/__profile":
@@ -745,9 +941,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "user_id": uid, "state": state})
         if path == "/__reset":
             with LOCK:
-                DEVICES.clear(); LIFECYCLE.clear(); CALL_LOG.clear()
-                FAIL.clear(); EFFECTIVE_DELETES.clear()
+                DEVICES.clear(); LIFECYCLE.clear(); CALL_LOG.clear(); ADMIN_PUTS.clear(); USER_TYPES.clear()
+                FAIL.clear(); EFFECTIVE_DELETES.clear(); FAIL_DEVICE.clear(); KEYS.clear()
                 EXISTING_USERS.clear(); PROFILES.clear(); PROFILE_FIELDS.clear()
+                RP_RECEIVED.clear(); RP_MODE.clear(); RP_REDIRECTED.clear()
                 STATE["secret"] = SECRET
                 STATE["reject_admin"] = False
             return self._send(200, {"ok": True})
@@ -772,14 +969,37 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/__fail":
             endpoint = body.get("endpoint", "")
             mode = body.get("mode", "off")
+            device_id = body.get("device_id")
             with LOCK:
-                if not endpoint or mode in ("off", None):
+                if device_id:
+                    if mode in ("off", None):
+                        FAIL_DEVICE.pop(device_id, None)
+                    else:
+                        FAIL_DEVICE[device_id] = mode
+                elif not endpoint or mode in ("off", None):
                     FAIL.pop(endpoint, None)
                 else:
                     FAIL[endpoint] = mode
             return self._send(200, {"ok": True, "fail": dict(FAIL)})
 
         self._log("POST", path)
+
+        # POST /_matrix/client/v3/keys/upload -- the user's own device keys (H4b:
+        # "keys uploadable"). Under delegated auth Synapse refuses a token whose
+        # device it does not hold ("Token is not active"), so the mock does too.
+        if path == "/_matrix/client/v3/keys/upload":
+            introspection, denied = self._cs_api_auth()
+            if denied:
+                return self._send(*denied)
+            user_id = _mxid(introspection.get("username") or "")
+            device_id = introspection.get("device_id") or ""
+            with LOCK:
+                present = any(d["device_id"] == device_id for d in DEVICES.get(user_id, []))
+                if present:
+                    KEYS[f"{user_id}/{device_id}"] = body
+            if not present:
+                return self._send(401, {"errcode": "M_UNKNOWN_TOKEN", "error": "Token is not active"})
+            return self._send(200, {"one_time_key_counts": {}})
 
         # -- admin surface --------------------------------------------------
         if path == "/_matrix/client/v3/keys/query":
@@ -830,6 +1050,8 @@ class Handler(BaseHTTPRequestHandler):
         # a name it wrongly sent to an existing device must show up here the way
         # it would on Synapse. This mock used to keep the old name, which hid it.
         if path == "/_synapse/mas/upsert_device":
+            if self._maybe_fail("upsert_device"):
+                return
             uid = _mxid(body["localpart"])
             with LOCK:
                 # Provisioning a device implies the user EXISTS — but it does
@@ -876,6 +1098,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             uid = _mxid(body.get("localpart", ""))
             device_id = body.get("device_id", "")
+            with LOCK:
+                per_device = FAIL_DEVICE.get(device_id)
+            if per_device:
+                with LOCK:
+                    FAIL["__device"] = per_device
+                try:
+                    self._maybe_fail("__device")
+                finally:
+                    with LOCK:
+                        FAIL.pop("__device", None)
+                return
             with LOCK:
                 devs = DEVICES.get(uid, [])
                 existed = any(d["device_id"] == device_id for d in devs)
@@ -939,6 +1172,9 @@ class Handler(BaseHTTPRequestHandler):
         p = urlparse(self.path)
         path = unquote(p.path)
         self._log("DELETE", path)
+        if re.match(r"^/_matrix/client/v3/devices/[^/]+$", p.path):
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            return self._forward_to_oidc("DELETE", self.rfile.read(n) if n else b"")
         if re.match(r"^/_synapse/admin/v2/users/(.+)/devices/(.+)$", path):
             return self._ported_away("POST /_synapse/mas/delete_device")
         return self._send(404, {"errcode": "M_NOT_FOUND", "error": path})
@@ -952,9 +1188,41 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/_matrix/client/v3/profile/([^/]+)/(.+)$", path)
         if m:
             return self._profile_field_put(m.group(1), m.group(2), body)
-        if re.match(r"^/_synapse/admin/v2/users/(.+)$", path):
-            return self._ported_away("POST /_synapse/mas/reactivate_user")
+        m = re.match(r"^/_synapse/admin/v2/users/(.+)$", path)
+        if m:
+            if "deactivated" in body:
+                return self._ported_away("POST /_synapse/mas/reactivate_user")
+            return self._admin_user_put(m.group(1), body)
         return self._send(404, {"errcode": "M_NOT_FOUND", "error": path})
+
+    def _admin_user_put(self, raw_user_id, body):
+        """PUT /_synapse/admin/v2/users/{mxid} - `SynapseClient::admin_put_user`.
+
+        The guest hand-off sends two of these, in order: `{"user_type": "io.inblock.guest"}`
+        and then `{"displayname": ...}`. Each is recorded, in order, in `admin_puts`
+        (`GET /__state`), and has its own fault endpoint for `POST /__fail`:
+        `admin_put_user_type` and `admin_put_displayname`. A 500 there models Synapse
+        refusing the write (ST-43 / SY-4).
+        """
+        denied = self._admin_auth()
+        if denied:
+            return self._send(*denied)
+        which = "user_type" if "user_type" in body else "displayname"
+        if self._maybe_fail("admin_put_" + which):
+            with LOCK:
+                ADMIN_PUTS.append({"user_id": unquote(raw_user_id), "field": which, "applied": False})
+            return
+        uid = unquote(raw_user_id)
+        with LOCK:
+            if _localpart_of(uid) not in EXISTING_USERS:
+                return self._send(404, {"errcode": "M_NOT_FOUND", "error": "User not found"})
+            if which == "user_type":
+                USER_TYPES[uid] = body["user_type"]
+            else:
+                _mark_profile(_localpart_of(uid), body["displayname"])
+                PROFILES[uid]["displayname"] = body["displayname"]
+            ADMIN_PUTS.append({"user_id": uid, "field": which, "value": body[which], "applied": True})
+        return self._send(200, {"name": uid})
 
     def _profile_field_put(self, raw_user_id, field, body):
         """PUT /_matrix/client/v3/profile/{mxid}/{field} — `publish_did_field`.

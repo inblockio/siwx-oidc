@@ -69,7 +69,8 @@ pub async fn resolve_credential_identity(
                 .map_err(|e| anyhow!("Failed to deserialize link entry: {}", e))?;
             info!(
                 "webauthn resolve_credential_identity: linked cred={} primary_did={}",
-                cred_id_b64, link.primary_did
+                crate::redact::fingerprint(cred_id_b64),
+                link.primary_did
             );
             Ok(ResolvedIdentity {
                 did: link.primary_did,

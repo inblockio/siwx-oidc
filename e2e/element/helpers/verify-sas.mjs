@@ -256,14 +256,29 @@ export async function readSasEmoji(page) {
 }
 
 /**
+ * The two whitelisted clicks that send `m.key.verification.start` for SAS. When BOTH
+ * sides click one, the two starts collide: one side cancels, and the walk dead-ends
+ * (EW-V1 and EW-D1 flaked on exactly that, on every build). Drivers that advance both
+ * pages let only the side that started first start (`allowSasStart`); the other side
+ * accepts the incoming start, as a person on the second device does.
+ */
+const SAS_START_LABELS = new Set(['dialog: Compare unique emoji -> Start', 'panel: Verify by emoji']);
+
+/** Whether a label returned by {@link advanceVerification} sent a SAS start. */
+export function isSasStart(label) {
+  return SAS_START_LABELS.has(label);
+}
+
+/**
  * Advance the verification UI by exactly one WHITELISTED click, if one is
  * available on this page right now. Returns the label clicked, or null.
+ * With `allowSasStart: false` the SAS start clicks are skipped (see SAS_START_LABELS).
  *
  * The whitelist is closed: no button outside it is ever clicked, so the driver
  * cannot wander into "Use recovery key", "Reset", "Proceed with reset", or the
  * Secure Backup wizard.
  */
-export async function advanceVerification(page) {
+export async function advanceVerification(page, { allowSasStart = true } = {}) {
   const candidates = [
     [
       'toast/panel: Start Verification',
@@ -289,6 +304,7 @@ export async function advanceVerification(page) {
   ];
 
   for (const [label, loc] of candidates) {
+    if (!allowSasStart && SAS_START_LABELS.has(label)) continue;
     let ok = false;
     try {
       ok = (await loc.count()) > 0 && (await loc.isVisible()) && (await loc.isEnabled());

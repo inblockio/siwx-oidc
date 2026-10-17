@@ -106,7 +106,7 @@ its first working-group draft appeared on 2026-09-01.
 
 siwx-oidc itself does **not** implement RFC 9421 or Web Bot Auth. Its agent path is CAIP-122
 over the OIDC authorization-code flow. The same key can also sign HTTP requests through the
-*experimental* `http-sig` feature of [aqua-auth](https://github.com/inblockio/aqua-rs-auth), the
+*experimental* `http-sig` feature of [aqua-auth](https://github.com/inblockio/aqua-auth), the
 crate siwx-oidc builds on; siwx-oidc does not use that feature, and nothing here has been tested
 against third-party verifiers.
 
@@ -196,7 +196,7 @@ A complete Docker Compose deployment (Synapse, Element Web, siwx-oidc, Redis, Ca
 - **Redis** holds all server state: clients, sessions, tokens and passkey credentials.
 - **aqua-auth**, the external crate that parses DIDs and verifies CAIP-122 signatures and
   passkey assertions, pinned to tag `v0.7.0` of
-  [inblockio/aqua-rs-auth](https://github.com/inblockio/aqua-rs-auth).
+  [inblockio/aqua-auth](https://github.com/inblockio/aqua-auth).
 
 ### What it does not do
 

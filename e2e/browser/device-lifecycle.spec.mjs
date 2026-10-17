@@ -460,7 +460,7 @@ test('R-G6 + H13: account_erase deactivates(erase=true) AND purges WebAuthn cred
 });
 
 test('H11: WebAuthn challenge is bound to its session (cross-session replay rejected)', async ({ page }) => {
-  // The auth challenge is keyed by session_id (webauthn:challenge/{session_id}).
+  // The auth challenge is keyed by session_id (webauthn:ceremony/{sha256(session_id)}).
   // The /account/passkey path makes session_id an explicit, client-echoed value
   // (start returns it; finish must echo it), which lets us prove the binding from
   // the browser without two /authorize sessions: a challenge issued under S1 must
@@ -508,7 +508,7 @@ test('H11: WebAuthn challenge is bound to its session (cross-session replay reje
       },
     });
     // Replay the captured S1 assertion under a DIFFERENT session_id (s2):
-    // webauthn:challenge/{s2} has no challenge -> reject.
+    // no challenge is stored for s2 -> reject.
     const s2 = s1 + '-FORGED';
     const replay = await fetch('/account/passkey/finish', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: mkBody(s2),

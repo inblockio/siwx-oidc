@@ -1,0 +1,1343 @@
+//! Policy for generic-class clients: which scopes they are granted, which static entries
+//! start-up refuses, and which accounts get a mailbox address. Pure functions, so every
+//! rule is unit-tested here and read the same way by `oidc.rs` and `axum_lib.rs`.
+
+use std::collections::{BTreeSet, HashMap};
+
+use openidconnect::core::CoreGrantType;
+
+use crate::db::grant::GrantKind;
+use crate::db::{ClientClass, ClientEntry, SiwxClientMetadata, TokenMetadata};
+use crate::mxid::localpart_for;
+
+/// The scope that unlocks the mailbox claim.
+pub const MAIL_SCOPE: &str = "io.inblock.mail";
+/// The userinfo claim that carries the mailbox address.
+pub const MAILBOX_CLAIM: &str = "io.inblock.mailbox";
+
+/// Scope prefixes that open a Matrix or Synapse session. A generic client is never
+/// granted one, whatever its configuration says.
+const MATRIX_SESSION_SCOPE_PREFIXES: [&str; 2] = ["urn:matrix:", "urn:synapse:"];
+
+/// The deployment settings the static-client rules read besides the entry itself.
+#[derive(Clone, Copy, Debug)]
+pub struct Deployment<'a> {
+    /// `mail_domain`, which start-up has already passed to [`validate_mail_domain`].
+    pub mail_domain: Option<&'a str>,
+    /// Whether `mas_shared_secret` is set (delegated-auth mode): the deployment has a
+    /// Synapse that supplies the account and the localpart of a signed-in user.
+    pub delegated_auth: bool,
+    /// Whether `synapse_endpoint` is set. The Synapse client exists only when this and
+    /// `mas_shared_secret` both are; without it a sign-in provisions no account and
+    /// resolves no localpart.
+    pub synapse_configured: bool,
+}
+
+/// What a generic client is granted: every requested scope that is in `allowed`, in
+/// request order and without duplicates, or `None` when `openid` is not among them. A
+/// scope the client may not have is dropped rather than refused (OpenID Connect Core 1.0
+/// section 5.4), so the result is always a subset of `allowed`.
+fn granted_scope(requested: &str, allowed: &[String]) -> Option<String> {
+    let mut granted: Vec<&str> = Vec::new();
+    for scope in requested.split(' ').filter(|s| !s.is_empty()) {
+        if allowed.iter().any(|a| a == scope) && !granted.contains(&scope) {
+            granted.push(scope);
+        }
+    }
+    granted.contains(&"openid").then(|| granted.join(" "))
+}
+
+/// `granted` (the result of [`granted_scope`]) plus every scope of `always_granted` it does
+/// not contain yet, appended in configuration order. Start-up keeps `always_granted` inside
+/// the client's allowed scopes, so the merged scope stays a subset of them too.
+fn with_always_granted(granted: &str, always_granted: &[String]) -> String {
+    let mut scopes: Vec<&str> = granted.split(' ').filter(|s| !s.is_empty()).collect();
+    for scope in always_granted {
+        if !scopes.contains(&scope.as_str()) {
+            scopes.push(scope);
+        }
+    }
+    scopes.join(" ")
+}
+
+/// What `client` is granted for a request for `requested`: the requested scopes it may have
+/// (which must include `openid`) plus the scopes its configuration always grants.
+///
+/// `None` means the request grants no `openid`, and also covers a Matrix-class client,
+/// whose scope this function does not decide. A caller that refuses a request at
+/// `/authorize` and one that issues the grant at the token endpoint both ask this function
+/// about the same scope string, so the request one refuses is the request the other
+/// refuses, and the grant issued is the one that was checked.
+pub fn grant_for(client: &ClientEntry, requested: &str) -> Option<String> {
+    match client.class {
+        ClientClass::Matrix => None,
+        ClientClass::Generic => {
+            let allowed = client.allowed_scopes.as_deref().unwrap_or(&[]);
+            let granted = granted_scope(requested, allowed)?;
+            Some(with_always_granted(&granted, &client.always_granted_scopes))
+        }
+    }
+}
+
+/// Whether a space-separated scope string contains `scope` as a whole word.
+pub fn has_scope(scopes: &str, scope: &str) -> bool {
+    scopes.split(' ').any(|s| s == scope)
+}
+
+/// The width of an opaque localpart, in characters.
+const OPAQUE_LOCALPART_WIDTH: usize = 16;
+
+/// Whether `localpart` has the shape of an opaque localpart: exactly 16 characters, each a
+/// lowercase base36 digit (`0-9`, `a-z`).
+///
+/// A mail server takes a mailbox name of any case and length, so this provider is the only
+/// gate on what the mailbox claim can carry. The shape is stated here, apart from the
+/// derivation in [`crate::mxid::localpart_for`], on purpose: changing the derivation without
+/// changing this makes the claim vanish instead of silently changing the shape of every
+/// address. `every_localpart_the_derivation_produces_passes_the_mailbox_gate` fails first.
+pub fn is_opaque_localpart(localpart: &str) -> bool {
+    localpart.len() == OPAQUE_LOCALPART_WIDTH
+        && localpart
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+}
+
+/// The mailbox address of an account, or `None`. This is the one place the value of the
+/// mailbox claim is built.
+///
+/// Only an account whose RECORDED localpart (`TokenMetadata::username`, set at sign-in) is
+/// an opaque localpart ([`is_opaque_localpart`]) and is the one derived from its DID gets
+/// one; a grandfathered legacy localpart never does. The two checks answer different
+/// questions, the shape of the name and whose name it is. Today the derivation implies the
+/// shape, so the shape check changes no outcome; it is kept so that the address format does
+/// not depend on how the derivation happens to be written. They only check the recorded
+/// value: the address is always built from `username` as recorded, never from a recomputed
+/// localpart. `mail_domain` is the configured value, which start-up has already passed to
+/// [`validate_mail_domain`].
+pub fn mailbox_for(username: &str, did: &str, mail_domain: Option<&str>) -> Option<String> {
+    let domain = mail_domain?;
+    (is_opaque_localpart(username) && username == localpart_for(did))
+        .then(|| format!("{username}@{domain}"))
+}
+
+/// The `io.inblock.mailbox` claim `/userinfo` carries for one access token, or `None`.
+///
+/// Every condition is checked here, for this request, from the token and from the client
+/// entry as it is now, so a client that changed class or lost the scope stops getting the
+/// claim for tokens it already holds:
+///
+/// 1. the token belongs to an `oidc` grant, the grant a code exchange issues to a client that
+///    holds no Matrix session, and the client is generic-class now. An `oidc` grant alone
+///    does not decide it: a deployment without a MAS shared secret issues them to every
+///    client;
+/// 2. the grant's scope contains [`MAIL_SCOPE`], and the client is still allowed it;
+/// 3. the recorded localpart is the opaque one derived from the token's DID ([`mailbox_for`]);
+/// 4. a mail domain is configured.
+///
+/// Any other kind of grant, and a legacy token with no grant record, gets no claim. Both the
+/// kind and the class are decided by an exhaustive `match`, so a grant kind or a client class
+/// added later does not compile until it is named here.
+pub fn mailbox_claim(
+    token: &TokenMetadata,
+    client: &ClientEntry,
+    mail_domain: Option<&str>,
+) -> Option<String> {
+    let oidc_grant = match token.grant_kind {
+        Some(GrantKind::Oidc) => true,
+        Some(GrantKind::MatrixDevice | GrantKind::Service) | None => false,
+    };
+    let generic_client = match client.class {
+        ClientClass::Generic => true,
+        ClientClass::Matrix => false,
+    };
+    let still_allowed = client
+        .allowed_scopes
+        .as_deref()
+        .is_some_and(|allowed| allowed.iter().any(|scope| scope == MAIL_SCOPE));
+    if !(oidc_grant && generic_client && still_allowed && has_scope(&token.scope, MAIL_SCOPE)) {
+        return None;
+    }
+    mailbox_for(&token.username, &token.did, mail_domain)
+}
+
+/// The longest DNS name, and the longest label in one, in characters (RFC 1035 section
+/// 2.3.4, without the trailing dot).
+const MAX_DOMAIN_LEN: usize = 253;
+const MAX_LABEL_LEN: usize = 63;
+
+/// Refuse a `mail_domain` that would mint malformed or ambiguous addresses: it must be a
+/// lowercase DNS name (labels of `a-z`, `0-9` and inner `-`, joined by single dots, at most
+/// 63 characters per label and 253 in all) whose last label is not all digits. The last
+/// rule is RFC 1123 section 2.1 and RFC 3696 section 2: a top-level label is never numeric,
+/// which is what keeps an IP address (`127.0.0.1`, `127.1`, `2130706433`) from passing for
+/// a name.
+pub fn validate_mail_domain(mail_domain: Option<&str>) -> Result<(), String> {
+    let Some(domain) = mail_domain else {
+        return Ok(());
+    };
+    let label_ok = |label: &str| {
+        !label.is_empty()
+            && label.len() <= MAX_LABEL_LEN
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    let last_label_is_numeric = domain
+        .rsplit('.')
+        .next()
+        .is_some_and(|label| label.bytes().all(|b| b.is_ascii_digit()));
+    if domain.len() <= MAX_DOMAIN_LEN && domain.split('.').all(label_ok) && !last_label_is_numeric {
+        Ok(())
+    } else {
+        Err(format!(
+            "mail_domain `{domain}` is not a lowercase DNS name: labels of a-z, 0-9 and inner \
+             hyphens of at most {MAX_LABEL_LEN} characters, at most {MAX_DOMAIN_LEN} in all, \
+             and a last label that is not all digits (an IP address is not a mail domain)"
+        ))
+    }
+}
+
+/// RFC 6749 section 3.3: a scope is a non-empty run of printable ASCII without `"` and `\`.
+/// That is also what keeps a space-separated scope string unambiguous.
+fn is_scope_token(scope: &str) -> bool {
+    !scope.is_empty()
+        && scope
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
+}
+
+/// Refuse a static client entry this server could not honour safely. Start-up runs it for
+/// every `default_clients` entry; the error names the client and the rule.
+pub fn validate_static_client(
+    id: &str,
+    entry: &ClientEntry,
+    deployment: Deployment<'_>,
+) -> Result<(), String> {
+    let refuse = |rule: String| Err(format!("default_clients.{id}: {rule}"));
+    if let Some(scope) = entry
+        .allowed_scopes
+        .iter()
+        .flatten()
+        .chain(&entry.always_granted_scopes)
+        .find(|s| !is_scope_token(s))
+    {
+        return refuse(format!(
+            "`{scope}` is not a scope: a scope is one word of printable characters (RFC 6749 section 3.3)"
+        ));
+    }
+    match entry.class {
+        ClientClass::Matrix => {
+            if entry.allowed_scopes.is_some() {
+                return refuse(
+                    "`allowed_scopes` applies only to class \"generic\"; \
+                     a Matrix-class client always gets the Matrix scope"
+                        .into(),
+                );
+            }
+            if !entry.always_granted_scopes.is_empty() {
+                return refuse("`always_granted_scopes` applies only to class \"generic\"".into());
+            }
+        }
+        ClientClass::Generic => {
+            if !deployment.delegated_auth {
+                return refuse(
+                    "a generic client needs `mas_shared_secret` (SIWXOIDC_MAS_SHARED_SECRET): \
+                     its account and localpart come from Synapse"
+                        .into(),
+                );
+            }
+            if !deployment.synapse_configured {
+                return refuse(
+                    "a generic client needs `synapse_endpoint` (SIWXOIDC_SYNAPSE_ENDPOINT): \
+                     without it no account is provisioned and no localpart is resolved"
+                        .into(),
+                );
+            }
+            let Some(allowed) = entry.allowed_scopes.as_deref() else {
+                return refuse("a generic client needs `allowed_scopes`".into());
+            };
+            if !allowed.iter().any(|s| s == "openid") {
+                return refuse("`allowed_scopes` must include \"openid\"".into());
+            }
+            if let Some(scope) = allowed.iter().find(|s| {
+                MATRIX_SESSION_SCOPE_PREFIXES
+                    .iter()
+                    .any(|prefix| s.starts_with(prefix))
+            }) {
+                return refuse(format!(
+                    "a generic client can never be granted `{scope}`: scopes starting with \
+                     `urn:matrix:` or `urn:synapse:` open a Matrix or Synapse session"
+                ));
+            }
+            if entry.always_granted_scopes.iter().any(|s| s == "openid") {
+                return refuse(
+                    "`always_granted_scopes` must not include \"openid\": a client requests it, \
+                     and it is never implied"
+                        .into(),
+                );
+            }
+            if let Some(scope) = entry
+                .always_granted_scopes
+                .iter()
+                .find(|s| !allowed.contains(s))
+            {
+                return refuse(format!(
+                    "`always_granted_scopes` must be a subset of `allowed_scopes`, \
+                     and `{scope}` is not in it"
+                ));
+            }
+            if allowed.iter().any(|s| s == MAIL_SCOPE) && deployment.mail_domain.is_none() {
+                return refuse(format!(
+                    "`{MAIL_SCOPE}` needs `mail_domain` (SIWXOIDC_MAIL_DOMAIN)"
+                ));
+            }
+            if entry.access_token_digest.is_some() {
+                return refuse("a generic client cannot carry a registration access token".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse and validate every `default_clients` entry, in id order so that a configuration
+/// with several faults reports the same one on every start. Start-up calls it before
+/// anything is written, and it needs no Redis.
+pub fn parse_static_clients(
+    configured: &HashMap<String, String>,
+    deployment: Deployment<'_>,
+) -> Result<Vec<(String, ClientEntry)>, String> {
+    let mut ids: Vec<&String> = configured.keys().collect();
+    ids.sort();
+    ids.into_iter()
+        .map(|id| {
+            let entry: ClientEntry = serde_json::from_str(&configured[id])
+                .map_err(|e| format!("default_clients.{id}: not a valid client entry: {e}"))?;
+            validate_static_client(id, &entry, deployment)?;
+            Ok((id.clone(), entry))
+        })
+        .collect()
+}
+
+/// Why the start-up sync ends every grant of a static client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantEnd {
+    /// The configuration no longer names the client.
+    Removed,
+    /// The client is registered as another class than the one its grants were issued to.
+    ClassChanged,
+    /// The scopes the client may be granted are not the ones its grants were issued under.
+    ScopesChanged,
+    /// The registration no longer allows the refresh grant its refresh tokens were issued under.
+    RefreshWithdrawn,
+}
+
+impl GrantEnd {
+    /// The word a log line carries for this reason.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GrantEnd::Removed => "removed",
+            GrantEnd::ClassChanged => "class_changed",
+            GrantEnd::ScopesChanged => "scopes_changed",
+            GrantEnd::RefreshWithdrawn => "refresh_withdrawn",
+        }
+    }
+}
+
+/// Whether a registration allows the refresh grant: it lists `refresh_token` in
+/// `grant_types`, or lists no `grant_types` at all (provisional). The one place the answer is
+/// decided: the code exchange asks it before it issues a refresh token, and
+/// [`grant_end`] asks it to end the refresh tokens of a client that lost the permission.
+pub fn registration_may_refresh(metadata: &SiwxClientMetadata) -> bool {
+    metadata
+        .grant_types()
+        .is_none_or(|grants| grants.contains(&CoreGrantType::RefreshToken))
+}
+
+/// The set of scopes `entry` may be granted: a list with a scope twice, or in another order,
+/// is the same policy, and no list is the empty list.
+fn allowed_set(entry: &ClientEntry) -> BTreeSet<&str> {
+    entry
+        .allowed_scopes
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .collect()
+}
+
+/// Whether replacing the stored entry `before` of a static client with `after` (`None`:
+/// deleting it) must end every grant the client holds, and why.
+///
+/// A generic client's grant carries a scope decided from the registration, and its refresh
+/// token keeps rotating at the token endpoint when the registration is gone, so without an
+/// end a grant would outlive the registration that justified it. It ends when the client is
+/// removed, when it changes class in either direction, and when the SET of scopes it may be
+/// granted changes. A widening counts too: every grant then follows the current policy
+/// exactly, at the price of one sign-in. `always_granted_scopes` is not part of the rule:
+/// start-up keeps it inside `allowed_scopes`, so a change to it alone leaves every grant
+/// inside what the client may have. The secret and the redirect URIs are not part of it
+/// either.
+///
+/// A refresh token is issued only while the registration allows the refresh grant
+/// ([`registration_may_refresh`]), so a registration that stops allowing it ends the grants
+/// too: their refresh tokens would keep rotating under a registration that forbids them.
+/// Allowing it again ends nothing, because no grant holds more than the registration now
+/// permits. When the scopes changed as well, the reason is the scopes.
+///
+/// A Matrix-class client never ends its grants here: they are Matrix sessions, which keep
+/// refreshing after the client's removal, as they always did. The classes are matched
+/// exhaustively, so a class added later fails to compile here instead of falling through.
+pub fn grant_end(before: &ClientEntry, after: Option<&ClientEntry>) -> Option<GrantEnd> {
+    match (before.class, after) {
+        (ClientClass::Matrix, None) => None,
+        (ClientClass::Generic, None) => Some(GrantEnd::Removed),
+        (ClientClass::Matrix, Some(after)) => match after.class {
+            ClientClass::Matrix => None,
+            ClientClass::Generic => Some(GrantEnd::ClassChanged),
+        },
+        (ClientClass::Generic, Some(after)) => match after.class {
+            ClientClass::Matrix => Some(GrantEnd::ClassChanged),
+            ClientClass::Generic => {
+                if allowed_set(before) != allowed_set(after) {
+                    Some(GrantEnd::ScopesChanged)
+                } else if registration_may_refresh(&before.metadata)
+                    && !registration_may_refresh(&after.metadata)
+                {
+                    Some(GrantEnd::RefreshWithdrawn)
+                } else {
+                    None
+                }
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::SiwxClientMetadata;
+    use openidconnect::RedirectUrl;
+
+    fn allowed(scopes: &[&str]) -> Vec<String> {
+        scopes.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A deployment with a Synapse (delegated-auth mode) and the given mail domain.
+    fn deployment(mail_domain: Option<&str>) -> Deployment<'_> {
+        Deployment {
+            mail_domain,
+            delegated_auth: true,
+            synapse_configured: true,
+        }
+    }
+
+    fn metadata() -> SiwxClientMetadata {
+        SiwxClientMetadata::new(
+            vec![RedirectUrl::new("https://mail.example.org/cb".into()).unwrap()],
+            Default::default(),
+        )
+    }
+
+    fn entry(class: ClientClass, scopes: Option<&[&str]>) -> ClientEntry {
+        ClientEntry {
+            class,
+            allowed_scopes: scopes.map(allowed),
+            ..ClientEntry::new("s", metadata(), None)
+        }
+    }
+
+    fn always(mut entry: ClientEntry, scopes: &[&str]) -> ClientEntry {
+        entry.always_granted_scopes = allowed(scopes);
+        entry
+    }
+
+    #[test]
+    fn granted_scope_keeps_only_allowed_scopes_and_needs_openid() {
+        let mail = allowed(&["openid", "profile", MAIL_SCOPE]);
+        assert_eq!(
+            granted_scope("openid io.inblock.mail urn:matrix:client:api:*", &mail).as_deref(),
+            Some("openid io.inblock.mail")
+        );
+        assert_eq!(
+            granted_scope("io.inblock.mail openid openid", &mail).as_deref(),
+            Some("io.inblock.mail openid"),
+            "request order, no duplicates"
+        );
+        assert_eq!(
+            granted_scope("io.inblock.mail", &mail),
+            None,
+            "openid is required"
+        );
+        assert_eq!(
+            granted_scope("openid io.inblock.mail", &allowed(&["openid"])).as_deref(),
+            Some("openid"),
+            "a scope the client may not have is dropped, never granted"
+        );
+        assert_eq!(granted_scope("", &mail), None);
+    }
+
+    #[test]
+    fn has_scope_matches_whole_words_only() {
+        assert!(has_scope("openid io.inblock.mail", MAIL_SCOPE));
+        assert!(!has_scope("openid io.inblock.mailx", MAIL_SCOPE));
+        assert!(!has_scope("openid", MAIL_SCOPE));
+    }
+
+    #[test]
+    fn always_granted_scopes_are_appended_without_duplicates() {
+        let mail = allowed(&[MAIL_SCOPE]);
+        assert_eq!(
+            with_always_granted("openid profile", &mail),
+            "openid profile io.inblock.mail"
+        );
+        assert_eq!(
+            with_always_granted("openid io.inblock.mail", &mail),
+            "openid io.inblock.mail",
+            "a scope the client did request is not repeated"
+        );
+        assert_eq!(with_always_granted("openid", &[]), "openid");
+        assert_eq!(
+            with_always_granted("openid", &allowed(&["b", "a", "b"])),
+            "openid b a",
+            "configuration order, no duplicates"
+        );
+    }
+
+    #[test]
+    fn a_client_that_requests_only_openid_and_profile_still_gets_the_mail_scope() {
+        let may_have = allowed(&["openid", "profile", MAIL_SCOPE]);
+        let granted = granted_scope("openid profile", &may_have).unwrap();
+        let merged = with_always_granted(&granted, &allowed(&[MAIL_SCOPE]));
+        assert_eq!(merged, "openid profile io.inblock.mail");
+        assert!(has_scope(&merged, MAIL_SCOPE));
+        assert!(
+            merged.split(' ').all(|s| may_have.iter().any(|a| a == s)),
+            "the merged scope stays inside the allowed scopes"
+        );
+    }
+
+    #[test]
+    fn a_generic_client_is_granted_what_it_may_have_plus_what_is_always_granted() {
+        let client = always(
+            entry(
+                ClientClass::Generic,
+                Some(&["openid", "profile", MAIL_SCOPE]),
+            ),
+            &[MAIL_SCOPE],
+        );
+        assert_eq!(
+            grant_for(&client, "openid profile urn:matrix:client:api:*").as_deref(),
+            Some("openid profile io.inblock.mail")
+        );
+        assert_eq!(
+            grant_for(&client, "openid io.inblock.mail").as_deref(),
+            Some("openid io.inblock.mail"),
+            "a scope the client did request is not repeated"
+        );
+        assert_eq!(
+            grant_for(
+                &entry(ClientClass::Generic, Some(&["openid"])),
+                "openid profile"
+            )
+            .as_deref(),
+            Some("openid"),
+            "without always-granted scopes the grant is the allowed part of the request"
+        );
+    }
+
+    #[test]
+    fn a_request_without_openid_is_refused_whatever_is_always_granted() {
+        let client = always(
+            entry(ClientClass::Generic, Some(&["openid", MAIL_SCOPE])),
+            &[MAIL_SCOPE],
+        );
+        assert_eq!(grant_for(&client, MAIL_SCOPE), None);
+        assert_eq!(grant_for(&client, "profile"), None);
+        assert_eq!(grant_for(&client, ""), None);
+    }
+
+    #[test]
+    fn a_generic_client_without_a_scope_policy_is_granted_nothing() {
+        assert_eq!(
+            grant_for(&entry(ClientClass::Generic, None), "openid"),
+            None
+        );
+    }
+
+    #[test]
+    fn only_a_generic_client_is_granted_a_scope_here() {
+        let matrix = entry(ClientClass::Matrix, Some(&["openid"]));
+        assert_eq!(
+            grant_for(&matrix, "openid"),
+            None,
+            "a Matrix-class client's scope is fixed at the token endpoint"
+        );
+    }
+
+    #[test]
+    fn only_the_opaque_localpart_gets_a_mailbox() {
+        let did = "did:key:z6MkmWziJJ2k3ckqVqnmMGVKefMhDSe4ZxrfvqksxDMGBa4v";
+        let opaque = crate::mxid::localpart_for(did);
+        assert_eq!(
+            mailbox_for(&opaque, did, Some("matrix.example.org")),
+            Some(format!("{opaque}@matrix.example.org"))
+        );
+        assert_eq!(
+            mailbox_for(
+                &crate::mxid::legacy_localpart(did),
+                did,
+                Some("matrix.example.org")
+            ),
+            None,
+            "a legacy localpart gets no mailbox"
+        );
+        assert_eq!(
+            mailbox_for(
+                &opaque,
+                "did:key:z6MkpFemPtmjvPZ1gFYM6d68tuwxxrcec4H2Ck23FRchU9ue",
+                Some("matrix.example.org")
+            ),
+            None,
+            "a localpart that is not this DID's own gets no mailbox"
+        );
+        assert_eq!(mailbox_for(&opaque, did, None), None);
+    }
+
+    #[test]
+    fn only_sixteen_lowercase_base36_characters_are_an_opaque_localpart() {
+        for opaque in [
+            "k3f9x2q7ab4d8m1p",
+            "1vo8g4vofiha69ua",
+            "0000000000000000",
+            "zzzzzzzzzzzzzzzz",
+        ] {
+            assert!(is_opaque_localpart(opaque), "{opaque:?} is opaque");
+        }
+        let malformed = [
+            ("upper case", "K3F9X2Q7AB4D8M1P"),
+            ("one upper case letter", "k3f9x2q7ab4d8m1P"),
+            ("15 characters", "k3f9x2q7ab4d8m1"),
+            ("17 characters", "k3f9x2q7ab4d8m1pa"),
+            ("empty", ""),
+            (
+                "the legacy form",
+                "did-key-z6mkmwzijj2k3ckqvqnmmgvkefmhdse4zxrfvqksxdmgba4v",
+            ),
+            ("a hyphen", "k3f9x2q7-b4d8m1p"),
+            ("an underscore", "k3f9x2q7_b4d8m1p"),
+            ("a dot", "k3f9x2q7.b4d8m1p"),
+            ("a colon", "k3f9x2q7:b4d8m1p"),
+            ("an at sign", "k3f9x2q7@b4d8m1p"),
+            ("a space", "k3f9x2q7 b4d8m1p"),
+            ("a trailing newline", "k3f9x2q7ab4d8m1\n"),
+            (
+                "a multi-byte letter that makes it 16 bytes",
+                "k3f9x2q7ab4d8m\u{e9}",
+            ),
+            (
+                "a multi-byte letter on top of 15 characters",
+                "k3f9x2q7ab4d8m1\u{e9}",
+            ),
+        ];
+        for (what, localpart) in malformed {
+            assert!(
+                !is_opaque_localpart(localpart),
+                "{what}: {localpart:?} is not opaque"
+            );
+        }
+    }
+
+    /// The gate and the derivation are stated apart, so that changing the derivation without
+    /// changing the gate makes the claim vanish instead of silently changing the address.
+    /// This is the test that fails first when only one of them is changed.
+    #[test]
+    fn every_localpart_the_derivation_produces_passes_the_mailbox_gate() {
+        let spellings = [
+            "did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            "did:pkh:eip155:1:0x5AAEB6053F3E94C9B9A09F33669435E7EF1BEAED",
+            "did:pkh:ed25519:0xabcdef1234567890",
+            "did:key:zDnaeUKTWUXc1mxSoRrEfV6wPWmQyHrKuTHLZgAkyUKfSbeMB",
+            "did:peer:2.Ez6LSbysY2xFMRpGMhb7tFTLMpeuPRaqaWM1yECx2AtzE3KCc",
+            "",
+        ];
+        let generated = (0..1000).map(|i| format!("did:key:zDerive{i}"));
+        for did in spellings.iter().map(|s| s.to_string()).chain(generated) {
+            let localpart = crate::mxid::localpart_for(&did);
+            assert!(
+                is_opaque_localpart(&localpart),
+                "the localpart derived for {did:?} fails the gate: {localpart:?}"
+            );
+        }
+    }
+
+    const CLAIM_DID: &str = "did:key:zDnaeUKTWUXc1mxSoRrEfV6wPWmQyHrKuTHLZgAkyUKfSbeMB";
+    const CLAIM_DOMAIN: &str = "matrix.example.org";
+
+    fn access_token(grant_kind: Option<GrantKind>, scope: &str, username: &str) -> TokenMetadata {
+        TokenMetadata {
+            username: username.to_string(),
+            device_id: String::new(),
+            scope: scope.to_string(),
+            client_id: "mail".to_string(),
+            iat: 0,
+            exp: i64::MAX,
+            did: CLAIM_DID.to_string(),
+            name: CLAIM_DID.to_string(),
+            kind: Some(crate::db::TokenKind::Access),
+            grant_kind,
+        }
+    }
+
+    /// The claim is what lets a mail server create a mailbox, so each condition has a case
+    /// that goes wrong when only that condition is dropped, and the case that meets them all
+    /// is asserted too: a claim that is never emitted would pass every absence check.
+    #[test]
+    fn the_mailbox_claim_decision_needs_every_condition() {
+        let opaque = localpart_for(CLAIM_DID);
+        let mail_client = entry(ClientClass::Generic, Some(&["openid", MAIL_SCOPE]));
+        let issued = access_token(Some(GrantKind::Oidc), "openid io.inblock.mail", &opaque);
+        assert_eq!(
+            mailbox_claim(&issued, &mail_client, Some(CLAIM_DOMAIN)),
+            Some(format!("{opaque}@{CLAIM_DOMAIN}")),
+            "every condition met"
+        );
+
+        let legacy = crate::mxid::legacy_localpart(CLAIM_DID);
+        let narrowed = entry(ClientClass::Generic, Some(&["openid"]));
+        let without_policy = entry(ClientClass::Generic, None);
+        let matrix_now = entry(ClientClass::Matrix, Some(&["openid", MAIL_SCOPE]));
+        let cases = [
+            (
+                "a Matrix device grant",
+                access_token(
+                    Some(GrantKind::MatrixDevice),
+                    "openid io.inblock.mail",
+                    &opaque,
+                ),
+                &mail_client,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "a service grant",
+                access_token(Some(GrantKind::Service), "openid io.inblock.mail", &opaque),
+                &mail_client,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "a legacy token with no grant",
+                access_token(None, "openid io.inblock.mail", &opaque),
+                &mail_client,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "no mail scope",
+                access_token(Some(GrantKind::Oidc), "openid", &opaque),
+                &mail_client,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "a scope that only starts with the mail scope",
+                access_token(Some(GrantKind::Oidc), "openid io.inblock.mailx", &opaque),
+                &mail_client,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "a client that no longer allows the mail scope",
+                issued.clone(),
+                &narrowed,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "a client with no scope policy",
+                issued.clone(),
+                &without_policy,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "a client that is Matrix-class now",
+                issued.clone(),
+                &matrix_now,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "a legacy localpart",
+                access_token(Some(GrantKind::Oidc), "openid io.inblock.mail", &legacy),
+                &mail_client,
+                Some(CLAIM_DOMAIN),
+            ),
+            (
+                "an opaque localpart that is another DID's",
+                access_token(
+                    Some(GrantKind::Oidc),
+                    "openid io.inblock.mail",
+                    &localpart_for("did:key:zDnotThisAccount"),
+                ),
+                &mail_client,
+                Some(CLAIM_DOMAIN),
+            ),
+            ("no mail domain", issued.clone(), &mail_client, None),
+        ];
+        for (why, token, client, domain) in cases {
+            assert_eq!(mailbox_claim(&token, client, domain), None, "{why}");
+        }
+    }
+
+    #[test]
+    fn a_mail_domain_must_be_a_lowercase_dns_name() {
+        assert!(validate_mail_domain(None).is_ok());
+        assert!(validate_mail_domain(Some("matrix.example.org")).is_ok());
+        assert!(validate_mail_domain(Some("matrix.test")).is_ok());
+        assert!(validate_mail_domain(Some("1password.example.com")).is_ok());
+        assert!(validate_mail_domain(Some("host.123abc")).is_ok());
+        assert!(validate_mail_domain(Some("localhost")).is_ok());
+        for bad in [
+            "",
+            "Matrix.example.org",
+            "user@example.org",
+            "example..org",
+            "-x.example.org",
+            "exa mple.org",
+            ".example.org",
+            "example.org.",
+            "  ",
+            " example.org",
+        ] {
+            assert!(
+                validate_mail_domain(Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mail_domain_is_bounded_in_length() {
+        let label_63 = "a".repeat(63);
+        assert!(validate_mail_domain(Some(&format!("{label_63}.example.org"))).is_ok());
+        assert!(
+            validate_mail_domain(Some(&format!("{}.example.org", "a".repeat(64)))).is_err(),
+            "a label of 64 characters"
+        );
+        let name_253 = format!("{label_63}.{label_63}.{label_63}.{}", "a".repeat(61));
+        assert_eq!(name_253.len(), 253);
+        assert!(validate_mail_domain(Some(&name_253)).is_ok());
+        assert!(
+            validate_mail_domain(Some(&format!("{name_253}a"))).is_err(),
+            "a name of 254 characters"
+        );
+    }
+
+    #[test]
+    fn a_mail_domain_is_never_an_ip_address() {
+        for ip in [
+            "127.0.0.1",
+            "127.1",
+            "2130706433",
+            "10.0.0.1",
+            "mail.example.org.1",
+            "1.2.3.4",
+        ] {
+            assert!(
+                validate_mail_domain(Some(ip)).is_err(),
+                "{ip:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn static_client_validation_refuses_what_it_cannot_honour_safely() {
+        let domain = Some("matrix.example.org");
+        let served = deployment(domain);
+        assert!(
+            validate_static_client("element", &entry(ClientClass::Matrix, None), served).is_ok()
+        );
+        assert!(validate_static_client(
+            "mail",
+            &entry(ClientClass::Generic, Some(&["openid", MAIL_SCOPE])),
+            served
+        )
+        .is_ok());
+        let without_domain = deployment(None);
+        let without_secret = Deployment {
+            delegated_auth: false,
+            ..deployment(domain)
+        };
+        let without_endpoint = Deployment {
+            synapse_configured: false,
+            ..deployment(domain)
+        };
+        let refused = [
+            (
+                "matrix-with-scopes",
+                entry(ClientClass::Matrix, Some(&["openid"])),
+                served,
+                "applies only to class",
+            ),
+            (
+                "generic-without-scopes",
+                entry(ClientClass::Generic, None),
+                served,
+                "needs `allowed_scopes`",
+            ),
+            (
+                "generic-without-openid",
+                entry(ClientClass::Generic, Some(&[MAIL_SCOPE])),
+                served,
+                "must include \"openid\"",
+            ),
+            (
+                "generic-with-matrix-scope",
+                entry(
+                    ClientClass::Generic,
+                    Some(&["openid", "urn:matrix:client:api:*"]),
+                ),
+                served,
+                "urn:matrix:client:api:*",
+            ),
+            (
+                "generic-with-synapse-scope",
+                entry(
+                    ClientClass::Generic,
+                    Some(&["openid", "urn:synapse:admin:*"]),
+                ),
+                served,
+                "urn:synapse:admin:*",
+            ),
+            (
+                "mail-without-domain",
+                entry(ClientClass::Generic, Some(&["openid", MAIL_SCOPE])),
+                without_domain,
+                "needs `mail_domain`",
+            ),
+            (
+                "scope-with-a-space",
+                entry(ClientClass::Generic, Some(&["openid", "profile email"])),
+                served,
+                "`profile email` is not a scope",
+            ),
+            (
+                "empty-scope",
+                entry(ClientClass::Generic, Some(&["openid", ""])),
+                served,
+                "`` is not a scope",
+            ),
+            (
+                "generic-without-a-mas-secret",
+                entry(ClientClass::Generic, Some(&["openid"])),
+                without_secret,
+                "needs `mas_shared_secret`",
+            ),
+            (
+                "generic-without-a-synapse-endpoint",
+                entry(ClientClass::Generic, Some(&["openid"])),
+                without_endpoint,
+                "needs `synapse_endpoint`",
+            ),
+        ];
+        for (id, e, d, rule) in refused {
+            let err = validate_static_client(id, &e, d).expect_err(id);
+            assert!(
+                err.starts_with(&format!("default_clients.{id}:")),
+                "the error names the client: {err}"
+            );
+            assert!(
+                err.contains(rule),
+                "the error names the rule {rule:?}: {err}"
+            );
+        }
+        let managed = ClientEntry {
+            class: ClientClass::Generic,
+            allowed_scopes: Some(allowed(&["openid"])),
+            ..ClientEntry::new("s", metadata(), Some("t"))
+        };
+        assert!(
+            validate_static_client("managed", &managed, served).is_err(),
+            "a generic client cannot be managed through /client/{{id}}"
+        );
+    }
+
+    /// A Matrix-class client is the same in either deployment mode; only the generic
+    /// class needs a Synapse.
+    #[test]
+    fn a_matrix_class_client_is_valid_without_a_synapse() {
+        for (delegated_auth, synapse_configured) in [(false, false), (true, false), (false, true)] {
+            let without_synapse = Deployment {
+                mail_domain: None,
+                delegated_auth,
+                synapse_configured,
+            };
+            assert!(
+                validate_static_client(
+                    "element",
+                    &entry(ClientClass::Matrix, None),
+                    without_synapse
+                )
+                .is_ok(),
+                "delegated_auth {delegated_auth}, synapse_configured {synapse_configured}"
+            );
+        }
+    }
+
+    #[test]
+    fn always_granted_scopes_must_be_allowed_and_never_openid() {
+        let served = deployment(Some("matrix.example.org"));
+        let generic = |extra: &[&str]| {
+            always(
+                entry(
+                    ClientClass::Generic,
+                    Some(&["openid", "profile", MAIL_SCOPE]),
+                ),
+                extra,
+            )
+        };
+        assert!(validate_static_client("none", &generic(&[]), served).is_ok());
+        assert!(validate_static_client("mail", &generic(&[MAIL_SCOPE]), served).is_ok());
+        assert!(validate_static_client("two", &generic(&["profile", MAIL_SCOPE]), served).is_ok());
+
+        let refused = [
+            (
+                "not-allowed",
+                generic(&["urn:example:other"]),
+                "`urn:example:other` is not in it",
+            ),
+            (
+                "partly-allowed",
+                generic(&[MAIL_SCOPE, "urn:example:other"]),
+                "`urn:example:other` is not in it",
+            ),
+            (
+                "openid",
+                generic(&["openid"]),
+                "must not include \"openid\"",
+            ),
+            (
+                "matrix-class",
+                always(entry(ClientClass::Matrix, None), &[MAIL_SCOPE]),
+                "`always_granted_scopes` applies only to class",
+            ),
+            ("empty-scope", generic(&[""]), "`` is not a scope"),
+            (
+                "scope-with-a-space",
+                generic(&["profile io.inblock.mail"]),
+                "is not a scope",
+            ),
+        ];
+        for (id, e, rule) in refused {
+            let err = validate_static_client(id, &e, served).expect_err(id);
+            assert!(
+                err.starts_with(&format!("default_clients.{id}:")),
+                "the error names the client: {err}"
+            );
+            assert!(
+                err.contains(rule),
+                "the error names the rule {rule:?}: {err}"
+            );
+        }
+    }
+
+    const MATRIX_ENTRY: &str =
+        r#"{"secret":"s","metadata":{"redirect_uris":["https://app.example.org/cb"]}}"#;
+    const MAIL_ENTRY: &str = r#"{"secret":"s","metadata":{"redirect_uris":["https://mail.example.org/cb"]},"class":"generic","allowed_scopes":["openid","profile","io.inblock.mail"],"always_granted_scopes":["io.inblock.mail"]}"#;
+
+    fn configured(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(id, raw)| (id.to_string(), raw.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn start_up_parses_every_static_client_in_id_order() {
+        let clients = parse_static_clients(
+            &configured(&[("mail", MAIL_ENTRY), ("element", MATRIX_ENTRY)]),
+            deployment(Some("matrix.example.org")),
+        )
+        .unwrap();
+        let ids: Vec<&str> = clients.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["element", "mail"]);
+        assert_eq!(clients[0].1.class, ClientClass::Matrix);
+        assert_eq!(clients[1].1.class, ClientClass::Generic);
+        assert_eq!(
+            clients[1].1.always_granted_scopes,
+            vec![MAIL_SCOPE.to_string()]
+        );
+        assert!(parse_static_clients(&HashMap::new(), deployment(None))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The refusal for `entries`; `ClientEntry` has no `Debug`, so `Result::unwrap_err` is
+    /// not available.
+    fn refusal(entries: &[(&str, &str)], deployment: Deployment<'_>) -> String {
+        match parse_static_clients(&configured(entries), deployment) {
+            Ok(_) => panic!("the configuration must be refused"),
+            Err(refusal) => refusal,
+        }
+    }
+
+    #[test]
+    fn start_up_names_the_client_whose_entry_cannot_be_used() {
+        let served = deployment(Some("matrix.example.org"));
+        let unreadable = refusal(&[("broken", "{not json")], served);
+        assert!(
+            unreadable.starts_with("default_clients.broken:"),
+            "{unreadable}"
+        );
+
+        let no_domain = refusal(&[("mail", MAIL_ENTRY)], deployment(None));
+        assert!(
+            no_domain.starts_with("default_clients.mail:"),
+            "{no_domain}"
+        );
+        assert!(no_domain.contains("SIWXOIDC_MAIL_DOMAIN"), "{no_domain}");
+
+        let no_secret = refusal(
+            &[("mail", MAIL_ENTRY)],
+            Deployment {
+                delegated_auth: false,
+                ..served
+            },
+        );
+        assert!(
+            no_secret.starts_with("default_clients.mail:"),
+            "{no_secret}"
+        );
+        assert!(
+            no_secret.contains("SIWXOIDC_MAS_SHARED_SECRET"),
+            "{no_secret}"
+        );
+
+        let no_endpoint = refusal(
+            &[("mail", MAIL_ENTRY)],
+            Deployment {
+                synapse_configured: false,
+                ..served
+            },
+        );
+        assert!(
+            no_endpoint.starts_with("default_clients.mail:"),
+            "{no_endpoint}"
+        );
+        assert!(
+            no_endpoint.contains("SIWXOIDC_SYNAPSE_ENDPOINT"),
+            "{no_endpoint}"
+        );
+
+        let both = refusal(&[("zeta", "{}"), ("alpha", "{}")], served);
+        assert!(
+            both.starts_with("default_clients.alpha:"),
+            "the first id in order is reported, so the message is stable: {both}"
+        );
+    }
+
+    const MAIL: &[&str] = &["openid", "io.inblock.mail"];
+
+    fn generic(scopes: &[&str]) -> ClientEntry {
+        entry(ClientClass::Generic, Some(scopes))
+    }
+
+    fn matrix() -> ClientEntry {
+        entry(ClientClass::Matrix, None)
+    }
+
+    /// The same registration with another secret and another redirect URI.
+    fn reconfigured(mut entry: ClientEntry) -> ClientEntry {
+        entry.secret_digest = crate::db::tokens::digest("another-secret");
+        entry.metadata = SiwxClientMetadata::new(
+            vec![RedirectUrl::new("https://other.example.org/cb".into()).unwrap()],
+            Default::default(),
+        );
+        entry
+    }
+
+    /// `entry`, its registration listing exactly `grants`.
+    fn registering(mut entry: ClientEntry, grants: &[CoreGrantType]) -> ClientEntry {
+        entry.metadata = entry.metadata.set_grant_types(Some(grants.to_vec()));
+        entry
+    }
+
+    #[test]
+    fn a_registration_may_refresh_unless_it_lists_grant_types_without_the_refresh_grant() {
+        use CoreGrantType::{AuthorizationCode, RefreshToken};
+        let cases: [(&str, ClientEntry, bool); 4] = [
+            ("lists no grant types (provisional)", generic(MAIL), true),
+            (
+                "lists the refresh grant",
+                registering(generic(MAIL), &[AuthorizationCode, RefreshToken]),
+                true,
+            ),
+            (
+                "lists the code grant only",
+                registering(generic(MAIL), &[AuthorizationCode]),
+                false,
+            ),
+            (
+                "lists no grant at all",
+                registering(generic(MAIL), &[]),
+                false,
+            ),
+        ];
+        for (what, entry, expected) in cases {
+            assert_eq!(
+                registration_may_refresh(&entry.metadata),
+                expected,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn grants_end_when_a_generic_client_loses_the_permission_to_refresh() {
+        use CoreGrantType::{AuthorizationCode, RefreshToken};
+        let refreshing = || registering(generic(MAIL), &[AuthorizationCode, RefreshToken]);
+        let code_only = || registering(generic(MAIL), &[AuthorizationCode]);
+        let cases: Vec<(&str, ClientEntry, Option<ClientEntry>, Option<GrantEnd>)> = vec![
+            (
+                "the refresh grant withdrawn",
+                refreshing(),
+                Some(code_only()),
+                Some(GrantEnd::RefreshWithdrawn),
+            ),
+            (
+                "the refresh grant withdrawn from a registration that listed no grant types",
+                generic(MAIL),
+                Some(code_only()),
+                Some(GrantEnd::RefreshWithdrawn),
+            ),
+            (
+                "the refresh grant withdrawn with the scopes changed too",
+                refreshing(),
+                Some(registering(generic(&["openid"]), &[AuthorizationCode])),
+                Some(GrantEnd::ScopesChanged),
+            ),
+            (
+                "offline_access removed from the allowed scopes",
+                generic(&["openid", "io.inblock.mail", "offline_access"]),
+                Some(generic(MAIL)),
+                Some(GrantEnd::ScopesChanged),
+            ),
+            (
+                "the refresh grant allowed again",
+                code_only(),
+                Some(refreshing()),
+                None,
+            ),
+            (
+                "grant types no longer listed (refresh allowed by default)",
+                code_only(),
+                Some(generic(MAIL)),
+                None,
+            ),
+            (
+                "grant types reordered, refresh still allowed",
+                refreshing(),
+                Some(registering(
+                    generic(MAIL),
+                    &[RefreshToken, AuthorizationCode],
+                )),
+                None,
+            ),
+            (
+                "grant types listed, refresh still allowed",
+                generic(MAIL),
+                Some(registering(generic(MAIL), &[RefreshToken])),
+                None,
+            ),
+            (
+                "a Matrix client withdrawn from refreshing",
+                registering(matrix(), &[AuthorizationCode, RefreshToken]),
+                Some(registering(matrix(), &[AuthorizationCode])),
+                None,
+            ),
+        ];
+        for (what, before, after, expected) in cases {
+            assert_eq!(grant_end(&before, after.as_ref()), expected, "{what}");
+        }
+    }
+
+    #[test]
+    fn grants_end_when_a_generic_client_is_removed_reclassified_or_rescoped() {
+        let cases: Vec<(&str, ClientEntry, Option<ClientEntry>, Option<GrantEnd>)> = vec![
+            ("removed", generic(MAIL), None, Some(GrantEnd::Removed)),
+            (
+                "generic to Matrix",
+                generic(MAIL),
+                Some(matrix()),
+                Some(GrantEnd::ClassChanged),
+            ),
+            (
+                "Matrix to generic",
+                matrix(),
+                Some(generic(MAIL)),
+                Some(GrantEnd::ClassChanged),
+            ),
+            (
+                "narrowed",
+                generic(MAIL),
+                Some(generic(&["openid"])),
+                Some(GrantEnd::ScopesChanged),
+            ),
+            (
+                "widened",
+                generic(MAIL),
+                Some(generic(&["openid", "io.inblock.mail", "offline_access"])),
+                Some(GrantEnd::ScopesChanged),
+            ),
+            (
+                "one scope swapped for another",
+                generic(MAIL),
+                Some(generic(&["openid", "profile"])),
+                Some(GrantEnd::ScopesChanged),
+            ),
+            ("unchanged", generic(MAIL), Some(generic(MAIL)), None),
+            (
+                "reordered, with a repeated scope",
+                generic(MAIL),
+                Some(generic(&["io.inblock.mail", "openid", "io.inblock.mail"])),
+                None,
+            ),
+            (
+                "no allowed scopes is the empty list",
+                entry(ClientClass::Generic, None),
+                Some(generic(&[])),
+                None,
+            ),
+            (
+                "another secret and redirect URI",
+                generic(MAIL),
+                Some(reconfigured(generic(MAIL))),
+                None,
+            ),
+            (
+                "only the always-granted scopes changed",
+                generic(MAIL),
+                Some(always(generic(MAIL), &["io.inblock.mail"])),
+                None,
+            ),
+            ("Matrix removed", matrix(), None, None),
+            ("Matrix unchanged", matrix(), Some(matrix()), None),
+            (
+                "Matrix with another secret and redirect URI",
+                matrix(),
+                Some(reconfigured(matrix())),
+                None,
+            ),
+        ];
+        for (what, before, after, expected) in cases {
+            assert_eq!(grant_end(&before, after.as_ref()), expected, "{what}");
+        }
+    }
+
+    #[test]
+    fn a_grant_end_names_its_reason_for_the_log() {
+        let reasons = [
+            (GrantEnd::Removed, "removed"),
+            (GrantEnd::ClassChanged, "class_changed"),
+            (GrantEnd::ScopesChanged, "scopes_changed"),
+            (GrantEnd::RefreshWithdrawn, "refresh_withdrawn"),
+        ];
+        for (end, word) in reasons {
+            assert_eq!(end.as_str(), word);
+        }
+    }
+}

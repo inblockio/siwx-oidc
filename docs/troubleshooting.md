@@ -47,11 +47,16 @@ after a deployment.
 |---|---|---|
 | `/authorize returned 401 Unauthorized instead of 303` | the `client_id` is not registered | register a client ([agents.md](agents.md#prerequisites)) |
 | `/authorize response missing session cookie` | the `redirect_uri` is not registered for that client; the server answered with a 303 to `/error?message=unregistered_redirect_uri`, which sets no session cookie | pass exactly a registered redirect URI (query strings are ignored in the comparison) |
+| `/authorize refused the request: invalid_scope: …` | the scope passed to `authenticate_with_scope` asks for nothing the server will grant this client; the server answered with a 303 to the redirect URI carrying `error` and `error_description`, and the client reports both | read the description; ask for a scope the client may have, or change the client's allowed scopes |
 | `/sign_in returned 400 …: DID method 'key' is not enabled on this server` | `supported_did_methods` does not contain `"key"` | add it (it is in the default) |
 | `/sign_in returned 401 …: Signature verification failed` | the signature does not match the DID in the message | check the key file; do not edit the generated message |
 | `/sign_in returned 401 …: This account has been deactivated …` | the account was deactivated | a deactivated account cannot sign in |
 | `/sign_in returned 503 …` | the deactivation check could not reach Synapse | check Synapse and the shared secret; retry |
-| `/token returned 400 …: {"error":"invalid_client","error_description":"Secret required."}` | the client was registered as a confidential client | register it with `token_endpoint_auth_method: "none"` |
+| `/sign_in refused the request: invalid_scope: …` (`AuthError::DeviceRefused`) | the server runs `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` and the device id passed to `authenticate_with_device` was signed out (deleted); it is never recreated | forget the id and sign in with a new one; check with `siwx_oidc_auth::is_device_refused` |
+| `/sign_in refused the request: access_denied: …` (`AuthError::AccessDenied`) | the same setting, for a deactivated or erased account (the 401 above) | a deactivated account cannot sign in; stop, do not retry |
+| `/sign_in refused the request: temporarily_unavailable: …` (`AuthError::TemporarilyUnavailable`) | the same setting: Synapse could not be asked about the account, or could not set up the device (the 503 above); no tokens were issued | retry later, as after an outage (`siwx_oidc_auth::is_transient`) |
+| `/token returned 401 …: {"error":"invalid_client","error_description":"Secret required."}` | the client was registered as a confidential client | register it with `token_endpoint_auth_method: "none"` |
+| `/token refresh returned 400 …: invalid_grant` with "client_id does not match the refresh token." | the refresh names another client than the one the tokens were issued to | refresh with the `client_id` used at sign-in |
 | `/token refresh returned 400 …: invalid_grant` | the refresh token was already rotated (more than 60 s ago), expired, or its session was revoked | sign in again with the key; always store the newest refresh token |
 | `/token error: unsupported_grant_type: device_code grant requires MSC3861 mode.` with `--device-flow` | the server is not in delegated-auth mode ("MSC3861 mode" is the older name) | the device flow needs a Synapse-backed deployment |
 | every run shows a different DID | no key was given, so an ephemeral key was generated | pass `--key-file` or set `SIWX_KEY_FILE` |
@@ -101,12 +106,15 @@ after a deployment.
    ([passkeys.md](passkeys.md#migration-notes)).
 7. **The picker shows only one account's passkeys**: the `siwx_user` cookie
    scoped it to the last signed-in user. "Use a different passkey" (`all: true`)
-   shows all of them ([passkeys.md](passkeys.md#scoping-the-passkey-picker)).
+   shows all of them ([passkeys.md](passkeys.md#scoping-the-passkey-picker)), and
+   **Sign out** on the account page ends the hint in this browser.
 8. **"User Verification flag not set"** or **"Sign count regression"**: the
    authenticator did not verify the user, or reported a counter lower than the
    stored one (a possible cloned authenticator).
-9. **"Session not found"**: the OIDC session (5 minutes) expired between
-   `/webauthn/authenticate/finish` and `/sign_in`. Look for proxy delays.
+9. **"Sign-in timed out"** page, or the client receives `error=access_denied`
+   with "The sign-in timed out": the login session (5 minutes) expired before
+   the sign-in finished. Start the sign-in again from the client. If it happens
+   within seconds, look for proxy delays.
 10. **The login page asks to confirm a new account**: the passkey resolves to a
     DID with no account. If the user expected an existing account, they chose a
     different passkey than the one they registered with, or their passkey was
@@ -231,6 +239,11 @@ MAS deployment before looking anywhere else.
 - **`/resolve` answers 503**: the deployment has no server name or no Synapse
   client. **502**: Synapse could not be asked; the body says what failed. **504**:
   the lookup took more than 10 seconds.
+- **`/resolve` says `exists: false` for an account that signed in before**: the
+  account is deactivated or erased. Synapse keeps such an account's localpart
+  reserved, and `/resolve` reports it as gone and reads nothing else from it
+  (`did: null` on the `?mxid=` path). A deactivated account that is reactivated
+  reads `exists: true` again.
 - **A 500 from Synapse on a profile read or write for one account**: that
   account has no profile row (element-hq/synapse#19702; affected: Synapse 1.160
   and earlier; 1.161 fixes some of the paths (#20149, #20172); #19702 remains
@@ -249,20 +262,31 @@ redis-cli GET 'webauthn:credential/<cred_id_b64>'
 redis-cli --scan --pattern 'webauthn:link/*'
 redis-cli SMEMBERS 'webauthn:by_did/<did>'
 
+# Session ids, codes and ceremony ids are stored as SHA-256 digests only:
+# hash the value you hold to find its entry.
+digest() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+
 # Ceremony challenges in flight (120 s)
-redis-cli --scan --pattern 'webauthn:challenge/*'
+redis-cli --scan --pattern 'webauthn:ceremony/*'
 
 # OIDC sessions (5 minutes); a passkey sign-in stores verified_did here
-redis-cli --scan --pattern 'sessions/*'
-redis-cli GET 'sessions/<session_id>' | python3 -m json.tool
+redis-cli --scan --pattern 'session/*'
+redis-cli GET "session/$(digest '<session cookie value>')" | python3 -m json.tool
 
 # Device-code grants (30 minutes)
-redis-cli --scan --pattern 'device_codes/*'
-redis-cli GET 'device_codes/<device_code>' | python3 -m json.tool
-redis-cli --scan --pattern 'user_codes/*'
+redis-cli --scan --pattern 'device_code/*'
+redis-cli GET "device_code/$(digest '<device_code>')" | python3 -m json.tool
+redis-cli GET "user_code/$(digest '<user_code>')"   # the device code's digest
 
-# Tokens and their metadata (username = localpart, device_id, scope, DID)
+# Grants (username = localpart, device_id, scope, DID). Tokens are stored as
+# SHA-256 digests only: hash a token you hold to find its entry.
+redis-cli HGETALL "at/$(printf %s '<access token>' | sha256sum | cut -d' ' -f1)"
+redis-cli HGETALL 'grant/<grant id from the access entry>'
+redis-cli SMEMBERS 'idx:grants:user/<localpart>'
+# Tokens written before the grant record (legacy, until they expire or, for a
+# refresh token, until it is presented and lifted into a grant)
 redis-cli GET 'token/<access or refresh token>' | python3 -m json.tool
+redis-cli GET "legacy_rt/$(printf %s '<legacy refresh token>' | sha256sum | cut -d' ' -f1)"
 ```
 
 Values can contain tokens and DIDs. Treat the output as sensitive.

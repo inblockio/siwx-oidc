@@ -13,7 +13,7 @@ wiring (Synapse, tokens, devices, account management) is in
 |---|---|---|
 | `siwx-oidc` | `src/` | The Axum server (binary `siwx-oidc`), the operator tool `migrate-credentials`, and a small library crate `siwx_oidc` (Redis layer, pure MXID and alias derivation, credential store) that integration tests link against. |
 | `siwx-oidc-auth` | `siwx-oidc-auth/` | Headless client, library and CLI: key-based sign-in, refresh, device flow, DID verification. See [agents.md](agents.md). |
-| `aqua-auth` | external, [inblockio/aqua-rs-auth](https://github.com/inblockio/aqua-rs-auth) | DID parsing and CAIP-122 signature verification, WebAuthn assertion verification, the optional credential store. Pinned by git tag (`v0.7.0` at the time of writing) in both `Cargo.toml` files. |
+| `aqua-auth` | external, [inblockio/aqua-auth](https://github.com/inblockio/aqua-auth) | DID parsing and CAIP-122 signature verification, WebAuthn assertion verification, the optional credential store. Pinned by git tag (`v0.7.0` at the time of writing) in both `Cargo.toml` files. |
 
 ## Three layers
 
@@ -73,16 +73,28 @@ New methods and namespaces are opt-in: operators enable them in
 
 **CAIP-122 (wallet, or any key the browser can sign with):**
 
-1. `GET /authorize` validates the client and redirect URI, creates a session (`sessions/{id}`,
-   300 s) and sets the `session` cookie, then redirects to the login page with a nonce.
+1. `GET /authorize` validates the client, the redirect URI (exact match against the
+   registration, query included), `response_type=code` (the only one accepted) and the `S256`
+   PKCE challenge. It creates a session (`session/{sha256(id)}`, 300 s) that binds the validated
+   request (client, redirect URI, state, response mode, challenge), sets the `session` cookie,
+   and redirects to the login page with a nonce and the request's values, each percent-encoded
+   so the page reads back the exact redirect URI its CAIP-122 message must bind.
 2. The page builds a CAIP-122 message (for Ethereum, an EIP-4361 message) containing the
    nonce, has the wallet sign it, and sets the `siwx` cookie to `{did, message, signature}`.
 3. `GET /sign_in` checks the DID method and namespace against configuration, verifies the
-   signature through `find_did_method(did).verify(…)`, checks the nonce and that the
-   `redirect_uri` is in the message's `Resources:`, then issues a single-use code.
+   signature through `find_did_method(did).verify(…)`, checks the nonce and that the bound
+   redirect URI is in the message's `Resources:`, then issues a single-use code for the request
+   bound to the session. `/sign_in` reads no authorization parameter from its query while the
+   session lives (the page appends them to its link; they never decide the code). When the
+   session has expired (it and its cookie live 300 s), it reads `client_id`, `redirect_uri`,
+   `state` and `response_mode` there only to send the user back: an `access_denied` redirect
+   when the client is registered and the redirect URI is one of its registered ones, else a
+   400 page saying the sign-in timed out (`oidc::expired_sign_in`). The passkey ceremonies
+   answer a missing `session` cookie with a 400 `{"error":"login_session_expired"}`, on which
+   the page goes to `/sign_in`.
 4. `POST /token` exchanges the code, with its PKCE `S256` verifier, for an ES256 ID token, an
-   access token and a refresh token. PKCE is mandatory for `response_type=code`: `/authorize`
-   refuses a request without a `code_challenge`.
+   access token and a refresh token. PKCE is mandatory: `/authorize` refuses a request without a
+   `code_challenge`, and `/token` refuses a code without one.
 
 **Server-verified ceremony (passkey):**
 
@@ -90,7 +102,8 @@ New methods and namespaces are opt-in: operators enable them in
 2. `/webauthn/authenticate/start` and `/finish` run the WebAuthn ceremony. On success the
    server derives `did:key:zDn…` from the passkey's P-256 key (or takes the linked wallet DID,
    see [passkeys.md](passkeys.md)) and stores it as `verified_did` in the session.
-3. `GET /sign_in` reads `verified_did` from the session (trusted, server-side) and issues the code.
+3. `GET /sign_in` reads `verified_did` from the session (trusted, server-side) and issues the
+   code for the bound request.
 4. `POST /token` as above.
 
 **Headless agent:** the same CAIP-122 flow, driven by `siwx-oidc-auth` with a local Ed25519 or
@@ -99,7 +112,8 @@ P-256 key (`did:key`), no browser. See [agents.md](agents.md).
 **Device authorization (RFC 8628, used for Element X QR login):**
 
 1. `POST /device_authorization` returns `device_code`, a `user_code` such as `WDJ-BMJ`, and the
-   verification URI `/device`.
+   verification URI `/device`. An optional `login_hint` (`mxid:@localpart:server_name`) names the
+   one account that may approve the code.
 2. The device polls `POST /token` with `grant_type=urn:ietf:params:oauth:grant-type:device_code`.
 3. The user opens `/device?user_code=…` and approves with a wallet signature or a passkey.
 4. The next poll returns tokens and provisions the Synapse device.
@@ -125,6 +139,7 @@ namespaces. EIP-4361 (Sign-In with Ethereum) is Final.
 ## Frontend
 
 `js/ui/src/App.svelte` is the login page (Svelte 4, webpack 5, built into `static/build`).
+Passkey sign-in is the default, highlighted method; the wallet is offered below it.
 
 - **Wallet:** `@wagmi/core` with the `injected()` connector, i.e. whatever EIP-1193 wallet the
   browser exposes (MetaMask, Brave, Coinbase extension). The SIWE message is built with
@@ -141,28 +156,60 @@ the server (`device_auth.rs`, `account.rs`) with their own inline scripts.
 ## Redis keyspace
 
 All state lives in one Redis (`redis_url`). Prefixes are defined in `src/db/mod.rs`,
-`src/webauthn.rs` and `src/account.rs`.
+`src/db/grant.rs`, `src/webauthn.rs` and `src/account.rs`.
+
+A credential a client holds (a token, an authorization code, a device or user code, a login
+session id, a ceremony id, a server-issued nonce, a client secret, a registration access token)
+appears in a key or value only as its lowercase hex SHA-256 (`db::tokens::digest`). Each
+digest-keyed prefix differs from the raw-keyed one an earlier build used, which the server still
+reads, and uses once, for the entry's remaining lifetime: a client presenting a stored digest as
+its credential reads a raw-keyed prefix nothing writes. A client entry keeps its key and stores
+its two credentials under member names an earlier build did not use, for the same reason. The
+`siwx_user` and `acct_session` cookies are digest-keyed the same way, and indexed per DID so
+`logout/all`, deactivation and erasure end them all. The account session's CSRF token is kept in
+its value: it authorizes nothing without the cookie. Passkey credential ids are keys too:
+they are public identifiers the server hands out in `allowCredentials`, not credentials.
 
 | Key | TTL | Holds |
 |---|---|---|
-| `sessions/{id}` | 300 s | `SessionEntry`: nonces, `verified_did`, sign-in count |
-| `sessions/{id}/signed_in` | 300 s | one-shot flag against double sign-in |
-| `codes/{code}` and `codes/{code}/consumed` | 300 s | `CodeEntry` (DID, client, PKCE challenge, device id, localpart) and its single-use flag |
-| `clients/{client_id}` | 30 d | `ClientEntry` (secret, metadata); `default_clients` are rewritten at every start |
-| `token/{token}` | access 300 s, refresh 90 d, admin 30–900 s | `TokenMetadata` (username, device id, scope, client, DID) |
-| `token_rotated/{old_refresh}` | 60 s | successor pair for a lost refresh response |
-| `idx:user_device/{username}/{device_id}` | 90 d | SET of token keys, for atomic revocation |
-| `tombstone:device/{username}/{device_id}`, `tombstone:user/{username}` | 900 s | refuse refresh while a revoke or deactivation sweep runs |
-| `caip122_nonce/{category}/{nonce}` (+ `/consumed`) | 300 s | server-issued nonce for device approval and account re-auth |
-| `device_codes/{device_code}` (+ `/redeemed`) | 1800 s | `DeviceCodeEntry` (RFC 8628) and its single-redemption claim |
-| `user_codes/{user_code}` | 1800 s | reverse lookup to the device code |
-| `account_session/{token}` | 600 s | `/account` session (`acct_session` cookie, `Path=/account`) |
-| `user:session/{token}` | 30 d | DID behind the opaque `siwx_user` cookie (passkey-picker scoping) |
-| `webauthn:challenge/{session_id}` | 120 s | registration or authentication ceremony state |
-| `webauthn:link_challenge/{session_id}` | 120 s | link ceremony state |
+| `session/{sha256(id)}` | 300 s | `SessionEntry`: the CAIP-122 nonce, `verified_did`, sign-in count, and the authorization request `/authorize` bound to it (client, redirect URI, state, response mode, PKCE challenge, scope, OIDC nonce) |
+| `session/{sha256(id)}/signed_in` | 300 s | one-shot flag against double sign-in |
+| `code/{sha256(code)}` | 300 s | `CodeEntry` (DID, client, PKCE challenge, device id, localpart, requested scope); read and deleted in one atomic step on exchange |
+| `sessions/{id}` (+ `/signed_in`), `codes/{code}` (+ `/consumed`) | 300 s | legacy: written by builds before digest keys and read until they expire. A legacy session moves to its digest key on its first write (a wallet sign-in writes none, so a session the previous build started keeps its raw key, spent, until it expires); a legacy signed-in flag still counts; a legacy code is consumed like a new one, unless a `/consumed` marker (left by older builds, which kept exchanged codes) exists. A legacy session holds the scope and the OIDC nonce beside its request; they are read into it |
+| `clients/{client_id}` | none (static), 30 d from last use (dynamic) | `ClientEntry`: metadata, the digests of the client secret and the registration access token (`secret_digest`, `access_token_digest`), and the client's class and scope policy (`class`, `allowed_scopes`, `always_granted_scopes`; an entry without them is a `matrix` client); `default_clients` are written, digested and with no expiry, at every start. An entry an earlier build wrote (`secret`, `access_token` in the clear) authenticates as it is and is replaced by its digest-only form, keeping its expiry, on its first read |
+| `clients:static` | none | SET of the static client ids, written by the start-up sync (`sync_static_clients`): a start records each id of `default_clients` before it writes the entry (with no TTL), and deletes each recorded id the map no longer names. The same step reads the stored entry first and, when a generic-class client is removed or changes class or allowed scopes, sets `epoch:client/{client_id}` (`client_policy::grant_end`). The ids are not credentials |
+| `grant/{sha256(handle)}` | 90 d after the last rotation, never past `absolute_exp`; a grant with no refresh token lives as long as its access token | the grant (`src/db/grant.rs`): kind, owner, client, device id, scope, `auth_time`, `auth_ms` (the authentication in milliseconds, compared with the epochs) and, when a cap applies, `absolute_exp` (all Redis `TIME`), generation, digests of the current and previous refresh token, whether the successor is used, and the sealed successor pair while it is unused. No token is stored |
+| `at/{sha256(access token)}` | the token's lifetime: 300 s, admin 30–900 s, never past the grant's `absolute_exp` | grant id, generation, kind, `iat`, `exp` |
+| `idx:grants:user/{username}`, `idx:grants:user_device/{username}/{device_id}` | the longest grant TTL written | SETs of grant ids, for atomic revocation |
+| `idx:grants:sid/{sid}` | the grant's TTL, extended with it | the grant id whose `sid` this is, for RP-initiated logout; deleted with the grant |
+| `outbox:backchannel_logout` | none (entries leave on delivery or after the last attempt) | sorted set of back-channel logout entries `{client_id, sub, sid, grant, attempt}` (no credential), scored by the Unix millisecond each is due; queued by `drop_grant` for every deleted `oidc` grant, claimed under a lease by the worker in `src/backchannel.rs` |
+| `token/{token}`, `idx:user_device/{username}/{device_id}` | access 300 s, refresh 90 d | legacy: tokens written before the grant record (`TokenMetadata`, classified by `db::legacy_token_kind`). Legacy access tokens stay readable until they expire; a legacy refresh token is lifted into a grant when it is first presented, which deletes its entry and index member; revocation still sweeps both keys. Nothing new is written there |
+| `legacy_rt/{sha256(legacy refresh token)}` | 90 d from the lift | the grant id a legacy refresh token was lifted into, so a replay of it is judged like the grant's previous token |
+| `epoch:global`, `epoch:client/{client_id}`, `epoch:user/{username}` | none | not-before epochs (I9), Unix milliseconds from Redis `TIME`, only moving later: every grant whose `auth_ms` is at or before the largest that applies is refused. `logout/all`, deactivation and erasure set the user epoch; the start-up sync sets a client epoch for a generic-class static client whose configuration ended its grants (`clients:static`); an operator sets the global epoch and any other |
+| `tombstone:device/{username}/{device_id}` | 900 s | holds the sign-out time (ms); refuses the issue and refresh of grants of that device authenticated at or before it, and a refused refresh deletes the grant (and the lift of a legacy refresh token of that device); a later sign-in on the same device id is untouched |
+| `tombstone:user/{username}` | 900 s | legacy: planted by builds before the user epoch; still read by the rotation and lift scripts for one release, never written |
+| `deleted:device/{localpart lowercased}/{device_id}` | `deleted_device_marker_ttl_secs` (365 d) | only with `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`: the delete time (ms) of a device siwx-oidc deleted; a Matrix-class sign-in that proposes the id is refused (`invalid_scope`), never recreated. Read with `EXISTS` only |
+| `device_reaper:lease` | `device_reaper_interval_secs` | only with `SIWXOIDC_DEVICE_REAPER_ENABLED`: the instance that set it (`NX`) runs this interval's reaper pass |
+| `caip122/{category}/{sha256(nonce)}` | 300 s | server-issued nonce for device approval (bound to the user code's digest) and account re-auth (bound to the action); read and deleted on use |
+| `device_code/{sha256(device code)}` (+ `/redeemed`) | 1800 s | `DeviceCodeEntry` (RFC 8628, with the user code's digest) and its single-redemption claim |
+| `user_code/{sha256(user code)}` | 1800 s | the device code's digest; the user code is hashed exactly as presented |
+| `device_passkey_offer/{sha256(user code)}` | 1800 s (60 s for a "none" answer) | `GET /device/verify` for a code that names an account (`login_hint`): `offered`, `no_passkey` or `no_account`, so repeating the request for a settled code asks neither the homeserver nor the credential store again. A separate key, never a field of the device code entry, so it cannot race an approval |
+| `caip122_nonce/{category}/{nonce}` (+ `/consumed`), `device_codes/{device_code}` (+ `/redeemed`), `user_codes/{user_code}` | 300 s / 1800 s | legacy: read until they expire. A legacy device code is found by either code and updated and deleted in place; its claim is digest-keyed, and a legacy claim still counts |
+| `acct_session/{sha256(cookie)}` | 600 s | `/account` session (`acct_session` cookie, `Path=/account`): `{did, csrf, exp}` |
+| `siwx_user/{sha256(cookie)}` | 30 d | DID behind the opaque `siwx_user` cookie (passkey-picker scoping) |
+| `idx:own_sessions/{sha256(canonical DID)}` | the longest session it names | sorted set of the DID's `siwx_user/…` and `acct_session/…` keys, scored by expiry (Unix ms, Redis `TIME`); written with the session in one script, pruned of expired members on each write, emptied with the sessions by `logout/all`, deactivation and erasure |
+| `account_session/{token}`, `user:session/{token}` | 600 s / 30 d | legacy own sessions: read until they expire, ended by the account page's sign-out, and found by a prefix scan when the user's sessions are revoked |
+| `guest:invite/{id}` | the invite's lifetime + `guest_session_max_secs` + 300 s | HASH of one guest invitation: host (`username`) and DID, room id, label, kind, state, `max_guests`, `used`, `session_secs`, `secret_hash` (SHA-256 of the `gi_` secret, never the secret), `created_at`, `expires_at` (Redis `TIME`) |
+| `guest:by_host/{host}`, `guest:by_room/{host}/{sha256(room_id)}` | as the longest invite | SETs of invite ids, for the host's list, the quotas and `meetings/end` |
+| `guest:quota/host_invites_hour/{host}/{hour}` | 3600 s | links a host made in one Redis `TIME` hour |
+| `guest:acct/{localpart}`, `guest:control` | none | read by the host API only: a guest record (S3 writes it; a missing `promoted_at` bars the account from hosting) and the kill switch (`disabled` refuses every host call) |
+| `webauthn:ceremony/{sha256(ceremony id)}` | 120 s | registration or authentication ceremony state, read and deleted in one step; the ceremony id is the `session` cookie, the `session_id` the account re-auth start returns, or `device_passkey_{user_code}` |
+| `webauthn:link_ceremony/{sha256(session id)}` | 120 s | link ceremony state |
+| `webauthn:challenge/{id}`, `webauthn:link_challenge/{id}` | 120 s | legacy ceremony state, read until it expires |
 | `webauthn:credential/{cred_id_b64}` | none | stored passkey (serialized `webauthn_rs::Passkey`) |
 | `webauthn:link/{cred_id_b64}` | none | `{primary_did, label}`: the passkey signs in as this DID |
 | `webauthn:by_did/{did}` | none | SET of credential ids for a DID (advisory index) |
+| `webauthn:no_passkey/{sha256(did)}` | 600 s | the device approval page's scan marker: `scanning` (30 s) while one request runs the credential scan for the DID, claimed by an atomic `SET NX EX` before the scan so concurrent requests do not each scan; `1` (600 s) once a scan found no passkey, and while it lives that page skips the scan. Read only by `credential_store::did_has_credential_bounded`, after the `by_did` index, so a passkey registered or linked later is still seen |
 | `aqua:webauthn:cred:{cred_id_b64}`, `aqua:webauthn:did:{did}` | none | aqua-auth credential store, only when `AQUA_WEBAUTHN_REDIS_URL` is set (may be another Redis) |
 
 Passkeys and links have no TTL but are only as durable as Redis persistence; a flushed Redis
@@ -172,7 +219,8 @@ loses them. Troubleshooting commands: [troubleshooting.md](troubleshooting.md).
 
 `tracing` with an `EnvFilter` (default `siwx_oidc=info,tower_http=info,warn`, overridden by
 `RUST_LOG`) and a human-readable or JSON formatter. Every request and response is logged with
-method, path, status and latency. Level rules: [AGENTS.md](../AGENTS.md#logging-conventions);
+method, path (never the query), status and latency. Credentials appear in logs only as
+fingerprints. Level rules: [AGENTS.md](../AGENTS.md#logging-conventions);
 settings: [configuration.md](configuration.md#logging).
 
 ## Lineage

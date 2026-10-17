@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Join the meeting</title>
+<link rel="stylesheet" href="/guest/assets/guest.css">
+</head>
+<body>
+<main>
+  <div class="card">
+    <h1 id="title">Join the meeting</h1>
+    <noscript><p class="err">This page needs JavaScript to create the key that lets you join.</p></noscript>
+    <p id="status">Checking your invitation...</p>
+
+    <div id="blocked" hidden>
+      <p id="blocked-text"></p>
+    </div>
+
+    <form id="join-form" method="post" action="/guest/join" autocomplete="on" novalidate hidden>
+      <label for="first_name">First name</label>
+      <input id="first_name" name="first_name" type="text" autocomplete="given-name" maxlength="100" required>
+      <label for="second_name">Last name</label>
+      <input id="second_name" name="second_name" type="text" autocomplete="family-name" maxlength="100" required>
+      <div id="email-row" hidden>
+        <label for="email">E-mail <span id="email-opt" class="opt" hidden>(optional)</span></label>
+        <input id="email" name="email" type="email" autocomplete="email" maxlength="254">
+      </div>
+      <p id="recording" class="note" hidden>This meeting may be recorded.</p>
+      <label class="check" for="consent">
+        <input id="consent" name="consent" type="checkbox">
+        <span id="consent-text">I agree that the host sees my name and that my details are used for this meeting only.</span>
+      </label>
+      <button id="submit" type="submit">Join</button>
+      <p id="error" class="err" role="alert" aria-live="polite"></p>
+      <p class="note">Your browser keeps a private key for this meeting. If you use a private or incognito window, closing it ends your access.</p>
+    </form>
+  </div>
+</main>
+<script type="module" src="/guest/assets/join.js"></script>
+</body>
+</html>

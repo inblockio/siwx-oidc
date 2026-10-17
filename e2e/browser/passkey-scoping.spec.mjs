@@ -21,6 +21,7 @@
 
 import { test, expect } from '@playwright/test';
 import net from 'node:net';
+import { createHash } from 'node:crypto';
 import { addVirtualAuthenticator, registerPasskey } from './webauthn-helper.mjs';
 import { makeWallet, injectMockWallet } from './wallet-helper.mjs';
 import { localpartFor } from './mxid-helper.mjs';
@@ -31,7 +32,9 @@ const REDIS_HOST = process.env.REDIS_HOST || '127.0.0.1';
 const REDIS_PORT = Number(process.env.REDIS_PORT || 6379);
 const SERVER_NAME = 'matrix.test'; // SIWEOIDC_MATRIX_SERVER_NAME in e2e/up.sh
 const CRED_PREFIX = 'webauthn:credential/';
-const USER_SESSION_PREFIX = 'user:session/'; // KV_USER_SESSION_PREFIX (db/mod.rs)
+// The picker hint is stored under the digest of its token (`OwnSession::PickerHint`
+// in src/db/mod.rs): `siwx_user/{hex(sha256(token))}` -> DID.
+const userSessionKey = (token) => `siwx_user/${createHash('sha256').update(token).digest('hex')}`;
 
 // -- minimal RESP-over-TCP Redis client (same pattern as stale-credential.spec) --
 function redisCmd(args) {
@@ -185,11 +188,11 @@ test('H1/H11/H2: cookie scopes the picker; escape + forged cookie fall back to u
   expect(unscoped.detected_mxid == null).toBe(true);
 
   // (b) Mint a VALID opaque user-session token -> DID A, the exact way the server
-  //     does (a Redis key user:session/{token} -> did). HttpOnly forbids JS from
+  //     does (a Redis key siwx_user/{sha256(token)} -> did). HttpOnly forbids JS from
   //     setting siwx_user, so we attach it via the browser context (the token is
   //     opaque; possession of it is the whole point).
   const token = 'e2etoken' + Date.now().toString(16) + Math.random().toString(16).slice(2);
-  const setRes = await redisCmd(['SET', `${USER_SESSION_PREFIX}${token}`, a.did]);
+  const setRes = await redisCmd(['SET', userSessionKey(token), a.did]);
   expect(setRes).toBe('OK');
   await page.context().addCookies([{ name: 'siwx_user', value: token, url: BASE }]);
 
@@ -258,7 +261,7 @@ test('account: siwx_user cookie scopes /account/passkey/start; escape + no cooki
 
   // (b) VALID siwx_user -> DID A: scope to A's credential ONLY, never B's.
   const token = 'accttoken' + Date.now().toString(16) + Math.random().toString(16).slice(2);
-  expect(await redisCmd(['SET', `${USER_SESSION_PREFIX}${token}`, a.did])).toBe('OK');
+  expect(await redisCmd(['SET', userSessionKey(token), a.did])).toBe('OK');
   await page.context().addCookies([{ name: 'siwx_user', value: token, url: BASE }]);
   const scoped = await accountStart(JSON.stringify({ action: 'org.matrix.profile' }));
   const ids = (scoped.publicKey.allowCredentials || []).map((c) => c.id);
@@ -324,7 +327,7 @@ test('device: siwx_user cookie scopes /device/passkey/start; escape + no cookie 
 
   // (b) VALID siwx_user -> DID A (the approver): scope to A's credential ONLY.
   const token = 'devtoken' + Date.now().toString(16) + Math.random().toString(16).slice(2);
-  expect(await redisCmd(['SET', `${USER_SESSION_PREFIX}${token}`, a.did])).toBe('OK');
+  expect(await redisCmd(['SET', userSessionKey(token), a.did])).toBe('OK');
   await page.context().addCookies([{ name: 'siwx_user', value: token, url: BASE }]);
   const scoped = await deviceStart(JSON.stringify({ user_code: userCode }));
   const ids = (scoped.publicKey.allowCredentials || []).map((c) => c.id);
@@ -352,7 +355,7 @@ test('account DOM: scope hint + escape render when scoped; escape re-runs userna
   // stays put for DOM assertions) and scope the picker to it via a valid cookie.
   const a = await registerPasskeyWithCredId(page, 'acct-dom-sess');
   const token = 'acctdom' + Date.now().toString(16) + Math.random().toString(16).slice(2);
-  expect(await redisCmd(['SET', `${USER_SESSION_PREFIX}${token}`, a.did])).toBe('OK');
+  expect(await redisCmd(['SET', userSessionKey(token), a.did])).toBe('OK');
   await page.context().addCookies([{ name: 'siwx_user', value: token, url: BASE }]);
 
   await page.goto('/account?action=org.matrix.profile');
@@ -403,7 +406,7 @@ test('device DOM: scope hint + escape render when scoped', async ({ page }) => {
     return (await r.json()).user_code;
   });
   const token = 'devdom' + Date.now().toString(16) + Math.random().toString(16).slice(2);
-  expect(await redisCmd(['SET', `${USER_SESSION_PREFIX}${token}`, a.did])).toBe('OK');
+  expect(await redisCmd(['SET', userSessionKey(token), a.did])).toBe('OK');
   await page.context().addCookies([{ name: 'siwx_user', value: token, url: BASE }]);
 
   // Open the approval page for the pending code: it auto-verifies and reveals

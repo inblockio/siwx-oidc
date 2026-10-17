@@ -23,6 +23,10 @@ use std::collections::BTreeSet;
 use std::fs;
 
 const AXUM_LIB: &str = "src/axum_lib.rs";
+/// The guest endpoints, merged into the app by `axum_lib.rs`. The shells and the
+/// layers' test routes live in `src/guest/layers.rs`, which is not read: they are
+/// not endpoints.
+const GUEST_ROUTES: &str = "src/guest/routes.rs";
 const OIDC: &str = "src/oidc.rs";
 const OPENAPI: &str = "docs/api/openapi.yaml";
 
@@ -60,7 +64,8 @@ fn path_constants() -> Vec<(String, String)> {
 
 /// Every path the router serves, as a literal.
 fn routed_paths() -> BTreeSet<String> {
-    let src = fs::read_to_string(AXUM_LIB).expect("read src/axum_lib.rs");
+    let src = fs::read_to_string(AXUM_LIB).expect("read src/axum_lib.rs")
+        + &fs::read_to_string(GUEST_ROUTES).expect("read src/guest/routes.rs");
     let constants = path_constants();
     let mut paths = BTreeSet::new();
 

@@ -11,20 +11,19 @@ use headers::{self, authorization::Bearer};
 use openidconnect::{
     core::{
         CoreAuthErrorResponseType, CoreAuthPrompt, CoreClaimName, CoreClientAuthMethod,
-        CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType, CoreGenderClaim,
-        CoreGrantType, CoreIdToken, CoreIdTokenClaims, CoreIdTokenFields, CoreJsonWebKey,
-        CoreJsonWebKeySet, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm,
-        CoreProviderMetadata, CoreRegisterErrorResponseType, CoreResponseType,
-        CoreSubjectIdentifierType, CoreTokenResponse, CoreTokenType,
+        CoreErrorResponseType, CoreGenderClaim, CoreGrantType, CoreJsonWebKey, CoreJsonWebKeySet,
+        CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm, CoreProviderMetadata,
+        CoreRegisterErrorResponseType, CoreResponseType, CoreSubjectIdentifierType, CoreTokenType,
     },
-    registration::{EmptyAdditionalClientMetadata, EmptyAdditionalClientRegistrationResponse},
+    registration::EmptyAdditionalClientRegistrationResponse,
     url::Url,
     AccessToken, AdditionalClaims, Audience, AuthUrl, ClientConfigUrl, ClientId, ClientSecret,
-    EmptyAdditionalClaims, EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserName,
-    EndUserUsername, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl, LocalizedClaim, Nonce, OpPolicyUrl,
-    OpTosUrl, PrivateSigningKey, RedirectUrl, RefreshToken, RegistrationAccessToken,
+    EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserName, EndUserUsername, IdToken,
+    IdTokenClaims, IdTokenFields, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl, LocalizedClaim, Nonce,
+    OpPolicyUrl, OpTosUrl, PrivateSigningKey, RedirectUrl, RefreshToken, RegistrationAccessToken,
     RegistrationUrl, RequestUrl, ResponseTypes, Scope, SigningError, StandardClaims,
-    SubjectIdentifier, TokenUrl, UserInfoClaims, UserInfoJsonWebToken, UserInfoUrl,
+    StandardTokenResponse, SubjectIdentifier, TokenUrl, UserInfoClaims, UserInfoJsonWebToken,
+    UserInfoUrl,
 };
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
@@ -39,17 +38,37 @@ use urlencoding::decode;
 use uuid::Uuid;
 
 use aqua_auth::find_did_method;
+use siwx_oidc::client_policy;
+use siwx_oidc::db::grant::{
+    EndedGrant, GrantKind, InvalidReason, NewGrant, RefreshPeek, RotateOutcome, RotateRequest,
+};
 use siwx_oidc::db::*;
 use subtle::ConstantTimeEq;
 
 use crate::did_assertion::DidPublication;
 use crate::synapse_client::{DeviceUpsert, PublishOutcome, SynapseClient};
 
-use crate::introspect::generate_opaque_token;
-
 /// Constant-time string comparison to prevent timing attacks on secrets.
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
+/// Extend a dynamic client's lifetime after a successful use. Best-effort: an error is
+/// logged and never changes the answer the caller gets.
+pub(crate) async fn touch_client_after_use(db_client: &DBClientType, client_id: &str) {
+    if let Err(e) = db_client.touch_client(client_id).await {
+        log_failed_touch(client_id, &e);
+    }
+}
+
+/// A failed touch leaves the client's lifetime as it was, so a dynamic client can expire
+/// while sessions still use it. That is an unexpected-but-handled condition: `warn`.
+fn log_failed_touch(client_id: &str, error: &anyhow::Error) {
+    warn!(
+        client_id = %client_id,
+        error = %error,
+        "touch_client failed (best-effort); the client's lifetime was not extended"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -62,6 +81,9 @@ lazy_static::lazy_static! {
     static ref SCOPES: Vec<Scope> = vec![
         Scope::new("openid".to_string()),
         Scope::new("profile".to_string()),
+        // A refresh token for a generic client is issued only when this was
+        // requested and the registration allows the refresh grant (I10).
+        Scope::new("offline_access".to_string()),
         // Stable Matrix scopes (MSC2967 graduated)
         Scope::new("urn:matrix:client:api:*".to_string()),
         Scope::new("urn:matrix:client:device:*".to_string()),
@@ -79,11 +101,15 @@ pub const REGISTER_PATH: &str = "/register";
 pub const CLIENT_PATH: &str = "/client";
 pub const USERINFO_PATH: &str = "/userinfo";
 pub const SIGNIN_PATH: &str = "/sign_in";
+/// OpenID Connect RP-Initiated Logout 1.0 `end_session_endpoint`.
+pub const END_SESSION_PATH: &str = "/end_session";
 pub const SIWX_COOKIE_KEY: &str = "siwx";
 /// RFC 8628 grant type of the device-code grant (`POST /token`).
 pub const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-type DBClientType = dyn DBClient + Sync;
+/// The token store. Concrete because the grant record (`siwx_oidc::db::grant`)
+/// is implemented on `RedisClient` itself, outside the `DBClient` trait.
+type DBClientType = RedisClient;
 
 // -- ES256 key wrapper implementing openidconnect's PrivateSigningKey ------
 
@@ -291,6 +317,60 @@ fn verification_jwk(verifying_key: &p256::ecdsa::VerifyingKey, kid: &str) -> Cor
     serde_json::from_value(jwk_value).expect("Failed to construct EC JWK")
 }
 
+// -- ID tokens ---------------------------------------------------------------
+
+/// The claims this provider adds to an ID token: the session id of the grant
+/// the token was issued with (I8; OpenID Connect Front-/Back-Channel Logout
+/// and RP-Initiated Logout name a session by it). Omitted, never `null`, when
+/// a grant has none (a `service` grant never comes with an ID token).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SidClaims {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+    /// `io.inblock.guest: true` for a guest (S4b). Absent, never `false`, for everyone
+    /// else: a relying party that tests for the key sees no difference on a normal account.
+    #[serde(
+        rename = "io.inblock.guest",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub guest: Option<bool>,
+}
+
+/// The guest claim for the subject of a token: `Some(true)` when guest mode is on, the
+/// token belongs to the guest client and the localpart has a live guest record, else
+/// `None`. One Redis read, and none at all for any other client or with guest mode off.
+pub(crate) async fn guest_claim(
+    config: &crate::config::Config,
+    db_client: &DBClientType,
+    client_id: &str,
+    localpart: &str,
+) -> Result<Option<bool>, CustomError> {
+    if !config.guest_enabled || config.guest_client_id.as_deref() != Some(client_id) {
+        return Ok(None);
+    }
+    Ok(db_client.guest_flag(localpart).await?.then_some(true))
+}
+
+impl AdditionalClaims for SidClaims {}
+
+/// The ID token claim set: the OIDC Core claims plus [`SidClaims`].
+pub type SiwxIdTokenClaims = IdTokenClaims<SidClaims, CoreGenderClaim>;
+/// A signed ID token of [`SiwxIdTokenClaims`].
+pub type SiwxIdToken =
+    IdToken<SidClaims, CoreGenderClaim, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm>;
+/// The token response fields carrying a [`SiwxIdToken`].
+pub type SiwxIdTokenFields = IdTokenFields<
+    SidClaims,
+    EmptyExtraTokenFields,
+    CoreGenderClaim,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJwsSigningAlgorithm,
+>;
+/// `POST /token`'s response: `CoreTokenResponse` with [`SidClaims`] in the ID
+/// token. The JSON shape is unchanged apart from the `sid` claim inside it.
+pub type SiwxTokenResponse = StandardTokenResponse<SiwxIdTokenFields, CoreTokenType>;
+
 // -- Error types -----------------------------------------------------------
 
 #[derive(Serialize, Debug)]
@@ -309,6 +389,15 @@ pub enum CustomError {
     BadRequestToken(TokenError),
     #[error("{0}")]
     Unauthorized(String),
+    /// A bearer token that cannot be used: unknown, expired, a refresh token presented as a
+    /// bearer token, or the token of a client that no longer exists. Renders as HTTP 401 with
+    /// `WWW-Authenticate: Bearer error="invalid_token"` (RFC 6750 section 3.1).
+    ///
+    /// Not a 400: a 400 reads as a fault in the caller's own request, which a resource server
+    /// may treat as temporary and retry, for a credential that can never work again. The
+    /// payload is the message for the log and the body; it never carries the token.
+    #[error("{0}")]
+    InvalidToken(String),
     /// A presented passkey credential is not registered on this server (a stale or
     /// revoked key chosen from the platform picker). Renders as HTTP 401 with a
     /// machine-readable JSON discriminator so the client can prune it via
@@ -317,10 +406,24 @@ pub enum CustomError {
     /// `unknown_credential`, never `internal_error`.
     #[error("unknown_credential: {0}")]
     UnknownCredential(String),
+    /// A passkey registration was refused because its credential id is already
+    /// registered; nothing was written. Renders as HTTP 400 with the fixed body
+    /// `{"error":"registration failed"}`, which names no reason and echoes no id.
+    #[error("registration refused")]
+    RegistrationRefused,
+    /// The endpoint no longer exists for any request (HTTP 410).
+    #[error("Gone")]
+    Gone,
     #[error("Not found")]
     NotFound,
     #[error("{0:?}")]
     Redirect(String),
+    /// The login session `/sign_in` completes is gone: it lives [`SESSION_LIFETIME`], and its
+    /// cookie as long, so a sign-in that took longer finds neither. Renders as the 400
+    /// timed-out page ([`sign_in_timed_out_page`]); the `/sign_in` handler first tries the
+    /// error redirect to the client ([`expired_sign_in`]).
+    #[error("login session expired")]
+    LoginSessionExpired,
     /// A dependency this request could not proceed without — Synapse — was
     /// unreachable or refused our credentials, so a check that must not be
     /// skipped could not be completed. Renders as **503**.
@@ -351,6 +454,11 @@ pub enum CustomError {
     /// logged at the point of failure and must never be put on the wire.
     #[error("{0}")]
     ServiceUnavailable(String),
+    /// A refusal with a fixed machine-readable body `{"error": code}` and its own
+    /// status. The guest paths use it: the 503 seam of the guest `sign_in` branch and
+    /// the refusal of a guest DID at a signature site (M6).
+    #[error("{code}")]
+    Coded { status: u16, code: &'static str },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -364,6 +472,19 @@ impl From<crate::webauthn::VerifyError> for CustomError {
             }
             // Every other verification failure keeps its existing 500/Other behavior.
             crate::webauthn::VerifyError::Other(inner) => CustomError::Other(inner),
+        }
+    }
+}
+
+impl From<crate::webauthn::RegisterFinishError> for CustomError {
+    fn from(e: crate::webauthn::RegisterFinishError) -> Self {
+        match e {
+            crate::webauthn::RegisterFinishError::Retired => CustomError::Gone,
+            crate::webauthn::RegisterFinishError::AlreadyRegistered => {
+                CustomError::RegistrationRefused
+            }
+            // Every other registration failure keeps its existing 500/Other behavior.
+            crate::webauthn::RegisterFinishError::Other(inner) => CustomError::Other(inner),
         }
     }
 }
@@ -528,6 +649,41 @@ pub fn jwks(
     Ok(CoreJsonWebKeySet::new(keys))
 }
 
+/// The scopes discovery lists. The mail scope appears only where the mailbox claim it
+/// unlocks can be issued, that is, when a mail domain is configured.
+fn scopes_supported(config: &crate::config::Config) -> Vec<Scope> {
+    let mut scopes = SCOPES.clone();
+    if config.mail_domain.is_some() {
+        scopes.push(Scope::new(client_policy::MAIL_SCOPE.to_string()));
+    }
+    scopes
+}
+
+/// The claims discovery lists. The two provider-specific ones appear only where userinfo can
+/// carry them: the Matrix ID needs a server name, the mailbox address a mail domain.
+fn claims_supported(config: &crate::config::Config) -> Vec<CoreClaimName> {
+    let mut claims: Vec<CoreClaimName> = [
+        "sub",
+        "aud",
+        "exp",
+        "iat",
+        "iss",
+        "preferred_username",
+        "name",
+        "picture",
+    ]
+    .into_iter()
+    .map(|claim| CoreClaimName::new(claim.to_string()))
+    .collect();
+    if config.matrix_server_name.is_some() {
+        claims.push(CoreClaimName::new("io.inblock.mxid".to_string()));
+    }
+    if config.mail_domain.is_some() {
+        claims.push(CoreClaimName::new(client_policy::MAILBOX_CLAIM.to_string()));
+    }
+    claims
+}
+
 pub fn metadata(config: &crate::config::Config) -> Result<CoreProviderMetadata, CustomError> {
     let base_url = &config.base_url;
     let pm = CoreProviderMetadata::new(
@@ -542,12 +698,11 @@ pub fn metadata(config: &crate::config::Config) -> Result<CoreProviderMetadata, 
                 .join(JWK_PATH)
                 .map_err(|e| anyhow!("Unable to join URL: {}", e))?,
         ),
-        vec![
-            ResponseTypes::new(vec![CoreResponseType::Code]),
-            ResponseTypes::new(vec![CoreResponseType::IdToken]),
-            ResponseTypes::new(vec![CoreResponseType::Token, CoreResponseType::IdToken]),
-        ],
-        vec![CoreSubjectIdentifierType::Pairwise],
+        // Exactly what `authorize` accepts: the authorization-code flow.
+        vec![ResponseTypes::new(vec![CoreResponseType::Code])],
+        // The `sub` is the user's DID, the same for every client
+        // (docs/identity-model.md), which is what `public` means.
+        vec![CoreSubjectIdentifierType::Public],
         SIGNING_ALG.to_vec(),
         EmptyAdditionalProviderMetadata {},
     )
@@ -562,17 +717,8 @@ pub fn metadata(config: &crate::config::Config) -> Result<CoreProviderMetadata, 
             .map_err(|e| anyhow!("Unable to join URL: {}", e))?,
     )))
     .set_userinfo_signing_alg_values_supported(Some(SIGNING_ALG.to_vec()))
-    .set_scopes_supported(Some(SCOPES.clone()))
-    .set_claims_supported(Some(vec![
-        CoreClaimName::new("sub".to_string()),
-        CoreClaimName::new("aud".to_string()),
-        CoreClaimName::new("exp".to_string()),
-        CoreClaimName::new("iat".to_string()),
-        CoreClaimName::new("iss".to_string()),
-        CoreClaimName::new("preferred_username".to_string()),
-        CoreClaimName::new("name".to_string()),
-        CoreClaimName::new("picture".to_string()),
-    ]))
+    .set_scopes_supported(Some(scopes_supported(config)))
+    .set_claims_supported(Some(claims_supported(config)))
     .set_registration_endpoint(Some(RegistrationUrl::from_url(
         base_url
             .join(REGISTER_PATH)
@@ -661,6 +807,22 @@ pub fn device_grant_unsupported() -> CustomError {
     })
 }
 
+/// The refusal of the RFC 8628 device-code grant for a generic-class client: that grant
+/// mints a Matrix session (a device, the Matrix scope), which a generic-class client
+/// never gets. `unauthorized_client` (RFC 6749 §5.2: the client may not use this grant
+/// type). Asked at `/device_authorization` and again before a device code is redeemed, so
+/// a code issued while the client was Matrix-class cannot be exchanged for a Matrix
+/// session after it became generic.
+pub fn refuse_device_grant_for(client: &ClientEntry) -> Result<(), CustomError> {
+    match client.class {
+        ClientClass::Matrix => Ok(()),
+        ClientClass::Generic => Err(CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::UnauthorizedClient,
+            error_description: "This client may not use the device-code grant.".to_string(),
+        })),
+    }
+}
+
 /// Build the full OIDC provider-metadata document served at [`METADATA_PATH`],
 /// including the non-standard Matrix/MSC extensions that the `openidconnect`
 /// crate cannot represent natively (introspection, device authorization,
@@ -706,8 +868,16 @@ pub fn provider_metadata_value(
     }
     value["grant_types_supported"] = serde_json::json!(grant_types);
     value["revocation_endpoint"] = serde_json::json!(format!("{}/oauth2/revoke", base));
+    // RP-initiated logout ends the grant an ID token's `sid` names, in both modes.
+    value["end_session_endpoint"] = serde_json::json!(format!("{base}{END_SESSION_PATH}"));
+    // Back-channel logout is sent for `oidc` grants only, and only generic mode
+    // issues them: in Matrix mode every grant is a Matrix device grant.
+    if !delegated_auth_enabled(config) {
+        value["backchannel_logout_supported"] = serde_json::json!(true);
+        value["backchannel_logout_session_supported"] = serde_json::json!(true);
+    }
     value["token_endpoint_auth_methods_supported"] =
-        serde_json::json!(["client_secret_post", "none"]);
+        serde_json::json!(["client_secret_basic", "client_secret_post", "none"]);
     value["prompt_values_supported"] = serde_json::json!(["login", "create"]);
     // Both advertised ONLY when this deployment can answer them: a client that
     // finds a key will use it, and a route that answers 503 (`/resolve`) or an
@@ -837,9 +1007,15 @@ async fn resolve_name(
     None
 }
 
+/// The claims about `did` that every ID token and userinfo response carries.
+///
+/// `class` is the class of the client the claims are for. A generic-class client gets no
+/// ENS lookup: its claims need no display name, and the lookup would send the user's
+/// address to a third party on every exchange and every userinfo call.
 async fn resolve_claims(
     config: &crate::config::Config,
     did: &str,
+    class: ClientClass,
 ) -> StandardClaims<CoreGenderClaim> {
     // canonical_subject is the OIDC sub claim — full DID string for did:pkh.
     let subject = find_did_method(did)
@@ -851,8 +1027,12 @@ async fn resolve_claims(
         .and_then(|m| m.address_for_message(did).ok())
         .unwrap_or_else(|| did.to_string());
 
+    let looks_up_ens = match class {
+        ClientClass::Matrix => true,
+        ClientClass::Generic => false,
+    };
     // ENS resolution only for eip155 DIDs.
-    let ens_name = if did.starts_with("did:pkh:eip155:") {
+    let ens_name = if looks_up_ens && did.starts_with("did:pkh:eip155:") {
         if let Ok(addr) = address_str.parse::<Address>() {
             resolve_name(
                 config.ens_api_url.as_ref(),
@@ -897,20 +1077,32 @@ pub struct TokenForm {
     pub device_code: Option<String>,
 }
 
+/// What the HTTP request says about the calling client outside the form: the
+/// `Authorization` header, which carries a client secret as `Basic` (with the
+/// client id as the user name, RFC 6749 §2.3.1) or, for some clients, as `Bearer`.
+#[derive(Default)]
+pub struct ClientCredentials {
+    /// The user name of an `Authorization: Basic` header: the client id.
+    pub basic_client_id: Option<String>,
+    /// The secret from the `Authorization` header (the Basic password or the
+    /// Bearer token). It wins over `client_secret` in the form.
+    pub secret: Option<String>,
+}
+
 pub async fn token(
     form: TokenForm,
-    secret: Option<String>,
+    credentials: ClientCredentials,
     signing_key: &EcdsaSigningKey,
     config: &crate::config::Config,
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
-) -> Result<CoreTokenResponse, CustomError> {
+) -> Result<SiwxTokenResponse, CustomError> {
     match form.grant_type {
         CoreGrantType::AuthorizationCode => {
-            token_authorization_code(form, secret, signing_key, config, db_client).await
+            token_authorization_code(form, credentials, signing_key, config, db_client).await
         }
         CoreGrantType::RefreshToken => {
-            token_refresh(form, config, db_client).await
+            token_refresh(form, credentials, config, db_client).await
         }
         CoreGrantType::DeviceCode => {
             token_device_code(form, signing_key, config, db_client, synapse_client).await
@@ -923,11 +1115,160 @@ pub async fn token(
     }
 }
 
-async fn token_refresh(
-    form: TokenForm,
+/// The client a request names, from the form and from an HTTP Basic header.
+/// They name the same client or only one of them is present: a request that
+/// names two different clients is malformed (RFC 6749 §2.3 allows one
+/// authentication method per request).
+fn named_client_id(
+    form: &TokenForm,
+    credentials: &ClientCredentials,
+) -> Result<Option<String>, CustomError> {
+    match (
+        form.client_id.as_deref(),
+        credentials.basic_client_id.as_deref(),
+    ) {
+        (Some(in_form), Some(in_header)) if !constant_time_eq(in_form, in_header) => {
+            Err(CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::InvalidRequest,
+                error_description:
+                    "client_id differs between the request body and the Authorization header."
+                        .to_string(),
+            }))
+        }
+        (Some(client_id), _) | (None, Some(client_id)) => Ok(Some(client_id.to_string())),
+        (None, None) => Ok(None),
+    }
+}
+
+// Client authentication at `POST /token`, for the two grants bound to a client:
+// the authorization code (`authenticate_code_client`, strict) and the refresh
+// token (`authenticate_refresh_client`, which tolerates a registration that has
+// expired). Both apply the same three steps through the same helpers, so they
+// cannot drift:
+//
+// 1. The client the request names (`named_client_id`, form or Basic header)
+//    must be the client the grant was issued to: `invalid_grant` otherwise. A
+//    request that names none is fine here (`check_named_client`).
+// 2. A secret the request presents is checked against the registration
+//    (`invalid_client`: "Bad secret."), whether the client is confidential or
+//    not (`check_client_secret`).
+// 3. A request that presents none must come from a public client
+//    (`invalid_client`: "Secret required."); which clients are confidential is
+//    decided in one place, `client_is_confidential`, which also sets the flag a
+//    grant records at issuance for the endpoint that cannot authenticate a
+//    client (`POST /_matrix/client/v3/refresh`).
+
+/// Step 1: the client the request names, if any, is the grant's client.
+/// `credential` names the grant in the error text.
+fn check_named_client(
+    bound_client_id: &str,
+    named_client_id: Option<&str>,
+    credential: &str,
+) -> Result<(), CustomError> {
+    match named_client_id {
+        Some(named) if !bound_client_id.is_empty() && !constant_time_eq(named, bound_client_id) => {
+            Err(CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::InvalidGrant,
+                error_description: format!("client_id does not match the {credential}."),
+            }))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Steps 2 and 3 against the client's registration: a presented secret must
+/// match it, and a request without one must come from a public client.
+fn check_client_secret(
+    client_entry: &ClientEntry,
+    presented_secret: Option<&str>,
+    config: &crate::config::Config,
+) -> Result<(), CustomError> {
+    match presented_secret {
+        Some(secret) if !client_entry.secret_matches(secret) => {
+            Err(CustomError::Unauthorized("Bad secret.".to_string()))
+        }
+        Some(_) => Ok(()),
+        None if client_is_confidential(Some(client_entry), config.require_secret) => {
+            Err(CustomError::Unauthorized("Secret required.".to_string()))
+        }
+        None => Ok(()),
+    }
+}
+
+/// Authenticate the client of an authorization code: the three steps above,
+/// and the registration must exist (a code was issued minutes ago to a
+/// registered client, so its absence is a fault: `invalid_client`). Returns
+/// the registration.
+async fn authenticate_code_client(
+    bound_client_id: &str,
+    named_client_id: Option<&str>,
+    presented_secret: Option<&str>,
     config: &crate::config::Config,
     db_client: &DBClientType,
-) -> Result<CoreTokenResponse, CustomError> {
+) -> Result<ClientEntry, CustomError> {
+    check_named_client(bound_client_id, named_client_id, "authorization code")?;
+    let client_entry = db_client
+        .get_client(bound_client_id.to_string())
+        .await?
+        .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
+    check_client_secret(&client_entry, presented_secret, config)?;
+    Ok(client_entry)
+}
+
+/// Authenticate the client of a refresh token: the three steps above, except
+/// that a registration that is gone is tolerated when the request presents no
+/// secret. A refresh token outlives its client's registration (30 days against
+/// 90), and refusing every such token would sign out every session older than a
+/// registration. Nothing is lost against the status quo: a secret cannot be
+/// checked against a registration that is gone, and a request that presents
+/// one is still refused (`invalid_client`).
+///
+/// This runs before the rotation script, as RFC 6749 orders it (client
+/// authentication first, §3.2.1 and §6). A consequence, kept on purpose: a
+/// superseded refresh token presented with a wrong secret is answered
+/// `invalid_client`, not like an unknown token. Telling the two apart needs a
+/// real token of the grant and reveals nothing about the token's state.
+async fn authenticate_refresh_client(
+    bound_client_id: &str,
+    named_client_id: Option<&str>,
+    presented_secret: Option<&str>,
+    config: &crate::config::Config,
+    db_client: &DBClientType,
+) -> Result<(), CustomError> {
+    check_named_client(bound_client_id, named_client_id, "refresh token")?;
+    match db_client.get_client(bound_client_id.to_string()).await? {
+        Some(client_entry) => check_client_secret(&client_entry, presented_secret, config),
+        None if presented_secret.is_none() => Ok(()),
+        None => Err(CustomError::Unauthorized(
+            "Unrecognised client id.".to_string(),
+        )),
+    }
+}
+
+/// Whether a client must authenticate with a secret: a registered
+/// `token_endpoint_auth_method` other than `none`, or none registered while
+/// `require_secret`. A client with no registration counts as public. The one
+/// rule behind step 3 above and behind the `confidential` flag a grant records
+/// at issuance, so `POST /_matrix/client/v3/refresh`, which cannot
+/// authenticate a client, refuses exactly the grants whose client
+/// `POST /token` would ask for a secret.
+pub(crate) fn client_is_confidential(client: Option<&ClientEntry>, require_secret: bool) -> bool {
+    match client.map(|c| c.metadata.token_endpoint_auth_method()) {
+        None => false,
+        Some(Some(CoreClientAuthMethod::None)) => false,
+        Some(Some(_)) => true,
+        Some(None) => require_secret,
+    }
+}
+
+async fn token_refresh(
+    form: TokenForm,
+    credentials: ClientCredentials,
+    config: &crate::config::Config,
+    db_client: &DBClientType,
+) -> Result<SiwxTokenResponse, CustomError> {
+    let named_client = named_client_id(&form, &credentials)?;
+    let presented_secret = credentials.secret.or(form.client_secret);
     let rt = form.refresh_token.ok_or_else(|| {
         CustomError::BadRequestToken(TokenError {
             error: CoreErrorResponseType::InvalidRequest,
@@ -935,153 +1276,131 @@ async fn token_refresh(
         })
     })?;
 
-    let metadata = match db_client.get_token(&rt).await? {
-        Some(m) => m,
-        None => {
-            // Grace replay (lost-response recovery): a rotated refresh token is
-            // deleted, but its successor pair is recorded under a short grace
-            // window. If the client lost the rotation response and retries with the
-            // old token, return the SAME successor instead of signing it out.
-            // Bounded by REFRESH_GRACE_TTL; genuinely unknown/expired tokens (no
-            // grace record) still fail closed below.
-            if let Some(succ) = db_client.get_rotated_token(&rt).await? {
-                let expires_in = (succ.access_exp - Utc::now().timestamp()).max(0) as u64;
-                let mut response = CoreTokenResponse::new(
-                    AccessToken::new(succ.access_token),
-                    CoreTokenType::Bearer,
-                    CoreIdTokenFields::new(None, EmptyExtraTokenFields {}),
-                );
-                response.set_expires_in(Some(&time::Duration::from_secs(expires_in)));
-                response.set_refresh_token(Some(RefreshToken::new(succ.refresh_token)));
-                return Ok(response);
+    // What the token names: the grant its handle names (or that a legacy token
+    // was lifted into), or a legacy refresh token (`token/{raw}`, written
+    // before the grant record) not lifted yet. An access or admin token,
+    // garbage, and a token of a grant that is gone are all answered exactly
+    // like an unknown token.
+    let (bound_client, legacy, peeked_grant) = match db_client.peek_refresh_token(&rt).await? {
+        RefreshPeek::Grant(grant) => (grant.client_id.clone(), None, Some(grant)),
+        RefreshPeek::Legacy(legacy) => (legacy.meta.client_id.clone(), Some(legacy), None),
+        RefreshPeek::Unknown => return Err(unknown_refresh_token()),
+    };
+
+    // A refresh token belongs to the client it was issued to (I7): before the
+    // rotation script runs, the request must be that client, and a
+    // confidential client must authenticate. `POST /_matrix/client/v3/refresh`
+    // carries no client identity, so it refuses a confidential client's grant
+    // instead (`compat::refresh`).
+    authenticate_refresh_client(
+        &bound_client,
+        named_client.as_deref(),
+        presented_secret.as_deref(),
+        config,
+        db_client,
+    )
+    .await?;
+
+    // S5: a guest's refresh is refused at its deadline, while its record is `reaping`,
+    // when the kill switch is on, and for a device the record does not list. A Redis
+    // read error is a 503 for the client to retry: the guard never passes on an error.
+    if let Some(grant) = &peeked_grant {
+        match crate::guest::handoff::guest_refresh_allowed(
+            config.guest_client_id.as_deref(),
+            db_client,
+            grant,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Err(guest_session_ended()),
+            Err(e) => {
+                warn!(error = %e, "guest refresh guard: record read failed");
+                return Err(CustomError::ServiceUnavailable(
+                    "The session store is unavailable; retry.".to_string(),
+                ));
             }
+        }
+    }
+
+    // The one rotation script (I3) decides everything else atomically: rotate,
+    // replay the unused successor of a lost response (I4), or refuse. The
+    // script checks the named client again; it can only agree here. A legacy
+    // refresh token is lifted into a grant instead (design 5.8): answered with
+    // a pair in the current format, so no user signs in again; its grant
+    // records the client's confidentiality by the rule every issuance uses.
+    let request = RotateRequest {
+        presented: &rt,
+        client_id: named_client.as_deref(),
+        refuse_confidential: false,
+    };
+    let outcome = match &legacy {
+        Some(legacy) => {
+            let client = db_client.get_client(legacy.meta.client_id.clone()).await?;
+            let confidential = client_is_confidential(client.as_ref(), config.require_secret);
+            db_client
+                .lift_legacy_refresh_token(&request, legacy, confidential)
+                .await?
+        }
+        None => db_client.rotate_refresh_token(&request).await?,
+    };
+    let (pair, expires_in) = match outcome {
+        RotateOutcome::Rotated(pair) | RotateOutcome::Replayed(pair) => {
+            let expires_in = pair.expires_in(ACCESS_TOKEN_TTL);
+            (pair.pair, expires_in)
+        }
+        // Reuse (I5, phase A): recorded, and answered like an unknown token.
+        RotateOutcome::Reuse(event) => {
+            event.emit();
+            return Err(unknown_refresh_token());
+        }
+        RotateOutcome::Invalid(InvalidReason::Revoked) => {
             return Err(CustomError::BadRequestToken(TokenError {
                 error: CoreErrorResponseType::InvalidGrant,
-                error_description: "Unknown or expired refresh token.".to_string(),
+                error_description: "Session has been revoked.".to_string(),
+            }));
+        }
+        RotateOutcome::Invalid(_) | RotateOutcome::ConfidentialClient => {
+            return Err(unknown_refresh_token());
+        }
+        // The same answer `check_named_client` gives a request that names
+        // another client.
+        RotateOutcome::ClientMismatch => {
+            return Err(CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::InvalidGrant,
+                error_description: "client_id does not match the refresh token.".to_string(),
             }));
         }
     };
 
-    if metadata.exp <= Utc::now().timestamp() {
-        return Err(CustomError::BadRequestToken(TokenError {
-            error: CoreErrorResponseType::InvalidGrant,
-            error_description: "Refresh token has expired.".to_string(),
-        }));
-    }
-
-    // Race guard (S3-3 / H3 + S3-4 / H6): refuse to rotate if this device was just
-    // signed out or the user was just deactivated/erased. Mirrors the same check
-    // in compat::refresh so neither refresh entry point can resurrect access for a
-    // torn-down device / terminated account.
-    let device_revoked = !metadata.device_id.is_empty()
-        && db_client
-            .is_device_revoked(&metadata.username, &metadata.device_id)
-            .await?;
-    if device_revoked || db_client.is_user_deactivated(&metadata.username).await? {
-        let _ = db_client.delete_token(&rt).await;
-        return Err(CustomError::BadRequestToken(TokenError {
-            error: CoreErrorResponseType::InvalidGrant,
-            error_description: "Session has been revoked.".to_string(),
-        }));
-    }
-
-    let (access_prefix, refresh_prefix) = if config.mas_shared_secret.is_some() {
-        ("mat_", "mcr_")
-    } else {
-        ("", "")
-    };
-
-    let now = Utc::now().timestamp();
-
-    let new_access = generate_opaque_token(access_prefix);
-    let access_meta = TokenMetadata {
-        username: metadata.username.clone(),
-        device_id: metadata.device_id.clone(),
-        scope: metadata.scope.clone(),
-        client_id: metadata.client_id.clone(),
-        iat: now,
-        exp: now + ACCESS_TOKEN_TTL as i64,
-        did: metadata.did.clone(),
-        name: metadata.name.clone(),
-    };
-    db_client
-        .set_token(&new_access, &access_meta, ACCESS_TOKEN_TTL)
-        .await?;
-
-    let new_refresh = generate_opaque_token(refresh_prefix);
-    let refresh_meta = TokenMetadata {
-        username: metadata.username.clone(),
-        device_id: metadata.device_id.clone(),
-        scope: metadata.scope.clone(),
-        client_id: metadata.client_id.clone(),
-        iat: now,
-        exp: now + REFRESH_TOKEN_TTL as i64,
-        did: metadata.did.clone(),
-        name: metadata.name.clone(),
-    };
-    db_client
-        .set_token(&new_refresh, &refresh_meta, REFRESH_TOKEN_TTL)
-        .await?;
-
-    let _ = db_client.delete_token(&rt).await;
-
-    // Check-mint-recheck (S3-3 / H3 + S3-4 / H6): if a revoke/deactivate sweep
-    // tombstoned this device/user in the gap between our pre-mint check and our
-    // writes, roll back the just-minted tokens so none can be resurrected.
-    //
-    // Fail OPEN on an indeterminate probe (Redis I/O error), CLOSED only on a
-    // definite tombstone. By this point `rt` has already been deleted and the
-    // grace pointer is not yet written, so a rollback here leaves the client
-    // holding neither the old nor the new refresh token — an unrecoverable
-    // sign-out. Treating an I/O error as a tombstone would convert a transient
-    // fault into permanent session loss; the tombstone TTL bounds the opposite
-    // risk to one access-token cycle (see `RevocationState`).
-    let revoked_now = db_client
-        .probe_revocation(&metadata.username, &metadata.device_id)
-        .await;
-    if revoked_now == RevocationState::Indeterminate {
-        warn!(
-            username = %metadata.username,
-            device_id = %metadata.device_id,
-            "refresh: revocation probe indeterminate after mint; committing \
-             (fail-open, bounded by tombstone TTL)"
-        );
-    }
-    if revoked_now.must_refuse() {
-        let _ = db_client.delete_token(&new_access).await;
-        let _ = db_client.delete_token(&new_refresh).await;
-        return Err(CustomError::BadRequestToken(TokenError {
-            error: CoreErrorResponseType::InvalidGrant,
-            error_description: "Session has been revoked.".to_string(),
-        }));
-    }
-
-    // Grace window: record old refresh token -> the successor pair we just minted,
-    // so a client that LOSES this rotation response (common on mobile) can replay
-    // the old token once within REFRESH_GRACE_TTL and recover instead of being
-    // signed out. Written only here, on the committed success path (after the
-    // H3/H6 check-mint-recheck), so it can never resolve to rolled-back tokens.
-    // Best-effort: a failure must not fail the rotation the client will observe.
-    let _ = db_client
-        .set_rotated_token(
-            &rt,
-            &RotatedToken {
-                access_token: new_access.clone(),
-                refresh_token: new_refresh.clone(),
-                access_exp: now + ACCESS_TOKEN_TTL as i64,
-            },
-            REFRESH_GRACE_TTL,
-        )
-        .await;
-
-    let mut response = CoreTokenResponse::new(
-        AccessToken::new(new_access),
+    let mut response = SiwxTokenResponse::new(
+        AccessToken::new(pair.access_token),
         CoreTokenType::Bearer,
-        CoreIdTokenFields::new(None, EmptyExtraTokenFields {}),
+        SiwxIdTokenFields::new(None, EmptyExtraTokenFields {}),
     );
-    response.set_expires_in(Some(&time::Duration::from_secs(ACCESS_TOKEN_TTL)));
-    response.set_refresh_token(Some(RefreshToken::new(new_refresh)));
+    response.set_expires_in(Some(&time::Duration::from_secs(expires_in)));
+    response.set_refresh_token(Some(RefreshToken::new(pair.refresh_token)));
+    // An accepted rotation or replay is a use of the client the grant belongs to.
+    touch_client_after_use(db_client, &bound_client).await;
     Ok(response)
+}
+
+/// 400 `invalid_grant` for a guest whose session is over (S5): the portal signs out and
+/// goes to `/guest/ended`.
+fn guest_session_ended() -> CustomError {
+    CustomError::BadRequestToken(TokenError {
+        error: CoreErrorResponseType::InvalidGrant,
+        error_description: "The guest session has ended.".to_string(),
+    })
+}
+
+/// The answer to a refresh token that is unknown, expired, of another kind, or
+/// reused: one answer, so a refusal reveals nothing about which it was.
+fn unknown_refresh_token() -> CustomError {
+    CustomError::BadRequestToken(TokenError {
+        error: CoreErrorResponseType::InvalidGrant,
+        error_description: "Unknown or expired refresh token.".to_string(),
+    })
 }
 
 fn device_code_error(error: &str, description: &str) -> CustomError {
@@ -1097,7 +1416,7 @@ async fn token_device_code(
     config: &crate::config::Config,
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
-) -> Result<CoreTokenResponse, CustomError> {
+) -> Result<SiwxTokenResponse, CustomError> {
     if !delegated_auth_enabled(config) {
         return Err(device_grant_unsupported());
     }
@@ -1115,7 +1434,7 @@ async fn token_device_code(
         })
     })?;
 
-    let mut entry = db_client
+    let (device_ref, mut entry) = db_client
         .get_device_code(&dc)
         .await?
         .ok_or_else(|| device_code_error("expired_token", "Device code expired or not found."))?;
@@ -1127,13 +1446,24 @@ async fn token_device_code(
         }));
     }
 
+    // This grant mints a Matrix session, so a generic-class client never redeems one, not
+    // even a code issued before the client changed class. Read before anything is recorded
+    // or claimed, so a refusal leaves the code as it was, and read with `?`, so a store
+    // fault is a fault and never a client served without its class. A client that is gone
+    // (an expired dynamic registration) was never generic and is still served, named after
+    // its id.
+    let client = db_client.get_client(client_id.clone()).await?;
+    if let Some(client) = &client {
+        refuse_device_grant_for(client)?;
+    }
+
     // Rate limiting: reject if polling faster than the interval.
     let now_ts = Utc::now().timestamp();
     if let Some(last) = entry.last_poll {
         if now_ts - last < DEVICE_CODE_INTERVAL as i64 {
             entry.last_poll = Some(now_ts);
             let _ = db_client
-                .update_device_code(&dc, &entry, DEVICE_CODE_LIFETIME)
+                .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
                 .await;
             return Err(device_code_error(
                 "slow_down",
@@ -1143,7 +1473,7 @@ async fn token_device_code(
     }
     entry.last_poll = Some(now_ts);
     let _ = db_client
-        .update_device_code(&dc, &entry, DEVICE_CODE_LIFETIME)
+        .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
         .await;
 
     match entry.status {
@@ -1152,14 +1482,88 @@ async fn token_device_code(
             "User has not yet approved.",
         )),
         DeviceCodeStatus::Denied => {
-            let _ = db_client.delete_device_code(&dc).await;
-            let _ = db_client.delete_user_code_mapping(&entry.user_code).await;
+            let _ = db_client.delete_device_code(&device_ref).await;
+            let _ = db_client.delete_user_code_mapping(&entry).await;
             Err(device_code_error(
                 "access_denied",
                 "User denied the request.",
             ))
         }
         DeviceCodeStatus::Approved => {
+            let did = entry
+                .did
+                .as_ref()
+                .ok_or_else(|| device_code_error("server_error", "Approved but no DID."))?
+                .clone();
+
+            // The device-id checks only read, so they run before the code is claimed: a
+            // refusal or a failed check (a Redis error) leaves the code unconsumed.
+            let proposed_device_id = scope_device_id(&entry.scope).map_err(|InvalidDeviceId| {
+                device_code_error("invalid_scope", INVALID_DEVICE_ID_MSG)
+            })?;
+            // GP-CLM-26, as in `sign_in`: a claimed guest's pre-claim device ids stay
+            // refused. The check sits before any Synapse call. A Redis error fails closed
+            // (no session is provisioned).
+            if let Some(ref proposed) = proposed_device_id {
+                match db_client.device_is_pre_claim_for_did(&did, proposed).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        warn!(did = %did, "device_code grant: refused a pre-claim device id (GP-CLM-26)");
+                        return Err(device_code_error(
+                            "invalid_scope",
+                            PRE_CLAIM_DEVICE_REFUSED_MSG,
+                        ));
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "device_code grant: pre-claim device check failed");
+                        return Err(device_code_error(
+                            "server_error",
+                            "The device could not be checked. Try again.",
+                        ));
+                    }
+                }
+            }
+            // SS4 flag 2 (8.1): a deleted device id is refused as at `sign_in`, as the
+            // token endpoint's `invalid_scope`, and the code is denied, so the verification
+            // page no longer reads approved and the next poll gets `access_denied`, never a
+            // token. Only reads before this point, so a failed check consumes nothing.
+            if let (true, Some(proposed)) = (
+                config.refuse_deleted_device_ids,
+                proposed_device_id.as_deref(),
+            ) {
+                match device_id_was_deleted(db_client, &did, proposed).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        warn!(
+                            security_event = "deleted_device_refused",
+                            channel = "device_code",
+                            client_id = %client_id,
+                            device_fp = %siwx_oidc::redact::fingerprint(proposed),
+                            "device_code grant: refused a deleted device id"
+                        );
+                        entry.status = DeviceCodeStatus::Denied;
+                        if let Err(e) = db_client
+                            .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
+                            .await
+                        {
+                            // The code stays approved, and every later poll is refused
+                            // here again while the marker lives: still never a token.
+                            warn!(error = %e, "device_code grant: could not deny the refused code");
+                        }
+                        return Err(device_code_error(
+                            "invalid_scope",
+                            DELETED_DEVICE_REFUSED_MSG,
+                        ));
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "device_code grant: deleted device check failed");
+                        return Err(device_code_error(
+                            "server_error",
+                            "The device could not be checked. Try again.",
+                        ));
+                    }
+                }
+            }
             // Atomically claim this approved device_code BEFORE issuing any token
             // (S3-1 / H9). Without this, two concurrent polls both pass the
             // `status == Approved` check and each mint a token pair (+ a phantom
@@ -1168,20 +1572,12 @@ async fn token_device_code(
             // winner deletes the device_code at the end, so a subsequent poll then
             // gets expired_token — same as a normal completed flow).
             if !db_client.try_claim_device_code(&dc).await? {
-                debug!(device_code = %dc, "device_code already claimed by a concurrent poll");
+                debug!(device_code_fp = %siwx_oidc::redact::fingerprint(&dc), "device_code already claimed by a concurrent poll");
                 return Err(device_code_error(
                     "authorization_pending",
                     "Device code is being processed.",
                 ));
             }
-
-            let did = entry
-                .did
-                .as_ref()
-                .ok_or_else(|| device_code_error("server_error", "Approved but no DID."))?
-                .clone();
-
-            let proposed_device_id = extract_device_id_from_scope(&entry.scope);
             debug!(
                 scope = %entry.scope,
                 extracted_device_id = ?proposed_device_id,
@@ -1204,32 +1600,56 @@ async fn token_device_code(
             // (never modern — see resolve_identity_or_legacy's fail-safe
             // direction), matching the pre-existing degraded-provisioning path.
             let resolved = crate::localpart::resolve_identity_or_legacy(&did, synapse_client).await;
+            // A code that names its account (`login_hint`) is redeemed only for that
+            // account. The approval checked it with the fallible resolver; this one
+            // degrades to the legacy localpart on a fault, which for an account on the
+            // modern localpart names another account. A mismatch issues nothing: on a
+            // degraded answer the claim is released and a later poll tries again,
+            // otherwise the code is refused and deleted.
+            if crate::device_auth::names_another_account(
+                entry.expected_mxid.as_deref(),
+                &resolved.localpart,
+            ) {
+                if let Err(e) = db_client.release_device_code_claim(&dc).await {
+                    warn!(error = %e, "device_code grant: could not release the claim");
+                }
+                if resolved.degraded {
+                    return Err(device_code_error(
+                        "temporarily_unavailable",
+                        DEVICE_PROVISIONING_UNAVAILABLE_MSG,
+                    ));
+                }
+                warn!(did = %did, "device_code grant: the approving identity is not the account the request names");
+                let _ = db_client.delete_device_code(&device_ref).await;
+                let _ = db_client.delete_user_code_mapping(&entry).await;
+                return Err(device_code_error(
+                    "access_denied",
+                    "The request was approved by an account other than the one it names.",
+                ));
+            }
             // Same DID publication as the wallet/passkey login path: the QR
             // flow provisions a real session for a real identity, so it must
             // publish (and re-assert) the same attested field. Both call sites
-            // route through the ONE `provision_synapse_device`, so there is no
-            // third place this could be forgotten.
+            // route through `provision_synapse_device_with`, which publishes through
+            // `provision_synapse_account`, so there is no other place this could
+            // be forgotten.
             let publication = DidPublication {
                 key: signing_key,
                 issuer: config.base_url.as_str(),
             };
             // Named after the client that started the grant, like sign_in.
-            // The name is cosmetic, so a failed client read falls back to the
-            // client id instead of failing a grant the user already approved.
-            let client = db_client
-                .get_client(client_id.clone())
-                .await
-                .unwrap_or_else(|e| {
-                    warn!(error = %e, "device_code grant: client read failed; naming the device after its client id");
-                    None
-                });
             let device_name = device_display_name(&client_id, client.as_ref());
             // The client's proposal goes in as is, so provisioning mints the id
             // when there is none and can tell a minted id (new, so it is named)
             // from a client-supplied one (maybe renamed by the user, so named
             // only when confirmed new). Without a Synapse client nothing is
             // provisioned and the id is minted here, for the token scope alone.
-            let dev_id = provision_synapse_device(
+            // SS4 flag 2 (8.27): no grant without a Synapse device, as at `sign_in`. A failed
+            // upsert answers `temporarily_unavailable` before the cross-signing reset window
+            // is armed and issues nothing; the claim is released, so the still-approved code
+            // is redeemed by a later poll once the homeserver is back (the code expires as
+            // usual otherwise). Flag 2 off keeps today's warning.
+            let dev_id = match provision_synapse_device_with(
                 &did,
                 &resolved,
                 synapse_client,
@@ -1237,65 +1657,82 @@ async fn token_device_code(
                 proposed_device_id.as_deref(),
                 config.matrix_server_name.as_deref(),
                 Some(&publication),
+                config.refuse_deleted_device_ids,
             )
             .await
-            .unwrap_or_else(|| resolve_device_id(proposed_device_id.as_deref()));
+            {
+                Ok(Some(dev_id)) => dev_id,
+                Ok(None) => resolve_device_id(proposed_device_id.as_deref()),
+                Err(()) => {
+                    if let Err(e) = db_client.release_device_code_claim(&dc).await {
+                        // The claim then lapses with the code: later polls read
+                        // `authorization_pending`, then `expired_token`. Never a token.
+                        warn!(error = %e, "device_code grant: could not release the claim");
+                    }
+                    return Err(device_code_error(
+                        "temporarily_unavailable",
+                        DEVICE_PROVISIONING_UNAVAILABLE_MSG,
+                    ));
+                }
+            };
 
             let now = Utc::now();
-            let iat = now.timestamp();
             let username = resolved.localpart;
             let scope = format!(
                 "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
                 dev_id
             );
 
-            let claims = resolve_claims(config, &did).await;
+            // The device grant is a Matrix session by construction, and a generic-class
+            // client was refused above.
+            let claims = resolve_claims(config, &did, ClientClass::Matrix).await;
             let display_name = claims
                 .name()
                 .and_then(|n| n.get(None))
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| did.clone());
 
-            let access_token = generate_opaque_token("mat_");
-            let access_meta = TokenMetadata {
-                username: username.clone(),
-                device_id: dev_id.clone(),
-                scope: scope.clone(),
-                client_id: client_id.clone(),
-                iat,
-                exp: iat + ACCESS_TOKEN_TTL as i64,
-                did: did.clone(),
-                name: display_name.clone(),
-            };
-            db_client
-                .set_token(&access_token, &access_meta, ACCESS_TOKEN_TTL)
+            // One Matrix-device grant per approved device code (I2).
+            let issued = db_client
+                .issue_grant(&NewGrant {
+                    kind: GrantKind::MatrixDevice,
+                    username,
+                    did: did.clone(),
+                    client_id: client_id.clone(),
+                    confidential_client: client_is_confidential(
+                        client.as_ref(),
+                        config.require_secret,
+                    ),
+                    device_id: dev_id.clone(),
+                    scope: scope.clone(),
+                    name: display_name,
+                    // The approval, recorded from Redis `TIME`; an entry an
+                    // older build approved counts from this poll.
+                    auth_ms: entry.auth_ms,
+                    access_ttl: ACCESS_TOKEN_TTL,
+                    refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+                    absolute_deadline: None,
+                })
                 .await?;
+            touch_client_after_use(db_client, &client_id).await;
+            let access_token = issued.access_token;
+            let refresh_token = issued.refresh_token.ok_or_else(|| {
+                anyhow!("device_code grant: issue_grant returned no refresh token")
+            })?;
 
-            let refresh_token = generate_opaque_token("mcr_");
-            let refresh_meta = TokenMetadata {
-                username,
-                device_id: dev_id.clone(),
-                scope: scope.clone(),
-                client_id: client_id.clone(),
-                iat,
-                exp: iat + REFRESH_TOKEN_TTL as i64,
-                did: did.clone(),
-                name: display_name,
-            };
-            db_client
-                .set_token(&refresh_token, &refresh_meta, REFRESH_TOKEN_TTL)
-                .await?;
-
-            let core_id_token = CoreIdTokenClaims::new(
+            let core_id_token = SiwxIdTokenClaims::new(
                 IssuerUrl::from_url(config.base_url.clone()),
                 vec![Audience::new(client_id)],
                 now + Duration::seconds(config.id_token_ttl_secs as i64),
                 now,
                 claims,
-                EmptyAdditionalClaims {},
+                SidClaims {
+                    sid: issued.sid,
+                    guest: None,
+                },
             );
 
-            let id_token = CoreIdToken::new(
+            let id_token = SiwxIdToken::new(
                 core_id_token,
                 signing_key,
                 CoreJwsSigningAlgorithm::EcdsaP256Sha256,
@@ -1305,15 +1742,15 @@ async fn token_device_code(
             .map_err(|e| anyhow!("{}", e))?;
 
             // Cleanup
-            let _ = db_client.delete_device_code(&dc).await;
-            let _ = db_client.delete_user_code_mapping(&entry.user_code).await;
+            let _ = db_client.delete_device_code(&device_ref).await;
+            let _ = db_client.delete_user_code_mapping(&entry).await;
 
             info!(did = %did, device_id = %dev_id, "device_code grant: tokens issued");
 
-            let mut response = CoreTokenResponse::new(
+            let mut response = SiwxTokenResponse::new(
                 AccessToken::new(access_token),
                 CoreTokenType::Bearer,
-                CoreIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
+                SiwxIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
             );
             response.set_expires_in(Some(&time::Duration::from_secs(ACCESS_TOKEN_TTL)));
             response.set_refresh_token(Some(RefreshToken::new(refresh_token)));
@@ -1328,13 +1765,197 @@ async fn token_device_code(
     }
 }
 
+/// The scopes generic mode can grant, in the order they are issued.
+const GENERIC_GRANTABLE_SCOPES: [&str; 3] = ["openid", "profile", "offline_access"];
+
+/// What a code exchange issues, when the grant is not a Matrix session, for the
+/// scope the authorization request asked for: [`generic_grant`] in generic mode,
+/// [`class_grant`] for a generic-class client.
+#[derive(Debug, PartialEq, Eq)]
+struct GenericGrant {
+    /// The scope recorded on the tokens: the requested scopes among
+    /// [`GENERIC_GRANTABLE_SCOPES`] that the registration allows, in that order.
+    scope: String,
+    /// Whether a refresh token is issued.
+    refresh_token: bool,
+    /// Whether the token response must name the scope, because it differs from
+    /// the request (RFC 6749 §5.1).
+    report_scope: bool,
+}
+
+/// The grant for a generic-mode (no MAS shared secret) code exchange (I10):
+/// least privilege for a relying party that is not a Matrix client.
+///
+/// - The scope granted is what was requested, limited to `openid`, `profile`
+///   and `offline_access`. Matrix scopes mean nothing here and are not granted.
+///   If nothing grantable was requested the grant is `openid`: the exchange
+///   issues an ID token regardless, so that is what is being granted
+///   (provisional).
+/// - `offline_access`, and with it a refresh token, is granted only when the
+///   client's registration allows the refresh grant. A registration that lists
+///   no `grant_types` is not a restriction (provisional): refusing it would
+///   withhold refresh tokens from clients that registered before this rule
+///   existed and never listed any.
+/// - `requested == None` is a code written by a build from before the scope
+///   travelled with it. Such a code lives 300 s, and for that window it is
+///   exchanged as it always was: `openid profile` and a refresh token.
+fn generic_grant(requested: Option<&str>, registration: &ClientEntry) -> GenericGrant {
+    let Some(requested) = requested else {
+        return GenericGrant {
+            scope: "openid profile".to_string(),
+            refresh_token: true,
+            report_scope: false,
+        };
+    };
+    let asked: Vec<&str> = requested.split_whitespace().collect();
+    let may_refresh = client_policy::registration_may_refresh(&registration.metadata);
+    let granted: Vec<&str> = GENERIC_GRANTABLE_SCOPES
+        .iter()
+        .copied()
+        .filter(|scope| asked.contains(scope))
+        .filter(|scope| *scope != "offline_access" || may_refresh)
+        .collect();
+    let scope = if granted.is_empty() {
+        "openid".to_string()
+    } else {
+        granted.join(" ")
+    };
+    GenericGrant::recording(scope, requested)
+}
+
+/// The grant for a generic-class client's code exchange in delegated-auth mode: what
+/// [`client_policy::grant_for`] allows for the scope the request bound, under the same
+/// refresh rule as [`generic_grant`] (I10): `offline_access`, and with it a refresh token,
+/// only when the client's registration allows the refresh grant. `None` when the request
+/// grants no `openid`.
+fn class_grant(requested: &str, client: &ClientEntry) -> Option<GenericGrant> {
+    let granted = client_policy::grant_for(client, requested)?;
+    let may_refresh = client_policy::registration_may_refresh(&client.metadata);
+    let scope = granted
+        .split(' ')
+        .filter(|scope| may_refresh || *scope != "offline_access")
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(GenericGrant::recording(scope, requested))
+}
+
+impl GenericGrant {
+    /// The grant that records `scope` for a request that asked for `requested`. The one
+    /// place the two rules that follow from a granted scope are written: a refresh token
+    /// goes with `offline_access` and with nothing else (I10), and the response names the
+    /// scope when it is not the set that was asked for.
+    fn recording(scope: String, requested: &str) -> Self {
+        let refresh_token = client_policy::has_scope(&scope, "offline_access");
+        let report_scope = {
+            let mut requested_set: Vec<&str> = requested.split_whitespace().collect();
+            requested_set.sort_unstable();
+            requested_set.dedup();
+            let mut granted_set: Vec<&str> = scope.split(' ').collect();
+            granted_set.sort_unstable();
+            requested_set != granted_set
+        };
+        GenericGrant {
+            scope,
+            refresh_token,
+            report_scope,
+        }
+    }
+}
+
+/// What a code exchange issues: the kind of grant and what goes with it.
+#[derive(Debug, PartialEq, Eq)]
+struct Issuance {
+    kind: GrantKind,
+    /// The Matrix device the grant belongs to; empty for a grant with none.
+    device_id: String,
+    /// The scope recorded on the grant and its tokens.
+    scope: String,
+    /// Whether a refresh token is issued.
+    refresh_token: bool,
+    /// Whether the token response must name the scope, because it differs from the
+    /// request (RFC 6749 §5.1).
+    report_scope: bool,
+}
+
+impl Issuance {
+    /// An `oidc` grant for `device_id` (empty: none) with the scope decisions of `grant`.
+    fn oidc(device_id: String, grant: GenericGrant) -> Self {
+        Issuance {
+            kind: GrantKind::Oidc,
+            device_id,
+            scope: grant.scope,
+            refresh_token: grant.refresh_token,
+            report_scope: grant.report_scope,
+        }
+    }
+}
+
+/// The refusal for every code the exchange will not honour for the client that presents it.
+fn code_not_issued_for_client() -> CustomError {
+    CustomError::BadRequestToken(TokenError {
+        error: CoreErrorResponseType::InvalidGrant,
+        error_description: "This code was not issued for this client.".to_string(),
+    })
+}
+
+/// What a code exchange issues, decided by the deployment mode, the class of the client
+/// the code was issued to (the sign-in branch it took) and the class of the client
+/// presenting it now. One table, no fall-through:
+///
+/// | delegated auth | issued to | client now | issues |
+/// |---|---|---|---|
+/// | yes | Matrix  | Matrix  | a `matrix_device` grant: the Matrix scope for the device `sign_in` provisioned, and always a refresh token, because Synapse and the Matrix clients depend on exactly that |
+/// | yes | generic | generic | an `oidc` grant with no device: what [`client_policy::grant_for`] allows for the bound scope, and a refresh token only for a granted `offline_access` (I10) |
+/// | no  | Matrix  | Matrix  | an `oidc` grant as [`generic_grant`] decides (I10) |
+/// | no  | generic | generic | refused: start-up refuses such a client, which has no Synapse to supply its localpart; this is the same refusal for an entry that did not come through start-up |
+/// | any | one class | the other | refused: the client changed class after `sign_in` ran, and a grant must never come from the other branch (a Matrix session for a mail client, or a deviceless grant for a Matrix one) |
+///
+/// A code written before the class was recorded came from the only sign-in branch there
+/// was, the Matrix one.
+fn exchange_issuance(
+    delegated_auth: bool,
+    client: &ClientEntry,
+    code: &CodeEntry,
+) -> Result<Issuance, CustomError> {
+    let issued_to = code.client_class.unwrap_or(ClientClass::Matrix);
+    match (delegated_auth, issued_to, client.class) {
+        (true, ClientClass::Matrix, ClientClass::Matrix) => {
+            let device_id = code.device_id.clone().unwrap_or_default();
+            Ok(Issuance {
+                kind: GrantKind::MatrixDevice,
+                scope: format!(
+                    "openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}"
+                ),
+                device_id,
+                refresh_token: true,
+                report_scope: false,
+            })
+        }
+        (false, ClientClass::Matrix, ClientClass::Matrix) => Ok(Issuance::oidc(
+            code.device_id.clone().unwrap_or_default(),
+            generic_grant(code.scope.as_deref(), client),
+        )),
+        (true, ClientClass::Generic, ClientClass::Generic) => {
+            let grant = class_grant(code.scope.as_deref().unwrap_or(""), client)
+                .ok_or_else(code_not_issued_for_client)?;
+            Ok(Issuance::oidc(String::new(), grant))
+        }
+        (false, ClientClass::Generic, ClientClass::Generic)
+        | (_, ClientClass::Matrix, ClientClass::Generic)
+        | (_, ClientClass::Generic, ClientClass::Matrix) => Err(code_not_issued_for_client()),
+    }
+}
+
 async fn token_authorization_code(
     form: TokenForm,
-    secret: Option<String>,
+    credentials: ClientCredentials,
     signing_key: &EcdsaSigningKey,
     config: &crate::config::Config,
     db_client: &DBClientType,
-) -> Result<CoreTokenResponse, CustomError> {
+) -> Result<SiwxTokenResponse, CustomError> {
+    // A malformed request is refused before the code is touched.
+    let named_client = named_client_id(&form, &credentials)?;
+    let presented_secret = credentials.secret.or(form.client_secret);
     let code = form.code.ok_or_else(|| {
         CustomError::BadRequestToken(TokenError {
             error: CoreErrorResponseType::InvalidRequest,
@@ -1349,101 +1970,76 @@ async fn token_authorization_code(
         })
     })?;
 
-    // C2 Step 1: bind the auth code to the client it was issued to. A correct
-    // client presents the same `client_id` at /authorize and /token. If the code
-    // carries a client_id (always set by `sign_in`), the request's client_id —
-    // when present — must match it, and the rest of the function runs against the
-    // code's client (never the request's). This prevents a leaked confidential
-    // client's code from being redeemed by a different (public) client.
-    if !code_entry.client_id.is_empty() {
-        if let Some(ref req_client_id) = form.client_id {
-            if !constant_time_eq(req_client_id, &code_entry.client_id) {
-                return Err(CustomError::BadRequestToken(TokenError {
-                    error: CoreErrorResponseType::InvalidGrant,
-                    error_description: "client_id does not match the authorization code."
-                        .to_string(),
-                }));
-            }
-        }
-    }
+    // Bind the code to the client it was issued to, and authenticate that
+    // client, through the helpers the refresh grant uses too. A correct client
+    // presents the same `client_id` at /authorize and /token; a code carries its
+    // client_id (always set by `sign_in`), and the rest of the function runs
+    // against the code's client, never the request's. This stops a leaked
+    // confidential client's code from being redeemed by a different (public)
+    // client.
     let client_id = if !code_entry.client_id.is_empty() {
         code_entry.client_id.clone()
-    } else if let Some(c) = form.client_id.clone() {
-        c
     } else {
-        code_entry.client_id.clone()
+        named_client.clone().unwrap_or_default()
     };
+    let client_entry = authenticate_code_client(
+        &client_id,
+        named_client.as_deref(),
+        presented_secret.as_deref(),
+        config,
+        db_client,
+    )
+    .await?;
 
-    if let Some(secret) = if let Some(b) = secret {
-        Some(b)
-    } else {
-        form.client_secret.clone()
-    } {
-        let client_entry = db_client
-            .get_client(client_id.clone())
-            .await?
-            .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
-        if !constant_time_eq(&secret, &client_entry.secret) {
-            return Err(CustomError::Unauthorized("Bad secret.".to_string()));
+    // PKCE: every code carries the challenge `/authorize` bound to its session,
+    // and the verifier must match it. A code without a challenge (only an older
+    // build wrote those) is refused.
+    let challenge = code_entry.code_challenge.as_ref().ok_or_else(|| {
+        CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description:
+                "This authorization code carries no PKCE challenge; restart the sign-in."
+                    .to_string(),
+        })
+    })?;
+    let verifier = form.code_verifier.as_ref().ok_or_else(|| {
+        CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "code_verifier required (PKCE).".to_string(),
+        })
+    })?;
+    let method = code_entry
+        .code_challenge_method
+        .as_deref()
+        .unwrap_or("S256");
+    // C2 Step 4b: reject the `plain` PKCE method. Discovery advertises S256
+    // only (`code_challenge_methods_supported = ["S256"]`); no compliant
+    // client sends `plain`, and the downgrade weakens the PKCE binding.
+    let computed = match method {
+        "S256" => {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(verifier.as_bytes());
+            URL_SAFE_NO_PAD.encode(hash)
         }
-    } else {
-        let client_entry = db_client
-            .get_client(client_id.clone())
-            .await?
-            .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
-        match client_entry.metadata.token_endpoint_auth_method() {
-            Some(CoreClientAuthMethod::None) => {}
-            Some(_) => {
-                return Err(CustomError::Unauthorized("Secret required.".to_string()));
-            }
-            None if config.require_secret => {
-                return Err(CustomError::Unauthorized("Secret required.".to_string()));
-            }
-            None => {}
-        }
-    }
-
-    // PKCE: validate code_verifier if a code_challenge was issued.
-    if let Some(ref challenge) = code_entry.code_challenge {
-        let verifier = form.code_verifier.as_ref().ok_or_else(|| {
-            CustomError::BadRequestToken(TokenError {
-                error: CoreErrorResponseType::InvalidGrant,
-                error_description: "code_verifier required (PKCE).".to_string(),
-            })
-        })?;
-        let method = code_entry
-            .code_challenge_method
-            .as_deref()
-            .unwrap_or("S256");
-        // C2 Step 4b: reject the `plain` PKCE method. Discovery advertises S256
-        // only (`code_challenge_methods_supported = ["S256"]`); no compliant
-        // client sends `plain`, and the downgrade weakens the PKCE binding.
-        let computed = match method {
-            "S256" => {
-                use sha2::{Digest, Sha256};
-                let hash = Sha256::digest(verifier.as_bytes());
-                URL_SAFE_NO_PAD.encode(hash)
-            }
-            _ => {
-                return Err(CustomError::BadRequestToken(TokenError {
-                    error: CoreErrorResponseType::InvalidGrant,
-                    error_description: "Unsupported code_challenge_method (only S256 is allowed)."
-                        .to_string(),
-                }));
-            }
-        };
-        if !constant_time_eq(&computed, challenge) {
+        _ => {
             return Err(CustomError::BadRequestToken(TokenError {
                 error: CoreErrorResponseType::InvalidGrant,
-                error_description: "code_verifier mismatch.".to_string(),
+                error_description: "Unsupported code_challenge_method (only S256 is allowed)."
+                    .to_string(),
             }));
         }
+    };
+    if !constant_time_eq(&computed, challenge) {
+        return Err(CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "code_verifier mismatch.".to_string(),
+        }));
     }
 
-    let msc3861_mode = config.mas_shared_secret.is_some();
+    // Decided before any claim is looked up, so a refusal costs no ENS call.
+    let issuance = exchange_issuance(delegated_auth_enabled(config), &client_entry, &code_entry)?;
 
     let now = Utc::now();
-    let iat = now.timestamp();
     // This request is DIFFERENT from the sign_in that provisioned the account,
     // so the resolved localpart travels via `CodeEntry.localpart` (set at
     // sign_in) rather than being recomputed here. `None` means the entry was
@@ -1454,74 +2050,69 @@ async fn token_authorization_code(
         .localpart
         .clone()
         .unwrap_or_else(|| crate::localpart::legacy_localpart(&code_entry.did));
-    let claims = resolve_claims(config, &code_entry.did).await;
+    let claims = resolve_claims(config, &code_entry.did, client_entry.class).await;
+    let guest = guest_claim(config, db_client, &client_id, &username).await?;
+    // S5: a guest's grant ends at its deadline (`absolute_exp`), so no refresh outlives
+    // the record even with the reaper stopped. Only the guest client's grants.
+    let absolute_deadline = if config.guest_client_id.as_deref() == Some(client_id.as_str()) {
+        db_client.guest_grant_deadline(&username).await?
+    } else {
+        None
+    };
     let display_name = claims
         .name()
         .and_then(|n| n.get(None))
         .map(|n| n.to_string())
         .unwrap_or_else(|| code_entry.did.clone());
 
-    let (access_prefix, refresh_prefix, scope) = if msc3861_mode {
-        let device_id = code_entry.device_id.clone().unwrap_or_default();
-        (
-            "mat_",
-            "mcr_",
-            format!(
-                "openid urn:matrix:client:api:* urn:matrix:client:device:{}",
-                device_id
-            ),
-        )
-    } else {
-        ("", "", "openid profile".to_string())
-    };
+    // One grant per code exchange (I2): its first access token, its refresh
+    // token when one is issued, and its index entries, written in one step.
+    let issued = db_client
+        .issue_grant(&NewGrant {
+            kind: issuance.kind,
+            username,
+            did: code_entry.did.clone(),
+            client_id: client_id.clone(),
+            confidential_client: client_is_confidential(Some(&client_entry), config.require_secret),
+            device_id: issuance.device_id,
+            scope: issuance.scope.clone(),
+            name: display_name,
+            auth_ms: Some(code_entry.auth_time.timestamp_millis()),
+            access_ttl: ACCESS_TOKEN_TTL,
+            refresh_inactivity_secs: issuance.refresh_token.then_some(REFRESH_TOKEN_TTL),
+            absolute_deadline,
+        })
+        .await
+        .map_err(|e| {
+            if e.is::<siwx_oidc::db::grant::IssueRevoked>() {
+                // M0a: the code was minted before its user, client or device was revoked.
+                CustomError::BadRequestToken(TokenError {
+                    error: CoreErrorResponseType::InvalidGrant,
+                    error_description: "Unknown or already-exchanged code.".to_string(),
+                })
+            } else {
+                CustomError::from(e)
+            }
+        })?;
+    touch_client_after_use(db_client, &client_id).await;
+    let refresh_token = issued.refresh_token.map(RefreshToken::new);
+    let access_token = AccessToken::new(issued.access_token);
 
-    let device_id = code_entry.device_id.clone().unwrap_or_default();
-
-    let opaque = generate_opaque_token(access_prefix);
-    let access_metadata = TokenMetadata {
-        username: username.clone(),
-        device_id: device_id.clone(),
-        scope: scope.clone(),
-        client_id: client_id.clone(),
-        iat,
-        exp: iat + ACCESS_TOKEN_TTL as i64,
-        did: code_entry.did.clone(),
-        name: display_name.clone(),
-    };
-    db_client
-        .set_token(&opaque, &access_metadata, ACCESS_TOKEN_TTL)
-        .await?;
-
-    let refresh_opaque = generate_opaque_token(refresh_prefix);
-    let refresh_metadata = TokenMetadata {
-        username,
-        device_id,
-        scope,
-        client_id: client_id.clone(),
-        iat,
-        exp: iat + REFRESH_TOKEN_TTL as i64,
-        did: code_entry.did.clone(),
-        name: display_name,
-    };
-    db_client
-        .set_token(&refresh_opaque, &refresh_metadata, REFRESH_TOKEN_TTL)
-        .await?;
-
-    let access_token = AccessToken::new(opaque);
-    let refresh_token = Some(RefreshToken::new(refresh_opaque));
-
-    let core_id_token = CoreIdTokenClaims::new(
+    let core_id_token = SiwxIdTokenClaims::new(
         IssuerUrl::from_url(config.base_url.clone()),
         vec![Audience::new(client_id.clone())],
         now + Duration::seconds(config.id_token_ttl_secs as i64),
         now,
         claims,
-        EmptyAdditionalClaims {},
+        SidClaims {
+            sid: issued.sid,
+            guest,
+        },
     )
     .set_nonce(code_entry.nonce)
     .set_auth_time(Some(code_entry.auth_time));
 
-    let id_token = CoreIdToken::new(
+    let id_token = SiwxIdToken::new(
         core_id_token,
         signing_key,
         CoreJwsSigningAlgorithm::EcdsaP256Sha256,
@@ -1532,13 +2123,25 @@ async fn token_authorization_code(
 
     let expires_in_secs = ACCESS_TOKEN_TTL;
 
-    let mut response = CoreTokenResponse::new(
+    let mut response = SiwxTokenResponse::new(
         access_token,
         CoreTokenType::Bearer,
-        CoreIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
+        SiwxIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
     );
     response.set_expires_in(Some(&time::Duration::from_secs(expires_in_secs)));
     response.set_refresh_token(refresh_token);
+    // RFC 6749 §5.1: the response says the granted scope when it differs from
+    // the request. A Matrix session never differs: it records a fixed scope the
+    // client did not choose, and has never put one here.
+    if issuance.report_scope {
+        response.set_scopes(Some(
+            issuance
+                .scope
+                .split_whitespace()
+                .map(|s| Scope::new(s.to_string()))
+                .collect(),
+        ));
+    }
     Ok(response)
 }
 
@@ -1566,6 +2169,89 @@ pub struct AuthorizeParams {
     pub response_mode: Option<String>,
 }
 
+/// M6: refuse a DID that has a guest record. Called after a signature has verified, at
+/// Path B of `sign_in`, account re-auth, device approval and the `siwx` cookie check of
+/// `link_start`. The one carve-out is `/guest/continue` for a live record, which does not
+/// come through here. A guest DID without a record (guest mode never on) is unchanged.
+/// A store failure refuses too: fail closed.
+pub async fn refuse_guest_did(
+    db_client: &(dyn DBClient + Sync),
+    did: &str,
+) -> Result<(), CustomError> {
+    match db_client.guest_did_has_record(did).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(CustomError::Coded {
+            status: 403,
+            code: "guest_identity",
+        }),
+        Err(e) => {
+            warn!(error = %e, "guest record lookup failed, refusing the signature");
+            Err(CustomError::ServiceUnavailable(
+                "The session store is unavailable; retry.".to_string(),
+            ))
+        }
+    }
+}
+
+/// The guest branch of `/authorize` binds the request to a login session that carries
+/// `guest_id`, with the marker already stripped from `scope`. Same session id, secret,
+/// nonce and cookie as [`authorize`]; no login page follows, `/guest/continue` does.
+pub async fn start_guest_session(
+    params: &AuthorizeParams,
+    state: &str,
+    scope: String,
+    guest_id: String,
+    db_client: &DBClientType,
+) -> Result<Box<Cookie<'static>>, CustomError> {
+    let code_challenge = params
+        .code_challenge
+        .clone()
+        .ok_or_else(|| CustomError::BadRequest("code_challenge is required.".to_string()))?;
+    let nonce: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(16)
+        .map(char::from)
+        .collect();
+    let secret: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(16)
+        .map(char::from)
+        .collect();
+    let session_id = Uuid::new_v4();
+    db_client
+        .set_session(
+            session_id.to_string(),
+            SessionEntry {
+                siwe_nonce: nonce,
+                secret,
+                signin_count: 0,
+                verified_did: None,
+                request: Some(AuthorizationRequest {
+                    client_id: params.client_id.clone(),
+                    redirect_uri: params.redirect_uri.as_str().to_string(),
+                    state: state.to_string(),
+                    response_mode: params.response_mode.clone(),
+                    code_challenge,
+                    scope: Some(scope),
+                    nonce: params.nonce.clone(),
+                }),
+                guest_id: Some(guest_id),
+            },
+        )
+        .await?;
+    let is_https = params.redirect_uri.url().scheme() == "https";
+    Ok(Box::new(
+        Cookie::build((SESSION_COOKIE_NAME, session_id.to_string()))
+            .same_site(SameSite::Strict)
+            .http_only(true)
+            .secure(is_https)
+            .max_age(cookie::time::Duration::seconds(
+                SESSION_LIFETIME.try_into().unwrap(),
+            ))
+            .build(),
+    ))
+}
+
 pub async fn authorize(
     params: AuthorizeParams,
     db_client: &DBClientType,
@@ -1574,11 +2260,6 @@ pub async fn authorize(
         .get_client(params.client_id.clone())
         .await
         .map_err(|e| anyhow!("Failed to get kv: {}", e))?;
-    if client_entry.is_none() {
-        return Err(CustomError::Unauthorized(
-            "Unrecognised client id.".to_string(),
-        ));
-    }
 
     let nonce: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -1586,18 +2267,12 @@ pub async fn authorize(
         .map(char::from)
         .collect();
 
-    let mut r_u = params.redirect_uri.clone().url().clone();
-    r_u.set_query(None);
-    let mut r_us: Vec<Url> = client_entry
-        .unwrap()
-        .metadata
-        .redirect_uris()
-        .clone()
-        .iter_mut()
-        .map(|u| u.url().clone())
-        .collect();
-    r_us.iter_mut().for_each(|u| u.set_query(None));
-    if !r_us.contains(&r_u) {
+    let Some(client_entry) = client_entry else {
+        return Err(CustomError::Unauthorized(
+            "Unrecognised client id.".to_string(),
+        ));
+    };
+    if !redirect_uri_is_registered(&client_entry, &params.redirect_uri) {
         return Err(CustomError::Redirect(
             "/error?message=unregistered_redirect_uri".to_string(),
         ));
@@ -1638,7 +2313,7 @@ pub async fn authorize(
         return Err(CustomError::Redirect(url.to_string()));
     }
 
-    if params.response_type.is_none() {
+    let Some(response_type) = params.response_type.as_ref() else {
         let mut url = params.redirect_uri.url().clone();
         url.query_pairs_mut().append_pair("state", &state);
         url.query_pairs_mut()
@@ -1646,8 +2321,22 @@ pub async fn authorize(
         url.query_pairs_mut()
             .append_pair("error_description", "Missing response_type");
         return Err(CustomError::Redirect(url.to_string()));
+    };
+    // Only the authorization-code flow is implemented, and discovery advertises
+    // only `code`. Any other response type goes back to the (validated)
+    // redirect URI as `unsupported_response_type` (RFC 6749 §4.1.2.1), and no
+    // login session is started.
+    if !matches!(response_type, CoreResponseType::Code) {
+        let mut url = params.redirect_uri.url().clone();
+        url.query_pairs_mut().append_pair("state", &state);
+        url.query_pairs_mut().append_pair(
+            "error",
+            CoreAuthErrorResponseType::UnsupportedResponseType.as_ref(),
+        );
+        url.query_pairs_mut()
+            .append_pair("error_description", "Only response_type=code is supported.");
+        return Err(CustomError::Redirect(url.to_string()));
     }
-    let _response_type = params.response_type.as_ref().unwrap();
 
     let scope_str = params.scope.as_str().trim();
     let scopes: Vec<&str> = scope_str.split(' ').filter(|s| !s.is_empty()).collect();
@@ -1658,7 +2347,77 @@ pub async fn authorize(
             anyhow!("The 'openid' scope or a Matrix scope (urn:matrix:*) is required.").into(),
         );
     }
+    // A generic-class client is granted only the scopes it may have, and the code exchange
+    // computes that grant from the scope bound below with the same `grant_for`. Refusing a
+    // request that would grant no `openid` here, before a session exists, spares the user
+    // a sign-in that could only fail. The string checked is the one the session carries,
+    // untrimmed, so every later reader sees the same words. A Matrix-class client's scope
+    // is not decided by `grant_for`, so it is not asked.
+    let scope_is_grantable = match client_entry.class {
+        ClientClass::Matrix => true,
+        ClientClass::Generic => {
+            client_policy::grant_for(&client_entry, params.scope.as_str()).is_some()
+        }
+    };
+    if !scope_is_grantable {
+        let mut url = params.redirect_uri.url().clone();
+        url.query_pairs_mut().append_pair("state", &state);
+        url.query_pairs_mut()
+            .append_pair("error", CoreAuthErrorResponseType::InvalidScope.as_ref());
+        url.query_pairs_mut()
+            .append_pair("error_description", GENERIC_OPENID_REQUIRED_MSG);
+        return Err(CustomError::Redirect(url.to_string()));
+    }
 
+    // A proposed device id outside the accepted charset is refused as an invalid scope,
+    // before a session exists; it is never replaced by a minted id (`device_id_is_valid`).
+    if scope_device_id(params.scope.as_str()).is_err() {
+        let mut url = params.redirect_uri.url().clone();
+        url.query_pairs_mut().append_pair("state", &state);
+        url.query_pairs_mut()
+            .append_pair("error", CoreAuthErrorResponseType::InvalidScope.as_ref());
+        url.query_pairs_mut()
+            .append_pair("error_description", INVALID_DEVICE_ID_MSG);
+        return Err(CustomError::Redirect(url.to_string()));
+    }
+
+    // Validate response_mode strictly (invalid_request semantics): discovery
+    // advertises exactly {"query","fragment"}, so anything else is a 400 rather
+    // than a silently-ignored param the client then waits on.
+    if let Some(rm) = &params.response_mode {
+        if rm != "query" && rm != "fragment" {
+            return Err(CustomError::BadRequest(format!(
+                "Unsupported response_mode '{rm}' (only 'query' and 'fragment' are supported)."
+            )));
+        }
+    }
+    // C2 Step 4b: reject `code_challenge_method=plain` up front. Discovery
+    // advertises S256 only. A missing method defaults to S256.
+    if let Some(ccm) = &params.code_challenge_method {
+        if ccm != "S256" {
+            return Err(CustomError::BadRequest(
+                "Unsupported code_challenge_method (only S256 is allowed).".to_string(),
+            ));
+        }
+    }
+    // C2 Step 4a: require S256 PKCE on every authorization request (the code
+    // flow is the only one). PKCE binds a redeemed code to the client that
+    // started the request. Every real client already sends S256 (Element X per
+    // the Matrix OAuth 2.0 profile, the in-house `siwx-oidc-auth` lib, and all
+    // e2e flows). Scope: ALL clients — every registered `ClientEntry` carries a
+    // server-issued secret regardless of `token_endpoint_auth_method`, so there
+    // is no client class that legitimately omits PKCE to exempt. The
+    // device-code grant (RFC 8628) does NOT pass through /authorize.
+    let Some(code_challenge) = params.code_challenge.clone() else {
+        return Err(CustomError::BadRequest(
+            "code_challenge is required (S256 PKCE) for the authorization-code flow.".to_string(),
+        ));
+    };
+
+    // Bind the request validated above to the login session. `sign_in` issues
+    // the code for exactly this request (client, redirect URI, state, response
+    // mode, PKCE challenge) and never for parameters it receives on the front
+    // channel, which may repeat it but not change it.
     let session_id = Uuid::new_v4();
     let session_secret: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -1670,14 +2429,25 @@ pub async fn authorize(
             session_id.to_string(),
             SessionEntry {
                 siwe_nonce: nonce.clone(),
-                oidc_nonce: params.nonce.clone(),
                 secret: session_secret.clone(),
                 signin_count: 0,
                 verified_did: None,
-                scope: Some(params.scope.as_str().to_string()),
+                request: Some(AuthorizationRequest {
+                    client_id: params.client_id.clone(),
+                    redirect_uri: params.redirect_uri.as_str().to_string(),
+                    state: state.clone(),
+                    response_mode: params.response_mode.clone(),
+                    code_challenge: code_challenge.clone(),
+                    scope: Some(params.scope.as_str().to_string()),
+                    nonce: params.nonce.clone(),
+                }),
+                guest_id: None,
             },
         )
         .await?;
+    // The request passed every check above, so the client is registered and the sign-in
+    // that follows may outlast the last of its lifetime.
+    touch_client_after_use(db_client, &params.client_id).await;
     let is_https = params.redirect_uri.url().scheme() == "https";
     let session_cookie = Cookie::build((SESSION_COOKIE_NAME, session_id.to_string()))
         .same_site(SameSite::Strict)
@@ -1694,73 +2464,28 @@ pub async fn authorize(
         .host()
         .map(|h| h.to_string())
         .unwrap_or_else(|| params.redirect_uri.url().scheme().to_string());
-    let oidc_nonce_param = if let Some(n) = &params.nonce {
-        format!("&oidc_nonce={}", n.secret())
-    } else {
-        "".to_string()
-    };
-    // Validate response_mode strictly (invalid_request semantics): discovery
-    // advertises exactly {"query","fragment"}, so anything else is a 400 rather
-    // than a silently-ignored param the client then waits on.
-    if let Some(rm) = &params.response_mode {
-        if rm != "query" && rm != "fragment" {
-            return Err(CustomError::BadRequest(format!(
-                "Unsupported response_mode '{rm}' (only 'query' and 'fragment' are supported)."
-            )));
-        }
+    // The login page reads these values to build its CAIP-122 message (which
+    // binds `redirect_uri` in its `Resources:`) and its link to /sign_in. Each
+    // value is percent-encoded so the page reads it back exactly: a redirect
+    // URI with several query parameters, or a state with `&` or `+`, would
+    // otherwise be cut or altered. /sign_in takes the request from the session;
+    // it reads them only when the session has expired (`expired_sign_in`).
+    let mut page = url::form_urlencoded::Serializer::new(String::new());
+    page.append_pair("nonce", &nonce)
+        .append_pair("domain", &domain)
+        .append_pair("redirect_uri", params.redirect_uri.as_str())
+        .append_pair("state", &state)
+        .append_pair("client_id", &params.client_id);
+    if let Some(n) = &params.nonce {
+        page.append_pair("oidc_nonce", n.secret());
     }
-    // Round-trip the non-default mode through the login SPA to /sign_in (same
-    // client-side round-trip as the PKCE params). Absent/"query" appends
-    // nothing, keeping the SPA URL byte-identical for existing clients.
-    let response_mode_param = if params.response_mode.as_deref() == Some("fragment") {
-        "&response_mode=fragment".to_string()
-    } else {
-        "".to_string()
-    };
-    // C2 Step 4b: reject `code_challenge_method=plain` up front so a `plain`
-    // challenge is never carried into /sign_in or stored on the CodeEntry.
-    // Discovery advertises S256 only. A missing method defaults to S256.
-    if let Some(ccm) = &params.code_challenge_method {
-        if ccm != "S256" {
-            return Err(CustomError::BadRequest(
-                "Unsupported code_challenge_method (only S256 is allowed).".to_string(),
-            ));
-        }
+    page.append_pair("code_challenge", &code_challenge)
+        .append_pair("code_challenge_method", "S256");
+    // Absent/"query" appends nothing.
+    if params.response_mode.as_deref() == Some("fragment") {
+        page.append_pair("response_mode", "fragment");
     }
-    // C2 Step 4a: require S256 PKCE for the authorization-code flow. PKCE is the
-    // only backstop that binds a redeemed code to the browser that initiated the
-    // request; without it, a leaked or stolen code is freely redeemable. Every
-    // real client already sends S256 (Element X per the Matrix OAuth 2.0 profile,
-    // the in-house `siwx-oidc-auth` lib, and all e2e flows), so requiring it is a
-    // spec-compliance tightening that breaks no compliant client. Scope: ALL
-    // code-flow clients — every registered `ClientEntry` carries a server-issued
-    // secret regardless of `token_endpoint_auth_method`, so there is no client
-    // class that legitimately omits PKCE to exempt. The device-code grant (RFC
-    // 8628) does NOT pass through /authorize and is unaffected.
-    if matches!(_response_type, CoreResponseType::Code) && params.code_challenge.is_none() {
-        return Err(CustomError::BadRequest(
-            "code_challenge is required (S256 PKCE) for the authorization-code flow.".to_string(),
-        ));
-    }
-    let pkce_params = match (&params.code_challenge, &params.code_challenge_method) {
-        (Some(cc), Some(ccm)) => format!("&code_challenge={cc}&code_challenge_method={ccm}"),
-        (Some(cc), None) => format!("&code_challenge={cc}&code_challenge_method=S256"),
-        _ => "".to_string(),
-    };
-    Ok((
-        format!(
-            "/?nonce={}&domain={}&redirect_uri={}&state={}&client_id={}{}{}{}",
-            nonce,
-            domain,
-            *params.redirect_uri,
-            state,
-            params.client_id,
-            oidc_nonce_param,
-            pkce_params,
-            response_mode_param
-        ),
-        Box::new(session_cookie),
-    ))
+    Ok((format!("/?{}", page.finish()), Box::new(session_cookie)))
 }
 
 // -- SiwX sign-in ----------------------------------------------------------
@@ -1915,11 +2640,41 @@ pub fn validate_caip122_envelope(
     Ok(())
 }
 
+/// Whether `redirect_uri` is one of the client's registered redirect URIs.
+///
+/// The match is exact (RFC 9700 §4.1.3): the whole URL, query included,
+/// compared after URL parsing. A registration that carries a query (Element Web
+/// registers `…/?no_universal_links=true`) matches only that exact query, and
+/// an extra or missing query component is a different URI. This is the one
+/// matcher for both `authorize` and `sign_in`, so the two cannot disagree.
+fn redirect_uri_is_registered(client: &ClientEntry, redirect_uri: &RedirectUrl) -> bool {
+    client
+        .metadata
+        .redirect_uris()
+        .iter()
+        .any(|registered| registered.url() == redirect_uri.url())
+}
+
+/// Whether `uri` is one of the client's registered `post_logout_redirect_uris`,
+/// matched exactly like [`redirect_uri_is_registered`] (RFC 9700 §4.1.3: the
+/// whole URL, query included, after URL parsing). The one matcher for
+/// RP-initiated logout, so a URI that is not registered never redirects.
+fn post_logout_redirect_uri_is_registered(client: &ClientEntry, uri: &Url) -> bool {
+    client
+        .metadata
+        .additional_metadata()
+        .post_logout_redirect_uris
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|registered| registered.url() == uri)
+}
+
 /// C2 Step 3: re-validate a `redirect_uri` against the client's *registered*
-/// redirect_uris, mirroring the exact check in `authorize` (query-stripped exact
-/// match). Used by `sign_in` so a code is never appended to an unregistered (e.g.
-/// attacker-controlled) redirect_uri — closing the open-redirect on BOTH the
-/// wallet (Path B) and WebAuthn (Path A) login paths.
+/// redirect_uris with the same exact match as `authorize`
+/// ([`redirect_uri_is_registered`]). Used by `sign_in` so a code is never
+/// appended to an unregistered redirect_uri, on BOTH the wallet (Path B) and
+/// WebAuthn (Path A) login paths.
 /// Returns the client's entry, so the caller can use its registration (the
 /// device name in `sign_in`) without a second read.
 async fn validate_registered_redirect_uri(
@@ -1933,17 +2688,7 @@ async fn validate_registered_redirect_uri(
         .map_err(|e| anyhow!("Failed to get kv: {}", e))?
         .ok_or_else(|| CustomError::Unauthorized("Unrecognised client id.".to_string()))?;
 
-    let mut r_u = redirect_uri.url().clone();
-    r_u.set_query(None);
-    let mut r_us: Vec<Url> = client_entry
-        .metadata
-        .redirect_uris()
-        .clone()
-        .iter_mut()
-        .map(|u| u.url().clone())
-        .collect();
-    r_us.iter_mut().for_each(|u| u.set_query(None));
-    if !r_us.contains(&r_u) {
+    if !redirect_uri_is_registered(&client_entry, redirect_uri) {
         return Err(CustomError::BadRequest(
             "redirect_uri is not registered for this client.".to_string(),
         ));
@@ -2024,33 +2769,97 @@ pub fn verify_siwx_cookie(
     Ok(siwx_cookie.did)
 }
 
-#[derive(Deserialize)]
-pub struct SignInParams {
-    pub redirect_uri: RedirectUrl,
-    pub state: String,
-    pub oidc_nonce: Option<Nonce>,
-    pub client_id: String,
-    /// PKCE code_challenge (passed through from /authorize).
-    pub code_challenge: Option<String>,
-    /// PKCE code_challenge_method. Only "S256" is accepted; "plain" is
-    /// rejected at /authorize.
-    pub code_challenge_method: Option<String>,
-    /// OAuth response_mode (passed through from /authorize; validated there).
-    pub response_mode: Option<String>,
+/// A bound request for `client_id` at `https://example.com/callback`, as
+/// `authorize` would store it. For tests that drive `sign_in` directly.
+#[cfg(test)]
+pub(crate) fn bound_test_request(client_id: &str) -> AuthorizationRequest {
+    AuthorizationRequest {
+        client_id: client_id.to_string(),
+        redirect_uri: "https://example.com/callback".to_string(),
+        state: "state".to_string(),
+        response_mode: None,
+        code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
+        scope: None,
+        nonce: None,
+    }
 }
 
-/// Extract a device_id from a scope string containing `urn:matrix:client:device:XXX`.
-fn extract_device_id_from_scope(scope: &str) -> Option<String> {
+/// The authorization request this sign-in completes: the one `/authorize`
+/// validated and bound to the session. It is the only source of the client,
+/// redirect URI, state, response mode, PKCE challenge and nonce: `sign_in`
+/// reads no authorization parameter from its own query while the session lives.
+/// The login page appends them to its `/sign_in` link; they are read only when
+/// the session has expired, and then only for the error redirect
+/// ([`expired_sign_in`]).
+fn bound_request(session: &SessionEntry) -> Result<AuthorizationRequest, CustomError> {
+    session.request.clone().ok_or_else(|| {
+        CustomError::BadRequest(
+            "This sign-in has no bound authorization request (it was started before a \
+             server update). Restart the sign-in from the application."
+                .to_string(),
+        )
+    })
+}
+
+/// A device id a scope proposes that is outside the accepted charset.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct InvalidDeviceId;
+
+/// What an authorization request answers (as `invalid_scope`, or a 400) when its scope
+/// proposes a device id outside [`device_id_is_valid`]'s charset.
+pub(crate) const INVALID_DEVICE_ID_MSG: &str =
+    "The requested device id is not valid. Use 1 to 64 letters, digits or . _ ~ - + /.";
+
+/// Whether `id` is an acceptable proposed device id: 1 to 64 characters of
+/// `[A-Za-z0-9._~+/-]`.
+///
+/// RFC 3986 unreserved characters (what MSC2967 allows) plus `+` and `/`, which Element X
+/// has sent in base64-style device ids. The charset is a security property, not only
+/// hygiene: `pre_claim_devices` on a guest record is one comma-joined Redis string
+/// (`COMMIT_CLAIM`, `read_pre_claim_devices`), so an id holding `,` would split into
+/// other ids and escape claim revocation and the GP-CLM-26 refusal. No character here is
+/// a comma, whitespace or control character.
+pub(crate) fn device_id_is_valid(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'+' | b'/' | b'-')
+        })
+}
+
+/// The device id a scope proposes via `urn:matrix:client:device:XXX` (or the MSC2967
+/// unstable prefix): `Ok(None)` when it proposes none, `Err` when a proposal is outside
+/// the accepted charset. An invalid proposal is refused by the caller, never replaced by
+/// a minted id.
+pub(crate) fn scope_device_id(scope: &str) -> Result<Option<String>, InvalidDeviceId> {
     const STABLE_PREFIX: &str = "urn:matrix:client:device:";
     const MSC2967_PREFIX: &str = "urn:matrix:org.matrix.msc2967.client:device:";
-    scope
-        .split_whitespace()
-        .find_map(|s| {
-            s.strip_prefix(STABLE_PREFIX)
-                .or_else(|| s.strip_prefix(MSC2967_PREFIX))
-                .map(|id| id.to_string())
-        })
-        .filter(|id| !id.is_empty())
+    let mut found = None;
+    for id in scope.split_whitespace().filter_map(|s| {
+        s.strip_prefix(STABLE_PREFIX)
+            .or_else(|| s.strip_prefix(MSC2967_PREFIX))
+    }) {
+        // An empty id is no proposal; every other one must be valid, whichever is used.
+        if id.is_empty() {
+            continue;
+        }
+        if !device_id_is_valid(id) {
+            return Err(InvalidDeviceId);
+        }
+        found.get_or_insert_with(|| id.to_string());
+    }
+    Ok(found)
+}
+
+/// [`scope_device_id`] over an optional request scope, an invalid proposal as the 400 that
+/// `sign_in` answers for an invalid scope.
+fn bound_device_id(scope: Option<&str>) -> Result<Option<String>, CustomError> {
+    match scope.map(scope_device_id) {
+        None | Some(Ok(None)) => Ok(None),
+        Some(Ok(Some(id))) => Ok(Some(id)),
+        Some(Err(InvalidDeviceId)) => {
+            Err(CustomError::BadRequest(INVALID_DEVICE_ID_MSG.to_string()))
+        }
+    }
 }
 
 /// Resolve the device_id to provision: use the client-proposed id when present,
@@ -2079,7 +2888,7 @@ const MAX_DEVICE_DISPLAY_NAME_CHARS: usize = 100;
 /// names (`client_name#de`) gets the one with the lexicographically smallest
 /// tag. The tagged names sit in a `HashMap`, so "the first one" would change
 /// from one sign-in to the next.
-fn device_display_name(client_id: &str, client: Option<&ClientEntry>) -> String {
+pub(crate) fn device_display_name(client_id: &str, client: Option<&ClientEntry>) -> String {
     let registered = client
         .and_then(|c| c.metadata.client_name())
         .and_then(|names| {
@@ -2115,27 +2924,14 @@ fn provider_written_displayname(current: &str, did: &str, localpart: &str) -> bo
     current == did || current == localpart
 }
 
-/// Provision a Synapse user+device for a DID. Best-effort: failures are logged
-/// but never fail the auth flow. Idempotent: re-provisioning the same device_id
-/// is a plain upsert that preserves the device's E2EE keys. Never deletes an
-/// existing device (device teardown is explicit — see `compat` / account actions).
+/// The ACCOUNT half of sign-in provisioning: create the Synapse account for a new identity
+/// (with its alias), heal a row-less profile, migrate a provider-written displayname, and
+/// publish the attested `io.inblock.did` field. It creates no device and arms no
+/// cross-signing reset.
 ///
-/// **Cross-signing reset arm (product 3B, 2026-07-25):** after upsert, always
-/// best-effort `allow_cross_signing_reset` so a half-reset client can publish
-/// replacement public keys without requiring a separate `/account` visit on
-/// every recovery path. First-time bootstrap still relies on MSC3967 when no
-/// master exists; this call is a no-op or soft-fail in that case and must not
-/// fail sign-in. Explicit MSC4312 account reauth remains available and still
-/// uses the honesty gate in `account.rs`.
-///
-/// `proposed_device_id`: the client-supplied device_id from the OAuth scope
-/// (stable for Element Web and Element X). When `None`, a fresh `SIWX_{uuid}`
-/// is minted.
-///
-/// `display_name` is the name a device CREATED by this sign-in gets
-/// ([`device_display_name`]). An existing device keeps its name: the device is
-/// upserted without one and named only when Synapse reports it created it (see
-/// the upsert below).
+/// This is the ONE place the DID tier is published. [`provision_synapse_device`] calls it
+/// before its device half; a generic-class sign-in calls it alone. Best-effort: it never
+/// fails a sign-in.
 ///
 /// **Loud failure + self-heal (2026-08-01 incident, discriminator corrected
 /// 2026-08-02):** a `provision_user` failure at first sign-in used to be
@@ -2200,23 +2996,18 @@ fn provider_written_displayname(current: &str, did: &str, localpart: &str) -> bo
 /// scenario. Taking the whole struct makes it impossible to call this with a
 /// localpart whose origin nobody stated, which is the only structural way to
 /// stop a future third call site from reintroducing the bug.
-pub async fn provision_synapse_device(
+pub async fn provision_synapse_account(
     did: &str,
     identity: &crate::localpart::ResolvedIdentity,
-    synapse_client: Option<&SynapseClient>,
-    display_name: &str,
-    proposed_device_id: Option<&str>,
+    synapse: &SynapseClient,
     server_name: Option<&str>,
     did_publication: Option<&DidPublication<'_>>,
-) -> Option<String> {
-    let synapse = synapse_client?;
+) {
     let localpart = identity.localpart.as_str();
-    let dev_id = resolve_device_id(proposed_device_id);
     // Tier 1. Derived here once and used by all three write paths below (first
     // sign-in, row-absent self-heal, provider-written migration) so they cannot
     // seed three different names for one account.
     let alias = siwx_oidc::alias::alias_for(did);
-    debug!("provisioning device_id={} for did={}", dev_id, did);
 
     match synapse.is_localpart_available(localpart).await {
         Ok(true) => {
@@ -2368,7 +3159,7 @@ pub async fn provision_synapse_device(
     // Plan invariant 1: sign-in NEVER fails because of this feature. Every
     // outcome — including a 500 from a row-less account (#19702) — is logged
     // and dropped, the same contract `upsert_device` and
-    // `allow_cross_signing_reset` have immediately below.
+    // `allow_cross_signing_reset` have in `provision_synapse_device`.
     //
     // # No `server_name`, no publication
     //
@@ -2442,6 +3233,85 @@ pub async fn provision_synapse_device(
             ),
         }
     }
+}
+
+/// Provision a Synapse user+device for a DID. Best-effort: failures are logged
+/// but never fail the auth flow. Idempotent: re-provisioning the same device_id
+/// is a plain upsert that preserves the device's E2EE keys. Never deletes an
+/// existing device (device teardown is explicit, see `compat` / account actions).
+///
+/// The account comes first: [`provision_synapse_account`] creates it, heals its profile and
+/// publishes the attested DID field, and its doc holds the tier model and the self-heal
+/// rules. `identity`, `server_name` and `did_publication` are handed to it unchanged. This
+/// function adds the device half.
+///
+/// **Cross-signing reset arm (product 3B, 2026-07-25):** after upsert, always
+/// best-effort `allow_cross_signing_reset` so a half-reset client can publish
+/// replacement public keys without requiring a separate `/account` visit on
+/// every recovery path. First-time bootstrap still relies on MSC3967 when no
+/// master exists; this call is a no-op or soft-fail in that case and must not
+/// fail sign-in. Explicit MSC4312 account reauth remains available and still
+/// uses the honesty gate in `account.rs`.
+///
+/// `proposed_device_id`: the client-supplied device_id from the OAuth scope
+/// (stable for Element Web and Element X). When `None`, a fresh `SIWX_{uuid}`
+/// is minted.
+///
+/// `display_name` is the name a device CREATED by this sign-in gets
+/// ([`device_display_name`]). An existing device keeps its name: the device is
+/// upserted without one and named only when Synapse reports it created it (see
+/// the upsert below).
+///
+/// The non-strict form, kept for tests: both production call sites (`sign_in`, the
+/// device-code grant) call [`provision_synapse_device_with`] with SS4 flag 2's strictness.
+#[cfg(test)]
+pub async fn provision_synapse_device(
+    did: &str,
+    identity: &crate::localpart::ResolvedIdentity,
+    synapse_client: Option<&SynapseClient>,
+    display_name: &str,
+    proposed_device_id: Option<&str>,
+    server_name: Option<&str>,
+    did_publication: Option<&DidPublication<'_>>,
+) -> Option<String> {
+    provision_synapse_device_with(
+        did,
+        identity,
+        synapse_client,
+        display_name,
+        proposed_device_id,
+        server_name,
+        did_publication,
+        false,
+    )
+    .await
+    // Not strict: never `Err`.
+    .ok()
+    .flatten()
+}
+
+/// [`provision_synapse_device`], failing closed when `strict` (SS4 flag 2, 8.27): a failed
+/// `upsert_device` is `Err(())`, answered before the cross-signing reset window is armed.
+/// Not `strict`, it is the warning it has always been and the device id is returned.
+#[allow(clippy::too_many_arguments)]
+async fn provision_synapse_device_with(
+    did: &str,
+    identity: &crate::localpart::ResolvedIdentity,
+    synapse_client: Option<&SynapseClient>,
+    display_name: &str,
+    proposed_device_id: Option<&str>,
+    server_name: Option<&str>,
+    did_publication: Option<&DidPublication<'_>>,
+    strict: bool,
+) -> std::result::Result<Option<String>, ()> {
+    let Some(synapse) = synapse_client else {
+        return Ok(None);
+    };
+    let localpart = identity.localpart.as_str();
+    let dev_id = resolve_device_id(proposed_device_id);
+    debug!("provisioning device_id={} for did={}", dev_id, did);
+
+    provision_synapse_account(did, identity, synapse, server_name, did_publication).await;
 
     // Upsert WITHOUT a name, then name the device only if this upsert created
     // it. Synapse overwrites an existing device's name whenever one is sent,
@@ -2459,6 +3329,14 @@ pub async fn provision_synapse_device(
             }
         }
         Ok(DeviceUpsert::AlreadyExisted) => {}
+        Err(e) if strict => {
+            warn!(
+                device_fp = %siwx_oidc::redact::fingerprint(&dev_id),
+                error = %e,
+                "upsert_device failed; refusing the sign-in (no grant without a device)"
+            );
+            return Err(());
+        }
         Err(e) => warn!("upsert_device failed: {}", e),
     }
 
@@ -2476,12 +3354,188 @@ pub async fn provision_synapse_device(
         );
     }
 
-    Some(dev_id)
+    Ok(Some(dev_id))
+}
+
+/// What `/authorize` (as an `invalid_scope` redirect) and `/sign_in` (as a 400) tell a
+/// generic-class client whose request grants it no `openid`.
+const GENERIC_OPENID_REQUIRED_MSG: &str = "This client must request the openid scope.";
+
+/// What `sign_in` answers (a 400, as for an invalid scope) when the scope proposes a device
+/// id the account held before its guest claim (GP-CLM-26).
+const PRE_CLAIM_DEVICE_REFUSED_MSG: &str =
+    "The requested device id cannot be used for this account. Choose another device.";
+
+/// What `sign_in` (as an `invalid_scope` redirect to the bound redirect_uri) and the
+/// device-code grant (as its `invalid_scope` JSON error) tell a Matrix-class client whose
+/// scope proposes a device id siwx-oidc deleted while SS4 flag 2 was on (8.1).
+pub(crate) const DELETED_DEVICE_REFUSED_MSG: &str = "The requested device id was signed out \
+     and cannot be used again. Sign in with a new device id.";
+
+/// What `sign_in` (as a `temporarily_unavailable` redirect) and the device-code grant (as
+/// its `temporarily_unavailable` JSON error) tell the client under SS4 flag 2 (8.27) when
+/// the homeserver could not provision the session's device: no grant is issued without a
+/// Synapse device.
+pub(crate) const DEVICE_PROVISIONING_UNAVAILABLE_MSG: &str = "Sign-in is temporarily \
+     unavailable because the homeserver could not set up this device. Please try again shortly.";
+
+/// What `sign_in` tells the client (as a `temporarily_unavailable` redirect, SS4 flag 2,
+/// 8.27) when a device check before provisioning (the pre-claim list, the deleted-id
+/// marker) could not be read: it fails closed, no code is issued.
+pub(crate) const DEVICE_CHECK_UNAVAILABLE_MSG: &str = "Sign-in is temporarily unavailable \
+     because the requested device id could not be checked. Please try again shortly.";
+
+/// SS4 flag 2 (8.12): whether `device_id` carries a deleted-id marker for the account of
+/// `did`. Both localparts a DID can hold are asked (the legacy and the modern one; a
+/// guest's is the modern one), so no homeserver probe is needed and the check can run
+/// before the deactivation gate. Two `EXISTS`; a Redis error is an error (fail closed).
+async fn device_id_was_deleted(
+    db_client: &DBClientType,
+    did: &str,
+    device_id: &str,
+) -> Result<bool> {
+    let legacy = siwx_oidc::mxid::legacy_localpart(did);
+    if db_client.is_deleted_device(&legacy, device_id).await? {
+        return Ok(true);
+    }
+    let modern = siwx_oidc::mxid::localpart_for(did);
+    Ok(modern != legacy && db_client.is_deleted_device(&modern, device_id).await?)
+}
+
+/// A `sign_in` refusal as the authorization error response (RFC 6749 4.1.2.1): a 303 to
+/// the redirect_uri `/authorize` bound, never an issuer page, carrying `error`,
+/// `error_description` and the bound `state`, in the fragment when the request asked for
+/// `response_mode=fragment` (as the success redirect does). No `iss`: the `/authorize`
+/// error redirects add none. Used under SS4 flag 2 only.
+fn sign_in_refusal_redirect(
+    redirect_uri: &RedirectUrl,
+    request: &AuthorizationRequest,
+    error: CoreAuthErrorResponseType,
+    description: &str,
+) -> CustomError {
+    authorization_error_redirect(
+        redirect_uri,
+        request.response_mode.as_deref(),
+        error,
+        description,
+        Some(&request.state),
+    )
+}
+
+/// The authorization error response (RFC 6749 4.1.2.1) to `redirect_uri`, which the caller
+/// has validated: `error`, `error_description` and `state` when there is one, in the
+/// fragment for `response_mode=fragment` and in the query otherwise. No `iss`.
+fn authorization_error_redirect(
+    redirect_uri: &RedirectUrl,
+    response_mode: Option<&str>,
+    error: CoreAuthErrorResponseType,
+    description: &str,
+    state: Option<&str>,
+) -> CustomError {
+    let mut url = redirect_uri.url().clone();
+    if response_mode == Some("fragment") {
+        let mut fragment = url::form_urlencoded::Serializer::new(String::new());
+        fragment
+            .append_pair("error", error.as_ref())
+            .append_pair("error_description", description);
+        if let Some(state) = state {
+            fragment.append_pair("state", state);
+        }
+        url.set_fragment(Some(&fragment.finish()));
+    } else {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("error", error.as_ref())
+            .append_pair("error_description", description);
+        if let Some(state) = state {
+            query.append_pair("state", state);
+        }
+    }
+    CustomError::Redirect(url.to_string())
+}
+
+/// The `error_description` of the redirect [`expired_sign_in`] answers.
+pub(crate) const SIGN_IN_TIMED_OUT_MSG: &str = "The sign-in timed out. Start it again.";
+
+/// What `/sign_in` answers when its login session is gone ([`CustomError::LoginSessionExpired`]).
+///
+/// The request `/authorize` bound went with the session, so this reads the parameters the
+/// login page repeats on its `/sign_in` link (`client_id`, `redirect_uri`, `state`,
+/// `response_mode`; the first of each counts), for one purpose: when `client_id` names a
+/// registered client and `redirect_uri` is one of its registered redirect URIs, matched as
+/// `/authorize` matches it, the answer is the `access_denied` error redirect there with that
+/// `state`, so the client can offer a new sign-in. The client checks the `state` against
+/// its own, as for any authorization response. Anything else (a parameter missing, an
+/// unknown client, an unregistered redirect URI, a failed client lookup) gets the timed-out
+/// page, which reflects no input and links nowhere. Issues no code and writes nothing.
+pub async fn expired_sign_in(query: Option<&str>, db_client: &DBClientType) -> CustomError {
+    let (mut client_id, mut redirect_uri, mut state, mut response_mode) = (None, None, None, None);
+    for (name, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        let slot = match name.as_ref() {
+            "client_id" => &mut client_id,
+            "redirect_uri" => &mut redirect_uri,
+            "state" => &mut state,
+            "response_mode" => &mut response_mode,
+            _ => continue,
+        };
+        slot.get_or_insert_with(|| value.into_owned());
+    }
+    let (Some(client_id), Some(redirect_uri)) = (client_id, redirect_uri) else {
+        return CustomError::LoginSessionExpired;
+    };
+    let Ok(redirect_uri) = RedirectUrl::new(redirect_uri) else {
+        return CustomError::LoginSessionExpired;
+    };
+    let client = match db_client.get_client(client_id.clone()).await {
+        Ok(Some(client)) => client,
+        Ok(None) => return CustomError::LoginSessionExpired,
+        Err(e) => {
+            warn!(error = %e, "expired sign-in: client lookup failed, showing the timed-out page");
+            return CustomError::LoginSessionExpired;
+        }
+    };
+    if !redirect_uri_is_registered(&client, &redirect_uri) {
+        return CustomError::LoginSessionExpired;
+    }
+    info!(client_id = %client_id, "sign_in: login session expired, error redirect to the client");
+    authorization_error_redirect(
+        &redirect_uri,
+        response_mode.as_deref(),
+        CoreAuthErrorResponseType::AccessDenied,
+        SIGN_IN_TIMED_OUT_MSG,
+        state.as_deref().filter(|s| !s.is_empty()),
+    )
+}
+
+/// The 503 a generic-class sign-in answers when the homeserver cannot confirm the account.
+const GENERIC_IDENTITY_UNAVAILABLE_MSG: &str = "Sign-in is temporarily unavailable \
+     because the homeserver could not confirm this account. Please try again shortly.";
+
+/// The localpart for a generic-class sign-in: the FALLIBLE `resolve_identity`, never the
+/// legacy guess. A Matrix sign-in degrades to the guess so an existing user is never
+/// severed from their account; a generic client's localpart becomes a mailbox address
+/// that can never be taken back, so there the guess is the worse failure, and a fault is
+/// a 503. With no homeserver configured there is nothing to ask: `resolve_identity` then
+/// answers the legacy localpart, which never gets a mailbox address.
+async fn resolve_generic_identity(
+    did: &str,
+    synapse_client: Option<&SynapseClient>,
+) -> Result<crate::localpart::ResolvedIdentity, CustomError> {
+    crate::localpart::resolve_identity(did, synapse_client)
+        .await
+        .map_err(|e| {
+            warn!(
+                did = %did,
+                error = %e,
+                "generic sign-in: identity resolution failed; refusing instead of guessing"
+            );
+            CustomError::ServiceUnavailable(GENERIC_IDENTITY_UNAVAILABLE_MSG.to_string())
+        })
 }
 
 /// `did_publication` carries the provider's signing key + issuer for the
 /// attested `io.inblock.did` profile field (see
-/// [`provision_synapse_device`]). It is built by the axum handler, which is the
+/// [`provision_synapse_account`]). It is built by the axum handler, which is the
 /// one place that holds both `AppState::signing_key` and `config.base_url`;
 /// `None` disables publication.
 #[allow(clippy::too_many_arguments)]
@@ -2489,25 +3543,34 @@ pub async fn sign_in(
     _base_url: &Url,
     allowed_did_methods: &[String],
     allowed_pkh_namespaces: &[String],
-    params: SignInParams,
     cookies: headers::Cookie,
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
     server_name: Option<&str>,
     did_publication: Option<&DidPublication<'_>>,
+    guest_config: Option<&crate::config::Config>,
 ) -> Result<(Url, String), CustomError> {
-    let session_id = if let Some(c) = cookies.get(SESSION_COOKIE_NAME) {
-        c
-    } else {
-        return Err(CustomError::BadRequest(
-            "Session cookie not found".to_string(),
-        ));
+    // No cookie and no session are the same fact: the login session expired.
+    let Some(session_id) = cookies.get(SESSION_COOKIE_NAME) else {
+        return Err(CustomError::LoginSessionExpired);
     };
-    let session_entry = if let Some(e) = db_client.get_session(session_id.to_string()).await? {
-        e
-    } else {
-        return Err(CustomError::BadRequest("Session not found".to_string()));
+    let Some(session_entry) = db_client.get_session(session_id.to_string()).await? else {
+        return Err(CustomError::LoginSessionExpired);
     };
+
+    // The request this sign-in completes, as `/authorize` bound it. Checked
+    // before the session is spent.
+    let request = bound_request(&session_entry)?;
+    let redirect_uri = RedirectUrl::new(request.redirect_uri.clone())
+        .map_err(|e| anyhow!("bound redirect_uri does not parse: {}", e))?;
+
+    // A session `/authorize` started for the guest marker is finished only by
+    // `/guest/continue`, which writes `verified_did`. Checked before the session is
+    // marked signed in, so a refusal burns nothing; the provisioning is further down,
+    // where the Matrix class arm branches on `guest_id`.
+    if session_entry.guest_id.is_some() {
+        crate::guest::handoff::guest_sign_in_precheck(&session_entry)?;
+    }
 
     // Atomically mark session as signed-in (prevents race-condition double sign-in).
     if !db_client
@@ -2604,18 +3667,25 @@ pub async fn sign_in(
             ));
         }
 
+        // M6: a guest DID does not sign in by signature on Path B.
+        refuse_guest_did(db_client, &siwx_cookie.did).await?;
+
         let msg_nonce = extract_nonce(&siwx_cookie.message)
             .ok_or_else(|| anyhow!("Nonce not found in CAIP-122 message"))?;
         if msg_nonce != session_entry.siwe_nonce {
             return Err(CustomError::BadRequest("Nonce mismatch".to_string()));
         }
 
-        let redirect_url = params.redirect_uri.url();
+        let redirect_url = redirect_uri.url();
         if !extract_resources(&siwx_cookie.message)
             .iter()
             .any(|r| Url::parse(r).ok().as_ref() == Some(redirect_url))
         {
-            return Err(anyhow!("Missing or mismatched resource in CAIP-122 message").into());
+            // The client signed a message that binds no (or another) redirect
+            // URI: its mistake, not a server fault.
+            return Err(CustomError::BadRequest(
+                "Missing or mismatched resource in CAIP-122 message".to_string(),
+            ));
         }
 
         // C1 (login path): enforce the message Expiration Time. The login
@@ -2627,13 +3697,104 @@ pub async fn sign_in(
         siwx_cookie.did
     };
 
+    // GP-CLM-26: a claimed guest's pre-claim device ids stay refused. The device tombstone
+    // lasts 900 s and Synapse keeps the device rows, so a login proposing one of those ids
+    // after that would reuse a revoked device. Placed after the DID is proven and BEFORE
+    // the deactivation gate and every other Synapse call. One cheap Redis read, only when
+    // the scope proposes an id; an account without a guest record has no field, so an
+    // ordinary account is unaffected. A Redis error fails closed (it hides whether a
+    // record exists): a server error (under SS4 flag 2 a `temporarily_unavailable`
+    // redirect) and no code is issued.
+    // The charset rule (`device_id_is_valid`) is enforced here too, as a 400, though
+    // `/authorize` already refused such a scope: a request bound before this check existed
+    // must not slip a comma-bearing id past the list lookup below.
+    // SS4 flag 2 (`guest_config` is the whole configuration; `None` only in tests): the
+    // refusals below go back to the client as the authorization error response at the
+    // bound redirect_uri (8.1, 8.11) instead of an issuer page with no exit, and so does a
+    // device check that could not be read (8.27, `temporarily_unavailable`).
+    let refuse_deleted_ids = guest_config.is_some_and(|c| c.refuse_deleted_device_ids);
+    let proposed_device_id = bound_device_id(request.scope.as_deref())?;
+    // SS4 flag 2: C2 step 3 (below) runs here instead, before the first refusal, so an
+    // error redirect only ever goes to a redirect_uri the client's registration still
+    // lists; a stale one gets the re-validation's issuer error. It reads Redis only, so
+    // the refusals still come before the deactivation gate and every Synapse call. Flag 2
+    // off keeps the re-validation where it was.
+    let revalidated_client = if refuse_deleted_ids {
+        Some(validate_registered_redirect_uri(&request.client_id, &redirect_uri, db_client).await?)
+    } else {
+        None
+    };
+    let check_unavailable = |what: &str, e: anyhow::Error| {
+        warn!(error = %e, "sign_in: {what} device check failed; refusing the sign-in");
+        sign_in_refusal_redirect(
+            &redirect_uri,
+            &request,
+            CoreAuthErrorResponseType::TemporarilyUnavailable,
+            DEVICE_CHECK_UNAVAILABLE_MSG,
+        )
+    };
+    if let Some(proposed) = proposed_device_id.clone() {
+        let pre_claim = match db_client.device_is_pre_claim_for_did(&did, &proposed).await {
+            Ok(pre_claim) => pre_claim,
+            Err(e) if refuse_deleted_ids => return Err(check_unavailable("pre-claim", e)),
+            Err(e) => return Err(e.into()),
+        };
+        if pre_claim {
+            warn!(did = %did, "sign_in: refused a pre-claim device id (GP-CLM-26)");
+            if refuse_deleted_ids {
+                return Err(sign_in_refusal_redirect(
+                    &redirect_uri,
+                    &request,
+                    CoreAuthErrorResponseType::InvalidScope,
+                    PRE_CLAIM_DEVICE_REFUSED_MSG,
+                ));
+            }
+            return Err(CustomError::BadRequest(
+                PRE_CLAIM_DEVICE_REFUSED_MSG.to_string(),
+            ));
+        }
+    }
+
+    // SS4 flag 2 (8.1, 8.12): a device id siwx-oidc deleted while the flag was on is never
+    // recreated (Synapse keeps a deleted device's cross-signing signature rows, which
+    // shadow a fresh key upload under the same id). Placed with GP-CLM-26 and for the
+    // same reasons: after the DID is proven, BEFORE the deactivation gate and every
+    // Synapse call, so a refusal provisions nothing, issues no code and arms no
+    // cross-signing reset; the login session is already spent. Matrix-class clients
+    // only (a generic client's token holds no device). A Redis error fails closed, as a
+    // `temporarily_unavailable` redirect.
+    if let (Some(client), Some(proposed)) =
+        (revalidated_client.as_ref(), proposed_device_id.as_deref())
+    {
+        let deleted = client.class == ClientClass::Matrix
+            && match device_id_was_deleted(db_client, &did, proposed).await {
+                Ok(deleted) => deleted,
+                Err(e) => return Err(check_unavailable("deleted-id", e)),
+            };
+        if deleted {
+            warn!(
+                security_event = "deleted_device_refused",
+                channel = "sign_in",
+                client_id = %request.client_id,
+                device_fp = %siwx_oidc::redact::fingerprint(proposed),
+                "sign_in: refused a deleted device id"
+            );
+            return Err(sign_in_refusal_redirect(
+                &redirect_uri,
+                &request,
+                CoreAuthErrorResponseType::InvalidScope,
+                DELETED_DEVICE_REFUSED_MSG,
+            ));
+        }
+    }
+
     // Deactivation gate. Synapse's delegated-auth path never checks
     // `users.deactivated` (zero references in `api/auth/mas.py`, 1.159.0) — it
     // trusts our introspection — and `is_localpart_available` reports a
     // deactivated user's localpart as *taken*, so without this a deactivated or
     // erased account signed straight back in and got a full session. Placed
-    // after the DID is proven but BEFORE `provision_synapse_device`, so a
-    // rejected sign-in leaves no Synapse state behind.
+    // after the DID is proven but BEFORE any provisioning, so a rejected
+    // sign-in leaves no Synapse state behind.
     //
     // # This runs BEFORE `resolve_identity_or_legacy` below, DELIBERATELY
     //
@@ -2644,7 +3805,7 @@ pub async fn sign_in(
     // audit, D4) — making that guard look like near-dead code on the login path.
     // The observation is correct and the ordering is still right. Do not swap
     // them to "make the guard reachable". `sign_in_deactivation_order_tests`
-    // (end of this file) fails if the gate moves anywhere later in `sign_in`.
+    // (a test module of this file) fails if the gate moves anywhere later in `sign_in`.
     //
     // Swapping them would not trade coverage for safety, it would build a live
     // deactivation BYPASS. `resolve_identity_or_legacy` is infallible by
@@ -2670,68 +3831,150 @@ pub async fn sign_in(
     // at APPROVAL time, in a different request, possibly minutes earlier), and
     // the cosmetic `detected_mxid` / `new_user` displays in
     // `axum_lib::detected_mxid_for` and `webauthn_authenticate_finish`.
-    crate::webauthn::reject_if_deactivated(synapse_client, &did).await?;
-
-    // C2 Step 3: re-validate the request redirect_uri against the client's
-    // registered set before issuing the code. `authorize` checks this, but
-    // `sign_in` re-receives `redirect_uri` as a query param and previously
-    // appended the code to whatever URL was supplied. This closes the open
-    // redirect on BOTH the wallet (Path B) and WebAuthn (Path A) paths. Path B
-    // additionally binds the redirect via the signed `Resources:` list above;
-    // this is the only redirect binding Path A has.
-    let client =
-        validate_registered_redirect_uri(&params.client_id, &params.redirect_uri, db_client)
-            .await?;
-    let device_name = device_display_name(&params.client_id, Some(&client));
-
-    // Extract client-proposed device_id from the session's stored scope (if any).
-    let proposed_device_id = session_entry
-        .scope
-        .as_deref()
-        .and_then(extract_device_id_from_scope);
-    // Resolve ONCE (grandfathering decision), and reuse the result as the
-    // single source of truth for both provisioning and the CodeEntry the
-    // eventual /token exchange reads back. Best-effort: a Synapse hiccup here
-    // must not fail sign-in, so an error degrades to the legacy localpart
-    // (never the modern one — see resolve_identity_or_legacy's fail-safe
-    // direction) exactly like the pre-existing degraded-provisioning path.
     //
-    // ORDERING (2026-09-13 audit): `reject_if_deactivated` above has already
-    // failed closed on a persistent probe error, so on THIS path the `degraded`
-    // fallback covers only the residual window — a fault arriving between that
-    // gate's probe and this one. That is deliberate and must not be "fixed" by
-    // reordering: the full argument, including the deactivation bypass a swap
-    // would open and the paths that do exercise `degraded` freely, is at the
-    // gate's call site above.
-    let resolved = crate::localpart::resolve_identity_or_legacy(&did, synapse_client).await;
-    let device_id = provision_synapse_device(
-        &did,
-        &resolved,
-        synapse_client,
-        &device_name,
-        proposed_device_id.as_deref(),
-        server_name,
-        did_publication,
-    )
-    .await;
+    // That window exists for a Matrix-class client only: a generic-class sign-in
+    // resolves with the fallible `resolve_identity` and answers a fault in it
+    // with a 503 (see the class match below).
+    //
+    // SS4 flag 2 (8.27): the gate's refusals go back to the client as the authorization
+    // error response at the bound redirect_uri, like the deleted-id refusal above:
+    // `access_denied` for a deactivated (or erased) account, `temporarily_unavailable`
+    // when the gate could not decide. Flag 2 off keeps the 401 and 503 issuer pages.
+    if let Err(e) = crate::webauthn::reject_if_deactivated(synapse_client, &did).await {
+        return Err(match e {
+            CustomError::Unauthorized(msg) if refuse_deleted_ids => sign_in_refusal_redirect(
+                &redirect_uri,
+                &request,
+                CoreAuthErrorResponseType::AccessDenied,
+                &msg,
+            ),
+            CustomError::ServiceUnavailable(msg) if refuse_deleted_ids => sign_in_refusal_redirect(
+                &redirect_uri,
+                &request,
+                CoreAuthErrorResponseType::TemporarilyUnavailable,
+                &msg,
+            ),
+            other => other,
+        });
+    }
+
+    // C2 Step 3: re-validate the bound redirect_uri against the client's
+    // registered set before issuing the code. `authorize` matched it when it
+    // bound the request; this re-check covers a registration that changed or
+    // expired since, on BOTH the wallet (Path B) and WebAuthn (Path A) paths.
+    // Path B additionally binds the redirect via the signed `Resources:` list
+    // above. Under SS4 flag 2 it already ran, before the refusals.
+    let client = match revalidated_client {
+        Some(client) => client,
+        None => {
+            validate_registered_redirect_uri(&request.client_id, &redirect_uri, db_client).await?
+        }
+    };
+
+    let (localpart, device_id) = match client.class {
+        ClientClass::Matrix if session_entry.guest_id.is_some() => {
+            // The guest branch (S4b): fence, fail-closed provisioning, marker, canonical
+            // name, device, `active`. It issues no device or account any other way.
+            let grant = crate::guest::handoff::provision_guest(
+                guest_config,
+                db_client,
+                synapse_client,
+                server_name,
+                &session_entry,
+                &request,
+                &client,
+                &did,
+            )
+            .await?;
+            (grant.localpart, Some(grant.device_id))
+        }
+        ClientClass::Matrix => {
+            let device_name = device_display_name(&request.client_id, Some(&client));
+
+            // Extract a client-proposed device_id from the bound request's scope (if any).
+            // Validated (and the pre-claim check made) before the deactivation gate.
+            // Resolve ONCE (grandfathering decision), and reuse the result as the
+            // single source of truth for both provisioning and the CodeEntry the
+            // eventual /token exchange reads back. Best-effort: a Synapse hiccup here
+            // must not fail sign-in, so an error degrades to the legacy localpart
+            // (never the modern one; see resolve_identity_or_legacy's fail-safe
+            // direction) exactly like the pre-existing degraded-provisioning path.
+            //
+            // ORDERING (2026-09-13 audit): `reject_if_deactivated` above has already
+            // failed closed on a persistent probe error, so on THIS path the `degraded`
+            // fallback covers only the residual window: a fault arriving between that
+            // gate's probe and this one. That is deliberate and must not be "fixed" by
+            // reordering: the full argument, including the deactivation bypass a swap
+            // would open and the paths that do exercise `degraded` freely, is at the
+            // gate's call site above.
+            let resolved = crate::localpart::resolve_identity_or_legacy(&did, synapse_client).await;
+            // SS4 flag 2 (8.27): no grant without a Synapse device. A failed upsert
+            // answers `temporarily_unavailable` before the cross-signing reset window is
+            // armed and before a code exists; flag 2 off keeps today's warning.
+            let device_id = provision_synapse_device_with(
+                &did,
+                &resolved,
+                synapse_client,
+                &device_name,
+                proposed_device_id.as_deref(),
+                server_name,
+                did_publication,
+                refuse_deleted_ids,
+            )
+            .await
+            .map_err(|()| {
+                sign_in_refusal_redirect(
+                    &redirect_uri,
+                    &request,
+                    CoreAuthErrorResponseType::TemporarilyUnavailable,
+                    DEVICE_PROVISIONING_UNAVAILABLE_MSG,
+                )
+            })?;
+            (resolved.localpart.clone(), device_id)
+        }
+        ClientClass::Generic => {
+            // The scope first: checking it has no side effects. `/authorize` asked the
+            // same of the request, so this catches only a client whose policy changed
+            // since, before an account is created that no code will ever redeem.
+            client_policy::grant_for(&client, request.scope.as_deref().unwrap_or(""))
+                .ok_or_else(|| CustomError::BadRequest(GENERIC_OPENID_REQUIRED_MSG.to_string()))?;
+            // The gate above covers a fault it sees; the fallible resolver here covers one
+            // that arrives after it, which the Matrix branch answers with the legacy guess.
+            let resolved = resolve_generic_identity(&did, synapse_client).await?;
+            if let Some(synapse) = synapse_client {
+                provision_synapse_account(&did, &resolved, synapse, server_name, did_publication)
+                    .await;
+            }
+            // No device and no cross-signing reset: a generic client's token is not a
+            // Matrix session, so there is nothing for either to belong to.
+            (resolved.localpart.clone(), None)
+        }
+    };
 
     let code_entry = CodeEntry {
         did: did.clone(),
-        nonce: params.oidc_nonce.clone(),
+        nonce: request.nonce.clone(),
         exchange_count: 0,
-        client_id: params.client_id.clone(),
-        auth_time: Utc::now(),
-        code_challenge: params.code_challenge.clone(),
-        code_challenge_method: params.code_challenge_method.clone(),
-        localpart: Some(resolved.localpart.clone()),
+        client_id: request.client_id.clone(),
+        // The authentication, from Redis `TIME` like every lifetime deadline
+        // (I6); the grant's absolute expiry counts from it.
+        auth_time: chrono::DateTime::<Utc>::from_timestamp_millis(
+            db_client.server_time_ms().await?,
+        )
+        .ok_or_else(|| anyhow!("Redis TIME out of range"))?,
+        code_challenge: Some(request.code_challenge.clone()),
+        code_challenge_method: Some("S256".to_string()),
+        localpart: Some(localpart),
         device_id,
+        scope: request.scope.clone(),
+        client_class: Some(client.class),
     };
 
     let code = Uuid::new_v4();
     db_client.set_code(code.to_string(), code_entry).await?;
 
-    let mut url = params.redirect_uri.url().clone();
-    if params.response_mode.as_deref() == Some("fragment") {
+    let mut url = redirect_uri.url().clone();
+    if request.response_mode.as_deref() == Some("fragment") {
         // matrix-js-sdk v42 requested `response_mode=fragment` on /authorize
         // (round-tripped here via the login SPA) and reads the authorization
         // response ONLY from the URL fragment. ALL response params go in the
@@ -2739,12 +3982,12 @@ pub async fn sign_in(
         // untouched with nothing appended to it.
         let fragment = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("code", &code.to_string())
-            .append_pair("state", &params.state)
+            .append_pair("state", &request.state)
             .finish();
         url.set_fragment(Some(&fragment));
     } else {
         url.query_pairs_mut().append_pair("code", &code.to_string());
-        url.query_pairs_mut().append_pair("state", &params.state);
+        url.query_pairs_mut().append_pair("state", &request.state);
     }
     // Surface the resolved DID alongside the redirect so the HTTP handler can mint
     // the opaque login user-session cookie ONLY on this success path (a real login
@@ -2759,11 +4002,32 @@ pub struct RegisterError {
     error: CoreRegisterErrorResponseType,
 }
 
+/// What dynamic registration checks beyond the metadata's own form: the SSRF
+/// guard on `backchannel_logout_uri` (D3) and the D4 switch.
+#[derive(Clone, Debug, Default)]
+pub struct RegistrationPolicy {
+    pub guard: crate::backchannel::UriGuard,
+    /// D4 (provisional): a client that may receive refresh tokens must register
+    /// a `backchannel_logout_uri`. Off by default, and never in Matrix mode.
+    pub require_backchannel_for_refresh: bool,
+}
+
+impl RegistrationPolicy {
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            guard: crate::backchannel::UriGuard::new(&config.backchannel_logout_allowed_hosts),
+            require_backchannel_for_refresh: config.backchannel_logout_required_for_refresh
+                && !delegated_auth_enabled(config),
+        }
+    }
+}
+
 pub async fn register(
-    payload: CoreClientMetadata,
+    payload: SiwxClientMetadata,
     base_url: Url,
     db_client: &DBClientType,
-) -> Result<CoreClientRegistrationResponse, CustomError> {
+    policy: &RegistrationPolicy,
+) -> Result<SiwxClientRegistrationResponse, CustomError> {
     let id = Uuid::new_v4();
     let secret: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -2779,6 +4043,8 @@ pub async fn register(
             }));
         }
     }
+    check_logout_metadata(&payload, policy).await?;
+    let logout_metadata = payload.additional_metadata().clone();
 
     let access_token = RegistrationAccessToken::new(
         thread_rng()
@@ -2788,17 +4054,15 @@ pub async fn register(
             .collect(),
     );
 
-    let entry = ClientEntry {
-        secret: secret.clone(),
-        metadata: payload,
-        access_token: Some(access_token.clone()),
-    };
+    // The response below is the only place the secret and the registration
+    // access token appear: the entry keeps their digests.
+    let entry = ClientEntry::new(&secret, payload, Some(access_token.secret()));
     db_client.set_client(id.to_string(), entry).await?;
 
-    Ok(CoreClientRegistrationResponse::new(
+    Ok(SiwxClientRegistrationResponse::new(
         ClientId::new(id.to_string()),
         redirect_uris,
-        EmptyAdditionalClientMetadata::default(),
+        logout_metadata,
         EmptyAdditionalClientRegistrationResponse::default(),
     )
     .set_client_secret(Some(ClientSecret::new(secret)))
@@ -2808,6 +4072,330 @@ pub async fn register(
             .map_err(|e| anyhow!("Unable to join URL: {}", e))?,
     )))
     .set_registration_access_token(Some(access_token)))
+}
+
+/// The logout metadata a registration may carry, else
+/// `invalid_client_metadata` (RFC 7591 §3.2.2): every
+/// `post_logout_redirect_uris` entry is an absolute URI without a fragment
+/// (as `redirect_uris`); a `backchannel_logout_uri` passes the SSRF guard
+/// ([`crate::backchannel::UriGuard::check`]: no fragment, `https`, every
+/// resolved address outside the refused classes, unless the host is
+/// allowlisted); and with the D4 switch on, a client that may receive refresh
+/// tokens registers one.
+async fn check_logout_metadata(
+    payload: &SiwxClientMetadata,
+    policy: &RegistrationPolicy,
+) -> Result<(), CustomError> {
+    let invalid = || {
+        CustomError::BadRequestRegister(RegisterError {
+            error: CoreRegisterErrorResponseType::InvalidClientMetadata,
+        })
+    };
+    let extra = payload.additional_metadata();
+    let uris = extra
+        .post_logout_redirect_uris
+        .as_deref()
+        .unwrap_or_default();
+    if uris.iter().any(|uri| uri.url().fragment().is_some()) {
+        return Err(invalid());
+    }
+    match &extra.backchannel_logout_uri {
+        Some(uri) => {
+            if let Err(refusal) = policy.guard.check(uri).await {
+                warn!(
+                    host = uri.host_str().unwrap_or_default(),
+                    refusal = ?refusal,
+                    "registration: backchannel_logout_uri refused"
+                );
+                return Err(invalid());
+            }
+        }
+        None if policy.require_backchannel_for_refresh
+            && client_policy::registration_may_refresh(payload) =>
+        {
+            return Err(invalid());
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+// -- RP-initiated logout (OpenID Connect RP-Initiated Logout 1.0) -------------
+
+/// The parameters of `GET`/`POST` [`END_SESSION_PATH`]. `logout_hint` and
+/// `ui_locales` are accepted by being ignored.
+#[derive(Debug, Default, Deserialize)]
+pub struct EndSessionParams {
+    pub id_token_hint: Option<String>,
+    pub client_id: Option<String>,
+    pub post_logout_redirect_uri: Option<String>,
+    pub state: Option<String>,
+}
+
+/// The claims end-session reads from a verified `id_token_hint`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HintClaims {
+    pub sub: String,
+    pub aud: Vec<String>,
+    pub sid: Option<String>,
+}
+
+/// Why an `id_token_hint` was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HintError {
+    /// Not a compact JWS with a JSON header and payload carrying `sub` and `aud`.
+    Malformed,
+    /// `alg` is not ES256 (`none` and `HS*` included).
+    Algorithm,
+    /// No `kid`, or one that is neither the live key's nor a retired key's.
+    UnknownKid,
+    /// The signature does not verify over the received bytes.
+    Signature,
+    /// `iss` is not this provider.
+    Issuer,
+}
+
+/// Verify an `id_token_hint`: an ID token this provider signed, with the live
+/// key or a retired one, named by its `kid`, over the received bytes, and
+/// issued by this provider. Its expiry is NOT checked: RP-Initiated Logout
+/// §2 lets an RP send an expired ID token, which still names the session.
+pub fn verify_id_token_hint(
+    hint: &str,
+    signing_key: &EcdsaSigningKey,
+    retired: &[CoreJsonWebKey],
+    issuer: &IssuerUrl,
+) -> Result<HintClaims, HintError> {
+    use openidconnect::JsonWebKey;
+
+    let mut parts = hint.split('.');
+    let (Some(header), Some(payload), Some(signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(HintError::Malformed);
+    };
+    let decode = |part: &str| {
+        URL_SAFE_NO_PAD
+            .decode(part)
+            .map_err(|_| HintError::Malformed)
+    };
+    let header: serde_json::Value =
+        serde_json::from_slice(&decode(header)?).map_err(|_| HintError::Malformed)?;
+    if header["alg"] != "ES256" {
+        return Err(HintError::Algorithm);
+    }
+    let kid = header["kid"].as_str().ok_or(HintError::UnknownKid)?;
+    let live = signing_key.as_verification_key();
+    let key = std::iter::once(&live)
+        .chain(retired.iter())
+        .find(|k| k.key_id().map(|id| id.as_str()) == Some(kid))
+        .ok_or(HintError::UnknownKid)?;
+    let signing_input_len = hint.len() - signature.len() - 1;
+    key.verify_signature(
+        &CoreJwsSigningAlgorithm::EcdsaP256Sha256,
+        &hint.as_bytes()[..signing_input_len],
+        &decode(signature)?,
+    )
+    .map_err(|_| HintError::Signature)?;
+    let claims: serde_json::Value =
+        serde_json::from_slice(&decode(payload)?).map_err(|_| HintError::Malformed)?;
+    if claims["iss"].as_str() != Some(issuer.as_str()) {
+        return Err(HintError::Issuer);
+    }
+    let sub = claims["sub"]
+        .as_str()
+        .ok_or(HintError::Malformed)?
+        .to_string();
+    let aud = match &claims["aud"] {
+        serde_json::Value::String(one) => vec![one.clone()],
+        serde_json::Value::Array(many) => many
+            .iter()
+            .map(|a| a.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(HintError::Malformed)?,
+        _ => return Err(HintError::Malformed),
+    };
+    let sid = claims["sid"].as_str().map(str::to_string);
+    Ok(HintClaims { sub, aud, sid })
+}
+
+/// What end-session answers.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EndSessionOutcome {
+    /// Back to the registered `post_logout_redirect_uri`, `state` appended.
+    Redirect(Url),
+    /// The signed-out page; `ended` says whether a grant was ended.
+    SignedOut { ended: bool },
+}
+
+/// A store fault on a sign-out path: retryable, never a pretended success.
+pub(crate) fn store_unavailable(e: anyhow::Error) -> CustomError {
+    warn!(error = %e, "sign-out: the token store is unavailable");
+    CustomError::ServiceUnavailable("The session store is unavailable; retry.".to_string())
+}
+
+/// OpenID Connect RP-Initiated Logout 1.0 at [`END_SESSION_PATH`].
+///
+/// Everything is checked before anything is ended: an `id_token_hint` must be
+/// an ID token this provider signed ([`verify_id_token_hint`]; expired is
+/// fine); a `client_id` must be the hint's audience; a
+/// `post_logout_redirect_uri` must be registered for that client, matched
+/// exactly ([`post_logout_redirect_uri_is_registered`]). Any failure is a 400
+/// that ends nothing and never redirects, so no unregistered URI is ever a
+/// redirect target. Then the grant the hint's `sid` names is ended, if it
+/// belongs to the hint's client and `sub` ([`RedisClient::end_grant_by_sid`]):
+/// only that grant, never a Matrix device (a device sign-out is the Matrix
+/// `logout`; see `compat::TeardownPolicy`). A hint without a `sid` (an ID
+/// token issued before grants had one) ends nothing. Back-channel logout of an
+/// ended `oidc` grant is enqueued by the deletion script itself (`drop_grant`).
+pub async fn end_session(
+    params: EndSessionParams,
+    signing_key: &EcdsaSigningKey,
+    retired: &[CoreJsonWebKey],
+    config: &crate::config::Config,
+    db_client: &DBClientType,
+) -> Result<EndSessionOutcome, CustomError> {
+    let issuer = IssuerUrl::from_url(config.base_url.clone());
+    let hint = match params.id_token_hint.as_deref().filter(|h| !h.is_empty()) {
+        Some(raw) => Some(
+            verify_id_token_hint(raw, signing_key, retired, &issuer).map_err(|reason| {
+                warn!(?reason, "end_session: id_token_hint refused");
+                CustomError::BadRequest(
+                    "id_token_hint is not an ID token this provider issued.".to_string(),
+                )
+            })?,
+        ),
+        None => None,
+    };
+    let named_client = params.client_id.as_deref().filter(|c| !c.is_empty());
+    let client_id = match (&hint, named_client) {
+        (Some(hint), Some(named)) => {
+            if !hint.aud.iter().any(|aud| aud == named) {
+                warn!(
+                    client_id = named,
+                    "end_session: client_id is not the hint's audience"
+                );
+                return Err(CustomError::BadRequest(
+                    "client_id does not match the id_token_hint.".to_string(),
+                ));
+            }
+            Some(named.to_string())
+        }
+        (Some(hint), None) => match hint.aud.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        },
+        (None, named) => named.map(str::to_string),
+    };
+
+    let redirect = match params
+        .post_logout_redirect_uri
+        .as_deref()
+        .filter(|u| !u.is_empty())
+    {
+        None => None,
+        Some(raw) => {
+            let refused = || {
+                warn!("end_session: post_logout_redirect_uri is not registered for the client");
+                CustomError::BadRequest(
+                    "post_logout_redirect_uri is not registered for this client.".to_string(),
+                )
+            };
+            let mut uri = Url::parse(raw).map_err(|_| refused())?;
+            let client_id = client_id.as_deref().ok_or_else(refused)?;
+            let client = db_client
+                .get_client(client_id.to_string())
+                .await
+                .map_err(store_unavailable)?
+                .ok_or_else(refused)?;
+            if !post_logout_redirect_uri_is_registered(&client, &uri) {
+                return Err(refused());
+            }
+            if let Some(state) = params.state.as_deref() {
+                uri.query_pairs_mut().append_pair("state", state);
+            }
+            Some(uri)
+        }
+    };
+
+    let mut ended = false;
+    if let (Some(hint), Some(client_id)) = (&hint, client_id.as_deref()) {
+        if let Some(sid) = hint.sid.as_deref() {
+            match db_client
+                .end_grant_by_sid(sid, client_id, &hint.sub)
+                .await
+                .map_err(store_unavailable)?
+            {
+                EndedGrant::Ended { grant_id, kind } => {
+                    ended = true;
+                    info!(grant_fp = %grant_id.fingerprint(), grant_kind = kind.as_str(),
+                        client_id, "end_session: grant ended");
+                }
+                EndedGrant::NotFound => {
+                    debug!(client_id, "end_session: no live grant carries the sid")
+                }
+                EndedGrant::Mismatch => warn!(
+                    client_id,
+                    "end_session: the sid names a grant of another client or subject; nothing ended"
+                ),
+            }
+        } else {
+            debug!(
+                client_id,
+                "end_session: the hint carries no sid; nothing ended"
+            );
+        }
+    }
+    Ok(match redirect {
+        Some(uri) => EndSessionOutcome::Redirect(uri),
+        None => EndSessionOutcome::SignedOut { ended },
+    })
+}
+
+/// The page end-session shows when it does not redirect. Reflects no input.
+pub fn signed_out_page(ended: bool) -> String {
+    let message = if ended {
+        "You are signed out: the session has ended."
+    } else {
+        "Nothing to sign out: no session was named, or it had already ended."
+    };
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Signed out</title></head><body><p>{message}</p></body></html>"
+    )
+}
+
+/// The page of [`CustomError::LoginSessionExpired`], in the look of the issuer's pages.
+/// Reflects no input and links nowhere: nothing it could link to was validated.
+pub fn sign_in_timed_out_page() -> String {
+    let css = crate::account::ACCOUNT_PAGE_CSS;
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign-in timed out</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<link href="https://api.fontshare.com/css?f[]=satoshi@300,400,500,700,900&display=swap" rel="stylesheet">
+<style>{css}</style>
+</head>
+<body>
+<div class="login-page">
+  <div class="ambient-glow"></div>
+  <div class="login-card">
+    <div class="card-inner">
+      <div class="logo-area">
+        <img src="/img/inblockio-logo.png" alt="inblock.io" class="logo logo-single">
+      </div>
+      <div class="auth-section">
+        <h1 class="title">Sign-in timed out</h1>
+        <p class="subtitle">The sign-in was not finished in time. Go back to the app and start again.</p>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>"##
+    )
 }
 
 // -- Client info / update / delete -----------------------------------------
@@ -2826,11 +4414,7 @@ async fn client_access(
         .get_client(client_id)
         .await?
         .ok_or(CustomError::NotFound)?;
-    let stored_access_token = client_entry.access_token.clone();
-    let stored = stored_access_token
-        .as_ref()
-        .ok_or_else(|| CustomError::Unauthorized("Bad access token.".to_string()))?;
-    if !constant_time_eq(stored.secret(), &access_token) {
+    if !client_entry.access_token_matches(&access_token) {
         return Err(CustomError::Unauthorized("Bad access token.".to_string()));
     }
     Ok(client_entry)
@@ -2839,7 +4423,7 @@ async fn client_access(
 pub async fn clientinfo(
     client_id: String,
     db_client: &DBClientType,
-) -> Result<CoreClientMetadata, CustomError> {
+) -> Result<SiwxClientMetadata, CustomError> {
     Ok(db_client
         .get_client(client_id)
         .await?
@@ -2858,11 +4442,13 @@ pub async fn client_delete(
 
 pub async fn client_update(
     client_id: String,
-    payload: CoreClientMetadata,
+    payload: SiwxClientMetadata,
     bearer: Option<Bearer>,
     db_client: &DBClientType,
+    policy: &RegistrationPolicy,
 ) -> Result<(), CustomError> {
     let mut client_entry = client_access(client_id.clone(), bearer, db_client).await?;
+    check_logout_metadata(&payload, policy).await?;
     client_entry.metadata = payload;
     Ok(db_client.set_client(client_id, client_entry).await?)
 }
@@ -2875,8 +4461,8 @@ pub struct UserInfoPayload {
 }
 
 /// The provider-specific claims siwx-oidc adds to the standard OIDC userinfo
-/// set: today, exactly one — the caller's Matrix ID, on the wire as
-/// `io.inblock.mxid`.
+/// set: the caller's Matrix ID, on the wire as `io.inblock.mxid`, and, for a
+/// generic mail client only, the caller's mailbox address, `io.inblock.mailbox`.
 ///
 /// # Why the claim is namespaced, and why it is not called `mxid`
 ///
@@ -2906,6 +4492,12 @@ pub struct UserInfoPayload {
 /// `SIWEOIDC_MATRIX_SERVER_NAME`) has no Matrix ID to report, and saying
 /// `"io.inblock.mxid": null` would make a consumer's `if "io.inblock.mxid" in
 /// claims` branch take the wrong turn while looking correct.
+///
+/// # `io.inblock.mailbox` follows the same rules
+///
+/// Omitted, never null, and present in the JSON and the signed-JWT variants alike. Every
+/// condition that gates it is in [`client_policy::mailbox_claim`], and its wire name is
+/// pinned by `userinfo_mailbox_claim_tests::mailbox_claim_opaque_only`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SiwxAdditionalClaims {
     /// The caller's fully-qualified Matrix ID, `@localpart:server_name`.
@@ -2915,6 +4507,21 @@ pub struct SiwxAdditionalClaims {
         skip_serializing_if = "Option::is_none"
     )]
     pub mxid: Option<String>,
+    /// The caller's mailbox address, `<opaque localpart>@<mail_domain>`. Present only under
+    /// the rule in [`client_policy::mailbox_claim`]; omitted, never null, otherwise.
+    #[serde(
+        rename = "io.inblock.mailbox",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mailbox: Option<String>,
+    /// `io.inblock.guest: true` for a guest (S4b); omitted, never `false`, otherwise.
+    #[serde(
+        rename = "io.inblock.guest",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub guest: Option<bool>,
 }
 
 impl AdditionalClaims for SiwxAdditionalClaims {}
@@ -2964,32 +4571,29 @@ pub enum UserInfoResponse {
 /// put a network call on a hot, read-only endpoint to recompute a value the
 /// struct already carries.
 ///
-/// # Both `None` cases mean "omit", and both are honest
+/// # Both "omit" cases are honest
 ///
 /// - `server_name = None` — a standalone deployment. There is no homeserver, so
 ///   there is no Matrix ID; a guessed one would name an account on a server that
 ///   does not exist.
-/// - `localpart = None` — the legacy `CodeEntry` fallback path, for an entry
-///   written before `CodeEntry.localpart` existed. That field's own doc blesses
-///   `legacy_localpart(did)` as the fallback for PROVISIONING continuity, where
-///   the alternative is severing a user from their account. This is not that:
-///   a userinfo claim is a statement of fact to a relying party, and the honest
-///   answer to "which localpart did we resolve for this session" is "this entry
-///   does not record one". An omitted claim degrades a consumer to the lookup it
-///   would have done anyway (`GET /resolve?did=…`, see [`crate::resolve`]); a
-///   derived one could quietly name the wrong account.
-fn mxid_claim(config: &crate::config::Config, localpart: Option<&str>) -> SiwxAdditionalClaims {
-    let mxid = match (config.matrix_server_name.as_deref(), localpart) {
-        // An empty localpart is treated as absent rather than rendered as
-        // `@:server`. Deviceless/admin-minted tokens are the shape that can
-        // carry one, and `@:server` is not a Matrix ID, it is a parse error
-        // waiting at the consumer.
-        (Some(server_name), Some(localpart)) if !localpart.is_empty() => Some(
-            crate::synapse_client::matrix_user_id(localpart, server_name),
-        ),
+/// - an empty `localpart` — the token records no localpart. The claim is then
+///   omitted, never derived from the DID: `legacy_localpart(did)` is a fallback
+///   for PROVISIONING continuity, where the alternative is severing a user from
+///   their account. This is not that: a userinfo claim is a statement of fact
+///   to a relying party, and the honest answer to "which localpart did we
+///   resolve for this session" is "this token does not record one". An omitted
+///   claim degrades a consumer to the lookup it would have done anyway
+///   (`GET /resolve?did=…`, see [`crate::resolve`]); a derived one could quietly
+///   name the wrong account. `@:server` would not be a Matrix ID either, but a
+///   parse error waiting at the consumer.
+fn mxid_claim(config: &crate::config::Config, localpart: &str) -> Option<String> {
+    match config.matrix_server_name.as_deref() {
+        Some(server_name) if !localpart.is_empty() => Some(crate::synapse_client::matrix_user_id(
+            localpart,
+            server_name,
+        )),
         _ => None,
-    };
-    SiwxAdditionalClaims { mxid }
+    }
 }
 
 /// `GET|POST /userinfo`.
@@ -3004,6 +4608,20 @@ fn mxid_claim(config: &crate::config::Config, localpart: Option<&str>) -> SiwxAd
 /// identity model (see `docs/identity-model.md`) exists precisely because a consumer that
 /// reads a Matrix identifier where it expected a DID, or the reverse, resolves
 /// the wrong account.
+///
+/// # What a refusal looks like
+///
+/// A token that cannot be used (unknown, expired, a refresh token or an authorization code
+/// presented as a bearer token, one an epoch refuses, or the token of a client that no
+/// longer exists) is [`CustomError::InvalidToken`]: a 401 with an RFC 6750 `invalid_token`
+/// challenge, so a resource server can tell a dead credential from a malformed request. A
+/// request that presents no token at all is a 400.
+///
+/// # No `email` claim, ever
+///
+/// A mail server that finds no mailbox claim may fall back to the standard `email` claim,
+/// so an `email` in any userinfo response would let that token open a mailbox. The only
+/// address claim is `io.inblock.mailbox`.
 pub async fn userinfo(
     config: &crate::config::Config,
     signing_key: &EcdsaSigningKey,
@@ -3019,53 +4637,39 @@ pub async fn userinfo(
         return Err(CustomError::BadRequest("Missing access token.".to_string()));
     };
 
-    // Try TokenMetadata first (covers both MSC3861 mat_ tokens and standalone tokens).
-    if let Some(metadata) = db_client.get_token(&token_str).await? {
-        if metadata.exp <= Utc::now().timestamp() {
-            return Err(CustomError::BadRequest("Token expired.".to_string()));
-        }
-        let client_entry = db_client
-            .get_client(metadata.client_id.clone())
-            .await?
-            .ok_or_else(|| CustomError::BadRequest("Unknown client.".to_string()))?;
-        // `metadata.username` IS the localpart (see `TokenMetadata::username`),
-        // already resolved through the grandfathering rule at sign-in.
-        let additional = mxid_claim(config, Some(metadata.username.as_str()));
-        let response =
-            SiwxUserInfoClaims::new(resolve_claims(config, &metadata.did).await, additional)
-                .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
-                .set_audiences(Some(vec![Audience::new(metadata.client_id)]));
-        return match client_entry.metadata.userinfo_signed_response_alg() {
-            None => Ok(UserInfoResponse::Json(response)),
-            Some(alg) => Ok(UserInfoResponse::Jwt(
-                SiwxUserInfoJsonWebToken::new(response, signing_key, alg.clone())
-                    .map_err(|_| anyhow!("Error signing response."))?,
-            )),
-        };
+    // Only an access token is a bearer credential (MSC3861 `mat_` tokens and
+    // standalone tokens alike). An authorization code, a refresh token and an
+    // unknown string all get the same answer: a code is redeemable only at the
+    // token endpoint, with its PKCE verifier.
+    let metadata = db_client
+        .check_access_token(&token_str)
+        .await?
+        .ok_or_else(|| CustomError::InvalidToken("Unknown token.".to_string()))?;
+    if metadata.exp <= Utc::now().timestamp() {
+        return Err(CustomError::InvalidToken("Token expired.".to_string()));
     }
-
-    // Legacy fallback: UUID-based access token backed by code entry (pre-refresh-token deployments).
-    let code_entry = if let Some(c) = db_client.get_code(token_str).await? {
-        c
-    } else {
-        return Err(CustomError::BadRequest("Unknown token.".to_string()));
+    let client_entry = db_client
+        .get_client(metadata.client_id.clone())
+        .await?
+        .ok_or_else(|| CustomError::InvalidToken("Unknown client.".to_string()))?;
+    touch_client_after_use(db_client, &metadata.client_id).await;
+    // `metadata.username` IS the localpart (see `TokenMetadata::username`),
+    // already resolved through the grandfathering rule at sign-in.
+    let additional = SiwxAdditionalClaims {
+        mxid: mxid_claim(config, &metadata.username),
+        mailbox: client_policy::mailbox_claim(
+            &metadata,
+            &client_entry,
+            config.mail_domain.as_deref(),
+        ),
+        guest: guest_claim(config, db_client, &metadata.client_id, &metadata.username).await?,
     };
-
-    let client_entry = if let Some(c) = db_client.get_client(code_entry.client_id.clone()).await? {
-        c
-    } else {
-        return Err(CustomError::BadRequest("Unknown client.".to_string()));
-    };
-
-    // The legacy path's localpart is an `Option`: a `CodeEntry` written before
-    // that field existed carries `None`, and `mxid_claim` then OMITS the claim
-    // rather than deriving one — see its doc for why a derivation would be a
-    // worse answer than silence here.
-    let additional = mxid_claim(config, code_entry.localpart.as_deref());
-    let response =
-        SiwxUserInfoClaims::new(resolve_claims(config, &code_entry.did).await, additional)
-            .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
-            .set_audiences(Some(vec![Audience::new(code_entry.client_id)]));
+    let response = SiwxUserInfoClaims::new(
+        resolve_claims(config, &metadata.did, client_entry.class).await,
+        additional,
+    )
+    .set_issuer(Some(IssuerUrl::from_url(config.base_url.clone())))
+    .set_audiences(Some(vec![Audience::new(metadata.client_id)]));
     match client_entry.metadata.userinfo_signed_response_alg() {
         None => Ok(UserInfoResponse::Json(response)),
         Some(alg) => Ok(UserInfoResponse::Jwt(
@@ -3358,14 +4962,14 @@ mod tests {
         db_client
             .set_client(
                 "client".into(),
-                ClientEntry {
-                    secret: "secret".into(),
-                    metadata: CoreClientMetadata::new(
+                ClientEntry::new(
+                    "secret",
+                    SiwxClientMetadata::new(
                         vec![RedirectUrl::new("https://example.com".into()).unwrap()],
-                        EmptyAdditionalClientMetadata {},
+                        LogoutClientMetadata::default(),
                     ),
-                    access_token: None,
-                },
+                    None,
+                ),
             )
             .await
             .unwrap();
@@ -3385,7 +4989,7 @@ mod tests {
         // Without ENS config, preferred_username is always the full DID.
         let did = "did:pkh:eip155:1:0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
         let config = config_no_ens();
-        let res = resolve_claims(&config, did).await;
+        let res = resolve_claims(&config, did, ClientClass::Matrix).await;
         assert_eq!(
             res.preferred_username().map(|u| u.to_string()),
             Some(did.to_string())
@@ -3399,7 +5003,7 @@ mod tests {
         // Non-eip155 DID — preferred_username is the full DID, no ENS attempt.
         let did = "did:pkh:ed25519:0xabcdef1234567890";
         let config = config_no_ens();
-        let res = resolve_claims(&config, did).await;
+        let res = resolve_claims(&config, did, ClientClass::Matrix).await;
         assert_eq!(
             res.preferred_username().map(|u| u.to_string()),
             Some(did.to_string())
@@ -3409,6 +5013,425 @@ mod tests {
     #[derive(Deserialize)]
     struct AuthorizeQueryParams {
         nonce: String,
+    }
+
+    /// The PKCE example pair from RFC 7636, Appendix B.
+    const RFC7636_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const RFC7636_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+    fn code_request(response_type: CoreResponseType) -> AuthorizeParams {
+        AuthorizeParams {
+            client_id: "client".into(),
+            redirect_uri: RedirectUrl::new("https://example.com".into()).unwrap(),
+            scope: Scope::new("openid".to_string()),
+            response_type: Some(response_type),
+            state: Some("state".into()),
+            nonce: Some(Nonce::new("oidc-nonce".into())),
+            prompt: None,
+            request_uri: None,
+            request: None,
+            code_challenge: Some(RFC7636_CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
+            response_mode: None,
+        }
+    }
+
+    /// `authorize` refuses every response type but `code`, back to the
+    /// validated redirect URI with `unsupported_response_type` and the state.
+    #[tokio::test]
+    async fn authorize_refuses_every_response_type_but_code() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        for response_type in [
+            CoreResponseType::IdToken,
+            CoreResponseType::Token,
+            CoreResponseType::None,
+        ] {
+            match authorize(code_request(response_type.clone()), &db_client).await {
+                Err(CustomError::Redirect(url)) => {
+                    let url = Url::parse(&url).unwrap();
+                    let q: std::collections::HashMap<_, _> = url.query_pairs().collect();
+                    assert_eq!(url.host_str(), Some("example.com"), "{url}");
+                    assert_eq!(
+                        q.get("error").map(|v| v.as_ref()),
+                        Some("unsupported_response_type"),
+                        "{url}"
+                    );
+                    assert_eq!(q.get("state").map(|v| v.as_ref()), Some("state"), "{url}");
+                }
+                other => panic!("{response_type:?} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// `authorize` binds the validated request to the session it starts.
+    #[tokio::test]
+    async fn authorize_binds_the_request_to_the_session() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        let mut params = code_request(CoreResponseType::Code);
+        params.response_mode = Some("fragment".into());
+        let (_url, cookie) = authorize(params, &db_client).await.unwrap();
+        let session = db_client
+            .get_session(cookie.value().to_string())
+            .await
+            .unwrap()
+            .expect("authorize stores the session");
+        assert_eq!(
+            session.request,
+            Some(AuthorizationRequest {
+                client_id: "client".into(),
+                redirect_uri: "https://example.com".into(),
+                state: "state".into(),
+                response_mode: Some("fragment".into()),
+                code_challenge: RFC7636_CHALLENGE.into(),
+                scope: Some("openid".into()),
+                nonce: Some(Nonce::new("oidc-nonce".into())),
+            })
+        );
+    }
+
+    fn session_with(request: Option<AuthorizationRequest>) -> SessionEntry {
+        SessionEntry {
+            siwe_nonce: "n".into(),
+            secret: "s".into(),
+            signin_count: 0,
+            verified_did: None,
+            request,
+            guest_id: None,
+        }
+    }
+
+    const ROUND_TRIP_REDIRECT: &str = "https://example.com/callback?a=1&b=2";
+    const ROUND_TRIP_STATE: &str = "st+a&b c";
+
+    async fn seed_round_trip_client(db: &RedisClient, client_id: &str) {
+        db.set_client(
+            client_id.to_string(),
+            ClientEntry::new(
+                "secret",
+                SiwxClientMetadata::new(
+                    vec![RedirectUrl::new(ROUND_TRIP_REDIRECT.into()).unwrap()],
+                    LogoutClientMetadata::default(),
+                ),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `authorize` hands the login page every value percent-encoded, so the
+    /// page reads back the exact redirect URI (which its CAIP-122 message
+    /// binds) and state, even with several query parameters or `&` and `+`.
+    #[tokio::test]
+    async fn authorize_hands_the_login_page_the_exact_values() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        let client_id = format!("round-trip-{}", Uuid::new_v4().simple());
+        seed_round_trip_client(&db_client, &client_id).await;
+        let mut params = code_request(CoreResponseType::Code);
+        params.client_id = client_id.clone();
+        params.redirect_uri = RedirectUrl::new(ROUND_TRIP_REDIRECT.into()).unwrap();
+        params.state = Some(ROUND_TRIP_STATE.into());
+        let (page_url, _cookie) = authorize(params, &db_client).await.unwrap();
+        let page = Url::parse(&format!("https://login.example{page_url}")).unwrap();
+        let q: std::collections::HashMap<_, _> = page.query_pairs().into_owned().collect();
+        assert_eq!(
+            q.get("redirect_uri").map(String::as_str),
+            Some(ROUND_TRIP_REDIRECT)
+        );
+        assert_eq!(q.get("state").map(String::as_str), Some(ROUND_TRIP_STATE));
+        assert_eq!(q.get("client_id"), Some(&client_id));
+        assert_eq!(q.get("oidc_nonce").map(String::as_str), Some("oidc-nonce"));
+        assert_eq!(
+            q.get("code_challenge").map(String::as_str),
+            Some(RFC7636_CHALLENGE)
+        );
+        assert_eq!(
+            q.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert!(
+            !q.contains_key("response_mode"),
+            "query mode is not forwarded"
+        );
+    }
+
+    /// `sign_in` reads no authorization parameter from its query (it takes
+    /// none): the code goes to the bound redirect URI with the bound state, and
+    /// the stored code carries the bound client, challenge, nonce and scope.
+    #[tokio::test]
+    async fn sign_in_issues_the_code_for_the_bound_request() {
+        sign_in_round_trip(false).await;
+    }
+
+    /// The same for a session a build before Phase 2b started (it lives 300 s):
+    /// stored under its raw id, with the scope and the OIDC nonce beside the
+    /// bound request. Its code carries both, as before the upgrade.
+    #[tokio::test]
+    async fn a_session_the_previous_build_bound_issues_its_code_with_its_scope_and_nonce() {
+        sign_in_round_trip(true).await;
+    }
+
+    async fn sign_in_round_trip(previous_build: bool) {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        let nonce = Uuid::new_v4().simple().to_string();
+        let client_id = format!("round-trip-{nonce}");
+        seed_round_trip_client(&db_client, &client_id).await;
+        let session_id = format!("round-trip-{nonce}");
+        if previous_build {
+            // Exactly the JSON 88027dc serialized for this session.
+            let stored = serde_json::json!({
+                "siwe_nonce": nonce,
+                "oidc_nonce": "oidc-nonce",
+                "secret": "secret",
+                "signin_count": 0,
+                "verified_did": "did:key:zDnaeBOUNDREQUEST",
+                "scope": "openid profile offline_access",
+                "request": {
+                    "client_id": client_id,
+                    "redirect_uri": ROUND_TRIP_REDIRECT,
+                    "state": ROUND_TRIP_STATE,
+                    "response_mode": null,
+                    "code_challenge": RFC7636_CHALLENGE,
+                },
+            });
+            db_client
+                .set_ex_raw(&format!("sessions/{session_id}"), &stored.to_string(), 300)
+                .await
+                .unwrap();
+        } else {
+            db_client
+                .set_session(
+                    session_id.clone(),
+                    SessionEntry {
+                        siwe_nonce: nonce.clone(),
+                        secret: "secret".into(),
+                        signin_count: 0,
+                        verified_did: Some("did:key:zDnaeBOUNDREQUEST".into()),
+                        request: Some(AuthorizationRequest {
+                            client_id: client_id.clone(),
+                            redirect_uri: ROUND_TRIP_REDIRECT.into(),
+                            state: ROUND_TRIP_STATE.into(),
+                            response_mode: None,
+                            code_challenge: RFC7636_CHALLENGE.into(),
+                            scope: Some("openid profile offline_access".into()),
+                            nonce: Some(Nonce::new("oidc-nonce".into())),
+                        }),
+                        guest_id: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
+        );
+        let (url, _did) = sign_in(
+            &Url::parse("https://example.com").unwrap(),
+            &["key".to_string()],
+            &[],
+            headers.typed_get::<headers::Cookie>().unwrap(),
+            &db_client,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            url.as_str()
+                .starts_with(&format!("{ROUND_TRIP_REDIRECT}&code=")),
+            "the code goes to the bound redirect URI: {url}"
+        );
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q.get("a").map(String::as_str), Some("1"));
+        assert_eq!(q.get("b").map(String::as_str), Some("2"));
+        assert_eq!(q.get("state").map(String::as_str), Some(ROUND_TRIP_STATE));
+        let entry = db_client
+            .try_consume_code(q["code"].clone())
+            .await
+            .unwrap()
+            .expect("the code is stored");
+        assert_eq!(entry.client_id, client_id);
+        assert_eq!(entry.code_challenge.as_deref(), Some(RFC7636_CHALLENGE));
+        assert_eq!(entry.code_challenge_method.as_deref(), Some("S256"));
+        assert_eq!(
+            entry.nonce.as_ref().map(|n| n.secret().as_str()),
+            Some("oidc-nonce")
+        );
+        assert_eq!(
+            entry.scope.as_deref(),
+            Some("openid profile offline_access"),
+            "the scope /authorize bound to the session travels into the code, \
+             where the token endpoint reads what was requested"
+        );
+    }
+
+    /// A session written by an older build carries no bound request; the
+    /// sign-in is refused with a clear "restart" error.
+    #[test]
+    fn a_session_without_a_bound_request_is_refused() {
+        match bound_request(&session_with(None)) {
+            Err(CustomError::BadRequest(msg)) => assert!(msg.contains("Restart"), "{msg}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// No `session` cookie and a cookie naming a session Redis does not hold (what is
+    /// left once the 300 s login session expired) are both `LoginSessionExpired`, which
+    /// the handler turns into the way back to the client (#68).
+    #[tokio::test]
+    async fn a_sign_in_without_its_login_session_is_login_session_expired() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        let expired = format!("{SESSION_COOKIE_NAME}={}", Uuid::new_v4());
+        for cookie in [expired.as_str(), "siwx_user=other"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("cookie", HeaderValue::from_str(cookie).unwrap());
+            let result = sign_in(
+                &Url::parse("https://example.com").unwrap(),
+                &["key".to_string()],
+                &[],
+                headers.typed_get::<headers::Cookie>().unwrap(),
+                &db_client,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(CustomError::LoginSessionExpired)),
+                "{cookie}: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    fn expired_sign_in_link(pairs: &[(&str, &str)]) -> String {
+        let mut q = url::form_urlencoded::Serializer::new(String::new());
+        for (name, value) in pairs {
+            q.append_pair(name, value);
+        }
+        q.finish()
+    }
+
+    /// The way back from an expired sign-in: the `access_denied` redirect to a redirect
+    /// URI the named client registered (its own query kept, the exact `state` added, the
+    /// fragment for `response_mode=fragment`), and the timed-out page for everything
+    /// else. The first occurrence of a parameter counts.
+    #[tokio::test]
+    async fn an_expired_sign_in_redirects_only_to_a_registered_redirect_uri() {
+        let Some((_config, db_client)) = default_config().await else {
+            return;
+        };
+        let client_id = format!("expired-{}", Uuid::new_v4().simple());
+        seed_round_trip_client(&db_client, &client_id).await;
+        let expect_redirect = |e: CustomError| match e {
+            CustomError::Redirect(url) => Url::parse(&url).unwrap(),
+            other => panic!("expected a redirect, got {other:?}"),
+        };
+
+        let link = expired_sign_in_link(&[
+            ("redirect_uri", ROUND_TRIP_REDIRECT),
+            ("state", ROUND_TRIP_STATE),
+            ("client_id", &client_id),
+            ("code_challenge", RFC7636_CHALLENGE),
+        ]);
+        let url = expect_redirect(expired_sign_in(Some(&link), &db_client).await);
+        let q: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+        assert_eq!(q.get("a").map(String::as_str), Some("1"), "{url}");
+        assert_eq!(q.get("b").map(String::as_str), Some("2"), "{url}");
+        assert_eq!(q.get("error").map(String::as_str), Some("access_denied"));
+        assert_eq!(
+            q.get("error_description").map(String::as_str),
+            Some(SIGN_IN_TIMED_OUT_MSG)
+        );
+        assert_eq!(q.get("state").map(String::as_str), Some(ROUND_TRIP_STATE));
+        assert!(!q.contains_key("code"));
+        assert_eq!(url.fragment(), None);
+
+        let link = expired_sign_in_link(&[
+            ("redirect_uri", ROUND_TRIP_REDIRECT),
+            ("state", ROUND_TRIP_STATE),
+            ("client_id", &client_id),
+            ("response_mode", "fragment"),
+        ]);
+        let url = expect_redirect(expired_sign_in(Some(&link), &db_client).await);
+        assert_eq!(
+            url.query(),
+            Some("a=1&b=2"),
+            "the error is not in the query"
+        );
+        let f: std::collections::HashMap<String, String> =
+            url::form_urlencoded::parse(url.fragment().unwrap().as_bytes())
+                .into_owned()
+                .collect();
+        assert_eq!(f.get("error").map(String::as_str), Some("access_denied"));
+        assert_eq!(f.get("state").map(String::as_str), Some(ROUND_TRIP_STATE));
+
+        // No state on the link: the redirect carries none.
+        let link = expired_sign_in_link(&[
+            ("redirect_uri", ROUND_TRIP_REDIRECT),
+            ("client_id", &client_id),
+        ]);
+        let url = expect_redirect(expired_sign_in(Some(&link), &db_client).await);
+        assert!(!url.query_pairs().any(|(k, _)| k == "state"), "{url}");
+
+        // The first redirect_uri counts, whatever follows it.
+        let link = expired_sign_in_link(&[
+            ("redirect_uri", ROUND_TRIP_REDIRECT),
+            ("redirect_uri", "https://attacker.example.org/cb"),
+            ("client_id", &client_id),
+        ]);
+        let url = expect_redirect(expired_sign_in(Some(&link), &db_client).await);
+        assert!(url.as_str().starts_with(ROUND_TRIP_REDIRECT), "{url}");
+
+        let page = [
+            // An unregistered redirect URI, also when a registered one follows it.
+            expired_sign_in_link(&[
+                ("redirect_uri", "https://attacker.example.org/cb"),
+                ("redirect_uri", ROUND_TRIP_REDIRECT),
+                ("client_id", &client_id),
+            ]),
+            // The registered URI with something appended is another URI.
+            expired_sign_in_link(&[
+                ("redirect_uri", "https://example.com/callback?a=1&b=2&c=3"),
+                ("client_id", &client_id),
+            ]),
+            // An unknown client.
+            expired_sign_in_link(&[
+                ("redirect_uri", ROUND_TRIP_REDIRECT),
+                ("client_id", "no-such-client"),
+            ]),
+            // A parameter missing, or none at all.
+            expired_sign_in_link(&[("redirect_uri", ROUND_TRIP_REDIRECT)]),
+            expired_sign_in_link(&[("client_id", &client_id)]),
+            String::new(),
+        ];
+        for link in page {
+            let answer = expired_sign_in(Some(&link), &db_client).await;
+            assert!(
+                matches!(answer, CustomError::LoginSessionExpired),
+                "{link}: {answer:?}"
+            );
+        }
+        assert!(matches!(
+            expired_sign_in(None, &db_client).await,
+            CustomError::LoginSessionExpired
+        ));
     }
 
     #[derive(Deserialize)]
@@ -3450,20 +5473,19 @@ mod tests {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(base_url.clone()),
             scope: Scope::new("openid".to_string()),
-            response_type: Some(CoreResponseType::IdToken),
+            response_type: Some(CoreResponseType::Code),
             state: Some("state".into()),
             nonce: None,
             prompt: None,
             request_uri: None,
             request: None,
-            code_challenge: None,
-            code_challenge_method: None,
+            code_challenge: Some(RFC7636_CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
             response_mode: None,
         };
         let (redirect_url, cookie) = authorize(params, &db_client).await.unwrap();
         let authorize_params: AuthorizeQueryParams =
             serde_urlencoded::from_str(redirect_url.split("/?").collect::<Vec<&str>>()[1]).unwrap();
-        let params: SignInParams = serde_urlencoded::from_str(&redirect_url).unwrap();
 
         // Build the CAIP-122 message (EIP-4361 format for eip155). The login
         // path now enforces the Expiration Time (C1 safe subset), so include a
@@ -3508,12 +5530,12 @@ mod tests {
             &base_url,
             &default_methods,
             &default_namespaces,
-            params,
             cookie,
             &db_client,
             None, // no synapse_client in tests
             None, // no matrix_server_name in tests
-            None, // DID publication is off: no Synapse to publish into
+            None, // DID publication is off: no Synapse to publish into,
+            None,
         )
         .await
         .unwrap();
@@ -3525,12 +5547,51 @@ mod tests {
         let signin_params: SignInQueryParams =
             serde_urlencoded::from_str(redirect_url.query().unwrap()).unwrap();
         let oidc_signing_key = EcdsaSigningKey::generate();
+        // The code is not a bearer token: /userinfo refuses it.
+        assert!(
+            userinfo(
+                &config,
+                &oidc_signing_key,
+                None,
+                UserInfoPayload {
+                    access_token: Some(signin_params.code.clone()),
+                },
+                &db_client,
+            )
+            .await
+            .is_err(),
+            "/userinfo must refuse an authorization code"
+        );
+        // It is exchanged at the token endpoint, and the access token from the
+        // exchange is accepted at /userinfo.
+        let tokens = token(
+            TokenForm {
+                code: Some(signin_params.code),
+                client_id: Some("client".into()),
+                client_secret: Some("secret".into()),
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(RFC7636_VERIFIER.into()),
+                refresh_token: None,
+                device_code: None,
+            },
+            ClientCredentials::default(),
+            &oidc_signing_key,
+            &config,
+            &db_client,
+            None,
+        )
+        .await
+        .unwrap();
         let _ = userinfo(
             &config,
             &oidc_signing_key,
             None,
             UserInfoPayload {
-                access_token: Some(signin_params.code),
+                access_token: Some(
+                    openidconnect::OAuth2TokenResponse::access_token(&tokens)
+                        .secret()
+                        .clone(),
+                ),
             },
             &db_client,
         )
@@ -3558,14 +5619,14 @@ mod tests {
             client_id: "client".into(),
             redirect_uri: RedirectUrl::from_url(base_url.clone()),
             scope: Scope::new("openid".to_string()),
-            response_type: Some(CoreResponseType::IdToken),
+            response_type: Some(CoreResponseType::Code),
             state: Some("state".into()),
             nonce: None,
             prompt: None,
             request_uri: None,
             request: None,
-            code_challenge: None,
-            code_challenge_method: None,
+            code_challenge: Some(RFC7636_CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
             response_mode: Some("fragment".into()),
         };
         let (redirect_url, cookie) = authorize(params, &db_client).await.unwrap();
@@ -3575,10 +5636,6 @@ mod tests {
         );
         let authorize_params: AuthorizeQueryParams =
             serde_urlencoded::from_str(redirect_url.split("/?").collect::<Vec<&str>>()[1]).unwrap();
-        // Same client round-trip as the real SPA: SignInParams reads
-        // response_mode back out of the forwarded URL.
-        let params: SignInParams = serde_urlencoded::from_str(&redirect_url).unwrap();
-        assert_eq!(params.response_mode.as_deref(), Some("fragment"));
 
         let expiration_time =
             (Utc::now() + Duration::hours(48)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -3614,9 +5671,9 @@ mod tests {
             &base_url,
             &["pkh".to_string()],
             &["eip155".to_string()],
-            params,
             cookie,
             &db_client,
+            None,
             None,
             None,
             None,
@@ -3638,6 +5695,54 @@ mod tests {
             fragment.contains("state=state"),
             "fragment must carry the state: {redirect_url}"
         );
+    }
+
+    /// Redirect URIs match the registration exactly, query included.
+    #[test]
+    fn redirect_uri_matching_is_exact() {
+        let client = |registered: &str| {
+            ClientEntry::new(
+                "secret",
+                SiwxClientMetadata::new(
+                    vec![RedirectUrl::new(registered.into()).unwrap()],
+                    LogoutClientMetadata::default(),
+                ),
+                None,
+            )
+        };
+        let uri = |u: &str| RedirectUrl::new(u.into()).unwrap();
+
+        let plain = client("https://example.com/cb");
+        assert!(redirect_uri_is_registered(
+            &plain,
+            &uri("https://example.com/cb")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &plain,
+            &uri("https://example.com/cb?x=1")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &plain,
+            &uri("https://example.com/cb/x")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &plain,
+            &uri("https://example.com/cb#x")
+        ));
+
+        let with_query = client("https://example.com/?no_universal_links=true");
+        assert!(redirect_uri_is_registered(
+            &with_query,
+            &uri("https://example.com/?no_universal_links=true")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &with_query,
+            &uri("https://example.com/")
+        ));
+        assert!(!redirect_uri_is_registered(
+            &with_query,
+            &uri("https://example.com/?no_universal_links=true&x=1")
+        ));
     }
 
     #[tokio::test]
@@ -3784,6 +5889,114 @@ mod tests {
         );
     }
 
+    /// The OIDC `sub` is the user's DID, the same value for every client
+    /// (`docs/identity-model.md`), which is the definition of a *public*
+    /// subject type. Discovery used to say `pairwise`, which promises a
+    /// different `sub` per client and would lead a relying party to expect one.
+    #[test]
+    fn discovery_advertises_public_subjects_only() {
+        let value = provider_metadata_value(&discovery_config(), true).unwrap();
+        assert_eq!(
+            value["subject_types_supported"],
+            serde_json::json!(["public"]),
+            "the sub is the DID, identical for every client"
+        );
+    }
+
+    /// Discovery says what this deployment serves: the one response type and the one subject
+    /// type that exist, and the provider-specific scope and claims only where userinfo can
+    /// carry them (the Matrix ID needs a server name, the mailbox address a mail domain).
+    #[test]
+    fn discovery_lists_only_what_is_served() {
+        let both = Config {
+            mail_domain: Some("matrix.example.org".into()),
+            matrix_server_name: Some("matrix.example.org".into()),
+            ..discovery_config()
+        };
+        let value = provider_metadata_value(&both, true).unwrap();
+        assert_eq!(
+            value["response_types_supported"],
+            serde_json::json!(["code"]),
+            "the implicit flows are not implemented"
+        );
+        assert_eq!(
+            value["subject_types_supported"],
+            serde_json::json!(["public"]),
+            "sub is the same DID for every client"
+        );
+
+        let listed = |value: &serde_json::Value, key: &str, item: &str| {
+            value[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} must be an array"))
+                .iter()
+                .any(|s| s.as_str() == Some(item))
+        };
+        assert!(listed(&value, "scopes_supported", "io.inblock.mail"));
+        for claim in ["io.inblock.mailbox", "io.inblock.mxid"] {
+            assert!(listed(&value, "claims_supported", claim), "{claim} missing");
+        }
+
+        let cases = [
+            (
+                "a mail domain alone",
+                Some("matrix.example.org"),
+                None,
+                true,
+                false,
+            ),
+            (
+                "a server name alone",
+                None,
+                Some("matrix.example.org"),
+                false,
+                true,
+            ),
+            ("neither", None, None, false, false),
+        ];
+        for (what, mail_domain, server_name, mail, mxid) in cases {
+            let config = Config {
+                mail_domain: mail_domain.map(str::to_string),
+                matrix_server_name: server_name.map(str::to_string),
+                ..discovery_config()
+            };
+            let value = provider_metadata_value(&config, true).unwrap();
+            assert_eq!(
+                listed(&value, "scopes_supported", "io.inblock.mail"),
+                mail,
+                "{what}: the mail scope"
+            );
+            assert_eq!(
+                listed(&value, "claims_supported", "io.inblock.mailbox"),
+                mail,
+                "{what}: the mailbox claim"
+            );
+            assert_eq!(
+                listed(&value, "claims_supported", "io.inblock.mxid"),
+                mxid,
+                "{what}: the Matrix ID claim"
+            );
+            assert!(
+                listed(&value, "scopes_supported", "urn:matrix:client:api:*"),
+                "{what}: the Matrix scopes are listed whatever else is"
+            );
+        }
+    }
+
+    /// `POST /token` reads the client secret from an `Authorization: Basic`
+    /// header (`client_secret_basic`), from the form (`client_secret_post`), and
+    /// accepts a public client with no secret (`none`). Discovery lists what
+    /// the endpoint implements, so a client that picks the RFC 8414 default
+    /// (`client_secret_basic`) finds it.
+    #[test]
+    fn discovery_advertises_every_client_authentication_method_the_token_endpoint_accepts() {
+        let value = provider_metadata_value(&discovery_config(), true).unwrap();
+        assert_eq!(
+            value["token_endpoint_auth_methods_supported"],
+            serde_json::json!(["client_secret_basic", "client_secret_post", "none"]),
+        );
+    }
+
     #[test]
     fn provider_metadata_advertises_msc4191_account_management() {
         // AC1: served metadata must include account_management_uri and an
@@ -3837,6 +6050,18 @@ mod tests {
             off.get(RESOLVE_ENDPOINT_METADATA_KEY).is_none(),
             "a deployment that would answer 503 must not advertise the route"
         );
+    }
+
+    /// Discovery advertises exactly the response types `authorize` accepts.
+    #[test]
+    fn discovery_advertises_only_the_code_response_type() {
+        for matrix_ready in [true, false] {
+            let value = provider_metadata_value(&discovery_config(), matrix_ready).unwrap();
+            assert_eq!(
+                value["response_types_supported"],
+                serde_json::json!(["code"])
+            );
+        }
     }
 
     #[test]
@@ -4010,7 +6235,11 @@ mod tests {
         db.set_device_code(
             &device_code,
             &DeviceCodeEntry {
-                user_code: format!("SA-{}", Uuid::new_v4().simple()),
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!(
+                    "SA-{}",
+                    Uuid::new_v4().simple()
+                )),
+                legacy_user_code: None,
                 client_id: "client".to_string(),
                 scope: "openid".to_string(),
                 status: DeviceCodeStatus::Approved,
@@ -4018,6 +6247,8 @@ mod tests {
                 device_id: None,
                 last_poll: None,
                 created_at: Utc::now().timestamp(),
+                auth_ms: None,
+                expected_mxid: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -4034,7 +6265,7 @@ mod tests {
                 refresh_token: None,
                 device_code: Some(device_code.clone()),
             },
-            None,
+            ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
             &config,
             &db,
@@ -4048,13 +6279,97 @@ mod tests {
             Err(other) => panic!("expected unsupported_grant_type, got {other:?}"),
             Ok(_) => panic!("a standalone deployment must not redeem a device code"),
         }
-        let entry = db
+        let (device_ref, entry) = db
             .get_device_code(&device_code)
             .await
             .unwrap()
             .expect("the refused code must be left in place");
         assert_eq!(entry.status, DeviceCodeStatus::Approved);
-        db.delete_device_code(&device_code).await.ok();
+        db.delete_device_code(&device_ref).await.ok();
+    }
+
+    /// A device-code poll that loses the claim to a concurrent poll logs that at
+    /// `debug!`. The device code is the credential the device polls with, so the
+    /// line names its fingerprint, never the code. Needs Redis.
+    #[tokio::test]
+    async fn a_device_poll_that_loses_the_claim_logs_the_code_only_as_a_fingerprint() {
+        use siwx_oidc::redact::fingerprint;
+
+        let Some((config, db)) = default_config().await else {
+            return;
+        };
+        let config = Config {
+            mas_shared_secret: Some("shared-secret".to_string()),
+            ..config
+        };
+        let device_code = format!("dvc_claimlost-{}", Uuid::new_v4().simple());
+        db.set_device_code(
+            &device_code,
+            &DeviceCodeEntry {
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!(
+                    "CL-{}",
+                    Uuid::new_v4().simple()
+                )),
+                legacy_user_code: None,
+                client_id: "client".to_string(),
+                scope: "openid".to_string(),
+                status: DeviceCodeStatus::Approved,
+                did: Some("did:key:zDnCLAIMLOST".to_string()),
+                device_id: None,
+                last_poll: None,
+                created_at: Utc::now().timestamp(),
+                auth_ms: None,
+                expected_mxid: None,
+            },
+            DEVICE_CODE_LIFETIME,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.try_claim_device_code(&device_code).await.unwrap(),
+            "the winning poll claims the code"
+        );
+
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let losing = token(
+            TokenForm {
+                code: None,
+                client_id: Some("client".to_string()),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code.clone()),
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &config,
+            &db,
+            None,
+        )
+        .await;
+        let output = logs.output();
+        match losing {
+            Err(CustomError::BadRequestToken(e)) => assert_eq!(
+                e.error,
+                CoreErrorResponseType::Extension("authorization_pending".to_string())
+            ),
+            other => panic!(
+                "the losing poll must be told to wait: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        assert!(
+            output.contains(&fingerprint(&device_code)),
+            "the claim-lost line names the code's fingerprint; captured:\n{output}"
+        );
+        assert!(
+            !output.contains(&device_code),
+            "the device code appears in the logs in the clear:\n{output}"
+        );
+        if let Ok(Some((device_ref, _))) = db.get_device_code(&device_code).await {
+            db.delete_device_code(&device_ref).await.ok();
+        }
     }
 
     #[tokio::test]
@@ -4120,38 +6435,54 @@ mod tests {
     fn test_extract_device_id_from_scope() {
         // Stable prefix
         assert_eq!(
-            extract_device_id_from_scope(
+            scope_device_id(
                 "openid urn:matrix:client:api:* urn:matrix:client:device:W6ujlqyJoG5+BxH9eLdYgizkylgTS9z6ZzWqRM0FIBQ"
-            ),
+            ).unwrap(),
             Some("W6ujlqyJoG5+BxH9eLdYgizkylgTS9z6ZzWqRM0FIBQ".to_string())
         );
         assert_eq!(
-            extract_device_id_from_scope(
+            scope_device_id(
                 "openid urn:matrix:client:api:* urn:matrix:client:device:SIWX_43efbac7"
-            ),
+            )
+            .unwrap(),
             Some("SIWX_43efbac7".to_string())
         );
         // MSC2967 unstable prefix (used by Element X)
         assert_eq!(
-            extract_device_id_from_scope(
+            scope_device_id(
                 "urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:CW2fdkGgZZW8StwGioe2CVKBb3685OjKt8wRUR0iZyc"
-            ),
+            ).unwrap(),
             Some("CW2fdkGgZZW8StwGioe2CVKBb3685OjKt8wRUR0iZyc".to_string())
         );
         // Device ID with slash (base64url-encoded, as sent by Element X)
         assert_eq!(
-            extract_device_id_from_scope(
+            scope_device_id(
                 "urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:r8LXBERpNLfhbR3a/Wy1m9xE6ennsd2RJltz0xLrt3A"
-            ),
+            ).unwrap(),
             Some("r8LXBERpNLfhbR3a/Wy1m9xE6ennsd2RJltz0xLrt3A".to_string())
         );
-        assert_eq!(extract_device_id_from_scope("openid"), None);
+        // The charset rule: a comma (or any character outside [A-Za-z0-9._~+/-]) or a length
+        // outside 1..=64 is an error, not a missing proposal.
+        for bad in ["X,Y", ",", "a=b", "a:b", "é", &"A".repeat(65)] {
+            let scope = format!("openid urn:matrix:client:device:{bad}");
+            assert_eq!(scope_device_id(&scope), Err(InvalidDeviceId), "{bad}");
+        }
         assert_eq!(
-            extract_device_id_from_scope("openid urn:matrix:client:api:*"),
+            scope_device_id("urn:matrix:client:device:ABCDEFGHIJ urn:matrix:client:device:X,Y"),
+            Err(InvalidDeviceId),
+            "every proposal is checked, not only the first"
+        );
+        for ok in ["ABCDEFGHIJ", "a.b_c~d-e", &"A".repeat(64)] {
+            let scope = format!("openid urn:matrix:client:device:{ok}");
+            assert_eq!(scope_device_id(&scope), Ok(Some(ok.to_string())));
+        }
+        assert_eq!(scope_device_id("openid").unwrap(), None);
+        assert_eq!(
+            scope_device_id("openid urn:matrix:client:api:*").unwrap(),
             None
         );
         assert_eq!(
-            extract_device_id_from_scope("openid urn:matrix:client:device:"),
+            scope_device_id("openid urn:matrix:client:device:").unwrap(),
             None
         );
     }
@@ -4944,8 +7275,8 @@ mod provision_synapse_device_tests {
 /// (see [`userinfo`]'s doc).
 ///
 /// Redis-backed, like the rest of this file's token tests: `userinfo` resolves
-/// its caller through `get_token`/`get_code`, and stubbing that out would test a
-/// different function than the one that ships.
+/// its caller through `get_token`, and stubbing that out would test a different
+/// function than the one that ships.
 #[cfg(test)]
 mod userinfo_mxid_claim_tests {
     use super::*;
@@ -4983,9 +7314,9 @@ mod userinfo_mxid_claim_tests {
 
     /// Register a client, optionally one that wants a SIGNED userinfo response.
     async fn seed_client(db: &RedisClient, client_id: &str, signed: bool) -> anyhow::Result<()> {
-        let mut metadata = CoreClientMetadata::new(
+        let mut metadata = SiwxClientMetadata::new(
             vec![RedirectUrl::new("https://example.com".into()).unwrap()],
-            EmptyAdditionalClientMetadata {},
+            LogoutClientMetadata::default(),
         );
         if signed {
             metadata = metadata
@@ -4993,11 +7324,7 @@ mod userinfo_mxid_claim_tests {
         }
         db.set_client(
             client_id.to_string(),
-            ClientEntry {
-                secret: "secret".into(),
-                metadata,
-                access_token: None,
-            },
+            ClientEntry::new("secret", metadata, None),
         )
         .await
     }
@@ -5012,6 +7339,8 @@ mod userinfo_mxid_claim_tests {
             exp: i64::MAX,
             did: DID.to_string(),
             name: "n".to_string(),
+            kind: Some(TokenKind::Access),
+            grant_kind: None,
         }
     }
 
@@ -5038,6 +7367,52 @@ mod userinfo_mxid_claim_tests {
             UserInfoResponse::Json(claims) => serde_json::to_value(claims).unwrap(),
             UserInfoResponse::Jwt(_) => panic!("this client did not request a signed response"),
         }
+    }
+
+    /// A successful userinfo call is a use, so it restores a dynamic client's lifetime.
+    #[tokio::test]
+    async fn a_successful_userinfo_call_extends_a_dynamic_client() {
+        let Some(db) = db().await else {
+            return;
+        };
+        let client_id = format!("touch-userinfo-{}", nonce());
+        seed_client(&db, &client_id, false).await.unwrap();
+        let key = format!("clients/{client_id}");
+        db.expire_raw(&key, 60).await.unwrap();
+        let token = format!("tok_{}", nonce());
+        db.set_token(&token, &token_meta(&client_id, LOCALPART), 120)
+            .await
+            .unwrap();
+
+        let _ = userinfo_json(&config_with_server_name(Some(SERVER_NAME)), &db, &token).await;
+
+        assert!(
+            db.ttl_raw(&key).await.unwrap() > 60,
+            "a used dynamic client gets its lifetime back"
+        );
+    }
+
+    /// A failed touch is the only sign that a dynamic client may expire while it is in
+    /// use, so it is a warning that names the client, not a debug line nobody reads.
+    #[test]
+    fn a_failed_lifetime_extension_is_logged_at_warn_with_the_client_id() {
+        let logs = siwx_oidc::test_support::LogCapture::start();
+
+        log_failed_touch("client-42", &anyhow!("redis went away"));
+
+        let log = logs.output();
+        assert!(
+            log.contains("WARN"),
+            "a failed touch must log at warn: {log}"
+        );
+        assert!(
+            log.contains("client-42"),
+            "the line names the client: {log}"
+        );
+        assert!(
+            log.contains("redis went away"),
+            "the line carries the error: {log}"
+        );
     }
 
     /// The happy path, and the only place the claim NAME is asserted.
@@ -5102,53 +7477,96 @@ mod userinfo_mxid_claim_tests {
         );
     }
 
-    /// The legacy `CodeEntry` fallback path (`get_code`, pre-refresh-token
-    /// deployments) carries an `Option<String>` localpart. Both spellings are
-    /// pinned here because the `None` arm is the one that must NOT derive a
-    /// localpart from the DID — see `mxid_claim`'s doc.
+    /// A token that records no localpart omits the claim; it is never derived
+    /// from the DID, which could name a different account than the one this
+    /// session was provisioned under. See `mxid_claim`'s doc.
     #[tokio::test]
-    async fn legacy_code_entry_path_reports_a_recorded_localpart_and_omits_an_absent_one() {
+    async fn a_token_without_a_recorded_localpart_omits_the_claim_rather_than_deriving_one() {
         let Some(db) = db().await else {
             return;
         };
-        let client_id = format!("mxid-claim-legacy-{}", nonce());
+        let client_id = format!("mxid-claim-no-localpart-{}", nonce());
         seed_client(&db, &client_id, false).await.unwrap();
-        let config = config_with_server_name(Some(SERVER_NAME));
-
-        let entry = |localpart: Option<&str>| CodeEntry {
-            exchange_count: 0,
-            did: DID.to_string(),
-            nonce: None,
-            client_id: client_id.clone(),
-            auth_time: Utc::now(),
-            code_challenge: None,
-            code_challenge_method: None,
-            device_id: None,
-            localpart: localpart.map(str::to_string),
-        };
-
-        let with_localpart = format!("code_{}", nonce());
-        db.set_code(with_localpart.clone(), entry(Some(LOCALPART)))
+        let token = format!("tok_{}", nonce());
+        db.set_token(&token, &token_meta(&client_id, ""), 120)
             .await
             .unwrap();
-        let body = userinfo_json(&config, &db, &with_localpart).await;
-        assert_eq!(
-            body.get(CLAIM).and_then(|v| v.as_str()),
-            Some(format!("@{LOCALPART}:{SERVER_NAME}").as_str()),
-            "a CodeEntry that RECORDS a localpart reports it: {body}"
-        );
 
-        let without_localpart = format!("code_{}", nonce());
-        db.set_code(without_localpart.clone(), entry(None))
-            .await
-            .unwrap();
-        let body = userinfo_json(&config, &db, &without_localpart).await;
+        let body = userinfo_json(&config_with_server_name(Some(SERVER_NAME)), &db, &token).await;
+
         assert!(
             body.get(CLAIM).is_none(),
-            "a pre-migration CodeEntry records no localpart, and userinfo must say \
-             nothing rather than DERIVE one — a derived value could name a different \
-             account than the one this session was provisioned under: {body}"
+            "a token with no recorded localpart must not carry a derived Matrix ID: {body}"
         );
+        assert_eq!(
+            body.get("sub").and_then(|v| v.as_str()),
+            Some(DID),
+            "`sub` is still the exact-case DID"
+        );
+    }
+
+    /// Only an access token is a bearer credential at `/userinfo`: an
+    /// authorization code and a refresh token are refused like unknown tokens.
+    #[tokio::test]
+    async fn userinfo_accepts_only_an_access_token() {
+        let Some(db) = db().await else {
+            return;
+        };
+        let client_id = format!("mxid-claim-kinds-{}", nonce());
+        seed_client(&db, &client_id, false).await.unwrap();
+        let config = config_with_server_name(Some(SERVER_NAME));
+        let key = EcdsaSigningKey::generate();
+
+        let code = format!("code_{}", nonce());
+        db.set_code(
+            code.clone(),
+            CodeEntry {
+                exchange_count: 0,
+                did: DID.to_string(),
+                nonce: None,
+                client_id: client_id.clone(),
+                auth_time: Utc::now(),
+                code_challenge: None,
+                code_challenge_method: None,
+                device_id: None,
+                localpart: Some(LOCALPART.to_string()),
+                scope: None,
+                client_class: None,
+            },
+        )
+        .await
+        .unwrap();
+        let refresh = format!("tok_{}", nonce());
+        db.set_token(
+            &refresh,
+            &TokenMetadata {
+                kind: Some(TokenKind::Refresh),
+                ..token_meta(&client_id, LOCALPART)
+            },
+            120,
+        )
+        .await
+        .unwrap();
+
+        for (what, token) in [
+            ("an authorization code", code),
+            ("a refresh token", refresh),
+        ] {
+            let out = userinfo(
+                &config,
+                &key,
+                None,
+                UserInfoPayload {
+                    access_token: Some(token),
+                },
+                &db,
+            )
+            .await;
+            assert!(
+                matches!(out, Err(CustomError::InvalidToken(ref m)) if m == "Unknown token."),
+                "/userinfo must refuse {what} like an unknown token"
+            );
+        }
     }
 
     /// The signed-JWT variant must carry the same claim. See this module's doc,
@@ -5216,6 +7634,9 @@ mod userinfo_mxid_claim_tests {
     }
 }
 
+#[cfg(test)]
+mod userinfo_mailbox_claim_tests;
+
 /// `sign_in` decides deactivation BEFORE it resolves the login localpart.
 ///
 /// The ordering rule is argued at the gate's call site in [`sign_in`]: the
@@ -5272,6 +7693,8 @@ mod sign_in_deactivation_order_tests {
         /// `query_user` answers `is_deactivated: true`; any other localpart is
         /// a 404, which `query_user` reads as "no such account".
         deactivated: HashSet<String>,
+        /// `upsert_device` answers 500 (SS4 WP6: a device that cannot be provisioned).
+        upsert_fails: bool,
         /// Every request, in arrival order.
         log: Mutex<Vec<String>>,
     }
@@ -5337,6 +7760,9 @@ mod sign_in_deactivation_order_tests {
             .lock()
             .unwrap()
             .push(format!("{method} {}", uri.path()));
+        if hs.upsert_fails && uri.path().ends_with("/upsert_device") {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
+        }
         (StatusCode::OK, Json(serde_json::json!({}))).into_response()
     }
 
@@ -5346,6 +7772,46 @@ mod sign_in_deactivation_order_tests {
     async fn sign_in_against(
         hs: Homeserver,
     ) -> Option<(Result<(Url, String), CustomError>, Vec<String>)> {
+        sign_in_as(hs, DID, None, |_| async {}).await
+    }
+
+    /// [`sign_in_against`] for `did`, with the request's `scope` and a `plant` step that
+    /// runs against the Redis client before `sign_in` (a guest record, say).
+    async fn sign_in_as<F, Fut>(
+        hs: Homeserver,
+        did: &str,
+        scope: Option<&str>,
+        plant: F,
+    ) -> Option<(Result<(Url, String), CustomError>, Vec<String>)>
+    where
+        F: FnOnce(RedisClient) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        sign_in_with(hs, did, scope, SignInSetup::default(), plant).await
+    }
+
+    /// What [`sign_in_with`] varies beyond [`sign_in_as`]: the bound `response_mode`, the
+    /// client's class, and the configuration `sign_in` reads (SS4 flag 2).
+    #[derive(Default)]
+    struct SignInSetup {
+        response_mode: Option<String>,
+        generic: bool,
+        config: Option<crate::config::Config>,
+        /// The client's registration no longer lists the bound redirect_uri.
+        stale_redirect: bool,
+    }
+
+    async fn sign_in_with<F, Fut>(
+        hs: Homeserver,
+        did: &str,
+        scope: Option<&str>,
+        setup: SignInSetup,
+        plant: F,
+    ) -> Option<(Result<(Url, String), CustomError>, Vec<String>)>
+    where
+        F: FnOnce(RedisClient) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let hs = Arc::new(hs);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -5368,21 +7834,27 @@ mod sign_in_deactivation_order_tests {
             server.abort();
             return None;
         };
+        plant(db.clone()).await;
         let nonce = Uuid::new_v4().simple().to_string();
         let client_id = format!("deactivation-order-{nonce}");
-        db.set_client(
-            client_id.clone(),
-            ClientEntry {
-                secret: "secret".into(),
-                metadata: CoreClientMetadata::new(
-                    vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
-                    EmptyAdditionalClientMetadata {},
-                ),
-                access_token: None,
-            },
-        )
-        .await
-        .unwrap();
+        let mut client = ClientEntry::new(
+            "secret",
+            SiwxClientMetadata::new(
+                vec![RedirectUrl::new(if setup.stale_redirect {
+                    "https://example.com/elsewhere".into()
+                } else {
+                    REDIRECT.into()
+                })
+                .unwrap()],
+                LogoutClientMetadata::default(),
+            ),
+            None,
+        );
+        if setup.generic {
+            client.class = ClientClass::Generic;
+            client.allowed_scopes = Some(vec!["openid".to_string()]);
+        }
+        db.set_client(client_id.clone(), client).await.unwrap();
         // The passkey path: the ceremony already verified the DID and stored it
         // in the session, so `sign_in` needs no CAIP-122 cookie.
         let session_id = format!("deactivation-order-{nonce}");
@@ -5390,11 +7862,15 @@ mod sign_in_deactivation_order_tests {
             session_id.clone(),
             SessionEntry {
                 siwe_nonce: nonce.clone(),
-                oidc_nonce: None,
                 secret: "secret".into(),
                 signin_count: 0,
-                verified_did: Some(DID.to_string()),
-                scope: None,
+                verified_did: Some(did.to_string()),
+                request: Some(AuthorizationRequest {
+                    scope: scope.map(str::to_string),
+                    response_mode: setup.response_mode.clone(),
+                    ..bound_test_request(&client_id)
+                }),
+                guest_id: None,
             },
         )
         .await
@@ -5405,26 +7881,17 @@ mod sign_in_deactivation_order_tests {
             HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
         );
         let cookies = headers.typed_get::<headers::Cookie>().unwrap();
-        let params = SignInParams {
-            redirect_uri: RedirectUrl::new(REDIRECT.into()).unwrap(),
-            state: "state".into(),
-            oidc_nonce: None,
-            client_id,
-            code_challenge: None,
-            code_challenge_method: None,
-            response_mode: None,
-        };
 
         let result = sign_in(
             &Url::parse("https://example.com").unwrap(),
             &["key".to_string()],
             &[],
-            params,
             cookies,
             &db,
             Some(&synapse),
             Some(SERVER_NAME),
             None,
+            setup.config.as_ref(),
         )
         .await;
         server.abort();
@@ -5506,6 +7973,608 @@ mod sign_in_deactivation_order_tests {
             "the gate's failed probe must be the only request: a second probe means the \
              login localpart was resolved (and guessed) before the gate decided"
         );
+    }
+
+    // ---- GP-CLM-26: a claimed guest's pre-claim device ids stay refused ----
+
+    const PRE_CLAIM: &str = "PRECLAIMDEV1";
+
+    fn scope_with(device: &str) -> String {
+        format!("openid urn:matrix:client:api:* urn:matrix:client:device:{device}")
+    }
+
+    /// A fresh DID, so parallel runs and reruns never share a record.
+    fn fresh_did() -> String {
+        format!("did:key:zDnClm26{}", Uuid::new_v4().simple())
+    }
+
+    /// The guest record as the claim script leaves it: `pre_claim_devices` on
+    /// `guest:acct/{localpart}` (the field is asserted against the real claim in
+    /// `guest::claim`'s tests; here it is planted so only `sign_in` is under test).
+    async fn plant_claimed_record(db: &RedisClient, did: &str) {
+        db.hset_for_test(
+            &siwx_oidc::db::guest_invites::guest_account_key(&localpart_for(did)),
+            "pre_claim_devices",
+            &format!("OTHERDEV0,{PRE_CLAIM}"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sign_in_refuses_a_pre_claim_device_id_before_any_synapse_call() {
+        let did = fresh_did();
+        let scope = scope_with(PRE_CLAIM);
+        let Some((result, log)) = sign_in_as(Homeserver::default(), &did, Some(&scope), |db| {
+            let did = did.clone();
+            async move { plant_claimed_record(&db, &did).await }
+        })
+        .await
+        else {
+            return;
+        };
+        match result {
+            Err(CustomError::BadRequest(msg)) => assert_eq!(msg, PRE_CLAIM_DEVICE_REFUSED_MSG),
+            other => panic!("a pre-claim device id must be refused, got {other:?}"),
+        }
+        assert!(
+            log.is_empty(),
+            "the refusal must precede every Synapse call (deactivation gate included): {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_in_accepts_no_proposed_id_or_a_fresh_one_for_a_claimed_account() {
+        for scope in [
+            Some("openid urn:matrix:client:api:*".to_string()),
+            Some(scope_with("FRESHDEV99")),
+            // A prefix of a listed id is not the id.
+            Some(scope_with("PRECLAIMDEV")),
+        ] {
+            let did = fresh_did();
+            let Some((result, _)) =
+                sign_in_as(Homeserver::default(), &did, scope.as_deref(), |db| {
+                    let did = did.clone();
+                    async move { plant_claimed_record(&db, &did).await }
+                })
+                .await
+            else {
+                return;
+            };
+            assert!(result.is_ok(), "{scope:?} must sign in, got {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_in_of_an_ordinary_account_is_unaffected_by_the_proposed_id() {
+        let did = fresh_did();
+        let scope = scope_with(PRE_CLAIM);
+        let Some((result, _)) =
+            sign_in_as(Homeserver::default(), &did, Some(&scope), |_| async {}).await
+        else {
+            return;
+        };
+        assert!(
+            result.is_ok(),
+            "an account with no guest record may propose any id, got {result:?}"
+        );
+    }
+
+    // ---- SS4 WP5: a deleted device id is refused at sign_in (flag 2, 8.1) ----
+
+    const DELETED: &str = "DELETEDDEV1";
+
+    fn flag2(on: bool) -> SignInSetup {
+        SignInSetup {
+            config: Some(crate::config::Config {
+                refuse_deleted_device_ids: on,
+                ..crate::config::Config::default()
+            }),
+            ..SignInSetup::default()
+        }
+    }
+
+    /// The marker as a delete under flag 2 leaves it, under the localpart `sign_in`
+    /// provisions for `did` on a homeserver where no account exists yet (the modern one).
+    async fn plant_deleted_marker(db: &RedisClient, did: &str) {
+        db.plant_deleted_device_marker(&localpart_for(did), DELETED, 60)
+            .await
+            .unwrap();
+    }
+
+    /// The query (or, with `fragment`, the fragment) of a refusal redirect.
+    fn refusal_params(
+        result: &Result<(Url, String), CustomError>,
+        fragment: bool,
+    ) -> HashMap<String, String> {
+        let Err(CustomError::Redirect(location)) = result else {
+            panic!("the refusal must be a redirect to the client, got {result:?}");
+        };
+        let url = Url::parse(location).unwrap();
+        assert_eq!(
+            format!("{}{}", url.origin().ascii_serialization(), url.path()),
+            REDIRECT,
+            "the refusal goes to the bound redirect_uri, never an issuer page"
+        );
+        let raw = if fragment {
+            assert!(url.query().is_none(), "fragment mode: nothing in the query");
+            url.fragment().unwrap_or_default().to_string()
+        } else {
+            assert!(url.fragment().is_none(), "query mode: no fragment");
+            url.query().unwrap_or_default().to_string()
+        };
+        url::form_urlencoded::parse(raw.as_bytes())
+            .into_owned()
+            .collect()
+    }
+
+    fn is_deleted_device_refusal(result: &Result<(Url, String), CustomError>) -> bool {
+        matches!(result, Err(CustomError::Redirect(l)) if l.contains("invalid_scope"))
+    }
+
+    #[tokio::test]
+    async fn sign_in_refuses_deleted_device_id_redirect_invalid_scope_with_state() {
+        let did = fresh_did();
+        let scope = scope_with(DELETED);
+        let Some((result, log)) = sign_in_with(
+            Homeserver::default(),
+            &did,
+            Some(&scope),
+            flag2(true),
+            |db| {
+                let did = did.clone();
+                async move { plant_deleted_marker(&db, &did).await }
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        let q = refusal_params(&result, false);
+        assert_eq!(q.get("error").map(String::as_str), Some("invalid_scope"));
+        assert_eq!(
+            q.get("error_description").map(String::as_str),
+            Some(DELETED_DEVICE_REFUSED_MSG)
+        );
+        assert_eq!(
+            q.get("state").map(String::as_str),
+            Some("state"),
+            "state echoed"
+        );
+        assert!(!q.contains_key("code"), "no code, so no grant");
+        assert!(
+            !q.contains_key("iss"),
+            "no iss: the authorize error redirects add none"
+        );
+        // No Synapse call at all: no upsert, no cross-signing reset arm, and the refusal
+        // precedes the deactivation gate.
+        assert!(log.is_empty(), "no homeserver call: {log:?}");
+    }
+
+    #[tokio::test]
+    async fn sign_in_deleted_device_flag2_off_recreates_as_today() {
+        let did = fresh_did();
+        let scope = scope_with(DELETED);
+        let Some((result, log)) = sign_in_with(
+            Homeserver::default(),
+            &did,
+            Some(&scope),
+            flag2(false),
+            |db| {
+                let did = did.clone();
+                async move { plant_deleted_marker(&db, &did).await }
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        let (url, _) = result.expect("flag 2 off: the deleted id signs in as today");
+        assert!(url.query().unwrap_or_default().contains("code="));
+        assert!(
+            log.iter().any(|l| l.ends_with("/upsert_device")),
+            "flag 2 off: the device is provisioned (recreated): {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refusal_honours_response_mode_fragment() {
+        let did = fresh_did();
+        let scope = scope_with(DELETED);
+        let setup = SignInSetup {
+            response_mode: Some("fragment".to_string()),
+            ..flag2(true)
+        };
+        let Some((result, _)) =
+            sign_in_with(Homeserver::default(), &did, Some(&scope), setup, |db| {
+                let did = did.clone();
+                async move { plant_deleted_marker(&db, &did).await }
+            })
+            .await
+        else {
+            return;
+        };
+        let f = refusal_params(&result, true);
+        assert_eq!(f.get("error").map(String::as_str), Some("invalid_scope"));
+        assert_eq!(f.get("state").map(String::as_str), Some("state"));
+    }
+
+    #[tokio::test]
+    async fn refusal_applies_to_matrix_class_clients_only() {
+        let did = fresh_did();
+        let scope = scope_with(DELETED);
+        let setup = SignInSetup {
+            generic: true,
+            ..flag2(true)
+        };
+        let Some((result, _)) =
+            sign_in_with(Homeserver::default(), &did, Some(&scope), setup, |db| {
+                let did = did.clone();
+                async move { plant_deleted_marker(&db, &did).await }
+            })
+            .await
+        else {
+            return;
+        };
+        assert!(
+            !is_deleted_device_refusal(&result),
+            "a generic-class client holds no Matrix device: not refused, got {result:?}"
+        );
+        // And a Matrix-class client proposing a fresh id is not refused either.
+        let did = fresh_did();
+        let fresh = scope_with("FRESHDEV99");
+        let Some((result, _)) = sign_in_with(
+            Homeserver::default(),
+            &did,
+            Some(&fresh),
+            flag2(true),
+            |db| {
+                let did = did.clone();
+                async move { plant_deleted_marker(&db, &did).await }
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(result.is_ok(), "a fresh id signs in, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn guest_preclaim_device_refusal_redirects_flag2_on() {
+        let did = fresh_did();
+        let scope = scope_with(PRE_CLAIM);
+        let Some((result, log)) = sign_in_with(
+            Homeserver::default(),
+            &did,
+            Some(&scope),
+            flag2(true),
+            |db| {
+                let did = did.clone();
+                async move { plant_claimed_record(&db, &did).await }
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        let q = refusal_params(&result, false);
+        assert_eq!(q.get("error").map(String::as_str), Some("invalid_scope"));
+        assert_eq!(
+            q.get("error_description").map(String::as_str),
+            Some(PRE_CLAIM_DEVICE_REFUSED_MSG)
+        );
+        assert_eq!(q.get("state").map(String::as_str), Some("state"));
+        assert!(log.is_empty(), "no homeserver call: {log:?}");
+    }
+
+    #[tokio::test]
+    async fn refusal_logs_hashed_device_id_only() {
+        let did = fresh_did();
+        let scope = scope_with(DELETED);
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let Some((result, _)) = sign_in_with(
+            Homeserver::default(),
+            &did,
+            Some(&scope),
+            flag2(true),
+            |db| {
+                let did = did.clone();
+                async move { plant_deleted_marker(&db, &did).await }
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        let output = logs.output();
+        assert!(is_deleted_device_refusal(&result), "{result:?}");
+        let lines: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains("deleted_device_refused"))
+            .collect();
+        assert_eq!(lines.len(), 1, "one security event line: {output}");
+        assert!(
+            lines[0].contains(&siwx_oidc::redact::fingerprint(DELETED)),
+            "the line names the device by its hash: {}",
+            lines[0]
+        );
+        assert!(
+            !output.contains(DELETED),
+            "the device id never appears in clear: {output}"
+        );
+    }
+
+    // ---- SS4 WP6: the other sign_in refusals become redirects (flag 2, 8.27) ----
+
+    /// A homeserver on which `did`'s account exists under the modern localpart and is
+    /// deactivated (an erased account is deactivated too).
+    fn deactivated_for(did: &str) -> Homeserver {
+        let modern = localpart_for(did);
+        Homeserver {
+            taken: HashSet::from([modern.clone()]),
+            deactivated: HashSet::from([modern]),
+            ..Homeserver::default()
+        }
+    }
+
+    /// The legacy availability probe answers 500: the deactivation gate cannot decide.
+    fn probe_fault_for(did: &str) -> Homeserver {
+        Homeserver {
+            faulted: HashSet::from([legacy_localpart(did)]),
+            ..Homeserver::default()
+        }
+    }
+
+    fn upsert_fault() -> Homeserver {
+        Homeserver {
+            upsert_fails: true,
+            ..Homeserver::default()
+        }
+    }
+
+    /// Asserts `result` is a refusal redirect with `error` and `description`, the bound
+    /// state and no code.
+    fn assert_refusal(result: &Result<(Url, String), CustomError>, error: &str, description: &str) {
+        let q = refusal_params(result, false);
+        assert_eq!(q.get("error").map(String::as_str), Some(error), "{q:?}");
+        assert_eq!(
+            q.get("error_description").map(String::as_str),
+            Some(description)
+        );
+        assert_eq!(q.get("state").map(String::as_str), Some("state"));
+        assert!(!q.contains_key("code"), "no code, so no grant: {q:?}");
+    }
+
+    fn armed_reset(log: &[String]) -> bool {
+        log.iter()
+            .any(|l| l.ends_with("/allow_cross_signing_reset"))
+    }
+
+    // ---- SS4 audit fixes #3 and #7 ----
+
+    /// #7: a refusal never redirects to a bound redirect_uri the client's registration no
+    /// longer lists. Flag 2 on, the re-validation (C2 step 3) runs before the refusals, so
+    /// a deactivated account or a deleted device id with a stale redirect_uri gets the
+    /// re-validation's issuer error, never a redirect.
+    #[tokio::test]
+    async fn sign_in_refusal_never_redirects_to_an_unregistered_redirect_uri() {
+        let did = fresh_did();
+        let stale = || SignInSetup {
+            stale_redirect: true,
+            ..flag2(true)
+        };
+        let Some((result, log)) =
+            sign_in_with(deactivated_for(&did), &did, None, stale(), |_| async {}).await
+        else {
+            return;
+        };
+        match result {
+            Err(CustomError::BadRequest(msg)) => assert!(msg.contains("not registered"), "{msg}"),
+            other => panic!("deactivated, stale redirect_uri: no redirect, got {other:?}"),
+        }
+        assert!(log.is_empty(), "nothing reached the homeserver: {log:?}");
+
+        let did = fresh_did();
+        let scope = scope_with(DELETED);
+        let Some((result, _)) =
+            sign_in_with(Homeserver::default(), &did, Some(&scope), stale(), |db| {
+                let did = did.clone();
+                async move {
+                    db.plant_deleted_device_marker(&localpart_for(&did), DELETED, 60)
+                        .await
+                        .unwrap()
+                }
+            })
+            .await
+        else {
+            return;
+        };
+        match result {
+            Err(CustomError::BadRequest(msg)) => assert!(msg.contains("not registered"), "{msg}"),
+            other => panic!("deleted id, stale redirect_uri: no redirect, got {other:?}"),
+        }
+    }
+
+    /// #3: flag 2 on, a Redis error in the device checks before provisioning (here the
+    /// pre-claim lookup, a wrong-type guest record) is a `temporarily_unavailable` redirect
+    /// with no code, not an issuer page; nothing reaches the homeserver. Flag 2 off keeps
+    /// today's server error.
+    #[tokio::test]
+    async fn sign_in_device_check_redis_error_redirects_temporarily_unavailable() {
+        for on in [true, false] {
+            let did = fresh_did();
+            let scope = scope_with("DEVICE_A");
+            let Some((result, log)) =
+                sign_in_with(Homeserver::default(), &did, Some(&scope), flag2(on), |db| {
+                    let did = did.clone();
+                    async move {
+                        db.zadd_for_test(
+                            &siwx_oidc::db::guest_invites::guest_account_key(&localpart_for(&did)),
+                            1,
+                            "not-a-hash",
+                        )
+                        .await
+                    }
+                })
+                .await
+            else {
+                return;
+            };
+            if on {
+                assert_refusal(
+                    &result,
+                    "temporarily_unavailable",
+                    DEVICE_CHECK_UNAVAILABLE_MSG,
+                );
+            } else {
+                assert!(
+                    !matches!(result, Ok(_) | Err(CustomError::Redirect(_))),
+                    "flag 2 off: today's issuer error, got {result:?}"
+                );
+            }
+            assert!(log.is_empty(), "nothing reached the homeserver: {log:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_in_deactivated_account_redirects_access_denied_flag2_on() {
+        let did = fresh_did();
+        let Some((result, log)) =
+            sign_in_with(deactivated_for(&did), &did, None, flag2(true), |_| async {}).await
+        else {
+            return;
+        };
+        assert_refusal(
+            &result,
+            "access_denied",
+            crate::webauthn::DEACTIVATED_REJECT_MSG,
+        );
+        assert!(
+            log.iter().all(|l| !l.starts_with("POST")),
+            "nothing provisioned for a refused account: {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_in_deactivated_account_keeps_401_page_flag2_off() {
+        let did = fresh_did();
+        let Some((result, _)) =
+            sign_in_with(deactivated_for(&did), &did, None, flag2(false), |_| async {
+            })
+            .await
+        else {
+            return;
+        };
+        match result {
+            Err(CustomError::Unauthorized(msg)) => {
+                assert_eq!(msg, crate::webauthn::DEACTIVATED_REJECT_MSG)
+            }
+            other => panic!("flag 2 off keeps today's 401 page, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_in_erased_account_redirects_access_denied() {
+        let did = fresh_did();
+        let Some((result, log)) =
+            sign_in_with(deactivated_for(&did), &did, None, flag2(true), |db| {
+                let did = did.clone();
+                async move {
+                    db.mark_account_erased(&localpart_for(&did), &did)
+                        .await
+                        .unwrap()
+                }
+            })
+            .await
+        else {
+            return;
+        };
+        assert_refusal(
+            &result,
+            "access_denied",
+            crate::webauthn::DEACTIVATED_REJECT_MSG,
+        );
+        assert!(log.iter().all(|l| !l.starts_with("POST")), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn sign_in_deactivation_probe_failure_redirects_temporarily_unavailable_no_grant() {
+        let did = fresh_did();
+        let Some((result, log)) =
+            sign_in_with(probe_fault_for(&did), &did, None, flag2(true), |_| async {}).await
+        else {
+            return;
+        };
+        assert_refusal(
+            &result,
+            "temporarily_unavailable",
+            crate::webauthn::DEACTIVATION_CHECK_UNAVAILABLE_MSG,
+        );
+        assert_eq!(
+            log,
+            vec![format!("is_localpart_available {}", legacy_localpart(&did))],
+            "the failed probe is the only homeserver call"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_in_upsert_device_failure_redirects_temporarily_unavailable_no_grant() {
+        let did = fresh_did();
+        let scope = scope_with("DEVICE_A");
+        let Some((result, log)) =
+            sign_in_with(upsert_fault(), &did, Some(&scope), flag2(true), |_| async {
+            })
+            .await
+        else {
+            return;
+        };
+        assert_refusal(
+            &result,
+            "temporarily_unavailable",
+            DEVICE_PROVISIONING_UNAVAILABLE_MSG,
+        );
+        assert!(
+            log.iter().any(|l| l.ends_with("/upsert_device")),
+            "the upsert was tried: {log:?}"
+        );
+    }
+
+    /// No cross-signing reset window is armed by a sign-in refused as
+    /// `temporarily_unavailable`, for either cause. Flag 2 off, an upsert failure stays
+    /// today's warning: the grant is issued and the window armed.
+    #[tokio::test]
+    async fn temporarily_unavailable_redirect_does_not_arm_reset_window() {
+        let did = fresh_did();
+        let Some((result, log)) =
+            sign_in_with(probe_fault_for(&did), &did, None, flag2(true), |_| async {}).await
+        else {
+            return;
+        };
+        assert!(
+            matches!(result, Err(CustomError::Redirect(_))),
+            "{result:?}"
+        );
+        assert!(!armed_reset(&log), "probe failure: no reset arm: {log:?}");
+
+        for on in [true, false] {
+            let did = fresh_did();
+            let Some((result, log)) =
+                sign_in_with(upsert_fault(), &did, None, flag2(on), |_| async {}).await
+            else {
+                return;
+            };
+            if on {
+                assert!(
+                    matches!(result, Err(CustomError::Redirect(_))),
+                    "{result:?}"
+                );
+                assert!(!armed_reset(&log), "upsert failure: no reset arm: {log:?}");
+            } else {
+                let (url, _) = result.expect("flag 2 off: the grant is issued as today");
+                assert!(url.query().unwrap_or_default().contains("code="));
+                assert!(armed_reset(&log), "flag 2 off: armed as today: {log:?}");
+            }
+        }
     }
 }
 
@@ -5652,20 +8721,16 @@ mod device_display_name_tests {
     }
 
     fn client_entry(client_name: Option<&str>) -> ClientEntry {
-        let mut metadata = CoreClientMetadata::new(
+        let mut metadata = SiwxClientMetadata::new(
             vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
-            EmptyAdditionalClientMetadata {},
+            LogoutClientMetadata::default(),
         );
         if let Some(name) = client_name {
             let mut names = LocalizedClaim::new();
             names.insert(None, ClientName::new(name.to_string()));
             metadata = metadata.set_client_name(Some(names));
         }
-        ClientEntry {
-            secret: "secret".into(),
-            metadata,
-            access_token: None,
-        }
+        ClientEntry::new("secret", metadata, None)
     }
 
     /// Asserts that exactly one device was upserted, that the upsert carried
@@ -5712,11 +8777,11 @@ mod device_display_name_tests {
             session_id.clone(),
             SessionEntry {
                 siwe_nonce: nonce.clone(),
-                oidc_nonce: None,
                 secret: "secret".into(),
                 signin_count: 0,
                 verified_did: Some(DID.to_string()),
-                scope: None,
+                request: Some(bound_test_request(&client_id)),
+                guest_id: None,
             },
         )
         .await
@@ -5726,24 +8791,15 @@ mod device_display_name_tests {
             "cookie",
             HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
         );
-        let params = SignInParams {
-            redirect_uri: RedirectUrl::new(REDIRECT.into()).unwrap(),
-            state: "state".into(),
-            oidc_nonce: None,
-            client_id: client_id.clone(),
-            code_challenge: None,
-            code_challenge_method: None,
-            response_mode: None,
-        };
         sign_in(
             &Url::parse("https://example.com").unwrap(),
             &["key".to_string()],
             &[],
-            params,
             headers.typed_get::<headers::Cookie>().unwrap(),
             &db,
             Some(&synapse),
             Some(SERVER_NAME),
+            None,
             None,
         )
         .await
@@ -5933,30 +8989,36 @@ mod device_display_name_tests {
         );
     }
 
-    /// The QR / device-code path used to name every device "Element X".
+    /// The grant of an approved device code counts from the approval, the
+    /// authentication, which the approval records on the entry from Redis
+    /// `TIME`; not from the poll that redeems it (I6).
     #[tokio::test]
-    async fn the_device_code_grant_names_the_device_after_its_client() {
+    async fn a_device_grant_counts_its_lifetime_from_the_approval() {
         let Some(db) = siwx_oidc::test_support::redis().await else {
             return;
         };
-        let (synapse, hs, server) = spawn(&[]).await;
+        let (synapse, _hs, server) = spawn(&[]).await;
         let nonce = Uuid::new_v4().simple().to_string();
-        let client_id = format!("device-name-dc-{nonce}");
+        let client_id = format!("device-auth-time-{nonce}");
         db.set_client(client_id.clone(), client_entry(Some("Pocket Client")))
             .await
             .unwrap();
-        let device_code = format!("dvc_device-name-{nonce}");
+        let device_code = format!("dvc_auth-time-{nonce}");
+        let approved_at = Utc::now().timestamp() - 1_000;
         db.set_device_code(
             &device_code,
             &DeviceCodeEntry {
-                user_code: format!("DN-{nonce}"),
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!("AT-{nonce}")),
+                legacy_user_code: None,
                 client_id: client_id.clone(),
                 scope: "openid".to_string(),
                 status: DeviceCodeStatus::Approved,
                 did: Some(DID.to_string()),
                 device_id: None,
                 last_poll: None,
-                created_at: Utc::now().timestamp(),
+                created_at: approved_at - 10,
+                auth_ms: Some(approved_at * 1000),
+                expected_mxid: None,
             },
             DEVICE_CODE_LIFETIME,
         )
@@ -5977,7 +9039,74 @@ mod device_display_name_tests {
                 refresh_token: None,
                 device_code: Some(device_code),
             },
-            None,
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &config,
+            &db,
+            Some(&synapse),
+        )
+        .await
+        .expect("an approved device code must be redeemed");
+        server.abort();
+        let access = openidconnect::OAuth2TokenResponse::access_token(&response);
+        let grant = db
+            .lookup_access_token(access.secret())
+            .await
+            .unwrap()
+            .expect("the issued access token is live")
+            .grant;
+        assert_eq!(grant.auth_time, approved_at, "auth_time is the approval");
+        assert_eq!(grant.auth_ms, approved_at * 1000, "auth_ms is the approval");
+    }
+
+    /// The QR / device-code path used to name every device "Element X".
+    #[tokio::test]
+    async fn the_device_code_grant_names_the_device_after_its_client() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (synapse, hs, server) = spawn(&[]).await;
+        let nonce = Uuid::new_v4().simple().to_string();
+        let client_id = format!("device-name-dc-{nonce}");
+        db.set_client(client_id.clone(), client_entry(Some("Pocket Client")))
+            .await
+            .unwrap();
+        let device_code = format!("dvc_device-name-{nonce}");
+        db.set_device_code(
+            &device_code,
+            &DeviceCodeEntry {
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!("DN-{nonce}")),
+                legacy_user_code: None,
+                client_id: client_id.clone(),
+                scope: "openid".to_string(),
+                status: DeviceCodeStatus::Approved,
+                did: Some(DID.to_string()),
+                device_id: None,
+                last_poll: None,
+                created_at: Utc::now().timestamp(),
+                auth_ms: None,
+                expected_mxid: None,
+            },
+            DEVICE_CODE_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let config = Config {
+            mas_shared_secret: Some("secret".to_string()),
+            matrix_server_name: Some(SERVER_NAME.to_string()),
+            ..Config::default()
+        };
+        let response = token(
+            TokenForm {
+                code: None,
+                client_id: Some(client_id),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code),
+            },
+            ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
             &config,
             &db,
@@ -5997,5 +9126,5399 @@ mod device_display_name_tests {
             scopes.contains(&format!("urn:matrix:client:device:{device_id}")),
             "the token must be scoped to the device that was provisioned: {scopes:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod client_binding_tests {
+    //! A refresh token belongs to the client it was issued to (I7), and the
+    //! token endpoint authenticates a client the same way for the code exchange
+    //! and the refresh grant. Needs Redis.
+    use super::*;
+    use crate::config::Config;
+    use openidconnect::core::CoreClientAuthMethod;
+
+    pub(super) const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    pub(super) const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    pub(super) const SECRET: &str = "the-registered-secret";
+
+    pub(super) fn unique(prefix: &str) -> String {
+        format!("{prefix}{}", Uuid::new_v4().simple())
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum Registration {
+        /// `token_endpoint_auth_method: none`, as Element Web and Element X register.
+        Public,
+        /// `client_secret_post`.
+        Confidential,
+        /// No `token_endpoint_auth_method`: confidential when `require_secret`.
+        Unset,
+    }
+
+    async fn seed_client(db: &RedisClient, registration: Registration) -> String {
+        seed_client_with(db, registration, None).await
+    }
+
+    /// A client registered with the given grant types (`None`: the registration
+    /// names none).
+    pub(super) async fn seed_client_with(
+        db: &RedisClient,
+        registration: Registration,
+        grant_types: Option<Vec<CoreGrantType>>,
+    ) -> String {
+        let id = unique("bind-");
+        let mut metadata = SiwxClientMetadata::new(
+            vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
+            LogoutClientMetadata::default(),
+        );
+        metadata = match registration {
+            Registration::Public => {
+                metadata.set_token_endpoint_auth_method(Some(CoreClientAuthMethod::None))
+            }
+            Registration::Confidential => metadata
+                .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::ClientSecretPost)),
+            Registration::Unset => metadata,
+        };
+        if let Some(grants) = grant_types {
+            metadata = metadata.set_grant_types(Some(grants));
+        }
+        db.set_client(id.clone(), ClientEntry::new(SECRET, metadata, None))
+            .await
+            .unwrap();
+        id
+    }
+
+    /// A deviceless grant of `client_id` with a refresh token; returns the token.
+    async fn seed_refresh_token(db: &RedisClient, client_id: &str) -> String {
+        db.issue_grant(&NewGrant {
+            kind: GrantKind::Oidc,
+            username: unique("localpart"),
+            did: "did:key:zDnBINDING".into(),
+            client_id: client_id.into(),
+            confidential_client: false,
+            device_id: String::new(),
+            scope: "openid".into(),
+            name: "did:key:zDnBINDING".into(),
+            auth_ms: Some(Utc::now().timestamp_millis()),
+            access_ttl: ACCESS_TOKEN_TTL,
+            refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+            absolute_deadline: None,
+        })
+        .await
+        .unwrap()
+        .refresh_token
+        .expect("the grant carries a refresh token")
+    }
+
+    async fn seed_code(db: &RedisClient, client_id: &str) -> String {
+        seed_code_with_scope(db, client_id, None).await
+    }
+
+    /// A code `sign_in` issued for an authorization request that asked for `scope`.
+    pub(super) async fn seed_code_with_scope(
+        db: &RedisClient,
+        client_id: &str,
+        scope: Option<&str>,
+    ) -> String {
+        let code = unique("code-");
+        db.set_code(
+            code.clone(),
+            CodeEntry {
+                exchange_count: 0,
+                did: "did:key:zDnBINDING".into(),
+                nonce: None,
+                client_id: client_id.into(),
+                auth_time: Utc::now(),
+                code_challenge: Some(CHALLENGE.into()),
+                code_challenge_method: Some("S256".into()),
+                device_id: None,
+                localpart: Some(unique("localpart")),
+                scope: scope.map(str::to_string),
+                client_class: None,
+            },
+        )
+        .await
+        .unwrap();
+        code
+    }
+
+    /// What the caller says about itself: the `client_id` of the form, the
+    /// `client_secret` of the form, and a secret from an `Authorization` header.
+    #[derive(Clone, Copy)]
+    struct Presented<'a> {
+        client_id: Option<&'a str>,
+        form_secret: Option<&'a str>,
+        /// The user name of an `Authorization: Basic` header.
+        header_client_id: Option<&'a str>,
+        header_secret: Option<&'a str>,
+    }
+
+    const NOTHING: Presented<'static> = Presented {
+        client_id: None,
+        form_secret: None,
+        header_client_id: None,
+        header_secret: None,
+    };
+
+    async fn refresh(
+        db: &RedisClient,
+        config: &Config,
+        refresh_token: &str,
+        who: Presented<'_>,
+    ) -> Result<SiwxTokenResponse, CustomError> {
+        token(
+            TokenForm {
+                code: None,
+                client_id: who.client_id.map(str::to_string),
+                client_secret: who.form_secret.map(str::to_string),
+                grant_type: CoreGrantType::RefreshToken,
+                code_verifier: None,
+                refresh_token: Some(refresh_token.to_string()),
+                device_code: None,
+            },
+            ClientCredentials {
+                basic_client_id: who.header_client_id.map(str::to_string),
+                secret: who.header_secret.map(str::to_string),
+            },
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            None,
+        )
+        .await
+    }
+
+    async fn exchange(
+        db: &RedisClient,
+        config: &Config,
+        code: &str,
+        who: Presented<'_>,
+    ) -> Result<SiwxTokenResponse, CustomError> {
+        token(
+            TokenForm {
+                code: Some(code.to_string()),
+                client_id: who.client_id.map(str::to_string),
+                client_secret: who.form_secret.map(str::to_string),
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(VERIFIER.to_string()),
+                refresh_token: None,
+                device_code: None,
+            },
+            ClientCredentials {
+                basic_client_id: who.header_client_id.map(str::to_string),
+                secret: who.header_secret.map(str::to_string),
+            },
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            None,
+        )
+        .await
+    }
+
+    /// The answer, reduced to what a client sees: success, `invalid_grant`
+    /// (the grant does not belong to this client), or `invalid_client` (the
+    /// client did not authenticate).
+    fn outcome(result: &Result<SiwxTokenResponse, CustomError>) -> String {
+        match result {
+            Ok(_) => "ok".to_string(),
+            Err(CustomError::BadRequestToken(e)) => match e.error {
+                CoreErrorResponseType::InvalidGrant => "invalid_grant".to_string(),
+                CoreErrorResponseType::InvalidRequest => "invalid_request".to_string(),
+                ref other => format!("{other:?}"),
+            },
+            Err(CustomError::Unauthorized(message)) => format!("invalid_client: {message}"),
+            Err(other) => format!("unexpected: {other:?}"),
+        }
+    }
+
+    fn refresh_token_of(result: Result<SiwxTokenResponse, CustomError>) -> String {
+        use openidconnect::OAuth2TokenResponse;
+        result
+            .unwrap_or_else(|e| panic!("the refresh must succeed: {e:?}"))
+            .refresh_token()
+            .expect("a rotation returns a refresh token")
+            .secret()
+            .clone()
+    }
+
+    /// The token's grant exists and was never rotated: a refusal consumed nothing.
+    async fn still_exists(db: &RedisClient, refresh_token: &str) -> bool {
+        db.peek_refresh_grant(refresh_token)
+            .await
+            .unwrap()
+            .is_some_and(|grant| grant.generation == 0)
+    }
+
+    // ---- S5: the guest refresh guard on /token, and `absolute_exp = deadline` ----
+
+    const GUEST_DID: &str = "did:key:zDnGUEST";
+
+    async fn guest_record(db: &RedisClient, state: &str, deadline_in: i64, device: &str) -> String {
+        let localpart = unique("guestlp");
+        db.put_guest_for_test(&localpart, GUEST_DID, state, deadline_in, &unique("h"))
+            .await;
+        db.sadd_raw_for_test(
+            &siwx_oidc::db::guest_records::devices_key(&localpart),
+            device,
+        )
+        .await;
+        localpart
+    }
+
+    async fn guest_grant(
+        db: &RedisClient,
+        client: &str,
+        localpart: &str,
+        device: &str,
+        deadline: Option<i64>,
+    ) -> (String, siwx_oidc::db::grant::GrantId) {
+        let issued = db
+            .issue_grant(&NewGrant {
+                kind: GrantKind::MatrixDevice,
+                username: localpart.into(),
+                did: GUEST_DID.into(),
+                client_id: client.into(),
+                confidential_client: false,
+                device_id: device.into(),
+                scope: "openid".into(),
+                name: "g".into(),
+                auth_ms: None,
+                access_ttl: ACCESS_TOKEN_TTL,
+                refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+                absolute_deadline: deadline,
+            })
+            .await
+            .unwrap();
+        (issued.refresh_token.unwrap(), issued.grant_id)
+    }
+
+    fn guest_config(client: &str) -> Config {
+        Config {
+            guest_client_id: Some(client.into()),
+            ..Config::default()
+        }
+    }
+
+    /// `ok`, `invalid_grant` or `5xx`: what a client sees.
+    fn guest_refresh_class(r: Result<SiwxTokenResponse, CustomError>) -> &'static str {
+        match r {
+            Ok(_) => "ok",
+            Err(CustomError::BadRequestToken(t))
+                if t.error == CoreErrorResponseType::InvalidGrant =>
+            {
+                "invalid_grant"
+            }
+            Err(CustomError::ServiceUnavailable(_)) => "5xx",
+            Err(other) => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// S5, ST-11 shape: with no reaper running the deadline, `reaping` and an unrecorded
+    /// device each refuse a guest's refresh with `invalid_grant`; a live, recorded one
+    /// rotates; a Redis read error is a 5xx; a non-guest client is unaffected.
+    #[tokio::test]
+    async fn st11_the_guest_refresh_guard_refuses_at_the_deadline_reaping_and_an_unrecorded_device()
+    {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let guest_client = seed_client(&db, Registration::Public).await;
+        let config = guest_config(&guest_client);
+        let now = Utc::now().timestamp();
+        let go = |rt: String| {
+            let (db, config, c) = (db.clone(), config.clone(), guest_client.clone());
+            async move {
+                guest_refresh_class(
+                    refresh(
+                        &db,
+                        &config,
+                        &rt,
+                        Presented {
+                            client_id: Some(&c),
+                            ..NOTHING
+                        },
+                    )
+                    .await,
+                )
+            }
+        };
+
+        // live and recorded: rotates
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let (rt, _) = guest_grant(&db, &guest_client, &lp, "DEV1", Some(now + 600)).await;
+        assert_eq!(go(rt).await, "ok");
+
+        // the deadline has passed (the record's; no reaper has run)
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let (rt, _) = guest_grant(&db, &guest_client, &lp, "DEV1", Some(now + 600)).await;
+        db.hset_raw_for_test(
+            &siwx_oidc::db::guest_invites::guest_account_key(&lp),
+            "deadline",
+            &(now - 5).to_string(),
+        )
+        .await;
+        assert_eq!(go(rt).await, "invalid_grant");
+
+        // reaping
+        let lp = guest_record(&db, "reaping", 600, "DEV1").await;
+        let (rt, _) = guest_grant(&db, &guest_client, &lp, "DEV1", Some(now + 600)).await;
+        assert_eq!(go(rt).await, "invalid_grant");
+
+        // no record at all (reaped)
+        let (rt, _) = guest_grant(&db, &guest_client, &unique("gone"), "DEV1", None).await;
+        assert_eq!(go(rt).await, "invalid_grant");
+
+        // a device the record does not list
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let (rt, _) = guest_grant(&db, &guest_client, &lp, "DEV2", Some(now + 600)).await;
+        assert_eq!(go(rt).await, "invalid_grant");
+
+        // a read error: the record key has the wrong type; never passed on
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let (rt, _) = guest_grant(&db, &guest_client, &lp, "DEV1", Some(now + 600)).await;
+        db.del_raw(&siwx_oidc::db::guest_invites::guest_account_key(&lp))
+            .await
+            .unwrap();
+        db.sadd_raw_for_test(&siwx_oidc::db::guest_invites::guest_account_key(&lp), "x")
+            .await;
+        assert_eq!(go(rt).await, "5xx");
+
+        // a non-guest client and a non-guest grant are unaffected (no record, no device)
+        let other = seed_client(&db, Registration::Public).await;
+        let rt = seed_refresh_token(&db, &other).await;
+        let r = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&other),
+                ..NOTHING
+            },
+        )
+        .await;
+        assert_eq!(guest_refresh_class(r), "ok");
+    }
+
+    /// S5: `absolute_exp = deadline` is written into a guest's grant only (the code
+    /// exchange of the guest client with a live record), and the rotation script itself
+    /// refuses past it, independent of the guard.
+    #[tokio::test]
+    async fn s5_absolute_exp_is_the_deadline_for_a_guest_grant_only() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let guest_client = seed_client(&db, Registration::Public).await;
+        let other_client = seed_client(&db, Registration::Public).await;
+        let config = guest_config(&guest_client);
+        let now = Utc::now().timestamp();
+        let exp_of = |db: RedisClient, id: siwx_oidc::db::grant::GrantId| async move {
+            db.hgetall_for_test(&format!("grant/{}", id.as_str()))
+                .await
+                .get("absolute_exp")
+                .cloned()
+        };
+        let exchange_code = |client: String, localpart: String| {
+            let (db, config) = (db.clone(), config.clone());
+            async move {
+                let code = unique("code-");
+                db.set_code(
+                    code.clone(),
+                    CodeEntry {
+                        exchange_count: 0,
+                        did: GUEST_DID.into(),
+                        nonce: None,
+                        client_id: client.clone(),
+                        auth_time: Utc::now(),
+                        code_challenge: Some(CHALLENGE.into()),
+                        code_challenge_method: Some("S256".into()),
+                        device_id: None,
+                        localpart: Some(localpart),
+                        scope: Some("openid offline_access".into()),
+                        client_class: None,
+                    },
+                )
+                .await
+                .unwrap();
+                let r = exchange(
+                    &db,
+                    &config,
+                    &code,
+                    Presented {
+                        client_id: Some(&client),
+                        ..NOTHING
+                    },
+                )
+                .await;
+                let rt = refresh_token_of(r);
+                match db.peek_refresh_token(&rt).await.unwrap() {
+                    RefreshPeek::Grant(g) => g,
+                    _ => panic!("no grant"),
+                }
+            }
+        };
+
+        // the guest client with a live record: the grant ends at the record's deadline
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let record_deadline = db
+            .guest_grant_deadline(&lp)
+            .await
+            .unwrap()
+            .expect("a live record has a deadline");
+        let g = exchange_code(guest_client.clone(), lp.clone()).await;
+        assert_eq!(g.absolute_exp, Some(record_deadline));
+        assert!(record_deadline >= now + 590 && record_deadline <= now + 610);
+
+        // another client with the very same live record: no absolute_exp
+        let g = exchange_code(other_client.clone(), lp.clone()).await;
+        assert_eq!(g.absolute_exp, None);
+
+        // the guest client without a record (or claimed): unchanged, the guard decides
+        let g = exchange_code(guest_client.clone(), unique("norecord")).await;
+        assert_eq!(g.absolute_exp, None);
+        let claimed = guest_record(&db, "claimed", 600, "DEV1").await;
+        assert_eq!(db.guest_grant_deadline(&claimed).await.unwrap(), None);
+
+        // a deadline already past refuses the issue (the code is then invalid_grant)
+        let late = guest_record(&db, "active", -5, "DEV1").await;
+        let late_deadline = db.guest_grant_deadline(&late).await.unwrap().unwrap();
+        assert!(late_deadline < now);
+        let err = db
+            .issue_grant(&NewGrant {
+                kind: GrantKind::MatrixDevice,
+                username: late,
+                did: GUEST_DID.into(),
+                client_id: guest_client.clone(),
+                confidential_client: false,
+                device_id: "DEV1".into(),
+                scope: "openid".into(),
+                name: "g".into(),
+                auth_ms: None,
+                access_ttl: ACCESS_TOKEN_TTL,
+                refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+                absolute_deadline: Some(late_deadline),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.is::<siwx_oidc::db::grant::IssueRevoked>());
+
+        // the rotation script refuses past `absolute_exp` on its own: the record says
+        // "live" (deadline far away), the GRANT says two seconds.
+        let lp = guest_record(&db, "active", 600, "DEV1").await;
+        let (rt, id) = guest_grant(&db, &guest_client, &lp, "DEV1", Some(now + 2)).await;
+        assert_eq!(exp_of(db.clone(), id).await, Some((now + 2).to_string()));
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let r = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&guest_client),
+                ..NOTHING
+            },
+        )
+        .await;
+        assert_ne!(
+            guest_refresh_class(r),
+            "ok",
+            "a refresh past absolute_exp rotates nothing"
+        );
+    }
+
+    /// Another client, even one that authenticates correctly as itself, cannot
+    /// refresh the token. A refusal leaves the token alone.
+    #[tokio::test]
+    async fn a_refresh_token_is_refused_to_a_client_it_was_not_issued_to() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let owner = seed_client(&db, Registration::Public).await;
+        let other = seed_client(&db, Registration::Confidential).await;
+        let rt = seed_refresh_token(&db, &owner).await;
+
+        let stolen = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&other),
+                form_secret: Some(SECRET),
+                header_client_id: None,
+                header_secret: None,
+            },
+        )
+        .await;
+        assert_eq!(outcome(&stolen), "invalid_grant");
+        assert!(
+            still_exists(&db, &rt).await,
+            "a refusal never deletes the token"
+        );
+
+        let own = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&owner),
+                ..NOTHING
+            },
+        )
+        .await;
+        assert_eq!(outcome(&own), "ok", "the owner still refreshes it");
+    }
+
+    /// Every path that authenticates a client compares digests: the code
+    /// exchange and the refresh grant (the secret) and `/client/{id}`
+    /// management (the registration access token). A client entry the previous
+    /// build stored in the clear authenticates with its secret and token, and
+    /// a digest read out of Redis is refused everywhere.
+    #[tokio::test]
+    async fn every_client_authentication_compares_digests_of_what_is_presented() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let id = unique("prev-client-");
+        let metadata = SiwxClientMetadata::new(
+            vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
+            LogoutClientMetadata::default(),
+        )
+        .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::ClientSecretBasic));
+        let previous_build = serde_json::json!({
+            "secret": SECRET,
+            "metadata": metadata,
+            "access_token": "the-registration-token",
+        });
+        db.set_ex_raw(&format!("clients/{id}"), &previous_build.to_string(), 600)
+            .await
+            .unwrap();
+        let bearer = |token: &str| Some(headers::Authorization::bearer(token).unwrap().0);
+        let outcome = |r: Result<(), CustomError>| match r {
+            Ok(()) => "ok".to_string(),
+            Err(CustomError::Unauthorized(message)) => format!("invalid_client: {message}"),
+            Err(other) => format!("{other:?}"),
+        };
+
+        // The previous build's entry: the plaintext credentials authenticate.
+        let code = authenticate_code_client(&id, None, Some(SECRET), &config, &db).await;
+        assert_eq!(outcome(code.map(|_| ())), "ok");
+        let stored = db.get_client(id.clone()).await.unwrap().unwrap();
+        assert!(!db
+            .get_raw(&format!("clients/{id}"))
+            .await
+            .unwrap()
+            .unwrap()
+            .contains(SECRET));
+        let refresh = authenticate_refresh_client(&id, None, Some(SECRET), &config, &db).await;
+        assert_eq!(outcome(refresh), "ok");
+        let manage = client_access(id.clone(), bearer("the-registration-token"), &db).await;
+        assert_eq!(outcome(manage.map(|_| ())), "ok");
+
+        // What Redis holds is no credential.
+        let secret_digest = stored.secret_digest.as_str();
+        let token_digest = stored.access_token_digest.clone().unwrap();
+        let code = authenticate_code_client(&id, None, Some(secret_digest), &config, &db).await;
+        assert_eq!(outcome(code.map(|_| ())), "invalid_client: Bad secret.");
+        let refresh =
+            authenticate_refresh_client(&id, None, Some(secret_digest), &config, &db).await;
+        assert_eq!(outcome(refresh), "invalid_client: Bad secret.");
+        let manage = client_access(id.clone(), bearer(&token_digest), &db).await;
+        assert_eq!(
+            outcome(manage.map(|_| ())),
+            "invalid_client: Bad access token."
+        );
+        db.del_raw(&format!("clients/{id}")).await.unwrap();
+    }
+
+    /// A confidential client authenticates at the refresh grant exactly as it
+    /// does at the code exchange: with the secret in the form or in a header.
+    #[tokio::test]
+    async fn a_confidential_client_must_authenticate_to_refresh() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Confidential).await;
+        let rt = seed_refresh_token(&db, &client).await;
+
+        for (what, who, expected) in [
+            (
+                "no credentials",
+                NOTHING,
+                "invalid_client: Secret required.",
+            ),
+            (
+                "a client_id and no secret",
+                Presented {
+                    client_id: Some(&client),
+                    ..NOTHING
+                },
+                "invalid_client: Secret required.",
+            ),
+            (
+                "a wrong form secret",
+                Presented {
+                    client_id: Some(&client),
+                    form_secret: Some("wrong"),
+                    header_client_id: None,
+                    header_secret: None,
+                },
+                "invalid_client: Bad secret.",
+            ),
+            (
+                "a wrong header secret",
+                Presented {
+                    header_secret: Some("wrong"),
+                    ..NOTHING
+                },
+                "invalid_client: Bad secret.",
+            ),
+        ] {
+            let result = refresh(&db, &config, &rt, who).await;
+            assert_eq!(outcome(&result), expected, "{what}");
+            assert!(
+                still_exists(&db, &rt).await,
+                "{what}: the token is untouched"
+            );
+        }
+
+        let with_form_secret = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&client),
+                form_secret: Some(SECRET),
+                header_client_id: None,
+                header_secret: None,
+            },
+        )
+        .await;
+        let rt2 = refresh_token_of(with_form_secret);
+        let with_header_secret = refresh(
+            &db,
+            &config,
+            &rt2,
+            Presented {
+                header_secret: Some(SECRET),
+                ..NOTHING
+            },
+        )
+        .await;
+        assert_eq!(outcome(&with_header_secret), "ok");
+    }
+
+    /// A refresh token written before the grant record (`token/{raw}`), as the
+    /// previous build left it for `client_id`. Returns the raw token.
+    async fn seed_legacy_refresh_token(db: &RedisClient, client_id: &str) -> String {
+        seed_legacy_device_refresh_token(db, client_id, "").await
+    }
+
+    /// [`seed_legacy_refresh_token`] for a Matrix device: the scope names the
+    /// Matrix API and the device, as the previous build wrote an agent's token
+    /// (`device_id` empty: a deviceless token with the `openid` scope).
+    async fn seed_legacy_device_refresh_token(
+        db: &RedisClient,
+        client_id: &str,
+        device_id: &str,
+    ) -> String {
+        let raw = format!("mcr_{}", Uuid::new_v4().simple());
+        let now = Utc::now().timestamp();
+        let scope = if device_id.is_empty() {
+            "openid".to_string()
+        } else {
+            format!("openid urn:matrix:client:api:* urn:matrix:client:device:{device_id}")
+        };
+        db.set_token(
+            &raw,
+            &TokenMetadata {
+                username: unique("localpart"),
+                device_id: device_id.into(),
+                scope,
+                client_id: client_id.into(),
+                iat: now,
+                exp: now + REFRESH_TOKEN_TTL as i64,
+                did: "did:key:zDnBINDING".into(),
+                name: "did:key:zDnBINDING".into(),
+                kind: Some(TokenKind::Refresh),
+                grant_kind: None,
+            },
+            REFRESH_TOKEN_TTL,
+        )
+        .await
+        .unwrap();
+        raw
+    }
+
+    /// Item 10 at `POST /token`: a legacy refresh token is lifted into a grant
+    /// and answered with a pair in the current format, but only for its own
+    /// client, authenticated exactly like any refresh; a refused request leaves
+    /// the legacy entry alone. The lifted grant records whether its client is
+    /// confidential by the one rule (`client_is_confidential`), so the Matrix
+    /// endpoint refuses its tokens exactly when this endpoint demands a secret.
+    #[tokio::test]
+    async fn a_legacy_refresh_token_is_lifted_for_its_own_client_with_its_confidentiality() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let other = seed_client(&db, Registration::Public).await;
+        for registration in [Registration::Confidential, Registration::Public] {
+            let client = seed_client(&db, registration).await;
+            let legacy = seed_legacy_refresh_token(&db, &client).await;
+            let named_other = refresh(
+                &db,
+                &config,
+                &legacy,
+                Presented {
+                    client_id: Some(&other),
+                    ..NOTHING
+                },
+            )
+            .await;
+            assert_eq!(
+                outcome(&named_other),
+                "invalid_grant",
+                "{registration:?}: another client"
+            );
+            let confidential = matches!(registration, Registration::Confidential);
+            if confidential {
+                let no_secret = refresh(
+                    &db,
+                    &config,
+                    &legacy,
+                    Presented {
+                        client_id: Some(&client),
+                        ..NOTHING
+                    },
+                )
+                .await;
+                assert_eq!(outcome(&no_secret), "invalid_client: Secret required.");
+            }
+            assert!(
+                db.get_token(&legacy).await.unwrap().is_some(),
+                "{registration:?}: a refused request leaves the legacy entry"
+            );
+
+            let lifted = refresh(
+                &db,
+                &config,
+                &legacy,
+                Presented {
+                    client_id: Some(&client),
+                    form_secret: confidential.then_some(SECRET),
+                    ..NOTHING
+                },
+            )
+            .await;
+            let new_rt = refresh_token_of(lifted);
+            assert!(
+                siwx_oidc::db::tokens::parse_refresh_token(&new_rt).is_some(),
+                "{registration:?}: the answer is in the current format"
+            );
+            assert!(
+                db.get_token(&legacy).await.unwrap().is_none(),
+                "{registration:?}: the legacy entry is gone"
+            );
+            let grant = db.peek_refresh_grant(&new_rt).await.unwrap().unwrap();
+            assert_eq!(grant.client_id, client);
+            assert_eq!(
+                grant.confidential_client, confidential,
+                "{registration:?}: the lifted grant records the client's confidentiality"
+            );
+            assert_eq!(grant.generation, 1);
+        }
+    }
+
+    /// A public client authenticates nothing: it may name itself or not. Naming
+    /// is optional because `siwx-oidc-auth` and Matrix clients send the id but
+    /// an older agent may not (provisional: see docs/matrix-integration.md).
+    #[tokio::test]
+    async fn a_public_client_refreshes_with_or_without_naming_itself() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Public).await;
+        let rt = seed_refresh_token(&db, &client).await;
+
+        let named = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&client),
+                ..NOTHING
+            },
+        )
+        .await;
+        let rt2 = refresh_token_of(named);
+        let anonymous = refresh(&db, &config, &rt2, NOTHING).await;
+        assert_eq!(outcome(&anonymous), "ok");
+    }
+
+    /// A client registered without an authentication method is confidential
+    /// when `require_secret` is on and public when it is off, the same rule the
+    /// code exchange applies.
+    #[tokio::test]
+    async fn an_unset_authentication_method_follows_require_secret() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client = seed_client(&db, Registration::Unset).await;
+        let strict = Config {
+            require_secret: true,
+            ..Config::default()
+        };
+        let lax = Config {
+            require_secret: false,
+            ..Config::default()
+        };
+
+        let rt = seed_refresh_token(&db, &client).await;
+        assert_eq!(
+            outcome(&refresh(&db, &strict, &rt, NOTHING).await),
+            "invalid_client: Secret required."
+        );
+        assert_eq!(outcome(&refresh(&db, &lax, &rt, NOTHING).await), "ok");
+    }
+
+    /// A refresh token outlives its client's registration (a registration lasts
+    /// 30 days, a refresh token 90 days from its last use). Refusing every such
+    /// token would sign out every session older than a registration, so the
+    /// token keeps refreshing when the request names the same client or none.
+    /// What cannot be done: name another client, or present a secret that can
+    /// no longer be checked. Provisional: a deployment decision for the
+    /// maintainers (see docs/matrix-integration.md).
+    #[tokio::test]
+    async fn a_token_outlives_its_clients_registration_but_not_its_binding() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let gone = seed_client(&db, Registration::Public).await;
+        let other = seed_client(&db, Registration::Public).await;
+        let rt = seed_refresh_token(&db, &gone).await;
+        db.delete_client(gone.clone()).await.unwrap();
+
+        assert_eq!(
+            outcome(
+                &refresh(
+                    &db,
+                    &config,
+                    &rt,
+                    Presented {
+                        client_id: Some(&other),
+                        ..NOTHING
+                    }
+                )
+                .await
+            ),
+            "invalid_grant",
+            "another client is refused"
+        );
+        assert_eq!(
+            outcome(
+                &refresh(
+                    &db,
+                    &config,
+                    &rt,
+                    Presented {
+                        client_id: Some(&gone),
+                        form_secret: Some(SECRET),
+                        header_client_id: None,
+                        header_secret: None
+                    }
+                )
+                .await
+            ),
+            "invalid_client: Unrecognised client id.",
+            "a secret that cannot be checked is refused"
+        );
+        let named = refresh(
+            &db,
+            &config,
+            &rt,
+            Presented {
+                client_id: Some(&gone),
+                ..NOTHING
+            },
+        )
+        .await;
+        let rt2 = refresh_token_of(named);
+        assert_eq!(
+            outcome(&refresh(&db, &config, &rt2, NOTHING).await),
+            "ok",
+            "the same client, or none, still refreshes"
+        );
+    }
+
+    /// The same at the lift: a LEGACY refresh token (`token/{raw}`, written by
+    /// a build before the grant record) whose client registration is gone is
+    /// lifted and answered in the current format, whether the request names
+    /// the client or not, and stays bound to that client. This is the shape of
+    /// most refresh tokens a long-running deployment holds at the upgrade (an
+    /// agent's registration expires after 30 days, its refresh token lives 90
+    /// days from its last use). A registration that is gone counts as public
+    /// under either `require_secret` (`client_is_confidential(None)`).
+    #[tokio::test]
+    async fn a_legacy_token_whose_registration_is_gone_is_lifted_at_the_token_endpoint() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let other = seed_client(&db, Registration::Public).await;
+        for require_secret in [true, false] {
+            let config = Config {
+                require_secret,
+                ..Config::default()
+            };
+            for (device, names_itself) in [
+                ("", true),
+                ("AQUA_LIFTGONE", true),
+                ("AQUA_LIFTGONE", false),
+            ] {
+                let what = format!(
+                    "require_secret={require_secret} device={device:?} names_itself={names_itself}"
+                );
+                let gone = seed_client(&db, Registration::Public).await;
+                let legacy = seed_legacy_device_refresh_token(&db, &gone, device).await;
+                db.delete_client(gone.clone()).await.unwrap();
+
+                let foreign = refresh(
+                    &db,
+                    &config,
+                    &legacy,
+                    Presented {
+                        client_id: Some(&other),
+                        ..NOTHING
+                    },
+                )
+                .await;
+                assert_eq!(outcome(&foreign), "invalid_grant", "{what}: another client");
+                assert!(
+                    db.get_token(&legacy).await.unwrap().is_some(),
+                    "{what}: a refused request leaves the legacy entry"
+                );
+
+                let lifted = refresh(
+                    &db,
+                    &config,
+                    &legacy,
+                    Presented {
+                        client_id: names_itself.then_some(gone.as_str()),
+                        ..NOTHING
+                    },
+                )
+                .await;
+                let new_rt = refresh_token_of(lifted);
+                assert!(
+                    siwx_oidc::db::tokens::parse_refresh_token(&new_rt).is_some(),
+                    "{what}: the answer is in the current format"
+                );
+                assert!(
+                    db.get_token(&legacy).await.unwrap().is_none(),
+                    "{what}: the legacy entry is gone"
+                );
+                let grant = db.peek_refresh_grant(&new_rt).await.unwrap().unwrap();
+                assert_eq!(grant.client_id, gone, "{what}: still bound to its client");
+                assert!(
+                    !grant.confidential_client,
+                    "{what}: a registration that is gone is public"
+                );
+                assert_eq!(grant.generation, 1, "{what}");
+                assert_eq!(grant.device_id, device, "{what}: the device is kept");
+
+                assert_eq!(
+                    outcome(
+                        &refresh(
+                            &db,
+                            &config,
+                            &new_rt,
+                            Presented {
+                                client_id: Some(&other),
+                                ..NOTHING
+                            }
+                        )
+                        .await
+                    ),
+                    "invalid_grant",
+                    "{what}: the lifted grant is bound to its client"
+                );
+                assert_eq!(
+                    outcome(&refresh(&db, &config, &new_rt, NOTHING).await),
+                    "ok",
+                    "{what}: the lifted token rotates"
+                );
+            }
+        }
+    }
+
+    /// An HTTP Basic header names the client in its user name, and that is
+    /// checked exactly like a `client_id` in the form, at both grants. A form
+    /// and a header that name different clients are a malformed request.
+    #[tokio::test]
+    async fn a_basic_header_names_the_client_like_the_form_does() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let owner = seed_client(&db, Registration::Confidential).await;
+        let other = seed_client(&db, Registration::Confidential).await;
+        let rt = seed_refresh_token(&db, &owner).await;
+
+        let someone_else = Presented {
+            header_client_id: Some(&other),
+            header_secret: Some(SECRET),
+            ..NOTHING
+        };
+        assert_eq!(
+            outcome(&refresh(&db, &config, &rt, someone_else).await),
+            "invalid_grant"
+        );
+        let spent = seed_code(&db, &owner).await;
+        assert_eq!(
+            outcome(&exchange(&db, &config, &spent, someone_else).await),
+            "invalid_grant"
+        );
+
+        // A form and a header that name different clients are malformed, and
+        // refused before the code is spent.
+        let split = Presented {
+            client_id: Some(&owner),
+            header_client_id: Some(&other),
+            header_secret: Some(SECRET),
+            ..NOTHING
+        };
+        let intact = seed_code(&db, &owner).await;
+        assert_eq!(
+            outcome(&refresh(&db, &config, &rt, split).await),
+            "invalid_request"
+        );
+        assert_eq!(
+            outcome(&exchange(&db, &config, &intact, split).await),
+            "invalid_request"
+        );
+        assert!(
+            still_exists(&db, &rt).await,
+            "refusals leave the token alone"
+        );
+
+        let own = Presented {
+            header_client_id: Some(&owner),
+            header_secret: Some(SECRET),
+            ..NOTHING
+        };
+        assert_eq!(
+            outcome(&exchange(&db, &config, &intact, own).await),
+            "ok",
+            "the malformed request did not spend the code"
+        );
+        assert_eq!(outcome(&refresh(&db, &config, &rt, own).await), "ok");
+    }
+
+    /// The replay of a lost response (I4) hands out the successor pair, so it
+    /// needs the same client binding as a fresh rotation: anyone holding the old
+    /// token must not get the new pair without the client's credentials.
+    #[tokio::test]
+    async fn a_replay_is_bound_to_the_client_too() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Confidential).await;
+        let other = seed_client(&db, Registration::Confidential).await;
+        let old = seed_refresh_token(&db, &client).await;
+        let credentials = Presented {
+            client_id: Some(&client),
+            form_secret: Some(SECRET),
+            header_client_id: None,
+            header_secret: None,
+        };
+
+        let successor = refresh_token_of(refresh(&db, &config, &old, credentials).await);
+        assert_eq!(
+            outcome(&refresh(&db, &config, &old, NOTHING).await),
+            "invalid_client: Secret required.",
+            "a replay without credentials gets no successor pair"
+        );
+        assert_eq!(
+            outcome(
+                &refresh(
+                    &db,
+                    &config,
+                    &old,
+                    Presented {
+                        client_id: Some(&other),
+                        form_secret: Some(SECRET),
+                        header_client_id: None,
+                        header_secret: None
+                    }
+                )
+                .await
+            ),
+            "invalid_grant",
+            "a replay by another client gets no successor pair"
+        );
+        let replay = refresh_token_of(refresh(&db, &config, &old, credentials).await);
+        assert_eq!(
+            replay, successor,
+            "the client itself still recovers the same pair while it is unused"
+        );
+    }
+
+    /// A replay returns the successor pair only while that pair is live and
+    /// unused. Once the successor has been rotated away or its grant revoked,
+    /// handing the pair out would answer a lost-response retry with tokens that
+    /// do not work. The replay is `invalid_grant`, like any unknown token.
+    #[tokio::test]
+    async fn a_replay_whose_successor_has_been_rotated_or_revoked_is_refused() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Public).await;
+
+        // Rotated: the client received the successor and has since used it.
+        let old = seed_refresh_token(&db, &client).await;
+        let successor = refresh_token_of(refresh(&db, &config, &old, NOTHING).await);
+        assert_eq!(
+            refresh_token_of(refresh(&db, &config, &old, NOTHING).await),
+            successor,
+            "while the successor is live the replay returns it"
+        );
+        let next = refresh_token_of(refresh(&db, &config, &successor, NOTHING).await);
+        assert_ne!(next, successor);
+        assert_eq!(
+            outcome(&refresh(&db, &config, &old, NOTHING).await),
+            "invalid_grant",
+            "a replay whose successor was rotated gets no pair"
+        );
+
+        // Revoked: the successor was deleted before the client used it.
+        let old = seed_refresh_token(&db, &client).await;
+        let successor = refresh_token_of(refresh(&db, &config, &old, NOTHING).await);
+        db.revoke_grant_of_token(&successor)
+            .await
+            .unwrap()
+            .expect("the successor's grant is revoked");
+        assert_eq!(
+            outcome(&refresh(&db, &config, &old, NOTHING).await),
+            "invalid_grant",
+            "a replay whose successor was revoked gets no pair"
+        );
+    }
+
+    /// H2 (I4, I5 phase A): the lost-response decision reads state, never a
+    /// clock. With the grant's recorded timestamps moved an hour into the past,
+    /// a replay of the previous refresh token still returns the same pair; once
+    /// the new access token has been accepted (as introspection or `/userinfo`
+    /// accepts it), the same replay is reuse: `invalid_grant`, one security
+    /// event with fingerprints only, and nothing revoked.
+    #[tokio::test]
+    async fn a_replay_an_hour_later_returns_the_same_pair_and_after_use_is_reuse() {
+        use bb8_redis::redis::AsyncCommands;
+        use openidconnect::OAuth2TokenResponse;
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Public).await;
+        let old = seed_refresh_token(&db, &client).await;
+        let first = refresh(&db, &config, &old, NOTHING).await.unwrap();
+        let pair = (
+            first.access_token().secret().clone(),
+            refresh_token_of(Ok(first)),
+        );
+
+        let grant = db.peek_refresh_grant(&old).await.unwrap().unwrap();
+        let key = format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_GRANT_PREFIX,
+            grant.grant_id.as_str()
+        );
+        let raw =
+            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
+        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        for field in ["last_used", "auth_time"] {
+            let _: i64 = conn.hincr(&key, field, -3600).await.unwrap();
+        }
+
+        let replay = refresh(&db, &config, &old, NOTHING).await.unwrap();
+        assert_eq!(
+            (
+                replay.access_token().secret().clone(),
+                refresh_token_of(Ok(replay))
+            ),
+            pair,
+            "an hour later the replay returns the SAME pair"
+        );
+
+        assert!(
+            db.lookup_access_token(&pair.0).await.unwrap().is_some(),
+            "the new access token is accepted"
+        );
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        assert_eq!(
+            outcome(&refresh(&db, &config, &old, NOTHING).await),
+            "invalid_grant",
+            "after first use the replay is reuse, answered like an unknown token"
+        );
+        let output = logs.output();
+        let events: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains(siwx_oidc::db::grant::REUSE_EVENT_MESSAGE))
+            .collect();
+        assert_eq!(events.len(), 1, "exactly one reuse event: {output}");
+        let event = events[0];
+        for field in [
+            "security_event=\"refresh_token_reuse\"",
+            "branch=\"previous_after_use\"",
+            "grant_kind=oidc",
+            "generation=1",
+            "grant_revoked=false",
+        ] {
+            assert!(event.contains(field), "the event carries {field}: {event}");
+        }
+        assert!(
+            event.contains(grant.grant_id.fingerprint()),
+            "the event names the grant by its fingerprint: {event}"
+        );
+        for secret in [&old, &pair.0, &pair.1] {
+            assert!(
+                !output.contains(secret.as_str()),
+                "no token in the logs: {output}"
+            );
+        }
+        assert_eq!(
+            outcome(&refresh(&db, &config, &pair.1, NOTHING).await),
+            "ok",
+            "phase A revokes nothing: the live chain keeps working"
+        );
+    }
+
+    /// I5 phase B at `POST /token`, with `reuse_revokes_grant` on: a superseded
+    /// refresh token gets exactly the answer an unknown token gets, the reuse
+    /// event records that the grant was revoked, and the grant is gone, so the
+    /// current holder's refresh token is refused too and the RP is sent one
+    /// back-channel logout token.
+    #[tokio::test]
+    async fn with_reuse_enforcement_a_superseded_token_at_the_token_endpoint_ends_its_grant() {
+        let Some(base) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let db = base.clone().with_reuse_enforcement(true);
+        let config = Config::default();
+        let client = seed_client(&db, Registration::Public).await;
+        let first = seed_refresh_token(&db, &client).await;
+        let grant = db.peek_refresh_grant(&first).await.unwrap().unwrap();
+        let second = refresh_token_of(refresh(&db, &config, &first, NOTHING).await);
+        let current = refresh_token_of(refresh(&db, &config, &second, NOTHING).await);
+
+        let unknown = refresh(&db, &config, "mcr_not_a_token", NOTHING).await;
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let reused = refresh(&db, &config, &first, NOTHING).await;
+        assert_eq!(outcome(&reused), "invalid_grant");
+        assert_eq!(
+            format!("{reused:?}"),
+            format!("{unknown:?}"),
+            "reuse is answered exactly like an unknown token"
+        );
+        let output = logs.output();
+        let events: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains(siwx_oidc::db::grant::REUSE_EVENT_MESSAGE))
+            .collect();
+        assert_eq!(events.len(), 1, "exactly one reuse event: {output}");
+        assert!(
+            events[0].contains("grant_revoked=true"),
+            "the event records the revocation: {}",
+            events[0]
+        );
+
+        assert!(
+            db.peek_refresh_grant(&current).await.unwrap().is_none(),
+            "the grant is gone"
+        );
+        assert_eq!(
+            outcome(&refresh(&db, &config, &current, NOTHING).await),
+            "invalid_grant",
+            "the current holder is refused at its next refresh"
+        );
+        let queued = db
+            .pending_logout_entries()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|(e, _)| e.grant == grant.grant_id.as_str())
+            .count();
+        assert_eq!(queued, 1, "one back-channel logout entry for the RP");
+    }
+
+    /// A grant records its client as confidential exactly when `POST /token`
+    /// demands that client's secret: the one rule (`client_is_confidential`)
+    /// behind both, so `POST /_matrix/client/v3/refresh`, which refuses a
+    /// confidential client's grant, refuses exactly the grants it could not
+    /// authenticate.
+    #[tokio::test]
+    async fn a_grant_records_its_client_as_confidential_exactly_when_token_demands_a_secret() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let strict = Config {
+            require_secret: true,
+            ..Config::default()
+        };
+        let lax = Config {
+            require_secret: false,
+            ..Config::default()
+        };
+        for (registration, config, label, confidential) in [
+            (Registration::Public, &strict, "public", false),
+            (Registration::Confidential, &lax, "confidential", true),
+            (Registration::Unset, &strict, "unset, secret required", true),
+            (Registration::Unset, &lax, "unset, secret optional", false),
+        ] {
+            let client = seed_client(&db, registration).await;
+            let code = seed_code_with_scope(&db, &client, Some("openid offline_access")).await;
+            let with_secret = Presented {
+                client_id: Some(&client),
+                form_secret: Some(SECRET),
+                header_client_id: None,
+                header_secret: None,
+            };
+            let rt = refresh_token_of(exchange(&db, config, &code, with_secret).await);
+            let grant = db.peek_refresh_grant(&rt).await.unwrap().unwrap();
+            assert_eq!(
+                grant.confidential_client, confidential,
+                "{label}: the flag the grant records"
+            );
+            let named_only = Presented {
+                client_id: Some(&client),
+                ..NOTHING
+            };
+            let demanded = outcome(&refresh(&db, config, &rt, named_only).await)
+                == "invalid_client: Secret required.";
+            assert_eq!(
+                grant.confidential_client, demanded,
+                "{label}: the recorded flag and the secret /token demands agree"
+            );
+        }
+    }
+
+    /// The two grants authenticate the client through the same helpers, so
+    /// they cannot drift: every way a request can present itself gets the same
+    /// answer from the code exchange and the refresh grant.
+    #[tokio::test]
+    async fn the_code_exchange_and_the_refresh_grant_authenticate_clients_identically() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let strict = Config {
+            require_secret: true,
+            ..Config::default()
+        };
+        let lax = Config {
+            require_secret: false,
+            ..Config::default()
+        };
+        let other = seed_client(&db, Registration::Confidential).await;
+
+        for (registration, config, label) in [
+            (Registration::Public, &strict, "public"),
+            (Registration::Confidential, &strict, "confidential"),
+            (Registration::Unset, &strict, "unset, secret required"),
+            (Registration::Unset, &lax, "unset, secret optional"),
+        ] {
+            let client = seed_client(&db, registration).await;
+            for (what, who) in [
+                ("nothing", NOTHING),
+                (
+                    "its id",
+                    Presented {
+                        client_id: Some(&client),
+                        ..NOTHING
+                    },
+                ),
+                (
+                    "its id and secret",
+                    Presented {
+                        client_id: Some(&client),
+                        form_secret: Some(SECRET),
+                        header_client_id: None,
+                        header_secret: None,
+                    },
+                ),
+                (
+                    "its id and a wrong secret",
+                    Presented {
+                        client_id: Some(&client),
+                        form_secret: Some("wrong"),
+                        header_client_id: None,
+                        header_secret: None,
+                    },
+                ),
+                (
+                    "a header secret",
+                    Presented {
+                        header_secret: Some(SECRET),
+                        ..NOTHING
+                    },
+                ),
+                (
+                    "another client's id and secret",
+                    Presented {
+                        client_id: Some(&other),
+                        form_secret: Some(SECRET),
+                        header_client_id: None,
+                        header_secret: None,
+                    },
+                ),
+            ] {
+                let code = seed_code(&db, &client).await;
+                let rt = seed_refresh_token(&db, &client).await;
+                let by_code = outcome(&exchange(&db, config, &code, who).await);
+                let by_refresh = outcome(&refresh(&db, config, &rt, who).await);
+                assert_eq!(
+                    by_refresh, by_code,
+                    "{label} client presenting {what}: the refresh grant answered \
+                     `{by_refresh}`, the code exchange `{by_code}`"
+                );
+            }
+        }
+    }
+
+    /// Every accepted use of a dynamic client restores its lifetime, and only the client
+    /// the grant or the code belongs to is touched. The store tests pin that a static
+    /// client never gets an expiry; these pin the call sites.
+    mod client_lifetime {
+        use super::*;
+
+        /// The client's registration key, with one minute of lifetime left.
+        async fn aged(db: &RedisClient, client_id: &str) -> String {
+            let key = format!("clients/{client_id}");
+            db.expire_raw(&key, 60).await.unwrap();
+            key
+        }
+
+        async fn restored(db: &RedisClient, key: &str) -> bool {
+            db.ttl_raw(key).await.unwrap() > 60
+        }
+
+        #[tokio::test]
+        async fn an_accepted_refresh_extends_a_dynamic_client() {
+            let Some(db) = siwx_oidc::test_support::redis().await else {
+                return;
+            };
+            let client = seed_client(&db, Registration::Public).await;
+            let rt = seed_refresh_token(&db, &client).await;
+            let key = aged(&db, &client).await;
+
+            refresh_token_of(refresh(&db, &Config::default(), &rt, NOTHING).await);
+
+            assert!(
+                restored(&db, &key).await,
+                "a refreshed session's dynamic client gets its lifetime back"
+            );
+        }
+
+        /// The touch follows an accepted refresh and names the grant's client: a refusal
+        /// touches nobody, and neither does a request that names another client.
+        #[tokio::test]
+        async fn a_refused_refresh_extends_no_client() {
+            let Some(db) = siwx_oidc::test_support::redis().await else {
+                return;
+            };
+            let owner = seed_client(&db, Registration::Public).await;
+            let other = seed_client(&db, Registration::Confidential).await;
+            let rt = seed_refresh_token(&db, &owner).await;
+            let owner_key = aged(&db, &owner).await;
+            let other_key = aged(&db, &other).await;
+
+            let refused = refresh(
+                &db,
+                &Config::default(),
+                &rt,
+                Presented {
+                    client_id: Some(&other),
+                    form_secret: Some(SECRET),
+                    header_client_id: None,
+                    header_secret: None,
+                },
+            )
+            .await;
+
+            assert_eq!(outcome(&refused), "invalid_grant");
+            assert!(!restored(&db, &owner_key).await, "the grant's client");
+            assert!(
+                !restored(&db, &other_key).await,
+                "the client the request named"
+            );
+        }
+
+        /// A registration-management update must not give a static client an expiry. A
+        /// static client is a client key with no TTL, and the update rewrites the entry in
+        /// place.
+        #[tokio::test]
+        async fn updating_a_static_client_leaves_it_without_an_expiry() {
+            let Some(db) = siwx_oidc::test_support::redis().await else {
+                return;
+            };
+            let metadata_for = |redirect: &str| {
+                SiwxClientMetadata::new(
+                    vec![RedirectUrl::new(redirect.into()).unwrap()],
+                    LogoutClientMetadata::default(),
+                )
+            };
+            let client_id = unique("update-static-");
+            let key = format!("clients/{client_id}");
+            let entry = ClientEntry::new(
+                SECRET,
+                metadata_for("https://example.com/cb"),
+                Some("registration-token"),
+            );
+            db.set_raw(&key, &serde_json::to_string(&entry).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                db.ttl_raw(&key).await.unwrap(),
+                -1,
+                "precondition: a static client has no expiry"
+            );
+
+            client_update(
+                client_id.clone(),
+                metadata_for("https://updated.example.org/cb"),
+                Some(
+                    headers::Authorization::bearer("registration-token")
+                        .unwrap()
+                        .0,
+                ),
+                &db,
+                &RegistrationPolicy::default(),
+            )
+            .await
+            .expect("the update is accepted");
+
+            assert_eq!(
+                db.ttl_raw(&key).await.unwrap(),
+                -1,
+                "an update must not give a static client an expiry"
+            );
+            let stored = db.get_client(client_id).await.unwrap().unwrap();
+            assert_eq!(
+                stored.metadata.redirect_uris()[0].as_str(),
+                "https://updated.example.org/cb",
+                "the update itself is stored"
+            );
+            db.del_raw(&key).await.ok();
+        }
+
+        #[tokio::test]
+        async fn a_code_exchange_extends_a_dynamic_client() {
+            let Some(db) = siwx_oidc::test_support::redis().await else {
+                return;
+            };
+            let client = seed_client(&db, Registration::Public).await;
+            let code = seed_code(&db, &client).await;
+            let key = aged(&db, &client).await;
+
+            let exchanged = exchange(&db, &Config::default(), &code, NOTHING).await;
+
+            assert_eq!(outcome(&exchanged), "ok");
+            assert!(
+                restored(&db, &key).await,
+                "a client whose code was exchanged gets its lifetime back"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_device_code_exchange_extends_a_dynamic_client() {
+            let Some(db) = siwx_oidc::test_support::redis().await else {
+                return;
+            };
+            let client = seed_client(&db, Registration::Public).await;
+            let device_code = unique("dvc_");
+            db.set_device_code(
+                &device_code,
+                &DeviceCodeEntry {
+                    user_code_digest: siwx_oidc::db::tokens::digest(&unique("UC-")),
+                    legacy_user_code: None,
+                    client_id: client.clone(),
+                    scope: "openid".to_string(),
+                    status: DeviceCodeStatus::Approved,
+                    did: Some("did:key:zDnBINDING".to_string()),
+                    device_id: None,
+                    last_poll: None,
+                    created_at: Utc::now().timestamp(),
+                    auth_ms: None,
+                    expected_mxid: None,
+                },
+                DEVICE_CODE_LIFETIME,
+            )
+            .await
+            .unwrap();
+            let key = aged(&db, &client).await;
+            let config = Config {
+                mas_shared_secret: Some("not-a-secret-test-fixture".to_string()),
+                ..Config::default()
+            };
+
+            let exchanged = token(
+                TokenForm {
+                    code: None,
+                    client_id: Some(client.clone()),
+                    client_secret: None,
+                    grant_type: CoreGrantType::DeviceCode,
+                    code_verifier: None,
+                    refresh_token: None,
+                    device_code: Some(device_code),
+                },
+                ClientCredentials::default(),
+                &EcdsaSigningKey::generate(),
+                &config,
+                &db,
+                None,
+            )
+            .await;
+
+            assert_eq!(outcome(&exchanged), "ok");
+            assert!(
+                restored(&db, &key).await,
+                "a client whose device code was exchanged gets its lifetime back"
+            );
+        }
+
+        /// `authorize` is the one touch that names the client the request carries, because
+        /// the request has no grant yet. It follows every check the request must pass: a
+        /// refused request extends no client, an accepted one extends the client it names.
+        #[tokio::test]
+        async fn an_authorization_request_extends_the_client_it_names_only_once_accepted() {
+            let Some(db) = siwx_oidc::test_support::redis().await else {
+                return;
+            };
+            let client = seed_client(&db, Registration::Public).await;
+            let key = aged(&db, &client).await;
+            let request = |redirect_uri: &str, challenge: Option<&str>| AuthorizeParams {
+                client_id: client.clone(),
+                redirect_uri: RedirectUrl::new(redirect_uri.into()).unwrap(),
+                scope: Scope::new("openid".to_string()),
+                response_type: Some(CoreResponseType::Code),
+                state: Some("state".into()),
+                nonce: None,
+                prompt: None,
+                request_uri: None,
+                request: None,
+                code_challenge: challenge.map(Into::into),
+                code_challenge_method: Some("S256".into()),
+                response_mode: None,
+            };
+
+            let unregistered = request("https://other.example.org/cb", Some(CHALLENGE));
+            assert!(authorize(unregistered, &db).await.is_err());
+            assert!(!restored(&db, &key).await, "an unregistered redirect URI");
+
+            let no_challenge = request("https://example.com/cb", None);
+            assert!(authorize(no_challenge, &db).await.is_err());
+            assert!(
+                !restored(&db, &key).await,
+                "a request without a PKCE challenge"
+            );
+
+            let accepted = request("https://example.com/cb", Some(CHALLENGE));
+            authorize(accepted, &db).await.unwrap();
+            assert!(
+                restored(&db, &key).await,
+                "an accepted request extends the client it names"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod scope_grant_tests {
+    //! What the code exchange issues for the scope that was requested.
+    //!
+    //! Generic mode (no MAS shared secret) grants only what was asked for and
+    //! allowed, and issues a refresh token only for `offline_access` to a client
+    //! whose registration allows the refresh grant (I10). Matrix mode is
+    //! unchanged: the Matrix scope for the device and a refresh token, whatever
+    //! was requested. Needs Redis.
+    use super::client_binding_tests::{
+        seed_client_with, seed_code_with_scope, unique, Registration, VERIFIER,
+    };
+    use super::*;
+    use crate::config::Config;
+    use openidconnect::OAuth2TokenResponse;
+
+    fn generic() -> Config {
+        Config::default()
+    }
+
+    fn matrix() -> Config {
+        Config {
+            mas_shared_secret: Some("shared-secret".to_string()),
+            ..Config::default()
+        }
+    }
+
+    fn may_refresh() -> Option<Vec<CoreGrantType>> {
+        Some(vec![
+            CoreGrantType::AuthorizationCode,
+            CoreGrantType::RefreshToken,
+        ])
+    }
+
+    fn code_grant_only() -> Option<Vec<CoreGrantType>> {
+        Some(vec![CoreGrantType::AuthorizationCode])
+    }
+
+    /// Redeem a code for a public client that sends no secret.
+    async fn exchange(
+        db: &RedisClient,
+        config: &Config,
+        client_id: &str,
+        code: &str,
+    ) -> SiwxTokenResponse {
+        token(
+            TokenForm {
+                code: Some(code.to_string()),
+                client_id: Some(client_id.to_string()),
+                client_secret: None,
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(VERIFIER.to_string()),
+                refresh_token: None,
+                device_code: None,
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the exchange must succeed: {e:?}"))
+    }
+
+    /// A public client, a code that asked for `scope`, and the exchange.
+    async fn issue(
+        db: &RedisClient,
+        config: &Config,
+        grants: Option<Vec<CoreGrantType>>,
+        scope: Option<&str>,
+    ) -> SiwxTokenResponse {
+        let client = seed_client_with(db, Registration::Public, grants).await;
+        let code = seed_code_with_scope(db, &client, scope).await;
+        exchange(db, config, &client, &code).await
+    }
+
+    fn scope_of(response: &SiwxTokenResponse) -> Option<String> {
+        response.scopes().map(|scopes| {
+            scopes
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+    }
+
+    async fn recorded_scope(db: &RedisClient, response: &SiwxTokenResponse) -> String {
+        db.check_access_token(response.access_token().secret())
+            .await
+            .unwrap()
+            .expect("the access token is stored")
+            .scope
+    }
+
+    /// Without `offline_access` there is no refresh token: a client that did
+    /// not ask for one does not hold a credential that outlives its session.
+    #[tokio::test]
+    async fn generic_mode_issues_a_refresh_token_only_for_offline_access() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+
+        let without = issue(&db, &generic(), may_refresh(), Some("openid profile")).await;
+        assert!(
+            without.refresh_token().is_none(),
+            "no offline_access, no refresh token"
+        );
+        assert_eq!(recorded_scope(&db, &without).await, "openid profile");
+        assert_eq!(
+            scope_of(&without),
+            None,
+            "the granted scope equals the requested one, so the response omits it"
+        );
+
+        let with = issue(
+            &db,
+            &generic(),
+            may_refresh(),
+            Some("openid profile offline_access"),
+        )
+        .await;
+        assert!(with.refresh_token().is_some(), "offline_access asked for");
+        assert_eq!(
+            recorded_scope(&db, &with).await,
+            "openid profile offline_access"
+        );
+        assert_eq!(scope_of(&with), None, "granted as requested");
+    }
+
+    /// `offline_access` also needs the client's registration to allow the
+    /// refresh grant. The scope that is not granted is not in the issued scope,
+    /// and the response says what was granted because it differs.
+    #[tokio::test]
+    async fn generic_mode_grants_offline_access_only_to_a_client_that_may_refresh() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+
+        let refused = issue(
+            &db,
+            &generic(),
+            code_grant_only(),
+            Some("openid offline_access"),
+        )
+        .await;
+        assert!(
+            refused.refresh_token().is_none(),
+            "the registration lists no refresh_token grant"
+        );
+        assert_eq!(recorded_scope(&db, &refused).await, "openid");
+        assert_eq!(
+            scope_of(&refused).as_deref(),
+            Some("openid"),
+            "the response names the granted scope, which differs from the request"
+        );
+
+        // Provisional: a registration that names no grant types is not a
+        // restriction. A client that never listed any would otherwise lose
+        // refresh tokens it was entitled to under the registration it made.
+        let unspecified = issue(&db, &generic(), None, Some("openid offline_access")).await;
+        assert!(unspecified.refresh_token().is_some());
+        assert_eq!(
+            recorded_scope(&db, &unspecified).await,
+            "openid offline_access"
+        );
+    }
+
+    /// The issued scope reflects the request intersected with what generic mode
+    /// supports; Matrix scopes mean nothing there and are not granted.
+    #[tokio::test]
+    async fn generic_mode_issues_the_scope_that_was_requested_and_supported() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+
+        let openid_only = issue(&db, &generic(), may_refresh(), Some("openid")).await;
+        assert_eq!(recorded_scope(&db, &openid_only).await, "openid");
+
+        let mixed = issue(
+            &db,
+            &generic(),
+            may_refresh(),
+            Some("openid email urn:matrix:client:api:* profile"),
+        )
+        .await;
+        assert_eq!(
+            recorded_scope(&db, &mixed).await,
+            "openid profile",
+            "supported scopes only, in a fixed order"
+        );
+        assert_eq!(
+            scope_of(&mixed).as_deref(),
+            Some("openid profile"),
+            "the granted scope differs from the request, so the response says so"
+        );
+
+        // Nothing supported was asked for: the exchange still issues an ID
+        // token, so `openid` is what is granted (provisional).
+        let matrix_only = issue(
+            &db,
+            &generic(),
+            may_refresh(),
+            Some("urn:matrix:client:api:*"),
+        )
+        .await;
+        assert_eq!(recorded_scope(&db, &matrix_only).await, "openid");
+    }
+
+    /// A code written before the scope travelled with it (an earlier build, for
+    /// the 300 s a code lives) is exchanged as it was then: `openid profile`
+    /// and a refresh token.
+    #[tokio::test]
+    async fn generic_mode_exchanges_a_code_with_no_recorded_scope_as_before() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let legacy = issue(&db, &generic(), may_refresh(), None).await;
+        assert!(legacy.refresh_token().is_some());
+        assert_eq!(recorded_scope(&db, &legacy).await, "openid profile");
+        assert_eq!(scope_of(&legacy), None);
+    }
+
+    /// Matrix mode is unchanged: whatever the request asked for, the code grant
+    /// records the Matrix scope for the device and issues a refresh token, and
+    /// the response carries no `scope`.
+    /// The claims of a response's ID token, decoded without verification.
+    pub(super) fn id_token_claims(response: &SiwxTokenResponse) -> serde_json::Value {
+        let jws = response
+            .extra_fields()
+            .id_token()
+            .expect("the code exchange returns an ID token")
+            .to_string();
+        let payload = jws.split('.').nth(1).expect("a compact JWS");
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap()
+    }
+
+    /// One raw `GET` on the test Redis.
+    pub(super) async fn raw_get(key: &str) -> Option<String> {
+        let url = siwx_oidc::test_support::redis_url();
+        let client = bb8_redis::redis::Client::open(url.as_str()).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        bb8_redis::redis::cmd("GET")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    /// The grant id an access token belongs to, read from the store.
+    async fn grant_of_access_token(access: &str) -> Option<String> {
+        let url = siwx_oidc::test_support::redis_url();
+        let client = bb8_redis::redis::Client::open(url.as_str()).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let key = format!(
+            "{}/{}",
+            siwx_oidc::db::grant::KV_ACCESS_TOKEN_PREFIX,
+            siwx_oidc::db::tokens::digest(access)
+        );
+        bb8_redis::redis::cmd("HGET")
+            .arg(key)
+            .arg("grant")
+            .query_async(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    /// Every ID token carries the `sid` of the grant the exchange created (I8),
+    /// in both modes, and two exchanges get two different sids.
+    #[tokio::test]
+    async fn every_id_token_carries_the_sid_of_its_grant() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let mut sids = Vec::new();
+        for config in [generic(), generic(), matrix()] {
+            let response = issue(&db, &config, may_refresh(), Some("openid offline_access")).await;
+            let claims = id_token_claims(&response);
+            let sid = claims["sid"]
+                .as_str()
+                .unwrap_or_else(|| panic!("the ID token carries a sid: {claims}"))
+                .to_string();
+            let grant = grant_of_access_token(response.access_token().secret())
+                .await
+                .expect("the access token names its grant");
+            assert_eq!(
+                raw_get(&format!(
+                    "{}/{sid}",
+                    siwx_oidc::db::grant::KV_GRANT_SID_IDX_PREFIX
+                ))
+                .await
+                .as_deref(),
+                Some(grant.as_str()),
+                "the sid names the grant of this exchange"
+            );
+            assert!(!sids.contains(&sid), "each grant has its own sid");
+            sids.push(sid);
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_mode_issues_the_matrix_scope_and_a_refresh_token_whatever_was_requested() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        for requested in [
+            None,
+            Some("openid"),
+            Some("openid profile"),
+            Some("openid offline_access"),
+            Some("urn:matrix:client:api:*"),
+        ] {
+            let client = seed_client_with(&db, Registration::Public, code_grant_only()).await;
+            let code = seed_code_with_scope(&db, &client, requested).await;
+            // Give the code a device, as provisioning does.
+            let mut entry = db.try_consume_code(code).await.unwrap().unwrap();
+            entry.device_id = Some("SIWX_ABCD1234".to_string());
+            let code = unique("code-");
+            db.set_code(code.clone(), entry).await.unwrap();
+
+            let response = exchange(&db, &matrix(), &client, &code).await;
+            assert!(
+                response.refresh_token().is_some(),
+                "Matrix mode issues a refresh token (requested {requested:?})"
+            );
+            assert_eq!(
+                recorded_scope(&db, &response).await,
+                "openid urn:matrix:client:api:* urn:matrix:client:device:SIWX_ABCD1234",
+                "requested {requested:?}"
+            );
+            assert_eq!(
+                scope_of(&response),
+                None,
+                "Matrix mode never put a scope in the token response (requested {requested:?})"
+            );
+            assert!(
+                response.access_token().secret().starts_with("mat_")
+                    && response
+                        .refresh_token()
+                        .unwrap()
+                        .secret()
+                        .starts_with("mcr_"),
+                "Matrix token prefixes are unchanged"
+            );
+        }
+    }
+
+    fn registration(grants: Option<Vec<CoreGrantType>>) -> ClientEntry {
+        let mut metadata = SiwxClientMetadata::new(
+            vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
+            LogoutClientMetadata::default(),
+        );
+        if let Some(grants) = grants {
+            metadata = metadata.set_grant_types(Some(grants));
+        }
+        ClientEntry::new("secret", metadata, None)
+    }
+
+    /// The pure decision, without Redis: ordering and duplicates do not matter,
+    /// the response names the scope only when it differs from the request.
+    #[test]
+    fn the_generic_grant_follows_the_request_and_the_registration() {
+        let grant =
+            |requested: Option<&str>, grants| generic_grant(requested, &registration(grants));
+        let expect = |scope: &str, refresh_token: bool, report_scope: bool| GenericGrant {
+            scope: scope.to_string(),
+            refresh_token,
+            report_scope,
+        };
+
+        assert_eq!(
+            grant(Some("profile  openid openid"), None),
+            expect("openid profile", false, false),
+            "order, spacing and repeats of the request are immaterial"
+        );
+        assert_eq!(
+            grant(Some("offline_access openid"), may_refresh()),
+            expect("openid offline_access", true, false)
+        );
+        assert_eq!(
+            grant(Some("openid offline_access"), code_grant_only()),
+            expect("openid", false, true),
+            "offline_access needs the refresh grant in the registration"
+        );
+        assert_eq!(
+            grant(Some("openid email"), None),
+            expect("openid", false, true),
+            "a scope generic mode does not know is not granted"
+        );
+        assert_eq!(
+            grant(Some(""), None),
+            expect("openid", false, true),
+            "nothing requested: openid, because an ID token is issued"
+        );
+        assert_eq!(
+            grant(None, code_grant_only()),
+            expect("openid profile", true, false),
+            "a code with no recorded scope is exchanged as it was before the scope travelled"
+        );
+    }
+
+    /// Discovery says `offline_access` is a scope this provider honours.
+    #[test]
+    fn discovery_advertises_offline_access() {
+        let value = provider_metadata_value(&Config::default(), false).unwrap();
+        let scopes: Vec<&str> = value["scopes_supported"]
+            .as_array()
+            .expect("scopes_supported is an array")
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        assert!(scopes.contains(&"offline_access"), "{scopes:?}");
+        for kept in ["openid", "profile", "urn:matrix:client:api:*"] {
+            assert!(scopes.contains(&kept), "{kept} is still advertised");
+        }
+    }
+}
+
+#[cfg(test)]
+mod end_session_tests {
+    //! RP-initiated logout (OpenID Connect RP-Initiated Logout 1.0): the
+    //! `id_token_hint` check, the exact `post_logout_redirect_uri` match, the
+    //! registration metadata and discovery. Redis-backed tests skip without it.
+    use super::client_binding_tests::{unique, VERIFIER};
+    use super::scope_grant_tests::id_token_claims;
+    use super::*;
+    use crate::config::Config;
+    use openidconnect::{OAuth2TokenResponse, PostLogoutRedirectUrl};
+
+    fn issuer() -> IssuerUrl {
+        IssuerUrl::from_url(Config::default().base_url)
+    }
+
+    /// An ID token for `client_id` and `did` carrying `sid`, signed by `key`,
+    /// issued `age` seconds ago and valid for `ttl` seconds from then.
+    fn id_token(
+        key: &EcdsaSigningKey,
+        client_id: &str,
+        did: &str,
+        sid: Option<&str>,
+        age: i64,
+        ttl: i64,
+    ) -> String {
+        let iat = Utc::now() - Duration::seconds(age);
+        let claims = SiwxIdTokenClaims::new(
+            issuer(),
+            vec![Audience::new(client_id.to_string())],
+            iat + Duration::seconds(ttl),
+            iat,
+            StandardClaims::new(SubjectIdentifier::new(did.to_string())),
+            SidClaims {
+                sid: sid.map(str::to_string),
+                guest: None,
+            },
+        );
+        SiwxIdToken::new(
+            claims,
+            key,
+            CoreJwsSigningAlgorithm::EcdsaP256Sha256,
+            None,
+            None,
+        )
+        .unwrap()
+        .to_string()
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    #[test]
+    fn an_id_token_hint_verifies_with_the_live_or_a_retired_key_expired_or_not() {
+        let live = EcdsaSigningKey::generate();
+        let fresh = id_token(&live, "rp", "did:key:zDnLive", Some("SID1"), 0, 300);
+        let expired = id_token(&live, "rp", "did:key:zDnLive", Some("SID1"), 7200, 300);
+        for hint in [&fresh, &expired] {
+            assert_eq!(
+                verify_id_token_hint(hint, &live, &[], &issuer()),
+                Ok(HintClaims {
+                    sub: "did:key:zDnLive".into(),
+                    aud: vec!["rp".into()],
+                    sid: Some("SID1".into()),
+                })
+            );
+        }
+        let old = EcdsaSigningKey::generate();
+        let by_old = id_token(&old, "rp", "did:key:zDnOld", None, 0, 300);
+        assert_eq!(
+            verify_id_token_hint(&by_old, &live, &[old.as_verification_key()], &issuer())
+                .map(|c| c.sid),
+            Ok(None),
+            "a retired key still verifies; a hint without a sid names nothing"
+        );
+        assert_eq!(
+            verify_id_token_hint(&by_old, &live, &[], &issuer()),
+            Err(HintError::UnknownKid)
+        );
+    }
+
+    #[test]
+    fn a_tampered_foreign_unsigned_or_misissued_hint_is_refused() {
+        let live = EcdsaSigningKey::generate();
+        let hint = id_token(&live, "rp", "did:key:zDnLive", Some("SID1"), 0, 300);
+        let parts: Vec<&str> = hint.split('.').collect();
+        let mut claims: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        claims["sid"] = serde_json::json!("SID2");
+        let tampered = format!(
+            "{}.{}.{}",
+            parts[0],
+            b64(claims.to_string().as_bytes()),
+            parts[2]
+        );
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+        let foreign_key = EcdsaSigningKey::generate();
+        let input = format!("{}.{}", parts[0], parts[1]);
+        let foreign = format!("{input}.{}", b64(&foreign_key.sign_es256(input.as_bytes())));
+        let with_alg = |alg: &str| {
+            let mut h = header.clone();
+            h["alg"] = serde_json::json!(alg);
+            format!(
+                "{}.{}.{}",
+                b64(h.to_string().as_bytes()),
+                parts[1],
+                parts[2]
+            )
+        };
+        let mut no_kid = header.clone();
+        no_kid.as_object_mut().unwrap().remove("kid");
+        let no_kid = format!(
+            "{}.{}.{}",
+            b64(no_kid.to_string().as_bytes()),
+            parts[1],
+            parts[2]
+        );
+        let other_issuer = IssuerUrl::new("https://other.example.org/".into()).unwrap();
+        for (what, hint, issuer, expected) in [
+            (
+                "a tampered payload",
+                tampered,
+                issuer(),
+                HintError::Signature,
+            ),
+            (
+                "another key under our kid",
+                foreign,
+                issuer(),
+                HintError::Signature,
+            ),
+            ("alg none", with_alg("none"), issuer(), HintError::Algorithm),
+            (
+                "alg HS256",
+                with_alg("HS256"),
+                issuer(),
+                HintError::Algorithm,
+            ),
+            ("no kid", no_kid, issuer(), HintError::UnknownKid),
+            (
+                "another issuer",
+                hint.clone(),
+                other_issuer,
+                HintError::Issuer,
+            ),
+            (
+                "four parts",
+                format!("{hint}.x"),
+                issuer(),
+                HintError::Malformed,
+            ),
+            (
+                "garbage",
+                "garbage".to_string(),
+                issuer(),
+                HintError::Malformed,
+            ),
+        ] {
+            assert_eq!(
+                verify_id_token_hint(&hint, &live, &[], &issuer),
+                Err(expected),
+                "{what}"
+            );
+        }
+    }
+
+    fn client_metadata(post_logout: &[&str]) -> SiwxClientMetadata {
+        SiwxClientMetadata::new(
+            vec![RedirectUrl::new("https://rp.example.org/cb".into()).unwrap()],
+            LogoutClientMetadata {
+                post_logout_redirect_uris: Some(
+                    post_logout
+                        .iter()
+                        .map(|u| PostLogoutRedirectUrl::new(u.to_string()).unwrap())
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+        )
+        .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::None))
+        .set_grant_types(Some(vec![
+            CoreGrantType::AuthorizationCode,
+            CoreGrantType::RefreshToken,
+        ]))
+    }
+
+    #[test]
+    fn post_logout_redirect_uri_matching_is_exact() {
+        let client = ClientEntry::new(
+            "s",
+            client_metadata(&["https://rp.example.org/bye?x=1"]),
+            None,
+        );
+        let is = |u: &str| post_logout_redirect_uri_is_registered(&client, &Url::parse(u).unwrap());
+        assert!(is("https://rp.example.org/bye?x=1"));
+        for other in [
+            "https://rp.example.org/bye",
+            "https://rp.example.org/bye?x=1&y=2",
+            "https://rp.example.org/bye?x=2",
+            "https://rp.example.org/bye/?x=1",
+            "http://rp.example.org/bye?x=1",
+            "https://rp.example.org.evil.example/bye?x=1",
+        ] {
+            assert!(!is(other), "{other}");
+        }
+        let none = ClientEntry::new("s", client_metadata(&[]), None);
+        assert!(!post_logout_redirect_uri_is_registered(
+            &none,
+            &Url::parse("https://rp.example.org/bye?x=1").unwrap()
+        ));
+    }
+
+    #[test]
+    fn discovery_advertises_the_end_session_endpoint() {
+        for config in [
+            Config::default(),
+            Config {
+                mas_shared_secret: Some("s".into()),
+                ..Config::default()
+            },
+        ] {
+            let value = provider_metadata_value(&config, false).unwrap();
+            assert_eq!(
+                value["end_session_endpoint"],
+                "http://127.0.0.1:8000/end_session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_stores_and_echoes_post_logout_redirect_uris_and_refuses_a_fragment() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let base = Config::default().base_url;
+        let response = register(
+            client_metadata(&["https://rp.example.org/bye"]),
+            base.clone(),
+            &db,
+            &RegistrationPolicy::default(),
+        )
+        .await
+        .expect("registration succeeds");
+        let echoed = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            echoed["post_logout_redirect_uris"],
+            serde_json::json!(["https://rp.example.org/bye"])
+        );
+        let stored = db
+            .get_client(response.client_id().to_string())
+            .await
+            .unwrap()
+            .expect("stored");
+        assert!(post_logout_redirect_uri_is_registered(
+            &stored,
+            &Url::parse("https://rp.example.org/bye").unwrap()
+        ));
+        let refused = register(
+            client_metadata(&["https://rp.example.org/bye#f"]),
+            base,
+            &db,
+            &RegistrationPolicy::default(),
+        )
+        .await;
+        match refused {
+            Err(CustomError::BadRequestRegister(e)) => assert_eq!(
+                serde_json::to_value(&e).unwrap()["error"],
+                "invalid_client_metadata"
+            ),
+            other => panic!("a fragment must be refused, got {other:?}"),
+        }
+    }
+
+    /// `/register` is the only client-creation path a caller without credentials can reach,
+    /// so no member of the request may select the generic class or grant scopes.
+    #[tokio::test]
+    async fn a_dynamically_registered_client_is_always_matrix_class() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let payload: SiwxClientMetadata = serde_json::from_value(serde_json::json!({
+            "redirect_uris": ["https://app.example.org/callback"],
+            "class": "generic",
+            "allowed_scopes": ["openid", "io.inblock.mail"],
+            "always_granted_scopes": ["io.inblock.mail"],
+        }))
+        .unwrap();
+        let response = register(
+            payload,
+            Config::default().base_url,
+            &db,
+            &RegistrationPolicy::default(),
+        )
+        .await
+        .unwrap();
+        let id = response.client_id().to_string();
+        let entry = db
+            .get_client(id.clone())
+            .await
+            .unwrap()
+            .expect("registered");
+        db.delete_client(id).await.ok();
+        assert_eq!(
+            entry.class,
+            ClientClass::Matrix,
+            "/register can never create a generic client"
+        );
+        assert_eq!(entry.allowed_scopes, None);
+        assert!(entry.always_granted_scopes.is_empty());
+    }
+
+    /// End-to-end in process, generic mode: an `oidc` grant from a real code
+    /// exchange is ended by its ID token, and the RP is sent back to its exact
+    /// registered URI with `state`; an expired hint naming another grant ends
+    /// that one; nothing else ends.
+    #[tokio::test]
+    async fn end_session_ends_the_named_oidc_grant_and_redirects_with_state() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let key = EcdsaSigningKey::generate();
+        let client_id = unique("endsess-");
+        db.set_client(
+            client_id.clone(),
+            ClientEntry::new("s", client_metadata(&["https://rp.example.org/bye"]), None),
+        )
+        .await
+        .unwrap();
+        let code = super::client_binding_tests::seed_code_with_scope(
+            &db,
+            &client_id,
+            Some("openid offline_access"),
+        )
+        .await;
+        let response = token(
+            TokenForm {
+                code: Some(code),
+                client_id: Some(client_id.clone()),
+                client_secret: None,
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(VERIFIER.to_string()),
+                refresh_token: None,
+                device_code: None,
+            },
+            ClientCredentials::default(),
+            &key,
+            &config,
+            &db,
+            None,
+        )
+        .await
+        .expect("the exchange succeeds");
+        let hint = response.extra_fields().id_token().unwrap().to_string();
+        let did = id_token_claims(&response)["sub"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let access = response.access_token().secret().clone();
+        let refresh = response
+            .refresh_token()
+            .expect("offline_access")
+            .secret()
+            .clone();
+
+        // A second grant of the same client and user, named by an expired hint.
+        let other = db
+            .issue_grant(&NewGrant {
+                kind: GrantKind::Oidc,
+                username: unique("lp"),
+                did: did.clone(),
+                client_id: client_id.clone(),
+                confidential_client: false,
+                device_id: String::new(),
+                scope: "openid".into(),
+                name: did.clone(),
+                auth_ms: None,
+                access_ttl: ACCESS_TOKEN_TTL,
+                refresh_inactivity_secs: None,
+                absolute_deadline: None,
+            })
+            .await
+            .unwrap();
+        let expired = id_token(&key, &client_id, &did, other.sid.as_deref(), 7200, 300);
+
+        let params = |hint: &str, uri: Option<&str>| EndSessionParams {
+            id_token_hint: Some(hint.to_string()),
+            client_id: None,
+            post_logout_redirect_uri: uri.map(str::to_string),
+            state: Some("s 1&2".into()),
+        };
+        let refused = end_session(
+            params(&hint, Some("https://rp.example.org/bye/")),
+            &key,
+            &[],
+            &config,
+            &db,
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(CustomError::BadRequest(_))),
+            "{refused:?}"
+        );
+        assert!(
+            db.check_access_token(&access).await.unwrap().is_some(),
+            "a refused request ends nothing"
+        );
+
+        let outcome = end_session(
+            params(&hint, Some("https://rp.example.org/bye")),
+            &key,
+            &[],
+            &config,
+            &db,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            EndSessionOutcome::Redirect(
+                Url::parse("https://rp.example.org/bye?state=s+1%262").unwrap()
+            )
+        );
+        assert!(
+            db.check_access_token(&access).await.unwrap().is_none(),
+            "the access token is inactive"
+        );
+        assert!(
+            matches!(
+                db.peek_refresh_token(&refresh).await.unwrap(),
+                RefreshPeek::Unknown
+            ),
+            "the refresh token names nothing"
+        );
+        assert!(
+            db.check_access_token(&other.access_token)
+                .await
+                .unwrap()
+                .is_some(),
+            "only the named grant ended"
+        );
+
+        let outcome = end_session(params(&expired, None), &key, &[], &config, &db)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            EndSessionOutcome::SignedOut { ended: true },
+            "an expired hint still names its grant"
+        );
+        assert!(db
+            .check_access_token(&other.access_token)
+            .await
+            .unwrap()
+            .is_none());
+        let again = end_session(params(&expired, None), &key, &[], &config, &db)
+            .await
+            .unwrap();
+        assert_eq!(again, EndSessionOutcome::SignedOut { ended: false });
+    }
+
+    /// A store fault on the way is a retryable 503, never an answer about the
+    /// request: a fault while ending the grant the hint's `sid` names is not
+    /// "nothing to end" (200), and a fault while reading the client for its
+    /// `post_logout_redirect_uri` is not "not registered" (400). Each fault is a
+    /// value of the wrong type at the key the step reads.
+    #[tokio::test]
+    async fn a_store_fault_while_ending_the_grant_or_reading_the_client_is_a_503() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config::default();
+        let key = EcdsaSigningKey::generate();
+        let did = "did:key:zDnEndSessionFault";
+        let params = |hint: String, uri: Option<&str>| EndSessionParams {
+            id_token_hint: Some(hint),
+            client_id: None,
+            post_logout_redirect_uri: uri.map(str::to_string),
+            state: None,
+        };
+
+        // Ending the grant: the sid index is not a string.
+        let client_id = unique("endsess-fault-grant-");
+        let sid = unique("SIDFAULT");
+        let sid_idx = format!("{}/{sid}", siwx_oidc::db::grant::KV_GRANT_SID_IDX_PREFIX);
+        db.sadd_raw(&sid_idx, "x").await.unwrap();
+        let hint = id_token(&key, &client_id, did, Some(&sid), 0, 300);
+        let outcome = end_session(params(hint, None), &key, &[], &config, &db).await;
+        db.del_raw(&sid_idx).await.ok();
+        assert!(
+            matches!(outcome, Err(CustomError::ServiceUnavailable(_))),
+            "a fault ending the grant is a 503, got {outcome:?}"
+        );
+
+        // Reading the client: its registration is not a string.
+        let client_id = unique("endsess-fault-client-");
+        let client_key = format!("clients/{client_id}");
+        db.sadd_raw(&client_key, "x").await.unwrap();
+        let hint = id_token(&key, &client_id, did, Some(&unique("SID")), 0, 300);
+        let outcome = end_session(
+            params(hint, Some("https://rp.example.org/bye")),
+            &key,
+            &[],
+            &config,
+            &db,
+        )
+        .await;
+        db.del_raw(&client_key).await.ok();
+        assert!(
+            matches!(outcome, Err(CustomError::ServiceUnavailable(_))),
+            "a fault reading the client is a 503, got {outcome:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod backchannel_registration_tests {
+    //! OpenID Connect Back-Channel Logout 1.0: the registration metadata, the
+    //! SSRF guard at registration, the D4 switch and discovery.
+    use super::*;
+    use crate::config::Config;
+
+    fn payload(extra: serde_json::Value) -> SiwxClientMetadata {
+        let mut doc = serde_json::json!({ "redirect_uris": ["https://rp.example.org/cb"] });
+        for (k, v) in extra.as_object().unwrap() {
+            doc[k] = v.clone();
+        }
+        serde_json::from_value(doc).unwrap()
+    }
+
+    fn refused_as_metadata(result: Result<impl std::fmt::Debug, CustomError>, what: &str) {
+        match result {
+            Err(CustomError::BadRequestRegister(e)) => assert_eq!(
+                serde_json::to_value(&e).unwrap()["error"],
+                "invalid_client_metadata",
+                "{what}"
+            ),
+            other => panic!("{what} must be refused as invalid_client_metadata, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_stores_backchannel_logout_metadata_and_refuses_an_unsafe_uri() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let base = Config::default().base_url;
+        let open = RegistrationPolicy::default();
+        let response = register(
+            payload(serde_json::json!({
+                "backchannel_logout_uri": "https://192.0.2.10/bcl?rp=1",
+                "backchannel_logout_session_required": true,
+            })),
+            base.clone(),
+            &db,
+            &open,
+        )
+        .await
+        .expect("a public https URI is accepted");
+        let echoed = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            echoed["backchannel_logout_uri"],
+            "https://192.0.2.10/bcl?rp=1"
+        );
+        assert_eq!(echoed["backchannel_logout_session_required"], true);
+        let stored = db
+            .get_client(response.client_id().to_string())
+            .await
+            .unwrap()
+            .expect("stored");
+        let extra = stored.metadata.additional_metadata();
+        assert_eq!(
+            extra.backchannel_logout_uri.as_ref().map(Url::as_str),
+            Some("https://192.0.2.10/bcl?rp=1")
+        );
+        assert_eq!(extra.backchannel_logout_session_required, Some(true));
+
+        for uri in [
+            "http://192.0.2.10/bcl",
+            "https://192.0.2.10/bcl#f",
+            "https://127.0.0.1/bcl",
+            "https://[::1]/bcl",
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.1/bcl",
+            "https://[fd00::1]/bcl",
+            "https://100.64.0.1/bcl",
+            "https://localhost/bcl",
+        ] {
+            let result = register(
+                payload(serde_json::json!({ "backchannel_logout_uri": uri })),
+                base.clone(),
+                &db,
+                &open,
+            )
+            .await;
+            refused_as_metadata(result, uri);
+        }
+
+        let listed = RegistrationPolicy {
+            guard: crate::backchannel::UriGuard::new(&["localhost".to_string()]),
+            ..RegistrationPolicy::default()
+        };
+        register(
+            payload(serde_json::json!({ "backchannel_logout_uri": "http://localhost:9/bcl" })),
+            base.clone(),
+            &db,
+            &listed,
+        )
+        .await
+        .expect("an allowlisted host is accepted");
+
+        let id = response.client_id().to_string();
+        let token = response
+            .registration_access_token()
+            .unwrap()
+            .secret()
+            .clone();
+        let update = client_update(
+            id,
+            payload(serde_json::json!({ "backchannel_logout_uri": "https://127.0.0.1/bcl" })),
+            Some(headers::Authorization::bearer(&token).unwrap().0),
+            &db,
+            &open,
+        )
+        .await;
+        refused_as_metadata(update, "an update to a loopback URI");
+    }
+
+    #[tokio::test]
+    async fn the_d4_switch_requires_a_backchannel_uri_from_a_client_that_may_refresh() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let generic_on = Config {
+            backchannel_logout_required_for_refresh: true,
+            ..Config::default()
+        };
+        let matrix_on = Config {
+            mas_shared_secret: Some("s".into()),
+            ..generic_on.clone()
+        };
+        let base = Config::default().base_url;
+        let required = RegistrationPolicy::from_config(&generic_on);
+        assert!(required.require_backchannel_for_refresh);
+        for (what, extra) in [
+            ("no grant_types (refresh allowed)", serde_json::json!({})),
+            (
+                "grant_types with refresh_token",
+                serde_json::json!({"grant_types": ["authorization_code", "refresh_token"]}),
+            ),
+        ] {
+            let result = register(payload(extra), base.clone(), &db, &required).await;
+            refused_as_metadata(result, what);
+        }
+        for (what, extra, policy) in [
+            (
+                "a client that may not refresh",
+                serde_json::json!({"grant_types": ["authorization_code"]}),
+                required.clone(),
+            ),
+            (
+                "a client with a back-channel URI",
+                serde_json::json!({"backchannel_logout_uri": "https://192.0.2.10/bcl"}),
+                required.clone(),
+            ),
+            (
+                "the switch off",
+                serde_json::json!({}),
+                RegistrationPolicy::from_config(&Config::default()),
+            ),
+            (
+                "Matrix mode",
+                serde_json::json!({}),
+                RegistrationPolicy::from_config(&matrix_on),
+            ),
+        ] {
+            register(payload(extra), base.clone(), &db, &policy)
+                .await
+                .unwrap_or_else(|e| panic!("{what} registers: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn discovery_advertises_backchannel_logout_only_in_generic_mode() {
+        let generic = provider_metadata_value(&Config::default(), false).unwrap();
+        assert_eq!(generic["backchannel_logout_supported"], true);
+        assert_eq!(generic["backchannel_logout_session_supported"], true);
+        let matrix = provider_metadata_value(
+            &Config {
+                mas_shared_secret: Some("s".into()),
+                ..Config::default()
+            },
+            true,
+        )
+        .unwrap();
+        assert!(
+            matrix.get("backchannel_logout_supported").is_none()
+                && matrix.get("backchannel_logout_session_supported").is_none(),
+            "Matrix mode sends no logout token, so it advertises none: {matrix}"
+        );
+    }
+}
+
+/// The generic client class: what a generic-class sign-in does, and that a Matrix-class
+/// client still does exactly what it did before classes existed. The recording homeserver
+/// extends the one in `sign_in_deactivation_order_tests` with a fault that starts at a
+/// given call, which is the only way to hit the window between the deactivation gate's
+/// probe and the sign-in's own resolution.
+#[cfg(test)]
+mod generic_client_tests {
+    use super::client_binding_tests::{CHALLENGE, VERIFIER};
+    use super::scope_grant_tests::{id_token_claims, raw_get};
+    use super::*;
+    use crate::config::Config;
+    use crate::localpart::{legacy_localpart, localpart_for};
+    use axum::extract::{Query, State};
+    use axum::http::{Method, StatusCode, Uri};
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use headers::{HeaderMap, HeaderMapExt, HeaderValue};
+    use openidconnect::OAuth2TokenResponse;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+
+    /// Synthetic: `find_did_method` checks only the `did:key:` prefix, and nothing here
+    /// parses the key.
+    const DID: &str = "did:key:zDnGENERICCLIENTCLASSTEST";
+    const SERVER_NAME: &str = "example.org";
+    const REDIRECT: &str = "https://mail.example.org/callback";
+    /// What a mail client asks for, including a Matrix scope it must never get.
+    const MAIL_REQUEST: &str = "openid io.inblock.mail urn:matrix:client:api:*";
+    const DEVICE_CALLS: [&str; 3] = [
+        "POST /_synapse/mas/upsert_device",
+        "POST /_synapse/mas/update_device_display_name",
+        "POST /_synapse/mas/allow_cross_signing_reset",
+    ];
+
+    #[derive(Default)]
+    struct Homeserver {
+        /// `is_localpart_available` answers `400 M_USER_IN_USE`.
+        taken: HashSet<String>,
+        /// `is_localpart_available` answers 500 for this localpart from its Nth call on
+        /// (1-based); earlier calls are answered normally.
+        fault_from_call: HashMap<String, usize>,
+        calls: Mutex<HashMap<String, usize>>,
+        log: Mutex<Vec<String>>,
+    }
+
+    async fn is_localpart_available(
+        State(hs): State<Arc<Homeserver>>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> axum::response::Response {
+        let lp = q.get("localpart").cloned().unwrap_or_default();
+        hs.log
+            .lock()
+            .unwrap()
+            .push(format!("is_localpart_available {lp}"));
+        let n = {
+            let mut calls = hs.calls.lock().unwrap();
+            let count = calls.entry(lp.clone()).or_insert(0);
+            *count += 1;
+            *count
+        };
+        if hs.fault_from_call.get(&lp).is_some_and(|from| n >= *from) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
+        }
+        if hs.taken.contains(&lp) {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"errcode": "M_USER_IN_USE", "error": "in use"})),
+            )
+                .into_response()
+        } else {
+            (StatusCode::OK, Json(serde_json::json!({"available": true}))).into_response()
+        }
+    }
+
+    /// No account here is deactivated: `query_user` answers 404, which the deactivation
+    /// gate reads as "no such account, nothing to reject".
+    async fn query_user(
+        State(hs): State<Arc<Homeserver>>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> axum::response::Response {
+        let lp = q.get("localpart").cloned().unwrap_or_default();
+        hs.log.lock().unwrap().push(format!("query_user {lp}"));
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"errcode": "M_NOT_FOUND", "error": "User not found"})),
+        )
+            .into_response()
+    }
+
+    /// Everything else (provisioning, profile reads) is recorded and answered `200 {}`.
+    async fn anything_else(
+        State(hs): State<Arc<Homeserver>>,
+        method: Method,
+        uri: Uri,
+    ) -> axum::response::Response {
+        hs.log
+            .lock()
+            .unwrap()
+            .push(format!("{method} {}", uri.path()));
+        (StatusCode::OK, Json(serde_json::json!({}))).into_response()
+    }
+
+    async fn spawn(
+        hs: Homeserver,
+    ) -> (Arc<Homeserver>, SynapseClient, tokio::task::JoinHandle<()>) {
+        let hs = Arc::new(hs);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral homeserver port");
+        let addr = listener.local_addr().expect("homeserver local_addr");
+        let app = Router::new()
+            .route(
+                "/_synapse/mas/is_localpart_available",
+                get(is_localpart_available),
+            )
+            .route("/_synapse/mas/query_user", get(query_user))
+            .fallback(anything_else)
+            .with_state(hs.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("homeserver");
+        });
+        (
+            hs,
+            SynapseClient::new(&format!("http://{addr}"), "secret"),
+            server,
+        )
+    }
+
+    /// The account half provisions a NEW identity's Synapse account and touches no device
+    /// and no cross-signing state.
+    #[tokio::test]
+    async fn the_account_half_provisions_the_account_and_creates_no_device() {
+        let (hs, synapse, server) = spawn(Homeserver::default()).await;
+        let resolved = crate::localpart::resolve_identity(DID, Some(&synapse))
+            .await
+            .expect("a healthy homeserver resolves");
+        assert!(resolved.is_new);
+
+        provision_synapse_account(DID, &resolved, &synapse, Some(SERVER_NAME), None).await;
+
+        server.abort();
+        let log = hs.log.lock().unwrap().clone();
+        assert!(
+            log.iter().any(|l| l == "POST /_synapse/mas/provision_user"),
+            "{log:?}"
+        );
+        for forbidden in DEVICE_CALLS {
+            assert!(
+                !log.iter().any(|l| l == forbidden),
+                "{forbidden} must not run: {log:?}"
+            );
+        }
+    }
+
+    fn nonce() -> String {
+        Uuid::new_v4().simple().to_string()
+    }
+
+    /// A public client (no secret at the token endpoint) registered for [`REDIRECT`] as
+    /// `class`, with `allowed` as its scope policy.
+    fn client_entry(class: ClientClass, allowed: Option<&[&str]>) -> ClientEntry {
+        ClientEntry {
+            class,
+            allowed_scopes: allowed.map(|a| a.iter().map(|s| s.to_string()).collect()),
+            ..ClientEntry::new(
+                "client-secret",
+                SiwxClientMetadata::new(
+                    vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
+                    LogoutClientMetadata::default(),
+                )
+                .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::None)),
+                None,
+            )
+        }
+    }
+
+    fn generic_client() -> ClientEntry {
+        client_entry(ClientClass::Generic, Some(&["openid", "io.inblock.mail"]))
+    }
+
+    /// A generic client that cannot ask for the mail scope and is always given it.
+    fn generic_client_always_granted_mail() -> ClientEntry {
+        ClientEntry {
+            always_granted_scopes: vec!["io.inblock.mail".to_string()],
+            ..generic_client()
+        }
+    }
+
+    fn matrix_client() -> ClientEntry {
+        client_entry(ClientClass::Matrix, None)
+    }
+
+    /// Whether the homeserver was asked to change anything.
+    fn wrote_anything(log: &[String]) -> bool {
+        log.iter()
+            .any(|l| l.starts_with("POST ") || l.starts_with("PUT "))
+    }
+
+    /// Whether the log holds the write of the `io.inblock.did` profile field of `localpart`.
+    fn published_the_did_field_of(log: &[String], localpart: &str) -> bool {
+        log.iter().any(|l| {
+            l.starts_with("PUT /_matrix/client/v3/profile/")
+                && l.contains(localpart)
+                && l.ends_with("/io.inblock.did")
+        })
+    }
+
+    /// One passkey-path `sign_in` for [`DID`] through `client`, for a session that `/authorize`
+    /// bound to a request for `scope`, on a provider that publishes the DID field. Returns the
+    /// outcome, the stored `CodeEntry` (when a code was issued) and the homeserver's request
+    /// log; `None` after a loud skip without Redis.
+    async fn sign_in_with(
+        client: ClientEntry,
+        scope: &str,
+        hs: Homeserver,
+    ) -> Option<(
+        Result<(Url, String), CustomError>,
+        Option<CodeEntry>,
+        Vec<String>,
+    )> {
+        let (hs, synapse, server) = spawn(hs).await;
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            server.abort();
+            return None;
+        };
+        let synapse = synapse.with_admin_mint(db.clone(), "siwx-admin".to_string(), 300);
+        let n = nonce();
+        let client_id = format!("generic-class-{n}");
+        db.set_client(client_id.clone(), client).await.unwrap();
+        let session_id = format!("generic-class-{n}");
+        db.set_session(
+            session_id.clone(),
+            SessionEntry {
+                siwe_nonce: n.clone(),
+                secret: "secret".into(),
+                signin_count: 0,
+                verified_did: Some(DID.to_string()),
+                request: Some(AuthorizationRequest {
+                    redirect_uri: REDIRECT.to_string(),
+                    scope: Some(scope.to_string()),
+                    ..bound_test_request(&client_id)
+                }),
+                guest_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={session_id}")).unwrap(),
+        );
+        let cookies = headers.typed_get::<headers::Cookie>().unwrap();
+        let key = EcdsaSigningKey::from_pem(&crate::did_assertion::test_p256_pem())
+            .expect("test PEM must load");
+        let publication = DidPublication {
+            key: &key,
+            issuer: "https://siwx.example.org",
+        };
+        let result = sign_in(
+            &Url::parse("https://siwx.example.org").unwrap(),
+            &["key".to_string()],
+            &[],
+            cookies,
+            &db,
+            Some(&synapse),
+            Some(SERVER_NAME),
+            Some(&publication),
+            None,
+        )
+        .await;
+        server.abort();
+        let code_entry = match &result {
+            Ok((url, _)) => {
+                let code = url
+                    .query_pairs()
+                    .find(|(k, _)| k == "code")
+                    .map(|(_, v)| v.into_owned())
+                    .expect("a successful sign_in redirects with a code");
+                db.try_consume_code(code).await.unwrap()
+            }
+            Err(_) => None,
+        };
+        let log = hs.log.lock().unwrap().clone();
+        Some((result, code_entry, log))
+    }
+
+    /// `/authorize` for a client registered as `client`, requesting `scope`: the login page
+    /// URL on success. `None` after a loud skip without Redis.
+    async fn authorize_with(
+        client: ClientEntry,
+        scope: &str,
+    ) -> Option<Result<String, CustomError>> {
+        let db = siwx_oidc::test_support::redis().await?;
+        let client_id = format!("generic-authorize-{}", nonce());
+        db.set_client(client_id.clone(), client).await.unwrap();
+        let params = AuthorizeParams {
+            client_id,
+            redirect_uri: RedirectUrl::new(REDIRECT.into()).unwrap(),
+            scope: Scope::new(scope.into()),
+            response_type: Some(CoreResponseType::Code),
+            state: Some("state".into()),
+            nonce: None,
+            prompt: None,
+            request_uri: None,
+            request: None,
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
+            response_mode: None,
+        };
+        Some(authorize(params, &db).await.map(|(url, _cookie)| url))
+    }
+
+    fn assert_invalid_scope_redirect(outcome: Result<String, CustomError>) {
+        match outcome {
+            Err(CustomError::Redirect(url)) => {
+                assert!(url.contains("error=invalid_scope"), "{url}");
+                assert!(url.contains("state=state"), "{url}");
+            }
+            other => panic!("expected an invalid_scope redirect, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_sign_in_creates_no_device_and_arms_no_reset() {
+        let Some((result, code, log)) =
+            sign_in_with(generic_client(), MAIL_REQUEST, Homeserver::default()).await
+        else {
+            return;
+        };
+        result.expect("a healthy generic sign-in succeeds");
+        let code = code.expect("the code entry is stored");
+        assert_eq!(
+            code.device_id, None,
+            "a generic sign-in provisions no Synapse device"
+        );
+        assert_eq!(code.localpart.as_deref(), Some(localpart_for(DID).as_str()));
+        assert_eq!(
+            code.client_class,
+            Some(ClientClass::Generic),
+            "the code records the branch sign-in took"
+        );
+        assert_eq!(
+            code.scope.as_deref(),
+            Some(MAIL_REQUEST),
+            "the code carries the bound scope, from which the exchange decides the grant"
+        );
+        assert!(
+            log.iter().any(|l| l == "POST /_synapse/mas/provision_user"),
+            "a new identity still gets its Synapse account: {log:?}"
+        );
+        for forbidden in DEVICE_CALLS {
+            assert!(
+                !log.iter().any(|l| l == forbidden),
+                "{forbidden} must not run for a generic client: {log:?}"
+            );
+        }
+    }
+
+    /// The device half is skipped; the DID tier is not. A generic account carries the same
+    /// provider-signed binding as any other, written for the localpart the sign-in resolved.
+    #[tokio::test]
+    async fn a_generic_sign_in_still_publishes_the_did_field() {
+        let Some((result, _code, log)) =
+            sign_in_with(generic_client(), MAIL_REQUEST, Homeserver::default()).await
+        else {
+            return;
+        };
+        result.expect("a healthy generic sign-in succeeds");
+        assert!(
+            published_the_did_field_of(&log, &localpart_for(DID)),
+            "{log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_sign_in_still_provisions_a_device_and_arms_the_reset() {
+        let Some((result, code, log)) =
+            sign_in_with(matrix_client(), "openid", Homeserver::default()).await
+        else {
+            return;
+        };
+        result.expect("a healthy Matrix sign-in succeeds");
+        let code = code.expect("the code entry is stored");
+        assert!(code.device_id.is_some());
+        assert_eq!(code.client_class, Some(ClientClass::Matrix));
+        for expected in [
+            "POST /_synapse/mas/provision_user",
+            "POST /_synapse/mas/upsert_device",
+            "POST /_synapse/mas/allow_cross_signing_reset",
+        ] {
+            assert!(
+                log.iter().any(|l| l == expected),
+                "{expected} must still run: {log:?}"
+            );
+        }
+        assert!(
+            published_the_did_field_of(&log, &localpart_for(DID)),
+            "{log:?}"
+        );
+    }
+
+    /// The modern localpart's probe answers the deactivation gate (call 1) and faults from
+    /// call 2 on: the residual window `sign_in`'s ordering note describes. A generic
+    /// sign-in must fail closed there, without provisioning or publishing anything.
+    #[tokio::test]
+    async fn generic_client_fails_closed() {
+        let hs = Homeserver {
+            fault_from_call: HashMap::from([(localpart_for(DID), 2)]),
+            ..Homeserver::default()
+        };
+        let Some((result, code, log)) = sign_in_with(generic_client(), MAIL_REQUEST, hs).await
+        else {
+            return;
+        };
+        match result {
+            Err(CustomError::ServiceUnavailable(msg)) => {
+                assert_eq!(msg, GENERIC_IDENTITY_UNAVAILABLE_MSG)
+            }
+            other => {
+                panic!("a fault after the gate must fail a generic sign-in closed, got {other:?}")
+            }
+        }
+        assert!(code.is_none(), "no code may be issued");
+        assert!(
+            !wrote_anything(&log),
+            "nothing may be provisioned or published on an unconfirmed localpart: {log:?}"
+        );
+    }
+
+    /// The contrast that gives the test above its meaning: the same fault lets a Matrix
+    /// sign-in through on the legacy guess, the documented fail-safe for Matrix accounts.
+    #[tokio::test]
+    async fn matrix_sign_in_still_degrades_to_the_legacy_guess_on_the_same_fault() {
+        let hs = Homeserver {
+            fault_from_call: HashMap::from([(localpart_for(DID), 2)]),
+            ..Homeserver::default()
+        };
+        let Some((result, code, _log)) = sign_in_with(matrix_client(), "openid", hs).await else {
+            return;
+        };
+        result.expect("a Matrix sign-in degrades instead of failing");
+        assert_eq!(
+            code.expect("the code entry is stored").localpart.as_deref(),
+            Some(legacy_localpart(DID).as_str())
+        );
+    }
+
+    /// `/authorize` refuses such a request first; this is the second check, for a session
+    /// bound before the client's policy changed. It runs before anything is provisioned.
+    #[tokio::test]
+    async fn a_generic_sign_in_without_openid_is_refused() {
+        let Some((result, code, log)) =
+            sign_in_with(generic_client(), "io.inblock.mail", Homeserver::default()).await
+        else {
+            return;
+        };
+        assert!(
+            matches!(result, Err(CustomError::BadRequest(_))),
+            "{result:?}"
+        );
+        assert!(code.is_none());
+        assert!(!wrote_anything(&log), "{log:?}");
+    }
+
+    /// An always-granted scope is added to a grant, never a grant of its own: a request
+    /// that names no `openid` is refused at /authorize and again at /sign_in, and no code
+    /// is stored for it.
+    #[tokio::test]
+    async fn an_always_granted_scope_does_not_make_up_for_a_missing_openid() {
+        let Some(outcome) = authorize_with(
+            generic_client_always_granted_mail(),
+            "urn:matrix:client:api:*",
+        )
+        .await
+        else {
+            return;
+        };
+        assert_invalid_scope_redirect(outcome);
+
+        let Some((result, code, log)) = sign_in_with(
+            generic_client_always_granted_mail(),
+            "urn:matrix:client:api:*",
+            Homeserver::default(),
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(
+            matches!(result, Err(CustomError::BadRequest(_))),
+            "{result:?}"
+        );
+        assert!(code.is_none());
+        assert!(!wrote_anything(&log), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn authorize_refuses_a_generic_request_that_grants_no_openid() {
+        // Passes the "openid or a Matrix scope" check, and grants nothing a generic client
+        // may have.
+        let Some(outcome) =
+            authorize_with(generic_client(), "urn:matrix:client:api:* io.inblock.mail").await
+        else {
+            return;
+        };
+        assert_invalid_scope_redirect(outcome);
+    }
+
+    #[tokio::test]
+    async fn authorize_accepts_a_generic_request_that_grants_openid() {
+        let Some(outcome) = authorize_with(generic_client(), MAIL_REQUEST).await else {
+            return;
+        };
+        let url = outcome.expect("a request that grants openid reaches the login page");
+        assert!(url.starts_with("/?nonce="), "{url}");
+    }
+
+    /// A Matrix-class client never had its scope checked against an allowed list: a request
+    /// with a Matrix scope and no `openid` still reaches the login page.
+    #[tokio::test]
+    async fn authorize_leaves_a_matrix_client_request_without_openid_alone() {
+        let Some(outcome) = authorize_with(matrix_client(), "urn:matrix:client:api:*").await else {
+            return;
+        };
+        let url = outcome.expect("a Matrix-class request is accepted as before");
+        assert!(url.starts_with("/?nonce="), "{url}");
+    }
+
+    // -- The code exchange ----------------------------------------------------------------
+
+    /// Delegated-auth mode (a MAS shared secret): the only mode that serves a generic-class
+    /// client.
+    fn delegated() -> Config {
+        Config {
+            mas_shared_secret: Some("mas-secret".into()),
+            ens_api_url: None,
+            eth_provider: None,
+            ..Config::default()
+        }
+    }
+
+    /// Generic mode: no MAS shared secret.
+    fn standalone() -> Config {
+        Config {
+            ens_api_url: None,
+            eth_provider: None,
+            ..Config::default()
+        }
+    }
+
+    /// A generic-class client whose policy allows exactly `allowed`.
+    fn generic_allowing(allowed: &[&str]) -> ClientEntry {
+        client_entry(ClientClass::Generic, Some(allowed))
+    }
+
+    /// The entry `sign_in` stores for `did` and a client of class `issued_to` (`None`: a
+    /// code written before the class was recorded).
+    fn code_entry_for(
+        did: &str,
+        client_id: &str,
+        issued_to: Option<ClientClass>,
+        device_id: Option<&str>,
+        scope: Option<&str>,
+    ) -> CodeEntry {
+        CodeEntry {
+            exchange_count: 0,
+            did: did.to_string(),
+            nonce: None,
+            client_id: client_id.to_string(),
+            auth_time: Utc::now(),
+            code_challenge: Some(CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
+            device_id: device_id.map(str::to_string),
+            localpart: Some(localpart_for(did)),
+            scope: scope.map(str::to_string),
+            client_class: issued_to,
+        }
+    }
+
+    async fn store_client(db: &RedisClient, client: ClientEntry) -> String {
+        let client_id = format!("exchange-{}", nonce());
+        db.set_client(client_id.clone(), client).await.unwrap();
+        client_id
+    }
+
+    async fn store_code(db: &RedisClient, entry: CodeEntry) -> String {
+        let code = format!("code-{}", nonce());
+        db.set_code(code.clone(), entry).await.unwrap();
+        code
+    }
+
+    async fn redeem(
+        db: &RedisClient,
+        config: &Config,
+        client_id: &str,
+        code: &str,
+    ) -> Result<SiwxTokenResponse, CustomError> {
+        token(
+            TokenForm {
+                code: Some(code.to_string()),
+                client_id: Some(client_id.to_string()),
+                client_secret: None,
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(VERIFIER.to_string()),
+                refresh_token: None,
+                device_code: None,
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            None,
+        )
+        .await
+    }
+
+    /// Register `client`, store the code `sign_in` would have issued to a client of class
+    /// `issued_to` for a request that asked for `scope`, and redeem it.
+    async fn exchange_for(
+        db: &RedisClient,
+        config: &Config,
+        client: ClientEntry,
+        issued_to: Option<ClientClass>,
+        scope: Option<&str>,
+    ) -> Result<SiwxTokenResponse, CustomError> {
+        let client_id = store_client(db, client).await;
+        let code = store_code(db, code_entry_for(DID, &client_id, issued_to, None, scope)).await;
+        redeem(db, config, &client_id, &code).await
+    }
+
+    /// The grant behind the access token of `response`, as stored.
+    async fn grant_of(
+        db: &RedisClient,
+        response: &SiwxTokenResponse,
+    ) -> siwx_oidc::db::grant::GrantView {
+        db.lookup_access_token(response.access_token().secret())
+            .await
+            .unwrap()
+            .expect("the access token resolves to its grant")
+            .grant
+    }
+
+    /// The scope the token response names, when it names one.
+    fn reported_scope(response: &SiwxTokenResponse) -> Option<Vec<String>> {
+        response
+            .scopes()
+            .map(|scopes| scopes.iter().map(|s| s.as_str().to_string()).collect())
+    }
+
+    fn assert_invalid_grant<T: std::fmt::Debug>(outcome: Result<T, CustomError>) {
+        match outcome {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error, CoreErrorResponseType::InvalidGrant)
+            }
+            other => panic!("expected invalid_grant, got {other:?}"),
+        }
+    }
+
+    /// Whether the test Redis holds `key`: one `EXISTS` on a key the caller computed.
+    async fn raw_exists(key: &str) -> bool {
+        let url = siwx_oidc::test_support::redis_url();
+        let client = bb8_redis::redis::Client::open(url.as_str()).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        bb8_redis::redis::cmd("EXISTS")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    /// `sign_in` for `client` asking for `scope`, then the exchange of the code it stored.
+    /// `None` after a loud skip without Redis.
+    async fn sign_in_then_exchange(
+        client: ClientEntry,
+        scope: &str,
+    ) -> Option<(SiwxTokenResponse, siwx_oidc::db::grant::GrantView)> {
+        let (result, code_entry, _log) = sign_in_with(client, scope, Homeserver::default()).await?;
+        result.expect("a healthy generic sign-in succeeds");
+        let entry = code_entry.expect("the code entry is stored");
+        let db = siwx_oidc::test_support::redis()
+            .await
+            .expect("Redis answered a moment ago");
+        let client_id = entry.client_id.clone();
+        let code = store_code(&db, entry).await;
+        let response = redeem(&db, &delegated(), &client_id, &code)
+            .await
+            .expect("the exchange succeeds");
+        let grant = grant_of(&db, &response).await;
+        Some((response, grant))
+    }
+
+    /// Every combination of deployment mode, the class a code was issued to and the class of
+    /// the client presenting it, in one place.
+    #[test]
+    fn the_exchange_decides_by_mode_and_by_the_class_of_the_code_and_the_client() {
+        let issued = |class: Option<ClientClass>, device: Option<&str>, scope: Option<&str>| {
+            code_entry_for(DID, "c", class, device, scope)
+        };
+        let matrix = Some(ClientClass::Matrix);
+        let generic = Some(ClientClass::Generic);
+
+        let session = exchange_issuance(
+            true,
+            &matrix_client(),
+            &issued(matrix, Some("SIWX_X"), None),
+        )
+        .expect("a Matrix client redeeming a Matrix code");
+        assert_eq!(
+            session,
+            Issuance {
+                kind: GrantKind::MatrixDevice,
+                device_id: "SIWX_X".into(),
+                scope: "openid urn:matrix:client:api:* urn:matrix:client:device:SIWX_X".into(),
+                refresh_token: true,
+                report_scope: false,
+            }
+        );
+        assert_eq!(
+            exchange_issuance(true, &matrix_client(), &issued(None, Some("SIWX_X"), None)).unwrap(),
+            session,
+            "a code written before the class was recorded came from the Matrix branch"
+        );
+
+        let standalone_grant = exchange_issuance(
+            false,
+            &matrix_client(),
+            &issued(matrix, None, Some("openid profile offline_access")),
+        )
+        .expect("a Matrix client redeeming a Matrix code in generic mode");
+        assert_eq!(
+            standalone_grant,
+            Issuance {
+                kind: GrantKind::Oidc,
+                device_id: String::new(),
+                scope: "openid profile offline_access".into(),
+                refresh_token: true,
+                report_scope: false,
+            }
+        );
+
+        let mail = exchange_issuance(
+            true,
+            &generic_client(),
+            &issued(generic, Some("SIWX_STRAY"), Some(MAIL_REQUEST)),
+        )
+        .expect("a generic client redeeming a generic code");
+        assert_eq!(
+            mail,
+            Issuance {
+                kind: GrantKind::Oidc,
+                device_id: String::new(),
+                scope: "openid io.inblock.mail".into(),
+                refresh_token: false,
+                report_scope: true,
+            },
+            "no device, and only what the policy allows of what the request bound"
+        );
+
+        assert_invalid_grant(exchange_issuance(
+            false,
+            &generic_client(),
+            &issued(generic, None, Some("openid")),
+        ));
+        for delegated in [true, false] {
+            // A generic code redeemed after the client became Matrix-class.
+            assert_invalid_grant(exchange_issuance(
+                delegated,
+                &matrix_client(),
+                &issued(generic, None, Some("openid io.inblock.mail")),
+            ));
+            // A Matrix code, or one from before the class, redeemed after the client became
+            // generic. The request grants `openid`, so the class is the only reason to refuse.
+            assert_invalid_grant(exchange_issuance(
+                delegated,
+                &generic_client(),
+                &issued(matrix, Some("SIWX_X"), Some("openid")),
+            ));
+            assert_invalid_grant(exchange_issuance(
+                delegated,
+                &generic_client(),
+                &issued(None, Some("SIWX_X"), Some("openid")),
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_generic_exchange_writes_an_oidc_grant_with_a_sid_no_device_index_and_the_granted_scope(
+    ) {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = store_client(&db, generic_client()).await;
+        // An identity of its own, so that no other grant is indexed under this localpart
+        // and the absence of a device index below means this grant has none.
+        let did = format!("did:key:zDnEXCHANGE{}", nonce());
+        // The request names a Matrix scope the client may never have, and the code carries
+        // a stray device: the class decides, not the code.
+        let code = store_code(
+            &db,
+            code_entry_for(
+                &did,
+                &client_id,
+                Some(ClientClass::Generic),
+                Some("SIWX_STRAY"),
+                Some(MAIL_REQUEST),
+            ),
+        )
+        .await;
+
+        let response = redeem(&db, &delegated(), &client_id, &code)
+            .await
+            .expect("the exchange succeeds");
+
+        let grant = grant_of(&db, &response).await;
+        assert_eq!(grant.kind, GrantKind::Oidc);
+        assert_eq!(grant.scope, "openid io.inblock.mail");
+        assert_eq!(grant.device_id, "");
+        assert_eq!(grant.client_id, client_id);
+        assert_eq!(grant.username, localpart_for(&did));
+        let sid = grant.sid.clone().expect("an oidc grant has a session id");
+        assert_eq!(id_token_claims(&response)["sid"], sid.as_str());
+        assert_eq!(
+            raw_get(&format!(
+                "{}/{sid}",
+                siwx_oidc::db::grant::KV_GRANT_SID_IDX_PREFIX
+            ))
+            .await
+            .as_deref(),
+            Some(grant.grant_id.as_str()),
+            "the sid names the grant of this exchange"
+        );
+        let device_index = siwx_oidc::db::grant::KV_GRANT_DEVICE_IDX_PREFIX;
+        for device in ["", "SIWX_STRAY"] {
+            assert!(
+                !raw_exists(&format!("{device_index}/{}/{device}", grant.username)).await,
+                "a generic grant is indexed under no device ({device:?})"
+            );
+        }
+        assert!(
+            raw_exists(&format!(
+                "{}/{}",
+                siwx_oidc::db::grant::KV_GRANT_USER_IDX_PREFIX,
+                grant.username
+            ))
+            .await,
+            "the user index still names it"
+        );
+        let metadata = db
+            .check_access_token(response.access_token().secret())
+            .await
+            .unwrap()
+            .expect("the access token is stored");
+        assert_eq!(metadata.grant_kind, Some(GrantKind::Oidc));
+        assert!(
+            response.refresh_token().is_none(),
+            "no offline_access was granted, so no refresh token"
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_code_exchange_grants_only_the_allowed_scope() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let response = exchange_for(
+            &db,
+            &delegated(),
+            generic_client(),
+            Some(ClientClass::Generic),
+            Some(MAIL_REQUEST),
+        )
+        .await
+        .expect("the exchange succeeds");
+
+        assert_eq!(
+            grant_of(&db, &response).await.scope,
+            "openid io.inblock.mail"
+        );
+        assert_eq!(
+            reported_scope(&response),
+            Some(vec!["openid".to_string(), "io.inblock.mail".to_string()]),
+            "the granted scope differs from the request, so the response names it"
+        );
+    }
+
+    /// The grant is computed from the scope the request bound, never from everything the
+    /// client's policy would allow: a client that asked for less than it may have gets less.
+    #[tokio::test]
+    async fn a_generic_grant_follows_the_bound_request_not_the_clients_allowed_scopes() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let response = exchange_for(
+            &db,
+            &delegated(),
+            generic_client(),
+            Some(ClientClass::Generic),
+            Some("openid"),
+        )
+        .await
+        .expect("the exchange succeeds");
+
+        assert_eq!(grant_of(&db, &response).await.scope, "openid");
+        assert_eq!(reported_scope(&response), None, "granted as requested");
+    }
+
+    /// Whether a token has a Synapse device is the class's decision, not the code's.
+    #[tokio::test]
+    async fn a_generic_token_never_carries_a_device() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = store_client(&db, generic_client()).await;
+        let code = store_code(
+            &db,
+            code_entry_for(
+                DID,
+                &client_id,
+                Some(ClientClass::Generic),
+                Some("SIWX_STRAY"),
+                Some("openid"),
+            ),
+        )
+        .await;
+
+        let response = redeem(&db, &delegated(), &client_id, &code)
+            .await
+            .expect("the exchange succeeds");
+
+        let grant = grant_of(&db, &response).await;
+        assert_eq!(grant.device_id, "");
+        assert!(!grant.scope.contains("SIWX_STRAY"), "{}", grant.scope);
+    }
+
+    /// A refresh token goes with a granted `offline_access` and with nothing else, however
+    /// the scope came to be granted.
+    #[tokio::test]
+    async fn a_generic_grant_issues_a_refresh_token_only_for_a_granted_offline_access() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let all = ["openid", "io.inblock.mail", "offline_access"];
+        let generic = Some(ClientClass::Generic);
+
+        let with = exchange_for(
+            &db,
+            &delegated(),
+            generic_allowing(&all),
+            generic,
+            Some("openid io.inblock.mail offline_access"),
+        )
+        .await
+        .expect("the exchange succeeds");
+        assert!(
+            with.refresh_token().is_some(),
+            "offline_access asked for and allowed"
+        );
+        assert_eq!(
+            grant_of(&db, &with).await.scope,
+            "openid io.inblock.mail offline_access"
+        );
+        assert_eq!(reported_scope(&with), None, "granted as requested");
+
+        let without = exchange_for(
+            &db,
+            &delegated(),
+            generic_allowing(&all),
+            generic,
+            Some("openid io.inblock.mail"),
+        )
+        .await
+        .expect("the exchange succeeds");
+        assert!(
+            without.refresh_token().is_none(),
+            "allowed but not asked for: the client holds no credential that outlives its session"
+        );
+
+        let not_allowed = exchange_for(
+            &db,
+            &delegated(),
+            generic_client(),
+            generic,
+            Some("openid offline_access"),
+        )
+        .await
+        .expect("the exchange succeeds");
+        assert!(
+            not_allowed.refresh_token().is_none(),
+            "asked for, not allowed"
+        );
+        assert_eq!(
+            reported_scope(&not_allowed),
+            Some(vec!["openid".to_string()]),
+            "the response names what was granted, which differs from the request"
+        );
+
+        let always_granted = ClientEntry {
+            always_granted_scopes: vec!["offline_access".to_string()],
+            ..generic_allowing(&all)
+        };
+        let always = exchange_for(&db, &delegated(), always_granted, generic, Some("openid"))
+            .await
+            .expect("the exchange succeeds");
+        assert!(
+            always.refresh_token().is_some(),
+            "granted without being asked for"
+        );
+        assert_eq!(grant_of(&db, &always).await.scope, "openid offline_access");
+
+        let mut code_grant_only = generic_allowing(&all);
+        code_grant_only.metadata = code_grant_only
+            .metadata
+            .set_grant_types(Some(vec![CoreGrantType::AuthorizationCode]));
+        let refused = exchange_for(
+            &db,
+            &delegated(),
+            code_grant_only,
+            generic,
+            Some("openid offline_access"),
+        )
+        .await
+        .expect("the exchange succeeds");
+        assert!(
+            refused.refresh_token().is_none(),
+            "the registration lists no refresh_token grant"
+        );
+        assert_eq!(grant_of(&db, &refused).await.scope, "openid");
+    }
+
+    /// What the exchange issues for a generic-class client is an ordinary `oidc` grant: its
+    /// refresh token rotates at the token endpoint, for the client it was issued to.
+    #[tokio::test]
+    async fn a_generic_grants_refresh_token_rotates_at_the_token_endpoint() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = store_client(
+            &db,
+            generic_allowing(&["openid", "io.inblock.mail", "offline_access"]),
+        )
+        .await;
+        let code = store_code(
+            &db,
+            code_entry_for(
+                DID,
+                &client_id,
+                Some(ClientClass::Generic),
+                None,
+                Some("openid io.inblock.mail offline_access"),
+            ),
+        )
+        .await;
+        let issued = redeem(&db, &delegated(), &client_id, &code)
+            .await
+            .expect("the exchange succeeds");
+        let refresh_token = issued
+            .refresh_token()
+            .expect("offline_access was granted")
+            .secret()
+            .clone();
+
+        let rotated = token(
+            TokenForm {
+                code: None,
+                client_id: Some(client_id.clone()),
+                client_secret: None,
+                grant_type: CoreGrantType::RefreshToken,
+                code_verifier: None,
+                refresh_token: Some(refresh_token),
+                device_code: None,
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &delegated(),
+            &db,
+            None,
+        )
+        .await
+        .expect("the refresh token rotates");
+
+        let before = grant_of(&db, &issued).await;
+        let after = grant_of(&db, &rotated).await;
+        assert_eq!(after.grant_id, before.grant_id, "the same grant");
+        assert_eq!(after.kind, GrantKind::Oidc);
+        assert_eq!(after.scope, "openid io.inblock.mail offline_access");
+        assert_eq!(after.device_id, "");
+        assert!(
+            rotated.scopes().is_none(),
+            "a refresh response names no scope: the grant's scope is fixed at issuance"
+        );
+    }
+
+    /// What the exchange issues to a generic-class client is not a Matrix session. In a
+    /// delegated-auth deployment introspection answers inactive for its access token (a
+    /// Matrix client's stays active), every Matrix bearer route and the Matrix refresh
+    /// endpoint refuse it and touch nothing, and the token endpoint still rotates its
+    /// refresh token.
+    #[tokio::test]
+    async fn a_generic_clients_tokens_are_refused_by_the_matrix_side_and_rotate_at_the_token_endpoint(
+    ) {
+        use crate::compat::{self, CompatState, DeleteDevicesRequest, RefreshRequest};
+        use axum_extra::headers::Authorization;
+        use axum_extra::TypedHeader;
+
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let did = format!("did:key:zRelyingParty{}", nonce());
+        let exchange = |client: ClientEntry, class: ClientClass, scope: &'static str| {
+            let (db, did) = (db.clone(), did.clone());
+            async move {
+                let client_id = store_client(&db, client).await;
+                let code = store_code(
+                    &db,
+                    code_entry_for(&did, &client_id, Some(class), None, Some(scope)),
+                )
+                .await;
+                let response = redeem(&db, &delegated(), &client_id, &code)
+                    .await
+                    .expect("the exchange succeeds");
+                (client_id, response)
+            }
+        };
+        let (mail_id, mail) = exchange(
+            generic_allowing(&["openid", "io.inblock.mail", "offline_access"]),
+            ClientClass::Generic,
+            "openid io.inblock.mail offline_access",
+        )
+        .await;
+        let (_, matrix) = exchange(
+            client_entry(ClientClass::Matrix, None),
+            ClientClass::Matrix,
+            "openid",
+        )
+        .await;
+        let mail_access = mail.access_token().secret().clone();
+        let mail_refresh = mail
+            .refresh_token()
+            .expect("offline_access was granted")
+            .secret()
+            .clone();
+        let matrix_access = matrix.access_token().secret().clone();
+
+        let introspect = |token: String| {
+            let db = db.clone();
+            async move {
+                crate::introspect::introspect(
+                    State(crate::axum_lib::IntrospectState {
+                        mas_shared_secret: delegated().mas_shared_secret,
+                        redis_client: db,
+                    }),
+                    Some(TypedHeader(Authorization::bearer("mas-secret").unwrap())),
+                    axum::extract::Form(crate::introspect::IntrospectForm {
+                        token,
+                        token_type_hint: None,
+                        client_id: None,
+                        client_secret: None,
+                    }),
+                )
+                .await
+                .expect("a 200")
+                .0
+            }
+        };
+        assert_eq!(
+            introspect(mail_access.clone()).await,
+            serde_json::json!({"active": false}),
+            "the access token of a generic-class client is not a Matrix session"
+        );
+        assert_eq!(
+            introspect(matrix_access.clone()).await["active"],
+            true,
+            "a Matrix client's access token stays active"
+        );
+
+        let matrix_side = CompatState::new(db.clone(), None, &delegated());
+        let bearer = |token: &str| Some(TypedHeader(Authorization::bearer(token).unwrap()));
+        let answers = [
+            (
+                "logout",
+                compat::logout(State(matrix_side.clone()), bearer(&mail_access))
+                    .await
+                    .into_response()
+                    .status(),
+            ),
+            (
+                "logout/all",
+                compat::logout_all(State(matrix_side.clone()), bearer(&mail_access))
+                    .await
+                    .into_response()
+                    .status(),
+            ),
+            (
+                "DELETE /devices/{id}",
+                compat::delete_device(
+                    State(matrix_side.clone()),
+                    axum::extract::Path("ANY".to_string()),
+                    bearer(&mail_access),
+                )
+                .await
+                .into_response()
+                .status(),
+            ),
+            (
+                "POST /delete_devices",
+                compat::delete_devices(
+                    State(matrix_side.clone()),
+                    bearer(&mail_access),
+                    Json(DeleteDevicesRequest {
+                        devices: vec!["ANY".to_string()],
+                    }),
+                )
+                .await
+                .into_response()
+                .status(),
+            ),
+            (
+                "POST /_matrix/client/v3/refresh",
+                compat::refresh(
+                    State(matrix_side.clone()),
+                    Json(RefreshRequest {
+                        refresh_token: mail_refresh.clone(),
+                    }),
+                )
+                .await
+                .into_response()
+                .status(),
+            ),
+        ];
+        for (route, status) in answers {
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{route}");
+        }
+        assert!(
+            db.lookup_access_token(&matrix_access)
+                .await
+                .unwrap()
+                .is_some(),
+            "no refusal ended the Matrix client's session"
+        );
+        let untouched = db
+            .resolve_refresh_token(&mail_refresh)
+            .await
+            .unwrap()
+            .expect("the refusals left the refresh token current");
+        assert_eq!(untouched.generation, 0, "and rotated nothing");
+
+        let rotated = token(
+            TokenForm {
+                code: None,
+                client_id: Some(mail_id.clone()),
+                client_secret: None,
+                grant_type: CoreGrantType::RefreshToken,
+                code_verifier: None,
+                refresh_token: Some(mail_refresh),
+                device_code: None,
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &delegated(),
+            &db,
+            None,
+        )
+        .await
+        .expect("the token endpoint still rotates the refused refresh token");
+        let after = grant_of(&db, &rotated).await;
+        assert_eq!(after.grant_id, untouched.grant_id, "the same grant");
+        assert_eq!(after.kind, GrantKind::Oidc);
+    }
+
+    // -- A static client's configuration changes at start-up ------------------------------
+    //
+    // Each test syncs through a client from `test_support`, which records static clients in a
+    // set of its own, and names its own client ids, so none prunes or ends the grants of a
+    // stack that shares this Redis. A client carries one set: a test that needs the starts of
+    // several independent clients takes a fresh client for each.
+
+    const MAIL_CLIENT_SCOPES: [&str; 3] = ["openid", "io.inblock.mail", "offline_access"];
+    const MAIL_CLIENT_REQUEST: &str = "openid io.inblock.mail offline_access";
+
+    /// One start of the server: the static clients in Redis become `clients`.
+    async fn start_server_with(db: &RedisClient, clients: Vec<(&str, ClientEntry)>) {
+        let clients = clients
+            .into_iter()
+            .map(|(id, entry)| (id.to_string(), entry))
+            .collect();
+        db.sync_static_clients(clients)
+            .await
+            .expect("the start-up sync succeeds");
+    }
+
+    fn static_id() -> String {
+        format!("static-{}", nonce())
+    }
+
+    /// The tokens of a sign-in at `client_id`, as the class its code was issued to.
+    async fn sign_in_at(
+        db: &RedisClient,
+        client_id: &str,
+        class: ClientClass,
+        scope: &str,
+    ) -> SiwxTokenResponse {
+        let code = store_code(
+            db,
+            code_entry_for(DID, client_id, Some(class), None, Some(scope)),
+        )
+        .await;
+        redeem(db, &delegated(), client_id, &code)
+            .await
+            .expect("the exchange succeeds")
+    }
+
+    /// The client epoch of `client_id`, in Unix milliseconds; `None` when none was set.
+    async fn client_epoch(db: &RedisClient, client_id: &str) -> Option<i64> {
+        db.get_raw(&siwx_oidc::db::grant::EpochScope::Client(client_id).key())
+            .await
+            .unwrap()
+            .map(|epoch| epoch.parse().expect("an epoch is a number"))
+    }
+
+    /// A sign-in in the first millisecond after the client's epoch: the earliest moment at
+    /// which a new grant can exist. (The exchange takes the grant's authentication time from
+    /// the code, and an epoch refuses a grant authenticated in its own millisecond.)
+    async fn sign_in_after_the_epoch(
+        db: &RedisClient,
+        client_id: &str,
+        class: ClientClass,
+        scope: &str,
+    ) -> SiwxTokenResponse {
+        let epoch = client_epoch(db, client_id)
+            .await
+            .expect("the change set the client epoch");
+        let entry = CodeEntry {
+            auth_time: chrono::DateTime::<Utc>::from_timestamp_millis(epoch + 1).unwrap(),
+            ..code_entry_for(DID, client_id, Some(class), None, Some(scope))
+        };
+        let code = store_code(db, entry).await;
+        redeem(db, &delegated(), client_id, &code)
+            .await
+            .expect("the exchange succeeds")
+    }
+
+    async fn refresh_at_the_token_endpoint(
+        db: &RedisClient,
+        client_id: &str,
+        grant: &SiwxTokenResponse,
+    ) -> Result<SiwxTokenResponse, CustomError> {
+        token(
+            TokenForm {
+                code: None,
+                client_id: Some(client_id.to_string()),
+                client_secret: None,
+                grant_type: CoreGrantType::RefreshToken,
+                code_verifier: None,
+                refresh_token: Some(
+                    grant
+                        .refresh_token()
+                        .expect("the grant carries a refresh token")
+                        .secret()
+                        .clone(),
+                ),
+                device_code: None,
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &delegated(),
+            db,
+            None,
+        )
+        .await
+    }
+
+    async fn userinfo_of(
+        db: &RedisClient,
+        grant: &SiwxTokenResponse,
+    ) -> Result<UserInfoResponse, CustomError> {
+        userinfo(
+            &delegated(),
+            &EcdsaSigningKey::generate(),
+            None,
+            UserInfoPayload {
+                access_token: Some(grant.access_token().secret().clone()),
+            },
+            db,
+        )
+        .await
+    }
+
+    /// Both places a grant is presented refuse it: userinfo its access token (asked first,
+    /// because a refused refresh deletes the grant) and the token endpoint its refresh token.
+    async fn assert_grant_ended(
+        db: &RedisClient,
+        client_id: &str,
+        grant: &SiwxTokenResponse,
+        what: &str,
+    ) {
+        assert!(
+            matches!(
+                userinfo_of(db, grant).await,
+                Err(CustomError::InvalidToken(_))
+            ),
+            "{what}: userinfo must refuse the access token"
+        );
+        match refresh_at_the_token_endpoint(db, client_id, grant).await {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error, CoreErrorResponseType::InvalidGrant, "{what}")
+            }
+            Err(other) => panic!("{what}: expected invalid_grant, got {other:?}"),
+            Ok(_) => panic!("{what}: the token endpoint must refuse the refresh token"),
+        }
+    }
+
+    /// Userinfo serves the grant's access token and the token endpoint rotates its refresh
+    /// token.
+    async fn assert_grant_works(
+        db: &RedisClient,
+        client_id: &str,
+        grant: &SiwxTokenResponse,
+        what: &str,
+    ) {
+        if let Err(e) = userinfo_of(db, grant).await {
+            panic!("{what}: userinfo refuses the access token: {e:?}");
+        }
+        if let Err(e) = refresh_at_the_token_endpoint(db, client_id, grant).await {
+            panic!("{what}: the token endpoint refuses the refresh token: {e:?}");
+        }
+    }
+
+    /// A restart that finds the configuration it left behind ends no session: not with the
+    /// entry written again, and not with the same scopes in another order.
+    #[tokio::test]
+    async fn a_restart_with_an_unchanged_configuration_keeps_a_generic_grant_working() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = static_id();
+        start_server_with(
+            &db,
+            vec![(&client_id, generic_allowing(&MAIL_CLIENT_SCOPES))],
+        )
+        .await;
+        let older = sign_in_at(&db, &client_id, ClientClass::Generic, MAIL_CLIENT_REQUEST).await;
+
+        let mut reordered = MAIL_CLIENT_SCOPES;
+        reordered.reverse();
+        for scopes in [MAIL_CLIENT_SCOPES, reordered] {
+            start_server_with(&db, vec![(&client_id, generic_allowing(&scopes))]).await;
+        }
+
+        assert_eq!(client_epoch(&db, &client_id).await, None);
+        assert_grant_works(&db, &client_id, &older, "a grant from before the restarts").await;
+    }
+
+    /// Removing a generic client from the configuration ends the grants it issued, though a
+    /// public client presents no secret to refresh with and its registration is gone. When the
+    /// id is configured again, what was issued before stays refused and a new sign-in works.
+    #[tokio::test]
+    async fn an_older_generic_grant_is_refused_after_its_client_is_removed() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = static_id();
+        let mail = generic_allowing(&MAIL_CLIENT_SCOPES);
+        start_server_with(&db, vec![(&client_id, mail.clone())]).await;
+        let older = sign_in_at(&db, &client_id, ClientClass::Generic, MAIL_CLIENT_REQUEST).await;
+        if let Err(e) = userinfo_of(&db, &older).await {
+            panic!("precondition: userinfo serves the grant: {e:?}");
+        }
+
+        start_server_with(&db, Vec::new()).await;
+        assert_grant_ended(&db, &client_id, &older, "after the removal").await;
+
+        start_server_with(&db, vec![(&client_id, mail)]).await;
+        let newer =
+            sign_in_after_the_epoch(&db, &client_id, ClientClass::Generic, MAIL_CLIENT_REQUEST)
+                .await;
+        assert_grant_works(&db, &client_id, &newer, "a sign-in after the removal").await;
+    }
+
+    /// A class change ends the grants of the client's old class, in either direction, and a
+    /// sign-in as the new class works at once.
+    #[tokio::test]
+    async fn an_older_grant_is_refused_after_a_class_change_in_either_direction() {
+        let cases = [
+            (
+                "generic to Matrix",
+                (generic_allowing(&MAIL_CLIENT_SCOPES), ClientClass::Generic),
+                (matrix_client(), ClientClass::Matrix),
+                (MAIL_CLIENT_REQUEST, "openid"),
+            ),
+            (
+                "Matrix to generic",
+                (matrix_client(), ClientClass::Matrix),
+                (generic_allowing(&MAIL_CLIENT_SCOPES), ClientClass::Generic),
+                ("openid", MAIL_CLIENT_REQUEST),
+            ),
+        ];
+        for (what, (before, was), (after, becomes), (old_scope, new_scope)) in cases {
+            let Some(db) = siwx_oidc::test_support::redis().await else {
+                return;
+            };
+            let client_id = static_id();
+            start_server_with(&db, vec![(&client_id, before)]).await;
+            let older = sign_in_at(&db, &client_id, was, old_scope).await;
+
+            start_server_with(&db, vec![(&client_id, after)]).await;
+            assert_grant_ended(&db, &client_id, &older, what).await;
+
+            let newer = sign_in_after_the_epoch(&db, &client_id, becomes, new_scope).await;
+            assert_grant_works(&db, &client_id, &newer, what).await;
+        }
+    }
+
+    /// Narrowing the scopes a generic client may be granted ends the grants issued under the
+    /// wider policy, and a sign-in under the narrower one works at once.
+    #[tokio::test]
+    async fn an_older_generic_grant_is_refused_after_the_allowed_scopes_change() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = static_id();
+        start_server_with(
+            &db,
+            vec![(&client_id, generic_allowing(&MAIL_CLIENT_SCOPES))],
+        )
+        .await;
+        let older = sign_in_at(&db, &client_id, ClientClass::Generic, MAIL_CLIENT_REQUEST).await;
+
+        let narrower = ["openid", "offline_access"];
+        start_server_with(&db, vec![(&client_id, generic_allowing(&narrower))]).await;
+        assert_grant_ended(&db, &client_id, &older, "after the narrowing").await;
+
+        let newer =
+            sign_in_after_the_epoch(&db, &client_id, ClientClass::Generic, MAIL_CLIENT_REQUEST)
+                .await;
+        assert_eq!(
+            grant_of(&db, &newer).await.scope,
+            "openid offline_access",
+            "the new grant is held to the narrower policy"
+        );
+        assert_grant_works(&db, &client_id, &newer, "a sign-in after the narrowing").await;
+    }
+
+    /// A generic-class client whose registration lists exactly `grants`.
+    fn generic_registered_for(grants: Vec<CoreGrantType>) -> ClientEntry {
+        let mut entry = generic_allowing(&MAIL_CLIENT_SCOPES);
+        entry.metadata = entry.metadata.set_grant_types(Some(grants));
+        entry
+    }
+
+    /// A registration that stops allowing the refresh grant ends the grants issued while it
+    /// did: their refresh tokens would otherwise keep rotating under a registration that no
+    /// longer allows them. A sign-in afterwards gets an access token and no refresh token.
+    #[tokio::test]
+    async fn an_older_generic_grant_is_refused_after_the_refresh_grant_is_withdrawn() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = static_id();
+        let refreshing = generic_registered_for(vec![
+            CoreGrantType::AuthorizationCode,
+            CoreGrantType::RefreshToken,
+        ]);
+        let code_only = generic_registered_for(vec![CoreGrantType::AuthorizationCode]);
+        start_server_with(&db, vec![(&client_id, refreshing)]).await;
+        let older = sign_in_at(&db, &client_id, ClientClass::Generic, MAIL_CLIENT_REQUEST).await;
+        assert!(
+            older.refresh_token().is_some(),
+            "precondition: the grant carries a refresh token"
+        );
+
+        start_server_with(&db, vec![(&client_id, code_only)]).await;
+        assert_grant_ended(
+            &db,
+            &client_id,
+            &older,
+            "after the refresh grant was withdrawn",
+        )
+        .await;
+
+        let newer =
+            sign_in_after_the_epoch(&db, &client_id, ClientClass::Generic, MAIL_CLIENT_REQUEST)
+                .await;
+        assert!(
+            newer.refresh_token().is_none(),
+            "the registration no longer allows a refresh token"
+        );
+        if let Err(e) = userinfo_of(&db, &newer).await {
+            panic!("a sign-in after the withdrawal gets a working access token: {e:?}");
+        }
+    }
+
+    /// A restart that lists the same refresh permission, in another form, ends nothing.
+    #[tokio::test]
+    async fn a_restart_that_keeps_the_refresh_permission_keeps_a_generic_grant_working() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = static_id();
+        start_server_with(
+            &db,
+            vec![(&client_id, generic_allowing(&MAIL_CLIENT_SCOPES))],
+        )
+        .await;
+        let older = sign_in_at(&db, &client_id, ClientClass::Generic, MAIL_CLIENT_REQUEST).await;
+
+        let listing_it = generic_registered_for(vec![CoreGrantType::RefreshToken]);
+        start_server_with(&db, vec![(&client_id, listing_it)]).await;
+
+        assert_eq!(client_epoch(&db, &client_id).await, None);
+        assert_grant_works(&db, &client_id, &older, "after listing the refresh grant").await;
+    }
+
+    /// A Matrix-class client's sessions are Matrix sessions: removing the client from the
+    /// configuration ends none, and they keep refreshing as before.
+    #[tokio::test]
+    async fn removing_a_matrix_class_static_client_leaves_its_sessions_refreshing() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = static_id();
+        start_server_with(&db, vec![(&client_id, matrix_client())]).await;
+        let session = sign_in_at(&db, &client_id, ClientClass::Matrix, "openid").await;
+
+        start_server_with(&db, Vec::new()).await;
+
+        assert_eq!(client_epoch(&db, &client_id).await, None);
+        refresh_at_the_token_endpoint(&db, &client_id, &session)
+            .await
+            .unwrap_or_else(|e| panic!("a Matrix session keeps refreshing: {e:?}"));
+    }
+
+    /// RFC 6749 section 5.1: the `scope` of a token response is the grant when it differs
+    /// from the request. This client asked for `openid profile`, may not have `profile`, and
+    /// is always given the mail scope, from the sign-in that bound the request to the
+    /// exchange that issued the grant.
+    #[tokio::test]
+    async fn the_token_response_reports_a_grant_that_differs_from_the_request() {
+        let Some((response, _grant)) =
+            sign_in_then_exchange(generic_client_always_granted_mail(), "openid profile").await
+        else {
+            return;
+        };
+
+        assert_eq!(
+            reported_scope(&response),
+            Some(vec!["openid".to_string(), "io.inblock.mail".to_string()])
+        );
+    }
+
+    /// A client that cannot ask for the mail scope still gets it: the scopes its
+    /// configuration always grants are appended to what it requested and is allowed. The
+    /// request below names `profile`, which this client may not have, so that is dropped.
+    #[tokio::test]
+    async fn a_generic_sign_in_is_granted_its_always_granted_scopes_without_requesting_them() {
+        let Some((_response, grant)) =
+            sign_in_then_exchange(generic_client_always_granted_mail(), "openid profile").await
+        else {
+            return;
+        };
+
+        assert_eq!(grant.scope, "openid io.inblock.mail");
+        assert_eq!(grant.kind, GrantKind::Oidc);
+        assert_eq!(grant.device_id, "");
+    }
+
+    #[tokio::test]
+    async fn matrix_code_exchange_keeps_the_matrix_scope() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        for issued_to in [Some(ClientClass::Matrix), None] {
+            let client_id = store_client(&db, matrix_client()).await;
+            let code = store_code(
+                &db,
+                code_entry_for(DID, &client_id, issued_to, Some("SIWX_KEEP"), None),
+            )
+            .await;
+
+            let response = redeem(&db, &delegated(), &client_id, &code)
+                .await
+                .expect("the exchange succeeds");
+
+            let grant = grant_of(&db, &response).await;
+            assert_eq!(grant.kind, GrantKind::MatrixDevice);
+            assert_eq!(
+                grant.scope,
+                "openid urn:matrix:client:api:* urn:matrix:client:device:SIWX_KEEP"
+            );
+            assert_eq!(grant.device_id, "SIWX_KEEP");
+            assert!(
+                response.refresh_token().is_some(),
+                "a Matrix session always carries a refresh token"
+            );
+            assert!(
+                reported_scope(&response).is_none(),
+                "the Matrix token response is unchanged"
+            );
+        }
+    }
+
+    /// Without delegated auth a Matrix-class client gets generic mode's grant, and a
+    /// generic-class client is refused: it has no Synapse to supply its localpart.
+    #[tokio::test]
+    async fn code_exchange_outside_delegated_auth_follows_the_class_too() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let response = exchange_for(
+            &db,
+            &standalone(),
+            matrix_client(),
+            Some(ClientClass::Matrix),
+            Some("openid profile"),
+        )
+        .await
+        .expect("the Matrix-class exchange succeeds");
+        let grant = grant_of(&db, &response).await;
+        assert_eq!(grant.kind, GrantKind::Oidc);
+        assert_eq!(grant.scope, "openid profile");
+
+        assert_invalid_grant(
+            exchange_for(
+                &db,
+                &standalone(),
+                generic_client(),
+                Some(ClientClass::Generic),
+                Some("openid"),
+            )
+            .await,
+        );
+    }
+
+    /// A request that grants no `openid` has no grant to issue, whatever the sign-in did
+    /// when the request was bound.
+    #[tokio::test]
+    async fn a_generic_code_whose_request_grants_no_openid_is_refused() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        for scope in [
+            Some("io.inblock.mail"),
+            Some("urn:matrix:client:api:*"),
+            None,
+        ] {
+            assert_invalid_grant(
+                exchange_for(
+                    &db,
+                    &delegated(),
+                    generic_client(),
+                    Some(ClientClass::Generic),
+                    scope,
+                )
+                .await,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_generic_code_redeemed_after_the_client_became_matrix_class_is_refused() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        assert_invalid_grant(
+            exchange_for(
+                &db,
+                &delegated(),
+                matrix_client(),
+                Some(ClientClass::Generic),
+                Some("openid io.inblock.mail"),
+            )
+            .await,
+        );
+    }
+
+    /// The other direction, and the code of a build from before the class was recorded.
+    #[tokio::test]
+    async fn a_matrix_code_redeemed_after_the_client_became_generic_is_refused() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        for issued_to in [Some(ClientClass::Matrix), None] {
+            assert_invalid_grant(
+                exchange_for(
+                    &db,
+                    &delegated(),
+                    generic_client(),
+                    issued_to,
+                    Some("openid"),
+                )
+                .await,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_generic_client_that_allows_no_scopes_is_refused_at_exchange() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        assert_invalid_grant(
+            exchange_for(
+                &db,
+                &delegated(),
+                client_entry(ClientClass::Generic, None),
+                Some(ClientClass::Generic),
+                Some("openid"),
+            )
+            .await,
+        );
+    }
+
+    // -- ENS lookups ----------------------------------------------------------------------
+
+    /// An ENS HTTP API stand-in that counts lookups and names every address `alice.eth`.
+    async fn spawn_ens() -> (
+        Arc<std::sync::atomic::AtomicUsize>,
+        Url,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new().fallback(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({ "ens_primary": "alice.eth" }))
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (hits, url, server)
+    }
+
+    /// An EIP-55 specification test vector, not anyone's wallet.
+    const EIP155_DID: &str = "did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+
+    #[tokio::test]
+    async fn generic_clients_trigger_no_ens_lookup() {
+        use std::sync::atomic::Ordering;
+        let (hits, url, server) = spawn_ens().await;
+        let config = Config {
+            ens_api_url: Some(url),
+            eth_provider: None,
+            ..Config::default()
+        };
+
+        let generic = resolve_claims(&config, EIP155_DID, ClientClass::Generic).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a generic client's claims must not send the address to an ENS API"
+        );
+        assert!(generic.name().is_none());
+
+        let matrix = resolve_claims(&config, EIP155_DID, ClientClass::Matrix).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a Matrix client keeps the configured lookup"
+        );
+        assert!(matrix.name().is_some());
+        server.abort();
+    }
+
+    /// The two endpoints a generic client's claims come from, each with an ENS API
+    /// configured: the code exchange (ID token claims, and the `name` stored on the grant)
+    /// and userinfo. A Matrix-class client's exchange is the control: it does look up.
+    #[tokio::test]
+    async fn a_generic_clients_exchange_and_userinfo_trigger_no_ens_lookup() {
+        use std::sync::atomic::Ordering;
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (hits, url, server) = spawn_ens().await;
+        let config = Config {
+            ens_api_url: Some(url),
+            ..delegated()
+        };
+        let generic_id = store_client(&db, generic_client()).await;
+        let matrix_id = store_client(&db, matrix_client()).await;
+
+        let code = store_code(
+            &db,
+            code_entry_for(
+                EIP155_DID,
+                &generic_id,
+                Some(ClientClass::Generic),
+                None,
+                Some("openid io.inblock.mail"),
+            ),
+        )
+        .await;
+        let response = redeem(&db, &config, &generic_id, &code)
+            .await
+            .expect("the generic exchange succeeds");
+        userinfo(
+            &config,
+            &EcdsaSigningKey::generate(),
+            None,
+            UserInfoPayload {
+                access_token: Some(response.access_token().secret().clone()),
+            },
+            &db,
+        )
+        .await
+        .map(|_| ())
+        .unwrap_or_else(|e| panic!("userinfo succeeds for the generic token: {e}"));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "neither the exchange nor userinfo may send a generic client's address to an ENS API"
+        );
+
+        let code = store_code(
+            &db,
+            code_entry_for(
+                EIP155_DID,
+                &matrix_id,
+                Some(ClientClass::Matrix),
+                Some("SIWX_ENS"),
+                None,
+            ),
+        )
+        .await;
+        redeem(&db, &config, &matrix_id, &code)
+            .await
+            .expect("the Matrix exchange succeeds");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a Matrix-class exchange keeps the configured lookup"
+        );
+        server.abort();
+    }
+
+    // -- The device-code grant ------------------------------------------------------------
+
+    async fn device_authorization_for(
+        db: &RedisClient,
+        client_id: String,
+    ) -> Result<crate::device_auth::DeviceAuthResponse, CustomError> {
+        crate::device_auth::device_authorization(
+            &delegated(),
+            db,
+            crate::device_auth::DeviceAuthRequest {
+                client_id,
+                scope: Some("openid".into()),
+                login_hint: None,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn generic_client_cannot_start_a_device_grant() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = store_client(&db, generic_client()).await;
+        match device_authorization_for(&db, client_id).await {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error, CoreErrorResponseType::UnauthorizedClient)
+            }
+            other => panic!("expected unauthorized_client, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_matrix_class_client_still_starts_a_device_grant() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = store_client(&db, matrix_client()).await;
+        device_authorization_for(&db, client_id)
+            .await
+            .map(|_| ())
+            .expect("a Matrix-class client starts the device-code grant as before");
+    }
+
+    /// The second way into the device grant: a code issued while the client was Matrix-class
+    /// and redeemed after it became generic. The poll refuses it before recording or
+    /// claiming anything, so no generic client is handed a Matrix session and the code stays
+    /// as it was.
+    #[tokio::test]
+    async fn a_device_code_of_a_generic_client_is_never_redeemed() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = store_client(&db, generic_client()).await;
+        let device_code = format!("dvc_generic-redeem-{}", nonce());
+        let mut entry = DeviceCodeEntry::new(
+            &format!("GR-{}", nonce()),
+            client_id.clone(),
+            "openid".to_string(),
+            Utc::now().timestamp(),
+        );
+        entry.status = DeviceCodeStatus::Approved;
+        entry.did = Some(DID.to_string());
+        db.set_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
+            .await
+            .unwrap();
+
+        let outcome = token(
+            TokenForm {
+                code: None,
+                client_id: Some(client_id),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code.clone()),
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &delegated(),
+            &db,
+            None,
+        )
+        .await;
+
+        match outcome {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error, CoreErrorResponseType::UnauthorizedClient)
+            }
+            Err(other) => panic!("expected unauthorized_client, got {other:?}"),
+            Ok(_) => panic!("a generic client must never be handed a Matrix session"),
+        }
+        let (device_ref, stored) = db
+            .get_device_code(&device_code)
+            .await
+            .unwrap()
+            .expect("the refused code is left in place");
+        assert_eq!(stored.status, DeviceCodeStatus::Approved);
+        assert_eq!(stored.last_poll, None, "the refused poll recorded nothing");
+        db.delete_device_code(&device_ref).await.ok();
+    }
+
+    // ---- a proposed device id must match [A-Za-z0-9._~+/-]{1,64} (PR #50 audit F1) ----
+
+    /// The scope a client sends with a device id in it.
+    fn device_scope(device: &str) -> String {
+        format!("openid urn:matrix:client:api:* urn:matrix:client:device:{device}")
+    }
+
+    #[tokio::test]
+    async fn authorize_refuses_a_device_id_with_a_comma() {
+        let Some(outcome) = authorize_with(matrix_client(), &device_scope("X,Y")).await else {
+            return;
+        };
+        assert_invalid_scope_redirect(outcome);
+    }
+
+    #[tokio::test]
+    async fn authorize_refuses_an_overlong_device_id() {
+        let Some(outcome) = authorize_with(matrix_client(), &device_scope(&"A".repeat(65))).await
+        else {
+            return;
+        };
+        assert_invalid_scope_redirect(outcome);
+    }
+
+    #[tokio::test]
+    async fn authorize_still_accepts_plain_and_unreserved_device_ids() {
+        for id in ["ABCDEFGHIJ", "a.b_c~d-e"] {
+            let Some(outcome) = authorize_with(matrix_client(), &device_scope(id)).await else {
+                return;
+            };
+            outcome.unwrap_or_else(|e| panic!("device id {id} must pass: {e:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_in_refuses_a_device_id_with_a_comma_before_any_homeserver_call() {
+        let Some((result, code, log)) =
+            sign_in_with(matrix_client(), &device_scope("X,Y"), Homeserver::default()).await
+        else {
+            return;
+        };
+        assert!(
+            matches!(result, Err(CustomError::BadRequest(_))),
+            "a comma in the proposed device id must be refused, got {result:?}"
+        );
+        assert!(code.is_none(), "no code is issued");
+        assert!(log.is_empty(), "no homeserver call: {log:?}");
+    }
+
+    #[tokio::test]
+    async fn device_authorization_refuses_a_device_id_with_a_comma() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = store_client(&db, matrix_client()).await;
+        let outcome = crate::device_auth::device_authorization(
+            &delegated(),
+            &db,
+            crate::device_auth::DeviceAuthRequest {
+                client_id,
+                scope: Some(device_scope("X,Y")),
+                login_hint: None,
+            },
+        )
+        .await;
+        match outcome {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error, CoreErrorResponseType::InvalidScope);
+                assert_eq!(e.error_description, INVALID_DEVICE_ID_MSG);
+            }
+            other => panic!(
+                "a comma in the proposed device id must be refused with invalid_scope, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
+
+    // ---- GP-CLM-26 on the device-code grant (PR #50 audit F3) ----
+
+    /// Redeem an approved device code for `did` whose scope proposes `device`.
+    async fn redeem_device_code(
+        db: &RedisClient,
+        did: &str,
+        device: &str,
+    ) -> Result<SiwxTokenResponse, CustomError> {
+        redeem_device_code_as(db, did, device, &format!("dvc_clm26-{}", nonce())).await
+    }
+
+    async fn redeem_device_code_as(
+        db: &RedisClient,
+        did: &str,
+        device: &str,
+        device_code: &str,
+    ) -> Result<SiwxTokenResponse, CustomError> {
+        redeem_device_code_with(db, did, device, device_code, &delegated()).await
+    }
+
+    async fn redeem_device_code_with(
+        db: &RedisClient,
+        did: &str,
+        device: &str,
+        device_code: &str,
+        config: &Config,
+    ) -> Result<SiwxTokenResponse, CustomError> {
+        let client_id = store_client(db, matrix_client()).await;
+        let device_code = device_code.to_string();
+        let mut entry = DeviceCodeEntry::new(
+            &format!("C26-{}", nonce()),
+            client_id.clone(),
+            device_scope(device),
+            Utc::now().timestamp(),
+        );
+        entry.status = DeviceCodeStatus::Approved;
+        entry.did = Some(did.to_string());
+        db.set_device_code(&device_code, &entry, DEVICE_CODE_LIFETIME)
+            .await
+            .unwrap();
+        token(
+            TokenForm {
+                code: None,
+                client_id: Some(client_id),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code),
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_device_grant_refuses_a_pre_claim_device_id() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let did = format!("did:key:zDnClm26dc{}", Uuid::new_v4().simple());
+        db.hset_for_test(
+            &siwx_oidc::db::guest_invites::guest_account_key(&localpart_for(&did)),
+            "pre_claim_devices",
+            "OTHERDEV0,PRECLAIMDEV1",
+        )
+        .await;
+
+        match redeem_device_code(&db, &did, "PRECLAIMDEV1").await {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error_description, PRE_CLAIM_DEVICE_REFUSED_MSG)
+            }
+            other => panic!(
+                "a pre-claim device id must be refused, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        // The refusal is decided before the code is claimed, so a failed check (a Redis
+        // error) never burns the code: the claim is still free afterwards.
+        let code = format!("dvc_clm26-{}", nonce());
+        assert!(redeem_device_code_as(&db, &did, "PRECLAIMDEV1", &code)
+            .await
+            .is_err());
+        assert!(
+            db.try_claim_device_code(&code).await.unwrap(),
+            "a refused redemption must not consume the device code"
+        );
+        // A fresh id, a prefix of a listed id, and no proposal at all are not refused.
+        for device in ["FRESHDEV99", "PRECLAIMDEV"] {
+            redeem_device_code(&db, &did, device)
+                .await
+                .unwrap_or_else(|e| panic!("{device} must pass: {e:?}"));
+        }
+    }
+
+    // ---- SS4 WP5: a deleted device id is refused at the token poll (flag 2, 8.1) ----
+
+    fn delegated_flag2() -> Config {
+        Config {
+            refuse_deleted_device_ids: true,
+            ..delegated()
+        }
+    }
+
+    /// An approved device code whose scope proposes a deleted id, polled once with flag 2.
+    async fn poll_deleted_device(
+        db: &RedisClient,
+    ) -> (String, Result<SiwxTokenResponse, CustomError>) {
+        let did = format!("did:key:zDnSs4wp5dc{}", Uuid::new_v4().simple());
+        db.plant_deleted_device_marker(&localpart_for(&did), "DELETEDDEV1", 60)
+            .await
+            .unwrap();
+        let code = format!("dvc_ss4-{}", nonce());
+        let first =
+            redeem_device_code_with(db, &did, "DELETEDDEV1", &code, &delegated_flag2()).await;
+        (code, first)
+    }
+
+    #[tokio::test]
+    async fn device_code_poll_refused_400_invalid_scope_and_code_denied() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (code, first) = poll_deleted_device(&db).await;
+        match first {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error.as_ref(), "invalid_scope");
+                assert_eq!(e.error_description, DELETED_DEVICE_REFUSED_MSG);
+            }
+            other => panic!(
+                "a deleted device id must be refused with invalid_scope, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        let (_, entry) = db
+            .get_device_code(&code)
+            .await
+            .unwrap()
+            .expect("the code is kept as denied until the client reads the denial");
+        assert!(
+            matches!(entry.status, DeviceCodeStatus::Denied),
+            "the refused code is denied, never left approved: {:?}",
+            entry.status
+        );
+    }
+
+    #[tokio::test]
+    async fn device_code_poll_after_refusal_is_access_denied() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (code, first) = poll_deleted_device(&db).await;
+        assert!(first.is_err());
+        // The next poll (past the interval) gets access_denied, never a token.
+        let (dref, mut entry) = db.get_device_code(&code).await.unwrap().unwrap();
+        entry.last_poll = None;
+        db.update_device_code(&dref, &entry, DEVICE_CODE_LIFETIME)
+            .await
+            .unwrap();
+        let second = token(
+            TokenForm {
+                code: None,
+                client_id: Some(entry.client_id.clone()),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(code.clone()),
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &delegated_flag2(),
+            &db,
+            None,
+        )
+        .await;
+        match second {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error.as_ref(), "access_denied")
+            }
+            other => panic!(
+                "the second poll must be access_denied, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn device_code_deleted_id_flag2_off_is_redeemed_as_today() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let did = format!("did:key:zDnSs4wp5off{}", Uuid::new_v4().simple());
+        db.plant_deleted_device_marker(&localpart_for(&did), "DELETEDDEV1", 60)
+            .await
+            .unwrap();
+        redeem_device_code(&db, &did, "DELETEDDEV1")
+            .await
+            .unwrap_or_else(|e| panic!("flag 2 off: redeemed as today: {e:?}"));
+    }
+
+    // ---- SS4 audit fix #1: no device-code grant without a Synapse device (flag 2, 8.27) ----
+
+    /// A homeserver whose `upsert_device` answers 500 while `upsert_fails` is set; every
+    /// other call is an empty 200. Records the device ids it was asked to upsert.
+    #[derive(Default)]
+    struct UpsertHomeserver {
+        upsert_fails: std::sync::atomic::AtomicBool,
+        upserts: Mutex<Vec<String>>,
+        /// Every request that is not a `GET`: provisioning of any kind.
+        writes: Mutex<Vec<String>>,
+    }
+
+    async fn upsert_homeserver_route(
+        State(hs): State<Arc<UpsertHomeserver>>,
+        method: axum::http::Method,
+        uri: Uri,
+        body: String,
+    ) -> axum::response::Response {
+        if method != axum::http::Method::GET {
+            hs.writes
+                .lock()
+                .unwrap()
+                .push(format!("{method} {}", uri.path()));
+        }
+        if uri.path().ends_with("/upsert_device") {
+            hs.upserts.lock().unwrap().push(body);
+            if hs.upsert_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
+            }
+            return (StatusCode::CREATED, Json(serde_json::json!({}))).into_response();
+        }
+        (StatusCode::OK, Json(serde_json::json!({}))).into_response()
+    }
+
+    async fn upsert_homeserver() -> (Arc<UpsertHomeserver>, SynapseClient) {
+        let hs = Arc::new(UpsertHomeserver::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .fallback(upsert_homeserver_route)
+            .with_state(hs.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (hs, SynapseClient::new(&format!("http://{addr}"), "secret"))
+    }
+
+    /// Poll an approved device code once, as a client past its interval.
+    async fn poll_device_code_against(
+        db: &RedisClient,
+        code: &str,
+        config: &Config,
+        synapse: &SynapseClient,
+    ) -> Result<SiwxTokenResponse, CustomError> {
+        let (dref, mut entry) = db.get_device_code(code).await.unwrap().unwrap();
+        entry.last_poll = None;
+        db.update_device_code(&dref, &entry, DEVICE_CODE_LIFETIME)
+            .await
+            .unwrap();
+        token(
+            TokenForm {
+                code: None,
+                client_id: Some(entry.client_id.clone()),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(code.to_string()),
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            config,
+            db,
+            Some(synapse),
+        )
+        .await
+    }
+
+    /// An approved device code proposing `device`, stored for a fresh DID.
+    async fn approved_device_code(db: &RedisClient, device: &str) -> String {
+        let client_id = store_client(db, matrix_client()).await;
+        let code = format!("dvc_ss4fix1-{}", nonce());
+        let mut entry = DeviceCodeEntry::new(
+            &format!("F1-{}", nonce()),
+            client_id,
+            device_scope(device),
+            Utc::now().timestamp(),
+        );
+        entry.status = DeviceCodeStatus::Approved;
+        entry.did = Some(format!("did:key:zDnSs4fix1{}", Uuid::new_v4().simple()));
+        db.set_device_code(&code, &entry, DEVICE_CODE_LIFETIME)
+            .await
+            .unwrap();
+        code
+    }
+
+    /// Flag 2 on: a failed `upsert_device` answers the poll `temporarily_unavailable` and
+    /// issues no grant; the code is released, so the next poll (the homeserver back) gets
+    /// the token for the same device.
+    #[tokio::test]
+    async fn device_code_upsert_failure_flag2_on_is_temporarily_unavailable_no_grant() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (hs, synapse) = upsert_homeserver().await;
+        hs.upsert_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let code = approved_device_code(&db, "DEVICE_A").await;
+
+        match poll_device_code_against(&db, &code, &delegated_flag2(), &synapse).await {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error.as_ref(), "temporarily_unavailable");
+            }
+            Err(other) => panic!("expected temporarily_unavailable, got {other:?}"),
+            Ok(_) => panic!("no grant may be issued without a Synapse device"),
+        }
+        assert_eq!(hs.upserts.lock().unwrap().len(), 1, "the upsert was tried");
+        let (_, entry) = db
+            .get_device_code(&code)
+            .await
+            .unwrap()
+            .expect("the code is kept for a retry");
+        assert_eq!(entry.status, DeviceCodeStatus::Approved);
+
+        hs.upsert_fails
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let retried = poll_device_code_against(&db, &code, &delegated_flag2(), &synapse)
+            .await
+            .unwrap_or_else(|e| panic!("the released code is redeemed on retry: {e:?}"));
+        let scope = serde_json::to_value(&retried).unwrap()["scope"].clone();
+        assert!(
+            scope
+                .as_str()
+                .is_some_and(|s| s.contains("urn:matrix:client:device:DEVICE_A")),
+            "the retry is for the same device: {scope}"
+        );
+        assert_eq!(
+            hs.upserts.lock().unwrap().len(),
+            2,
+            "the retry upserted the device"
+        );
+    }
+
+    /// A code that names its account (`login_hint`) is redeemed only for that account.
+    /// The approval routes refuse another account first; this is the check at the poll,
+    /// for an identity the approval-time resolver and the grant's resolver read
+    /// differently. An approved entry whose identity resolves to another account is
+    /// answered `access_denied`, the code and its user-code mapping are deleted, and the
+    /// homeserver sees no write at all. The same entry naming the identity's own account
+    /// is redeemed, so the refusal is the check's and not a broken setup's.
+    #[tokio::test]
+    async fn a_hinted_device_code_is_not_redeemed_for_another_account() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (hs, synapse) = upsert_homeserver().await;
+        let client_id = store_client(&db, matrix_client()).await;
+        let did = format!("did:key:zDnHint{}", Uuid::new_v4().simple());
+        let store = |expected: String| {
+            let client_id = client_id.clone();
+            let did = did.clone();
+            let db = &db;
+            async move {
+                let code = format!("dvc_hint-{}", nonce());
+                let user_code = format!("HINT-{}", nonce());
+                let mut entry = DeviceCodeEntry::new(
+                    &user_code,
+                    client_id,
+                    device_scope("DEVICE_A"),
+                    Utc::now().timestamp(),
+                );
+                entry.status = DeviceCodeStatus::Approved;
+                entry.did = Some(did);
+                entry.expected_mxid = Some(expected);
+                db.set_device_code(&code, &entry, DEVICE_CODE_LIFETIME)
+                    .await
+                    .unwrap();
+                db.set_user_code_mapping(&user_code, &code, DEVICE_CODE_LIFETIME)
+                    .await
+                    .unwrap();
+                (code, user_code)
+            }
+        };
+
+        // Control: the account the identity signs in as redeems the code.
+        let own = format!("@{}:example.org", localpart_for(&did));
+        let (own_code, _) = store(own).await;
+        poll_device_code_against(&db, &own_code, &delegated(), &synapse)
+            .await
+            .unwrap_or_else(|e| panic!("the named account must redeem its code: {e:?}"));
+        let provisioned = hs.writes.lock().unwrap().len();
+        assert!(provisioned > 0, "the control provisioned the device");
+
+        // Another account is refused, and nothing more is written to the homeserver.
+        let (code, user_code) = store(format!("@someone-else-{}:example.org", nonce())).await;
+        match poll_device_code_against(&db, &code, &delegated(), &synapse).await {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error.as_ref(), "access_denied")
+            }
+            other => panic!(
+                "another account must be denied at the poll, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        assert!(
+            db.get_device_code(&code).await.unwrap().is_none(),
+            "the refused code is deleted"
+        );
+        assert!(
+            db.get_device_code_by_user_code(&user_code)
+                .await
+                .unwrap()
+                .is_none(),
+            "its user-code mapping is deleted"
+        );
+        assert_eq!(
+            hs.writes.lock().unwrap().len(),
+            provisioned,
+            "a refused redemption provisions nothing: {:?}",
+            hs.writes.lock().unwrap()
+        );
+    }
+
+    /// Flag 2 off: a failed upsert stays today's warning and the grant is issued.
+    #[tokio::test]
+    async fn device_code_upsert_failure_flag2_off_is_redeemed_as_today() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (hs, synapse) = upsert_homeserver().await;
+        hs.upsert_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let code = approved_device_code(&db, "DEVICE_A").await;
+        poll_device_code_against(&db, &code, &delegated(), &synapse)
+            .await
+            .unwrap_or_else(|e| panic!("flag 2 off: redeemed as today: {e:?}"));
     }
 }

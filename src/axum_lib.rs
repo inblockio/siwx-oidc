@@ -3,7 +3,7 @@
 // Modified by inblock.io assets GmbH. See NOTICE.
 
 use axum::{
-    extract::{rejection::QueryRejection, Form, Json, Path, Query, State},
+    extract::{rejection::QueryRejection, Form, Json, Path, Query, RawQuery, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::{delete, get, post},
@@ -12,14 +12,12 @@ use axum::{
 use axum_extra::{
     headers::{
         authorization::{Basic, Bearer},
-        Authorization, ContentType,
+        Authorization, ContentType, HeaderMapExt,
     },
     TypedHeader,
 };
 use headers::Header;
-use openidconnect::core::{
-    CoreClientMetadata, CoreClientRegistrationResponse, CoreErrorResponseType, CoreJsonWebKeySet,
-};
+use openidconnect::core::{CoreErrorResponseType, CoreJsonWebKeySet};
 use std::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
@@ -45,7 +43,9 @@ use super::resolve;
 use super::synapse_client::SynapseClient;
 use super::webauthn as wa;
 use aqua_auth::{all_cipher_suites, all_did_methods};
+use siwx_oidc::client_policy;
 use siwx_oidc::db::*;
+use siwx_oidc::redact::fingerprint;
 
 // -- Shared application state ----------------------------------------------
 
@@ -61,6 +61,7 @@ struct AppState {
     webauthn: Arc<Webauthn>,
     rp_id: String,
     rp_origin: String,
+    rp_dispatch: Arc<wa::RpDispatch>,
     synapse_client: Option<Arc<SynapseClient>>,
 }
 
@@ -130,9 +131,18 @@ impl IntoResponse for CustomError {
             CustomError::Unauthorized(msg) => {
                 warn!(error = %msg, "unauthorized");
             }
+            CustomError::InvalidToken(msg) => {
+                warn!(error = %msg, "invalid_token");
+            }
             CustomError::UnknownCredential(cred_id) => {
                 // Expected user condition (stale/revoked passkey), NOT a server fault.
-                warn!(credential_id = %cred_id, "unknown_credential");
+                warn!(credential_fp = %fingerprint(cred_id), "unknown_credential");
+            }
+            CustomError::RegistrationRefused => {
+                warn!("registration_refused");
+            }
+            CustomError::Gone => {
+                warn!("gone");
             }
             // A server-side fault we have already CLASSIFIED, unlike
             // `internal_error`. Logged under its own name so an operator can
@@ -141,8 +151,17 @@ impl IntoResponse for CustomError {
             CustomError::ServiceUnavailable(msg) => {
                 warn!(error = %msg, "service_unavailable");
             }
+            CustomError::Coded {
+                status,
+                code: reason,
+            } => {
+                warn!(status = %status, reason = %reason, "coded_refusal");
+            }
             CustomError::Other(e) => {
                 warn!(error = %e, "internal_error");
+            }
+            CustomError::LoginSessionExpired => {
+                warn!("login_session_expired");
             }
             CustomError::NotFound | CustomError::Redirect(_) => {}
         }
@@ -154,10 +173,28 @@ impl IntoResponse for CustomError {
             CustomError::BadRequestRegister(e) => {
                 (StatusCode::BAD_REQUEST, Json(e)).into_response()
             }
-            CustomError::BadRequestToken(e) => (StatusCode::BAD_REQUEST, Json(e)).into_response(),
+            // RFC 6749 §5.2: `invalid_client` (the client did not authenticate)
+            // is a 401; every other token error is a 400.
+            CustomError::BadRequestToken(e) => {
+                let status = if e.error == CoreErrorResponseType::InvalidClient {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                (status, Json(e)).into_response()
+            }
             CustomError::Unauthorized(_) => {
                 (StatusCode::UNAUTHORIZED, self.to_string()).into_response()
             }
+            // RFC 6750 section 3: a rejected bearer token is answered with the Bearer
+            // challenge naming `invalid_token`, so a resource server can tell a dead
+            // credential from a malformed request.
+            CustomError::InvalidToken(_) => (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, r#"Bearer error="invalid_token""#)],
+                self.to_string(),
+            )
+                .into_response(),
             // 401 + machine-readable discriminator. The client keys on `error` to
             // call `signalUnknownCredential` and shows `message` to the user. The
             // echoed `credential_id` is the exact id the client just presented, so
@@ -173,11 +210,29 @@ impl IntoResponse for CustomError {
                 })),
             )
                 .into_response(),
+            // A fixed body that names no reason and echoes no credential id.
+            CustomError::RegistrationRefused => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "registration failed" })),
+            )
+                .into_response(),
+            CustomError::Gone => (StatusCode::GONE, self.to_string()).into_response(),
             CustomError::NotFound => (StatusCode::NOT_FOUND, self.to_string()).into_response(),
             CustomError::Redirect(uri) => Redirect::to(&uri).into_response(),
+            CustomError::LoginSessionExpired => (
+                StatusCode::BAD_REQUEST,
+                [(header::CACHE_CONTROL, "no-store")],
+                axum::response::Html(oidc::sign_in_timed_out_page()),
+            )
+                .into_response(),
             CustomError::ServiceUnavailable(_) => {
                 (StatusCode::SERVICE_UNAVAILABLE, self.to_string()).into_response()
             }
+            CustomError::Coded { status, code } => (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                Json(serde_json::json!({ "error": code })),
+            )
+                .into_response(),
             CustomError::Other(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()).into_response()
             }
@@ -208,20 +263,83 @@ fn matrix_ready(state: &AppState) -> bool {
     state.config.matrix_server_name.is_some() && state.synapse_client.is_some()
 }
 
+/// A failure of `POST /token`, with whether the client tried HTTP Basic: the
+/// 401 for `invalid_client` must then carry a matching challenge (RFC 6749
+/// §5.2). The challenge is not sent to a client that authenticated in the form
+/// (or not at all), so a browser never shows a credentials prompt for it.
+struct TokenEndpointError {
+    error: CustomError,
+    basic_attempted: bool,
+}
+
+impl IntoResponse for TokenEndpointError {
+    fn into_response(self) -> Response {
+        let challenge = self.basic_attempted
+            && matches!(
+                &self.error,
+                CustomError::BadRequestToken(e) if e.error == CoreErrorResponseType::InvalidClient
+            );
+        let mut response = self.error.into_response();
+        if challenge {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                header::HeaderValue::from_static("Basic realm=\"siwx-oidc\", charset=\"UTF-8\""),
+            );
+        }
+        response
+    }
+}
+
+/// What `POST /token` learns about the calling client from the `Authorization`
+/// header, and whether the client attempted HTTP Basic (which decides the
+/// `WWW-Authenticate` challenge on a failure).
+///
+/// One header, read as either scheme. A handler that takes
+/// `Option<TypedHeader<Authorization<Bearer>>>` and
+/// `Option<TypedHeader<Authorization<Basic>>>` as two extractors answers every
+/// request that carries the header with a 400 ("invalid HTTP header"), because
+/// each extractor rejects a header of the other scheme instead of yielding
+/// `None`. That is how `client_secret_basic` never worked here.
+///
+/// A Basic user name and password are form-urldecoded (`form_urldecode`); a
+/// Bearer token is an opaque string and is taken as sent.
+fn client_credentials(headers: &HeaderMap) -> (oidc::ClientCredentials, bool) {
+    let basic = headers.typed_get::<Authorization<Basic>>();
+    let bearer = headers.typed_get::<Authorization<Bearer>>();
+    let basic_attempted = basic.is_some();
+    let credentials = oidc::ClientCredentials {
+        basic_client_id: basic.as_ref().map(|b| form_urldecode(b.username())),
+        secret: if let Some(b) = bearer {
+            Some(b.token().to_string())
+        } else {
+            basic.map(|b| form_urldecode(b.password()))
+        },
+    };
+    (credentials, basic_attempted)
+}
+
+/// Undo the `application/x-www-form-urlencoded` encoding RFC 6749 section 2.3.1
+/// applies to a client id and a secret before they go into a Basic header:
+/// `+` is a space and `%XX` a byte. Without it a secret that contains a
+/// character that encodes never matches its registration. Bytes that are not
+/// UTF-8 once decoded are kept as the `+`-expanded text, which then simply fails
+/// the comparison.
+fn form_urldecode(value: &str) -> String {
+    let spaced = value.replace('+', " ");
+    urlencoding::decode(&spaced)
+        .map(std::borrow::Cow::into_owned)
+        .unwrap_or(spaced)
+}
+
 async fn token(
     State(state): State<AppState>,
-    bearer: Option<TypedHeader<Authorization<Bearer>>>,
-    basic: Option<TypedHeader<Authorization<Basic>>>,
+    headers: HeaderMap,
     Form(form): Form<oidc::TokenForm>,
-) -> Result<Json<serde_json::Value>, CustomError> {
-    let secret = if let Some(b) = bearer {
-        Some(b.0 .0.token().to_string())
-    } else {
-        basic.map(|b| b.0 .0.password().to_string())
-    };
+) -> Result<Json<serde_json::Value>, TokenEndpointError> {
+    let (credentials, basic_attempted) = client_credentials(&headers);
     let token_response = oidc::token(
         form,
-        secret,
+        credentials,
         &state.signing_key,
         &state.config,
         &state.redis_client,
@@ -231,7 +349,7 @@ async fn token(
     .map_err(|e| {
         // OAuth2 RFC 6749 §5.2: token endpoint errors MUST be JSON.
         // Wrap non-Token errors so they always produce a JSON body.
-        match e {
+        let error = match e {
             CustomError::BadRequestToken(_) => e,
             CustomError::Unauthorized(msg) => CustomError::BadRequestToken(oidc::TokenError {
                 error: CoreErrorResponseType::InvalidClient,
@@ -241,23 +359,80 @@ async fn token(
                 error: CoreErrorResponseType::InvalidRequest,
                 error_description: other.to_string(),
             }),
+        };
+        TokenEndpointError {
+            error,
+            basic_attempted,
         }
     })?;
     // Strip null fields (e.g. "id_token": null on refresh responses) because
     // oidc-client-ts treats a present-but-null id_token as a validation target
     // and fails when it cannot decode it as a JWT.
-    let mut value = serde_json::to_value(token_response)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize token response: {}", e))?;
+    let mut value = serde_json::to_value(token_response).map_err(|e| TokenEndpointError {
+        error: anyhow::anyhow!("Failed to serialize token response: {}", e).into(),
+        basic_attempted,
+    })?;
     if let serde_json::Value::Object(ref mut map) = value {
         map.retain(|_, v| !v.is_null());
     }
     Ok(value.into())
 }
 
+async fn end_session_get(
+    State(state): State<AppState>,
+    Query(params): Query<oidc::EndSessionParams>,
+) -> Result<Response, CustomError> {
+    end_session_response(&state, params).await
+}
+
+async fn end_session_post(
+    State(state): State<AppState>,
+    Form(params): Form<oidc::EndSessionParams>,
+) -> Result<Response, CustomError> {
+    end_session_response(&state, params).await
+}
+
+/// RP-initiated logout (`oidc::end_session`): a 303 to the registered
+/// `post_logout_redirect_uri`, else the signed-out page.
+async fn end_session_response(
+    state: &AppState,
+    params: oidc::EndSessionParams,
+) -> Result<Response, CustomError> {
+    let outcome = oidc::end_session(
+        params,
+        &state.signing_key,
+        &state.retired_verification_keys,
+        &state.config,
+        &state.redis_client,
+    )
+    .await?;
+    Ok(match outcome {
+        oidc::EndSessionOutcome::Redirect(uri) => Redirect::to(uri.as_str()).into_response(),
+        oidc::EndSessionOutcome::SignedOut { ended } => (
+            [(header::CACHE_CONTROL, "no-store")],
+            axum::response::Html(oidc::signed_out_page(ended)),
+        )
+            .into_response(),
+    })
+}
+
 async fn authorize(
     State(state): State<AppState>,
+    request_headers: HeaderMap,
     Query(params): Query<oidc::AuthorizeParams>,
 ) -> Result<(HeaderMap, Redirect), CustomError> {
+    // The guest marker routes the request to the hand-off branch (S4): it never reaches
+    // the login page. With guest mode off the marker is an ordinary, ignored scope word.
+    if state.config.guest_enabled && crate::guest::handoff::scope_has_marker(params.scope.as_str())
+    {
+        return crate::guest::handoff::authorize(
+            &state.config,
+            &state.redis_client,
+            params,
+            &request_headers,
+        )
+        .await;
+    }
     let (url, session_cookie) = oidc::authorize(params, &state.redis_client).await?;
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -267,11 +442,20 @@ async fn authorize(
     Ok((headers, Redirect::to(&url)))
 }
 
+/// `GET /sign_in`. The code is issued for the request `/authorize` bound to the
+/// session, never from the query. The query (the authorization parameters the login
+/// page repeats on its link) is read only when the login session is gone, to send the
+/// user back to a registered redirect URI with an error ([`oidc::expired_sign_in`]).
 async fn sign_in(
     State(state): State<AppState>,
-    Query(params): Query<oidc::SignInParams>,
-    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
+    RawQuery(query): RawQuery,
 ) -> Result<(HeaderMap, Redirect), CustomError> {
+    // A browser whose only cookie for the issuer was the expired login cookie sends
+    // no Cookie header at all.
+    let Some(TypedHeader(cookies)) = cookies else {
+        return Err(oidc::expired_sign_in(query.as_deref(), &state.redis_client).await);
+    };
     // `sign_in` returns ONLY on the success path (a real login that issued a code),
     // surfacing the resolved DID (covers BOTH passkey and wallet, and runs only
     // after the browser confirmed the new-user gate). Error/early returns short-
@@ -288,18 +472,25 @@ async fn sign_in(
         key: &state.signing_key,
         issuer: state.config.base_url.as_str(),
     };
-    let (url, did) = oidc::sign_in(
+    let (url, did) = match oidc::sign_in(
         &state.config.base_url,
         &state.config.supported_did_methods,
         &state.config.supported_pkh_namespaces,
-        params,
         cookies,
         &state.redis_client,
         state.synapse_client.as_deref(),
         state.config.matrix_server_name.as_deref(),
         Some(&publication),
+        Some(&state.config),
     )
-    .await?;
+    .await
+    {
+        Ok(signed_in) => signed_in,
+        Err(CustomError::LoginSessionExpired) => {
+            return Err(oidc::expired_sign_in(query.as_deref(), &state.redis_client).await)
+        }
+        Err(e) => return Err(e),
+    };
 
     // Mint an opaque login user-session bound to the DID and Set-Cookie it (Path=/,
     // HttpOnly, SameSite=Strict, Secure on https). The cookie value is the opaque
@@ -320,9 +511,11 @@ async fn sign_in(
 
 async fn register(
     State(state): State<AppState>,
-    Json(payload): Json<CoreClientMetadata>,
-) -> Result<(StatusCode, Json<CoreClientRegistrationResponse>), CustomError> {
-    let registration = oidc::register(payload, state.config.base_url, &state.redis_client).await?;
+    Json(payload): Json<SiwxClientMetadata>,
+) -> Result<(StatusCode, Json<SiwxClientRegistrationResponse>), CustomError> {
+    let policy = oidc::RegistrationPolicy::from_config(&state.config);
+    let registration =
+        oidc::register(payload, state.config.base_url, &state.redis_client, &policy).await?;
     Ok((StatusCode::CREATED, registration.into()))
 }
 
@@ -401,7 +594,7 @@ async fn userinfo_post(
 async fn clientinfo(
     State(state): State<AppState>,
     Path(client_id): Path<String>,
-) -> Result<Json<CoreClientMetadata>, CustomError> {
+) -> Result<Json<SiwxClientMetadata>, CustomError> {
     Ok(oidc::clientinfo(client_id, &state.redis_client)
         .await?
         .into())
@@ -411,13 +604,14 @@ async fn client_update(
     State(state): State<AppState>,
     Path(client_id): Path<String>,
     bearer: Option<TypedHeader<Authorization<Bearer>>>,
-    Json(payload): Json<CoreClientMetadata>,
+    Json(payload): Json<SiwxClientMetadata>,
 ) -> Result<(), CustomError> {
     oidc::client_update(
         client_id,
         payload,
         bearer.map(|b| b.0 .0),
         &state.redis_client,
+        &oidc::RegistrationPolicy::from_config(&state.config),
     )
     .await
 }
@@ -465,10 +659,16 @@ async fn device_page_handler(
 async fn device_verify_handler(
     State(state): State<AppState>,
     Query(query): Query<device_auth::DevicePageQuery>,
-) -> Result<StatusCode, CustomError> {
+) -> Result<Json<device_auth::DeviceVerifyResponse>, CustomError> {
     let code = query.user_code.as_deref().unwrap_or("");
-    device_auth::device_verify(&state.redis_client, code).await?;
-    Ok(StatusCode::OK)
+    let resp = device_auth::device_lookup(
+        &state.redis_client,
+        state.synapse_client.as_deref(),
+        state.config.matrix_server_name.as_deref(),
+        code,
+    )
+    .await?;
+    Ok(Json(resp))
 }
 
 async fn device_nonce_handler(
@@ -518,8 +718,9 @@ fn user_session_token(
 
 /// Resolve the opaque `siwx_user` login cookie to a DID for scoping a passkey picker,
 /// or `None` (usernameless) when `force_all`, or when the cookie is absent, forged, or
-/// expired. NEVER errors: a Redis hiccup degrades to `None`. The login handler inlines
-/// the same read; the account + device re-auth start handlers share this.
+/// expired. NEVER errors: a Redis hiccup degrades to `None`. Every passkey picker
+/// reads the cookie through this: the login handler and the account + device re-auth
+/// start handlers.
 ///
 /// Enumeration-safety: the cookie value is an opaque server token (two UUIDs); a
 /// forged/guessed value is a Redis miss -> `None` -> usernameless, leaking nothing.
@@ -562,7 +763,7 @@ async fn device_passkey_start_handler(
         .get("user_code")
         .and_then(|v| v.as_str())
         .ok_or_else(|| CustomError::BadRequest("Missing user_code".to_string()))?;
-    device_auth::device_verify(&state.redis_client, user_code).await?;
+    let entry = device_auth::device_verify(&state.redis_client, user_code).await?;
     let session_id = format!("device_passkey_{}", user_code);
     // Identity-scope the picker to the APPROVER's own passkeys when their opaque
     // `siwx_user` login cookie is present (Path=/ reaches this endpoint via the
@@ -570,24 +771,37 @@ async fn device_passkey_start_handler(
     // offer is never the security check: `verify_credential` + `reject_if_new_identity`
     // still run under the PROVEN DID. Degrade open: absent/forged/expired cookie, or
     // the `{"all":true}` escape hatch -> None -> usernameless, never an error.
-    let scope_did =
+    let mut scope_did =
         user_session_scope_did(&state.redis_client, &cookies, payload_force_all(&payload)).await;
-    let rcr = wa::authenticate_start(
-        &state.webauthn,
-        &state.redis_client,
-        &session_id,
-        scope_did.as_deref(),
-    )
-    .await?;
-    let detected_mxid = detected_mxid_for(
+    let mut detected_mxid = detected_mxid_for(
         state.synapse_client.as_deref(),
         state.config.matrix_server_name.as_deref(),
         scope_did.as_deref(),
     )
     .await;
+    // A request that names its account (`login_hint`) is approved only by that
+    // account, so a cookie that scopes the picker to another account's keys would
+    // offer only keys that are refused: drop that scope (usernameless). The hint
+    // itself never scopes the picker, because a requester-supplied identifier must
+    // not list an account's credential ids (see "Passkeys" in AGENTS.md).
+    if let Some(expected) = entry.expected_mxid.as_deref() {
+        if detected_mxid.as_deref() != Some(expected) {
+            scope_did = None;
+            detected_mxid = None;
+        }
+    }
+    let rcr = wa::authenticate_start(
+        &state.rp_dispatch,
+        &state.redis_client,
+        &session_id,
+        scope_did.as_deref(),
+        true,
+    )
+    .await?;
     Ok(Json(AuthenticateStartResponse {
         challenge: rcr,
         detected_mxid,
+        linked_passkey_login: false,
     }))
 }
 
@@ -603,7 +817,7 @@ async fn device_passkey_finish_handler(
     let auth_response: PublicKeyCredential = serde_json::from_value(payload.clone())
         .map_err(|e| CustomError::BadRequest(format!("Invalid credential: {}", e)))?;
     let session_id = format!("device_passkey_{}", user_code);
-    let resp = wa::verify_credential(
+    let resp = wa::verify_credential_legacy(
         &state.redis_client,
         &session_id,
         &state.rp_id,
@@ -632,14 +846,38 @@ async fn device_passkey_finish_handler(
 
 // -- WebAuthn route handlers -----------------------------------------------
 
+/// The login session a passkey ceremony of the login page runs under. Its cookie lives
+/// as long as the session (300 s), so without it the sign-in has timed out: a 400
+/// `{"error":"login_session_expired"}`, on which the login page goes to `/sign_in`, whose
+/// answer leads back to the client (`oidc::expired_sign_in`).
+fn login_session(
+    cookies: Option<TypedHeader<headers::Cookie>>,
+) -> Result<(headers::Cookie, String), CustomError> {
+    cookies
+        .and_then(|TypedHeader(cookies)| {
+            let session_id = cookies.get(SESSION_COOKIE_NAME)?.to_string();
+            Some((cookies, session_id))
+        })
+        .ok_or(CustomError::Coded {
+            status: 400,
+            code: "login_session_expired",
+        })
+}
+
 async fn webauthn_register_start(
     State(state): State<AppState>,
-    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
     Json(payload): Json<wa::RegisterStartRequest>,
-) -> Result<Json<CreationChallengeResponse>, CustomError> {
-    let session_id = cookies
-        .get(SESSION_COOKIE_NAME)
-        .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
+) -> Result<Json<serde_json::Value>, CustomError> {
+    let (_, session_id) = login_session(cookies)?;
+    let session_id = session_id.as_str();
+    // With a distinct unified RP the offer is options only (ES256, resident
+    // key); the browser creates the key and no server write happens.
+    if let Some(options) =
+        wa::unified_registration_options(&state.rp_dispatch, payload.display_name.as_deref())?
+    {
+        return Ok(Json(options));
+    }
     let ccr = wa::register_start(
         &state.webauthn,
         &state.redis_client,
@@ -647,18 +885,23 @@ async fn webauthn_register_start(
         payload.display_name,
     )
     .await?;
-    Ok(Json(ccr))
+    Ok(Json(
+        serde_json::to_value(&ccr).map_err(|e| anyhow::anyhow!("encode options: {}", e))?,
+    ))
 }
 
+/// Registration finish. With a distinct unified RP the key is created in the
+/// browser and proven by its first login, so every request is answered 410;
+/// a single-RP deployment (the default) still verifies and stores the passkey.
 async fn webauthn_register_finish(
     State(state): State<AppState>,
-    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
     Json(reg_response): Json<RegisterPublicKeyCredential>,
 ) -> Result<Json<wa::RegisterFinishResponse>, CustomError> {
-    let session_id = cookies
-        .get(SESSION_COOKIE_NAME)
-        .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
-    let resp = wa::register_finish(
+    let (_, session_id) = login_session(cookies)?;
+    let session_id = session_id.as_str();
+    let resp = wa::register_finish_for(
+        &state.rp_dispatch,
         &state.webauthn,
         &state.redis_client,
         session_id,
@@ -678,6 +921,15 @@ async fn webauthn_register_finish(
 struct AuthenticateStartBody {
     #[serde(default)]
     all: bool,
+    /// Base64url SubjectPublicKeyInfo of a key the browser just created; names
+    /// the signer of the first unified login. Unusable values are ignored.
+    #[serde(default)]
+    key_hint_spki_b64url: Option<String>,
+    /// Ask for the legacy RP (stored and wallet-linked passkeys) instead of the
+    /// unified RP. Only meaningful in a two-RP deployment; with one RP both are
+    /// the same offer.
+    #[serde(default)]
+    legacy: bool,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -709,20 +961,27 @@ struct AuthenticateStartResponse {
     challenge: RequestChallengeResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     detected_mxid: Option<String>,
+    /// True in a two-RP deployment: the login page then offers "sign in with a
+    /// linked passkey" (the legacy RP, where wallet-linked passkeys live).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    linked_passkey_login: bool,
 }
 
 async fn webauthn_authenticate_start(
     State(state): State<AppState>,
-    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
     Query(query): Query<AuthenticateStartQuery>,
     body: Option<Json<AuthenticateStartBody>>,
 ) -> Result<Json<AuthenticateStartResponse>, CustomError> {
-    let session_id = cookies
-        .get(SESSION_COOKIE_NAME)
-        .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
+    let (cookies, session_id) = login_session(cookies)?;
+    let session_id = session_id.as_str();
 
     // Escape hatch: `?all=1` OR JSON `{"all": true}` forces usernameless even with
     // a cookie ("use a different passkey").
+    let key_hint = body
+        .as_ref()
+        .and_then(|Json(b)| b.key_hint_spki_b64url.clone());
+    let legacy = body.as_ref().map(|Json(b)| b.legacy).unwrap_or(false);
     let force_all = body.map(|Json(b)| b.all).unwrap_or(false)
         || query
             .all
@@ -730,28 +989,23 @@ async fn webauthn_authenticate_start(
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-    // Read the opaque `siwx_user` cookie -> DID (Redis). A missing/forged/expired
-    // token resolves to None -> usernameless (enumeration-safe). When forced, skip
-    // the lookup entirely.
-    let scope_did = if force_all {
-        None
-    } else {
-        match cookies.get(USER_SESSION_COOKIE) {
-            Some(token) => state
-                .redis_client
-                .lookup_user_session(token)
-                .await
-                .ok()
-                .flatten(),
-            None => None,
-        }
-    };
+    // Read the opaque `siwx_user` cookie -> DID through the helper every passkey
+    // picker shares. A missing/forged/expired token or a Redis fault resolves to
+    // None -> usernameless (enumeration-safe); when forced, there is no lookup.
+    let scope_did = user_session_scope_did(
+        &state.redis_client,
+        &Some(TypedHeader(cookies.clone())),
+        force_all,
+    )
+    .await;
 
-    let challenge = wa::authenticate_start(
-        &state.webauthn,
+    let challenge = wa::authenticate_start_with_hint(
+        &state.rp_dispatch,
         &state.redis_client,
         session_id,
         scope_did.as_deref(),
+        legacy,
+        key_hint.as_deref(),
     )
     .await?;
 
@@ -771,6 +1025,7 @@ async fn webauthn_authenticate_start(
     Ok(Json(AuthenticateStartResponse {
         challenge,
         detected_mxid,
+        linked_passkey_login: state.rp_dispatch.unified.is_some(),
     }))
 }
 
@@ -799,20 +1054,53 @@ struct WebauthnAuthenticateFinishResponse {
 
 async fn webauthn_authenticate_finish(
     State(state): State<AppState>,
-    TypedHeader(cookies): TypedHeader<headers::Cookie>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
+    request_headers: axum::http::HeaderMap,
     Json(auth_response): Json<PublicKeyCredential>,
-) -> Result<Json<WebauthnAuthenticateFinishResponse>, CustomError> {
-    let session_id = cookies
-        .get(SESSION_COOKIE_NAME)
-        .ok_or_else(|| CustomError::BadRequest("Session cookie not found".to_string()))?;
-    let resp = wa::authenticate_finish(
+) -> Result<axum::response::Response, CustomError> {
+    let (cookies, session_id) = login_session(cookies)?;
+    let session_id = session_id.as_str();
+
+    // Hints for the unified login, in order of trust: the `aqua_did_hint`
+    // cookies, then the `siwx_user` session DID. A hint only ever picks among
+    // the two keys the assertion itself recovers.
+    let mut hints: Vec<aqua_auth::DidHint> = Vec::new();
+    for value in request_headers.get_all(axum::http::header::COOKIE) {
+        if let Ok(raw) = value.to_str() {
+            hints.extend(aqua_auth::hints_from_cookie_header(raw));
+        }
+    }
+    if let Some(did) = user_session_scope_did(
+        &state.redis_client,
+        &Some(TypedHeader(cookies.clone())),
+        false,
+    )
+    .await
+    {
+        hints.extend(aqua_auth::DidHint::parse(&did));
+    }
+
+    let step = wa::authenticate_finish_step(
         &state.redis_client,
         session_id,
-        &state.rp_id,
-        &state.rp_origin,
+        &state.rp_dispatch,
         auth_response,
+        &hints,
     )
     .await?;
+    let hint_cookie = wa::login_hint_cookie(&state.rp_dispatch, &step);
+    let resp = match step {
+        wa::LoginStep::Done { resp, .. } => resp,
+        wa::LoginStep::NeedSecondAssertion(options) => {
+            // A plain re-prompt: the browser asks for the same credential again.
+            return Ok(Json(serde_json::json!({
+                "ok": false,
+                "need_second_assertion": true,
+                "options": options,
+            }))
+            .into_response());
+        }
+    };
 
     // Detection only (no blocking, no change to provisioning). The verified DID
     // is already stored in the session by authenticate_finish; the new-user gate
@@ -837,12 +1125,19 @@ async fn webauthn_authenticate_finish(
         None => (false, String::new()),
     };
 
-    Ok(Json(WebauthnAuthenticateFinishResponse {
+    let mut response = Json(WebauthnAuthenticateFinishResponse {
         ok: resp.ok,
         did: resp.did,
         new_user,
         mxid,
-    }))
+    })
+    .into_response();
+    if let Some(cookie) = hint_cookie.and_then(|c| axum::http::HeaderValue::from_str(&c).ok()) {
+        response
+            .headers_mut()
+            .append(axum::http::header::SET_COOKIE, cookie);
+    }
+    Ok(response)
 }
 
 // -- Account linking route handlers (Phase 2) ------------------------------
@@ -867,6 +1162,8 @@ async fn webauthn_link_start(
         &state.config.supported_did_methods,
         &state.config.supported_pkh_namespaces,
     )?;
+    // M6: a guest DID never links a passkey through a signature.
+    oidc::refuse_guest_did(&state.redis_client, &primary_did).await?;
 
     let ccr = wa::link_start(
         &state.webauthn,
@@ -939,7 +1236,7 @@ const USER_SESSION_COOKIE: &str = "siwx_user";
 /// `Set-Cookie` value that establishes the opaque login user-session. Mirrors
 /// [`account_cookie_set`] but with `Path=/` (so it reaches the login-time
 /// `/webauthn/authenticate/start`) and the longer [`USER_SESSION_LIFETIME`].
-fn user_cookie_set(base_url: &url::Url, token: &str) -> String {
+pub(crate) fn user_cookie_set(base_url: &url::Url, token: &str) -> String {
     let secure = if base_url.scheme() == "https" {
         "; Secure"
     } else {
@@ -953,7 +1250,6 @@ fn user_cookie_set(base_url: &url::Url, token: &str) -> String {
 
 /// `Set-Cookie` value that clears the opaque login user-session (escape hatch /
 /// sign-out). Mirrors [`account_cookie_clear`] with `Path=/`.
-#[allow(dead_code)]
 fn user_cookie_clear(base_url: &url::Url) -> String {
     let secure = if base_url.scheme() == "https" {
         "; Secure"
@@ -1142,6 +1438,46 @@ async fn account_action_handler(
     Ok((headers, Json(response)))
 }
 
+/// `POST /account/sign_out`: the account page's explicit sign-out. Ends this
+/// browser's account session and `siwx_user` picker hint (each found by the
+/// digest of the cookie presented) and clears both cookies; the sessions of
+/// other browsers stay. Idempotent: without cookies it clears them all the
+/// same. A store fault is the retryable 503, never a sign-out that reports
+/// success while a session stays live.
+async fn account_sign_out_handler(
+    State(state): State<AppState>,
+    cookies: Option<TypedHeader<headers::Cookie>>,
+) -> Result<(axum::http::HeaderMap, Json<serde_json::Value>), CustomError> {
+    if let Some(token) = account_session_token(&cookies) {
+        state
+            .redis_client
+            .end_own_session(OwnSession::Account, token)
+            .await
+            .map_err(oidc::store_unavailable)?;
+    }
+    if let Some(token) = cookies
+        .as_ref()
+        .and_then(|TypedHeader(c)| c.get(USER_SESSION_COOKIE))
+    {
+        state
+            .redis_client
+            .end_own_session(OwnSession::PickerHint, token)
+            .await
+            .map_err(oidc::store_unavailable)?;
+    }
+    let mut headers = axum::http::HeaderMap::new();
+    for cookie in [
+        account_cookie_clear(&state.config.base_url),
+        user_cookie_clear(&state.config.base_url),
+    ] {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+            headers.append(axum::http::header::SET_COOKIE, v);
+        }
+    }
+    info!("account page sign-out");
+    Ok((headers, Json(serde_json::json!({ "signed_out": true }))))
+}
+
 async fn account_passkey_start_handler(
     State(state): State<AppState>,
     cookies: Option<TypedHeader<headers::Cookie>>,
@@ -1160,10 +1496,11 @@ async fn account_passkey_start_handler(
     let scope_did =
         user_session_scope_did(&state.redis_client, &cookies, payload_force_all(&payload)).await;
     let rcr = wa::authenticate_start(
-        &state.webauthn,
+        &state.rp_dispatch,
         &state.redis_client,
         &session_id,
         scope_did.as_deref(),
+        true,
     )
     .await?;
     let mut value = serde_json::to_value(&rcr)
@@ -1221,6 +1558,111 @@ async fn account_passkey_finish_handler(
 }
 
 // -- Application entry point -----------------------------------------------
+
+/// The configured `default_clients`, each as the entry [`ClientEntry`] keeps: configured
+/// with its secret (and registration access token, if any) in the clear, held as their
+/// digests. Every entry passes `client_policy::validate_static_client` for this
+/// deployment, so a client the server could not honour safely stops start-up, naming the
+/// client and the rule, before anything is written.
+fn parse_default_clients(config: &config::Config) -> anyhow::Result<Vec<(String, ClientEntry)>> {
+    let deployment = client_policy::Deployment {
+        mail_domain: config.mail_domain.as_deref(),
+        delegated_auth: oidc::delegated_auth_enabled(config),
+        synapse_configured: config.synapse_endpoint.is_some(),
+    };
+    client_policy::parse_static_clients(&config.default_clients, deployment)
+        .map_err(anyhow::Error::msg)
+}
+
+fn log_pruned_static_clients(pruned: usize) {
+    if pruned > 0 {
+        info!(
+            pruned,
+            "deleted static clients that default_clients no longer names"
+        );
+    }
+}
+
+/// Make the static clients in Redis equal the configured `default_clients`, at every
+/// start: each is written with no expiry, and each client an earlier start wrote that the
+/// map no longer names is deleted. Every instance that shares one Redis must carry the
+/// same map: the last start wins.
+async fn store_default_clients(config: &config::Config, db: &RedisClient) -> anyhow::Result<()> {
+    let mut clients = parse_default_clients(config)?;
+    // Guest mode (S4b): the portal's client is a static public client, seeded here from
+    // `guest_client_*` so that code issuance can read it. A start-up that cannot seed it
+    // stops, and so does a `default_clients` entry that claims its id.
+    if let Some((id, entry)) =
+        crate::guest::guest_client_entry(config).map_err(anyhow::Error::msg)?
+    {
+        if clients.iter().any(|(existing, _)| *existing == id) {
+            anyhow::bail!("default_clients names {id:?}, which is guest_client_id");
+        }
+        clients.push((id, entry));
+    }
+    let pruned = db.sync_static_clients(clients).await?;
+    log_pruned_static_clients(pruned);
+    Ok(())
+}
+
+/// How long the start-up prune waits before its first retry, and the longest it ever waits.
+const PRUNE_FIRST_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+const PRUNE_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `prune` until it succeeds once, and return how many clients it deleted.
+///
+/// A failure is logged and retried after `first_wait`, then after twice as long each time,
+/// up to `cap`: a Redis that is only slow to come up is found quickly, and one that stays
+/// down is asked about once per `cap`. `pause` is how the task waits (`tokio::time::sleep`
+/// in the server; the tests record the waits instead of sitting through them).
+async fn prune_until_done<Prune, PruneFut, Pause, PauseFut>(
+    mut prune: Prune,
+    mut pause: Pause,
+    first_wait: std::time::Duration,
+    cap: std::time::Duration,
+) -> usize
+where
+    Prune: FnMut() -> PruneFut,
+    PruneFut: std::future::Future<Output = anyhow::Result<usize>>,
+    Pause: FnMut(std::time::Duration) -> PauseFut,
+    PauseFut: std::future::Future<Output = ()>,
+{
+    let mut wait = first_wait.min(cap);
+    loop {
+        match prune().await {
+            Ok(pruned) => return pruned,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    retry_in_secs = wait.as_secs_f64(),
+                    "could not prune removed static clients; they stay registered until a prune succeeds"
+                );
+                pause(wait).await;
+                wait = wait.saturating_mul(2).min(cap);
+            }
+        }
+    }
+}
+
+/// With no `default_clients` there is nothing to write, and start-up must keep needing no
+/// Redis, as it does for every deployment without static clients
+/// (`tests/graceful_shutdown.rs` pins that). The clients an earlier configuration named
+/// are pruned in a background task that keeps retrying until one prune succeeds: a removed
+/// client with no expiry must not stay registered because Redis was briefly unreachable at
+/// start-up.
+fn prune_static_clients_in_background(redis_client: &RedisClient) {
+    let redis_client = redis_client.clone();
+    tokio::spawn(async move {
+        let pruned = prune_until_done(
+            || redis_client.sync_static_clients(Vec::new()),
+            tokio::time::sleep,
+            PRUNE_FIRST_RETRY,
+            PRUNE_RETRY_CAP,
+        )
+        .await;
+        log_pruned_static_clients(pruned);
+    });
+}
 
 pub async fn main() {
     // Precedence and the naming contract (SIWXOIDC_ / siwx-oidc.toml, with the
@@ -1298,17 +1740,44 @@ pub async fn main() {
         }
     }
 
+    // Guest mode (S1): a misconfigured guest path exits non-zero here, before anything binds.
+    crate::guest::validate_guest_config(&config).unwrap_or_else(|e| panic!("FATAL: {e}"));
+
+    // SS4: flag 1 requires flag 2; a refused combination exits here, before anything binds.
+    config
+        .check_session_end_flags()
+        .unwrap_or_else(|e| panic!("FATAL: {e}"));
+
+    let grant_lifetime = config
+        .grant_lifetime()
+        .unwrap_or_else(|e| panic!("FATAL: {e}"));
+    if grant_lifetime.is_configured() {
+        info!(
+            global_secs = ?grant_lifetime.global_secs,
+            per_client = grant_lifetime.per_client_secs.len(),
+            "absolute grant lifetime configured"
+        );
+    }
+    if config.reuse_revokes_grant {
+        info!("refresh token reuse enforcement on: a reuse event revokes its grant");
+    }
+    // Checked whether or not a static client uses it, before anything reads Redis.
+    client_policy::validate_mail_domain(config.mail_domain.as_deref())
+        .unwrap_or_else(|e| panic!("FATAL: {e}"));
     let redis_client = RedisClient::new(&config.redis_url)
         .await
-        .expect("Could not build Redis client");
+        .expect("Could not build Redis client")
+        .with_grant_lifetime(grant_lifetime)
+        .with_reuse_enforcement(config.reuse_revokes_grant);
 
-    for (id, entry) in &config.default_clients.clone() {
-        let entry: ClientEntry =
-            serde_json::from_str(entry).expect("Deserialisation of ClientEntry failed");
-        redis_client
-            .set_client(id.to_string(), entry.clone())
+    // Configured clients are written before the server listens, and a failure stops
+    // start-up.
+    if config.default_clients.is_empty() && !config.guest_enabled {
+        prune_static_clients_in_background(&redis_client);
+    } else {
+        store_default_clients(&config, &redis_client)
             .await
-            .unwrap();
+            .expect("Could not store default_clients");
     }
 
     // The `kid` is NOT chosen here. Both branches let `EcdsaSigningKey` derive
@@ -1387,12 +1856,13 @@ pub async fn main() {
         None => Vec::new(),
     };
 
-    let wa_config = wa::build_webauthn(
+    let (wa_config, rp_dispatch) = wa::build_rp_dispatch(
         &config.base_url,
         config.rp_id.as_deref(),
         config.rp_origin.as_deref(),
+        config.legacy_rp_id.as_deref(),
     )
-    .expect("Failed to initialize WebAuthn — check SIWXOIDC_BASE_URL, SIWXOIDC_RP_ID, SIWXOIDC_RP_ORIGIN");
+    .expect("Failed to initialize WebAuthn: check SIWXOIDC_BASE_URL, SIWXOIDC_RP_ID, SIWXOIDC_RP_ORIGIN, SIWXOIDC_LEGACY_RP_ID");
 
     // Initialize Synapse client for MSC3861 device lifecycle (optional).
     //
@@ -1401,17 +1871,29 @@ pub async fn main() {
     // API require from Synapse 1.157 on. Without it, `list_devices` /
     // `get_device` / `has_cross_signing_keys` fail closed with a clear error
     // instead of silently presenting a credential Synapse no longer accepts.
+    if config.revoke_deletes_device {
+        info!("revoke_deletes_device on: revoke ends a Matrix session with its device; teardown is strict");
+    }
     let synapse_client = match (&config.synapse_endpoint, &config.mas_shared_secret) {
         (Some(endpoint), Some(secret)) => {
             info!("Synapse client enabled: {}", endpoint);
             Some(Arc::new(
-                SynapseClient::new(endpoint.as_str(), secret).with_admin_mint(
-                    redis_client.clone(),
-                    config.admin_token_localpart.clone(),
-                    // Clamped here, at the configuration boundary, exactly as
-                    // `AdminTokenState` clamps it for the HTTP mint endpoint.
-                    admin_token::clamp_admin_token_ttl(config.admin_token_ttl_secs),
-                ),
+                SynapseClient::new(endpoint.as_str(), secret)
+                    .with_admin_mint(
+                        redis_client.clone(),
+                        config.admin_token_localpart.clone(),
+                        // Clamped here, at the configuration boundary, exactly as
+                        // `AdminTokenState` clamps it for the HTTP mint endpoint.
+                        admin_token::clamp_admin_token_ttl(config.admin_token_ttl_secs),
+                    )
+                    // SS4 flag 1: every teardown that reaches Synapse is strict.
+                    .with_strict_teardown(config.revoke_deletes_device)
+                    // SS4 flag 2: every delete plants the deleted-id marker.
+                    .with_deleted_markers(
+                        config
+                            .refuse_deleted_device_ids
+                            .then_some(config.deleted_device_marker_ttl_secs),
+                    ),
             ))
         }
         _ => None,
@@ -1425,16 +1907,99 @@ pub async fn main() {
         webauthn: Arc::new(wa_config.webauthn),
         rp_id: wa_config.rp_id,
         rp_origin: wa_config.rp_origin,
+        rp_dispatch: Arc::new(rp_dispatch),
         synapse_client,
     };
 
+    // Back-channel logout: one outbox worker per instance (claims are atomic,
+    // so instances never deliver one entry twice at once). Never awaited by a
+    // request; it stops with the process.
+    tokio::spawn(
+        crate::backchannel::Worker {
+            redis: state.redis_client.clone(),
+            signing_key: state.signing_key.clone(),
+            issuer: openidconnect::IssuerUrl::from_url(state.config.base_url.clone())
+                .as_str()
+                .to_string(),
+            guard: crate::backchannel::UriGuard::new(
+                &state.config.backchannel_logout_allowed_hosts,
+            ),
+            policy: crate::backchannel::OutboxPolicy::default(),
+        }
+        .run(),
+    );
+    if !state.config.backchannel_logout_allowed_hosts.is_empty() {
+        info!(
+            hosts = ?state.config.backchannel_logout_allowed_hosts,
+            "back-channel logout: these hosts skip the address check"
+        );
+    }
+
+    // The guest reaper: on every instance, whether or not guests are enabled (a guest is
+    // still erased after an operator turns them off). Stopped with the server.
+    let (reaper_stop, reaper_stopped) = tokio::sync::watch::channel(false);
+    let reaper_stopped_orphan = reaper_stopped.clone();
+    let reaper_task = match (
+        state.synapse_client.clone(),
+        state.config.matrix_server_name.clone(),
+    ) {
+        (Some(synapse), Some(server_name)) => {
+            let policy = crate::guest::reaper::ReaperPolicy::from_config(&state.config);
+            let grace = policy.shutdown_grace;
+            let reaper = crate::guest::reaper::Reaper::new(
+                state.redis_client.clone(),
+                synapse,
+                server_name,
+                policy,
+            );
+            Some((tokio::spawn(reaper.run(reaper_stopped)), grace))
+        }
+        _ => {
+            info!("guest reaper not started: synapse_endpoint, mas_shared_secret or matrix_server_name is not set");
+            None
+        }
+    };
+
+    // SS4 flag 3: the device reaper, stopped with the guest reaper. Off: no task.
+    let device_reaper_task = crate::device_reaper::spawn(
+        &state.config,
+        state.redis_client.clone(),
+        state.synapse_client.clone(),
+        reaper_stopped_orphan.clone(),
+    );
+
+    // The report-only orphan scan, beside the reaper and stopped with it.
+    let orphan_task = match (
+        state.synapse_client.clone(),
+        state.config.matrix_server_name.clone(),
+        state.config.guest_orphan_report_secs,
+    ) {
+        (Some(synapse), Some(server_name), secs) if secs > 0 => {
+            let scan = crate::guest::orphan::OrphanScan {
+                redis: state.redis_client.clone(),
+                synapse,
+                server_name,
+                interval: Duration::from_secs(secs),
+                guest_enabled: state.config.guest_enabled,
+            };
+            Some(tokio::spawn(scan.run(reaper_stopped_orphan)))
+        }
+        _ => None,
+    };
+
+    let guest_router = crate::guest::routes::router_with(
+        &state.config,
+        state.redis_client.clone(),
+        state.synapse_client.clone(),
+        Some(state.webauthn.clone()),
+    );
     let introspect_state = IntrospectState::from(&state);
     let admin_token_state = AdminTokenState::from(&state);
-    let compat_state = compat::CompatState {
-        redis_client: state.redis_client.clone(),
-        synapse_client: state.synapse_client.clone(),
-        server_name: state.config.matrix_server_name.clone(),
-    };
+    let compat_state = compat::CompatState::new(
+        state.redis_client.clone(),
+        state.synapse_client.clone(),
+        &state.config,
+    );
 
     let app = Router::new()
         .nest_service("/build", ServeDir::new("./static/build"))
@@ -1454,6 +2019,10 @@ pub async fn main() {
             get(clientinfo).delete(client_delete).post(client_update),
         )
         .route(oidc::SIGNIN_PATH, get(sign_in))
+        .route(
+            oidc::END_SESSION_PATH,
+            get(end_session_get).post(end_session_post),
+        )
         .route("/webauthn/register/start", post(webauthn_register_start))
         .route("/webauthn/register/finish", post(webauthn_register_finish))
         .route(
@@ -1486,6 +2055,7 @@ pub async fn main() {
         .route("/account/nonce", get(account_nonce_handler))
         .route("/account/wallet", post(account_wallet_handler))
         .route("/account/action", post(account_action_handler))
+        .route("/account/sign_out", post(account_sign_out_handler))
         .route(
             "/account/passkey/start",
             post(account_passkey_start_handler),
@@ -1536,55 +2106,101 @@ pub async fn main() {
         .route(
             "/_matrix/client/v3/refresh",
             post(compat::refresh).with_state(compat_state),
-        )
-        .layer(
-            TraceLayer::new_for_http()
-                .on_request(|req: &axum::http::Request<_>, _span: &tracing::Span| {
-                    info!(
-                        method = %req.method(),
-                        path = %req.uri().path(),
-                        "request"
-                    );
-                })
-                .on_response(
-                    |res: &axum::http::Response<_>, latency: Duration, _span: &tracing::Span| {
-                        info!(
-                            status = res.status().as_u16(),
-                            latency_ms = latency.as_millis() as u64,
-                            "response"
-                        );
-                    },
-                )
-                .on_failure(
-                    |error: ServerErrorsFailureClass, latency: Duration, _span: &tracing::Span| {
-                        warn!(
-                            error = %error,
-                            latency_ms = latency.as_millis() as u64,
-                            "request failed"
-                        );
-                    },
-                ),
-        )
-        .layer(
-            CorsLayer::new()
-                .allow_origin(AllowOrigin::any())
-                .allow_methods([
-                    axum::http::Method::GET,
-                    axum::http::Method::POST,
-                    axum::http::Method::OPTIONS,
-                ])
-                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
         );
 
+    let app = with_request_logging(app).layer(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::any())
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
+    );
+    // Merged after the CORS layer so the guest routes inherit none of it: they carry
+    // their own origin check, CORS, body cap and headers (`guest::layers`). With guest
+    // mode off every `/guest` path answers 503 and nothing else changes.
+    let app = app.merge(with_request_logging(guest_router));
+
     let addr = SocketAddr::from((config.address, config.port));
-    // Before the bind: from the moment the port accepts, a SIGTERM is handled.
+    // The handlers are installed before the bind and "Listening on" is logged after it, so the
+    // line means the port accepts and a SIGTERM or SIGINT is handled from here on.
+    // `tests/graceful_shutdown.rs` waits for it, and reads the port from it when asked for
+    // port 0; do not move it before the bind.
     let shutdown = shutdown_signal();
-    info!("Listening on {}", addr);
-    let listener = TcpListener::bind(addr).await.unwrap();
+    let listener = TcpListener::bind(addr)
+        .await
+        .unwrap_or_else(|e| panic!("FATAL: could not bind {addr}: {e}"));
+    info!(
+        "Listening on {}",
+        listener.local_addr().expect("read the bound address")
+    );
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            // The reaper takes no new guest and gives a teardown in flight a bounded time.
+            let _ = reaper_stop.send(true);
+        })
         .await
         .unwrap();
+    if let Some((task, grace)) = reaper_task {
+        let _ = tokio::time::timeout(grace + Duration::from_secs(1), task).await;
+    }
+    if let Some(task) = orphan_task {
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+    }
+    if let Some(task) = device_reaper_task {
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+    }
+}
+
+/// Request logging: one `info!` line per request (method and path) and one per
+/// response (status and latency). The path only, never the query.
+///
+/// A query carries credentials (`/device?user_code=…` is the link the device
+/// flow hands the user), so it is kept out of the span as well as out of the
+/// events. tower-http's default span records the whole URI and prints it in
+/// front of every event logged while the request is handled, which at debug
+/// level is every line. The span is at `DEBUG`, as the default one is, so it
+/// stays off under the default filter. Pinned by
+/// `request_logging_names_the_path_and_never_the_query`.
+fn with_request_logging(router: Router) -> Router {
+    router.layer(
+        TraceLayer::new_for_http()
+            .make_span_with(|req: &axum::http::Request<_>| {
+                tracing::debug_span!(
+                    "request",
+                    method = %req.method(),
+                    path = %req.uri().path(),
+                )
+            })
+            .on_request(|req: &axum::http::Request<_>, _span: &tracing::Span| {
+                info!(
+                    method = %req.method(),
+                    path = %req.uri().path(),
+                    "request"
+                );
+            })
+            .on_response(
+                |res: &axum::http::Response<_>, latency: Duration, _span: &tracing::Span| {
+                    info!(
+                        status = res.status().as_u16(),
+                        latency_ms = latency.as_millis() as u64,
+                        "response"
+                    );
+                },
+            )
+            .on_failure(
+                |error: ServerErrorsFailureClass, latency: Duration, _span: &tracing::Span| {
+                    warn!(
+                        error = %error,
+                        latency_ms = latency.as_millis() as u64,
+                        "request failed"
+                    );
+                },
+            ),
+    )
 }
 
 /// Resolves on SIGTERM (`docker stop`, Kubernetes) or SIGINT (Ctrl-C); the
@@ -1731,21 +2347,30 @@ mod unknown_credential_response_tests {
         let scoped = serde_json::to_value(AuthenticateStartResponse {
             challenge: rcr.clone(),
             detected_mxid: Some("@did-key-zdn:matrix.example.com".to_string()),
+            linked_passkey_login: true,
         })
         .unwrap();
         assert_eq!(scoped["publicKey"]["challenge"], "AAECAwQFBgcICQ");
         assert_eq!(scoped["publicKey"]["rpId"], "matrix.example.com");
         assert!(scoped["publicKey"]["allowCredentials"].is_array());
         assert_eq!(scoped["detected_mxid"], "@did-key-zdn:matrix.example.com");
+        assert_eq!(scoped["linked_passkey_login"], true);
 
         // Unscoped: extra omitted entirely; publicKey still intact.
         let unscoped = serde_json::to_value(AuthenticateStartResponse {
             challenge: rcr,
             detected_mxid: None,
+            linked_passkey_login: false,
         })
         .unwrap();
         assert_eq!(unscoped["publicKey"]["challenge"], "AAECAwQFBgcICQ");
         assert!(unscoped.get("detected_mxid").is_none());
+        assert!(unscoped.get("linked_passkey_login").is_none());
+        // The request flag defaults to the unified RP and reads `legacy: true`.
+        let default: AuthenticateStartBody = serde_json::from_str("{}").unwrap();
+        assert!(!default.legacy);
+        let legacy: AuthenticateStartBody = serde_json::from_str(r#"{"legacy":true}"#).unwrap();
+        assert!(legacy.legacy);
     }
 
     /// H3 (escape hatch): the account/device `{"all":true}` body flag forces
@@ -1826,7 +2451,7 @@ mod unknown_credential_response_tests {
     /// usernameless `None`, NEVER propagate it (which would 500 the picker). A future
     /// refactor to `?` would break this invariant while every miss-path test stayed
     /// green — so pin the error path here. We force a real, fast `WRONGTYPE` error by
-    /// storing the `user:session/{token}` key as a SET, so the `GET` in
+    /// storing the `siwx_user/{digest}` key as a SET, so the `GET` in
     /// `lookup_user_session` errors. Needs Redis (`siwx_oidc::test_support::redis`).
     #[tokio::test]
     async fn user_session_scope_did_degrades_open_on_redis_error() {
@@ -1834,8 +2459,8 @@ mod unknown_credential_response_tests {
             return;
         };
         let token = format!("wrongtype{}", uuid::Uuid::new_v4().simple());
-        // KV_USER_SESSION_PREFIX is in scope via `use siwx_oidc::db::*` at the top.
-        let key = format!("{}/{}", KV_USER_SESSION_PREFIX, token);
+        // The digest key the lookup reads first (`OwnSession::PickerHint`).
+        let key = format!("siwx_user/{}", siwx_oidc::db::tokens::digest(&token));
         // SET-typed value at the exact key lookup_user_session GETs -> WRONGTYPE error.
         redis
             .sadd_raw(&key, "x")
@@ -1853,5 +2478,665 @@ mod unknown_credential_response_tests {
         );
 
         redis.del_raw(&key).await.ok();
+    }
+
+    /// Enumeration safety with a DID-shaped forged value: a `siwx_user` cookie
+    /// whose value is the DID of an account with a registered passkey (a
+    /// `did:key`, and a `did:pkh` address) is a miss like any other forged
+    /// value. The picker stays usernameless with zero credential ids and no
+    /// `detected_mxid`, so a client can never name the account it wants listed.
+    /// The control: a genuine session for the same DID does scope the picker to
+    /// the seeded passkey, so the empty answer is not an empty index.
+    #[tokio::test]
+    async fn a_did_shaped_forged_user_cookie_yields_usernameless_empty_allow_credentials() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let base = url::Url::parse("http://localhost:8000").unwrap();
+        let (_cfg, dispatch) =
+            wa::build_rp_dispatch(&base, None, None, None).expect("build rp dispatch");
+        let cookie_of = |value: &str| {
+            let header = format!("siwx_user={value}");
+            let hv = axum::http::HeaderValue::from_str(&header).expect("header value");
+            Some(TypedHeader(
+                headers::Cookie::decode(&mut std::iter::once(&hv)).expect("decode cookie"),
+            ))
+        };
+        let n = uuid::Uuid::new_v4().simple().to_string();
+        let dids = [
+            format!("did:key:zDnaeForged{n}"),
+            format!("did:pkh:eip155:1:0x{n}00000000"),
+        ];
+        for (i, did) in dids.iter().enumerate() {
+            let cred = URL_SAFE_NO_PAD.encode(format!("cred-{n}-{i}").as_bytes());
+            redis.index_add_passkey(did, &cred).await.expect("seed");
+
+            let genuine = redis.create_user_session(did).await.expect("mint");
+            let scope = user_session_scope_did(&redis, &cookie_of(&genuine), false).await;
+            assert_eq!(scope.as_deref(), Some(did.as_str()), "control: {did}");
+            let rcr = wa::authenticate_start(
+                &dispatch,
+                &redis,
+                &format!("didgenuine{n}{i}"),
+                scope.as_deref(),
+                false,
+            )
+            .await
+            .expect("authenticate_start");
+            assert_eq!(
+                rcr.public_key.allow_credentials.len(),
+                1,
+                "control: a genuine session offers the seeded passkey of {did}"
+            );
+
+            let forged = cookie_of(did);
+            assert_eq!(
+                user_session_token(&forged, false),
+                Some(did.as_str()),
+                "the forged value reaches the lookup"
+            );
+            let scope = user_session_scope_did(&redis, &forged, false).await;
+            assert_eq!(
+                scope, None,
+                "a DID as the cookie value scopes nothing: {did}"
+            );
+            let rcr = wa::authenticate_start(
+                &dispatch,
+                &redis,
+                &format!("didforged{n}{i}"),
+                scope.as_deref(),
+                false,
+            )
+            .await
+            .expect("authenticate_start");
+            assert!(
+                rcr.public_key.allow_credentials.is_empty(),
+                "a DID-shaped forged cookie lists no credential id: {did}"
+            );
+            assert_eq!(
+                detected_mxid_for(None, Some("matrix.example.com"), scope.as_deref()).await,
+                None,
+                "and detects no account: {did}"
+            );
+
+            redis.revoke_own_sessions(did).await.ok();
+            redis
+                .del_raw(&format!(
+                    "{}/{did}",
+                    siwx_oidc::db::KV_WEBAUTHN_BY_DID_PREFIX
+                ))
+                .await
+                .ok();
+        }
+    }
+}
+
+#[cfg(test)]
+mod registration_refused_response_tests {
+    //! Infra-free guards for how `/webauthn/register/finish` renders a refused
+    //! registration. The refusal itself is covered against Redis in
+    //! `webauthn::tests`.
+    use super::*;
+    use crate::webauthn::RegisterFinishError;
+
+    /// An already-registered credential id maps to `RegistrationRefused` and
+    /// renders as HTTP 400 with exactly `{"error":"registration failed"}`.
+    #[tokio::test]
+    async fn an_already_registered_credential_id_renders_400_with_a_fixed_body() {
+        let ce: CustomError = RegisterFinishError::AlreadyRegistered.into();
+        assert!(matches!(ce, CustomError::RegistrationRefused));
+
+        let resp = ce.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json, serde_json::json!({ "error": "registration failed" }));
+    }
+
+    /// Every other registration failure keeps its existing 500.
+    #[tokio::test]
+    async fn other_register_finish_errors_stay_internal_errors() {
+        let ce: CustomError = RegisterFinishError::Other(anyhow::anyhow!("no challenge")).into();
+        assert!(matches!(ce, CustomError::Other(_)));
+        assert_eq!(
+            ce.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+}
+
+#[cfg(test)]
+mod request_logging_tests {
+    //! What the request-logging layer may put in the logs. Drives the layer over
+    //! a real socket: the span a layer opens is part of every line logged while
+    //! the request is handled, so only a request through the real stack shows it.
+    use super::*;
+
+    /// A query carries credentials (`/device` takes the user code in its
+    /// `verification_uri_complete`), so a request is logged by method and path.
+    /// tower-http's default span records the full URI and prints it in front of
+    /// every event logged during the request when debug logging is on, which is
+    /// the case this guards.
+    #[tokio::test]
+    async fn request_logging_names_the_path_and_never_the_query() {
+        let logs = siwx_oidc::test_support::LogCapture::start();
+        let app = with_request_logging(Router::new().route(
+            "/device",
+            get(|| async {
+                // An event inside the handler carries the request's span.
+                info!("handling");
+                "ok"
+            }),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let secret = "QUERYSECRET-WDJB-MJHT";
+        let response = reqwest::get(format!(
+            "http://{addr}/device?user_code={secret}&access_token=tok-{secret}"
+        ))
+        .await
+        .unwrap();
+        assert!(response.status().is_success());
+        server.abort();
+        let output = logs.output();
+
+        assert!(
+            output.contains("path=/device"),
+            "the request line names the path; captured:\n{output}"
+        );
+        assert!(
+            output.contains("handling"),
+            "the handler's own event was captured; captured:\n{output}"
+        );
+        assert!(
+            !output.contains(secret),
+            "a query value appears in the logs:\n{}",
+            output
+                .lines()
+                .filter(|l| l.contains(secret))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(
+            !output.contains("user_code="),
+            "a query parameter name appears in the logs:\n{output}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod token_endpoint_error_tests {
+    //! The status and challenge of a failed `POST /token`: RFC 6749 §5.2 makes
+    //! `invalid_client` a 401, with a `WWW-Authenticate` challenge when the
+    //! client attempted HTTP Basic, and every other token error a 400.
+    use super::*;
+
+    fn token_error(error: CoreErrorResponseType) -> CustomError {
+        CustomError::BadRequestToken(oidc::TokenError {
+            error,
+            error_description: "described".to_string(),
+        })
+    }
+
+    fn respond(error: CustomError, basic_attempted: bool) -> Response {
+        TokenEndpointError {
+            error,
+            basic_attempted,
+        }
+        .into_response()
+    }
+
+    #[test]
+    fn invalid_client_is_a_401_and_every_other_token_error_a_400() {
+        for (error, expected) in [
+            (
+                CoreErrorResponseType::InvalidClient,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (CoreErrorResponseType::InvalidGrant, StatusCode::BAD_REQUEST),
+            (
+                CoreErrorResponseType::InvalidRequest,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                CoreErrorResponseType::UnsupportedGrantType,
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let shown = format!("{error:?}");
+            assert_eq!(
+                respond(token_error(error), false).status(),
+                expected,
+                "{shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_failed_basic_attempt_is_challenged() {
+        let challenged = respond(token_error(CoreErrorResponseType::InvalidClient), true);
+        assert_eq!(challenged.status(), StatusCode::UNAUTHORIZED);
+        assert!(challenged
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .is_some_and(|v| v.to_str().unwrap().starts_with("Basic ")));
+
+        for (what, response) in [
+            (
+                "invalid_client without a Basic attempt",
+                respond(token_error(CoreErrorResponseType::InvalidClient), false),
+            ),
+            (
+                "invalid_grant after a Basic attempt",
+                respond(token_error(CoreErrorResponseType::InvalidGrant), true),
+            ),
+        ] {
+            assert!(
+                response.headers().get(header::WWW_AUTHENTICATE).is_none(),
+                "{what}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod client_credentials_tests {
+    //! What `POST /token` makes of the `Authorization` header.
+    use super::*;
+
+    fn form_encode(value: &str) -> String {
+        url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+    }
+
+    fn with_header(header: impl axum_extra::headers::Header) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.typed_insert(header);
+        headers
+    }
+
+    /// RFC 6749 §2.3.1: the client id and the secret are encoded with
+    /// `application/x-www-form-urlencoded` before they are joined and Base64
+    /// encoded into the Basic header, so the server must decode both before it
+    /// compares them. A secret with a character that encodes (a space, `+`, `%`,
+    /// `&`, `:`, a non-ASCII letter) would otherwise never match.
+    #[test]
+    fn basic_credentials_are_form_urldecoded_before_they_are_compared() {
+        let (id, secret) = ("client id", "p@ss w%rd+x&y:z/\u{e9}");
+        let headers = with_header(Authorization::basic(&form_encode(id), &form_encode(secret)));
+
+        let (credentials, basic_attempted) = client_credentials(&headers);
+        assert!(basic_attempted);
+        assert_eq!(credentials.basic_client_id.as_deref(), Some(id));
+        assert_eq!(credentials.secret.as_deref(), Some(secret));
+    }
+
+    /// A secret with nothing to encode, the usual generated kind, passes through
+    /// unchanged; and a Bearer token is an opaque string, never form-decoded.
+    #[test]
+    fn a_plain_basic_secret_and_a_bearer_token_are_taken_as_sent() {
+        let headers = with_header(Authorization::basic("client", "0123abcdEF-_.~"));
+        let (credentials, _) = client_credentials(&headers);
+        assert_eq!(credentials.basic_client_id.as_deref(), Some("client"));
+        assert_eq!(credentials.secret.as_deref(), Some("0123abcdEF-_.~"));
+
+        let headers = with_header(Authorization::bearer("a%2Bb+c").unwrap());
+        let (credentials, basic_attempted) = client_credentials(&headers);
+        assert!(!basic_attempted);
+        assert_eq!(credentials.basic_client_id, None);
+        assert_eq!(credentials.secret.as_deref(), Some("a%2Bb+c"));
+    }
+}
+
+#[cfg(test)]
+mod start_up_write_isolation_tests {
+    //! The start-up write deletes every client the real set `clients:static` records and
+    //! the configured map no longer names. The Redis a test reaches can be a running
+    //! stack's or a developer's deployment's, so a test's start-up write must never go
+    //! through that set. Needs Redis.
+    use super::*;
+
+    /// The database this test claims, so the real set it writes there is its own.
+    const OWN_DB: u8 = 11;
+
+    fn config_naming(id: &str) -> config::Config {
+        let mut config = config::Config::default();
+        config.default_clients.insert(
+            id.to_string(),
+            serde_json::json!({
+                "secret": "not-a-secret-test-fixture",
+                "metadata": {"redirect_uris": ["https://rp.example.org/cb"]},
+            })
+            .to_string(),
+        );
+        config
+    }
+
+    /// A deployment records its static client in the real set. The start-up write a test
+    /// makes through `test_support` records its own client in a set of its own, so it
+    /// deletes nothing it did not write. The deployment is a plain client on the database
+    /// this test claims: the test never writes to the real set of any other database.
+    #[tokio::test]
+    async fn the_start_up_write_of_a_test_leaves_a_foreign_static_client_alone() {
+        let Some(test_redis) = siwx_oidc::test_support::redis_db(OWN_DB).await else {
+            return;
+        };
+        let deployment = RedisClient::new(&siwx_oidc::test_support::redis_db_url(OWN_DB))
+            .await
+            .unwrap();
+        // Whatever an earlier failed run left in this database's real set.
+        deployment.sync_static_clients(Vec::new()).await.unwrap();
+
+        let foreign = format!("foreign-{}", uuid::Uuid::new_v4().simple());
+        store_default_clients(&config_naming(&foreign), &deployment)
+            .await
+            .unwrap();
+        let ours = format!("default-{}", uuid::Uuid::new_v4().simple());
+        store_default_clients(&config_naming(&ours), &test_redis)
+            .await
+            .unwrap();
+
+        assert!(
+            deployment
+                .get_client(foreign.clone())
+                .await
+                .unwrap()
+                .is_some(),
+            "a test's start-up write deleted a static client it never wrote"
+        );
+        assert_eq!(
+            deployment.sync_static_clients(Vec::new()).await.unwrap(),
+            1,
+            "the real set still records the foreign client, and only it"
+        );
+        assert!(deployment.get_client(foreign).await.unwrap().is_none());
+        assert_eq!(
+            test_redis.sync_static_clients(Vec::new()).await.unwrap(),
+            1,
+            "the test client's own set records exactly the client it wrote"
+        );
+        assert!(test_redis.get_client(ours).await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod default_clients_tests {
+    //! `default_clients` are configured in the clear and stored as digests.
+    //! In process, because the one static client the mock stack configures has no
+    //! registration access token. Needs Redis.
+    use super::*;
+
+    /// The configured secret and registration access token appear in no key
+    /// and no value Redis holds for the client after the start-up write, and
+    /// the client authenticates with exactly the configured values.
+    #[tokio::test]
+    async fn default_clients_are_stored_only_as_digests_and_authenticate() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let id = format!("default-{}", uuid::Uuid::new_v4().simple());
+        let secret = format!("configured-secret-{}", uuid::Uuid::new_v4().simple());
+        let token = format!("configured-token-{}", uuid::Uuid::new_v4().simple());
+        let configured = serde_json::json!({
+            "secret": secret,
+            "metadata": {"redirect_uris": ["https://rp.example.org/cb"]},
+            "access_token": token,
+        });
+        let mut config = config::Config::default();
+        config
+            .default_clients
+            .insert(id.clone(), configured.to_string());
+
+        store_default_clients(&config, &redis).await.unwrap();
+
+        let key = format!("clients/{id}");
+        assert_eq!(
+            redis.keys_raw(&format!("*{id}*")).await.unwrap(),
+            vec![key.clone()]
+        );
+        let stored = redis.get_raw(&key).await.unwrap().unwrap();
+        assert!(
+            !stored.contains(&secret),
+            "the secret is stored in the clear: {stored}"
+        );
+        assert!(
+            !stored.contains(&token),
+            "the token is stored in the clear: {stored}"
+        );
+        let entry = redis.get_client(id.clone()).await.unwrap().unwrap();
+        assert!(entry.secret_matches(&secret));
+        assert!(entry.access_token_matches(&token));
+        assert!(!entry.secret_matches(&entry.secret_digest));
+        redis.del_raw(&key).await.unwrap();
+    }
+
+    /// The start-up parse hands the policy this deployment's settings: a generic client
+    /// needs the MAS shared secret and the Synapse endpoint (the Synapse client exists only
+    /// with both), and the mail scope needs the mail domain. No Redis: the parse reads none.
+    #[test]
+    fn a_generic_static_client_is_checked_against_the_deployment_it_runs_in() {
+        let entry = r#"{"secret":"not-a-secret-test-fixture","metadata":{"redirect_uris":["https://mail.example.org/cb"]},"class":"generic","allowed_scopes":["openid","io.inblock.mail"]}"#;
+        let mut config = config::Config::default();
+        config.default_clients.insert("mailer".into(), entry.into());
+        let refusal = |config: &config::Config| match parse_default_clients(config) {
+            Ok(_) => panic!("the configuration must be refused"),
+            Err(refusal) => refusal.to_string(),
+        };
+
+        let without_synapse = refusal(&config);
+        assert!(
+            without_synapse.starts_with("default_clients.mailer:")
+                && without_synapse.contains("SIWXOIDC_MAS_SHARED_SECRET"),
+            "{without_synapse}"
+        );
+
+        config.mas_shared_secret = Some("not-a-secret-test-fixture".into());
+        let without_endpoint = refusal(&config);
+        assert!(
+            without_endpoint.starts_with("default_clients.mailer:")
+                && without_endpoint.contains("SIWXOIDC_SYNAPSE_ENDPOINT"),
+            "{without_endpoint}"
+        );
+
+        config.synapse_endpoint = Some("http://synapse.example.org:8008".parse().unwrap());
+        let without_domain = refusal(&config);
+        assert!(
+            without_domain.starts_with("default_clients.mailer:")
+                && without_domain.contains("SIWXOIDC_MAIL_DOMAIN"),
+            "{without_domain}"
+        );
+
+        config.mail_domain = Some("matrix.example.org".into());
+        let parsed = match parse_default_clients(&config) {
+            Ok(parsed) => parsed,
+            Err(refusal) => panic!("the deployment serves the client: {refusal}"),
+        };
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "mailer");
+        assert_eq!(parsed[0].1.class, ClientClass::Generic);
+    }
+}
+
+#[cfg(test)]
+mod static_client_prune_tests {
+    //! The start-up prune keeps trying until one attempt succeeds. No Redis and no sleeping:
+    //! the attempt is a closure and the pause records the wait it was asked for.
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Run `prune_until_done` with an attempt that fails `failures` times and then deletes
+    /// `pruned` clients. Returns the result, how many attempts ran, and every wait requested.
+    async fn run(
+        failures: usize,
+        pruned: usize,
+        first_wait: Duration,
+        cap: Duration,
+    ) -> (usize, usize, Vec<Duration>) {
+        let attempts = Mutex::new(0usize);
+        let waits = Mutex::new(Vec::new());
+        let result = prune_until_done(
+            || {
+                let mut count = attempts.lock().unwrap();
+                *count += 1;
+                let attempt = *count;
+                async move {
+                    if attempt <= failures {
+                        Err(anyhow::anyhow!("redis is unreachable"))
+                    } else {
+                        Ok(pruned)
+                    }
+                }
+            },
+            |wait| {
+                waits.lock().unwrap().push(wait);
+                std::future::ready(())
+            },
+            first_wait,
+            cap,
+        )
+        .await;
+        let attempts = *attempts.lock().unwrap();
+        let waits = waits.into_inner().unwrap();
+        (result, attempts, waits)
+    }
+
+    #[tokio::test]
+    async fn a_prune_that_works_at_once_runs_once_and_never_waits() {
+        let (result, attempts, waits) = run(0, 3, PRUNE_FIRST_RETRY, PRUNE_RETRY_CAP).await;
+        assert_eq!(result, 3);
+        assert_eq!(attempts, 1);
+        assert!(waits.is_empty(), "no failure, so no wait: {waits:?}");
+    }
+
+    /// The prune is retried until Redis answers once, and what the successful attempt
+    /// deleted is what comes back.
+    #[tokio::test]
+    async fn a_prune_that_fails_is_retried_until_it_succeeds() {
+        let (result, attempts, waits) =
+            run(3, 5, Duration::from_secs(1), Duration::from_secs(60)).await;
+        assert_eq!(result, 5, "the successful attempt's count is returned");
+        assert_eq!(attempts, 4, "three failures, then the success");
+        assert_eq!(waits.len(), 3, "one wait after each failure: {waits:?}");
+    }
+
+    /// The wait doubles after every failure and stops growing at the cap, so an outage of
+    /// any length is polled about once per cap and never gives up.
+    #[tokio::test]
+    async fn the_wait_doubles_up_to_the_cap_and_stays_there() {
+        let (_, attempts, waits) = run(8, 0, Duration::from_secs(1), Duration::from_secs(60)).await;
+        let seconds: Vec<u64> = waits.iter().map(Duration::as_secs).collect();
+        assert_eq!(seconds, [1, 2, 4, 8, 16, 32, 60, 60]);
+        assert_eq!(attempts, 9);
+    }
+
+    /// A first wait above the cap is clamped to it, so `cap` is a true upper bound.
+    #[tokio::test]
+    async fn no_wait_ever_exceeds_the_cap() {
+        let (_, _, waits) = run(3, 0, Duration::from_secs(90), Duration::from_secs(60)).await;
+        assert_eq!(waits.len(), 3);
+        assert!(
+            waits.iter().all(|wait| *wait <= Duration::from_secs(60)),
+            "{waits:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod invalid_token_response_tests {
+    //! The RFC 6750 answer to a bearer token that cannot be used. No Redis and no network: the
+    //! variant `oidc::userinfo` returns for such a token, rendered as the endpoint sends it.
+    use super::*;
+
+    fn challenges(response: &Response) -> Vec<&str> {
+        response
+            .headers()
+            .get_all(header::WWW_AUTHENTICATE)
+            .iter()
+            .map(|value| value.to_str().expect("an ASCII challenge"))
+            .collect()
+    }
+
+    /// A resource server reads the status and the challenge, not the body: a 401 with
+    /// `error="invalid_token"` says the credential is dead, where a 400 reads as a fault in the
+    /// server's own request and may be retried as a temporary failure.
+    #[tokio::test]
+    async fn an_invalid_token_is_a_401_with_the_rfc_6750_challenge() {
+        let response = CustomError::InvalidToken("Unknown token.".to_string()).into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(challenges(&response), [r#"Bearer error="invalid_token""#]);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"Unknown token.");
+    }
+
+    /// Only a rejected bearer token is a Bearer challenge. A client that fails to
+    /// authenticate (`Unauthorized`) and a malformed request keep the answers they had.
+    #[test]
+    fn no_other_error_carries_a_bearer_challenge() {
+        let others = [
+            CustomError::BadRequest("Missing access token.".to_string()),
+            CustomError::Unauthorized("Bad secret.".to_string()),
+            CustomError::NotFound,
+        ];
+        for other in others {
+            let what = other.to_string();
+            let response = other.into_response();
+            assert!(
+                challenges(&response).is_empty(),
+                "{what}: no Bearer challenge on this answer"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod login_session_tests {
+    //! The login page's passkey ceremonies tell an expired login session from every other
+    //! refusal, so the page can hand over to `/sign_in` (#68).
+    use super::*;
+    use headers::HeaderMapExt;
+
+    #[tokio::test]
+    async fn a_ceremony_without_the_login_cookie_answers_login_session_expired() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "siwx_user=other".parse().unwrap());
+        let other_cookie_only = headers.typed_get::<headers::Cookie>().map(TypedHeader);
+        for cookies in [None, other_cookie_only] {
+            let response = login_session(cookies).unwrap_err().into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], br#"{"error":"login_session_expired"}"#);
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "session=abc; siwx_user=x".parse().unwrap());
+        let (_, session_id) =
+            login_session(headers.typed_get::<headers::Cookie>().map(TypedHeader)).unwrap();
+        assert_eq!(session_id, "abc");
+    }
+
+    /// The page an expired sign-in shows when the client cannot be told: a 400 HTML page
+    /// that is never cached and says what happened.
+    #[tokio::test]
+    async fn an_expired_login_session_renders_the_timed_out_page() {
+        let response = CustomError::LoginSessionExpired.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Sign-in timed out"));
     }
 }

@@ -306,9 +306,12 @@ supported and additive, but no shipping client speaks it, so it buys nothing tod
 
 | Key pattern | TTL | Content |
 |-------------|-----|---------|
-| `device_codes/{code}` | `expires_in` | `{ user_code, client_id, scope, status, did, device_id, last_poll, created_at }` |
-| `device_codes/{code}/redeemed` | `expires_in` | single-redemption claim |
-| `user_codes/{code}` | `expires_in` | the device code (reverse lookup for approval page) |
+| `device_code/{sha256(device_code)}` | `expires_in` | `{ user_code_digest, client_id, scope, status, did, device_id, last_poll, created_at }` |
+| `device_code/{sha256(device_code)}/redeemed` | `expires_in` | single-redemption claim |
+| `user_code/{sha256(user_code)}` | `expires_in` | the device code's digest (reverse lookup for approval page) |
+
+Neither code is stored in the clear. Entries an earlier build wrote under `device_codes/{code}`
+and `user_codes/{code}` are read until they expire.
 
 Status (as stored): `Pending` -> `Approved` (with DID) or `Denied`
 
@@ -334,8 +337,8 @@ Logic:
 1. Validate client_id exists in Redis
 2. Generate high-entropy `device_code` (`dvc_` + 32 base62 characters)
 3. Generate human-readable `user_code` (6 chars, base-20: `BCDFGHJKLMNPQRSTVWXZ`, hyphenated: `WDJ-BMJ`)
-4. Store `device_codes/{code}` in Redis with TTL = `expires_in`
-5. Store `user_codes/{code}` in Redis with TTL = `expires_in` (reverse lookup)
+4. Store `device_code/{sha256(code)}` in Redis with TTL = `expires_in`
+5. Store `user_code/{sha256(code)}` in Redis with TTL = `expires_in` (reverse lookup)
 6. Return JSON response
 
 Response:
@@ -359,8 +362,8 @@ Flow:
 1. If `user_code` in query string, pre-fill it
 2. User authenticates (wallet CAIP-122 signature or WebAuthn passkey)
 3. Server verifies the authentication proof
-4. Server looks up `user_codes/{code}` to find the `device_code`
-5. Server updates `device_codes/{code}` status to `approved`, stores verified DID
+4. Server looks up `user_code/{sha256(code)}` to find the device code's digest
+5. Server updates that `device_code/{digest}` entry's status to `approved`, stores verified DID
 6. Page shows "Device approved" confirmation
 
 The approval page must verify the user's identity. It can use the same authentication

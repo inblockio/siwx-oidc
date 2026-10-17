@@ -11,6 +11,7 @@ An index of the documentation in this repository. Start with the project
 | [identity-model.md](identity-model.md) | The three identifiers (alias, MXID, DID), MXID derivation and grandfathering, the `io.inblock.did` wire format, trust model, publication, verification, `GET /resolve`, the `io.inblock.mxid` claim |
 | [matrix-integration.md](matrix-integration.md) | Wiring siwx-oidc into Synapse, dependencies and risks, MSC3861 history, token model, admin-token mint, device lifecycle, MSC4191 account management, device-code/QR login, cross-signing, what is not supported |
 | [passkeys.md](passkeys.md) | WebAuthn architecture, DID derivation, linking to a wallet, picker scoping, the new-account policy, unknown credentials |
+| [guest-portal.md](guest-portal.md) | Operator guide for guest mode: prerequisites, enabling, lifecycle, acceptance A1 to A8, kill switch, audit events, retention and residues, the posture and proxy check scripts |
 | [troubleshooting.md](troubleshooting.md) | Symptoms and fixes for headless, wallet, passkey, account, QR and DID problems; Redis inspection |
 | [architecture.md](architecture.md) | Layers, code map, DID methods, frontend, Redis keyspace, logging, lineage from siwe-oidc |
 | [configuration.md](configuration.md) | Every configuration option, key rotation, reverse proxy and CORS, running with Docker |
@@ -44,7 +45,9 @@ describe the current behaviour.
 | [design/2026-06-19-passkey-offer-scoping-minimal-behavior.md](design/2026-06-19-passkey-offer-scoping-minimal-behavior.md) | The minimal behaviour for which passkeys are offered in each flow |
 | [design/2026-07-25-webauthn-prf-4s-unlock-evaluation.md](design/2026-07-25-webauthn-prf-4s-unlock-evaluation.md) | Evaluation of WebAuthn PRF as a Matrix secret-storage unlock (rejected as proposed) |
 | [design/2026-09-09-did-profile-field-feasibility.md](design/2026-09-09-did-profile-field-feasibility.md) | Feasibility of publishing the DID as an MSC4133 profile field on Synapse 1.159.0 |
-| [design/guest-portal/00-overview.md](design/guest-portal/00-overview.md) | Draft design set for anonymous guests joining a Matrix video call by link: flow model, Synapse validation, guest client, security limits, claim by passkey, wireframes, implementation plan (design only, nothing implemented), reference material and the prepared next step, a consolidation session |
+| [design/2026-10-02-token-handling-prior-art.md](design/2026-10-02-token-handling-prior-art.md) | Standards (RFC 9700, OAuth 2.1, browser-based apps BCP), other authorization servers and Matrix client behaviour for refresh-token rotation, reuse detection and storage; the principles adopted |
+| [design/2026-10-02-token-lifecycle-rework.md](design/2026-10-02-token-lifecycle-rework.md) | Security-first plan for the token lifecycle in Matrix and generic OIDC mode: threat model, invariants, the grant record and atomic rotation script, lifetime, revocation propagation, phases and open decisions (issue #30) |
+| [design/guest-portal/00-overview.md](design/guest-portal/00-overview.md) | Draft design set for anonymous guests joining a Matrix video call by link: flow model, Synapse validation, guest client, security limits, claim by passkey, wireframes, implementation plan and reference material. The baseline the guest path was built from (#49 to #57) and the design baseline aqua-meet pins; where they differ, the code and the guest docs describe the current behaviour |
 
 ## Audits and findings
 
@@ -101,5 +104,5 @@ check, and building the Docker image.
   the Synapse and Element deployment, including the
   [Synapse patch registry](https://github.com/inblockio/siwx-oidc-matrix-server/blob/main/patches/synapse/README.md)
   and the [Element Web patch registry](https://github.com/inblockio/siwx-oidc-matrix-server/blob/main/patches/element-web/README.md).
-- [aqua-auth](https://github.com/inblockio/aqua-rs-auth): the DID and signature
+- [aqua-auth](https://github.com/inblockio/aqua-auth): the DID and signature
   verification library siwx-oidc builds on.

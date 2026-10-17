@@ -43,7 +43,7 @@ test.beforeAll(async () => {
   await requireElementStack();
 });
 
-test('EW-C1: full SSO click-path — Element → siwx wallet UI → Secure Backup → app shell', async ({
+test('EW-C1: full SSO click-path — Element → siwx wallet UI → Secure Backup → app shell', { tag: '@ew-p1' }, async ({
   page,
 }) => {
   test.setTimeout(360_000);

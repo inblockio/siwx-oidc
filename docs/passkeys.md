@@ -31,7 +31,21 @@ aqua-auth's `DIDMethod` trait (see [architecture.md](architecture.md) and the
 - **Registration** uses the `webauthn-rs` safe API (`=0.6.1-dev`). New
   registrations require a **discoverable (resident) credential**, so the
   authenticator can offer the user's own passkey without the server listing
-  credential IDs.
+  credential IDs. Registration (`/webauthn/register/finish`) is
+  **create-only**: the passkey is stored with an atomic set-if-absent before
+  any index or mirror write, so a credential ID that is already registered,
+  or that has `webauthn:link/{id}` state, is refused (HTTP 400,
+  `{"error":"registration failed"}`) and the stored passkey, the link entry,
+  the `webauthn:by_did` index and the credential-store mirror stay as they
+  were
+  (`registering_an_existing_credential_id_is_refused_and_the_stored_blob_is_unchanged`,
+  `registering_an_id_with_existing_link_state_is_refused`). With the
+  aqua-auth credential store enabled (`AQUA_WEBAUTHN_REDIS_URL`), an ID that
+  store already holds is refused the same way, even when the legacy namespace
+  has no entry for it, and its store row keeps its key and DID
+  (`a_credential_id_held_only_by_the_shared_store_is_refused`). That store
+  check and the later mirror write are two steps, not one atomic operation
+  across the two namespaces.
 - **Assertion** is verified with aqua-auth's `verify_webauthn_assertion`
   (P-256), against the challenge stored for the session. The server also
   requires the **user-verification** flag and rejects a **signature-counter
@@ -66,7 +80,7 @@ linked to the other's identity.
 | Endpoint | Purpose |
 |---|---|
 | `POST /webauthn/register/start` | registration options (`CreationChallengeResponse`) |
-| `POST /webauthn/register/finish` | verify the attestation, store the credential; returns `{did, credential_id}` |
+| `POST /webauthn/register/finish` | verify the attestation, store the credential if its id is new; returns `{did, credential_id}`, or 400 `{"error":"registration failed"}` for an id already registered, with link state, or held by the enabled credential store |
 | `POST /webauthn/authenticate/start` | assertion options, scoped by the `siwx_user` cookie (below), plus `detected_mxid` |
 | `POST /webauthn/authenticate/finish` | verify the assertion, store the verified DID; returns `{ok, did, new_user, mxid}` |
 | `POST /link/webauthn/start` | begin registering a passkey for the caller's wallet DID |
@@ -96,14 +110,21 @@ rather than as a new `did:key`:
 
 | Key | TTL | Content |
 |---|---|---|
-| `webauthn:challenge/{session_id}` | 120 s | ceremony state (registration state or assertion challenge) |
+| `webauthn:ceremony/{sha256(ceremony id)}` | 120 s | ceremony state (registration state or assertion challenge), read and deleted in one step |
 | `webauthn:credential/{cred_id_b64}` | none | the stored passkey (serialised `webauthn_rs::Passkey`, including its counter) |
 | `webauthn:link/{cred_id_b64}` | none | `{primary_did, label}` for a linked passkey |
-| `webauthn:link_challenge/{session_id}` | 120 s | link ceremony state and the wallet DID |
+| `webauthn:link_ceremony/{sha256(session id)}` | 120 s | link ceremony state and the wallet DID |
 | `webauthn:by_did/{did}` | none | set of credential IDs that resolve to the DID |
-| `user:session/{token}` | 30 days | opaque login user session: token → DID |
-| `device_codes/{device_code}` | 1800 s | device-code grant state |
-| `user_codes/{user_code}` | 1800 s | user code → device code |
+| `webauthn:no_passkey/{sha256(did)}` | 600 s (30 s while `scanning`) | the device page's scan marker: `scanning` while one request scans for the DID, `1` once a scan found no passkey. Bounds the credential scan to one per DID per window, concurrent requests included (see below) |
+| `siwx_user/{sha256(token)}` | 30 days | opaque login user session: token → DID (indexed under `idx:own_sessions/…`; a legacy `user:session/{token}` is read until it expires) |
+| `device_code/{sha256(device code)}` | 1800 s | device-code grant state (with the user code's digest) |
+| `user_code/{sha256(user code)}` | 1800 s | user code → the device code's digest |
+| `device_passkey_offer/{sha256(user code)}` | 1800 s (60 s for a "none" answer) | the device page's answer for a hinted code: `offered`, `no_passkey` or `no_account` |
+
+Ceremony, device and user codes are keyed by their digest so the store never holds a value a
+client presents; entries a build before digest keys wrote under `webauthn:challenge/`,
+`webauthn:link_challenge/`, `device_codes/` and `user_codes/` are read until they expire. See
+[architecture.md](architecture.md#redis-keyspace).
 
 For login and linking, `{session_id}` is the OIDC session. The device-approval
 flow uses `device_passkey_{user_code}`, and the account page uses
@@ -113,9 +134,36 @@ flow uses `device_passkey_{user_code}`, and the account page uses
 (under its `did:key`) and when one is linked (under the wallet DID), and pruned
 on erasure. It is advisory: if it is missing, `get_passkeys_for_did` scans the
 credential keyspace and fills it back in
-(`get_passkeys_for_did_scan_fallback_equals_index`), so a missed update costs a
-scan and never hides a passkey. A failed index update never fails the
+(`get_passkeys_for_did_scan_fallback_equals_index`), so for the login picker a
+missed update costs a scan and never hides a passkey (the device page's marker
+below is the one exception). A failed index update never fails the
 registration.
+
+**The device page's scan is bounded.** `GET /device/verify` is unauthenticated and,
+for a code that names an account (`login_hint`), asks whether that account has a
+passkey, which for a DID with none is an index miss and so the full scan above. It
+therefore goes through `credential_store::did_has_credential_bounded`: the
+`by_did` index first, then the shared store, then the `webauthn:no_passkey` marker,
+and the scan only when none answers. The caller claims the scan before running it,
+with one atomic `SET webauthn:no_passkey/{sha256(did)} scanning NX EX`, so of any
+number of concurrent requests exactly one scans. A request that loses the claim reads
+the marker: `1` means no passkey, and `scanning` means the server cannot tell yet, so
+the page keeps the passkey button and nothing is kept for the code. The scan that
+finds nothing replaces the marker with `1` for ten minutes, and one that finds a
+passkey deletes it (the back-filled index answers next). A scan that fails, or skipped
+a key it could not read, cannot tell and keeps its claim until it expires 30 seconds
+after it was taken, as does a claim abandoned by a dropped request, so a failing scan
+repeats at most once per 30 seconds per account. While the shared store fails, the
+page cannot tell and does not scan. So: at most one completed scan per DID per ten
+minutes, concurrent callers included. A passkey registered or linked inside the
+window lands in the index, which is read before the marker, so the marker hides it
+only if that best-effort index write failed. The login picker and every other caller
+keep `get_passkeys_for_did` as before. The answer for a code is kept in
+`device_passkey_offer/…` too, so repeating the request for a settled code asks
+neither the homeserver nor the credential store again
+(`concurrent_checks_of_one_did_run_exactly_one_scan`,
+`a_did_with_no_passkey_is_scanned_once_per_window`,
+`the_passkey_answer_for_a_code_is_computed_once`).
 
 **Optional shared credential store.** Setting `AQUA_WEBAUTHN_REDIS_URL` makes
 siwx-oidc also write credentials to aqua-auth's credential store at that Redis
@@ -138,9 +186,15 @@ never with an identifier the client supplies.
 
 - **The `siwx_user` cookie.** Set after a successful `/sign_in` and after an
   account re-auth: `Path=/`, `HttpOnly`, `SameSite=Strict`, `Secure` on https,
-  `Max-Age` 30 days. Its value is a random token; the DID lives only in Redis at
-  `user:session/{token}`. It is separate from the `acct_session` cookie of the
-  account page (`Path=/account`).
+  `Max-Age` 30 days. Its value is a random token; the DID lives only in Redis, under
+  the token's digest (`siwx_user/{sha256(token)}`). It is separate from the
+  `acct_session` cookie of the account page (`Path=/account`).
+- **Ending it.** The account page's **Sign out** (`POST /account/sign_out`) ends this
+  browser's hint and account session and clears both cookies. `logout/all`,
+  deactivation and erasure end every hint and account session of the user. RP-initiated
+  logout (`/end_session`) leaves the hint alone: it ends an RP's grant, the hint is not
+  a session at this provider (it authorizes nothing), and a navigation to `/end_session`
+  from an RP on another site does not carry the `SameSite=Strict` cookie anyway.
 - **Scoping.** `authenticate_start` looks up the token, and sets
   `allowCredentials` to exactly the credentials of that DID: its own passkeys
   plus any linked to it. The response adds `detected_mxid`

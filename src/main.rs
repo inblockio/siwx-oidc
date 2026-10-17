@@ -5,18 +5,22 @@
 mod account;
 mod admin_token;
 mod axum_lib;
+mod backchannel;
 mod compat;
 mod config;
 mod device_auth;
+// SS4 flag 3: removes devices no client can use (off by default).
+mod device_reaper;
 // Provider-attested DID assertions: the field name, the `{did, proof}` value
 // builder, and the ES256 minter behind the `io.inblock.did` profile object.
 //
-// The write channel that calls it is `oidc::provision_synapse_device` ->
+// The write channel that calls it is `oidc::provision_synapse_account` ->
 // `synapse_client::publish_did_field`, reached from BOTH sign-in paths. The
 // `#[allow(dead_code)]` that sat here while only the minter existed is gone;
 // if it ever needs to come back, that means the publication call site was
 // deleted and users stopped getting an attested DID.
 mod did_assertion;
+mod guest;
 mod introspect;
 mod localpart;
 mod oidc;
@@ -24,6 +28,7 @@ mod oidc;
 // discovery hint only — see the module doc's "never an authorization source".
 mod resolve;
 mod synapse_client;
+mod teardown;
 mod webauthn;
 
 #[tokio::main]

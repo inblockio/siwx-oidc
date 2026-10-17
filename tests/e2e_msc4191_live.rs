@@ -3,15 +3,19 @@
 //! needs from `e2e_msc3861.rs` so this file can be run on its own and never
 //! modifies the existing test file.
 //!
-//! This is authorized production testing using a throwaway wallet identity that
-//! cleans up after itself (device_delete at the end).
+//! Every test that signs in uses a fresh throwaway wallet identity, whose
+//! first sign-in creates an account on the target homeserver, and deactivates
+//! that account at the end (`org.matrix.account_deactivate`).
+//! `msc4191_device_management_live` deactivates it also when a check failed,
+//! and fails when the deactivation does not succeed; the cross-signing tests
+//! deactivate best effort after their last check.
 //!
 //! Required environment variables:
 //!   SIWEOIDC_HOST - base URL of the siwx-oidc instance (default: http://localhost:8081)
 //!   MATRIX_HOST   - base URL of the Matrix homeserver (default: http://localhost:8448)
 //!
-//! Run:
-//!   SIWEOIDC_HOST=https://siwx-oidc.inblock.io MATRIX_HOST=https://matrix.inblock.io \
+//! Run (set `E2E_STRICT_SKIPS=1` so a skipped assertion fails):
+//!   SIWEOIDC_HOST=https://siwx.example.org MATRIX_HOST=https://matrix.example.org \
 //!     cargo test --test e2e_msc4191_live -- --ignored --nocapture
 
 use base64::{
@@ -452,21 +456,82 @@ async fn post_account_action(
 // Test: MSC4191 device management lifecycle (AC2 + AC3) against prod
 // ---------------------------------------------------------------------------
 
+/// Deactivate a throwaway identity's account through the signed account action
+/// (`org.matrix.account_deactivate`). `Ok` only when siwx-oidc answers that
+/// the account is deactivated. The request runs as its own task, so a transport
+/// failure (which `post_account_action` turns into a panic) comes back as an
+/// `Err` instead of replacing the failure of the test it cleans up after.
+async fn deactivate_throwaway(
+    signing_key: &SigningKey,
+    address: &str,
+    did: &str,
+) -> Result<(), String> {
+    let (key, address, did) = (signing_key.clone(), address.to_string(), did.to_string());
+    let (status, body) = tokio::spawn(async move {
+        post_account_action(&key, &address, &did, "org.matrix.account_deactivate", None).await
+    })
+    .await
+    .map_err(|e| format!("the deactivation request failed: {e}"))?;
+    let kind = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| v["kind"].as_str().map(str::to_string));
+    if status == StatusCode::OK && kind.as_deref() == Some("deactivated") {
+        Ok(())
+    } else {
+        Err(format!("deactivation answered {status} {body}"))
+    }
+}
+
+/// AC2 + AC3 against a live deployment, with a throwaway identity that is
+/// deactivated at the end, also when a check failed.
 #[tokio::test]
 #[ignore]
 async fn msc4191_device_management_live() {
-    let oidc = siweoidc_host();
-    let matrix = matrix_host();
-    eprintln!("[e2e] SIWEOIDC_HOST={oidc}");
-    eprintln!("[e2e] MATRIX_HOST={matrix}");
-
-    // 1. Fresh throwaway identity.
+    // 1. Fresh throwaway identity. Its first sign-in creates an account, which
+    //    is deactivated below, also when a check in the lifecycle failed: the
+    //    lifecycle runs as its own task, so a failed assertion comes back as a
+    //    `JoinError` here instead of unwinding past the cleanup.
     let secret_key = k256::SecretKey::random(&mut thread_rng());
     let signing_key = SigningKey::from(&secret_key);
     let addr_bytes = address_from_key(signing_key.verifying_key());
     let address = eip55_checksum(&addr_bytes);
     let did = format!("did:pkh:eip155:1:{}", address);
     eprintln!("[e2e] throwaway did={did}");
+
+    let outcome = tokio::spawn(device_management_lifecycle(
+        signing_key.clone(),
+        address.clone(),
+        did.clone(),
+    ))
+    .await;
+    let cleanup = deactivate_throwaway(&signing_key, &address, &did).await;
+    match outcome {
+        Ok(()) => {
+            if let Err(e) = cleanup {
+                panic!("the throwaway account was not deactivated: {e}");
+            }
+            eprintln!("[e2e] cleanup: the throwaway account is deactivated");
+        }
+        Err(join) => {
+            match &cleanup {
+                Ok(()) => eprintln!("[e2e] failed; the throwaway account is deactivated"),
+                Err(e) => eprintln!("[e2e] failed; the throwaway account was not deactivated: {e}"),
+            }
+            match join.try_into_panic() {
+                Ok(payload) => std::panic::resume_unwind(payload),
+                Err(join) => panic!("the test task did not complete: {join}"),
+            }
+        }
+    }
+}
+
+/// The device-management lifecycle (AC2, AC3) for one throwaway identity;
+/// `msc4191_device_management_live` deactivates its account afterwards.
+async fn device_management_lifecycle(signing_key: SigningKey, address: String, did: String) {
+    let oidc = siweoidc_host();
+    let matrix = matrix_host();
+    eprintln!("[e2e] SIWEOIDC_HOST={oidc}");
+    eprintln!("[e2e] MATRIX_HOST={matrix}");
 
     // 2. Full wallet login -> provisioned device + access token.
     let login = login_with_key(&signing_key, &address, &did).await;
@@ -697,7 +762,7 @@ async fn msc4191_device_management_live() {
         eprintln!("[e2e] whoami(before) user_id={user_id} (AC3 precondition OK)");
     }
 
-    // device_delete (this is also the cleanup for the throwaway identity).
+    // device_delete of the session's own device.
     let (del_status, del_body) = post_account_action(
         &signing_key,
         &address,

@@ -58,44 +58,62 @@ export async function requireElementStack() {
 
 /**
  * Open Element and wait for either the welcome/login shell or an already-logged-in app.
- * Returns 'app' | 'login' | 'unknown'.
+ * Returns 'app' | 'login' | 'unknown' ('unknown' when neither appears within `timeout`).
+ *
+ * Signed out, Element does not stay on its own page: with `sso_redirect_options.immediate`
+ * (siwx-oidc-matrix-server's Element config) it redirects to the provider's sign-in page a
+ * few hundred milliseconds after `domcontentloaded`, while its own document still has an
+ * empty body. A `page.evaluate` that runs as that navigation commits fails with "Execution
+ * context was destroyed". So the landing is awaited with `page.waitForFunction`, which
+ * Playwright runs again in each new document after a navigation: Element's empty document
+ * reads as not landed yet, and the wait ends on the page the redirect leads to.
  */
-export async function openElement(page) {
+export async function openElement(page, { timeout = 45_000 } = {}) {
   await page.goto(ELEMENT_URL, { waitUntil: 'domcontentloaded' });
   // Element loads a large SPA; wait for either login affordance or room list chrome.
-  const deadline = Date.now() + 45_000;
-  while (Date.now() < deadline) {
-    const state = await page.evaluate(() => {
-      const body = document.body?.innerText || '';
-      if (
-        document.querySelector('[data-testid="room-list"]') ||
-        document.querySelector('.mx_RoomList') ||
-        body.includes('Home') && document.querySelector('.mx_MatrixChat')
-      ) {
-        return 'app';
-      }
-      if (
-        body.includes('Sign in') ||
-        body.includes('Continue') ||
-        body.includes('homeserver') ||
-        document.querySelector('[data-testid="login"]') ||
-        document.querySelector('.mx_AuthPage')
-      ) {
-        return 'login';
-      }
-      return 'unknown';
-    });
-    if (state !== 'unknown') return state;
-    await page.waitForTimeout(500);
+  try {
+    const landed = await page.waitForFunction(
+      () => {
+        const body = document.body?.innerText || '';
+        if (
+          document.querySelector('[data-testid="room-list"]') ||
+          document.querySelector('.mx_RoomList') ||
+          body.includes('Home') && document.querySelector('.mx_MatrixChat')
+        ) {
+          return 'app';
+        }
+        if (
+          body.includes('Sign in') ||
+          body.includes('Continue') ||
+          body.includes('homeserver') ||
+          document.querySelector('[data-testid="login"]') ||
+          document.querySelector('.mx_AuthPage')
+        ) {
+          return 'login';
+        }
+        return null; // not landed yet: keep waiting
+      },
+      null,
+      { timeout, polling: 250 },
+    );
+    return await landed.jsonValue();
+  } catch (e) {
+    if (e?.name === 'TimeoutError') return 'unknown';
+    throw e;
   }
-  return 'unknown';
 }
 
 /**
  * Best-effort: clear Element localStorage so each test starts logged out.
+ *
+ * Cleared from Element's static `config.json`, a document on Element's origin that runs no
+ * Element code. Clearing it from Element's own page raced Element's redirect to the provider
+ * (see openElement): the clear could fail as the navigation committed, or run in the
+ * provider's document and clear the wrong origin.
  */
 export async function clearElementSession(page) {
-  await page.goto(ELEMENT_URL, { waitUntil: 'domcontentloaded' });
+  const elementBase = ELEMENT_URL.endsWith('/') ? ELEMENT_URL : `${ELEMENT_URL}/`;
+  await page.goto(new URL('config.json', elementBase).href, { waitUntil: 'load' });
   await page.evaluate(() => {
     try {
       localStorage.clear();

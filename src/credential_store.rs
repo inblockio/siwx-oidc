@@ -32,6 +32,12 @@
 //! miss. That makes flipping the flag safe even if the backfill
 //! ([`crate::credential_migration`]) has not run, or has not finished.
 //!
+//! # Registration
+//!
+//! A mirror write inserts or replaces. Registration is create-only, so before
+//! it writes anything it asks [`shared_store_holds`] and refuses an id the store
+//! already holds, even when the legacy namespace has no entry for it.
+//!
 //! # What this module does NOT touch
 //!
 //! Account linking. `webauthn:link/*` is written only by the binary's
@@ -51,7 +57,11 @@ use tokio::sync::OnceCell;
 use tracing::{error, info, warn};
 
 use crate::credential_migration::sign_count_from_blob;
-use crate::db::{RedisClient, KV_WEBAUTHN_CREDENTIAL_PREFIX};
+use crate::db::{
+    RedisClient, KV_WEBAUTHN_BY_DID_PREFIX, KV_WEBAUTHN_CREDENTIAL_PREFIX,
+    KV_WEBAUTHN_NO_PASSKEY_PREFIX,
+};
+use crate::redact::{fingerprint, redact_url};
 
 /// The runtime flag. Set to a Redis URL to enable the shared store.
 pub const ENABLE_ENV: &str = "AQUA_WEBAUTHN_REDIS_URL";
@@ -128,12 +138,16 @@ pub async fn probe_at_boot() -> Result<()> {
     if shared_store().await.is_none() {
         error!("credential store: {ENABLE_ENV} is set but the store could not be opened");
         anyhow::bail!(
-            "{ENABLE_ENV} is set to {url} but the aqua-auth credential store could not be \
+            "{ENABLE_ENV} is set to {shown} but the aqua-auth credential store could not be \
              opened. Refusing to start: serving legacy-only while the operator believes \
-             dual-write is on silently strands every credential registered from now on."
+             dual-write is on silently strands every credential registered from now on.",
+            shown = redact_url(url)
         );
     }
-    info!("credential store: dual-write ENABLED -> {url}");
+    info!(
+        "credential store: dual-write ENABLED -> {shown}",
+        shown = redact_url(url)
+    );
     Ok(())
 }
 
@@ -148,7 +162,10 @@ pub async fn mirror_credential(cred_id_b64: &str, blob: &str, did: &str, label: 
         return;
     };
     let Some(id) = credential_id(cred_id_b64) else {
-        warn!("mirror_credential: {cred_id_b64} is not base64url; not mirrored");
+        warn!(
+            "mirror_credential: {cred} is not base64url; not mirrored",
+            cred = fingerprint(cred_id_b64)
+        );
         return;
     };
     // The counter lives inside the blob. Reading it here (rather than passing 0)
@@ -161,7 +178,10 @@ pub async fn mirror_credential(cred_id_b64: &str, blob: &str, did: &str, label: 
     {
         Some(Ok(n)) => n,
         _ => {
-            warn!("mirror_credential: {cred_id_b64} has no readable cred.counter; not mirrored");
+            warn!(
+                "mirror_credential: {cred} has no readable cred.counter; not mirrored",
+                cred = fingerprint(cred_id_b64)
+            );
             return;
         }
     };
@@ -177,9 +197,50 @@ pub async fn mirror_credential(cred_id_b64: &str, blob: &str, did: &str, label: 
         })
         .await;
     match res {
-        Ok(()) => info!("mirror_credential: {cred_id_b64} -> aqua-auth store (did={did})"),
-        Err(e) => warn!("mirror_credential: {cred_id_b64} failed: {e}"),
+        Ok(()) => info!(
+            "mirror_credential: {cred} -> aqua-auth store (did={did})",
+            cred = fingerprint(cred_id_b64)
+        ),
+        Err(e) => warn!(
+            "mirror_credential: {cred} failed: {e}",
+            cred = fingerprint(cred_id_b64)
+        ),
     }
+}
+
+/// Whether the shared aqua-auth store already holds a credential under this
+/// id. `Ok(false)` when the flag is off.
+///
+/// Registration asks this before its create-only legacy write, because
+/// [`mirror_credential`] inserts or replaces: without the check, an id the
+/// store already holds (written there by another service sharing the store, or
+/// one whose legacy entry is gone) would get its row's key and `did` replaced
+/// by the new registration.
+///
+/// A failed lookup is an `Err`, never `false`: registration fails closed (the
+/// user can retry) instead of mirroring over a row it could not see. An id
+/// that is not base64url is `Ok(false)`, because [`mirror_credential`] never
+/// writes such an id either.
+///
+/// The check and the later mirror write are separate operations on a Redis
+/// that may be another server than the legacy one, so no atomic step covers
+/// both: a writer outside this process that inserts the same id between them
+/// is still replaced. Closing that gap needs a create-only insert in the store
+/// itself.
+pub async fn shared_store_holds(cred_id_b64: &str) -> Result<bool> {
+    let Some(store) = shared_store().await else {
+        return Ok(false);
+    };
+    let Some(id) = credential_id(cred_id_b64) else {
+        return Ok(false);
+    };
+    let row = store.get_by_id(&id).await.map_err(|e| {
+        anyhow::anyhow!(
+            "aqua-auth credential store lookup for {cred} failed: {e}",
+            cred = fingerprint(cred_id_b64)
+        )
+    })?;
+    Ok(row.is_some())
 }
 
 /// Mirror an advanced sign counter. No-op when the flag is off. Best-effort.
@@ -195,7 +256,10 @@ pub async fn mirror_sign_count(cred_id_b64: &str, new_count: u32) {
     };
     match store.update_sign_count(&id, new_count).await {
         Ok(()) | Err(WebauthnStoreError::NotFound) => {}
-        Err(e) => warn!("mirror_sign_count: {cred_id_b64} failed: {e}"),
+        Err(e) => warn!(
+            "mirror_sign_count: {cred} failed: {e}",
+            cred = fingerprint(cred_id_b64)
+        ),
     }
 }
 
@@ -213,7 +277,10 @@ pub async fn mirror_delete(did: &str, cred_id_b64: &str) {
     };
     match store.delete(did, &id).await {
         Ok(_) => {}
-        Err(e) => warn!("mirror_delete: {cred_id_b64} failed: {e}"),
+        Err(e) => warn!(
+            "mirror_delete: {cred} failed: {e}",
+            cred = fingerprint(cred_id_b64)
+        ),
     }
 }
 
@@ -260,7 +327,10 @@ fn reconcile_sign_count(cred_id_b64: &str, blob: String, stored: u32) -> String 
     match serde_json::to_string(&value) {
         Ok(s) => s,
         Err(e) => {
-            warn!("read_blob: {cred_id_b64} sign-count reconcile failed ({e}); using stored blob");
+            warn!(
+                "read_blob: {cred} sign-count reconcile failed ({e}); using stored blob",
+                cred = fingerprint(cred_id_b64)
+            );
             blob
         }
     }
@@ -275,7 +345,10 @@ pub async fn read_blob(redis: &RedisClient, cred_id_b64: &str) -> Result<Option<
                     if let Ok(blob) = String::from_utf8(row.public_key) {
                         return Ok(Some(reconcile_sign_count(cred_id_b64, blob, stored_count)));
                     }
-                    warn!("read_blob: {cred_id_b64} in the aqua-auth store is not UTF-8; falling back");
+                    warn!(
+                        "read_blob: {cred} in the aqua-auth store is not UTF-8; falling back",
+                        cred = fingerprint(cred_id_b64)
+                    );
                 }
                 Ok(None) => {}
                 Err(e) => warn!("read_blob: aqua-auth store lookup failed ({e}); falling back"),
@@ -334,6 +407,154 @@ where
     Ok(ids)
 }
 
+/// What [`did_has_credential_bounded`] could tell about a DID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasskeyCheck {
+    /// The DID has a stored passkey.
+    Found,
+    /// The DID has none: a scan found nothing, or a recent scan did.
+    Absent,
+    /// The server cannot tell now: another request holds the scan claim (running, or kept
+    /// by a scan that failed or skipped a read, until the claim expires), or the aqua-auth
+    /// store failed. Nothing is kept for the code, so a later call asks again.
+    Unknown,
+}
+
+/// The value of a `webauthn:no_passkey` marker once a scan found no passkey.
+const NO_PASSKEY_MARKER: &str = "1";
+
+/// The value of a `webauthn:no_passkey` marker while one request is scanning.
+const SCAN_CLAIM: &str = "scanning";
+
+/// The longest a scan claim lives (seconds), counted from when it was taken. A request
+/// dropped mid-scan, or a scan that failed or skipped a read, leaves its claim, so this
+/// bounds how long callers for that DID are told "cannot tell" and how often a failing
+/// scan can run again.
+const SCAN_CLAIM_TTL_SECS: u64 = 30;
+
+/// Whether `did` has a stored passkey, for the unauthenticated device approval page,
+/// with the credential scan bounded.
+///
+/// [`list_credential_ids`] answers an index miss with `KEYS webauthn:link/*` and
+/// `KEYS webauthn:credential/*` plus a `GET` per credential, and a DID with no passkey
+/// is exactly an index miss every time. The device page is reachable by anyone who can
+/// mint a code, naming any account, so it must not run that scan per request, however
+/// many requests arrive at once. This reads, in order: the `webauthn:by_did` index, the
+/// aqua-auth store when it is on, then the `webauthn:no_passkey` marker, and scans only
+/// when none of them answers and the caller wins the claim on the marker.
+///
+/// The claim is one atomic `SET webauthn:no_passkey/{digest} scanning NX EX` made
+/// BEFORE the scan, so of any number of concurrent callers exactly one scans. A caller
+/// that loses the claim answers from the marker: `1` is [`PasskeyCheck::Absent`],
+/// `scanning` is [`PasskeyCheck::Unknown`]. The winner replaces the marker with `1` for
+/// `negative_ttl_secs` when the scan finds nothing (so one DID costs at most one completed
+/// scan per window), and deletes it when the scan finds a passkey (the index the scan
+/// back-fills answers the next call). A scan that fails, or that skipped a key whose
+/// read failed, is [`PasskeyCheck::Unknown`] and keeps its claim until the claim expires,
+/// so a failing scan repeats at most once per claim lifetime per DID (a `KEYS` that timed
+/// out on the client still ran on the server). While the aqua-auth store fails, the
+/// answer is [`PasskeyCheck::Unknown`] without a scan, since a scan then could not say
+/// "no passkey" anyway. A passkey registered or linked inside the window lands in the
+/// index, which is read before the marker, so the marker hides it only if that
+/// best-effort index write failed. The login picker and every other caller keep
+/// [`list_credential_ids`] unchanged.
+pub async fn did_has_credential_bounded<F>(
+    redis: &RedisClient,
+    did: &str,
+    derive: F,
+    negative_ttl_secs: u64,
+) -> Result<PasskeyCheck>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let index_key = format!("{}/{}", KV_WEBAUTHN_BY_DID_PREFIX, did);
+    if !redis.smembers_raw(&index_key).await?.is_empty() {
+        return Ok(PasskeyCheck::Found);
+    }
+    // A failed read anywhere means "no passkey" cannot be said, only "cannot tell".
+    let mut store_failed = false;
+    if let Some(store) = shared_store().await {
+        match store.list_for_did(did).await {
+            Ok(rows) if !rows.is_empty() => return Ok(PasskeyCheck::Found),
+            Ok(_) => {}
+            Err(e) => {
+                warn!("did_has_credential_bounded: aqua-auth store failed ({e}); legacy only");
+                store_failed = true;
+            }
+        }
+    }
+    let marker_key = format!(
+        "{}/{}",
+        KV_WEBAUTHN_NO_PASSKEY_PREFIX,
+        crate::db::tokens::digest(did)
+    );
+    if let Some(marker) = redis.get_raw(&marker_key).await? {
+        return Ok(marker_answer(&marker));
+    }
+    if store_failed {
+        // A scan could only answer Found or Unknown now, and both keep the button: no
+        // full-keyspace scan while the store is down.
+        return Ok(PasskeyCheck::Unknown);
+    }
+    // Claim the scan before running it, so that concurrent callers do not each run it.
+    let claim_ttl = negative_ttl_secs.clamp(1, SCAN_CLAIM_TTL_SECS);
+    if !redis
+        .set_nx_ex_raw(&marker_key, SCAN_CLAIM, claim_ttl)
+        .await?
+    {
+        // Another request holds the scan, or has just finished it.
+        return Ok(match redis.get_raw(&marker_key).await? {
+            Some(marker) => marker_answer(&marker),
+            None => PasskeyCheck::Unknown,
+        });
+    }
+    // The scan (and its back-fill of the index) is the picker's own. A failure keeps the
+    // claim until it expires: releasing it would let the next request scan again at once
+    // (a KEYS that timed out on the client still ran on the server), so a failing scan
+    // repeats at most once per claim lifetime per DID.
+    match redis.get_passkeys_for_did_reporting(did, derive).await {
+        Ok((found, _)) if !found.is_empty() => {
+            release_claim(redis, &marker_key).await;
+            Ok(PasskeyCheck::Found)
+        }
+        Ok((_, false)) => {
+            warn!("did_has_credential_bounded: a read failed during the check; cannot tell");
+            Ok(PasskeyCheck::Unknown)
+        }
+        Ok(_) => {
+            if let Err(e) = redis
+                .set_ex_raw(&marker_key, NO_PASSKEY_MARKER, negative_ttl_secs)
+                .await
+            {
+                warn!("did_has_credential_bounded: could not plant the no-passkey marker: {e}");
+            }
+            Ok(PasskeyCheck::Absent)
+        }
+        Err(e) => {
+            warn!("did_has_credential_bounded: the credential scan failed ({e})");
+            Ok(PasskeyCheck::Unknown)
+        }
+    }
+}
+
+/// What a marker some other request left says: `1` is a finished scan that found nothing,
+/// anything else (`scanning`, or a value this build does not know) is "cannot tell".
+fn marker_answer(marker: &str) -> PasskeyCheck {
+    if marker == NO_PASSKEY_MARKER {
+        PasskeyCheck::Absent
+    } else {
+        PasskeyCheck::Unknown
+    }
+}
+
+/// Delete the scan claim so a later call can scan. If this fails the claim expires by
+/// itself within [`SCAN_CLAIM_TTL_SECS`].
+async fn release_claim(redis: &RedisClient, marker_key: &str) {
+    if let Err(e) = redis.del_raw(marker_key).await {
+        warn!("did_has_credential_bounded: could not release the scan claim: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +592,280 @@ mod tests {
             Some("redis://127.0.0.1:6379"),
             "a URL means on, trimmed"
         );
+    }
+
+    /// The device page asks about a DID anyone can name, so a DID with no passkey is
+    /// scanned once per window and a later passkey is still seen at once. Needs Redis.
+    #[tokio::test]
+    async fn a_did_with_no_passkey_is_scanned_once_per_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(db) = crate::test_support::redis().await else {
+            return;
+        };
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let did = format!("did:key:zNoPasskey{nonce}");
+        // One stored credential, so every scan has something to look at: `derive` runs
+        // once per `webauthn:credential/*` key a scan reads.
+        let cred_key = format!("{}/probe-{nonce}", KV_WEBAUTHN_CREDENTIAL_PREFIX);
+        db.set_raw(&cred_key, "{}").await.unwrap();
+        let marker_key = format!(
+            "{}/{}",
+            KV_WEBAUTHN_NO_PASSKEY_PREFIX,
+            crate::db::tokens::digest(&did)
+        );
+        let index_key = format!("{}/{did}", KV_WEBAUTHN_BY_DID_PREFIX);
+
+        let scans = AtomicUsize::new(0);
+        let derive = |_: &str| {
+            scans.fetch_add(1, Ordering::SeqCst);
+            None
+        };
+        assert_eq!(
+            did_has_credential_bounded(&db, &did, derive, 60)
+                .await
+                .unwrap(),
+            PasskeyCheck::Absent
+        );
+        assert!(
+            scans.load(Ordering::SeqCst) >= 1,
+            "the first check scans the credentials"
+        );
+        let ttl = db.ttl_raw(&marker_key).await.unwrap();
+        assert!(
+            (1..=60).contains(&ttl),
+            "a scan that found nothing plants the marker for the window: {ttl}"
+        );
+
+        let before = scans.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            assert_eq!(
+                did_has_credential_bounded(&db, &did, derive, 60)
+                    .await
+                    .unwrap(),
+                PasskeyCheck::Absent
+            );
+        }
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            before,
+            "inside the window the credentials are not scanned again"
+        );
+
+        // A passkey registered inside the window lands in the index, read before the marker.
+        db.index_add_passkey(&did, &format!("probe-{nonce}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            did_has_credential_bounded(&db, &did, derive, 60)
+                .await
+                .unwrap(),
+            PasskeyCheck::Found
+        );
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            before,
+            "answered by the index"
+        );
+
+        // Without the marker the scan runs again (the window really is what bounds it).
+        db.del_raw(&index_key).await.unwrap();
+        db.del_raw(&marker_key).await.unwrap();
+        assert_eq!(
+            did_has_credential_bounded(&db, &did, derive, 60)
+                .await
+                .unwrap(),
+            PasskeyCheck::Absent
+        );
+        assert!(scans.load(Ordering::SeqCst) > before);
+
+        db.del_raw(&cred_key).await.unwrap();
+        db.del_raw(&marker_key).await.unwrap();
+    }
+
+    /// A DID the scan finds a passkey for is answered `true` and plants no marker.
+    /// Needs Redis.
+    #[tokio::test]
+    async fn a_did_with_a_passkey_plants_no_marker() {
+        let Some(db) = crate::test_support::redis().await else {
+            return;
+        };
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let did = format!("did:key:zHasPasskey{nonce}");
+        let cred_key = format!("{}/has-{nonce}", KV_WEBAUTHN_CREDENTIAL_PREFIX);
+        db.set_raw(&cred_key, &did).await.unwrap();
+        let marker_key = format!(
+            "{}/{}",
+            KV_WEBAUTHN_NO_PASSKEY_PREFIX,
+            crate::db::tokens::digest(&did)
+        );
+        let derive = |raw: &str| (raw == did).then(|| did.clone());
+        assert_eq!(
+            did_has_credential_bounded(&db, &did, derive, 60)
+                .await
+                .unwrap(),
+            PasskeyCheck::Found
+        );
+        assert!(
+            db.get_raw(&marker_key).await.unwrap().is_none(),
+            "a scan that finds a passkey leaves neither a marker nor its claim"
+        );
+        db.del_raw(&cred_key).await.unwrap();
+        db.del_raw(&format!("{}/{did}", KV_WEBAUTHN_BY_DID_PREFIX))
+            .await
+            .unwrap();
+    }
+
+    /// The bound holds for concurrent callers, not only sequential ones: of many requests
+    /// for one DID with no passkey that arrive together, exactly one runs the scan. The
+    /// scan reads every stored credential once and runs `derive` on it, so the count of
+    /// `derive` calls on this test's own credentials is the count of scans times
+    /// `CREDS`. Needs Redis.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_checks_of_one_did_run_exactly_one_scan() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        const CALLS: usize = 10;
+        const CREDS: usize = 40;
+        let Some(db) = crate::test_support::redis().await else {
+            return;
+        };
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let did = format!("did:key:zConcurrent{nonce}");
+        let tag = format!("probe-body-{nonce}");
+        // Enough credentials that a scan is not over before the other callers arrive.
+        let mut cred_keys = Vec::new();
+        for i in 0..CREDS {
+            let key = format!("{}/probe-{nonce}-{i}", KV_WEBAUTHN_CREDENTIAL_PREFIX);
+            db.set_raw(&key, &tag).await.unwrap();
+            cred_keys.push(key);
+        }
+        let marker_key = format!(
+            "{}/{}",
+            KV_WEBAUTHN_NO_PASSKEY_PREFIX,
+            crate::db::tokens::digest(&did)
+        );
+        let reads = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(tokio::sync::Barrier::new(CALLS));
+        let mut calls = Vec::new();
+        for _ in 0..CALLS {
+            let (db, did, tag) = (db.clone(), did.clone(), tag.clone());
+            let (reads, start) = (reads.clone(), start.clone());
+            calls.push(tokio::spawn(async move {
+                let derive = move |raw: &str| {
+                    if raw == tag {
+                        reads.fetch_add(1, Ordering::SeqCst);
+                    }
+                    None
+                };
+                start.wait().await;
+                did_has_credential_bounded(&db, &did, derive, 60)
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut answers = Vec::new();
+        for call in calls {
+            answers.push(call.await.unwrap());
+        }
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            CREDS,
+            "{CALLS} concurrent callers ran one scan between them (each scan reads {CREDS} \
+             credentials): {answers:?}"
+        );
+        assert!(
+            answers.contains(&PasskeyCheck::Absent),
+            "the caller that scanned says there is none: {answers:?}"
+        );
+        assert!(
+            !answers.contains(&PasskeyCheck::Found),
+            "no caller invents a passkey: {answers:?}"
+        );
+        // Every caller that did not scan said "cannot tell" or read the finished marker.
+        assert_eq!(
+            db.get_raw(&marker_key).await.unwrap().as_deref(),
+            Some("1"),
+            "the finished scan left the no-passkey marker"
+        );
+        let ttl = db.ttl_raw(&marker_key).await.unwrap();
+        assert!(
+            (1..=60).contains(&ttl),
+            "the marker lives for the window: {ttl}"
+        );
+        assert_eq!(
+            did_has_credential_bounded(&db, &did, |_: &str| None, 60)
+                .await
+                .unwrap(),
+            PasskeyCheck::Absent
+        );
+
+        for key in cred_keys {
+            db.del_raw(&key).await.unwrap();
+        }
+        db.del_raw(&marker_key).await.unwrap();
+    }
+
+    /// A `scanning` marker means another request is scanning now: the answer is "cannot
+    /// tell", nothing is scanned, and the marker is left for its owner to replace. Once
+    /// the owner has written `1` the answer is "none". Needs Redis.
+    #[tokio::test]
+    async fn a_scan_in_progress_is_cannot_tell_and_scans_nothing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(db) = crate::test_support::redis().await else {
+            return;
+        };
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let did = format!("did:key:zScanning{nonce}");
+        let cred_key = format!("{}/probe-{nonce}", KV_WEBAUTHN_CREDENTIAL_PREFIX);
+        db.set_raw(&cred_key, "{}").await.unwrap();
+        let marker_key = format!(
+            "{}/{}",
+            KV_WEBAUTHN_NO_PASSKEY_PREFIX,
+            crate::db::tokens::digest(&did)
+        );
+        db.set_ex_raw(&marker_key, SCAN_CLAIM, 30).await.unwrap();
+
+        let scans = AtomicUsize::new(0);
+        let derive = |_: &str| {
+            scans.fetch_add(1, Ordering::SeqCst);
+            None
+        };
+        for _ in 0..3 {
+            assert_eq!(
+                did_has_credential_bounded(&db, &did, derive, 60)
+                    .await
+                    .unwrap(),
+                PasskeyCheck::Unknown
+            );
+        }
+        assert_eq!(scans.load(Ordering::SeqCst), 0, "nothing was scanned");
+        assert_eq!(
+            db.get_raw(&marker_key).await.unwrap().as_deref(),
+            Some(SCAN_CLAIM),
+            "the claim is the scanning request's to replace"
+        );
+
+        // The owner finished and found nothing.
+        db.set_ex_raw(&marker_key, NO_PASSKEY_MARKER, 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            did_has_credential_bounded(&db, &did, derive, 60)
+                .await
+                .unwrap(),
+            PasskeyCheck::Absent
+        );
+        assert_eq!(scans.load(Ordering::SeqCst), 0, "still nothing scanned");
+
+        db.del_raw(&cred_key).await.unwrap();
+        db.del_raw(&marker_key).await.unwrap();
+    }
+
+    #[test]
+    fn only_a_finished_scan_marker_says_there_is_no_passkey() {
+        assert_eq!(marker_answer(NO_PASSKEY_MARKER), PasskeyCheck::Absent);
+        assert_eq!(marker_answer(SCAN_CLAIM), PasskeyCheck::Unknown);
+        assert_eq!(marker_answer(""), PasskeyCheck::Unknown);
+        assert_eq!(marker_answer("0"), PasskeyCheck::Unknown);
     }
 }
