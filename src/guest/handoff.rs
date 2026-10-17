@@ -1032,15 +1032,32 @@ pub async fn resume(State(state): State<GuestState>, headers: HeaderMap) -> Resp
 /// time anyone reads it), says the account is deleted and calls `forgetKey()` on this
 /// browser's key store. After a claim (ten minutes) the page reads
 /// `resume`, says the account is kept and still forgets the browser key.
-pub async fn ended_page() -> Response {
+/// "Back to inblock.io Meet" leads to the origin of `guest_client_url` (the Meet start page and
+/// its sign-in). The target comes from the config only, never from the request, so the link
+/// cannot be steered; without a `guest_client_url` there is no link.
+pub async fn ended_page(State(state): State<GuestState>) -> Response {
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        ENDED_HTML,
+        ENDED_HTML.replace("{{BACK}}", &back_link(&state.config)),
     )
         .into_response()
+}
+
+/// The ended page's way back to Meet: a link to the origin of `guest_client_url`, or nothing.
+fn back_link(config: &Config) -> String {
+    let Some(origin) = config.guest_client_url.as_ref().map(|u| u.origin()) else {
+        return String::new();
+    };
+    if !origin.is_tuple() {
+        return String::new();
+    }
+    format!(
+        r#"<p><a class="button" id="back" href="{}/">Back to inblock.io Meet</a></p>"#,
+        html_escape(&origin.ascii_serialization())
+    )
 }
 
 #[cfg(test)]
@@ -2908,9 +2925,33 @@ mod tests {
         assert_eq!(status, 200);
         assert!(text.contains("This guest account is deleted; this browser forgets its key."));
         assert!(text.contains("/guest/assets/ended.js"));
+        // No guest_client_url: no way back is drawn, and no placeholder is left.
+        assert!(!text.contains("id=\"back\""));
+        assert!(!text.contains("{{BACK}}"));
         let (status, _, js) = get(&e, "/guest/assets/ended.js", &[]).await;
         assert_eq!(status, 200);
         assert!(js.contains("forgetKey"));
+    }
+
+    /// The way back to Meet is the origin of `guest_client_url` (path and query dropped), from
+    /// the config only: a query on the ended page changes nothing.
+    #[tokio::test]
+    async fn the_ended_page_links_back_to_the_meet_origin_from_the_config() {
+        let Some(e) = env(|c| {
+            c.guest_client_url =
+                Some(url::Url::parse("https://meet.example.org/guest/start?x=1").unwrap())
+        })
+        .await
+        else {
+            return;
+        };
+        let (status, _, text) =
+            get(&e, "/guest/ended?return_to=https://evil.example.com/", &[]).await;
+        assert_eq!(status, 200);
+        assert!(text.contains(
+            r#"<a class="button" id="back" href="https://meet.example.org/">Back to inblock.io Meet</a>"#
+        ));
+        assert!(!text.contains("evil.example.com"));
     }
 
     /// The guest client is a static public client with exactly the configured redirects.
