@@ -172,7 +172,7 @@ test('PH-1: not-ready session sees the honest QR reason and a Verify session act
   expect(LIE_QR.test(qr.text), `the provider-blame lie still renders: "${qr.text}"`).toBe(false);
   expect(HONEST_QR_SNIPPET.test(qr.text), `honest reason absent: "${qr.text}"`).toBe(true);
 
-  const verifyBtn = qr.buttons.find((b) => /verify session/i.test(b.label));
+  const verifyBtn = qr.buttons.find((b) => /verify (session|device)/i.test(b.label));
   expect(verifyBtn, `no "Verify session" control in section; buttons=${JSON.stringify(qr.buttons)}`).toBeTruthy();
   expect(verifyBtn.disabled, '"Verify session" control is disabled').toBe(false);
 });
@@ -201,7 +201,7 @@ test('PH-2: current session with null verification status gets a verify exit, no
   let verifyOffered = false;
   for (let i = 0; i < 30; i++) {
     surface = await readSettingsSurface(page);
-    verifyOffered = surface.buttons.some((b) => /verify session|verify this session/i.test(b));
+    verifyOffered = surface.buttons.some((b) => /verify (this )?(session|device)/i.test(b));
     if (verifyOffered || FALSE_ENCRYPTION_COPY.test(surface.text)) break;
     await page.waitForTimeout(1000);
   }

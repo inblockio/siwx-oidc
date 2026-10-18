@@ -216,14 +216,14 @@ async function readCurrentSessionCard(page) {
       const text = (el) => (el.textContent || '').replace(/\s+/g, ' ').trim();
 
       const heads = [...document.querySelectorAll('h1,h2,h3,h4,h5,[role="heading"]')].filter(vis);
-      const cur = heads.find((h) => /^current session\b/i.test(text(h)));
+      const cur = heads.find((h) => /^current (session|device)\b/i.test(text(h)));
       if (!cur) return { found: false, headings: heads.map(text).slice(0, 15) };
 
       const FOLLOWING = 4; // Node.DOCUMENT_POSITION_FOLLOWING
       const PRECEDING = 2; // Node.DOCUMENT_POSITION_PRECEDING
       const next = heads.find(
         (h) =>
-          /^(other sessions|security recommendations)\b/i.test(text(h)) &&
+          /^(other (sessions|devices)|security recommendations)\b/i.test(text(h)) &&
           !!(cur.compareDocumentPosition(h) & FOLLOWING),
       );
       const inRange = (el) =>
@@ -453,7 +453,7 @@ test('EW-D1: add a second device while device A is live — every screen on both
 
     const expand = item.locator('.mx_DeviceExpandDetailsButton');
     if (await expand.count()) {
-      const alreadyOpen = await item.getByRole('button', { name: /^verify session$/i }).count();
+      const alreadyOpen = await item.getByRole('button', { name: /^verify (session|device)$/i }).count();
       if (!alreadyOpen) await expand.first().click({ timeout: 20_000 });
     }
 
@@ -464,7 +464,7 @@ test('EW-D1: add a second device while device A is live — every screen on both
         `disabled=${JSON.stringify(tileBefore.disabled)} text="${tileBefore.text}"`,
     );
 
-    const verifyBtn = item.getByRole('button', { name: /^verify session$/i }).first();
+    const verifyBtn = item.getByRole('button', { name: /^verify (session|device)$/i }).first();
     await expect(
       verifyBtn,
       `"Verify session" did not render on device B's tile. It is gated on ` +

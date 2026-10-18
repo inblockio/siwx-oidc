@@ -205,13 +205,17 @@ export async function readTripwire(page) {
   });
 }
 
-/** Element chrome: user menu -> All settings -> Sessions tab. */
+/**
+ * Element chrome: user menu -> All settings -> Sessions tab. Element Web 1.12.31 renamed
+ * "sessions" to "devices" in the UI (tab "Devices", button "Verify device", headings
+ * "Current device" / "Other devices"), so the specs accept both labels.
+ */
 export async function openSessionsTab(page) {
   await page.locator('.mx_UserMenu').click();
   await page.getByRole('menuitem', { name: /all settings/i }).click({ timeout: 20_000 });
   await page
     .locator('[role="tab"], .mx_TabbedView_tabLabel')
-    .filter({ hasText: /sessions/i })
+    .filter({ hasText: /\b(sessions|devices)\b/i })
     .first()
     .click({ timeout: 20_000 });
 }

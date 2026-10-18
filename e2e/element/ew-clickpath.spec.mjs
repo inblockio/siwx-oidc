@@ -112,7 +112,7 @@ test('EW-C2: Element chrome "Sign out" — teardown endpoint + device policy + t
     await page.getByRole('menuitem', { name: /all settings/i }).click({ timeout: 20_000 });
     await page
       .locator('[role="tab"], .mx_TabbedView_tabLabel')
-      .filter({ hasText: /sessions/i })
+      .filter({ hasText: /\b(sessions|devices)\b/i })
       .first()
       .click({ timeout: 20_000 });
     await page.getByRole('button', { name: /show details/i }).first().click({ timeout: 20_000 });

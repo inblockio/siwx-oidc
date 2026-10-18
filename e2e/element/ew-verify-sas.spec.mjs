@@ -244,11 +244,11 @@ test('EW-V1: second session cross-signed by SAS/emoji from a live first session 
 
     const expand = item.locator('.mx_DeviceExpandDetailsButton');
     if (await expand.count()) {
-      const alreadyOpen = await item.getByRole('button', { name: /^verify session$/i }).count();
+      const alreadyOpen = await item.getByRole('button', { name: /^verify (session|device)$/i }).count();
       if (!alreadyOpen) await expand.first().click({ timeout: 20_000 });
     }
 
-    const verifyBtn = item.getByRole('button', { name: /^verify session$/i }).first();
+    const verifyBtn = item.getByRole('button', { name: /^verify (session|device)$/i }).first();
     try {
       await expect(verifyBtn).toBeVisible({ timeout: 60_000 });
     } catch (e) {

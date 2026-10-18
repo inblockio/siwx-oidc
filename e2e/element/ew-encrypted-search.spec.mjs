@@ -282,7 +282,7 @@ test('UX1-UX8 encrypted search on hosted Element Web', { tag: '@ew-p6' }, async 
   await page.getByRole('menuitem', { name: /all settings/i }).click({ timeout: 20_000 });
   await page
     .locator('[role="tab"], .mx_TabbedView_tabLabel')
-    .filter({ hasText: /sessions/i })
+    .filter({ hasText: /\b(sessions|devices)\b/i })
     .first()
     .click({ timeout: 20_000 });
   await page.getByRole('button', { name: /show details/i }).first().click({ timeout: 20_000 });

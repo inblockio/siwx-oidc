@@ -481,8 +481,8 @@ test('H3-C: B-initiated "Use another device" on the new device gate reaches a ve
     while (Date.now() < reqDeadline && !sawOnA) {
       const d = await describeSurface(pageA);
       if (
-        d.panels.some((p) => /verification request|verify.*session|incoming/i.test(p)) ||
-        d.buttons.some((b) => /^start verification$/i.test(b) || /^verify session$/i.test(b))
+        d.panels.some((p) => /verification request|verify.*(session|device)|incoming/i.test(p)) ||
+        d.buttons.some((b) => /^start verification$/i.test(b) || /^verify (session|device)$/i.test(b))
       ) {
         sawOnA = d;
         break;
