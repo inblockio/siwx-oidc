@@ -344,6 +344,11 @@ is one read through the same helper as GP-SEC-56, made only for an account that 
 fresh id after a claim (GP-CLM-11), so it never meets the refusal. The implementing change must resolve the id before the
 write-ahead append of a device id (`provision_synapse_device` generates it today, `src/oidc.rs:2203-2215`) and pass it in as
 `proposed_device_id`, so the record lists the id before the call that creates it.
+`sign_in` makes the check a second time, after it samples the code's `auth_time` and before it stores the code, for the device
+the code carries. A claim can commit while a hand-off provisions a second device (its commit does not wait for the hand-off
+lease, which `HANDOFF_ACTIVATE` drops): the device is then in `pre_claim_devices`, and its tombstone predates `auth_ms`, so the
+grant script would issue the grant. The re-check refuses that sign-in, and a claim that commits after the re-check plants a
+tombstone at or after `auth_ms`, which the grant script refuses. The sample must stay before the re-check.
 
 **The cap counts records, and only erase releases a slot.** The count is the membership of `guest:claimed`. A claimed
 account that only deactivates itself (the `org.matrix.account_deactivate` action of `/account`) keeps its record, its Synapse

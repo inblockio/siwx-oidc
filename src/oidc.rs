@@ -3533,6 +3533,16 @@ async fn resolve_generic_identity(
         })
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Test seam: `sign_in` signals the first `Notify` once provisioning is done and waits
+    /// for the second before it samples the authentication time.
+    pub(crate) static AFTER_PROVISIONING_FOR_TEST: std::sync::Arc<(
+        tokio::sync::Notify,
+        tokio::sync::Notify,
+    )>;
+}
+
 /// `did_publication` carries the provider's signing key + issuer for the
 /// attested `io.inblock.did` profile field (see
 /// [`provision_synapse_account`]). It is built by the axum handler, which is the
@@ -3733,6 +3743,19 @@ pub async fn sign_in(
             DEVICE_CHECK_UNAVAILABLE_MSG,
         )
     };
+    let refuse_pre_claim = || {
+        warn!(did = %did, "sign_in: refused a pre-claim device id (GP-CLM-26)");
+        if refuse_deleted_ids {
+            sign_in_refusal_redirect(
+                &redirect_uri,
+                &request,
+                CoreAuthErrorResponseType::InvalidScope,
+                PRE_CLAIM_DEVICE_REFUSED_MSG,
+            )
+        } else {
+            CustomError::BadRequest(PRE_CLAIM_DEVICE_REFUSED_MSG.to_string())
+        }
+    };
     if let Some(proposed) = proposed_device_id.clone() {
         let pre_claim = match db_client.device_is_pre_claim_for_did(&did, &proposed).await {
             Ok(pre_claim) => pre_claim,
@@ -3740,18 +3763,7 @@ pub async fn sign_in(
             Err(e) => return Err(e.into()),
         };
         if pre_claim {
-            warn!(did = %did, "sign_in: refused a pre-claim device id (GP-CLM-26)");
-            if refuse_deleted_ids {
-                return Err(sign_in_refusal_redirect(
-                    &redirect_uri,
-                    &request,
-                    CoreAuthErrorResponseType::InvalidScope,
-                    PRE_CLAIM_DEVICE_REFUSED_MSG,
-                ));
-            }
-            return Err(CustomError::BadRequest(
-                PRE_CLAIM_DEVICE_REFUSED_MSG.to_string(),
-            ));
+            return Err(refuse_pre_claim());
         }
     }
 
@@ -3951,6 +3963,28 @@ pub async fn sign_in(
         }
     };
 
+    #[cfg(test)]
+    if let Ok(gate) = AFTER_PROVISIONING_FOR_TEST.try_with(std::sync::Arc::clone) {
+        let (reached, proceed) = &*gate;
+        reached.notify_one();
+        proceed.notified().await;
+    }
+
+    let auth_ms = db_client.server_time_ms().await?;
+    // The sample above must come before this re-check. A claim that commits after
+    // the re-check plants its device tombstone at Redis `TIME` at or after
+    // `auth_ms`, which the grant script refuses at the exchange; a claim that
+    // committed before the re-check is caught here. Sampling after the re-check
+    // reopens that window.
+    if let Some(device) = device_id.as_deref() {
+        match db_client.device_is_pre_claim_for_did(&did, device).await {
+            Ok(true) => return Err(refuse_pre_claim()),
+            Ok(false) => {}
+            Err(e) if refuse_deleted_ids => return Err(check_unavailable("pre-claim", e)),
+            Err(e) => return Err(e.into()),
+        }
+    }
+
     let code_entry = CodeEntry {
         did: did.clone(),
         nonce: request.nonce.clone(),
@@ -3958,10 +3992,8 @@ pub async fn sign_in(
         client_id: request.client_id.clone(),
         // The authentication, from Redis `TIME` like every lifetime deadline
         // (I6); the grant's absolute expiry counts from it.
-        auth_time: chrono::DateTime::<Utc>::from_timestamp_millis(
-            db_client.server_time_ms().await?,
-        )
-        .ok_or_else(|| anyhow!("Redis TIME out of range"))?,
+        auth_time: chrono::DateTime::<Utc>::from_timestamp_millis(auth_ms)
+            .ok_or_else(|| anyhow!("Redis TIME out of range"))?,
         code_challenge: Some(request.code_challenge.clone()),
         code_challenge_method: Some("S256".to_string()),
         localpart: Some(localpart),

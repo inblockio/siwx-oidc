@@ -2151,6 +2151,73 @@ mod tests {
         );
     }
 
+    /// Pins the second pre-claim check in `sign_in`: a claim that commits after the
+    /// hand-off activated, and before the code's authentication time is sampled,
+    /// snapshots the new device (already in `guest:devices`) into `pre_claim_devices`
+    /// and plants its tombstone before that time, so only the re-check stops a grant.
+    /// The sign-in is refused instead of issuing a code.
+    #[tokio::test]
+    async fn a_device_a_claim_snapshots_during_its_hand_off_gets_no_code() {
+        let Some((e, _mock, synapse)) = guest_env(|_| {}).await else {
+            return;
+        };
+        let g = Guest::new();
+        let (lp, handle) = record(&e, &g, "active", 600).await;
+        e.redis
+            .sadd_raw_for_test(
+                &siwx_oidc::db::guest_records::devices_key(&lp),
+                "DEVICE0001",
+            )
+            .await;
+        let sid = start_session(&e, &g, &handle, "DEVICE0002").await;
+
+        let gate = std::sync::Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        let inject_gate = std::sync::Arc::clone(&gate);
+        let (result, ()) = crate::oidc::AFTER_PROVISIONING_FOR_TEST
+            .scope(gate, async {
+                let inject = async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        inject_gate.0.notified(),
+                    )
+                    .await
+                    .expect("sign_in never reached the seam after provisioning");
+                    use sha2::{Digest, Sha256};
+                    let hash = hex::encode(Sha256::digest(handle.as_bytes()));
+                    assert_eq!(
+                        e.redis
+                            .commit_guest_claim(&lp, &hash, "cred-test", 200, false)
+                            .await
+                            .unwrap(),
+                        siwx_oidc::db::guest_records::ClaimCas::Claimed
+                    );
+                    assert!(
+                        crate::guest::claim::finish_claim_revoke(&e.redis, None, &lp)
+                            .await
+                            .is_ok()
+                    );
+                    let devices = e.redis.read_pre_claim_devices(&lp).await.unwrap();
+                    assert!(
+                        devices.iter().any(|d| d == "DEVICE0002"),
+                        "the claim snapped the new device: {devices:?}"
+                    );
+                    inject_gate.1.notify_one();
+                };
+                tokio::join!(sign_in_as(&e, &synapse, &sid), inject)
+            })
+            .await;
+
+        // This env leaves `refuse_deleted_device_ids` off, so the refusal is the 400,
+        // the same text the flag-on path sends as an `invalid_scope` redirect.
+        match result {
+            Err(CustomError::BadRequest(msg)) => assert_eq!(
+                msg,
+                "The requested device id cannot be used for this account. Choose another device."
+            ),
+            other => panic!("the hand-off must be refused, not issued a code: {other:?}"),
+        }
+    }
+
     /// The device the hand-off creates is named after the guest client's `client_name`
     /// (`guest_client_name`), or after the client id when none is configured or the name is
     /// blank. Each case has a client id of its own: the client record is shared by every
