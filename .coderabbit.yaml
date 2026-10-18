@@ -1,0 +1,8 @@
+# Trust-boundary repository. CodeRabbit reviews it, then pauses so a run of
+# pushes does not spend the org quota. Set by the allow-list on 2026-10-18.
+reviews:
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 2
