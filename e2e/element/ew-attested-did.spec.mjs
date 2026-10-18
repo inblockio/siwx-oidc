@@ -129,6 +129,7 @@ test.afterAll(async () => {
  * through the browser, so EW_DID_NEGATIVE does not touch it): `{did, proof}` or null.
  */
 async function servedBinding() {
+  if (!session.access_token) throw new Error('no access token from the Element client');
   const user = encodeURIComponent(session.user_id);
   for (const prefix of ['/_matrix/client/v3', '/_matrix/client/unstable/uk.tcpip.msc4133']) {
     const r = await fetch(`${MATRIX_URL}${prefix}/profile/${user}/${DID_FIELD}`, {

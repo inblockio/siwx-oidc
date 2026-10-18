@@ -229,7 +229,7 @@ test('EW-UA8: candidate: the Sessions manager signs out the second device', asyn
   await item.click();
 
   let path;
-  const manage = page.getByRole('button', { name: /manage this session/i }).first();
+  const manage = page.getByRole('button', { name: /manage this (session|device)/i }).first();
   if (await manage.isVisible().catch(() => false)) {
     // Delegated auth: Element hands device management to the provider's account page.
     path = 'account-page';
