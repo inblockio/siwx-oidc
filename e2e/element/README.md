@@ -80,7 +80,8 @@ The selection, on a lab whose Element runs the build under test (the T2 pairs st
   ew-attested-did.spec.mjs ew-clickpath.spec.mjs ew-copy-markdown.spec.mjs ew-encrypted-search.spec.mjs \
   ew-h3-second-device-walk.spec.mjs ew-journey-add-device.spec.mjs ew-journey-exits.spec.mjs \
   ew-journey-reset-after-no-recovery.spec.mjs ew-login.spec.mjs ew-patch-honesty.spec.mjs \
-  ew-recovery-entry.spec.mjs ew-sw-media-auth.spec.mjs ew-u3prime-no-forced-reset.spec.mjs ew-verify-sas.spec.mjs
+  ew-recovery-entry.spec.mjs ew-s1-redacted-edit-crawl.spec.mjs ew-sw-media-auth.spec.mjs \
+  ew-u3prime-no-forced-reset.spec.mjs ew-verify-sas.spec.mjs
 ./run.sh --grep '@ew-p1\b' ...     # one entry: \b, or @ew-p1 also selects @ew-p10 and @ew-p11
 ./run.sh --list --grep '@ew-p|@ew-delta' ...   # what would run
 ```

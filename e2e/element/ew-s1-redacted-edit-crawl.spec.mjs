@@ -113,7 +113,8 @@ async function loginKeepingRecoveryKey(page, wallet) {
   await page.goto(ELEMENT_URL, { waitUntil: 'domcontentloaded' });
   await page.waitForURL((u) => u.origin === new URL(SIWX_URL).origin, { timeout: 60_000 });
   await page.getByRole('button', { name: 'Sign in with Ethereum' }).click();
-  await page.getByRole('button', { name: 'Skip for now' }).click();
+  // The passkey interstitial is optional: bounded, and the flow goes on without it.
+  await page.getByRole('button', { name: 'Skip for now' }).click({ timeout: 30_000 }).catch(() => {});
   await page.waitForURL((u) => u.origin === new URL(ELEMENT_URL).origin, { timeout: 60_000 });
 
   const chat = page.locator('.mx_MatrixChat');
