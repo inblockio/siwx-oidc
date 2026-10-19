@@ -383,6 +383,14 @@ paths:
           description: |
             `invalid_client`: the client did not authenticate (RFC 6749 §5.2). A
             request that tried HTTP Basic gets `WWW-Authenticate: Basic`.
+        "503":
+          description: |
+            `temporarily_unavailable`, with `Retry-After`: a server-side fault
+            (the token store or a dependency) that decided nothing about the
+            code, refresh token or device code. Retry with the same request; a
+            refresh whose rotation committed before the fault returns the same
+            pair on the retry. The body carries no `errcode`, which a Matrix
+            client would take for a sign-out.
 
   /userinfo:
     get:

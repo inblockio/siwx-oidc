@@ -272,8 +272,27 @@ struct TokenEndpointError {
     basic_attempted: bool,
 }
 
+/// Seconds a client waits before it retries a `POST /token` that met a server-side fault.
+const TOKEN_RETRY_AFTER_SECS: &str = "5";
+
 impl IntoResponse for TokenEndpointError {
     fn into_response(self) -> Response {
+        // Not a 4xx: a Matrix client ends the session on any 4xx from the token endpoint,
+        // and matrix-js-sdk on any error body with an `errcode`, 5xx included. It retries
+        // a 5xx with an RFC 6749 body, and the retry of a refresh whose rotation committed
+        // gets the same pair back (I4). The description names no internal error.
+        if let CustomError::ServiceUnavailable(_) | CustomError::Other(_) = &self.error {
+            warn!(error = %self.error, "token endpoint: server-side fault, answered with a retryable 503");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, TOKEN_RETRY_AFTER_SECS)],
+                Json(serde_json::json!({
+                    "error": "temporarily_unavailable",
+                    "error_description": "The token service is temporarily unavailable; retry.",
+                })),
+            )
+                .into_response();
+        }
         let challenge = self.basic_attempted
             && matches!(
                 &self.error,
@@ -350,7 +369,11 @@ async fn token(
         // OAuth2 RFC 6749 §5.2: token endpoint errors MUST be JSON.
         // Wrap non-Token errors so they always produce a JSON body.
         let error = match e {
-            CustomError::BadRequestToken(_) => e,
+            // A server-side fault (the store, a dependency) decides nothing about the
+            // grant: `TokenEndpointError` answers it with a retryable 503.
+            CustomError::BadRequestToken(_)
+            | CustomError::ServiceUnavailable(_)
+            | CustomError::Other(_) => e,
             CustomError::Unauthorized(msg) => CustomError::BadRequestToken(oidc::TokenError {
                 error: CoreErrorResponseType::InvalidClient,
                 error_description: msg,

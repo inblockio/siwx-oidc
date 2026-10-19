@@ -842,6 +842,13 @@ doc; read it before changing the code the rule covers.
   returns the store error instead of folding it into "unknown"). Pin:
   `a_store_fault_at_the_matrix_refresh_endpoint_is_a_retryable_503`,
   `a_store_fault_on_a_bearer_route_is_a_retryable_503`.
+- **A server-side fault at `POST /token` is a 503 `temporarily_unavailable` with `Retry-After`
+  and no `errcode`, never a 4xx.** Element Web (matrix-js-sdk) ends the session on any 4xx from
+  the token endpoint and on any error body with an `errcode`, 5xx included; it retries every
+  other failure. `TokenEndpointError` renders `ServiceUnavailable` and `Other` (a store error,
+  a dependency) this way, and the body names no internal error. A refresh whose rotation
+  committed before the fault gets the same pair on the retry (I4). Pin:
+  `a_store_fault_at_the_token_endpoint_is_a_retryable_503_without_an_errcode`.
 - **In delegated-auth mode the Matrix side acts on Matrix credentials only; an `oidc` grant (a
   generic-class client's) is not one.** Introspection answers `{"active": false}` for its access
   token (the endpoint exists only in that mode); the bearer routes (`logout`, `logout/all`,
