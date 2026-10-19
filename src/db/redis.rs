@@ -1911,6 +1911,34 @@ mod tests {
         (base << 20) | u128::from(COUNTER.fetch_add(1, Ordering::Relaxed) & 0xF_FFFF)
     }
 
+    /// A command the server answers after more than half a second still succeeds. The
+    /// rotation script commits whether or not its caller waits for the answer, so a
+    /// caller that gives up early reports a failure for a rotation that happened. The
+    /// script below holds the server for 700 ms, as a loaded host or a stall would.
+    #[tokio::test]
+    async fn a_redis_answer_slower_than_half_a_second_is_awaited() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        const HOLD_LUA: &str = r#"
+            local t = redis.call('TIME')
+            local start = tonumber(t[1]) * 1000000 + tonumber(t[2])
+            repeat
+                local n = redis.call('TIME')
+                local now = tonumber(n[1]) * 1000000 + tonumber(n[2])
+            until now - start >= tonumber(ARGV[1])
+            return 1
+        "#;
+        let mut conn = client.pool.get().await.unwrap();
+        let held: bb8_redis::redis::RedisResult<i64> = bb8_redis::redis::cmd("EVAL")
+            .arg(HOLD_LUA)
+            .arg(0)
+            .arg(700_000)
+            .query_async(&mut *conn)
+            .await;
+        assert_eq!(held.ok(), Some(1), "a 700 ms answer must not time out");
+    }
+
     fn token_meta(device_id: &str, username: &str) -> TokenMetadata {
         TokenMetadata {
             username: username.to_string(),

@@ -14034,6 +14034,65 @@ mod generic_client_tests {
         db.delete_device_code(&device_ref).await.ok();
     }
 
+    /// RFC 8628 §3.2: `expires_in` is the lifetime of the device code. A poll answers
+    /// for the code and never extends it, so a code polled every few seconds still
+    /// expires when it was due. The user code is written once and never extended, so a
+    /// code that outlives it can no longer be approved; it is only answered
+    /// `authorization_pending` for as long as its client keeps polling.
+    #[tokio::test]
+    async fn polling_a_device_code_never_extends_its_lifetime() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client_id = store_client(&db, matrix_client()).await;
+        let device_code = format!("dvc_lifetime-{}", nonce());
+        let entry = DeviceCodeEntry::new(
+            &format!("LT-{}", nonce()),
+            client_id.clone(),
+            "openid".to_string(),
+            Utc::now().timestamp(),
+        );
+        // A code with 100 s of its lifetime left.
+        db.set_device_code(&device_code, &entry, 100).await.unwrap();
+
+        let outcome = token(
+            TokenForm {
+                code: None,
+                client_id: Some(client_id),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code.clone()),
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &delegated(),
+            &db,
+            None,
+        )
+        .await;
+        match outcome {
+            Err(CustomError::BadRequestToken(e)) => assert_eq!(
+                e.error,
+                CoreErrorResponseType::Extension("authorization_pending".to_string())
+            ),
+            Err(other) => panic!("expected authorization_pending, got {other:?}"),
+            Ok(_) => panic!("a pending code issues nothing"),
+        }
+
+        let key = format!(
+            "device_code/{}",
+            siwx_oidc::db::tokens::digest(&device_code)
+        );
+        let left = db.ttl_raw(&key).await.unwrap();
+        assert!(
+            (1..=100).contains(&left),
+            "the poll must leave the code's remaining lifetime alone; it now has {left} s"
+        );
+        db.del_raw(&key).await.ok();
+    }
+
     // ---- a proposed device id must match [A-Za-z0-9._~+/-]{1,64} (PR #50 audit F1) ----
 
     /// The scope a client sends with a device id in it.
