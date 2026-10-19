@@ -107,7 +107,9 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   `MIGRATION_TEST_REDIS_URL`; and the pure check `an_absent_strict_skips_variable_means_strict`
   in `e2e_account_lifecycle_live` and in `e2e_did_field_live` (1 each). In the headless
   client's crate it also runs the three pure checks of `siwx-oidc-auth/tests/live_upgrade.rs`'s
-  helpers.
+  helpers and the 109 unit and hermetic tests of the rotation canary
+  (`siwx-oidc-auth/tests/rotation_canary_unit.rs`, which compiles the modules of
+  `examples/rotation_canary.rs`; the hermetic ones talk to a fake server inside the test process).
 - **Redis-backed tests** get their Redis from `siwx_oidc::test_support` (`src/test_support.rs`):
   `SIWX_TEST_REDIS_URL`, default `redis://localhost`. When it is unreachable each test prints
   one `SKIP <test>: …` line to stderr and passes; with `SIWX_TEST_REQUIRE_REDIS=1` it fails
@@ -154,7 +156,8 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   sessions in every shape a deployment holds before the switch and checks them after it,
   in stages (`QUALIFY_STAGE=mint|check|cleanup`, state in a 0700 `QUALIFY_STATE_DIR`),
   against a real deployment or the mock; `siwx-oidc-auth/examples/soak.rs` holds a population
-  of sessions across the switch. `e2e/element/upgrade-survival.sh` (T2) does the same for a
+  of sessions across the switch. `siwx-oidc-auth/examples/rotation_canary.rs` is the check to
+  run before and after a signing-key rotation: see "Rotation canary" in e2e/README.md. `e2e/element/upgrade-survival.sh` (T2) does the same for a
   person in Element Web: on the siwx-oidc-matrix-server lab pinned by image digest it signs in
   through Element in a persistent browser profile before the switch, replaces only siwx-oidc,
   and checks the session, the crypto, the history, the Sessions manager, a second tab, a

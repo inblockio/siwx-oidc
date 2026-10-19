@@ -656,6 +656,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(*denied)
             return self._send(200, {"next_batch": "s0", "rooms": {}})
 
+        # GET /_matrix/client/v3/joined_rooms -- the rotation canary's tripwire reads it.
+        # The mock models no room membership (the same "account with no rooms" as
+        # `sync` above), so a tripwire that fires needs a real Synapse.
+        if path == "/_matrix/client/v3/joined_rooms":
+            introspection, denied = self._cs_api_auth()
+            if denied:
+                return self._send(*denied)
+            return self._send(200, {"joined_rooms": []})
+
         # -- unauthenticated C-S API ---------------------------------------
         # GET /_matrix/client/v3/profile/{mxid}/{field}  (read_did_field; test read-back)
         m = re.match(r"^/_matrix/client/v3/profile/([^/]+)/(.+)$", path)
@@ -878,7 +887,9 @@ class Handler(BaseHTTPRequestHandler):
         if rp:
             n = int(self.headers.get("Content-Length", 0) or 0)
             return self._stub_rp(rp.group(1), rp.group(2), self.rfile.read(n) if n else b"")
-        if path == "/_matrix/client/v3/refresh":
+        if path in ("/_matrix/client/v3/refresh", "/_matrix/client/v3/logout"):
+            # A deployment's edge routes both to siwx-oidc (the rotation canary
+            # probes `/logout` and judges it by a refresh afterwards).
             n = int(self.headers.get("Content-Length", 0) or 0)
             self._log("POST", path)
             return self._forward_to_oidc("POST", self.rfile.read(n) if n else b"")
@@ -1186,6 +1197,8 @@ class Handler(BaseHTTPRequestHandler):
         self._log("PUT", path)
         # PUT /_matrix/client/v3/profile/{mxid}/{field}  (publish_did_field)
         m = re.match(r"^/_matrix/client/v3/profile/([^/]+)/(.+)$", path)
+        if m and m.group(2) == "displayname":
+            return self._profile_displayname_put(m.group(1), body)
         if m:
             return self._profile_field_put(m.group(1), m.group(2), body)
         m = re.match(r"^/_synapse/admin/v2/users/(.+)$", path)
@@ -1223,6 +1236,34 @@ class Handler(BaseHTTPRequestHandler):
                 PROFILES[uid]["displayname"] = body["displayname"]
             ADMIN_PUTS.append({"user_id": uid, "field": which, "value": body[which], "applied": True})
         return self._send(200, {"name": uid})
+
+    def _profile_displayname_put(self, raw_user_id, body):
+        """PUT /_matrix/client/v3/profile/{mxid}/displayname AS THE USER.
+
+        Synapse lets a user set their own displayname with any C-S API token and
+        refuses another user's (403) unless the requester is an admin. The
+        rotation canary names its account this way at `init`. Only the user case
+        is modelled; the admin write of any other profile field stays in
+        `_profile_field_put`.
+        """
+        introspection, denied = self._cs_api_auth()
+        if denied:
+            return self._send(*denied)
+        user_id = unquote(raw_user_id)
+        if _mxid(introspection.get("username") or "") != user_id:
+            return self._send(403, {
+                "errcode": "M_FORBIDDEN",
+                "error": "Cannot set another user's displayname",
+            })
+        if "displayname" not in body:
+            return self._send(400, {
+                "errcode": "M_BAD_JSON",
+                "error": "body must carry `displayname` as its key",
+            })
+        with LOCK:
+            _mark_profile(_localpart_of(user_id), body["displayname"])
+            PROFILES[user_id]["displayname"] = body["displayname"]
+        return self._send(200, {})
 
     def _profile_field_put(self, raw_user_id, field, body):
         """PUT /_matrix/client/v3/profile/{mxid}/{field} — `publish_did_field`.
