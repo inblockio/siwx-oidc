@@ -1915,7 +1915,11 @@ mod tests {
     /// rotation script commits whether or not its caller waits for the answer, so a
     /// caller that gives up early reports a failure for a rotation that happened. The
     /// script below holds the server for 700 ms, as a loaded host or a stall would.
+    ///
+    /// Ignored: the hold stalls every other test on the same Redis. Run it alone:
+    /// `cargo test --lib a_redis_answer_slower -- --ignored`.
     #[tokio::test]
+    #[ignore = "holds the shared test Redis for 700 ms; run alone"]
     async fn a_redis_answer_slower_than_half_a_second_is_awaited() {
         let Some(client) = crate::test_support::redis().await else {
             return;
