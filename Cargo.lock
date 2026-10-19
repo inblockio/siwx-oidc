@@ -4776,6 +4776,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "hex",
+ "libc",
  "p256",
  "rand 0.8.6",
  "reqwest",

@@ -406,3 +406,53 @@ unavailable for more than 120 s in a row, or any session still in the previous f
 the first refresh into the current one; connection errors and 502/503/504 are retried and
 counted, not failures, within those 120 s. Every account is deactivated at the end, also on
 SIGINT or SIGTERM (exit 3: interrupted, not a pass).
+
+### Rotation canary (`examples/rotation_canary.rs`)
+
+A headless check that a deployment still signs people in after its signing key was rotated:
+one persistent identity per environment (an Ed25519 key, one registered client, one account that
+never joins a room) signs in with PKCE, and six checks judge the answer. It prints only
+`CANARY <check> result=ok|FAIL|SKIP reason=<code> key=value...` lines and a summary, and never a
+token, code, nonce, cookie, proof or key.
+
+```bash
+# once per environment; the identity is kept in ~/.aqua-secrets/rotation-canary/<env>/
+cargo run -p siwx-oidc-auth --example rotation_canary -- init --env dev \
+  --issuer https://siwx.example.org --homeserver https://matrix.example.org --server-name example.org
+# before a rotation (--baseline) and after it
+cargo run -p siwx-oidc-auth --example rotation_canary -- check --env dev \
+  --issuer https://siwx.example.org --homeserver https://matrix.example.org --server-name example.org \
+  --live-kid <kid now signing> --expect-kids <the kids /jwk must publish> --dropped-kids <exposed kids> [--baseline]
+```
+
+| Check | Passes when |
+|---|---|
+| `discovery` | 200 (502 to 504 retried for a minute); `issuer` is `--issuer` up to one trailing slash; `jwks_uri` on its origin |
+| `jwks` | the published kid set equals `--expect-kids` exactly, no `--dropped-kids` member, every kid derived from its own `x`,`y` |
+| `sign_in` | PKCE sign-in with the stored key and client; ID token `ES256`, `kid` = `--live-kid`, signature verified against the `/jwk` entry, `iss`, `aud`, `sub`, and `iat`/`exp` within 30 s of the server's `Date` |
+| `whoami` | 200, `user_id` on `--server-name` |
+| `did_proof` | the `io.inblock.did` proof carries the live kid, verifies (`verify_did_assertion`), is the key's DID and is no older than this run's `/authorize` answer |
+| `logout` | the account has no room and no device but this run's; after the logout, a refresh with this run's refresh token is refused with `invalid_grant` (a 200 from `/logout` proves nothing) |
+
+Exit codes: 0 all six ran and passed, 1 a check failed, 2 usage or local state (`--no-matrix`
+outside `--env local`, a missing, loose or foreign identity), 3 logout not proven, 4 the tripwire
+fired (a room or a device nobody recorded: someone else is using the key). `--no-matrix` (only with
+`--env local`) runs three checks and skips three, and the summary says so. Only `--baseline` may
+register a new client when the stored one is refused. `init --replace` erases the account with its
+own key (`io.inblock.account_erase`) before it makes a new one. `devices.json` in the identity
+directory lists the devices the canary created and has not yet seen gone, so a run that died before
+its logout does not fire the next run's tripwire.
+
+Against the mock stack: the Synapse mock answers `GET /joined_rooms` (always empty),
+forwards `POST /_matrix/client/v3/logout` to siwx-oidc as the edge does, and lets a user set their own
+`displayname` (`PUT /profile/{mxid}/displayname`). The stack needs `SIWXOIDC_SIGNING_KEY_PEM`
+(without a durable key the server mints no DID proof) and, to test `--dropped-kids`, a public key
+in `SIWXOIDC_RETIRED_SIGNING_KEYS_PEM`; `up.sh` sets neither, so start the three containers with
+those variables or add them to a copy of it. Negatives to try: `--live-kid` set to the retired kid
+(`sign_in` and `did_proof` fail), a retired kid listed in `--dropped-kids` (`jwks` fails),
+`POST /__fail {"endpoint":"publish_did_field","mode":"500"}` (`did_proof_stale`), a device
+added with `POST /__seed_device` (exit 4).
+
+`cargo test -p siwx-oidc-auth --test rotation_canary_unit` runs the canary's 80 unit and hermetic
+tests (a fake server inside the test process: a logout that revokes nothing, a clock an hour off,
+a token signed by another key, a server that puts a token into a printed field, a panic).

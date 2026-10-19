@@ -37,3 +37,10 @@ base64 = "0.22"
 tokio = { version = "1", features = ["full"] }
 url = "2"
 urlencoding = "2"
+
+# `setrlimit(RLIMIT_CORE, 0)` for the rotation canary (an example), so a crash
+# cannot leave a core file holding a key or a token, and the tests that check
+# modes and the umask. `libc` is already in the lock file through tokio; the
+# shipped library does not get it.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
