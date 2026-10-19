@@ -1467,6 +1467,11 @@ async fn replace_erases_the_old_account_with_the_old_key_and_makes_a_new_identit
         assert!(!hygiene::taint_hit(line, &minted), "{line}");
     }
     assert!(!hygiene::taint_tripped());
+    // And the taint check holds them, whether or not any line was about to print one.
+    for prefix in ["csrf_", "acct_", "cs_", "rat_", "n"] {
+        let token = minted.iter().find(|t| t.starts_with(prefix)).unwrap();
+        assert!(hygiene::raw_tainted(token), "{prefix}... is not held");
+    }
 }
 
 #[tokio::test]
