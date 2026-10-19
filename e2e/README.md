@@ -430,20 +430,31 @@ cargo run -p siwx-oidc-auth --example rotation_canary -- check --env dev \
 | `discovery` | 200 (502 to 504 retried for a minute); `issuer` is `--issuer` up to one trailing slash; `jwks_uri` on its origin |
 | `jwks` | the published kid set equals `--expect-kids` exactly, no `--dropped-kids` member, every kid derived from its own `x`,`y` |
 | `sign_in` | PKCE sign-in with the stored key and client; ID token `ES256`, `kid` = `--live-kid`, signature verified against the `/jwk` entry, `iss`, `aud`, `sub`, and `iat`/`exp` within 30 s of the server's `Date` |
-| `whoami` | 200, `user_id` on `--server-name` |
+| `whoami` | 200, `user_id` is the MXID `init` recorded (`mxid_changed` otherwise: the key resolves to another account), on `--server-name` |
 | `did_proof` | the `io.inblock.did` proof carries the live kid, verifies (`verify_did_assertion`), is the key's DID and is no older than this run's `/authorize` answer |
-| `logout` | the account has no room and no device but this run's; after the logout, a refresh with this run's refresh token is refused with `invalid_grant` (a 200 from `/logout` proves nothing) |
+| `logout` | the account has no room and no device but this run's (leftovers of the canary's own runs and the device of an unfinished sign-in are named, see below); after the logout, a refresh with this run's refresh token is refused with `invalid_grant` (a 200 from `/logout` proves nothing) |
 
 Exit codes: 0 all six ran and passed, 1 a check failed, 2 usage or local state (`--no-matrix`
 outside `--env local`, a missing, loose or foreign identity), 3 logout not proven, 4 the tripwire
 fired (a room or a device nobody recorded: someone else is using the key). `--no-matrix` (only with
 `--env local`) runs three checks and skips three, and the summary says so. Only `--baseline` may
 register a new client when the stored one is refused. `init --replace` erases the account with its
-own key (`io.inblock.account_erase`) before it makes a new one. `devices.json` in the identity
-directory lists the devices the canary created and has not yet seen gone, so a run that died before
-its logout does not fire the next run's tripwire. An `init` that fails before its sign-in leaves `key.pem` in
-place (the account may or may not exist): check the homeserver, then remove the directory by hand and run
-`init` again; `init --replace` needs the old account to exist.
+own key (`io.inblock.account_erase`) before it makes a new one; an unreadable `client.json` is
+refused, a missing `key.pem` with an account named in `client.json` is `key_missing`, and the
+server's own "no account for this key" refusal means there is nothing to erase.
+
+`devices.json` in the identity directory is the canary's ledger. The server makes the Synapse device
+at `/sign_in`, before the code exchange, so a sign-in that fails or is killed afterwards leaves a
+device nobody recorded. The ledger holds the devices a run knew (dropped again once a logout through
+`/logout` is proven) and an attempt marker written before each sign-in and dropped once the run knows
+its device. At the next run an unrecorded `SIWX_` device that an earlier marker can explain is reported
+as `unfinished_sign_in_device` (exit 1) and tolerated from then on; a recorded one is a leftover,
+tolerated and deleted (`leftover_not_deleted` if it cannot be); a device without a marker, or more
+devices than markers, fires the tripwire (exit 4) and nothing is deleted. `init` probes how `/logout`
+is routed: 200 means the homeserver routes it to siwx-oidc, 401, 404 or 405 with a Matrix `errcode`
+means `/oauth2/revoke` is the way, and any other answer fails `init` with the status and records
+nothing. An `init` that fails before its sign-in leaves `key.pem` and a `client.json` with no account
+in place: `init --replace` clears it.
 
 Against the mock stack: the Synapse mock answers `GET /joined_rooms` (always empty),
 forwards `POST /_matrix/client/v3/logout` to siwx-oidc as the edge does, and lets a user set their own
@@ -455,6 +466,6 @@ those variables or add them to a copy of it. Negatives to try: `--live-kid` set 
 `POST /__fail {"endpoint":"publish_did_field","mode":"500"}` (`did_proof_stale`), a device
 added with `POST /__seed_device` (exit 4).
 
-`cargo test -p siwx-oidc-auth --test rotation_canary_unit` runs the canary's 80 unit and hermetic
+`cargo test -p siwx-oidc-auth --test rotation_canary_unit` runs the canary's 109 unit and hermetic
 tests (a fake server inside the test process: a logout that revokes nothing, a clock an hour off,
 a token signed by another key, a server that puts a token into a printed field, a panic).
