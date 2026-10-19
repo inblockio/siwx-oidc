@@ -441,7 +441,9 @@ fired (a room or a device nobody recorded: someone else is using the key). `--no
 register a new client when the stored one is refused. `init --replace` erases the account with its
 own key (`io.inblock.account_erase`) before it makes a new one. `devices.json` in the identity
 directory lists the devices the canary created and has not yet seen gone, so a run that died before
-its logout does not fire the next run's tripwire.
+its logout does not fire the next run's tripwire. An `init` that fails before its sign-in leaves `key.pem` in
+place (the account may or may not exist): check the homeserver, then remove the directory by hand and run
+`init` again; `init --replace` needs the old account to exist.
 
 Against the mock stack: the Synapse mock answers `GET /joined_rooms` (always empty),
 forwards `POST /_matrix/client/v3/logout` to siwx-oidc as the edge does, and lets a user set their own
