@@ -28,6 +28,11 @@ pub struct Reply {
     pub json: Option<Value>,
     /// The server's `Date`, unix seconds.
     pub date: Option<i64>,
+    /// The `Set-Cookie` headers as received. Credentials: callers wrap them.
+    pub set_cookies: Vec<String>,
+    /// The body as text, for deciding on (a plain-text refusal is not JSON).
+    /// Never printed.
+    text: String,
 }
 
 impl fmt::Debug for Reply {
@@ -40,6 +45,11 @@ impl Reply {
     /// 502, 503 or 504: an edge in front of a server that is being recreated, or a store fault.
     pub fn is_unavailable(&self) -> bool {
         matches!(self.status, 502..=504)
+    }
+
+    /// Whether the body, read as text, contains `needle`.
+    pub fn body_contains(&self, needle: &str) -> bool {
+        self.text.contains(needle)
     }
 
     pub fn str_field(&self, name: &str) -> Option<&str> {
@@ -58,6 +68,9 @@ pub fn client() -> Result<reqwest::Client, Reason> {
         .timeout(HTTP_TIMEOUT)
         // The sign-in reads `Location` headers itself.
         .redirect(reqwest::redirect::Policy::none())
+        // The canary talks to the hosts it was told to, never through a proxy
+        // an environment variable names: a proxy would see every credential.
+        .no_proxy()
         .user_agent("rotation-canary/1")
         .build()
         .map_err(|_| Reason::Internal)
@@ -81,13 +94,29 @@ pub async fn send(request: reqwest::RequestBuilder) -> Result<Reply, NetErr> {
         .get(reqwest::header::DATE)
         .and_then(|v| v.to_str().ok())
         .and_then(parse_http_date);
+    let set_cookies = response
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(str::to_string)
+        .collect();
     let body = response.bytes().await.map_err(net_err)?;
-    let json = if body.len() <= MAX_BODY {
-        serde_json::from_slice(&body).ok()
+    let (json, text) = if body.len() <= MAX_BODY {
+        (
+            serde_json::from_slice(&body).ok(),
+            String::from_utf8_lossy(&body).into_owned(),
+        )
     } else {
-        None
+        (None, String::new())
     };
-    Ok(Reply { status, json, date })
+    Ok(Reply {
+        status,
+        json,
+        date,
+        set_cookies,
+        text,
+    })
 }
 
 #[cfg(test)]
@@ -100,6 +129,8 @@ mod tests {
             status: 200,
             json: Some(serde_json::json!({"access_token": "mat_SecretSecretSecretSecretSecret12"})),
             date: None,
+            set_cookies: vec![],
+            text: String::new(),
         };
         let shown = format!("{reply:?} {reply:#?}");
         assert!(shown.contains("status: 200"));
@@ -116,16 +147,22 @@ mod tests {
             status: 400,
             json: Some(serde_json::json!({"error": "invalid_grant"})),
             date: None,
+            set_cookies: vec![],
+            text: String::new(),
         };
         let matrix = Reply {
             status: 401,
             json: Some(serde_json::json!({"errcode": "M_UNKNOWN_TOKEN"})),
             date: None,
+            set_cookies: vec![],
+            text: String::new(),
         };
         let none = Reply {
             status: 500,
             json: None,
             date: None,
+            set_cookies: vec![],
+            text: String::new(),
         };
         assert_eq!(oauth.error_code(), Some("invalid_grant"));
         assert_eq!(matrix.error_code(), Some("M_UNKNOWN_TOKEN"));
@@ -133,13 +170,17 @@ mod tests {
         assert!(Reply {
             status: 503,
             json: None,
-            date: None
+            date: None,
+            set_cookies: vec![],
+            text: String::new(),
         }
         .is_unavailable());
         assert!(!Reply {
             status: 500,
             json: None,
-            date: None
+            date: None,
+            set_cookies: vec![],
+            text: String::new(),
         }
         .is_unavailable());
     }

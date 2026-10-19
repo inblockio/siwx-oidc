@@ -47,9 +47,9 @@ impl From<AuthTokens> for Tokens {
     }
 }
 
-/// `POST /register`: a public client. Its registration access token is wrapped
-/// (and so held by the taint check) and dropped: the canary never manages the
-/// registration, it lets it expire.
+/// `POST /register`: a public client. Its registration access token (and a
+/// client secret, were one issued) is wrapped, so held by the taint check, and
+/// dropped: the canary never manages the registration, it lets it expire.
 pub async fn register_client(http: &reqwest::Client, issuer: &str) -> Result<String, Reason> {
     let reply = send(
         http.post(format!("{issuer}/register"))
@@ -66,13 +66,27 @@ pub async fn register_client(http: &reqwest::Client, issuer: &str) -> Result<Str
     if !(200..300).contains(&reply.status) {
         return Err(Reason::RegisterFailed);
     }
-    let _registration_token = reply
-        .str_field("registration_access_token")
-        .map(|t| Secret::new(t.to_string()));
+    // Credentials of the registration: held by the taint check, then dropped.
+    for name in ["registration_access_token", "client_secret"] {
+        let _held = reply.str_field(name).map(|t| Secret::new(t.to_string()));
+    }
+    hold_cookies(&reply);
     reply
         .str_field("client_id")
         .map(str::to_string)
         .ok_or(Reason::RegisterFailed)
+}
+
+/// Hold the value of every cookie a reply sets (and the whole `name=value`) in
+/// the taint check: a session cookie is a credential.
+pub fn hold_cookies(reply: &Reply) {
+    for cookie in &reply.set_cookies {
+        let pair = cookie.split(';').next().unwrap_or_default();
+        let _whole = Secret::new(pair.to_string());
+        if let Some((_, value)) = pair.split_once('=') {
+            let _value = Secret::new(value.to_string());
+        }
+    }
 }
 
 /// What `GET /authorize` says about the stored client.
@@ -146,23 +160,34 @@ pub async fn sign_in(
 }
 
 /// `POST /_matrix/client/v3/logout` without a token: siwx-oidc answers 200 `{}`
-/// (also for an unknown token); a homeserver that does not route the path to
-/// siwx-oidc answers 401, 404 or similar.
+/// (also for an unknown token), which means the edge routes the path to it. A
+/// homeserver that does not route it answers 401, 404 or 405 with a Matrix
+/// `errcode` in the body, and then `/oauth2/revoke` is the way out. Anything
+/// else (429, a 5xx, a page with no `errcode` from an edge that is not
+/// Matrix, no answer) says nothing about the route and is an error, with the
+/// status: recording `revoke` on such an answer would pin the weaker route.
 pub async fn probe_logout_route(
     http: &reqwest::Client,
     homeserver: &str,
-) -> Result<LogoutRoute, Reason> {
+) -> Result<LogoutRoute, (Reason, u16)> {
     let reply = send(
         http.post(format!("{homeserver}/_matrix/client/v3/logout"))
             .json(&serde_json::json!({})),
     )
     .await
-    .map_err(|_| Reason::RouteProbeFailed)?;
-    Ok(if reply.status == 200 {
-        LogoutRoute::Matrix
-    } else {
-        LogoutRoute::Revoke
-    })
+    .map_err(|_| (Reason::RouteProbeFailed, 0))?;
+    classify_route_probe(reply.status, reply.str_field("errcode").is_some())
+}
+
+pub fn classify_route_probe(
+    status: u16,
+    has_matrix_errcode: bool,
+) -> Result<LogoutRoute, (Reason, u16)> {
+    match status {
+        200 => Ok(LogoutRoute::Matrix),
+        401 | 404 | 405 if has_matrix_errcode => Ok(LogoutRoute::Revoke),
+        other => Err((Reason::RouteProbeFailed, other)),
+    }
 }
 
 /// What the account looks like from its own token: the rooms it has joined and
@@ -210,17 +235,32 @@ pub async fn read_account(
 }
 
 /// The identity tripwire's verdict. The canary account has never joined a room
-/// and holds no device but this run's; a device of an earlier run of the
-/// canary that is still on the ledger (`tolerated`) is a leftover, not a
-/// stranger.
+/// and holds no device but this run's, with two exceptions that are named and
+/// never silent:
+///
+/// - `leftovers`: devices an earlier run of the canary recorded (`tolerated`).
+/// - `unfinished`: devices nobody recorded that an unfinished sign-in of the
+///   canary can explain. The server mints `SIWX_<uuid>` at `/sign_in`, before
+///   the token exchange, so a sign-in that failed or was killed after it leaves
+///   one. They are explained only when every unexplained device has a `SIWX_`
+///   id and there are no more of them than `attempts`, the sign-ins started
+///   and never finished.
+///
+/// Anything else unexplained is a stranger and fires the tripwire.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Judgement {
     pub fired: bool,
     pub strangers: Vec<String>,
+    pub unfinished: Vec<String>,
     pub leftovers: Vec<String>,
 }
 
-pub fn judge(reading: &Reading, own: Option<&str>, tolerated: &BTreeSet<String>) -> Judgement {
+pub fn judge(
+    reading: &Reading,
+    own: Option<&str>,
+    tolerated: &BTreeSet<String>,
+    attempts: usize,
+) -> Judgement {
     let mut leftovers = Vec::new();
     let mut others = Vec::new();
     for id in &reading.listed {
@@ -233,16 +273,20 @@ pub fn judge(reading: &Reading, own: Option<&str>, tolerated: &BTreeSet<String>)
             others.push(id.clone());
         }
     }
-    // Without a whoami there is no telling which device is this run's: one
-    // unexplained device must be it, two or more cannot all be.
-    let strangers = if own.is_none() && others.len() <= 1 {
-        Vec::new()
+    // Without a whoami there is no telling which device is this run's: one of
+    // the others must be it.
+    let unexplained = others.len().saturating_sub(usize::from(own.is_none()));
+    let (strangers, unfinished) = if unexplained == 0 {
+        (Vec::new(), Vec::new())
+    } else if attempts >= unexplained && others.iter().all(|id| id.starts_with("SIWX_")) {
+        (Vec::new(), others)
     } else {
-        others
+        (others, Vec::new())
     };
     Judgement {
         fired: reading.rooms > 0 || !strangers.is_empty(),
         strangers,
+        unfinished,
         leftovers,
     }
 }
@@ -367,15 +411,6 @@ async fn clean_up_issued_pair(http: &reqwest::Client, issuer: &str, reply: &Repl
     }
 }
 
-/// Best effort for a run with no Matrix side (`--no-matrix`): revoke the
-/// refresh token so the sign-in leaves no live grant.
-pub async fn revoke_quietly(http: &reqwest::Client, issuer: &str, tokens: &Tokens) -> bool {
-    match &tokens.refresh {
-        Some(refresh) => revoke(http, issuer, refresh).await == Some(200),
-        None => false,
-    }
-}
-
 #[derive(serde::Deserialize)]
 struct AccountNonce {
     nonce: String,
@@ -392,7 +427,7 @@ pub async fn erase_account(
     http: &reqwest::Client,
     issuer: &str,
     key: &SiwxKey,
-) -> Result<(), (Reason, u16)> {
+) -> Result<EraseOutcome, (Reason, u16)> {
     let failed = |status: u16| (Reason::EraseFailed, status);
     let SiwxKey::Ed25519(signing_key) = key else {
         return Err(failed(0));
@@ -403,6 +438,7 @@ pub async fn erase_account(
     )
     .await
     .map_err(|_| failed(0))?;
+    hold_cookies(&nonce_reply);
     if nonce_reply.status != 200 {
         return Err(failed(nonce_reply.status));
     }
@@ -446,12 +482,34 @@ pub async fn erase_account(
     )
     .await
     .map_err(|_| failed(0))?;
+    // The reply of a re-authentication carries an account session: a CSRF token
+    // in the body and a cookie. Held by the taint check.
+    hold_cookies(&reply);
+    let _csrf = reply.str_field("csrf").map(|t| Secret::new(t.to_string()));
     if (200..300).contains(&reply.status) && reply.str_field("kind") == Some("erased") {
-        Ok(())
+        Ok(EraseOutcome::Erased)
+    } else if reply.status == 400 && reply.body_contains(NO_ACCOUNT_REFUSAL) {
+        // The server ran the check and found no account for this key (the
+        // sign-in that would have made it never got that far): nothing to erase.
+        Ok(EraseOutcome::NoAccount)
     } else {
         Err(failed(reply.status))
     }
 }
+
+/// What `erase_account` achieved.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EraseOutcome {
+    Erased,
+    /// The server refused because the key has no account.
+    NoAccount,
+}
+
+/// A part of the message `account_wallet` answers (400) when the signature is
+/// good but no account exists for the DID (`NEW_IDENTITY_REJECT_MSG` in
+/// `src/webauthn.rs`). Compared, never printed. A deactivated or erased account
+/// has a different refusal, and stays a failure: it may be reactivatable.
+const NO_ACCOUNT_REFUSAL: &str = "is not linked to an existing account";
 
 /// Wait this long between the retries of the discovery fetch.
 pub const RETRY_PAUSE: Duration = Duration::from_secs(3);
@@ -476,17 +534,24 @@ mod tests {
         ids.iter().map(|s| s.to_string()).collect()
     }
 
+    fn clean() -> Judgement {
+        Judgement {
+            fired: false,
+            strangers: vec![],
+            unfinished: vec![],
+            leftovers: vec![],
+        }
+    }
+
     #[test]
     fn only_this_runs_device_is_clean() {
-        let j = judge(&reading(0, &["SIWX_now"]), Some("SIWX_now"), &ledger(&[]));
-        assert_eq!(
-            j,
-            Judgement {
-                fired: false,
-                strangers: vec![],
-                leftovers: vec![]
-            }
+        let j = judge(
+            &reading(0, &["SIWX_now"]),
+            Some("SIWX_now"),
+            &ledger(&[]),
+            0,
         );
+        assert_eq!(j, clean());
     }
 
     #[test]
@@ -495,6 +560,7 @@ mod tests {
             &reading(0, &["SIWX_now", "ATTACKER"]),
             Some("SIWX_now"),
             &ledger(&["SIWX_old"]),
+            0,
         );
         assert!(j.fired);
         assert_eq!(j.strangers, vec!["ATTACKER".to_string()]);
@@ -502,7 +568,15 @@ mod tests {
 
     #[test]
     fn a_joined_room_fires_the_tripwire_even_with_no_stranger_device() {
-        assert!(judge(&reading(1, &["SIWX_now"]), Some("SIWX_now"), &ledger(&[])).fired);
+        assert!(
+            judge(
+                &reading(1, &["SIWX_now"]),
+                Some("SIWX_now"),
+                &ledger(&[]),
+                0
+            )
+            .fired
+        );
     }
 
     #[test]
@@ -511,22 +585,110 @@ mod tests {
             &reading(0, &["SIWX_now", "SIWX_old"]),
             Some("SIWX_now"),
             &ledger(&["SIWX_old"]),
+            0,
         );
         assert_eq!(
             j,
             Judgement {
-                fired: false,
-                strangers: vec![],
-                leftovers: vec!["SIWX_old".to_string()]
+                leftovers: vec!["SIWX_old".to_string()],
+                ..clean()
             }
         );
     }
 
     #[test]
     fn without_a_whoami_one_unexplained_device_is_this_runs_and_two_are_not() {
-        assert!(!judge(&reading(0, &["SIWX_x"]), None, &ledger(&[])).fired);
-        let j = judge(&reading(0, &["SIWX_x", "SIWX_y"]), None, &ledger(&[]));
+        assert!(!judge(&reading(0, &["SIWX_x"]), None, &ledger(&[]), 0).fired);
+        let j = judge(&reading(0, &["SIWX_x", "SIWX_y"]), None, &ledger(&[]), 0);
         assert!(j.fired);
         assert_eq!(j.strangers.len(), 2);
+    }
+
+    #[test]
+    fn an_unrecorded_siwx_device_with_an_unfinished_attempt_is_reported_not_fired() {
+        let j = judge(
+            &reading(0, &["SIWX_now", "SIWX_killed"]),
+            Some("SIWX_now"),
+            &ledger(&[]),
+            1,
+        );
+        assert!(!j.fired, "it is explained, but under its own name");
+        assert_eq!(j.unfinished, vec!["SIWX_killed".to_string()]);
+        assert!(j.strangers.is_empty());
+    }
+
+    #[test]
+    fn a_device_with_no_attempt_to_match_it_still_fires() {
+        let j = judge(
+            &reading(0, &["SIWX_now", "SIWX_killed"]),
+            Some("SIWX_now"),
+            &ledger(&[]),
+            0,
+        );
+        assert!(j.fired);
+        assert!(j.unfinished.is_empty());
+    }
+
+    #[test]
+    fn more_unrecorded_devices_than_attempts_fire_and_none_is_excused() {
+        let j = judge(
+            &reading(0, &["SIWX_now", "SIWX_a", "SIWX_b"]),
+            Some("SIWX_now"),
+            &ledger(&[]),
+            1,
+        );
+        assert!(j.fired);
+        assert_eq!(j.strangers.len(), 2);
+        assert!(j.unfinished.is_empty());
+    }
+
+    #[test]
+    fn an_attempt_never_explains_a_device_the_server_did_not_mint() {
+        // `SIWX_<uuid>` is what the server mints when no device id is proposed,
+        // which is what the canary does; a client's own id is not its leftover.
+        let j = judge(
+            &reading(0, &["SIWX_now", "ELEMENTXDEVICE"]),
+            Some("SIWX_now"),
+            &ledger(&[]),
+            3,
+        );
+        assert!(j.fired);
+        assert_eq!(j.strangers, vec!["ELEMENTXDEVICE".to_string()]);
+    }
+
+    #[test]
+    fn a_room_fires_even_when_every_device_is_explained() {
+        let j = judge(
+            &reading(1, &["SIWX_now", "SIWX_killed"]),
+            Some("SIWX_now"),
+            &ledger(&[]),
+            1,
+        );
+        assert!(j.fired);
+        assert_eq!(j.unfinished.len(), 1);
+    }
+
+    #[test]
+    fn the_logout_route_probe_pins_revoke_only_on_a_matrix_refusal() {
+        assert_eq!(classify_route_probe(200, false), Ok(LogoutRoute::Matrix));
+        for status in [401, 404, 405] {
+            assert_eq!(
+                classify_route_probe(status, true),
+                Ok(LogoutRoute::Revoke),
+                "{status}"
+            );
+            assert_eq!(
+                classify_route_probe(status, false),
+                Err((Reason::RouteProbeFailed, status)),
+                "an edge that is not Matrix says nothing about the route ({status})"
+            );
+        }
+        for status in [400, 403, 429, 500, 502, 503, 504] {
+            assert_eq!(
+                classify_route_probe(status, true),
+                Err((Reason::RouteProbeFailed, status)),
+                "{status}"
+            );
+        }
     }
 }

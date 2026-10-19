@@ -21,7 +21,7 @@ use siwx_oidc_auth::{verify_did_assertion, SiwxKey, DID_PROFILE_FIELD};
 use crate::cli::{CheckConfig, Matrix};
 use crate::flow::{self, Probe, Tokens, RETRY_PAUSE};
 use crate::hygiene::{self, Secret};
-use crate::identity::{self, ClientRecord};
+use crate::identity::{self, Attempt, ClientRecord, LogoutRoute};
 use crate::jose::{
     check_times, header_kid, issuers_match, judge_jwks, parse_jwks, verify_id_token, Expect,
     JwkEntry,
@@ -99,6 +99,8 @@ struct Cx {
     key: SiwxKey,
     record: ClientRecord,
     jwks: Option<Vec<JwkEntry>>,
+    /// Names this run's sign-in attempt on the device ledger.
+    attempt_id: String,
 }
 
 pub async fn run(cfg: CheckConfig, root: &Path) -> i32 {
@@ -121,6 +123,11 @@ pub async fn run(cfg: CheckConfig, root: &Path) -> i32 {
     if !issuers_match(&record.issuer, &cfg.issuer) {
         return refuse("identity", Reason::StoredIssuerDiffers, 2);
     }
+    // `init` writes the record before its sign-in, with the account not yet
+    // known: such an identity was never finished.
+    if record.mxid.is_empty() {
+        return refuse("identity", Reason::NotInitialized, 2);
+    }
     let http = match flow::http() {
         Ok(http) => http,
         Err(reason) => return refuse("client", reason, 1),
@@ -132,6 +139,7 @@ pub async fn run(cfg: CheckConfig, root: &Path) -> i32 {
         key,
         record,
         jwks: None,
+        attempt_id: format!("{:016x}", rand::random::<u64>()),
     };
     let mut run = Run::default();
 
@@ -147,13 +155,45 @@ pub async fn run(cfg: CheckConfig, root: &Path) -> i32 {
         (Some(session), None) => {
             run.skip("whoami", Reason::NoMatrix, vec![]);
             run.skip("did_proof", Reason::NoMatrix, vec![]);
-            // No Matrix side to log out of: still leave no live grant.
-            let revoked = flow::revoke_quietly(&cx.http, &cx.cfg.issuer, &session.tokens).await;
-            run.skip(
-                "logout",
-                Reason::NoMatrix,
-                vec![("revoked", if revoked { "yes" } else { "no" }.to_string())],
-            );
+            // No Matrix side to log out of: the grant is still ended by
+            // `/oauth2/revoke` and proven gone by a refresh. A grant that is
+            // not proven gone fails the run (the skipped check is no excuse).
+            let report = flow::logout_and_prove(
+                &cx.http,
+                &cx.cfg.issuer,
+                None,
+                LogoutRoute::Revoke,
+                &cx.record.client_id,
+                &session.tokens,
+            )
+            .await;
+            let mut fields = vec![
+                (
+                    "revoked",
+                    if report.reason == Reason::Ok {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                    .to_string(),
+                ),
+                (
+                    "logout_status",
+                    report
+                        .logout_status
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                ),
+                ("refresh", report.refresh.to_string()),
+            ];
+            if let Some(cleanup) = report.cleanup {
+                fields.push(("cleanup", cleanup.to_string()));
+            }
+            if report.reason == Reason::Ok {
+                run.skip("logout", Reason::NoMatrix, fields);
+            } else {
+                run.fail("logout", report.reason, fields);
+            }
         }
         (Some(session), Some(matrix)) => {
             let me = cx.whoami(&mut run, &session, &matrix).await;
@@ -349,6 +389,24 @@ impl Cx {
                 return None;
             }
         };
+        // The server creates the Synapse device at `/sign_in`, before the code
+        // is exchanged: if this run fails or is killed from here on, the ledger
+        // says a device without an id here may exist. Without a Matrix side
+        // there is no device.
+        if self.cfg.matrix.is_some() {
+            let attempt = Attempt {
+                id: self.attempt_id.clone(),
+                at: chrono::Utc::now().timestamp(),
+            };
+            if identity::update_ledger(&self.dir, |ledger| ledger.attempts.push(attempt)).is_err() {
+                run.fail(
+                    CHECK,
+                    Reason::IdentityWriteFailed,
+                    vec![("client", client.to_string())],
+                );
+                return None;
+            }
+        }
         // Seconds on this host's monotonic clock since the server's `Date`.
         let since_probe = std::time::Instant::now();
         let tokens =
@@ -414,7 +472,8 @@ impl Cx {
         })
     }
 
-    /// C4: the access token works at the homeserver and names a user on `--server-name`.
+    /// C4: the access token works at the homeserver and names the MXID `init`
+    /// recorded, which is on `--server-name`.
     async fn whoami(&self, run: &mut Run, session: &Session, matrix: &Matrix) -> Option<WhoAmI> {
         const CHECK: &str = "whoami";
         let reply = send(
@@ -448,19 +507,26 @@ impl Cx {
         let device = reply.str_field("device_id").map(str::to_string);
         let on_server =
             mxid.starts_with('@') && mxid.ends_with(&format!(":{}", matrix.server_name));
-        let fields = vec![
+        let mut fields = vec![
             ("mxid", mxid.clone()),
             ("device", device.clone().unwrap_or_default()),
         ];
-        // The device is on the ledger from the moment it is known: if this run
-        // dies before its logout, the next run's tripwire knows it for ours.
+        // The device is on the ledger from the moment it is known, and the
+        // attempt that made it is finished: if this run dies before its logout,
+        // the next run's tripwire knows the device for ours.
         if let Some(device) = &device {
-            let mut pending = identity::read_pending(&self.dir);
-            if pending.insert(device.clone()) {
-                let _ = identity::write_pending(&self.dir, &pending);
-            }
+            let id = self.attempt_id.clone();
+            let _ = identity::update_ledger(&self.dir, |ledger| {
+                ledger.pending.insert(device.clone());
+                ledger.attempts.retain(|a| a.id != id);
+            });
         }
-        if on_server {
+        if mxid != self.record.mxid {
+            // The key must keep resolving to the one account `init` recorded.
+            // Another account on the same server would pass every other check.
+            fields.push(("recorded", self.record.mxid.clone()));
+            run.fail(CHECK, Reason::MxidChanged, fields);
+        } else if on_server {
             run.ok(CHECK, fields);
         } else {
             run.fail(CHECK, Reason::ServerNameMismatch, fields);
@@ -547,27 +613,36 @@ impl Cx {
     }
 
     /// C6: the tripwire (the account has no rooms and no device but this
-    /// run's, leftovers of earlier runs of the canary excepted), then the logout
-    /// by the recorded route, passing only when this run's refresh token is then
+    /// run's; leftovers of earlier runs of the canary and devices of its
+    /// unfinished sign-ins are named, not excused silently), then the logout by
+    /// the recorded route, passing only when this run's refresh token is then
     /// refused. Always attempted once C3 signed in.
     async fn logout(&self, run: &mut Run, session: &Session, matrix: &Matrix, me: Option<&WhoAmI>) {
         const CHECK: &str = "logout";
         let own_device = me.and_then(|m| m.device.as_deref());
-        let pending = identity::read_pending(&self.dir);
+        let ledger = identity::read_ledger(&self.dir);
+        let earlier_attempts = ledger
+            .attempts
+            .iter()
+            .filter(|a| a.id != self.attempt_id)
+            .count();
         let reading =
             flow::read_account(&self.http, &matrix.homeserver, &session.tokens.access).await;
         let judged = reading
             .as_ref()
-            .map(|r| flow::judge(r, own_device, &pending));
+            .map(|r| flow::judge(r, own_device, &ledger.pending, earlier_attempts));
         // Forget the canary's own leftovers, but never touch anything while the
         // tripwire is fired: the evidence stays.
         let mut cleaned = BTreeSet::new();
+        let mut stuck = Vec::new();
         if let Some(judged) = judged.as_ref().filter(|j| !j.fired) {
             for id in &judged.leftovers {
                 if flow::delete_device(&self.http, &matrix.homeserver, &session.tokens.access, id)
                     .await
                 {
                     cleaned.insert(id.clone());
+                } else {
+                    stuck.push(id.clone());
                 }
             }
         }
@@ -581,28 +656,49 @@ impl Cx {
             &session.tokens,
         )
         .await;
-        // The ledger keeps this run's device (its deletion cannot be read back
-        // with a revoked token) and every earlier one still listed.
-        let ledger = reading.as_ref().map(|r| {
-            let mut keep: BTreeSet<String> = pending
-                .iter()
-                .filter(|id| r.listed.contains(id) && !cleaned.contains(*id))
-                .cloned()
-                .collect();
-            keep.extend(own_device.map(str::to_string));
-            keep
-        });
-        let ledger_word = match ledger {
-            Some(keep) => match identity::write_pending(&self.dir, &keep) {
-                Ok(()) => "ok",
-                Err(_) => "failed",
-            },
-            None => "unchanged",
+        let ledger_word = match (&reading, &judged) {
+            (Some(r), Some(j)) => {
+                // A logout through `/logout` deletes the device and a refresh
+                // refused afterwards proves it ended: the device leaves the
+                // ledger. By `/oauth2/revoke` the device may stay, so it stays
+                // on the ledger until a later run sees it gone.
+                let proven = report.reason == Reason::Ok && report.route == LogoutRoute::Matrix;
+                let mut next = ledger.clone();
+                next.pending
+                    .retain(|id| r.listed.contains(id) && !cleaned.contains(id));
+                // Devices of unfinished sign-ins are reported now and tolerated
+                // (and deleted) from the next run on.
+                next.pending.extend(j.unfinished.iter().cloned());
+                match own_device {
+                    Some(own) if proven => {
+                        next.pending.remove(own);
+                    }
+                    Some(own) => {
+                        next.pending.insert(own.to_string());
+                    }
+                    None => {}
+                }
+                if !j.fired {
+                    // The markers were weighed against what the account holds.
+                    // This run's own stays while its device id is unknown.
+                    let keep = if own_device.is_none() {
+                        Some(&self.attempt_id)
+                    } else {
+                        None
+                    };
+                    next.attempts.retain(|a| Some(&a.id) == keep);
+                }
+                match identity::write_ledger(&self.dir, &next) {
+                    Ok(()) => "ok",
+                    Err(_) => "failed",
+                }
+            }
+            _ => "unchanged",
         };
-        let (tripwire, reason_if_fired) = match &judged {
-            Some(j) if j.fired => ("fired", Some(Reason::IdentityCompromised)),
-            Some(_) => ("clean", None),
-            None => ("unavailable", None),
+        let tripwire = match &judged {
+            Some(j) if j.fired => "fired",
+            Some(_) => "clean",
+            None => "unavailable",
         };
         let mut fields: Fields = vec![
             ("route", report.route.word().to_string()),
@@ -636,6 +732,12 @@ impl Cx {
                 fields.push(("leftovers", list(&j.leftovers)));
                 fields.push(("cleaned", cleaned.len().to_string()));
             }
+            if !stuck.is_empty() {
+                fields.push(("stuck", list(&stuck)));
+            }
+            if !j.unfinished.is_empty() {
+                fields.push(("unfinished", list(&j.unfinished)));
+            }
             if !j.strangers.is_empty() {
                 fields.push(("strangers", list(&j.strangers)));
             }
@@ -643,10 +745,15 @@ impl Cx {
         if let Some(cleanup) = report.cleanup {
             fields.push(("cleanup", cleanup.to_string()));
         }
-        let reason = match (reason_if_fired, judged.is_none(), report.reason) {
-            (Some(fired), _, _) => fired,
-            (None, true, Reason::Ok) => Reason::TripwireUnavailable,
-            (None, _, reason) => reason,
+        // Most serious first: a fired tripwire (exit 4), a logout that is not
+        // proven (exit 3), then the failures that are exit 1.
+        let reason = match &judged {
+            Some(j) if j.fired => Reason::IdentityCompromised,
+            _ if report.reason != Reason::Ok => report.reason,
+            None => Reason::TripwireUnavailable,
+            Some(_) if !stuck.is_empty() => Reason::LeftoverNotDeleted,
+            Some(j) if !j.unfinished.is_empty() => Reason::UnfinishedSignInDevice,
+            Some(_) => Reason::Ok,
         };
         match reason {
             Reason::Ok => run.ok(CHECK, fields),

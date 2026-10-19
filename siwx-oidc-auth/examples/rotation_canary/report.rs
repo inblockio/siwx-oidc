@@ -104,6 +104,7 @@ reasons! {
     WhoamiStatus => "whoami_status",
     WhoamiMalformed => "whoami_malformed",
     ServerNameMismatch => "server_name_mismatch",
+    MxidChanged => "mxid_changed",
     // C5 did proof.
     ProfileUnreachable => "profile_unreachable",
     ProfileStatus => "profile_status",
@@ -116,6 +117,8 @@ reasons! {
     // C6 logout.
     IdentityCompromised => "identity_compromised",
     TripwireUnavailable => "tripwire_unavailable",
+    UnfinishedSignInDevice => "unfinished_sign_in_device",
+    LeftoverNotDeleted => "leftover_not_deleted",
     NoRefreshToken => "no_refresh_token",
     LogoutStatus => "logout_status",
     LogoutIneffective => "logout_ineffective",
@@ -127,6 +130,7 @@ reasons! {
     BlockedByWhoami => "blocked_by_whoami",
     // init.
     EraseFailed => "erase_failed",
+    KeyMissing => "key_missing",
     DisplayNameFailed => "display_name_failed",
     RouteProbeFailed => "route_probe_failed",
     // Output and process.
@@ -212,8 +216,16 @@ pub fn render(check: &str, verdict: Verdict, reason: Reason, fields: &[(&str, St
 }
 
 /// Render a check line and print it through the taint check.
+///
+/// A field value is checked as received, before the output charset cleans it:
+/// cleaning can break the windows of a credential that holds characters outside
+/// the charset. A line with such a value is replaced by the refusal marker.
 pub fn emit(check: &str, verdict: Verdict, reason: Reason, fields: &[(&str, String)]) {
-    hygiene::print_line(render(check, verdict, reason, fields), check);
+    if fields.iter().any(|(_, raw)| hygiene::raw_tainted(raw)) {
+        hygiene::print_refusal(check);
+    } else {
+        hygiene::print_line(render(check, verdict, reason, fields), check);
+    }
 }
 
 /// The summary line, in the one shape the wrapper gates on.
@@ -305,6 +317,34 @@ mod tests {
             ),
             "CANARY logout result=SKIP reason=no_matrix revoked=<none>"
         );
+    }
+
+    #[test]
+    fn a_field_value_holding_a_credential_is_refused_before_it_is_cleaned() {
+        let held = "aaaaa+bbbbb+ccccc+ddddd+eeeee+fffff+ggggg";
+        let _secret = hygiene::Secret::new(held.to_string());
+        hygiene::start_capture();
+        emit(
+            "whoami",
+            Verdict::Ok,
+            Reason::Ok,
+            &[("device", format!("SIWX_{held}"))],
+        );
+        emit(
+            "whoami",
+            Verdict::Ok,
+            Reason::Ok,
+            &[("device", "SIWX_clean".to_string())],
+        );
+        let lines = hygiene::take_capture();
+        assert_eq!(
+            lines,
+            vec![
+                "CANARY taint result=FAIL reason=output_refused check=whoami".to_string(),
+                "CANARY whoami result=ok reason=ok device=SIWX_clean".to_string(),
+            ]
+        );
+        assert!(hygiene::taint_tripped());
     }
 
     #[test]

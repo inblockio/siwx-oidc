@@ -93,24 +93,42 @@ pub fn taint_hit(line: &str, credentials: &[String]) -> bool {
     })
 }
 
-/// The line to print for `line`: itself, or, when it carries a window of a held
-/// credential, a refusal marker that names only the check (a literal of this
-/// program). A refusal fails the run.
-pub fn guard(line: String, check: &str) -> String {
-    let held = CREDENTIALS
+fn held_credentials() -> Vec<String> {
+    CREDENTIALS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    if taint_hit(&line, &held) {
-        trip();
-        format!(
-            "CANARY taint result=FAIL reason={} check={}",
-            Reason::OutputRefused.code(),
-            value(check)
-        )
+        .clone()
+}
+
+/// The line to print instead of one that carried a credential: a refusal
+/// marker that names only the check (a literal of this program). Printing it
+/// fails the run.
+pub fn refusal(check: &str) -> String {
+    trip();
+    format!(
+        "CANARY taint result=FAIL reason={} check={}",
+        Reason::OutputRefused.code(),
+        value(check)
+    )
+}
+
+/// The line to print for `line`: itself, or, when it carries a window of a held
+/// credential, the refusal marker.
+pub fn guard(line: String, check: &str) -> String {
+    if taint_hit(&line, &held_credentials()) {
+        refusal(check)
     } else {
         line
     }
+}
+
+/// Whether a value, as received and before [`value`] cleans it, carries a
+/// window of a held credential. The rendered line is checked too, but cleaning
+/// turns every character outside the output charset into `_`, which can break
+/// the windows of a credential that has such characters, so the raw value is
+/// the one to look at.
+pub fn raw_tainted(raw: &str) -> bool {
+    taint_hit(raw, &held_credentials())
 }
 
 #[cfg(not(test))]
@@ -171,7 +189,15 @@ pub fn value(s: &str) -> String {
 /// Print one finished line to stdout through the taint check. A closed stdout
 /// is ignored: the verdict is the exit code.
 pub fn print_line(line: String, check: &str) {
-    let line = guard(line, check);
+    write_out(guard(line, check));
+}
+
+/// Print the refusal marker for `check` (a value of it was a credential).
+pub fn print_refusal(check: &str) {
+    write_out(refusal(check));
+}
+
+fn write_out(line: String) {
     #[cfg(test)]
     {
         let captured = CAPTURE.with(|c| match c.borrow_mut().as_mut() {
@@ -192,7 +218,8 @@ pub fn print_line(line: String, check: &str) {
 
 /// `panic = "abort"` cannot be set for an example, so a hook prints the source
 /// location and nothing else (the payload can carry anything, a response body
-/// included) and aborts.
+/// included) and leaves with `_exit(70)`: no unwinding, no `atexit` handlers,
+/// and no `SIGABRT` for a crash handler to turn into a core file or a report.
 pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let at = info
@@ -206,9 +233,13 @@ pub fn install_panic_hook() {
             value(&at)
         );
         let _ = err.flush();
-        std::process::abort();
+        // SAFETY: `_exit` takes no pointers and does not return.
+        unsafe { libc::_exit(PANIC_EXIT_CODE) }
     }));
 }
+
+/// `EX_SOFTWARE`: an internal error.
+pub const PANIC_EXIT_CODE: i32 = 70;
 
 /// The last two components of a path: enough to find the line, no home
 /// directory in the output.
@@ -217,8 +248,10 @@ fn short_path(path: &str) -> String {
     parts.into_iter().rev().collect::<Vec<_>>().join("/")
 }
 
-/// `setrlimit(RLIMIT_CORE, 0)`: a crash cannot leave a core file holding a key
-/// or a token. `true` when the limit is now zero.
+/// `setrlimit(RLIMIT_CORE, 0)` and, on Linux, `prctl(PR_SET_DUMPABLE, 0)`: a
+/// crash cannot leave a core file holding a key or a token, and no other
+/// process of this user can read the memory through `ptrace` or `/proc/<pid>/mem`.
+/// `true` when both took.
 #[cfg(unix)]
 pub fn disable_core_dumps() -> bool {
     let zero = libc::rlimit {
@@ -226,7 +259,19 @@ pub fn disable_core_dumps() -> bool {
         rlim_max: 0,
     };
     // SAFETY: `zero` is a valid, initialised `rlimit` that outlives the call.
-    unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) == 0 }
+    let limited = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) == 0 };
+    limited && not_dumpable()
+}
+
+#[cfg(target_os = "linux")]
+fn not_dumpable() -> bool {
+    // SAFETY: `PR_SET_DUMPABLE` takes plain integers.
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) == 0 }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn not_dumpable() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -312,6 +357,21 @@ mod tests {
         );
         assert!(!refused.contains("GuardTestToken"));
         assert!(taint_tripped(), "a refusal must fail the run");
+    }
+
+    #[test]
+    fn a_credential_in_a_raw_value_is_found_even_where_cleaning_would_hide_it() {
+        // Every 12-character window of this credential holds a `+`, which
+        // cleaning turns into `_`: the cleaned text holds no window of it.
+        let held = "aaaaa+bbbbb+ccccc+ddddd+eeeee+fffff+ggggg";
+        let _secret = Secret::new(held.to_string());
+        let raw = format!("device {held} end");
+        assert!(raw_tainted(&raw));
+        assert!(
+            !taint_hit(&value(&raw), &[held.to_string()]),
+            "the cleaned value hides it, which is why the raw one is checked"
+        );
+        assert!(!raw_tainted("device SIWX_abcdef end"));
     }
 
     #[test]

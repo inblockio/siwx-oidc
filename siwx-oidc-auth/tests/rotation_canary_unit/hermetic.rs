@@ -62,6 +62,15 @@ fn jws(key: &SigningKey, header: Value, claims: Value) -> String {
     format!("{h}.{p}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
 }
 
+/// The Ed25519 key a `did:key:z6Mk...` names.
+fn did_verifying_key(did: &str) -> Option<ed25519_dalek::VerifyingKey> {
+    let bytes = bs58::decode(did.strip_prefix("did:key:z")?)
+        .into_vec()
+        .ok()?;
+    let key: [u8; 32] = bytes.strip_prefix(&[0xED, 0x01])?.try_into().ok()?;
+    ed25519_dalek::VerifyingKey::from_bytes(&key).ok()
+}
+
 /// How the fake misbehaves. Everything defaults to a healthy deployment.
 #[derive(Clone)]
 struct Quirks {
@@ -84,6 +93,23 @@ struct Quirks {
     token_status_after_logout: Option<u16>,
     rooms: usize,
     extra_devices: Vec<String>,
+    /// `POST /logout` without a token answers this (status, with a Matrix
+    /// `errcode`) instead of 200: an edge that does not route it.
+    logout_probe: Option<(u16, bool)>,
+    /// The logout revokes the tokens but leaves the device.
+    leave_device_on_logout: bool,
+    /// `DELETE /devices/{id}` answers this and deletes nothing when not 200.
+    delete_device_status: u16,
+    /// whoami names this account instead of the signed-in one.
+    whoami_user_id: Option<String>,
+    /// The code exchange fails after `/sign_in` made the device.
+    token_fails: bool,
+    /// `/oauth2/revoke` answers 200 and revokes nothing.
+    revoke_is_noop: bool,
+    /// `/account/wallet` refuses with this status.
+    erase_refused: Option<u16>,
+    /// whoami answers this status.
+    whoami_status: Option<u16>,
 }
 
 impl Default for Quirks {
@@ -100,6 +126,14 @@ impl Default for Quirks {
             token_status_after_logout: None,
             rooms: 0,
             extra_devices: Vec::new(),
+            logout_probe: None,
+            leave_device_on_logout: false,
+            delete_device_status: 200,
+            whoami_user_id: None,
+            token_fails: false,
+            revoke_is_noop: false,
+            erase_refused: None,
+            whoami_status: None,
         }
     }
 }
@@ -116,10 +150,17 @@ struct State {
     access: String,
     refresh: String,
     device: String,
+    /// The device `/sign_in` made, before the code was exchanged.
+    signed_in_device: String,
     /// Every credential the fake handed out, for the leak assertions.
     minted: Vec<String>,
     devices: Vec<String>,
     display_name: Option<String>,
+    /// Whether the key's DID has an account (`/sign_in` makes it).
+    account_exists: bool,
+    /// Nonces handed out by `/account/nonce`, until used.
+    nonces: Vec<String>,
+    erased: bool,
 }
 
 #[derive(Clone)]
@@ -143,6 +184,14 @@ struct Response {
 }
 
 fn reply(status: u16, body: Value) -> Response {
+    Response {
+        status,
+        headers: vec![],
+        body: body.to_string(),
+    }
+}
+
+fn text_reply(status: u16, body: &str) -> Response {
     Response {
         status,
         headers: vec![],
@@ -179,9 +228,13 @@ impl Fake {
             access: String::new(),
             refresh: String::new(),
             device: String::new(),
+            signed_in_device: String::new(),
             minted: Vec::new(),
             devices: Vec::new(),
             display_name: None,
+            account_exists: true,
+            nonces: Vec::new(),
+            erased: false,
         }));
         let fake = Fake { state, base };
         let serving = fake.clone();
@@ -290,11 +343,17 @@ impl Fake {
             }),
             ("POST", "/register") => self.with(|s| {
                 let registration_token = random("rat_", 40);
-                s.minted.push(registration_token.clone());
+                let client_secret = random("cs_", 40);
+                s.minted
+                    .extend([registration_token.clone(), client_secret.clone()]);
                 s.client_id = random("client-", 12);
                 reply(
                     201,
-                    json!({"client_id": s.client_id, "registration_access_token": registration_token}),
+                    json!({
+                        "client_id": s.client_id,
+                        "registration_access_token": registration_token,
+                        "client_secret": client_secret,
+                    }),
                 )
             }),
             ("GET", "/authorize") => self.with(|s| {
@@ -314,6 +373,14 @@ impl Fake {
             ("GET", "/sign_in") => {
                 let cookie = r.headers.get("cookie").cloned().unwrap_or_default();
                 if cookie.contains("session=fake-session") && cookie.contains("siwx=") {
+                    // Like the server: the device is made here, before the code is
+                    // exchanged at `/token`.
+                    self.with(|s| {
+                        s.signed_in_device = random("SIWX_", 8);
+                        let made = s.signed_in_device.clone();
+                        s.devices.push(made);
+                        s.account_exists = true;
+                    });
                     redirect(format!("{REDIRECT_URI}?code=fake-code&state=headless"), None)
                 } else {
                     reply(400, json!({"error": "no session"}))
@@ -322,21 +389,29 @@ impl Fake {
             ("POST", "/token") => self.token(r),
             ("POST", "/oauth2/revoke") => self.with(|s| {
                 let form = form_of(&r.body);
-                if form.get("token") == Some(&s.refresh) {
+                if form.get("token") == Some(&s.refresh) && !s.quirks.revoke_is_noop {
                     s.logged_out = true;
                 }
                 reply(200, json!({}))
             }),
             ("POST", "/_matrix/client/v3/logout") => {
                 if Self::bearer(r).is_none() {
-                    return reply(200, json!({}));
+                    return match self.with(|s| s.quirks.logout_probe) {
+                        None => reply(200, json!({})),
+                        Some((status, true)) => {
+                            reply(status, json!({"errcode": "M_UNRECOGNIZED", "error": "x"}))
+                        }
+                        Some((status, false)) => text_reply(status, "<html>not matrix</html>"),
+                    };
                 }
                 let authorised = self.authorised(r);
                 self.with(|s| {
                     if authorised && !s.quirks.logout_is_noop {
                         s.logged_out = true;
-                        let own = s.device.clone();
-                        s.devices.retain(|d| *d != own);
+                        if !s.quirks.leave_device_on_logout {
+                            let own = s.device.clone();
+                            s.devices.retain(|d| *d != own);
+                        }
                     }
                     reply(s.quirks.logout_status, json!({}))
                 })
@@ -345,13 +420,17 @@ impl Fake {
                 if !self.authorised(r) {
                     return reply(401, json!({"errcode": "M_UNKNOWN_TOKEN"}));
                 }
+                if let Some(status) = self.with(|s| s.quirks.whoami_status) {
+                    return reply(status, json!({"errcode": "M_UNKNOWN"}));
+                }
                 self.with(|s| {
                     let device = if s.quirks.device_is_refresh_token {
                         s.refresh.clone()
                     } else {
                         s.device.clone()
                     };
-                    reply(200, json!({"user_id": s.mxid, "device_id": device}))
+                    let user_id = s.quirks.whoami_user_id.clone().unwrap_or(s.mxid.clone());
+                    reply(200, json!({"user_id": user_id, "device_id": device}))
                 })
             }
             ("GET", "/_matrix/client/v3/joined_rooms") => {
@@ -384,11 +463,30 @@ impl Fake {
                     .unwrap()
                     .to_string();
                 self.with(|s| {
+                    if s.quirks.delete_device_status != 200 {
+                        return reply(s.quirks.delete_device_status, json!({"errcode": "M_UNKNOWN"}));
+                    }
                     s.devices.retain(|d| *d != id);
                     s.quirks.extra_devices.retain(|d| *d != id);
-                });
-                reply(200, json!({}))
+                    reply(200, json!({}))
+                })
             }
+            ("GET", "/account/nonce") => self.with(|s| {
+                let nonce = random("n", 24);
+                s.minted.push(nonce.clone());
+                s.nonces.push(nonce.clone());
+                let expires = Utc::now().timestamp() + s.quirks.clock_offset + 300;
+                reply(
+                    200,
+                    json!({
+                        "nonce": nonce,
+                        "expiration_time": DateTime::from_timestamp(expires, 0).unwrap()
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        "resources": [format!("{}/account?action=io.inblock.account_erase", s.base)],
+                    }),
+                )
+            }),
+            ("POST", "/account/wallet") => self.wallet(r),
             ("GET", p)
                 if p.starts_with("/_matrix/client/v3/profile/") && p.ends_with("/io.inblock.did") =>
             {
@@ -417,6 +515,55 @@ impl Fake {
         }
     }
 
+    /// `POST /account/wallet` for the erase action: the signature must be the
+    /// DID's over the message, the message must carry a nonce the fake issued.
+    fn wallet(&self, r: &Request) -> Response {
+        let body: Value = serde_json::from_slice(&r.body).unwrap_or_default();
+        let field = |name: &str| body[name].as_str().unwrap_or_default().to_string();
+        let (action, did, message, signature) = (
+            field("action"),
+            field("did"),
+            field("message"),
+            field("signature"),
+        );
+        self.with(|s| {
+            if let Some(status) = s.quirks.erase_refused {
+                return text_reply(status, "refused");
+            }
+            let signed = did_verifying_key(&did).is_some_and(|key| {
+                use ed25519_dalek::Verifier;
+                hex::decode(&signature)
+                    .ok()
+                    .and_then(|b| ed25519_dalek::Signature::from_slice(&b).ok())
+                    .is_some_and(|sig| key.verify(message.as_bytes(), &sig).is_ok())
+            });
+            let nonce = s.nonces.iter().position(|n| message.contains(n.as_str()));
+            if action != "io.inblock.account_erase" || !signed || nonce.is_none() {
+                return reply(401, json!({"error": "bad signature or nonce"}));
+            }
+            s.nonces.remove(nonce.unwrap());
+            if !s.account_exists {
+                return text_reply(
+                    400,
+                    "This passkey/wallet is not linked to an existing account. Create an account at sign-in first.",
+                );
+            }
+            s.account_exists = false;
+            s.erased = true;
+            let csrf = random("csrf_", 32);
+            let cookie = random("acct_", 32);
+            s.minted.extend([csrf.clone(), cookie.clone()]);
+            let mut response = reply(
+                200,
+                json!({"status": "completed", "action": action, "kind": "erased", "csrf": csrf}),
+            );
+            response
+                .headers
+                .push(("Set-Cookie".to_string(), format!("acct_session={cookie}; Path=/")));
+            response
+        })
+    }
+
     fn token(&self, r: &Request) -> Response {
         let form = form_of(&r.body);
         self.with(|s| match form.get("grant_type").map(String::as_str) {
@@ -426,10 +573,11 @@ impl Fake {
                 {
                     return reply(400, json!({"error": "invalid_grant"}));
                 }
+                if s.quirks.token_fails {
+                    return reply(500, json!({"error": "server_error"}));
+                }
                 let body = self.mint_session(s);
-                s.device = random("SIWX_", 8);
-                let own = s.device.clone();
-                s.devices.push(own);
+                s.device = s.signed_in_device.clone();
                 reply(200, body)
             }
             Some("refresh_token") => {
@@ -809,20 +957,218 @@ async fn a_joined_room_fires_the_tripwire() {
 async fn a_device_the_canary_left_behind_is_tolerated_and_forgotten() {
     let (fake, scratch) = (Fake::start().await, Scratch::new("leftover"));
     let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
-    identity::write_pending(&dir, &BTreeSet::from(["SIWX_old".to_string()])).unwrap();
+    identity::update_ledger(&dir, |l| {
+        l.pending.insert("SIWX_old".to_string());
+    })
+    .unwrap();
     fake.quirks(|q| q.extra_devices = vec!["SIWX_old".to_string()]);
     let run = run_check(check_cfg(&fake, true), &scratch.0).await;
     assert_eq!(run.code, 0, "{:#?}", run.lines);
     assert!(run.has("logout", "leftovers=SIWX_old"));
     assert!(run.has("logout", "cleaned=1"));
     assert!(fake.with(|s| s.quirks.extra_devices.is_empty()));
-    let ledger = identity::read_pending(&dir);
-    assert!(!ledger.contains("SIWX_old"));
-    assert_eq!(
-        ledger.len(),
-        1,
-        "this run's own device stays until the next run sees it gone"
+    assert!(
+        identity::read_ledger(&dir).pending.is_empty(),
+        "the leftover is gone, and this run's own device left the ledger with its proven logout"
     );
+}
+
+#[tokio::test]
+async fn a_leftover_that_cannot_be_deleted_fails_the_check() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("stuck"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    identity::update_ledger(&dir, |l| {
+        l.pending.insert("SIWX_old".to_string());
+    })
+    .unwrap();
+    fake.quirks(|q| {
+        q.extra_devices = vec!["SIWX_old".to_string()];
+        q.delete_device_status = 500;
+    });
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    assert!(run.has("logout", "reason=leftover_not_deleted"));
+    assert!(run.has("logout", "stuck=SIWX_old"));
+    assert!(
+        identity::read_ledger(&dir).pending.contains("SIWX_old"),
+        "it stays on the ledger until it is gone"
+    );
+}
+
+#[tokio::test]
+async fn the_account_the_key_resolves_to_must_stay_the_one_init_recorded() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("mxid"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    fake.quirks(|q| q.whoami_user_id = Some("@someone-else:matrix.test".to_string()));
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    assert!(
+        run.has("whoami", "result=FAIL reason=mxid_changed"),
+        "{}",
+        run.line("whoami")
+    );
+    assert!(run.has("whoami", "mxid=@someone-else:matrix.test"));
+    assert!(run.has(
+        "whoami",
+        &format!("recorded={}", fake.with(|s| s.mxid.clone()))
+    ));
+    assert!(run.has("logout", "result=ok"), "the session is still ended");
+    assert_eq!(
+        identity::read_client(&dir).unwrap().mxid,
+        fake.with(|s| s.mxid.clone()),
+        "the record is not rewritten to follow the server"
+    );
+}
+
+#[tokio::test]
+async fn an_identity_whose_init_never_learned_its_account_is_not_checked() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("halfmade"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    let mut record = identity::read_client(&dir).unwrap();
+    record.mxid = String::new();
+    identity::write_client(&dir, &record).unwrap();
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 2);
+    assert_eq!(
+        run.lines,
+        vec!["CANARY identity result=FAIL reason=not_initialized".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn a_proven_matrix_logout_takes_the_device_off_the_ledger_and_a_revoke_logout_keeps_it() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("ledger-drop"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 0);
+    assert_eq!(identity::read_ledger(&dir), identity::Ledger::default());
+
+    let (fake, scratch) = (Fake::start().await, Scratch::new("ledger-keep"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Revoke);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 0);
+    let device = fake.with(|s| s.device.clone());
+    assert_eq!(
+        identity::read_ledger(&dir).pending,
+        BTreeSet::from([device]),
+        "`/oauth2/revoke` may leave the device: it stays until a run sees it gone"
+    );
+}
+
+#[tokio::test]
+async fn a_sign_in_that_failed_after_its_device_was_made_is_reported_then_forgiven() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("unfinished"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+
+    // Run 1: the server made the device at /sign_in, the code exchange failed.
+    fake.quirks(|q| q.token_fails = true);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1);
+    assert!(run.has("sign_in", "reason=sign_in_failed"));
+    let ledger = identity::read_ledger(&dir);
+    assert_eq!(ledger.attempts.len(), 1, "the attempt is on the ledger");
+    assert!(ledger.pending.is_empty(), "and the device is not");
+    let killed = fake.with(|s| s.signed_in_device.clone());
+    assert_eq!(fake.with(|s| s.devices.clone()), vec![killed.clone()]);
+
+    // Run 2: the device is there, unrecorded, and explained by the attempt:
+    // reported under its own reason (exit 1), not the tripwire (exit 4).
+    fake.quirks(|q| q.token_fails = false);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    assert!(run.has("logout", "result=FAIL reason=unfinished_sign_in_device"));
+    assert!(run.has("logout", &format!("unfinished={killed}")));
+    assert!(run.has("logout", "tripwire=clean"));
+    let ledger = identity::read_ledger(&dir);
+    assert!(ledger.attempts.is_empty(), "the marker is spent");
+    assert!(
+        ledger.pending.contains(&killed),
+        "the device is the canary's now"
+    );
+
+    // Run 3: it is a leftover, tolerated and deleted.
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    assert!(run.has("logout", &format!("leftovers={killed}")));
+    assert!(run.has("logout", "cleaned=1"));
+    assert_eq!(identity::read_ledger(&dir), identity::Ledger::default());
+    assert!(fake.with(|s| s.devices.is_empty()));
+}
+
+#[tokio::test]
+async fn a_device_that_no_attempt_can_explain_still_fires_the_tripwire() {
+    // No marker at all.
+    let (fake, scratch) = (Fake::start().await, Scratch::new("nomarker"));
+    identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    fake.quirks(|q| q.extra_devices = vec!["SIWX_stranger".to_string()]);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 4, "{:#?}", run.lines);
+
+    // A marker, but the device is not of the kind the server mints without a proposal.
+    let (fake, scratch) = (Fake::start().await, Scratch::new("othermarker"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    identity::update_ledger(&dir, |l| {
+        l.attempts.push(identity::Attempt {
+            id: "old".to_string(),
+            at: 1,
+        })
+    })
+    .unwrap();
+    fake.quirks(|q| q.extra_devices = vec!["ELEMENTXDEVICE".to_string()]);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 4, "{:#?}", run.lines);
+    assert!(run.has("logout", "strangers=ELEMENTXDEVICE"));
+    assert_eq!(
+        identity::read_ledger(&dir).attempts.len(),
+        1,
+        "the marker is evidence too while the tripwire is fired"
+    );
+
+    // One marker explains one device, not two.
+    let (fake, scratch) = (Fake::start().await, Scratch::new("twodevices"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    identity::update_ledger(&dir, |l| {
+        l.attempts.push(identity::Attempt {
+            id: "old".to_string(),
+            at: 1,
+        })
+    })
+    .unwrap();
+    fake.quirks(|q| q.extra_devices = vec!["SIWX_a".to_string(), "SIWX_b".to_string()]);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 4, "{:#?}", run.lines);
+}
+
+#[tokio::test]
+async fn a_run_that_never_learned_its_device_keeps_its_marker_for_the_next_run() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("nowhoami"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    // whoami fails, so this run never learns its device id, and the logout
+    // leaves the device behind.
+    fake.quirks(|q| {
+        q.whoami_status = Some(503);
+        q.leave_device_on_logout = true;
+    });
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    assert!(run.has("whoami", "reason=whoami_status"));
+    assert!(
+        run.has("logout", "result=ok"),
+        "its one unexplained device is its own"
+    );
+    let ledger = identity::read_ledger(&dir);
+    assert_eq!(ledger.attempts.len(), 1, "the marker stays");
+    assert!(ledger.pending.is_empty());
+
+    fake.quirks(|q| {
+        q.whoami_status = None;
+        q.leave_device_on_logout = false;
+    });
+    let left = fake.with(|s| s.signed_in_device.clone());
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    assert!(run.has("logout", "reason=unfinished_sign_in_device"));
+    assert!(run.has("logout", &format!("unfinished={left}")));
 }
 
 #[tokio::test]
@@ -977,11 +1323,302 @@ async fn init_makes_the_identity_prints_no_credential_and_refuses_to_run_twice()
     );
 }
 
+fn init_cfg(fake: &Fake, replace: bool) -> InitConfig {
+    InitConfig {
+        env: "local".to_string(),
+        issuer: fake.base.clone(),
+        matrix: Matrix {
+            homeserver: fake.base.clone(),
+            server_name: SERVER_NAME.to_string(),
+        },
+        replace,
+    }
+}
+
+async fn run_init(cfg: InitConfig, root: &Path) -> Run {
+    hygiene::start_capture();
+    let code = init::run(cfg, root).await;
+    Run {
+        code,
+        lines: hygiene::take_capture(),
+    }
+}
+
+#[tokio::test]
+async fn init_pins_revoke_only_when_the_edge_answers_with_a_matrix_refusal() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("probe-revoke"));
+    fake.quirks(|q| q.logout_probe = Some((404, true)));
+    let run = run_init(init_cfg(&fake, false), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    assert!(run.has("init_client", "logout_route=revoke"));
+    let dir = scratch.0.join("local");
+    assert_eq!(
+        identity::read_client(&dir).unwrap().logout_route,
+        LogoutRoute::Revoke
+    );
+    // The revoke route may leave the device: init's device is on the ledger.
+    let device = fake.with(|s| s.device.clone());
+    assert_eq!(
+        identity::read_ledger(&dir).pending,
+        BTreeSet::from([device])
+    );
+    assert!(identity::read_ledger(&dir).attempts.is_empty());
+}
+
+#[tokio::test]
+async fn init_records_nothing_when_the_probe_says_nothing_about_the_route() {
+    for (status, errcode) in [
+        (429, true),
+        (503, true),
+        (502, false),
+        (404, false),
+        (500, false),
+    ] {
+        let (fake, scratch) = (Fake::start().await, Scratch::new("probe-fail"));
+        fake.quirks(|q| q.logout_probe = Some((status, errcode)));
+        let run = run_init(init_cfg(&fake, false), &scratch.0).await;
+        assert_eq!(run.code, 1, "{status} {errcode}: {:#?}", run.lines);
+        assert_eq!(
+            run.line("init_client"),
+            format!("CANARY init_client result=FAIL reason=route_probe_failed status={status}")
+        );
+        let dir = scratch.0.join("local");
+        assert!(
+            !identity::client_exists(&dir),
+            "no client record for {status}"
+        );
+        assert!(!dir.join(identity::DEVICES_FILE).exists());
+        assert!(
+            fake.with(|s| s.devices.is_empty()),
+            "no sign-in was started"
+        );
+    }
+}
+
+#[tokio::test]
+async fn init_with_a_matrix_logout_leaves_the_ledger_empty() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("init-ledger"));
+    let run = run_init(init_cfg(&fake, false), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    assert_eq!(
+        identity::read_ledger(&scratch.0.join("local")),
+        identity::Ledger::default(),
+        "the device is deleted by the proven logout and the attempt is finished"
+    );
+}
+
+#[tokio::test]
+async fn an_init_whose_sign_in_failed_leaves_a_half_made_identity_that_replace_can_clear() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("init-half"));
+    fake.quirks(|q| q.token_fails = true);
+    let run = run_init(init_cfg(&fake, false), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    let dir = scratch.0.join("local");
+    assert!(identity::key_exists(&dir));
+    assert_eq!(
+        identity::read_client(&dir).unwrap().mxid,
+        "",
+        "the account was never learned"
+    );
+    assert_eq!(identity::read_ledger(&dir).attempts.len(), 1);
+    // `check` will not run on it.
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 2);
+
+    // The server made the device and the account at /sign_in; the key can erase it.
+    fake.quirks(|q| q.token_fails = false);
+    let did = identity::load_key(&dir).unwrap().did();
+    fake.with(|s| s.did = did);
+    let run = run_init(init_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    assert!(run.has("init_erase", "erased=yes"));
+}
+
+#[tokio::test]
+async fn replace_erases_the_old_account_with_the_old_key_and_makes_a_new_identity() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("replace"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    let old_did = identity::load_key(&dir).unwrap().did();
+    let run = run_init(init_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    assert_eq!(
+        run.line("init_erase"),
+        "CANARY init_erase result=ok reason=ok erased=yes"
+    );
+    assert!(fake.with(|s| s.erased), "the old account was erased");
+    assert_ne!(
+        identity::load_key(&dir).unwrap().did(),
+        old_did,
+        "a new key"
+    );
+    assert_eq!(
+        identity::read_client(&dir).unwrap().mxid,
+        fake.with(|s| s.mxid.clone())
+    );
+    // The erase reply's nonce, csrf token and cookie are credentials.
+    let minted = fake.with(|s| s.minted.clone());
+    assert!(minted.iter().any(|t| t.starts_with("csrf_")));
+    assert!(minted.iter().any(|t| t.starts_with("acct_")));
+    assert!(
+        minted.iter().any(|t| t.starts_with("cs_")),
+        "a client secret"
+    );
+    for line in &run.lines {
+        assert!(!hygiene::taint_hit(line, &minted), "{line}");
+    }
+    assert!(!hygiene::taint_tripped());
+}
+
+#[tokio::test]
+async fn replace_goes_on_when_the_server_says_the_key_has_no_account() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("replace-none"));
+    identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    fake.with(|s| s.account_exists = false);
+    let run = run_init(init_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    assert_eq!(
+        run.line("init_erase"),
+        "CANARY init_erase result=ok reason=ok erased=no_account"
+    );
+}
+
+#[tokio::test]
+async fn replace_stops_when_the_server_refuses_the_erase_for_any_other_reason() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("replace-refused"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    let before = identity::load_key(&dir).unwrap().did();
+    fake.quirks(|q| q.erase_refused = Some(401));
+    let run = run_init(init_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1);
+    assert_eq!(
+        run.line("init_erase"),
+        "CANARY init_erase result=FAIL reason=erase_failed status=401"
+    );
+    assert_eq!(
+        identity::load_key(&dir).unwrap().did(),
+        before,
+        "nothing was replaced"
+    );
+    assert!(identity::client_exists(&dir));
+}
+
+#[tokio::test]
+async fn replace_refuses_when_the_key_is_gone_but_the_record_names_an_account() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("replace-nokey"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    std::fs::remove_file(dir.join(identity::KEY_FILE)).unwrap();
+    let run = run_init(init_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 2);
+    assert_eq!(
+        run.lines,
+        vec![format!(
+            "CANARY init_erase result=FAIL reason=key_missing mxid={}",
+            fake.with(|s| s.mxid.clone())
+        )]
+    );
+    assert!(
+        identity::client_exists(&dir),
+        "the record that names the account stays"
+    );
+    assert!(!fake.with(|s| s.erased));
+}
+
+#[tokio::test]
+async fn replace_refuses_a_client_record_it_cannot_read() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("replace-garbage"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    let before = identity::load_key(&dir).unwrap().did();
+    std::fs::write(dir.join(identity::CLIENT_FILE), b"{ not json").unwrap();
+    let run = run_init(init_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 2);
+    assert_eq!(
+        run.lines,
+        vec!["CANARY init_identity result=FAIL reason=identity_unreadable".to_string()]
+    );
+    assert_eq!(
+        identity::load_key(&dir).unwrap().did(),
+        before,
+        "the key is untouched"
+    );
+    assert!(!fake.with(|s| s.erased));
+}
+
+#[tokio::test]
+async fn replace_of_a_record_that_never_learned_its_account_with_no_key_has_nothing_to_strand() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("replace-empty"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    let mut record = identity::read_client(&dir).unwrap();
+    record.mxid = String::new();
+    identity::write_client(&dir, &record).unwrap();
+    std::fs::remove_file(dir.join(identity::KEY_FILE)).unwrap();
+    let run = run_init(init_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+}
+
+#[tokio::test]
+async fn no_matrix_with_a_revoke_that_revokes_nothing_fails_the_summary_exit_3() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("nomatrix-revoke"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    fake.quirks(|q| q.revoke_is_noop = true);
+    let run = run_check(check_cfg(&fake, false), &scratch.0).await;
+    assert_eq!(run.code, 3, "{:#?}", run.lines);
+    assert!(run.has("logout", "result=FAIL reason=logout_ineffective"));
+    assert!(run.has("logout", "revoked=no"));
+    assert_eq!(
+        run.summary(),
+        "CANARY summary checks_run=4 skipped=2 result=FAIL"
+    );
+    assert!(
+        identity::read_ledger(&dir).attempts.is_empty(),
+        "no Matrix side, no device, no marker"
+    );
+}
+
+#[test]
+fn a_proxy_named_by_the_environment_is_not_used() {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "hermetic::proxy_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("ROTATION_CANARY_PROXY_CHILD", "1")
+        // Nothing listens on the discard port: a request through it fails.
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("http_proxy", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .env("all_proxy", "http://127.0.0.1:9")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Run only by the test above, in a child process whose environment names a proxy.
+#[tokio::test]
+async fn proxy_child() {
+    if std::env::var_os("ROTATION_CANARY_PROXY_CHILD").is_none() {
+        return;
+    }
+    let fake = Fake::start().await;
+    let http = crate::net::client().unwrap();
+    let reply = crate::net::send(http.get(format!("{}/jwk", fake.base)))
+        .await
+        .expect("the request must go direct, not through HTTP_PROXY");
+    assert_eq!(reply.status, 200);
+}
+
 // -- process-level hygiene --------------------------------------------------
 
 #[test]
-fn a_panic_prints_only_its_location_and_aborts() {
-    use std::os::unix::process::ExitStatusExt;
+fn a_panic_prints_only_its_location_and_leaves_with_exit_70() {
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -1006,7 +1643,11 @@ fn a_panic_prints_only_its_location_and_aborts() {
         !all.contains("SECRET-PANIC-PAYLOAD"),
         "the payload must not be printed: {all}"
     );
-    assert_eq!(out.status.signal(), Some(6), "aborted, not unwound: {all}");
+    assert_eq!(
+        out.status.code(),
+        Some(70),
+        "_exit(70): no unwinding, no SIGABRT for a crash handler: {all}"
+    );
 }
 
 /// Run only by the test above, in a child process.
@@ -1030,4 +1671,7 @@ fn core_dumps_are_off_after_startup() {
     // SAFETY: `limit` is a valid out-pointer for the call.
     assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) }, 0);
     assert_eq!((limit.rlim_cur, limit.rlim_max), (0, 0));
+    // SAFETY: `PR_GET_DUMPABLE` takes plain integers.
+    #[cfg(target_os = "linux")]
+    assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
 }

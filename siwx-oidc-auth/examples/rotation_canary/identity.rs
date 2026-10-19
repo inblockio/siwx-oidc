@@ -186,32 +186,49 @@ pub fn write_client(dir: &Path, record: &ClientRecord) -> Result<(), Reason> {
     write_private_atomic(dir, CLIENT_FILE, &text)
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct DeviceLedger {
-    #[serde(default)]
-    pending: BTreeSet<String>,
+/// A sign-in the canary started. The server creates the Synapse device at
+/// `/sign_in`, before the code is exchanged, so a sign-in that failed or was
+/// killed afterwards leaves a device the canary never saw an id for. The
+/// marker is written before the sign-in and dropped once the run knows its own
+/// device; one still there at the next run says "one device of this kind may
+/// be unrecorded".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attempt {
+    pub id: String,
+    /// Unix seconds on this host's clock; informative only.
+    pub at: i64,
 }
 
-/// The devices this canary created and has not yet seen gone (`devices.json`).
-/// A run that dies before its logout, or a deployment whose logout leaves the
-/// device behind, would otherwise make the next run's tripwire fire on the
-/// canary's own leftover. Only this program writes the file, so a stranger's
-/// device is never in it. An unreadable ledger reads as empty: the tripwire
-/// gets stricter, never looser.
-pub fn read_pending(dir: &Path) -> BTreeSet<String> {
+/// `devices.json`: what the canary knows about the devices it made. Only this
+/// program writes the file, so a stranger's device is never in it. An
+/// unreadable ledger reads as empty: the tripwire gets stricter, never looser.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ledger {
+    /// Devices created by a run of the canary and not yet seen gone.
+    #[serde(default)]
+    pub pending: BTreeSet<String>,
+    /// Sign-ins started and not finished.
+    #[serde(default)]
+    pub attempts: Vec<Attempt>,
+}
+
+pub fn read_ledger(dir: &Path) -> Ledger {
     fs::read_to_string(dir.join(DEVICES_FILE))
         .ok()
-        .and_then(|text| serde_json::from_str::<DeviceLedger>(&text).ok())
-        .map(|ledger| ledger.pending)
+        .and_then(|text| serde_json::from_str::<Ledger>(&text).ok())
         .unwrap_or_default()
 }
 
-pub fn write_pending(dir: &Path, pending: &BTreeSet<String>) -> Result<(), Reason> {
-    let text = serde_json::to_string_pretty(&DeviceLedger {
-        pending: pending.clone(),
-    })
-    .map_err(|_| Reason::IdentityWriteFailed)?;
+pub fn write_ledger(dir: &Path, ledger: &Ledger) -> Result<(), Reason> {
+    let text = serde_json::to_string_pretty(ledger).map_err(|_| Reason::IdentityWriteFailed)?;
     write_private_atomic(dir, DEVICES_FILE, &text)
+}
+
+/// Read the ledger, change it, write it back.
+pub fn update_ledger(dir: &Path, change: impl FnOnce(&mut Ledger)) -> Result<(), Reason> {
+    let mut ledger = read_ledger(dir);
+    change(&mut ledger);
+    write_ledger(dir, &ledger)
 }
 
 /// Remove the old identity's files (after its account was erased).
@@ -393,13 +410,43 @@ mod tests {
     fn the_device_ledger_round_trips_and_an_unreadable_one_reads_as_empty() {
         let scratch = Scratch::new("ledger");
         let dir = ensure_dir(&scratch.0, "dev").unwrap();
-        assert!(read_pending(&dir).is_empty());
-        let pending = BTreeSet::from(["SIWX_a".to_string(), "SIWX_b".to_string()]);
-        write_pending(&dir, &pending).unwrap();
+        assert_eq!(read_ledger(&dir), Ledger::default());
+        let ledger = Ledger {
+            pending: BTreeSet::from(["SIWX_a".to_string(), "SIWX_b".to_string()]),
+            attempts: vec![Attempt {
+                id: "abc".to_string(),
+                at: 1_700_000_000,
+            }],
+        };
+        write_ledger(&dir, &ledger).unwrap();
         assert_eq!(mode(&dir.join(DEVICES_FILE)), 0o600);
-        assert_eq!(read_pending(&dir), pending);
+        assert_eq!(read_ledger(&dir), ledger);
+        update_ledger(&dir, |l| {
+            l.pending.remove("SIWX_a");
+            l.attempts.clear();
+        })
+        .unwrap();
+        assert_eq!(
+            read_ledger(&dir).pending,
+            BTreeSet::from(["SIWX_b".to_string()])
+        );
+        assert!(read_ledger(&dir).attempts.is_empty());
         fs::write(dir.join(DEVICES_FILE), b"{ not json").unwrap();
-        assert!(read_pending(&dir).is_empty(), "stricter, never looser");
+        assert_eq!(
+            read_ledger(&dir),
+            Ledger::default(),
+            "stricter, never looser"
+        );
+    }
+
+    #[test]
+    fn a_ledger_of_the_first_version_without_attempts_still_reads() {
+        let scratch = Scratch::new("ledger-v1");
+        let dir = ensure_dir(&scratch.0, "dev").unwrap();
+        fs::write(dir.join(DEVICES_FILE), br#"{"pending":["SIWX_old"]}"#).unwrap();
+        let ledger = read_ledger(&dir);
+        assert_eq!(ledger.pending, BTreeSet::from(["SIWX_old".to_string()]));
+        assert!(ledger.attempts.is_empty());
     }
 
     #[test]
