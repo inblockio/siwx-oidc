@@ -848,11 +848,17 @@ doc; read it before changing the code the rule covers.
   other failure. `TokenEndpointError` renders `ServiceUnavailable` and `Other` (a store error,
   a dependency) this way, and the body names no internal error. A refresh whose rotation
   committed before the fault gets the same pair on the retry (I4). Pin:
-  `a_store_fault_at_the_token_endpoint_is_a_retryable_503_without_an_errcode`.
+  `a_store_fault_at_the_token_endpoint_is_a_retryable_503_without_an_errcode`,
+  and for a refusal that is not a fault, `a_device_code_approved_before_an_epoch_is_invalid_grant`
+  (`IssueRevoked` is `invalid_grant` in both the code and the device-code grant).
 - **A device code keeps the lifetime it was issued with** (RFC 8628 §3.2). Every write after
-  issuance (a poll, an approval, a denial) goes through `update_device_code`, one
-  `SET … XX KEEPTTL`: no write extends the code, and none writes back a code that expired since
-  it was read (a plain `SET` would leave it with no expiry). The user code is written once. Pin:
+  issuance (a poll, an approval, a denial) goes through `update_device_code`, one script: no
+  write extends a pending code, none writes back a code that expired since it was read (a plain
+  `SET` would leave it with no expiry), and it answers whether it wrote. A decided code keeps at
+  least `DEVICE_CODE_DECIDED_GRACE_SECS` (two poll intervals), so the device collects an
+  approval made in the code's last seconds; a decided code can no longer be approved, so the
+  grace opens nothing. An approval is reported only once it is stored, and a poll whose code
+  expired since it was read answers `expired_token`. The user code is written once. Pin:
   `polling_a_device_code_never_extends_its_lifetime`,
   `a_device_code_update_keeps_its_expiry_and_never_revives_an_expired_code`.
 - **In delegated-auth mode the Matrix side acts on Matrix credentials only; an `oidc` grant (a

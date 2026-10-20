@@ -3200,9 +3200,10 @@ mod token_store_fault_tests {
 
     /// A value of the wrong type where the grant is read: every read of it fails.
     async fn plant_store_fault(key: &str) {
-        let raw =
-            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
-        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let mut conn =
+            siwx_oidc::test_support::raw_connection(&siwx_oidc::test_support::redis_url())
+                .await
+                .unwrap();
         let _: () = bb8_redis::redis::cmd("SET")
             .arg(key)
             .arg("planted store fault")

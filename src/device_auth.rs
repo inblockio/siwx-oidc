@@ -1396,7 +1396,13 @@ pub async fn device_approve(
     entry.did = Some(did.clone());
     // The authentication, from Redis `TIME`: the grant's `auth_time` (I6).
     entry.auth_ms = Some(db_client.server_time_ms().await?);
-    let _ = db_client.update_device_code(&device_ref, &entry).await;
+    // The approval is reported only once it is stored: a code that expired while the
+    // checks above ran is not written again, and its device would never be told.
+    if !db_client.update_device_code(&device_ref, &entry).await? {
+        return Err(CustomError::BadRequest(
+            "User code not found or expired".to_string(),
+        ));
+    }
     info!(user_code_fp = %fingerprint(&req.user_code), did = %did, "device approved");
 
     Ok(DeviceApproveResponse {
@@ -1444,7 +1450,13 @@ pub async fn device_approve_passkey(
     entry.status = DeviceCodeStatus::Approved;
     entry.did = Some(verified_did.to_string());
     entry.auth_ms = Some(db_client.server_time_ms().await?);
-    let _ = db_client.update_device_code(&device_ref, &entry).await;
+    // The approval is reported only once it is stored: a code that expired while the
+    // checks above ran is not written again, and its device would never be told.
+    if !db_client.update_device_code(&device_ref, &entry).await? {
+        return Err(CustomError::BadRequest(
+            "User code not found or expired".to_string(),
+        ));
+    }
     info!(user_code_fp = %fingerprint(user_code), did = %verified_did, "device approved via passkey");
 
     Ok(DeviceApproveResponse {

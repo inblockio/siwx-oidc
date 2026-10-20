@@ -1470,7 +1470,14 @@ async fn token_device_code(
         }
     }
     entry.last_poll = Some(now_ts);
-    let _ = db_client.update_device_code(&device_ref, &entry).await;
+    // A code that expired since it was read is answered as expired, never from the
+    // copy read before. A failed write only loses the poll's rate-limit bookkeeping.
+    if let Ok(false) = db_client.update_device_code(&device_ref, &entry).await {
+        return Err(device_code_error(
+            "expired_token",
+            "Device code expired or not found.",
+        ));
+    }
 
     match entry.status {
         DeviceCodeStatus::Pending => Err(device_code_error(
@@ -1706,7 +1713,19 @@ async fn token_device_code(
                     refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
                     absolute_deadline: None,
                 })
-                .await?;
+                .await
+                .map_err(|e| {
+                    if e.is::<siwx_oidc::db::grant::IssueRevoked>() {
+                        // As in the code exchange: approved before its user, client or
+                        // device was revoked. A refusal for good, never the retryable 503.
+                        CustomError::BadRequestToken(TokenError {
+                            error: CoreErrorResponseType::InvalidGrant,
+                            error_description: "The approval has been revoked.".to_string(),
+                        })
+                    } else {
+                        CustomError::from(e)
+                    }
+                })?;
             touch_client_after_use(db_client, &client_id).await;
             let access_token = issued.access_token;
             let refresh_token = issued.refresh_token.ok_or_else(|| {
@@ -9084,6 +9103,75 @@ mod device_display_name_tests {
         assert_eq!(grant.auth_ms, approved_at * 1000, "auth_ms is the approval");
     }
 
+    /// A device code approved before an epoch of its client is refused for good, as a
+    /// code exchange is: `invalid_grant`, never the retryable 503 of a store fault.
+    #[tokio::test]
+    async fn a_device_code_approved_before_an_epoch_is_invalid_grant() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (synapse, _hs, server) = spawn(&[]).await;
+        let nonce = Uuid::new_v4().simple().to_string();
+        let client_id = format!("device-epoch-{nonce}");
+        db.set_client(client_id.clone(), client_entry(Some("Pocket Client")))
+            .await
+            .unwrap();
+        let approved_at = Utc::now().timestamp() - 1_000;
+        let device_code = format!("dvc_epoch-{nonce}");
+        db.set_device_code(
+            &device_code,
+            &DeviceCodeEntry {
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!("EP-{nonce}")),
+                legacy_user_code: None,
+                client_id: client_id.clone(),
+                scope: "openid".to_string(),
+                status: DeviceCodeStatus::Approved,
+                did: Some(DID.to_string()),
+                device_id: None,
+                last_poll: None,
+                created_at: approved_at - 10,
+                auth_ms: Some(approved_at * 1000),
+                expected_mxid: None,
+            },
+            DEVICE_CODE_LIFETIME,
+        )
+        .await
+        .unwrap();
+        db.set_epoch(siwx_oidc::db::grant::EpochScope::Client(&client_id))
+            .await
+            .unwrap();
+        let config = Config {
+            mas_shared_secret: Some("secret".to_string()),
+            matrix_server_name: Some(SERVER_NAME.to_string()),
+            ..Config::default()
+        };
+        let outcome = token(
+            TokenForm {
+                code: None,
+                client_id: Some(client_id),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code),
+            },
+            ClientCredentials::default(),
+            &EcdsaSigningKey::generate(),
+            &config,
+            &db,
+            Some(&synapse),
+        )
+        .await;
+        server.abort();
+        match outcome {
+            Err(CustomError::BadRequestToken(e)) => {
+                assert_eq!(e.error, CoreErrorResponseType::InvalidGrant)
+            }
+            Err(other) => panic!("expected invalid_grant, got {other:?}"),
+            Ok(_) => panic!("a code approved before the epoch issues nothing"),
+        }
+    }
+
     /// The QR / device-code path used to name every device "Element X".
     #[tokio::test]
     async fn the_device_code_grant_names_the_device_after_its_client() {
@@ -10363,9 +10451,10 @@ mod client_binding_tests {
             siwx_oidc::db::grant::KV_GRANT_PREFIX,
             grant.grant_id.as_str()
         );
-        let raw =
-            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
-        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let mut conn =
+            siwx_oidc::test_support::raw_connection(&siwx_oidc::test_support::redis_url())
+                .await
+                .unwrap();
         for field in ["last_used", "auth_time"] {
             let _: i64 = conn.hincr(&key, field, -3600).await.unwrap();
         }
@@ -11101,8 +11190,7 @@ mod scope_grant_tests {
     /// One raw `GET` on the test Redis.
     pub(super) async fn raw_get(key: &str) -> Option<String> {
         let url = siwx_oidc::test_support::redis_url();
-        let client = bb8_redis::redis::Client::open(url.as_str()).unwrap();
-        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let mut conn = siwx_oidc::test_support::raw_connection(&url).await.unwrap();
         bb8_redis::redis::cmd("GET")
             .arg(key)
             .query_async(&mut conn)
@@ -11113,8 +11201,7 @@ mod scope_grant_tests {
     /// The grant id an access token belongs to, read from the store.
     async fn grant_of_access_token(access: &str) -> Option<String> {
         let url = siwx_oidc::test_support::redis_url();
-        let client = bb8_redis::redis::Client::open(url.as_str()).unwrap();
-        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let mut conn = siwx_oidc::test_support::raw_connection(&url).await.unwrap();
         let key = format!(
             "{}/{}",
             siwx_oidc::db::grant::KV_ACCESS_TOKEN_PREFIX,
@@ -12647,8 +12734,7 @@ mod generic_client_tests {
     /// Whether the test Redis holds `key`: one `EXISTS` on a key the caller computed.
     async fn raw_exists(key: &str) -> bool {
         let url = siwx_oidc::test_support::redis_url();
-        let client = bb8_redis::redis::Client::open(url.as_str()).unwrap();
-        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let mut conn = siwx_oidc::test_support::raw_connection(&url).await.unwrap();
         bb8_redis::redis::cmd("EXISTS")
             .arg(key)
             .query_async(&mut conn)

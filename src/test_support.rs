@@ -106,9 +106,8 @@ async fn connect(url: Url) -> Option<RedisClient> {
 /// without Redis those tests failed after 30 seconds.
 pub async fn probe(url: &Url) -> Result<(), String> {
     use bb8_redis::redis;
-    let client = redis::Client::open(url.as_str()).map_err(|e| e.to_string())?;
     let ping = async {
-        let mut conn = client.get_multiplexed_async_connection().await?;
+        let mut conn = raw_connection(url).await?;
         redis::cmd("PING").query_async::<String>(&mut conn).await
     };
     match tokio::time::timeout(PROBE_TIMEOUT, ping).await {
@@ -116,6 +115,20 @@ pub async fn probe(url: &Url) -> Result<(), String> {
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err(format!("no answer within {PROBE_TIMEOUT:?}")),
     }
+}
+
+/// A connection to the Redis at `url` outside the pool, for a test that reads or writes
+/// a key directly. Its commands wait as long as the pool's do
+/// ([`crate::db::REDIS_RESPONSE_TIMEOUT`]), not the redis crate's 500 ms, so a
+/// test that holds the server (`CLIENT PAUSE`) does not fail the tests running beside it.
+pub async fn raw_connection(
+    url: &Url,
+) -> bb8_redis::redis::RedisResult<bb8_redis::redis::aio::MultiplexedConnection> {
+    let config = bb8_redis::redis::AsyncConnectionConfig::new()
+        .set_response_timeout(Some(crate::db::REDIS_RESPONSE_TIMEOUT));
+    bb8_redis::redis::Client::open(url.as_str())?
+        .get_multiplexed_async_connection_with_config(&config)
+        .await
 }
 
 /// Skip the calling test with one `SKIP` line on stderr, or panic when

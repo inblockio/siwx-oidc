@@ -29,7 +29,7 @@ use super::*;
 /// that happened, and a stall fails every command in flight on the instance, not only
 /// the slow one. A healthy answer takes milliseconds; the bound only keeps a request from
 /// hanging on a connection that died without closing.
-pub(crate) const REDIS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const REDIS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The pool's connection manager. bb8-redis's own connects with the redis crate's default
 /// configuration, whose response timeout is 500 ms, and offers no way to change it.
@@ -1785,25 +1785,40 @@ impl DBClient for RedisClient {
         &self,
         device_code: &DeviceCodeRef,
         entry: &DeviceCodeEntry,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        // One step: an entry that expired since the lookup stays gone (a plain SET
+        // would write it back with no expiry at all), the code keeps its lifetime
+        // (KEEPTTL), and a decided code keeps at least the grace.
+        const UPDATE_LUA: &str = r#"
+            if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+            redis.call('SET', KEYS[1], ARGV[1], 'KEEPTTL')
+            local grace = tonumber(ARGV[2])
+            if grace > 0 and redis.call('TTL', KEYS[1]) < grace then
+                redis.call('EXPIRE', KEYS[1], grace)
+            end
+            return 1
+        "#;
         let value = serde_json::to_string(entry)
             .map_err(|e| anyhow!("Failed to serialize DeviceCodeEntry: {}", e))?;
+        let grace = match entry.status {
+            DeviceCodeStatus::Pending => 0,
+            DeviceCodeStatus::Approved | DeviceCodeStatus::Denied => DEVICE_CODE_DECIDED_GRACE_SECS,
+        };
         let mut conn = self
             .pool
             .get()
             .await
             .map_err(|e| anyhow!("Redis pool: {}", e))?;
-        // XX: an entry that expired since the lookup stays gone (a plain SET would
-        // write it back with no expiry at all). KEEPTTL: the code keeps its lifetime.
-        let _: Option<String> = bb8_redis::redis::cmd("SET")
+        let written: i64 = bb8_redis::redis::cmd("EVAL")
+            .arg(UPDATE_LUA)
+            .arg(1)
             .arg(stored_device_code_key(device_code))
             .arg(&value)
-            .arg("XX")
-            .arg("KEEPTTL")
+            .arg(grace)
             .query_async(&mut *conn)
             .await
             .map_err(|e| anyhow!("Failed to update a device code: {}", e))?;
-        Ok(())
+        Ok(written == 1)
     }
 
     async fn plant_deleted_device_marker(
@@ -1985,9 +2000,9 @@ mod tests {
             return;
         };
         let mut conn = client.pool.get().await.unwrap();
-        let raw =
-            bb8_redis::redis::Client::open(crate::test_support::redis_url().as_str()).unwrap();
-        let mut pauser = raw.get_multiplexed_async_connection().await.unwrap();
+        let mut pauser = crate::test_support::raw_connection(&crate::test_support::redis_url())
+            .await
+            .unwrap();
         let _: () = bb8_redis::redis::cmd("CLIENT")
             .arg("PAUSE")
             .arg(700)
@@ -2014,8 +2029,10 @@ mod tests {
         );
     }
 
-    /// An update keeps the lifetime the code was created with and never writes back a
-    /// code that expired since it was read: a plain `SET` would leave it with no expiry.
+    /// A pending code keeps the lifetime it was created with; a decided one keeps at
+    /// least the grace its device needs to collect the decision; and an update never
+    /// writes back a code that expired since it was read (a plain `SET` would leave it
+    /// with no expiry), and says so.
     #[tokio::test]
     async fn a_device_code_update_keeps_its_expiry_and_never_revives_an_expired_code() {
         let Some(client) = crate::test_support::redis().await else {
@@ -2026,17 +2043,24 @@ mod tests {
         let key = format!("device_code/{}", digest(&device_code));
         let entry = DeviceCodeEntry::new(&format!("KEEP-{n}"), "c".into(), "openid".into(), 0);
         client
-            .set_device_code(&device_code, &entry, 60)
+            .set_device_code(&device_code, &entry, 3)
             .await
             .unwrap();
         let (r, mut found) = client.get_device_code(&device_code).await.unwrap().unwrap();
 
+        found.last_poll = Some(1);
+        assert!(client.update_device_code(&r, &found).await.unwrap());
+        let left = client.ttl_raw(&key).await.unwrap();
+        assert!((1..=3).contains(&left), "a poll kept the expiry: {left} s");
+
         found.status = DeviceCodeStatus::Approved;
-        client.update_device_code(&r, &found).await.unwrap();
+        assert!(client.update_device_code(&r, &found).await.unwrap());
         let left = client.ttl_raw(&key).await.unwrap();
         assert!(
-            (1..=60).contains(&left),
-            "the update kept the expiry: {left} s"
+            (crate::db::DEVICE_CODE_DECIDED_GRACE_SECS as i64 - 1
+                ..=crate::db::DEVICE_CODE_DECIDED_GRACE_SECS as i64)
+                .contains(&left),
+            "an approval in the last seconds keeps the grace: {left} s"
         );
         let (_, stored) = client.get_device_code(&device_code).await.unwrap().unwrap();
         assert_eq!(
@@ -2046,7 +2070,10 @@ mod tests {
         );
 
         client.del_raw(&key).await.unwrap();
-        client.update_device_code(&r, &found).await.unwrap();
+        assert!(
+            !client.update_device_code(&r, &found).await.unwrap(),
+            "nothing was written"
+        );
         assert_eq!(
             client.ttl_raw(&key).await.unwrap(),
             -2,

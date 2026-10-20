@@ -980,8 +980,7 @@ mod tests {
         };
         let mut url = siwx_oidc::test_support::redis_url();
         url.set_path("/10");
-        let raw = bb8_redis::redis::Client::open(url.as_str()).unwrap();
-        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let mut conn = siwx_oidc::test_support::raw_connection(&url).await.unwrap();
         let _: i64 = bb8_redis::redis::cmd("DEL")
             .arg(siwx_oidc::db::outbox::KV_BACKCHANNEL_OUTBOX)
             .query_async(&mut conn)
