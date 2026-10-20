@@ -471,6 +471,15 @@ struct StoredClientEntry {
     always_granted_scopes: Vec<String>,
 }
 
+/// The refusals of a client entry that read as JSON. Fixed texts, none of them quotes
+/// the entry, so `client_policy::parse_static_clients` may show them where it must not
+/// show what serde says about a value of the wrong type.
+pub const CLIENT_ENTRY_FAULTS: [&str; 3] = [
+    "a client entry holds its secret both as a digest and in the clear",
+    "a client entry holds no secret",
+    "a client entry holds its registration access token both as a digest and in the clear",
+];
+
 impl TryFrom<StoredClientEntry> for ClientEntry {
     type Error = &'static str;
 
@@ -478,20 +487,14 @@ impl TryFrom<StoredClientEntry> for ClientEntry {
         let secret_digest = match (stored.secret_digest, stored.secret) {
             (Some(digest), None) => digest,
             (None, Some(secret)) => tokens::digest(&secret),
-            (Some(_), Some(_)) => {
-                return Err("a client entry holds its secret both as a digest and in the clear")
-            }
-            (None, None) => return Err("a client entry holds no secret"),
+            (Some(_), Some(_)) => return Err(CLIENT_ENTRY_FAULTS[0]),
+            (None, None) => return Err(CLIENT_ENTRY_FAULTS[1]),
         };
-        let access_token_digest =
-            match (stored.access_token_digest, stored.access_token) {
-                (digest, None) => digest,
-                (None, Some(token)) => Some(tokens::digest(token.secret())),
-                (Some(_), Some(_)) => return Err(
-                    "a client entry holds its registration access token both as a digest and in \
-                     the clear",
-                ),
-            };
+        let access_token_digest = match (stored.access_token_digest, stored.access_token) {
+            (digest, None) => digest,
+            (None, Some(token)) => Some(tokens::digest(token.secret())),
+            (Some(_), Some(_)) => return Err(CLIENT_ENTRY_FAULTS[2]),
+        };
         Ok(ClientEntry {
             secret_digest,
             metadata: stored.metadata,

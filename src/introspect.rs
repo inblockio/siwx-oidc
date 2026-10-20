@@ -47,8 +47,13 @@ pub fn generate_opaque_token(prefix: &str) -> String {
 /// [`crate::admin_token`] so both shared-secret-authenticated endpoints
 /// authenticate identically and neither can drift into a short-circuiting
 /// `==` comparison.
+///
+/// An empty expected secret matches nothing, an empty presented one included: an
+/// empty form field or a bare `Bearer ` header must never be a credential. Start-up
+/// refuses an empty `mas_shared_secret` (`Config::read_secret_files`); this is the
+/// second line, for any other way an empty one could get here.
 pub fn verify_shared_secret(provided: &[u8], expected: &[u8]) -> bool {
-    provided.len() == expected.len() && bool::from(provided.ct_eq(expected))
+    !expected.is_empty() && provided.len() == expected.len() && bool::from(provided.ct_eq(expected))
 }
 
 /// Form body for the introspection request.
@@ -287,6 +292,53 @@ mod tests {
                 json.0
             ),
         }
+    }
+
+    /// O-F1: with an empty configured secret (the `${VAR:-}` compose default) an
+    /// empty `client_secret` field was a credential and `POST /oauth2/introspect` answered
+    /// 200. Start-up now refuses that configuration; this is the second line.
+    #[test]
+    fn an_empty_expected_secret_matches_nothing() {
+        assert!(!verify_shared_secret(b"", b""));
+        assert!(!verify_shared_secret(b"x", b""));
+        assert!(!verify_shared_secret(b"", b"x"));
+        assert!(verify_shared_secret(b"x", b"x"));
+        assert!(!verify_shared_secret(b"x", b"y"));
+        assert!(!verify_shared_secret(b"xx", b"x"));
+    }
+
+    /// The endpoint, with an empty configured secret, answers an empty presented one with
+    /// 401 and never looks the token up (the pool never connects: nothing listens there).
+    #[tokio::test]
+    async fn introspection_with_an_empty_configured_secret_refuses_an_empty_client_secret() {
+        use siwx_oidc::db::RedisClient;
+        let redis_client = RedisClient::new(&"redis://127.0.0.1:1".parse().unwrap())
+            .await
+            .expect("the pool is built without connecting");
+        let state = IntrospectState {
+            mas_shared_secret: Some(String::new()),
+            redis_client,
+        };
+        let unknown = String::from("unknown");
+        let ask = |client_secret: &'static str| {
+            let state = state.clone();
+            let token = unknown.clone();
+            async move {
+                introspect(
+                    State(state),
+                    None,
+                    Form(IntrospectForm {
+                        token,
+                        token_type_hint: None,
+                        client_id: None,
+                        client_secret: Some(client_secret.into()),
+                    }),
+                )
+                .await
+            }
+        };
+        assert_eq!(ask("").await.err(), Some(StatusCode::UNAUTHORIZED));
+        assert_eq!(ask("x").await.err(), Some(StatusCode::UNAUTHORIZED));
     }
 
     #[test]

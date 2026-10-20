@@ -151,20 +151,22 @@ where
     Ok(Some(url))
 }
 
-/// Deserializes an optional string that is a secret. figment reads an environment value
-/// that looks like a number or a boolean as one (a secret of digits only, say),
-/// and serde's error for the wrong type quotes the value, which start-up prints. Such a
-/// value is refused here without quoting it. It is not converted back to a string: `007`
-/// was read as 7, so the original is gone. A secret file is not parsed this way.
-fn secret_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+/// Deserializes an optional string that is a secret, or that may be one (the path of a
+/// secret file, with the secret pasted into it). figment reads an environment value that
+/// looks like a number or a boolean as one (a secret of digits only, say), and serde's
+/// error for the wrong type quotes the value, which start-up prints. Such a value is
+/// refused here without quoting it, with `not_a_string` as the reason. It is not
+/// converted back to a string: `007` was read as 7, so the original is gone.
+fn non_quoting_string<'de, D>(
+    deserializer: D,
+    not_a_string: &'static str,
+) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::de::{Error, Visitor};
 
-    const NOT_A_STRING: &str = "must be a string, but the value was read as a number or a \
-         boolean (the value is not shown): quote it in the TOML file, or give it as a file";
-    struct SecretVisitor;
+    struct SecretVisitor(&'static str);
     impl<'de> Visitor<'de> for SecretVisitor {
         type Value = Option<String>;
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -183,25 +185,56 @@ where
             Ok(Some(v.to_string()))
         }
         fn visit_bool<E: Error>(self, _: bool) -> Result<Self::Value, E> {
-            Err(E::custom(NOT_A_STRING))
+            Err(E::custom(self.0))
         }
         fn visit_i64<E: Error>(self, _: i64) -> Result<Self::Value, E> {
-            Err(E::custom(NOT_A_STRING))
+            Err(E::custom(self.0))
         }
         fn visit_i128<E: Error>(self, _: i128) -> Result<Self::Value, E> {
-            Err(E::custom(NOT_A_STRING))
+            Err(E::custom(self.0))
         }
         fn visit_u64<E: Error>(self, _: u64) -> Result<Self::Value, E> {
-            Err(E::custom(NOT_A_STRING))
+            Err(E::custom(self.0))
         }
         fn visit_u128<E: Error>(self, _: u128) -> Result<Self::Value, E> {
-            Err(E::custom(NOT_A_STRING))
+            Err(E::custom(self.0))
         }
         fn visit_f64<E: Error>(self, _: f64) -> Result<Self::Value, E> {
-            Err(E::custom(NOT_A_STRING))
+            Err(E::custom(self.0))
         }
     }
-    deserializer.deserialize_option(SecretVisitor)
+    deserializer.deserialize_option(SecretVisitor(not_a_string))
+}
+
+/// A secret given inline (`mas_shared_secret`). See [`non_quoting_string`]. A secret file is
+/// not parsed this way: its content is text.
+fn secret_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    non_quoting_string(
+        deserializer,
+        "must be a string, but the value was read as a number or a boolean (the value is \
+         not shown): quote it in the TOML file, or give it as a file",
+    )
+}
+
+/// The path of a secret file (`mas_shared_secret_file`, `redis_password_file`), a blank
+/// value meaning unset like [`blank_string_as_none`]. An operator who pastes the secret
+/// itself into this setting must not see it echoed, by figment's type error for a value it
+/// read as a number any more than by an "unreadable file" error (`secret_file::read`
+/// refuses a path that is not absolute without showing it).
+fn secret_file_path<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(non_quoting_string(
+        deserializer,
+        "must be the absolute path of a file (a string), but the value was read as a number \
+         or a boolean (the value is not shown)",
+    )?
+    .map(|raw| raw.trim().to_string())
+    .filter(|raw| !raw.is_empty()))
 }
 
 /// Deserializes `redis_url`. The error says that the value is not a URL and why, and
@@ -247,11 +280,13 @@ pub struct Config {
     pub redis_url: Url,
     /// A file holding the Redis password (read once at start, one trailing newline
     /// removed); it becomes the password of `redis_url`, percent-encoded as needed. Start
-    /// refuses it when `redis_url` already carries a password, when `redis_url` cannot
-    /// carry one (no host), and when the file is unreadable or empty. An empty value
-    /// means unset.
+    /// refuses it when `redis_url` already carries a password, when `redis_url` is a
+    /// unix-socket URL of any spelling (the client reads such a password only from the
+    /// URL's `pass` parameter) or cannot carry a password (no host), and when the file is
+    /// not an absolute path to a regular file, is unreadable or empty, or has whitespace
+    /// at either end, a control character or a byte order mark. An empty value means unset.
     /// Env: `SIWXOIDC_REDIS_PASSWORD_FILE`
-    #[serde(default, deserialize_with = "blank_string_as_none")]
+    #[serde(default, deserialize_with = "secret_file_path")]
     pub redis_password_file: Option<String>,
     pub default_clients: HashMap<String, String>,
     pub require_secret: bool,
@@ -290,16 +325,18 @@ pub struct Config {
     /// `/oauth2/introspect` and `/oauth2/admin_token`, and this provider to
     /// Synapse's `/_synapse/mas/*`. When set, issued tokens carry the Matrix
     /// `mat_`/`mcr_` prefixes and scopes (tokens are opaque and stored in Redis
-    /// in both modes) and those two endpoints become active.
+    /// in both modes) and those two endpoints become active. Set but empty (or only
+    /// whitespace) is a start error, never "unset": see [`Config::read_secret_files`].
     /// Env: `SIWEOIDC_MAS_SHARED_SECRET`
     #[serde(default, deserialize_with = "secret_string")]
     pub mas_shared_secret: Option<String>,
     /// A file holding the MAS shared secret (read once at start, one trailing newline
     /// removed), in place of `mas_shared_secret`. Start refuses it together with
-    /// `mas_shared_secret`, and when the file is unreadable or empty. An empty value
-    /// means unset.
+    /// `mas_shared_secret`, and when the file is not an absolute path to a regular file,
+    /// is unreadable or empty, or has whitespace at either end, a control character or a
+    /// byte order mark. An empty value means unset.
     /// Env: `SIWXOIDC_MAS_SHARED_SECRET_FILE`
-    #[serde(default, deserialize_with = "blank_string_as_none")]
+    #[serde(default, deserialize_with = "secret_file_path")]
     pub mas_shared_secret_file: Option<String>,
     /// Synapse homeserver endpoint for provisioning calls (MSC3861 Agent C).
     /// Example: `http://matrix_synapse:8080`
@@ -566,8 +603,9 @@ pub const MIN_GRANT_ABSOLUTE_LIFETIME_SECS: u64 = siwx_oidc::db::DEVICE_CODE_LIF
 impl Config {
     /// Reads the secrets that live in files (`mas_shared_secret_file`,
     /// `redis_password_file`), once, into `mas_shared_secret` and the password of
-    /// `redis_url`. A setting that is not set changes nothing. The error names the
-    /// setting and the path and never any content (see [`siwx_oidc::secret_file`]).
+    /// `redis_url`, and refuses a `mas_shared_secret` that is empty. A setting that is not
+    /// set changes nothing. The error names the setting and the path and never any
+    /// content (see [`siwx_oidc::secret_file`]).
     pub fn read_secret_files(&mut self) -> Result<(), String> {
         use siwx_oidc::secret_file;
         if let Some(path) = self.mas_shared_secret_file.as_deref() {
@@ -581,16 +619,30 @@ impl Config {
             self.mas_shared_secret = Some(secret);
             tracing::info!(path, "mas_shared_secret read from its file");
         }
+        // A compose `${VAR:-}` default hands the server an empty `mas_shared_secret`. It
+        // would switch Matrix mode on with a secret that every caller who sends an empty
+        // field matches, so an empty or blank value is refused, not taken as unset: the
+        // operator who meant "off" removes the variable, and the one who meant a secret
+        // gives it one.
+        if self
+            .mas_shared_secret
+            .as_deref()
+            .is_some_and(|secret| secret.trim().is_empty())
+        {
+            return Err(
+                "mas_shared_secret (SIWXOIDC_MAS_SHARED_SECRET) is set but empty: give \
+                 it a value, give the secret as mas_shared_secret_file \
+                 (SIWXOIDC_MAS_SHARED_SECRET_FILE), or remove the setting to leave Matrix mode off"
+                    .into(),
+            );
+        }
         if let Some(path) = self.redis_password_file.as_deref() {
-            if secret_file::url_carries_password(&self.redis_url) {
-                return Err(secret_file::both_set(
-                    "redis_password_file (SIWXOIDC_REDIS_PASSWORD_FILE)",
-                    "the password in redis_url (SIWXOIDC_REDIS_URL)",
-                ));
-            }
-            let password = secret_file::read("redis_password_file", path)?;
-            self.redis_url =
-                secret_file::url_with_password("redis_url", &self.redis_url, &password)?;
+            self.redis_url = secret_file::redis_url_with_password_file(
+                "redis_url (SIWXOIDC_REDIS_URL)",
+                &self.redis_url,
+                "redis_password_file (SIWXOIDC_REDIS_PASSWORD_FILE)",
+                path,
+            )?;
             tracing::info!(path, "redis_url password read from its file");
         }
         Ok(())
@@ -1330,6 +1382,7 @@ mod tests {
 
     // -- Secrets from files -----------------------------------------------------------
 
+    use rand::Rng;
     use siwx_oidc::test_support::{leaked_window, random_secret, redis_url_with_password};
 
     /// Writes `content` to `name` in the jail's directory and returns the absolute path.
@@ -1639,6 +1692,119 @@ mod tests {
             }
             std::env::remove_var("SIWXOIDC_MAS_SHARED_SECRET");
             assert_eq!(figment().extract::<Config>()?.mas_shared_secret, None);
+            Ok(())
+        });
+    }
+
+    /// O-F1: the compose `${VAR:-}` default hands the server an empty secret. Start-up
+    /// refuses it (and a blank one) rather than starting in Matrix mode with a secret that
+    /// an empty form field matches. Unset and a real value are untouched.
+    #[test]
+    fn an_empty_or_blank_inline_mas_secret_is_refused_at_start() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            for (name, value) in [
+                ("SIWXOIDC_MAS_SHARED_SECRET", ""),
+                ("SIWXOIDC_MAS_SHARED_SECRET", "   "),
+                ("SIWEOIDC_MAS_SHARED_SECRET", ""),
+            ] {
+                jail.set_env(name, value);
+                let mut c = figment().extract::<Config>()?;
+                let error = c.read_secret_files().unwrap_err();
+                assert!(
+                    error.contains("mas_shared_secret") && error.contains("empty"),
+                    "{name}={value:?}: {error}"
+                );
+                std::env::remove_var(name);
+            }
+            // The blank file setting is unset (a compose default), the inline one is not.
+            jail.set_env("SIWXOIDC_MAS_SHARED_SECRET", "");
+            jail.set_env("SIWXOIDC_MAS_SHARED_SECRET_FILE", "");
+            let error = figment()
+                .extract::<Config>()?
+                .read_secret_files()
+                .unwrap_err();
+            assert!(error.contains("mas_shared_secret"), "{error}");
+            // Unset, and a real value, start.
+            std::env::remove_var("SIWXOIDC_MAS_SHARED_SECRET");
+            std::env::remove_var("SIWXOIDC_MAS_SHARED_SECRET_FILE");
+            figment().extract::<Config>()?.read_secret_files().unwrap();
+            jail.set_env("SIWXOIDC_MAS_SHARED_SECRET", "not-a-secret-test-fixture");
+            figment().extract::<Config>()?.read_secret_files().unwrap();
+            Ok(())
+        });
+    }
+
+    /// O-F2: the secret pasted into a file setting is not echoed, whether figment reads
+    /// it as a number (its type error quotes the value) or as a string (a path that is
+    /// not absolute is not shown).
+    #[test]
+    fn a_secret_pasted_into_a_file_setting_is_refused_without_being_shown() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            let digits = rand::thread_rng()
+                .gen_range(10u64.pow(17)..10u64.pow(18))
+                .to_string();
+            for name in [
+                "SIWXOIDC_MAS_SHARED_SECRET_FILE",
+                "SIWXOIDC_REDIS_PASSWORD_FILE",
+            ] {
+                jail.set_env(name, &digits);
+                let error = figment().extract::<Config>().err().expect("refused");
+                for shown in [error.to_string(), format!("{error:?}")] {
+                    assert!(
+                        shown.to_lowercase().contains("_file"),
+                        "{name}: names the setting: {shown}"
+                    );
+                    assert_eq!(leaked_window(&shown, &digits), None, "{name}: {shown}");
+                }
+                let pasted = random_secret(40);
+                jail.set_env(name, &pasted);
+                let mut c = figment().extract::<Config>()?;
+                let error = c.read_secret_files().unwrap_err();
+                assert!(error.contains("absolute"), "{name}: {error}");
+                assert_eq!(leaked_window(&error, &pasted), None, "{name}: {error}");
+                std::env::remove_var(name);
+            }
+            // A TOML number is refused the same way.
+            jail.create_file(
+                "siwx-oidc.toml",
+                &format!("[default]\nmas_shared_secret_file = {digits}\n"),
+            )?;
+            let error = figment().extract::<Config>().err().expect("refused");
+            assert_eq!(leaked_window(&format!("{error:?}"), &digits), None);
+            Ok(())
+        });
+    }
+
+    /// Grok F2: a unix-socket `redis_url` with a host (`localhost`) took the file's
+    /// password into its user information, where the client does not look. Refused,
+    /// whatever the scheme's spelling or the host.
+    #[test]
+    fn a_redis_password_file_is_refused_with_a_unix_socket_url() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            let password = random_secret(40);
+            jail.set_env(
+                "SIWXOIDC_REDIS_PASSWORD_FILE",
+                secret_file(jail, "redis", &password),
+            );
+            for url in [
+                "redis+unix:///run/redis.sock",
+                "redis+unix://localhost/run/redis.sock",
+                "valkey+unix://localhost/run/valkey.sock?db=1",
+                "unix://localhost/run/redis.sock",
+            ] {
+                jail.set_env("SIWXOIDC_REDIS_URL", url);
+                let mut c = figment().extract::<Config>()?;
+                let error = c.read_secret_files().unwrap_err();
+                assert!(
+                    error.contains("redis_password_file") && error.contains("unix-socket"),
+                    "{url}: {error}"
+                );
+                assert_eq!(c.redis_url.as_str(), url, "the URL is untouched");
+                assert_eq!(leaked_window(&error, &password), None, "{error}");
+            }
             Ok(())
         });
     }

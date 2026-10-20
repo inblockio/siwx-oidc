@@ -1,6 +1,6 @@
-//! Secrets that come from files (`mas_shared_secret_file`, `redis_password_file`), through
-//! the real binary: what it reads, what it refuses, and that no refusal or failure prints a
-//! secret.
+//! Secrets that come from files (`mas_shared_secret_file`, `redis_password_file`, and
+//! `AQUA_WEBAUTHN_REDIS_PASSWORD_FILE` for the credential store), through the real binary:
+//! what it reads, what it refuses, and that no refusal or failure prints a secret.
 //!
 //! Every secret here is generated per run. The refusal tests need no Redis (the spawned
 //! server gets an address nothing listens on); the two that serve requests or connect to a
@@ -241,6 +241,147 @@ fn a_redis_password_file_that_cannot_apply_stops_start_up_and_prints_no_password
     );
 }
 
+/// Grok F2: a unix-socket `redis_url` takes its password only from its `pass` parameter, so a
+/// password file is refused for every spelling of the scheme, with or without a host.
+#[test]
+fn a_redis_password_file_with_a_unix_socket_url_stops_start_up() {
+    let password = random_secret(40);
+    let file = SecretFile::with(&password);
+    for url in [
+        "unix:///run/redis.sock",
+        "redis+unix://localhost/run/redis.sock",
+        "valkey+unix://localhost/run/valkey.sock",
+    ] {
+        let stderr = refused_start(&[
+            ("SIWXOIDC_REDIS_URL", url.to_string()),
+            ("SIWXOIDC_REDIS_PASSWORD_FILE", file.path()),
+        ]);
+        assert!(
+            stderr.contains("FATAL")
+                && stderr.contains("redis_password_file")
+                && stderr.contains("unix-socket"),
+            "{url}: {stderr}"
+        );
+        assert_holds_none_of(&stderr, &[&password], url);
+    }
+}
+
+/// O-F5: a file that another reader (Synapse strips all surrounding whitespace from its MAS
+/// secret file) would read as a different secret is refused, for both settings.
+#[test]
+fn a_secret_file_that_another_reader_would_read_differently_stops_start_up() {
+    let secret = random_secret(40);
+    for (what, content, rule) in [
+        ("a second newline", format!("{secret}\n\n"), "whitespace"),
+        ("a leading space", format!(" {secret}\n"), "whitespace"),
+        ("two lines", format!("{secret}\n{secret}\n"), "control"),
+        ("a BOM", format!("\u{feff}{secret}"), "byte order mark"),
+    ] {
+        let file = SecretFile::with(&content);
+        for (setting, label) in [
+            ("SIWXOIDC_MAS_SHARED_SECRET_FILE", "mas_shared_secret_file"),
+            ("SIWXOIDC_REDIS_PASSWORD_FILE", "redis_password_file"),
+        ] {
+            let stderr = refused_start(&[(setting, file.path())]);
+            assert!(
+                stderr.contains("FATAL")
+                    && stderr.contains(label)
+                    && stderr.contains(&file.path())
+                    && stderr.contains(rule),
+                "{what}, {label}: {stderr}"
+            );
+            assert_holds_none_of(&stderr, &[&secret], what);
+        }
+    }
+}
+
+/// O-F8: a path that names a named pipe blocked start-up forever, because opening a pipe
+/// waits for a writer. It is refused at once (`refused_start` fails the test after 20 s).
+#[test]
+fn a_secret_file_path_that_is_a_named_pipe_stops_start_up_instead_of_blocking_it() {
+    let fifo = std::env::temp_dir().join(format!(
+        "siwx-secret-files-fifo-{}",
+        random_secret(16).to_lowercase()
+    ));
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let path = fifo.to_str().unwrap().to_string();
+    for setting in [
+        "SIWXOIDC_MAS_SHARED_SECRET_FILE",
+        "SIWXOIDC_REDIS_PASSWORD_FILE",
+    ] {
+        let stderr = refused_start(&[(setting, path.clone())]);
+        assert!(
+            stderr.contains("FATAL")
+                && stderr.contains(&path)
+                && stderr.contains("not a regular file"),
+            "{setting}: {stderr}"
+        );
+    }
+    std::fs::remove_file(&fifo).ok();
+}
+
+/// The gap: `AQUA_WEBAUTHN_REDIS_URL` carried the Redis password in the environment. Its
+/// password file is refused where `redis_password_file` is, from the same helper, and in
+/// every refusal neither password is printed.
+#[test]
+fn the_webauthn_redis_password_file_is_refused_where_redis_password_file_is() {
+    let (in_url, in_file) = (random_secret(40), random_secret(40));
+    let file = SecretFile::with(&in_file);
+    let padded = SecretFile::with(&format!("{in_file}\n\n"));
+    let missing = std::env::temp_dir().join(format!("siwx-missing-{}", random_secret(16)));
+    let missing = missing.to_str().unwrap().to_string();
+    let cases = [
+        (
+            "a password in the URL as well",
+            Some(redis_url_with_password(&in_url, "redis.example.org:6379")),
+            file.path(),
+            "both set",
+        ),
+        (
+            "a unix-socket URL",
+            Some("redis+unix://localhost/run/redis.sock".to_string()),
+            file.path(),
+            "unix-socket",
+        ),
+        (
+            "a file that is missing",
+            Some("redis://redis.example.org".to_string()),
+            missing.clone(),
+            missing.as_str(),
+        ),
+        (
+            "a file with a second newline",
+            Some("redis://redis.example.org".to_string()),
+            padded.path(),
+            "whitespace",
+        ),
+        (
+            "the password file alone",
+            None,
+            file.path(),
+            "AQUA_WEBAUTHN_REDIS_URL is not",
+        ),
+    ];
+    for (what, url, path, rule) in cases {
+        let mut env = vec![("AQUA_WEBAUTHN_REDIS_PASSWORD_FILE", path)];
+        if let Some(url) = url {
+            env.push(("AQUA_WEBAUTHN_REDIS_URL", url));
+        }
+        let stderr = refused_start(&env);
+        assert!(
+            stderr.contains("FATAL")
+                && stderr.contains("AQUA_WEBAUTHN_REDIS_PASSWORD_FILE")
+                && stderr.contains(rule),
+            "{what}: {stderr}"
+        );
+        assert_holds_none_of(&stderr, &[&in_url, &in_file], what);
+    }
+}
+
 /// A bad setting beside a real secret file: whatever refuses the start, and wherever it
 /// does, the output holds no part of the secrets the start-up had read or been given.
 #[test]
@@ -378,18 +519,15 @@ async fn the_mas_secret_file_is_the_secret_the_server_checks() {
     );
 }
 
-/// The password reaches the Redis server: a fake Redis records what the client sends first.
-/// The password holds characters a URL must encode, and a `%` sequence, which the URL
-/// encoder leaves alone and the client would decode.
-#[test]
-fn the_redis_password_file_is_what_the_client_sends_to_redis() {
-    let password = format!("p%41:/@?#+ \u{e9}{}", random_secret(24));
-    let file = SecretFile::with(&format!("{password}\n"));
+/// A fake Redis: the port it listens on, and a thread that returns what the first client
+/// that connects sends (it answers every chunk with `+OK`, so a client that waits for a
+/// reply goes on). A client that never connects makes it return nothing after 30 s, so the
+/// test fails instead of hanging.
+fn recording_redis() -> (u16, std::thread::JoinHandle<Vec<u8>>) {
     let fake = TcpListener::bind("127.0.0.1:0").unwrap();
-    let redis_port = fake.local_addr().unwrap().port();
+    let port = fake.local_addr().unwrap().port();
     fake.set_nonblocking(true).unwrap();
     let recorder = std::thread::spawn(move || {
-        // A client that never connects must fail the test, not hang it.
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut connection = loop {
             match fake.accept() {
@@ -404,7 +542,6 @@ fn the_redis_password_file_is_what_the_client_sends_to_redis() {
             .unwrap();
         let mut seen = Vec::new();
         let mut buffer = [0u8; 1024];
-        // Answer every chunk with OK so a client that waits for a reply goes on.
         while let Ok(n @ 1..) = connection.read(&mut buffer) {
             seen.extend_from_slice(&buffer[..n]);
             if connection.write_all(b"+OK\r\n").is_err() {
@@ -413,6 +550,17 @@ fn the_redis_password_file_is_what_the_client_sends_to_redis() {
         }
         seen
     });
+    (port, recorder)
+}
+
+/// The password reaches the Redis server: a fake Redis records what the client sends first.
+/// The password holds characters a URL must encode, and a `%` sequence, which the URL
+/// encoder leaves alone and the client would decode.
+#[test]
+fn the_redis_password_file_is_what_the_client_sends_to_redis() {
+    let password = format!("p%41:/@?#+ \u{e9}{}", random_secret(24));
+    let file = SecretFile::with(&format!("{password}\n"));
+    let (redis_port, recorder) = recording_redis();
     let _server = started(
         free_port(),
         &[
@@ -429,6 +577,47 @@ fn the_redis_password_file_is_what_the_client_sends_to_redis() {
         seen.contains("AUTH") && seen.contains(&password),
         "the client did not AUTH with the file's password:\n{seen:?}"
     );
+}
+
+/// The gap: the credential store's Redis password, from `AQUA_WEBAUTHN_REDIS_PASSWORD_FILE`,
+/// is what the store's client sends to its Redis. The store connects at boot (before the
+/// server's own Redis is used), so the server's own Redis here is one nothing listens on.
+#[test]
+fn the_webauthn_redis_password_file_is_what_the_credential_store_sends_to_redis() {
+    let password = format!("p%41:/@?#+ \u{e9}{}", random_secret(24));
+    let file = SecretFile::with(&format!("{password}\r\n"));
+    let (redis_port, recorder) = recording_redis();
+    let mut server = Server(
+        command(
+            free_port(),
+            &[
+                (
+                    "AQUA_WEBAUTHN_REDIS_URL",
+                    format!("redis://127.0.0.1:{redis_port}"),
+                ),
+                ("AQUA_WEBAUTHN_REDIS_PASSWORD_FILE", file.path()),
+            ],
+        )
+        .spawn()
+        .expect("spawn the siwx-oidc binary"),
+    );
+    let seen = recorder.join().unwrap();
+    server.0.kill().ok();
+    let mut stderr = String::new();
+    server.0.wait().ok();
+    server
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .ok();
+    let seen = String::from_utf8_lossy(&seen);
+    assert!(
+        seen.contains("AUTH") && seen.contains(&password),
+        "the store's client did not AUTH with the file's password:\n{seen:?}"
+    );
+    assert_holds_none_of(&stderr, &[&password], "the server's output");
 }
 
 // -- A connect error ---------------------------------------------------------------------

@@ -78,7 +78,8 @@ pub async fn redis() -> Option<RedisClient> {
 /// in it, say). Each such test takes its own number; taken so far: 4 to 7 and
 /// 12 to 15 (guest route tests, `env(Some(n))`/`env_in(Some(n))` and the reaper),
 /// 2 and 8 (the orphan scan), 9 (the outbox), 10 (back-channel logout), 11
-/// (static-client isolation), 3 (the server of `tests/secret_files_startup.rs`). Free: 1.
+/// (static-client isolation), 3 (the server of `tests/secret_files_startup.rs`), 1
+/// (`tests/audit_pr82_findings.rs`). Free: none.
 pub async fn redis_db(db: u8) -> Option<RedisClient> {
     connect(redis_db_url(db)).await
 }

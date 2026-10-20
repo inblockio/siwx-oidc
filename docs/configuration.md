@@ -50,7 +50,7 @@ Env names are shown with the `SIWXOIDC_` prefix; each also works as `SIWEOIDC_â€
 | `port` | `SIWXOIDC_PORT` | `8000` | Port to bind. `0` lets the system pick a free port; the `Listening on` log line names the one bound. |
 | `base_url` | `SIWXOIDC_BASE_URL` | `http://127.0.0.1:8000` | Issuer URL, advertised in discovery and used in every endpoint URL. Also the default WebAuthn RP ID (its host) and origin. **Must have a hostname**, see below. |
 | `redis_url` | `SIWXOIDC_REDIS_URL` | `redis://localhost` | Redis holding sessions, codes, tokens, clients and passkeys. A password goes in the URL's user information (the part before `@`) or in `redis_password_file`, never both. A value that is not a URL stops the start; the error never quotes it, because it may hold the password. |
-| `redis_password_file` | `SIWXOIDC_REDIS_PASSWORD_FILE` | none | Path of a file holding the Redis password. Read once at start and put into `redis_url` as its password (percent-encoded, so any character is allowed); see [Secrets in files](#secrets-in-files). Start-up refuses it when `redis_url` already carries a password, when `redis_url` has no host (a unix-socket URL cannot carry one), and when the file is unreadable or empty. An empty value is unset. |
+| `redis_password_file` | `SIWXOIDC_REDIS_PASSWORD_FILE` | none | Path of a file holding the Redis password. Read once at start and put into `redis_url` as its password (percent-encoded, so any character is allowed); see [Secrets in files](#secrets-in-files). Start-up refuses it when `redis_url` already carries a password (in its user information or its `pass` parameter), when `redis_url` is a unix-socket URL of any spelling (`unix`, `redis+unix`, `valkey+unix`, with or without a host: the Redis client reads a unix-socket password only from the URL's own `pass` parameter, so a password from a file would be dropped), when `redis_url` has no host, and when the file is not acceptable (rules below). An empty value is unset. |
 | `log_format` | `SIWXOIDC_LOG_FORMAT` | `pretty` | `pretty` or `json`. See [Logging](#logging). |
 
 **The default `base_url` does not start.** WebAuthn refuses an IP literal as RP ID, so with
@@ -84,34 +84,52 @@ services:
         read_only: true
 ```
 
-The rules, the same for both:
+The rules, the same for both (and for the credential store's own
+`AQUA_WEBAUTHN_REDIS_PASSWORD_FILE`, below):
 
+- **The path is absolute and names a regular file** (a symbolic link to one is followed). A
+  relative path, a named pipe, a device and a directory are refused before anything is read,
+  so a wrong path can neither block the start nor read an endless stream. A path that is not
+  absolute is not shown in the error: it is most likely the secret itself, given to the file
+  setting by mistake.
 - **The value is the file's content with at most one trailing line ending removed** (`\n` or
-  `\r\n`), nothing else: a space at either end belongs to the value, and so does a second
-  newline. Write the file with `printf %s` or an editor that adds one newline, not with
-  anything that pads it.
+  `\r\n`). What is left must not be empty, must not start or end with whitespace, must not
+  hold a control character (so the secret is one line) and must not start with a byte order
+  mark; the start is refused otherwise. Synapse strips all surrounding whitespace from the
+  file that holds its copy of the MAS secret, so a file shared by both services with an extra
+  newline or a space would otherwise give two different secrets. Write the file with
+  `printf %s` or an editor that adds one newline, not with anything that pads it.
 - **The file is read once, at start.** A changed secret takes a restart. A single-file bind
   mount keeps pointing at the old inode when the file is replaced, so recreate the container
   rather than restarting it.
 - **A file and the inline setting together are a start error**, for the MAS secret (an empty
   inline value counts as set) and for the Redis password (a password already in `redis_url`).
-  So is a file that cannot be read, that is empty, that is not UTF-8 or that is larger than
-  8192 bytes; for the Redis password also a `redis_url` that cannot carry a password (it has
-  no host, as a unix-socket URL has). An empty path is unset, so a compose `${VAR:-}` default
+  So is a file that cannot be read, that is not UTF-8 or that is larger than 8192 bytes; for
+  the Redis password also a `redis_url` that is a unix-socket URL (of any spelling, with or
+  without a host) or has no host. An empty path is unset, so a compose `${VAR:-}` default
   switches the option off.
+- **An empty `mas_shared_secret` is a start error, not "unset".** The compose pattern
+  `SIWXOIDC_MAS_SHARED_SECRET: ${MAS_SHARED_SECRET:-}` hands the server an empty string when
+  the variable is missing. Taken as a secret it would switch Matrix mode on with a shared
+  secret that a request with an empty `client_secret` matches, so the server refuses to
+  start (and the shared-secret comparison never matches an empty secret). To leave Matrix
+  mode off, remove the variable.
 - **A refusal exits non-zero and names the setting and the path, never any content.** No other
   start-up or connection message holds either value: a `redis_url` that does not parse is
-  reported without being quoted, and so is a `mas_shared_secret` that the environment parser
-  read as a number (use the file, or quote it in the TOML file). The log says only that a file
-  was read, and which path.
+  reported without being quoted, a `mas_shared_secret` or a `_file` setting that the
+  environment parser read as a number is reported without its value (use the file, or quote
+  it in the TOML file), and a `default_clients` entry that does not parse is reported by its
+  position only. The log says only that a file was read, and which path.
 - **The Redis password goes into the URL with every character encoded**, so it may hold `@`,
   `/`, `:`, `#`, `?` or `%`. The user name, host, port and database of `redis_url` stay as
   they are.
 - The user the image runs as (UID/GID 10001) must be able to read the file. Mode `0440` owned by
   that user, or by a group it is in, is enough.
 
-Not covered: the signing key, and `AQUA_WEBAUTHN_REDIS_URL` (below), which is read from the
-environment as a whole URL and has no file option.
+The credential store has its own Redis URL, `AQUA_WEBAUTHN_REDIS_URL`, and its own file option,
+`AQUA_WEBAUTHN_REDIS_PASSWORD_FILE` (see [Variables outside the config
+struct](#variables-outside-the-config-struct)), under exactly these rules. Not covered here:
+the signing key.
 
 ### Signing keys
 
@@ -251,24 +269,30 @@ authenticates the client. The entry holds `"secret_digest"` (64 lowercase hex ch
 webmail = '{"secret_digest":â€¦,"metadata":{"redirect_uris":["https://mail.example.org/callback"]}}'
 ```
 
-The digest is the SHA-256 of the exact bytes the client sends as its secret. Compute it from
-the secret's file without the secret on a command line, where `ps` and the shell history would
-show it:
+The digest is the SHA-256 of the exact bytes the client sends as its secret. Write the secret
+to a file with no newline at the end, so that the file, the secret the client sends and the
+hash all describe the same bytes, and hash that file as it is. Neither command puts the secret
+on a command line, where `ps` and the shell history would show it:
 
 ```sh
-tr -d '\n' < client-secret | sha256sum | cut -d' ' -f1
+umask 077
+openssl rand -base64 36 | tr -d '\n' > client-secret   # 48 characters, no newline
+sha256sum < client-secret | cut -d' ' -f1              # the digest for secret_digest
 ```
 
-A trailing newline changes the digest. `sha256sum < client-secret` hashes the newline that an
-editor or `echo` leaves at the end of the file, but a client that reads its secret from a file
-normally drops it, so that digest would never match. The `tr` above removes it, which is right
-when the client strips one trailing newline, as siwx-oidc does for its own secret files. If your
-client sends the file as it is, hash the file as it is.
+A file written with `printf %s` or the pipeline above has no trailing newline. One written with
+an editor or `echo` has one, and a client that sends the file's content with the newline removed
+sends other bytes than `sha256sum` hashed, so that digest would never match; the same holds for
+the `\r` of a CRLF file. Write the file as above rather than stripping characters from it for
+the hash, and test the client against the server once.
 
 Start-up refuses a `secret_digest` that is not exactly 64 lowercase hex characters, and names the
 client without quoting the value: a raw secret pasted into this field, or an upper-case digest,
-would otherwise start without error and never match. A digest is unsalted, so it protects a
-long random secret (use 32 or more random characters) and not a guessable one.
+would otherwise start without error and never match. It cannot refuse every raw secret: **a
+secret that is itself 64 lowercase hex characters** (`openssl rand -hex 32` makes exactly that)
+has the form of a digest, so pasted into `secret_digest` it passes the check and never matches.
+Use a secret of another shape or length, such as the base64 text above. A digest is unsalted, so
+it protects a long random secret (use 32 or more random characters) and not a guessable one.
 
 Every start makes the static clients in Redis equal that instance's `default_clients`: it writes
 each entry, with no expiry, and deletes each client an earlier start wrote that the map no longer
@@ -487,7 +511,7 @@ lookup.
 
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
-| `mas_shared_secret` | `SIWXOIDC_MAS_SHARED_SECRET` | none | Secret shared with Synapse (its `matrix_authentication_service.secret`). Enables Matrix mode: `mat_`/`mcr_` token prefixes and Matrix scopes, `POST /oauth2/introspect`, `POST /oauth2/admin_token`, and the device-code grant. Without it those endpoints answer 404, the grant is refused, and discovery advertises neither introspection nor the device-code grant. |
+| `mas_shared_secret` | `SIWXOIDC_MAS_SHARED_SECRET` | none | Secret shared with Synapse (its `matrix_authentication_service.secret`). Set but empty (or only whitespace) is a start error, never "unset". Enables Matrix mode: `mat_`/`mcr_` token prefixes and Matrix scopes, `POST /oauth2/introspect`, `POST /oauth2/admin_token`, and the device-code grant. Without it those endpoints answer 404, the grant is refused, and discovery advertises neither introspection nor the device-code grant. |
 | `mas_shared_secret_file` | `SIWXOIDC_MAS_SHARED_SECRET_FILE` | none | Path of a file holding the MAS shared secret, in place of `mas_shared_secret`: read once at start, and it enables Matrix mode exactly as the inline setting does. Setting it together with `mas_shared_secret` is a start error, as is an unreadable or empty file; see [Secrets in files](#secrets-in-files). An empty value is unset. |
 | `synapse_endpoint` | `SIWXOIDC_SYNAPSE_ENDPOINT` | none | Synapse base URL as reachable from siwx-oidc (e.g. `http://synapse:8008`). With `mas_shared_secret` it enables the Synapse client: provisioning, devices, deactivation, DID publication, the sign-in gates. A generic-class `default_clients` entry needs both: start-up refuses it without either. |
 | `matrix_server_name` | `SIWXOIDC_MATRIX_SERVER_NAME` | none | The homeserver's `server_name`. Needed to build MXIDs: DID publication, `GET /resolve`, the `io.inblock.mxid` userinfo claim, `/account` device actions and the passkey picker's account hint. Without it those degrade (skipped, omitted or 503), never 500. |
@@ -585,11 +609,17 @@ SADD guest:banned_hosts <host>           # host = the invite's host identity (To
 | Variable | Meaning |
 |---|---|
 | `RUST_LOG` | Log filter, see [Logging](#logging). |
-| `AQUA_WEBAUTHN_REDIS_URL` | Unset or empty (default): passkeys live only in `webauthn:credential/*`. Set to a Redis URL: every passkey write is mirrored into aqua-auth's credential store there and reads fall back through it. The server refuses to start if the URL is set but the store cannot be opened. The legacy namespace stays authoritative, so unsetting it loses nothing. The URL carries the Redis password when that Redis has one, and this variable has no file option: it is set whole in the environment. |
+| `AQUA_WEBAUTHN_REDIS_URL` | Unset or empty (default): passkeys live only in `webauthn:credential/*`. Set to a Redis URL: every passkey write is mirrored into aqua-auth's credential store there and reads fall back through it. The server refuses to start if the URL is set but the store cannot be opened. The legacy namespace stays authoritative, so unsetting it loses nothing. The URL carries the Redis password when that Redis has one; to keep the password out of the environment, leave it out of the URL and use `AQUA_WEBAUTHN_REDIS_PASSWORD_FILE`. |
+| `AQUA_WEBAUTHN_REDIS_PASSWORD_FILE` | Path of a file holding the Redis password of `AQUA_WEBAUTHN_REDIS_URL`, read at start and put into that URL as its password, under exactly the rules of `redis_password_file` ([Secrets in files](#secrets-in-files)): an absolute path to a regular file, one trailing newline removed, no whitespace at either end. Start-up refuses it when the URL already carries a password (the file and an inline password together are never accepted), when the URL is a unix-socket URL of any spelling or has no host, when the file is unusable, and when it is set with no `AQUA_WEBAUTHN_REDIS_URL` (the store would stay off while its password looks configured). An empty value is unset. |
 
 The image also ships `migrate-credentials`, which backfills existing passkeys into that store:
-`migrate-credentials [--apply] [--source-redis URL] [--target-redis URL]`. It is a dry run
-without `--apply`, only adds keys, and can be re-run.
+`migrate-credentials [--apply] [--source-redis URL] [--target-redis URL]` (an option takes its
+value as the next argument or as `--option=value`). It is a dry run without `--apply`, only
+adds keys, and can be re-run. A URL may carry the Redis password, so give it in the environment
+rather than on the command line: the target defaults to `AQUA_WEBAUTHN_REDIS_URL` with the
+password from `AQUA_WEBAUTHN_REDIS_PASSWORD_FILE`, the source to `REDIS_URL`. The tool prints
+each endpoint as scheme, host, port and path only, and an argument it does not know without its
+text.
 
 ## Logging
 

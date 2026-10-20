@@ -101,6 +101,11 @@ pub fn digest(value: &str) -> String {
 /// Whether `value` has the form [`digest`] returns: exactly 64 lowercase hex characters.
 /// A stored digest is compared byte for byte, so any other spelling of the same bytes
 /// (upper case) never matches.
+///
+/// This is a check of the form and cannot be more: a raw secret that is itself 64
+/// lowercase hex characters (`openssl rand -hex 32`) has the form of a digest, so one pasted
+/// into a `secret_digest` field passes and never matches. The operator documentation says so
+/// and asks for a secret of another shape.
 pub fn is_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -198,6 +203,14 @@ mod tests {
             digest("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    /// O-F10: the limit of the form check, pinned so that nobody mistakes it for a defence.
+    #[test]
+    fn a_raw_secret_of_64_lowercase_hex_characters_has_the_form_of_a_digest() {
+        let raw_hex = "0123456789abcdef".repeat(4);
+        assert!(is_digest(&raw_hex), "indistinguishable by form: {raw_hex}");
+        assert_ne!(digest(&raw_hex), raw_hex, "and it never matches as one");
     }
 
     #[test]
