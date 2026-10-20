@@ -36,10 +36,21 @@
 //!   refresh token is then refused with `invalid_grant`.
 //! - No device id is proposed: with deleted-device markers on, a pinned id would
 //!   be refused for a year once it was signed out. The server mints
-//!   `SIWX_<uuid>` per run and the logout deletes it. A device a run leaves
-//!   behind (it died, or the homeserver failed to delete it) is on the ledger
-//!   `devices.json`, which only this program writes: the next run tolerates it
-//!   and deletes it, while a device nobody recorded fires the tripwire.
+//!   `SIWX_<uuid>` per run and the logout deletes it, best-effort: it answers
+//!   200 whether or not the device went. The ledger `devices.json`, which only
+//!   this program writes, therefore holds three things. The devices a run left
+//!   behind (it died, or the logout went by `/oauth2/revoke`): the next run
+//!   tolerates and deletes them. The devices whose logout a run proved (the
+//!   refresh token was refused), until a run sees them gone: one still listed
+//!   is reported as `device_survived_logout` and deleted, not taken for a
+//!   stranger. And a marker for each sign-in that was started and not
+//!   finished, because the server makes the device before the code exchange.
+//!   A device nobody recorded fires the tripwire, unless a live marker can
+//!   explain it, and a marker explains a device only if the device has a
+//!   minted `SIWX_` id, carries the canary's own display name and has never
+//!   been seen in use (no `last_seen_ts`). Markers expire after three days and
+//!   at most sixteen are kept (`identity::ATTEMPT_MAX_AGE_SECS`,
+//!   `identity::ATTEMPT_CAP`).
 //! - Only `--baseline` (the run before a rotation) may register a new client
 //!   when the stored one is refused. A later run that cannot use it fails: that
 //!   is what an existing client's stored registration would see.
@@ -50,16 +61,22 @@
 //!
 //! Every credential this program holds (the access, refresh and ID token, the
 //! registration access token, the account-action nonce and signature, the DID
-//! proof, the key's PEM) is a `hygiene::Secret`, whose `Debug` and `Display`
-//! print `[redacted]`. The authorization code, the PKCE verifier, the CAIP-122
-//! nonce and the session cookie live only inside `siwx_oidc_auth`'s code flow
-//! and never reach this program. Errors from the library, reqwest and the
-//! server are mapped to reason codes and their text is dropped, `AuthTokens` is
-//! consumed on arrival and never printed. Every line passes a taint check that
-//! refuses a line containing 12 consecutive characters of any held credential
-//! (a refusal marker is printed instead and the run fails). `panic = "abort"`
-//! cannot be set per example, so a panic hook prints only the source location
-//! and aborts; `RLIMIT_CORE` is set to 0 first.
+//! proof, the session cookies the replies set, the key's PEM) is a
+//! `hygiene::Secret`, whose `Debug` and `Display` print `[redacted]`. The
+//! authorization code, the PKCE verifier and the CAIP-122 nonce live only
+//! inside `siwx_oidc_auth`'s code flow and never reach this program; the
+//! cookie of the `/authorize` probe, the one session this program opens itself,
+//! is held by the taint check and dropped. Errors from the library, reqwest and
+//! the server are mapped to reason codes and their text is dropped,
+//! `AuthTokens` is consumed on arrival and never printed. Every line passes a
+//! taint check that refuses a line containing 12 consecutive characters of any
+//! held credential (a refusal marker is printed instead and the run fails).
+//! `panic = "abort"` cannot be set per example, so a panic hook prints only the
+//! source location and leaves with `_exit(70)` (no unwinding, no `atexit`
+//! handlers, no `SIGABRT` for a crash handler to turn into a core file).
+//! `RLIMIT_CORE` is set to 0 first, and on Linux `PR_SET_DUMPABLE` is cleared,
+//! so a crash leaves no core file and no other process of the user can read
+//! the memory through `ptrace` or `/proc/<pid>/mem`.
 //!
 //! The modules live in `rotation_canary/`; their tests, and the hermetic runs
 //! against a fake server, are in `tests/rotation_canary_unit.rs`.

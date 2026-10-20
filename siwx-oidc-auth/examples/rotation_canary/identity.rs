@@ -2,7 +2,8 @@
 //! `~/.aqua-secrets/rotation-canary/<env>/`: `key.pem` (the canary account's
 //! Ed25519 key, 0600), `client.json` (public: the registered client, the issuer
 //! it belongs to, the logout route, the account's MXID), `devices.json` (the
-//! devices the canary created and has not yet seen gone) and `.lock`.
+//! devices the canary created and has not yet seen gone, the ones whose logout
+//! it proved, and its unfinished sign-ins) and `.lock`.
 //!
 //! The directory is 0700 and `key.pem` is created 0600 by the `open(2)` that
 //! creates it, so no byte of the key is ever in a file with wider modes. The
@@ -192,11 +193,44 @@ pub fn write_client(dir: &Path, record: &ClientRecord) -> Result<(), Reason> {
 /// marker is written before the sign-in and dropped once the run knows its own
 /// device; one still there at the next run says "one device of this kind may
 /// be unrecorded".
+///
+/// A marker is a licence to excuse one device, so it does not last: see
+/// [`ATTEMPT_MAX_AGE_SECS`] and [`ATTEMPT_CAP`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attempt {
     pub id: String,
-    /// Unix seconds on this host's clock; informative only.
+    /// Unix seconds on this host's clock when the sign-in started.
     pub at: i64,
+}
+
+/// How long a marker can excuse a device: three days. A run that died leaves
+/// its marker for the next run, which is a person or a job a few hours to a
+/// weekend away (a Friday evening failure and a Monday run are about 64 hours
+/// apart). A marker older than that belongs to a run nobody is waiting for any
+/// more, and the longer it stays valid the longer it can cover a device
+/// somebody else made. An expired marker explains nothing: its device reads as
+/// a stranger and fires the tripwire, the safe direction.
+pub const ATTEMPT_MAX_AGE_SECS: i64 = 3 * 24 * 60 * 60;
+
+/// The most markers that count, and the most the ledger keeps (the oldest are
+/// dropped first). Each run that fails between its `/authorize` probe and its
+/// `whoami` leaves one, and an operator chasing a broken token endpoint may
+/// retry a dozen times, so the cap is above that. Without a cap the number of
+/// devices the canary excuses would grow with every failed run, and the
+/// tripwire would get looser the longer the deployment is unhealthy.
+pub const ATTEMPT_CAP: usize = 16;
+
+/// A marker dated this far ahead of this host's clock is still believed (the
+/// clock is not exact); one dated further ahead is not, so a clock set back
+/// cannot keep a marker alive past its age limit.
+const ATTEMPT_FUTURE_SLACK_SECS: i64 = 300;
+
+impl Attempt {
+    /// Whether the marker may still explain a device at `now` (unix seconds).
+    pub fn is_live(&self, now: i64) -> bool {
+        self.at <= now.saturating_add(ATTEMPT_FUTURE_SLACK_SECS)
+            && now.saturating_sub(self.at) <= ATTEMPT_MAX_AGE_SECS
+    }
 }
 
 /// `devices.json`: what the canary knows about the devices it made. Only this
@@ -207,9 +241,39 @@ pub struct Ledger {
     /// Devices created by a run of the canary and not yet seen gone.
     #[serde(default)]
     pub pending: BTreeSet<String>,
-    /// Sign-ins started and not finished.
+    /// Devices whose logout a run proved (the refresh token was refused after
+    /// it) and that no run has yet seen gone. The proof is about the grant, not
+    /// the device: siwx-oidc deletes the Synapse device on a logout best-effort
+    /// and answers 200 whether or not that worked, so one of these may still be
+    /// listed at the next run. It is then reported under its own reason and
+    /// deleted, not taken for a stranger. Dropped once a run sees it gone.
+    #[serde(default)]
+    pub logged_out: BTreeSet<String>,
+    /// Sign-ins started and not finished, oldest first.
     #[serde(default)]
     pub attempts: Vec<Attempt>,
+}
+
+impl Ledger {
+    /// How many unfinished sign-ins of earlier runs (not `own`, this run's)
+    /// can still explain a device at `now`: the live markers, at most
+    /// [`ATTEMPT_CAP`].
+    pub fn live_attempts(&self, now: i64, own: &str) -> usize {
+        self.attempts
+            .iter()
+            .filter(|a| a.id != own && a.is_live(now))
+            .count()
+            .min(ATTEMPT_CAP)
+    }
+
+    /// Add a marker: the expired ones are dropped first and, when the cap would
+    /// be passed, the oldest live ones after them.
+    pub fn record_attempt(&mut self, attempt: Attempt, now: i64) {
+        self.attempts.retain(|a| a.is_live(now));
+        self.attempts.push(attempt);
+        let excess = self.attempts.len().saturating_sub(ATTEMPT_CAP);
+        self.attempts.drain(..excess);
+    }
 }
 
 pub fn read_ledger(dir: &Path) -> Ledger {
@@ -413,6 +477,7 @@ mod tests {
         assert_eq!(read_ledger(&dir), Ledger::default());
         let ledger = Ledger {
             pending: BTreeSet::from(["SIWX_a".to_string(), "SIWX_b".to_string()]),
+            logged_out: BTreeSet::from(["SIWX_c".to_string()]),
             attempts: vec![Attempt {
                 id: "abc".to_string(),
                 at: 1_700_000_000,
@@ -447,6 +512,97 @@ mod tests {
         let ledger = read_ledger(&dir);
         assert_eq!(ledger.pending, BTreeSet::from(["SIWX_old".to_string()]));
         assert!(ledger.attempts.is_empty());
+        assert!(ledger.logged_out.is_empty());
+    }
+
+    #[test]
+    fn a_ledger_without_logged_out_devices_still_reads() {
+        let scratch = Scratch::new("ledger-v2");
+        let dir = ensure_dir(&scratch.0, "dev").unwrap();
+        fs::write(
+            dir.join(DEVICES_FILE),
+            br#"{"pending":[],"attempts":[{"id":"abc","at":1700000000}]}"#,
+        )
+        .unwrap();
+        let ledger = read_ledger(&dir);
+        assert_eq!(ledger.attempts.len(), 1);
+        assert!(ledger.logged_out.is_empty());
+    }
+
+    fn attempt(id: &str, at: i64) -> Attempt {
+        Attempt {
+            id: id.to_string(),
+            at,
+        }
+    }
+
+    const NOW: i64 = 1_800_000_000;
+
+    #[test]
+    fn a_marker_explains_a_device_only_for_three_days() {
+        assert!(attempt("a", NOW).is_live(NOW));
+        assert!(attempt("a", NOW - ATTEMPT_MAX_AGE_SECS).is_live(NOW));
+        assert!(!attempt("a", NOW - ATTEMPT_MAX_AGE_SECS - 1).is_live(NOW));
+        assert!(!attempt("a", 1).is_live(NOW), "a marker from 1970 is spent");
+    }
+
+    #[test]
+    fn a_marker_from_the_future_is_believed_a_little_and_not_for_ever() {
+        assert!(attempt("a", NOW + 60).is_live(NOW), "a clock a minute off");
+        assert!(
+            !attempt("a", NOW + 3_600).is_live(NOW),
+            "an hour ahead is not a clock error; a marker set that far ahead would never age"
+        );
+        assert!(!attempt("a", i64::MAX).is_live(NOW));
+        assert!(!attempt("a", i64::MIN).is_live(NOW));
+    }
+
+    #[test]
+    fn only_live_markers_of_other_runs_count() {
+        let ledger = Ledger {
+            attempts: vec![
+                attempt("old", NOW - ATTEMPT_MAX_AGE_SECS - 10),
+                attempt("fresh", NOW - 10),
+                attempt("mine", NOW - 1),
+            ],
+            ..Ledger::default()
+        };
+        assert_eq!(ledger.live_attempts(NOW, "mine"), 1);
+        assert_eq!(ledger.live_attempts(NOW, "nobody"), 2);
+    }
+
+    #[test]
+    fn the_markers_that_count_are_capped_even_in_a_ledger_that_holds_more() {
+        let ledger = Ledger {
+            attempts: (0..ATTEMPT_CAP + 5)
+                .map(|n| attempt(&format!("m{n}"), NOW - 10))
+                .collect(),
+            ..Ledger::default()
+        };
+        assert_eq!(ledger.live_attempts(NOW, "mine"), ATTEMPT_CAP);
+    }
+
+    #[test]
+    fn recording_a_marker_drops_expired_ones_and_keeps_at_most_the_cap_newest() {
+        let mut ledger = Ledger {
+            attempts: vec![attempt("old", 1)],
+            ..Ledger::default()
+        };
+        ledger.record_attempt(attempt("a", NOW), NOW);
+        assert_eq!(ledger.attempts, vec![attempt("a", NOW)], "expired is gone");
+        for n in 0..ATTEMPT_CAP + 3 {
+            ledger.record_attempt(attempt(&format!("n{n}"), NOW), NOW);
+        }
+        assert_eq!(ledger.attempts.len(), ATTEMPT_CAP);
+        assert_eq!(
+            ledger.attempts.last().unwrap().id,
+            format!("n{}", ATTEMPT_CAP + 2),
+            "the newest is kept"
+        );
+        assert!(
+            ledger.attempts.iter().all(|a| a.id != "a" && a.id != "n0"),
+            "the oldest go first"
+        );
     }
 
     #[test]

@@ -24,7 +24,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::checks;
 use crate::cli::{CheckConfig, InitConfig, Matrix};
-use crate::flow::REDIRECT_URI;
+use crate::flow::{self, REDIRECT_URI};
 use crate::hygiene::{self, Secret};
 use crate::identity::{self, ClientRecord, LogoutRoute};
 use crate::init;
@@ -110,6 +110,13 @@ struct Quirks {
     erase_refused: Option<u16>,
     /// whoami answers this status.
     whoami_status: Option<u16>,
+    /// How `GET /devices` describes a device, by id: its display name and its
+    /// `last_seen_ts`. A device not named here is described the way a device
+    /// that an unfinished sign-in of the canary leaves is: named after the
+    /// canary's client and never seen.
+    device_meta: HashMap<String, (Option<String>, Option<i64>)>,
+    /// `/authorize` sets one more cookie, with this value, besides the session.
+    authorize_cookie: Option<String>,
 }
 
 impl Default for Quirks {
@@ -134,6 +141,8 @@ impl Default for Quirks {
             revoke_is_noop: false,
             erase_refused: None,
             whoami_status: None,
+            device_meta: HashMap::new(),
+            authorize_cookie: None,
         }
     }
 }
@@ -360,7 +369,7 @@ impl Fake {
                 if r.query.get("client_id") != Some(&s.client_id) {
                     return reply(401, json!({"error": "Unrecognised client id."}));
                 }
-                redirect(
+                let mut response = redirect(
                     format!(
                         "/sign_in?nonce={}&state=headless&redirect_uri={}&client_id={}",
                         random("", 16),
@@ -368,7 +377,13 @@ impl Fake {
                         s.client_id
                     ),
                     Some("session=fake-session"),
-                )
+                );
+                if let Some(value) = &s.quirks.authorize_cookie {
+                    response
+                        .headers
+                        .push(("Set-Cookie".to_string(), format!("probe={value}; Path=/")));
+                }
+                response
             }),
             ("GET", "/sign_in") => {
                 let cookie = r.headers.get("cookie").cloned().unwrap_or_default();
@@ -451,7 +466,19 @@ impl Fake {
                 self.with(|s| {
                     let mut ids = s.devices.clone();
                     ids.extend(s.quirks.extra_devices.clone());
-                    let devices: Vec<Value> = ids.iter().map(|d| json!({"device_id": d})).collect();
+                    let devices: Vec<Value> = ids
+                        .iter()
+                        .map(|d| {
+                            let (name, seen) = s.quirks.device_meta.get(d).cloned().unwrap_or((
+                                Some(flow::DEVICE_NAME.to_string()),
+                                None,
+                            ));
+                            json!({
+                                "device_id": d, "display_name": name,
+                                "last_seen_ip": null, "last_seen_ts": seen,
+                            })
+                        })
+                        .collect();
                     reply(200, json!({ "devices": devices }))
                 })
             }
@@ -1041,7 +1068,23 @@ async fn a_proven_matrix_logout_takes_the_device_off_the_ledger_and_a_revoke_log
     let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
     let run = run_check(check_cfg(&fake, true), &scratch.0).await;
     assert_eq!(run.code, 0);
-    assert_eq!(identity::read_ledger(&dir), identity::Ledger::default());
+    let device = fake.with(|s| s.device.clone());
+    assert_eq!(
+        identity::read_ledger(&dir),
+        identity::Ledger {
+            logged_out: BTreeSet::from([device]),
+            ..identity::Ledger::default()
+        },
+        "the proof is about the grant: the device waits on the ledger until a run sees it gone"
+    );
+    // The next run finds it gone and forgets it, and holds its own.
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    let device = fake.with(|s| s.device.clone());
+    assert_eq!(
+        identity::read_ledger(&dir).logged_out,
+        BTreeSet::from([device])
+    );
 
     let (fake, scratch) = (Fake::start().await, Scratch::new("ledger-keep"));
     let dir = identity_for(&scratch.0, &fake, LogoutRoute::Revoke);
@@ -1091,8 +1134,26 @@ async fn a_sign_in_that_failed_after_its_device_was_made_is_reported_then_forgiv
     assert_eq!(run.code, 0, "{:#?}", run.lines);
     assert!(run.has("logout", &format!("leftovers={killed}")));
     assert!(run.has("logout", "cleaned=1"));
-    assert_eq!(identity::read_ledger(&dir), identity::Ledger::default());
+    let ledger = identity::read_ledger(&dir);
+    assert!(ledger.pending.is_empty() && ledger.attempts.is_empty());
+    assert_eq!(
+        ledger.logged_out,
+        BTreeSet::from([fake.with(|s| s.device.clone())]),
+        "only this run's own, proven device is left on it"
+    );
     assert!(fake.with(|s| s.devices.is_empty()));
+}
+
+/// A marker an earlier run left, started `age_secs` ago by this host's clock.
+fn leave_marker(dir: &Path, id: &str, age_secs: i64) {
+    let at = Utc::now().timestamp() - age_secs;
+    identity::update_ledger(dir, |l| {
+        l.attempts.push(identity::Attempt {
+            id: id.to_string(),
+            at,
+        })
+    })
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1107,13 +1168,7 @@ async fn a_device_that_no_attempt_can_explain_still_fires_the_tripwire() {
     // A marker, but the device is not of the kind the server mints without a proposal.
     let (fake, scratch) = (Fake::start().await, Scratch::new("othermarker"));
     let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
-    identity::update_ledger(&dir, |l| {
-        l.attempts.push(identity::Attempt {
-            id: "old".to_string(),
-            at: 1,
-        })
-    })
-    .unwrap();
+    leave_marker(&dir, "old", 0);
     fake.quirks(|q| q.extra_devices = vec!["ELEMENTXDEVICE".to_string()]);
     let run = run_check(check_cfg(&fake, true), &scratch.0).await;
     assert_eq!(run.code, 4, "{:#?}", run.lines);
@@ -1127,13 +1182,7 @@ async fn a_device_that_no_attempt_can_explain_still_fires_the_tripwire() {
     // One marker explains one device, not two.
     let (fake, scratch) = (Fake::start().await, Scratch::new("twodevices"));
     let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
-    identity::update_ledger(&dir, |l| {
-        l.attempts.push(identity::Attempt {
-            id: "old".to_string(),
-            at: 1,
-        })
-    })
-    .unwrap();
+    leave_marker(&dir, "old", 0);
     fake.quirks(|q| q.extra_devices = vec!["SIWX_a".to_string(), "SIWX_b".to_string()]);
     let run = run_check(check_cfg(&fake, true), &scratch.0).await;
     assert_eq!(run.code, 4, "{:#?}", run.lines);
@@ -1169,6 +1218,232 @@ async fn a_run_that_never_learned_its_device_keeps_its_marker_for_the_next_run()
     assert_eq!(run.code, 1, "{:#?}", run.lines);
     assert!(run.has("logout", "reason=unfinished_sign_in_device"));
     assert!(run.has("logout", &format!("unfinished={left}")));
+}
+
+/// How a homeserver describes a stranger's device: any name or none, seen or not.
+fn describe(fake: &Fake, id: &str, name: Option<&str>, last_seen_ts: Option<i64>) {
+    fake.quirks(|q| {
+        q.device_meta
+            .insert(id.to_string(), (name.map(str::to_string), last_seen_ts));
+    });
+}
+
+#[tokio::test]
+async fn a_stranger_with_a_siwx_id_cannot_pass_as_an_unfinished_sign_in() {
+    // Each stranger has a live marker to hide behind and an id of the kind the
+    // server mints, and each fails one of the other two conditions.
+    let strangers: [(&str, Option<&str>, Option<i64>); 3] = [
+        ("another-clients-name", Some("Element Web"), None),
+        ("no-name", None, None),
+        (
+            "seen-in-use",
+            Some("rotation-canary"),
+            Some(1_700_000_000_000),
+        ),
+    ];
+    for (tag, name, last_seen_ts) in strangers {
+        let (fake, scratch) = (Fake::start().await, Scratch::new(tag));
+        let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+        leave_marker(&dir, "leftover", 60);
+        fake.quirks(|q| q.extra_devices = vec!["SIWX_stranger".to_string()]);
+        describe(&fake, "SIWX_stranger", name, last_seen_ts);
+        let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+        assert_eq!(run.code, 4, "{tag}: {:#?}", run.lines);
+        assert!(run.has("logout", "reason=identity_compromised"), "{tag}");
+        assert!(run.has("logout", "strangers=SIWX_stranger"), "{tag}");
+        assert!(
+            fake.with(|s| s
+                .quirks
+                .extra_devices
+                .contains(&"SIWX_stranger".to_string())),
+            "{tag}: evidence stays"
+        );
+        assert_eq!(
+            identity::read_ledger(&dir).attempts.len(),
+            1,
+            "{tag}: the marker is evidence too while the tripwire is fired"
+        );
+    }
+
+    // The same marker and the same id, but a device that looks like the
+    // canary's own unfinished sign-in: reported, not the tripwire.
+    let (fake, scratch) = (Fake::start().await, Scratch::new("own-unfinished"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    leave_marker(&dir, "leftover", 60);
+    fake.quirks(|q| q.extra_devices = vec!["SIWX_killed".to_string()]);
+    describe(&fake, "SIWX_killed", Some("rotation-canary"), None);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    assert!(run.has("logout", "reason=unfinished_sign_in_device"));
+    assert!(run.has("logout", "unfinished=SIWX_killed"));
+    assert!(run.has("logout", "tripwire=clean"));
+}
+
+#[tokio::test]
+async fn a_marker_older_than_the_age_limit_explains_no_device() {
+    let age_limit = identity::ATTEMPT_MAX_AGE_SECS;
+    // Just past the limit: the canary-shaped device reads as a stranger.
+    let (fake, scratch) = (Fake::start().await, Scratch::new("stale-marker"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    leave_marker(&dir, "stale", age_limit + 120);
+    fake.quirks(|q| q.extra_devices = vec!["SIWX_killed".to_string()]);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 4, "{:#?}", run.lines);
+    assert!(run.has("logout", "strangers=SIWX_killed"));
+
+    // Just inside it: the same device is the canary's own unfinished sign-in.
+    let (fake, scratch) = (Fake::start().await, Scratch::new("fresh-marker"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    leave_marker(&dir, "fresh", age_limit - 600);
+    fake.quirks(|q| q.extra_devices = vec!["SIWX_killed".to_string()]);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    assert!(run.has("logout", "reason=unfinished_sign_in_device"));
+}
+
+#[tokio::test]
+async fn the_markers_a_ledger_holds_are_capped() {
+    let cap = identity::ATTEMPT_CAP;
+    // Forty live markers, but the ledger keeps (and counts) `cap` of them, this
+    // run's own among them, so `cap` unrecorded devices are one too many.
+    let (fake, scratch) = (Fake::start().await, Scratch::new("marker-cap"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    for n in 0..40 {
+        leave_marker(&dir, &format!("m{n}"), 60);
+    }
+    let devices: Vec<String> = (0..cap).map(|n| format!("SIWX_dead{n}")).collect();
+    fake.quirks(|q| q.extra_devices = devices.clone());
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 4, "{:#?}", run.lines);
+    assert!(
+        identity::read_ledger(&dir).attempts.len() <= cap,
+        "the file does not grow past the cap either"
+    );
+
+    // One fewer is within what the cap allows: reported, not the tripwire.
+    let (fake, scratch) = (Fake::start().await, Scratch::new("marker-cap-ok"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    for n in 0..40 {
+        leave_marker(&dir, &format!("m{n}"), 60);
+    }
+    let devices: Vec<String> = (0..cap - 1).map(|n| format!("SIWX_dead{n}")).collect();
+    fake.quirks(|q| q.extra_devices = devices.clone());
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    assert!(run.has("logout", "reason=unfinished_sign_in_device"));
+}
+
+#[tokio::test]
+async fn a_device_that_outlives_a_proven_logout_is_reported_and_deleted_not_a_stranger() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("survivor"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+
+    // Run 1: the logout is proven (the refresh token is refused), but the
+    // homeserver keeps the device, as siwx-oidc's best-effort delete may.
+    fake.quirks(|q| q.leave_device_on_logout = true);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    let survivor = fake.with(|s| s.device.clone());
+    assert!(fake.with(|s| s.devices.contains(&survivor)));
+    assert_eq!(
+        identity::read_ledger(&dir).logged_out,
+        BTreeSet::from([survivor.clone()])
+    );
+
+    // Run 2: it is still listed. Under its own reason, deleted, no tripwire.
+    fake.quirks(|q| q.leave_device_on_logout = false);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    assert!(run.has("logout", "result=FAIL reason=device_survived_logout"));
+    assert!(run.has("logout", &format!("survivors={survivor}")));
+    assert!(run.has("logout", "survivors_cleaned=1"));
+    assert!(run.has("logout", "tripwire=clean"));
+    assert!(!run.has("logout", "strangers="));
+    assert!(
+        !fake.with(|s| s.devices.contains(&survivor)),
+        "the survivor was deleted"
+    );
+    assert_clean(&run, &fake);
+    let second = fake.with(|s| s.device.clone());
+    assert_eq!(
+        identity::read_ledger(&dir).logged_out,
+        BTreeSet::from([second]),
+        "the survivor left the ledger with its deletion; this run's own device is on it"
+    );
+
+    // Run 3: nothing survived; the ledger holds only the last run's device.
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    assert!(!run.has("logout", "survivors="));
+    let third = fake.with(|s| s.device.clone());
+    assert_eq!(
+        identity::read_ledger(&dir).logged_out,
+        BTreeSet::from([third]),
+        "a device seen gone is forgotten"
+    );
+}
+
+#[tokio::test]
+async fn a_survivor_that_cannot_be_deleted_stays_on_the_ledger_and_fails_the_check() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("survivor-stuck"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    fake.quirks(|q| q.leave_device_on_logout = true);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    let survivor = fake.with(|s| s.device.clone());
+
+    fake.quirks(|q| {
+        q.leave_device_on_logout = false;
+        q.delete_device_status = 500;
+    });
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    assert!(run.has("logout", "reason=leftover_not_deleted"));
+    assert!(run.has("logout", &format!("survivors={survivor}")));
+    assert!(run.has("logout", &format!("stuck={survivor}")));
+    assert!(run.has("logout", "survivors_cleaned=0"));
+    assert!(run.has("logout", "tripwire=clean"));
+    assert!(identity::read_ledger(&dir).logged_out.contains(&survivor));
+}
+
+#[tokio::test]
+async fn a_survivor_beside_a_stranger_does_not_excuse_it_and_nothing_is_deleted() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("survivor-stranger"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    fake.quirks(|q| q.leave_device_on_logout = true);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    let survivor = fake.with(|s| s.device.clone());
+
+    fake.quirks(|q| {
+        q.leave_device_on_logout = false;
+        q.extra_devices = vec!["STRANGER".to_string()];
+    });
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 4, "{:#?}", run.lines);
+    assert!(run.has("logout", "strangers=STRANGER"));
+    assert!(run.has("logout", &format!("survivors={survivor}")));
+    assert!(
+        fake.with(|s| s.devices.contains(&survivor)),
+        "evidence stays while the tripwire is fired"
+    );
+    assert!(identity::read_ledger(&dir).logged_out.contains(&survivor));
+}
+
+#[tokio::test]
+async fn the_cookie_of_the_authorize_probe_is_held_as_a_credential() {
+    let (fake, http) = (Fake::start().await, crate::flow::http().unwrap());
+    let cookie = random("sess-", 24);
+    fake.quirks(|q| q.authorize_cookie = Some(cookie.clone()));
+    assert!(!hygiene::raw_tainted(&cookie), "not held before the probe");
+    let client_id = fake.with(|s| s.client_id.clone());
+    let probe = crate::flow::probe_authorize(&http, &fake.base, &client_id).await;
+    assert!(matches!(probe, crate::flow::Probe::Valid { .. }));
+    assert!(hygiene::raw_tainted(&cookie), "the value is held");
+    assert!(
+        hygiene::raw_tainted(&format!("probe={cookie}")),
+        "so is the whole pair"
+    );
 }
 
 #[tokio::test]

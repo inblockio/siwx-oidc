@@ -432,7 +432,7 @@ cargo run -p siwx-oidc-auth --example rotation_canary -- check --env dev \
 | `sign_in` | PKCE sign-in with the stored key and client; ID token `ES256`, `kid` = `--live-kid`, signature verified against the `/jwk` entry, `iss`, `aud`, `sub`, and `iat`/`exp` within 30 s of the server's `Date` |
 | `whoami` | 200, `user_id` is the MXID `init` recorded (`mxid_changed` otherwise: the key resolves to another account), on `--server-name` |
 | `did_proof` | the `io.inblock.did` proof carries the live kid, verifies (`verify_did_assertion`), is the key's DID and is no older than this run's `/authorize` answer |
-| `logout` | the account has no room and no device but this run's (leftovers of the canary's own runs and the device of an unfinished sign-in are named, see below); after the logout, a refresh with this run's refresh token is refused with `invalid_grant` (a 200 from `/logout` proves nothing) |
+| `logout` | the account has no room and no device but this run's (leftovers of the canary's own runs, devices that outlived a proven logout and the device of an unfinished sign-in are named, see below); after the logout, a refresh with this run's refresh token is refused with `invalid_grant` (a 200 from `/logout` proves nothing) |
 
 Exit codes: 0 all six ran and passed, 1 a check failed, 2 usage or local state (`--no-matrix`
 outside `--env local`, a missing, loose or foreign identity), 3 logout not proven, 4 the tripwire
@@ -445,13 +445,20 @@ server's own "no account for this key" refusal means there is nothing to erase.
 
 `devices.json` in the identity directory is the canary's ledger. The server makes the Synapse device
 at `/sign_in`, before the code exchange, so a sign-in that fails or is killed afterwards leaves a
-device nobody recorded. The ledger holds the devices a run knew (dropped again once a logout through
-`/logout` is proven) and an attempt marker written before each sign-in and dropped once the run knows
-its device. At the next run an unrecorded `SIWX_` device that an earlier marker can explain is reported
-as `unfinished_sign_in_device` (exit 1) and tolerated from then on; a recorded one is a leftover,
-tolerated and deleted (`leftover_not_deleted` if it cannot be); a device without a marker, or more
-devices than markers, fires the tripwire (exit 4) and nothing is deleted. `init` probes how `/logout`
-is routed: 200 means the homeserver routes it to siwx-oidc, 401, 404 or 405 with a Matrix `errcode`
+device nobody recorded. The ledger holds three things: the devices a run left behind (it died, or
+the logout went by `/oauth2/revoke`), which the next run tolerates and deletes (`leftover_not_deleted`
+if it cannot); the devices whose logout a run proved (the refresh token was refused), until a run
+sees them gone, because that proof is about the grant and siwx-oidc deletes the Synapse device
+best-effort, so one still listed at the next run is reported as `device_survived_logout` (exit 1)
+and deleted, not taken for a stranger; and an attempt marker written before each sign-in and dropped
+once the run knows its device. A device nobody recorded is explained by a marker only if it has an
+id the server minted (`SIWX_`), the display name `rotation-canary` (the registered client's name)
+and no `last_seen_ts` (never used); it is then reported as `unfinished_sign_in_device` (exit 1) and
+tolerated from then on. Markers expire after three days and at most sixteen are kept. Any other
+device, a device without a live marker, or more devices than markers, fires the tripwire (exit 4)
+and nothing is deleted.
+
+`init` probes how `/logout` is routed: 200 means the homeserver routes it to siwx-oidc, 401, 404 or 405 with a Matrix `errcode`
 means `/oauth2/revoke` is the way, and any other answer fails `init` with the status and records
 nothing. An `init` that fails before its sign-in leaves `key.pem` and a `client.json` with no account
 in place: `init --replace` clears it.
@@ -466,6 +473,6 @@ those variables or add them to a copy of it. Negatives to try: `--live-kid` set 
 `POST /__fail {"endpoint":"publish_did_field","mode":"500"}` (`did_proof_stale`), a device
 added with `POST /__seed_device` (exit 4).
 
-`cargo test -p siwx-oidc-auth --test rotation_canary_unit` runs the canary's 109 unit and hermetic
+`cargo test -p siwx-oidc-auth --test rotation_canary_unit` runs the canary's 129 unit and hermetic
 tests (a fake server inside the test process: a logout that revokes nothing, a clock an hour off,
 a token signed by another key, a server that puts a token into a printed field, a panic).

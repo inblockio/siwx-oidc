@@ -24,6 +24,13 @@ use crate::report::Reason;
 pub const REDIRECT_URI: &str = "https://agent.example.org/callback";
 pub const CLIENT_NAME: &str = "rotation-canary";
 pub const DISPLAY_NAME: &str = "rotation-canary";
+/// The display name of a device this program's sign-in makes: siwx-oidc names a
+/// new device after the registered `client_name` (`device_display_name` in
+/// `src/oidc.rs`), which is [`CLIENT_NAME`].
+pub const DEVICE_NAME: &str = CLIENT_NAME;
+/// The prefix of the id siwx-oidc mints for a device when the client proposes
+/// none, which is what this program does.
+const MINTED_DEVICE_PREFIX: &str = "SIWX_";
 /// RFC 7636 appendix B's challenge: the `/authorize` probe never completes a
 /// flow, so it needs no verifier of its own.
 const PROBE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
@@ -118,10 +125,20 @@ pub async fn probe_authorize(http: &reqwest::Client, issuer: &str, client_id: &s
         ("code_challenge_method", "S256"),
     ]);
     match send(request).await {
-        Ok(r) if r.status == 303 => Probe::Valid { date: r.date },
-        Ok(r) if r.status == 401 => Probe::ClientRefused,
-        Ok(r) if r.is_unavailable() => Probe::Unavailable,
-        Ok(_) => Probe::Unexpected,
+        Ok(r) => {
+            // The probe opens a server session and sets its cookie: a
+            // credential, held by the taint check like every other one.
+            hold_cookies(&r);
+            if r.status == 303 {
+                Probe::Valid { date: r.date }
+            } else if r.status == 401 {
+                Probe::ClientRefused
+            } else if r.is_unavailable() {
+                Probe::Unavailable
+            } else {
+                Probe::Unexpected
+            }
+        }
         Err(_) => Probe::Unavailable,
     }
 }
@@ -190,12 +207,47 @@ pub fn classify_route_probe(
     }
 }
 
+/// A device as the homeserver lists it (`GET /devices`). The display name and
+/// the last-seen time are compared and never printed: they are the server's
+/// words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Device {
+    pub id: String,
+    /// `None` when the field is absent, null or not a string.
+    pub display_name: Option<String>,
+    /// Whether the device has ever been seen in use: `last_seen_ts` is present
+    /// and not null (whatever its value, so an odd value reads as "seen").
+    pub seen: bool,
+}
+
+impl Device {
+    /// Whether the device looks like the one an unfinished sign-in of this
+    /// program leaves: an id the server minted, the canary's own display name,
+    /// and never used (the sign-in died before it got, or used, a token, and a
+    /// device whose token was used has a `last_seen_ts`).
+    ///
+    /// A device whose naming failed (siwx-oidc names a new device best-effort)
+    /// does not match, and nor does one whose `last_seen_ts` is set: both read
+    /// as strangers, which is the safe direction.
+    pub fn looks_unfinished(&self) -> bool {
+        self.id.starts_with(MINTED_DEVICE_PREFIX)
+            && self.display_name.as_deref() == Some(DEVICE_NAME)
+            && !self.seen
+    }
+}
+
 /// What the account looks like from its own token: the rooms it has joined and
 /// the devices it holds.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Reading {
     pub rooms: usize,
-    pub listed: Vec<String>,
+    pub listed: Vec<Device>,
+}
+
+impl Reading {
+    pub fn has(&self, id: &str) -> bool {
+        self.listed.iter().any(|d| d.id == id)
+    }
 }
 
 pub async fn read_account(
@@ -227,24 +279,45 @@ pub async fn read_account(
                 .get("devices")?
                 .as_array()?
                 .iter()
-                .map(|d| d.get("device_id")?.as_str().map(str::to_string))
-                .collect::<Option<Vec<String>>>()
+                .map(parse_device)
+                .collect::<Option<Vec<Device>>>()
         })
         .flatten()?;
     Some(Reading { rooms, listed })
 }
 
+/// One entry of the `devices` array; `None` when it has no string `device_id`
+/// (the whole reading is then unusable, as it always was).
+fn parse_device(entry: &serde_json::Value) -> Option<Device> {
+    Some(Device {
+        id: entry.get("device_id")?.as_str()?.to_string(),
+        display_name: entry
+            .get("display_name")
+            .and_then(|n| n.as_str())
+            .map(str::to_string),
+        seen: entry.get("last_seen_ts").is_some_and(|t| !t.is_null()),
+    })
+}
+
 /// The identity tripwire's verdict. The canary account has never joined a room
-/// and holds no device but this run's, with two exceptions that are named and
+/// and holds no device but this run's, with three exceptions that are named and
 /// never silent:
 ///
 /// - `leftovers`: devices an earlier run of the canary recorded (`tolerated`).
+/// - `survivors`: devices whose logout an earlier run proved (`logged_out`) and
+///   that are still listed. The proof was about the grant; the Synapse device is
+///   deleted by siwx-oidc best-effort, so it can outlive it. They are the
+///   canary's own and are not a stranger, but they are a fault of the server
+///   and get their own reason.
 /// - `unfinished`: devices nobody recorded that an unfinished sign-in of the
 ///   canary can explain. The server mints `SIWX_<uuid>` at `/sign_in`, before
 ///   the token exchange, so a sign-in that failed or was killed after it leaves
-///   one. They are explained only when every unexplained device has a `SIWX_`
-///   id and there are no more of them than `attempts`, the sign-ins started
-///   and never finished.
+///   one. A device is explained only when it looks like that device
+///   ([`Device::looks_unfinished`]: a minted id, the canary's own display name,
+///   never seen in use), every unexplained device does, and there are no more
+///   of them than `attempts`, the live markers of sign-ins started and never
+///   finished. One stranger that does not look the part fires the tripwire for
+///   all of them.
 ///
 /// Anything else unexplained is a stranger and fires the tripwire.
 #[derive(Debug, PartialEq, Eq)]
@@ -253,41 +326,51 @@ pub struct Judgement {
     pub strangers: Vec<String>,
     pub unfinished: Vec<String>,
     pub leftovers: Vec<String>,
+    pub survivors: Vec<String>,
 }
 
 pub fn judge(
     reading: &Reading,
     own: Option<&str>,
     tolerated: &BTreeSet<String>,
+    logged_out: &BTreeSet<String>,
     attempts: usize,
 ) -> Judgement {
     let mut leftovers = Vec::new();
-    let mut others = Vec::new();
-    for id in &reading.listed {
-        if Some(id.as_str()) == own {
+    let mut survivors = Vec::new();
+    let mut others: Vec<&Device> = Vec::new();
+    for device in &reading.listed {
+        let id = device.id.as_str();
+        if Some(id) == own {
             continue;
         }
         if tolerated.contains(id) {
-            leftovers.push(id.clone());
+            leftovers.push(device.id.clone());
+        } else if logged_out.contains(id) {
+            survivors.push(device.id.clone());
         } else {
-            others.push(id.clone());
+            others.push(device);
         }
     }
     // Without a whoami there is no telling which device is this run's: one of
-    // the others must be it.
+    // the others must be it, and it has to look like an unfinished sign-in's
+    // like the rest (a run's own device that does not is read as a stranger:
+    // stricter, never looser).
     let unexplained = others.len().saturating_sub(usize::from(own.is_none()));
+    let ids = |devices: &[&Device]| devices.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
     let (strangers, unfinished) = if unexplained == 0 {
         (Vec::new(), Vec::new())
-    } else if attempts >= unexplained && others.iter().all(|id| id.starts_with("SIWX_")) {
-        (Vec::new(), others)
+    } else if attempts >= unexplained && others.iter().all(|d| d.looks_unfinished()) {
+        (Vec::new(), ids(&others))
     } else {
-        (others, Vec::new())
+        (ids(&others), Vec::new())
     };
     Judgement {
         fired: reading.rooms > 0 || !strangers.is_empty(),
         strangers,
         unfinished,
         leftovers,
+        survivors,
     }
 }
 
@@ -523,10 +606,20 @@ pub fn http() -> Result<reqwest::Client, Reason> {
 mod tests {
     use super::*;
 
+    /// A device the way an unfinished sign-in of the canary leaves it: named
+    /// for the canary's client and never seen in use.
+    fn device(id: &str) -> Device {
+        Device {
+            id: id.to_string(),
+            display_name: Some(DEVICE_NAME.to_string()),
+            seen: false,
+        }
+    }
+
     fn reading(rooms: usize, ids: &[&str]) -> Reading {
         Reading {
             rooms,
-            listed: ids.iter().map(|s| s.to_string()).collect(),
+            listed: ids.iter().map(|id| device(id)).collect(),
         }
     }
 
@@ -540,6 +633,7 @@ mod tests {
             strangers: vec![],
             unfinished: vec![],
             leftovers: vec![],
+            survivors: vec![],
         }
     }
 
@@ -548,6 +642,7 @@ mod tests {
         let j = judge(
             &reading(0, &["SIWX_now"]),
             Some("SIWX_now"),
+            &ledger(&[]),
             &ledger(&[]),
             0,
         );
@@ -560,6 +655,7 @@ mod tests {
             &reading(0, &["SIWX_now", "ATTACKER"]),
             Some("SIWX_now"),
             &ledger(&["SIWX_old"]),
+            &ledger(&[]),
             0,
         );
         assert!(j.fired);
@@ -573,6 +669,7 @@ mod tests {
                 &reading(1, &["SIWX_now"]),
                 Some("SIWX_now"),
                 &ledger(&[]),
+                &ledger(&[]),
                 0
             )
             .fired
@@ -585,6 +682,7 @@ mod tests {
             &reading(0, &["SIWX_now", "SIWX_old"]),
             Some("SIWX_now"),
             &ledger(&["SIWX_old"]),
+            &ledger(&[]),
             0,
         );
         assert_eq!(
@@ -598,8 +696,23 @@ mod tests {
 
     #[test]
     fn without_a_whoami_one_unexplained_device_is_this_runs_and_two_are_not() {
-        assert!(!judge(&reading(0, &["SIWX_x"]), None, &ledger(&[]), 0).fired);
-        let j = judge(&reading(0, &["SIWX_x", "SIWX_y"]), None, &ledger(&[]), 0);
+        assert!(
+            !judge(
+                &reading(0, &["SIWX_x"]),
+                None,
+                &ledger(&[]),
+                &ledger(&[]),
+                0
+            )
+            .fired
+        );
+        let j = judge(
+            &reading(0, &["SIWX_x", "SIWX_y"]),
+            None,
+            &ledger(&[]),
+            &ledger(&[]),
+            0,
+        );
         assert!(j.fired);
         assert_eq!(j.strangers.len(), 2);
     }
@@ -609,6 +722,7 @@ mod tests {
         let j = judge(
             &reading(0, &["SIWX_now", "SIWX_killed"]),
             Some("SIWX_now"),
+            &ledger(&[]),
             &ledger(&[]),
             1,
         );
@@ -623,6 +737,7 @@ mod tests {
             &reading(0, &["SIWX_now", "SIWX_killed"]),
             Some("SIWX_now"),
             &ledger(&[]),
+            &ledger(&[]),
             0,
         );
         assert!(j.fired);
@@ -634,6 +749,7 @@ mod tests {
         let j = judge(
             &reading(0, &["SIWX_now", "SIWX_a", "SIWX_b"]),
             Some("SIWX_now"),
+            &ledger(&[]),
             &ledger(&[]),
             1,
         );
@@ -650,6 +766,7 @@ mod tests {
             &reading(0, &["SIWX_now", "ELEMENTXDEVICE"]),
             Some("SIWX_now"),
             &ledger(&[]),
+            &ledger(&[]),
             3,
         );
         assert!(j.fired);
@@ -661,6 +778,7 @@ mod tests {
         let j = judge(
             &reading(1, &["SIWX_now", "SIWX_killed"]),
             Some("SIWX_now"),
+            &ledger(&[]),
             &ledger(&[]),
             1,
         );
@@ -690,5 +808,191 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    fn reading_of(rooms: usize, listed: Vec<Device>) -> Reading {
+        Reading { rooms, listed }
+    }
+
+    #[test]
+    fn a_stranger_with_a_siwx_id_does_not_pass_as_an_unfinished_sign_in() {
+        // A live marker, a minted-looking id: only the device itself can tell.
+        let strangers = [
+            (
+                "another client's name",
+                Device {
+                    display_name: Some("Element Web".to_string()),
+                    ..device("SIWX_stranger")
+                },
+            ),
+            (
+                "no name",
+                Device {
+                    display_name: None,
+                    ..device("SIWX_stranger")
+                },
+            ),
+            (
+                "the canary's name but seen in use",
+                Device {
+                    seen: true,
+                    ..device("SIWX_stranger")
+                },
+            ),
+            (
+                "the canary's name, unseen, but an id the server did not mint",
+                device("STRANGER"),
+            ),
+        ];
+        for (what, stranger) in strangers {
+            let id = stranger.id.clone();
+            let j = judge(
+                &reading_of(0, vec![device("SIWX_now"), stranger]),
+                Some("SIWX_now"),
+                &ledger(&[]),
+                &ledger(&[]),
+                1,
+            );
+            assert!(j.fired, "{what}");
+            assert_eq!(j.strangers, vec![id], "{what}");
+            assert!(j.unfinished.is_empty(), "{what}");
+        }
+    }
+
+    #[test]
+    fn the_canarys_own_unfinished_device_is_still_excused_by_a_marker() {
+        let j = judge(
+            &reading(0, &["SIWX_now", "SIWX_killed"]),
+            Some("SIWX_now"),
+            &ledger(&[]),
+            &ledger(&[]),
+            1,
+        );
+        assert!(!j.fired);
+        assert_eq!(j.unfinished, vec!["SIWX_killed".to_string()]);
+    }
+
+    #[test]
+    fn one_stranger_among_excusable_devices_fires_for_all_of_them() {
+        let j = judge(
+            &reading_of(
+                0,
+                vec![
+                    device("SIWX_now"),
+                    device("SIWX_killed"),
+                    Device {
+                        seen: true,
+                        ..device("SIWX_stranger")
+                    },
+                ],
+            ),
+            Some("SIWX_now"),
+            &ledger(&[]),
+            &ledger(&[]),
+            2,
+        );
+        assert!(j.fired);
+        assert_eq!(j.strangers.len(), 2, "no part of the doubt is excused");
+        assert!(j.unfinished.is_empty());
+    }
+
+    #[test]
+    fn without_a_whoami_a_stranger_cannot_hide_as_this_runs_device() {
+        // One of two unexplained devices is this run's. Both must look like an
+        // unfinished sign-in's for the marker to cover the other; a seen one
+        // could be the stranger, so it fires.
+        let seen = Device {
+            seen: true,
+            ..device("SIWX_b")
+        };
+        let j = judge(
+            &reading_of(0, vec![device("SIWX_a"), seen]),
+            None,
+            &ledger(&[]),
+            &ledger(&[]),
+            1,
+        );
+        assert!(j.fired);
+        let j = judge(
+            &reading(0, &["SIWX_a", "SIWX_b"]),
+            None,
+            &ledger(&[]),
+            &ledger(&[]),
+            1,
+        );
+        assert!(!j.fired);
+        assert_eq!(j.unfinished.len(), 2);
+    }
+
+    #[test]
+    fn a_device_whose_logout_was_proven_is_a_survivor_not_a_stranger() {
+        let j = judge(
+            &reading_of(
+                0,
+                vec![
+                    device("SIWX_now"),
+                    // Used by the canary itself: seen, and still not a stranger.
+                    Device {
+                        seen: true,
+                        display_name: None,
+                        ..device("SIWX_before")
+                    },
+                ],
+            ),
+            Some("SIWX_now"),
+            &ledger(&[]),
+            &ledger(&["SIWX_before"]),
+            0,
+        );
+        assert_eq!(
+            j,
+            Judgement {
+                survivors: vec!["SIWX_before".to_string()],
+                ..clean()
+            }
+        );
+    }
+
+    #[test]
+    fn a_survivor_does_not_excuse_a_stranger_beside_it() {
+        let j = judge(
+            &reading(0, &["SIWX_now", "SIWX_before", "ATTACKER"]),
+            Some("SIWX_now"),
+            &ledger(&[]),
+            &ledger(&["SIWX_before"]),
+            5,
+        );
+        assert!(j.fired);
+        assert_eq!(j.strangers, vec!["ATTACKER".to_string()]);
+        assert_eq!(j.survivors, vec!["SIWX_before".to_string()]);
+    }
+
+    #[test]
+    fn a_device_reads_from_the_shape_the_homeserver_lists() {
+        use serde_json::json;
+        let named = parse_device(&json!({
+            "device_id": "SIWX_a", "display_name": "rotation-canary",
+            "last_seen_ip": null, "last_seen_ts": null,
+        }))
+        .unwrap();
+        assert_eq!(named, device("SIWX_a"));
+        assert!(named.looks_unfinished());
+        // Absent and null mean "never seen"; any value means seen.
+        let bare = parse_device(&json!({"device_id": "SIWX_b"})).unwrap();
+        assert!(!bare.seen);
+        assert_eq!(bare.display_name, None);
+        assert!(!bare.looks_unfinished(), "no name is not the canary's name");
+        for ts in [json!(1_700_000_000_000_i64), json!(0), json!("soon")] {
+            let seen = parse_device(&json!({
+                "device_id": "SIWX_c", "display_name": "rotation-canary", "last_seen_ts": ts,
+            }))
+            .unwrap();
+            assert!(seen.seen && !seen.looks_unfinished(), "{ts}");
+        }
+        // A name that is not a string is no name; an entry with no id is no reading.
+        let odd = parse_device(&json!({"device_id": "SIWX_d", "display_name": 7})).unwrap();
+        assert_eq!(odd.display_name, None);
+        assert!(parse_device(&json!({"display_name": "rotation-canary"})).is_none());
+        assert!(parse_device(&json!({"device_id": 7})).is_none());
     }
 }

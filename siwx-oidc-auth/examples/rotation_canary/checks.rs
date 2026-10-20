@@ -394,11 +394,14 @@ impl Cx {
         // says a device without an id here may exist. Without a Matrix side
         // there is no device.
         if self.cfg.matrix.is_some() {
+            let now = chrono::Utc::now().timestamp();
             let attempt = Attempt {
                 id: self.attempt_id.clone(),
-                at: chrono::Utc::now().timestamp(),
+                at: now,
             };
-            if identity::update_ledger(&self.dir, |ledger| ledger.attempts.push(attempt)).is_err() {
+            if identity::update_ledger(&self.dir, |ledger| ledger.record_attempt(attempt, now))
+                .is_err()
+            {
                 run.fail(
                     CHECK,
                     Reason::IdentityWriteFailed,
@@ -613,30 +616,35 @@ impl Cx {
     }
 
     /// C6: the tripwire (the account has no rooms and no device but this
-    /// run's; leftovers of earlier runs of the canary and devices of its
-    /// unfinished sign-ins are named, not excused silently), then the logout by
-    /// the recorded route, passing only when this run's refresh token is then
-    /// refused. Always attempted once C3 signed in.
+    /// run's; leftovers of earlier runs of the canary, devices that outlived a
+    /// proven logout and devices of its unfinished sign-ins are named, not
+    /// excused silently), then the logout by the recorded route, passing only
+    /// when this run's refresh token is then refused. Always attempted once C3
+    /// signed in.
     async fn logout(&self, run: &mut Run, session: &Session, matrix: &Matrix, me: Option<&WhoAmI>) {
         const CHECK: &str = "logout";
         let own_device = me.and_then(|m| m.device.as_deref());
         let ledger = identity::read_ledger(&self.dir);
-        let earlier_attempts = ledger
-            .attempts
-            .iter()
-            .filter(|a| a.id != self.attempt_id)
-            .count();
+        let earlier_attempts =
+            ledger.live_attempts(chrono::Utc::now().timestamp(), &self.attempt_id);
         let reading =
             flow::read_account(&self.http, &matrix.homeserver, &session.tokens.access).await;
-        let judged = reading
-            .as_ref()
-            .map(|r| flow::judge(r, own_device, &ledger.pending, earlier_attempts));
-        // Forget the canary's own leftovers, but never touch anything while the
-        // tripwire is fired: the evidence stays.
+        let judged = reading.as_ref().map(|r| {
+            flow::judge(
+                r,
+                own_device,
+                &ledger.pending,
+                &ledger.logged_out,
+                earlier_attempts,
+            )
+        });
+        // Forget the canary's own leftovers and the devices that outlived a
+        // proven logout, but never touch anything while the tripwire is fired:
+        // the evidence stays.
         let mut cleaned = BTreeSet::new();
         let mut stuck = Vec::new();
         if let Some(judged) = judged.as_ref().filter(|j| !j.fired) {
-            for id in &judged.leftovers {
+            for id in judged.leftovers.iter().chain(&judged.survivors) {
                 if flow::delete_device(&self.http, &matrix.homeserver, &session.tokens.access, id)
                     .await
                 {
@@ -658,20 +666,25 @@ impl Cx {
         .await;
         let ledger_word = match (&reading, &judged) {
             (Some(r), Some(j)) => {
-                // A logout through `/logout` deletes the device and a refresh
-                // refused afterwards proves it ended: the device leaves the
-                // ledger. By `/oauth2/revoke` the device may stay, so it stays
-                // on the ledger until a later run sees it gone.
+                // A logout through `/logout` ends the grant and, best-effort,
+                // deletes the device; a refresh refused afterwards proves the
+                // grant ended and says nothing about the device. So the device
+                // leaves `pending` for `logged_out`, where the next run either
+                // sees it gone or finds it still there and reports it. By
+                // `/oauth2/revoke` the device may stay, so it stays on the
+                // ledger until a later run sees it gone.
                 let proven = report.reason == Reason::Ok && report.route == LogoutRoute::Matrix;
                 let mut next = ledger.clone();
-                next.pending
-                    .retain(|id| r.listed.contains(id) && !cleaned.contains(id));
+                next.pending.retain(|id| r.has(id) && !cleaned.contains(id));
+                next.logged_out
+                    .retain(|id| r.has(id) && !cleaned.contains(id));
                 // Devices of unfinished sign-ins are reported now and tolerated
                 // (and deleted) from the next run on.
                 next.pending.extend(j.unfinished.iter().cloned());
                 match own_device {
                     Some(own) if proven => {
                         next.pending.remove(own);
+                        next.logged_out.insert(own.to_string());
                     }
                     Some(own) => {
                         next.pending.insert(own.to_string());
@@ -728,9 +741,14 @@ impl Cx {
             ("ledger", ledger_word.to_string()),
         ];
         if let Some(j) = &judged {
+            let deleted = |ids: &[String]| ids.iter().filter(|id| cleaned.contains(*id)).count();
             if !j.leftovers.is_empty() {
                 fields.push(("leftovers", list(&j.leftovers)));
-                fields.push(("cleaned", cleaned.len().to_string()));
+                fields.push(("cleaned", deleted(&j.leftovers).to_string()));
+            }
+            if !j.survivors.is_empty() {
+                fields.push(("survivors", list(&j.survivors)));
+                fields.push(("survivors_cleaned", deleted(&j.survivors).to_string()));
             }
             if !stuck.is_empty() {
                 fields.push(("stuck", list(&stuck)));
@@ -752,6 +770,7 @@ impl Cx {
             _ if report.reason != Reason::Ok => report.reason,
             None => Reason::TripwireUnavailable,
             Some(_) if !stuck.is_empty() => Reason::LeftoverNotDeleted,
+            Some(j) if !j.survivors.is_empty() => Reason::DeviceSurvivedLogout,
             Some(j) if !j.unfinished.is_empty() => Reason::UnfinishedSignInDevice,
             Some(_) => Reason::Ok,
         };
