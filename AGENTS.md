@@ -33,7 +33,7 @@ everything else exists only in the binary crate.
 | `main.rs` | Binary entry point. Declares the binary-only modules and calls `axum_lib::main`. |
 | `lib.rs` | Library crate root. `synapse_client` is deliberately not re-exported (see Invariants). |
 | `axum_lib.rs` | Startup: loads config through `config::figment()`, validates it (DID methods and pkh namespaces against the aqua-auth registries, signing key, retired keys, WebAuthn), `store_default_clients` (digested, no expiry, prunes the clients the map no longer names), `AppState`, the router, handler glue, the `siwx_user` / `acct_session` cookies, the CORS layer. |
-| `config.rs` | `Config`, its defaults, and `figment()`: the one place config names and precedence are defined. Reference: [docs/configuration.md](docs/configuration.md). |
+| `config.rs` | `Config`, its defaults, and `figment()`: the one place config names and precedence are defined. `Config::read_secret_files` reads `mas_shared_secret_file` and `redis_password_file` once at start. `Config` is deliberately not `Debug` (it holds secrets). Reference: [docs/configuration.md](docs/configuration.md). |
 | `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_code_client` and `authenticate_refresh_client` authenticate the client for the first two, and `client_is_confidential` decides which clients must present a secret; `exchange_issuance` decides what a code exchange issues, by deployment mode and client class), `userinfo`, client registration, RP-initiated logout (`end_session`, `verify_id_token_hint`), retired-key parsing, ENS claims, `provision_synapse_account` (the account half of provisioning and the single DID-publication site) and `provision_synapse_device` (calls it, then adds the device half). |
 | `introspect.rs` | `POST /oauth2/introspect` (RFC 7662) for Synapse, inactive for an `oidc` grant's token; opaque `mat_`/`mcr_` token generation. |
 | `admin_token.rs` | `POST /oauth2/admin_token`: short-TTL token whose scope carries `urn:synapse:admin:*`. |
@@ -47,11 +47,12 @@ everything else exists only in the binary crate.
 | `backchannel.rs` | OpenID Connect Back-Channel Logout: `mint_logout_token`, the SSRF guard (`refused_class`, `UriGuard`), `deliver`, and the outbox `Worker` started by `axum_lib::main`. |
 | `localpart.rs` | Grandfathering policy: `resolve_identity` (fallible) and `resolve_identity_or_legacy` (fail-safe to legacy). |
 | `mxid.rs` (lib) | Pure localpart derivation: `localpart_for`, `legacy_localpart`, `canonicalize`. `sha2` only. |
-| `redact.rs` (lib) | `fingerprint`, `redact_key`, `redact_url`: what a log line may say about a credential. |
+| `redact.rs` (lib) | `fingerprint`, `redact_key`, `redact_url`: what a log line may say about a credential. `redact_url` rebuilds a URL from scheme, host, port and path, so a password in the user information, the `pass` query of a unix-socket URL or a fragment never survives. |
+| `secret_file.rs` (lib) | Secrets read from mounted files: `read` (an absolute path to a regular file, so a named pipe cannot block start-up; one trailing line ending removed, and what is left must not be empty, start or end with whitespace, hold a control character or start with a BOM, because Synapse strips surrounding whitespace from the file it shares; every error names the setting and, for an absolute path, the path, and never content, and a path that is not absolute is not shown), `redis_url_with_password_file` (the one rule for every Redis password file: a URL that already carries a password and every unix-socket scheme are refused, because the client reads a unix-socket password only from `pass`), `url_with_password` (`Url::set_password` leaves `%` alone, so it encodes `%` first; without that the Redis client decodes `%41` to `A`), `url_carries_password`, `both_set`. |
 | `signing/` (lib) | The provider's signing interface `ProviderSigner` and its backends (`signing_backend`): `EcdsaSigningKey` (ES256, key-derived `kid`, `fingerprint_of_public`, `verification_jwk`; `pem` and `ephemeral`) and `socket::SocketSigner` (`socket`); `sign_jwt` and `CaptureKey`, which sign an openidconnect token through an async backend. `protocol.rs` (the `siwx-signer` wire protocol), `shape.rs` (what the signer signs, per purpose), `server.rs` (the signer's socket service, `bind`). In the library so `siwx-signer` reuses the key type and the `kid` derivation. Guide: [docs/signer.md](docs/signer.md). |
 | `alias.rs` (lib) | `alias_for(did)`: the generated `Firstname Surname` a new account is seeded with. |
 | `credential_identity.rs` (lib) | Which identity a stored passkey authenticates: a `webauthn:link/*` entry overrides the derived `did:key`. |
-| `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL`; `did_has_credential_bounded`, the scan-bounded passkey check of the device page. |
+| `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL` (its password may come from the file `AQUA_WEBAUTHN_REDIS_PASSWORD_FILE`: `resolve_url`, under the rules of `redis_password_file`); `did_has_credential_bounded`, the scan-bounded passkey check of the device page. |
 | `credential_migration.rs` (lib) | Additive backfill of passkey credentials into the aqua-auth store. |
 | `client_policy.rs` (lib) | Pure rules for generic-class clients: `grant_for` (the scopes a client is granted), `mailbox_claim` (what userinfo asks: every condition of the mailbox claim) and `mailbox_for` (the one place its value is built), `validate_mail_domain`, `validate_static_client`, and `parse_static_clients`, which start-up runs on `default_clients` before anything is written, and `grant_end` (whether replacing or deleting a static client's stored entry ends its grants, and why). |
 | `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry` with the digests of its secret and registration access token, its `ClientClass` and scope policy, and `client_entry_without_plaintext`, `DeviceCodeEntry` and the `DeviceCodeRef` naming its layout, `TokenMetadata` with its `TokenKind` and the `GrantKind` of its grant, `grant_kind`, which only `AccessGrant::metadata` sets and which is never stored), `Ceremony`, `OwnSession` (the `siwx_user` and `acct_session` layouts), `legacy_token_kind`, Redis key prefixes and TTLs. |
@@ -100,9 +101,12 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 49 tests in thirteen files:
-  `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (6),
-  `static_client_startup` (10), `log_hygiene_credential_store` (1),
+  `cargo test --workspace` runs the unit tests of both crates plus 66 tests in fifteen files:
+  `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (7),
+  `static_client_startup` (10), `secret_files_startup` (12, one of which serves requests from
+  database 3 of the test Redis), `audit_pr82_findings` (4, the pins of the audit of the
+  secret-file change; one of them takes database 1 of the test Redis),
+  `log_hygiene_credential_store` (1),
   `log_capture_callsite_interest` (1), `siwx_signer_cli` (10) and `signing_backend_startup` (4),
   which need nothing; `account_linking_dual_write` (6), which needs the test Redis, and `log_hygiene`
   (4, one of them needs it);
@@ -1323,6 +1327,18 @@ structured output.
   `the_boot_check_never_prints_the_redis_password`. A new log site that names a credential
   variable fails the scan; add the variable name to `CREDENTIAL_NAMES` in `tests/log_hygiene.rs`
   when you introduce a new kind of credential.
+- **A start-up error about a secret setting names the setting and the path, never the value**
+  (`secret_file`, `mas_shared_secret_file`, `redis_password_file`,
+  `AQUA_WEBAUTHN_REDIS_PASSWORD_FILE`). A value that figment, `Url` or serde_json would quote
+  in its own error (a `redis_url` that does not parse, a `mas_shared_secret` or a `_file`
+  setting read as a number, a `default_clients` entry with a number where a string belongs)
+  is refused by a `deserialize_with` in `config.rs` or mapped to its position
+  (`client_policy::entry_error`) so that it does not. A URL is printed only through
+  `redact_url`, and an unknown command-line argument of `migrate-credentials` only as its
+  option name. An empty `mas_shared_secret` is a start error and
+  `verify_shared_secret` never matches an empty one. Pin: `tests/secret_files_startup.rs` and
+  `tests/audit_pr82_findings.rs` (no 16-character window of a generated secret in any
+  refusal), `the_config_is_not_debug`.
 - Use structured fields (`info!(did = %did, "sign_in success")`), not string interpolation.
 - Log errors at the boundary (`CustomError::into_response`). Modules that bypass `CustomError`
   (`introspect`, `compat`, `resolve`) log their own errors.

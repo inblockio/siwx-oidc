@@ -51,23 +51,33 @@ pub fn redact_key(key: &str) -> String {
     }
 }
 
-/// `url` without its user name and password, for log lines and error messages.
+/// `url` reduced to where it points, for log lines and error messages: its scheme, host,
+/// port and path, and nothing else.
 ///
-/// A Redis URL carries the password (`redis://:password@host:6379`), so printing
-/// the configured URL prints the secret. An input that is not a URL is replaced
-/// by a placeholder rather than echoed, because whatever it is, it was meant to
-/// be one.
+/// A Redis URL carries the password in its user information (the part before the `@`)
+/// and, for a unix socket, in the `pass` query parameter
+/// (`redis+unix:///run/redis.sock?pass=...`); a fragment or any other query
+/// parameter may hold one too. The URL is therefore rebuilt from the parts that cannot,
+/// instead of cleared of the parts that can: a part this function does not know about
+/// stays out. A URL with no hierarchical part (`redis:user:password@host`) is shown as its
+/// scheme alone, and an input that is not a URL is replaced by a placeholder rather than
+/// echoed, because whatever it is, it was meant to be one.
 pub fn redact_url(url: &str) -> String {
-    match url::Url::parse(url) {
-        Ok(mut parsed) => {
-            // These fail only for a URL that cannot carry credentials at all
-            // (`mailto:`), which has nothing to remove.
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            parsed.to_string()
-        }
-        Err(_) => "<not a URL>".to_string(),
+    let Ok(parsed) = url::Url::parse(url) else {
+        return "<not a URL>".to_string();
+    };
+    if parsed.cannot_be_a_base() {
+        return format!("{}:<hidden>", parsed.scheme());
     }
+    let mut shown = format!("{}://", parsed.scheme());
+    if let Some(host) = parsed.host_str() {
+        shown.push_str(host);
+    }
+    if let Some(port) = parsed.port() {
+        shown.push_str(&format!(":{port}"));
+    }
+    shown.push_str(parsed.path());
+    shown
 }
 
 #[cfg(test)]
@@ -134,6 +144,62 @@ mod tests {
             redact_url("redis://redis.internal:6379"),
             "redis://redis.internal:6379"
         );
+    }
+
+    /// O-F3 / Grok F1: a unix-socket URL carries its password in the `pass` query, a
+    /// host-less URL has no user information to clear, and a TCP URL may carry the
+    /// password in both places. None of it is printed.
+    #[test]
+    fn a_url_shows_where_it_points_and_nothing_else() {
+        let password = crate::test_support::random_secret(40);
+        for (url, shown) in [
+            (
+                format!("redis+unix:///run/redis.sock?db=2&pass={password}"),
+                "redis+unix:///run/redis.sock",
+            ),
+            (
+                format!("unix:///run/redis.sock?pass={password}&db=2"),
+                "unix:///run/redis.sock",
+            ),
+            (
+                format!("valkey+unix://localhost/run/valkey.sock?pass={password}"),
+                "valkey+unix://localhost/run/valkey.sock",
+            ),
+            (
+                format!(
+                    "{}?pass={password}",
+                    crate::test_support::redis_url_with_password(&password, "127.0.0.1:6379")
+                ),
+                "redis://127.0.0.1:6379",
+            ),
+            (
+                format!(
+                    "{}?x={password}#{password}",
+                    crate::test_support::redis_url_with_password(&password, "redis.example.org/2")
+                        .replacen("://", "://user", 1)
+                ),
+                "redis://redis.example.org/2",
+            ),
+            (
+                format!("rediss://redis.example.org:6380/1?pass={password}"),
+                "rediss://redis.example.org:6380/1",
+            ),
+            (
+                crate::test_support::redis_url_with_password(&password, "[::1]:6379/0"),
+                "redis://[::1]:6379/0",
+            ),
+            // No hierarchical part: the "path" is everything after the scheme.
+            (format!("redis:user:{password}@host"), "redis:<hidden>"),
+            (format!("redis:{password}"), "redis:<hidden>"),
+        ] {
+            let output = redact_url(&url);
+            assert_eq!(output, shown, "{url}");
+            assert_eq!(
+                crate::test_support::leaked_window(&output, &password),
+                None,
+                "{output}"
+            );
+        }
     }
 
     #[test]

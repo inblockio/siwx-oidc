@@ -17,6 +17,11 @@ pub mod client_policy;
 /// In the library crate so `tests/log_hygiene.rs` can pin it.
 pub mod redact;
 
+/// Secrets read from files mounted read-only (`mas_shared_secret_file`,
+/// `redis_password_file`): the one set of rules for the value and for the errors, which
+/// never hold content. In the library crate so `tests/*.rs` can pin it.
+pub mod secret_file;
+
 /// Tier 1 of the identity model: the human-readable alias a new account is
 /// seeded with, derived deterministically from the DID. Pure (`sha2` only),
 /// and in the library crate for the same reason as `mxid` — `tests/*.rs` link

@@ -495,6 +495,12 @@ mod tests {
     use std::sync::atomic::{AtomicU16, Ordering};
     use std::sync::Mutex;
 
+    /// Database 10 of the test Redis has two users, the two tests that run an outbox
+    /// [`Worker`]. A worker claims every due entry in its database, so the tests take turns
+    /// (Redis has 16 databases and every other number is taken: see
+    /// `test_support::redis_db`).
+    static DB_10: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn entry(sid: &str) -> LogoutEntry {
         LogoutEntry {
             client_id: "rp-1".into(),
@@ -992,16 +998,17 @@ mod tests {
     /// signer made, verifiable with its key. With the signer stopped nothing is
     /// sent, the entry stays queued with its attempt count unchanged, and once
     /// the lease ends a worker that can sign delivers it as its first attempt.
-    /// Database 3 is this test's own (see `test_support::redis_db`).
+    /// It shares database 10 with the worker test below and takes turns with it (`DB_10`).
     #[tokio::test]
     async fn through_the_socket_signer_a_logout_is_delivered_and_a_stopped_signer_spends_no_attempt(
     ) {
         use siwx_oidc::signing::socket::SocketSigner;
         use siwx_oidc::test_support::TestSigner;
-        let Some(db) = siwx_oidc::test_support::redis_db(3).await else {
+        let _turn = DB_10.lock().await;
+        let Some(db) = siwx_oidc::test_support::redis_db(10).await else {
             return;
         };
-        let url = siwx_oidc::test_support::redis_db_url(3);
+        let url = siwx_oidc::test_support::redis_db_url(10);
         let mut conn = siwx_oidc::test_support::raw_connection(&url).await.unwrap();
         let _: i64 = bb8_redis::redis::cmd("DEL")
             .arg(siwx_oidc::db::outbox::KV_BACKCHANNEL_OUTBOX)
@@ -1087,6 +1094,7 @@ mod tests {
     /// fingerprints only; an RP without a URI is never contacted.
     #[tokio::test]
     async fn the_worker_delivers_retries_a_failing_rp_then_drops_it_with_a_warning() {
+        let _turn = DB_10.lock().await;
         let Some(db) = siwx_oidc::test_support::redis_db(10).await else {
             return;
         };

@@ -12,6 +12,16 @@
 //! shared aqua-auth credential store", and a deployment cannot end up with two
 //! of the three services pointed at it.
 //!
+//! # The password
+//!
+//! The Redis password goes in the URL's user information (the part before the `@`), which
+//! puts it in the environment. `AQUA_WEBAUTHN_REDIS_PASSWORD_FILE` names a file that holds it instead,
+//! under exactly the rules of `redis_password_file` ([`crate::secret_file`]): one
+//! trailing newline removed, no whitespace at either end, an absolute path to a regular
+//! file; the password in the file and in the URL together is a start error, as is a
+//! unix-socket URL (the client reads that password only from the URL's `pass`
+//! parameter) and a file with no URL to put it in.
+//!
 //! # Dual-write, not cut-over
 //!
 //! With the flag on, every write goes to BOTH namespaces. The legacy namespace
@@ -66,6 +76,10 @@ use crate::redact::{fingerprint, redact_url};
 /// The runtime flag. Set to a Redis URL to enable the shared store.
 pub const ENABLE_ENV: &str = "AQUA_WEBAUTHN_REDIS_URL";
 
+/// The file that holds the Redis password of [`ENABLE_ENV`]'s URL, in place of a
+/// password in the URL (and so in the environment).
+pub const PASSWORD_FILE_ENV: &str = "AQUA_WEBAUTHN_REDIS_PASSWORD_FILE";
+
 static SHARED: OnceCell<Option<RedisWebauthnStore>> = OnceCell::const_new();
 
 /// The enable decision, split out so it is testable without touching process
@@ -73,6 +87,50 @@ static SHARED: OnceCell<Option<RedisWebauthnStore>> = OnceCell::const_new();
 /// means OFF.
 fn enabled_url(raw: Option<&str>) -> Option<&str> {
     raw.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// The URL the store opens, given the values of [`ENABLE_ENV`] and [`PASSWORD_FILE_ENV`]:
+/// `None` when the flag is off, the URL as it is when there is no password file, and
+/// the URL with the file's password in it when there is one. Pure, so it is testable without
+/// the process environment.
+///
+/// Refused, with an error that names the settings and holds no content: a password file
+/// with no URL (the store would stay off while the operator believes its password is
+/// set), and everything [`crate::secret_file::redis_url_with_password_file`] refuses.
+pub fn resolve_url(
+    url: Option<&str>,
+    password_file: Option<&str>,
+) -> Result<Option<String>, String> {
+    let file = password_file.map(str::trim).filter(|s| !s.is_empty());
+    match (enabled_url(url), file) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(format!(
+            "{PASSWORD_FILE_ENV} is set but {ENABLE_ENV} is not: the store would stay off \
+             while its password looks configured; set the URL, or remove the password file"
+        )),
+        (Some(url), None) => Ok(Some(url.to_string())),
+        (Some(url), Some(path)) => {
+            // `Url`'s error does not quote the input, and this one says only what failed.
+            let parsed = url::Url::parse(url).map_err(|_| {
+                format!("{ENABLE_ENV} is not a valid URL (the value is not shown: it may hold a password)")
+            })?;
+            crate::secret_file::redis_url_with_password_file(
+                ENABLE_ENV,
+                &parsed,
+                PASSWORD_FILE_ENV,
+                path,
+            )
+            .map(|with_password| Some(with_password.to_string()))
+        }
+    }
+}
+
+/// [`resolve_url`] for the process environment.
+pub fn configured_url() -> Result<Option<String>, String> {
+    resolve_url(
+        std::env::var(ENABLE_ENV).ok().as_deref(),
+        std::env::var(PASSWORD_FILE_ENV).ok().as_deref(),
+    )
 }
 
 /// The shared aqua-auth credential store, or `None` when the flag is off.
@@ -83,9 +141,14 @@ fn enabled_url(raw: Option<&str>) -> Option<&str> {
 pub async fn shared_store() -> Option<&'static RedisWebauthnStore> {
     SHARED
         .get_or_init(|| async {
-            let raw = std::env::var(ENABLE_ENV).ok();
-            let url = enabled_url(raw.as_deref())?;
-            match RedisWebauthnStore::connect(url).await {
+            let url = match configured_url() {
+                Ok(url) => url?,
+                Err(e) => {
+                    error!("credential store: {e}");
+                    return None;
+                }
+            };
+            match RedisWebauthnStore::connect(&url).await {
                 Ok(s) => {
                     info!("webauthn credential store: aqua-auth shared store ENABLED (dual-write)");
                     Some(s)
@@ -130,11 +193,13 @@ fn legacy_key(cred_id_b64: &str) -> String {
 /// unreachable Redis fails at boot rather than at first login. That property is
 /// only real for a service that actually connects at boot. This is that call.
 pub async fn probe_at_boot() -> Result<()> {
-    let declared = std::env::var(ENABLE_ENV).ok();
-    let Some(url) = enabled_url(declared.as_deref()) else {
+    // The password file is read, and refused if it must be, before the store is opened:
+    // a refusal names the settings and never the password (`secret_file`).
+    let Some(url) = configured_url().map_err(anyhow::Error::msg)? else {
         info!("credential store: dual-write DISABLED ({ENABLE_ENV} unset); legacy namespace only");
         return Ok(());
     };
+    let url = url.as_str();
     if shared_store().await.is_none() {
         error!("credential store: {ENABLE_ENV} is set but the store could not be opened");
         anyhow::bail!(
@@ -578,6 +643,139 @@ mod tests {
     #[test]
     fn legacy_key_matches_the_namespace_the_ceremony_writes() {
         assert_eq!(legacy_key("abc"), "webauthn:credential/abc");
+    }
+
+    /// A password file in the temp dir, removed on drop.
+    struct PasswordFile(std::path::PathBuf);
+
+    impl PasswordFile {
+        fn with(content: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "siwx-webauthn-password-test-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::write(&path, content).unwrap();
+            PasswordFile(path)
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+
+    impl Drop for PasswordFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// The gap: `AQUA_WEBAUTHN_REDIS_URL` carried the Redis password in the environment and
+    /// had no file option. The file's password lands in the URL, with every character
+    /// encoded, and nothing else about the URL changes.
+    #[test]
+    fn the_password_file_puts_its_password_into_the_url() {
+        let password = format!("p%41:/@?#{}", crate::test_support::random_secret(32));
+        let file = PasswordFile::with(&format!("{password}\r\n"));
+        let url = resolve_url(
+            Some("redis://user@redis.example.org:6380/3"),
+            Some(file.path()),
+        )
+        .unwrap()
+        .expect("on");
+        let client = bb8_redis::redis::Client::open(url.as_str()).unwrap();
+        let info = client.get_connection_info();
+        assert_eq!(info.redis_settings().password(), Some(password.as_str()));
+        assert_eq!(info.redis_settings().username(), Some("user"));
+        assert_eq!(info.redis_settings().db(), 3);
+        // Without a file the URL is passed on exactly as it was given (trimmed).
+        assert_eq!(
+            resolve_url(Some(" redis://redis.example.org "), None).unwrap(),
+            Some("redis://redis.example.org".to_string())
+        );
+        // A blank file setting is unset, like the others; both blank is off.
+        assert_eq!(
+            resolve_url(Some("redis://redis.example.org"), Some("  ")).unwrap(),
+            Some("redis://redis.example.org".to_string())
+        );
+        assert_eq!(resolve_url(None, Some("")).unwrap(), None);
+        assert_eq!(resolve_url(Some(""), None).unwrap(), None);
+    }
+
+    /// The same refusals as `redis_password_file`, from the same helper, and no content in
+    /// any of them.
+    #[test]
+    fn the_password_file_is_refused_where_redis_password_file_is() {
+        use crate::test_support::{leaked_window, random_secret, redis_url_with_password};
+        let (in_url, in_file) = (random_secret(40), random_secret(40));
+        let file = PasswordFile::with(&in_file);
+        let missing = std::env::temp_dir().join(format!("siwx-missing-{}", random_secret(16)));
+        let missing = missing.to_str().unwrap().to_string();
+        let padded = PasswordFile::with(&format!("{in_file}\n\n"));
+        for (what, url, path, says) in [
+            (
+                "the password in the URL as well",
+                Some(redis_url_with_password(&in_url, "redis.example.org")),
+                file.path().to_string(),
+                "both set",
+            ),
+            (
+                "the password in the query as well",
+                Some(format!("redis://redis.example.org?pass={in_url}")),
+                file.path().to_string(),
+                "both set",
+            ),
+            (
+                "a unix-socket URL",
+                Some("redis+unix://localhost/run/redis.sock".to_string()),
+                file.path().to_string(),
+                "unix-socket",
+            ),
+            (
+                "a unix-socket URL without a host",
+                Some("unix:///run/redis.sock".to_string()),
+                file.path().to_string(),
+                "unix-socket",
+            ),
+            (
+                "a file that is missing",
+                Some("redis://redis.example.org".to_string()),
+                missing.clone(),
+                missing.as_str(),
+            ),
+            (
+                "a file with a second newline",
+                Some("redis://redis.example.org".to_string()),
+                padded.path().to_string(),
+                "whitespace",
+            ),
+            (
+                "a path that is not absolute",
+                Some("redis://redis.example.org".to_string()),
+                in_file.clone(),
+                "absolute",
+            ),
+            (
+                "no URL to put it in",
+                None,
+                file.path().to_string(),
+                "is not",
+            ),
+        ] {
+            let error = resolve_url(url.as_deref(), Some(&path)).unwrap_err();
+            assert!(
+                error.contains(PASSWORD_FILE_ENV) || error.contains(ENABLE_ENV),
+                "{what}: names the setting: {error}"
+            );
+            assert!(error.contains(says), "{what}: {error}");
+            for secret in [&in_url, &in_file] {
+                assert_eq!(leaked_window(&error, secret), None, "{what}: {error}");
+            }
+        }
+        // A URL that does not parse is refused without being quoted.
+        let bad = redis_url_with_password(&in_url, "redis.example.org:not-a-port");
+        let error = resolve_url(Some(&bad), Some(file.path())).unwrap_err();
+        assert!(error.contains(ENABLE_ENV), "{error}");
+        assert_eq!(leaked_window(&error, &in_url), None, "{error}");
     }
 
     /// OFF is the default, and a blank value is OFF too. This is the property

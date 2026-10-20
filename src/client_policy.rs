@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, HashMap};
 use openidconnect::core::CoreGrantType;
 
 use crate::db::grant::GrantKind;
-use crate::db::{ClientClass, ClientEntry, SiwxClientMetadata, TokenMetadata};
+use crate::db::{ClientClass, ClientEntry, SiwxClientMetadata, TokenMetadata, CLIENT_ENTRY_FAULTS};
 use crate::mxid::localpart_for;
 
 /// The scope that unlocks the mailbox claim.
@@ -216,6 +216,17 @@ pub fn validate_static_client(
     deployment: Deployment<'_>,
 ) -> Result<(), String> {
     let refuse = |rule: String| Err(format!("default_clients.{id}: {rule}"));
+    // An entry configured with `secret` is digested on the way in and always passes. One
+    // configured with `secret_digest` is compared byte for byte, so a raw secret pasted
+    // there, or an upper-case digest, would never match and nothing would say why. The
+    // rule does not quote the value: it may be the secret.
+    if !crate::db::tokens::is_digest(&entry.secret_digest) {
+        return refuse(
+            "`secret_digest` must be the SHA-256 of the client secret as exactly 64 lowercase \
+             hex characters (a raw secret in this field never matches)"
+                .into(),
+        );
+    }
     if let Some(scope) = entry
         .allowed_scopes
         .iter()
@@ -301,6 +312,37 @@ pub fn validate_static_client(
     Ok(())
 }
 
+/// What start-up may say about a `default_clients` entry that does not parse: the kind of
+/// fault and where it is, never the text. serde's own message for a value of the wrong type
+/// quotes it (`invalid type: integer `123…`, expected a string`), and an entry holds a
+/// secret, so a number pasted where a string belongs would be printed. The entry's own
+/// refusals ([`CLIENT_ENTRY_FAULTS`]) are fixed texts and are kept.
+fn entry_error(e: &serde_json::Error) -> String {
+    use serde_json::error::Category;
+    let what = match e.classify() {
+        Category::Syntax => "it is not valid JSON".to_string(),
+        Category::Eof => "it ends before the entry is complete".to_string(),
+        Category::Io => "it could not be read".to_string(),
+        Category::Data => {
+            let text = e.to_string();
+            match CLIENT_ENTRY_FAULTS
+                .iter()
+                .find(|fault| text.starts_with(**fault))
+            {
+                Some(fault) => (*fault).to_string(),
+                None => "a field has a type or a value the entry does not allow, or a \
+                         required field is missing"
+                    .to_string(),
+            }
+        }
+    };
+    format!(
+        "{what} (line {}, column {}; the text is not shown, because it may be a secret)",
+        e.line(),
+        e.column()
+    )
+}
+
 /// Parse and validate every `default_clients` entry, in id order so that a configuration
 /// with several faults reports the same one on every start. Start-up calls it before
 /// anything is written, and it needs no Redis.
@@ -312,8 +354,12 @@ pub fn parse_static_clients(
     ids.sort();
     ids.into_iter()
         .map(|id| {
-            let entry: ClientEntry = serde_json::from_str(&configured[id])
-                .map_err(|e| format!("default_clients.{id}: not a valid client entry: {e}"))?;
+            let entry: ClientEntry = serde_json::from_str(&configured[id]).map_err(|e| {
+                format!(
+                    "default_clients.{id}: not a valid client entry: {}",
+                    entry_error(&e)
+                )
+            })?;
             validate_static_client(id, &entry, deployment)?;
             Ok((id.clone(), entry))
         })
@@ -1073,6 +1119,135 @@ mod tests {
             Ok(_) => panic!("the configuration must be refused"),
             Err(refusal) => refusal,
         }
+    }
+
+    /// O-F9: serde's error for a value of the wrong type quotes it. A secret of digits,
+    /// unquoted in the JSON, read as a number and was printed by the start-up refusal. The
+    /// refusal now says the kind of fault and the position, and the entry's own fixed
+    /// refusals stay.
+    #[test]
+    fn a_default_clients_entry_that_does_not_parse_is_refused_without_quoting_it() {
+        const FIXTURE: &str = "not-a-secret-test-fixture";
+        let digits =
+            rand::Rng::gen_range(&mut rand::thread_rng(), 10u64.pow(17)..10u64.pow(18)).to_string();
+        // Starts with a letter that opens no JSON literal, so that it is not valid JSON
+        // whatever the rest is (a leading digit would parse as a number).
+        let text = format!("k{}", crate::test_support::random_secret(39));
+        let meta = r#""metadata":{"redirect_uris":["https://app.example.org/cb"]}"#;
+        for (what, entry, says) in [
+            (
+                "an unquoted number as the secret",
+                format!(r#"{{"secret":{digits},{meta}}}"#),
+                "a field has a type or a value",
+            ),
+            (
+                "a number as the secret digest",
+                format!(r#"{{"secret_digest":{digits},{meta}}}"#),
+                "a field has a type or a value",
+            ),
+            (
+                "a secret value in a field that takes a class",
+                format!(r#"{{"secret":"{FIXTURE}","class":"{text}",{meta}}}"#),
+                "a field has a type or a value",
+            ),
+            (
+                "a secret that is not JSON at all",
+                text.clone(),
+                "not valid JSON",
+            ),
+            (
+                "an entry that ends early",
+                format!(r#"{{"secret":"{text}","#),
+                "ends before",
+            ),
+        ] {
+            let refusal = refusal(&[("app", &entry)], deployment(None));
+            assert!(
+                refusal.starts_with("default_clients.app: not a valid client entry:")
+                    && refusal.contains("line 1, column"),
+                "{what}: {refusal}"
+            );
+            assert!(refusal.contains(says), "{what}: {refusal}");
+            for secret in [&digits, &text] {
+                assert_eq!(
+                    crate::test_support::leaked_window(&refusal, secret),
+                    None,
+                    "{what}: {refusal}"
+                );
+            }
+        }
+        // The entry's own refusals are fixed texts, and are kept.
+        let none = refusal(&[("app", &format!("{{{meta}}}"))], deployment(None));
+        assert!(none.contains("holds no secret"), "{none}");
+        let zeros = "0".repeat(64);
+        let twice = format!(r#"{{"secret":"{FIXTURE}","secret_digest":"{zeros}",{meta}}}"#);
+        let twice = refusal(&[("app", &twice)], deployment(None));
+        assert!(
+            twice.contains("both as a digest and in the clear"),
+            "{twice}"
+        );
+    }
+
+    /// A client configured only by `secret_digest` (a secret that never sits in the
+    /// configuration): start-up accepts it, and the entry matches the raw secret and
+    /// nothing else.
+    #[test]
+    fn a_static_client_configured_only_by_digest_matches_the_raw_secret_and_no_other() {
+        let raw = crate::test_support::random_secret(40);
+        let digest = crate::db::tokens::digest(&raw);
+        let entry = format!(
+            r#"{{"secret_digest":"{digest}","metadata":{{"redirect_uris":["https://app.example.org/cb"]}}}}"#
+        );
+        let clients =
+            parse_static_clients(&configured(&[("app", &entry)]), deployment(None)).unwrap();
+        let client = &clients[0].1;
+        assert!(client.secret_matches(&raw));
+        assert!(
+            !client.secret_matches(&format!("{raw}\n")),
+            "a newline is part of the secret"
+        );
+        assert!(!client.secret_matches(&crate::test_support::random_secret(40)));
+        assert!(
+            !client.secret_matches(&client.secret_digest),
+            "the digest is no credential"
+        );
+    }
+
+    /// A `secret_digest` that is not 64 lowercase hex characters is refused at start-up
+    /// by the client's name, and the refusal never holds the value: it may be a raw secret.
+    #[test]
+    fn a_secret_digest_that_is_not_64_lowercase_hex_stops_start_up_without_quoting_it() {
+        let raw = crate::test_support::random_secret(40);
+        let good = crate::db::tokens::digest(&raw);
+        for (what, value) in [
+            ("a raw secret", raw.clone()),
+            ("upper case", good.to_uppercase()),
+            ("too short", good[..63].to_string()),
+            ("too long", format!("{good}0")),
+            ("not hex", format!("{}z", &good[..63])),
+            ("empty", String::new()),
+        ] {
+            let entry = format!(
+                r#"{{"secret_digest":"{value}","metadata":{{"redirect_uris":["https://app.example.org/cb"]}}}}"#
+            );
+            let refusal = refusal(&[("app", &entry)], deployment(None));
+            assert!(
+                refusal.starts_with("default_clients.app:")
+                    && refusal.contains("`secret_digest` must be")
+                    && refusal.contains("64 lowercase hex"),
+                "{what}: {refusal}"
+            );
+            assert_eq!(
+                crate::test_support::leaked_window(&refusal, &value),
+                None,
+                "{what}: the refusal quotes the value"
+            );
+        }
+        // The same entry with a good digest is accepted.
+        let entry = format!(
+            r#"{{"secret_digest":"{good}","metadata":{{"redirect_uris":["https://app.example.org/cb"]}}}}"#
+        );
+        assert!(parse_static_clients(&configured(&[("app", &entry)]), deployment(None)).is_ok());
     }
 
     #[test]
