@@ -198,7 +198,7 @@ async fn a_backend_failure_is_returned_and_no_token_is() {
     })
     .await;
     let err = result.expect_err("no token without a signature");
-    assert!(err.is_backend());
+    assert!(err.is_retryable());
     assert!(matches!(err, SignError::Unavailable(_)));
 }
 
@@ -232,7 +232,7 @@ async fn a_builder_that_signs_zero_or_two_times_is_an_assembly_error() {
     .await;
     let err = twice.expect_err("two signatures for one token are refused");
     assert!(matches!(err, SignError::Assembly(_)));
-    assert!(!err.is_backend(), "an assembly fault is not the signer's");
+    assert!(!err.is_retryable(), "an assembly fault is not the signer's");
 }
 
 #[test]
@@ -273,7 +273,12 @@ fn fake_signer(
 }
 
 fn public_of(key: &EcdsaSigningKey, kid: &str) -> Vec<u8> {
-    protocol::public_answer(kid, serde_json::to_value(key.verification_jwk()).unwrap())
+    protocol::public_answer(
+        kid,
+        serde_json::to_value(key.verification_jwk()).unwrap(),
+        ISSUER,
+        3600,
+    )
 }
 
 fn is_public(request: &[u8]) -> bool {
@@ -324,7 +329,8 @@ async fn connect_refuses_an_error_or_a_non_es256_answer() {
     let jwk = serde_json::to_value(key.verification_jwk()).unwrap();
     let task = fake_signer(&socket, move |_| {
         let mut answer: serde_json::Value =
-            serde_json::from_slice(&protocol::public_answer(&kid, jwk.clone())).unwrap();
+            serde_json::from_slice(&protocol::public_answer(&kid, jwk.clone(), ISSUER, 3600))
+                .unwrap();
         answer["alg"] = serde_json::json!("RS256");
         Some(format!("{answer}\n").into_bytes())
     });
@@ -334,6 +340,70 @@ async fn connect_refuses_an_error_or_a_non_es256_answer() {
     ));
     task.abort();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The start check: the signer's issuer and lifetime limit come with its key,
+/// and a server whose `base_url` or token lifetimes the signer would refuse
+/// is told which setting to change, before any token is asked for.
+#[tokio::test]
+async fn connect_keeps_the_signers_issuer_and_limit_and_refuses_what_it_would_not_sign() {
+    let dir = temp_dir("client-fits");
+    let socket = dir.join("s.sock");
+    let key = EcdsaSigningKey::generate();
+    let kid = key.kid().to_string();
+    let task = fake_signer(&socket, move |_| Some(public_of(&key, &kid)));
+    let signer = SocketSigner::connect(&socket, TIMEOUT).await.unwrap();
+    task.abort();
+    assert_eq!(signer.issuer(), ISSUER);
+    assert_eq!(signer.max_token_lifetime_secs(), 3600);
+
+    let fits = |issuer: &str, ttl: u64| {
+        signer.check_fits(issuer, &[("id_token_ttl_secs", ttl), ("logout token", 120)])
+    };
+    assert_eq!(fits(ISSUER, 300), Ok(()));
+    assert_eq!(fits(ISSUER, 3600), Ok(()), "the limit itself is signed");
+    let other = fits("https://other.example.org/", 300).unwrap_err();
+    assert!(other.contains("--issuer"), "{other}");
+    let above = fits(ISSUER, 3601).unwrap_err();
+    assert!(
+        above.contains("id_token_ttl_secs is 3601 s, above the signer's limit of 3600 s"),
+        "{above}"
+    );
+    let zero = fits(ISSUER, 0).unwrap_err();
+    assert!(zero.contains("id_token_ttl_secs is 0"), "{zero}");
+    assert!(signer
+        .check_fits(ISSUER, &[("logout token", 7200)])
+        .unwrap_err()
+        .contains("logout token"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What a request may answer as retryable: a signer that is down, slow or
+/// misbehaving, never a refusal of the message or an assembly fault.
+#[test]
+fn only_a_signer_fault_is_retryable() {
+    for retryable in [
+        SignError::Unavailable("x".into()),
+        SignError::Timeout(2000),
+        SignError::BadAnswer,
+        SignError::BadSignature,
+        SignError::KidMismatch {
+            expected: "a".into(),
+            got: "b".into(),
+        },
+        SignError::Refused(ErrorCode::Internal),
+    ] {
+        assert!(retryable.is_retryable(), "{retryable:?}");
+    }
+    for permanent in [
+        SignError::Refused(ErrorCode::Shape),
+        SignError::Refused(ErrorCode::BadRequest),
+        SignError::Refused(ErrorCode::TooLarge),
+        SignError::Refused(ErrorCode::BadVersion),
+        SignError::Assembly("x".into()),
+    ] {
+        assert!(!permanent.is_retryable(), "{permanent:?}");
+    }
 }
 
 /// Requirement 3: every answer is checked. A signature by another key under
@@ -398,7 +468,11 @@ async fn every_sign_answer_is_verified_and_a_bad_one_is_an_error_never_a_signatu
             format!("{err:?}").starts_with(expected),
             "{case}: expected {expected}, got {err:?}"
         );
-        assert!(err.is_backend(), "{case}: a signer fault is a 503");
+        assert_eq!(
+            err.is_retryable(),
+            case != "refused",
+            "{case}: a signer fault is a 503, a shape refusal is not retryable"
+        );
     }
     task.abort();
     let _ = std::fs::remove_dir_all(&dir);

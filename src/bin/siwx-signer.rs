@@ -14,8 +14,8 @@
 //! payload. Nothing this binary prints or logs carries key bytes or the bytes
 //! it signs. See `docs/signer.md`.
 
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -45,11 +45,12 @@ serve options (each flag can also be set by its environment variable):
   --rate-alarm-per-minute <n>       SIWX_SIGNER_RATE_ALARM_PER_MINUTE    0 turns it off (default 600)
   --read-timeout-ms <n>             SIWX_SIGNER_READ_TIMEOUT_MS          (default 2000)
 
+The key file must be readable by its owner only (no group or other bits).
 self-test loads the key and signs and verifies a fixed internal message
 (exit 0 when it works); it is the container healthcheck and signs nothing
-outward. keygen writes a fresh key into an EXISTING, EMPTY regular file that
-only its owner can read; it prints only `kid=<kid>`. kid prints only
-`kid=<kid>`.
+outward. keygen writes a fresh key into an EXISTING, EMPTY regular file with
+one link that only its owner can read; it prints only `kid=<kid>`. kid prints
+only `kid=<kid>`.
 ";
 
 /// A usage error (exit 2) or a failure (exit 1). The message never carries key
@@ -204,23 +205,59 @@ impl Flags {
     }
 }
 
-/// Load the PKCS#8 P-256 key at `path`. The file's bytes are wiped from memory
-/// after parsing; an error names the path and the kind of failure only.
+/// Load the PKCS#8 P-256 key at `path`, which only its owner may read.
+///
+/// The file is read into one buffer sized from its length, so no reallocation
+/// leaves a copy of the PEM behind, and the buffer is wiped after parsing. An
+/// error names the path and the kind of failure only.
 fn load_key(path: &Path) -> Result<EcdsaSigningKey, Failure> {
-    let pem = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
+    let shown = path.display();
+    // O_NONBLOCK: a FIFO at the path fails below instead of blocking the open.
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| Failure::Failed(format!("cannot read the key file {shown}: {}", e.kind())))?;
+    let meta = file.metadata().map_err(|e| {
+        Failure::Failed(format!("cannot inspect the key file {shown}: {}", e.kind()))
+    })?;
+    let len = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+    if !meta.is_file() || len > MAX_KEY_FILE_BYTES {
+        return Err(Failure::Failed(format!(
+            "the key file {shown} is not a regular file of at most {MAX_KEY_FILE_BYTES} bytes"
+        )));
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(Failure::Failed(format!(
+            "the key file {shown} is open to group or others (mode {:o}); make it 0600 \
+             (or 0400)",
+            mode & 0o777
+        )));
+    }
+    // One spare byte, so reading to the end needs no reallocation; a file that
+    // grew since is refused instead of read on.
+    let mut pem = Zeroizing::new(Vec::with_capacity(len + 1));
+    (&mut file)
+        .take(meta.len() + 1)
+        .read_to_end(&mut pem)
+        .map_err(|e| Failure::Failed(format!("cannot read the key file {shown}: {}", e.kind())))?;
+    let not_a_key = || {
         Failure::Failed(format!(
-            "cannot read the key file {}: {}",
-            path.display(),
-            e.kind()
+            "the key file {shown} does not hold a PKCS#8 P-256 private key"
         ))
-    })?);
-    EcdsaSigningKey::from_pem(&pem).map_err(|_| {
-        Failure::Failed(format!(
-            "the key file {} does not hold a PKCS#8 P-256 private key",
-            path.display()
-        ))
-    })
+    };
+    if pem.len() > len {
+        return Err(Failure::Failed(format!(
+            "the key file {shown} changed while it was read"
+        )));
+    }
+    let text = std::str::from_utf8(&pem).map_err(|_| not_a_key())?;
+    EcdsaSigningKey::from_pem(text).map_err(|_| not_a_key())
 }
+
+/// The largest key file read: a PKCS#8 P-256 PEM is about 240 bytes.
+const MAX_KEY_FILE_BYTES: usize = 16 * 1024;
 
 fn self_test(key_file: &Path) -> Result<(), Failure> {
     let key = load_key(key_file)?;
@@ -235,44 +272,40 @@ fn self_test(key_file: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Write a fresh key into `out`, which must already exist, be a regular file
-/// (not a symlink), be empty, and be readable by its owner only. The file is
-/// opened without `O_CREAT` and with `O_NOFOLLOW`, and checked again through
-/// the open handle, so nothing at `out` is created or replaced.
+/// Write a fresh key into `out`, which must already exist and be a regular
+/// file (not a symlink, a FIFO or a device) with one link, empty, and readable
+/// by its owner only. The path is checked before it is opened, it is opened
+/// without `O_CREAT`, with `O_NOFOLLOW` and `O_NONBLOCK` (so nothing at `out`
+/// can block the open), and the open handle is checked again to be the same
+/// file. Nothing at `out` is created or replaced, and a key never lands under
+/// a second name.
 fn keygen(out: &Path) -> Result<String, String> {
     let shown = out.display();
-    let meta = std::fs::symlink_metadata(out).map_err(|e| {
+    let before = std::fs::symlink_metadata(out).map_err(|e| {
         format!(
             "{shown}: {}; keygen writes into an existing, empty file (create it first, with \
              its owner and mode 0600)",
             e.kind()
         )
     })?;
-    if meta.file_type().is_symlink() {
+    if before.file_type().is_symlink() {
         return Err(format!(
             "{shown} is a symlink; refusing to write through it"
         ));
     }
+    fit_for_a_key(&shown, &before)?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(out)
         .map_err(|e| format!("cannot open {shown}: {}", e.kind()))?;
-    let meta = file
+    let opened = file
         .metadata()
         .map_err(|e| format!("cannot inspect {shown}: {}", e.kind()))?;
-    if !meta.is_file() {
-        return Err(format!("{shown} is not a regular file"));
+    if (opened.dev(), opened.ino()) != (before.dev(), before.ino()) {
+        return Err(format!("{shown} was replaced while it was opened"));
     }
-    if meta.len() != 0 {
-        return Err(format!("{shown} is not empty; refusing to overwrite a key"));
-    }
-    if meta.permissions().mode() & 0o077 != 0 {
-        return Err(format!(
-            "{shown} is open to group or others (mode {:o}); make it 0600 first",
-            meta.permissions().mode() & 0o777
-        ));
-    }
+    fit_for_a_key(&shown, &opened)?;
     let secret = p256::SecretKey::random(&mut rand::rngs::OsRng);
     let pem = secret
         .to_pkcs8_pem(LineEnding::LF)
@@ -285,6 +318,30 @@ fn keygen(out: &Path) -> Result<String, String> {
         .and_then(|()| file.sync_all())
         .map_err(|e| format!("cannot write {shown}: {}", e.kind()))?;
     Ok(key.kid().to_string())
+}
+
+/// Whether `meta` is a file keygen may write a key into: a regular file with
+/// one link, empty, with no group or other permission bits.
+fn fit_for_a_key(shown: &std::path::Display<'_>, meta: &std::fs::Metadata) -> Result<(), String> {
+    if !meta.is_file() {
+        return Err(format!("{shown} is not a regular file"));
+    }
+    if meta.nlink() != 1 {
+        return Err(format!(
+            "{shown} has {} links; a key file has exactly one name",
+            meta.nlink()
+        ));
+    }
+    if meta.len() != 0 {
+        return Err(format!("{shown} is not empty; refusing to overwrite a key"));
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "{shown} is open to group or others (mode {:o}); make it 0600 first",
+            meta.permissions().mode() & 0o777
+        ));
+    }
+    Ok(())
 }
 
 fn serve(flags: &Flags) -> Result<(), Failure> {
@@ -353,7 +410,8 @@ fn serve(flags: &Flags) -> Result<(), Failure> {
         .build()
         .map_err(|e| Failure::Failed(format!("cannot start the runtime: {e}")))?;
     runtime.block_on(async {
-        let listener = server::bind(&socket).map_err(|e| Failure::Failed(format!("{e:#}")))?;
+        let (listener, socket_file) =
+            server::bind(&socket).map_err(|e| Failure::Failed(format!("{e:#}")))?;
         info!(
             kid = %service.kid(),
             socket = %socket.display(),
@@ -367,9 +425,11 @@ fn serve(flags: &Flags) -> Result<(), Failure> {
                 info!("siwx-signer stopping");
             }
         }
-        // The socket goes with the process; a stale one would be removed at the
-        // next start anyway.
-        let _ = std::fs::remove_file(&socket);
+        // The socket goes with the process, but only while it is the one this
+        // process bound: a signer that has bound the path since keeps its socket.
+        if !socket_file.remove() {
+            info!(socket = %socket.display(), "the socket is no longer this signer's; left in place");
+        }
         Ok(())
     })
 }

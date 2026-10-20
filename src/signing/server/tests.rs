@@ -66,6 +66,15 @@ async fn public_names_the_key_and_sign_answers_a_signature_that_verifies() {
         "the published JWK, built by the one verification_jwk"
     );
     assert!(public.jwk.get("d").is_none(), "never the private scalar");
+    assert_eq!(
+        public.issuer,
+        format!("{TEST_SIGNER_ISSUER}/"),
+        "the issuer, in the form siwx-oidc writes `iss`"
+    );
+    assert_eq!(
+        public.max_token_lifetime_secs,
+        DEFAULT_MAX_TOKEN_LIFETIME_SECS
+    );
 
     let msg = logout_message(key.kid(), "did:key:zSubject");
     let answer = exchange(
@@ -97,7 +106,7 @@ async fn a_peer_with_another_uid_is_refused_and_logged() {
         .await
         .err()
         .expect("a refused peer gets no key");
-    assert!(err.is_backend());
+    assert!(err.is_retryable());
     let log = capture.output();
     assert!(
         log.contains(&format!("peer_refused uid={}", current_uid())),
@@ -256,6 +265,34 @@ async fn sign_requests_beyond_the_bound_in_a_minute_raise_one_rate_alarm() {
     assert!(log.contains("signs_per_minute=3 bound=2"), "{log}");
 }
 
+/// The alarm counts signatures. Refusals sign nothing: a burst of them (a
+/// permanent shape refusal retried) raises no `rate_alarm`, and they are
+/// counted apart in the minute's summary.
+#[tokio::test]
+async fn refusals_are_not_counted_as_signatures_in_the_rate_alarm() {
+    let capture = LogCapture::start();
+    let key = EcdsaSigningKey::generate();
+    let mut options = TestSigner::options();
+    options.rate_alarm_per_minute = 2;
+    let service = SignerService::new(key, options).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let foreign = logout_message("ffffffffffffffff", "did:key:zSubject");
+    for _ in 0..5 {
+        let line = &protocol::sign_request(Purpose::LogoutToken, &foreign);
+        let answer = service.answer(&line[..line.len() - 1], now, current_uid());
+        assert_eq!(error_of(&answer), ErrorCode::Shape);
+    }
+    for _ in 0..2 {
+        let answer = service.answer(b"not json", now, current_uid());
+        assert_eq!(error_of(&answer), ErrorCode::BadRequest);
+    }
+    service.close_window();
+    let log = capture.output();
+    assert_eq!(log.matches("rate_alarm").count(), 0, "{log}");
+    assert!(log.contains("refused=7"), "{log}");
+    assert!(log.contains("logout_tokens=0"), "{log}");
+}
+
 #[test]
 fn the_issuer_is_compared_in_the_form_siwx_oidc_writes_it() {
     let service = SignerService::new(
@@ -278,7 +315,7 @@ async fn bind_replaces_a_stale_socket_refuses_anything_else_and_sets_mode_0660()
     // A socket left by a run that died: its file stays after the listener goes.
     drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
     assert!(socket.exists());
-    let listener = bind(&socket).expect("a stale socket is replaced");
+    let (listener, _file) = bind(&socket).expect("a stale socket is replaced");
     let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, SOCKET_MODE);
     drop(listener);
@@ -295,5 +332,44 @@ async fn bind_replaces_a_stale_socket_refuses_anything_else_and_sets_mode_0660()
         "a symlink is never followed or replaced"
     );
     assert_eq!(std::fs::read(&file).unwrap(), b"keep me");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A socket a running signer serves is never taken over: `bind` refuses it
+/// and the running signer keeps answering. A socket file is removed on
+/// shutdown only while it is the one this process bound.
+#[tokio::test]
+async fn bind_refuses_a_served_socket_and_removes_only_its_own() {
+    let key = EcdsaSigningKey::generate();
+    let running = TestSigner::start(key.clone(), TestSigner::options());
+    let refusal = bind(&running.socket).expect_err("a served socket is refused");
+    assert!(
+        format!("{refusal:#}").contains("served by a running signer"),
+        "{refusal:#}"
+    );
+    let answer = exchange(&running.socket, &protocol::public_request()).await;
+    assert!(
+        protocol::parse_answer::<PublicAnswer>(&answer)
+            .unwrap()
+            .is_ok(),
+        "the running signer still answers"
+    );
+
+    let dir = temp_dir("bind-own");
+    let socket = dir.join("signer.sock");
+    let (old_listener, old_file) = bind(&socket).unwrap();
+    // The old signer stops accepting, a new one finds the socket dead and binds.
+    drop(old_listener);
+    let (_new_listener, new_file) = bind(&socket).expect("a dead socket is replaced");
+    assert!(
+        !old_file.remove(),
+        "the old file is gone: nothing to remove"
+    );
+    assert!(
+        std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+        "the new socket survives the old signer's shutdown"
+    );
+    assert!(new_file.remove(), "the new signer removes its own socket");
+    assert!(!socket.exists());
     let _ = std::fs::remove_dir_all(&dir);
 }

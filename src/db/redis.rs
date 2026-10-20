@@ -163,6 +163,24 @@ end
 return 0
 "#;
 
+/// Put a consumed code's entry back (see [`RedisClient::restore_code`]):
+/// `KEYS[1]` the code's digest key, `ARGV[1]` the entry, `ARGV[2]` the
+/// original expiry in Unix milliseconds. Writes only while nothing is stored
+/// under the key and the expiry is still ahead (Redis `TIME`), and only for
+/// the time left. Returns 1 when it wrote the entry.
+const RESTORE_CODE_SCRIPT: &str = r#"
+local t = redis.call('TIME')
+local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local left = tonumber(ARGV[2]) - now_ms
+if left <= 0 then
+  return 0
+end
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', string.format('%.0f', left)) then
+  return 1
+end
+return 0
+"#;
+
 /// Replace a client entry by its digest-only form only while it is still
 /// exactly the entry that was read, keeping its expiry. `KEYS[1]` the entry,
 /// `ARGV[1]` the value read, `ARGV[2]` its digest-only form. A concurrent
@@ -1377,6 +1395,43 @@ impl RedisClient {
 }
 
 impl RedisClient {
+    /// Put back the entry of a code that [`DBClient::try_consume_code`] handed
+    /// out to an exchange that then answered nothing, because the ID token
+    /// could not be signed, so the client's retry redeems it. The grant that
+    /// exchange issued must be discarded first
+    /// ([`RedisClient::discard_unanswered_grant`]): a code still yields at most
+    /// one answered grant.
+    ///
+    /// Written only while no entry is stored under the code, and only for the
+    /// rest of its lifetime ([`ENTRY_LIFETIME`] from its `auth_time`, which
+    /// `sign_in` samples from Redis `TIME` just before it stores the code), so a
+    /// restored code never outlives the original. Returns whether it was put back.
+    pub async fn restore_code(&self, code: &str, entry: &CodeEntry) -> Result<bool> {
+        let value = serde_json::to_string(entry)
+            .map_err(|e| anyhow!("Failed to serialize code entry: {}", e))?;
+        let expires_ms = entry.auth_time.timestamp_millis() + ENTRY_LIFETIME as i64 * 1000;
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+        let restored: i64 = bb8_redis::redis::cmd("EVAL")
+            .arg(RESTORE_CODE_SCRIPT)
+            .arg(1)
+            .arg(code_key(code))
+            .arg(value)
+            .arg(expires_ms)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("Failed to restore a code: {}", e))?;
+        debug!(
+            "restore_code: code_fp={} restored={}",
+            fingerprint(code),
+            restored == 1
+        );
+        Ok(restored == 1)
+    }
+
     /// Set the client epoch of `client_id` when replacing its stored entry with `after`
     /// (`None`: deleting it) ends the grants it holds ([`client_policy::grant_end`]), so every
     /// grant authenticated before now is refused at both refresh endpoints and at userinfo.

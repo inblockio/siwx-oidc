@@ -299,7 +299,8 @@ impl TestSigner {
         let service = crate::signing::server::SignerService::new(key, options)
             .expect("the test signer options are valid");
         let kid = service.kid().to_string();
-        let listener = crate::signing::server::bind(&socket).expect("the test socket binds");
+        let (listener, _file) =
+            crate::signing::server::bind(&socket).expect("the test socket binds");
         let task = tokio::spawn(std::sync::Arc::new(service).serve(listener));
         Self {
             dir,

@@ -8,13 +8,19 @@
 //!
 //! | Request | Answer |
 //! |---|---|
-//! | `{"v":1,"op":"public"}` | `{"v":1,"kid":"…","jwk":{…},"alg":"ES256"}` |
+//! | `{"v":1,"op":"public"}` | `{"v":1,"kid":"…","jwk":{…},"alg":"ES256","issuer":"…","max_token_lifetime_secs":3600}` |
 //! | `{"v":1,"op":"sign","purpose":"id_token","msg":"<base64url>"}` | `{"v":1,"kid":"…","sig":"<base64url r‖s>"}` |
 //! | anything refused | `{"v":1,"error":"<code>"}` with a code of [`ErrorCode`] |
 //!
 //! `purpose` is one of [`Purpose`]; `msg` is the JWS signing input
 //! (`BASE64URL(header).BASE64URL(payload)`) in unpadded base64url. An error
 //! answer never echoes the request.
+//!
+//! The `public` answer also names the two bounds the signer checks every
+//! token against ([`super::shape`]): the `issuer` it was started with (as a
+//! URL string, `https://example.org/`) and the longest `exp - iat` it signs.
+//! siwx-oidc compares both with its own configuration at start, so a mismatch
+//! stops the start instead of turning every token into a refusal.
 
 use std::fmt;
 
@@ -114,12 +120,27 @@ impl fmt::Display for ErrorCode {
 }
 
 /// A request as the signer reads it.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum Request {
     /// `op: public`: the signer's `kid` and public JWK.
     Public,
     /// `op: sign`: a signature over `msg` (decoded) for `purpose`.
     Sign { purpose: Purpose, msg: Vec<u8> },
+}
+
+/// Names the purpose and the message length, never the message: a token
+/// payload carries personal data.
+impl fmt::Debug for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Request::Public => f.write_str("Public"),
+            Request::Sign { purpose, msg } => f
+                .debug_struct("Sign")
+                .field("purpose", purpose)
+                .field("msg_len", &msg.len())
+                .finish(),
+        }
+    }
 }
 
 /// One message on the wire, members in the documented order (`v` first).
@@ -141,6 +162,8 @@ enum Wire<'a> {
         kid: &'a str,
         jwk: Value,
         alg: &'static str,
+        issuer: &'a str,
+        max_token_lifetime_secs: i64,
     },
     SignAnswer {
         v: u64,
@@ -212,13 +235,16 @@ fn only_fields(object: &Map<String, Value>, allowed: &[&str]) -> Result<(), Erro
     }
 }
 
-/// The `public` answer line.
-pub fn public_answer(kid: &str, jwk: Value) -> Vec<u8> {
+/// The `public` answer line: the key, and the issuer and longest token
+/// lifetime the signer signs.
+pub fn public_answer(kid: &str, jwk: Value, issuer: &str, max_token_lifetime_secs: i64) -> Vec<u8> {
     line(Wire::PublicAnswer {
         v: VERSION,
         kid,
         jwk,
         alg: "ES256",
+        issuer,
+        max_token_lifetime_secs,
     })
 }
 
@@ -247,12 +273,15 @@ fn line(message: Wire<'_>) -> Vec<u8> {
     bytes
 }
 
-/// The answer to `public`, as a client reads it.
+/// The answer to `public`, as a client reads it. Every member is required: an
+/// answer without the bounds is not one this build can check.
 #[derive(Debug, Deserialize)]
 pub struct PublicAnswer {
     pub kid: String,
     pub jwk: Value,
     pub alg: String,
+    pub issuer: String,
+    pub max_token_lifetime_secs: i64,
 }
 
 /// The answer to `sign`, as a client reads it.
@@ -307,6 +336,25 @@ mod tests {
                 msg
             })
         );
+    }
+
+    /// `Debug` of a request names its purpose and length, never the message.
+    #[test]
+    fn a_request_prints_no_message_bytes() {
+        let msg = b"eyJhbGciOiJFUzI1NiJ9.not-a-secret-test-fixture-marker".to_vec();
+        let shown = format!(
+            "{:?}",
+            Request::Sign {
+                purpose: Purpose::Userinfo,
+                msg: msg.clone()
+            }
+        );
+        assert_eq!(
+            shown,
+            format!("Sign {{ purpose: Userinfo, msg_len: {} }}", msg.len())
+        );
+        assert!(!shown.contains("marker"));
+        assert_eq!(format!("{:?}", Request::Public), "Public");
     }
 
     #[test]
@@ -385,11 +433,23 @@ mod tests {
     #[test]
     fn answers_parse_on_the_client_side() {
         let jwk = serde_json::json!({"kty": "EC"});
-        let public = public_answer("0123456789abcdef", jwk.clone());
+        let public = public_answer(
+            "0123456789abcdef",
+            jwk.clone(),
+            "https://example.org/",
+            3600,
+        );
         let parsed: PublicAnswer = parse_answer(&public).unwrap().unwrap();
         assert_eq!(parsed.kid, "0123456789abcdef");
         assert_eq!(parsed.jwk, jwk);
         assert_eq!(parsed.alg, "ES256");
+        assert_eq!(parsed.issuer, "https://example.org/");
+        assert_eq!(parsed.max_token_lifetime_secs, 3600);
+        // An answer from a signer that names no bounds is not a `public` answer.
+        assert!(parse_answer::<PublicAnswer>(
+            br#"{"v":1,"kid":"0123456789abcdef","jwk":{"kty":"EC"},"alg":"ES256"}"#
+        )
+        .is_none());
 
         let sign = sign_answer("0123456789abcdef", &[1, 2, 3]);
         let parsed: SignAnswer = parse_answer(&sign).unwrap().unwrap();

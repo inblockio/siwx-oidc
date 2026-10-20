@@ -1069,6 +1069,51 @@ mod interop_with_the_shipped_verifier {
         handle.abort();
     }
 
+    /// AUDIT PR83 F3, end to end: a confused or compromised caller asks the
+    /// signer for a `userinfo` signature over a DID proof's payload (plus an
+    /// `aud`, which the userinfo shape requires). The signer signs it, and the
+    /// shipped verifier accepts the result as a provider-attested DID binding:
+    /// the `did_proof` shape (exact members, `typ` JWT, `sub` a DID) is not
+    /// what decides whether a DID proof can be had.
+    #[tokio::test]
+    async fn audit_pr83_a_userinfo_signature_is_not_a_did_proof() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use siwx_oidc::signing::socket::SocketSigner;
+        use siwx_oidc::signing::Purpose;
+        use siwx_oidc::test_support::TestSigner;
+        let key = EcdsaSigningKey::from_pem(&test_p256_pem()).expect("test PEM must load");
+        let (issuer, handle) = spawn_issuer(&key).await;
+        let iss = format!("{issuer}/");
+        let mut options = TestSigner::options();
+        options.issuer = iss.clone();
+        let service = TestSigner::start(key.clone(), options);
+        let signer = SocketSigner::connect(&service.socket, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let header = serde_json::json!({"alg": "ES256", "typ": "JWT", "kid": key.kid()});
+        let payload = serde_json::json!({"iss": iss, "aud": "any-client", "sub": DID,
+            "mxid": MXID, "iat": now});
+        let input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+        );
+        let outcome = signer.sign(Purpose::Userinfo, input.as_bytes()).await;
+        let accepted = match outcome {
+            Err(_) => false,
+            Ok(sig) => {
+                let proof = format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig));
+                verify_did_assertion(&issuer, &proof, MXID).await.is_ok()
+            }
+        };
+        handle.abort();
+        assert!(
+            !accepted,
+            "a signature asked for as `userinfo` must not verify as a DID proof"
+        );
+    }
+
     /// H6/H8: the replay guard holds across the crate boundary too.
     ///
     /// This is the whole security property of the `mxid` claim: user B copies

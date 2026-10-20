@@ -35,6 +35,28 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// Run `siwx-signer` with `args` and wait at most `limit` for it to end:
+/// `None` when it was still running (it is killed then).
+fn run_within(args: &[&str], limit: Duration) -> Option<Output> {
+    let mut child = Command::new(BIN)
+        .env_clear()
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn siwx-signer");
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            return Some(child.wait_with_output().unwrap());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
 /// An empty file only its owner can read: what an operator pre-creates.
 fn empty_private_file(path: &Path) {
     std::fs::File::create(path).unwrap();
@@ -150,6 +172,7 @@ fn self_test_passes_with_a_key_and_fails_without_printing_the_file() {
     let bad = dir.join("bad_key");
     let marker = "not-a-key-test-fixture-marker";
     std::fs::write(&bad, format!("{marker}\n")).unwrap();
+    std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o600)).unwrap();
     for command in ["self-test", "kid"] {
         let out = signer(&[command, "--key-file", bad.to_str().unwrap()]);
         assert_eq!(out.status.code(), Some(1), "{command}");
@@ -380,5 +403,135 @@ fn serve_refuses_to_replace_a_file_that_is_not_a_socket() {
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     assert!(text(&out.stderr).contains("not a socket"));
     assert_eq!(std::fs::read(&socket).unwrap(), b"keep me");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AUDIT PR83 F7: `keygen` checks the file type only after `open`, and opens
+/// without `O_NONBLOCK`, so a FIFO at `--out` blocks it forever (it waits for a
+/// reader). It also writes into a file with a second hard link, so the key
+/// exists under a name the operator did not choose.
+#[test]
+fn audit_pr83_keygen_refuses_a_fifo_at_once_and_a_hard_linked_file() {
+    let dir = temp_dir("cli-keygen-audit");
+    let fifo = dir.join("fifo");
+    let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let finished = run_within(
+        &["keygen", "--out", fifo.to_str().unwrap()],
+        Duration::from_secs(3),
+    )
+    .map(|out| out.status);
+    assert!(
+        finished.is_some_and(|s| !s.success()),
+        "keygen refuses a FIFO at once instead of blocking on it"
+    );
+
+    let first = dir.join("first");
+    empty_private_file(&first);
+    let second = dir.join("second");
+    std::fs::hard_link(&first, &second).unwrap();
+    let out = signer(&["keygen", "--out", second.to_str().unwrap()]);
+    let written = std::fs::metadata(&first).unwrap().len();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !out.status.success() && written == 0,
+        "keygen refuses a file with more than one link (wrote {written} bytes)"
+    );
+}
+
+/// AUDIT PR83 F8 (adapted to the fix): two signers on one socket path. A
+/// second signer started while the first still serves the socket refuses to
+/// take it over and exits, and the first keeps answering. When a new signer
+/// has replaced the socket anyway (the old one stopped accepting, the new one
+/// found it dead and bound), the old one's shutdown leaves the new socket in
+/// place: it removes only the socket file it bound.
+#[test]
+fn audit_pr83_an_old_signer_stopping_leaves_the_new_signers_socket() {
+    let dir = temp_dir("cli-serve-overlap");
+    let (key_path, _kid) = generated_key(&dir);
+    let socket = dir.join("signer.sock");
+    let old = Serving::start(&key_path, &socket, current_uid());
+
+    let uid = format!("--allowed-uid={}", current_uid());
+    let second = run_within(
+        &[
+            "serve",
+            "--key-file",
+            key_path.to_str().unwrap(),
+            "--socket",
+            socket.to_str().unwrap(),
+            "--issuer",
+            "http://localhost",
+            &uid,
+        ],
+        Duration::from_secs(10),
+    )
+    .expect("a second signer on a served socket exits at once");
+    assert_eq!(second.status.code(), Some(1), "{}", text(&second.stderr));
+    assert!(
+        text(&second.stderr).contains("served by a running signer"),
+        "{}",
+        text(&second.stderr)
+    );
+    let answer = exchange(&socket, &protocol::public_request());
+    assert!(
+        protocol::parse_answer::<PublicAnswer>(&answer)
+            .unwrap()
+            .is_ok(),
+        "the first signer still answers"
+    );
+
+    // The overlap the refusal cannot see: the new socket is bound at the path.
+    std::fs::remove_file(&socket).unwrap();
+    let new = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let _ = old.terminate();
+    let reachable = UnixStream::connect(&socket).is_ok();
+    drop(new);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        reachable,
+        "the new signer's socket survives the old signer's shutdown"
+    );
+}
+
+/// AUDIT PR83 I3: a key file that group or others can read is refused by
+/// every subcommand that loads one, and the refusal prints no key byte.
+#[test]
+fn a_key_file_others_can_read_is_refused_by_serve_self_test_and_kid() {
+    let dir = temp_dir("cli-key-mode");
+    let (key_path, _kid) = generated_key(&dir);
+    let pem = std::fs::read_to_string(&key_path).unwrap();
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let key = key_path.to_str().unwrap();
+    let socket = dir.join("signer.sock");
+    for args in [
+        vec!["self-test", "--key-file", key],
+        vec!["kid", "--key-file", key],
+        vec![
+            "serve",
+            "--key-file",
+            key,
+            "--socket",
+            socket.to_str().unwrap(),
+            "--issuer",
+            "http://localhost",
+        ],
+    ] {
+        let out = run_within(&args, Duration::from_secs(10)).expect("refused at once");
+        let printed = format!("{}{}", text(&out.stdout), text(&out.stderr));
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {printed}");
+        assert!(
+            printed.contains("open to group or others (mode 640)"),
+            "{args:?}: {printed}"
+        );
+        assert!(!printed.contains("PRIVATE KEY"), "{args:?}");
+        for line in pem.lines().filter(|l| !l.starts_with("-----")) {
+            assert!(!printed.contains(line), "{args:?} printed key bytes");
+        }
+    }
+    assert!(!socket.exists(), "serve bound nothing");
+    // 0400 is fine: only the owner can read it.
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+    assert!(signer(&["self-test", "--key-file", key]).status.success());
     let _ = std::fs::remove_dir_all(&dir);
 }

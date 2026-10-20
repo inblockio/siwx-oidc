@@ -96,12 +96,16 @@ Every start logs one line naming the backend and the live `kid`, never key mater
 
 Unset keeps the behaviour from before backends: an existing deployment that sets nothing new
 starts exactly as it did. With `socket`, siwx-oidc holds no private key and never generates one:
-at start it asks the signer for its public key and exits non-zero if that fails or if the
-signer names a `kid` other than the one its public key derives to. Every signature the signer
-returns is verified against that key before it is used. When a signature cannot be had (the
-signer down, slow or misbehaving), the token endpoint answers its retryable 503, signed
-userinfo answers 503, the DID profile field is not written (the next sign-in re-asserts it),
-and a back-channel logout stays queued without spending a delivery attempt.
+at start it asks the signer for its public key and exits non-zero if that fails, if the
+signer names a `kid` other than the one its public key derives to, signs for an issuer other
+than `base_url`, or would refuse the `id_token_ttl_secs` in use (0, or above the signer's
+lifetime limit). Every signature the signer returns is verified against that key before it is
+used. When a signature cannot be had (the signer down, slow or misbehaving), the token endpoint
+answers its retryable 503 (the code or approved device code stays redeemable, and nothing it
+issued stays behind), signed userinfo answers 503, the DID profile field is not written (the
+next sign-in re-asserts it), and a back-channel logout stays queued without spending a delivery
+attempt. A signer that refuses the token itself is a 500 without `Retry-After`. A client may
+register no `userinfo_signed_response_alg` other than `ES256` under `socket`.
 `retired_signing_keys_pem` works with every backend. Setup and the protocol:
 [signer.md](signer.md).
 

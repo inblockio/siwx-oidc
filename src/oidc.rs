@@ -111,19 +111,48 @@ pub use siwx_oidc::signing::{EcdsaSigningKey, ProviderSigner};
 
 /// A failed signature at a request (the token endpoint, signed userinfo).
 ///
-/// A backend fault (the signer down, slow, or answering with a refusal, a
-/// foreign `kid` or a signature that does not verify) is a retryable 503: no
-/// token is issued and nothing is answered that was not signed. An assembly
-/// fault (openidconnect could not build the token) stays the 500 it always was.
-/// The log names the purpose and the failure, never the bytes to be signed.
+/// A signer fault that asking again can cure (the signer down, slow, failing
+/// on its own side, or answering with a foreign `kid` or a signature that does
+/// not verify) is a retryable 503: no token is issued and nothing is answered
+/// that was not signed. A refusal of the message itself (`shape`, and the
+/// protocol refusals) fails the same way on every retry, so it is a 500
+/// `server_error` without `Retry-After`. An assembly fault (openidconnect
+/// could not build the token) stays what it always was. The log names the
+/// purpose and the failure, never the bytes to be signed.
 fn signing_failed(purpose: Purpose) -> impl Fn(SignError) -> CustomError {
     move |e| {
         warn!(purpose = %purpose, error = %e, "signing failed");
-        if e.is_backend() {
-            CustomError::ServiceUnavailable("The signing service is unavailable.".to_string())
-        } else {
-            CustomError::Other(anyhow!("Error signing response."))
+        match e {
+            _ if e.is_retryable() => {
+                CustomError::ServiceUnavailable("The signing service is unavailable.".to_string())
+            }
+            SignError::Refused(_) => CustomError::Coded {
+                status: 500,
+                code: "server_error",
+            },
+            _ => CustomError::Other(anyhow!("Error signing response.")),
         }
+    }
+}
+
+/// Discard a grant a token request issued and then answered nothing for (its
+/// ID token could not be signed): its tokens were never handed out, so no
+/// logout is queued. A failure is logged; the grant then expires unused.
+async fn discard_unanswered_grant(
+    db_client: &DBClientType,
+    issued: &siwx_oidc::db::grant::IssuedGrant,
+    username: &str,
+    device_id: &str,
+) {
+    if let Err(e) = db_client
+        .discard_unanswered_grant(issued, username, device_id)
+        .await
+    {
+        warn!(
+            grant = issued.grant_id.fingerprint(),
+            error = %e,
+            "could not discard the grant of an unanswered token request; it expires unused"
+        );
     }
 }
 
@@ -1458,7 +1487,7 @@ async fn token_device_code(
             // is armed and issues nothing; the claim is released, so the still-approved code
             // is redeemed by a later poll once the homeserver is back (the code expires as
             // usual otherwise). Flag 2 off keeps today's warning.
-            let dev_id = match provision_synapse_device_with(
+            let (dev_id, created_device) = match provision_synapse_device_with(
                 &did,
                 &resolved,
                 synapse_client,
@@ -1470,8 +1499,8 @@ async fn token_device_code(
             )
             .await
             {
-                Ok(Some(dev_id)) => dev_id,
-                Ok(None) => resolve_device_id(proposed_device_id.as_deref()),
+                Ok(Some(device)) => (device.id, device.created),
+                Ok(None) => (resolve_device_id(proposed_device_id.as_deref()), false),
                 Err(()) => {
                     if let Err(e) = db_client.release_device_code_claim(&dc).await {
                         // The claim then lapses with the code: later polls read
@@ -1502,6 +1531,7 @@ async fn token_device_code(
                 .unwrap_or_else(|| did.clone());
 
             // One Matrix-device grant per approved device code (I2).
+            let grant_username = username.clone();
             let issued = db_client
                 .issue_grant(&NewGrant {
                     kind: GrantKind::MatrixDevice,
@@ -1536,10 +1566,7 @@ async fn token_device_code(
                     }
                 })?;
             touch_client_after_use(db_client, &client_id).await;
-            let access_token = issued.access_token;
-            let refresh_token = issued.refresh_token.ok_or_else(|| {
-                anyhow!("device_code grant: issue_grant returned no refresh token")
-            })?;
+            let access_token = issued.access_token.clone();
 
             let core_id_token = SiwxIdTokenClaims::new(
                 IssuerUrl::from_url(config.base_url.clone()),
@@ -1548,14 +1575,13 @@ async fn token_device_code(
                 now,
                 claims,
                 SidClaims {
-                    sid: issued.sid,
+                    sid: issued.sid.clone(),
                     guest: None,
                 },
             );
 
-            // A signing failure answers 503 before the device code is deleted.
             let id_token_access = AccessToken::new(access_token.clone());
-            let id_token = sign_jwt(signing_key, Purpose::IdToken, |key| {
+            let signed = sign_jwt(signing_key, Purpose::IdToken, |key| {
                 SiwxIdToken::new(
                     core_id_token,
                     key,
@@ -1564,8 +1590,37 @@ async fn token_device_code(
                     None,
                 )
             })
-            .await
-            .map_err(signing_failed(Purpose::IdToken))?;
+            .await;
+            let id_token = match signed {
+                Ok(id_token) => id_token,
+                Err(e) => {
+                    // Nothing is answered, so nothing stays behind that nobody
+                    // holds: the grant goes, a device this poll created goes,
+                    // and the claim is released last, so the still-approved code
+                    // (not deleted) is redeemed by the poll the 503 invites.
+                    discard_unanswered_grant(db_client, &issued, &grant_username, &dev_id).await;
+                    if let (true, Some(synapse)) = (created_device, synapse_client) {
+                        let server_name = config.matrix_server_name.as_deref().unwrap_or_default();
+                        if let Err(e) = synapse
+                            .delete_device(&grant_username, &dev_id, server_name)
+                            .await
+                        {
+                            warn!(
+                                device_fp = %siwx_oidc::redact::fingerprint(&dev_id),
+                                error = %e,
+                                "device_code grant: could not delete the device of an unanswered poll"
+                            );
+                        }
+                    }
+                    if let Err(e) = db_client.release_device_code_claim(&dc).await {
+                        warn!(error = %e, "device_code grant: could not release the claim");
+                    }
+                    return Err(signing_failed(Purpose::IdToken)(e));
+                }
+            };
+            let refresh_token = issued.refresh_token.ok_or_else(|| {
+                anyhow!("device_code grant: issue_grant returned no refresh token")
+            })?;
 
             // Cleanup
             let _ = db_client.delete_device_code(&device_ref).await;
@@ -1789,12 +1844,17 @@ async fn token_authorization_code(
         })
     })?;
 
-    let code_entry = db_client.try_consume_code(code).await?.ok_or_else(|| {
-        CustomError::BadRequestToken(TokenError {
-            error: CoreErrorResponseType::InvalidGrant,
-            error_description: "Unknown or already-exchanged code.".to_string(),
-        })
-    })?;
+    let code_entry = db_client
+        .try_consume_code(code.clone())
+        .await?
+        .ok_or_else(|| {
+            CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::InvalidGrant,
+                error_description: "Unknown or already-exchanged code.".to_string(),
+            })
+        })?;
+    // What the code held, to put it back if the exchange answers nothing.
+    let consumed = code_entry.clone();
 
     // Bind the code to the client it was issued to, and authenticate that
     // client, through the helpers the refresh grant uses too. A correct client
@@ -1893,6 +1953,8 @@ async fn token_authorization_code(
 
     // One grant per code exchange (I2): its first access token, its refresh
     // token when one is issued, and its index entries, written in one step.
+    let grant_username = username.clone();
+    let grant_device_id = issuance.device_id.clone();
     let issued = db_client
         .issue_grant(&NewGrant {
             kind: issuance.kind,
@@ -1921,8 +1983,7 @@ async fn token_authorization_code(
             }
         })?;
     touch_client_after_use(db_client, &client_id).await;
-    let refresh_token = issued.refresh_token.map(RefreshToken::new);
-    let access_token = AccessToken::new(issued.access_token);
+    let access_token = AccessToken::new(issued.access_token.clone());
 
     let core_id_token = SiwxIdTokenClaims::new(
         IssuerUrl::from_url(config.base_url.clone()),
@@ -1931,14 +1992,14 @@ async fn token_authorization_code(
         now,
         claims,
         SidClaims {
-            sid: issued.sid,
+            sid: issued.sid.clone(),
             guest,
         },
     )
     .set_nonce(code_entry.nonce)
     .set_auth_time(Some(code_entry.auth_time));
 
-    let id_token = sign_jwt(signing_key, Purpose::IdToken, |key| {
+    let signed = sign_jwt(signing_key, Purpose::IdToken, |key| {
         SiwxIdToken::new(
             core_id_token,
             key,
@@ -1947,8 +2008,30 @@ async fn token_authorization_code(
             None,
         )
     })
-    .await
-    .map_err(signing_failed(Purpose::IdToken))?;
+    .await;
+    let id_token = match signed {
+        Ok(id_token) => id_token,
+        Err(e) => {
+            // Nothing is answered, so nothing stays behind that nobody holds:
+            // the grant goes (no logout: no relying party got its `sid`), then
+            // the code comes back, so the retry a 503 invites redeems it.
+            discard_unanswered_grant(db_client, &issued, &grant_username, &grant_device_id).await;
+            match db_client.restore_code(&code, &consumed).await {
+                Ok(true) => {}
+                Ok(false) => debug!(
+                    code_fp = %siwx_oidc::redact::fingerprint(&code),
+                    "code exchange: the code was not put back (expired)"
+                ),
+                Err(e) => warn!(
+                    code_fp = %siwx_oidc::redact::fingerprint(&code),
+                    error = %e,
+                    "code exchange: could not put the code back after a signing failure"
+                ),
+            }
+            return Err(signing_failed(Purpose::IdToken)(e));
+        }
+    };
+    let refresh_token = issued.refresh_token.map(RefreshToken::new);
 
     let expires_in_secs = ACCESS_TOKEN_TTL;
 
@@ -3134,6 +3217,16 @@ pub async fn provision_synapse_device(
     // Not strict: never `Err`.
     .ok()
     .flatten()
+    .map(|device| device.id)
+}
+
+/// The Matrix device [`provision_synapse_device_with`] provisioned, and whether
+/// that call created it (Synapse answered 201). Only a device the call created
+/// may be deleted again when the sign-in then answers nothing: an existing one
+/// belongs to the user.
+struct ProvisionedDevice {
+    id: String,
+    created: bool,
 }
 
 /// [`provision_synapse_device`], failing closed when `strict` (SS4 flag 2, 8.27): a failed
@@ -3149,7 +3242,7 @@ async fn provision_synapse_device_with(
     server_name: Option<&str>,
     did_publication: Option<&DidPublication<'_>>,
     strict: bool,
-) -> std::result::Result<Option<String>, ()> {
+) -> std::result::Result<Option<ProvisionedDevice>, ()> {
     let Some(synapse) = synapse_client else {
         return Ok(None);
     };
@@ -3165,8 +3258,10 @@ async fn provision_synapse_device_with(
     // the user renamed. Synapse's 201 is the one race-free signal that the
     // device is new: a separate "does it exist?" read could be overtaken by a
     // concurrent sign-in. Failing to name a new device is cosmetic.
+    let mut created = false;
     match synapse.upsert_device(localpart, &dev_id).await {
         Ok(DeviceUpsert::Created) => {
+            created = true;
             if let Err(e) = synapse
                 .update_device_display_name(localpart, &dev_id, display_name)
                 .await
@@ -3200,7 +3295,10 @@ async fn provision_synapse_device_with(
         );
     }
 
-    Ok(Some(dev_id))
+    Ok(Some(ProvisionedDevice {
+        id: dev_id,
+        created,
+    }))
 }
 
 /// What `/authorize` (as an `invalid_scope` redirect) and `/sign_in` (as a 400) tell a
@@ -3787,7 +3885,8 @@ pub async fn sign_in(
                     CoreAuthErrorResponseType::TemporarilyUnavailable,
                     DEVICE_PROVISIONING_UNAVAILABLE_MSG,
                 )
-            })?;
+            })?
+            .map(|device| device.id);
             (resolved.localpart.clone(), device_id)
         }
         ClientClass::Generic => {
@@ -3881,13 +3980,19 @@ pub struct RegisterError {
 }
 
 /// What dynamic registration checks beyond the metadata's own form: the SSRF
-/// guard on `backchannel_logout_uri` (D3) and the D4 switch.
+/// guard on `backchannel_logout_uri` (D3), the D4 switch, and the signed
+/// userinfo algorithm under the `socket` backend.
 #[derive(Clone, Debug, Default)]
 pub struct RegistrationPolicy {
     pub guard: crate::backchannel::UriGuard,
     /// D4 (provisional): a client that may receive refresh tokens must register
     /// a `backchannel_logout_uri`. Off by default, and never in Matrix mode.
     pub require_backchannel_for_refresh: bool,
+    /// `signing_backend = socket`: a `userinfo_signed_response_alg` other than
+    /// ES256 is refused, because the signer signs ES256 only and would refuse
+    /// every userinfo response of that client. The other backends keep
+    /// accepting what they accepted before.
+    pub es256_userinfo_only: bool,
 }
 
 impl RegistrationPolicy {
@@ -3896,7 +4001,30 @@ impl RegistrationPolicy {
             guard: crate::backchannel::UriGuard::new(&config.backchannel_logout_allowed_hosts),
             require_backchannel_for_refresh: config.backchannel_logout_required_for_refresh
                 && !delegated_auth_enabled(config),
+            es256_userinfo_only: matches!(
+                config.signing_backend(),
+                Ok(crate::config::SigningBackend::Socket { .. })
+            ),
         }
+    }
+}
+
+/// Under [`RegistrationPolicy::es256_userinfo_only`], a client asks for no
+/// signed userinfo or for ES256, else `invalid_client_metadata`.
+fn check_userinfo_alg(
+    payload: &SiwxClientMetadata,
+    policy: &RegistrationPolicy,
+) -> Result<(), CustomError> {
+    match payload.userinfo_signed_response_alg() {
+        Some(alg)
+            if policy.es256_userinfo_only && *alg != CoreJwsSigningAlgorithm::EcdsaP256Sha256 =>
+        {
+            warn!(alg = ?alg, "registration: userinfo_signed_response_alg other than ES256 refused (signing_backend = socket)");
+            Err(CustomError::BadRequestRegister(RegisterError {
+                error: CoreRegisterErrorResponseType::InvalidClientMetadata,
+            }))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -3922,6 +4050,7 @@ pub async fn register(
         }
     }
     check_logout_metadata(&payload, policy).await?;
+    check_userinfo_alg(&payload, policy)?;
     let logout_metadata = payload.additional_metadata().clone();
 
     let access_token = RegistrationAccessToken::new(
@@ -4327,6 +4456,7 @@ pub async fn client_update(
 ) -> Result<(), CustomError> {
     let mut client_entry = client_access(client_id.clone(), bearer, db_client).await?;
     check_logout_metadata(&payload, policy).await?;
+    check_userinfo_alg(&payload, policy)?;
     client_entry.metadata = payload;
     Ok(db_client.set_client(client_id, client_entry).await?)
 }
@@ -8623,6 +8753,8 @@ mod device_display_name_tests {
         devices: Mutex<HashMap<String, Option<String>>>,
         upserts: Mutex<Vec<serde_json::Value>>,
         renames: Mutex<Vec<serde_json::Value>>,
+        /// Device ids `delete_device` removed.
+        deletes: Mutex<Vec<String>>,
         always_200: bool,
     }
 
@@ -8645,6 +8777,7 @@ mod device_display_name_tests {
             ),
             upserts: Mutex::new(Vec::new()),
             renames: Mutex::new(Vec::new()),
+            deletes: Mutex::new(Vec::new()),
             always_200,
         });
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -8712,6 +8845,21 @@ mod device_display_name_tests {
                                 StatusCode::OK
                             }
                             None => StatusCode::NOT_FOUND,
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/_synapse/mas/delete_device",
+                post(
+                    |State(hs): State<Arc<Homeserver>>, Json(body): Json<serde_json::Value>| async move {
+                        let id = body["device_id"].as_str().unwrap().to_string();
+                        let existed = hs.devices.lock().unwrap().remove(&id).is_some();
+                        hs.deletes.lock().unwrap().push(id);
+                        if existed {
+                            StatusCode::NO_CONTENT
+                        } else {
+                            StatusCode::NOT_FOUND
                         }
                     },
                 ),
@@ -8998,9 +9146,6 @@ mod device_display_name_tests {
         );
     }
 
-    /// The grant of an approved device code counts from the approval, the
-    /// authentication, which the approval records on the entry from Redis
-    /// `TIME`; not from the poll that redeems it (I6).
     /// The device-code grant signs its ID token through the same path as the
     /// code exchange: with the `socket` signer down it answers the retryable
     /// 503 and no token, and the approved code is not deleted.
@@ -9081,6 +9226,234 @@ mod device_display_name_tests {
         );
     }
 
+    /// AUDIT PR83 F1: a signing failure in the device-code grant answers the
+    /// retryable 503 and keeps the approved code, but leaves the redemption
+    /// claim set, so the retry the 503 invites never redeems the code: every
+    /// later poll is `authorization_pending` until the code expires. The
+    /// failed poll has also provisioned a Matrix device and issued a grant that
+    /// nobody holds.
+    #[tokio::test]
+    async fn audit_pr83_a_device_grant_retried_after_a_signer_outage_is_redeemed() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (synapse, hs, server) = spawn(&[]).await;
+        let nonce = Uuid::new_v4().simple().to_string();
+        let client_id = format!("device-signer-retry-{nonce}");
+        db.set_client(client_id.clone(), client_entry(Some("Pocket Client")))
+            .await
+            .unwrap();
+        let device_code = format!("dvc_signer-retry-{nonce}");
+        let approved_at = Utc::now().timestamp();
+        db.set_device_code(
+            &device_code,
+            &DeviceCodeEntry {
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!("SR-{nonce}")),
+                legacy_user_code: None,
+                client_id: client_id.clone(),
+                scope: "openid".to_string(),
+                status: DeviceCodeStatus::Approved,
+                did: Some(DID.to_string()),
+                device_id: None,
+                last_poll: None,
+                created_at: approved_at,
+                auth_ms: Some(approved_at * 1000),
+                expected_mxid: None,
+            },
+            DEVICE_CODE_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let config = Config {
+            mas_shared_secret: Some("secret".to_string()),
+            matrix_server_name: Some(SERVER_NAME.to_string()),
+            ..Config::default()
+        };
+        let form = || TokenForm {
+            code: None,
+            client_id: Some(client_id.clone()),
+            client_secret: None,
+            grant_type: CoreGrantType::DeviceCode,
+            code_verifier: None,
+            refresh_token: None,
+            device_code: Some(device_code.clone()),
+        };
+        let key = EcdsaSigningKey::generate();
+        let service = siwx_oidc::test_support::TestSigner::start(
+            key.clone(),
+            siwx_oidc::test_support::TestSigner::options(),
+        );
+        let signer = siwx_oidc::signing::socket::SocketSigner::connect(
+            &service.socket,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        service.stop();
+        let first = token(
+            form(),
+            ClientCredentials::default(),
+            &signer,
+            &config,
+            &db,
+            Some(&synapse),
+        )
+        .await;
+        assert!(matches!(first, Err(CustomError::ServiceUnavailable(_))));
+        let devices_after_failure = hs.devices.lock().unwrap().len();
+        assert_eq!(
+            hs.upserts.lock().unwrap().len(),
+            1,
+            "the failed poll provisioned one device"
+        );
+        assert_eq!(
+            devices_after_failure, 0,
+            "and deleted it again: no phantom device"
+        );
+        assert_eq!(hs.deletes.lock().unwrap().len(), 1);
+        // A client that waits its interval before it polls again.
+        let (dref, mut entry) = db.get_device_code(&device_code).await.unwrap().unwrap();
+        entry.last_poll = Some(Utc::now().timestamp() - DEVICE_CODE_INTERVAL as i64 - 1);
+        db.update_device_code(&dref, &entry).await.unwrap();
+
+        // The signer is back: the retry the 503 asked for.
+        let retry = token(
+            form(),
+            ClientCredentials::default(),
+            &key,
+            &config,
+            &db,
+            Some(&synapse),
+        )
+        .await;
+        server.abort();
+        assert!(
+            retry.is_ok(),
+            "the approved code is redeemed once the signer is back, not {:?} \
+             (the failed poll left {devices_after_failure} Matrix device(s))",
+            retry.as_ref().err()
+        );
+        assert_eq!(
+            hs.devices.lock().unwrap().len(),
+            1,
+            "one device, the redeemed one"
+        );
+        assert!(
+            db.get_device_code(&device_code).await.unwrap().is_none(),
+            "the redeemed code is gone"
+        );
+    }
+
+    /// AUDIT PR83 F1: a poll that fails to sign for a device the client
+    /// proposed and that already existed leaves that device alone (it is the
+    /// user's), and the retry redeems the code for the same device.
+    #[tokio::test]
+    async fn a_failed_poll_never_deletes_a_device_it_did_not_create() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (synapse, hs, server) = spawn(&["KEPTDEVICE"]).await;
+        let nonce = Uuid::new_v4().simple().to_string();
+        let client_id = format!("device-signer-keep-{nonce}");
+        db.set_client(client_id.clone(), client_entry(Some("Pocket Client")))
+            .await
+            .unwrap();
+        let device_code = format!("dvc_signer-keep-{nonce}");
+        let approved_at = Utc::now().timestamp();
+        let scope = "openid urn:matrix:client:api:* urn:matrix:client:device:KEPTDEVICE";
+        db.set_device_code(
+            &device_code,
+            &DeviceCodeEntry {
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!("SK-{nonce}")),
+                legacy_user_code: None,
+                client_id: client_id.clone(),
+                scope: scope.to_string(),
+                status: DeviceCodeStatus::Approved,
+                did: Some(DID.to_string()),
+                device_id: None,
+                last_poll: None,
+                created_at: approved_at,
+                auth_ms: Some(approved_at * 1000),
+                expected_mxid: None,
+            },
+            DEVICE_CODE_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let config = Config {
+            mas_shared_secret: Some("secret".to_string()),
+            matrix_server_name: Some(SERVER_NAME.to_string()),
+            ..Config::default()
+        };
+        let form = || TokenForm {
+            code: None,
+            client_id: Some(client_id.clone()),
+            client_secret: None,
+            grant_type: CoreGrantType::DeviceCode,
+            code_verifier: None,
+            refresh_token: None,
+            device_code: Some(device_code.clone()),
+        };
+        let key = EcdsaSigningKey::generate();
+        let service = siwx_oidc::test_support::TestSigner::start(
+            key.clone(),
+            siwx_oidc::test_support::TestSigner::options(),
+        );
+        let signer = siwx_oidc::signing::socket::SocketSigner::connect(
+            &service.socket,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        service.stop();
+        let first = token(
+            form(),
+            ClientCredentials::default(),
+            &signer,
+            &config,
+            &db,
+            Some(&synapse),
+        )
+        .await;
+        assert!(matches!(first, Err(CustomError::ServiceUnavailable(_))));
+        assert!(
+            hs.deletes.lock().unwrap().is_empty(),
+            "an existing device is never deleted"
+        );
+        assert_eq!(
+            hs.devices.lock().unwrap()["KEPTDEVICE"].as_deref(),
+            Some(USERS_NAME)
+        );
+        let (dref, mut entry) = db.get_device_code(&device_code).await.unwrap().unwrap();
+        entry.last_poll = Some(Utc::now().timestamp() - DEVICE_CODE_INTERVAL as i64 - 1);
+        db.update_device_code(&dref, &entry).await.unwrap();
+        let retry = token(
+            form(),
+            ClientCredentials::default(),
+            &key,
+            &config,
+            &db,
+            Some(&synapse),
+        )
+        .await;
+        server.abort();
+        use openidconnect::OAuth2TokenResponse;
+        let response = retry.expect("the retry redeems the code");
+        let scopes: Vec<String> = response
+            .scopes()
+            .unwrap()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(
+            scopes.contains(&"urn:matrix:client:device:KEPTDEVICE".to_string()),
+            "{scopes:?}"
+        );
+    }
+
+    /// The grant of an approved device code counts from the approval, the
+    /// authentication, which the approval records on the entry from Redis
+    /// `TIME`; not from the poll that redeems it (I6).
     #[tokio::test]
     async fn a_device_grant_counts_its_lifetime_from_the_approval() {
         let Some(db) = siwx_oidc::test_support::redis().await else {
@@ -11951,6 +12324,63 @@ mod backchannel_registration_tests {
             ),
             other => panic!("{what} must be refused as invalid_client_metadata, got {other:?}"),
         }
+    }
+
+    /// AUDIT PR83 F6: under `signing_backend = socket` a client asks for no
+    /// signed userinfo or for ES256; any other algorithm would make every
+    /// userinfo response of that client a signer refusal. Registration and the
+    /// client update refuse it; the other backends accept it as before.
+    #[tokio::test]
+    async fn socket_mode_refuses_a_userinfo_alg_other_than_es256_at_registration() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let socket = Config {
+            signing_backend: Some(crate::config::SigningBackendKind::Socket),
+            signer_socket: Some("/run/signer/signer.sock".into()),
+            ..Config::default()
+        };
+        let policy = RegistrationPolicy::from_config(&socket);
+        assert!(policy.es256_userinfo_only);
+        assert!(!RegistrationPolicy::from_config(&Config::default()).es256_userinfo_only);
+        let base = Config::default().base_url;
+        let rs256 = || payload(serde_json::json!({ "userinfo_signed_response_alg": "RS256" }));
+        refused_as_metadata(
+            register(rs256(), base.clone(), &db, &policy).await,
+            "RS256 under the socket backend",
+        );
+        let accepted = register(
+            payload(serde_json::json!({ "userinfo_signed_response_alg": "ES256" })),
+            base.clone(),
+            &db,
+            &policy,
+        )
+        .await
+        .expect("ES256 is what the signer signs");
+        register(payload(serde_json::json!({})), base.clone(), &db, &policy)
+            .await
+            .expect("no signed userinfo at all");
+        let client_id = accepted.client_id().to_string();
+        let token = accepted
+            .registration_access_token()
+            .unwrap()
+            .secret()
+            .clone();
+        refused_as_metadata(
+            client_update(
+                client_id.clone(),
+                rs256(),
+                Some(headers::Authorization::bearer(&token).unwrap().0),
+                &db,
+                &policy,
+            )
+            .await,
+            "RS256 in a client update",
+        );
+        register(rs256(), base, &db, &RegistrationPolicy::default())
+            .await
+            .expect("the in-process backends accept what they accepted before");
+        db.delete_client(client_id).await.ok();
     }
 
     #[tokio::test]

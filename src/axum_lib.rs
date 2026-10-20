@@ -372,10 +372,14 @@ async fn token(
         // Wrap non-Token errors so they always produce a JSON body.
         let error = match e {
             // A server-side fault (the store, a dependency) decides nothing about the
-            // grant: `TokenEndpointError` answers it with a retryable 503.
+            // grant: `TokenEndpointError` answers it with a retryable 503. A signer's
+            // refusal of the token (`signing_backend = socket`) is the 500
+            // `server_error` it was raised as: a retry fails the same way, and a 4xx
+            // would end a Matrix client's session.
             CustomError::BadRequestToken(_)
             | CustomError::ServiceUnavailable(_)
-            | CustomError::Other(_) => e,
+            | CustomError::Other(_)
+            | CustomError::Coded { status: 500, .. } => e,
             CustomError::Unauthorized(msg) => CustomError::BadRequestToken(oidc::TokenError {
                 error: CoreErrorResponseType::InvalidClient,
                 error_description: msg,
@@ -1819,7 +1823,10 @@ pub async fn main() {
         config::SigningBackend::Socket { path, timeout } => {
             // The key lives in the signer process; this one never holds or
             // generates one. A signer that cannot be asked, or that names a `kid`
-            // its key does not derive to, stops the start.
+            // its key does not derive to, stops the start. So does one that would
+            // refuse every token this server asks for (another issuer, a token
+            // lifetime above its limit, or 0): its healthcheck would stay green
+            // while every sign-in failed.
             let signer = siwx_oidc::signing::socket::SocketSigner::connect(path.clone(), timeout)
                 .await
                 .unwrap_or_else(|e| {
@@ -1829,6 +1836,21 @@ pub async fn main() {
                          public key failed: {e}"
                     )
                 });
+            signer
+                .check_fits(
+                    config.base_url.as_str(),
+                    &[
+                        (
+                            "id_token_ttl_secs (SIWXOIDC_ID_TOKEN_TTL_SECS)",
+                            config.id_token_ttl_secs,
+                        ),
+                        (
+                            "the back-channel logout token lifetime",
+                            crate::backchannel::LOGOUT_TOKEN_LIFETIME_SECS.unsigned_abs(),
+                        ),
+                    ],
+                )
+                .unwrap_or_else(|e| panic!("FATAL: signing_backend = socket: {e}"));
             Arc::new(signer)
         }
         config::SigningBackend::Pem => {
@@ -3296,7 +3318,8 @@ mod token_store_fault_tests {
 mod signer_fault_tests {
     //! With `signing_backend = socket` and the signer down, `POST /token` answers the
     //! retryable 503 of a server-side fault (with `Retry-After`, no `errcode`, no
-    //! token) and signed userinfo answers 503: nothing unsigned is handed out.
+    //! token) and signed userinfo answers 503: nothing unsigned is handed out. A
+    //! signer that refuses the message itself is a 500 without `Retry-After`.
     use super::*;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use headers::authorization::Bearer;
@@ -3345,15 +3368,9 @@ mod signer_fault_tests {
         ClientEntry::new("client-secret", metadata, None)
     }
 
-    #[tokio::test]
-    async fn a_stopped_signer_is_a_retryable_503_at_the_token_endpoint_and_at_signed_userinfo() {
-        let Some(redis) = siwx_oidc::test_support::redis().await else {
-            return;
-        };
-        let service = TestSigner::start(EcdsaSigningKey::generate(), TestSigner::options());
-        let signer = SocketSigner::connect(&service.socket, std::time::Duration::from_secs(2))
-            .await
-            .unwrap();
+    /// A client with signed userinfo, a code for it, and an access token of
+    /// its grant: `(client_id, code, access_token)`.
+    async fn fixture(redis: &RedisClient) -> (String, String, String) {
         let tag = uuid::Uuid::new_v4().simple().to_string();
         let client_id = format!("signer-fault-{tag}");
         redis
@@ -3398,15 +3415,21 @@ mod signer_fault_tests {
             .await
             .unwrap()
             .access_token;
-        service.stop();
-        let state = state(redis, Arc::new(signer));
+        (client_id, code, access)
+    }
 
+    /// `POST /token` for `code`: status, `Retry-After`, body.
+    async fn exchange(
+        state: &AppState,
+        client_id: &str,
+        code: &str,
+    ) -> (StatusCode, Option<header::HeaderValue>, serde_json::Value) {
         let response = token(
             State(state.clone()),
             HeaderMap::new(),
             Form(oidc::TokenForm {
-                code: Some(code),
-                client_id: Some(client_id),
+                code: Some(code.to_string()),
+                client_id: Some(client_id.to_string()),
                 client_secret: None,
                 grant_type: openidconnect::core::CoreGrantType::AuthorizationCode,
                 code_verifier: Some(VERIFIER.to_string()),
@@ -3422,20 +3445,77 @@ mod signer_fault_tests {
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        (status, retry_after, body)
+    }
+
+    /// Signed userinfo for `access`: status and `Retry-After`.
+    async fn signed_userinfo(
+        state: &AppState,
+        access: &str,
+    ) -> (StatusCode, Option<header::HeaderValue>) {
+        let response = userinfo(
+            State(state.clone()),
+            Some(TypedHeader(
+                Authorization::<Bearer>::bearer(access).unwrap(),
+            )),
+        )
+        .await
+        .into_response();
+        let retry_after = response.headers().get(header::RETRY_AFTER).cloned();
+        (response.status(), retry_after)
+    }
+
+    #[tokio::test]
+    async fn a_stopped_signer_is_a_retryable_503_at_the_token_endpoint_and_at_signed_userinfo() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let service = TestSigner::start(EcdsaSigningKey::generate(), TestSigner::options());
+        let signer = SocketSigner::connect(&service.socket, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let (client_id, code, access) = fixture(&redis).await;
+        service.stop();
+        let state = state(redis, Arc::new(signer));
+
+        let (status, retry_after, body) = exchange(&state, &client_id, &code).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert_eq!(body["error"], "temporarily_unavailable", "{body}");
         assert!(body.get("errcode").is_none(), "no errcode: {body}");
         assert!(body.get("id_token").is_none() && body.get("access_token").is_none());
         assert!(retry_after.is_some(), "the 503 says when to retry");
 
-        let response = userinfo(
-            State(state),
-            Some(TypedHeader(
-                Authorization::<Bearer>::bearer(&access).unwrap(),
-            )),
-        )
-        .await
-        .into_response();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let (status, _) = signed_userinfo(&state, &access).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// AUDIT PR83 F6: a signer that refuses the message (`shape`; here a
+    /// signer started for another issuer, which the start check would have
+    /// stopped) fails the same way on every retry. It is a 500 `server_error`
+    /// without `Retry-After`, never the retryable 503, and no token.
+    #[tokio::test]
+    async fn a_shape_refusal_is_a_500_without_retry_after_never_the_retryable_503() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let mut options = TestSigner::options();
+        options.issuer = "https://other.example.org".to_string();
+        let service = TestSigner::start(EcdsaSigningKey::generate(), options);
+        let signer = SocketSigner::connect(&service.socket, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let (client_id, code, access) = fixture(&redis).await;
+        let state = state(redis, Arc::new(signer));
+
+        let (status, retry_after, body) = exchange(&state, &client_id, &code).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["error"], "server_error", "{body}");
+        assert!(retry_after.is_none(), "no Retry-After for a refusal");
+        assert!(body.get("id_token").is_none() && body.get("access_token").is_none());
+
+        let (status, retry_after) = signed_userinfo(&state, &access).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(retry_after.is_none());
+        drop(service);
     }
 }

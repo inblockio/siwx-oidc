@@ -179,8 +179,9 @@ fn test_pem() -> String {
 }
 
 /// Generate a key with `siwx-signer keygen` and serve it on `socket` for this
-/// process's uid. Returns the signer and the key's kid.
-fn start_signer(dir: &Path, socket: &Path) -> (Process, String) {
+/// process's uid, for the issuer `http://localhost` unless `env` says
+/// otherwise. Returns the signer and the key's kid.
+fn start_signer(dir: &Path, socket: &Path, env: &[(&str, &str)]) -> (Process, String) {
     let bin = env!("CARGO_BIN_EXE_siwx-signer");
     let key = dir.join("signing_key");
     std::fs::File::create(&key).unwrap();
@@ -205,6 +206,9 @@ fn start_signer(dir: &Path, socket: &Path) -> (Process, String) {
         .env("SIWX_SIGNER_ISSUER", "http://localhost")
         .env("SIWX_SIGNER_ALLOWED_UID", current_uid().to_string())
         .arg("serve");
+    for (key, value) in env {
+        command.env(key, value);
+    }
     let mut signer = Process::spawn(command);
     signer
         .wait_for("siwx-signer listening")
@@ -251,7 +255,7 @@ fn the_unset_backend_starts_as_before_and_names_its_backend() {
 fn the_socket_backend_starts_with_the_signers_key_and_publishes_it() {
     let dir = temp_dir("startup-socket");
     let socket = dir.join("signer.sock");
-    let (_signer, kid) = start_signer(&dir, &socket);
+    let (_signer, kid) = start_signer(&dir, &socket, &[]);
     let socket = socket.to_str().unwrap().to_string();
     let mut server = server(&[
         ("SIWXOIDC_SIGNING_BACKEND", "socket"),
@@ -308,6 +312,64 @@ fn the_socket_backend_refuses_to_start_without_a_signer_or_with_a_pem() {
     let (status, output) = server(&[("SIWXOIDC_SIGNING_BACKEND", "pem")]).exit();
     assert!(!status.success());
     assert!(output.contains("needs signing_key_pem"), "{output}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AUDIT PR83 F5: the signer's `public` answer names its issuer and its
+/// longest token lifetime, and the server refuses to start when the signer
+/// would refuse every token it asks for: another issuer, an
+/// `id_token_ttl_secs` above the signer's limit, or 0. Without the check the
+/// signer's healthcheck stays green while every sign-in fails.
+#[test]
+fn the_socket_backend_refuses_a_signer_for_another_issuer_or_a_lifetime_it_will_not_sign() {
+    let dir = temp_dir("startup-fits");
+    let socket = dir.join("signer.sock");
+    let (_signer, _kid) = start_signer(
+        &dir,
+        &socket,
+        &[("SIWX_SIGNER_MAX_TOKEN_LIFETIME_SECS", "600")],
+    );
+    let socket = socket.to_str().unwrap().to_string();
+    let backend = [
+        ("SIWXOIDC_SIGNING_BACKEND", "socket"),
+        ("SIWXOIDC_SIGNER_SOCKET", socket.as_str()),
+    ];
+    let with = |extra: &[(&'static str, &'static str)]| {
+        let mut env: Vec<(&str, &str)> = backend.to_vec();
+        env.extend_from_slice(extra);
+        server(&env).exit()
+    };
+
+    let (status, output) = with(&[("SIWXOIDC_ID_TOKEN_TTL_SECS", "601")]);
+    assert!(!status.success(), "{output}");
+    assert!(
+        output.contains("id_token_ttl_secs (SIWXOIDC_ID_TOKEN_TTL_SECS) is 601 s, above the signer's limit of 600 s"),
+        "{output}"
+    );
+    assert!(!output.contains("Listening on"), "{output}");
+
+    let (status, output) = with(&[("SIWXOIDC_ID_TOKEN_TTL_SECS", "0")]);
+    assert!(!status.success(), "{output}");
+    assert!(
+        output.contains("SIWXOIDC_ID_TOKEN_TTL_SECS) is 0"),
+        "{output}"
+    );
+
+    let (status, output) = with(&[("SIWXOIDC_BASE_URL", "http://other.localhost")]);
+    assert!(!status.success(), "{output}");
+    assert!(
+        output.contains("the signer signs for issuer \"http://localhost/\""),
+        "{output}"
+    );
+
+    // The same signer with a lifetime it signs: the server starts.
+    let mut fits = server(&[
+        ("SIWXOIDC_SIGNING_BACKEND", "socket"),
+        ("SIWXOIDC_SIGNER_SOCKET", socket.as_str()),
+        ("SIWXOIDC_ID_TOKEN_TTL_SECS", "600"),
+    ]);
+    assert_eq!(backend_line(&mut fits).0, "socket");
+    listening_port(&mut fits);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

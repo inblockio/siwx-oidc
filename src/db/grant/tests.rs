@@ -1974,3 +1974,78 @@ async fn end_grant_by_sid_deletes_exactly_the_named_grant_of_its_client_and_did(
         EndedGrant::NotFound
     );
 }
+
+/// AUDIT PR83 F1/F2: a grant whose tokens were never answered (its ID token
+/// could not be signed) is discarded with its access token, its index entries
+/// and its sid entry, and queues no back-channel logout, unlike a revocation
+/// of the same kind of grant.
+#[tokio::test]
+async fn an_unanswered_grant_is_discarded_with_its_tokens_and_queues_no_logout() {
+    let Some(client) = crate::test_support::redis().await else {
+        return;
+    };
+    let user = format!("discard{}", nonce());
+    let oidc = NewGrant {
+        kind: GrantKind::Oidc,
+        device_id: String::new(),
+        ..matrix_grant(&user, "")
+    };
+    let pending = |id: GrantId| {
+        let client = &client;
+        async move {
+            client
+                .pending_logout_entries()
+                .await
+                .expect("pending_logout_entries")
+                .into_iter()
+                .filter(|(e, _)| e.grant == id.as_str())
+                .count()
+        }
+    };
+
+    for new in [oidc.clone(), matrix_grant(&user, "DEV1")] {
+        let issued = issue(&client, &new).await;
+        let sid = issued.sid.clone().expect("an ID-token grant has a sid");
+        assert!(client
+            .discard_unanswered_grant(&issued, &new.username, &new.device_id)
+            .await
+            .unwrap());
+        assert!(!tombstone(&client, &grant_key(&issued.grant_id)).await);
+        assert!(!tombstone(&client, &at_key(&issued.access_token)).await);
+        assert!(!tombstone(&client, &format!("idx:grants:sid/{sid}")).await);
+        assert!(client
+            .check_access_token(&issued.access_token)
+            .await
+            .unwrap()
+            .is_none());
+        let mut indices = vec![user_idx_key(&user)];
+        if !new.device_id.is_empty() {
+            indices.push(device_idx_key(&user, &new.device_id));
+        }
+        for idx in indices {
+            let members: Vec<String> = raw(&client, &["SMEMBERS", &idx]).await;
+            assert!(
+                !members.contains(&issued.grant_id.as_str().to_string()),
+                "{idx}"
+            );
+        }
+        assert_eq!(
+            pending(issued.grant_id.clone()).await,
+            0,
+            "no logout queued"
+        );
+        assert!(!client
+            .discard_unanswered_grant(&issued, &new.username, &new.device_id)
+            .await
+            .unwrap());
+    }
+
+    // The control: revoking an answered `oidc` grant queues its logout.
+    let answered = issue(&client, &oidc).await;
+    client
+        .revoke_grant_of_token(&answered.access_token)
+        .await
+        .unwrap()
+        .expect("the grant of a live token");
+    assert_eq!(pending(answered.grant_id.clone()).await, 1);
+}

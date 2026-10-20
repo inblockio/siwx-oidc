@@ -7,6 +7,13 @@
 //! derives to is refused. Every signature is then checked before it is used:
 //! the answer must name that `kid`, and the signature must verify against the
 //! cached public key (one P-256 verify). A failure is an error, never a token.
+//!
+//! The `public` answer also names the issuer and the longest token lifetime
+//! the signer signs. [`SocketSigner::check_fits`] compares them with this
+//! process's configuration at start: a signer that would refuse every token
+//! (another issuer, a shorter limit) stops the start, while its healthcheck
+//! would stay green. Both are cached with the key, so a signer restarted with
+//! another key, issuer or limit needs a siwx-oidc restart too.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -29,6 +36,8 @@ pub struct SocketSigner {
     timeout: Duration,
     kid: String,
     verifying_key: VerifyingKey,
+    issuer: String,
+    max_token_lifetime_secs: i64,
 }
 
 impl SocketSigner {
@@ -61,12 +70,54 @@ impl SocketSigner {
             timeout,
             kid,
             verifying_key,
+            issuer: public.issuer,
+            max_token_lifetime_secs: public.max_token_lifetime_secs,
         })
     }
 
     /// The socket this signer is reached at.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The issuer the signer checks every `iss` against.
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// The longest `exp - iat` the signer signs, in seconds.
+    pub fn max_token_lifetime_secs(&self) -> i64 {
+        self.max_token_lifetime_secs
+    }
+
+    /// Whether the tokens this process will ask for are ones the signer signs:
+    /// `issuer` (this process's `base_url`, as it writes `iss`) is the
+    /// signer's, and every lifetime in `lifetimes` (a name for the message,
+    /// and seconds) is at least 1 and at most the signer's limit. The error
+    /// names the setting to change.
+    pub fn check_fits(&self, issuer: &str, lifetimes: &[(&str, u64)]) -> Result<(), String> {
+        if issuer != self.issuer {
+            return Err(format!(
+                "the signer signs for issuer {:?}, this server writes {issuer:?}: start the \
+                 signer with --issuer set to this server's base_url",
+                self.issuer
+            ));
+        }
+        for (name, secs) in lifetimes {
+            if *secs == 0 {
+                return Err(format!(
+                    "{name} is 0: the signer refuses a token that expires when it is issued"
+                ));
+            }
+            if i64::try_from(*secs).map_or(true, |s| s > self.max_token_lifetime_secs) {
+                return Err(format!(
+                    "{name} is {secs} s, above the signer's limit of {} s: lower it, or raise \
+                     the signer's --max-token-lifetime-secs",
+                    self.max_token_lifetime_secs
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

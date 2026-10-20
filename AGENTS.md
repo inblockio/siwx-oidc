@@ -100,10 +100,10 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 45 tests in thirteen files:
+  `cargo test --workspace` runs the unit tests of both crates plus 49 tests in thirteen files:
   `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (6),
   `static_client_startup` (10), `log_hygiene_credential_store` (1),
-  `log_capture_callsite_interest` (1), `siwx_signer_cli` (7) and `signing_backend_startup` (3),
+  `log_capture_callsite_interest` (1), `siwx_signer_cli` (10) and `signing_backend_startup` (4),
   which need nothing; `account_linking_dual_write` (6), which needs the test Redis, and `log_hygiene`
   (4, one of them needs it);
   `credential_migration_live` (2), which needs its own disposable, empty Redis named by
@@ -244,21 +244,42 @@ doc; read it before changing the code the rule covers.
   `the_capture_path_gives_the_in_process_key_byte_identical_tokens`.
 - **`signing_backend = socket`: siwx-oidc holds no private key.** It refuses `signing_key_pem` from
   any layer, never generates a key, derives the `kid` itself from the signer's public key at start
-  and exits when the signer names another, and verifies every signature against that key before
-  using it. Unset keeps the behaviour from before backends. Pin:
+  and exits when the signer names another, exits when the signer's `public` answer names another
+  issuer than `base_url` or a lifetime limit below `id_token_ttl_secs` (or the logout token's), or
+  `id_token_ttl_secs` is 0, and verifies every signature against that key before using it. Unset
+  keeps the behaviour from before backends. Pin:
   `socket_refuses_a_pem_from_every_layer`, `an_unset_backend_keeps_the_behaviour_from_before_backends`,
   `connect_derives_the_kid_itself_and_refuses_a_signer_that_names_another`,
+  `connect_keeps_the_signers_issuer_and_limit_and_refuses_what_it_would_not_sign`,
   `every_sign_answer_is_verified_and_a_bad_one_is_an_error_never_a_signature`,
-  `the_socket_backend_refuses_to_start_without_a_signer_or_with_a_pem`.
+  `the_socket_backend_refuses_to_start_without_a_signer_or_with_a_pem`,
+  `the_socket_backend_refuses_a_signer_for_another_issuer_or_a_lifetime_it_will_not_sign`.
 - **A signature that cannot be had fails closed**: a retryable 503 at `/token` and at signed
   userinfo, no DID field write (never `{did}` over a good proof), a logout kept queued without
-  spending an attempt. Pin: `a_stopped_signer_is_a_retryable_503_at_the_token_endpoint_and_at_signed_userinfo`,
+  spending an attempt. A refusal of the message itself (`shape`, a protocol refusal) is a 500
+  `server_error` without `Retry-After` (`SignError::is_retryable`), never the retryable 503. A
+  token request whose ID token cannot be signed leaves nothing behind that nobody holds: the
+  grant it issued is discarded with no logout queued (`discard_unanswered_grant`, a quiet
+  `drop_grant`), the authorization code is put back for the rest of its life (`restore_code`),
+  and a device-code poll deletes the Matrix device it created (never one that existed) and
+  releases its claim, so the retry redeems the same code. Pin:
+  `a_stopped_signer_is_a_retryable_503_at_the_token_endpoint_and_at_signed_userinfo`,
+  `a_shape_refusal_is_a_500_without_retry_after_never_the_retryable_503`,
+  `audit_pr83_a_code_exchange_retried_after_a_signer_outage_succeeds`,
+  `audit_pr83_a_device_grant_retried_after_a_signer_outage_is_redeemed`,
+  `a_failed_poll_never_deletes_a_device_it_did_not_create`,
+  `an_unanswered_grant_is_discarded_with_its_tokens_and_queues_no_logout`,
   `with_the_signer_stopped_the_did_field_is_not_written`,
   `through_the_socket_signer_a_logout_is_delivered_and_a_stopped_signer_spends_no_attempt`.
 - **`siwx-signer` signs only the shapes siwx-oidc emits** (`signing::shape`), and logs neither
   key nor message bytes. A change to what a token carries (a new header member, a new `typ`, an
-  `exp` on the DID assertion) must change the shape check in the same change, or the `socket`
-  backend answers 503 for it. Pin: the `signing::shape` tests, every test in
+  `exp` on the DID assertion, a claim userinfo or an ID token did not carry) must change the shape
+  check in the same change, or the `socket` backend answers a 500 for it. The purposes stay
+  disjoint: userinfo carries no time and no `nonce`, `at_hash`, `c_hash`, `auth_time`, `sid` or
+  `mxid`, and an ID token and a logout token no `mxid`, so no signature serves as an endless ID
+  token or a DID proof; a member named twice is refused. Pin: the `signing::shape` tests
+  (`no_purpose_signs_what_another_purpose_emits`, `audit_pr83_a_member_named_twice_is_refused`),
+  `audit_pr83_a_userinfo_signature_is_not_a_did_proof`, every test in
   `oidc::signer_backend_tests`, `a_shape_refusal_and_a_signature_log_the_purpose_and_length_never_the_message`.
 - **`kid` is derived from the public key** (`signing::fingerprint_of_public`, through
   `EcdsaSigningKey::fingerprint_of`; `siwx-signer` and the socket backend use the same function).
@@ -877,7 +898,9 @@ doc; read it before changing the code the rule covers.
   and no `errcode`, never a 4xx.** Element Web (matrix-js-sdk) ends the session on any 4xx from
   the token endpoint and on any error body with an `errcode`, 5xx included; it retries every
   other failure. `TokenEndpointError` renders `ServiceUnavailable` and `Other` (a store error,
-  a dependency) this way, and the body names no internal error. A refresh whose rotation
+  a dependency) this way, and the body names no internal error. The one 500 is a signer's
+  refusal of the token (`signing_backend = socket`): `server_error` without `Retry-After`, no
+  `errcode`, because a retry fails the same way. A refresh whose rotation
   committed before the fault gets the same pair on the retry (I4). Pin:
   `a_store_fault_at_the_token_endpoint_is_a_retryable_503_without_an_errcode`,
   and for a refusal that is not a fault, `a_device_code_approved_before_an_epoch_is_invalid_grant`

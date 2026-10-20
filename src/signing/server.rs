@@ -13,13 +13,22 @@
 //! One line per request: the operation, the purpose, the `kid`, the message
 //! length, the peer uid and the result (with a fixed reason for a shape
 //! refusal). Never the message bytes (a token payload carries personal data)
-//! and never key material. Signatures are counted per purpose; a summary line
-//! is logged each minute that saw any, and a `rate_alarm` warning once in a
-//! minute in which sign requests exceed the configured bound.
+//! and never key material. Signatures are counted per purpose and refusals
+//! apart; a summary line is logged each minute that saw any, and a
+//! `rate_alarm` warning once in a minute in which the signatures made exceed
+//! the configured bound (a refusal signs nothing and is not counted there).
+//!
+//! # The socket file
+//!
+//! [`bind`] replaces a socket file only when nothing accepts connections on
+//! it (a signer that died), and refuses to start while another signer still
+//! serves it. On shutdown the signer removes the socket file only while it is
+//! still the one it bound ([`SocketFile::remove`]): when two signers overlap in
+//! a restart, the old one's stop never deletes the new one's socket.
 
 use std::io;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::path::Path;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,7 +48,7 @@ pub const DEFAULT_ALLOWED_UID: u32 = 10001;
 pub const DEFAULT_MAX_TOKEN_LIFETIME_SECS: i64 = 3600;
 /// The default allowed distance of `iat` from the signer's clock (seconds).
 pub const DEFAULT_MAX_CLOCK_SKEW_SECS: i64 = 300;
-/// The default bound on sign requests per minute before `rate_alarm`.
+/// The default bound on signatures per minute before `rate_alarm`.
 pub const DEFAULT_RATE_ALARM_PER_MINUTE: u64 = 600;
 /// The default bound on reading one request.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -80,12 +89,17 @@ impl ServiceOptions {
 struct Window {
     /// Signatures made, per purpose (indexed by [`slot`]).
     signed: [u64; 4],
-    /// Requests refused (any error answer).
+    /// Requests refused (any error answer). Not part of the alarm: a refusal
+    /// signs nothing.
     refused: u64,
-    /// Every counted request: signed plus refused. `public` is not counted.
-    requests: u64,
     /// Whether this minute's `rate_alarm` was logged.
     alarmed: bool,
+}
+
+impl Window {
+    fn signatures(&self) -> u64 {
+        self.signed.iter().sum()
+    }
 }
 
 /// The signing service. Holds the key; never prints it (`EcdsaSigningKey` has
@@ -130,7 +144,12 @@ impl SignerService {
                 max_token_lifetime_secs: options.max_token_lifetime_secs,
                 max_clock_skew_secs: options.max_clock_skew_secs,
             },
-            public_answer: protocol::public_answer(&kid, jwk),
+            public_answer: protocol::public_answer(
+                &kid,
+                jwk,
+                &options.issuer,
+                options.max_token_lifetime_secs,
+            ),
             key,
             options,
             window: Mutex::new(Window::default()),
@@ -170,7 +189,7 @@ impl SignerService {
     /// Log the minute's counts (when there were any) and start a new minute.
     fn close_window(&self) {
         let window = std::mem::take(&mut *self.window.lock().unwrap_or_else(|e| e.into_inner()));
-        if window.requests > 0 {
+        if window.signatures() > 0 || window.refused > 0 {
             info!(
                 id_tokens = window.signed[slot(Purpose::IdToken)],
                 did_proofs = window.signed[slot(Purpose::DidProof)],
@@ -183,19 +202,21 @@ impl SignerService {
         }
     }
 
-    /// Count one sign request; warn once in a minute that exceeds the bound.
+    /// Count one request: a signature made for `Some(purpose)`, a refusal for
+    /// `None`. Warn once in a minute whose signatures exceed the bound.
     fn count(&self, purpose: Option<Purpose>) {
         let mut window = self.window.lock().unwrap_or_else(|e| e.into_inner());
-        window.requests += 1;
-        match purpose {
-            Some(purpose) => window.signed[slot(purpose)] += 1,
-            None => window.refused += 1,
-        }
+        let Some(purpose) = purpose else {
+            window.refused += 1;
+            return;
+        };
+        window.signed[slot(purpose)] += 1;
+        let signs = window.signatures();
         let bound = self.options.rate_alarm_per_minute;
-        if bound > 0 && window.requests > bound && !window.alarmed {
+        if bound > 0 && signs > bound && !window.alarmed {
             window.alarmed = true;
             warn!(
-                signs_per_minute = window.requests,
+                signs_per_minute = signs,
                 bound,
                 kid = %self.kid(),
                 "rate_alarm"
@@ -313,16 +334,43 @@ async fn read_request(stream: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
+/// How long [`bind`] waits for an existing socket to accept a connection.
+const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Bind the socket at `path`, mode [`SOCKET_MODE`].
 ///
-/// A stale socket left by an earlier run is removed first; anything else at
-/// the path (a file, a directory, a symlink) is refused, never deleted. Between
-/// the bind and the mode change the socket has the umask's mode; a peer that
-/// connects in that moment is still refused by the uid check.
-pub fn bind(path: &Path) -> Result<UnixListener> {
+/// An existing socket file is replaced only when nothing accepts connections
+/// on it (a signer that died left it). One that a running signer still serves
+/// is refused, as is anything else at the path (a file, a directory, a
+/// symlink), which is never deleted. Between the bind and the mode change the
+/// socket has the umask's mode; a peer that connects in that moment is still
+/// refused by the uid check.
+///
+/// Returns the listener and the [`SocketFile`] it made, which the caller
+/// removes on shutdown.
+pub fn bind(path: &Path) -> Result<(UnixListener, SocketFile)> {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path)
-            .with_context(|| format!("removing the stale socket {}", path.display()))?,
+        Ok(meta) if meta.file_type().is_socket() => {
+            match accepts_connections(path) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(anyhow!(
+                        "{} is served by a running signer; refusing to take it over (stop that \
+                         signer first)",
+                        path.display()
+                    ))
+                }
+                Err(e) => {
+                    return Err(anyhow!(
+                        "cannot tell whether a signer still serves {}: {e}; refusing to \
+                         replace it",
+                        path.display()
+                    ))
+                }
+            }
+            std::fs::remove_file(path)
+                .with_context(|| format!("removing the stale socket {}", path.display()))?
+        }
         Ok(_) => {
             return Err(anyhow!(
                 "{} exists and is not a socket; refusing to replace it",
@@ -334,9 +382,62 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
     }
     let listener =
         UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+    let file = SocketFile::of(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE))
         .with_context(|| format!("setting the mode of {}", path.display()))?;
-    Ok(listener)
+    Ok((listener, file))
+}
+
+/// Whether a process accepts connections on the socket at `path`: a connect
+/// that succeeds, or does not finish within [`LIVENESS_PROBE_TIMEOUT`] (a full
+/// backlog, a stopped process), means yes; a refused one means no. Any other
+/// failure is returned, and the caller replaces nothing.
+fn accepts_connections(path: &Path) -> io::Result<bool> {
+    let (sender, answer) = std::sync::mpsc::channel();
+    let probe = path.to_path_buf();
+    // A blocking connect in a thread of its own, so a socket that never
+    // answers cannot hold the start; the thread ends with its connect.
+    std::thread::spawn(move || {
+        let _ = sender.send(std::os::unix::net::UnixStream::connect(probe).map(drop));
+    });
+    match answer.recv_timeout(LIVENESS_PROBE_TIMEOUT) {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => Ok(false),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Ok(true),
+    }
+}
+
+/// The socket file a [`bind`] made, known by its device and inode.
+#[derive(Debug)]
+pub struct SocketFile {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl SocketFile {
+    fn of(path: &Path) -> Result<Self> {
+        let meta = std::fs::symlink_metadata(path)
+            .with_context(|| format!("inspecting the new socket {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+
+    /// Remove the socket file if it is still the one [`bind`] made. A socket
+    /// another signer has bound at the path since is left alone. Returns
+    /// whether the file was removed.
+    pub fn remove(&self) -> bool {
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(meta) if meta.dev() == self.dev && meta.ino() == self.ino => {
+                std::fs::remove_file(&self.path).is_ok()
+            }
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]

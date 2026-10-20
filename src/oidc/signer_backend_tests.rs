@@ -469,3 +469,72 @@ async fn every_real_emission_has_the_shape_the_signer_allows_and_a_tampered_one_
         );
     }
 }
+
+/// AUDIT PR83 F2: the code exchange answers a signer outage with the retryable
+/// 503 (`Retry-After`), but the code was consumed and a grant issued before
+/// the ID token was signed, so the retry the 503 invites is refused as an
+/// already-exchanged code and the issued grant is held by nobody.
+#[tokio::test]
+async fn audit_pr83_a_code_exchange_retried_after_a_signer_outage_succeeds() {
+    let Some(db) = siwx_oidc::test_support::redis().await else {
+        return;
+    };
+    let key = EcdsaSigningKey::generate();
+    let service = TestSigner::start(key.clone(), TestSigner::options());
+    let signer = socket_signer(&service).await;
+    let client_id = store_client(&db, client(false)).await;
+    let code = format!("code-{}", nonce());
+    db.set_code(
+        code.clone(),
+        CodeEntry {
+            exchange_count: 0,
+            did: DID.to_string(),
+            nonce: None,
+            client_id: client_id.to_string(),
+            auth_time: Utc::now(),
+            code_challenge: Some(CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
+            device_id: None,
+            localpart: Some(localpart_for(DID)),
+            scope: Some("openid".into()),
+            client_class: Some(ClientClass::Matrix),
+        },
+    )
+    .await
+    .unwrap();
+    let form = || TokenForm {
+        code: Some(code.clone()),
+        client_id: Some(client_id.to_string()),
+        client_secret: None,
+        grant_type: CoreGrantType::AuthorizationCode,
+        code_verifier: Some(VERIFIER.to_string()),
+        refresh_token: None,
+        device_code: None,
+    };
+    service.stop();
+    let first = token(
+        form(),
+        ClientCredentials::default(),
+        &signer,
+        &config(),
+        &db,
+        None,
+    )
+    .await;
+    assert!(matches!(first, Err(CustomError::ServiceUnavailable(_))));
+    // The signer is back (in process here): the retry the 503 asked for.
+    let retry = token(
+        form(),
+        ClientCredentials::default(),
+        &key,
+        &config(),
+        &db,
+        None,
+    )
+    .await;
+    assert!(
+        retry.is_ok(),
+        "a retried exchange after a 503 is served, not {:?}",
+        retry.as_ref().err()
+    );
+}

@@ -287,11 +287,21 @@ pub enum SignError {
 }
 
 impl SignError {
-    /// Whether the failure is the backend's (the signer down, slow or
-    /// misbehaving), which a request answers with a retryable 503, rather than
-    /// the token's own assembly, which stays the 500 it was before backends.
-    pub fn is_backend(&self) -> bool {
-        !matches!(self, SignError::Assembly(_))
+    /// Whether asking again can succeed: the signer down, slow or misbehaving,
+    /// or failing on its own side (`internal`). A request answers it with a
+    /// retryable 503. A refusal of the request itself (`shape`, `bad_request`,
+    /// `too_large`, `bad_version`) and a token that could not be assembled
+    /// fail the same way every time, and are never answered as retryable.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            SignError::Assembly(_) => false,
+            SignError::Refused(code) => *code == protocol::ErrorCode::Internal,
+            SignError::Unavailable(_)
+            | SignError::Timeout(_)
+            | SignError::BadAnswer
+            | SignError::KidMismatch { .. }
+            | SignError::BadSignature => true,
+        }
     }
 }
 
