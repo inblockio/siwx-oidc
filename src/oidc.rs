@@ -7681,6 +7681,9 @@ mod userinfo_mxid_claim_tests {
 #[cfg(test)]
 mod userinfo_mailbox_claim_tests;
 
+#[cfg(test)]
+mod static_client_digest_tests;
+
 /// `sign_in` decides deactivation BEFORE it resolves the login localpart.
 ///
 /// The ordering rule is argued at the gate's call site in [`sign_in`]: the

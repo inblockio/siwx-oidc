@@ -1691,7 +1691,7 @@ pub async fn main() {
     // Precedence and the naming contract (SIWXOIDC_ / siwx-oidc.toml, with the
     // legacy SIWEOIDC_ / siwe-oidc.toml still read) live in `config::figment`.
     let figment = config::figment();
-    let config = figment.extract::<config::Config>().unwrap();
+    let mut config = figment.extract::<config::Config>().unwrap();
     let legacy_names = config::LegacyNames::detect(&figment);
 
     let env_filter = EnvFilter::try_from_default_env()
@@ -1729,6 +1729,12 @@ pub async fn main() {
             config::CONFIG_FILE,
         );
     }
+
+    // Secrets that live in files are read here, once, before anything connects or uses
+    // them; a refusal exits non-zero and names the setting and the path, never content.
+    config
+        .read_secret_files()
+        .unwrap_or_else(|e| panic!("FATAL: {e}"));
 
     // Fail fast when the dual-write flag names a Redis we cannot open. Lazy
     // resolution would degrade to legacy-only, silently and permanently, while

@@ -174,7 +174,9 @@ tool (`src/bin/migrate-credentials.rs`, shipped in the image next to the
 server): `migrate-credentials [--apply] [--source-redis URL] [--target-redis URL]`.
 It is a dry run unless given `--apply`, only adds keys, and can be re-run; the
 logic is the library module `credential_migration`. If the variable names a
-Redis that cannot be opened, the server refuses to start.
+Redis that cannot be opened, the server refuses to start. A Redis password
+belongs in `AQUA_WEBAUTHN_REDIS_PASSWORD_FILE`, not in the URL
+([configuration](configuration.md#variables-outside-the-config-struct)).
 
 ## Scoping the passkey picker
 
