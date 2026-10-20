@@ -361,11 +361,7 @@ async fn reaper_uses_only_exists_and_scard() {
         .sadd_raw_for_test(&format!("idx:user_device/{lp}/DEVICE_B"), "token/stale")
         .await;
     let url = siwx_oidc::test_support::redis_db_url(12);
-    let inner = bb8_redis::redis::Client::open(url.as_str())
-        .unwrap()
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap();
+    let inner = siwx_oidc::test_support::raw_connection(&url).await.unwrap();
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
     let mut reaper = f.reaper(&live());
     reaper.grants = Arc::new(Recording(tokio::sync::Mutex::new(Recorder {

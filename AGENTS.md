@@ -842,6 +842,25 @@ doc; read it before changing the code the rule covers.
   returns the store error instead of folding it into "unknown"). Pin:
   `a_store_fault_at_the_matrix_refresh_endpoint_is_a_retryable_503`,
   `a_store_fault_on_a_bearer_route_is_a_retryable_503`.
+- **A server-side fault at `POST /token` is a 503 `temporarily_unavailable` with `Retry-After`
+  and no `errcode`, never a 4xx.** Element Web (matrix-js-sdk) ends the session on any 4xx from
+  the token endpoint and on any error body with an `errcode`, 5xx included; it retries every
+  other failure. `TokenEndpointError` renders `ServiceUnavailable` and `Other` (a store error,
+  a dependency) this way, and the body names no internal error. A refresh whose rotation
+  committed before the fault gets the same pair on the retry (I4). Pin:
+  `a_store_fault_at_the_token_endpoint_is_a_retryable_503_without_an_errcode`,
+  and for a refusal that is not a fault, `a_device_code_approved_before_an_epoch_is_invalid_grant`
+  (`IssueRevoked` is `invalid_grant` in both the code and the device-code grant).
+- **A device code keeps the lifetime it was issued with** (RFC 8628 §3.2). Every write after
+  issuance (a poll, an approval, a denial) goes through `update_device_code`, one script: no
+  write extends a pending code, none writes back a code that expired since it was read (a plain
+  `SET` would leave it with no expiry), and it answers whether it wrote. A decided code keeps at
+  least `DEVICE_CODE_DECIDED_GRACE_SECS` (two poll intervals), so the device collects an
+  approval made in the code's last seconds; a decided code can no longer be approved, so the
+  grace opens nothing. An approval is reported only once it is stored, and a poll whose code
+  expired since it was read answers `expired_token`. The user code is written once. Pin:
+  `polling_a_device_code_never_extends_its_lifetime`,
+  `a_device_code_update_keeps_its_expiry_and_never_revives_an_expired_code`.
 - **In delegated-auth mode the Matrix side acts on Matrix credentials only; an `oidc` grant (a
   generic-class client's) is not one.** Introspection answers `{"active": false}` for its access
   token (the endpoint exists only in that mode); the bearer routes (`logout`, `logout/all`,
@@ -1202,6 +1221,12 @@ doc; read it before changing the code the rule covers.
   `sigint_finishes_and_exits_zero_with_an_idle_connection_open`,
   `a_request_in_flight_when_sigterm_arrives_is_still_answered`,
   `a_server_that_cannot_bind_says_which_address`.
+- **A Redis command may take up to 5 s** (`REDIS_RESPONSE_TIMEOUT`, set by the pool's own
+  `ConnectionManager`). bb8-redis's manager keeps the redis crate's 500 ms default, under which
+  one stall of half a second fails every command in flight on the instance, and a rotation
+  script that commits is reported to its caller as a failure. Do not go back to
+  `bb8_redis::RedisConnectionManager`, and never set no timeout: a connection that died without
+  closing would hang its requests. Pin: `a_redis_answer_slower_than_half_a_second_is_awaited`.
 - **Credential store: dual-write, not cut-over.** The legacy `webauthn:credential/*` namespace
   stays authoritative; mirror writes are best-effort; the backfill is additive and idempotent.
   Pin: `backfill_is_additive_link_aware_counter_preserving_and_idempotent` (needs its own

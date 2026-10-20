@@ -272,8 +272,27 @@ struct TokenEndpointError {
     basic_attempted: bool,
 }
 
+/// Seconds a client waits before it retries a `POST /token` that met a server-side fault.
+const TOKEN_RETRY_AFTER_SECS: &str = "5";
+
 impl IntoResponse for TokenEndpointError {
     fn into_response(self) -> Response {
+        // Not a 4xx: a Matrix client ends the session on any 4xx from the token endpoint,
+        // and matrix-js-sdk on any error body with an `errcode`, 5xx included. It retries
+        // a 5xx with an RFC 6749 body, and the retry of a refresh whose rotation committed
+        // gets the same pair back (I4). The description names no internal error.
+        if let CustomError::ServiceUnavailable(_) | CustomError::Other(_) = &self.error {
+            warn!(error = %self.error, "token endpoint: server-side fault, answered with a retryable 503");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, TOKEN_RETRY_AFTER_SECS)],
+                Json(serde_json::json!({
+                    "error": "temporarily_unavailable",
+                    "error_description": "The token service is temporarily unavailable; retry.",
+                })),
+            )
+                .into_response();
+        }
         let challenge = self.basic_attempted
             && matches!(
                 &self.error,
@@ -350,7 +369,11 @@ async fn token(
         // OAuth2 RFC 6749 §5.2: token endpoint errors MUST be JSON.
         // Wrap non-Token errors so they always produce a JSON body.
         let error = match e {
-            CustomError::BadRequestToken(_) => e,
+            // A server-side fault (the store, a dependency) decides nothing about the
+            // grant: `TokenEndpointError` answers it with a retryable 503.
+            CustomError::BadRequestToken(_)
+            | CustomError::ServiceUnavailable(_)
+            | CustomError::Other(_) => e,
             CustomError::Unauthorized(msg) => CustomError::BadRequestToken(oidc::TokenError {
                 error: CoreErrorResponseType::InvalidClient,
                 error_description: msg,
@@ -3138,5 +3161,102 @@ mod login_session_tests {
             .await
             .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("Sign-in timed out"));
+    }
+}
+
+#[cfg(test)]
+mod token_store_fault_tests {
+    //! What `POST /token` answers when the store fails under it. matrix-js-sdk ends a
+    //! session on any 4xx from the token endpoint and on any error body with an
+    //! `errcode` (`oauth/tokenRefresher.ts`, `oauth/index.ts`); it retries every other
+    //! failure. A store fault decides nothing about the grant, so it is a 503 with an
+    //! RFC 6749 body and no `errcode`.
+    use super::*;
+    use siwx_oidc::db::grant::{GrantId, KV_GRANT_PREFIX};
+    use siwx_oidc::db::tokens;
+
+    fn state(redis: RedisClient) -> AppState {
+        let base = url::Url::parse("http://localhost:8000").unwrap();
+        let (wa_config, rp_dispatch) =
+            wa::build_rp_dispatch(&base, None, None, None).expect("build rp dispatch");
+        AppState {
+            signing_key: Arc::new(EcdsaSigningKey::generate()),
+            retired_verification_keys: Arc::new(Vec::new()),
+            config: config::Config {
+                base_url: base,
+                mas_shared_secret: Some("mas-secret".into()),
+                ens_api_url: None,
+                eth_provider: None,
+                ..config::Config::default()
+            },
+            redis_client: redis,
+            webauthn: Arc::new(wa_config.webauthn),
+            rp_id: wa_config.rp_id,
+            rp_origin: wa_config.rp_origin,
+            rp_dispatch: Arc::new(rp_dispatch),
+            synapse_client: None,
+        }
+    }
+
+    /// A value of the wrong type where the grant is read: every read of it fails.
+    async fn plant_store_fault(key: &str) {
+        let mut conn =
+            siwx_oidc::test_support::raw_connection(&siwx_oidc::test_support::redis_url())
+                .await
+                .unwrap();
+        let _: () = bb8_redis::redis::cmd("SET")
+            .arg(key)
+            .arg("planted store fault")
+            .arg("EX")
+            .arg(60)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_store_fault_at_the_token_endpoint_is_a_retryable_503_without_an_errcode() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let rt = tokens::new_refresh_token(&tokens::new_grant_handle());
+        let handle = tokens::parse_refresh_token(&rt).unwrap().handle;
+        plant_store_fault(&format!(
+            "{}/{}",
+            KV_GRANT_PREFIX,
+            GrantId::of_handle(handle).as_str()
+        ))
+        .await;
+
+        let response = token(
+            State(state(redis)),
+            HeaderMap::new(),
+            Form(oidc::TokenForm {
+                code: None,
+                client_id: Some("any-client".into()),
+                client_secret: None,
+                grant_type: openidconnect::core::CoreGrantType::RefreshToken,
+                code_verifier: None,
+                refresh_token: Some(rt),
+                device_code: None,
+            }),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let retry_after = response.headers().get(header::RETRY_AFTER).cloned();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a store fault is not the client's error: {body}"
+        );
+        assert!(body.get("errcode").is_none(), "no errcode: {body}");
+        assert_eq!(body["error"], "temporarily_unavailable", "{body}");
+        assert!(retry_after.is_some(), "the 503 says when to retry");
     }
 }

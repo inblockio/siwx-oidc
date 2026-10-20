@@ -2193,9 +2193,10 @@ mod tests {
     /// gets the same `Err` from the store that a lost connection, a timeout or
     /// an out-of-memory refusal gives it. The key expires on its own.
     async fn plant_store_fault(key: &str) {
-        let raw =
-            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
-        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let mut conn =
+            siwx_oidc::test_support::raw_connection(&siwx_oidc::test_support::redis_url())
+                .await
+                .unwrap();
         let _: () = bb8_redis::redis::cmd("SET")
             .arg(key)
             .arg("planted store fault")
@@ -2284,9 +2285,10 @@ mod tests {
     /// restoring them: a planted fault overwrites the set, and the retry after
     /// the fault needs it back.
     async fn set_members(key: &str) -> Vec<String> {
-        let raw =
-            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
-        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let mut conn =
+            siwx_oidc::test_support::raw_connection(&siwx_oidc::test_support::redis_url())
+                .await
+                .unwrap();
         bb8_redis::redis::cmd("SMEMBERS")
             .arg(key)
             .query_async(&mut conn)
@@ -2295,9 +2297,10 @@ mod tests {
     }
 
     async fn restore_set(key: &str, members: &[String]) {
-        let raw =
-            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
-        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let mut conn =
+            siwx_oidc::test_support::raw_connection(&siwx_oidc::test_support::redis_url())
+                .await
+                .unwrap();
         let _: () = bb8_redis::redis::cmd("DEL")
             .arg(key)
             .query_async(&mut conn)
@@ -2527,9 +2530,10 @@ mod tests {
     /// A sorted set's members with their scores, to put it back after a
     /// planted fault replaced it.
     async fn zset_entries(key: &str) -> Vec<(String, String)> {
-        let raw =
-            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
-        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let mut conn =
+            siwx_oidc::test_support::raw_connection(&siwx_oidc::test_support::redis_url())
+                .await
+                .unwrap();
         bb8_redis::redis::cmd("ZRANGE")
             .arg(key)
             .arg(0)
@@ -2541,9 +2545,10 @@ mod tests {
     }
 
     async fn restore_zset(key: &str, entries: &[(String, String)]) {
-        let raw =
-            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
-        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let mut conn =
+            siwx_oidc::test_support::raw_connection(&siwx_oidc::test_support::redis_url())
+                .await
+                .unwrap();
         let _: () = bb8_redis::redis::cmd("DEL")
             .arg(key)
             .query_async(&mut conn)
@@ -3824,9 +3829,10 @@ mod tests {
             "the bearer stays for the retry"
         );
         // The store recovers: the index is back.
-        let raw =
-            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
-        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let mut conn =
+            siwx_oidc::test_support::raw_connection(&siwx_oidc::test_support::redis_url())
+                .await
+                .unwrap();
         let _: () = bb8_redis::redis::cmd("DEL")
             .arg(&idx)
             .query_async(&mut conn)
@@ -4130,9 +4136,10 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
-        let raw =
-            bb8_redis::redis::Client::open(siwx_oidc::test_support::redis_url().as_str()).unwrap();
-        let mut conn = raw.get_multiplexed_async_connection().await.unwrap();
+        let mut conn =
+            siwx_oidc::test_support::raw_connection(&siwx_oidc::test_support::redis_url())
+                .await
+                .unwrap();
         let key = format!("deleted:device/{user}/{dev}");
         let ttl: i64 = bb8_redis::redis::cmd("TTL")
             .arg(&key)

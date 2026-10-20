@@ -27,7 +27,7 @@ pub mod outbox;
 mod redis;
 pub mod seal;
 pub mod tokens;
-pub use self::redis::{device_has_live_grant_on, RedisClient};
+pub use self::redis::{device_has_live_grant_on, RedisClient, REDIS_RESPONSE_TIMEOUT};
 
 const KV_CLIENT_PREFIX: &str = "clients";
 /// Redis SET of the client ids written from `default_clients`, so the next start can
@@ -292,6 +292,9 @@ pub const TOMBSTONE_TTL_SECS: u64 = 900; // 15 min
 pub const DEVICE_CODE_LIFETIME: u64 = 1800; // 30 minutes
 /// Minimum polling interval for device code grant (seconds).
 pub const DEVICE_CODE_INTERVAL: u64 = 5;
+/// The least a decided device code keeps of its lifetime: two poll intervals, so the
+/// device collects an approval or a denial made in the code's last seconds.
+pub const DEVICE_CODE_DECIDED_GRACE_SECS: u64 = 2 * DEVICE_CODE_INTERVAL;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CodeEntry {
@@ -1001,15 +1004,18 @@ pub trait DBClient {
         &self,
         device_code: &str,
     ) -> Result<Option<(DeviceCodeRef, DeviceCodeEntry)>>;
-    /// Update the entry a lookup returned, where the lookup found it, with a
-    /// TTL in seconds (preserving the original TTL is the caller's
-    /// responsibility).
+    /// Update the entry a lookup returned, where the lookup found it, and answer
+    /// whether it was written: a code that expired since the lookup is not written
+    /// again (`false`). A pending code keeps the expiry it was created with (RFC 8628
+    /// §3.2: `expires_in` is its lifetime), however often it is polled. A decided code
+    /// (approved or denied) keeps at least [`DEVICE_CODE_DECIDED_GRACE_SECS`], so the
+    /// device's next poll, one interval away, still finds the decision; it can no
+    /// longer be approved, so the grace opens nothing.
     async fn update_device_code(
         &self,
         device_code: &DeviceCodeRef,
         entry: &DeviceCodeEntry,
-        ttl: u64,
-    ) -> Result<()>;
+    ) -> Result<bool>;
     /// Redis `TIME` in Unix milliseconds: the clock of every lifetime deadline
     /// (I6) and of the epochs (I9), so instances with skewed clocks agree.
     async fn server_time_ms(&self) -> Result<i64>;
