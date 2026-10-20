@@ -125,8 +125,8 @@ async fn run() -> Result<ExitCode> {
     } else {
         println!("migrate-credentials: DRY RUN (nothing will be written; pass --apply to write)");
     }
-    println!("  source: {}", args.source);
-    println!("  target: {}", args.target);
+    println!("{}", endpoint_line("source", &args.source));
+    println!("{}", endpoint_line("target", &args.target));
 
     let migration =
         CredentialMigration::new(&redis, &store, &derive_did_from_passkey_blob, args.apply);
@@ -144,4 +144,27 @@ async fn run() -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// The line that names an endpoint: its URL without the user name and password it carries.
+fn endpoint_line(role: &str, url: &str) -> String {
+    format!("  {role}: {}", siwx_oidc::redact::redact_url(url))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint_line;
+    use siwx_oidc::test_support::{leaked_window, random_secret, redis_url_with_password};
+
+    /// The URLs come from the command line or the environment and carry the Redis password.
+    #[test]
+    fn the_endpoints_it_prints_never_carry_the_password() {
+        let password = random_secret(40);
+        let url = redis_url_with_password(&password, "redis.example.org:6379/2");
+        for role in ["source", "target"] {
+            let line = endpoint_line(role, &url);
+            assert_eq!(line, format!("  {role}: redis://redis.example.org:6379/2"));
+            assert_eq!(leaked_window(&line, &password), None);
+        }
+    }
 }

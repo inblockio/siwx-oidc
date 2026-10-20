@@ -33,7 +33,7 @@ everything else exists only in the binary crate.
 | `main.rs` | Binary entry point. Declares the binary-only modules and calls `axum_lib::main`. |
 | `lib.rs` | Library crate root. `synapse_client` is deliberately not re-exported (see Invariants). |
 | `axum_lib.rs` | Startup: loads config through `config::figment()`, validates it (DID methods and pkh namespaces against the aqua-auth registries, signing key, retired keys, WebAuthn), `store_default_clients` (digested, no expiry, prunes the clients the map no longer names), `AppState`, the router, handler glue, the `siwx_user` / `acct_session` cookies, the CORS layer. |
-| `config.rs` | `Config`, its defaults, and `figment()`: the one place config names and precedence are defined. Reference: [docs/configuration.md](docs/configuration.md). |
+| `config.rs` | `Config`, its defaults, and `figment()`: the one place config names and precedence are defined. `Config::read_secret_files` reads `mas_shared_secret_file` and `redis_password_file` once at start. `Config` is deliberately not `Debug` (it holds secrets). Reference: [docs/configuration.md](docs/configuration.md). |
 | `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_code_client` and `authenticate_refresh_client` authenticate the client for the first two, and `client_is_confidential` decides which clients must present a secret; `exchange_issuance` decides what a code exchange issues, by deployment mode and client class), `userinfo`, client registration, RP-initiated logout (`end_session`, `verify_id_token_hint`), `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, `provision_synapse_account` (the account half of provisioning and the single DID-publication site) and `provision_synapse_device` (calls it, then adds the device half). |
 | `introspect.rs` | `POST /oauth2/introspect` (RFC 7662) for Synapse, inactive for an `oidc` grant's token; opaque `mat_`/`mcr_` token generation. |
 | `admin_token.rs` | `POST /oauth2/admin_token`: short-TTL token whose scope carries `urn:synapse:admin:*`. |
@@ -48,6 +48,7 @@ everything else exists only in the binary crate.
 | `localpart.rs` | Grandfathering policy: `resolve_identity` (fallible) and `resolve_identity_or_legacy` (fail-safe to legacy). |
 | `mxid.rs` (lib) | Pure localpart derivation: `localpart_for`, `legacy_localpart`, `canonicalize`. `sha2` only. |
 | `redact.rs` (lib) | `fingerprint`, `redact_key`, `redact_url`: what a log line may say about a credential. |
+| `secret_file.rs` (lib) | Secrets read from mounted files: `read` (one trailing line ending removed; unreadable, empty, non-UTF-8 and oversized files are errors that name the setting and the path and never content), `url_with_password` (`Url::set_password` leaves `%` alone, so it encodes `%` first; without that the Redis client decodes `%41` to `A`), `url_carries_password`, `both_set`. |
 | `alias.rs` (lib) | `alias_for(did)`: the generated `Firstname Surname` a new account is seeded with. |
 | `credential_identity.rs` (lib) | Which identity a stored passkey authenticates: a `webauthn:link/*` entry overrides the derived `did:key`. |
 | `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL`; `did_has_credential_bounded`, the scan-bounded passkey check of the device page. |
@@ -98,9 +99,10 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 35 tests in eleven files:
+  `cargo test --workspace` runs the unit tests of both crates plus 42 tests in twelve files:
   `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (6),
-  `static_client_startup` (10), `log_hygiene_credential_store` (1) and
+  `static_client_startup` (10), `secret_files_startup` (7, one of which serves requests from
+  database 3 of the test Redis), `log_hygiene_credential_store` (1) and
   `log_capture_callsite_interest` (1), which need nothing; `account_linking_dual_write` (6), which needs the test Redis, and `log_hygiene`
   (4, one of them needs it);
   `credential_migration_live` (2), which needs its own disposable, empty Redis named by
@@ -1267,6 +1269,12 @@ structured output.
   `the_boot_check_never_prints_the_redis_password`. A new log site that names a credential
   variable fails the scan; add the variable name to `CREDENTIAL_NAMES` in `tests/log_hygiene.rs`
   when you introduce a new kind of credential.
+- **A start-up error about a secret setting names the setting and the path, never the value**
+  (`secret_file`, `mas_shared_secret_file`, `redis_password_file`). A value that figment or
+  `Url` would quote in its own error (a `redis_url` that does not parse, a `mas_shared_secret`
+  read as a number) is refused by a `deserialize_with` in `config.rs` that does not. Pin:
+  `tests/secret_files_startup.rs` (no 16-character window of a generated secret in any refusal)
+  and `the_config_is_not_debug`.
 - Use structured fields (`info!(did = %did, "sign_in success")`), not string interpolation.
 - Log errors at the boundary (`CustomError::into_response`). Modules that bypass `CustomError`
   (`introspect`, `compat`, `resolve`) log their own errors.

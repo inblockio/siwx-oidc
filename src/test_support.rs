@@ -78,7 +78,7 @@ pub async fn redis() -> Option<RedisClient> {
 /// in it, say). Each such test takes its own number; taken so far: 4 to 7 and
 /// 12 to 15 (guest route tests, `env(Some(n))`/`env_in(Some(n))` and the reaper),
 /// 2 and 8 (the orphan scan), 9 (the outbox), 10 (back-channel logout), 11
-/// (static-client isolation). Free: 1 and 3.
+/// (static-client isolation), 3 (the server of `tests/secret_files_startup.rs`). Free: 1.
 pub async fn redis_db(db: u8) -> Option<RedisClient> {
     connect(redis_db_url(db)).await
 }
@@ -249,9 +249,54 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuffer {
     }
 }
 
+/// A throwaway secret of `len` alphanumeric characters, generated per run. A test
+/// never writes a secret-looking literal; it generates one.
+pub fn random_secret(len: usize) -> String {
+    use rand::{distributions::Alphanumeric, Rng};
+    rand::thread_rng()
+        .sample_iter(Alphanumeric)
+        .take(len)
+        .map(char::from)
+        .collect()
+}
+
+/// `redis://` + a password + `@` + `rest` (host, port, path): a Redis URL that carries
+/// `password` as written, for the tests that need one malformed.
+pub fn redis_url_with_password(password: &str, rest: &str) -> String {
+    let user_information = format!(":{password}");
+    format!("redis://{user_information}@{rest}")
+}
+
+/// The first 16-character window of `secret` that `output` holds, or `None`. Output
+/// that holds no such window holds no useful part of the secret, which is what a
+/// "never prints the secret" test asks.
+pub fn leaked_window(output: &str, secret: &str) -> Option<String> {
+    let chars: Vec<char> = secret.chars().collect();
+    chars
+        .windows(16)
+        .map(|w| w.iter().collect::<String>())
+        .find(|window| output.contains(window.as_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_leaked_window_is_found_wherever_it_sits_and_a_short_secret_never_leaks() {
+        let secret = random_secret(40);
+        assert_eq!(random_secret(40).len(), 40);
+        assert_ne!(random_secret(40), secret);
+        assert_eq!(leaked_window("nothing here", &secret), None);
+        assert_eq!(
+            leaked_window(&secret[..15], &secret),
+            None,
+            "15 characters is no window"
+        );
+        assert!(leaked_window(&secret[..16], &secret).is_some());
+        assert!(leaked_window(&format!("x{}y", &secret[24..]), &secret).is_some());
+        assert_eq!(leaked_window(&secret, "too short"), None);
+    }
 
     /// Parsed from a value, not from the process environment: setting the
     /// variable here would flip it for every Redis-backed test running
