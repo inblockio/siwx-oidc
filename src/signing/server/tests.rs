@@ -358,6 +358,11 @@ async fn bind_refuses_a_served_socket_and_removes_only_its_own() {
     let dir = temp_dir("bind-own");
     let socket = dir.join("signer.sock");
     let (old_listener, old_file) = bind(&socket).unwrap();
+    // A second name keeps the old socket's inode in use. Without it the replacement below
+    // frees that inode, ext4 (not tmpfs) may hand the same number to the next file, and the
+    // new socket then carries the old one's device and inode: `SocketFile` could not tell
+    // them apart, and this test would fail on a disk-backed temporary directory.
+    std::fs::hard_link(&socket, dir.join("old.sock")).unwrap();
     // The old signer stops accepting, a new one finds the socket dead and binds.
     drop(old_listener);
     let (_new_listener, new_file) = bind(&socket).expect("a dead socket is replaced");
