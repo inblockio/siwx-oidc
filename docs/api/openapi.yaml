@@ -386,11 +386,14 @@ paths:
         "503":
           description: |
             `temporarily_unavailable`, with `Retry-After`: a server-side fault
-            (the token store or a dependency) that decided nothing about the
-            code, refresh token or device code. Retry with the same request; a
-            refresh whose rotation committed before the fault returns the same
-            pair on the retry. The body carries no `errcode`, which a Matrix
-            client would take for a sign-out.
+            (the token store or a dependency), not a refusal. A refresh is
+            retried with the same request; one whose rotation committed before
+            the fault returns the same pair on the retry. An authorization code
+            or a device code the fault met after it was taken is spent: the
+            retry is `invalid_grant` (a code) or `authorization_pending` until
+            the claim lapses (a device code), and the client starts a new
+            sign-in. The body carries no `errcode`, which a Matrix client would
+            take for a sign-out.
 
   /userinfo:
     get:
